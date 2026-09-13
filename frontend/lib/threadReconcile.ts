@@ -86,6 +86,46 @@ export function localOnlyTail(
 }
 
 /**
+ * The server's rows, with the TREE POSITION this tab gave an answer put back
+ * where the server's copy of that same answer has none — 2026-09-13.
+ *
+ * An answer the server stored itself carries the same `generation_id` as the
+ * copy this tab streamed, and `localOnlyTail` rightly skips the local copy as
+ * a duplicate. But when the server's row has no `meta.branch` (an orchestrator
+ * that predates `answer_branch`, or a row written before the POST carried it)
+ * and the local one does, skipping it threw away the only record of where the
+ * answer belongs — and a row without a branch attaches to whatever precedes
+ * it, which for a regenerate is the previous answer: a stacked copy instead of
+ * a version.
+ *
+ * Only `branch` is carried, only onto a row that has none, and only by
+ * generation id — never by position. Rows that need nothing keep their exact
+ * object identity, and so does the array when no row changed, so a caller can
+ * tell "nothing to repair" by `===` (the poll's no-op, M-08).
+ */
+export function withLocalBranches(
+  local: ChatMessage[],
+  server: ChatMessage[],
+): ChatMessage[] {
+  const branches = new Map<string, NonNullable<ChatMessage['meta']>['branch']>();
+  for (const m of local) {
+    const gen = m.meta?.generation_id;
+    if (typeof gen === 'string' && m.meta?.branch) branches.set(gen, m.meta.branch);
+  }
+  if (branches.size === 0) return server;
+  let changed = false;
+  const out = server.map((m) => {
+    const gen = m.meta?.generation_id;
+    if (typeof gen !== 'string' || m.meta?.branch) return m;
+    const branch = branches.get(gen);
+    if (!branch) return m;
+    changed = true;
+    return { ...m, meta: { ...(m.meta ?? {}), branch } };
+  });
+  return changed ? out : server;
+}
+
+/**
  * Server truth WITHOUT throwing away what only this tab knows — the reload
  * and poll path (fe-chat F1).
  *
@@ -142,5 +182,8 @@ export function reconcileThread(
           : s.meta,
     } as ChatMessage;
   });
-  return [...merged, ...localOnlyTail(local, server)];
+  // The tree positions this tab gave answers the server stored without one
+  // (withLocalBranches) — so the poll never flips a version back into a
+  // stacked copy while the repaired thread is on its way to the server.
+  return [...withLocalBranches(local, merged), ...localOnlyTail(local, server)];
 }

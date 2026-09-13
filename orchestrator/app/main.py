@@ -325,6 +325,14 @@ _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: A send intent (V29): browser-minted, one per press of Send, re-sent on
 #: every retry of that message. Same alphabet as a conversation id.
 _INTENT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 2026-09-13 (the duplicate answers): where a regenerate, an edit or a send
+#: in a conversation with versions asks its ANSWER to be stored in the
+#: browser's conversation tree (frontend/lib/branching.ts). `self` is the
+#: answer's branch id (the browser derives it from the intent); `parent` is the
+#: question's — its own branch id, or the positional `#<index>` a message
+#: without one is known by.
+_ANSWER_BRANCH_SELF_RE = _re.compile(r"^b-[A-Za-z0-9_-]{1,64}$")
+_ANSWER_BRANCH_PARENT_RE = _re.compile(r"^(?:b-[A-Za-z0-9_-]{1,64}|#[0-9]{1,6})$")
 #: A bare call's session label. SAME shape rule as a conversation id since
 #: 2026-09-12 (F034): it is half of the synthetic conversation key below, so an
 #: unvalidated session_id was an unvalidated conversation key — free to contain
@@ -1305,6 +1313,10 @@ class LiveGeneration:
         self.intent_id: Optional[str] = None
         self.attempt: int = 1
         self.persisted = False
+        # 2026-09-13: the tree position the request asked this answer to be
+        # stored under (ChatRequest.answer_branch), written onto the stored
+        # row's meta.branch. None = an ordinary send, stored exactly as before.
+        self.answer_branch: Optional[dict] = None
         # The last status written to the chat_requests row, and the failure
         # text a 'failed' row records — the same sentence the error event
         # carried, never an upstream body.
@@ -1678,6 +1690,15 @@ class ChatRequest(BaseModel):
     # starting another (docs/upload-reliability/API.md). Absent from old
     # clients: the server mints one and keeps the event shapes they expect.
     intent_id: Optional[str] = None
+    # 2026-09-13 (the duplicate answers): {"self": "b-…", "parent": "b-…"|"#N"}
+    # — where the answer belongs in the browser's conversation tree. Since V29
+    # the SERVER stores the answer (before `done`), so a position the browser
+    # only held locally was lost: an untagged row attaches to whatever row
+    # precedes it, which for "Try again" is the previous answer — stacked
+    # copies instead of versions. Written onto the stored answer's
+    # `meta.branch`; kept in the request snapshot, so a resume files its answer
+    # in the same place. Absent = today's behaviour, byte for byte.
+    answer_branch: Optional[dict] = None
     # Supplied only by the offline evaluation runner. The application receives
     # the stable case identifier, never the expected plan, query or answer.
     test_case_id: Optional[str] = None
@@ -1695,6 +1716,23 @@ class ChatRequest(BaseModel):
         if value is not None and not _INTENT_ID_RE.fullmatch(value):
             raise ValueError("intent_id must be 1-64 characters of [A-Za-z0-9_-]")
         return value
+
+    @field_validator("answer_branch")
+    @classmethod
+    def _valid_answer_branch(cls, value: Optional[dict]) -> Optional[dict]:
+        if value is None:
+            return None
+        if set(value) - {"self", "parent"}:
+            raise ValueError("answer_branch may carry only self and parent")
+        branch_self = value.get("self")
+        parent = value.get("parent")
+        if not isinstance(branch_self, str) or not _ANSWER_BRANCH_SELF_RE.fullmatch(branch_self):
+            raise ValueError("answer_branch.self must be b- and 1-64 characters of [A-Za-z0-9_-]")
+        if parent is not None and (
+            not isinstance(parent, str) or not _ANSWER_BRANCH_PARENT_RE.fullmatch(parent)
+        ):
+            raise ValueError("answer_branch.parent must be a branch id or #<index>")
+        return {"self": branch_self, **({"parent": parent} if parent is not None else {})}
 
     @field_validator("session_id")
     @classmethod
@@ -2324,6 +2362,10 @@ async def _store_failure(gen: "LiveGeneration", partial: str, *, resumable: bool
         "generation_id": gen.generation_id,
         "intent_id": gen.intent_id,
         "attempt": gen.attempt,
+        # Under the same tree position as the answer a retry will store, so
+        # the browser reads the record as that answer's failed attempt, not
+        # as a version of its own (frontend/lib/branching.ts buildTree).
+        **({"branch": dict(gen.answer_branch)} if gen.answer_branch else {}),
         "error": {
             "message": gen.error,
             "code": gen.error_code,
@@ -2426,6 +2468,11 @@ async def _store_answer(gen: "LiveGeneration") -> None:
         return
     meta = dict(gen.final_meta or {})
     meta.setdefault("generation_id", gen.generation_id)
+    if gen.answer_branch:
+        # The request said where this answer belongs in the conversation tree
+        # (a "Try again", an edit): store it THERE. Without it the row attaches
+        # to whatever precedes it — the previous answer, for a regenerate.
+        meta["branch"] = dict(gen.answer_branch)
     log = logging.getLogger(__name__)
     try:
         stored = await db.run_in_thread(
@@ -2913,6 +2960,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
     gen = LiveGeneration(request.conversation_id, viewer)
     gen.intent_id = intent_id
+    gen.answer_branch = request.answer_branch
     row = await db.run_in_thread(
         db.create_chat_request,
         intent_id,
@@ -3055,6 +3103,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     superseded, conv_key_outer, intent_id,
                 )
 
+    if request.answer_branch and not resumed and not sweep_caller:
+        # A new VERSION of an answer was asked for (a "Try again", an edit, a
+        # send after a fork). Ids only, never content: the next incident about
+        # answers that stack or vanish can be read from here.
+        logging.getLogger(__name__).info(
+            "answer_branch intent=%s conversation=%s self=%s parent=%s",
+            intent_id,
+            conv_key_outer,
+            request.answer_branch["self"],
+            request.answer_branch.get("parent", ""),
+        )
     _live_generations[conv_key_outer] = gen
     _resuming.pop(gen.generation_id, None)
     # One correlation envelope per HTTP attempt. `test_case_id` is only a

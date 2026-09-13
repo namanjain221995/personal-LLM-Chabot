@@ -58,6 +58,7 @@ import {
 import { uploadDocumentFile } from '@/lib/uploadDocument';
 import type { SendOptions } from './Composer';
 import {
+  answerBranchFor,
   branchForAppend,
   branchForVersion,
   hasBranches,
@@ -70,7 +71,7 @@ import {
   type BranchSelection,
 } from '@/lib/branching';
 import type { MessageFeedback } from '@/lib/feedback';
-import { truncateFailure } from '@/lib/historyApi';
+import { intentAnswered, planRegenerate } from '@/lib/regenerate';
 import ChatErrorPage from './ChatErrorPage';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
@@ -81,7 +82,6 @@ import {
   getLiveStream,
   isStreaming,
   markClarificationSubmitted,
-  messagesDiscardedByRegenerate,
   startStream,
   stopStream,
   streamingIds,
@@ -120,7 +120,6 @@ import type { SelectionCandidate } from '@/lib/selectedContext';
 import { Composer, type Attachment, type ComposerHandle } from './Composer';
 import { SelectionAsk } from './SelectionAsk';
 import { SalesforceStarterCard } from './SalesforceStarterCard';
-import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { ArtifactPanel } from './artifacts/ArtifactPanel';
@@ -262,6 +261,22 @@ export function intentForRetry(question: ChatMessage | undefined): string {
   return intent?.id && reusable.includes(intent.state)
     ? intent.id
     : newIntentId();
+}
+
+/**
+ * The intent a "Try again" of `question` sends — 2026-09-13.
+ *
+ * `intentForRetry`, except that an intent whose answer is already stored is
+ * never reused. The question's meta can be adopted from a server copy written
+ * before the answer landed (`accepted`), and the server REPLAYS the stored
+ * answer for a known intent: reusing it would turn "Try again" into a click
+ * that does nothing. An answered intent is finished, whatever its label says.
+ */
+export function intentForRegenerate(
+  all: ChatMessage[],
+  question: ChatMessage,
+): string {
+  return intentAnswered(all, question) ? newIntentId() : intentForRetry(question);
 }
 
 export function newIntentId(): string {
@@ -472,11 +487,6 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       setReconciling(true);
     }
   }, []);
-  /** Armed regenerate awaiting confirmation (it would discard later turns). */
-  const [pendingRegenerate, setPendingRegenerate] = useState<{
-    messageId: string;
-    discarded: number;
-  } | null>(null);
   /**
    * The user turn open for in-place editing, if any (ChatGPT-style).
    *
@@ -1317,6 +1327,21 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     });
   }, [refreshList]);
 
+  // 2026-09-13: a refused whole-thread PUT adopts the SERVER's copy into the
+  // cache (lib/history pushAll). Folded into the view at once, rather than on
+  // the next 8-second poll: until then the screen showed this tab's copy
+  // while the cache held the server's, and "Try again" in that window acted
+  // on a thread that no longer existed. A conversation with a stream in this
+  // tab is left to the stream, which owns the screen until it ends.
+  useEffect(() => {
+    const store = getHistoryStore();
+    return store.subscribe?.((id) => {
+      if (id !== activeIdRef.current || isStreaming(id)) return;
+      const cached = store.get(id);
+      if (cached) adoptServerMessages(id, cached.messages);
+    });
+  }, [adoptServerMessages]);
+
   // Poll for generations still running server-side: powers the sidebar
   // spinner across reloads and pulls in answers that finished while this
   // conversation wasn't on screen.
@@ -1964,7 +1989,18 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // is the single path the model is sent.
       const turns = [...messagesRef.current, userMessage];
       const context = [...threadRef.current, userMessage];
-      const answerBranch = branchForAppend(turns, context);
+      // 2026-09-13: in a conversation that already has versions the answer's
+      // tree position is also sent to the server (`answer_branch`), which
+      // stores it on the row. A row without one attaches to whatever precedes
+      // it, and after a fork that is not reliably this question. An ordinary
+      // linear send keeps its byte-identical body.
+      const announceBranch = hasBranches(messagesRef.current);
+      const answerBranch = announceBranch
+        ? answerBranchFor(turns, userMessage, intentId)
+        : branchForAppend(turns, context);
+      // Recorded WITH the intent, so a retry of this send — even one that
+      // never reached startStream (an upload that failed) — sends the same.
+      const intentBranch = announceBranch ? { answer_branch: answerBranch } : {};
       persist(conversationId, turns);
       // H-01: the turn goes on screen HERE, not as a side effect of opening a
       // stream. `persist` only writes the store and the sidebar, so a dataset
@@ -1990,13 +2026,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         // once it has. Moved on at every step below.
         userMessage.meta = {
           ...(userMessage.meta ?? {}),
-          intent: { id: intentId, state: 'waiting_for_attachments' },
+          intent: { id: intentId, state: 'waiting_for_attachments', ...intentBranch },
         };
         persist(conversationId, turns);
       } else {
         userMessage.meta = {
           ...(userMessage.meta ?? {}),
-          intent: { id: intentId, state: 'submitting' },
+          intent: { id: intentId, state: 'submitting', ...intentBranch },
         };
         persist(conversationId, turns);
         setStreaming(true);
@@ -2172,6 +2208,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
               ...(userMessage.meta ?? {}),
               intent: {
                 id: intentId,
+                ...intentBranch,
                 state: 'unsent',
                 reason:
                   failed.length === 1
@@ -2191,7 +2228,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           // that says the request is on its way — with an id to ask about.
           userMessage.meta = {
             ...(userMessage.meta ?? {}),
-            intent: { id: intentId, state: 'submitting' },
+            intent: { id: intentId, state: 'submitting', ...intentBranch },
           };
           persist(conversationId, turns);
           pendingSendRef.current.delete(conversationId);
@@ -2202,6 +2239,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
             turns,
             context,
             assistantBranch: answerBranch,
+            announceBranch,
             prefs: prefsRef.current,
             // NEW-14: the file itself does not travel — it is already on the
             // server, keyed by this conversation. Saying so is what lets the
@@ -2261,6 +2299,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         turns,
         context,
         assistantBranch: answerBranch,
+        announceBranch,
         prefs: prefsRef.current,
         // 2026-09-02: images accompany documents now ("compare the chart to
         // the report") — the document engine takes them as extra_images.
@@ -2391,35 +2430,31 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // Never a default: sending a subset without being asked is precisely
       // the silent loss the notice exists to prevent.
 
-      // In a conversation that has versions, truncating would delete the
-      // OTHER branches too — they live in the same flat list. So the retry is
-      // appended as a newer answer to the same question instead, and the one
-      // it supersedes stays reachable. A conversation that has never been
-      // edited has no branches to protect and keeps the original behaviour
-      // exactly: confirmed truncate, then re-stream.
-      let turns = context;
-      if (hasBranches(all)) {
-        turns = all;
-      } else if (all.length > context.length + 1) {
-        // The sync path cannot shrink a thread (that guard is what stops a
-        // stale cache from destroying history), so this intentional shrink
-        // goes through the dedicated truncate endpoint — reached ONLY from
-        // here, and only after the user confirmed.
-        try {
-          await getHistoryStore().truncateMessages(id, context.length);
-        } catch (err) {
-          const { message, reload } = truncateFailure(err);
-          toast(message, 'error');
-          if (reload) {
-            const conv = await getHistoryStore()
-              .load(id, { force: true })
-              .catch(() => null);
-            if (conv && activeIdRef.current === id) setMessages(conv.messages);
-          }
-          return;
-        }
-        setMessages(context);
-      }
+      // EVERY regenerate is a VERSION (2026-09-13, the duplicate answers).
+      //
+      // This used to replace the old answer: in a conversation without
+      // versions it truncated through the history endpoint, but ONLY when
+      // this tab showed more than one answer under the question — and since
+      // V29 the server stores each answer itself, so whether that was true
+      // depended on whether an 8-second poll had loaded the server's rows.
+      // One click deleted every earlier answer without a confirmation (the
+      // dialog counted only the rows BELOW the button); the next, with no
+      // poll in between, stacked a copy. Now nothing is removed and nothing
+      // depends on what this tab has loaded: the new answer is a sibling of
+      // the old ones (`‹ 2 / 2 ›`), and the request tells the server where
+      // it goes (lib/regenerate).
+      const question = view[userIdx];
+      const intentId = intentForRegenerate(all, question);
+      const plan = planRegenerate(all, question, intentId);
+      // Land on the new version, the way an edit lands on `2 / 2` — including
+      // when an OLDER version is on screen, whose selection would otherwise
+      // keep it there while the new answer streams out of sight.
+      const fork = plan.assistantBranch.parent ?? ROOT;
+      setBranchSelection((prev) =>
+        prev[fork] === undefined
+          ? prev
+          : selectVersion(plan.turns, prev, fork, plan.assistantBranch.self),
+      );
 
       setStreaming(true);
       setEditingMessageId(null);
@@ -2427,12 +2462,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         // The SAME send when this is a retry of one that never landed, a new
         // one when the person is asking for a different answer to a question
         // that already has one.
-        intentId: intentForRetry(view[userIdx]),
-        intentMessageId: view[userIdx].id,
+        intentId,
+        intentMessageId: question.id,
         conversationId: id,
-        turns,
+        turns: plan.turns,
         context,
-        assistantBranch: branchForAppend(turns, context),
+        assistantBranch: plan.assistantBranch,
+        announceBranch: plan.announceBranch,
         prefs: prefsRef.current,
         images: resend.images,
         pdf: resend.pdf,
@@ -2550,7 +2586,12 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         ...(at === -1 ? [] : threadRef.current.slice(0, at)),
         edited,
       ];
-      const answerBranch = branchForAppend(turns, context);
+      // A rewrite is a DIFFERENT question, so it is a different send: a new
+      // intent, on the new version's own turn — and its answer's place in the
+      // tree travels with the request, so the row the server stores is filed
+      // under the edit and not under whatever it happens to follow.
+      const intentId = newIntentId();
+      const answerBranch = answerBranchFor(turns, edited, intentId);
 
       setEditingMessageId(null);
       // The new version remembers what the original remembered — every image
@@ -2570,14 +2611,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       setUnreachable(false);
       setStreaming(true);
       void startStream({
-        // A rewrite is a DIFFERENT question, so it is a different send: a new
-        // intent, on the new version's own turn.
-        intentId: newIntentId(),
+        intentId,
         intentMessageId: edited.id,
         conversationId: id,
         turns,
         context,
         assistantBranch: answerBranch,
+        announceBranch: true,
         prefs: prefsRef.current,
         images: resend.images,
         pdf: resend.pdf,
@@ -2593,26 +2633,15 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
   );
 
   /**
-   * Regenerating an OLDER answer restarts the thread from that point and
-   * discards every later turn. That is destructive and irreversible, so it
-   * asks first; regenerating the last answer runs straight away.
+   * "Try again" on any answer, the last or an older one.
+   *
+   * There is nothing to confirm (2026-09-13): a regenerate adds a version and
+   * removes nothing, so the dialog that warned "This will delete all messages
+   * after this point" would describe something that no longer happens. The
+   * later turns stay reachable under the version they were asked on.
    */
   const regenerate = useCallback(
     (messageId: string) => {
-      // Once a conversation has versions, a retry adds an answer beside the
-      // old one and removes nothing — so there is nothing to warn about.
-      if (hasBranches(messagesRef.current)) {
-        void runRegenerate(messageId);
-        return;
-      }
-      const discarded = messagesDiscardedByRegenerate(
-        threadRef.current,
-        messageId,
-      );
-      if (discarded > 0) {
-        setPendingRegenerate({ messageId, discarded });
-        return;
-      }
       void runRegenerate(messageId);
     },
     [runRegenerate],
@@ -2642,8 +2671,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // a `1 / 2` with nothing to navigate between. Re-asking as-is is what
       // Regenerate is for, so that is what it does (owner request 2026-09-03):
       // the SAME user turn, a new answer beside the old one, exactly as the
-      // "Try again" button would — confirmation for an older answer included,
-      // because the same rows are at stake. The comparison is the editor's own
+      // "Try again" button would — a version, never a deletion (2026-09-13).
+      // The comparison is the editor's own
       // normalisation (outer trim only): "Read these" → "Read these carefully"
       // and a moved line break are both real edits.
       if (next === (original.content ?? '').trim()) {
@@ -2708,17 +2737,22 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     setUnreachable(false);
     setStreaming(true);
     const context = view.slice(0, userIdx + 1);
+    const question = view[userIdx];
+    // A retry of a send that failed is the same send (F14): the server
+    // attaches to what it has rather than starting a second generation — and
+    // it re-sends the same `answer_branch` its first POST carried, so every
+    // attempt files its answer in one place (lib/regenerate). Nothing else is
+    // dropped from storage: only this send's own failure record.
+    const intentId = intentForRegenerate(all, question);
+    const plan = planRegenerate(all, question, intentId);
     void startStream({
-      // A retry of a send that failed is the same send (F14): the server
-      // attaches to what it has rather than starting a second generation.
-      intentId: intentForRetry(view[userIdx]),
-      intentMessageId: view[userIdx].id,
+      intentId,
+      intentMessageId: question.id,
       conversationId: id,
-      // Retrying must not drop the other branches from storage, so a branched
-      // conversation keeps its whole list and the answer is appended.
-      turns: hasBranches(all) ? all : context,
+      turns: plan.turns,
       context,
-      assistantBranch: branchForAppend(hasBranches(all) ? all : context, context),
+      assistantBranch: plan.assistantBranch,
+      announceBranch: plan.announceBranch,
       prefs: prefsRef.current,
       images: resend.images,
       pdf: resend.pdf,
@@ -3252,21 +3286,6 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         conversationId={activeId}
         open={summaryOpen}
         onClose={() => setSummaryOpen(false)}
-      />
-
-      <ConfirmDialog
-        open={pendingRegenerate !== null}
-        title="Regenerate this response?"
-        body={`This will delete all messages after this point (${
-          pendingRegenerate?.discarded ?? 0
-        } message${pendingRegenerate?.discarded === 1 ? '' : 's'}).`}
-        confirmLabel="Regenerate"
-        onConfirm={() => {
-          const target = pendingRegenerate;
-          setPendingRegenerate(null);
-          if (target) void runRegenerate(target.messageId);
-        }}
-        onCancel={() => setPendingRegenerate(null)}
       />
 
       {/* Portals to <body> — see the note in SearchPalette.tsx. */}

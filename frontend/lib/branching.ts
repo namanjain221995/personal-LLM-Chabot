@@ -26,8 +26,8 @@
  * The positional fallback id (`#3`) is safe for the same reason the server's
  * own replace endpoint documents — "cannot shrink a thread, only append to
  * it, so index N before is index N after". Truncation is the one operation
- * that could invalidate it, which is why `hasBranches` gates it (see
- * ChatApp's regenerate).
+ * that could invalidate it, and since 2026-09-13 the chat never truncates:
+ * "Try again" adds a version too (ChatApp's runRegenerate, lib/regenerate).
  *
  * ── Why siblings need no explicit "version group" ───────────────────────────
  *
@@ -75,7 +75,10 @@ export interface Tree {
   ids: string[];
   /** Durable id of each message's parent (ROOT for thread starts). */
   parents: string[];
-  /** Child positions by parent id, in document order (oldest version first). */
+  /**
+   * Child positions by parent id, in document order (oldest version first).
+   * A row superseded by a later row with the same `self` is in no list.
+   */
   children: Map<string, number[]>;
 }
 
@@ -91,8 +94,22 @@ export function buildTree(all: ChatMessage[]): Tree {
     if (declared === undefined && branchOf(m)) return ROOT;
     return i === 0 ? ROOT : ids[i - 1];
   });
+  // Two rows with the SAME `self` are two attempts of ONE send (2026-09-13):
+  // an answer's self is derived from its intent (answerSelfForIntent), and a
+  // retry of that intent re-sends it. The earlier row is the attempt the
+  // later one supersedes — a failure record, an interrupted partial, a copy
+  // the server kept after the tab dropped it — so only the LATEST row with a
+  // given self is a child. Without this a retried send showed its own
+  // failure as a separate version beside its answer.
+  const latest = new Map<string, number>();
+  for (let i = 0; i < all.length; i += 1) {
+    const self = branchOf(all[i])?.self;
+    if (self !== undefined) latest.set(self, i);
+  }
   const children = new Map<string, number[]>();
   for (let i = 0; i < all.length; i += 1) {
+    const self = branchOf(all[i])?.self;
+    if (self !== undefined && latest.get(self) !== i) continue;
     const list = children.get(parents[i]);
     if (list) list.push(i);
     else children.set(parents[i], [i]);
@@ -273,6 +290,52 @@ export function branchForAppend(
   const index = all.findIndex((m) => m.id === last.id);
   const parent = index === -1 ? branchOf(last)?.self : ids[index];
   return { self: newBranchId(), ...(parent ? { parent } : {}) };
+}
+
+/**
+ * The durable id `message` has in the tree of `all`: its own `branch.self`,
+ * or the positional `#i` a message without one is known by.
+ *
+ * Falls back to the message's declared self when it is not in `all` at all,
+ * and to undefined when there is nothing to name it by.
+ */
+export function treeIdOf(
+  all: ChatMessage[],
+  message: ChatMessage,
+): string | undefined {
+  const index = all.findIndex((m) => m.id === message.id);
+  if (index === -1) return branchOf(message)?.self;
+  return buildTree(all).ids[index];
+}
+
+/**
+ * The branch id every attempt of one send files its answer under.
+ *
+ * Derived from the intent rather than minted, so it is the same value
+ * however the retry is reached — "Send now", Retry, a re-attach after a
+ * reload — even when the intent meta that recorded it did not survive. The
+ * intent id is 1-64 characters of [A-Za-z0-9_-], which keeps this inside the
+ * shape the server validates (`b-` + 1-64 of the same alphabet).
+ */
+export function answerSelfForIntent(intentId: string): string {
+  return `b-${intentId}`;
+}
+
+/**
+ * Where the answer to `question`, sent under `intentId`, belongs: a child of
+ * the question — beside any answer the question already has, which is what
+ * makes a regenerate a VERSION rather than a replacement.
+ */
+export function answerBranchFor(
+  all: ChatMessage[],
+  question: ChatMessage,
+  intentId: string,
+): BranchMeta {
+  const parent = treeIdOf(all, question);
+  return {
+    self: answerSelfForIntent(intentId),
+    ...(parent ? { parent } : {}),
+  };
 }
 
 /**

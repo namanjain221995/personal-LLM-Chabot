@@ -83,6 +83,20 @@ export interface ChatRequestBody {
    * reliability/API.md, POST /chat).
    */
   intent_id?: string;
+  /**
+   * 2026-09-13: where the answer belongs in the conversation tree — `self`
+   * the answer's branch id, `parent` the question's. Sent by a regenerate,
+   * an edit and a send in a conversation that has versions; the orchestrator
+   * stores it on the answer's `meta.branch`, so a "Try again" becomes a
+   * version instead of a stacked copy. Forwarded only when well-formed.
+   */
+  answer_branch?: AnswerBranch;
+}
+
+/** The tree position a send asks the server to store its answer under. */
+export interface AnswerBranch {
+  self: string;
+  parent?: string;
 }
 
 /** Body the orchestrator's POST /chat endpoint accepts (§10 + V2 §1 + V8). */
@@ -110,6 +124,24 @@ export interface OrchestratorChatRequest {
   clarification?: Record<string, unknown>;
   /** The browser's send intent — see ChatRequestBody.intent_id. */
   intent_id?: string;
+  /** The answer's tree position — see ChatRequestBody.answer_branch. */
+  answer_branch?: AnswerBranch;
+}
+
+/**
+ * `answer_branch` as it may be forwarded: exactly `{self, parent?}`, both
+ * strings, nothing else. Anything the browser sent beyond that shape is not
+ * passed on — the orchestrator validates the values (422), but it should
+ * never be handed keys this proxy did not mean to send.
+ */
+export function forwardableAnswerBranch(value: unknown): AnswerBranch | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const { self, parent } = value as { self?: unknown; parent?: unknown };
+  if (typeof self !== 'string' || self === '') return null;
+  if (parent !== undefined && typeof parent !== 'string') return null;
+  return { self, ...(parent !== undefined ? { parent } : {}) };
 }
 
 /**
@@ -223,6 +255,7 @@ export function toOrchestratorChatRequest(
   // (a "Skip" carries none), because the request it resumes supplies the
   // question. Everything else with no text and no attachment would 422.
   if (!message && !body.clarification) return null;
+  const answerBranch = forwardableAnswerBranch(body.answer_branch);
   return {
     message,
     // V9: forward the whole conversation so the model remembers this chat.
@@ -258,5 +291,8 @@ export function toOrchestratorChatRequest(
     // Only when the browser minted one, so a client that predates intents
     // keeps producing byte-identical requests and the server mints its own.
     ...(body.intent_id ? { intent_id: body.intent_id } : {}),
+    // Only when the browser announced one (a regenerate, an edit, a send in a
+    // branched conversation), so an ordinary send stays byte-identical.
+    ...(answerBranch ? { answer_branch: answerBranch } : {}),
   };
 }

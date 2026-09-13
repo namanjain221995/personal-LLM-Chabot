@@ -25,6 +25,7 @@ import { getHistoryStore, newId } from './history';
 import { foldTurnForModel } from './selectedContext';
 import type { ChatPrefs } from './prefs';
 import { copyForCategory, toClientError } from './errorTypes';
+import { withoutFailedAttempt } from './regenerate';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
 import type {
   BranchMeta,
@@ -84,6 +85,12 @@ interface LiveStream extends LiveStreamView {
   /** The server's generation, from the FIRST meta event. */
   generationId?: string;
   attempt?: number;
+  /**
+   * A re-attach's view of the whole stored thread, kept until the leading
+   * meta names the intent being answered (see placeAttachedAnswer). Unset
+   * on every stream this tab started itself.
+   */
+  attachThread?: ChatMessage[];
 }
 
 const streams = new Map<string, LiveStream>();
@@ -320,23 +327,6 @@ export function attachBaseTurns(messages: ChatMessage[]): ChatMessage[] {
 }
 
 /**
- * How many messages regenerating `messageId` would throw away.
- *
- * Regenerate restarts from the user turn that produced the target answer, so
- * everything after the target is discarded. On the LAST answer that is just
- * the answer itself (0 extra) — the expected behavior. Deeper in the thread
- * it silently destroys every later turn, which needs confirmation first.
- */
-export function messagesDiscardedByRegenerate(
-  messages: ChatMessage[],
-  messageId: string,
-): number {
-  const idx = messages.findIndex((m) => m.id === messageId);
-  if (idx === -1) return 0;
-  return messages.length - idx - 1;
-}
-
-/**
  * Patch the streaming answer — M-09.
  *
  * This ran `s.messages.map()` per token: a closure call and an id comparison
@@ -402,7 +392,8 @@ function patchIntent(
     existing.state === next.state &&
     existing.generation_id === next.generation_id &&
     existing.attempt === next.attempt &&
-    existing.reason === next.reason
+    existing.reason === next.reason &&
+    existing.answer_branch === next.answer_branch
   ) {
     return;
   }
@@ -933,6 +924,10 @@ async function consume(s: LiveStream, body: ReadableStream<Uint8Array>) {
         intent_id?: string;
       };
       if (typeof extra.generation_id === 'string' && !s.generationId) {
+        if (s.attachThread) {
+          if (typeof extra.intent_id === 'string') placeAttachedAnswer(s, extra.intent_id);
+          s.attachThread = undefined;
+        }
         s.generationId = extra.generation_id;
         s.attempt = typeof extra.attempt === 'number' ? extra.attempt : 1;
         patchIntent(
@@ -1065,6 +1060,22 @@ export interface StartStreamOptions {
   context?: ChatMessage[];
   /** Where the answer belongs in the tree (see BranchMeta). */
   assistantBranch?: BranchMeta;
+  /**
+   * 2026-09-13: also TELL the server — `answer_branch` on the POST, which
+   * the orchestrator writes onto the stored answer's `meta.branch`.
+   *
+   * Since V29 the server stores the answer itself, before `done`, so a tree
+   * position that lives only in this tab is lost the moment the server copy
+   * is adopted: the answer then attaches to whatever row physically precedes
+   * it, which for a regenerate is the PREVIOUS answer — three stacked copies
+   * instead of `‹ 3 / 3 ›`. Set for a regenerate, an edit and a send in a
+   * conversation that already has versions; absent for an ordinary send,
+   * whose body stays byte-identical.
+   *
+   * Recorded on the question's `meta.intent.answer_branch` with the intent,
+   * so a retry of the SAME intent sends the identical value (lib/regenerate).
+   */
+  announceBranch?: boolean;
   prefs: ChatPrefs;
   /** 2026-08-05: up to 5 attached images (base64, no data: prefix). */
   images?: string[] | null;
@@ -1160,7 +1171,18 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
   // Said before the request goes out, so a reload in the gap between this
   // line and the server's first event finds a turn that admits it does not
   // know yet — and reconciles it against the server rather than guessing.
-  if (opts.intentId) patchIntent(s, { state: 'submitting', id: opts.intentId });
+  const answerBranch =
+    opts.announceBranch && opts.assistantBranch ? opts.assistantBranch : undefined;
+  if (opts.intentId) {
+    // `answer_branch` is written EXPLICITLY, undefined included: the patch is
+    // spread over the previous intent, and a new send must not inherit the
+    // branch an earlier one announced.
+    patchIntent(s, {
+      state: 'submitting',
+      id: opts.intentId,
+      answer_branch: answerBranch,
+    });
+  }
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
   let connected = false;
@@ -1209,6 +1231,9 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         ...(opts.clarification ? { clarification: opts.clarification } : {}),
         // V29: one logical send, however many times it is retried.
         ...(opts.intentId ? { intent_id: opts.intentId } : {}),
+        // 2026-09-13: where the answer belongs, for the server to store it
+        // there. Only when announced — see StartStreamOptions.announceBranch.
+        ...(answerBranch ? { answer_branch: answerBranch } : {}),
       }),
       signal: s.controller.signal,
     });
@@ -1233,6 +1258,41 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
       markUnreachable(s, null, 'NETWORK_ERROR');
     }
   }
+}
+
+/**
+ * Put a re-attached answer where its SEND says it belongs — 2026-09-13.
+ *
+ * A re-attach seeds from `attachBaseTurns`: everything up to the last user
+ * turn, because the replay rebuilds the answer from scratch. That is right
+ * for an ordinary send and wrong for a version. A regenerate leaves the
+ * earlier answers to the same question in the thread, and they sit AFTER that
+ * question — so the base hid every one of them for the length of the stream,
+ * and a regenerate of an OLDER answer was drawn under the last question
+ * instead of its own.
+ *
+ * The leading meta names the intent, and a version send recorded its
+ * `answer_branch` on that intent's turn. With both, the stream holds the
+ * whole thread (minus only a failure record this attempt supersedes) and the
+ * answer is filed under the recorded branch. Without them — an ordinary
+ * send, or a turn this browser never saw — the base stands exactly as it was.
+ */
+function placeAttachedAnswer(s: LiveStream, intentId: string): void {
+  const all = s.attachThread ?? [];
+  s.attachThread = undefined;
+  const question = all.find(
+    (m) => m.role === 'user' && m.meta?.intent?.id === intentId,
+  );
+  const branch = question?.meta?.intent?.answer_branch;
+  if (!question || !branch) return;
+  const placeholder = s.messages.find((m) => m.id === s.assistantId);
+  if (!placeholder) return;
+  s.messages = [
+    ...withoutFailedAttempt(all, question),
+    { ...placeholder, meta: metaWithBranch(placeholder.meta, branch) },
+  ];
+  s.intentMessageId = question.id;
+  s.intentId = intentId;
 }
 
 /**
@@ -1344,6 +1404,9 @@ async function runAttach(conversationId: string): Promise<AttachOutcome> {
   const question = [...turns].reverse().find((m) => m.role === 'user');
   s.intentMessageId = question?.id;
   s.intentId = question?.meta?.intent?.id;
+  // Until the leading meta says which send this is: a VERSION (a regenerate
+  // or an edit) is re-placed beside its siblings then, instead of hiding them.
+  s.attachThread = base?.messages ?? [];
   try {
     await consume(s, res.body);
   } catch (err) {
