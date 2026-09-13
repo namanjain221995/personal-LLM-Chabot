@@ -1235,3 +1235,75 @@ They check:
 * **`.env.example`** should document `ENGINE_OOM_SCORE_ADJ` and
   `AUX_ENGINE_OOM_SCORE_ADJ` next to `ENGINE_COLD_START_BUDGET_S`. That file
   is outside this change's scope.
+
+---
+
+## 15. Open owner decision: chat documents beside public long answers
+
+**Status (2026-09-14): not decided.** The code ships the reviewed engineering
+default, `ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=refuse`, and the release review
+of the integration series asks for the owner's explicit choice before this
+reaches `main`. Until someone with that authority records a choice in this
+section, treat `refuse` as provisional. The rule itself is CONTRACT §12.3 and
+the module docstring of `orchestrator/app/admission.py` (CHAT DOCUMENTS BESIDE
+PUBLIC LONG ANSWERS, BACK TO BACK).
+
+### What the default costs
+
+The public API has no per-caller usage limit while `PUBLIC_API_ENFORCE_LIMITS`
+(`quotas.limits_enforced()`) is off, its default,
+and any `/v1` answer that plans more than
+`ADMISSION_V1_LONG_OUTPUT_THRESHOLD_TOKENS` (8,192) runs in the LONG_OUTPUT
+lane. Under `refuse`:
+
+* while a public long answer decodes, a chat request whose prompt is above
+  `ADMISSION_LONG_THRESHOLD_TOKENS` (131,072) waits up to
+  `ADMISSION_LONG_WAIT_S` (600 s) for the engine to go idle and is then
+  refused. A 1,000,000-token answer can hold the engine for hours (the module
+  docstring estimates up to about 5.8 h), and the document's KV charge could
+  not fit beside it in any case;
+* **one API key can therefore keep chat large-document turns out** for as long
+  as its long answer runs;
+* the BACK TO BACK hold (`ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S`, 1,800 s; 0 =
+  off) stops the NEXT public long answer after such a refusal. It does not stop
+  the answer already running;
+* the hold has a cost the other way too. In the virtual-time bench
+  `orchestrator/tools/api_load_bench.py`, scenario `doomed_chat_doc_blocks_v1`,
+  950K chat documents that can never fit beside a 400K public job made the
+  hold refuse 7 of 9 16K-output public answers, and none of the 6 documents
+  got in either. That cost is pinned by
+  `test_the_back_to_back_hold_refuses_small_v1_long_answers_after_a_doomed_chat_document`.
+
+### The choices
+
+| choice | how | what it trades |
+|---|---|---|
+| keep `refuse` | nothing to change; record the decision here | chat large-document turns are refused while a public long answer runs |
+| `proceed` | `ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed` | a chat document goes in beside public long answers, within the managed KV limit: a large prefill beside up to two decodes, the GDN fault shape the `refuse` rule exists to avoid |
+| narrow the exposure until decided | lower `PUBLIC_API_MAX_OUTPUT_TOKENS` (default 1,000,000) | a public answer holds the engine for a time proportional to its ceiling, so a lower ceiling shortens every refusal window; it also withdraws the published 1M output promise, so the public docs must change with it |
+
+These settings come from the orchestrator container's environment, which changes
+only when the container is recreated, and that restart fails every running
+multi-hour generation (API.md §13.7). Change them when
+`public_api_engine_in_flight{engine="main.long"}` and
+`llm_admission_long_output_decoding` are zero.
+
+### How to see it happening
+
+* orchestrator log, WARNING: `admission: a chat large document was refused
+  beside N public long answer(s); new public long answers are held for up to
+  S s`;
+* `llm_admission_v1_long_output_chat_holds_total` increasing;
+* `llm_admission_long_output_decoding` above zero at the same time as
+  `llm_admission_rejections_total{reason="timeout"}` rises.
+
+Known gap: the lane label on `llm_admission_lane_active` and
+`llm_admission_waiting` still has only `normal` and `long` in
+`orchestrator/app/metrics.py`, so the LONG_OUTPUT lane is published as
+`lane="other"` until the metrics vocabulary gains `long_output`.
+
+### Decision record
+
+| date | decided by | choice | notes |
+|---|---|---|---|
+| — | — | — | pending |

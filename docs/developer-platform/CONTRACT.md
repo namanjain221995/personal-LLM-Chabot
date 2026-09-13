@@ -841,6 +841,9 @@ Why these numbers:
   managed limit. Either way, after such a refusal no new public long answer is
   admitted for `ADMISSION_V1_LONG_OUTPUT_CHAT_HOLD_S` (1,800 s) or until a chat
   document runs, so consecutive public jobs cannot keep chat documents out.
+  The `refuse` default is the reviewed engineering default and is still
+  **pending the owner's explicit decision** (2026-09-14); the costs, the
+  choices and the decision record are in OPERATIONS.md §15.
 * **`router`**: the public budget is 47% of the 52,512-token pool, so chat keeps
   at least 27,936 tokens (about twelve concurrent freshness classifications).
 * **`ocr`**: engine `--max-num-seqs 8`; chat `read_images` batches use 4 and
