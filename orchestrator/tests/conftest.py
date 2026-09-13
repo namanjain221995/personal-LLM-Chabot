@@ -63,6 +63,24 @@ from app.config import settings  # noqa: E402
 #: about. `schema_migrations` is deliberately absent — truncating it would make
 #: the next init_schema() re-run every migration.
 _APP_TABLES = (
+    # V34 (2026-09-12) the developer platform. Deliveries cascade from their
+    # endpoint, endpoints/keys/service accounts/responses/claims/counters all
+    # cascade from their project, and the project from its workspace — but a
+    # V34 table left out of this list keeps its rows between tests, and a
+    # usage counter that survives is a quota test that passes until somebody
+    # runs it twice. `public_models` and `platform_secrets` have no parent at
+    # all and would otherwise never be emptied.
+    "api_webhook_deliveries",
+    "api_webhook_endpoints",
+    "api_idempotency",
+    "api_usage_minute",
+    "api_usage_daily",
+    "api_responses",
+    "api_keys",
+    "api_service_accounts",
+    "api_projects",
+    "public_models",
+    "platform_secrets",
     # V30 diagnostic traces. Events cascade from their trace, but listing both
     # also restarts the event identity between tests.
     "query_trace_events",
