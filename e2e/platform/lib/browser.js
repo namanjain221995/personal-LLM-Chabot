@@ -236,8 +236,10 @@ async function waitForText(page, pattern, timeoutMs = 30_000) {
  *                                     toolbar role, the wrapper of one table, or
  *                                     a short strip that does not scroll
  *                                     vertically (a chip row, a code block).
- * Wholly off-screen elements (a closed drawer translated away) and anything
- * under aria-hidden or inert are ignored; an absolutely positioned element is
+ * Wholly off-screen elements (a closed drawer translated away), anything
+ * under aria-hidden or inert, and anything inside a screen-reader-only box
+ * (clipped to nothing, or 1x1 px with its overflow hidden) are ignored; an
+ * absolutely positioned element is
  * only clipped by its containing block and that block's ancestors.
  *
  * The document term is kept too. On a mobile-emulated viewport Chrome zooms
@@ -308,10 +310,33 @@ async function measureOverflow(page, requestedWidth) {
       for (let p = node; p; p = p.parentElement) if (flagged.has(p)) return true;
       return false;
     };
+    /**
+     * Visually hidden ON PURPOSE (2026-09-14): the element or an ancestor is
+     * the screen-reader-only pattern — an absolutely positioned box clipped to
+     * nothing (`clip: rect(0 0 0 0)` or `clip-path: inset(50%)`), or a box of
+     * at most 1x1 px that clips its own overflow. Nothing inside such a box
+     * can paint, however wide its text runs, but a text RANGE is not clipped,
+     * so the range branch below read the console's hidden scope list (569 px
+     * of text in a 1x1 `span.sr-only`) as cut off at 1024-1440 px.
+     */
+    const visuallyHidden = (el) => {
+      for (let a = el; a && a !== doc; a = a.parentElement) {
+        const as = getComputedStyle(a);
+        const outOfFlow = as.position === 'absolute' || as.position === 'fixed';
+        if (outOfFlow && as.clip.replace(/[\s,]|px/g, '') === 'rect(0000)') return true;
+        if (outOfFlow && as.clipPath.replace(/\s/g, '') === 'inset(50%)') return true;
+        if (as.overflowX !== 'visible' && as.overflowY !== 'visible') {
+          const ar = a.getBoundingClientRect();
+          if (ar.width <= 1 && ar.height <= 1) return true;
+        }
+      }
+      return false;
+    };
     const invisible = (el) =>
       Boolean(el.closest('[aria-hidden="true"], [inert]')) ||
       getComputedStyle(el).visibility === 'hidden' ||
-      Number(getComputedStyle(el).opacity) === 0;
+      Number(getComputedStyle(el).opacity) === 0 ||
+      visuallyHidden(el);
 
     /**
      * Wholly off-screen AND moved there on purpose: the element, or an

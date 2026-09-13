@@ -19,6 +19,7 @@ const page = (body, bodyStyle = 'margin:0') =>
   `data:text/html,${encodeURIComponent(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><body style="${bodyStyle}">${body}</body>`)}`;
 
 const longWord = 'x'.repeat(400);
+const srOnly = 'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;white-space:nowrap;border-width:0';
 
 // [name, body, bodyStyle, expected "how" fragment]
 const DEFECTS = [
@@ -41,6 +42,12 @@ const DEFECTS = [
     'margin:0',
     'scrolls sideways inside main',
   ],
+  [
+    'absolutely positioned text that is NOT clipped to nothing, cut off by its shell (the sr-only exemption stays narrow)',
+    (w) => `<div style="height:100dvh;overflow:hidden"><div style="display:flex"><div style="flex:none;width:${w - 300}px"></div><div style="position:relative;width:300px"><span style="position:absolute;white-space:nowrap">${longWord}</span></div></div></div>`,
+    'margin:0',
+    'cut off at the screen edge by overflow-x:hidden on div',
+  ],
   ['content clipped by overflow-x hidden on body', (w) => `<div style="width:${w + 240}px;height:20px">clipped</div>`, 'margin:0;overflow-x:hidden', 'cut off at the screen edge by overflow-x:hidden on body'],
   [
     'content clipped by an overflow-hidden shell',
@@ -62,6 +69,18 @@ const CLEAN = [
   ['a closed drawer translated off-screen', () => '<aside style="position:fixed;top:0;right:0;width:320px;height:100dvh;transform:translateX(100%)">drawer</aside>', 'margin:0;overflow:hidden'],
   ['a closed drawer in an overflow-hidden shell', () => '<div style="position:relative;height:100dvh;overflow:hidden"><aside style="position:absolute;top:0;left:100%;width:320px;height:100%">drawer</aside></div>', 'margin:0'],
   ['text truncated with an ellipsis', () => `<div style="display:flex"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0"><b>${longWord}</b></span></div>`, 'margin:0'],
+  // The console's key table (2026-09-14): a scope list for screen readers in
+  // a cell near the right edge, far wider than its 1x1 box.
+  [
+    'screen-reader-only text (clip: rect(0,0,0,0)) in a cell near the right edge',
+    (w) => `<div style="height:100dvh;overflow:hidden"><table style="width:100%"><tr><td style="width:${w - 300}px">name</td><td>models.read <span style="${srOnly};clip:rect(0,0,0,0)">${longWord}</span></td></tr></table></div>`,
+    'margin:0',
+  ],
+  [
+    'screen-reader-only text in the clip-path form',
+    (w) => `<div style="height:100dvh;overflow:hidden"><div style="display:flex"><div style="flex:none;width:${w - 200}px"></div><div style="position:relative;width:200px">scopes <span style="${srOnly};clip-path:inset(50%)">${longWord}</span></div></div></div>`,
+    'margin:0',
+  ],
   ['a decorative wide element under aria-hidden, clipped by its card', (w) => `<div style="position:relative;overflow:hidden;height:50px"><div aria-hidden="true" style="width:${w + 300}px;height:5px"></div></div>`, 'margin:0'],
 ];
 
