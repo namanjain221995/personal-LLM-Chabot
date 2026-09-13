@@ -72,6 +72,24 @@ describe('contract details', () => {
     // Only the last segment decides asset-ness: /v1.2/report is a page.
     expect(authRedirect('/v1.2/report', false)).toBe('/login');
   });
+
+  it('does not treat a dotted LAST segment as an asset either (2026-09-13)', () => {
+    // The rule used to be "the last segment contains a dot", which handed a
+    // signed-out visitor the shell of any gated page whose dynamic segment
+    // held one. Assets are an allowlist now (tests/edge-asset-gate.test.ts).
+    expect(authRedirect('/admin/members/1.x', false)).toBe('/login');
+    expect(authRedirect('/admin/members/1.x/conversations/2.y', false)).toBe('/login');
+    expect(authRedirect('/admin/members/1.png', false)).toBe('/login');
+    expect(authRedirect('/api.json', false)).toBe('/login');
+    expect(authRedirect('/%2e%2e/admin', false)).toBe('/login');
+    expect(authRedirect('/admin%2Fmembers.png', false)).toBe('/login');
+  });
+
+  it('still lets the sign-in page load its own artwork signed out', () => {
+    expect(authRedirect('/illustrator/login.webp', false)).toBeNull();
+    expect(authRedirect('/techsara-mark.png', false)).toBeNull();
+    expect(authRedirect('/favicon.png', false)).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

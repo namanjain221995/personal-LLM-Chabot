@@ -262,12 +262,56 @@ function isPublicPrefixPage(page: string): boolean {
 }
 
 /**
+ * THE FILES A SIGNED-OUT BROWSER MAY FETCH WITHOUT THE GATE (2026-09-13).
+ *
+ * This used to be "any last path segment containing a dot", which also let a
+ * signed-out visitor load the shell of any gated page by putting a dot in a
+ * dynamic segment. The pages fetch their data through cookie-checked BFF calls,
+ * so no data followed, but the gate is meant to be the first line, not a
+ * courtesy. An asset is now exactly what this app really serves unauthenticated
+ * so that /login itself can render:
+ *
+ *   - a small set of well-known root files (favicon, robots, sitemap, manifest);
+ *   - an image or video file at the ROOT (public/*.png, *.webm, and Next's
+ *     root metadata images such as /icon.png), or under /illustrator/ (the
+ *     sign-in artwork).
+ *
+ * Depth is the point: no page tree lives at the root with a file extension, so
+ * `/admin/members/1.png` stays a page and stays gated. The name must be plain
+ * characters — no `%`, so no encoded separator or dot can dress a path up as a
+ * file — and it is case-sensitive, as Next applies the matcher and as the
+ * files are served. The build output under /_next/ is excluded before this.
+ * Adding a new public sub-directory means adding it here (signed-out pages
+ * would otherwise get a redirect instead of the file, which is the failure
+ * direction to prefer).
+ *
+ * middleware.ts spells the same rule into its matcher so assets skip the
+ * middleware entirely; tests/edge-asset-gate.test.ts holds the two together.
+ */
+const PUBLIC_ROOT_FILES = new Set([
+  '/favicon.ico',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/manifest.json',
+  '/manifest.webmanifest',
+]);
+
+const STATIC_ASSET_FILE =
+  /^\/(?:illustrator\/)?[A-Za-z0-9_-][A-Za-z0-9._-]*\.(?:png|jpe?g|gif|webp|avif|svg|ico|webm|mp4)$/;
+
+/** True only for the unauthenticated static files described above. */
+export function isStaticAssetPath(pathname: string): boolean {
+  return PUBLIC_ROOT_FILES.has(pathname) || STATIC_ASSET_FILE.test(pathname);
+}
+
+/**
  * The middleware's redirect decision, pure so it is unit-testable.
  *
  * Gates PAGES only, on cookie PRESENCE only — validity is the server's job
  * (every /api/* call re-checks it; a stale cookie just means one bounce
  * through a 401). /api/* must answer with statuses rather than redirects,
- * and /_next/* plus dotted static assets have to load on /login itself.
+ * and /_next/* plus the public static files (isStaticAssetPath) have to load
+ * on /login itself.
  *
  * The three exclusions are the middleware matcher's, spelled the same way and
  * for the same reasons — including the SLASH after `api`, which is what keeps
@@ -297,8 +341,7 @@ export function authRedirect(
   ) {
     return null;
   }
-  const lastSegment = pathname.slice(pathname.lastIndexOf('/') + 1);
-  if (lastSegment.includes('.')) return null; // favicon.ico, *.png, …
+  if (isStaticAssetPath(pathname)) return null;
   const page =
     pathname.length > 1 && pathname.endsWith('/')
       ? pathname.slice(0, -1)

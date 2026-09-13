@@ -3,11 +3,11 @@ const nextConfig = {
   output: 'standalone',
   reactStrictMode: true,
   poweredByHeader: false,
-  // Security headers (2026-09-01, with login). Deliberately NOT a full
-  // Content-Security-Policy: the theme-init inline script and Next's own
-  // hydration scripts would need nonce plumbing, and a broken CSP fails
-  // silently per-resource — the risk/benefit is wrong for a LAN deployment.
-  // These four are safe everywhere:
+  // Security headers (2026-09-01, with login). The Content-Security-Policy is
+  // NOT here: it carries a per-request nonce, so middleware.ts sets it on every
+  // page (lib/csp.ts, 2026-09-13). A static header cannot hold a nonce, and a
+  // static policy Next's inline scripts would tolerate has to allow every
+  // inline script. These four are static and safe everywhere:
   // - nosniff: uploaded/report files must never be content-sniffed into HTML
   // - DENY framing: the chat must not be embeddable for click-jacking
   // - referrer: never leak conversation URLs off-origin
@@ -36,6 +36,21 @@ const nextConfig = {
             value: 'camera=(), microphone=(self), geolocation=()',
           },
         ],
+      },
+      {
+        // The public developer documentation (2026-09-13). A prerendered page
+        // was sent with Next's build-time default, `s-maxage=31536000`, which
+        // invites a shared cache to keep a stale copy for a year after the
+        // docs change. Pages now render per request (the CSP nonce), and a
+        // docs page is the same for every reader — no session is read — so a
+        // short public lifetime with revalidation is both safe and cheap. A
+        // cached copy replays its nonce to other readers for those minutes;
+        // that matters only where a page reflects input, and these pages
+        // render repository text and nothing a request supplies.
+        // Next leaves a Cache-Control that is already set alone
+        // (server/send-payload.js).
+        source: '/docs/:path*',
+        headers: [{ key: 'Cache-Control', value: 'public, max-age=300, must-revalidate' }],
       },
       {
         // The public share pages. The Next metadata on /share/[token] already

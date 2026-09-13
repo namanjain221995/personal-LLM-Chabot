@@ -1,5 +1,5 @@
 /**
- * Edge page gating (enterprise auth retrofit).
+ * Edge page gating (enterprise auth retrofit), and the page CSP (2026-09-13).
  *
  * Decides ONE thing, from cookie PRESENCE alone: does this page request get
  * through, bounce to /login (signed out), or bounce home (signed in but on
@@ -9,6 +9,14 @@
  * The decision itself lives in lib/auth.ts (authRedirect) so it is
  * unit-testable without Next.
  *
+ * A page that gets through leaves with a Content-Security-Policy built around
+ * a nonce minted here, once per request (lib/csp.ts explains every source).
+ * The policy goes on the REQUEST as well as the response: Next reads the nonce
+ * from the request's policy header while rendering and stamps it on every
+ * script it emits, and app/layout.tsx reads `x-nonce` for the one inline script
+ * of its own. Both request headers are SET, never appended, so a value a
+ * client sent can never be the one the render uses.
+ *
  * Note: Next 16 renamed this convention to proxy.ts; middleware.ts remains
  * supported (deprecated) with identical behavior — see
  * node_modules/next/dist/docs/01-app/03-api-reference/03-file-conventions/proxy.md.
@@ -17,6 +25,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 
 import { authRedirect, SESSION_COOKIE } from '@/lib/auth';
+import { contentSecurityPolicy, createNonce, cspHeaderName } from '@/lib/csp';
 
 export function middleware(req: NextRequest): NextResponse {
   const target = authRedirect(
@@ -24,16 +33,28 @@ export function middleware(req: NextRequest): NextResponse {
     req.cookies.has(SESSION_COOKIE),
   );
   if (target) return NextResponse.redirect(new URL(target, req.url));
-  return NextResponse.next();
+
+  const nonce = createNonce();
+  const policy = contentSecurityPolicy(nonce, {
+    dev: process.env.NODE_ENV === 'development',
+  });
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set('x-nonce', nonce);
+  requestHeaders.set('content-security-policy', policy);
+  requestHeaders.delete('content-security-policy-report-only');
+  const res = NextResponse.next({ request: { headers: requestHeaders } });
+  res.headers.set(cspHeaderName(process.env.CSP_REPORT_ONLY), policy);
+  return res;
 }
 
 export const config = {
-  // Pages only. Three namespaces are excluded and nothing else:
+  // Pages only. Three namespaces and the public static files are excluded,
+  // and nothing else:
   //
   //   /api/    route handlers, which answer with statuses (a fetch cannot
   //            follow a redirect to a login PAGE);
-  //   /_next/  the build output, which together with dotted static assets has
-  //            to load on /login itself;
+  //   /_next/  the build output, which together with the public static files
+  //            has to load on /login itself;
   //   v1       the public developer API (CONTRACT §1), which reads exactly one
   //            credential — the Authorization header — and must never be
   //            redirected, cookie-gated, or told anything about a session.
@@ -55,7 +76,17 @@ export const config = {
   // (CONTRACT §6) and would have shipped with no edge gate whatsoever, for the
   // sake of a prefix only ever meant to name the route-handler namespace.
   //
+  // THE FOURTH EXCLUSION IS AN ALLOWLIST (2026-09-13). It used to be any path
+  // containing a dot, which skipped the gate for a gated page whose dynamic
+  // segment held one. It is now lib/auth.ts isStaticAssetPath, spelled as a
+  // regex: an image or video file at the root or under /illustrator/, or one of
+  // the well-known root files. Everything else — dotted or not — runs the
+  // middleware, so it is gated and it gets the page CSP.
+  //
   // authRedirect re-checks the same exclusions, so widening this matcher
-  // cannot silently widen the gate.
-  matcher: ['/((?!api/|_next/|v1(?:/|$)|.*\\..*).*)'],
+  // cannot silently widen the gate. The matcher must stay a string literal:
+  // Next reads it statically at build time.
+  matcher: [
+    '/((?!api/|_next/|v1(?:/|$)|(?:illustrator/)?[A-Za-z0-9_-][A-Za-z0-9._-]*\\.(?:png|jpe?g|gif|webp|avif|svg|ico|webm|mp4)$|(?:favicon\\.ico|robots\\.txt|sitemap\\.xml|manifest\\.json|manifest\\.webmanifest)$).*)',
+  ],
 };
