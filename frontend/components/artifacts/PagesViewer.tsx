@@ -249,7 +249,7 @@ export function PagesViewer({
   const pageNumbers = useMemo(() => Array.from({ length: total }, (_, i) => i + 1), [total]);
 
   const toolButton =
-    'inline-flex h-7 w-7 items-center justify-center rounded-md text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-40 disabled:hover:bg-transparent';
+    'inline-flex h-7 w-7 items-center justify-center rounded-md max-sm:h-8 max-sm:w-8 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-40 disabled:hover:bg-transparent';
 
   return (
     <div className="flex h-full min-h-0 flex-col" data-testid="pages-viewer">
@@ -399,8 +399,11 @@ export function PagesViewer({
                 }`}
               >
                 {state.status === 'ready' ? (
+                  // object-contain: a landscape slide in this portrait box
+                  // was cropped on both sides by object-cover, down to the
+                  // middle of its title.
                   // eslint-disable-next-line @next/next/no-img-element
-                  <img src={state.url} alt="" className="h-full w-full object-cover object-top" draggable={false} />
+                  <img src={state.url} alt="" className="h-full w-full object-contain" draggable={false} />
                 ) : (
                   <span className="pb-1 text-[10px] text-faint">{page}</span>
                 )}

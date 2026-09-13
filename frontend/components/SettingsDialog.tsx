@@ -104,7 +104,7 @@ export function SettingsDialog({
             type="button"
             onClick={onClose}
             aria-label="Close settings"
-            className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+            className="inline-flex items-center justify-center rounded-md p-1 text-faint max-sm:h-8 max-sm:w-8 max-sm:p-0 [@media(pointer:coarse)]:h-8 [@media(pointer:coarse)]:w-8 [@media(pointer:coarse)]:p-0 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
           >
             <IconX size={15} />
           </button>
@@ -113,7 +113,10 @@ export function SettingsDialog({
         <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
           <nav
             aria-label="Settings sections"
-            className="flex shrink-0 gap-1 overflow-x-auto border-b border-border p-2 sm:w-44 sm:flex-col sm:gap-0.5 sm:border-b-0 sm:border-r"
+            // Wraps on a phone (fe audit 2026-09-13): a sideways-scrolling
+            // row hid "Help" (and half of "Sessions" at 360 px) with nothing
+            // to say more tabs existed.
+            className="flex shrink-0 flex-wrap gap-1 border-b border-border p-2 sm:w-44 sm:flex-col sm:flex-nowrap sm:gap-0.5 sm:border-b-0 sm:border-r"
           >
             {SECTIONS.map((s) => (
               <button

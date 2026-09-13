@@ -22,6 +22,7 @@ import {
 /** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+import { DEFAULT_APP_NAME } from '@/lib/appName';
 import { fetchMe, handleSessionEnd, userScopeKey } from '@/lib/auth';
 import { copyForCategory, toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
@@ -133,6 +134,31 @@ const PANEL_MIN_PCT = 45;
 const PANEL_MAX_PCT = 55;
 const PANEL_MIN_PX = 520;
 const PANEL_MAX_PX = 960;
+/**
+ * 2026-09-13 (fe audit, chat HIGH): the conversation beside an open panel is
+ * never narrower than this. Without a floor, a 768–1024 px screen with the
+ * sidebar still open left the thread 187–284 px wide: card titles collapsed
+ * to 0 px, the composer's controls broke onto two rows. 360 px is a phone's
+ * width, where the thread and composer are already known to work.
+ */
+const THREAD_MIN_PX = 360;
+/** The divider's width (`w-1.5`), part of the row the floor is carved from. */
+const DIVIDER_PX = 6;
+/**
+ * Between `md` (where the panel becomes a column) and this width, opening a
+ * file hides the sidebar so the thread keeps a readable column; closing the
+ * panel puts it back. At 1280 px and up both fit beside the panel.
+ */
+const PANEL_SIDEBAR_AUTOCLOSE =
+  '(min-width: 768px) and (max-width: 1279px)';
+/**
+ * The panel column's min-width. The 520 px floor yields to 62 % of the row
+ * (see artifactPanelPct) AND to whatever keeps THREAD_MIN_PX for the thread,
+ * but never below the 45 % clamp, which is what the divider can reach.
+ */
+const PANEL_MIN_WIDTH_CSS = `max(${PANEL_MIN_PCT}%, min(${PANEL_MIN_PX}px, 62%, calc(100% - ${
+  THREAD_MIN_PX + DIVIDER_PX
+}px)))`;
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
 import {
@@ -144,11 +170,8 @@ import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
 import { useToast } from './Providers';
-import { IconArrowDown, IconShare, IconSidebar } from './icons';
+import { IconAlert, IconArrowDown, IconShare, IconSidebar, IconX } from './icons';
 import { ShareDialog } from './ShareDialog';
-
-const APP_NAME =
-  process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
 
 /**
  * An attachment whose bytes started uploading when it was ATTACHED
@@ -327,7 +350,22 @@ export function userTurnView(
   return legacy ? { ...base, kind: 'unsent' } : { ...base, kind: 'status_unknown' };
 }
 
-export function ChatApp() {
+/**
+ * `appName` is what the header calls the product when no conversation is
+ * open.
+ *
+ * It arrives as a PROP from app/page.tsx, never from `process.env` here. This
+ * is a client component: its browser bundle inlines NEXT_PUBLIC_APP_NAME as it
+ * was at BUILD time (the default, since no image passes it as a build arg),
+ * while the server renders it per request (app/layout.tsx reads headers() for
+ * the CSP nonce) with the RUNTIME value. Where the two differ — the e2e stack
+ * runs "TechSara AI (e2e)" — the h1's text did not match on hydration: React
+ * error #418 on every chat load, and the root re-render wiped the theme class
+ * off <html>, so a reader who chose light got dark (fe audit 2026-09-13).
+ * A prop is serialised once by the server, so both sides render one string.
+ * (DEFAULT_APP_NAME is only the fallback for a caller that passes nothing.)
+ */
+export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {}) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [archived, setArchived] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -365,6 +403,12 @@ export function ChatApp() {
     status: UploadStatus;
   } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  /**
+   * The sidebar was hidden by opening a file (PANEL_SIDEBAR_AUTOCLOSE), not by
+   * the person — so closing the panel gives it back. Cleared the moment they
+   * reopen it themselves.
+   */
+  const sidebarAutoClosedRef = useRef(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
   const [prefs, setPrefs] = useState<ChatPrefs>(DEFAULT_PREFS);
@@ -394,6 +438,21 @@ export function ChatApp() {
    * Only a ?c= restore can collide with one, so a bare "/" never waits.
    */
   const [reconciling, setReconciling] = useState(false);
+  /**
+   * The ?c= id the mount effect is still reconciling, or null once it is done.
+   * The 8-second poll's first tick runs in the same commit as that effect and
+   * used to reconcile the SAME id a second time — before the cache had even
+   * hydrated — so every deep link asked /chat/active twice and fetched the
+   * conversation twice (two console 404s for a deleted one, fe audit
+   * 2026-09-13). The poll leaves that id to the mount effect until it is done.
+   */
+  const bootReconcileRef = useRef<string | null>(null);
+  /**
+   * A ?c= deep link named a conversation the server does not have (deleted, or
+   * another account's — the same 404). Shown over the new chat that replaced
+   * it, until the person moves on; the bad id is already gone from the URL.
+   */
+  const [missingConversation, setMissingConversation] = useState(false);
 
   // Set BEFORE first paint, so the composer is never briefly interactive.
   // A useState initializer cannot do this: it runs during SSR where there is
@@ -521,6 +580,16 @@ export function ChatApp() {
   const openArtifact = useCallback<OpenArtifact>(
     (ref: ArtifactRef, originId: string, fileKey: string, siblings: ArtifactRef[]) => {
       rememberThreadScroll();
+      if (
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia(PANEL_SIDEBAR_AUTOCLOSE).matches
+      ) {
+        setSidebarOpen((open) => {
+          // Idempotent, so a double-invoked updater (StrictMode) is harmless.
+          if (open) sidebarAutoClosedRef.current = true;
+          return false;
+        });
+      }
       setArtifactPanel({
         refs: siblings,
         artifactId: ref.artifact_id,
@@ -534,6 +603,17 @@ export function ChatApp() {
   const closeArtifactPanel = useCallback(() => {
     rememberThreadScroll();
     setArtifactPanel(null);
+    if (sidebarAutoClosedRef.current) {
+      sidebarAutoClosedRef.current = false;
+      // Not below `md`: there the sidebar is a modal drawer, and closing a
+      // file must not throw one over the thread.
+      if (
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(min-width: 768px)').matches
+      ) {
+        setSidebarOpen(true);
+      }
+    }
   }, [rememberThreadScroll]);
   // Prev/next inside the panel: the column keeps its width, so the thread's
   // scroll position is left alone — only the marked card changes.
@@ -993,6 +1073,7 @@ export function ChatApp() {
     // truth (plus any still-running generation) is reconciled after that.
     const wanted = new URLSearchParams(window.location.search).get('c');
     if (wanted) {
+      bootReconcileRef.current = wanted;
       setActiveId(wanted);
       activeIdRef.current = wanted;
       setPrefs(loadPrefs(window.localStorage, wanted));
@@ -1123,6 +1204,28 @@ export function ChatApp() {
           // the poll and with reopening a chat, so the three can no longer
           // disagree about what "no stream in this tab" means.
           await reconcileConversation(wanted);
+          if (
+            !cancelled &&
+            activeIdRef.current === wanted &&
+            !isStreaming(wanted) &&
+            store.get(wanted) === null &&
+            store.wasNotFound?.(wanted) === true
+          ) {
+            // The server answered 404 and nothing of it is cached: there is no
+            // such conversation for this account. Keeping the id on screen
+            // opened a silent New Chat under it — a first message would have
+            // been sent into a conversation that does not exist, and a reload
+            // repeated the whole thing. Say so, drop the id from the URL, and
+            // start the chat that is actually on screen from the defaults.
+            setMessages([]);
+            setActiveId(null);
+            activeIdRef.current = null;
+            setLoadingId(null);
+            setUrlConversation(null);
+            setPrefs({ ...DEFAULT_PREFS });
+            savePrefs(window.localStorage, null, DEFAULT_PREFS);
+            setMissingConversation(true);
+          }
         }
       } finally {
         settleReconcile();
@@ -1133,7 +1236,13 @@ export function ChatApp() {
         // loader itself on delivery.
         if (wanted && !cancelled && !isStreaming(wanted)) settleLoading(wanted);
       }
-    })();
+    })().finally(() => {
+      // Every exit, early returns included, hands the id back to the poll.
+      // Not after a cleanup: a StrictMode re-run has claimed it again.
+      if (!cancelled && bootReconcileRef.current === wanted) {
+        bootReconcileRef.current = null;
+      }
+    });
     return () => {
       cancelled = true;
     };
@@ -1206,6 +1315,8 @@ export function ChatApp() {
     async function tick() {
       if (document.hidden) return;
       const id = activeIdRef.current;
+      // The mount effect is reconciling this deep link right now.
+      if (id && bootReconcileRef.current === id) return;
       if (!id) {
         // No conversation open: the sidebar still wants the busy set, and a
         // failure to get it is not news worth showing anywhere.
@@ -1677,6 +1788,7 @@ export function ChatApp() {
         const title = text || first?.name || '';
         const conv = getHistoryStore().create(title);
         conversationId = conv.id;
+        setMissingConversation(false);
         setActiveId(conv.id);
         activeIdRef.current = conv.id;
         // The draft prefs become this conversation's prefs (V2 §4c).
@@ -2612,6 +2724,7 @@ export function ChatApp() {
   // answer is saved to history when it finishes.
   const newChat = useCallback(() => {
     setSearchOpen(false);
+    setMissingConversation(false);
     setActiveId(null);
     activeIdRef.current = null;
     setMessages([]);
@@ -2629,6 +2742,7 @@ export function ChatApp() {
   const selectConversation = useCallback(
     (id: string) => {
       const store = getHistoryStore();
+      setMissingConversation(false);
       setActiveId(id);
       activeIdRef.current = id;
       setPrefs(loadPrefs(window.localStorage, id));
@@ -3206,7 +3320,10 @@ export function ChatApp() {
                 // re-mounted the button and re-attached it (see Sidebar).
                 ref={sidebarToggleRef}
                 type="button"
-                onClick={() => setSidebarOpen(true)}
+                onClick={() => {
+                  sidebarAutoClosedRef.current = false;
+                  setSidebarOpen(true);
+                }}
                 aria-label="Show sidebar"
                 aria-expanded={false}
                 title="Show sidebar"
@@ -3215,7 +3332,7 @@ export function ChatApp() {
                 <IconSidebar size={17} />
               </button>
             )}
-            <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
+            <h1 className="sr-only">{activeId ? activeTitle : appName}</h1>
             {/* Share (2026-09-05). The header's one deliberate addition since
                 the engine badge was removed: an ACTION, not a passive label.
                 It appears only for a conversation that exists and has finished
@@ -3282,7 +3399,41 @@ export function ChatApp() {
                 <p className="text-sm text-muted">Loading conversation…</p>
               </div>
             ) : thread.length === 0 ? (
-              <EmptyState />
+              missingConversation && activeId === null ? (
+                <div className="relative h-full">
+                  {/* Over the greeting, not instead of it: the screen really
+                      is a new chat now, and says why it is not the one the
+                      link asked for. */}
+                  <div className="absolute inset-x-0 top-3 z-10 flex justify-center px-4">
+                    <div
+                      role="status"
+                      data-testid="conversation-not-found"
+                      className="flex w-full max-w-md items-start gap-2.5 rounded-ts border border-border bg-surface py-2.5 pl-3.5 pr-2 text-sm shadow-lg"
+                    >
+                      <IconAlert size={16} className="mt-0.5 shrink-0 text-muted" />
+                      <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                        <p className="font-medium text-ink">Conversation not found</p>
+                        <p className="mt-0.5 text-muted">
+                          That link is to a chat that was deleted or belongs to
+                          another account. This is a new chat.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setMissingConversation(false)}
+                        aria-label="Dismiss notice"
+                        title="Dismiss"
+                        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        <IconX size={14} />
+                      </button>
+                    </div>
+                  </div>
+                  <EmptyState />
+                </div>
+              ) : (
+                <EmptyState />
+              )
             ) : (
               <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
                 {thread.map((m, i) => {
@@ -3488,7 +3639,7 @@ export function ChatApp() {
               className="contents md:block md:h-full md:min-w-0"
               style={{
                 flexBasis: `${artifactPanelPct}%`,
-                minWidth: `min(${PANEL_MIN_PX}px, 62%)`,
+                minWidth: PANEL_MIN_WIDTH_CSS,
                 maxWidth: `${PANEL_MAX_PX}px`,
               }}
             >

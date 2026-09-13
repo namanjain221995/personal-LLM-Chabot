@@ -390,7 +390,7 @@ export function SearchPalette({
             type="button"
             onClick={onClose}
             aria-label="Close search"
-            className="shrink-0 rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+            className="inline-flex shrink-0 items-center justify-center rounded-md p-1 text-faint max-sm:h-8 max-sm:w-8 max-sm:p-0 [@media(pointer:coarse)]:h-8 [@media(pointer:coarse)]:w-8 [@media(pointer:coarse)]:p-0 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
           >
             <IconX size={15} />
           </button>

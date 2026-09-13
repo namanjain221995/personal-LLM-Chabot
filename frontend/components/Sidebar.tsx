@@ -128,8 +128,25 @@ function SidebarImpl({
    */
   const drawerOwnedFocus = useRef(false);
 
+  /**
+   * The drawer is never part of the server HTML (fe audit 2026-09-13).
+   *
+   * ChatApp starts with the sidebar open — right for a desktop — and only
+   * learns it is on a phone after hydration. Rendering the drawer on the
+   * server therefore painted a modal overlay of placeholders ("No
+   * conversations yet.") as a phone's first frame, and the focus-restore
+   * below then parked a visible focus ring on "Show sidebar" on every load.
+   * Gated on mount, the first client render matches the server (no drawer),
+   * and ChatApp's matchMedia close lands in the same batch as this flag, so
+   * a phone never mounts the drawer at all unless someone opens it.
+   */
+  const [mounted, setMounted] = useState(false);
   useEffect(() => {
-    if (!open) return;
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!open || !mounted) return;
     openerRef.current = document.activeElement as HTMLElement | null;
     drawerOwnedFocus.current = false;
     // preventScroll for the same reason the palette does it: focusing inside a
@@ -148,7 +165,7 @@ function SidebarImpl({
       }
       drawerOwnedFocus.current = false;
     };
-  }, [open, restoreFocusRef]);
+  }, [open, mounted, restoreFocusRef]);
 
   function onDrawerKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
     const drawer = drawerRef.current;
@@ -219,7 +236,7 @@ function SidebarImpl({
               type="button"
               onClick={() => onSelect(c.id)}
               aria-current={activeId === c.id ? 'true' : undefined}
-              className={`flex w-full items-center gap-1.5 rounded-lg py-1.5 pl-2.5 pr-9 text-left text-sm transition-colors duration-ts ${
+              className={`flex w-full items-center gap-1.5 rounded-lg py-1.5 pl-2.5 pr-9 text-left [@media(pointer:coarse)]:pr-10 text-sm transition-colors duration-ts ${
                 activeId === c.id
                   ? 'bg-surface-2 text-ink'
                   // Full --ts-text, same as the active row: a conversation
@@ -292,7 +309,7 @@ function SidebarImpl({
           onClick={onOpenSearch}
           aria-label="Search chats"
           title="Search chats (Ctrl K)"
-          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          className="rounded-lg p-1.5 text-icon max-md:p-2 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
         >
           <IconSearch size={16} />
         </button>
@@ -313,7 +330,7 @@ function SidebarImpl({
           type="button"
           onClick={onClose}
           aria-label="Close sidebar"
-          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
+          className="rounded-lg p-1.5 text-icon max-md:p-2 transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
         >
           <IconX size={16} />
         </button>
@@ -327,7 +344,9 @@ function SidebarImpl({
         >
           <IconPlus size={15} className="text-accent" />
           New chat
-          <kbd className="ml-auto rounded border border-border px-1.5 py-px font-mono text-[10px] text-faint">
+          {/* A keyboard chord means nothing on a phone: the drawer copy is only
+              ever visible below md, where this stays hidden. */}
+          <kbd className="ml-auto hidden rounded border border-border px-1.5 py-px font-mono text-[10px] text-faint md:inline">
             {NEW_CHAT_SHORTCUT_LABEL}
           </kbd>
         </button>
@@ -438,7 +457,7 @@ function SidebarImpl({
       </aside>
 
       {/* Mobile: slide-over drawer — a modal overlay, and now says so (L-03) */}
-      {open && (
+      {open && mounted && (
         <div className="fixed inset-0 z-50 md:hidden">
           {/* Click-outside-to-close. It is deliberately NOT a tab stop: a
               full-screen button ahead of the panel is a phantom stop for

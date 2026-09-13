@@ -375,6 +375,54 @@ describe('server history store: pull + lazy load (V2 §4b)', () => {
     expect(loaded?.messages[1].pdfName).toBeUndefined();
   });
 
+  it('dates a conversation it never cached by the server, not by the load (fe audit 2026-09-13)', async () => {
+    // A ?c= deep link in a browser with no cache used to stamp the chat with
+    // Date.now(), which put it at the top of Recents for good.
+    const server = makeServer();
+    server.convs.set('old-chat', {
+      title: 'Older chat',
+      messages: [{ role: 'user', content: 'hello', meta: null }],
+    });
+    const api: HistoryApi = {
+      ...server.api,
+      async get(id) {
+        return { ...(await server.api.get(id)), updatedAt: '2026-09-13T00:55:41Z' };
+      },
+    };
+    const store = createServerHistoryStore({ storage: makeStorage(), api });
+    expect(store.get('old-chat')).toBeNull();
+    const loaded = await store.load('old-chat');
+    expect(loaded?.updatedAt).toBe(Date.parse('2026-09-13T00:55:41Z'));
+    expect(store.get('old-chat')?.updatedAt).toBe(Date.parse('2026-09-13T00:55:41Z'));
+  });
+
+  it('tells a conversation the server does not have apart from one it could not reach (fe audit 2026-09-13)', async () => {
+    // load() answers null for both. A ?c= deep link to a deleted chat needs
+    // the difference: "not found" is worth saying, a network blip is not.
+    const server = makeServer();
+    const store = createServerHistoryStore({ storage: makeStorage(), api: server.api });
+
+    expect(await store.load('gone')).toBeNull();
+    expect(store.wasNotFound?.('gone')).toBe(true);
+
+    server.setOffline(true);
+    expect(await store.load('unreachable')).toBeNull();
+    expect(store.wasNotFound?.('unreachable')).toBe(false);
+    // A failed re-read is not a verdict either way: the earlier 404 is dropped.
+    expect(await store.load('gone')).toBeNull();
+    expect(store.wasNotFound?.('gone')).toBe(false);
+
+    server.setOffline(false);
+    expect(await store.load('gone')).toBeNull();
+    expect(store.wasNotFound?.('gone')).toBe(true);
+    server.convs.set('gone', {
+      title: 'Back again',
+      messages: [{ role: 'user', content: 'hello', meta: null }],
+    });
+    expect((await store.load('gone', { force: true }))?.title).toBe('Back again');
+    expect(store.wasNotFound?.('gone')).toBe(false);
+  });
+
   it('appending after a server load does not duplicate loaded messages', async () => {
     const server = makeServer();
     server.convs.set('remote-2', {

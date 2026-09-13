@@ -62,8 +62,11 @@ export function ConfirmDialog({
         <div className="flex items-start gap-3">
           <IconAlert size={18} className="mt-0.5 shrink-0 text-danger" />
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-ink">{title}</h2>
-            <p className="mt-1 text-sm text-muted">{body}</p>
+            {/* overflow-wrap:anywhere — a body that quotes a URL or an id (the
+                webhook "Remove this endpoint?" sentence) must wrap inside the
+                panel, not run past its border and the viewport. */}
+            <h2 className="text-sm font-semibold text-ink [overflow-wrap:anywhere]">{title}</h2>
+            <p className="mt-1 text-sm text-muted [overflow-wrap:anywhere]">{body}</p>
           </div>
         </div>
         <div className="mt-4 flex justify-end gap-2">

@@ -134,7 +134,7 @@ export function AttachMenu({
         aria-expanded={open}
         aria-label="Add photos, files and tools"
         title="Add photos, files and tools"
-        className="shrink-0 rounded-full border border-border p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+        className="shrink-0 rounded-full border border-border p-1.5 text-muted max-sm:p-2 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
       >
         <IconPlus
           size={16}

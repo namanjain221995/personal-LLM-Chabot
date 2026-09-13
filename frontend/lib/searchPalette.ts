@@ -184,7 +184,37 @@ export function buildPaletteModel(
  * underneath would be noise, not evidence.
  */
 export function rowSnippet(result: SearchResult): string | null {
-  return result.matchedIn === 'message' ? result.snippet : null;
+  if (result.matchedIn !== 'message' || result.snippet === null) return null;
+  return plainSnippet(result.snippet) || null;
+}
+
+/**
+ * A message snippet as plain text (fe audit 2026-09-13).
+ *
+ * The server windows the STORED answer, which is markdown, so a hit inside a
+ * formatted reply read "# Heading one for the audit Here is **bold**,…". The
+ * row is one truncated line of evidence, not a renderer: drop the syntax
+ * (headings, emphasis, code ticks, link and image targets, quote and bullet
+ * markers, table pipes and rules) and keep every word. Prose dashes, `2 + 3`,
+ * `C#`, `_id` and `snake_case` / `__init__` identifiers are left alone.
+ */
+export function plainSnippet(snippet: string): string {
+  return snippet
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/(^|\s)#{1,6}(?=\s)/g, '$1')
+    .replace(/(^|\s)>(?=\s)/g, '$1')
+    .replace(/(^|\s)\*(?=\s)/g, '$1')
+    .replace(/\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?/g, ' ')
+    .replace(/\|/g, ' ')
+    .replace(/\*\*|~~|`+/g, '')
+    .replace(/(^|[\s(])\*(?=\S)/g, '$1')
+    .replace(/(\S)\*(?=[\s).,;:!?…]|$)/g, '$1')
+    // _emphasis_ only as a PAIR around underscore-free words, so `_id`,
+    // snake_case and __init__ keep every underscore.
+    .replace(/(^|[\s(])_([^\s_](?:[^_]*[^\s_])?)_(?=[\s).,;:!?…]|$)/g, '$1$2')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /* ------------------------------------------------------------ snippets */

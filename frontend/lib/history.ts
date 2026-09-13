@@ -127,6 +127,18 @@ export interface ServerHistoryStore extends HistoryStore {
    */
   load(id: string, opts?: { force?: boolean }): Promise<Conversation | null>;
   /**
+   * true when the latest server read of `id` answered 404 and this browser
+   * held no copy of it — the conversation does not exist for this account (a
+   * missing id and someone else's are the same 404, orchestrator history.py
+   * §3c). `load()` answers null for that AND for a network failure; only this
+   * tells them apart, so a ?c= deep link to a deleted chat can say so instead
+   * of opening a silent New Chat under the bad id (fe audit 2026-09-13).
+   *
+   * Optional so a partial test double need not provide it; the browser store
+   * always does.
+   */
+  wasNotFound?(id: string): boolean;
+  /**
    * V3 §2: the conversation as a downloadable Markdown file (loading its
    * messages first). null = the conversation is gone.
    */
@@ -764,6 +776,9 @@ export function createServerHistoryStore(
   const local = storeOverCache(cache);
   const api = options.api ?? createHistoryApi();
 
+  /** Ids whose latest uncached server read was a 404 (see wasNotFound). */
+  const notFound = new Set<string>();
+
   /** Per-conversation push chains keep background syncs ordered. */
   const chains = new Map<string, Promise<void>>();
   const inFlight = new Set<Promise<void>>();
@@ -1094,6 +1109,7 @@ export function createServerHistoryStore(
     }
     try {
       const server = await api.get(id);
+      notFound.delete(id);
       if (
         force &&
         !adoptServer &&
@@ -1122,11 +1138,16 @@ export function createServerHistoryStore(
         ...(m.role === 'user' ? {} : { status: 'done' as const }),
         createdAt: now - (server.messages.length - i),
       }));
+      // A conversation this browser never cached takes the SERVER's
+      // updated_at, not "now": stamping the load time moved every deep-linked
+      // chat to the top of Recents, where it stayed after a reload even
+      // though nothing in it had changed (fe audit 2026-09-13).
+      const serverUpdatedAt = toEpoch(server.updatedAt, now);
       const conv: Conversation = {
         id,
         title: server.title || cached?.title || 'Conversation',
-        createdAt: cached?.createdAt ?? now,
-        updatedAt: cached?.updatedAt ?? now,
+        createdAt: cached?.createdAt ?? serverUpdatedAt,
+        updatedAt: cached?.updatedAt ?? serverUpdatedAt,
         ...(cached?.pinned !== undefined ? { pinned: cached.pinned } : {}),
         ...(cached?.archived !== undefined ? { archived: cached.archived } : {}),
         messages,
@@ -1141,7 +1162,11 @@ export function createServerHistoryStore(
         else delete st.stamps[id];
       });
       return conv;
-    } catch {
+    } catch (err) {
+      // Remembered only with nothing cached: a cached copy is still served,
+      // exactly as before, and a network failure is not a verdict.
+      if (!cached && isNotFound(err)) notFound.add(id);
+      else notFound.delete(id);
       return cached; // offline — serve the cached copy (may be stale)
     }
   }
@@ -1468,6 +1493,8 @@ export function createServerHistoryStore(
     },
 
     load: (id, opts) => loadConversation(id, opts?.force === true),
+
+    wasNotFound: (id) => notFound.has(id),
 
     async flush() {
       while (inFlight.size > 0) {

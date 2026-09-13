@@ -16,7 +16,7 @@
  * more (orchestrator/app/engines/orchestrate.py).
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ModelChoice, ReasoningEffort } from '@/lib/types';
 import { IconCheck, IconChevronDown } from './icons';
 
@@ -35,6 +35,21 @@ const EFFORT_SHORT: Record<ReasoningEffort, string> = {
   think: 'Think',
   max: 'Max',
 };
+
+/** The least room the effort menu keeps from either edge of the viewport. */
+export const MENU_VIEWPORT_GUTTER_PX = 12;
+
+/**
+ * How far to move a menu right so its left edge clears the viewport gutter —
+ * 0 when it already fits. A menu with no box (not laid out) is left alone.
+ */
+export function menuShiftIntoViewport(
+  rect: { left: number; width: number },
+  gutter = MENU_VIEWPORT_GUTTER_PX,
+): number {
+  if (rect.width <= 0) return 0;
+  return rect.left < gutter ? Math.round(gutter - rect.left) : 0;
+}
 
 /** What each level actually does — shown so the trade-off is never a guess. */
 const EFFORT_HELP: Record<ReasoningEffort, string> = {
@@ -56,6 +71,20 @@ export function ModelPicker({
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const chipRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Keep the menu on screen (fe audit 2026-09-13). It hangs LEFTWARD from the
+  // chip's right edge, and on a phone that edge is only ~250 px from the left
+  // of the screen, so a 288 px menu started 11–41 px off-screen. Measured
+  // before paint and nudged right by exactly the overshoot; wide screens,
+  // where it fits, are untouched.
+  useLayoutEffect(() => {
+    const menu = menuRef.current;
+    if (!open || !menu) return;
+    menu.style.transform = '';
+    const shift = menuShiftIntoViewport(menu.getBoundingClientRect());
+    if (shift > 0) menu.style.transform = `translateX(${shift}px)`;
+  }, [open]);
 
   // Close on outside click / Escape while open.
   useEffect(() => {
@@ -100,7 +129,7 @@ export function ModelPicker({
         aria-expanded={open}
         aria-label={`Effort: ${EFFORT_LABEL[effort]}`}
         title="Choose how much work the model does"
-        className="inline-flex items-center gap-1 rounded-full border border-border px-2.5 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+        className="inline-flex items-center gap-1 rounded-full border border-border px-2.5 py-1 text-xs max-sm:py-1.5 font-medium text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
       >
         {EFFORT_SHORT[effort]}
         <IconChevronDown
@@ -111,12 +140,14 @@ export function ModelPicker({
 
       {open && (
         <div
+          ref={menuRef}
           role="menu"
           aria-label="Effort"
           // right-0: the chip sits at the RIGHT end of the controls row
           // (before the mic and Send since 2026-09-07), so the popover must
           // grow leftward or it would clip past the composer's edge.
-          className="absolute bottom-full right-0 z-30 mb-2 w-[288px] rounded-ts border border-border bg-surface p-1 shadow-xl"
+          // max-w: never wider than the viewport less both gutters.
+          className="absolute bottom-full right-0 z-30 mb-2 w-[288px] max-w-[calc(100vw-24px)] rounded-ts border border-border bg-surface p-1 shadow-xl"
         >
           <p className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-faint">
             How hard should it work?

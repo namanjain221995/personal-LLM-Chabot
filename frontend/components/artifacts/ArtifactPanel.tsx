@@ -426,7 +426,7 @@ export function ArtifactPanel({
                 // screen-reader user, and this one says what the header's
                 // cannot — why it is the only way to see the file.
                 aria-label={`Download ${current.filename} to open it in its own application`}
-                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium text-ink no-underline transition-colors duration-ts hover:bg-surface-2"
+                className="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 py-1 text-xs font-medium text-ink no-underline max-sm:min-h-8 [@media(pointer:coarse)]:min-h-8 transition-colors duration-ts hover:bg-surface-2"
                 data-testid="artifact-panel-download-fallback"
               >
                 <IconDownload size={13} />
@@ -487,7 +487,7 @@ export function ArtifactPanel({
             download={current.filename}
             aria-label={`Download ${current.filename}`}
             title={`Download ${current.filename}`}
-            className="inline-flex items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink"
+            className="inline-flex items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted max-sm:min-h-8 max-sm:min-w-8 max-sm:justify-center [@media(pointer:coarse)]:min-h-8 transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink"
             data-testid="artifact-panel-download"
           >
             <IconDownload size={14} />

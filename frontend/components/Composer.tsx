@@ -1128,7 +1128,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                     type="button"
                     onClick={() => removeAttachment(attachment.clientId)}
                     aria-label={`Remove attachment ${attachment.name}`}
-                    className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                    className="rounded-md p-1 text-faint max-sm:p-2.5 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
                   >
                     <IconX size={13} />
                   </button>
@@ -1180,8 +1180,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                       i === commandIndex ? 'bg-surface-2' : 'hover:bg-surface-2'
                     }`}
                   >
-                    <span className="font-medium text-ink">/{c.name}</span>
-                    <span className="text-xs text-faint">{c.argument}</span>
+                    <span className="shrink-0 whitespace-nowrap font-medium text-ink">/{c.name}</span>
+                    <span className="shrink-0 whitespace-nowrap text-xs text-faint">{c.argument}</span>
                     <span className="ml-auto min-w-0 truncate text-xs text-muted">
                       {c.hint}
                     </span>

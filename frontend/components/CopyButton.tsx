@@ -78,7 +78,10 @@ export function CopyButton({
       onClick={copy}
       aria-label={copied ? 'Copied' : label}
       title={copied ? 'Copied' : label}
-      className={`inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink ${className}`}
+      // A 30 px chip is under the 32 px tap floor: on a phone (max-sm) and on
+      // any touch screen wider than one (pointer:coarse — a tablet reading
+      // the docs), it is 32 px tall. A mouse keeps the compact chip.
+      className={`inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs max-sm:min-h-8 [@media(pointer:coarse)]:min-h-8 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink ${className}`}
     >
       {copied ? (
         <IconCheck size={13} className="text-accent" />

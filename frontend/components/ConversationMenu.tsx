@@ -258,10 +258,14 @@ export function ConversationMenu({
         aria-expanded={open}
         aria-label={`Options for conversation: ${title}`}
         title="Options"
-        className={`rounded-md p-1 text-faint transition-colors duration-ts hover:bg-border hover:text-ink focus-visible:opacity-100 ${
+        // Touch screens (fe audit 2026-09-13): there is no hover to reveal
+        // the trigger, so on a device without one it is always shown — and
+        // sized to a fingertip on a coarse pointer — instead of an invisible
+        // 23 px target that only the open chat's row made findable.
+        className={`flex items-center justify-center rounded-md p-1 text-faint transition-colors duration-ts hover:bg-border hover:text-ink focus-visible:opacity-100 [@media(pointer:coarse)]:h-8 [@media(pointer:coarse)]:w-8 ${
           open || active
             ? 'opacity-100'
-            : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
+            : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100'
         } ${open ? 'bg-border text-ink' : ''}`}
       >
         <IconDots size={15} />

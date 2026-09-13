@@ -19,6 +19,22 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/**
+ * Click a download link without asking jsdom to follow it. jsdom cannot
+ * navigate and logs "Not implemented: navigation" for every followed link;
+ * cancelling the default in the capture phase keeps the run's output clean
+ * and still delivers the click to React's handlers (as in artifact-card).
+ */
+function clickWithoutNavigating(link: HTMLElement) {
+  const noNavigation = (e: Event) => e.preventDefault();
+  window.addEventListener('click', noNavigation, true);
+  try {
+    fireEvent.click(link);
+  } finally {
+    window.removeEventListener('click', noNavigation, true);
+  }
+}
+
 /** A class token — `\b` cannot bound `]`, so the boundary is whitespace or the string's ends. */
 const MAX_W = /(^|\s)max-w-\[680px\](\s|$)/;
 const W_FULL = /(^|\s)w-full(\s|$)/;
@@ -152,7 +168,7 @@ describe('FileCard — Open and Download never cross', () => {
     expect(open.contains(download)).toBe(false);
     expect(download.getAttribute('href')).toBe(`/api/artifacts/${ID}/v/1/f/${FILE_ID}?disposition=attachment`);
     expect(download.getAttribute('download')).toBe('onboarding-sop-v1.pdf');
-    fireEvent.click(download);
+    clickWithoutNavigating(download);
     expect(onOpen).not.toHaveBeenCalled();
   });
 
@@ -192,7 +208,7 @@ describe('FileCard — a file with nothing to preview', () => {
     expect(body.getAttribute('download')).toBe('onboarding-sop-v1.pdf');
     // One link, not two: the body IS the download.
     expect(screen.getAllByRole('link').length).toBe(1);
-    fireEvent.click(body);
+    clickWithoutNavigating(body);
     expect(onOpen).not.toHaveBeenCalled();
   });
 
