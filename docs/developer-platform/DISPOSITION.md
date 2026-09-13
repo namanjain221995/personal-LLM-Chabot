@@ -124,7 +124,7 @@ proposed owner.
 | N029 | P2 | FOUND IN VERIFICATION | admin-usage | The only request throttle in the system is keyed to login email — there is no per-principal or … | **PARTLY FIXED** | `/v1` has a quota layer keyed by project and key in the orchestrator. Admin, analytics and chat routes still have no per-principal or per-address limit beyond login. | API platform core (done); remainder unowned — propose the orchestrator wiring owner |
 | F026 | P2 | ADJUSTED | authn-authz | FastAPI /docs, /redoc and /openapi.json are unauthenticated on an 0.0.0.0-bound port and … | **FIXED** | Same change as F076. | Orchestrator wiring |
 | F027 | P2 | ADJUSTED | authn-authz | AUTH_TRUST_PROXY_HEADERS=true plus a directly reachable orchestrator makes X-Forwarded-For … | **OPERATOR ACTION** | Browser side not fixed: `authn/sessions.py` still believes `X-Forwarded-For` whenever `AUTH_TRUST_PROXY_HEADERS=true`, so a LAN host that reaches :8080 chooses the address written to sessions, audit and the login lockout (OA-8). The BFF half is fixed (F002). The `/v1` half is fixed: `apiplatform/resolver.client_address` believes a forwarded address only from a peer in `PUBLIC_API_TRUSTED_PROXIES` (OA-22 sets it). | repository owner (OA-8, OA-22); peer-conditional trust for sessions deferred to the authn owner |
-| F028 | P2 | ADJUSTED | authn-authz | Invitation-claim account takeover: an ADMIN can seize any disabled or removed account — … | **PARTLY FIXED** | Issuing side fixed: `orchestrator/app/authn/invites.py` `claim_refusal`, applied in `admin_api.create_invitation` (outrank rule; a removed account only by a super admin; refusals audited as `invitation_refused`). Tests in `tests/test_authn_admin_hardening.py`. **Accepting side not wired**: `store.accept_invitation` does not apply the rule, so an invitation issued before this release can still claim an account. OA-9 revokes those. | admin surface hardening wave; repository owner (OA-9) |
+| F028 | P2 | ADJUSTED | authn-authz | Invitation-claim account takeover: an ADMIN can seize any disabled or removed account — … | **FIXED** | Closed on all three doors (2026-09-13). Issuing: `authn/invites.py` `claim_refusal` in `admin_api.create_invitation`, refusals audited as `invitation_refused`. Accepting: `authn/api.py` re-checks the rule with the inviter's rank read at acceptance (fails closed for a deactivated, removed or deleted inviter), `store.accept_invitation` no longer rewrites an existing membership's role and revokes the claimed account's old sessions, refusals audited as `invitation_claim_refused`. Restart: `bootstrap.ensure_identity_baseline` no longer hands a membership back to a removed (disabled, membership-less) account. Tests: `tests/test_authn_admin_hardening.py`, `tests/test_authn_invite_accept.py` (each shown failing without its fix). OA-9 remains as defence in depth for invitations issued before the release. |
 | F029 | P2 | CONFIRMED | authn-authz | An ADMIN can read a SUPER_ADMIN's (and a peer admin's) conversations, uploads and reports — the … | **FIXED** | `admin_api.py` `_inspectable_member` applies `outranks` on every member content and session read. Test `test_an_admin_cannot_read_a_super_admins_conversations_uploads_or_reports_but_can_read_a_members`. | admin surface hardening wave |
 | F033 | P2 | ADJUSTED | authn-authz | No request-body size limit anywhere: PUT /auth/preferences validates size only after the whole … | **FIXED** | Same middleware as F016. | Orchestrator wiring |
 | N006 | P2 | FOUND IN VERIFICATION | authn-authz | An ADMIN can read per-person usage analytics through Cap.WORKSPACE_READ, contradicting … | **FIXED** | Same change as F078. | admin surface hardening wave |
@@ -428,9 +428,11 @@ not use it on this host.
 
 ### OA-9 — Revoke invitations issued before the F028 fix
 
-The issuing side now refuses to invite an existing account above the inviter's
-rank, but accepting an **already issued** invitation still claims the account.
-List pending invitations addressed to an existing account (read-only):
+Defence in depth only. Both the issuing and the accepting side now refuse an
+invitation that would claim an account the inviter does not outrank, so an
+old invitation can no longer take an account over. Revoking the stale ones
+still tidies the list. Pending invitations addressed to an existing account
+(read-only):
 
 ```sql
 SELECT i.id, i.email, i.role, i.invited_by, i.created_at, i.expires_at, u.id AS existing_user_id, u.status
@@ -455,15 +457,15 @@ The pipeline derives the branch from the deployed ref
 (`DEPLOY_BRANCH: ${{ inputs.branch || github.ref_name }}`), so this changes
 nothing at runtime. The README table was corrected in this branch.
 
-### OA-11 — Run the platform retention sweep by hand until it is scheduled (F040)
+### OA-11 — Retention for the tables the platform sweep does not cover (F040)
 
-```bash
-docker exec sf-local-ai-orchestrator-1 python -c "from app import db; print(db.prune_api_platform())"
-```
-
-Prints rows removed per table. Try it on `techsara-e2e-orchestrator` first.
-Weekly is enough at today's volumes. It does not touch `usage_events`,
-`query_traces` or `chat_requests`, which have no retention at all.
+The developer platform's own tables are pruned automatically: the orchestrator
+lifespan runs `db.prune_api_platform` 60 s after start and then every
+`ARTIFACT_MAINTENANCE_INTERVAL_S`, together with the rotated-key sweep, and the
+loop survives any exception. What remains is a policy decision, not a command:
+`usage_events`, `query_traces` and `chat_requests` still have no retention at
+all and grow without bound. Choose a retention window for each and schedule it
+the same way; until then, watch their size.
 
 ### OA-12 — Recreate node-exporter on the head (F056)
 
