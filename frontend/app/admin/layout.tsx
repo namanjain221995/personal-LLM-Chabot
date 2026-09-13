@@ -32,6 +32,7 @@ import {
   IconFlask,
   IconGauge,
   IconGrid,
+  IconKey,
   IconLink,
   IconMail,
   IconMessages,
@@ -180,6 +181,16 @@ function navGroups(me: Me): NavGroup[] {
     });
   }
   if (security.length) groups.push({ title: 'Security', items: security });
+  // The developer platform (owner request, 2026-09-13): API keys, projects,
+  // usage and the playground live in the console at /api. Drawn only for the
+  // capability the console itself requires — the page refuses everyone else
+  // server-side regardless of what is drawn here.
+  if (can(me, 'api.console.access')) {
+    groups.push({
+      title: 'Developer',
+      items: [{ href: '/api', label: 'API platform', icon: <IconKey size={15} /> }],
+    });
+  }
   return groups;
 }
 

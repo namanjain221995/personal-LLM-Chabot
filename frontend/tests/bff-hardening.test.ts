@@ -21,7 +21,7 @@
  *     /api is gated — and, since 2026-09-13, it excludes the PUBLIC API
  *     namespace as a whole, its bare root /v1 included, which the trailing
  *     slash in `v1/` used to leave cookie-gated (CONTRACT §1);
- *  7. /docs sits behind the session gate at every depth (CONTRACT §17).
+ *  7. /docs is public at every depth (owner decision 2026-09-13); /api is not.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -705,23 +705,30 @@ describe('the middleware matcher', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. /docs — signed-in reading, CONTRACT §17
+// 7. /docs — public at every depth (owner decision, 2026-09-13)
 // ---------------------------------------------------------------------------
 
 describe('the developer documentation', () => {
-  it.each(['/docs', '/docs/quickstart', '/docs/guides/webhooks'])(
+  it.each(['/docs', '/docs/', '/docs/quickstart', '/docs/guides/webhooks'])(
     'lets a signed-in member read %s, at any depth',
     (path) => {
       expect(authRedirect(path, true)).toBeNull();
     },
   );
 
-  it.each(['/docs', '/docs/quickstart', '/docs/guides/webhooks'])(
-    'sends a signed-out visitor at %s to sign-in',
+  it.each(['/docs', '/docs/', '/docs/quickstart', '/docs/guides/webhooks'])(
+    'lets a signed-out visitor read %s too, at every depth — the documentation is public',
     (path) => {
-      // Not public: the contract grants the documentation to signed-in people.
-      // A PUBLIC_PREFIXES entry would also have split the gate one segment
-      // deep, publishing /docs/quickstart and bouncing /docs/guides/webhooks.
+      // Owner decision 2026-09-13. A whole-subtree rule, not a PUBLIC_PREFIXES
+      // entry, whose one-segment depth guard would have published
+      // /docs/quickstart and bounced /docs/guides/webhooks.
+      expect(authRedirect(path, false)).toBeNull();
+    },
+  );
+
+  it.each(['/docsx', '/docs-private', '/documents', '/api', '/admin', '/'])(
+    'still sends a signed-out visitor at %s to sign-in: only the /docs subtree was published',
+    (path) => {
       expect(authRedirect(path, false)).toBe('/login');
     },
   );
