@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from .. import db
 from ..config import settings
-from . import invites, passwords, sessions, store
+from . import invites, passwords, proxy_trust, sessions, store
 from .principal import (
     Principal,
     _build as build_principal,
@@ -76,11 +76,31 @@ def _features_for_ui(principal: Principal) -> Dict[str, bool]:
     return features
 
 
-def _login_sync(body: LoginRequest, ip: str, user_agent: str) -> Dict[str, Any]:
-    """The blocking half of login. Returns {user, cookie} or raises."""
+def _login_sync(
+    body: LoginRequest, ip: str, user_agent: str, *, ip_throttled: bool = True
+) -> Dict[str, Any]:
+    """The blocking half of login. Returns {user, cookie} or raises.
+
+    `ip_throttled=False` drops the per-address half of the throttle and keeps
+    the per-email half. The route passes it for a request that our own proxy
+    relayed without naming a client (sessions.ClientOrigin.shared_proxy).
+
+    WHY (2026-09-13, security review). Such a request's address is the
+    frontend container's, the same for every person signing in through it,
+    so an `ip:` key there is one lock shared by everyone: a few failed logins
+    for made-up emails, from anyone, refused every correct password until the
+    lock expired. A higher threshold would only raise the price of that
+    lockout, not remove it, so the key is not used at all. What still bounds
+    guessing on that path: the per-email lock, the password hash cost, and
+    the edge in front of the frontend. A caller that reaches the orchestrator
+    directly, or a client address a trusted proxy names, keeps its own
+    per-address lock.
+    """
     email_key = f"email:{body.email.strip().lower()}"
-    ip_key = f"ip:{ip or 'unknown'}"
-    for key in (email_key, ip_key):
+    throttle_keys = [email_key]
+    if ip_throttled:
+        throttle_keys.append(f"ip:{ip or 'unknown'}")
+    for key in throttle_keys:
         if store.throttle_check(key) is not None:
             raise HTTPException(
                 status_code=429,
@@ -96,7 +116,7 @@ def _login_sync(body: LoginRequest, ip: str, user_agent: str) -> Dict[str, Any]:
     ok = bool(user) and matches and user["status"] == "active" and member is not None
 
     if not ok:
-        for key in (email_key, ip_key):
+        for key in throttle_keys:
             store.throttle_failure(
                 key,
                 window_seconds=settings.auth_login_window_seconds,
@@ -138,8 +158,16 @@ def _login_sync(body: LoginRequest, ip: str, user_agent: str) -> Dict[str, Any]:
 
 @router.post("/login")
 async def login(body: LoginRequest, request: Request, response: Response) -> dict:
-    ip, user_agent = sessions.client_meta(request)
-    result = await db.run_in_thread(_login_sync, body, ip, user_agent)
+    # In a worker thread so the classification may wait (bounded) for the
+    # frontend's name lookup on first use or after the frontend moved: an
+    # unrecognised frontend would make its address a lock shared by everyone.
+    origin = await db.run_in_thread(
+        sessions.client_origin, request, resolve_wait=proxy_trust.RESOLVE_WAIT_S
+    )
+    user_agent = request.headers.get("user-agent", "")
+    result = await db.run_in_thread(
+        _login_sync, body, origin.ip, user_agent, ip_throttled=not origin.shared_proxy
+    )
     sessions.set_cookie(
         response, result["cookie"], remember=body.remember, request=request
     )

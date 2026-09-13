@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import Request, Response
 
 from ..config import settings
-from . import store
+from . import proxy_trust, store
+
+log = logging.getLogger(__name__)
 
 #: Session ids are 16 random bytes (hex), secrets 32 random bytes (urlsafe).
 _SID_BYTES = 16
@@ -216,16 +220,130 @@ def clear_cookie(response: Response, *, request: Optional[Request] = None) -> No
     )
 
 
+# ---------------------------------------------------------------------------
+# Where a request came from
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClientOrigin:
+    """Who sent a request, as far as this process can actually tell.
+
+    `ip` is what session rows, audit events and the login throttle record.
+    `forwarded` means `ip` came from a trusted proxy's `X-Forwarded-For`;
+    `via_trusted_proxy` means the socket peer is one of the deployment's own
+    proxies (normally the frontend container).
+    """
+
+    ip: str
+    forwarded: bool
+    via_trusted_proxy: bool
+
+    @property
+    def shared_proxy(self) -> bool:
+        """The peer is our proxy and it named no client, so `ip` is the
+        proxy's own address, the same for every person behind it. It
+        identifies nobody and must not be used as a per-client key."""
+        return self.via_trusted_proxy and not self.forwarded
+
+
+_warned_no_trusted_proxy = False
+
+
+def _warn_no_trusted_proxy() -> None:
+    """Say once per process that the header switch is on with nobody trusted.
+
+    That combination used to mean "believe everyone"; it now means "believe
+    no one", and behind a proxy every sign-in then shares the proxy's address
+    as its per-address lock. Worth one loud line rather than silence.
+    """
+    global _warned_no_trusted_proxy
+    if _warned_no_trusted_proxy:
+        return
+    _warned_no_trusted_proxy = True
+    log.warning(
+        "AUTH_TRUST_PROXY_HEADERS is on but no trusted proxy is known: neither "
+        "AUTH_TRUSTED_PROXIES nor PUBLIC_API_TRUSTED_PROXIES names one and "
+        "AUTH_FRONTEND_HOST %r resolves to no usable address. X-Forwarded-For is "
+        "ignored, and requests relayed by a proxy share its address for the "
+        "login throttle",
+        proxy_trust.frontend_host(),
+    )
+
+
+def client_origin(request: Request, *, resolve_wait: float = 0.0) -> ClientOrigin:
+    """Classify a request's source for sessions, audit and the login throttle.
+
+    WHY (2026-09-13, security review). This used to take the first
+    `X-Forwarded-For` entry from ANY peer whenever AUTH_TRUST_PROXY_HEADERS
+    was on. Whoever reaches the orchestrator's port directly writes that
+    header themselves, so the per-address login lock could be dodged or
+    pointed at someone else, and the audit trail recorded a chosen string.
+    The rule follows `apiplatform/resolver.client_address` for `/v1`, so the
+    two surfaces agree about who the caller is:
+
+    * the socket peer is not a trusted proxy: the peer is the address, and
+      the header is ignored, whatever it says;
+    * the peer is a trusted proxy and AUTH_TRUST_PROXY_HEADERS is on: walk
+      `X-Forwarded-For` from the RIGHT (the hop our proxy appended), skipping
+      hops that are themselves trusted proxies; the leftmost entry is
+      whatever the client typed;
+    * a trusted peer that names no usable client: the peer, flagged
+      `shared_proxy`, because it is the same address for everyone behind it.
+      (Where the resolver answers None for an unreadable hop, this answers
+      the proxy: an audit row still needs an address, and a shared-proxy
+      origin is given no per-address identity either way.)
+
+    Who counts as a trusted proxy is `proxy_trust`'s decision: the configured
+    lists, plus the frontend recognised by name, minus the container's
+    gateways. Two deliberate differences from the `/v1` resolver follow from
+    that: the frontend is recognised without configuration, and a gateway
+    address inside a trusted CIDR is not a proxy.
+
+    AUTH_TRUST_PROXY_HEADERS stays the master switch for believing the
+    header at all; whether the peer IS our proxy does not depend on it.
+
+    `resolve_wait` lets a caller running in a worker thread (the login route)
+    wait briefly for a frontend lookup it needs; event-loop callers leave it 0.
+    """
+    peer_raw = request.client.host if request.client else ""
+    peer = proxy_trust.parse_address(peer_raw) if peer_raw else None
+    if peer is None:
+        return ClientOrigin(ip=peer_raw, forwarded=False, via_trusted_proxy=False)
+    trust = proxy_trust.view_for_peer(peer, wait=resolve_wait)
+    if trust.empty and trust.settled and settings.auth_trust_proxy_headers:
+        _warn_no_trusted_proxy()
+    if not proxy_trust.is_trusted(peer, trust):
+        return ClientOrigin(ip=str(peer), forwarded=False, via_trusted_proxy=False)
+    unnamed = ClientOrigin(ip=str(peer), forwarded=False, via_trusted_proxy=True)
+    if not settings.auth_trust_proxy_headers:
+        return unnamed
+    hops = [
+        hop.strip()
+        for hop in str(request.headers.get("x-forwarded-for", "") or "").split(",")
+        if hop.strip()
+    ]
+    if not hops:
+        return unnamed
+    for hop in reversed(hops):
+        address = proxy_trust.parse_address(hop)
+        if address is None:
+            return unnamed
+        if not proxy_trust.is_trusted(address, trust):
+            return ClientOrigin(ip=str(address), forwarded=True, via_trusted_proxy=True)
+    # Every hop is one of our own proxies: the leftmost is the closest thing
+    # to a client the chain names, and it is still an address we trust.
+    return ClientOrigin(
+        ip=str(proxy_trust.parse_address(hops[0])), forwarded=True, via_trusted_proxy=True
+    )
+
+
 def client_meta(request: Request) -> Tuple[str, str]:
     """(ip, user_agent) for session rows and audit events.
 
-    The direct peer address unless AUTH_TRUST_PROXY_HEADERS opts into
-    X-Forwarded-For — an unauthenticated header is an attacker-controlled
-    string and must not become the audit trail's idea of "where from".
+    The address is `client_origin(request).ip`: the socket peer, or a
+    forwarded address only when a trusted proxy supplied it. An
+    unauthenticated header from anyone else is an attacker-controlled string
+    and must not become the audit trail's idea of "where from".
     """
-    ip = request.client.host if request.client else ""
-    if settings.auth_trust_proxy_headers:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            ip = forwarded.split(",")[0].strip()
-    return ip, request.headers.get("user-agent", "")
+    return client_origin(request).ip, request.headers.get("user-agent", "")
