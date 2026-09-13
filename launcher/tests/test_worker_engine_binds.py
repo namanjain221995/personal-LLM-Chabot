@@ -1,18 +1,21 @@
-"""Where the cluster scripts put the unauthenticated engines (audit F043/F050/F051).
+"""Where the cluster scripts put the unauthenticated worker engines.
 
-The developer-platform audit (2026-09-13) reached three model APIs with no
-credential from the office LAN and the tailnet: the main engine through a
-0.0.0.0 bind, and the worker's OCR (:30004) and speech (:30007) engines
+The developer-platform audit (2026-09-13, F043/F051) reached the worker's OCR
+(:30004) and speech (:30007) engines with no credential from the office LAN,
 through a bind on the worker's management address, which scripts/ocr.sh and
-scripts/whisper.sh read from enP7s7 over ssh. The worker engines now bind
-CLUSTER_WORKER_IP, the RoCE rail between the two Sparks, and the scripts'
-fallback for the head's API bind is loopback, agreeing with the launcher.
+scripts/whisper.sh read from enP7s7 over ssh. Commit 229031c moved both to
+CLUSTER_WORKER_IP, the RoCE rail. The owner reverted that the same day
+(option A): every consumer -- the head orchestrator's OCR_BASE_URL and
+ASR_BASE_URLS, Prometheus's OCR scrape target -- dials the management address,
+and the next `ocr.sh up` / `whisper.sh up` would have left them all dialling a
+refused port. The engines stay on the management address and the host packet
+filter closes the LAN (scripts/host-guard.sh, operator actions OA-4/OA-6).
+What 229031c added and these tests keep: an empty or wildcard address stops
+the script instead of binding nothing or everything.
 
 Each bind function is extracted from its script and run in bash with a fake
-``ssh`` on PATH that records any call and answers with the LAN address the
-audit measured, so a regression to the management-interface read shows up as
-that address in the output. Nothing here touches Docker, a socket or the
-network.
+``ssh`` on PATH that records the call and answers with a chosen address.
+Nothing here touches Docker, a socket or the network.
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ except ImportError:  # `unittest discover -s launcher/tests` imports top-level m
     from support import REPO_ROOT
 
 SCRIPTS = REPO_ROOT / "scripts"
-MANAGEMENT_LAN_ADDRESS = "192.168.9.68"  # the worker's enP7s7 address the audit probed
+MANAGEMENT_LAN_ADDRESS = "192.168.9.68"  # the worker's enP7s7 address; OCR/ASR consumers dial it
 RAIL_ADDRESS = "10.100.184.2"
 
 
@@ -56,10 +59,13 @@ class WorkerEngineBindTests(unittest.TestCase):
         bin_dir.mkdir()
         self.ssh_log = self.root / "ssh.log"
         fake_ssh = bin_dir / "ssh"
+        # The answer comes from FAKE_SSH_ANSWER so a test can make the read
+        # come back empty or as a wildcard; the default is what the worker's
+        # enP7s7 carries in production.
         fake_ssh.write_text(
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{self.ssh_log}"\n'
-            f'printf "{MANAGEMENT_LAN_ADDRESS}\\n"\n',
+            f'printf "%s" "${{FAKE_SSH_ANSWER-{MANAGEMENT_LAN_ADDRESS}}}"\n',
             encoding="utf-8",
         )
         fake_ssh.chmod(0o755)
@@ -91,26 +97,29 @@ class WorkerEngineBindTests(unittest.TestCase):
             timeout=30,
         )
 
-    def test_the_worker_ocr_and_speech_engines_bind_the_rail_address_not_the_management_lan(self) -> None:
+    def test_the_worker_ocr_and_speech_engines_bind_the_management_address_their_consumers_dial(self) -> None:
+        # The head orchestrator dials http://192.168.9.68:30004/v1 and
+        # :30007/v1; a rail bind (229031c) refuses every one of those calls.
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
             with self.subTest(script=script):
+                if self.ssh_log.exists():
+                    self.ssh_log.unlink()
                 result = self._bind_address(script, function, "worker", CLUSTER_WORKER_IP=RAIL_ADDRESS)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout, RAIL_ADDRESS)
-                self.assertNotIn(MANAGEMENT_LAN_ADDRESS, result.stdout)
-                self.assertFalse(
-                    self.ssh_log.exists(),
-                    "the bind must not come from reading a worker interface over ssh",
-                )
+                self.assertEqual(result.stdout, MANAGEMENT_LAN_ADDRESS)
+                self.assertNotEqual(result.stdout, RAIL_ADDRESS)
+                self.assertIn("enP7s7", self.ssh_log.read_text(encoding="utf-8"), "the address is read from the management interface")
 
-    def test_a_missing_or_wildcard_worker_address_stops_the_script_instead_of_binding_wider(self) -> None:
+    def test_an_empty_or_wildcard_management_address_stops_the_script_instead_of_binding_nothing_or_everything(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
-            for value in ("", "0.0.0.0", "::"):
-                with self.subTest(script=script, CLUSTER_WORKER_IP=value):
-                    result = self._bind_address(script, function, "worker", CLUSTER_WORKER_IP=value)
+            for answer in ("", "0.0.0.0", "::"):
+                with self.subTest(script=script, ssh_answer=answer):
+                    result = self._bind_address(
+                        script, function, "worker", CLUSTER_WORKER_IP=RAIL_ADDRESS, FAKE_SSH_ANSWER=answer
+                    )
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
-                    self.assertIn("CLUSTER_WORKER_IP", result.stderr)
+                    self.assertIn("enP7s7", result.stderr)
 
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
@@ -119,13 +128,19 @@ class WorkerEngineBindTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "172.17.0.1")
 
-    def test_the_scripts_fall_back_to_loopback_for_the_head_api_bind_like_the_launcher(self) -> None:
-        """cluster-common.sh defaulted CLUSTER_API_BIND_ADDRESS to 0.0.0.0, the
-        wildcard audit F050 reached from the LAN; the launcher's fallback is
-        now 127.0.0.1 and the scripts must agree with it."""
-        lib = self.root / "repo" / "scripts" / "lib"
+    def _probe(self, generated_bind: str | None) -> str:
+        """cluster-common.sh's CLUSTER_API_BIND_ADDRESS and api_url, as the
+        cluster-*.sh scripts see them, for a generated.env holding
+        ``generated_bind`` (None: no generated.env at all)."""
+        repo = self.root / f"repo-{generated_bind or 'none'}"
+        lib = repo / "scripts" / "lib"
         lib.mkdir(parents=True)
         shutil.copy(SCRIPTS / "lib" / "cluster-common.sh", lib / "cluster-common.sh")
+        if generated_bind is not None:
+            (repo / ".runtime").mkdir()
+            (repo / ".runtime" / "generated.env").write_text(
+                f"CLUSTER_API_BIND_ADDRESS={generated_bind}\n", encoding="utf-8"
+            )
         program = (
             f'. "{lib / "cluster-common.sh"}"\n'
             "cluster_load_settings\n"
@@ -139,9 +154,16 @@ class WorkerEngineBindTests(unittest.TestCase):
             timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "127.0.0.1|http://127.0.0.1:8000")
-        self.assertNotIn("0.0.0.0", result.stdout)
-        self.assertEqual(result.stdout.split("|")[0], cluster.DEFAULT_API_BIND_ADDRESS)
+        return result.stdout
+
+    def test_the_scripts_probe_loopback_when_generated_env_names_no_head_bind(self) -> None:
+        self.assertEqual(self._probe(None), "127.0.0.1|http://127.0.0.1:8000")
+
+    def test_the_scripts_probe_the_wildcard_head_the_launcher_generates_on_loopback(self) -> None:
+        # The launcher's dual-mode bind; a probe of http://0.0.0.0 would be a
+        # URL no operator could copy, so api_host maps it to 127.0.0.1.
+        self.assertEqual(cluster.DEFAULT_API_BIND_ADDRESS, "0.0.0.0")
+        self.assertEqual(self._probe(cluster.DEFAULT_API_BIND_ADDRESS), "0.0.0.0|http://127.0.0.1:8000")
 
 
 if __name__ == "__main__":

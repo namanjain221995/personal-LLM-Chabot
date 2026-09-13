@@ -223,13 +223,13 @@ other code raises:
 | `origin_not_allowed` | 403 | `permission_error` | no | `_authorize` |
 | `model_not_found` | 404 | `invalid_request_error` | no | unknown model, a model outside the key's allowlist, or one disabled by a `public_models` row — indistinguishable on purpose |
 | `response_not_found` | 404 | `invalid_request_error` | no | `GET`/`cancel` on an id that is not this project's |
-| `idempotency_conflict` | 409 | `invalid_request_error` | no | same `Idempotency-Key`, different body fingerprint |
+| `idempotency_conflict` | 409 | `invalid_request_error` | no, unless it carries `Retry-After` | same `Idempotency-Key`, different body fingerprint; also "a request with this Idempotency-Key is still running" (`Retry-After: 2`) |
 | `request_too_large` | 413 | `invalid_request_error` | no | the middleware's `Content-Length` or counting check, or `_json_body` |
-| `rate_limit_error` | 429 | `rate_limit_error` | yes | the project's or the key's requests per minute, input or output tokens per minute; also "a request with this Idempotency-Key is still running" (`Retry-After: 2`) |
-| `quota_exceeded` | 429 | `rate_limit_error` | yes | daily token quota; `Retry-After` runs to the next UTC midnight |
-| `concurrency_limit_exceeded` | 429 | `rate_limit_error` | yes | the project's in-flight slots or the key's own share (`Retry-After` about 1 s), **or** the shared admission lanes refusing (`AdmissionRejected` → `Retry-After: 5`) |
+| `rate_limit_error` | 429 | `rate_limit_error` | yes | only with `PUBLIC_API_ENFORCE_LIMITS=true`: the project's or the key's requests per minute, input or output tokens per minute |
+| `quota_exceeded` | 429 | `rate_limit_error` | yes | only with `PUBLIC_API_ENFORCE_LIMITS=true`: daily token quota; `Retry-After` runs to the next UTC midnight |
+| `concurrency_limit_exceeded` | 429 | `rate_limit_error` | yes | only with `PUBLIC_API_ENFORCE_LIMITS=true`: the project's in-flight slots or the key's own share (`Retry-After` about 1 s) |
 | `model_recovering` | 503 | `service_unavailable_error` | yes | breaker open / queued for recovery while the engine controller does not report DOWN or WEDGED |
-| `model_unavailable` | 503 | `service_unavailable_error` | yes | the same, when the controller reports DOWN or WEDGED; also the code a restart-orphaned background response is failed with |
+| `model_unavailable` | 503 | `service_unavailable_error` | yes | the same, when the controller reports DOWN or WEDGED; the shared admission lanes refusing (`AdmissionRejected` → `Retry-After: 5`, "at capacity"); also the code a restart-orphaned background response is failed with |
 | `timeout` | 504 | `timeout_error` | yes | an `asyncio.TimeoutError` out of the generation |
 | `internal_error` | 500 | `server_error` | no | anything else, including a deployment with no usable API-key pepper (§12) |
 
@@ -484,7 +484,7 @@ keys, tight separators, UTF-8).
 * **First use** wins the claim; the request runs; the claim is finished with the
   response id when the response ends, or with no id when it failed.
 * **Same key, different body**: `409 idempotency_conflict`.
-* **Same key, same body, original still running**: `429 rate_limit_error`,
+* **Same key, same body, original still running**: `409 idempotency_conflict`,
   `param: Idempotency-Key`, `Retry-After: 2`. A claim left `in_flight` by a
   process that died is taken over after
   `PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS` (default twice the generation

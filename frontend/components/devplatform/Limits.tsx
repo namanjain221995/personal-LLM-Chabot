@@ -22,6 +22,17 @@
  * the router has no such operation, and the form says so instead of
  * pretending a blank was saved. The server owns the maximum of each field;
  * the one check here is that a value is a whole number at all.
+ *
+ * UNLIMITED BY DEFAULT (owner decision, 2026-09-13). The public API has no
+ * request, token-per-minute, daily-quota or concurrency limit unless the
+ * operator sets PUBLIC_API_ENFORCE_LIMITS=true. When the server says the
+ * limits are not enforced, those five rows read Unlimited and have NO input:
+ * a field that saves a number nothing enforces is a control that does
+ * nothing, and a stored number drawn beside it would advertise a ceiling that
+ * does not exist. The two PER-REQUEST ceilings (max input and output tokens)
+ * are technical safety limits the owner kept, so they stay editable in both
+ * modes. A pre-switch orchestrator sends no flag and did enforce, so a
+ * missing flag keeps the enforced form (`limitsEnforcement`).
  */
 
 import { useEffect, useState, type FormEvent } from 'react';
@@ -35,12 +46,20 @@ import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { Section } from '@/components/admin/analytics/ui';
 import { consolePut, messageOf } from './api';
 import { consolePaths } from './paths';
-import { ConsoleEmpty, ProjectSelect, limitText, useProjects } from './shared';
+import {
+  ConsoleEmpty,
+  ProjectSelect,
+  limitText,
+  limitsEnforcement,
+  limitsUnlimited,
+  useProjects,
+} from './shared';
 import { useConsole } from './useConsole';
 import { useConsoleStatus } from './status';
 import type { ProjectLimits } from './types';
 
-type LimitKey = keyof ProjectLimits;
+/** A ceiling's field name — every key but the enforcement flag. */
+type LimitKey = Exclude<keyof ProjectLimits, 'enforced'>;
 
 /** One row of the form: CONTRACT §12's name, default and the smallest value. */
 const FIELDS: { key: LimitKey; label: string; hint: string; min: number }[] = [
@@ -51,6 +70,19 @@ const FIELDS: { key: LimitKey; label: string; hint: string; min: number }[] = [
   { key: 'daily_token_quota', label: 'Daily token quota', hint: 'Platform default 2,000,000, reset daily and surviving a restart.', min: 0 },
   { key: 'max_input_tokens', label: 'Max input tokens per request', hint: "Platform default: the model's ceiling.", min: 1 },
   { key: 'max_output_tokens', label: 'Max output tokens per request', hint: 'Platform default 8,192, never above the model ceiling.', min: 1 },
+];
+
+/**
+ * The usage limits PUBLIC_API_ENFORCE_LIMITS switches off (2026-09-13). The
+ * rest of FIELDS — the per-request token ceilings — are safety limits that
+ * apply in both modes.
+ */
+export const USAGE_LIMIT_KEYS: readonly LimitKey[] = [
+  'rpm',
+  'input_tpm',
+  'output_tpm',
+  'max_concurrency',
+  'daily_token_quota',
 ];
 
 type Draft = Record<LimitKey, string>;
@@ -72,9 +104,13 @@ function draftOf(limits: ProjectLimits): Draft {
 export function limitsChanges(
   saved: ProjectLimits,
   draft: Draft,
+  unlimited = false,
 ): Partial<Record<LimitKey, number>> {
   const body: Partial<Record<LimitKey, number>> = {};
   for (const { key, label, min } of FIELDS) {
+    // Not enforced, so not offered and never sent (2026-09-13): a PUT of a
+    // usage limit while the switch is off would be a save that does nothing.
+    if (unlimited && USAGE_LIMIT_KEYS.includes(key)) continue;
     const text = draft[key].trim();
     if (text === '') {
       if (saved[key] !== null) {
@@ -99,7 +135,12 @@ export function LimitsPanel() {
   const [projectId, setProjectId] = useState('');
   const selected = projects.find((p) => p.id === projectId) ?? projects[0] ?? null;
 
-  const limits = useConsole<{ limits: ProjectLimits; can_manage: boolean }>(
+  const limits = useConsole<{
+    limits: ProjectLimits;
+    can_manage: boolean;
+    enforced?: boolean;
+    limits_enforced?: boolean;
+  }>(
     consolePaths.limits(selected?.id ?? ''),
     {},
     selected !== null,
@@ -111,6 +152,12 @@ export function LimitsPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const saved = limits.data?.limits ?? null;
+  // Unknown (no answer yet, or a pre-switch server) is NOT unlimited: the
+  // form stays in its enforced shape until the server says otherwise.
+  const unlimited = limitsUnlimited(limitsEnforcement(limits.data));
+  const fields = unlimited
+    ? FIELDS.filter((field) => !USAGE_LIMIT_KEYS.includes(field.key))
+    : FIELDS;
 
   // Only the server's answer populates the form. There is no fallback to a
   // guessed value while it loads: an empty form that is disabled is honest, a
@@ -130,7 +177,7 @@ export function LimitsPanel() {
     if (!selected || !draft || !saved || busy) return;
     let body: Partial<Record<LimitKey, number>>;
     try {
-      body = limitsChanges(saved, draft);
+      body = limitsChanges(saved, draft, unlimited);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Check the values.');
       return;
@@ -171,7 +218,11 @@ export function LimitsPanel() {
     <div>
       <ConsoleHeader
         title="Limits"
-        description="Ceilings for this project. They are enforced in the orchestrator on every call, counted in PostgreSQL, and they survive a restart. An empty field inherits the platform default; 0 allows nothing."
+        description={
+          unlimited
+            ? 'The public API is unlimited: no request, token-per-minute, daily quota or concurrency limit is applied to /v1 or the playground. Usage is still recorded. The per-request token ceilings below still apply.'
+            : 'Ceilings for this project. They are enforced in the orchestrator on every call, counted in PostgreSQL, and they survive a restart. An empty field inherits the platform default; 0 allows nothing.'
+        }
       />
 
       <AdminToolbar>
@@ -182,14 +233,37 @@ export function LimitsPanel() {
         />
       </AdminToolbar>
 
-      <Section title="Rate and quota" first>
+      {unlimited && (
+        <Section title="Usage limits" first>
+          <dl className="max-w-xl space-y-2 text-sm">
+            {FIELDS.filter((field) => USAGE_LIMIT_KEYS.includes(field.key)).map(
+              (field) => (
+                <div
+                  key={field.key}
+                  className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-[var(--admin-separator)] pb-2"
+                >
+                  <dt className="text-xs text-faint">{field.label}</dt>
+                  <dd className="text-right text-sm text-ink">Unlimited</dd>
+                </div>
+              ),
+            )}
+          </dl>
+          <p className="mt-3 max-w-xl text-xs text-muted">
+            Not enforced, so there is nothing to set. An operator turns these
+            limits on with PUBLIC_API_ENFORCE_LIMITS=true; the fields to set
+            them appear here when they are.
+          </p>
+        </Section>
+      )}
+
+      <Section title={unlimited ? 'Per-request ceilings' : 'Rate and quota'} first={!unlimited}>
         {(error || limits.error) && (
           <div className="mb-4">
             <ErrorPanel message={(error ?? limits.error) as string} />
           </div>
         )}
         <form onSubmit={save} className="max-w-xl space-y-4">
-          {FIELDS.map((field) => (
+          {fields.map((field) => (
             <div key={field.key}>
               <Field label={field.label}>
                 <input
@@ -216,8 +290,9 @@ export function LimitsPanel() {
           ))}
           <p className="flex items-start gap-1.5 text-xs text-muted">
             <IconAlert size={13} className="mt-px shrink-0 text-warn" />
-            Raising a ceiling raises what this project can take from the shared
-            inference lanes. The chat application draws on the same engine.
+            {unlimited
+              ? 'Requests still wait in the engine’s shared admission queue, which the chat application draws on too.'
+              : 'Raising a ceiling raises what this project can take from the shared inference lanes. The chat application draws on the same engine.'}
           </p>
           <div className="flex justify-end">
             <button

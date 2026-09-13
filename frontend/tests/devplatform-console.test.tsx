@@ -16,7 +16,11 @@
  * and must offer no way back to it afterwards.
  */
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { ProjectSelect } from '@/components/devplatform/shared';
+import {
+  ProjectSelect,
+  limitsEnforcement,
+  usageLimitText,
+} from '@/components/devplatform/shared';
 import type { Project } from '@/components/devplatform/types';
 import userEvent from '@testing-library/user-event';
 import type { ComponentProps, ReactNode } from 'react';
@@ -88,7 +92,7 @@ import {
   snippetBody,
 } from '@/components/devplatform/snippets';
 import { SCOPES } from '@/components/devplatform/types';
-import { limitsChanges } from '@/components/devplatform/Limits';
+import { USAGE_LIMIT_KEYS, limitsChanges } from '@/components/devplatform/Limits';
 import { consolePaths } from '@/components/devplatform/paths';
 import type { Me } from '@/components/admin/api';
 
@@ -1047,6 +1051,189 @@ describe('the limits form', () => {
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(put.url).toBe(`/api/devplatform/projects/${PROJECT.id}/limits`);
     expect(JSON.parse(String(put.init.body))).toEqual({ input_tpm: 5 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PUBLIC_API_ENFORCE_LIMITS (owner decision 2026-09-13: unlimited by default)
+// ---------------------------------------------------------------------------
+
+describe('usage limits when the server does not enforce them', () => {
+  const NONE = {
+    rpm: null,
+    input_tpm: null,
+    output_tpm: null,
+    max_concurrency: null,
+    daily_token_quota: null,
+    max_input_tokens: null,
+    max_output_tokens: null,
+  };
+  const blank = {
+    rpm: '',
+    input_tpm: '',
+    output_tpm: '',
+    max_concurrency: '',
+    daily_token_quota: '',
+    max_input_tokens: '',
+    max_output_tokens: '',
+  };
+  const USAGE_LABELS = [
+    'Requests per minute',
+    'Input tokens per minute',
+    'Output tokens per minute',
+    'Concurrent requests',
+    'Daily token quota',
+  ];
+
+  it('reads the flag wherever the orchestrator puts it, and reports a pre-switch answer as unknown', () => {
+    expect(limitsEnforcement({ limits: NONE, enforced: false })).toBe(false);
+    expect(limitsEnforcement({ limits: { ...NONE, enforced: false } })).toBe(false);
+    expect(limitsEnforcement({ stats: { limits_enforced: false } })).toBe(false);
+    expect(limitsEnforcement({ limits_enforced: true })).toBe(true);
+    expect(limitsEnforcement(undefined, { enforce_limits: false })).toBe(false);
+    expect(limitsEnforcement({ limits: NONE, can_manage: true })).toBeNull();
+    expect(limitsEnforcement(null, undefined)).toBeNull();
+  });
+
+  it('says Unlimited for a usage limit only when the server said so, whatever is stored', () => {
+    expect(usageLimitText(60, false)).toBe('Unlimited');
+    expect(usageLimitText(null, false)).toBe('Unlimited');
+    expect(usageLimitText(60, true)).toBe('60');
+    expect(usageLimitText(0, true)).toBe('0 — nothing allowed');
+    // A pre-switch orchestrator enforced, so unknown keeps the enforced words.
+    expect(usageLimitText(null, null)).toBe('Platform default');
+  });
+
+  it('never sends a usage limit while they are off, but still sends a per-request ceiling', () => {
+    expect(USAGE_LIMIT_KEYS).toEqual([
+      'rpm',
+      'input_tpm',
+      'output_tpm',
+      'max_concurrency',
+      'daily_token_quota',
+    ]);
+    expect(
+      limitsChanges(NONE, { ...blank, rpm: '5', max_output_tokens: '2048' }, true),
+    ).toEqual({ max_output_tokens: 2048 });
+    // And with the switch on, the same draft sends both — unchanged behaviour.
+    expect(
+      limitsChanges(NONE, { ...blank, rpm: '5', max_output_tokens: '2048' }, false),
+    ).toEqual({ rpm: 5, max_output_tokens: 2048 });
+  });
+
+  it('renders the Limits tab as Unlimited with no usage-limit inputs, no stored numbers, and saves only the per-request ceiling', async () => {
+    state.search = new URLSearchParams('tab=limits');
+    const calls = route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      // A stored 60 from before the switch: it must not be drawn as a ceiling.
+      [`GET ${consolePaths.limits(PROJECT.id)}`]: () =>
+        jsonResponse({ limits: { ...NONE, rpm: 60 }, enforced: false, can_manage: true }),
+      [`PUT ${consolePaths.limits(PROJECT.id)}`]: () =>
+        jsonResponse({ limits: { ...NONE, max_output_tokens: 2048 }, enforced: false }),
+    });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    const maxOut = (await screen.findByLabelText(
+      'Max output tokens per request',
+    )) as HTMLInputElement;
+    await waitFor(() => expect(screen.getAllByText('Unlimited')).toHaveLength(5));
+    for (const label of USAGE_LABELS) {
+      expect(screen.queryByLabelText(label)).toBeNull();
+      const row = screen.getByText(label).parentElement as HTMLElement;
+      expect(within(row).getByText('Unlimited')).toBeTruthy();
+    }
+    expect(screen.queryByText(/Platform default 60/)).toBeNull();
+    expect(screen.queryByText(/Saved: 60/)).toBeNull();
+    expect(screen.queryByText(/They are enforced in the orchestrator/)).toBeNull();
+    expect(screen.getByText(/The public API is unlimited/)).toBeTruthy();
+    expect(screen.getByLabelText('Max input tokens per request')).toBeTruthy();
+
+    fireEvent.change(maxOut, { target: { value: '2048' } });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Save limits' }));
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    const put = calls.find((c) => c.method === 'PUT')!;
+    expect(JSON.parse(String(put.init.body))).toEqual({ max_output_tokens: 2048 });
+  });
+
+  it('keeps every enforced field and its stored number when the server says the limits are on', async () => {
+    state.search = new URLSearchParams('tab=limits');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.limits(PROJECT.id)}`]: () =>
+        jsonResponse({ limits: { ...NONE, rpm: 60 }, enforced: true, can_manage: true }),
+    });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    const rpm = (await screen.findByLabelText('Requests per minute')) as HTMLInputElement;
+    await waitFor(() => expect(rpm.value).toBe('60'));
+    for (const label of USAGE_LABELS) expect(screen.getByLabelText(label)).toBeTruthy();
+    expect(screen.getByText(/Saved: 60\./)).toBeTruthy();
+    expect(screen.getByText(/They are enforced in the orchestrator/)).toBeTruthy();
+    expect(screen.queryByText('Unlimited')).toBeNull();
+  });
+
+  it('shows Unlimited in the project settings dialog instead of a stored rate', async () => {
+    state.search = new URLSearchParams('tab=projects');
+    serve({
+      projects: {
+        projects: [
+          { ...PROJECT, limits: { ...PROJECT.limits, rpm: 60, enforced: false } },
+        ],
+      },
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole('button', { name: `Actions for ${PROJECT.name}` }),
+    );
+    await user.click(await screen.findByRole('menuitem', { name: /view settings/i }));
+    const row = (await screen.findByText('Requests / minute')).parentElement as HTMLElement;
+    expect(within(row).getByText('Unlimited')).toBeTruthy();
+    expect(screen.getAllByText('Unlimited')).toHaveLength(5);
+    expect(screen.queryByText('60')).toBeNull();
+  });
+
+  it('shows the stored rate in the project settings dialog when limits are enforced', async () => {
+    state.search = new URLSearchParams('tab=projects');
+    serve({
+      projects: {
+        projects: [{ ...PROJECT, limits: { ...PROJECT.limits, rpm: 60, enforced: true } }],
+      },
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole('button', { name: `Actions for ${PROJECT.name}` }),
+    );
+    await user.click(await screen.findByRole('menuitem', { name: /view settings/i }));
+    const row = (await screen.findByText('Requests / minute')).parentElement as HTMLElement;
+    expect(within(row).getByText('60')).toBeTruthy();
+    expect(screen.queryByText('Unlimited')).toBeNull();
+  });
+
+  it('says Unlimited on the overview when the limits are off', async () => {
+    serve({ overview: { ...overviewOf({ active_keys: 1 }), limits_enforced: false } });
+    render(<ConsoleShell me={ADMIN} />);
+    const label = await screen.findByText('Usage limits');
+    expect(within(label.parentElement as HTMLElement).getByText('Unlimited')).toBeTruthy();
+    expect(screen.queryByText('Enforced per project')).toBeNull();
+  });
+
+  it('says the limits are enforced on the overview when they are on', async () => {
+    const body = overviewOf({ active_keys: 1 });
+    serve({ overview: { ...body, stats: { ...body.stats, limits_enforced: true } } });
+    render(<ConsoleShell me={ADMIN} />);
+    const label = await screen.findByText('Usage limits');
+    expect(
+      within(label.parentElement as HTMLElement).getByText('Enforced per project'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Unlimited')).toBeNull();
+  });
+
+  it('draws no limits line on the overview when the server does not say, rather than guessing', async () => {
+    serve({ overview: overviewOf({ active_keys: 1, requests: 3 }) });
+    render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(screen.getByText('3')).toBeTruthy());
+    expect(screen.queryByText('Usage limits')).toBeNull();
   });
 });
 

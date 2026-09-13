@@ -56,12 +56,13 @@ cannot lose a job you were told we had.
 \`stream\` and \`background\` cannot both be true. There is no stream to
 attach to.
 
-A background response holds one of your project's
-[concurrent-request slots](/docs/rate-limits#concurrency) for its whole life —
-from the \`202\` until it completes, fails or is cancelled — and shares that
-count with your synchronous and streaming calls. When every slot is taken, the
-submit itself is refused with \`429 concurrency_limit_exceeded\` and a
-\`Retry-After\`, rather than accepted into a queue you cannot see.
+There is no cap on how many background responses a project runs at once —
+the API enforces no concurrency [limits](/docs/rate-limits). They share the
+engine with everything else, so a thousand submitted together are accepted
+together and then served as fast as the engine can serve them. A job that
+cannot get a place in the engine's shared queue ends \`failed\` with
+\`model_unavailable\` — the engine's capacity, not a limit on your
+project — and can be submitted again.
 
 ## Collecting the answer
 
@@ -78,8 +79,9 @@ object with the same \`code\` vocabulary as the [HTTP
 envelope](/docs/errors).
 
 Poll politely — a few seconds between attempts, with a ceiling — and
-remember that a poll is a request like any other and counts against your
-[rate limits](/docs/rate-limits).
+remember that a poll is a request like any other: it is recorded in your
+[usage](/docs/usage), and a tight loop spends the engine's shared capacity
+on nothing.
 
 ~~~python
 import time

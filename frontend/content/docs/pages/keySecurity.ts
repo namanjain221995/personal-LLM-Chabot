@@ -87,8 +87,9 @@ rotate  ──►  new key issued, old key still valid for the overlap
         ──►  the window closes, or you revoke the old key early
 ~~~
 
-Both keys draw on the same project allowance while they overlap — limits are
-per project, not per key — so the window costs nothing extra.
+Both keys are recorded against the same project while they overlap — usage
+is per project, not per key — and the API enforces no usage limits, so the
+window costs nothing extra.
 
 A rotation with an overlap of **zero** is the compromise case: the old key is
 revoked in the same step, and nothing it sends is accepted afterwards.

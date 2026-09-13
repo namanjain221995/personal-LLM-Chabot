@@ -26,15 +26,20 @@
 # binds the docker bridge gateway (172.17.0.1), which the orchestrator's
 # container can reach and nothing off-box can.
 #
-# THE MANAGEMENT ADDRESS IS ITSELF AN EXPOSURE. The developer-platform audit
-# (F043/F051, 2026-09-13) measured `GET http://192.168.9.68:30004/v1/models`
-# answering 200 with no credential from the office LAN: this is a full
-# OpenAI-compatible vLLM server, so any host there gets free image inference
-# on the GPU the main model's TP=2 pair shares. OCR_BIND stays required (no
-# default here, so nothing binds by accident); the value comes from
-# scripts/ocr.sh (ocr_bind_address), and the audit's fix is to derive the
-# worker's bind from CLUSTER_WORKER_IP, the RoCE rail the worker sentinel
-# already binds, rewriting OCR_BASE_URL and OCR_REMOTE_BASE_URL in lockstep.
+# THE MANAGEMENT ADDRESS IS ITSELF AN EXPOSURE, AND THE BIND STAYS ON IT. The
+# developer-platform audit (F043/F051, 2026-09-13) measured
+# `GET http://192.168.9.68:30004/v1/models` answering 200 with no credential
+# from the office LAN: this is a full OpenAI-compatible vLLM server, so any
+# host there gets free image inference on the GPU the main model's TP=2 pair
+# shares. The owner chose option A the same day: the worker engine keeps the
+# management address, because every consumer dials it (the head orchestrator
+# and e2e orchestrator OCR_BASE_URL/OCR_REMOTE_BASE_URL, Prometheus's
+# .runtime/prometheus/ocr.json target), and a RoCE-rail bind is no boundary
+# under Linux's weak-host model anyway. The exposure is closed by the host
+# packet filter (scripts/host-guard.sh, operator actions OA-4/OA-6: 30004
+# accepted on enP7s7 from the head 192.168.9.54 only, dropped elsewhere and on
+# tailscale0). OCR_BIND stays required (no default here, so nothing binds by
+# accident); the value comes from scripts/ocr.sh (ocr_bind_address).
 name: sf-local-ai-ocr
 
 services:

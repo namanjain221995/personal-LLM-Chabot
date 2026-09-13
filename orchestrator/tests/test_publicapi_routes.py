@@ -43,6 +43,19 @@ TEST_PEPPER = "routes-pepper-01234567890abcdefg"
 TOKENS: Dict[str, str] = {}
 
 
+@pytest.fixture()
+def limits_enforced(monkeypatch):
+    """PUBLIC_API_ENFORCE_LIMITS=true for one test.
+
+    The owner decision of 2026-09-13 made the public API unlimited by default,
+    so every test below that pins a rate, quota or concurrency REFUSAL (or the
+    RateLimit fields) asks for enforcement explicitly: the enforcement code
+    stays available to an operator, so it stays tested. The unlimited default
+    has its own tests, which do not use this fixture.
+    """
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
+
+
 @pytest.fixture(autouse=True)
 def _pepper(monkeypatch):
     """A configured pepper, and no cached one from a neighbouring test."""
@@ -561,6 +574,7 @@ def test_a_background_response_is_durable_before_the_202_is_returned(api, engine
 # ---------------------------------------------------------- §12 quotas --
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_the_rate_limit_refuses_the_next_request_in_the_same_minute(
     api, platform, engine
 ):
@@ -579,6 +593,7 @@ def test_the_rate_limit_refuses_the_next_request_in_the_same_minute(
     assert "RateLimit-Policy" in first.headers
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_the_rate_limit_headers_are_on_every_response_including_the_refusal(
     api, platform, engine
 ):
@@ -606,6 +621,7 @@ def test_the_rate_limit_headers_are_on_every_response_including_the_refusal(
     assert refused.headers["RateLimit"].startswith('"requests";r=0;')
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_spent_daily_quota_is_a_429_quota_exceeded(api, platform, engine):
     engine(["ok"])
     projects.update_project(platform["project"]["id"], WORKSPACE, daily_token_quota=10)
@@ -618,6 +634,7 @@ def test_a_spent_daily_quota_is_a_429_quota_exceeded(api, platform, engine):
     assert int(response.headers["Retry-After"]) >= 1
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_the_quota_gate_runs_before_the_engine_is_ever_called(api, platform, engine):
     fake = engine(["ok"])
     projects.update_project(platform["project"]["id"], WORKSPACE, rpm=1)
@@ -630,6 +647,7 @@ def test_the_quota_gate_runs_before_the_engine_is_ever_called(api, platform, eng
     assert fake.calls == 1
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_streaming_request_over_the_concurrency_limit_is_a_429_not_a_broken_stream(
     api, platform, engine
 ):
@@ -990,6 +1008,7 @@ async def _wait_until(predicate, *, timeout: float = 30.0) -> None:
         ("get", "/v1/usage", None),
     ],
 )
+@pytest.mark.usefixtures("limits_enforced")
 def test_twelve_simultaneous_requests_against_rpm_one_admit_exactly_one(
     platform, engine, monkeypatch, method, path, body
 ):
@@ -1032,6 +1051,7 @@ def test_twelve_simultaneous_requests_against_rpm_one_admit_exactly_one(
 # ------------------------------- one counter per project (race 2) --
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_twelve_simultaneous_streams_from_two_keys_share_the_projects_two_slots(
     platform, gated
 ):
@@ -1079,6 +1099,7 @@ def test_twelve_simultaneous_streams_from_two_keys_share_the_projects_two_slots(
     assert quotas.in_flight(caller) == 0
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_background_job_and_a_stream_draw_on_the_same_project_slots(
     api, platform, gated
 ):
@@ -1230,6 +1251,7 @@ def json_bytes(payload: Any) -> bytes:
     return _json.dumps(payload).encode()
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_stream_refused_by_the_ceiling_writes_no_row_and_frees_its_idempotency_key(
     api, platform, engine
 ):
@@ -1252,6 +1274,7 @@ def test_a_stream_refused_by_the_ceiling_writes_no_row_and_frees_its_idempotency
 
 
 @pytest.mark.parametrize("method, path, body", ALL_ROUTES, ids=[r[1] for r in ALL_ROUTES])
+@pytest.mark.usefixtures("limits_enforced")
 def test_every_authenticated_route_spends_one_request_of_the_rate_limit(
     api, platform, engine, method, path, body
 ):
@@ -1277,6 +1300,7 @@ def test_every_authenticated_route_spends_one_request_of_the_rate_limit(
         ("/v1/chat/completions", {"model": registry.TECHSARA_35B, "logit_bias": {}}),
     ],
 )
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_request_refused_by_validation_still_counts_against_the_rate_limit(
     api, platform, engine, path, bad
 ):
@@ -1730,6 +1754,7 @@ def test_a_sync_request_cancelled_after_the_engine_ran_is_charged_and_leaves_in_
     assert quotas.in_flight(_caller()) == 0
 
 
+@pytest.mark.usefixtures("limits_enforced")
 def test_a_sync_request_refused_by_the_slot_frees_its_idempotency_key_and_writes_no_row(
     api, platform, engine
 ):
@@ -1851,3 +1876,199 @@ def test_the_bare_api_root_is_the_contract_404_and_never_a_redirect(api, engine)
         assert body["error"]["request_id"]
     anonymous = api.get("/v1", follow_redirects=False)
     assert anonymous.status_code == 404 and "location" not in {k.lower() for k in anonymous.headers}
+
+
+import json  # noqa: E402
+
+
+# ======================================================================
+# Unlimited by default (owner decision, 2026-09-13): PUBLIC_API_ENFORCE_LIMITS
+# is false unless an operator sets it. These tests run on the shipped default
+# and never ask for `limits_enforced`.
+# ======================================================================
+
+
+def _project_day(project_id: str) -> Dict[str, int]:
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT COALESCE(SUM(requests), 0) AS requests, "
+            "       COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "       COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+            "       COALESCE(SUM(rate_limited), 0) AS rate_limited "
+            "  FROM api_usage_daily WHERE project_id = %s",
+            (project_id,),
+        ).fetchone()
+    return {k: int(v) for k, v in row.items()}
+
+
+def test_the_shipped_default_enforces_no_limits():
+    """The suite's own settings are the shipped ones: nothing in the test
+    environment turns the limits on, so every test without `limits_enforced`
+    exercises the unlimited default."""
+    assert settings.public_api_enforce_limits is False
+
+
+def test_with_the_limits_off_seventy_requests_against_rpm_one_all_succeed_without_a_ratelimit_header(
+    api, platform
+):
+    """The smoke check, in-process: 70 quick requests — above the old default
+    of 60 a minute, against a project whose stored rpm is 1 — are all 200,
+    none carries RateLimit or RateLimit-Policy, and all 70 are counted once."""
+    project_id = platform["project"]["id"]
+    projects.update_project(project_id, WORKSPACE, rpm=1)
+
+    responses = [api.get("/v1/models", headers=_auth()) for _ in range(70)]
+
+    assert [r.status_code for r in responses] == [200] * 70
+    for response in responses:
+        assert "RateLimit" not in response.headers
+        assert "RateLimit-Policy" not in response.headers
+        assert response.headers["X-Request-Id"]
+    day = _project_day(project_id)
+    assert day["requests"] == 70
+    assert day["rate_limited"] == 0
+
+
+def test_with_the_limits_off_a_spent_daily_quota_refuses_nothing_and_usage_is_still_recorded(
+    api, platform, engine
+):
+    """A daily quota of 10 tokens already overspent, token rates of 1 a
+    minute: generations still run, and each one's measured usage is written
+    to the ledger exactly once."""
+    engine(["ok"], usage={"prompt_tokens": 37, "completion_tokens": 112})
+    project_id = platform["project"]["id"]
+    projects.update_project(
+        project_id, WORKSPACE, daily_token_quota=10, input_tpm=1, output_tpm=1
+    )
+    db.bump_usage_daily(project_id, input_tokens=8, output_tokens=8)
+
+    statuses = [
+        api.post("/v1/responses", json=_body(), headers=_auth()).status_code
+        for _ in range(5)
+    ]
+
+    assert statuses == [200] * 5
+    day = _project_day(project_id)
+    assert day["requests"] == 5
+    assert day["input_tokens"] == 8 + 5 * 37
+    assert day["output_tokens"] == 8 + 5 * 112
+    assert day["rate_limited"] == 0
+    # And the per-person analytics half: one usage_events row per request.
+    with db.connection() as con:
+        events = con.execute(
+            "SELECT count(*) AS n, COALESCE(SUM(input_tokens), 0) AS input_tokens "
+            "  FROM usage_events WHERE workspace_id = %s AND mode = 'api'",
+            (WORKSPACE,),
+        ).fetchone()
+    assert int(events["n"]) == 5
+    assert int(events["input_tokens"]) == 5 * 37
+
+
+def test_with_the_limits_off_simultaneous_streams_beyond_max_concurrency_all_run(
+    platform, gated
+):
+    """Eight streams opened at once against max_concurrency=1, all held open
+    by an engine that will not answer yet: every one reaches the engine,
+    every one ends 200, and every slot comes back."""
+    project_id = platform["project"]["id"]
+    projects.update_project(project_id, WORKSPACE, max_concurrency=1, rpm=1)
+    caller = _caller()
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=_bare_app())
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://api.test", timeout=60
+        ) as client:
+            tasks = [
+                asyncio.ensure_future(
+                    client.post("/v1/responses", json=_body(stream=True), headers=_auth())
+                )
+                for _ in range(8)
+            ]
+            await _wait_until(lambda: gated.calls >= 8)
+            peak = quotas.in_flight(caller)
+            gated.gate.set()
+            return peak, await asyncio.gather(*tasks)
+
+    peak, responses = asyncio.run(scenario())
+
+    assert [r.status_code for r in responses] == [200] * 8
+    assert all("RateLimit" not in r.headers for r in responses)
+    assert peak == 8
+    assert gated.calls == 8
+    assert quotas.in_flight(caller) == 0
+    assert _project_day(project_id)["requests"] == 8
+
+
+def test_with_the_limits_off_a_failure_carries_no_ratelimit_header_either(api, platform):
+    """The refusal path builds its headers separately from the admission path
+    (`_refusal_headers`); it must not advertise a limit either."""
+    invalid = api.post("/v1/responses", json=_body(nonsense=True), headers=_auth())
+
+    assert invalid.status_code == 400
+    assert "RateLimit" not in invalid.headers
+    assert "RateLimit-Policy" not in invalid.headers
+
+
+def test_with_the_limits_off_a_recovering_engine_still_answers_503_with_retry_after(
+    api, engine, monkeypatch
+):
+    """Retry-After on 503 model_recovering is the engine's, not the quota
+    engine's, and the owner decision keeps it."""
+    class QueuedForRecovery(RuntimeError):
+        pass
+
+    monkeypatch.setattr("app.publicapi.streaming._engine_state_name", lambda: "RECOVERING")
+    engine([], fail=QueuedForRecovery("the model is restarting"))
+
+    response = api.post("/v1/responses", json=_body(), headers=_auth())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_recovering"
+    assert int(response.headers["Retry-After"]) >= 1
+    assert "RateLimit" not in response.headers
+
+
+def test_with_the_limits_off_the_body_cap_still_refuses_with_413(api, platform, monkeypatch):
+    """A technical safety limit, kept: unlimited usage is not unlimited bytes."""
+    monkeypatch.setattr(settings, "public_api_max_body_bytes", 4096, raising=False)
+
+    response = api.post("/v1/responses", json=_body(input="x" * 8192), headers=_auth())
+
+    assert response.status_code == 413
+    assert "RateLimit" not in response.headers
+
+
+def test_with_the_limits_off_a_full_engine_admission_lane_is_a_retryable_503_not_a_limit(
+    api, platform, engine
+):
+    """The engine's shared admission queue is the one physical ceiling left:
+    a refusal there is `503 model_unavailable` with Retry-After — the engine
+    at capacity, never a 429 naming a concurrency limit the API does not
+    enforce (owner decision 2026-09-13) — and it advertises no RateLimit."""
+    class AdmissionRejected(RuntimeError):
+        pass
+
+    engine([], fail=AdmissionRejected("every lane is busy"))
+
+    response = api.post("/v1/responses", json=_body(), headers=_auth())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_unavailable"
+    assert "safe to retry" in response.json()["error"]["message"]
+    assert int(response.headers["Retry-After"]) >= 1
+    assert "RateLimit" not in response.headers
+
+
+def test_the_served_schema_follows_the_switch(api, monkeypatch):
+    """What `/v1/openapi.json` advertises is decided per request from the same
+    switch the gate reads: no RateLimit header and no `quota_exceeded` when
+    off; both back when on."""
+    off = api.get("/v1/openapi.json").json()
+    monkeypatch.setattr(settings, "public_api_enforce_limits", True)
+    on = api.get("/v1/openapi.json").json()
+
+    assert "RateLimit" not in json.dumps(off)
+    assert "quota_exceeded" not in json.dumps(off["paths"])
+    assert "RateLimit" in json.dumps(on)
+    assert "quota_exceeded" in json.dumps(on["paths"])

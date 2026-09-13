@@ -238,7 +238,34 @@ def _require(principal: Principal, cap: Cap) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The five USAGE limits PUBLIC_API_ENFORCE_LIMITS switches off. The two
+#: per-request token ceilings are technical safety limits the owner kept
+#: (2026-09-13) and are always shown as stored.
+_USAGE_LIMIT_FIELDS = ("rpm", "input_tpm", "output_tpm", "max_concurrency", "daily_token_quota")
+
+
 def _limits_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A project's limits as the console shows them.
+
+    UNLIMITED SAYS UNLIMITED (owner decision, 2026-09-13). With
+    PUBLIC_API_ENFORCE_LIMITS off — the default — `enforced` is false and the
+    five usage limits are null, whatever the row stores: a console that shows
+    `rpm: 60` beside an API that admits the 61st request is showing a number
+    nothing enforces. The stored numbers are kept in the row (and in the audit
+    trail, see `_stored_limits`) for the day an operator turns enforcement on.
+    """
+    payload = _stored_limits(row)
+    enforced = quotas.limits_enforced()
+    if not enforced:
+        for field in _USAGE_LIMIT_FIELDS:
+            payload[field] = None
+    payload["enforced"] = enforced
+    return payload
+
+
+def _stored_limits(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The limit columns exactly as stored — for the audit trail, which must
+    record what a change moved from and to whether or not it is enforced."""
     return {
         "rpm": _int_or_none(row.get("rpm")),
         "input_tpm": _int_or_none(row.get("input_tpm")),
@@ -763,6 +790,9 @@ async def overview(
             stats[field] = None
     if not principal.can(Cap.API_USAGE_READ):
         stats["today"] = None
+    # Not a secret and not a per-project fact: whether the platform enforces
+    # usage limits at all (owner decision 2026-09-13, default false).
+    stats["limits_enforced"] = quotas.limits_enforced()
     return {
         "workspace": {"id": principal.workspace_id, "name": principal.workspace_name},
         "stats": stats,
@@ -1261,6 +1291,9 @@ async def read_limits(
     project = await _project_or_404(principal, project_id)
     return {
         "limits": _limits_payload(project),
+        # Top-level too, so a page that only reads the envelope can say
+        # "Unlimited" without digging (owner decision 2026-09-13).
+        "limits_enforced": quotas.limits_enforced(),
         "can_manage": principal.can(Cap.API_LIMITS_MANAGE),
     }
 
@@ -1291,7 +1324,7 @@ async def set_limits(
     )
     if row is None:  # pragma: no cover — _project_or_404 already proved it exists
         raise HTTPException(status_code=404, detail="No such project.")
-    before = _limits_payload(project)
+    before = _stored_limits(project)
     await db.run_in_thread(
         audit,
         principal,
@@ -1951,6 +1984,14 @@ async def _read_capped_body(request: Request, limit: int) -> bytes:
 # `quotas.reserve` (atomic per project under an advisory lock) and
 # `quotas.concurrency_slot` (one in-process counter per project), charged to a
 # per-workspace PLAYGROUND ALLOWANCE.
+#
+# UNLIMITED BY DEFAULT, THE SAME WAY (owner decision 2026-09-13). The
+# playground inherits PUBLIC_API_ENFORCE_LIMITS from those two calls and
+# checks nothing itself: with the switch off a run is recorded against the
+# allowance and never refused for rate, quota or concurrency, and its response
+# carries no RateLimit fields (`Reservation.headers()` is empty). The engine's
+# shared admission lanes still stand behind it, and a full lane is still the
+# `/v1` 429.
 #
 # WHY A SYSTEM PROJECT ROW. The quota ledgers (`api_usage_minute`,
 # `api_usage_daily`) key on `api_projects.id` with a foreign key, and the

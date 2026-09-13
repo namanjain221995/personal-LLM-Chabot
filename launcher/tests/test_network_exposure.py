@@ -5,10 +5,17 @@ measured on the DGX head on 2026-09-13 (docs/developer-platform/AUDIT.md):
 
 * F050/F042/F012/F065 -- the main vLLM engine, which has no ``--api-key``,
   answered ``GET /v1/models`` with 200 on the office LAN, the tailnet and both
-  RoCE rails, because ``PUBLISH_MODEL_PORTS=true`` made the launcher render
-  ``CLUSTER_API_BIND_ADDRESS=0.0.0.0`` for the host-network head, and the
-  single-node published overlay put port 8000 on ``TECHSARA_BIND_ADDRESS``
-  (the APPLICATION's bind) instead of ``TECHSARA_MODEL_BIND_ADDRESS``;
+  RoCE rails. The single-node published overlay put port 8000 on
+  ``TECHSARA_BIND_ADDRESS`` (the APPLICATION's bind) instead of
+  ``TECHSARA_MODEL_BIND_ADDRESS``, which stays fixed. The host-network
+  dual-mode head, however, KEEPS ``0.0.0.0`` (owner decision, option A, the
+  same day): commit 229031c narrowed it to the bridge gateway, and the
+  worker's healthcheck, which dials the head's RoCE address and kills its own
+  rank after 8 misses, would have taken the two-node engine down on the next
+  recreate. That exposure is closed by the host packet filter
+  (scripts/host-guard.sh, operator actions OA-4/OA-6), so the tests below pin
+  the REACHABILITY the head needs, and that the controller's port does not
+  widen along with it;
 * F051 -- the speech engine's compose file defaulted its bind to a literal
   office-LAN address;
 * F056 -- node-exporter defaulted to 0.0.0.0:9100, full host inventory;
@@ -63,8 +70,8 @@ def _detectors(gateway: str | None) -> ClusterDetectors:
     )
 
 
-def _head_bind(*, publish_model_ports: bool, gateway: str | None) -> str:
-    values = resolve_cluster_settings(
+def _resolve(*, publish_model_ports: bool, gateway: str | None) -> dict[str, str]:
+    return resolve_cluster_settings(
         {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": HEAD_IP, "CLUSTER_WORKER_IP": WORKER_IP},
         profile_id="dgx-spark",
         publish_model_ports=publish_model_ports,
@@ -73,40 +80,51 @@ def _head_bind(*, publish_model_ports: bool, gateway: str | None) -> str:
         vllm_port=8000,
         detectors=_detectors(gateway),
     )
-    return values["CLUSTER_API_BIND_ADDRESS"]
+
+
+def _covers(bind: str, address: str) -> bool:
+    """Whether a listener bound to ``bind`` accepts connections to ``address``."""
+    return bind in {WILDCARD, address}
+
+
+#: The worker's vllm-worker healthcheck, as compose.cluster-worker.yaml spells
+#: it: the head's RoCE address, not a service name or the bridge gateway.
+WORKER_HEALTHCHECK_URL = "http://${CLUSTER_HEAD_IP:?}:${VLLM_PORT:-8000}/health"
 
 
 class HeadBindResolutionTests(unittest.TestCase):
     """launcher/techsara_cli/cluster.py decides where the host-network head listens."""
 
-    def test_the_dual_mode_head_binds_the_docker_bridge_gateway_even_when_model_ports_are_published(self) -> None:
-        # The production .env has PUBLISH_MODEL_PORTS=true; this is the exact
-        # input that rendered 0.0.0.0 and put the engine on the LAN.
-        self.assertEqual(_head_bind(publish_model_ports=True, gateway=BRIDGE_GATEWAY), BRIDGE_GATEWAY)
-        self.assertEqual(_head_bind(publish_model_ports=False, gateway=BRIDGE_GATEWAY), BRIDGE_GATEWAY)
+    def test_the_worker_healthcheck_dials_the_head_on_its_rail_address_and_kills_its_rank_when_it_cannot(self) -> None:
+        # The premise of every test below; if the worker ever dials something
+        # else, the head's required reachability changes with it.
+        text = (REPO_ROOT / "compose" / "compose.cluster-worker.yaml").read_text(encoding="utf-8")
+        self.assertIn(WORKER_HEALTHCHECK_URL, text)
+        self.assertIn("kill -9", text)
 
-    def test_the_dual_mode_head_falls_back_to_loopback_and_never_to_every_interface_when_the_gateway_is_unknown(self) -> None:
+    def test_the_dual_mode_head_bind_covers_the_rail_address_the_worker_dials_published_or_not(self) -> None:
+        # PUBLISH_MODEL_PORTS=true is production's .env; false is .env.example.
         for publish in (True, False):
-            with self.subTest(publish_model_ports=publish):
-                self.assertEqual(_head_bind(publish_model_ports=publish, gateway=None), LOOPBACK)
+            for gateway in (BRIDGE_GATEWAY, None):
+                with self.subTest(publish_model_ports=publish, gateway=gateway):
+                    values = _resolve(publish_model_ports=publish, gateway=gateway)
+                    bind = values["CLUSTER_API_BIND_ADDRESS"]
+                    self.assertTrue(_covers(bind, values["CLUSTER_HEAD_IP"]), f"the worker healthcheck cannot reach a head on {bind}")
 
-    def test_the_bridge_gateway_is_probed_whether_or_not_model_ports_are_published(self) -> None:
-        # The old code skipped the probe when publishing, because it was about
-        # to bind every interface anyway. Not probing IS the exposure.
-        for publish in (True, False):
-            with self.subTest(publish_model_ports=publish):
-                probed: list[str] = []
-                detectors = ClusterDetectors(
-                    ifname_for_ip=_detectors(None).ifname_for_ip,
-                    hcas_for_ifnames=_detectors(None).hcas_for_ifnames,
-                    docker_bridge_gateway=lambda: probed.append("bridge") or BRIDGE_GATEWAY,
-                )
-                resolve_cluster_settings(
-                    {"CLUSTER_MODE": "dual", "CLUSTER_HEAD_IP": HEAD_IP, "CLUSTER_WORKER_IP": WORKER_IP},
-                    profile_id="dgx-spark", publish_model_ports=publish, context=262144,
-                    startup_arguments=(), vllm_port=8000, detectors=detectors,
-                )
-                self.assertEqual(probed, ["bridge"])
+    def test_the_dual_mode_head_bind_also_covers_the_bridge_gateway_and_loopback_callers(self) -> None:
+        # vLLM takes ONE --host: the orchestrator, sync-worker and Prometheus
+        # dial the bridge gateway, the scripts, deploy gate and CI loopback.
+        # Only the wildcard covers them and the rail at once.
+        values = _resolve(publish_model_ports=True, gateway=BRIDGE_GATEWAY)
+        bind = values["CLUSTER_API_BIND_ADDRESS"]
+        for caller_address in (HEAD_IP, BRIDGE_GATEWAY, LOOPBACK):
+            with self.subTest(caller_address=caller_address):
+                self.assertTrue(_covers(bind, caller_address))
+
+    def test_the_bridge_gateway_is_generated_as_its_own_key_for_the_controller(self) -> None:
+        self.assertEqual(_resolve(publish_model_ports=True, gateway=BRIDGE_GATEWAY)["CLUSTER_BRIDGE_GATEWAY"], BRIDGE_GATEWAY)
+        # Unreadable: empty, never a wildcard; compose renders loopback.
+        self.assertEqual(_resolve(publish_model_ports=True, gateway=None)["CLUSTER_BRIDGE_GATEWAY"], "")
 
 
 class ComposeFileBindTests(unittest.TestCase):
@@ -259,9 +277,9 @@ class RenderedExposureTests(unittest.TestCase):
                     self.assertTrue(ports, f"{name}/{service} is not published at all")
                     self.assertEqual({p.get("host_ip") for p in ports}, {LOOPBACK}, f"{name}/{service}")
 
-    def test_the_published_dual_mode_head_and_its_controller_stay_off_the_lan(self) -> None:
+    def _render_dual(self, gateway: str | None, **extra: str):
         with (
-            patch.object(environment, "CLUSTER_DETECTORS", _detectors(BRIDGE_GATEWAY)),
+            patch.object(environment, "CLUSTER_DETECTORS", _detectors(gateway)),
             patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
         ):
             _profile, rendered = self._render(
@@ -270,22 +288,43 @@ class RenderedExposureTests(unittest.TestCase):
                     "CLUSTER_MODE": "dual",
                     "CLUSTER_HEAD_IP": HEAD_IP,
                     "CLUSTER_WORKER_IP": WORKER_IP,
-                    # Both production values that used to open the engine.
+                    # Production's values.
                     "PUBLISH_MODEL_PORTS": "true",
                     "TECHSARA_BIND_ADDRESS": WILDCARD,
+                    **extra,
                 },
             )
-        services = rendered["services"]
-        argv = list(services["vllm"]["command"])
-        self.assertEqual(argv[argv.index("--host") + 1], BRIDGE_GATEWAY)
-        controller = services["engine-controller"]["environment"]
-        self.assertEqual(controller["HEAD_API_URL"], f"http://{BRIDGE_GATEWAY}:8000")
-        self.assertEqual(controller["CONTROLLER_BIND"], f"{LOOPBACK},{BRIDGE_GATEWAY}")
-        # The callers that reach the head and the controller through the
-        # bridge gateway are still wired to it.
+        return rendered["services"]
+
+    def test_the_rendered_dual_mode_head_answers_on_the_rail_address_its_worker_dials(self) -> None:
+        services = self._render_dual(BRIDGE_GATEWAY)
+        vllm = services["vllm"]
+        self.assertEqual(vllm.get("network_mode"), "host")
+        argv = list(vllm["command"])
+        bind = argv[argv.index("--host") + 1]
+        self.assertTrue(_covers(bind, HEAD_IP), f"--host {bind} is unreachable from the worker healthcheck")
+        # The head's own healthcheck URL is rendered from the same bind, and
+        # the kernel answers 0.0.0.0 on loopback (what production runs today).
+        self.assertIn(f"http://{bind}:8000/health", vllm["healthcheck"]["test"][1])
+        # The callers that reach the head through the bridge gateway are still wired to it.
         for service in ("orchestrator", "sync-worker"):
             extra_hosts = {str(item).replace("=", ":") for item in services[service].get("extra_hosts") or []}
             self.assertIn("vllm:host-gateway", extra_hosts)
+
+    def test_the_engine_controller_does_not_widen_with_the_head_and_dials_it_through_the_bridge_gateway(self) -> None:
+        # 229031c derived CONTROLLER_BIND from the head's bind: with the head
+        # on 0.0.0.0 that is "127.0.0.1,0.0.0.0", which controller.py collapses
+        # to a wildcard 9838 on the LAN. These values are also exactly what the
+        # running controller carries (recreated 2026-09-13T02:54:50Z).
+        controller = self._render_dual(BRIDGE_GATEWAY)["engine-controller"]["environment"]
+        self.assertEqual(controller["CONTROLLER_BIND"], f"{LOOPBACK},{BRIDGE_GATEWAY}")
+        self.assertNotIn(WILDCARD, controller["CONTROLLER_BIND"])
+        self.assertEqual(controller["HEAD_API_URL"], f"http://{BRIDGE_GATEWAY}:8000")
+
+    def test_an_unreadable_bridge_gateway_leaves_the_controller_on_loopback_never_on_every_interface(self) -> None:
+        controller = self._render_dual(None)["engine-controller"]["environment"]
+        self.assertEqual(set(controller["CONTROLLER_BIND"].split(",")), {LOOPBACK})
+        self.assertEqual(controller["HEAD_API_URL"], f"http://{LOOPBACK}:8000")
 
     def test_the_single_node_engine_controller_listens_on_loopback_only(self) -> None:
         _profile, rendered = self._render(overlays.FIXTURES["dgx-spark"], {"TECHSARA_BIND_ADDRESS": WILDCARD})

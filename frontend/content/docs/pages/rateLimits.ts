@@ -1,152 +1,114 @@
 import type { DocPage } from '../types';
 import { EXAMPLE_STATUS } from '../samples';
 
+// 2026-09-13, owner decision (explicit and final): the public API has NO
+// request, token, daily, monthly or concurrency limits. This page used to be
+// a table of allowances and three ways to be throttled; a reader who sized a
+// client against numbers that are no longer enforced would build a slower
+// client for nothing. It now says so first, keeps the technical limits that
+// did not go away (context window, output ceiling, body size, the engine's
+// shared queue), and describes the enforced mode only as what an operator
+// gets by turning PUBLIC_API_ENFORCE_LIMITS on — off by default.
 export const rateLimits: DocPage = {
   slug: 'rate-limits',
   title: 'Rate limits',
   summary:
-    'What a project is allowed per minute, per day and at once — and how to ' +
-    'back off when you reach it.',
+    'There are no usage limits on the API today — what still applies, and ' +
+    'how to back off when the model is restarting.',
   section: 'API reference',
   examples: EXAMPLE_STATUS,
   body: `
-Limits belong to the **project**. Every key in a project draws on the same
-allowance: the counters are summed across all of the project's keys, so
-minting a second key does not buy a second allowance. A key can carry its own
-lower requests-per-minute or concurrency figure to keep one service inside a
-share of the project — it can only ever *tighten* its project's numbers,
-never raise them. A key with no figure of its own uses the project's.
+**The API currently enforces no usage limits.** There is no limit on requests
+per minute, no limit on tokens per minute, no daily or monthly token quota and
+no cap on how many requests a project runs at once. No \`/v1\` request is
+refused with \`rate_limit_error\`, \`quota_exceeded\` or
+\`concurrency_limit_exceeded\` for how much it uses, and **no response carries a
+\`RateLimit\` or \`RateLimit-Policy\` header** — a header advertising a limit
+that does not exist would be worse than none.
+
+That is a decision, not a gap waiting to be filled; the
+[changelog](/docs/changelog) records it on 2026-09-13.
+
+## What still applies
+
+These are technical limits of the model and the server, not allowances, and
+they apply to every request:
+
+| Limit | Value | What you see |
+| --- | --- | --- |
+| Body bytes | 1 MiB | \`413 request_too_large\`, checked before the body is parsed. |
+| Input tokens | The model's context window | \`400 context_length_exceeded\`, refused before admission. |
+| Output tokens | 8,192 by default | The default is clamped to the [model's ceiling](/docs/models); asking for more than the ceiling is a \`400\`. |
+| The engine's queue | Shared with the TechSara chat application | A request waits its turn; one that cannot get a place is \`503 model_unavailable\` with \`Retry-After\` — the engine's capacity, not a count of your requests. |
+
+The last row is what "unlimited" does not mean: there is one engine behind
+the API, and a thousand requests at once are served as fast as that engine
+can serve them, not a thousand times faster. Sending more in parallel than it
+can generate makes each answer wait longer — [stream](/docs/streaming) so
+your users see output as soon as it exists.
+
+## Usage is still recorded
+
+Every \`/v1\` request that presents a key is still counted, once,
+reads included — the console's usage view, the request log and
+[\`GET /v1/usage\`](/docs/usage) keep working exactly as before. Recording
+what you used is not the same as limiting it. The two routes that take no key
+are not counted:
+\`GET /v1/openapi.json\` and the browser's \`OPTIONS\` preflight.
+
+## Backing off on 503
+
+The one refusal you should still plan for is the model restarting. While it
+does, requests are answered with \`503 model_recovering\` — safe to send
+again — or, if the engine is down rather than restarting,
+\`503 model_unavailable\`. Both carry \`Retry-After\` in whole seconds, never
+less than \`1\`. Treat a \`429 concurrency_limit_exceeded\` from a full
+engine queue the same way.
+
+* **Honour \`Retry-After\`.** It is the server's estimate of when the retry
+  can succeed; retrying sooner only adds to the queue the restart has to
+  drain.
+* **Add jitter.** A fleet that retries on the same tick recreates the spike
+  it was refused in.
+* **Cap your attempts**, and back off harder on \`model_unavailable\` than on
+  \`model_recovering\`.
+* **Send an [\`Idempotency-Key\`](/docs/idempotency)** on anything you
+  retry, so a retry after a lost connection cannot run the work twice.
+
+A streaming request may instead be allowed to wait through a recovery, and
+you see a \`response.queued\` event rather than an error — see
+[API status](/docs/status). [Errors](/docs/errors#what-to-retry) has a worked
+retry loop.
+
+## If an operator enables limits
+
+The limits still exist in the code, behind one server setting,
+\`PUBLIC_API_ENFORCE_LIMITS\`, which is **off by default**. Nothing in this
+section applies unless the operator of your deployment has turned it on; if
+they have, they will tell you.
+
+With it on, limits belong to the **project**: the counters are
+summed across all of the project's keys, and a key's own figure can only
+*tighten* its project's numbers, never raise them. A limit set to \`0\` allows nothing.
+A new project starts with:
 
 | Limit | Default | Enforced |
 | --- | --- | --- |
-| Requests per minute | 60 | Sliding window, durable across restarts. |
+| Requests per minute | 60 | Sliding window, every request that presents a key. |
 | Input tokens per minute | 200,000 | Durable counter. |
 | Output tokens per minute | 60,000 | Durable counter. |
-| Concurrent requests | 4 | In flight at once, across sync, streaming and background. |
-| Tokens per day | 2,000,000 | Durable, survives a restart. |
-| Body bytes | 1 MiB | Checked before parsing. |
-| Input tokens | The model's ceiling | Checked before admission. |
-| Output tokens | 8,192 by default | Clamped to the model's ceiling. |
+| Concurrent requests | 4 | In flight at once — a [background response](/docs/background) holds one from its \`202\` until it ends. |
+| Tokens per day | 2,000,000 | Resets at midnight UTC. |
 
-Your project's real numbers are in the console; the defaults above are what a
-new project starts with.
-
-## Every request counts
-
-Every \`/v1\` request that presents a key counts one against requests per
-minute — reads included. \`GET /v1/models\`, \`GET /v1/responses/{id}\`,
-\`POST /v1/responses/{id}/cancel\` and \`GET /v1/usage\` spend the same
-allowance a generation does, so a status poll in a tight loop is a rate limit
-you are choosing to hit. Only the two routes that take no key are free:
-\`GET /v1/openapi.json\` and the browser's \`OPTIONS\` preflight.
-
-A request refused *by* a limit does not use up the allowance it was refused
-for.
-
-## Zero means zero
-
-A limit set to \`0\` allows nothing. A project whose requests per minute is
-\`0\` answers every request with \`429\`; a daily token quota of \`0\` is
-\`quota_exceeded\` on the first request; a concurrency of \`0\` refuses every
-request as \`concurrency_limit_exceeded\`. That is how an administrator pauses
-a project without revoking its keys, and a key whose own figure is \`0\` is
-parked the same way while its siblings carry on. \`0\` is never read as "use
-the default" — only a key figure that was never set inherits the project's.
-
-## Concurrency
-
-One count per project covers every kind of request: a synchronous call holds
-a slot until its answer is written, a stream holds one until the stream ends,
-and a [background response](/docs/background) holds one from its \`202\`
-until it completes, fails or is cancelled. Over the limit is an immediate
-\`429 concurrency_limit_exceeded\` — never a queue, so the wait is yours to
-decide on rather than hidden inside a request you are timing.
-
-## Tokens
-
-Input tokens are estimated, pessimistically, and that estimate is reserved
-against the per-minute and daily counters when the request is admitted; when
-it finishes, the estimate is replaced by the counts the engine reported,
-written once. Output
-cannot be known in advance, so the output-per-minute limit refuses the request
-*after* the one that crossed the line. The daily quota counts input and output
-together.
-
-The daily quota resets at **midnight UTC**, not at midnight where you are. A
-caller in Kolkata gets the reset at 05:30 local.
-
-## The headers
-
-Every authenticated \`/v1\` response carries, \`429\`s included:
-
-~~~http
-RateLimit: "requests";r=41;t=23
-RateLimit-Policy: "requests";q=60;w=60, "concurrency";q=4;qu="concurrent-requests"
-~~~
-
-\`r\` is how many requests remain in the current window and \`t\` is the
-seconds until it resets; \`q\` and \`w\` are the quota and window that apply to
-the key you sent. Read them and slow down *before* you are refused — a client
-that only reacts to \`429\` spends part of every minute being refused.
-
-The fields follow the IETF \`RateLimit\` header draft (revision 11): two
-structured fields, not the older \`RateLimit-Limit\` / \`-Remaining\` /
-\`-Reset\` triple some libraries still expect. The token limits are enforced
-but not advertised in these fields — the draft has no unit for model tokens,
-and a number in the wrong unit would be worse than none.
-
+Over a limit is \`429\` with \`Retry-After\`: \`rate_limit_error\` for the
+per-minute limits, \`quota_exceeded\` for the daily quota and
+\`concurrency_limit_exceeded\` for too many in flight — one type,
+\`rate_limit_error\`, so one retry branch handles all three. Responses then
+carry the IETF draft-11 headers, for example
+\`RateLimit: "requests";r=41;t=23\` and
+\`RateLimit-Policy: "requests";q=60;w=60, "concurrency";q=4;qu="concurrent-requests"\`.
 A \`401\` carries no quota headers at all, deliberately: rate-limit state
 handed to a caller who has not proved who they are would let a stranger watch
 another tenant's traffic.
-
-Every \`429\` and every \`503\` carries \`Retry-After\`, in whole seconds, at
-least \`1\`, with jitter already added so a fleet throttled together does not
-return together.
-
-If you are calling from a browser, these headers plus \`X-Request-Id\` and
-\`Retry-After\` are exposed to your JavaScript on cross-origin responses —
-without that a browser client can read the status code and nothing else.
-
-## The three ways to be throttled
-
-| Code | Meaning | What to do |
-| --- | --- | --- |
-| \`rate_limit_error\` | Requests or tokens per minute exceeded. | Wait out the window. |
-| \`quota_exceeded\` | The daily token quota is exhausted. | Wait for midnight UTC, or ask for more quota. |
-| \`concurrency_limit_exceeded\` | Too many requests in flight. | Run fewer at once — a queue of 4 that never blocks beats 40 that mostly fail. |
-
-All three share the \`rate_limit_error\` type, so one retry branch handles
-them: honour \`Retry-After\`, add jitter, cap the attempts. See
-[errors](/docs/errors#what-to-retry) for a worked retry loop.
-
-## Why the quota gate comes first
-
-Generation lanes are shared with the TechSara chat application, and the quota
-is checked *before* a request is admitted to one. Without that ordering a
-single project could hold every lane and starve everyone signed in to the
-product. It is also why \`concurrency_limit_exceeded\` is a normal thing to see
-under load rather than a fault: the limit is doing its job.
-
-## Designing for the limits
-
-* **Batch nothing you can stream.** A streamed answer holds one slot and
-  gives your user output immediately.
-* **Use [background responses](/docs/background)** for long work and let the
-  webhook wake you, instead of polling — every poll is a request.
-* **Poll politely** when you must: seconds apart, with a ceiling.
-* **Add jitter.** A fleet that retries on the same tick recreates the spike
-  it was throttled for.
-* **Set \`max_output_tokens\`.** The token-per-minute counters care about
-  what you actually generate.
-* **Separate the workloads by project**, not by key. Two keys in one project
-  share one allowance; a batch job and an interactive feature in different
-  projects cannot exhaust each other.
-
-## Asking for more
-
-Limits are set per project in the console; raising a workspace's ceiling is
-super-admin territory. Bring the numbers: the requests per minute you need,
-your typical prompt and answer sizes, and whether the traffic is interactive
-or batch.
 `.trim(),
 };

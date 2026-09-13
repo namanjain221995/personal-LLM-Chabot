@@ -16,8 +16,9 @@ export const usage: DocPage = {
 GET /v1/usage
 ~~~
 
-Requires the \`usage.read\` scope, and counts against the project's
-[rate limits](/docs/rate-limits) like every other call. The range is project-scoped and bounded —
+Requires the \`usage.read\` scope, and is recorded like every other call —
+recorded, not limited: the API enforces no usage
+[limits](/docs/rate-limits). The range is project-scoped and bounded —
 you read your own project's counters over a window, not the workspace's
 history in one call.
 
@@ -51,15 +52,16 @@ you did not ask for.
       "input_tokens": 183204,
       "output_tokens": 52117,
       "errors": 3,
-      "rate_limited": 1
+      "rate_limited": 0
     }
   ]
 }
 ~~~
 
 One row per day, for your project. \`errors\` counts requests that ended in a
-failure; \`rate_limited\` counts the ones that were refused for a limit, which
-is the number to watch before asking for more capacity.
+failure; \`rate_limited\` counts the ones refused for a usage limit, and
+stays \`0\` unless an operator has
+[enabled limits](/docs/rate-limits#if-an-operator-enables-limits).
 
 The same shape is in \`/v1/openapi.json\` if you are generating a client.
 
@@ -93,8 +95,6 @@ dashboard that is confidently wrong.
 
 * **The developer console** at [\`${CONSOLE_PATH}\`](${CONSOLE_PATH}) shows
   your projects' usage, the per-key activity and the request log.
-* **Rate-limit headers** on every response tell you where you are inside the
-  current window — see [rate limits](/docs/rate-limits).
 
 API traffic goes into the same ledger the rest of the product uses, so it
 shows up in the workspace's existing analytics rather than in a parallel
@@ -103,7 +103,6 @@ universe of its own.
 ## Timing
 
 Counters are written when a request completes, so a request still in flight
-is not in them yet, and a very recent request may be seconds behind. For "am
-I about to be throttled", read the \`RateLimit\` headers, which are live.
+is not in them yet, and a very recent request may be seconds behind.
 `.trim(),
 };

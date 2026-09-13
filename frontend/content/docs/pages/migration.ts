@@ -86,8 +86,9 @@ anything this platform adds later will live.
 3. Replace your error handling with the [error codes](/docs/errors), and keep
    \`request_id\`.
 4. Add an [\`Idempotency-Key\`](/docs/idempotency) to anything you retry.
-5. Read the \`RateLimit\` headers and size your concurrency to the project's
-   limits — see [rate limits](/docs/rate-limits).
+5. Drop any code that waits on \`RateLimit\` headers or a \`429\` quota:
+   the API sends neither — see [rate limits](/docs/rate-limits). Keep the
+   backoff on \`503\`.
 6. Move long work to [background responses](/docs/background) before you meet
    your first proxy timeout, not after.
 `.trim(),

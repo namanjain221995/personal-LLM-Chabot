@@ -68,7 +68,16 @@ export const CONSOLE_PATH = '/api';
 /**
  * WHETHER THE EXAMPLES HAVE BEEN RUN — the one switch (CONTRACT §17).
  *
- * `false` today, and the reason is precise. The `/v1` routes EXIST: they are
+ * 2026-09-13, second change the same day: the switch was flipped to `true`
+ * after the first end-to-end run, then set back to `false` when the owner
+ * removed every usage limit from the API. The pages changed with that
+ * decision (the rate-limits page, the `curl -i` sample that printed RateLimit
+ * headers, the retry guidance), and a run that checked the OLD pages cannot
+ * vouch for the new ones. The integration lead re-runs
+ * scripts/docs_examples_run.py against the stack and flips it back only when
+ * it passes — with a changelog heading containing "examples executed".
+ *
+ * The original reason for `false`, still the rule: The `/v1` routes EXIST: they are
  * declared in `orchestrator/app/publicapi/router.py` and mounted by
  * `orchestrator/app/main.py`. What has not happened yet is the end-to-end run
  * of THESE examples against a running deployment, and CONTRACT §17 says an
@@ -89,7 +98,7 @@ export const CONSOLE_PATH = '/api';
  * tests/docs-site.test.tsx refuses a `true` that has no changelog entry
  * behind it.
  */
-export const EXAMPLES_EXECUTED: boolean = true;
+export const EXAMPLES_EXECUTED: boolean = false;
 
 /** The notice while the examples have not been run. */
 export const NOT_EXECUTED_NOTE =

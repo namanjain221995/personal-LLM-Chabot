@@ -13,6 +13,13 @@
  * model count, and today's requests from the usage ledger. Nothing is
  * derived, extrapolated or defaulted in here — while the answer is loading a
  * figure is "…", and when the call failed it is "—", never 0.
+ *
+ * USAGE LIMITS (owner decision, 2026-09-13). The public API is unlimited
+ * unless PUBLIC_API_ENFORCE_LIMITS is on, and a developer landing here should
+ * not have to guess whether a 429 is coming. When the overview says the limits
+ * are off the page says Unlimited; when it says they are on it says so and
+ * points at the per-project ceilings. When it says nothing (a pre-switch
+ * orchestrator) the line is absent rather than guessed.
  */
 
 import Link from 'next/link';
@@ -24,7 +31,7 @@ import { compact } from '@/components/admin/analytics/format';
 import { ADMIN_SECONDARY_BUTTON } from '@/components/admin/controls';
 import type { Me } from '@/components/admin/api';
 import { tabHref } from './nav';
-import { ConsoleEmpty } from './shared';
+import { ConsoleEmpty, limitsEnforcement } from './shared';
 import { useConsole } from './useConsole';
 import { consolePaths } from './paths';
 import { useConsoleStatus } from './status';
@@ -43,6 +50,7 @@ export function OverviewPanel({ me }: { me: Me }) {
   }, [loading, error, data, announce]);
 
   const stats = data?.stats;
+  const enforcement = limitsEnforcement(data, stats);
   const figure = (value: number | undefined) =>
     value === undefined ? (loading ? '…' : '—') : compact(value);
 
@@ -76,6 +84,19 @@ export function OverviewPanel({ me }: { me: Me }) {
             }
           />
         </StatRow>
+        {enforcement !== null && (
+          <dl className="mt-4 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm">
+            <dt className="text-xs text-faint">Usage limits</dt>
+            <dd className="font-semibold text-ink">
+              {enforcement ? 'Enforced per project' : 'Unlimited'}
+            </dd>
+            <dd className="basis-full text-xs text-muted sm:basis-auto">
+              {enforcement
+                ? 'Requests per minute, tokens per minute, the daily quota and concurrency are capped per project.'
+                : 'No request, token-per-minute, daily quota or concurrency limit applies. Usage is still recorded.'}
+            </dd>
+          </dl>
+        )}
       </Section>
 
       <Section title="Getting started">

@@ -20,16 +20,21 @@
 # docker bridge gateway (172.17.0.1), which the orchestrator's container can
 # reach and nothing off-box can.
 #
-# THE MANAGEMENT ADDRESS IS ITSELF AN EXPOSURE. The developer-platform audit
-# (F051, 2026-09-13) measured `GET http://192.168.9.68:30007/health` answering
-# 200 from the office LAN: the server has no authentication, so any host there
-# can upload audio and burn the worker GPU the main model's TP=2 pair shares.
-# The address comes from scripts/whisper.sh (whisper_bind_address); the
-# audit's fix is to derive the worker's bind from CLUSTER_WORKER_IP, the RoCE
-# rail the worker sentinel already binds, and to rewrite ASR_BASE_URL and
-# ASR_BASE_URLS in the same change. Until then this file at least has no LAN
-# literal of its own: WHISPER_BIND is required, so a `docker compose up` run
-# by hand fails instead of silently binding the office network.
+# THE MANAGEMENT ADDRESS IS ITSELF AN EXPOSURE, AND THE BIND STAYS ON IT. The
+# developer-platform audit (F051, 2026-09-13) measured
+# `GET http://192.168.9.68:30007/health` answering 200 from the office LAN:
+# the server has no authentication, so any host there can upload audio and
+# burn the worker GPU the TP=2 pair shares. The owner chose option A the same
+# day: the worker engine keeps the management address, because every
+# consumer dials it (the head orchestrator's ASR_BASE_URL/ASR_BASE_URLS,
+# scripts/asr_language_probe.py), and a RoCE-rail bind is no boundary under
+# Linux's weak-host model anyway. The exposure is closed by the host packet
+# filter (scripts/host-guard.sh, operator actions OA-4/OA-6: 30007 accepted on
+# enP7s7 from the head 192.168.9.54 only, dropped elsewhere and on
+# tailscale0). The address comes from scripts/whisper.sh
+# (whisper_bind_address), and this file has no LAN literal of its own:
+# WHISPER_BIND is required, so a `docker compose up` run by hand fails instead
+# of silently binding the office network.
 
 services:
   whisper:

@@ -109,6 +109,15 @@ class CallerLimits:
     console reads.
 
     ZERO IS ZERO. A stored 0 refuses everything; only NULL inherits.
+
+    RESOLVED EVEN WHEN NOTHING ENFORCES THEM (owner decision, 2026-09-13).
+    PUBLIC_API_ENFORCE_LIMITS defaults to false, and then the five usage
+    ceilings here are carried but never compared with anything — that switch
+    is read in `quotas.reserve` / `quotas.take_slot`, the two admission
+    decisions, and deliberately not here: the resolver says who the caller is
+    and what is configured, and one place decides whether it is enforced.
+    `max_input_tokens` / `max_output_tokens` are technical ceilings and apply
+    either way.
     """
 
     rpm: int

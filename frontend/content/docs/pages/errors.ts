@@ -47,13 +47,13 @@ The same value is on every response as \`X-Request-Id\`, success included.
 | \`origin_not_allowed\` | 403 | Browser \`Origin\` outside the project's allowlist. |
 | \`model_not_found\` | 404 | Unknown model, or one this key may not use. |
 | \`response_not_found\` | 404 | Not this project's response. |
-| \`idempotency_conflict\` | 409 | Same \`Idempotency-Key\`, different body. |
+| \`idempotency_conflict\` | 409 | Same \`Idempotency-Key\`, different body — or the same body while the first request with that key is still running, which carries \`Retry-After\`. |
 | \`request_too_large\` | 413 | Body over 1 MiB. |
-| \`rate_limit_error\` | 429 | Requests or tokens per minute exceeded. |
-| \`quota_exceeded\` | 429 | The daily token quota is exhausted. |
-| \`concurrency_limit_exceeded\` | 429 | Too many requests in flight. |
+| \`rate_limit_error\` | 429 | Only if an operator has [enabled limits](/docs/rate-limits#if-an-operator-enables-limits): requests or tokens per minute exceeded. |
+| \`quota_exceeded\` | 429 | Only if an operator has enabled limits: the daily token quota is exhausted. |
+| \`concurrency_limit_exceeded\` | 429 | Only if an operator has enabled limits: too many of the project's requests in flight. |
 | \`model_recovering\` | 503 | The engine is restarting. Retry-safe. |
-| \`model_unavailable\` | 503 | The engine is down. |
+| \`model_unavailable\` | 503 | The engine is down, or at capacity: its queue, shared with the chat application, is full. Retry-safe. |
 | \`timeout\` | 504 | Generation exceeded the wall clock. |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
 
@@ -68,19 +68,30 @@ bare framework error your parser has never seen.
 \`rate_limit_error\`, \`service_unavailable_error\`, \`timeout_error\`,
 \`server_error\`.
 
-All three 429 codes share the \`rate_limit_error\` type on purpose: your
-reaction to every one of them is the same — wait for \`Retry-After\`, then
-retry — so one type means one retry branch rather than three near-identical
-ones.
+The API enforces **no usage limits** today — no request, token, daily or
+concurrency limit (see [rate limits](/docs/rate-limits)) — so no request is
+refused with a \`429\`. The two refusals that remain are not limits either,
+and neither is spelled as one: an [idempotency key](/docs/idempotency) whose
+first request is still running is a \`409 idempotency_conflict\` with
+\`Retry-After\` — "come back in two seconds for the answer" — and an engine
+whose shared queue is too deep to join is a \`503 model_unavailable\` — the
+engine's capacity, the same for every caller. The three \`429\` codes
+stay in the vocabulary for deployments whose operator turns limits on, and
+share the \`rate_limit_error\` type on purpose: your reaction to every one of
+them is the same — wait for \`Retry-After\`, then retry — so one type means
+one retry branch rather than three near-identical ones.
 
 ## What to retry
 
 Retry, unchanged, with backoff:
 
 \`rate_limit_error\`, \`quota_exceeded\`, \`concurrency_limit_exceeded\`,
-\`model_recovering\`, \`model_unavailable\`, \`timeout\`.
+\`model_recovering\`, \`model_unavailable\`, \`timeout\`. Of those, the
+three \`429\` codes arrive only where an operator enables limits. Also retry a
+\`409\` that carries \`Retry-After\`: it is your own earlier request with the
+same idempotency key, still running, and the retry collects its answer.
 
-The five \`429\` and \`503\` codes carry \`Retry-After\`, in whole seconds and
+The five \`429\` and \`503\` codes, and a still-running \`409\`, carry \`Retry-After\`, in whole seconds and
 never less than \`1\`. Honour it, add jitter, and cap your attempts.
 \`timeout\` is a \`504\` and carries no \`Retry-After\`: the generation ran out
 of wall clock, so back off on your own schedule — and before you retry,
@@ -88,8 +99,8 @@ consider [streaming](/docs/streaming) or a
 [background response](/docs/background), which a long generation suits
 better.
 
-Do **not** retry a \`400\`, \`401\`, \`403\`, \`404\`, \`409\` or \`413\`
-unchanged: nothing about the next identical attempt will be different. Fix
+Do **not** retry a \`400\`, \`401\`, \`403\`, \`404\`, \`413\` or a
+\`409\` without \`Retry-After\` unchanged: nothing about the next identical attempt will be different. Fix
 the request, the key or the scope.
 
 A \`500\` is ours. Retry once with a fresh
@@ -101,6 +112,8 @@ import random
 import time
 
 RETRYABLE = {
+    # quota_exceeded and concurrency_limit_exceeded arrive only if an operator
+    # enables limits; listing them costs nothing.
     "rate_limit_error", "quota_exceeded", "concurrency_limit_exceeded",
     "model_recovering", "model_unavailable", "timeout",
 }
@@ -112,11 +125,13 @@ def send_with_retry(client, payload, *, attempts=5):
             return response.json()
 
         code = response.json().get("error", {}).get("code", "")
-        if code not in RETRYABLE or attempt == attempts - 1:
+        # A 409 with Retry-After is this key's first request, still running.
+        running = response.status_code == 409 and "Retry-After" in response.headers
+        if (code not in RETRYABLE and not running) or attempt == attempts - 1:
             response.raise_for_status()
 
         # Honour Retry-After, then add jitter so a fleet of clients does not
-        # come back in lockstep and cause the next rate limit itself.
+        # come back in lockstep and cause the next spike themselves.
         wait = float(response.headers.get("Retry-After", 2 ** attempt))
         time.sleep(wait + random.uniform(0, 1))
     raise RuntimeError("unreachable")

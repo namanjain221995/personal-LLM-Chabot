@@ -392,10 +392,11 @@ decide whether they mean anything:
 1. **The model's own port.** While the main engine's OpenAI API answers
    unauthenticated on the LAN (audit F050/F042/F012), anyone on that network
    can skip keys, scopes, quotas, usage records and audit entirely by calling
-   port 8000. The launcher and compose changes in this branch narrow the bind,
-   but they take effect only when the engine is recreated — a main-model
-   restart in a production window — and the host packet filter in
-   DISPOSITION.md is the backstop.
+   port 8000. The bind stays `0.0.0.0` on purpose (owner option A,
+   2026-09-13: the worker's healthcheck and the interview-analysis tenant dial
+   the head over RoCE rail A, and a narrower bind would take the two-node
+   engine down). The exposure is closed by the host packet filter,
+   `scripts/host-guard.sh` — §13 — which the owner applies with no restart.
 2. **The orchestrator's own port.** `:8080` is published on
    `TECHSARA_BIND_ADDRESS`. For `/v1`, a forwarded address is believed only from
    a peer in `PUBLIC_API_TRUSTED_PROXIES`, so a LAN host calling `:8080` directly
@@ -616,12 +617,12 @@ preview of an API answer.
   refusal, the Salesforce routes failing closed.
 * **Frontend**: the `/v1` edge, the `/api` console and `/docs` pages, the
   bounded and header-honest proxies, the middleware matcher change.
-* **Infrastructure files** (launcher bind address, compose port bindings,
-  engine-controller and node-exporter binds) were being changed in the same
-  branch while this was written. Changes that alter the main engine's bind need
-  the engine recreated — a main-model restart — and a routine deploy does not
-  restart the main model. Plan a `--full` deploy in a production window for
-  them, separately from the application release.
+* **Infrastructure files.** The main engine's bind is unchanged (option A:
+  `0.0.0.0` on the head, the management address for the worker's OCR and
+  speech engines), so nothing in this release needs a main-model restart. The
+  engine-controller and node-exporter binds take effect when those containers
+  are next recreated. The engine exposure is closed separately by the host
+  packet filter (§13), which is not part of a deploy and restarts nothing.
 
 A routine rolling deploy carries the application changes. `API_KEY_PEPPER` and
 the frontend variables of §2 must be in place **before** it.
@@ -660,3 +661,88 @@ To remove the platform's data after a deliberate, permanent rollback, drop the
 eleven tables named in `SCHEMA-V34.md` and delete row `34` from
 `schema_migrations` — in a maintenance window, after a backup, and only once
 nobody expects those keys to work again.
+
+---
+
+## 13. The host packet filter on the engine ports
+
+The raw model engines have no authentication, so they must not be reachable
+from the office LAN or the tailnet. On 2026-09-13 the repository owner chose to
+keep their binds (option A) — the head vLLM API on `0.0.0.0:8000`, the worker's
+OCR and speech engines on `192.168.9.68` — because the head's callers sit on
+loopback, the Docker bridges and RoCE rail A at once, and the worker's
+`vllm-worker` healthcheck (`http://10.100.184.1:8000/health`, `kill -9` of its
+rank after 8 misses) would take the TP=2 engine down under any narrower head
+bind. `scripts/host-guard.sh` closes the exposure by ingress interface instead.
+The full reasoning, the rule tables and the consumer each rule serves are in
+DISPOSITION.md OA-3 (withdrawn), OA-4 and OA-6.
+
+**What applying it costs: nothing running.** It adds one nftables table,
+`inet techsara_guard`. No container, engine or model restarts; established
+connections are accepted first, so a generation in flight survives; only TCP to
+the guarded ports is judged, so SSH, the Cloudflare tunnel, the torch master
+port and the NCCL listeners are untouched; it never flushes the ruleset and
+never touches Docker's chains.
+
+| node | guarded tcp ports | accepted from | dropped |
+|---|---|---|---|
+| head | 8000-8005, 9100, 9835, 9838 | lo; docker0 and br-* from 172.16.0.0/12; enp1s0f1np1 from 10.100.184.0/24; enP2p1s0f1np1 from 10.100.185.0/24 | enP7s7, tailscale0, any other ingress (IPv4 and IPv6) |
+| worker | 9100, 9835, 9839, 30004, 30007 | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
+
+`apply` refuses, before calling nft, if the rules would drop a consumer in its
+built-in consumer table, if an interface it names is missing, or if a peer
+connected right now to a guarded port would lose its next connection.
+
+### Head (OA-4)
+
+```bash
+sudo scripts/host-guard.sh plan       # the exact ruleset; changes nothing, needs no root
+sudo scripts/host-guard.sh apply      # self-test + preflight, nft -c -f, one atomic nft -f
+scripts/host-guard.sh verify          # table/state, loopback probes; from the worker: rail -> 200, LAN -> timeout
+gh variable set ENGINE_EXPOSURE_ENFORCE --body true --repo namanjain221995/personal-LLM-Chabot   # only after verify passes
+```
+
+Run `verify` straight after `apply`. **If its rail probe fails, remove the
+guard immediately** — the worker healthcheck kills its rank after 4 minutes of
+misses:
+
+```bash
+sudo scripts/host-guard.sh remove     # rollback: deletes table inet techsara_guard, nothing else
+```
+
+Also check one real chat, every Prometheus target UP, and from an office
+laptop `curl -m 5 http://192.168.9.54:8000/v1/models` timing out.
+
+### Worker (OA-6)
+
+```bash
+W=techsphere@10.100.184.2
+scp scripts/host-guard.sh "$W":.techsara-cluster/host-guard.sh
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh plan --role worker'
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker'
+ssh    "$W" 'bash ~/.techsara-cluster/host-guard.sh verify --role worker'
+# rollback:
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh remove'
+```
+
+Then from the head `scripts/ocr.sh verify` and `scripts/whisper.sh verify`
+must still succeed, the worker's Prometheus targets stay UP, and from an
+office laptop `curl -m 5 http://192.168.9.68:30004/v1/models` times out.
+
+### Day to day
+
+* `scripts/host-guard.sh explain 8000 enp1s0f1np1 10.100.184.2` — what the
+  ruleset does to one new connection, without root.
+* `sudo nft list table inet techsara_guard` — the rules with per-rule
+  counters. The rail-A accept on the head climbs with the worker healthcheck;
+  a climbing `enP7s7` drop counter is someone on the LAN trying the raw port.
+* A new consumer of a guarded port (a service on another network, a new
+  bridge with a custom name) must be added to the script's rules **and** its
+  consumer table, then `apply` re-run; `apply` refuses while such a peer is
+  connected and would be cut.
+* The table does not survive a reboot. Never persist it through the stock
+  `/etc/nftables.conf` (it starts with `flush ruleset`, which deletes Docker's
+  rules); use the oneshot systemd unit in DISPOSITION.md OA-4.
+* Not covered: Docker-published ports (`0.0.0.0:8080`, `:3000`, `:9000`)
+  traverse Docker's FORWARD path, not the input hook (DISPOSITION.md OA-7,
+  OA-8).

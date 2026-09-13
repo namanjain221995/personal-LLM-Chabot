@@ -33,7 +33,6 @@ A project's settings are the cheapest security you will ever configure:
 | Model allowlist | A key that can only reach the models you named. |
 | Origin allowlist | A key that browsers can only use from your own site. |
 | IP allowlist | A key that only works from your own servers. |
-| Rate and token limits | A key whose abuse has a ceiling per minute and per day. |
 | Retention window | A background output that stops existing sooner. |
 
 ### In your application
@@ -47,8 +46,12 @@ A project's settings are the cheapest security you will ever configure:
   tolerance. See [webhooks](/docs/webhooks#verifying-the-signature).
 * **Log \`request_id\`, never the key.** The public half of a key
   (\`tsk_live_<public id>\`) is safe to log; the rest is the credential.
-* **Handle \`429\` and \`503\` deliberately** rather than retrying in a tight
-  loop. See [rate limits](/docs/rate-limits).
+* **Handle \`503\` deliberately** rather than retrying in a tight loop:
+  honour \`Retry-After\` and add jitter. See
+  [rate limits](/docs/rate-limits#backing-off-on-503).
+* **Watch your usage.** The API enforces no request, token or daily limits,
+  so a stolen key's abuse has no ceiling — revoke it and read the
+  [usage](/docs/usage) to see what it spent.
 
 ## Our side
 

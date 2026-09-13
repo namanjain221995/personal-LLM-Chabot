@@ -110,6 +110,15 @@ services:
     # PID 1) is what makes the container exit so `restart: unless-stopped`
     # brings it back; the pgrep patterns use [ ] so they never match this
     # healthcheck's own shell.
+    #
+    # THIS CHECK DIALS THE HEAD ON ITS RAIL ADDRESS (CLUSTER_HEAD_IP), so the
+    # head's API bind must cover that address. On 2026-09-13 commit 229031c
+    # narrowed the head to the Docker bridge gateway, which this curl cannot
+    # reach: after 8 misses it would have killed this rank and the TP=2 engine
+    # with it. The head stays on 0.0.0.0 (launcher cluster.py
+    # DEFAULT_API_BIND_ADDRESS; owner option A), and its LAN/tailnet exposure
+    # is closed by the head's packet filter, which must keep accepting 8000 on
+    # rail A from this node (scripts/host-guard.sh, operator actions OA-4/OA-6).
     init: true
     healthcheck:
       test:

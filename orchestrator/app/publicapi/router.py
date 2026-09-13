@@ -32,9 +32,19 @@ WHAT THIS SURFACE WILL NOT DO.
   something a reader has to prove is ignored.
 
 WHAT IT OWES, ON EVERY RESPONSE. `X-Request-Id`, so a support conversation can
-name one request; the CONTRACT §12 `RateLimit` headers; `Retry-After` on every
-429 and 503; and the CONTRACT §9 envelope on every failure, including the ones
-raised inside a streaming body.
+name one request; the CONTRACT §12 `RateLimit` headers WHEN THE LIMITS ARE
+ENFORCED; `Retry-After` on every 429 and 503; and the CONTRACT §9 envelope on
+every failure, including the ones raised inside a streaming body.
+
+UNLIMITED BY DEFAULT (owner decision, 2026-09-13). PUBLIC_API_ENFORCE_LIMITS is
+false unless an operator sets it, and then no route here is refused for rate,
+quota or concurrency and no `RateLimit` / `RateLimit-Policy` field is sent.
+None of that is decided in this file: `_admit` still calls `quotas.reserve`
+for every authenticated route (the ledgers are still written, once per
+request) and the handlers still take `quotas.concurrency_slot`; the switch is
+read inside those two and inside `quotas.limit_headers`, which is where both
+header paths below get their fields. `Retry-After` on 503 `model_recovering`
+is the engine's, and stays.
 
 WHAT THIS FILE DOES NOT IMPLEMENT, AND CALLS INSTEAD. Identity is
 `apiplatform/resolver.py`; the four limits, the sliding window and the
@@ -235,6 +245,10 @@ def _refusal_headers(caller: ApiCaller) -> Dict[str, str]:
     read, which matters most when the reason we are here is that the database
     is unhealthy (verifier finding 2026-09-13: the old helper swallowed that
     failure and the headers silently vanished).
+
+    Empty when the limits are not enforced (owner decision 2026-09-13):
+    `limit_headers` builds no field for a limit that does not exist, so a 503
+    or a validation failure advertises no `RateLimit` either.
     """
     try:
         return quotas.limit_headers(caller, remaining=0)
@@ -1481,13 +1495,10 @@ async def _nothing_ran(
 
 def _still_running() -> errors.ApiError:
     # The first attempt is still running. Telling the caller to come back is
-    # honest and cheap; running the model a second time is neither.
-    return errors.ApiError(
-        "rate_limit_error",
-        "A request with this Idempotency-Key is still running.",
-        param="Idempotency-Key",
-        retry_after=2,
-    )
+    # honest and cheap; running the model a second time is neither. A 409
+    # (2026-09-13): as a 429 `rate_limit_error` it named a rate limit the API
+    # no longer has.
+    return errors.idempotency_in_progress(retry_after=2)
 
 
 def _row_error(row: Mapping[str, Any]) -> errors.ApiError:

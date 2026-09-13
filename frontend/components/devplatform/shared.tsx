@@ -28,9 +28,66 @@ export function limitText(value: number | null | undefined): string {
   return value.toLocaleString();
 }
 
+/**
+ * Whether the orchestrator enforces the USAGE limits — requests per minute,
+ * tokens per minute, the daily quota and per-project concurrency.
+ *
+ * OWNER DECISION 2026-09-13: the public API has no usage limits unless
+ * PUBLIC_API_ENFORCE_LIMITS is set, and it defaults to false. The console must
+ * then say Unlimited rather than draw a stored or default number that nothing
+ * enforces — a figure that looks like a ceiling is an invented number.
+ *
+ * TOLERANT OF THE SHAPE on purpose: the flag is read as `enforced`,
+ * `limits_enforced` or `enforce_limits`, on the object itself or on its
+ * `limits` / `stats`, from the first source that carries a boolean. `null`
+ * means no source said — a pre-switch orchestrator, which enforced every
+ * limit, so callers treat null as enforced (see `limitsUnlimited`).
+ */
+export function limitsEnforcement(...sources: unknown[]): boolean | null {
+  const flagOf = (value: unknown): boolean | null => {
+    if (!value || typeof value !== 'object') return null;
+    const record = value as Record<string, unknown>;
+    for (const name of ['enforced', 'limits_enforced', 'enforce_limits']) {
+      if (typeof record[name] === 'boolean') return record[name] as boolean;
+    }
+    return null;
+  };
+  for (const source of sources) {
+    const own = flagOf(source);
+    if (own !== null) return own;
+    if (source && typeof source === 'object') {
+      const record = source as Record<string, unknown>;
+      const nested = flagOf(record.limits) ?? flagOf(record.stats);
+      if (nested !== null) return nested;
+    }
+  }
+  return null;
+}
+
+/** True only when the server SAID the limits are off; unknown stays enforced. */
+export function limitsUnlimited(enforcement: boolean | null): boolean {
+  return enforcement === false;
+}
+
+/**
+ * A usage limit (rpm, tpm, daily quota, concurrency) in words: Unlimited when
+ * the server said limits are not enforced, whatever number is stored; the
+ * enforced wording of `limitText` otherwise.
+ */
+export function usageLimitText(
+  value: number | null | undefined,
+  enforcement: boolean | null,
+): string {
+  return limitsUnlimited(enforcement) ? 'Unlimited' : limitText(value);
+}
+
 /** The project list, shared by every project-scoped panel. */
 export function useProjects() {
-  return useConsole<{ projects: Project[] }>(consolePaths.projects());
+  return useConsole<{
+    projects: Project[];
+    limits_enforced?: boolean;
+    enforced?: boolean;
+  }>(consolePaths.projects());
 }
 
 /**

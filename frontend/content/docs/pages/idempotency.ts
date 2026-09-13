@@ -35,9 +35,9 @@ Supported on [\`POST /v1/responses\`](/docs/responses) and
 | --- | --- |
 | A new key | The request runs normally. |
 | The same key, the same body, after the original finished | A replay of the original, in the original's shape. The model is not invoked twice. |
-| The same key, the same body, after the original **failed** or was **refused before it ran** — a \`503\` or a \`429\`, say | Nothing to replay: the key is released, and your retry runs. A failure is not kept for 24 hours to be handed back to a client that did exactly what \`Retry-After\` told it to. |
-| The same key, while the first is still running | \`429 rate_limit_error\`, "A request with this Idempotency-Key is still running", with a short \`Retry-After\`. |
-| The same key, a **different** body | \`409 idempotency_conflict\`. |
+| The same key, the same body, after the original **failed** or was **refused before it ran** — a \`503\`, say | Nothing to replay: the key is released, and your retry runs. A failure is not kept for 24 hours to be handed back to a client that did exactly what \`Retry-After\` told it to. |
+| The same key, while the first is still running | \`409 idempotency_conflict\`, "A request with this Idempotency-Key is still running", with a short \`Retry-After\`. Retry after it to collect the answer. |
+| The same key, a **different** body | \`409 idempotency_conflict\`, with no \`Retry-After\`: retrying will never succeed. |
 | A key that is empty, longer than 255 characters, or not printable ASCII | \`400 invalid_request_error\` with \`param\` \`Idempotency-Key\` — never silently treated as "no key". |
 
 Keys are scoped to your project and the endpoint, and are retained for
@@ -55,8 +55,8 @@ second time. A background request replays as its \`202\` with the response as
 it stands now. If you need the answer itself to survive a lost connection,
 send the request with \`"background": true\` and the same key.
 
-A replay is still a request: it counts against the project's
-[rate limits](/docs/rate-limits) like any other.
+A replay is still a request: it is recorded in the project's
+[usage](/docs/usage) like any other.
 
 The conflict case is the important one. A key is a promise that two requests
 are the same request; if the body differs, one of them is a mistake, and
@@ -64,8 +64,8 @@ guessing which would be worse than refusing.
 
 The still-running case is the second most important. Telling you to come back
 in a couple of seconds is honest and cheap; running the model a second time
-would be neither. Treat it as any other \`429\`: honour \`Retry-After\` and
-retry with the same key, and you will get the original response.
+would be neither. This \`429\` is not a usage limit — the API enforces
+none — so honour \`Retry-After\` and retry with the same key, and you will get the original response.
 
 ## Choosing a key
 

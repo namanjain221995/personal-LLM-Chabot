@@ -37,11 +37,14 @@ started), no end-to-end run, and nothing was checked against the running
 production stack. "FIXED" therefore means "the change and its test are in the
 tree", not "verified in production".
 
-**FIXED in code is not the same as live.** Every infrastructure row
-(F050, F042, F012, F065, F055, F047, N025, F056) changes a bind address that
-only takes effect when the affected container is recreated; for the main
-engine that is a main-model restart in a production window (OA-3), which a
-routine deploy does not do.
+**FIXED in code is not the same as live.** The controller and exporter rows
+(F055, F047, N025, F056) change a bind address that only takes effect when the
+affected container is recreated. The engine rows (F050, F042, F012, F065, F043,
+F051) do NOT change a bind: under the owner's option A (2026-09-13) the head
+vLLM API stays on `0.0.0.0:8000` and the worker's OCR and speech engines stay on
+the worker's management address, and the exposure is closed by the host packet
+filter `scripts/host-guard.sh` (OA-4 on the head, OA-6 on the worker), which
+the owner applies without restarting anything.
 
 ## Summary
 
@@ -60,9 +63,11 @@ The audit marked two findings as release blockers. Neither is closed:
 
 * **F064** — a fork pull request can run code on the production DGX. Only the
   repository owner can close it (OA-1 today, OA-2 durably).
-* **F050** — the main model's raw API answers anyone on the LAN. The code that
-  set the wildcard bind is changed, but the running engine keeps its bind until
-  it is recreated (OA-3); the host filter (OA-4) closes it without a restart.
+* **F050** — the main model's raw API answers anyone on the LAN. The bind stays
+  `0.0.0.0` on purpose (option A: the worker's healthcheck and the
+  interview-analysis tenant dial the head over RoCE rail A); the exposure is
+  closed when the owner runs OA-4, `scripts/host-guard.sh apply` on the head,
+  which needs no restart and causes no model downtime.
 
 And, from checking this table, three things the release needs from the
 operator that are not in `AUDIT.md` (full list in
@@ -91,22 +96,22 @@ proposed owner.
 | id | sev | verdict | area | finding | disposition | what happened / what is left | owner |
 |---|---|---|---|---|---|---|---|
 | F064 | P0 | CONFIRMED | cicd | A fork pull request can execute arbitrary code on the production DGX as a sudo+docker user | **OPERATOR ACTION** | Cannot be fixed in code: on a `pull_request` event GitHub runs the workflow file from the pull request's own head, so every guard in `pipeline.yml` and `workflow_policy.py` is editable by the attacker. `on: pull_request:` is unchanged. Immediate remedy OA-1, durable fix OA-2. | repository owner |
-| F050 | P0 | CONFIRMED | edge-devops | The main model's raw OpenAI API is unauthenticated and reachable from the office LAN, the … | **PARTLY FIXED** | Code: `launcher/techsara_cli/cluster.py` no longer lets `PUBLISH_MODEL_PORTS` move the dual-mode head to `0.0.0.0` (bridge gateway, loopback fallback); `.env.example` and the published overlays now bind 8000 to `TECHSARA_MODEL_BIND_ADDRESS`; pinned by `launcher/tests/test_network_exposure.py`. **Not live**: the running engine keeps `--host 0.0.0.0` until it is recreated, which is a main-model restart (OA-3). Host packet filter OA-4 is the backstop. | infrastructure hardening wave; repository owner for OA-3/OA-4 |
-| F065 | P1 | ADJUSTED | cicd | The raw, unauthenticated vLLM OpenAI API is bound to 0.0.0.0:8000 and the verify gate is blind … | **PARTLY FIXED** | Half (1) is the F050 launcher/compose change, live only after OA-3. Half (2), a bind-address assertion in the `verify` job, was not added (no `ss -l` check in `pipeline.yml`). | CI/CD (verify assertion); repository owner (OA-3) |
+| F050 | P0 | CONFIRMED | edge-devops | The main model's raw OpenAI API is unauthenticated and reachable from the office LAN, the … | **PARTLY FIXED** | Option A (owner, 2026-09-13): the dual-mode head keeps `--host 0.0.0.0` (`launcher/techsara_cli/cluster.py` `DEFAULT_API_BIND_ADDRESS`), because vLLM takes one `--host` and its callers sit on lo, docker0, the app bridge and RoCE rail A — the worker's `vllm-worker` healthcheck curls `http://10.100.184.1:8000/health` and kills its rank after 8 misses. The narrower bridge-gateway bind of commit 229031c would have taken the TP=2 engine down on its next recreate and is reverted. Exposure is closed by `scripts/host-guard.sh` (table `inet techsara_guard`; tests `launcher/tests/test_host_guard.py`): tcp 8000-8005, 9100, 9835, 9838 accepted from lo, the Docker bridges (172.16.0.0/12 on docker0/br-*) and both rails; dropped on `enP7s7` (office LAN), `tailscale0` and any other ingress, IPv4 and IPv6. `.env.example` and the single-node published overlays still bind 8000 to `TECHSARA_MODEL_BIND_ADDRESS`. **Not live** until OA-4. | infrastructure hardening wave (script); repository owner (OA-4) |
+| F065 | P1 | ADJUSTED | cicd | The raw, unauthenticated vLLM OpenAI API is bound to 0.0.0.0:8000 and the verify gate is blind … | **PARTLY FIXED** | Half (1): as F050 — the bind stays wide under option A and the host guard closes it (OA-4). Half (2): `verify` reads the live listener (`.github/workflows/scripts/engine_bind.py check`, commit 2fd37f3), which is RED against the deliberate `0.0.0.0:8000` as written; under option A the CI/CD owner is changing it to accept a wildcard only when it is guarded, and the owner turns that into an enforced gate by setting `ENGINE_EXPOSURE_ENFORCE=true` once `scripts/host-guard.sh verify` passes (OA-4 step 4). | CI/CD (verify gate); repository owner (OA-4) |
 | F066 | P1 | CONFIRMED | cicd | workflow_policy P4 accepts an INVERTED branch guard, so a self-hosted job restricted to "every … | **DEFERRED** | Not fixed. P4 still tests `refs/heads/<default>` as a substring and skips the pull_request check when the condition contains `!=`, so an inverted guard passes. Low value until OA-1/OA-2, because the policy job itself runs from the pull request head (F064). | CI/CD |
 | F067 | P1 | CONFIRMED | cicd | The whole gate architecture assumes branch protection that does not exist; `CI passed` is not a … | **OPERATOR ACTION** | Repository settings, not code: required reviewers and a `main`-only branch policy on the `production` environment, and a ruleset on `main` requiring `CI passed` and one review. OA-5. | repository owner |
 | N021 | P1 | FOUND IN VERIFICATION | cicd | P4 is skipped entirely when `runs-on` is an expression: a matrix can smuggle `self-hosted` past … | **DEFERRED** | Not fixed. `_runs_on_text` still stringifies a `${{ }}` expression, so a matrix can smuggle `self-hosted` past P4. | CI/CD |
 | F034 | P1 | ADJUSTED | database | Bare /chat calls write private document and page text under a conversation key any other user … | **FIXED** | `orchestrator/app/main.py`: `session_id` validated to `^[A-Za-z0-9_-]{1,64}$` and client `conversation_id`s shaped `u<digits>-` refused on `ChatRequest` and `StopRequest`; the Salesforce routes refuse the shape. `orchestrator/app/uploads.py`: the claim, chunked-claim and read routes refuse it. `orchestrator/app/history.py` `create_conversation` now refuses it too (400). Tests in `tests/test_orchestrator_hardening.py`. | Orchestrator wiring |
 | N010 | P1 | FOUND IN VERIFICATION | database | GET /chat/salesforce/{id} and POST /chat/salesforce/cancel fail OPEN on unowned ids, and the … | **FIXED** | `main.py` `salesforce_context` computes the starter card against a throwaway key unless the caller owns the id; `salesforce_cancel` refuses unless `owner == viewer`; both refuse the reserved shape. Tests `test_salesforce_context_*`, `test_cancelling_a_clarification_under_an_unowned_id_is_refused`. | Orchestrator wiring |
-| F051 | P1 | ADJUSTED | edge-devops | The worker node's OCR and speech engines answer unauthenticated on the office LAN | **PARTLY FIXED** | `compose/compose.whisper.yaml` now requires `WHISPER_BIND` (no LAN-address default); `compose/compose.ocr.yaml` documents the exposure. `scripts/whisper.sh` and `scripts/ocr.sh` still derive the management address, so the engines stay on the LAN until rebound (OA-6). | infrastructure hardening wave; repository owner (OA-6) |
+| F051 | P1 | ADJUSTED | edge-devops | The worker node's OCR and speech engines answer unauthenticated on the office LAN | **PARTLY FIXED** | Option A: `scripts/ocr.sh` and `scripts/whisper.sh` keep binding the worker's management address (192.168.9.68, where the running orchestrator's `OCR_REMOTE_BASE_URL`, `ASR_BASE_URLS` and Prometheus' `ocr.json` point); the rail rebind is reverted because it would have moved the engines out of lockstep with those consumers. `compose/compose.whisper.yaml` still requires `WHISPER_BIND` (no LAN default). Exposure closed by `scripts/host-guard.sh --role worker`: 30004, 30007, 9100, 9835 accepted on `enP7s7` only from the head (192.168.9.54), 9839 only from the rails, all dropped on `tailscale0`. Not live until OA-6. | infrastructure hardening wave; repository owner (OA-6) |
 | F052 | P1 | CONFIRMED | edge-devops | Portainer is published on 0.0.0.0:9000 (and IPv6) with the Docker socket mounted — … | **OPERATOR ACTION** | An unmanaged container outside the repository. OA-7. | repository owner |
 | N017 | P1 | FOUND IN VERIFICATION | edge-devops | The unauthenticated model APIs sit on the same Docker network as the Cloudflare tunnel, so one … | **DEFERRED** | Not fixed: `compose.yaml` is unchanged, so the model services still share the `application` network with `cloudflared`. | infrastructure owner |
-| F042 | P1 | ADJUSTED | inference-model-registry | The raw vLLM OpenAI endpoint listens on every host interface with no authentication | **PARTLY FIXED** | Same code change as F050; not live until OA-3. The audit's recommended control is the host packet filter, OA-4. | infrastructure hardening wave; repository owner |
-| F043 | P1 | CONFIRMED | inference-model-registry | The OCR model engine on the worker node is reachable unauthenticated on the LAN | **PARTLY FIXED** | Documented in `compose/compose.ocr.yaml`; the bind is unchanged. OA-6 (rebind to the RoCE rail) or OA-4 applied on the worker. | repository owner |
+| F042 | P1 | ADJUSTED | inference-model-registry | The raw vLLM OpenAI endpoint listens on every host interface with no authentication | **PARTLY FIXED** | Same as F050: the wildcard bind is kept for the cross-node consumers, and the audit's own recommended control — a host packet filter — is `scripts/host-guard.sh` (table `inet techsara_guard`; tests `launcher/tests/test_host_guard.py`). Not live until OA-4. | infrastructure hardening wave; repository owner (OA-4) |
+| F043 | P1 | CONFIRMED | inference-model-registry | The OCR model engine on the worker node is reachable unauthenticated on the LAN | **PARTLY FIXED** | As F051: the OCR engine stays on the management address and the worker host guard (OA-6) admits only the head on `enP7s7`. Binding the rail would not have been a boundary anyway: under the Linux weak-host model a LAN host routing 10.100.184.2 via 192.168.9.68 reaches a rail-bound socket through `enP7s7`; the guard drops by ingress interface. | repository owner (OA-6) |
 | F044 | P1 | ADJUSTED | inference-model-registry | A non-streaming LONG-lane request keeps the NORMAL lane closed for the whole generation, and … | **FIXED** | `orchestrator/app/admission.py`: a LONG admission arms a prefill grace (`closure_grace_s`, capped at `LONG_CLOSURE_MAX_S` = 1200 s) that reopens NORMAL without a first token, and a waiter defers its bound for at most that ceiling. Tests `test_a_non_streaming_long_request_reopens_the_normal_lane_*` and siblings in `tests/test_inference_hardening.py`. | inference hardening wave |
 | F045 | P1 | CONFIRMED | inference-model-registry | json_completion and chat_completion_with_reasoning never record token usage, so usage_events … | **FIXED** | `orchestrator/app/llm.py`: both `json_completion` branches and the best-of-N path now call `_capture_usage`. Tests `test_a_guided_json_completion_records_the_tokens_the_engine_reported` and siblings. `/v1` was not affected (it uses `stream_chat_events` only). | inference hardening wave |
 | N013 | P1 | FOUND IN VERIFICATION | inference-model-registry | A crafted non-Latin prompt bypasses the LONG admission lane entirely, because admission … | **FIXED** | `orchestrator/app/context.py` + `admission.py`: the lane decision uses the exact count `fit_request` measured, and a "certainly small" verdict only from `upper_bound_messages` (UTF-8 bytes). Test `test_a_gujarati_prompt_whose_character_estimate_is_under_half_the_threshold_takes_the_long_lane`. Note: `/v1`'s own quota gate still estimates input at three characters per token (`router._admit` → `quotas.reserve`). | inference hardening wave |
-| F012 | P1 | ADJUSTED | orchestrator-core | The raw vLLM model API is listening on 0.0.0.0:8000 with no authentication — /v1 on this host … | **PARTLY FIXED** | Same as F050/F042: code narrowed, not live until OA-3; OA-4 closes it without a restart. While open, anyone on the LAN bypasses every `/v1` key, quota and record by calling port 8000. | infrastructure hardening wave; repository owner |
+| F012 | P1 | ADJUSTED | orchestrator-core | The raw vLLM model API is listening on 0.0.0.0:8000 with no authentication — /v1 on this host … | **PARTLY FIXED** | Same as F050/F042: bind kept wide (option A), exposure closed by the host guard, applied with OA-4 and no restart. Until then anyone on the LAN bypasses every `/v1` key, quota and record by calling port 8000. | infrastructure hardening wave; repository owner (OA-4) |
 | F015 | P1 | CONFIRMED | orchestrator-core | A 422 on POST /chat echoes the ENTIRE request body back to an unauthenticated caller | **FIXED** | `main.py` `_validation_error_without_input_echo` returns only `type`, `loc`, `msg` for every route; `/v1` resolves the key before parsing. Tests `test_a_422_from_chat_does_not_echo_the_request_body_back_to_the_caller` and two more. | Orchestrator wiring |
 | F016 | P1 | ADJUSTED | orchestrator-core | No request body size limit anywhere on the orchestrator; an unauthenticated caller's body is … | **FIXED** | `main.py` `RequestBodySizeLimitMiddleware` (pure ASGI): `Content-Length` refusal plus a counting `receive`; 128 MiB default (`MAX_REQUEST_BODY_BYTES`), uploads above every per-purpose cap, 1 MiB on `/v1` in the public envelope. Tests `test_a_declared_oversize_body_*`, `test_a_body_with_no_declared_length_*`, `test_a_chunked_oversize_v1_body_*`. | Orchestrator wiring |
 | F017 | P1 | CONFIRMED | orchestrator-core | LiveGeneration.events grows without bound — every SSE frame of every in-flight generation is … | **DEFERRED** | Not fixed: `LiveGeneration.events` is still an unbounded list in `main.py`. `/v1` does not use `_live_generations`, so the API surface does not add to it. | Orchestrator wiring (main.py owner) |
@@ -147,7 +152,7 @@ proposed owner.
 | N012 | P2 | FOUND IN VERIFICATION | database | web_pages is a single global corpus with no tenant predicate on retrieval — one API caller can … | **DEFERRED** | Not reachable from `/v1`: CONTRACT §7 exposes no retrieval or web search, and the router calls `stream_chat_events` only. Must be settled before any retrieval is exposed to API callers. | Database / web-memory owner |
 | F053 | P2 | ADJUSTED | edge-devops | The orchestrator publishes on 0.0.0.0:8080 and serves FastAPI's /docs, /redoc and /openapi.json … | **PARTLY FIXED** | The schema pages are off (F076). The orchestrator port is still published on `TECHSARA_BIND_ADDRESS` (`compose.yaml` unchanged) and on every interface in the legacy `docker-compose.yml`. OA-8. | Orchestrator wiring (done); repository owner (OA-8) |
 | F054 | P2 | ADJUSTED | edge-devops | The orchestrator container carries every secret in the project, including the Cloudflare tunnel … | **DEFERRED** | Not fixed: `compose.yaml` still passes every secret to the orchestrator. `API_KEY_PEPPER` joins them when set. | infrastructure owner |
-| F055 | P2 | ADJUSTED | edge-devops | The engine controller's state and metrics API is on 0.0.0.0:9838 with no authentication | **PARTLY FIXED** | `monitoring/engine-controller/controller.py` defaults `CONTROLLER_BIND` to `127.0.0.1` and accepts a comma list; the compose overlays pass loopback plus, in dual mode, the bridge gateway. Tests in `launcher/tests/test_network_exposure.py`. Live only when the controller container is recreated (OA-3 or a controller-only recreate, outside a recovery window). | infrastructure hardening wave; repository owner |
+| F055 | P2 | ADJUSTED | edge-devops | The engine controller's state and metrics API is on 0.0.0.0:9838 with no authentication | **PARTLY FIXED** | `monitoring/engine-controller/controller.py` defaults `CONTROLLER_BIND` to `127.0.0.1` and accepts a comma list; the compose overlays pass loopback plus, in dual mode, the bridge gateway. Tests in `launcher/tests/test_network_exposure.py`. Live since the controller recreate of 2026-09-13T02:54:50Z (`127.0.0.1` and `172.17.0.1`); 9838 is also in the head host guard (OA-4) as defence in depth. | infrastructure hardening wave; repository owner |
 | F056 | P2 | ADJUSTED | edge-devops | node_exporter publishes full host telemetry on 0.0.0.0:9100 with no firewall behind it | **PARTLY FIXED** | `compose/compose.monitoring.yaml` defaults node-exporter to `172.17.0.1:9100` (the worker overlay already defaulted to loopback). Live only after the monitoring stack is recreated (OA-12). | infrastructure hardening wave; repository owner (OA-12) |
 | F057 | P2 | ADJUSTED | edge-devops | cadvisor receives the Docker socket through a read-only bind of /var/run, which does not make … | **DEFERRED** | Only the misleading comment was corrected (`compose/compose.monitoring.yaml` now records the root-equivalent risk as accepted). The docker-socket-proxy sidecar was not added. | infrastructure owner |
 | F058 | P2 | ADJUSTED | edge-devops | AUTH_TRUST_PROXY_HEADERS is on while the orchestrator is directly reachable on 0.0.0.0:8080, so … | **OPERATOR ACTION** | Same as F027: browser side OA-8; `/v1` now uses `PUBLIC_API_TRUSTED_PROXIES`. | repository owner; authn owner |
@@ -169,7 +174,7 @@ proposed owner.
 | F049 | P2 | ADJUSTED | inference-model-registry | Module and function docs still describe gpt-oss-120b and a 131072 window, which the /docs build … | **FIXED** | `llm.py`/`context.py` docstrings no longer name a retired model or a fixed window (one historical sentence in `llm.py` remains, worded as history). Test `test_the_inference_docs_name_no_retired_model_and_no_fixed_context_window`. Also moot for publishing: FastAPI's schema is off and the public document is hand-built. | inference hardening wave |
 | N014 | P2 | FOUND IN VERIFICATION | inference-model-registry | One user-triggerable 400 on any streaming call permanently disables token telemetry for the … | **FIXED** | `llm.py`: a refusal of `stream_options.include_usage` pauses the option for `_USAGE_RETRY_S` (600 s) instead of for the process lifetime, a 400 that is not about the option propagates, and a counter records the pause. Tests `test_a_bad_request_on_a_stream_propagates_*`, `test_a_runtime_that_refuses_the_usage_option_is_asked_again_*`. Relevant to `/v1`: while usage is not measured, token quotas do not advance. | inference hardening wave |
 | N015 | P2 | FOUND IN VERIFICATION | inference-model-registry | The orchestrator's /health and /metrics are unauthenticated on 0.0.0.0:8080 and publish live … | **DEFERRED** | Not fixed: `/health` and `/metrics` unchanged. OA-8 limits who can reach them. | Orchestrator wiring |
-| N016 | P2 | FOUND IN VERIFICATION | inference-model-registry | User-submitted OCR images cross the office LAN in cleartext because OCR_BASE_URL points at the … | **OPERATOR ACTION** | OA-6 (move OCR onto the RoCE rail, rewriting `OCR_BASE_URL`/`OCR_REMOTE_BASE_URL` in lockstep). | repository owner |
+| N016 | P2 | FOUND IN VERIFICATION | inference-model-registry | User-submitted OCR images cross the office LAN in cleartext because OCR_BASE_URL points at the … | **OPERATOR ACTION** | Still open under option A: the OCR engine stays on the management address, so images still cross the 1 GbE office LAN in cleartext between the two Sparks. OA-6 limits who can reach the engine, not who can sniff the segment. Moving OCR onto the rail needs the engine rebind and `OCR_BASE_URL`/`OCR_REMOTE_BASE_URL`/`ocr.json` rewritten in one window. | repository owner; infrastructure (rail move) |
 | F013 | P2 | ADJUSTED | orchestrator-core | /docs, /redoc and /openapi.json are enabled and unauthenticated on a 0.0.0.0-published port, … | **FIXED** | Same change as F076. | Orchestrator wiring |
 | F014 | P2 | ADJUSTED | orchestrator-core | GET /health is unauthenticated and returns internal hostnames, container paths, engine capacity … | **DEFERRED** | Not fixed: `GET /health` still returns the full document unauthenticated. OA-8 limits reach. | Orchestrator wiring |
 | F019 | P2 | ADJUSTED | orchestrator-core | BUILD BLOCKER — the app-wide CSRF middleware and the 3-origin CORS allowlist will break every … | **FIXED** | `main.py`: `_reject_cross_site_writes` skips `/v1` (`_is_public_api_path`, which does not match `/v1beta…`); `BrowserCorsExceptPublicApi` leaves the credentialed allowlist unwidened and off `/v1`; the router answers its own preflight without `Access-Control-Allow-Credentials`. Tests in `tests/test_publicapi_mount.py`; preflight verified by probe. | Orchestrator wiring + Public API surface |
@@ -283,55 +288,138 @@ public. The cost is that the repository is no longer public.
 Longer term, whichever is chosen: take `techsphere` out of the `docker` group
 in favour of a socket proxy, so a job is not root-equivalent by default.
 
-### OA-3 — Recreate the main engine so the new bind takes effect (F050, F042, F012, F065)
+### OA-3 — WITHDRAWN (was: recreate the main engine on the bridge gateway)
 
-The launcher change stops `PUBLISH_MODEL_PORTS=true` from putting the dual-mode
-head on `0.0.0.0`; the running engine still has `--host 0.0.0.0` in its argv.
+**Do not run it.** OA-3 asked for `./techsara redetect` plus a `--full` deploy
+so the head vLLM API would come back on the Docker bridge gateway
+(`172.17.0.1`) instead of `0.0.0.0`. That bind takes the two-node engine down:
 
-In a production window, after the branch is on `main`:
+* the worker's `sf-local-ai-worker-vllm-worker-1` healthcheck curls
+  `http://10.100.184.1:8000/health` over RoCE rail A every 30 s and `kill -9`s
+  its own rank after 8 misses (4 minutes; the head's access log shows 120
+  `GET /health` per hour from `10.100.184.2`). A socket on `172.17.0.1` never
+  answers on `10.100.184.1`, so the TP=2 engine dies, and the controller
+  re-pairs into the same unreachable head;
+* the interview-analysis tenant on the worker posts completions to
+  `http://10.100.184.1:8000/v1` and loses the engine;
+* vLLM takes one `--host`, and the other callers need loopback (the head
+  healthcheck, `deploy.sh`'s completion gate, the cluster scripts, CI) and the
+  bridges (orchestrator, sync-worker, Prometheus, litellm-dgx).
+
+The repository owner chose option A on 2026-09-13: keep the binds production
+runs today and close the exposure with the host packet filter (OA-4 on the
+head, OA-6 on the worker). The launcher's `DEFAULT_API_BIND_ADDRESS` is back to
+`0.0.0.0`. One leftover to know about: the rolling deploy of 71d6e95 already
+wrote `CLUSTER_API_BIND_ADDRESS=172.17.0.1` into `.runtime/generated.env`. The
+running engine is unaffected (it keeps `--host 0.0.0.0` until recreated), but
+**once this branch is on `main`, run `./techsara redetect` (the restored
+launcher rewrites the value to `0.0.0.0`) before any head recreate** — a `--full` deploy, `./techsara up` with an engine change —
+and confirm with `grep CLUSTER_API_BIND_ADDRESS .runtime/generated.env`.
+
+### OA-4 — Host packet filter on the head (F050, F042, F012, F065, F047, F055, N025, F056)
+
+Closes the office-LAN and tailnet exposure of the head's unauthenticated ports
+— vLLM `8000`, the aux model publishes `8001-8005`, node_exporter `9100`, the
+GPU exporter `9835`, the engine controller `9838` — **with no restart and no
+model downtime**: it adds one nftables table; no container, engine or model is
+touched, the first rule keeps every established connection (a generation in
+flight survives), and only TCP to those ports is judged, so SSH (22), the
+Cloudflare tunnel (outbound), the torch master port and the NCCL listeners are
+untouched. It never flushes the ruleset and never touches Docker's chains.
+
+What `scripts/host-guard.sh` installs (`plan` prints it exactly): table
+`inet techsara_guard`, an input chain at priority -10 with policy accept —
+
+| order | match | verdict | who needs it (consumer map, 2026-09-13) |
+|---|---|---|---|
+| 1 | `ct state established,related` | accept | requests in flight |
+| 2 | `iifname lo` | accept | head healthcheck, controller canaries (logged from 192.168.9.54 but arriving on lo), CI verify, `deploy.sh`, cluster scripts |
+| 3 | not TCP / TCP to any other port | accept | DHCP, neighbour discovery, tailscale WireGuard, SSH, 29501, NCCL |
+| 4 | `docker0` or `br-*` from 172.16.0.0/12 | accept | orchestrator 172.18.0.19, sync-worker, Prometheus 172.18.0.15, e2e stack, litellm-dgx 172.17.0.4 |
+| 5 | `enp1s0f1np1` from 10.100.184.0/24 | accept | **the worker healthcheck** (8 misses kill the engine), the interview-analysis tenant |
+| 6 | `enP2p1s0f1np1` from 10.100.185.0/24 | accept | the same consumers over rail B |
+| 7 | `enP7s7`, then `tailscale0`, then anything else | drop (counted) | office LAN, tailnet, spoofed sources, an interface that comes up later |
+
+`apply` refuses — before nft is ever called — if the rendered rules would drop
+any consumer in its built-in consumer table, if an interface or rail subnet it
+names is not on this host, if a Docker-style bridge carries a name the rules do
+not accept, or if any peer **connected right now** to a guarded port would lose
+its next connection (read with `ss`). It then runs `nft -c -f` and installs
+with one `nft -f` transaction; a re-run replaces the table with the same bytes.
+
+On the head, from the deploy checkout once this branch is on `main`:
 
 ```bash
-./techsara redetect                       # rewrites .runtime/generated.env (CLUSTER_API_BIND_ADDRESS)
-grep CLUSTER_API_BIND_ADDRESS .runtime/generated.env   # expect the bridge gateway, e.g. 172.17.0.1 — not 0.0.0.0
-scripts/deploy.sh --ref main --full       # recreates every container, the TP=2 pair included
-ss -ltnH 'sport = :8000'                  # the listener must not be 0.0.0.0
+# 1. The exact ruleset; installs nothing (root is not needed; sudo is harmless).
+#    Exits 2 if the ruleset fails its own consumer self-test.
+sudo scripts/host-guard.sh plan
+
+# 2. Self-test, interface and live-peer preflight, nft -c -f, then one nft -f.
+sudo scripts/host-guard.sh apply
+
+# 3. Immediately: the table (or its /run state file), loopback probes, and from
+#    the worker over ssh -- rail A to 10.100.184.1:8000 must answer 200 and the
+#    office LAN to 192.168.9.54:8000 must TIME OUT. Exits 1 on any FAIL.
+scripts/host-guard.sh verify
+
+# 4. Only after step 3 passes: make the pipeline enforce the guarded exposure.
+gh variable set ENGINE_EXPOSURE_ENFORCE --body true --repo namanjain221995/personal-LLM-Chabot
 ```
 
-Cold start is budgeted at up to 900 s. Before the window, confirm the consumers
-still reach the new address: the orchestrator and sync worker
-(`vllm:host-gateway`), the engine controller, Prometheus, the unmanaged
-`litellm-dgx` container (`host.docker.internal:8000`), and the
-interview-analysis pipeline on the worker, which calls the raw port over the
-RoCE address — **that one will lose access**, because after the recreate the
-head listens on the Docker bridge gateway only. Move it to the orchestrator's
-`/v1` with an API key before the window.
-From a LAN host, `curl -m 5 http://192.168.9.54:8000/v1/models` must then fail
-to connect.
+Set the variable to the literal `true`: an unset Actions variable is `null`,
+not `false`. After step 3 also send one real chat, open Grafana (every
+Prometheus target still UP), and from an office laptop confirm
+`curl -m 5 http://192.168.9.54:8000/v1/models` times out.
 
-### OA-4 — Host packet filter for the engine and controller ports (F050, F042, F012, F047, F055, N025)
-
-Closes the LAN, tailnet and RoCE exposure of `:8000` and `:9838` on the head
-**without a restart**, and stays as a backstop after OA-3. Both processes use
-host networking, so the host's input hook sees their traffic.
-
-First check the bridge subnets on this host:
-`docker network inspect -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}' $(docker network ls -q)`.
-With the audit-time values (bridges `172.17–172.19.0.0/16`, RoCE rails
-`10.100.184.0/24` and `10.100.185.0/24`):
+**If step 3 reports the rail probe FAILED, remove the guard at once** — the
+worker healthcheck has 8 misses x 30 s = 4 minutes before it kills its rank:
 
 ```bash
-sudo nft add table inet techsara_guard
-sudo nft 'add chain inet techsara_guard input { type filter hook input priority -10 ; policy accept ; }'
-sudo nft add rule inet techsara_guard input iifname "lo" tcp dport '{ 8000, 9838 }' accept
-sudo nft add rule inet techsara_guard input ip saddr '{ 172.17.0.0/16, 172.18.0.0/16, 172.19.0.0/16 }' tcp dport '{ 8000, 9838 }' accept
-sudo nft add rule inet techsara_guard input ip saddr '{ 10.100.184.0/24, 10.100.185.0/24 }' tcp dport 8000 accept
-sudo nft add rule inet techsara_guard input tcp dport '{ 8000, 9838 }' drop
+sudo scripts/host-guard.sh remove     # deletes table inet techsara_guard and nothing else
 ```
 
-Before persisting, prove every consumer listed in OA-3 still works, plus
-`/health`'s engine check and one real chat. Undo:
-`sudo nft delete table inet techsara_guard`. Persist by adding the same table to
-`/etc/nftables.conf` once verified.
+`scripts/host-guard.sh explain PORT IFNAME SADDR` prints what the ruleset does
+to one new connection (for example `explain 8000 enp1s0f1np1 10.100.184.2`).
+`sudo nft list table inet techsara_guard` shows the per-rule counters: the rail
+A accept should climb by about two packets a minute from the healthcheck.
+
+**Persistence.** The table lives in kernel memory; a reboot clears it and the
+ports are open again until it is reapplied. Do **not** put it in the stock
+`/etc/nftables.conf` and enable `nftables.service`: that file begins with
+`flush ruleset`, which deletes Docker's NAT and filter rules on every load and
+cuts every published port and the tunnel. After a week of clean counters, copy
+the script out of the deploy checkout (a `git checkout` must not change it
+under a boot) and run it from a oneshot unit:
+
+```ini
+# /etc/systemd/system/techsara-host-guard.service
+[Unit]
+Description=techsara host guard (nftables table inet techsara_guard)
+Wants=network-online.target
+After=network-online.target docker.service tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/techsara-host-guard apply --role head
+ExecStop=/usr/local/sbin/techsara-host-guard remove
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo install -m 0755 scripts/host-guard.sh /usr/local/sbin/techsara-host-guard
+sudo systemctl daemon-reload && sudo systemctl enable techsara-host-guard.service
+```
+
+(`enable` without `--now` changes nothing until the next boot; the table
+installed in step 2 stays.)
+
+Out of scope of this filter and still wildcard on the head: `0.0.0.0:8080`
+(orchestrator), `0.0.0.0:3000` (frontend) and `0.0.0.0:9000` (portainer) are
+Docker-published, so they traverse DOCKER-USER/FORWARD, never the input hook
+(OA-7, OA-8); `*:5201` iperf3 and `*:29501` (OA-16).
 
 ### OA-5 — Environment approval and a ruleset on `main` (F067)
 
@@ -365,28 +453,55 @@ single maintainer a count of 1 blocks every merge — set it to `0` (the
 Confirm with `gh api repos/namanjain221995/personal-LLM-Chabot/rulesets` and
 `gh api repos/namanjain221995/personal-LLM-Chabot/environments/production`.
 
-### OA-6 — The worker's OCR and speech engines off the office LAN (F043, F051, N016)
+### OA-6 — Host packet filter on the worker (F043, F051)
 
-Both are host-network on the worker (`:30004` OCR, `:30007` speech) and bound to
-its management address. `scripts/ocr.sh` and `scripts/whisper.sh` still derive
-that address, so the no-code remedy is a filter on the **worker** accepting only
-the head:
+The worker's OCR (`:30004`) and speech (`:30007`) engines, node_exporter
+(`:9100`) and GPU exporter (`:9835`) are host-network and bound to the worker's
+management address `192.168.9.68`; the sentinel (`:9839`) is on
+`10.100.184.2`. Under option A they stay there — the running orchestrator,
+e2e orchestrator and Prometheus dial `192.168.9.68` — and the worker variant of
+the same script closes them. Like OA-4 it restarts nothing and causes **no
+model downtime**; SSH and the vLLM rank, Gloo and NCCL ports are never judged.
+
+| order | match | verdict | who needs it |
+|---|---|---|---|
+| 1 | `ct state established,related` | accept | in flight; replies to the worker's own healthcheck and tenant calls to the head |
+| 2 | `iifname lo` | accept | the OCR, speech, sentinel and GPU-exporter container healthchecks |
+| 3 | not TCP / TCP to any other port | accept | SSH, rank ports, UDP, ICMP |
+| 4 | `enp1s0f1np1` from 10.100.184.0/24 | accept | the head's engine controller to the sentinel |
+| 5 | `enP2p1s0f1np1` from 10.100.185.0/24 | accept | rail B |
+| 6 | `enP7s7` from 192.168.9.54, ports 9100, 9835, 30004, 30007 | accept | the head: orchestrator OCR and ASR clients, Prometheus, the controller's GPU probe |
+| 7 | `docker0` / `br-*` from 172.16.0.0/12 | accept | worker-local containers |
+| 8 | `enP7s7`, then `tailscale0`, then anything else | drop (counted) | office LAN, tailnet |
+
+Row 6 admits the head, not specifically the orchestrator: every bridge
+container on the head leaves as `192.168.9.54`.
+
+The worker has no repository checkout, so copy the script next to its compose
+files and run it there (`-t` for the sudo prompt):
 
 ```bash
-HEAD_LAN=192.168.9.54        # the head's management address at audit time; confirm with `ip -4 addr` on the head
-sudo nft add table inet techsara_guard
-sudo nft 'add chain inet techsara_guard input { type filter hook input priority -10 ; policy accept ; }'
-sudo nft add rule inet techsara_guard input iifname "lo" tcp dport '{ 30004, 30007 }' accept
-sudo nft add rule inet techsara_guard input ip saddr "{ ${HEAD_LAN}, 10.100.184.0/24, 10.100.185.0/24 }" tcp dport '{ 30004, 30007 }' accept
-sudo nft add rule inet techsara_guard input tcp dport '{ 30004, 30007 }' drop
+W=techsphere@10.100.184.2
+scp scripts/host-guard.sh "$W":.techsara-cluster/host-guard.sh
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh plan --role worker'
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker'
+ssh    "$W" 'bash ~/.techsara-cluster/host-guard.sh verify --role worker'
 ```
 
-Confirm with `scripts/ocr.sh verify` and `scripts/whisper.sh verify` from the
-head, one real image through chat (`/health` cannot see a degenerate OCR
-answer), and a refused connect from another LAN host. The durable fix — bind to
-`CLUSTER_WORKER_IP` and rewrite `OCR_BASE_URL`, `OCR_REMOTE_BASE_URL` and the
-speech URL in lockstep, which also takes user images off the 1 GbE LAN (N016) —
-is deferred to the infrastructure owner.
+Then from the head: `scripts/ocr.sh verify` must still read its test image and
+`scripts/whisper.sh verify` must still transcribe (`/health` cannot see a
+degenerate OCR answer); Prometheus' `192.168.9.68:9100`, `:9835` and `:30004`
+targets must stay UP; the engine controller's
+`techsara_vllm_worker_reachable` must stay `1`. From an office laptop,
+`curl -m 5 http://192.168.9.68:30004/v1/models` must time out. Rollback:
+
+```bash
+ssh -t techsphere@10.100.184.2 'sudo bash ~/.techsara-cluster/host-guard.sh remove'
+```
+
+Persist it on the worker the same way as OA-4 (`--role worker` in the unit).
+The cleartext hop of user images over the office LAN (N016) is not closed by
+this; it needs the rail move described in that row.
 
 ### OA-7 — Portainer (F052)
 
@@ -505,13 +620,18 @@ pid 2308), and remove whatever starts it. The master port `29501` has no bind
 flag; restrict it to the RoCE rails on the head:
 
 ```bash
-sudo nft add rule inet techsara_guard input ip saddr '{ 10.100.184.0/24, 10.100.185.0/24 }' tcp dport 29501 accept
-sudo nft add rule inet techsara_guard input iifname "lo" tcp dport 29501 accept
-sudo nft add rule inet techsara_guard input tcp dport 29501 drop
+sudo nft add table inet techsara_rank_guard
+sudo nft 'add chain inet techsara_rank_guard input { type filter hook input priority -5 ; policy accept ; }'
+sudo nft add rule inet techsara_rank_guard input ct state established,related accept
+sudo nft add rule inet techsara_rank_guard input iifname "lo" tcp dport 29501 accept
+sudo nft add rule inet techsara_rank_guard input iifname '{ "enp1s0f1np1", "enP2p1s0f1np1" }' tcp dport 29501 accept
+sudo nft add rule inet techsara_rank_guard input tcp dport 29501 drop
 ```
 
-(Uses the table from OA-4.) Confirm the pair still forms after the next engine
-restart before persisting.
+Its own table, not `inet techsara_guard`: `scripts/host-guard.sh apply`
+deletes and redefines that table, so rules added to it by hand vanish on the
+next apply. Confirm the pair still forms after the next engine restart before
+persisting.
 
 ### OA-17 — `litellm-dgx` (N018)
 
@@ -586,13 +706,13 @@ the console.
 
 | proposed owner | findings |
 |---|---|
-| CI/CD | F066, N021, N022, F073, N024; the remainders of F065 and N023 (a live bind assertion in `verify`) and F074 (a dispatch-only rollback job); the dispatch job of OA-2 |
+| CI/CD | F066, N021, N022, F073, N024; the remainder of N023; the `ENGINE_EXPOSURE_ENFORCE` gate of F065 (OA-4 step 4) and F074 (a dispatch-only rollback job); the dispatch job of OA-2 |
 | Orchestrator wiring (`app/main.py`) | F017, F021, F022, F014, N015; remainders of F023 (chat routes) and F030(a); a start-up sweep for orphaned background responses (F025) |
 | Database | F035, F038, F039, N011; remainders of F036, F040 (`usage_events`, `query_traces`, `chat_requests` retention), F041, N009 |
 | Frontend BFF hardening | F079, F009, F011, N001; remainders of F006 and F030(b) |
 | admin frontend | F077, F008, F080 |
 | authn owner | peer-conditional forwarded-header trust for sessions, audit and login lockout (F027, F058, N026); the accept side of F028 |
-| infrastructure | N017, F054, F057, F061; the durable part of F043/F051/N016; `TRUSTED_CLIENT_IP_HEADER` and `PUBLIC_API_TRUSTED_PROXIES` in `compose.yaml` |
+| infrastructure | N017, F054, F057, F061; the rail move of N016 (OCR images off the office LAN); `TRUSTED_CLIENT_IP_HEADER` and `PUBLIC_API_TRUSTED_PROXIES` in `compose.yaml` |
 | Webhooks | a route that rotates a webhook signing secret with an overlap |
 | memory owner | the remainder of N008 |
 | Public API surface | the open contract disagreements in API.md §12 |

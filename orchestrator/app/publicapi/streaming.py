@@ -216,9 +216,11 @@ def engine_error(exc: BaseException) -> errors.ApiError:
     # that. The names are matched structurally for the same reason.
     if name == "AdmissionRejected":
         # The NORMAL and LONG lanes are shared with the chat application
-        # (CONTRACT §11). A refusal there is "too much in flight", which is a
-        # 429 with a Retry-After, never a 500.
-        return errors.concurrency_limit_exceeded(retry_after=5)
+        # (CONTRACT §11). A refusal there is the ENGINE at capacity, not a
+        # limit on this caller: a 503 with a Retry-After, never a 500, and
+        # never a 429 naming a concurrency limit the API does not enforce
+        # (owner decision 2026-09-13, limits removed).
+        return errors.model_at_capacity(retry_after=5)
     if name in ("QueuedForRecovery", "BreakerOpen", "ModelUnavailable"):
         return _recovery_error()
     if isinstance(exc, asyncio.TimeoutError):

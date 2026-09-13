@@ -30,12 +30,26 @@ the routes read: the error codes come from `errors.error_codes()`, the scopes
 from `apiplatform.scopes`, the model ids and ceilings from `registry`. A
 document that restated them would be a second source of truth, and the second
 one is always the one that is wrong.
+
+THE LIMITS ARE READ FROM THE SAME SWITCH THE GATE READS (owner decision,
+2026-09-13). With PUBLIC_API_ENFORCE_LIMITS off — the default — the API has no
+request, token or concurrency limit, so this document advertises no
+`rate_limit_error` on a read, no `quota_exceeded`, and no `RateLimit` header:
+a client generator turns every documented 429 and header into retry and
+throttling code, and a documented limit that does not exist makes a client
+slow itself down for nothing. With the limits off NO route sends a 429 at
+all, so none is documented. The two refusals that stay are not limits and are
+not spelled as one: the SHARED engine's admission lane being full is
+`503 model_unavailable` ("at capacity", retry-safe), and a request whose
+Idempotency-Key is still running is `409 idempotency_conflict` with
+`Retry-After` — the 409 description and its optional header say so.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 from ..apiplatform.scopes import SCOPE_DESCRIPTIONS, Scope
+from ..config import settings
 from . import errors, registry
 
 #: The published title and version. The version is the CONTRACT's, not the
@@ -67,6 +81,36 @@ _BEARER_DESCRIPTION = (
 )
 
 
+def _limits_enforced() -> bool:
+    # Read at call time, like the gate (`quotas.limits_enforced`); not
+    # imported from there because this module must stay importable without
+    # the database layer `quotas` pulls in (the api_contract lint job).
+    return bool(getattr(settings, "public_api_enforce_limits", False))
+
+
+#: The 409 and 503 descriptions name the two refusals that are not limits, so
+#: a reader of the schema does not have to guess which 409 is retryable and
+#: which 503 is "busy" rather than "down" (2026-09-13).
+_DESCRIPTIONS = {
+    409: (
+        "idempotency_conflict: the same Idempotency-Key with a different body "
+        "(do not retry), or with the same body while the first request is "
+        "still running (carries Retry-After; retry to collect its answer)."
+    ),
+    503: (
+        "model_recovering; model_unavailable — the engine is restarting, down, "
+        "or at capacity (its queue is shared with the chat application). "
+        "Retry after Retry-After seconds."
+    ),
+}
+
+
+def _description(status: int, names: List[str]) -> str:
+    if status in _DESCRIPTIONS and set(names) <= {"idempotency_conflict", "model_recovering", "model_unavailable"}:
+        return _DESCRIPTIONS[status]
+    return "; ".join(sorted(names))
+
+
 def _error_responses(*codes: str) -> Dict[str, Any]:
     """`{status: response}` for the codes an operation can actually raise.
 
@@ -81,7 +125,7 @@ def _error_responses(*codes: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for status, names in sorted(by_status.items()):
         out[str(status)] = {
-            "description": "; ".join(sorted(names)),
+            "description": _description(status, names),
             "headers": (
                 {
                     "Retry-After": {
@@ -90,6 +134,17 @@ def _error_responses(*codes: str) -> Dict[str, Any]:
                     }
                 }
                 if status in (429, 503)
+                else {
+                    "Retry-After": {
+                        "description": (
+                            "Present only when the first request with this "
+                            "Idempotency-Key is still running."
+                        ),
+                        "required": False,
+                        "schema": {"type": "integer", "minimum": errors.MIN_RETRY_AFTER},
+                    }
+                }
+                if status == 409
                 else {}
             ),
             "content": {
@@ -111,6 +166,9 @@ _ALWAYS = (
     "rate_limit_error",
     "internal_error",
 )
+#: The codes above that exist only because a usage limit is enforced. Dropped
+#: from the document when PUBLIC_API_ENFORCE_LIMITS is off (2026-09-13).
+_ALWAYS_LIMIT_CODES = frozenset({"rate_limit_error"})
 #: Everything that can go wrong on the way to the engine.
 _GENERATION = (
     "invalid_request_error",
@@ -125,19 +183,40 @@ _GENERATION = (
     "model_unavailable",
     "timeout",
 )
+#: All three 429 codes go with the limits (2026-09-13). They used to stay:
+#: the Idempotency-Key "still running" answer was a `rate_limit_error` and a
+#: full admission lane a `concurrency_limit_exceeded`. Those are now a 409
+#: and a 503, so with the limits off nothing on a generating route is a 429.
+_GENERATION_LIMIT_CODES = frozenset({"rate_limit_error", "quota_exceeded", "concurrency_limit_exceeded"})
+
+
+def _always() -> tuple:
+    if _limits_enforced():
+        return _ALWAYS
+    return tuple(code for code in _ALWAYS if code not in _ALWAYS_LIMIT_CODES)
+
+
+def _generation() -> tuple:
+    if _limits_enforced():
+        return _GENERATION
+    return tuple(code for code in _GENERATION if code not in _GENERATION_LIMIT_CODES)
 
 
 def _request_id_header() -> Dict[str, Any]:
-    return {
+    headers: Dict[str, Any] = {
         "X-Request-Id": {
             "description": "Echoed on every response; quote it in a support request.",
             "schema": {"type": "string"},
         },
-        "RateLimit": {
+    }
+    # Only when a limit exists to describe (owner decision 2026-09-13): the
+    # server sends no RateLimit field with the limits off.
+    if _limits_enforced():
+        headers["RateLimit"] = {
             "description": 'Remaining requests in the window, RFC 9239 style: `"requests";r=59;t=41`.',
             "schema": {"type": "string"},
-        },
-    }
+        }
+    return headers
 
 
 def _schemas() -> Dict[str, Any]:
@@ -479,7 +558,7 @@ def _paths() -> Dict[str, Any]:
                 "security": [{"bearerAuth": []}],
                 "responses": {
                     "200": json_ok("#/components/schemas/ModelList"),
-                    **_error_responses(*_ALWAYS),
+                    **_error_responses(*_always()),
                 },
             }
         },
@@ -505,7 +584,7 @@ def _paths() -> Dict[str, Any]:
                 ],
                 "responses": {
                     "200": json_ok("#/components/schemas/Model"),
-                    **_error_responses(*_ALWAYS, "model_not_found"),
+                    **_error_responses(*_always(), "model_not_found"),
                 },
             }
         },
@@ -554,7 +633,7 @@ def _paths() -> Dict[str, Any]:
                             }
                         },
                     },
-                    **_error_responses(*_ALWAYS, *_GENERATION),
+                    **_error_responses(*_always(), *_generation()),
                 },
             }
         },
@@ -579,7 +658,7 @@ def _paths() -> Dict[str, Any]:
                 ],
                 "responses": {
                     "200": json_ok("#/components/schemas/Response"),
-                    **_error_responses(*_ALWAYS, "response_not_found"),
+                    **_error_responses(*_always(), "response_not_found"),
                 },
             }
         },
@@ -604,7 +683,7 @@ def _paths() -> Dict[str, Any]:
                 ],
                 "responses": {
                     "200": json_ok("#/components/schemas/Response"),
-                    **_error_responses(*_ALWAYS, "response_not_found"),
+                    **_error_responses(*_always(), "response_not_found"),
                 },
             }
         },
@@ -633,7 +712,7 @@ def _paths() -> Dict[str, Any]:
                 },
                 "responses": {
                     "200": json_ok("#/components/schemas/ChatCompletion"),
-                    **_error_responses(*_ALWAYS, *_GENERATION),
+                    **_error_responses(*_always(), *_generation()),
                 },
             }
         },
@@ -665,7 +744,7 @@ def _paths() -> Dict[str, Any]:
                 ],
                 "responses": {
                     "200": json_ok("#/components/schemas/UsageList"),
-                    **_error_responses(*_ALWAYS, "invalid_request_error"),
+                    **_error_responses(*_always(), "invalid_request_error"),
                 },
             }
         },
@@ -713,6 +792,15 @@ def public_openapi() -> Dict[str, Any]:
                 "\"request_id\"}}`.\n\n"
                 "Token counts are **null, never 0**, when the engine did not "
                 "report them."
+                + (
+                    ""
+                    if _limits_enforced()
+                    else "\n\nThere are no request, token-per-minute, daily or "
+                    "concurrency limits: usage is recorded (see `/v1/usage`) "
+                    "but never refused. The model's context window, "
+                    "`max_output_tokens` ceilings and the request body size "
+                    "cap still apply."
+                )
             ),
             "contact": {"name": "TechSara Solutions", "url": "https://techsarasolutions.com"},
         },
