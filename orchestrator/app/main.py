@@ -211,6 +211,11 @@ async def lifespan(_app: FastAPI):
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()
+        # The reranker's pooled client (rerank.py, 2026-09-13) is per loop and
+        # must be closed on the loop that owns its sockets, which is this one.
+        from . import rerank as _rerank
+
+        await _rerank.close_rerank_client()
         await db.run_in_thread(db.close_pool)
 
 

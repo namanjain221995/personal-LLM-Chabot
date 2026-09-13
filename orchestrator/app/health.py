@@ -13,11 +13,13 @@ time, and the offline test suite mocks the probe functions.
 """
 from __future__ import annotations
 
+import os
 import time
 
 import asyncio
 import importlib.util
 import threading
+import weakref
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -745,13 +747,106 @@ def engine_availability() -> dict:
         return {"status": "unknown", "detail": f"{type(exc).__name__}: {exc}"[:200]}
 
 
-async def check_dependencies() -> dict:
-    """Probe every §8 dependency concurrently.
+def _env_float(name: str, default: float) -> float:
+    """config._float semantics (unset or blank -> default; otherwise float()),
+    read here until the integration lead moves the tunable into config.py."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
 
-    Returns {"status": "ok"|"degraded", "checks": {name: {"status": ...}}}
-    with one entry per vLLM service plus "duckdb"; overall status is "ok"
-    only when every check passed.
-    """
+
+#: How long one dependency fan-out answers /health (2026-09-13, plan item 3c).
+#: Every call used to open the DuckDB warehouse, the app database, the LanceDB
+#: embedding and web indexes, the reports volume and probe every model server:
+#: seven thread probes plus the HTTP probes, re-run for the container
+#: healthcheck (30 s), the blackbox probe (15 s) and every deploy poll. py-spy
+#: put that at 8 % of the orchestrator's CPU under 8 concurrent Fast requests
+#: (2026-09-05). A report a few seconds old is the same report. Set to 0 to
+#: probe on every call. Named as it will be in config.py.
+HEALTH_DEPENDENCY_CACHE_S = _env_float("HEALTH_DEPENDENCY_CACHE_S", 4.0)
+
+#: loop id -> {"loop": weakref, "lock", "entry": (stamp, fingerprint, probe)}.
+#: Per event loop because the in-flight lock is loop-bound, and because a
+#: probe result belongs to the process state that produced it.
+_DEPS_CACHE: Dict[int, dict] = {}
+
+
+def _probe_fingerprint() -> tuple:
+    """What a cached fan-out was computed FROM: the probe callables and the
+    whole settings object. A monkeypatched probe or a changed setting is a
+    different probe, so it never answers from a stale result; the check is a
+    shallow dict comparison, microseconds against the fan-out it replaces."""
+    return (
+        _probe_vllm,
+        _check_duckdb,
+        _check_app_db,
+        _check_embedding_index,
+        _probe_ocr,
+        _probe_reranker,
+        _probe_remote_reranker,
+        _probe_inprocess_reranker,
+        probe_context_window,
+        _check_web_index,
+        _check_work,
+        _check_artifacts,
+        httpx.AsyncClient,
+        dict(vars(settings)),
+    )
+
+
+def _same_fingerprint(a: tuple, b: tuple) -> bool:
+    try:
+        return len(a) == len(b) and all(x is y or x == y for x, y in zip(a, b))
+    except Exception:  # noqa: BLE001 — an uncomparable value is a miss
+        return False
+
+
+def reset_dependency_cache() -> None:
+    """Forget every cached probe (tests, or after a configuration change)."""
+    _DEPS_CACHE.clear()
+
+
+async def _dependency_probe() -> Tuple[List[Tuple[str, str]], Dict[str, str], list]:
+    """The fan-out, served from a HEALTH_DEPENDENCY_CACHE_S cache. Concurrent
+    callers on one loop await the probe already in flight instead of starting
+    their own. Each caller gets its own copy of the per-check dicts.
+    A Settings attribute of the same name wins (config.py, 2026-09-13)."""
+    ttl = float(getattr(settings, "health_dependency_cache_s", HEALTH_DEPENDENCY_CACHE_S))
+    if ttl <= 0:
+        return await _dependency_probe_uncached()
+    loop = asyncio.get_running_loop()
+    state = _DEPS_CACHE.get(id(loop))
+    if state is None or state["loop"]() is not loop:
+        state = {"loop": weakref.ref(loop), "lock": asyncio.Lock(), "entry": None}
+        _DEPS_CACHE[id(loop)] = state
+        # Tests create hundreds of loops; production has one.
+        for key in [k for k, v in _DEPS_CACHE.items() if v["loop"]() is None]:
+            _DEPS_CACHE.pop(key, None)
+
+    def fresh(fingerprint: tuple):
+        entry = state["entry"]
+        if entry is None:
+            return None
+        stamp, cached_fp, probe = entry
+        if time.monotonic() - stamp >= ttl or not _same_fingerprint(cached_fp, fingerprint):
+            return None
+        return probe
+
+    fingerprint = _probe_fingerprint()
+    probe = fresh(fingerprint)
+    if probe is None:
+        async with state["lock"]:
+            fingerprint = _probe_fingerprint()
+            probe = fresh(fingerprint)
+            if probe is None:
+                probe = await _dependency_probe_uncached()
+                state["entry"] = (time.monotonic(), fingerprint, probe)
+    targets, seen, results = probe
+    return list(targets), dict(seen), [dict(r) if isinstance(r, dict) else r for r in results]
+
+
+async def _dependency_probe_uncached() -> Tuple[List[Tuple[str, str]], Dict[str, str], list]:
     # Profiles may colocate several roles on one model server (the DGX default
     # shares main/vision and router/agent; Mac commonly shares even more).
     # Probe each process once while retaining a capability record per role.
@@ -785,6 +880,22 @@ async def check_dependencies() -> dict:
             asyncio.to_thread(_check_work),
             asyncio.to_thread(_check_artifacts),
         )
+    return vllm_targets, seen, list(results)
+
+
+async def check_dependencies() -> dict:
+    """Probe every §8 dependency concurrently.
+
+    Returns {"status": "ok"|"degraded", "checks": {name: {"status": ...}}}
+    with one entry per vLLM service plus "duckdb"; overall status is "ok"
+    only when every check passed.
+
+    The probe fan-out is cached for HEALTH_DEPENDENCY_CACHE_S (see
+    `_dependency_probe`). The engine-availability overlay below is NOT: it is
+    in-memory, costs nothing, and a controller verdict or breaker change must
+    show on the very next call, not four seconds later.
+    """
+    vllm_targets, seen, results = await _dependency_probe()
     required_count = len(vllm_targets)
     checks: Dict[str, dict] = {
         name: result

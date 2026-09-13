@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional
+import os
+import threading
+import time
+from collections import OrderedDict
+from typing import List, Optional, Tuple
 
 from . import db, llm
 from .config import settings
@@ -39,6 +43,138 @@ _EMBED_BATCH = 64
 # 500 rows at 1024 dimensions, on the event loop. `recall.cosine_many` scores
 # the batch in one pass, which brings 500 rows back under ~2 ms.
 _CANDIDATE_LIMIT = 500
+
+
+def _env_float(name: str, default: float) -> float:
+    """config._float semantics (unset or blank -> default; otherwise float()),
+    read here until the integration lead moves the tunable into config.py."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
+
+#: How long one user's candidate rows are reused (2026-09-13, plan item 3e).
+#: Every assistant turn re-read the newest 500 message_embeddings rows WITH
+#: their full message content — 754 kB of content plus 2 MB of vectors for
+#: the owner (1,303 rows, read-only SELECT 2026-09-13) — and then lower()ed
+#: and split() every one on the event loop. The rows only change when the
+#: backfill writes new vectors (which invalidates below) or a conversation is
+#: deleted (the fingerprint check below sees the count drop). 0 disables.
+#: Named as it will be in config.py.
+CROSS_CHAT_EMBEDDINGS_CACHE_S = _env_float("CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
+#: Entries are per (user, model, excluded conversation, limit) because the
+#: exclusion changes WHICH 500 rows come back. Worst case ~3 MB each.
+_CANDIDATE_CACHE_MAX = 16
+
+#: key -> (monotonic stamp, fingerprint, rows). Filled and read from worker
+#: threads, hence the lock.
+_candidate_cache: "OrderedDict[tuple, Tuple[float, tuple, List[dict]]]" = OrderedDict()
+_candidate_lock = threading.Lock()
+#: Bumped (under the lock) by every invalidation: per user, and for everyone.
+#: A fetch that STARTED before an invalidation must not store its rows after
+#: it (second prover pass, 2026-09-13, recall_cache_race.py: a rename that
+#: landed while a fetch was in flight left the old title served for 60 s).
+_user_generations: "dict[int, int]" = {}
+_all_generation = [0]
+
+
+def _generation(user_id: int) -> tuple:
+    return (_all_generation[0], _user_generations.get(user_id, 0))
+
+
+def invalidate_message_embeddings(user_id: Optional[int] = None) -> None:
+    """Forget cached recall candidates for one user (or everyone).
+
+    For writes the fingerprint cannot see: a conversation renamed or titled,
+    a stored answer overwritten in place (main.py). New vectors and deletions
+    need not call it — the fingerprint of the rows a key reads sees both."""
+    with _candidate_lock:
+        if user_id is None:
+            _all_generation[0] += 1
+            _candidate_cache.clear()
+            return
+        _user_generations[user_id] = _user_generations.get(user_id, 0) + 1
+        for key in [k for k in _candidate_cache if k[0] == user_id]:
+            _candidate_cache.pop(key, None)
+
+
+def _embeddings_fingerprint(user_id: int, model_id: str, exclude_conversation_id: str = "") -> tuple:
+    """A cheap summary of exactly the rows one cache key reads — this user's
+    vectors OUTSIDE the excluded conversation — over idx_message_embeddings_user.
+
+    Scoped to the key since the second prover pass (2026-09-13). It used to
+    summarise ALL the user's vectors, and every turn's background backfill
+    stores the previous turn's vectors — in the conversation the turn
+    excludes — so the fingerprint moved every turn and the cache never hit
+    for someone chatting (instrumented fast_path_bench followup: 0 hits, 17
+    misses, fingerprint (1,1,...) .. (15,15,...)). Rows added or deleted
+    anywhere the key reads move the count or the id sum. Blocking."""
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT count(*) AS n, max(message_id) AS top, coalesce(sum(message_id), 0) AS total"
+            "  FROM message_embeddings"
+            " WHERE user_id = %s AND model_id = %s AND conversation_id <> %s",
+            (user_id, model_id, exclude_conversation_id or ""),
+        ).fetchone()
+    return (int(row["n"] or 0), row["top"], int(row["total"] or 0))
+
+
+def _normalised(content: Optional[str]) -> str:
+    return " ".join((content or "").lower().split())
+
+
+def _load_candidates(
+    user_id: int, model_id: str, exclude_conversation_id: Optional[str], limit: int
+) -> List[dict]:
+    """`db.fetch_message_embeddings`, cached, with each row's content already
+    normalised (`_norm`) for the echo filter in `_rank_candidates`. Blocking: run in a thread."""
+    # A Settings attribute of the same name wins (config.py, 2026-09-13).
+    ttl = float(getattr(settings, "cross_chat_embeddings_cache_s", CROSS_CHAT_EMBEDDINGS_CACHE_S))
+
+    def fetch() -> List[dict]:
+        rows = db.fetch_message_embeddings(user_id, model_id, exclude_conversation_id, limit)
+        for r in rows:
+            r["_norm"] = _normalised(r.get("content"))
+        return rows
+
+    if ttl <= 0:
+        return fetch()
+    key = (user_id, model_id, exclude_conversation_id or "", int(limit))
+    with _candidate_lock:
+        generation = _generation(user_id)
+    fingerprint = _embeddings_fingerprint(user_id, model_id, exclude_conversation_id or "")
+    now = time.monotonic()
+    with _candidate_lock:
+        hit = _candidate_cache.get(key)
+        if hit is not None and now - hit[0] < ttl and hit[1] == fingerprint:
+            _candidate_cache.move_to_end(key)
+            return hit[2]
+    rows = fetch()
+    with _candidate_lock:
+        if _generation(user_id) != generation:
+            return rows  # invalidated while this fetch ran: serve, never store
+        _candidate_cache[key] = (now, fingerprint, rows)
+        _candidate_cache.move_to_end(key)
+        for stale in [k for k, v in _candidate_cache.items() if now - v[0] >= ttl]:
+            _candidate_cache.pop(stale, None)
+        while len(_candidate_cache) > _CANDIDATE_CACHE_MAX:
+            _candidate_cache.popitem(last=False)
+    return rows
+
+
+def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict]) -> List[tuple]:
+    """(score, row) best first, echoes of the question dropped. CPU work over
+    up to 500 rows, so it runs in a thread, not on the event loop."""
+    norm_query = " ".join((query or "").lower().split())
+    # Another conversation asking the same question carries no
+    # information — this is exactly the failure mode keyword recall
+    # had before its snippet fix; don't reintroduce it semantically.
+    kept = [c for c in candidates if c["_norm"] != norm_query]
+    scores = cosine_many(query_vec, [c["embedding"] for c in kept])
+    scored = list(zip(scores, kept))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
 
 
 def _embedding_available() -> bool:
@@ -86,13 +222,17 @@ async def ensure_message_embeddings(user_id: int) -> int:
             }
             for m, v in zip(pending, vectors)
         ]
-        return await db.run_in_thread(
+        stored = await db.run_in_thread(
             db.store_message_embeddings,
             user_id,
             settings.embed_model,
             len(vectors[0]),
             rows,
         )
+        # No invalidation here (2026-09-13): the key-scoped fingerprint sees
+        # new vectors where a key reads them, and invalidating the whole user
+        # threw away every entry on every turn.
+        return stored
     except Exception:
         log.warning("message embedding backfill failed", exc_info=True)
         return 0
@@ -134,7 +274,7 @@ async def semantic_hits(
         return []
     try:
         candidates = await db.run_in_thread(
-            db.fetch_message_embeddings,
+            _load_candidates,
             user_id,
             settings.embed_model,
             exclude_conversation_id,
@@ -143,18 +283,7 @@ async def semantic_hits(
         if not candidates:
             return []
         query_vec = await llm.embed_query(query)
-        norm_query = " ".join((query or "").lower().split())
-        # Another conversation asking the same question carries no
-        # information — this is exactly the failure mode keyword recall
-        # had before its snippet fix; don't reintroduce it semantically.
-        kept = [
-            c
-            for c in candidates
-            if " ".join((c["content"] or "").lower().split()) != norm_query
-        ]
-        scores = cosine_many(query_vec, [c["embedding"] for c in kept])
-        scored = list(zip(scores, kept))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        scored = await db.run_in_thread(_rank_candidates, query, query_vec, candidates)
         hits: List[dict] = []
         seen_snippets: set = set()
         # A RELATIVE floor as well as the absolute one. The absolute floor
