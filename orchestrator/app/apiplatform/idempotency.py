@@ -230,6 +230,49 @@ def _live_row_on(
     return dict(row) if row is not None else None
 
 
+#: TTL-below-lease is warned about once per process, not once per claim.
+_WARNED_TTL_BELOW_LEASE = False
+
+
+def in_flight_lease_seconds() -> float:
+    """How long an `in_flight` claim is protected from takeover.
+
+    THE 1M-OUTPUT DERIVATION (2026-09-13). The lease was twice the chat app's
+    generation wall clock (8,400 s on this deployment). A public generation
+    may now run for PUBLIC_API_GEN_WALL_CLOCK_S (6 h) — a 1,000,000-token
+    answer at the measured 71-101 tok/s is 2.8-3.9 h — and a background job
+    may first wait PUBLIC_API_BACKGROUND_GATE_WAIT_S (1 h) for capacity. With
+    the old lease, a client retrying after 2 h 20 m would TAKE OVER the claim
+    of a generation that was still running and start a second 1M-token
+    generation on the same key. So: the larger of the configured lease and
+    2 x the public wall clock + the background wait = 46,800 s (13 h) by
+    default, still inside the 24 h retention.
+
+    An operator who sets PUBLIC_API_IDEMPOTENCY_TTL_HOURS below the lease is
+    warned: past the TTL a claim is reclaimable whatever the lease says, so
+    the protection above silently shrinks to the TTL.
+    """
+    global _WARNED_TTL_BELOW_LEASE
+    from ..publicapi import registry
+
+    configured = max(0.0, float(settings.public_api_idempotency_in_flight_lease_seconds))
+    public_clock = max(0.0, registry.setting_float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0))
+    background_wait = max(
+        0.0, registry.setting_float("PUBLIC_API_BACKGROUND_GATE_WAIT_S", 3600.0)
+    )
+    lease = max(configured, 2.0 * public_clock + background_wait)
+    ttl_seconds = float(settings.public_api_idempotency_ttl_hours) * 3600.0
+    if ttl_seconds < lease and not _WARNED_TTL_BELOW_LEASE:
+        _WARNED_TTL_BELOW_LEASE = True
+        log.warning(
+            "PUBLIC_API_IDEMPOTENCY_TTL_HOURS (%.1f h) is shorter than the in-flight "
+            "lease (%.0f s): a retry after the TTL can re-run a generation that is "
+            "still in progress",
+            float(settings.public_api_idempotency_ttl_hours), lease,
+        )
+    return lease
+
+
 def _claim_row(
     con: Any,
     project_id: str,
@@ -242,7 +285,7 @@ def _claim_row(
 ) -> bool:
     """One statement: claim a fresh key or take over a reclaimable row.
     True when this call owns the work. Runs on the caller's connection."""
-    lease = max(0.0, float(settings.public_api_idempotency_in_flight_lease_seconds))
+    lease = in_flight_lease_seconds()
     row = con.execute(
         _CLAIM_SQL,
         {

@@ -535,10 +535,15 @@ def test_a_413_on_v1_carries_a_request_id_and_the_v1_cors_headers():
     """Wave-2 verifier: the 413 had no `X-Request-Id`, `request_id: null`, and
     no CORS headers (browser CORS skips `/v1`, and the router's `_decorate`
     never runs for a response the router did not produce) — a developer's
-    browser SDK saw an opaque failure instead of `request_too_large`."""
+    browser SDK saw an opaque failure instead of `request_too_large`.
+
+    Posted to `/v1/embeddings` since 2026-09-13: its cap is 1 MiB before AND
+    after main.py adopts the per-route public caps (`/v1/responses` becomes
+    20 MiB then, and this test would have turned into a 401 for a reason
+    that has nothing to do with what it pins — adversarial review)."""
     client = TestClient(app)
     response = client.post(
-        "/v1/responses",
+        "/v1/embeddings",
         content=b"x" * (2 * 1024 * 1024),
         headers={"content-type": "application/json", "origin": FOREIGN_ORIGIN},
     )
@@ -551,6 +556,82 @@ def test_a_413_on_v1_carries_a_request_id_and_the_v1_cors_headers():
     assert response.headers["access-control-allow-origin"] == FOREIGN_ORIGIN
     assert "X-Request-Id" in response.headers["access-control-expose-headers"]
     assert "access-control-allow-credentials" not in response.headers
+
+
+def _main_uses_the_public_per_route_caps() -> bool:
+    from app.publicapi import models as public_models
+
+    return all(
+        app_main.body_cap_for("POST", path).signed_in == public_models.body_cap_for("POST", path)
+        for path in ("/v1/responses", "/v1/chat/completions", "/v1/audio/transcriptions")
+    )
+
+
+def _png_of(padding: int) -> bytes:
+    import struct
+    import zlib
+
+    raw = b"\x89PNG\r\n\x1a\n"
+    header = struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0)
+    raw += struct.pack(">I", 13) + b"IHDR" + header + struct.pack(">I", zlib.crc32(b"IHDR" + header))
+    pad = b"\x00" * padding
+    return raw + struct.pack(">I", len(pad)) + b"tEXt" + pad + struct.pack(">I", zlib.crc32(b"tEXt" + pad))
+
+
+@pytest.mark.xfail(
+    not _main_uses_the_public_per_route_caps(),
+    strict=True,
+    reason=(
+        "needs integration in app/main.py (another owner's file): body_cap_for must use "
+        "publicapi.models.body_cap_for(method, path) for /v1 paths. Strict: when it lands, "
+        "this XPASSes and the marker must go."
+    ),
+)
+def test_the_mounted_app_lets_an_image_request_and_an_audio_upload_over_one_mib_reach_the_router():
+    """Adversarial review 2026-09-13: CONTRACT §8 advertises 20 MiB on the two
+    generation routes and 26 MiB on transcriptions, the Next edge enforces
+    those, and the router tests pass — but the application's middleware still
+    capped every `/v1` path at 1 MiB, so a 2 MiB image request and every audio
+    upload over 1 MiB were refused before the router saw them. Unauthenticated
+    on purpose: past the middleware the router answers 401, which is the
+    proof the body got through."""
+    import base64
+
+    client = TestClient(app)
+    image = base64.b64encode(_png_of(1_600_000)).decode()
+    body = {
+        "model": "techsara-35b",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What is this?"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{image}"},
+                ],
+            }
+        ],
+    }
+    imaged = client.post("/v1/responses", json=body)
+    audio = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"\x00" * (3 * 1024 * 1024), "audio/wav")},
+        data={"model": "techsara-whisper"},
+    )
+    assert imaged.status_code == 401, imaged.text[:200]
+    assert audio.status_code == 401, audio.text[:200]
+
+
+def test_a_body_over_one_mib_on_a_text_only_public_route_is_still_refused_by_the_middleware():
+    """The other half, true before and after the main.py integration: the
+    larger caps belong to the two generation routes and transcriptions only."""
+    client = TestClient(app)
+    for path in ("/v1/embeddings", "/v1/rerank"):
+        response = client.post(
+            path,
+            content=b"x" * (2 * 1024 * 1024),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413, (path, response.text[:200])
 
 
 def test_a_chunked_oversize_body_on_a_public_route_is_a_413_not_a_500():

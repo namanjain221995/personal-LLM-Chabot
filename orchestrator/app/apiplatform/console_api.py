@@ -47,14 +47,18 @@ same `parse_responses_request` validation, the same registry resolution with
 the same (per-workspace) database narrowing, the same QUOTA ENGINE in front of
 admission — charged to a per-workspace playground allowance — and the same
 pump (`publicapi.streaming`), so the same envelopes, error codes and §10 SSE
-grammar. It writes no `api_responses` row and no conversation history: it is a
-console action, not a project's API traffic, and a project's request log must
-show what its keys did.
+grammar. Since 2026-09-13 it also plans through `/v1`'s planner and waits at
+`/v1`'s per-engine capacity gates, and it may target every CHAT model in the
+catalogue — see the block above `_record_playground`. It writes no
+`api_responses` row and no conversation history: it is a console action, not a
+project's API traffic, and a project's request log must show what its keys
+did.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import functools
 import hashlib
 import json
@@ -556,8 +560,35 @@ class ModelToggleRequest(_Body):
 # ---------------------------------------------------------------------------
 
 
+def _catalogue() -> Sequence[Any]:
+    """Every public model the CODE knows, configured on this deployment or not.
+
+    2026-09-13 (owner request: the Models page offers every model TechSara
+    runs). `registry.catalogue()` lists all of them, each with a `status` of
+    `available` or `not_configured`; `registry.declared_models()` lists only
+    the ones this deployment can serve. The console needs the former — an
+    operator deciding whether to withdraw `techsara-ocr` must be able to see
+    it on a deployment whose OCR engine is switched off today — while `/v1`
+    keeps resolving against the latter.
+
+    Feature-detected rather than imported by name: the catalogue arrives in
+    `publicapi/registry.py` from another team in the same wave, and until it
+    does the declared tuple is the whole catalogue (everything in it is
+    available by construction).
+    """
+    catalogue = getattr(registry, "catalogue", None)
+    if callable(catalogue):
+        return tuple(catalogue())
+    return tuple(registry.declared_models())
+
+
 def _declared_ids() -> List[str]:
-    return [model.id for model in registry.declared_models()]
+    """The ids a console write may name — the CATALOGUE's, not only the
+    configured models'. A project allowlist naming `techsara-whisper` on a
+    deployment without speech is still a meaningful restriction for the day
+    the engine is switched on, and withdrawing a model before it is configured
+    is how an operator keeps it dark when it is."""
+    return [str(model.id) for model in _catalogue()]
 
 
 def _model_overrides(workspace_id: str) -> Dict[str, bool]:
@@ -1849,24 +1880,149 @@ async def platform_settings(
 # ---------------------------------------------------------------------------
 
 
+#: The capability flags a console model entry carries, in the order the
+#: Models page draws its badges. A CLOSED list (2026-09-13): the entry is
+#: built from this allow-list rather than by copying `to_wire()["capabilities"]`,
+#: so a flag the registry grows later appears here only through a reviewed
+#: diff, and a missing flag reads as False rather than as absent.
+CONSOLE_CAPABILITY_FLAGS = (
+    "chat",
+    "streaming",
+    "vision",
+    "ocr",
+    "embeddings",
+    "rerank",
+    "audio_transcription",
+    "tools",
+    "background",
+)
+
+#: The model kinds the console knows how to describe (CONTRACT §15, 2026-09-13).
+CONSOLE_MODEL_KINDS = ("chat", "embedding", "rerank", "transcription")
+
+#: The per-model technical limits the console may show, and their type. Same
+#: allow-list rule as the capability flags: nothing the registry sends under
+#: `limits` reaches the browser unless it is named here.
+CONSOLE_MODEL_LIMITS = {
+    "max_images_per_request": int,
+    "max_inputs_per_request": int,
+    "max_documents_per_request": int,
+    "embedding_dimensions": int,
+    "max_audio_seconds": int,
+    "max_audio_bytes": int,
+    "response_formats": list,
+}
+
+#: What each kind is served on when the registry does not say (a pre-catalogue
+#: registry, whose one model is a chat model). Public `/v1` paths only.
+_DEFAULT_ENDPOINTS = {
+    "chat": ["/v1/responses", "/v1/chat/completions"],
+    "embedding": ["/v1/embeddings"],
+    "rerank": ["/v1/rerank"],
+    "transcription": ["/v1/audio/transcriptions"],
+}
+
+
+def _model_kind(model: Any, wire: Optional[Dict[str, Any]] = None) -> str:
+    """`chat`, `embedding`, `rerank` or `transcription` — from the registry
+    when it says, else inferred from the capability flags (a pre-catalogue
+    `PublicModel` has no `kind`, and its only model is a chat model)."""
+    wire = wire if wire is not None else model.to_wire()
+    kind = wire.get("kind") or getattr(model, "kind", None)
+    if kind in CONSOLE_MODEL_KINDS:
+        return str(kind)
+    caps = wire.get("capabilities") or {}
+    if caps.get("audio_transcription"):
+        return "transcription"
+    if caps.get("rerank"):
+        return "rerank"
+    if caps.get("embeddings") and not caps.get("chat"):
+        return "embedding"
+    return "chat"
+
+
+def _public_path(value: Any) -> Optional[str]:
+    """A `/v1/...` path, or None. The endpoints list is rendered in a browser
+    and CONTRACT §15 says no engine URL leaves the server; a value that is not
+    a plain public path (an absolute URL, a host, an internal route) is
+    dropped rather than trusted, whatever produced it."""
+    text = str(value or "").strip()
+    if not text.startswith("/v1/") or "//" in text or any(ch.isspace() for ch in text):
+        return None
+    return text
+
+
+def _console_model(model: Any, *, enabled: bool) -> Dict[str, Any]:
+    """One row of the console's Models page, built from an EXPLICIT allow-list.
+
+    Rule 3 of this module applied to the catalogue: `to_wire()` is already the
+    public rendering, but the console does not hand it to the serialiser as-is
+    — every key below is named, so an `internal`, `engine` or base-URL field
+    that ever reaches a `to_wire()` by mistake stops here instead of in a
+    browser. `None` means the registry did not report the value, and the page
+    draws "—" for it; nothing here invents a ceiling.
+    """
+    wire = model.to_wire()
+    caps = wire.get("capabilities") or {}
+    kind = _model_kind(model, wire)
+    raw_endpoints = wire.get("endpoints")
+    if isinstance(raw_endpoints, (list, tuple)):
+        endpoints = [path for path in (_public_path(item) for item in raw_endpoints) if path]
+    else:
+        endpoints = list(_DEFAULT_ENDPOINTS[kind])
+    raw_limits = wire.get("limits") if isinstance(wire.get("limits"), dict) else {}
+    limits: Dict[str, Any] = {}
+    for name, kind_of in CONSOLE_MODEL_LIMITS.items():
+        value = raw_limits.get(name)
+        if value is None:
+            continue
+        if kind_of is list:
+            if isinstance(value, (list, tuple)):
+                limits[name] = [str(item) for item in value]
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            limits[name] = int(value)
+    status = str(wire.get("status") or getattr(model, "status", "") or "available")
+    return {
+        "id": str(wire.get("id") or model.id),
+        "object": "model",
+        "owned_by": "techsara",
+        "status": status,
+        "kind": kind,
+        "capabilities": {flag: bool(caps.get(flag, False)) for flag in CONSOLE_CAPABILITY_FLAGS},
+        "endpoints": endpoints,
+        "context_window": _int_or_none(wire.get("context_window")),
+        "max_input_tokens": _int_or_none(wire.get("max_input_tokens")),
+        "max_output_tokens": _int_or_none(wire.get("max_output_tokens")),
+        "default_max_output_tokens": _int_or_none(wire.get("default_max_output_tokens")),
+        "limits": limits,
+        "enabled": bool(enabled),
+    }
+
+
 @router.get("/models")
 async def list_models(
     principal: Principal = Depends(require_capability(Cap.API_CONSOLE_ACCESS)),
 ) -> dict:
-    """What the CODE declares, plus whether the database has disabled it.
+    """Every model the CODE catalogues, plus whether the database withdrew it.
 
     The database may only narrow (CONTRACT-3 §15), so this list is built from
-    `registry.declared_models()` and the stored rows are read as a flag on each
-    entry. A `public_models` row naming an id the code does not declare cannot
-    appear here at all, because there is nothing for it to be a flag ON —
-    which is the narrowing rule made visible in the console.
+    the registry's catalogue and the stored rows are read as a flag on each
+    entry. A `public_models` row naming an id the code does not catalogue
+    cannot appear here at all, because there is nothing for it to be a flag ON
+    — which is the narrowing rule made visible in the console.
+
+    ALL SIX SINCE 2026-09-13 (owner request). The catalogue includes models
+    whose engine this deployment does not run; they are listed with
+    `status: "not_configured"` rather than hidden, so the page can say "not
+    configured on this deployment" instead of leaving an operator to wonder
+    why a documented model is missing. `enabled` is still only the database's
+    flag: a not-configured model is unavailable whatever it says.
     """
     stored = await db.run_in_thread(db.public_model_overrides, principal.workspace_id)
-    models = []
-    for model in registry.declared_models():
-        entry = model.to_wire()
-        entry["enabled"] = bool(stored.get(model.id, True))
-        models.append(entry)
+    models = [
+        _console_model(model, enabled=bool(stored.get(model.id, True)))
+        for model in _catalogue()
+    ]
     return {"models": models, "can_manage": principal.can(Cap.API_MODELS_MANAGE)}
 
 
@@ -1877,7 +2033,7 @@ async def set_model_enabled(
     request: Request,
     principal: Principal = Depends(require_capability(Cap.API_MODELS_MANAGE)),
 ) -> dict:
-    """Disable (or re-enable) a declared public model FOR THIS WORKSPACE.
+    """Disable (or re-enable) a catalogued public model FOR THIS WORKSPACE.
 
     PER WORKSPACE since 2026-09-13. `api.models.manage` is a workspace
     membership capability, and the write used to land in a deployment-wide
@@ -1887,7 +2043,9 @@ async def set_model_enabled(
     principal's workspace, so the blast radius and the audit trail are the
     same workspace.
 
-    An id the code does not declare is a 404 and no row is written. Storing it
+    An id the code does not catalogue is a 404 and no row is written (every
+    catalogue id is accepted since 2026-09-13, configured or not, so a model
+    can be withdrawn BEFORE its engine is switched on). Storing an unknown id
     would create a `public_models` row that can never do anything — and would
     invite the belief that writing one is how a model becomes public, which is
     exactly the belief CONTRACT-3 §15 exists to prevent.
@@ -2129,16 +2287,50 @@ def _playground_caller(
 
 
 class _Slot:
-    """A concurrency slot released exactly once, from whichever path gets
-    there first."""
+    """A concurrency slot — and, since 2026-09-13, the shared engine's
+    capacity gate — released exactly once, from whichever path gets there
+    first."""
 
-    def __init__(self, stack: contextlib.ExitStack) -> None:
+    def __init__(
+        self,
+        stack: contextlib.ExitStack,
+        gate: Optional[contextlib.AsyncExitStack] = None,
+    ) -> None:
         self._stack: Optional[contextlib.ExitStack] = stack
+        self._gate: Optional[contextlib.AsyncExitStack] = gate
+
+    def attach_gate(self, gate: Optional[contextlib.AsyncExitStack]) -> None:
+        self._gate = gate
 
     def release(self) -> None:
+        """The project concurrency slot. Synchronous, so any `finally` may call it."""
         stack, self._stack = self._stack, None
         if stack is not None:
             stack.close()
+
+    async def release_all(self) -> None:
+        """The capacity gate, then the project slot.
+
+        The gate is closed in its OWN task and awaited through a shield: this
+        runs from `finally` blocks that are usually executing under the
+        cancellation of a client that went away, and Starlette's cancel scope
+        re-cancels every await inside it. An unshielded release could be
+        interrupted before it returned the engine's slot, and a leaked gate on
+        a shared engine is a permanent loss of public capacity until restart.
+        """
+        gate, self._gate = self._gate, None
+        try:
+            if gate is not None:
+                work = asyncio.ensure_future(gate.aclose())
+                try:
+                    await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    # The release carries on in its own task.
+                    raise
+                except Exception:  # noqa: BLE001 — a release must not mask the answer
+                    log.warning("a playground capacity gate did not release cleanly", exc_info=True)
+        finally:
+            self.release()
 
 
 class _Settlement:
@@ -2246,6 +2438,243 @@ class _SlotStreamingResponse(StreamingResponse):
             self._slot.release()
             if self._settle is not None and not self._body_started:
                 await self._settle.nothing_ran()
+            # After the settlement, not before it: the gate's release is
+            # shielded but still an await, and a body that never started
+            # must give its estimate back even if this one is interrupted.
+            await self._slot.release_all()
+
+
+# --- planning, capacity and the applied ceiling (2026-09-13) ------------------
+#
+# THE OWNER REQUEST. The playground may target every CHAT model the platform
+# runs (techsara-35b, techsara-8b-vision, techsara-ocr), and techsara-35b may
+# generate up to 1,000,000 tokens. The playground must decide both EXACTLY as
+# `/v1` does, so the pieces below are the public API's own:
+#
+# * `publicapi.planning.plan_generation` resolves the requested ceiling, the
+#   clamp to the remaining context window, the per-request wall clock and the
+#   capacity gate a request needs;
+# * `publicapi.capacity.hold` is the per-engine gate that keeps public work
+#   from starving the chat application on a shared engine — a bounded FIFO
+#   wait that ends in 503 `model_at_capacity` with a Retry-After, never 429;
+# * the applied ceiling is what the generation actually ran under, and it is
+#   recorded in the ledger and relayed on the response.
+#
+# THE SEAM. `planning` and `capacity` are built by another team in the same
+# wave, so both are feature-detected and this file is correct in either merge
+# order: without `planning` the playground keeps the pre-wave resolution
+# (`_legacy_plan`: the model ceiling, no clamp, the engine's own wall clock)
+# and no gate; with it, the playground plans and gates exactly as `/v1` does.
+
+
+def _optional_publicapi_module(name: str) -> Any:
+    """`app.publicapi.<name>` if it exists, else None.
+
+    `find_spec` first, then a plain import: a module that EXISTS but fails to
+    import must fail loudly, not quietly send the playground back to the
+    pre-wave behaviour — `except ImportError` around the import would do
+    exactly that for any ImportError raised inside the module.
+    """
+    import importlib
+    import importlib.util
+
+    qualified = f"{__package__.rsplit('.', 1)[0]}.publicapi.{name}"
+    if importlib.util.find_spec(qualified) is None:
+        return None
+    return importlib.import_module(qualified)
+
+
+def _planning() -> Any:
+    return _optional_publicapi_module("planning")
+
+
+def _capacity() -> Any:
+    return _optional_publicapi_module("capacity")
+
+
+@dataclasses.dataclass(frozen=True)
+class _LegacyPlan:
+    """The pre-wave resolution, shaped like `planning.GenerationPlan` so the
+    rest of the handler reads one set of attribute names."""
+
+    messages: List[Dict[str, Any]]
+    requested_max_output_tokens: int
+    planned_max_output_tokens: int
+    max_tokens_for_engine: int
+    estimated_input_tokens: int
+    footprint_tokens: int
+    temperature: float
+    wall_clock_s: Optional[float] = None
+    clamped: bool = False
+    gate_engine: Optional[str] = None
+
+
+def _legacy_plan(parsed: api_models.ResponsesRequest, model: Any) -> _LegacyPlan:
+    default_out = registry.default_max_output_tokens() or FALLBACK_MAX_OUTPUT_TOKENS
+    ceiling = model.max_output_tokens or default_out
+    max_tokens = parsed.resolve_max_output_tokens(
+        ceiling=ceiling, default=min(default_out, ceiling)
+    )
+    messages = parsed.chat_messages()
+    estimate = _estimate_input_tokens(messages)
+    return _LegacyPlan(
+        messages=list(messages),
+        requested_max_output_tokens=max_tokens,
+        planned_max_output_tokens=max_tokens,
+        max_tokens_for_engine=max_tokens,
+        estimated_input_tokens=estimate,
+        footprint_tokens=estimate + max_tokens,
+        temperature=0.2 if parsed.temperature is None else float(parsed.temperature),
+    )
+
+
+def _plan(parsed: api_models.ResponsesRequest, model: Any) -> Any:
+    """The generation plan, from `/v1`'s own planner when it exists.
+
+    `project_max_output_tokens=None`: a playground run is charged to the
+    workspace's allowance, never to the project it was pointed at, and the
+    project contributes only its model allowlist (see `playground_execute`).
+    """
+    planning = _planning()
+    if planning is None:
+        return _legacy_plan(parsed, model)
+    return planning.plan_generation(parsed, model, project_max_output_tokens=None)
+
+
+def _refuse_non_text_input(payload: Dict[str, Any]) -> None:
+    """Text only in the playground this wave (2026-09-13 design).
+
+    `/v1` accepts image parts for vision models, as data: URLs inside a 20 MiB
+    body; the playground reads at most the 1 MiB text cap and has no picker for
+    an image, so a part that is not `input_text` is refused by name rather
+    than cut off by the body cap mid-upload.
+    """
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return
+    for index, item in enumerate(items):
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not (isinstance(part, dict) and part.get("type") == "input_text"):
+                raise api_errors.invalid_request(
+                    "The console playground sends text only; send image input "
+                    "from your own code with an API key.",
+                    param=f"input.{index}.content",
+                )
+
+
+def _generation_spec(
+    plan: Any, model: Any, *, response_id: str, created_at: int
+) -> streaming.GenerationSpec:
+    """The spec for this run — through `streaming.spec_from_plan`, the one way
+    `/v1` turns a plan into a spec, whenever the plan came from the planner.
+
+    The legacy plan builds the six fields the playground has always set, which
+    is exactly the pre-wave spec (main engine, the engine's own wall clock).
+    """
+    from_plan = getattr(streaming, "spec_from_plan", None)
+    if callable(from_plan) and not isinstance(plan, _LegacyPlan):
+        return from_plan(plan, response_id=response_id, created_at=created_at)
+    return streaming.GenerationSpec(
+        response_id=response_id,
+        model=model.id,
+        messages=list(plan.messages),
+        max_tokens=int(plan.max_tokens_for_engine),
+        temperature=float(plan.temperature),
+        created_at=created_at,
+    )
+
+
+async def _enter_capacity_gate(plan: Any) -> Optional[contextlib.AsyncExitStack]:
+    """Wait for the shared engine's public capacity, BEFORE any status line.
+
+    Same order and wait as `/v1`'s synchronous and streaming paths: after the
+    quota reservation and the concurrency slot, before the response starts,
+    bounded by `capacity.sync_wait_s()` (PUBLIC_API_GATE_WAIT_S, 30 s) — so a
+    refusal is a real HTTP 503 with a Retry-After, and the silent wait stays
+    well under Cloudflare's 100 s origin timeout. None when the plan names no
+    gate (a techsara-35b request whose footprint fits the NORMAL admission
+    lanes, which stay the gate there, as today).
+    """
+    engine = getattr(plan, "gate_engine", None)
+    if not engine:
+        return None
+    capacity = _capacity()
+    if capacity is None:
+        # A plan that names a gate with no gate to hold it is a wiring fault.
+        # Fail CLOSED: an ungated run on a shared engine is the starvation the
+        # gate exists to prevent, and a 503 is retry-safe.
+        log.error("the plan names capacity gate %r but publicapi.capacity is missing", engine)
+        raise api_errors.model_unavailable()
+    gate = contextlib.AsyncExitStack()
+    try:
+        await gate.enter_async_context(
+            capacity.hold(
+                str(engine),
+                # The planner's weight: the footprint on the router's token
+                # budget, 0 where the gate counts requests only (OCR, the main
+                # engine's long lane).
+                weight_tokens=int(
+                    getattr(plan, "gate_weight_tokens", getattr(plan, "footprint_tokens", 0)) or 0
+                ),
+                wait_s=float(capacity.sync_wait_s()),
+                # The OCR engine shares a GPU with a main-model rank, so its
+                # gate first waits (bounded) for chat to be idle.
+                yield_to_chat=bool(getattr(plan, "yield_to_chat", False)),
+            )
+        )
+    except BaseException:
+        await gate.aclose()
+        raise
+    return gate
+
+
+def _reserved_output_tokens(plan: Any) -> Optional[int]:
+    """The output tokens the quota engine reserves for this run.
+
+    The planner's rule when it exists (`planning.reservation_output_tokens`,
+    the one `/v1` uses): enforced, the planned ceiling; NOT enforced (the
+    owner's default), at most PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS, so a
+    running 1,000,000-token generation does not show a million output tokens
+    in today's usage for the hours it runs — the reservation is settled to the
+    measured count at the end either way; None when the request named no
+    budget and nothing clamped it, so `quotas` reserves its own default.
+    The legacy plan applies the same cap itself.
+    """
+    enforced = quotas.limits_enforced()
+    if not isinstance(plan, _LegacyPlan):
+        helper = getattr(_planning(), "reservation_output_tokens", None)
+        if callable(helper):
+            return helper(plan, limits_enforced=enforced)
+    planned = max(1, int(plan.planned_max_output_tokens))
+    if enforced:
+        return planned
+    default = int(getattr(settings, "public_api_default_max_output_tokens", 0) or 0)
+    return max(1, min(planned, default or FALLBACK_MAX_OUTPUT_TOKENS))
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _applied_max_output_tokens(plan: Any, outcome: streaming.StreamOutcome) -> int:
+    """The ceiling this generation actually ran under.
+
+    The pump computes it (`StreamOutcome.max_output_tokens`: the planned value
+    until the engine has run, the exact one after, through the planner's own
+    formula), so the playground records and relays the SAME number `/v1`
+    puts on its terminal event rather than deriving a second one. The planned
+    value stands in only for a pump that predates the field — it is exact on
+    the legacy path, where the value sent IS the ceiling.
+    """
+    measured = _positive_int(getattr(outcome, "max_output_tokens", None))
+    if measured is not None:
+        return measured
+    return max(1, int(plan.planned_max_output_tokens))
 
 
 async def _record_playground(
@@ -2254,7 +2683,8 @@ async def _record_playground(
     caller: ApiCaller,
     reservation: quotas.Reservation,
     project: Optional[Dict[str, Any]],
-    model: registry.PublicModel,
+    model: Any,
+    plan: Any,
     request_id: str,
     outcome: streaming.StreamOutcome,
     streamed: bool,
@@ -2266,6 +2696,11 @@ async def _record_playground(
     run that did not cost the same GPU, and the analytics console must see
     both. A FAILED run is recorded too — a generation that burned engine time
     and then died is exactly the kind a capacity review must not lose.
+
+    The ceiling fields (2026-09-13) are the same four `/v1` writes: what was
+    asked for, what the generation ran under, whether the window clamped it,
+    and the wall clock it was given — so a three-hour playground run reads in
+    the ledger as the long run it was.
     """
     usage = api_models.Usage.from_llm(outcome.usage)
     try:
@@ -2283,6 +2718,7 @@ async def _record_playground(
         )
     except Exception:  # noqa: BLE001 — recording must never break a response
         log.warning("playground token spend was not written to the quota ledger", exc_info=True)
+    wall_clock = getattr(plan, "wall_clock_s", None)
     await usage_ledger.record_async(
         user_id=principal.user_id,
         workspace_id=principal.workspace_id,
@@ -2293,7 +2729,7 @@ async def _record_playground(
         generation_id=request_id,
         route=PLAYGROUND_ROUTE,
         effort=streaming.PUBLIC_EFFORT,
-        model=model.internal,
+        model=str(getattr(model, "internal", "") or model.id),
         mode="playground",
         input_tokens=None if usage is None else usage.input_tokens,
         output_tokens=None if usage is None else usage.output_tokens,
@@ -2307,6 +2743,10 @@ async def _record_playground(
             "project_id": None if project is None else project["id"],
             "streamed": bool(streamed),
             "source": "console_playground",
+            "max_output_tokens_requested": int(plan.requested_max_output_tokens),
+            "max_output_tokens_applied": _applied_max_output_tokens(plan, outcome),
+            "clamped": bool(getattr(plan, "clamped", False)),
+            "wall_clock_s": None if wall_clock is None else float(wall_clock),
         },
     )
 
@@ -2327,15 +2767,18 @@ async def playground_execute(
 
     WHAT IS SHARED WITH `/v1`, deliberately: the request type and its
     `extra="forbid"` validation, the COUNTED body cap, the model registry
-    including the database's narrowing, the per-model output ceiling, the QUOTA
-    ENGINE (reserve + concurrency slot, against the workspace's playground
-    allowance), and — since 2026-09-13 — the generation pump itself:
-    `streaming.run_to_completion` and `streaming.responses_sse`. The console
-    used to carry its own copy of that pump, and the copy mapped every engine
-    refusal to 500 `internal_error` where `/v1` answers 429 / 503 / 504 with a
-    `Retry-After`, and never emitted `response.queued` or `response.failed`.
-    One pump means a developer debugging in the console sees what their code
-    will get.
+    including the database's narrowing, the QUOTA ENGINE (reserve +
+    concurrency slot, against the workspace's playground allowance), the
+    generation pump itself (`streaming.run_to_completion` and
+    `streaming.responses_sse`) and — since 2026-09-13 — the planner and the
+    per-engine capacity gates, so the output ceiling (up to 1,000,000 tokens
+    on techsara-35b), its clamp to the context window, the wall clock and the
+    503 at capacity are the ones the developer's own code will get.
+
+    CHAT MODELS ONLY. Every chat-kind model in the catalogue may be targeted;
+    an embeddings, rerank or speech model is a 400 naming `model`, in the same
+    sentence `/v1/responses` uses — after the 404 for a model this caller may
+    not use, never before it (CONTRACT §4: no existence disclosure).
 
     `project_id` is a QUERY parameter, not a body field: the body is the public
     request shape byte for byte, and nothing in a body may select a tenant
@@ -2366,6 +2809,7 @@ async def playground_execute(
 
     try:
         parsed = api_models.parse_responses_request(payload)
+        _refuse_non_text_input(payload)
         if parsed.background:
             raise api_errors.invalid_request(
                 "The console playground runs a request and waits for it; "
@@ -2385,22 +2829,28 @@ async def playground_execute(
             # 404, never 403: a model this caller may not use and a model that
             # does not exist are the same answer (CONTRACT-3 §4).
             raise api_errors.model_not_found(parsed.model)
-        default_out = registry.default_max_output_tokens() or FALLBACK_MAX_OUTPUT_TOKENS
-        ceiling = model.max_output_tokens or default_out
-        max_tokens = parsed.resolve_max_output_tokens(
-            ceiling=ceiling, default=min(default_out, ceiling)
-        )
+        if _model_kind(model) != "chat":
+            # The registry's own sentence when it has one, so the playground
+            # and `/v1` refuse in one spelling.
+            sentence = getattr(registry, "unsupported_endpoint_message", None)
+            raise api_errors.invalid_request(
+                sentence(model.id, "/v1/responses")
+                if callable(sentence)
+                else f"The model `{model.id}` does not support /v1/responses.",
+                param="model",
+            )
+        # Off the event loop: planning estimates the prompt's tokens, and the
+        # 2026-09-05 Fast-mode regression was exactly that kind of CPU work on
+        # the loop every chat request shares.
+        plan = await db.run_in_thread(_plan, parsed, model)
     except api_errors.ApiError as exc:
         return _api_error_response(exc, request_id)
 
-    messages = parsed.chat_messages()
     kind = "stream" if parsed.stream else "sync"
-    spec = streaming.GenerationSpec(
+    spec = _generation_spec(
+        plan,
+        model,
         response_id=f"resp_{secrets.token_hex(12)}",
-        model=model.id,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.2 if parsed.temperature is None else float(parsed.temperature),
         created_at=int(time.time()),
     )
     allowance_row = await db.run_in_thread(
@@ -2409,17 +2859,19 @@ async def playground_execute(
     caller = _playground_caller(principal, allowance_row, allowed)
 
     # THE GATE, IN FRONT OF ADMISSION (CONTRACT-3 §11), in the same order
-    # `/v1` uses: the durable window first, then the in-process slot.
+    # `/v1` uses: the durable window first, then the in-process slot, then the
+    # shared engine's capacity gate.
     try:
         reservation = await db.run_in_thread(
             functools.partial(
                 quotas.reserve,
                 caller,
                 kind=kind,
-                estimated_input_tokens=_estimate_input_tokens(messages),
-                # The ceiling this run resolved, so the output reservation is
-                # what it may actually generate rather than the global default.
-                max_output_tokens=max_tokens,
+                estimated_input_tokens=int(plan.estimated_input_tokens),
+                # The ceiling this run planned, so the output reservation is
+                # what it may actually generate rather than the global default
+                # (capped while limits are off: `_reserved_output_tokens`).
+                max_output_tokens=_reserved_output_tokens(plan),
             )
         )
     except api_errors.ApiError as exc:
@@ -2439,6 +2891,18 @@ async def playground_execute(
         await settlement.nothing_ran()
         raise
     slot = _Slot(stack)
+    try:
+        slot.attach_gate(await _enter_capacity_gate(plan))
+    except api_errors.ApiError as exc:
+        # At capacity (or no gate to hold): nothing ran, the estimate comes
+        # back, and the answer is the `/v1` 503 with its Retry-After.
+        slot.release()
+        await settlement.nothing_ran()
+        return _api_error_response(exc, request_id, rate_headers)
+    except BaseException:
+        slot.release()
+        await settlement.nothing_ran()
+        raise
 
     if parsed.stream:
 
@@ -2449,6 +2913,7 @@ async def playground_execute(
                 reservation=reservation,
                 project=project,
                 model=model,
+                plan=plan,
                 request_id=request_id,
                 outcome=outcome,
                 streamed=True,
@@ -2459,7 +2924,7 @@ async def playground_execute(
                 async for frame in streaming.responses_sse(spec, on_finish=on_finish):
                     yield frame
             finally:
-                slot.release()
+                await slot.release_all()
 
         return _SlotStreamingResponse(
             frames(),
@@ -2469,8 +2934,17 @@ async def playground_execute(
             headers={**streaming.SSE_HEADERS, **rate_headers, "X-Request-Id": request_id},
         )
 
+    # 2026-09-13 (adversarial review; the `/v1` finding applies here too): a
+    # playground run whose browser has gone gives its gate, its slot and the
+    # engine back at once, not when a generation nobody reads has finished.
+    outcome = streaming.new_outcome(spec)
+    client_gone = False
     try:
-        outcome = await streaming.run_to_completion(spec)
+        outcome = await streaming.run_to_completion_watching(
+            spec, receive=request.receive, outcome=outcome
+        )
+    except streaming.ClientGone:
+        client_gone = True
     except BaseException:
         # Raised or cancelled before `_record_playground`: the engine may have
         # run, so the estimate stays charged — but the reservation is settled
@@ -2479,26 +2953,39 @@ async def playground_execute(
         await settlement.may_have_run()
         raise
     finally:
-        slot.release()
+        await slot.release_all()
     await _record_playground(
         principal=principal,
         caller=caller,
         reservation=reservation,
         project=project,
         model=model,
+        plan=plan,
         request_id=request_id,
         outcome=outcome,
         streamed=False,
     )
+    if client_gone:
+        # Recorded above with what the engine produced; nobody is listening.
+        return JSONResponse(status_code=499, content=None)
     if outcome.error is not None:
         return _api_error_response(outcome.error, request_id, rate_headers)
+    body = outcome.response().to_wire()
+    # Relayed on the response (2026-09-13): the ceiling the generation ran
+    # under, and whether it stopped there. `setdefault`, so the pump's own
+    # values win the moment `Response` carries them.
+    body.setdefault("max_output_tokens", _applied_max_output_tokens(plan, outcome))
+    body.setdefault(
+        "incomplete_details",
+        {"reason": "max_output_tokens"} if outcome.finish_reason == "length" else None,
+    )
     return JSONResponse(
-        content=outcome.response().to_wire(),
+        content=body,
         headers={**rate_headers, "X-Request-Id": request_id},
     )
 
 
-def _estimate_input_tokens(messages: Sequence[Dict[str, str]]) -> int:
+def _estimate_input_tokens(messages: Sequence[Dict[str, Any]]) -> int:
     """The same pessimistic estimate `/v1` charges the input window with
     (`context.estimate_messages`). Imported late: `context` pulls the
     tokenizer stack, and the console's other routes must not need it."""

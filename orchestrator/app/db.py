@@ -2334,6 +2334,36 @@ CREATE TABLE IF NOT EXISTS platform_secrets (
 """
 
 
+_MIGRATION_V35 = """
+-- V35 (2026-09-13): the output ceiling a /v1 generation was actually given.
+--
+-- The owner raised the public max_output_tokens ceiling to 1,000,000 — the
+-- flagship model's whole context window — and decided that a request whose
+-- input plus max_output_tokens overflows that window is CLAMPED to what is
+-- left rather than refused. A clamp the caller cannot see is a silent
+-- truncation, so the applied ceiling is part of the response object, and
+-- `GET /v1/responses/{id}` reads it back from here. Written as the PLANNED
+-- value when the row is created, and as the exact APPLIED value when the
+-- generation ends. NULL only on rows written before this migration.
+--
+-- finish_reason is kept because `incomplete_details` ("the answer stopped at
+-- that ceiling") must survive for a background response read back hours
+-- later. Only the two reasons the wire vocabulary has; anything else (our own
+-- wall-clock stop) is a failure recorded in error_code, not a finish.
+--
+-- ADD COLUMN IF NOT EXISTS keeps the statement idempotent on a database that
+-- already has it; both columns are NULLable so no existing row is scanned or
+-- rewritten under the 15 s statement timeout.
+ALTER TABLE api_responses
+    ADD COLUMN IF NOT EXISTS max_output_tokens integer
+        CONSTRAINT api_responses_max_output_tokens CHECK
+        (max_output_tokens IS NULL OR max_output_tokens >= 1),
+    ADD COLUMN IF NOT EXISTS finish_reason text
+        CONSTRAINT api_responses_finish_reason CHECK
+        (finish_reason IS NULL OR finish_reason IN ('stop', 'length'));
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2369,6 +2399,7 @@ _MIGRATIONS: tuple = (
     (32, _MIGRATION_V32),
     (33, _MIGRATION_V33),
     (34, _MIGRATION_V34),
+    (35, _MIGRATION_V35),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -6872,9 +6903,11 @@ _API_RESPONSE_UPDATABLE = frozenset({
     "status", "streamed", "input_tokens", "output_tokens", "ttft_ms",
     "duration_ms", "error_code", "error_message", "output_text",
     "cancel_requested", "metadata", "started_at", "completed_at", "expires_at",
+    # V35 (2026-09-13): the applied output ceiling and why generation stopped.
+    "max_output_tokens", "finish_reason",
 })
 _API_RESPONSE_JSON = frozenset({"metadata"})
-_API_RESPONSE_TEXT = frozenset({"error_code", "error_message", "output_text"})
+_API_RESPONSE_TEXT = frozenset({"error_code", "error_message", "output_text", "finish_reason"})
 _API_RESPONSE_TERMINAL = ("completed", "failed", "cancelled")
 
 #: The columns a LIST read of `api_keys` returns. Spelled out rather than
@@ -7583,6 +7616,7 @@ def create_api_response(
     instructions_present: bool = False,
     metadata: Optional[dict] = None,
     expires_at: Optional[datetime] = None,
+    max_output_tokens: Optional[int] = None,
 ) -> dict:
     """The durable row a `/v1/responses` request gets BEFORE any expensive
     work, so a background request survives the client that asked for it.
@@ -7590,6 +7624,9 @@ def create_api_response(
     `expires_at` defaults to the project's own retention window, computed from
     the project row in the same statement — retention that depends on a
     caller remembering to pass a date is not retention.
+
+    `max_output_tokens` (V35) is the PLANNED output ceiling; the recorder
+    overwrites it with the applied one when the generation ends.
     """
     columns = [
         "id", "project_id", "workspace_id", "key_id", "model", "status",
@@ -7610,6 +7647,10 @@ def create_api_response(
         columns.append("metadata")
         selects.append("%s")
         params.append(_json_object("api_responses.metadata", metadata))
+    if max_output_tokens is not None:
+        columns.append("max_output_tokens")
+        selects.append("%s")
+        params.append(int(max_output_tokens))
     params.extend([project_id, workspace_id])
     with connection() as con:
         row = con.execute(

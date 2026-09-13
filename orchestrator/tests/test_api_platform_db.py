@@ -92,16 +92,17 @@ def _key(project_row, workspace_id, *, public_id="pub0000000000001", **kwargs) -
 # --------------------------------------------------------------- migration --
 
 
-def test_the_migration_list_ends_at_v34_and_the_test_database_is_fully_migrated():
+def test_the_migration_list_ends_at_v35_and_the_test_database_is_fully_migrated():
     versions = [version for version, _ddl in db._MIGRATIONS]
 
-    assert versions == list(range(1, 35))
-    assert db.LATEST_SCHEMA_VERSION == 34
-    assert db.schema_version() == 34
+    # V35 (2026-09-13): api_responses.max_output_tokens and finish_reason.
+    assert versions == list(range(1, 36))
+    assert db.LATEST_SCHEMA_VERSION == 35
+    assert db.schema_version() == 35
     # Applying an applied migration is a no-op, which is what makes the
     # startup path safe to run on every boot.
     db.init_schema()
-    assert db.schema_version() == 34
+    assert db.schema_version() == 35
 
 
 def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():
@@ -138,7 +139,7 @@ def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():
             highest = con.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-        assert highest == 34
+        assert highest == 35
         assert {
             "api_projects", "api_service_accounts", "api_keys", "api_responses",
             "api_idempotency", "api_usage_minute", "api_usage_daily",
@@ -2324,3 +2325,50 @@ def test_the_prune_decides_an_idempotency_claim_is_expired_on_the_database_clock
         )
     assert db.prune_api_platform()["api_idempotency"] == 0
     assert db.get_idempotency(project["id"], "/v1/responses", "idem-clock") is not None
+
+
+# ------------------------------------------------------------------- V35 --
+
+
+def test_a_response_row_keeps_its_planned_ceiling_and_then_the_applied_one(project, tenants):
+    """V35 (2026-09-13): a request may be CLAMPED to what the context window
+    leaves, so `GET /v1/responses/{id}` must be able to say what was applied —
+    and why the answer stopped — hours after a background job finished."""
+    row = db.create_api_response(
+        project["id"], tenants["a"], "techsara-35b", "req_1", max_output_tokens=1_000_000
+    )
+    assert row["max_output_tokens"] == 1_000_000 and row["finish_reason"] is None
+
+    updated = db.update_api_response(
+        row["id"], project["id"], max_output_tokens=699_488, finish_reason="length"
+    )
+    assert updated["max_output_tokens"] == 699_488
+    assert updated["finish_reason"] == "length"
+
+    untouched = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_2")
+    assert untouched["max_output_tokens"] is None
+
+
+def test_the_schema_refuses_a_ceiling_below_one_and_a_finish_reason_the_wire_does_not_have(
+    project, tenants
+):
+    row = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_1")
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.update_api_response(row["id"], project["id"], max_output_tokens=0)
+    # Our own wall-clock stop is a failure in error_code, never a finish.
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.update_api_response(row["id"], project["id"], finish_reason="wall_clock")
+
+
+def test_the_v35_migration_is_idempotent_on_a_database_that_already_has_it():
+    with db.connection() as con:
+        con.execute(db._MIGRATION_V35)
+        con.execute(db._MIGRATION_V35)
+        columns = {
+            row["column_name"] if isinstance(row, dict) else row[0]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'api_responses'"
+            ).fetchall()
+        }
+    assert {"max_output_tokens", "finish_reason"} <= columns

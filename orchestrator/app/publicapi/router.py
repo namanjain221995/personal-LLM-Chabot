@@ -1,4 +1,14 @@
-"""`/v1` — the eight public endpoints of CONTRACT §7.
+"""`/v1` — the public endpoints of CONTRACT §7.
+
+SIX MODELS, TWO GENERATING ROUTES (2026-09-13). `POST /v1/responses` and
+`POST /v1/chat/completions` serve every chat-kind model in the registry —
+techsara-35b on the main engine, techsara-8b-vision on the router,
+techsara-ocr on Unlimited-OCR — with image input for the ones that see, a
+1,000,000-token output ceiling on the flagship clamped to what its context
+window leaves, and a per-engine capacity gate in front of the engines the chat
+app shares. What each request may be is decided once, by
+`publicapi/planning.py`, before admission; the embeddings, rerank and speech
+routes are added from `publicapi/endpoints.py` by the hook at the bottom.
 
 THE SHAPE OF EVERY ROUTE IS THE SAME, AND THE ORDER IS THE POINT (CONTRACT §4):
 
@@ -89,10 +99,13 @@ from ..apiplatform.resolver import ApiCaller
 from ..apiplatform.scopes import InsufficientScopeError, Scope, requires
 from . import (
     background,
+    capacity,
+    engines,
     errors,
     events,
     models,
     openapi as openapi_module,
+    planning,
     registry,
     streaming,
 )
@@ -128,13 +141,22 @@ PREFLIGHT_HEADERS: Dict[str, str] = {
 #: `Retry-After` its own retry logic depends on.
 _EXPOSE_HEADERS = "X-Request-Id, RateLimit, RateLimit-Policy, Retry-After"
 
-#: CONTRACT §12: "8,192 default, model ceiling max | clamped".
+#: CONTRACT §12: "8,192 default". The live number is
+#: PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS, read by the registry per request;
+#: this constant is the documented default, kept for readers of the contract.
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
 #: CONTRACT §8's default when the caller does not ask for one. 0.2 is what the
 #: chat application asks for, and an API that answered a repeated question
-#: differently from the product would be the more surprising choice.
+#: differently from the product would be the more surprising choice. Per model
+#: since 2026-09-13 (`PublicModel.default_temperature`: OCR reads at 0.0).
 DEFAULT_TEMPERATURE = 0.2
+
+#: Above this many body bytes the JSON is decoded — and the request validated,
+#: which base64-decodes every image — in a worker thread. A 20 MiB image body
+#: parsed on the event loop stalls every chat stream in the process for the
+#: length of the parse: the shape of the 2026-09-05 Fast-mode regression.
+OFF_LOOP_BODY_BYTES = 64 * 1024
 
 #: `GET /v1/usage` over an unbounded range is a client-supplied result size —
 #: OWASP API4. The same bound `db.read_usage_daily` enforces, named here so the
@@ -463,7 +485,15 @@ def _completion_id(response_id: str) -> str:
 
 
 async def _authorize(request: Request, caller: ApiCaller, operation: str) -> None:
+    """Scope, then origin, for one of THIS file's routes (`SCOPES`)."""
+    await authorize_scope(request, caller, SCOPES[operation])
+
+
+async def authorize_scope(request: Request, caller: ApiCaller, requirement: Any) -> None:
     """Scope, then origin. In that order, and both before any work.
+
+    Public (2026-09-13) so `publicapi/endpoints.py` applies the SAME two
+    checks to its routes with its own requirement, rather than a copy.
 
     The scope answers "may this credential call this endpoint at all"; the
     origin answers "may this BROWSER use this credential from where it is".
@@ -471,7 +501,7 @@ async def _authorize(request: Request, caller: ApiCaller, operation: str) -> Non
     applies only when the request carries one, because that is the only case
     where the answer is a browser's to enforce.
     """
-    SCOPES[operation].check(caller.scopes)
+    requirement.check(caller.scopes)
     origin = request.headers.get("origin")
     if not origin:
         return
@@ -511,136 +541,37 @@ async def _resolve_model(caller: ApiCaller, model_id: str) -> registry.PublicMod
     return model
 
 
-async def _json_body(request: Request) -> Any:
+async def _json_body(request: Request, *, limit: Optional[int] = None) -> Any:
     """The decoded body, refused by SIZE before it is parsed (CONTRACT §8).
 
     Two checks, not one. `Content-Length` is the cheap refusal and it is what
     stops us reading a gigabyte; the length of what actually arrived is the
     honest one, because a chunked request declares no length at all and a lying
     one declares whatever it likes.
+
+    `limit` is the TRANSPORT cap: 20 MiB on the generating routes since
+    2026-09-13 (images), where the 1 MiB rule moves to the TEXT inside the
+    body (`models.parse_responses_request`). The body length is left on
+    `request.state` so the caller can validate a large one off the loop.
     """
-    limit = models.max_body_bytes()
+    limit = models.max_body_bytes() if limit is None else int(limit)
     declared = request.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > limit:
         raise errors.request_too_large(limit)
     raw = await request.body()
+    request.state.public_body_bytes = len(raw)
     if len(raw) > limit:
         raise errors.request_too_large(limit)
     if not raw.strip():
         raise errors.invalid_request("The request body must be a JSON object.")
     try:
+        if len(raw) > OFF_LOOP_BODY_BYTES:
+            return await asyncio.to_thread(json.loads, raw)
         return json.loads(raw)
     except ValueError:
         # The decoder's own message names a byte offset into the caller's body,
         # which is their prompt. CONTRACT §16: we do not echo it.
         raise errors.invalid_request("The request body is not valid JSON.") from None
-
-
-def _context_limit_error(
-    caller: ApiCaller, model_id: str, bounded_input_tokens: int
-) -> Optional[errors.ApiError]:
-    """CONTRACT §8/§12: input over the model's ceiling is a 400, BEFORE admission.
-
-    `bounded_input_tokens` MUST be a count the real prompt cannot exceed —
-    `context.upper_bound_messages`, never `context.estimate_messages`. A hard
-    ceiling decided on the 3-chars-per-token estimate was gameable DOWN
-    (re-verifier probe, 2026-09-13): the Qwen pre-tokenizer isolates every
-    digit, so `input="7"*2900` estimated at 974 tokens, passed a project
-    `max_input_tokens=1000` and reached the engine as ~2,900 real tokens; a
-    1 MiB digit body (~1.05M tokens) estimated at ~350k and passed the 1M
-    window. A byte-level BPE spends at most one token per UTF-8 byte, so the
-    byte length is a bound no caller can push below the truth.
-
-    THE TRADE-OFF, accepted deliberately: a legitimate prose prompt runs at
-    roughly 3-4 bytes per token (more for non-Latin scripts), so a prompt
-    whose REAL count is inside the ceiling but whose byte length is up to a
-    few times the ceiling is refused. A false refusal is a 400 the developer
-    can act on (shorten, or raise the project ceiling); a false admission is
-    a documented hard limit that does not hold and an oversized prompt in
-    the lanes shared with the chat app. The engine's `/tokenize` would be
-    exact, but it is another dependency on the hot path and `/v1` calls
-    `stream_chat_events` and nothing lower (CONTRACT §11).
-
-    Never raised anywhere until 2026-09-13 (verifier finding): a prompt over
-    the context window went through the quota gate and into the shared
-    admission lanes, and came back as whatever the engine's refusal mapped to
-    — usually a 500.
-
-    The ceiling is the smaller of the model's (`registry`, read from the
-    settings the engine was started with) and the project's
-    `max_input_tokens`. The project's value obeys the platform rule that 0
-    means ZERO and only None inherits. The registry's 0 is different: it means
-    the deployment never told us its window, and inventing one would refuse
-    requests the engine would serve, so that one is skipped.
-
-    Resolved against the DECLARED registry (no database read): an override
-    can only disable a model, never change its window, and the 404 for a
-    model this key may not use is still decided by `_resolve_model` later.
-    """
-    declared = registry.resolve_public_model(model_id, allowed=caller.models, overrides=None)
-    if declared is None:
-        return None
-    ceilings = []
-    if int(declared.max_input_tokens or 0) > 0:
-        ceilings.append(int(declared.max_input_tokens))
-    project_ceiling = getattr(caller.limits, "max_input_tokens", None)
-    if project_ceiling is not None:
-        ceilings.append(max(0, int(project_ceiling)))
-    if not ceilings:
-        return None
-    limit = min(ceilings)
-    if int(bounded_input_tokens) > limit:
-        return errors.context_length_exceeded(
-            requested=int(bounded_input_tokens), limit=limit, upper_bound=True
-        )
-    return None
-
-
-def _max_tokens(
-    request_model: models.ResponsesRequest,
-    model: registry.PublicModel,
-    caller: Optional[ApiCaller] = None,
-) -> int:
-    """How many tokens this request may generate — VALIDATED EARLY.
-
-    Called before the durable row is written, not with the spec afterwards: an
-    explicit `max_output_tokens` over the ceiling is a 400 (CONTRACT §8), and
-    a 400 that has already inserted an `api_responses` row leaves a permanent
-    record of a request that never ran. The ceiling is the model's, narrowed
-    by the project's `max_output_tokens` when it sets one (0 means zero).
-    """
-    ceiling = max(1, int(model.max_output_tokens or DEFAULT_MAX_OUTPUT_TOKENS))
-    project_ceiling = getattr(getattr(caller, "limits", None), "max_output_tokens", None)
-    if project_ceiling is not None:
-        if int(project_ceiling) < 1:
-            raise errors.invalid_request(
-                "This project may not generate output tokens.", param="max_output_tokens"
-            )
-        ceiling = min(ceiling, int(project_ceiling))
-    return request_model.resolve_max_output_tokens(
-        ceiling=ceiling, default=DEFAULT_MAX_OUTPUT_TOKENS
-    )
-
-
-def _spec(
-    request_model: models.ResponsesRequest,
-    model: registry.PublicModel,
-    response_id: str,
-    created_at: int,
-    max_tokens: int,
-) -> streaming.GenerationSpec:
-    return streaming.GenerationSpec(
-        response_id=response_id,
-        model=model.id,
-        messages=request_model.chat_messages(),
-        max_tokens=max_tokens,
-        temperature=(
-            DEFAULT_TEMPERATURE
-            if request_model.temperature is None
-            else float(request_model.temperature)
-        ),
-        created_at=created_at,
-    )
 
 
 # ------------------------------------------------------------ recording --
@@ -655,6 +586,7 @@ def _recorder(
     streamed: bool,
     held: Optional[idempotency.Claim] = None,
     reservation: Any = None,
+    plan: Optional[planning.GenerationPlan] = None,
 ) -> streaming.OnFinish:
     """The one write per request of CONTRACT §16, plus the durable row.
 
@@ -676,6 +608,11 @@ def _recorder(
 
     async def finish(outcome: streaming.StreamOutcome) -> None:
         counted = outcome.usage_model()
+        usage_source = (
+            None
+            if counted is None
+            else str((outcome.usage or {}).get("source") or "engine")
+        )
         input_tokens = None if counted is None else counted.input_tokens
         output_tokens = None if counted is None else counted.output_tokens
         await usage_ledger.record_async(
@@ -700,6 +637,26 @@ def _recorder(
                 "project_id": project_id,
                 "request_id": request_id,
                 "streamed": bool(streamed),
+                # 2026-09-13: "engine" when vLLM reported the counts,
+                # "counted_at_stop" when a wall clock cut the stream before
+                # its usage chunk and this server counted (CONTRACT §8.3).
+                "usage_source": usage_source,
+                # 2026-09-13: what was asked for, what the window allowed,
+                # and the clock this generation ran under — the numbers a
+                # "why did my 1M answer stop" conversation starts from.
+                **(
+                    {}
+                    if plan is None
+                    else {
+                        "max_output_tokens_requested": plan.requested_max_output_tokens,
+                        "max_output_tokens_applied": outcome.max_output_tokens,
+                        "clamped": bool(
+                            outcome.max_output_tokens is not None
+                            and outcome.max_output_tokens < plan.requested_max_output_tokens
+                        ),
+                        "wall_clock_s": plan.wall_clock_s,
+                    }
+                ),
             },
         )
         # The quota ledgers, ONCE per request and never per token. The
@@ -736,6 +693,7 @@ def _recorder(
         if outcome.error is not None:
             fields["error_code"] = outcome.error.code
             fields["error_message"] = errors.redact(outcome.error.message)
+        fields.update(background.persisted_generation_fields(outcome))
         try:
             await db.run_in_thread(
                 db.update_api_response, response_id, project_id, **fields
@@ -754,6 +712,7 @@ async def _claim_row(
     response_id: str,
     *,
     status: str = "queued",
+    max_output_tokens: Optional[int] = None,
 ) -> None:
     """The durable `api_responses` row for a synchronous or streamed request.
 
@@ -780,6 +739,7 @@ async def _claim_row(
             streamed=bool(request_model.stream),
             instructions_present=bool(request_model.instructions),
             metadata=dict(request_model.metadata or {}),
+            max_output_tokens=max_output_tokens,
         )
     )
 
@@ -826,37 +786,104 @@ class _Parsed:
     #: 2026-09-13: validation failures were unmetered).
     deferred: Optional[errors.ApiError] = None
     estimate: int = 0
+    #: The generation as planned against the DECLARED registry (2026-09-13).
+    plan: Optional[planning.GenerationPlan] = None
+    #: A plan refusal that is not about input size (the endpoint, images,
+    #: max_output_tokens). Raised only after the model has been resolved, so
+    #: a model this key may not use is still the 404 first.
+    plan_error: Optional[errors.ApiError] = None
+
+
+def _declared_for(caller: ApiCaller, model_id: str) -> Optional[registry.PublicModel]:
+    """The model as the CODE declares it for this key — no database read.
+    An override can only disable a model, never change its window, and the
+    404 for a disabled one is still decided by `_resolve_model` later."""
+    return registry.resolve_public_model(model_id, allowed=caller.models, overrides=None)
 
 
 async def _parse_generating(
-    request: Request, caller: ApiCaller, parse: Callable[[Any], Tuple[models.ResponsesRequest, bool]]
+    request: Request,
+    caller: ApiCaller,
+    parse: Callable[[Any], Tuple[models.ResponsesRequest, bool]],
+    endpoint: str = registry.ENDPOINT_RESPONSES,
 ) -> _Parsed:
     parsed = _Parsed()
     try:
-        parsed.payload = await _json_body(request)
-        parsed.request_model, parsed.include_usage = parse(parsed.payload)
+        parsed.payload = await _json_body(request, limit=models.max_media_body_bytes())
+        if int(getattr(request.state, "public_body_bytes", 0) or 0) > OFF_LOOP_BODY_BYTES:
+            parsed.request_model, parsed.include_usage = await asyncio.to_thread(
+                parse, parsed.payload
+            )
+        else:
+            parsed.request_model, parsed.include_usage = parse(parsed.payload)
     except errors.ApiError as refusal:
         parsed.deferred = refusal
         return parsed
-    messages = parsed.request_model.chat_messages()
-    # Two different counts for two different decisions (2026-09-13). The HARD
-    # ceiling refuses on the byte bound, which a caller cannot game down (see
-    # `_context_limit_error`). The SOFT input-TPM reservation keeps the
-    # estimate: `quotas.record_usage(reservation=)` settles it to the measured
-    # count when the request ends, so an under-estimate there self-corrects,
-    # and reserving the byte bound would spend 3-4x a prose prompt's budget
-    # for the length of the request.
-    too_long = _context_limit_error(
-        caller, parsed.request_model.model, context.upper_bound_messages(messages)
-    )
-    estimate = context.estimate_messages(messages)
-    if too_long is not None:
-        # Refused, so it spends no input-token budget — but it still spends a
-        # request, like any other refusal after the gate.
-        parsed.deferred = too_long
+    declared = _declared_for(caller, parsed.request_model.model)
+    if declared is None:
+        # The 404 is `_generate`'s, after admission. The soft reservation
+        # still needs an estimate.
+        parsed.estimate = context.estimate_messages(parsed.request_model.chat_messages())
         return parsed
-    parsed.estimate = estimate
+    if declared.engine in engines.SIDECAR_CHAT_ENGINES:
+        # Narrow-only and cached for five minutes: the engine's own served
+        # window may shrink the public ceiling, never widen it.
+        await engines.served_window(declared.engine)
+        declared = _declared_for(caller, parsed.request_model.model) or declared
+    limits = getattr(caller, "limits", None)
+    try:
+        # Two different counts for two different decisions (2026-09-13). The
+        # HARD input ceiling refuses on the byte bound, which a caller cannot
+        # game down (`planning.plan_generation`, step 2); the SOFT input-TPM
+        # reservation keeps the estimate, which `quotas.record_usage` settles
+        # to the measured count when the request ends.
+        parsed.plan = await _plan(
+            parsed.request_model,
+            declared,
+            project_max_output_tokens=getattr(limits, "max_output_tokens", None),
+            project_max_input_tokens=getattr(limits, "max_input_tokens", None),
+            endpoint=endpoint,
+            large=int(getattr(request.state, "public_body_bytes", 0) or 0) > OFF_LOOP_BODY_BYTES,
+        )
+    except errors.ApiError as refusal:
+        if refusal.code == "context_length_exceeded":
+            # Refused, so it spends no input-token budget — but it still
+            # spends a request, like any other refusal after the gate.
+            parsed.deferred = refusal
+            return parsed
+        parsed.plan_error = refusal
+        parsed.estimate = context.estimate_messages(parsed.request_model.chat_messages())
+        return parsed
+    parsed.estimate = parsed.plan.estimated_input_tokens
     return parsed
+
+
+async def _plan(
+    request_model: models.ResponsesRequest,
+    model: registry.PublicModel,
+    *,
+    large: bool,
+    **kwargs: Any,
+) -> planning.GenerationPlan:
+    """`planning.plan_generation`, off the loop for a large body: counting a
+    megabyte of text byte by byte is CPU the chat streams would wait for."""
+    call = functools.partial(planning.plan_generation, request_model, model, **kwargs)
+    if large:
+        return await asyncio.to_thread(call)
+    return call()
+
+
+def _reserved_output(parsed: _Parsed) -> Optional[int]:
+    """The output reservation for admission (`planning.reservation_output_tokens`)."""
+    if parsed.plan is not None:
+        return planning.reservation_output_tokens(
+            parsed.plan, limits_enforced=quotas.limits_enforced()
+        )
+    # `request_model` is None when validation failed: the 400 is DEFERRED
+    # until after admission so a malformed request still counts against the
+    # rate limit. Reading an attribute off it turned every invalid body into
+    # a 500 (caught by the end-to-end run, 2026-09-13).
+    return getattr(parsed.request_model, "max_output_tokens", None)
 
 
 def _kind_of(request_model: Optional[models.ResponsesRequest]) -> str:
@@ -875,17 +902,15 @@ def _parse_responses(payload: Any) -> Tuple[models.ResponsesRequest, bool]:
 async def create_response(request: Request, caller: ApiCaller = Depends(resolve_caller)) -> Response:
     """Sync, streaming or background — CONTRACT §8, §10, §11, §13, §14."""
     await _authorize(request, caller, "create_response")
-    parsed = await _parse_generating(request, caller, _parse_responses)
+    parsed = await _parse_generating(
+        request, caller, _parse_responses, registry.ENDPOINT_RESPONSES
+    )
     reservation = await _admit(
         request,
         caller,
         kind=_kind_of(parsed.request_model),
         estimated_input_tokens=parsed.estimate,
-        # `request_model` is None when validation failed: the 400 is DEFERRED
-        # until after admission so a malformed request still counts against
-        # the rate limit. Reading an attribute off it turned every invalid
-        # body into a 500 (caught by the end-to-end run, 2026-09-13).
-        max_output_tokens=getattr(parsed.request_model, "max_output_tokens", None),
+        max_output_tokens=_reserved_output(parsed),
     )
     if parsed.deferred is not None:
         raise parsed.deferred
@@ -942,17 +967,15 @@ async def create_chat_completion(
     endpoints end up with two different ideas of what `max_tokens` means.
     """
     await _authorize(request, caller, "create_chat_completion")
-    parsed = await _parse_generating(request, caller, _from_chat_completions)
+    parsed = await _parse_generating(
+        request, caller, _from_chat_completions, registry.ENDPOINT_CHAT_COMPLETIONS
+    )
     reservation = await _admit(
         request,
         caller,
         kind=_kind_of(parsed.request_model),
         estimated_input_tokens=parsed.estimate,
-        # `request_model` is None when validation failed: the 400 is DEFERRED
-        # until after admission so a malformed request still counts against
-        # the rate limit. Reading an attribute off it turned every invalid
-        # body into a 500 (caught by the end-to-end run, 2026-09-13).
-        max_output_tokens=getattr(parsed.request_model, "max_output_tokens", None),
+        max_output_tokens=_reserved_output(parsed),
     )
     if parsed.deferred is not None:
         raise parsed.deferred
@@ -966,25 +989,33 @@ async def _generate(
 
     The order, and why:
 
-    1. the model (404) and the output ceiling (400) — cheap, and before any
-       write;
+    1. the model (404), then the plan's own refusals (400: endpoint, images,
+       output ceiling) — cheap, and before any write;
     2. the `Idempotency-Key` claim, so a replay answers without a slot, a row
        or the engine;
     3. background → `background.start`, the ONE background implementation
        (it takes the project's concurrency slot for the job's whole life and
        writes the row);
-    4. streaming → `_SlotStream`, which takes the slot INSIDE the response
-       call that also releases it;
-    5. synchronous → the slot around the row and the generation, in this
-       coroutine.
+    4. streaming → `_SlotStream`, which takes the slot — and the engine's
+       capacity gate — INSIDE the response call that also releases them;
+    5. synchronous → the slot and the gate around the row and the
+       generation, in this coroutine.
+
+    A capacity-gate wait for 4 and 5 happens BEFORE the status line, bounded
+    by PUBLIC_API_GATE_WAIT_S (30 s), so a refusal is a real 503 with a
+    Retry-After. A background job waits inside its own task instead.
     """
     request_model = parsed.request_model
     assert request_model is not None
     route = "v1_chat_completions" if chat else "v1_responses"
     request_id = _request_id(request)
     try:
-        model = await _resolve_model(caller, request_model.model)
-        max_tokens = _max_tokens(request_model, model, caller)
+        await _resolve_model(caller, request_model.model)
+        if parsed.plan_error is not None:
+            raise parsed.plan_error
+        plan = parsed.plan
+        if plan is None:  # pragma: no cover - a resolved model always has a plan
+            raise errors.internal_error()
         held = await _claim_idempotency(request, caller, route, parsed.payload)
         if held is not None and not held.claimed:
             await _nothing_ran(caller, reservation, None)
@@ -998,7 +1029,7 @@ async def _generate(
     try:
         response_id = _new_response_id()
         created = int(time.time())
-        spec = _spec(request_model, model, response_id, created, max_tokens)
+        spec = streaming.spec_from_plan(plan, response_id=response_id, created_at=created)
         on_finish = _recorder(
             caller,
             route=route,
@@ -1007,6 +1038,7 @@ async def _generate(
             streamed=request_model.stream,
             held=held,
             reservation=reservation,
+            plan=plan,
         )
 
         if request_model.background:
@@ -1039,10 +1071,16 @@ async def _generate(
                 caller=caller,
                 request=request,
                 prepare=functools.partial(
-                    _claim_row, caller, request_id, request_model, response_id
+                    _claim_row,
+                    caller,
+                    request_id,
+                    request_model,
+                    response_id,
+                    max_output_tokens=spec.planned,
                 ),
                 on_refused=functools.partial(_nothing_ran, caller, reservation, held),
                 on_abandoned=functools.partial(_record_abandoned, spec, on_finish),
+                capacity_for=functools.partial(_capacity_gate, plan),
             )
     except BaseException:
         await _nothing_ran(caller, reservation, held)
@@ -1061,9 +1099,29 @@ async def _generate(
     generating = False
     try:
         with quotas.concurrency_slot(caller, KIND_SYNC):
-            await _claim_row(caller, request_id, request_model, response_id, status="in_progress")
-            generating = True
-            outcome = await streaming.run_to_completion(spec, outcome=partial)
+            async with _capacity_gate(plan):
+                await _claim_row(
+                    caller,
+                    request_id,
+                    request_model,
+                    response_id,
+                    status="in_progress",
+                    max_output_tokens=spec.planned,
+                )
+                generating = True
+                # Watching the client (adversarial review 2026-09-13): an
+                # abandoned synchronous request must give its gate, its
+                # admission slot and the engine back when its caller leaves,
+                # not when a generation nobody will read has finished.
+                outcome = await streaming.run_to_completion_watching(
+                    spec, receive=request.receive, outcome=partial
+                )
+    except streaming.ClientGone:
+        # Recorded like any cancellation that ran: charged for what the engine
+        # produced, the row leaves `in_progress`. Nobody reads the answer; the
+        # nginx-style 499 is for the access log.
+        await streaming.settle(on_finish, partial)
+        return Response(status_code=499)
     except BaseException as exc:
         if not generating:
             await _nothing_ran(caller, reservation, held)
@@ -1095,7 +1153,22 @@ async def _generate(
             content=outcome.text,
             finish_reason=outcome.chat_finish_reason(),
             usage=counted,
+            max_output_tokens=outcome.max_output_tokens,
         )
+    )
+
+
+def _capacity_gate(plan: planning.GenerationPlan) -> Any:
+    """The capacity gate a synchronous or streaming generation holds, or a
+    no-op when its engine needs none (NORMAL-lane techsara-35b work is gated
+    by the shared admission lanes inside `llm.stream_chat_events`)."""
+    if not plan.gate_engine:
+        return contextlib.nullcontext()
+    return capacity.hold(
+        plan.gate_engine,
+        weight_tokens=plan.gate_weight_tokens,
+        wait_s=capacity.sync_wait_s(),
+        yield_to_chat=plan.yield_to_chat,
     )
 
 
@@ -1107,8 +1180,9 @@ def _chat_body(
     content: Optional[str],
     finish_reason: str,
     usage: Optional[models.Usage],
+    max_output_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return {
+    body = {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(created),
@@ -1132,6 +1206,11 @@ def _chat_body(
             }
         ),
     }
+    # A top-level EXTENSION (2026-09-13): the output ceiling actually applied,
+    # which the window may have clamped below the `max_tokens` sent.
+    # OpenAI-derived clients ignore a key they do not know.
+    body["max_output_tokens"] = max_output_tokens
+    return body
 
 
 @router.get("/usage", operation_id="getUsage")
@@ -1278,6 +1357,7 @@ class _SlotStream(StreamingResponse):
         on_refused: Callable[[], Awaitable[None]],
         on_abandoned: Callable[[], Awaitable[None]],
         kind: str = KIND_STREAM,
+        capacity_for: Optional[Callable[[], Any]] = None,
     ) -> None:
         super().__init__(frames, media_type="text/event-stream", headers=streaming.SSE_HEADERS)
         self._frames = frames
@@ -1287,6 +1367,11 @@ class _SlotStream(StreamingResponse):
         self._on_refused = on_refused
         self._on_abandoned = on_abandoned
         self._kind = kind
+        #: The engine's capacity gate (2026-09-13), taken in the same place as
+        #: the slot and for the same reason: before the status line, so a
+        #: refusal is a real 503; released by the same block, however the
+        #: response ends.
+        self._capacity_for = capacity_for or contextlib.nullcontext
         self.started = False
         self.body_iterator = self._tracked()
 
@@ -1311,18 +1396,19 @@ class _SlotStream(StreamingResponse):
         admitted = False
         try:
             with quotas.concurrency_slot(self._caller, self._kind):
-                admitted = True
-                try:
-                    await self._prepare()
-                except Exception as exc:  # noqa: BLE001 - still before the status line
-                    await _shielded(self._on_refused(), "release the idempotency key")
-                    failure = exc if isinstance(exc, errors.ApiError) else errors.from_unexpected(exc)
-                    await self._refusal(failure)(scope, receive, send)
-                    return
-                try:
-                    await super().__call__(scope, receive, send)
-                finally:
-                    await _shielded(self._close(), "close the stream")
+                async with self._capacity_for():
+                    admitted = True
+                    try:
+                        await self._prepare()
+                    except Exception as exc:  # noqa: BLE001 - still before the status line
+                        await _shielded(self._on_refused(), "release the idempotency key")
+                        failure = exc if isinstance(exc, errors.ApiError) else errors.from_unexpected(exc)
+                        await self._refusal(failure)(scope, receive, send)
+                        return
+                    try:
+                        await super().__call__(scope, receive, send)
+                    finally:
+                        await _shielded(self._close(), "close the stream")
         except errors.ApiError as refusal:
             if admitted:
                 raise
@@ -1376,13 +1462,22 @@ def _row_to_wire(row: Mapping[str, Any]) -> Dict[str, Any]:
         error = models.ResponseError(
             code=str(row["error_code"]), message=str(row.get("error_message") or "")
         )
+    status = str(row.get("status") or "queued")
+    stored_ceiling = row.get("max_output_tokens")
     return models.Response(
         id=str(row["id"]),
         created_at=_row_created(row),
-        status=str(row.get("status") or "queued"),  # type: ignore[arg-type]
+        status=status,  # type: ignore[arg-type]
         model=str(row.get("model") or ""),
         output=[models.OutputMessage.of(text)] if text else [],
         usage=_row_usage(row),
+        # V35: null only for a row written before the column existed.
+        max_output_tokens=(int(stored_ceiling) if stored_ceiling else None),
+        incomplete_details=(
+            models.IncompleteDetails.for_finish(row.get("finish_reason"))
+            if status == "completed"
+            else None
+        ),
         error=error,
     ).to_wire()
 
@@ -1557,8 +1652,9 @@ async def _replay(
                 created=_row_created(row),
                 model=str(row.get("model") or ""),
                 content=text,
-                finish_reason="stop",
+                finish_reason=streaming.chat_finish_reason(row.get("finish_reason")),
                 usage=_row_usage(row),
+                max_output_tokens=(int(row["max_output_tokens"]) if row.get("max_output_tokens") else None),
             )
         )
     return StreamingResponse(
@@ -1583,7 +1679,10 @@ async def _replay_frames(
         if status == "failed":
             yield chunks.error_chunk(_row_error(row))
         else:
-            yield chunks.stop("stop")
+            yield chunks.stop(
+                streaming.chat_finish_reason(row.get("finish_reason")),
+                max_output_tokens=(int(row["max_output_tokens"]) if row.get("max_output_tokens") else None),
+            )
             if include_usage:
                 counted = _row_usage(row)
                 yield chunks.usage_chunk(
@@ -1612,15 +1711,74 @@ async def _replay_frames(
 #: naming the field, for the reason CONTRACT §8 gives: a sampling parameter
 #: that is accepted and dropped cannot be detected by the caller, and an API
 #: whose knobs might be decorative is an API nobody can build on.
-_CHAT_FIELDS = ("model", "messages", "stream", "max_tokens", "temperature", "stream_options")
+_CHAT_FIELDS = (
+    "model",
+    "messages",
+    "stream",
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "stream_options",
+)
+
+
+def _chat_content(content: Any, where: str) -> Any:
+    """Chat Completions content → the Responses content the one validator reads.
+
+    A string stays a string. A part list may hold `{"type": "text", "text"}`
+    and `{"type": "image_url", "image_url": {"url", "detail"?}}` and nothing
+    else; each becomes its Responses twin (`input_text` / `input_image`), so
+    the data-URL rule, the size limit and the magic-byte check are applied by
+    exactly one piece of code for both dialects.
+    """
+    if not isinstance(content, list):
+        return content
+    converted = []
+    for index, part in enumerate(content):
+        param = f"{where}.{index}"
+        if not isinstance(part, Mapping):
+            raise errors.invalid_request("Each content part must be an object.", param=param)
+        kind = part.get("type")
+        if kind == "text":
+            unknown = sorted(key for key in part if key not in ("type", "text"))
+            if unknown:
+                raise errors.invalid_request(
+                    f"Unsupported field in a text part: {unknown[0]}.", param=param
+                )
+            converted.append({"type": "input_text", "text": part.get("text")})
+        elif kind == "image_url":
+            unknown = sorted(key for key in part if key not in ("type", "image_url"))
+            image = part.get("image_url")
+            if unknown or not isinstance(image, Mapping):
+                raise errors.invalid_request(
+                    "An image_url part must be {\"type\": \"image_url\", "
+                    "\"image_url\": {\"url\": \"data:…\"}}.",
+                    param=param,
+                )
+            extra = sorted(key for key in image if key not in ("url", "detail"))
+            if extra:
+                raise errors.invalid_request(
+                    f"Unsupported field in image_url: {extra[0]}.", param=f"{param}.image_url"
+                )
+            item: Dict[str, Any] = {"type": "input_image", "image_url": image.get("url")}
+            if image.get("detail") is not None:
+                item["detail"] = image.get("detail")
+            converted.append(item)
+        else:
+            raise errors.invalid_request(
+                "Each content part must have type text or image_url.", param=param
+            )
+    return converted
 
 
 def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]:
     """The compatibility body → the one validated request type.
 
-    `max_tokens` is the older spelling of `max_output_tokens` and is mapped;
-    `stream_options.include_usage` is not a generation parameter at all but a
-    framing one, so it is taken out here and handed to the chunk builder.
+    `max_tokens` and its newer spelling `max_completion_tokens` both map to
+    `max_output_tokens`, and sending both is a 400 rather than a guess at
+    which one was meant; `stream_options.include_usage` is not a generation
+    parameter at all but a framing one, so it is taken out here and handed to
+    the chunk builder.
     """
     if not isinstance(payload, Mapping):
         raise errors.invalid_request("The request body must be a JSON object.")
@@ -1640,13 +1798,31 @@ def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]
             f"Unsupported stream option: {sorted(unknown_options)[0]}.",
             param="stream_options",
         )
+    if payload.get("max_tokens") is not None and payload.get("max_completion_tokens") is not None:
+        raise errors.invalid_request(
+            "Send max_tokens or max_completion_tokens, not both.",
+            param="max_completion_tokens",
+        )
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        messages = [
+            (
+                {**message, "content": _chat_content(message.get("content"), f"messages.{index}.content")}
+                if isinstance(message, Mapping) and "content" in message
+                else message
+            )
+            for index, message in enumerate(messages)
+        ]
     body: Dict[str, Any] = {
         "model": payload.get("model"),
-        "input": payload.get("messages"),
+        "input": messages,
         "stream": bool(payload.get("stream", False)),
     }
-    if payload.get("max_tokens") is not None:
-        body["max_output_tokens"] = payload["max_tokens"]
+    ceiling = payload.get("max_tokens")
+    if ceiling is None:
+        ceiling = payload.get("max_completion_tokens")
+    if ceiling is not None:
+        body["max_output_tokens"] = ceiling
     if payload.get("temperature") is not None:
         body["temperature"] = payload["temperature"]
     return models.parse_responses_request(body), bool(options.get("include_usage", False))
@@ -1671,3 +1847,83 @@ def install_error_handlers(app: Any) -> None:
         response = _error_body(exc, request_id)
         _decorate(request, response, request_id)
         return response
+
+
+# ---------------------------------------------- helpers other files use --
+#
+# PUBLIC NAMES for the seams `publicapi/endpoints.py` builds on (2026-09-13):
+# the same order and the same refusals as the routes above, rather than a copy
+# of them in a second file that would drift.
+
+
+async def admit(
+    request: Request,
+    caller: ApiCaller,
+    *,
+    kind: str,
+    estimated_input_tokens: int = 0,
+    max_output_tokens: Optional[int] = None,
+):
+    """`_admit`: count this request once and admit it."""
+    return await _admit(
+        request,
+        caller,
+        kind=kind,
+        estimated_input_tokens=estimated_input_tokens,
+        max_output_tokens=max_output_tokens,
+    )
+
+
+async def resolve_model(caller: ApiCaller, model_id: str) -> registry.PublicModel:
+    """`_resolve_model`: the model for this request, or 404 — never 403."""
+    return await _resolve_model(caller, model_id)
+
+
+def request_id(request: Request) -> str:
+    """The `X-Request-Id` this request carries."""
+    return _request_id(request)
+
+
+def error_response(exc: errors.ApiError, request_id: str) -> JSONResponse:
+    """The CONTRACT §9 envelope for `exc`, with its Retry-After."""
+    return _error_body(exc, request_id)
+
+
+# ---------------------------------------------------- the endpoints hook --
+
+#: Whether `publicapi/endpoints.py` added its routes, and why not when it did
+#: not — so a test and an operator can ask instead of inferring it from a 404.
+ENDPOINTS_MOUNTED = False
+ENDPOINTS_MOUNT_ERROR: Optional[str] = None
+
+
+def _register_endpoints() -> None:
+    """Add `/v1/embeddings`, `/v1/rerank` and `/v1/audio/transcriptions`.
+
+    LAST IN THE FILE, and guarded. Last because those routes build on the
+    helpers above, and a module importing this one half-way through would
+    read a half-built router. Guarded because several engineers share this
+    tree (tests/test_publicapi_mount.py's "will not import" rule): a broken
+    or half-written endpoints module logs and leaves the routes of this file
+    serving, instead of taking `/v1` — or, through main.py's own guard, the
+    whole developer platform — down with it.
+    """
+    global ENDPOINTS_MOUNTED, ENDPOINTS_MOUNT_ERROR
+    try:
+        from . import endpoints as _endpoints
+
+        _endpoints.register(router)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        ENDPOINTS_MOUNTED = False
+        ENDPOINTS_MOUNT_ERROR = type(exc).__name__
+        log.warning(
+            "the /v1 embeddings, rerank and transcription routes are not mounted (%s)",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return
+    ENDPOINTS_MOUNTED = True
+    ENDPOINTS_MOUNT_ERROR = None
+
+
+_register_endpoints()

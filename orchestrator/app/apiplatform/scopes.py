@@ -1,6 +1,6 @@
 """The scope vocabulary for the public developer API — closed, flat, and data.
 
-CONTRACT-3 §7. FOUR scopes exist and no fifth can be spelled: an unknown
+CONTRACT-3 §7. SEVEN scopes exist and no eighth can be spelled: an unknown
 string is a parse ERROR, never a silently-dropped entry. That rule is the
 whole point of this module. The alternative — tolerating an unrecognised
 scope — means a typo in a console form (`responses.wrte`) produces a key that
@@ -19,6 +19,22 @@ that do not exist would have meant a console offering a tick-box that grants
 nothing, and — the part that matters — a vocabulary drifting away from the
 document that is supposed to move first. If `/v1` ever grows webhook
 endpoints, amend CONTRACT-3 §7 and add the scopes back here, in that order.
+
+FROM FOUR TO SEVEN (2026-09-13, owner request: every model TechSara runs on
+`/v1`). `embeddings.write`, `rerank.write` and `audio.write` arrive WITH their
+endpoints — `POST /v1/embeddings`, `POST /v1/rerank` and
+`POST /v1/audio/transcriptions` — and in CONTRACT §7's table first, which is
+the order the paragraph above demands. One scope per route, not one scope per
+MODEL: a scope names what a credential may CALL, and which model it may call it
+on is the key's `allowed_models`, a different column with a different answer.
+That is also why the three chat-kind models share `responses.write` — they are
+the same two endpoints. All three new scopes are in `DEFAULT_SCOPES`: each
+spends engine time exactly as `responses.write` does, which is already a
+default, and a default key that 403s on `/v1/embeddings` would read as a broken
+product. KEYS MINTED BEFORE THIS CHANGE KEEP THEIR STORED SCOPES and so do not
+gain the new ones — nothing here rewrites `api_keys.scopes`, because widening a
+credential nobody re-issued is exactly the silent grant this module refuses to
+make. A developer who wants embeddings on an old key creates a new key.
 
 SCOPES ARE DATA, NOT ROLES. There is no implication table here, and adding one
 would be a change of contract. `responses.write` does not grant
@@ -62,6 +78,14 @@ class Scope(str, Enum):
     RESPONSES_WRITE = "responses.write"
     #: Read the project's own usage counters (CONTRACT §7 `/v1/usage`).
     USAGE_READ = "usage.read"
+    #: Create embeddings — `POST /v1/embeddings` (2026-09-13).
+    EMBEDDINGS_WRITE = "embeddings.write"
+    #: Rerank documents against a query — `POST /v1/rerank` (2026-09-13).
+    RERANK_WRITE = "rerank.write"
+    #: Transcribe audio — `POST /v1/audio/transcriptions` (2026-09-13). Named
+    #: `audio`, not `transcriptions`, because that is the path's own family
+    #: (`/v1/audio/…`) and the name a client library already groups it under.
+    AUDIO_WRITE = "audio.write"
 
 
 #: Every scope. Computed from the enum so a new member can never be forgotten
@@ -76,19 +100,35 @@ SCOPE_DESCRIPTIONS: dict[Scope, str] = {
     Scope.RESPONSES_READ: "Read responses created by this project.",
     Scope.RESPONSES_WRITE: "Create and cancel responses.",
     Scope.USAGE_READ: "Read this project's usage counters.",
+    Scope.EMBEDDINGS_WRITE: "Create embeddings.",
+    Scope.RERANK_WRITE: "Rerank documents against a query.",
+    Scope.AUDIO_WRITE: "Transcribe audio.",
 }
 
 #: What the console offers when the person creating a key does not choose.
 #:
-#: The three scopes an integration that calls the API needs, and nothing else:
+#: The scopes an integration that calls the API needs, and nothing else:
 #: reading the project's usage counters is a separate job, usually for a
 #: separate credential — a billing dashboard has no business being able to
 #: spend the quota it is reading. STANDARDS.md (Stripe): ship the restricted
 #: key as the default path and make the broad one the exception, so the blast
 #: radius of a leak is small by default rather than by remembering to tick
 #: boxes.
+#:
+#: The three WRITE scopes added on 2026-09-13 are in the default for the same
+#: reason `responses.write` always was: each spends engine time on the
+#: project's behalf and nothing more, so leaving them out would not shrink a
+#: leak's blast radius (the key can already generate) — it would only make a
+#: default key 403 on three documented endpoints. `usage.read` stays opt-in.
 DEFAULT_SCOPES: FrozenSet[Scope] = frozenset(
-    {Scope.MODELS_READ, Scope.RESPONSES_READ, Scope.RESPONSES_WRITE}
+    {
+        Scope.MODELS_READ,
+        Scope.RESPONSES_READ,
+        Scope.RESPONSES_WRITE,
+        Scope.EMBEDDINGS_WRITE,
+        Scope.RERANK_WRITE,
+        Scope.AUDIO_WRITE,
+    }
 )
 
 ScopeInput = Union[Scope, str]

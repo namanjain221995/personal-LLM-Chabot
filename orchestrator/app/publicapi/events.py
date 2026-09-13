@@ -392,7 +392,12 @@ class ChatCompletionChunks:
     def finished(self) -> bool:
         return self._done
 
-    def _chunk(self, choices: Iterable[Mapping[str, Any]], usage: Any = None) -> str:
+    def _chunk(
+        self,
+        choices: Iterable[Mapping[str, Any]],
+        usage: Any = None,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> str:
         if self._done:
             raise StreamProtocolError(
                 "a chunk was framed after data: [DONE]; the stream is over"
@@ -405,6 +410,9 @@ class ChatCompletionChunks:
             "choices": [dict(choice) for choice in choices],
             "usage": usage,
         }
+        for key, value in (extra or {}).items():
+            # Extensions are ADDED, never allowed to rename the chunk.
+            body.setdefault(key, value)
         return f"data: {_dumps(body)}\n\n"
 
     def delta(self, text: str, *, index: int = 0) -> str:
@@ -419,15 +427,30 @@ class ChatCompletionChunks:
             self._first = False
         return self._chunk([{"index": int(index), "delta": payload, "finish_reason": None}])
 
-    def stop(self, finish_reason: str = "stop", *, index: int = 0) -> str:
+    def stop(
+        self,
+        finish_reason: str = "stop",
+        *,
+        index: int = 0,
+        max_output_tokens: Optional[int] = None,
+    ) -> str:
         """The chunk that names why generation ended: `stop`, or `length` when
         the answer hit `max_tokens`. A client that never sees one must treat
-        the answer as truncated."""
+        the answer as truncated.
+
+        `max_output_tokens` (2026-09-13) is a top-level EXTENSION key on this
+        one chunk: the ceiling actually applied, which can be lower than the
+        `max_tokens` the caller sent when their prompt left less of the
+        context window. OpenAI-derived clients ignore keys they do not know.
+        """
         if self._stopped:
             raise StreamProtocolError("the finish_reason chunk was framed twice")
         self._stopped = True
         self._first = False
-        return self._chunk([{"index": int(index), "delta": {}, "finish_reason": finish_reason}])
+        extra = None if max_output_tokens is None else {"max_output_tokens": int(max_output_tokens)}
+        return self._chunk(
+            [{"index": int(index), "delta": {}, "finish_reason": finish_reason}], extra=extra
+        )
 
     def usage_chunk(self, usage: Optional[Mapping[str, Any]]) -> str:
         """The final, choice-less chunk. Only when the caller asked for usage:

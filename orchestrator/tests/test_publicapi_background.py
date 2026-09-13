@@ -1196,3 +1196,71 @@ def test_with_the_limits_off_jobs_beyond_the_projects_ceiling_all_run_and_give_t
     assert beside == 7
     assert after == 0
     assert sorted(str(row["status"]) for row in stored) == ["completed"] * 6
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-13: the applied output ceiling, and waiting queued for capacity
+# ---------------------------------------------------------------------------
+
+
+def test_a_background_row_is_born_with_the_planned_ceiling_and_ends_with_the_applied_one(project):
+    class _Truncated:
+        def __init__(self, spec):
+            self.spec, self.usage, self.error = spec, {"prompt_tokens": 9, "completion_tokens": 4}, None
+            self.first_token_at = None
+            self.finish_reason = "length"
+
+        async def stream(self):
+            yield _Chunk("token", "cut short")
+
+        def applied_max_output_tokens(self):
+            return 700_000
+
+        async def aclose(self):
+            return None
+
+    background.set_generation_factory(_Truncated)
+
+    async def scenario():
+        row = await _start(project, _spec(max_tokens=1_000_000, planned_max_output_tokens=900_000))
+        born = dict(row)
+        await background.drain(timeout=10)
+        return born, await db.run_in_thread(db.get_api_response, row["id"], project["id"])
+
+    born, final = asyncio.run(scenario())
+
+    # The 202 already says what the job will be allowed…
+    assert born["max_output_tokens"] == 900_000
+    # …and the row read back hours later says what it WAS allowed and why it
+    # stopped — the incomplete_details of GET /v1/responses/{id}.
+    assert final["status"] == "completed"
+    assert final["max_output_tokens"] == 700_000
+    assert final["finish_reason"] == "length"
+
+
+def test_our_own_wall_clock_stop_is_never_stored_as_a_finish_reason(project):
+    class _Stopped:
+        def __init__(self, spec):
+            self.spec, self.usage = spec, None
+            self.error = errors.timeout(20_900)
+            self.first_token_at = None
+            self.finish_reason = "wall_clock"
+
+        async def stream(self):
+            yield _Chunk("token", "partial")
+
+        async def aclose(self):
+            return None
+
+    background.set_generation_factory(_Stopped)
+
+    async def scenario():
+        row = await _start(project)
+        await background.drain(timeout=10)
+        return await db.run_in_thread(db.get_api_response, row["id"], project["id"])
+
+    final = asyncio.run(scenario())
+    assert final["status"] == "failed" and final["error_code"] == "timeout"
+    assert final["finish_reason"] is None
+    # The partial answer is kept for the caller who waited hours for it.
+    assert final["output_text"] == "partial"

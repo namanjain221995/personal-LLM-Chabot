@@ -19,6 +19,16 @@ while the first draft was being written. Files were still changing at that
 time; re-check §12 before relying on it. Line numbers are deliberately avoided;
 symbols are named instead so the reference survives edits.
 
+**2026-09-13, afternoon — the all-models wave.** The owner asked for every model
+TechSara runs on `/v1` and for output up to 1,000,000 tokens. That wave's code
+(`publicapi/registry.py`, `planning.py`, `engines.py`, `capacity.py`,
+`sidecars.py`, `endpoints.py`, `multipart.py`, `apiplatform/scopes.py`, V35) was
+being written in parallel with this update, so **§13 describes it from the
+binding design, not from the code**, and says for each item which symbol to
+read to confirm it. §1–§12 remain the code as it was read at 02:50 IST, with a
+pointer to §13 wherever the wave changes them. Re-derive §13 from the tree after
+the wave merges and fold it into the sections above.
+
 ---
 
 ## 1. Where it lives and how a request reaches it
@@ -27,7 +37,7 @@ symbols are named instead so the reference survives edits.
 |---|---|---|
 | public edge (today) | `https://ai.techsarasolutions.com/v1/…` → the Next.js route handler, which forwards `authorization`, `idempotency-key`, `content-type`, `origin` and a few more by name, never `cookie`, and pipes the body and the response stream through unbuffered | `frontend/app/v1/[[...path]]/route.ts` |
 | orchestrator | `APIRouter(prefix="/v1", route_class=PublicRoute)` mounted by `app/main.py` inside a guarded import; `main.PUBLIC_API_MOUNTED` says whether it is there | `orchestrator/app/publicapi/router.py` |
-| engine | `llm.stream_chat_events(..., model_choice="smart")` and nothing lower, through the shared admission lanes and the breaker | `orchestrator/app/publicapi/streaming.py` |
+| engine | `llm.stream_chat_events(..., model_choice="smart")` and nothing lower, through the shared admission lanes and the breaker — for `techsara-35b`. The other five models go through `publicapi/engines.py` or `publicapi/sidecars.py` under per-engine capacity gates (§13.3) | `orchestrator/app/publicapi/streaming.py` |
 
 Middleware that treats `/v1` differently from the chat application
 (`app/main.py`, matched by `_is_public_api_path`: `/v1` itself and anything
@@ -101,7 +111,9 @@ browser `Principal`.
 
 ### Scopes
 
-A closed vocabulary of four (`apiplatform/scopes.Scope`). An unknown scope
+A closed vocabulary of four (`apiplatform/scopes.Scope`) at the 02:50 read; seven
+after the all-models wave, which adds `embeddings.write`, `rerank.write` and
+`audio.write` (§13.5). An unknown scope
 string stored on a key or a service account makes that key answer 401, with an
 ERROR log line. Scopes imply nothing: `responses.write` does not grant
 `responses.read`.
@@ -257,7 +269,8 @@ the declared set is served unchanged — a database failure can never add a mode
 `max_input_tokens` and `max_output_tokens` are read from settings at call time
 (`registry._main_limits`), so they follow the served deployment. `vision` is
 advertised from the model's capabilities, but `/v1` accepts text content only
-(§6.3). The internal checkpoint name is never rendered.
+(§6.3). The internal checkpoint name is never rendered. **Superseded by the
+all-models wave**: six ids, a wider model object and image input (§13.1, §13.2).
 
 ### `GET /v1/models/{model}` — `models.read`
 
@@ -620,3 +633,157 @@ report `"length"` when the engine did; key rotation has an overlap window
 (`overlap_hours`, default `PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS` = 168, at
 most 30 days); a concurrency 429 no longer leaves a `queued` row or poisons its
 `Idempotency-Key`.
+
+## 13. The all-models wave (2026-09-13) — as designed, to be re-read from the code
+
+Binding design: the architect's brief of 2026-09-13 and `CONTRACT.md` §7–§16,
+which were amended first. Nothing in this section was read out of code; each
+item names the symbol to confirm once the wave has merged.
+
+### 13.1 The catalogue
+
+| public id | engine key | kind | reached through | declared when | confirm in |
+|---|---|---|---|---|---|
+| `techsara-35b` | `main` | chat | `llm.stream_chat_events` | always | `registry.declared_models` |
+| `techsara-8b-vision` | `router` | chat | `publicapi/engines.stream_chat`, gate `router` | `router_base_url` set and ≠ `openai_base_url` | same |
+| `techsara-ocr` | `ocr` | chat | `publicapi/engines.stream_chat`, gate `ocr` | `settings.ocr_enabled` | same |
+| `techsara-embed` | `embed` | embedding | `publicapi/sidecars`, gate `embed` | `embed_base_url` set | same |
+| `techsara-rerank` | `rerank` | rerank | `publicapi/sidecars` → `/score`, gate `rerank` | remote rerank backend with a base URL | same |
+| `techsara-whisper` | `asr` | transcription | `publicapi/sidecars` → whisper replica, gate `asr` | `settings.asr_enabled` | same |
+
+`registry.catalogue()` returns all six with `status` `available` or
+`not_configured` (the console lists it); `declared_models()` returns only the
+available ones (`/v1/models`). A `public_models` row still only narrows. The
+model wire object gains `kind`, the capability flags `rerank`,
+`audio_transcription`, `ocr`, `background`, `endpoints`, `context_window`,
+nullable `max_input_tokens` / `max_output_tokens`, `default_max_output_tokens`
+and `limits`. Internal names, engine keys and URLs never render
+(`PublicModel.to_wire`). `guard_public_id` enforces
+`^techsara-[a-z0-9]+(-[a-z0-9]+)*$`; `guard_internal_target` refuses an
+address-shaped internal target and an engine key outside the closed set.
+
+Ceilings per model are CONTRACT §12.2. Three `generated.env` values disagree
+with the running engines and must not be trusted by the registry:
+`ROUTER_CONTEXT_LENGTH=65536` (engine 49,152), `EMBED_CONTEXT_LENGTH` and
+`RERANKER_CONTEXT_LENGTH=32768` (engines 4,096).
+
+### 13.2 Generation: planning, clamp, wall clock
+
+`publicapi/planning.plan_generation(request_model, model, *,
+project_max_output_tokens)` → `GenerationPlan` (requested / planned / engine
+`max_tokens`, estimated and bounded input, footprint, `wall_clock_s`,
+temperature, `clamped`, gate). Order: explicit value over the ceiling → 400;
+input over `max_input_tokens` → 400 `context_length_exceeded`; otherwise clamp
+`planned = max(1, min(requested, window − input − reserve))`; applied value from
+`llm.get_applied_max_tokens()` when `llm.py` exposes it, else the post-hoc formula
+of CONTRACT §8.3. Wall clock `min(PUBLIC_API_GEN_WALL_CLOCK_S, max(floor,
+prefill + planned / min_tps))`. Confirm in `planning.py`, and in
+`streaming.Generation` for the `wall_clock_s + 30 s` backstop and the
+`inspect.signature` feature-detection of `stream_chat_events(wall_clock_s=…,
+wall_clock_marker=False)`.
+
+**Until `llm.py` accepts `wall_clock_s`, every `techsara-35b` generation is still
+cut at `GEN_WALL_CLOCK_S` (4,200 s).** The public docs carry a caveat for that,
+driven by `LONG_OUTPUT_WALL_CLOCK_LIVE` in `frontend/content/docs/samples.ts`,
+and `frontend/tests/docs-site.test.tsx` fails the day the parameter appears in
+`llm.py` until the switch is flipped.
+
+Response object keys `max_output_tokens` (planned on early snapshots, applied on
+the terminal) and `incomplete_details` (`{"reason": "max_output_tokens"}` on a
+`length` stop; `status` stays `completed`). `chat.completion` and the finish chunk
+gain `max_output_tokens`. Chat Completions accepts `max_completion_tokens`.
+V35: `api_responses.max_output_tokens`, `api_responses.finish_reason`.
+
+Image input on the two generation routes: `data:` URLs only (png, jpeg, webp,
+gif; magic bytes checked; ≤ 10 MiB decoded, `413`), per-model count, `user`
+role only; body cap `PUBLIC_API_MAX_MEDIA_BODY_BYTES` 20 MiB with the 1 MiB
+text rule after parsing; JSON above 64 KiB parsed off the event loop. On
+`techsara-ocr` with no text and no instructions the server appends `OCR`.
+Confirm in `publicapi/models.py`.
+
+### 13.3 Capacity gates
+
+`publicapi/capacity.hold(engine, *, weight_tokens, wait_s, yield_to_chat)`: per
+engine, FIFO, bounded wait, refusal `errors.model_at_capacity(retry_after)` (503
+`model_unavailable`). Numbers and their arguments: CONTRACT §12.3. Sync, stream
+and sidecar requests wait ≤ `PUBLIC_API_GATE_WAIT_S` (30 s) **before** the status
+line; background jobs wait ≤ `PUBLIC_API_BACKGROUND_GATE_WAIT_S` (3,600 s) inside
+the job while `queued`. Chat-app paths never take a gate. Gauges
+`public_api_engine_in_flight` / `public_api_engine_waiting` by engine.
+`main.long` applies above a 131,072-token footprint (input at its byte bound +
+planned output); `main.extended` (2 at a time) to any other flagship request
+planning more than 8,192 output tokens; at or under 8,192 the shared admission
+NORMAL lanes remain the only gate. Both main gates step aside while a chat
+request is in the LONG admission lane. Router gate weights are also byte-bound.
+Changed after the adversarial review of 2026-09-13 (CONTRACT §12.3).
+
+A synchronous generation watches its connection
+(`streaming.run_to_completion_watching`) and is cancelled at a disconnect. A
+wall-clock stop records server-counted usage (`usage_source: counted_at_stop`).
+The main engine's one window retry after an estimated clamp: CONTRACT §8.3.
+
+### 13.4 The three new routes
+
+`publicapi/endpoints.register(router)` is called from the bottom of `router.py`
+inside an import guard, so an import failure leaves the eight older routes
+working. Request and response shapes: CONTRACT §8.4–§8.6. Each resolves the key,
+checks scope then origin, reserves one `sync` request, resolves the model and
+checks its kind, refuses `Idempotency-Key` with 400, writes no `api_responses`
+row, and records one `usage_events` row (routes `v1_embeddings`, `v1_rerank`,
+`v1_audio_transcriptions`; meta in CONTRACT §16). The multipart body is parsed
+in memory (`publicapi/multipart.py`), never through `UploadFile`.
+
+### 13.5 Scopes
+
+`Scope.EMBEDDINGS_WRITE`, `RERANK_WRITE`, `AUDIO_WRITE`, all in
+`DEFAULT_SCOPES`; `usage.read` stays opt-in. Stored keys keep their stored
+scopes, so keys created before the wave answer `403 insufficient_scope` on the
+new routes. `responses.write` covers all three chat-kind models.
+
+### 13.6 Idempotency lease
+
+`apiplatform/idempotency.py`: in-flight lease `max(configured,
+2 × PUBLIC_API_GEN_WALL_CLOCK_S + PUBLIC_API_BACKGROUND_GATE_WAIT_S)` = 46,800 s
+(13 h) by default, below the 24 h TTL. Consequence documented publicly: a claim
+orphaned by a restart answers `409` for up to 13 h, so a client retries a
+restart-failed long job with a new key.
+
+### 13.7 Outside this wave's reach (integration items)
+
+* `config.py` declares the `PUBLIC_API_*` settings of CONTRACT §12.4 (until
+  then readers fall back to `os.environ` with the same parse rules).
+* `llm.py`: `wall_clock_s` / `wall_clock_marker` on `stream_chat_events`,
+  `get_applied_max_tokens()`.
+* `.github/workflows/scripts/public-api-surface.txt` gains the three routes; the
+  `api_contract` gate is red until it does.
+* `main.py`: `body_cap_for` uses `publicapi.models.body_cap_for(method, path)`
+  for `/v1` (20 MiB generation routes, 26 MiB transcriptions); until then the
+  mounted app refuses image and audio bodies over 1 MiB. A strict xfail in
+  `test_publicapi_mount.py` flips when it lands.
+* `admission.py`: `_ahead` leaves out `capacity.public_long_lived_decoding()`,
+  so a chat LONG request is not held for the whole idle wait by a decoding
+  public job (strict xfail in `test_publicapi_main_engine_priority.py`).
+* `asr.py`: `RoutedProvider.reserve(index)`, the clean seam for
+  `sidecars.counted_in_dictation_routing` (which uses `_active` until then).
+* `scripts/docs_examples_run.py` needs specs for the new and re-ordered example
+  blocks before the examples can be run and `EXAMPLES_EXECUTED` flipped.
+* Engine-level priority scheduling (`--scheduling-policy priority`) is an operator
+  decision and the real fix for KV pressure on the main engine.
+* A deploy restarts the orchestrator and fails every running multi-hour
+  generation; `scripts/deploy.sh` should wait or warn while
+  `public_api_engine_in_flight{engine="main.long"} > 0`.
+
+### 13.8 New disagreements to watch
+
+13. **`status` stays `completed` on a `length` stop.** OpenAI-shaped clients
+    expect `incomplete`; V34's status CHECK has no such value, so the signal is
+    `incomplete_details`. Documented publicly as a deviation.
+14. **Request Logs miss three routes.** The console's request log reads
+    `api_responses`; embeddings, rerank and transcription calls count in usage
+    but have no row there.
+15. **Audio seconds are not in `GET /v1/usage`.** They are in
+    `usage_events.meta.audio_seconds` only.
+16. **The OCR engine's own default prompt is still `document parsing`**
+    (`engines/ocr.py` `_DEFAULT_PROMPT`, overridable by `OCR_PROMPT`), the prompt
+    that loops; the public path appends `OCR` instead. The chat application's
+    read path is unchanged by this wave.
