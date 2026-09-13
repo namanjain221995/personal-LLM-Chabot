@@ -109,6 +109,15 @@ services:
         soft: 1
         hard: 1
     restart: unless-stopped
+    # FIRST IN LINE FOR THE KERNEL'S OOM KILLER (OPERATIONS.md section 14).
+    # This engine holds ~15 GiB of the node's unified memory that the
+    # kernel does not charge to its RSS, so by default it is scored like a 1 GiB
+    # process and the kernel would pick the main engine's rank before it. OCR is
+    # an optional feature (the orchestrator degrades without it) and the restart
+    # policy brings the engine back. The vLLM rank beside it ranks after every
+    # application process (-450 recommended) once ENGINE_OOM_SCORE_ADJ reaches it.
+    # Applied when scripts/ocr.sh up next CREATES this container; no deploy does.
+    oom_score_adj: 900
     healthcheck:
       # Probes the address the server ACTUALLY binds, by reading the same two
       # variables the command line does, so the two cannot drift apart. A

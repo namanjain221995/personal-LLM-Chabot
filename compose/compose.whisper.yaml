@@ -72,6 +72,11 @@ services:
       # speech service has no business sharing a namespace with them.
       - whisper-cache:/cache/huggingface
     restart: unless-stopped
+    # SECOND IN LINE FOR THE KERNEL'S OOM KILLER, after the OCR engine
+    # (OPERATIONS.md section 14): 3-5 GiB of GPU (unified) memory
+    # the kernel does not see in its score, an optional feature, and a clean
+    # restart. Applied when scripts/whisper.sh up next CREATES the container.
+    oom_score_adj: 800
     healthcheck:
       # Probes the address the server ACTUALLY binds, by reading the same two
       # variables it does, so the two cannot drift apart. `ready` is checked,

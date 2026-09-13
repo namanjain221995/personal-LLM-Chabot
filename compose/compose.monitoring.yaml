@@ -60,6 +60,14 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM ORDER (OPERATIONS.md section 14): telemetry is killed after the OCR
+    # (900) and speech (800) engines and the auxiliary engines once their switch
+    # is set (700), and before every application service (0); the main engine
+    # ranks near last (-450 recommended). Dashboards and secondary
+    # exporters 600; Prometheus and the host/GPU exporters 500, because they
+    # hold the evidence of the incident itself. Applied when scripts/monitoring.sh
+    # up next CREATES these containers; `techsara up` and deploys never touch them.
+    oom_score_adj: 500
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:9090/-/healthy || exit 1"]
       interval: 30s
@@ -110,6 +118,8 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
     depends_on:
       prometheus:
         condition: service_healthy
@@ -167,6 +177,8 @@ services:
       - /sys:/host/sys:ro
       - /:/host:ro,rslave
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 500
     logging: *monitoring-logging
 
   # --- Spark 1 GPU telemetry --------------------------------------------
@@ -198,6 +210,8 @@ services:
     ports:
       - "127.0.0.1:9835:9835"
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 500
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9835/healthz', timeout=3).status==200 else 1)\""]
       interval: 30s
@@ -246,6 +260,8 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
     logging: *monitoring-logging
 
   # --- PostgreSQL: the application database ------------------------------
@@ -294,6 +310,8 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
     depends_on:
       postgres:
         condition: service_healthy
@@ -317,6 +335,8 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9836/healthz', timeout=3).status==200 else 1)\""]
       interval: 30s
@@ -338,6 +358,8 @@ services:
     networks:
       - application
     restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
     logging: *monitoring-logging
 
 volumes:

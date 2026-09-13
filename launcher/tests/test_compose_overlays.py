@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -222,7 +223,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
                 command += ["-f", str(path)]
             # Every optional profile at once: a service that only resolves when
             # its profile is inactive would still be a latent failure.
-            for name in ("embeddings", "ocr", "search", "admin"):
+            for name in ("embeddings", "reranker", "ocr", "search", "admin"):
                 command += ["--profile", name]
             command += ["config", *config_args]
             environment = dict(os.environ)
@@ -763,6 +764,66 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         # A worker.env from the previous cluster-sync.sh (no digest) still renders.
         older = self._render_worker(self.WORKER_ENV)
         self.assertEqual(older["services"]["vllm-worker-sentinel"]["environment"]["SENTINEL_CODE_SHA"], "")
+
+    def test_the_engine_oom_switches_are_inert_until_set_on_both_head_chains_and_touch_nothing_else(self) -> None:
+        """OUT-OF-MEMORY ORDER WITHOUT A RESTART (OPERATIONS.md section 14).
+        compose.dgx-spark.yaml gives vllm `oom_score_adj: ${ENGINE_OOM_SCORE_ADJ:-0}`
+        and vllm-router/-embed/-reranker `${AUX_ENGINE_OOM_SCORE_ADJ:-0}`. With
+        the launcher's real DGX chains -- dual, and the single-node chain
+        CLUSTER_MODE=auto falls back to when the peer or ssh is missing --
+        unset, empty and 0 render the SAME definition for every service
+        (Compose omits a zero; test_oom_score_adj proves an omitted key hashes
+        like no key), so a tree carrying the switches is no definition change.
+        A set ENGINE key renders on vllm in BOTH chains (review finding: the
+        single-node chain used to drop it) and changes nothing else; a set AUX
+        key changes exactly the three auxiliary engines. (In production the
+        keys sit in .env, which is also the orchestrator's env_file, so the
+        orchestrator -- recreated by routine deploys anyway -- changes too;
+        here .env keys ride the process environment, as _compose_config
+        explains.) Every render uses a fresh temporary model cache, so the
+        workspace path is normalised before comparing."""
+        fixture = FIXTURES["dgx-spark"]
+        dual = {
+            "CLUSTER_MODE": "dual",
+            "CLUSTER_HEAD_IP": "192.168.100.1",
+            "CLUSTER_WORKER_IP": "192.168.100.2",
+            "PUBLISH_MODEL_PORTS": "true",
+        }
+        single = {"CLUSTER_MODE": "single", "PUBLISH_MODEL_PORTS": "true"}
+        detectors = ClusterDetectors(
+            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
+            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
+            docker_bridge_gateway=lambda: "172.17.0.1",
+        )
+        auxiliary = {"vllm-router", "vllm-embed", "vllm-reranker"}
+
+        def services(chain: dict, extra: dict) -> dict:
+            _profile, rendered = self._render(fixture, {**chain, **extra})
+            text = re.sub(r"[^\"\s]*techsara-overlay-[A-Za-z0-9_]+", "<workspace>", json.dumps(rendered["services"]))
+            return json.loads(text)
+
+        with patch.object(environment, "CLUSTER_DETECTORS", detectors):
+            for label, chain in (("dual", dual), ("single", single)):
+                with self.subTest(chain=label):
+                    unset = services(chain, {})
+                    command = unset["vllm"]["command"]
+                    if label == "dual":
+                        self.assertEqual(command[command.index("--node-rank") + 1], "0", "the dual-mode head is what is rendered")
+                    else:
+                        self.assertNotIn("--node-rank", command, "the single-node chain is what is rendered")
+                    self.assertTrue({"vllm", "postgres", "orchestrator", "frontend", "engine-controller"} | auxiliary <= set(unset))
+                    for name, service in unset.items():
+                        self.assertNotIn("oom_score_adj", service, name)
+                    for value in ("", "0"):
+                        inert = services(chain, {"ENGINE_OOM_SCORE_ADJ": value, "AUX_ENGINE_OOM_SCORE_ADJ": value})
+                        self.assertEqual(inert, unset, f"switches set to {value!r} must render like unset")
+                    engine = services(chain, {"ENGINE_OOM_SCORE_ADJ": "-450"})
+                    self.assertEqual(engine["vllm"].pop("oom_score_adj"), -450)
+                    self.assertEqual(engine, unset, "the engine key changes the head engine and nothing else")
+                    aux = services(chain, {"AUX_ENGINE_OOM_SCORE_ADJ": "700"})
+                    for name in auxiliary:
+                        self.assertEqual(aux[name].pop("oom_score_adj"), 700, name)
+                    self.assertEqual(aux, unset, "the aux key changes the three auxiliary engines and nothing else")
 
     def test_the_kill_tier_age_guard_follows_the_cold_start_budget_on_both_nodes(self) -> None:
         """Review round 2 (sre, minor): the last-resort kill's age guard was a

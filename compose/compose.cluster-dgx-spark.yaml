@@ -91,6 +91,11 @@ services:
     ulimits:
       memlock: -1
     stop_grace_period: 2m
+    # `oom_score_adj: ${ENGINE_OOM_SCORE_ADJ:-0}` (out-of-memory order,
+    # OPERATIONS.md section 14) is inherited from compose.dgx-spark.yaml, so
+    # the single-node chain CLUSTER_MODE=auto can fall back to renders the same
+    # number as this one. It is deliberately not repeated here: one
+    # declaration, one place to change it.
     # REPORT-ONLY, WITH ONE LAST-RESORT TIER (contract §6, v2). Exactly one
     # actor restarts the pair: the engine controller (`engine-controller`
     # below). It confirms a dead engine (/health 5xx) in one observation, a

@@ -105,6 +105,39 @@ services:
         soft: 1
         hard: 1
     restart: unless-stopped
+    # OUT-OF-MEMORY ORDER (docs/developer-platform/OPERATIONS.md section 14).
+    # GB10 memory is unified: the engine's CUDA/UVM memory is not charged to
+    # its RSS, so at Docker's default 0 the kernel scores a VLLM::Worker_TP or
+    # EngineCore like a small process (the worker OOM-killed three
+    # EngineCores on 2026-07-22).
+    #
+    # oom_score_adj CANNOT PROMISE "NEVER". The recommended value is -450, not
+    # -1000: it ranks the engine after every application process and
+    # systemd-journald (-250) but BEFORE dockerd and docker-proxy (-500),
+    # dbus-daemon and snapd (-900) and containerd and its shims (-999/-998),
+    # all measured on both nodes 2026-09-13. At -1000 or -999, once nothing
+    # else is left, the kernel kills dockerd instead; with live-restore off
+    # the restarted daemon stops and restarts EVERY container on the node,
+    # this engine included, and with nothing killable left the node hangs
+    # (kernel.panic=0 on both nodes).
+    #
+    # INERT UNTIL SET, ON PURPOSE. Unset, empty or 0, Compose omits the key and
+    # the service hashes exactly as it did without the line, so merging it
+    # recreates nothing. Any other value is a DEFINITION change that every
+    # create path applies: the launcher's "not serving" branch (the preserve
+    # flag dropped after ONE failed probe), a hand-run `./techsara up` or
+    # scripts/cluster-up.sh, deploy.sh --full, cluster-worker.sh start and
+    # cluster-recover.sh --clear-kernel-cache. So no model reload is ever
+    # scheduled to apply it: ENGINE_OOM_SCORE_ADJ goes into .env only
+    # immediately before a recreate that is happening for its own reason.
+    #
+    # Declared in THIS file rather than the cluster overlay, so the
+    # single-node chain that CLUSTER_MODE=auto falls back to (peer not found,
+    # ssh preflight failed) carries it too. The worker's vllm-worker reads the
+    # same key from worker.env (scripts/cluster-sync.sh ships it). Applied at
+    # container CREATION only: `docker restart` (the engine controller, the
+    # sentinel, cluster-recover.sh --force) keeps the creation-time value.
+    oom_score_adj: ${ENGINE_OOM_SCORE_ADJ:-0}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30000/v1/models -o /dev/null || exit 1"]
       interval: 30s
@@ -272,6 +305,22 @@ services:
         soft: 1
         hard: 1
     restart: unless-stopped
+    # OUT-OF-MEMORY ORDER (OPERATIONS.md section 14): an EXPENDABLE holder of
+    # unified memory the kernel cannot see (router 16.5 GiB, embed and
+    # reranker 4 GiB each, measured 2026-09-13), ranked at 0 by default --
+    # i.e. behind the VS Code server, sync-worker and, often, the orchestrator
+    # and postgres. A UVM-driven OOM is relieved only by killing a GPU holder,
+    # so the recommended AUX_ENGINE_OOM_SCORE_ADJ=700 puts these three engines
+    # after OCR (900) and speech (800) and ahead of telemetry and every
+    # application service. The orchestrator degrades without them (router
+    # fallback, in-process reranker, embeddings off) and restart: unless-stopped
+    # brings them back; the launcher's readiness wait counts only restarts that
+    # happen during its own wait, so an OOM restart does not disable a role.
+    # INERT UNTIL SET: unset, empty or 0 renders nothing and the hash is
+    # unchanged. The launcher runs `up -d --no-deps` on this service in EVERY
+    # deploy, so setting the key reloads these three models (never the main
+    # engine) on the next deploy -- set it when that reload is acceptable.
+    oom_score_adj: ${AUX_ENGINE_OOM_SCORE_ADJ:-0}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:30002/v1/models -o /dev/null || exit 1"]
       interval: 30s
@@ -318,6 +367,8 @@ services:
     networks:
       - inference
     restart: unless-stopped
+    # Out-of-memory order: see vllm-router above (AUX_ENGINE_OOM_SCORE_ADJ).
+    oom_score_adj: ${AUX_ENGINE_OOM_SCORE_ADJ:-0}
     healthcheck:
       test:
         - CMD-SHELL
@@ -360,6 +411,8 @@ services:
     networks:
       - inference
     restart: unless-stopped
+    # Out-of-memory order: see vllm-router above (AUX_ENGINE_OOM_SCORE_ADJ).
+    oom_score_adj: ${AUX_ENGINE_OOM_SCORE_ADJ:-0}
     healthcheck:
       test:
         - CMD-SHELL

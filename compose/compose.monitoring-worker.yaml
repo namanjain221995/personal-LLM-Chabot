@@ -49,6 +49,10 @@ services:
       - /sys:/host/sys:ro
       - /:/host:ro,rslave
     restart: unless-stopped
+    # OOM ORDER: after this node's OCR (900) and speech (800) engines, before
+    # every application process; the vLLM rank ranks near last (-450 recommended,
+    # OPERATIONS.md section 14). Applied when scripts/monitoring.sh up next CREATES it.
+    oom_score_adj: 500
     logging: *worker-logging
 
   dgx-gpu-exporter:
@@ -78,6 +82,8 @@ services:
     # process failure that the restart policy retries until the NIC is up.
     network_mode: host
     restart: unless-stopped
+    # OOM order: see node-exporter above.
+    oom_score_adj: 500
     healthcheck:
       # Probes the address the exporter ACTUALLY binds, by reading the same
       # two environment variables it does - so the two can never drift apart.
