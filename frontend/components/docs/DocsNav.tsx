@@ -47,7 +47,7 @@ export function DocsNav({
             <li key={section.title}>
               <h2
                 id={headingId}
-                className="px-3 pb-2 text-[11px] font-semibold uppercase tracking-wider text-faint"
+                className="px-3 pb-2 text-[11px] font-semibold uppercase tracking-wider text-muted"
               >
                 {section.title}
               </h2>

@@ -24,7 +24,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ComponentProps, ReactNode } from 'react';
 
@@ -1814,6 +1814,10 @@ function serveConsoleAccess(body: { allowed: boolean }) {
 }
 
 describe('the shell', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('offers a skip link, a menu toggle and the API status page', () => {
     render(
       <DocsShell>
@@ -1862,15 +1866,21 @@ describe('the shell', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Menu' }));
   });
 
-  it('keeps the console and chat links reachable when the header drops them', () => {
+  it('keeps the console and chat links reachable when the header drops them', async () => {
     // At 400px the header holds the brand, the menu button and the status
     // link and nothing else. The other two move into the drawer rather than
     // disappearing — `sm:hidden` here against `hidden sm:block` there, so
-    // exactly one copy is ever visible.
+    // exactly one copy is ever visible. (Console only for a reader the
+    // console opens for; see the next tests.)
+    serveConsoleAccess({ allowed: true });
     const { container } = render(
       <DocsShell>
         <p>page body</p>
       </DocsShell>,
+    );
+    const header = screen.getByRole('banner');
+    expect((await within(header).findByRole('link', { name: 'Console' })).className).toContain(
+      'sm:block',
     );
     const drawerExtras = container.querySelector('#docs-nav-panel .sm\\:hidden');
     expect(drawerExtras).toBeTruthy();
@@ -1878,11 +1888,50 @@ describe('the shell', () => {
     expect(
       within(drawerExtras as HTMLElement).getByRole('link', { name: 'Back to chat' }),
     ).toBeTruthy();
+  });
 
-    const header = screen.getByRole('banner');
-    expect(within(header).getByRole('link', { name: 'Console' }).className).toContain(
-      'sm:block',
+  it('asks its private endpoint, not the page, whether this reader may open the console', async () => {
+    const fetchMock = serveConsoleAccess({ allowed: true });
+    render(
+      <DocsShell>
+        <p>page body</p>
+      </DocsShell>,
     );
+    const link = await within(screen.getByRole('banner')).findByRole('link', { name: 'Console' });
+    expect(link.getAttribute('href')).toBe('/api');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/docs/console-access');
+  });
+
+  it('leaves the Console link out for a reader the console would refuse', async () => {
+    // /api answers a member with a 404 by design (CONTRACT §6). A link drawn
+    // for everyone sent members and signed-out readers to "not found".
+    const fetchMock = serveConsoleAccess({ allowed: false });
+    render(
+      <DocsShell>
+        <p>page body</p>
+      </DocsShell>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByRole('link', { name: 'Console' })).toBeNull();
+    // Chat stays: it is where every signed-in reader came from.
+    expect(screen.getAllByRole('link', { name: 'Back to chat' }).length).toBe(2);
+  });
+
+  it('leaves it out when the question cannot be answered', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(
+      <DocsShell>
+        <p>page body</p>
+      </DocsShell>,
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(screen.queryByRole('link', { name: 'Console' })).toBeNull();
   });
 
   it('renders the table of contents exactly once, whatever the viewport', () => {

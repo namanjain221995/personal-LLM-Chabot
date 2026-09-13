@@ -1,8 +1,8 @@
 import type { Metadata } from 'next';
-import { notFound } from 'next/navigation';
+import { notFound, permanentRedirect } from 'next/navigation';
 
 import { DocsArticle } from '@/components/docs/DocsArticle';
-import { DOC_PAGES, OVERVIEW_SLUG, findDocPage } from '@/content/docs';
+import { DOC_PAGES, OVERVIEW_SLUG, docHref, findDocPage } from '@/content/docs';
 
 /**
  * /docs/<slug> — one documentation page from the registry.
@@ -39,7 +39,16 @@ export default async function DocsPage({
   params: Promise<{ slug: string }>;
 }) {
   const { slug } = await params;
-  const page = slug === OVERVIEW_SLUG ? undefined : findDocPage(slug);
-  if (!page) notFound();
+  // The overview's own slug, typed as a path, goes where the overview lives
+  // instead of a 404 (it was a dead end: `/docs/overview` is the obvious
+  // guess for the page every other slug sits beside). One URL still serves it.
+  if (slug === OVERVIEW_SLUG) permanentRedirect('/docs');
+  const page = findDocPage(slug);
+  if (!page) {
+    // `/docs/ERRORS` is a typo of a real page, not a missing one.
+    const lower = slug.toLowerCase();
+    if (lower !== slug && findDocPage(lower)) permanentRedirect(docHref(lower));
+    notFound();
+  }
   return <DocsArticle page={page} />;
 }

@@ -20,7 +20,7 @@ export function OnThisPage({ headings }: { headings: DocHeading[] }) {
   if (headings.length < 2) return null;
   return (
     <nav aria-label="On this page" className="text-sm">
-      <h2 className="pb-2 text-[11px] font-semibold uppercase tracking-wider text-faint">
+      <h2 className="pb-2 text-[11px] font-semibold uppercase tracking-wider text-muted">
         On this page
       </h2>
       <ul className="space-y-1 border-l border-border">
