@@ -22,7 +22,6 @@ import { IconBan } from '@/components/admin/icons';
 import { IconPlus } from '@/components/icons';
 import { formatRelative, formatWhen } from '@/lib/format';
 import { can, type Me } from '@/components/admin/api';
-import type { AdminColumn } from '@/components/admin/AdminTable';
 import { RowMenu, type RowMenuItem } from '@/components/admin/RowMenu';
 import { StatusChip } from '@/components/admin/chips';
 import { ADMIN_PRIMARY_BUTTON, AdminToolbar } from '@/components/admin/controls';
@@ -36,7 +35,9 @@ import {
   EnvironmentChip,
   MonoValue,
   ProjectSelect,
+  ProjectsLoadError,
   useProjects,
+  type ConsoleColumn,
 } from './shared';
 import { useConsole } from './useConsole';
 import { useConsoleStatus } from './status';
@@ -106,14 +107,18 @@ export function KeysPanel({ me }: { me: Me }) {
   const [revokeTarget, setRevokeTarget] = useState<ApiKey | null>(null);
 
   const rows = keys.data?.keys ?? [];
+  // No project list yet: the keys request has not been sent, so neither "no
+  // keys" nor "no projects" is known. Drawn as the table's skeleton.
+  const projectsPending = projectsQuery.loading && projectsQuery.data === null;
   const mayCreate = can(me, 'api.keys.create');
   const mayRevoke = can(me, 'api.keys.revoke');
 
   useEffect(() => {
-    if (keys.loading) announce('Loading API keys.');
+    if (projectsQuery.error) announce(projectsQuery.error);
+    else if (projectsPending || keys.loading) announce('Loading API keys.');
     else if (keys.error) announce(keys.error);
     else announce(`${rows.length} key${rows.length === 1 ? '' : 's'}.`);
-  }, [keys.loading, keys.error, rows.length, announce]);
+  }, [projectsQuery.error, projectsPending, keys.loading, keys.error, rows.length, announce]);
 
   async function revoke(key: ApiKey) {
     try {
@@ -125,7 +130,7 @@ export function KeysPanel({ me }: { me: Me }) {
     }
   }
 
-  const columns: AdminColumn<ApiKey>[] = useMemo(
+  const columns: ConsoleColumn<ApiKey>[] = useMemo(
     () => [
       {
         key: 'name',
@@ -144,9 +149,10 @@ export function KeysPanel({ me }: { me: Me }) {
         key: 'environment',
         label: 'Environment',
         width: '130px',
-        // Below lg the key's own prefix (tsk_live_ / tsk_test_) says it, and
-        // the 130px goes to the key column so a phone can still read it.
-        hideBelowLg: true,
+        // Below xl the key's own prefix (tsk_live_ / tsk_test_) says it, and
+        // the 130px goes to the key column: at 1024px it left the key 74px
+        // (responsive audit, 2026-09-13).
+        hideBelow: 'xl',
         render: (k) => <EnvironmentChip environment={k.environment} />,
       },
       {
@@ -241,12 +247,14 @@ export function KeysPanel({ me }: { me: Me }) {
       </AdminToolbar>
 
       <div className="mt-5">
-        {!projectsQuery.loading && projects.length === 0 ? (
+        {projectsQuery.error ? (
+          <ProjectsLoadError query={projectsQuery} />
+        ) : !projectsQuery.loading && projects.length === 0 ? (
           <ConsoleEmpty
             title="No projects, so no keys"
             body="A key belongs to a project — create one on the Projects tab first, then come back here to mint a key for it."
           />
-        ) : !keys.loading && !keys.error && rows.length === 0 ? (
+        ) : !projectsPending && !keys.loading && !keys.error && rows.length === 0 ? (
           <ConsoleEmpty
             title="No keys in this project"
             body="Create a key to start calling /v1. You will see the secret exactly once, on the screen that creates it, so have somewhere ready to put it."
@@ -269,7 +277,7 @@ export function KeysPanel({ me }: { me: Me }) {
             minWidth={920}
             rows={rows}
             rowKey={(k) => k.id}
-            loading={keys.loading && keys.data === null}
+            loading={projectsPending || (keys.loading && keys.data === null)}
             empty="No keys in this project."
             error={keys.error}
             onRetry={keys.reload}

@@ -49,6 +49,7 @@ import { consolePaths } from './paths';
 import {
   ConsoleEmpty,
   ProjectSelect,
+  ProjectsLoadError,
   limitText,
   limitsEnforcement,
   limitsUnlimited,
@@ -245,6 +246,15 @@ export function LimitsPanel() {
         />
       </AdminToolbar>
 
+      {/* Without the project list there is no project to limit: say why the
+          form below is empty and offer the retry, rather than a disabled
+          form that explains nothing (audit, 2026-09-13). */}
+      {projectsQuery.error && (
+        <div className="mt-5">
+          <ProjectsLoadError query={projectsQuery} />
+        </div>
+      )}
+
       {unlimited && (
         <Section title="Usage limits" first>
           <dl className="max-w-xl space-y-2 text-sm">
@@ -271,7 +281,11 @@ export function LimitsPanel() {
       <Section title={unlimited ? 'Per-request ceilings' : 'Rate and quota'} first={!unlimited}>
         {(error || limits.error) && (
           <div className="mb-4">
-            <ErrorPanel message={(error ?? limits.error) as string} />
+            {/* A save error is answered by the form; a failed load by Retry. */}
+            <ErrorPanel
+              message={(error ?? limits.error) as string}
+              onRetry={error ? undefined : limits.reload}
+            />
           </div>
         )}
         <form onSubmit={save} className="max-w-xl space-y-4">

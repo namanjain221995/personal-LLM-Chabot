@@ -32,13 +32,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useToast } from '@/components/Providers';
 import { can, type Me } from '@/components/admin/api';
-import type { AdminColumn } from '@/components/admin/AdminTable';
 import { Switch } from '@/components/admin/Switch';
 import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { NOT_MEASURED, compact } from '@/components/admin/analytics/format';
 import { consolePut, messageOf } from './api';
 import { consolePaths } from './paths';
-import { ConsoleEmpty, ConsoleTable } from './shared';
+import { ConsoleEmpty, ConsoleTable, type ConsoleColumn } from './shared';
 import { useConsole } from './useConsole';
 import { useConsoleStatus } from './status';
 import {
@@ -266,7 +265,7 @@ export function ModelsPanel({ me }: { me: Me }) {
     }
   }
 
-  const columns: AdminColumn<ConsoleModel>[] = useMemo(
+  const columns: ConsoleColumn<ConsoleModel>[] = useMemo(
     () => [
       {
         key: 'model',
@@ -308,7 +307,9 @@ export function ModelsPanel({ me }: { me: Me }) {
         label: 'Max input',
         width: '120px',
         align: 'right',
-        hideBelowLg: true,
+        // Folded below xl so a 1024px laptop keeps the model column readable
+        // and the publish switch on screen; the cards below carry it.
+        hideBelow: 'xl',
         render: (m) => (
           <span className="tabular-nums text-muted" title={exactTokens(m.max_input_tokens)}>
             {compact(m.max_input_tokens)}

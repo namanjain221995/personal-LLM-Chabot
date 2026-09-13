@@ -37,11 +37,13 @@ const state = vi.hoisted(() => ({
    * dialog.
    */
   dialogsAlwaysMounted: false,
+  /** One router for every render, as Next's is, so `replace` can be asserted. */
+  router: { replace: vi.fn(), push: vi.fn() },
 }));
 
 vi.mock('next/navigation', () => ({
   usePathname: () => '/api',
-  useRouter: () => ({ replace: vi.fn(), push: vi.fn() }),
+  useRouter: () => state.router,
   useSearchParams: () => state.search,
   notFound: () => {
     throw new Error('NEXT_NOT_FOUND');
@@ -189,6 +191,8 @@ beforeEach(() => {
   state.search = new URLSearchParams();
   state.session = { state: 'allowed', me: ADMIN };
   state.dialogsAlwaysMounted = false;
+  state.router.replace.mockClear();
+  state.router.push.mockClear();
 });
 
 afterEach(() => {
@@ -1663,9 +1667,10 @@ function phoneGeometry(table: HTMLTableElement) {
   const hiddenOnPhone = (el: Element) => el.className.split(/\s+/).includes('hidden');
   const visible = Array.from(table.querySelectorAll('col')).filter((c) => !hiddenOnPhone(c));
   const fixed = visible.reduce((sum, col) => sum + (parseFloat(col.style.width) || 0), 0);
-  // The inline min-width is the DESKTOP floor; below lg a wrapper must lift it,
-  // or the table keeps scrolling sideways past a 400px screen.
-  const lifted = table.closest('[class*="max-lg:[&_table]:!min-w-0"]') !== null;
+  // The inline min-width is the DESKTOP floor; below xl (so below lg too) a
+  // wrapper must lift it, or the table keeps scrolling sideways past a 400px
+  // screen.
+  const lifted = table.closest('[class~="max-xl:[&_table]:!min-w-0"]') !== null;
   return { identity: PHONE_TABLE_WIDTH - fixed, lifted, hiddenOnPhone };
 }
 
@@ -2276,6 +2281,7 @@ describe('the streaming snippets', () => {
 
   it('reads the Python event stream line by line with a per-chunk timeout, in Python literals', () => {
     const snippet = pythonSnippet(streamed);
+    expect(snippet.startsWith('import json\nimport os\nimport httpx\n')).toBe(true);
     expect(snippet).toContain('with httpx.stream(');
     expect(snippet).toContain('"stream": True');
     expect(snippet).not.toMatch(/:\s(true|false|null)\b/);
@@ -2294,6 +2300,31 @@ describe('the streaming snippets', () => {
     expect(snippet).not.toContain('"stream"');
   });
 
+  it('prints the answer from its delta events and raises on either failure terminal, in both languages', () => {
+    // Printing raw `data:` lines put JSON on the terminal and exited 0 after a
+    // generation that died. tests/devplatform-snippets-run.test.ts runs both
+    // against a stub CONTRACT §10 stream; this pins the branches.
+    const python = pythonSnippet(streamed);
+    expect(python).toContain('if event == "response.output_text.delta":');
+    expect(python).toContain('print(data["delta"], end="", flush=True)');
+    expect(python).toContain('elif event == "response.failed":');
+    expect(python).toContain('elif event == "error":');
+    const js = javascriptSnippet(streamed);
+    expect(js).toContain("if (event === 'response.output_text.delta') process.stdout.write(data.delta);");
+    expect(js).toContain("else if (event === 'response.failed') throw new Error(");
+    expect(js).toContain("else if (event === 'error') throw new Error(");
+    // A chunk may end mid-line: the unfinished tail is kept for the next one.
+    expect(js).toContain('buffer = lines.pop();');
+  });
+
+  it('says how to run the JavaScript, because top-level await needs an ES module', () => {
+    for (const stream of [true, false]) {
+      expect(javascriptSnippet({ ...streamed, stream }).split('\n')[0]).toBe(
+        '// Node 18 or later. Save as request.mjs and run: node request.mjs',
+      );
+    }
+  });
+
   it('reads the JavaScript body as a stream and asks curl not to buffer', () => {
     const js = javascriptSnippet(streamed);
     expect(js).toContain('for await (const chunk of response.body)');
@@ -2308,5 +2339,542 @@ describe('the streaming snippets', () => {
     expect(pythonLiteral({ a: [true, null, 1.5], b: {}, c: [] })).toBe(
       '{\n    "a": [\n        True,\n        None,\n        1.5\n    ],\n    "b": {},\n    "c": []\n}',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Responsive audit, 2026-09-13: what the console still did wrong at every width
+// ---------------------------------------------------------------------------
+
+/**
+ * The px the console gives a table at a window width, from lg up: the 240px
+ * rail, a 16px allowance for the page's scrollbar, then the content column's
+ * 1180px cap less its 32px of padding a side.
+ */
+const consoleColumnAt = (viewport: number) => Math.min(viewport - 240 - 16, 1180) - 64;
+
+/**
+ * What a table draws at a laptop or desktop width, read from the markup — jsdom
+ * applies no stylesheet, so the tiers are read off the wrapper's class names,
+ * which are the exact rules the stylesheet is generated from.
+ */
+function desktopGeometry(table: HTMLTableElement, viewport: number) {
+  const wrapper = table.closest('[data-testid="console-table"]') as HTMLElement;
+  expect(wrapper).not.toBeNull();
+  const classes = wrapper.className.split(/\s+/);
+  const has = (tier: 'xl' | '2xl', n: number) => {
+    const rules = ['col', 'th', 'td'].map((el) => `max-${tier}:[&_${el}:nth-child(${n})]:!hidden`);
+    const present = rules.filter((rule) => classes.includes(rule));
+    // A tier that hid the <col> but not its cells (or the reverse) would
+    // shift every later column, so it is all three or none.
+    expect(present.length === 0 || present.length === 3).toBe(true);
+    return present.length === 3;
+  };
+  const labels = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent ?? '');
+  const cols = Array.from(table.querySelectorAll('col'));
+  const hidden = (index: number) =>
+    (viewport < 1280 && has('xl', index + 1)) || (viewport < 1536 && has('2xl', index + 1));
+  const visible = cols.filter((_, i) => !hidden(i));
+  const fixed = visible.reduce((sum, col) => sum + (parseFloat(col.style.width) || 0), 0);
+  const lifted = classes.includes('max-xl:[&_table]:!min-w-0');
+  const floor = parseFloat(table.style.getPropertyValue('--admin-table-min'));
+  const column = consoleColumnAt(viewport);
+  const width = lifted && viewport < 1280 ? column : Math.max(column, floor);
+  return {
+    clipped: width > column,
+    identity: width - fixed,
+    hiddenLabels: labels.filter((_, i) => hidden(i)),
+  };
+}
+
+const LAPTOP_AND_DESKTOP = [1024, 1100, 1279, 1280, 1366, 1440, 1535, 1536, 1920];
+
+function expectFitsEveryDesktop(table: HTMLTableElement) {
+  for (const viewport of LAPTOP_AND_DESKTOP) {
+    const { clipped, identity } = desktopGeometry(table, viewport);
+    expect({ viewport, clipped }).toEqual({ viewport, clipped: false });
+    expect({ viewport, readable: identity >= READABLE_IDENTITY }).toEqual({
+      viewport,
+      readable: true,
+    });
+  }
+}
+
+const LOG_ROW = {
+  id: 'resp_1',
+  request_id: 'req_0a6e65d0818a4abb942cdc3e5ae5939d',
+  model: 'techsara-35b',
+  status: 'completed',
+  background: false,
+  streamed: true,
+  input_tokens: 23,
+  output_tokens: 16,
+  ttft_ms: 10,
+  duration_ms: 211,
+  error_code: '',
+  metadata: {},
+  key: { id: 'key_1', name: 'a key with a long descriptive name', last_four: '7ON6' },
+  created_at: '2026-09-13T09:00:00Z',
+  started_at: null,
+  completed_at: null,
+};
+
+const WEBHOOK_ROW = {
+  id: 'whe_1',
+  project_id: PROJECT.id,
+  url: 'https://hooks.example.com/services/techsara/billing-assistant/production/receiver',
+  events: ['response.completed'],
+  status: 'active',
+  include_output: false,
+  has_secret: true,
+  rotation_in_progress: false,
+  created_at: null,
+  last_delivery_at: null,
+  last_delivery_status: '',
+  consecutive_failures: 0,
+  disabled_at: null,
+};
+
+describe('the console tables from 1024px to 1920px', () => {
+  it('keeps the keys table and its revoke menu inside the column, folding Environment until xl', async () => {
+    state.search = new URLSearchParams('tab=keys');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.keys(PROJECT.id)}`]: () => jsonResponse({ keys: [KEY_ROW] }),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const menu = await screen.findByRole('button', { name: 'Actions for Edge server' });
+    const table = menu.closest('table') as HTMLTableElement;
+    expectFitsEveryDesktop(table);
+    expect(desktopGeometry(table, 1024).hiddenLabels).toEqual(['Environment']);
+    expect(desktopGeometry(table, 1280).hiddenLabels).toEqual([]);
+  });
+
+  it('keeps the request log readable at 1024 by folding Key and Duration until xl and Shape until 2xl', async () => {
+    state.search = new URLSearchParams('tab=logs');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.logs(PROJECT.id)}`]: () =>
+        jsonResponse({ project: { id: PROJECT.id, name: PROJECT.name }, requests: [LOG_ROW] }),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const copy = await screen.findByRole('button', { name: 'Copy request id' });
+    const table = copy.closest('table') as HTMLTableElement;
+    expectFitsEveryDesktop(table);
+    expect(desktopGeometry(table, 1024).hiddenLabels).toEqual(['Key', 'Duration', 'Shape']);
+    expect(desktopGeometry(table, 1280).hiddenLabels).toEqual(['Shape']);
+    expect(desktopGeometry(table, 1536).hiddenLabels).toEqual([]);
+  });
+
+  it('keeps the webhooks, projects and models tables inside the column at every desktop width', async () => {
+    state.search = new URLSearchParams('tab=webhooks');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.webhooks(PROJECT.id)}`]: () => jsonResponse({ webhooks: [WEBHOOK_ROW] }),
+      'GET models': () => jsonResponse({ models: [MODEL], can_manage: true }),
+    });
+    const { unmount } = render(<ConsoleShell me={SUPER_ADMIN} />);
+    const hook = await screen.findByRole('button', { name: `Actions for ${WEBHOOK_ROW.url}` });
+    expectFitsEveryDesktop(hook.closest('table') as HTMLTableElement);
+    unmount();
+
+    state.search = new URLSearchParams('tab=projects');
+    const projects = render(<ConsoleShell me={SUPER_ADMIN} />);
+    const row = await screen.findByRole('button', { name: `Actions for ${PROJECT.name}` });
+    expectFitsEveryDesktop(row.closest('table') as HTMLTableElement);
+    projects.unmount();
+
+    state.search = new URLSearchParams('tab=models');
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    const toggle = await screen.findByRole('switch', { name: /publish techsara-35b/i });
+    const table = toggle.closest('table') as HTMLTableElement;
+    expectFitsEveryDesktop(table);
+    expect(desktopGeometry(table, 1024).hiddenLabels).toEqual(['Max input']);
+  });
+
+  it('keeps the last four of a key visible when its name is too long for the log column', async () => {
+    state.search = new URLSearchParams('tab=logs');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.logs(PROJECT.id)}`]: () =>
+        jsonResponse({ project: { id: PROJECT.id, name: PROJECT.name }, requests: [LOG_ROW] }),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const name = await screen.findByText(LOG_ROW.key.name);
+    // The name truncates; the last four sit in their own unshrinkable span.
+    expect(name.className).toContain('truncate');
+    const lastFour = name.nextElementSibling as HTMLElement;
+    expect(lastFour.textContent).toContain('…7ON6');
+    expect(lastFour.className).toContain('shrink-0');
+  });
+});
+
+describe('the consoleTableClass tiers', () => {
+  it('emits one complete col, th and td rule per folded column and nothing for the rest', async () => {
+    const { consoleTableClass } = await import('@/components/devplatform/shared');
+    const classes = consoleTableClass([{}, { hideBelow: 'xl' }, {}, { hideBelow: '2xl' }]).split(' ');
+    expect(classes).toContain('max-xl:[&_table]:!min-w-0');
+    for (const el of ['col', 'th', 'td']) {
+      expect(classes).toContain(`max-xl:[&_${el}:nth-child(2)]:!hidden`);
+      expect(classes).toContain(`max-2xl:[&_${el}:nth-child(4)]:!hidden`);
+    }
+    expect(classes.some((c) => c.includes('nth-child(1)') || c.includes('nth-child(3)'))).toBe(false);
+  });
+});
+
+describe('a console request that fails', () => {
+  const refuse = () =>
+    jsonResponse({ error: { message: 'The console service is restarting.' } }, 503);
+
+  const falseEmpty: [string, RegExp][] = [
+    ['keys', /No projects, so no keys|No keys in this project/],
+    ['logs', /No projects to log|No requests yet/],
+    ['webhooks', /No projects to notify|No endpoints in this project/],
+    ['limits', /No projects to limit/],
+  ];
+
+  for (const [tab, empty] of falseEmpty) {
+    it(`shows the error and a Retry on ${tab} when the project list fails, never an empty state`, async () => {
+      state.search = new URLSearchParams(`tab=${tab}`);
+      const calls = route({ 'GET projects': refuse });
+      render(<ConsoleShell me={SUPER_ADMIN} />);
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent).toContain('The console service is restarting.');
+      expect(screen.queryByText(empty)).toBeNull();
+
+      const projectCalls = () => calls.filter((c) => c.url.includes('/api/devplatform/projects')).length;
+      const before = projectCalls();
+      await userEvent.setup().click(within(alert).getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(projectCalls()).toBe(before + 1));
+    });
+  }
+
+  it('says nothing about keys while the project list is still on its way', async () => {
+    state.search = new URLSearchParams('tab=keys');
+    const pending = deferred<Response>();
+    route({ 'GET projects': () => pending.promise });
+    render(<ConsoleShell me={ADMIN} />);
+    await screen.findByRole('heading', { name: 'API keys' });
+    expect(screen.queryByText(/No keys in this project|No projects, so no keys/)).toBeNull();
+    await act(async () => {
+      pending.resolve(jsonResponse({ projects: [] }));
+    });
+    await screen.findByText(/No projects, so no keys/);
+  });
+
+  it('shows the model list failure with a Retry on the playground instead of "no chat model"', async () => {
+    state.search = new URLSearchParams('tab=playground');
+    const calls = route({ 'GET models': refuse });
+    render(<ConsoleShell me={ADMIN} />);
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('The console service is restarting.');
+    expect(screen.queryByText(/No chat model is published/)).toBeNull();
+    await userEvent.setup().click(within(alert).getByRole('button', { name: 'Retry' }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.url.includes('/api/devplatform/models')).length).toBe(2),
+    );
+  });
+
+  it('shows no project count beside the projects error, and the count once the list arrives', async () => {
+    state.search = new URLSearchParams('tab=projects');
+    let fail = true;
+    route({ 'GET projects': () => (fail ? refuse() : jsonResponse({ projects: [PROJECT] })) });
+    render(<ConsoleShell me={ADMIN} />);
+    const alert = await screen.findByRole('alert');
+    expect(screen.queryByText(/\d+ projects?$/)).toBeNull();
+    fail = false;
+    await userEvent.setup().click(within(alert).getByRole('button', { name: 'Retry' }));
+    await screen.findByText('1 project');
+  });
+
+  it('offers a Retry when the limits of a project fail to load', async () => {
+    state.search = new URLSearchParams('tab=limits');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      [`GET ${consolePaths.limits(PROJECT.id)}`]: refuse,
+    });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByRole('button', { name: 'Retry' })).toBeTruthy();
+  });
+});
+
+describe('the console navigation below lg', () => {
+  function mountAt(tab: string) {
+    state.search = new URLSearchParams(tab ? `tab=${tab}` : '');
+    route({
+      'GET projects': () => jsonResponse({ projects: [] }),
+      'GET overview': () => jsonResponse(overviewOf({})),
+    });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+  }
+
+  it('is a menu button with a 40px target that names the section on show, not a sideways strip', async () => {
+    mountAt('webhooks');
+    const toggle = screen.getByRole('button', { name: 'Open console menu' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-controls')).toBe('console-rail');
+    expect(toggle.className).toContain('h-10');
+    expect(toggle.className).toContain('w-10');
+    expect(screen.getByTestId('console-current-section').textContent).toBe('Webhooks');
+    const header = toggle.closest('header') as HTMLElement;
+    expect(header.className).not.toContain('overflow-x-auto');
+    expect(header.querySelectorAll('a')).toHaveLength(0);
+    // Closed, the rail is not drawn below lg; from lg it is the column.
+    const rail = document.getElementById('console-rail') as HTMLElement;
+    expect(rail.className.split(/\s+/)).toContain('hidden');
+    expect(rail.className).toContain('lg:flex');
+  });
+
+  it('opens a drawer holding every section and both ways out, focused on the section on show', async () => {
+    mountAt('webhooks');
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Open console menu' }));
+    const toggle = screen.getByRole('button', { name: 'Close console menu' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    const rail = document.getElementById('console-rail') as HTMLElement;
+    expect(rail.className.split(/\s+/)).not.toContain('hidden');
+    expect(rail.className).toContain('fixed');
+    const active = within(rail).getByRole('link', { name: 'Webhooks' });
+    expect(active.getAttribute('aria-current')).toBe('page');
+    expect(document.activeElement).toBe(active);
+    const links = within(rail).getAllByRole('link');
+    for (const name of ['Overview', 'API keys', 'Limits', 'Documentation', 'Settings', 'Admin', 'Back to chat']) {
+      expect(links.some((link) => link.textContent === name)).toBe(true);
+    }
+    // Every row is 36px tall: a thumb's target, where the strip's were 22px.
+    for (const link of links) expect(link.className).toContain('h-9');
+  });
+
+  it('closes on Escape and hands focus back to the menu button', async () => {
+    mountAt('keys');
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Open console menu' }));
+    await user.keyboard('{Escape}');
+    const toggle = screen.getByRole('button', { name: 'Open console menu' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(toggle);
+  });
+
+  it('closes when the scrim is tapped or the section on show is chosen again', async () => {
+    mountAt('keys');
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: 'Open console menu' }));
+    await user.click(screen.getByTestId('console-drawer-scrim'));
+    expect(screen.getByRole('button', { name: 'Open console menu' }).getAttribute('aria-expanded')).toBe('false');
+
+    await user.click(screen.getByRole('button', { name: 'Open console menu' }));
+    const rail = document.getElementById('console-rail') as HTMLElement;
+    const current = within(rail).getByRole('link', { name: 'API keys' });
+    // jsdom cannot navigate; the click still reaches React's handler.
+    current.addEventListener('click', (event) => event.preventDefault());
+    fireEvent.click(current);
+    expect(screen.getByRole('button', { name: 'Open console menu' }).getAttribute('aria-expanded')).toBe('false');
+  });
+});
+
+describe('the address bar and the document title', () => {
+  it('names the section on show in the document title', async () => {
+    const { consoleTitle } = await import('@/components/devplatform/ConsoleShell');
+    state.search = new URLSearchParams('tab=keys');
+    route({ 'GET projects': () => jsonResponse({ projects: [] }) });
+    const { unmount } = render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(document.title).toBe('API keys · Developer platform · TechSara'));
+    unmount();
+
+    state.search = new URLSearchParams('tab=logs');
+    render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(document.title).toBe('Request logs · Developer platform · TechSara'));
+    expect(consoleTitle(undefined)).toBe('Developer platform · TechSara');
+  });
+
+  it('keeps the section in the title when Next swaps in a fresh metadata <title> on a soft navigation', async () => {
+    // Measured in Chrome: on every tab change Next removes the layout's
+    // <title> and inserts a new "Developer platform · TechSara" after the
+    // shell's effect ran, so a plain document.title assignment lost.
+    for (const el of Array.from(document.querySelectorAll('title'))) el.remove();
+    const theirs = document.createElement('title');
+    theirs.textContent = 'Developer platform · TechSara';
+    document.head.appendChild(theirs);
+    try {
+      state.search = new URLSearchParams('tab=keys');
+      route({ 'GET projects': () => jsonResponse({ projects: [] }) });
+      render(<ConsoleShell me={ADMIN} />);
+      await waitFor(() => expect(document.title).toBe('API keys · Developer platform · TechSara'));
+      // The text node React holds is rewritten in place, not replaced.
+      expect(theirs.firstChild?.nodeValue).toBe('API keys · Developer platform · TechSara');
+
+      theirs.remove();
+      const fresh = document.createElement('title');
+      fresh.textContent = 'Developer platform · TechSara';
+      document.head.appendChild(fresh);
+      await waitFor(() => expect(document.title).toBe('API keys · Developer platform · TechSara'));
+      expect(document.querySelectorAll('title')).toHaveLength(1);
+    } finally {
+      cleanup();
+      for (const el of Array.from(document.querySelectorAll('title'))) el.remove();
+    }
+  });
+
+  it('replaces ?tab=limits with the Overview an admin is actually shown', async () => {
+    state.search = new URLSearchParams('tab=limits');
+    route({ 'GET overview': () => jsonResponse(overviewOf({})) });
+    render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(state.router.replace).toHaveBeenCalledWith('/api', { scroll: false }));
+    expect(state.router.push).not.toHaveBeenCalled();
+    await waitFor(() => expect(document.title).toBe('Overview · Developer platform · TechSara'));
+  });
+
+  it('drops a tab that names nothing and keeps the rest of the query', async () => {
+    state.search = new URLSearchParams('tab=nonsense&utm=mail');
+    route({ 'GET overview': () => jsonResponse(overviewOf({})) });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    await waitFor(() =>
+      expect(state.router.replace).toHaveBeenCalledWith('/api?utm=mail', { scroll: false }),
+    );
+  });
+
+  it('leaves a tab this account may open exactly as it is', async () => {
+    state.search = new URLSearchParams('tab=limits');
+    route({ 'GET projects': () => jsonResponse({ projects: [] }) });
+    render(<ConsoleShell me={SUPER_ADMIN} />);
+    await screen.findByText(/No projects to limit/);
+    expect(state.router.replace).not.toHaveBeenCalled();
+  });
+});
+
+describe('the usage chart axis', () => {
+  it('draws every day of the window and leaves a gap, not a zero, for a day with no row', async () => {
+    const { usageDays } = await import('@/components/devplatform/Usage');
+    const day = (d: string, requests: number, errors = 0) => ({
+      day: d,
+      requests,
+      errors,
+      input_tokens: 0,
+      output_tokens: 0,
+      rate_limited: 0,
+    });
+    const axis = usageDays({
+      range: { days: 5, start: '2026-08-30', end: '2026-09-03' },
+      series: [day('2026-08-30', 4, 1), day('2026-09-03', 9)],
+    });
+    // Across a month boundary, local-midnight labels so no zone moves a day.
+    expect(axis.labels).toEqual([
+      '2026-08-30T00:00:00',
+      '2026-08-31T00:00:00',
+      '2026-09-01T00:00:00',
+      '2026-09-02T00:00:00',
+      '2026-09-03T00:00:00',
+    ]);
+    expect(axis.requests).toEqual([4, null, null, null, 9]);
+    expect(axis.errors).toEqual([1, null, null, null, 0]);
+  });
+
+  it('falls back to the listed days when the server sends no usable range', async () => {
+    const { usageDays } = await import('@/components/devplatform/Usage');
+    const row = { day: '2026-09-13', requests: 600, errors: 0, input_tokens: 0, output_tokens: 0, rate_limited: 0 };
+    const axis = usageDays({
+      range: { days: 30, start: 'garbage', end: '2026-09-13' },
+      series: [row],
+    });
+    expect(axis.labels).toEqual(['2026-09-13T00:00:00']);
+    expect(axis.requests).toEqual([600]);
+    expect(usageDays(null)).toEqual({ labels: [], requests: [], errors: [] });
+  });
+
+  it('bounds both toolbar selects to the toolbar so a long project name cannot widen a phone', async () => {
+    state.search = new URLSearchParams('tab=usage');
+    const long = { ...PROJECT, name: 'conformance-node-2026-09-13T07-52-43-441Z' };
+    route({
+      'GET projects': () => jsonResponse({ projects: [long] }),
+      'GET usage': () =>
+        jsonResponse({
+          range: { days: 30, start: '2026-08-15', end: '2026-09-13' },
+          series: [],
+          totals: { requests: 0, input_tokens: 0, output_tokens: 0, errors: 0, rate_limited: 0, total_tokens: 0 },
+          projects: [],
+        }),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    await screen.findByRole('option', { name: /conformance-node/ });
+    for (const label of ['Project', 'Time range']) {
+      const wrapper = screen.getByLabelText(label).parentElement!.parentElement as HTMLElement;
+      expect(wrapper.className).toContain('min-w-0');
+      expect(wrapper.className).toContain('max-w-full');
+      expect(wrapper.className).toContain('[&_select]:max-w-full');
+    }
+  });
+});
+
+describe('the usage page when its report fails', () => {
+  it('shows the error with a Retry and claims no project served nothing', async () => {
+    state.search = new URLSearchParams('tab=usage');
+    route({
+      'GET projects': () => jsonResponse({ projects: [PROJECT] }),
+      'GET usage': () => jsonResponse({ error: { message: 'The console service is restarting.' } }, 503),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    await screen.findByText('The console service is restarting.');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(screen.queryByText(/No project has served a request/)).toBeNull();
+    expect(screen.queryByText(/No API requests in this window/)).toBeNull();
+  });
+});
+
+describe('a request log status that is wider than its column', () => {
+  it('wraps an error code after its underscores instead of running into the next column', async () => {
+    const { StatusCell } = await import('@/components/devplatform/RequestLogs');
+    render(
+      <StatusCell
+        row={{ ...(LOG_ROW as unknown as import('@/components/devplatform/types').RequestLogRow), status: 'failed', error_code: 'model_unavailable' }}
+      />,
+    );
+    const cell = screen.getByTestId('log-status');
+    expect(cell.textContent).toBe('model_unavailable');
+    expect(cell.className).toContain('whitespace-normal');
+    expect(cell.className).toContain('[overflow-wrap:anywhere]');
+    expect(cell.className).toContain('text-danger');
+    // One break opportunity after the underscore, none inside the words.
+    expect(cell.querySelectorAll('wbr')).toHaveLength(1);
+  });
+});
+
+describe('the playground with a long unbroken token', () => {
+  it('lets both columns shrink below lg and breaks the answer, the error and the request id anywhere', async () => {
+    state.search = new URLSearchParams('tab=playground');
+    const token = 'A'.repeat(1200);
+    route({
+      'GET models': () => jsonResponse({ models: [MODEL], can_manage: false }),
+      'POST playground/execute': () =>
+        jsonResponse(
+          { error: { message: `Refused: see https://docs.example.com/${token}` } },
+          429,
+          { 'x-request-id': `req_${token}` },
+        ),
+    });
+    render(<ConsoleShell me={ADMIN} />);
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText('Input'), 'Say hello');
+    await user.click(screen.getByRole('button', { name: 'Run' }));
+
+    const error = await screen.findByTestId('playground-error');
+    expect(error.textContent).toContain(token);
+    expect(error.className).toContain('min-w-0');
+    expect(error.className).toContain('[overflow-wrap:anywhere]');
+
+    const request = screen.getByRole('region', { name: 'Request' });
+    const response = screen.getByRole('region', { name: 'Response' });
+    const grid = request.parentElement as HTMLElement;
+    // An implicit track grows to min-content; an explicit minmax(0,1fr) cannot.
+    expect(grid.className.split(/\s+/)).toContain('grid-cols-[minmax(0,1fr)]');
+    expect(request.className).toContain('min-w-0');
+    expect(response.className).toContain('min-w-0');
+
+    const output = screen.getByTestId('playground-output');
+    expect(output.className).toContain('[overflow-wrap:anywhere]');
+    // `break-words` does not lower min-content, which is the whole bug.
+    expect(output.className).not.toContain('break-words');
+    const id = within(response).getByText(`req_${token}`);
+    expect(id.className).toContain('[overflow-wrap:anywhere]');
   });
 });

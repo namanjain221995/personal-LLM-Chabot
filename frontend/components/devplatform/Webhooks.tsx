@@ -46,7 +46,14 @@ import { ADMIN_PRIMARY_BUTTON, AdminToolbar } from '@/components/admin/controls'
 import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { consoleDelete, consolePatch, consolePost, messageOf } from './api';
 import { consolePaths } from './paths';
-import { ConsoleEmpty, ConsoleTable, MonoValue, ProjectSelect, useProjects } from './shared';
+import {
+  ConsoleEmpty,
+  ConsoleTable,
+  MonoValue,
+  ProjectSelect,
+  ProjectsLoadError,
+  useProjects,
+} from './shared';
 import { useConsole } from './useConsole';
 import { useConsoleStatus } from './status';
 import { WEBHOOK_EVENTS, type WebhookEndpoint } from './types';
@@ -68,12 +75,16 @@ export function WebhooksPanel() {
   const [deleteTarget, setDeleteTarget] = useState<WebhookEndpoint | null>(null);
 
   const rows = hooks.data?.webhooks ?? [];
+  // Before the project list arrives no endpoint request has been sent, so "no
+  // endpoints" is not known yet — the table's skeleton says so instead.
+  const projectsPending = projectsQuery.loading && projectsQuery.data === null;
 
   useEffect(() => {
-    if (hooks.loading) announce('Loading webhook endpoints.');
+    if (projectsQuery.error) announce(projectsQuery.error);
+    else if (projectsPending || hooks.loading) announce('Loading webhook endpoints.');
     else if (hooks.error) announce(hooks.error);
     else announce(`${rows.length} endpoint${rows.length === 1 ? '' : 's'}.`);
-  }, [hooks.loading, hooks.error, rows.length, announce]);
+  }, [projectsQuery.error, projectsPending, hooks.loading, hooks.error, rows.length, announce]);
 
   async function remove(endpoint: WebhookEndpoint) {
     try {
@@ -113,7 +124,13 @@ export function WebhooksPanel() {
       label: 'Endpoint',
       render: (e) => (
         <div className="min-w-0">
-          <div className="truncate font-medium text-ink" title={e.url}>
+          {/* Two wrapped lines, not one truncated one: on a phone every
+              endpoint read "https://hooks.ex…" and two of them could not be
+              told apart (audit, 2026-09-13). */}
+          <div
+            className="line-clamp-2 whitespace-normal font-medium text-ink [overflow-wrap:anywhere]"
+            title={e.url}
+          >
             {e.url}
           </div>
           <MonoValue value={e.events.join(', ') || 'No events subscribed'} />
@@ -188,7 +205,7 @@ export function WebhooksPanel() {
     },
   ];
 
-  if (!projectsQuery.loading && projects.length === 0) {
+  if (!projectsQuery.loading && !projectsQuery.error && projects.length === 0) {
     return (
       <div>
         <ConsoleHeader title="Webhooks" />
@@ -229,7 +246,9 @@ export function WebhooksPanel() {
       </AdminToolbar>
 
       <div className="mt-5">
-        {!hooks.loading && !hooks.error && rows.length === 0 ? (
+        {projectsQuery.error ? (
+          <ProjectsLoadError query={projectsQuery} />
+        ) : !projectsPending && !hooks.loading && !hooks.error && rows.length === 0 ? (
           <ConsoleEmpty
             title="No endpoints in this project"
             body="Add an HTTPS endpoint to be told when a background response finishes, fails or is cancelled. Every delivery is signed with a secret you see once, when the endpoint is created."
@@ -240,7 +259,7 @@ export function WebhooksPanel() {
             minWidth={920}
             rows={rows}
             rowKey={(e) => e.id}
-            loading={hooks.loading && hooks.data === null}
+            loading={projectsPending || (hooks.loading && hooks.data === null)}
             empty="No endpoints in this project."
             error={hooks.error}
             onRetry={hooks.reload}

@@ -107,7 +107,12 @@ export function ProjectsPanel({ me }: { me: Me }) {
         label: 'Project',
         render: (p) => (
           <div className="min-w-0">
-            <div className="truncate font-medium text-ink" title={p.name}>
+            {/* Wrapped, not truncated: on a phone every
+                "docs-examples-2026…" row read the same (audit, 2026-09-13). */}
+            <div
+              className="whitespace-normal font-medium text-ink [overflow-wrap:anywhere]"
+              title={p.name}
+            >
               {p.name}
             </div>
             <MonoValue value={p.id} />
@@ -186,10 +191,14 @@ export function ProjectsPanel({ me }: { me: Me }) {
           ) : undefined
         }
       >
-        <span className="text-xs text-faint">
-          {projects.length.toLocaleString()} project
-          {projects.length === 1 ? '' : 's'}
-        </span>
+        {/* A count only from a list that arrived: beside a failed request
+            "0 projects" was an invented number (audit, 2026-09-13). */}
+        {data !== null && !error && (
+          <span className="text-xs text-faint">
+            {projects.length.toLocaleString()} project
+            {projects.length === 1 ? '' : 's'}
+          </span>
+        )}
       </AdminToolbar>
 
       <div className="mt-5">

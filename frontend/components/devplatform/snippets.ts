@@ -115,6 +115,15 @@ export function pythonLiteral(value: unknown, depth = 0): string {
  * shape a long answer can take. The read timeout is per chunk, not per
  * answer: the server sends a heartbeat every 15 s, so 60 s only trips on a
  * dead connection however long the generation runs.
+ *
+ * IT READS EVENTS, NOT RAW LINES (responsive audit follow-up, 2026-09-13).
+ * Printing every `data:` line put a wall of JSON on the terminal, and — worse
+ * — a `response.failed` or `error` terminal printed like any other frame and
+ * the script exited 0 after a generation that died. Both snippets now print
+ * the answer as it is written, the usage at the end, and raise on either
+ * failure terminal, which is what the docs' streaming guide does. Heartbeat
+ * comments (`: ping`) and blank lines match no branch and are skipped. Run
+ * against a stub server speaking CONTRACT §10 frames before it shipped.
  */
 export function pythonSnippet(req: SnippetRequest): string {
   const body = pythonLiteral(snippetBody(req));
@@ -122,6 +131,7 @@ export function pythonSnippet(req: SnippetRequest): string {
   if (req.stream) {
     const indented = body.split('\n').join('\n    ');
     return [
+      'import json',
       'import os',
       'import httpx',
       '',
@@ -133,9 +143,22 @@ export function pythonSnippet(req: SnippetRequest): string {
       '    timeout=httpx.Timeout(30.0, read=60.0),',
       ') as response:',
       '    response.raise_for_status()',
+      '    event = None',
       '    for line in response.iter_lines():',
-      '        if line.startswith("data: "):',
-      '            print(line[len("data: "):])',
+      '        if line.startswith("event: "):',
+      '            event = line[len("event: "):]',
+      '        elif line.startswith("data: "):',
+      '            data = json.loads(line[len("data: "):])',
+      '            if event == "response.output_text.delta":',
+      '                print(data["delta"], end="", flush=True)',
+      '            elif event == "response.completed":',
+      '                print()',
+      '                print("usage:", data["response"]["usage"])',
+      '            elif event == "response.failed":',
+      '                error = data["response"]["error"]',
+      '                raise RuntimeError(f"{error[\'code\']}: {error[\'message\']}")',
+      '            elif event == "error":',
+      '                raise RuntimeError(f"{data[\'code\']}: {data[\'message\']}")',
     ].join('\n');
   }
   return [
@@ -166,16 +189,38 @@ export function javascriptSnippet(req: SnippetRequest): string {
     '});',
     'if (!response.ok) throw new Error(`HTTP ${response.status}`);',
   ];
+  // Top-level await: Node 18+ runs it as an ES module, hence the file name.
+  const header = '// Node 18 or later. Save as request.mjs and run: node request.mjs';
   if (req.stream) {
     return [
+      header,
       ...request,
+      '',
+      '// Events arrive as "event: <name>" then "data: <json>" lines. A chunk can',
+      '// end mid-line, so the unfinished tail waits for the next one.',
       'const decoder = new TextDecoder();',
+      "let buffer = '';",
+      "let event = '';",
       'for await (const chunk of response.body) {',
-      '  process.stdout.write(decoder.decode(chunk, { stream: true }));',
+      '  buffer += decoder.decode(chunk, { stream: true });',
+      "  const lines = buffer.split('\\n');",
+      '  buffer = lines.pop();',
+      '  for (const raw of lines) {',
+      "    const line = raw.endsWith('\\r') ? raw.slice(0, -1) : raw;",
+      "    if (line.startsWith('event: ')) {",
+      "      event = line.slice('event: '.length);",
+      "    } else if (line.startsWith('data: ')) {",
+      "      const data = JSON.parse(line.slice('data: '.length));",
+      "      if (event === 'response.output_text.delta') process.stdout.write(data.delta);",
+      "      else if (event === 'response.completed') console.log('\\nusage:', data.response.usage);",
+      "      else if (event === 'response.failed') throw new Error(`${data.response.error.code}: ${data.response.error.message}`);",
+      "      else if (event === 'error') throw new Error(`${data.code}: ${data.message}`);",
+      '    }',
+      '  }',
       '}',
     ].join('\n');
   }
-  return [...request, 'console.log(await response.json());'].join('\n');
+  return [header, ...request, 'console.log(await response.json());'].join('\n');
 }
 
 export const SNIPPET_LANGUAGES = [

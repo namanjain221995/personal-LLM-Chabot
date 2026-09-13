@@ -43,6 +43,7 @@ import { IconAlert, IconPlay, IconStop } from '@/components/icons';
 import { SSEParser } from '@/lib/sse';
 import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { Section, Stat, StatRow } from '@/components/admin/analytics/ui';
+import { ErrorPanel } from '@/components/admin/ui';
 import { NOT_MEASURED, compact } from '@/components/admin/analytics/format';
 import {
   ADMIN_PRIMARY_BUTTON,
@@ -358,7 +359,19 @@ export function PlaygroundPanel() {
     }
   }
 
-  if (!models.loading && available.length === 0) {
+  // A failed model list is an error with a Retry, not "no chat model is
+  // published": an orchestrator restart read as a deployment with no models
+  // (audit, 2026-09-13).
+  if (models.error && models.data === null) {
+    return (
+      <div>
+        <ConsoleHeader title="Playground" />
+        <ErrorPanel message={models.error} onRetry={models.reload} />
+      </div>
+    );
+  }
+
+  if (!models.loading && !models.error && available.length === 0) {
     return (
       <div>
         <ConsoleHeader title="Playground" />
@@ -377,8 +390,13 @@ export function PlaygroundPanel() {
         description="Send a request the way your application will, and watch the stream frame by frame. It runs on your session — the playground never asks for, stores or sends an API key."
       />
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <section aria-label="Request">
+      {/* `minmax(0,1fr)` below lg too, and `min-w-0` on both columns. An
+          implicit grid track grows to its content's min-content width, so
+          one unbroken token in the answer (a URL, a base64 string) made the
+          track — and the whole page — 1680px wide on a 360px phone
+          (responsive audit, 2026-09-13). */}
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <section aria-label="Request" className="min-w-0">
           <h2 className="text-sm font-medium text-ink">Request</h2>
           <div className="mt-3 space-y-3">
             <Field label="Model">
@@ -484,17 +502,27 @@ export function PlaygroundPanel() {
           </div>
         </section>
 
-        <section aria-label="Response">
+        <section aria-label="Response" className="min-w-0">
           <h2 className="text-sm font-medium text-ink">Response</h2>
           {error && (
             <p role="alert" className="mt-3 flex items-start gap-1.5 text-sm text-danger">
               <IconAlert size={15} className="mt-0.5 shrink-0" />
-              {error}
+              {/* Its own shrinkable item: as a bare text child of the flex
+                  line, a URL in the server's sentence ran past the column. */}
+              <span
+                data-testid="playground-error"
+                className="min-w-0 [overflow-wrap:anywhere]"
+              >
+                {error}
+              </span>
             </p>
           )}
+          {/* `overflow-wrap: anywhere`, not `break-words`: only `anywhere`
+              lowers the min-content width, which is what the grid track
+              sizes to. */}
           <pre
             data-testid="playground-output"
-            className="mt-3 max-h-72 min-h-[120px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-bg p-3 font-mono text-xs text-ink"
+            className="mt-3 max-h-72 min-h-[120px] overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-bg p-3 font-mono text-xs text-ink [overflow-wrap:anywhere]"
           >
             {output || (running ? '' : 'The answer appears here.')}
           </pre>
@@ -574,7 +602,9 @@ export function PlaygroundPanel() {
             <p className="mt-2 text-xs text-faint">
               Request id:{' '}
               {requestId ? (
-                <code className="font-mono text-muted">{requestId}</code>
+                <code className="font-mono text-muted [overflow-wrap:anywhere]">
+                  {requestId}
+                </code>
               ) : (
                 <span className="text-faint">
                   not yet — it arrives with the response
