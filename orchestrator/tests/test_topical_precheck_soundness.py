@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import random
 import time
 
@@ -119,6 +120,88 @@ def test_a_fast_turn_grounds_on_the_same_page_as_think(monkeypatch, label, url, 
     out = lk.Prepared(verdict=freshness.static_timeless_task())
     asyncio.run(lk._topical(question, out, effort="fast"))
     assert out.decision == "static_topical" and want in out.grounding, (label, out.decision, out.degraded)
+
+
+
+# ── the threshold arithmetic at its exact boundary (re-prover, 2026-09-14) ──
+#
+# The soundness tests above use questions whose pages hold most of their
+# stems, so a pre-check asking for ONE stem more than the gate (the
+# re-prover's mutation RP-V1, `need = ceil(0.34 * n - 1e-9) + 1`) passed all of
+# them, while making every one-content-word Fast question ("What is
+# photosynthesis?") a proven miss even with a page titled for it.
+
+
+def _words(n: int) -> list:
+    """n distinct stems: a digit keeps `_stem` off each token."""
+    return [f"w{i}" for i in range(n)]
+
+
+def _gate_passes(question: str, title_words: list) -> bool:
+    """The gate's own lexical test for a page titled with `title_words`."""
+    page = web_memory.Evidence(url="https://t.test/", title=" ".join(title_words), text="",
+                               domain="t.test", authority=0, fetched_at=None)
+    return web_memory._lexical_score(question, page) >= lk._TOPICAL_LEXICAL_FLOOR
+
+
+class _NeedRecorder:
+    """A vocabulary stand-in that records the `need` the pre-check asks for."""
+
+    def __init__(self):
+        self.calls = []
+
+    def could_pass(self, stems, need):
+        self.calls.append((len(stems), need))
+        return False
+
+
+def test_the_precheck_asks_for_exactly_the_fewest_stems_with_which_the_gate_clears_its_floor(monkeypatch):
+    """For every n, `need` is the smallest k such that a page titled with k of
+    the question's n stems scores `_lexical_score >= floor`. One more and a
+    page the gate grounds on is called a proven miss; one fewer and the
+    pre-check proves fewer misses than it may. n runs to 200 because
+    0.34 * 150 is 51.00000000000001 in floating point: a bare ceil asks for 52,
+    but 51/150 clears the floor (the `- 1e-9`)."""
+    recorder = _NeedRecorder()
+    monkeypatch.setattr(lk._page_vocabulary, "current", lambda: recorder)
+    float_edges = []
+    for n in range(1, 201):
+        words = _words(n)
+        question = " ".join(words)
+        assert len(set(web_memory._terms(question))) == n
+        recorder.calls.clear()
+        assert lk._topical_precheck(question) is False
+        [(asked_with, need)] = recorder.calls
+        assert asked_with == n
+        assert _gate_passes(question, words[:need]), f"n={n}: need={need} asks for more stems than the gate does"
+        assert not _gate_passes(question, words[: need - 1]), f"n={n}: need={need} asks for fewer stems than the gate does"
+        if need < math.ceil(lk._TOPICAL_LEXICAL_FLOOR * n):
+            float_edges.append(n)
+    assert 150 in float_edges, float_edges
+
+
+def test_a_one_word_question_with_a_page_titled_for_it_is_not_a_proven_miss():
+    _store("https://bio.test/photosynthesis", "Photosynthesis",
+           "Plants convert light into chemical energy in chloroplasts. " * 10)
+    assert len(set(web_memory._terms("What is photosynthesis?"))) == 1
+    assert lk._topical_precheck("What is photosynthesis?") is True
+
+
+@pytest.mark.parametrize("n", [1, 3, 4, 150])
+def test_a_stored_page_holding_exactly_the_gates_boundary_count_of_stems_is_a_maybe(n):
+    """The real vocabulary and Bloom filter at the boundary: the fewest stems
+    with which the gate passes (found by the gate, not by the pre-check's
+    formula) must be enough; for small n, one fewer must be a proven miss."""
+    words = _words(n)
+    question = " ".join(words)
+    boundary = next(k for k in range(n + 1) if _gate_passes(question, words[:k]))
+    _store("https://edge.test/page", " ".join(words[:boundary]), "unrelated filler text only " * 10)
+    assert lk._topical_precheck(question) is True, (n, boundary)
+    if n <= 4:
+        _store("https://edge.test/page", " ".join(words[: boundary - 1]), "different unrelated filler " * 10)
+        with db.connection() as con:
+            con.execute("UPDATE web_pages SET indexed_at = now()")
+        assert lk._topical_precheck(question) is False, (n, boundary)
 
 
 def test_a_question_no_stored_page_can_answer_is_still_a_proven_miss():

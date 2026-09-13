@@ -16,9 +16,15 @@ Pinned here, each by a test that fails without its change:
   - a pre-check that cannot tell, fails, or is switched off falls back to the
     pre-change wait, not to the short deadline;
   - a corpus with no page that could pass the gate is not waited on at all;
-  - a Fast timeless TASK never asks the router; a live-value question with no
-    recency word ("euro to dollar", "is AWS down") still does, and still gets
-    the Fast live lookup (revised 2026-09-13: the first skip made it 0 of 4);
+  - the router skip is OPT-IN (FRESHNESS_FAST_SKIP_ROUTER, default off since
+    2026-09-14): with the shipped default every Fast question asks the router,
+    and a live value in a timeless-task shape ("write a poem for our cji")
+    gets the Fast live lookup, as on HEAD (the re-prover: 37/50 with the skip
+    on by default, 50/50 on HEAD);
+  - with the skip switched on, a Fast timeless TASK does not ask the router; a
+    live-value question with no recency word ("euro to dollar", "is AWS down")
+    still does, and still gets the Fast live lookup (revised 2026-09-13: the
+    first skip made it 0 of 4);
   - Think and Max keep today's order and wait for grounding however slow.
 
 Time is driven with small real deadlines (tens of milliseconds) and events,
@@ -76,11 +82,12 @@ def _clean(monkeypatch):
     # The defaults this change ships, set explicitly so an operator's
     # environment cannot change what these tests prove. Both wall-clock
     # bounds are OFF by default since the second prover pass (2026-09-13);
-    # the tests of the opt-in bounds set their own values.
+    # the router skip is OFF by default since the re-prover (2026-09-14).
+    # The tests of the opt-in behaviour set their own values.
     _tune(monkeypatch, "_FAST_TOPICAL_DEADLINE_S", 0.0)
     _tune(monkeypatch, "_FAST_TOPICAL_HIT_BUDGET_S", 0.0)
     _tune(monkeypatch, "_FAST_TOPICAL_PRECHECK", True)
-    _tune(monkeypatch, "_FAST_SKIP_ROUTER", True)
+    _tune(monkeypatch, "_FAST_SKIP_ROUTER", False)
     _tune(monkeypatch, "_FAST_CONCURRENT_RETRIEVE", True)
     monkeypatch.setattr(lk, "claims_for", lambda q, limit=3: [])
     yield
@@ -352,10 +359,10 @@ def test_the_tunables_parse_like_config_py(monkeypatch):
     assert lk._env_float("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", 0.3) == 0.3
     monkeypatch.setenv("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", "0.25")
     assert lk._env_float("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", 0.3) == 0.25
-    monkeypatch.setenv("FRESHNESS_FAST_SKIP_ROUTER", "off")
-    assert lk._env_bool("FRESHNESS_FAST_SKIP_ROUTER", True) is False
+    monkeypatch.setenv("FRESHNESS_FAST_SKIP_ROUTER", "on")
+    assert lk._env_bool("FRESHNESS_FAST_SKIP_ROUTER", False) is True
     monkeypatch.setenv("FRESHNESS_FAST_SKIP_ROUTER", "")
-    assert lk._env_bool("FRESHNESS_FAST_SKIP_ROUTER", True) is True
+    assert lk._env_bool("FRESHNESS_FAST_SKIP_ROUTER", False) is False
 
 
 # ── the pre-check ────────────────────────────────────────────────────────────
@@ -451,7 +458,8 @@ def test_the_precheck_never_rejects_a_question_the_full_topical_gate_accepts(mon
 
 
 @pytest.mark.parametrize("question", ["hello, how are you?", "write me a haiku about autumn", "translate this sentence"])
-def test_a_fast_timeless_task_never_asks_the_router(monkeypatch, question):
+def test_with_the_skip_switched_on_a_fast_timeless_task_never_asks_the_router(monkeypatch, question):
+    _tune(monkeypatch, "_FAST_SKIP_ROUTER", True)  # opt-in; the default asks the router
     calls = []
     _router(monkeypatch, Freshness.RECENT, calls=calls)
     monkeypatch.setattr(lk, "_topical_precheck", lambda q: False)
@@ -470,8 +478,8 @@ LIVE_WITHOUT_A_RECENCY_WORD = [
 ]
 
 
-@pytest.mark.parametrize("question", LIVE_WITHOUT_A_RECENCY_WORD)
-def test_a_fast_live_value_question_asks_the_router_and_makes_the_live_lookup(monkeypatch, question):
+def _live_lookup_turn(monkeypatch, question):
+    """One Fast turn whose router answers RECENT: (router calls, live lookups, prepared)."""
     calls, lookups = [], []
     _router(monkeypatch, Freshness.RECENT, calls=calls)
 
@@ -485,10 +493,92 @@ def test_a_fast_live_value_question_asks_the_router_and_makes_the_live_lookup(mo
     monkeypatch.setattr(lk, "retrieve", empty)
     monkeypatch.setattr(lk, "_fast_lookup", lookup)
     prepared = run(_prepare(question, web_search_pref="auto", allow_network=True))
+    return calls, lookups, prepared
+
+
+@pytest.mark.parametrize("skip_router", [False, True], ids=["skip-default-off", "skip-on"])
+@pytest.mark.parametrize("question", LIVE_WITHOUT_A_RECENCY_WORD)
+def test_a_fast_live_value_question_asks_the_router_and_makes_the_live_lookup(monkeypatch, question, skip_router):
+    _tune(monkeypatch, "_FAST_SKIP_ROUTER", skip_router)
+    calls, lookups, prepared = _live_lookup_turn(monkeypatch, question)
     assert calls == [question], "the router must decide a live-value question"
     assert prepared.verdict.reason == "router" and prepared.verdict.needs_evidence
     assert lookups == [question], "HEAD made the Fast live lookup here; so must this"
     assert prepared.decision == "fast_lookup_failed"
+
+
+#: The re-prover's live values in timeless-task shapes (2026-09-14,
+#: scratchpad rp3/lookup/fast_lookup_probe_rp3.py): with the skip ON by default
+#: each of these was settled STATIC/timeless_task, answered from weights, where
+#: HEAD asked the router and made the Fast live lookup. The allowlist's word
+#: lists do not see role abbreviations after "our", lowercase brand and person
+#: names, or statistics nouns — which is why the skip ships off.
+LIVE_IN_A_TIMELESS_SHAPE = [
+    "draft a letter to my cm about potholes",
+    "write a poem for our cji",
+    "write an essay on unemployment figures in india",
+    "write a birthday wish for our dgp",
+    "give me some slogans for aap in punjab",
+    "compose a poem honouring rbi guv",
+    "write a thank you note to our hon'ble cm",
+    "tell me a joke about elon musk",
+    "write a poem for virat kohli on his retirement",
+    "draft a letter to indigo about their baggage allowance",
+    "write an email to airtel about their unlimited plan",
+    "write a song about jio recharge plans",
+    "write a poem about our district collector",
+]
+
+
+def _shipped_skip_router(monkeypatch) -> bool:
+    """FRESHNESS_FAST_SKIP_ROUTER exactly as it ships: no environment, a fresh
+    Settings, and the module's own default read from its source (its
+    import-time value is what the environment of this process made it)."""
+    import ast
+
+    from app.config import Settings
+
+    monkeypatch.delenv("FRESHNESS_FAST_SKIP_ROUTER", raising=False)
+    module_defaults = [
+        ast.literal_eval(node.args[1])
+        for node in ast.walk(ast.parse(inspect.getsource(lk)))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_env_bool"
+        and len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "FRESHNESS_FAST_SKIP_ROUTER"
+    ]
+    assert len(module_defaults) == 1, module_defaults
+    monkeypatch.setattr(lk, "_FAST_SKIP_ROUTER", module_defaults[0])
+    monkeypatch.setattr(settings, "freshness_fast_skip_router", Settings().freshness_fast_skip_router)
+    return lk.fast_skip_router()
+
+
+def test_the_router_skip_ships_switched_off_in_settings_and_in_the_module(monkeypatch):
+    assert _shipped_skip_router(monkeypatch) is False
+    assert lk._FAST_SKIP_ROUTER is False
+
+
+@pytest.mark.parametrize("question", LIVE_IN_A_TIMELESS_SHAPE)
+def test_with_the_shipped_default_a_live_value_in_a_timeless_shape_asks_the_router_and_makes_the_live_lookup(
+    monkeypatch, question
+):
+    _shipped_skip_router(monkeypatch)
+    calls, lookups, prepared = _live_lookup_turn(monkeypatch, question)
+    assert calls == [question], "with the shipped default every Fast question asks the router"
+    assert prepared.verdict.reason == "router" and prepared.verdict.needs_evidence, prepared.verdict
+    assert lookups == [question], "HEAD made the Fast live lookup here; so must the shipped default"
+    assert prepared.decision == "fast_lookup_failed"
+
+
+def test_with_the_shipped_default_even_a_plainly_timeless_fast_task_asks_the_router(monkeypatch):
+    """The default is today's behaviour, not a narrower allowlist."""
+    _shipped_skip_router(monkeypatch)
+    calls = []
+    _router(monkeypatch, Freshness.STATIC, calls=calls)
+    monkeypatch.setattr(lk, "_topical_precheck", lambda q: False)
+    prepared = run(_prepare("write me a haiku about autumn"))
+    assert freshness.clearly_timeless("write me a haiku about autumn", now_year=datetime.now(timezone.utc).year)
+    assert calls == ["write me a haiku about autumn"]
+    assert prepared.verdict.reason == "router"
 
 
 def test_a_time_sensitive_fast_question_still_consults_the_router(monkeypatch):

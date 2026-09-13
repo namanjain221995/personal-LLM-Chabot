@@ -134,10 +134,12 @@ _FAST_TOPICAL_HIT_BUDGET_S = _env_float("KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S", 0
 #: KNOWLEDGE_FAST_TOPICAL_PRECHECK — ask the page vocabulary whether ANY page
 #: could pass the topical gate before waiting on the full hybrid retrieval.
 _FAST_TOPICAL_PRECHECK = _env_bool("KNOWLEDGE_FAST_TOPICAL_PRECHECK", True)
-#: FRESHNESS_FAST_SKIP_ROUTER — settle a Fast question that is clearly a
-#: timeless task (freshness.clearly_timeless) as STATIC instead of asking the
-#: router.
-_FAST_SKIP_ROUTER = _env_bool("FRESHNESS_FAST_SKIP_ROUTER", True)
+#: FRESHNESS_FAST_SKIP_ROUTER — OPT-IN, default false (off; 2026-09-14). When
+#: on, settle a Fast question that is clearly a timeless task
+#: (freshness.clearly_timeless) as STATIC instead of asking the router. Off,
+#: every undecided Fast question asks the router as before: the allowlist
+#: still let 13 of 50 live-value questions in timeless-task shapes skip it.
+_FAST_SKIP_ROUTER = _env_bool("FRESHNESS_FAST_SKIP_ROUTER", False)
 #: KNOWLEDGE_FAST_CONCURRENT_RETRIEVE — start the time-sensitive retrieval
 #: while the router is still deciding, instead of after it.
 _FAST_CONCURRENT_RETRIEVE = _env_bool("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", True)
@@ -790,9 +792,11 @@ async def prepare(
     try:
         if fast and router_on and router_would_be_asked(question, now_year=now.year):
             if fast_skip_router() and clearly_timeless(question, now_year=now.year):
-                # A timeless task with no live-value signal in it ("write me a
-                # haiku", "hello, how are you?"): no router round trip. Any
-                # doubt goes to the router below, as it did before.
+                # OPT-IN (FRESHNESS_FAST_SKIP_ROUTER, default off). A timeless
+                # task with no live-value signal in it ("write me a haiku",
+                # "hello, how are you?"): no router round trip. Any doubt goes
+                # to the router below, as it did before. With the default,
+                # every Fast question takes the router branch.
                 verdict = static_timeless_task()
             else:
                 if fast_concurrent_retrieve():

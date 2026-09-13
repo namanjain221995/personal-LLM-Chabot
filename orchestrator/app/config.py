@@ -911,15 +911,20 @@ class Settings:
         # of static turns that find nothing stop there. It can only rule a
         # question out, never add grounding.
         self.knowledge_fast_topical_precheck: bool = _bool("KNOWLEDGE_FAST_TOPICAL_PRECHECK", True)
-        # FRESHNESS_FAST_SKIP_ROUTER — settle a Fast question as STATIC
-        # without the router (mean 0.216 s, p95 0.483 s, 2026-09-13) only
-        # when it positively reads as a timeless task with no live-value
-        # signal (freshness.clearly_timeless). Revised the same day from
-        # "no recency word": that answered "euro to dollar" and "is AWS down"
-        # from weights, the Fast live lookup falling from 4/4 on HEAD to 0/4.
-        # Every doubt still goes to the router. Applies only while
+        # FRESHNESS_FAST_SKIP_ROUTER — OPT-IN, default false (off): every
+        # Fast question the regex pass leaves undecided asks the router, as
+        # before 2026-09-13. When on, a Fast question that positively reads
+        # as a timeless task with no live-value signal
+        # (freshness.clearly_timeless) is settled STATIC without the router
+        # (mean 0.216 s, p95 0.483 s, 2026-09-13). Off by default since the
+        # re-prover of 2026-09-14: the allowlist's vetoes are word lists, and
+        # 13 of 50 new live-value questions in timeless-task shapes ("write a
+        # poem for our cji", "draft a letter to indigo about their baggage
+        # allowance", "write an essay on unemployment figures in india")
+        # still skipped the router and answered from weights where HEAD made
+        # the Fast live lookup (37/50 vs 50/50). Applies only while
         # FRESHNESS_ROUTER_ENABLED is on.
-        self.freshness_fast_skip_router: bool = _bool("FRESHNESS_FAST_SKIP_ROUTER", True)
+        self.freshness_fast_skip_router: bool = _bool("FRESHNESS_FAST_SKIP_ROUTER", False)
         # KNOWLEDGE_FAST_CONCURRENT_RETRIEVE — start the time-sensitive
         # retrieval while the router is still deciding instead of after it,
         # so the router's 0.216 s mean no longer sits in front of it.

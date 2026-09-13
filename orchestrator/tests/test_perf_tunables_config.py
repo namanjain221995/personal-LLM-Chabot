@@ -57,7 +57,7 @@ TUNABLES = (
     Tunable("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", "knowledge_fast_topical_deadline_s", float, 0.0, lk, "_env_float"),
     Tunable("KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S", "knowledge_fast_topical_hit_budget_s", float, 0.0, lk, "_env_float"),
     Tunable("KNOWLEDGE_FAST_TOPICAL_PRECHECK", "knowledge_fast_topical_precheck", bool, True, lk, "_env_bool"),
-    Tunable("FRESHNESS_FAST_SKIP_ROUTER", "freshness_fast_skip_router", bool, True, lk, "_env_bool"),
+    Tunable("FRESHNESS_FAST_SKIP_ROUTER", "freshness_fast_skip_router", bool, False, lk, "_env_bool"),
     Tunable("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", "knowledge_fast_concurrent_retrieve", bool, True, lk, "_env_bool"),
     Tunable("HEALTH_DEPENDENCY_CACHE_S", "health_dependency_cache_s", float, 4.0, health, "_env_float"),
     Tunable("CROSS_CHAT_EMBEDDINGS_CACHE_S", "cross_chat_embeddings_cache_s", float, 60.0, memory_semantic, "_env_float"),

@@ -307,6 +307,13 @@ TIMELESS_TASK_REASON = "timeless_task"
 # RECENT default on timeout. A wrong skip answers a live question from
 # weights; a wrong route costs one router call (mean 0.216 s, p95 0.483 s,
 # measured 2026-09-13), so every doubt resolves to the router.
+#
+# The skip itself is OPT-IN since 2026-09-14 (FRESHNESS_FAST_SKIP_ROUTER,
+# default false): the vetoes below are still word lists, and the re-prover's
+# 50 new live-value questions in timeless-task shapes skipped the router on 13
+# ("write a poem for our cji", "write an email to airtel about their unlimited
+# plan", "tell me a joke about elon musk"). With the default every Fast
+# question the regex pass leaves undecided asks the router, as on HEAD.
 # --------------------------------------------------------------------------
 
 #: A message that is ONLY small talk. Anchored at both ends: "hi, is AWS down"
@@ -588,8 +595,9 @@ _SKIP_MAX_CHARS = 500
 
 def clearly_timeless(question: str, *, now_year: int) -> bool:
     """Undecided by the regex pass, positively a timeless task, and not one
-    live-value signal in it. The ONLY questions Fast settles without the
-    router; see the block comment above for why the default is to ask."""
+    live-value signal in it. The ONLY questions Fast may settle without the
+    router, and only while FRESHNESS_FAST_SKIP_ROUTER is on (default off);
+    see the block comment above for why the default is to ask."""
     q = (question or "").strip()
     if not q or len(q) > _SKIP_MAX_CHARS or not router_would_be_asked(q, now_year=now_year):
         return False

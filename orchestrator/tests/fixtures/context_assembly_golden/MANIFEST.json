@@ -58,7 +58,7 @@
     "real_think_eval_topical_hit": "the same at Think",
     "real_fast_accented_page": "Fast, real retrieval: 'explain crème brûlée caramelising' (the first pre-check rejected it: search_tsv keeps 'crème', the gate's _WORD splits it)",
     "real_fast_passage_past_200k": "Fast, real retrieval: the answer sits past search_tsv's 200,000-char cap in a 205k-char page",
-    "real_fast_timeless_task_with_a_matching_page": "Fast, real retrieval: a timeless task (router skipped on the new tree) whose page is a topical hit"
+    "real_fast_timeless_task_with_a_matching_page": "Fast, real retrieval: a timeless task whose page is a topical hit (the router is asked with the shipped default; FRESHNESS_FAST_SKIP_ROUTER, opt-in since 2026-09-14, would skip it)"
   },
   "real_scenarios_captured": "2026-09-13 by the closing engineer from git archive HEAD (tree aefd714), twice into scratch cap1/cap2, diff -r empty; the 14 earlier files recaptured byte-identical"
 }
