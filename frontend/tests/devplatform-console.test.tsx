@@ -15,7 +15,7 @@
  * rows, and the show-once key flow — which must show the secret exactly once
  * and must offer no way back to it afterwards.
  */
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import {
   ProjectSelect,
   limitsEnforcement,
@@ -59,6 +59,13 @@ vi.mock('next/link', () => ({
   },
 }));
 
+// The async queries in this file wait on a whole console render (fetch mocks,
+// effects, a portal). The default 1 s budget failed on a loaded CI runner —
+// Pipeline run 34754339201, "Unable to find role=dialog" after 1148 ms — while
+// the same test passes in about 300 ms on an idle one. Nothing asserted here
+// is about speed, so the budget reflects shared CI hardware, not a looser test.
+configure({ asyncUtilTimeout: 5000 });
+
 vi.mock('@/components/admin/AdminDialog', async (importOriginal) => {
   const real = await importOriginal<typeof import('@/components/admin/AdminDialog')>();
   return {
@@ -67,7 +74,13 @@ vi.mock('@/components/admin/AdminDialog', async (importOriginal) => {
       if (state.dialogsAlwaysMounted && !props.open) {
         return <div data-closed="true">{props.children}</div>;
       }
-      return real.AdminDialog(props);
+      // Rendered as an ELEMENT, not called as a function (2026-09-13). Calling
+      // it inlined AdminDialog's hooks into this mock's fiber on open renders
+      // only, so hooks ran conditionally and React logged "Expected static
+      // flag was missing" on every run of the show-once tests. The secret
+      // lives in the parent dialog's state (CreateKeyDialog, WebhookDialog),
+      // so the closed-but-mounted assertions still test what they claim.
+      return <real.AdminDialog {...props} />;
     },
   };
 });
