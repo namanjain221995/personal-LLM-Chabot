@@ -30,9 +30,23 @@
     "                              16-hex file-id SHAPE of CONTRACT-2 §2, accepted nowhere;",
     "  * docs/availability/ADR-0002-high-availability.md, commit d2d15a7, line 95",
     "                            - prose naming the config key ADMISSION_NORMAL_MAX",
-    "                              and its value 10 beside the word `tokens`."
+    "                              and its value 10 beside the word `tokens`.",
+    "",
+    "2026-09-13 (reviewed, seven entropy hits from the developer platform, none a credential):",
+    "  * frontend/app/api/devplatform/[...path]/route.ts, commit b6ef491, line 159",
+    "                            - a code comment quoting `max_length=64`;",
+    "  * frontend/content/docs/pages/background.ts:28 and idempotency.ts:25, commit b6ef491",
+    "                            - documentation example Idempotency-Key UUIDs; an",
+    "                              idempotency key is a request label, not a credential;",
+    "  * orchestrator/tests/test_api_platform_keys.py, commit 0d7093b, line 49",
+    "                            - FIXED_SECRET, a deliberately patterned fake fixture",
+    "                              the key-minting tests use so their output is stable;",
+    "  * orchestrator/tests/test_api_platform_webhooks.py, commit 0d7093b, line 116",
+    "                            - an assert naming the SECRET variable; no value on the line;",
+    "  * docs/developer-platform/STANDARDS.md, commit 7ff6e15, lines 707 and 803",
+    "                            - the IETF Idempotency-Key draft's own example UUID."
   ],
-  "reviewed": "2026-09-12",
+  "reviewed": "2026-09-13",
   "findings": [
     {
       "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
@@ -123,6 +137,48 @@
       "rule": "generic-api-key",
       "file": "docs/availability/ADR-0002-high-availability.md",
       "line": 95
+    },
+    {
+      "fingerprint": "b6ef49116a7e116c1d0b3899c64038cfac4fc171:frontend/app/api/devplatform/[...path]/route.ts:generic-api-key:159",
+      "rule": "generic-api-key",
+      "file": "frontend/app/api/devplatform/[...path]/route.ts",
+      "line": 159
+    },
+    {
+      "fingerprint": "b6ef49116a7e116c1d0b3899c64038cfac4fc171:frontend/content/docs/pages/background.ts:generic-api-key:28",
+      "rule": "generic-api-key",
+      "file": "frontend/content/docs/pages/background.ts",
+      "line": 28
+    },
+    {
+      "fingerprint": "b6ef49116a7e116c1d0b3899c64038cfac4fc171:frontend/content/docs/pages/idempotency.ts:generic-api-key:25",
+      "rule": "generic-api-key",
+      "file": "frontend/content/docs/pages/idempotency.ts",
+      "line": 25
+    },
+    {
+      "fingerprint": "0d7093be85d44c74846854548fea85e48839450e:orchestrator/tests/test_api_platform_keys.py:generic-api-key:49",
+      "rule": "generic-api-key",
+      "file": "orchestrator/tests/test_api_platform_keys.py",
+      "line": 49
+    },
+    {
+      "fingerprint": "0d7093be85d44c74846854548fea85e48839450e:orchestrator/tests/test_api_platform_webhooks.py:generic-api-key:116",
+      "rule": "generic-api-key",
+      "file": "orchestrator/tests/test_api_platform_webhooks.py",
+      "line": 116
+    },
+    {
+      "fingerprint": "7ff6e158800371eb59ae02256776309c55ef778b:docs/developer-platform/STANDARDS.md:generic-api-key:707",
+      "rule": "generic-api-key",
+      "file": "docs/developer-platform/STANDARDS.md",
+      "line": 707
+    },
+    {
+      "fingerprint": "7ff6e158800371eb59ae02256776309c55ef778b:docs/developer-platform/STANDARDS.md:generic-api-key:803",
+      "rule": "generic-api-key",
+      "file": "docs/developer-platform/STANDARDS.md",
+      "line": 803
     }
   ]
 }
