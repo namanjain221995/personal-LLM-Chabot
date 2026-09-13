@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import functools
 import logging
 import math
 import re
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -1140,26 +1142,54 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     # domain: a crawled site whose footer carries the entity's name must
     # not fill the whole candidate set with boilerplate. Quarantined pages
     # (V16) never leave the store.
-    sql = """WITH ranked AS (
-               SELECT id, url, title, text, domain, authority, fetched_at,
-                      published_at, modified_at, source_type, origin,
-                      ts_rank_cd(search_tsv, websearch_to_tsquery('english', %s), 32) AS rank,
-                      row_number() OVER (
-                        PARTITION BY domain
-                        ORDER BY ts_rank_cd(search_tsv, websearch_to_tsquery('english', %s), 32) DESC
-                      ) AS dn
+    #
+    # Shape of the statement (2026-09-13, plan item 3a). The lexical stage is
+    # the slowest part of retrieve: p50 0.223 s / p95 0.984 s
+    # (knowledge_stage_seconds, 4 days), and it used to carry the FULL text of
+    # every matching page through the window sort — pages reach 2,367,944
+    # chars — and compute ts_rank_cd twice per row, once for `rank` and again
+    # inside the window. Now the rank is computed once, the per-domain cut and
+    # the LIMIT run over (id, domain, rank) only, and text is read for the
+    # surviving rows alone. Row order is the ranked order, carried through the
+    # join as `ord`.
+    #
+    # The text is the FULL text, as before (2026-09-13, second prover pass).
+    # It was briefly capped at the 200,000 chars `search_tsv` indexes, on the
+    # argument that a term past the cap never made the page match. But a page
+    # matches on ANY term in its head and `_best_window` then looks for the
+    # passage carrying the MOST terms, which can lie past the cap: a
+    # 249,196-char leaderboard with the asked-for row at 240,154 left the
+    # evidence at Think and Max too (lexical 0.33 -> 0.17, prepare
+    # decision local -> stale_offline, adv_longpage.py). The cap's saving was
+    # the window sort not carrying text, which this shape keeps.
+    sql = """WITH matched AS (
+               SELECT id, domain,
+                      ts_rank_cd(search_tsv, websearch_to_tsquery('english', %s), 32) AS rank
                  FROM web_pages
                 WHERE search_tsv @@ websearch_to_tsquery('english', %s)
                   AND text <> ''
                   AND quarantined_at IS NULL
+             ), ranked AS (
+               SELECT id, rank,
+                      row_number() OVER (PARTITION BY domain ORDER BY rank DESC) AS dn
+                 FROM matched
+             ), picked AS (
+               SELECT id, rank, dn, ord FROM (
+                 SELECT id, rank, dn, row_number() OVER (ORDER BY rank DESC) AS ord
+                   FROM ranked WHERE dn <= 3
+               ) numbered ORDER BY ord LIMIT %s
              )
-             SELECT * FROM ranked WHERE dn <= 3 ORDER BY rank DESC LIMIT %s"""
+             SELECT p.id, p.url, p.title, p.text, p.domain,
+                    p.authority, p.fetched_at, p.published_at, p.modified_at,
+                    p.source_type, p.origin, picked.rank, picked.dn
+               FROM picked JOIN web_pages p ON p.id = picked.id
+              ORDER BY picked.ord"""
     try:
         with db.connection() as con:
-            rows = list(con.execute(sql, (plain, plain, plain, limit)).fetchall())
+            rows = list(con.execute(sql, (plain, plain, limit)).fetchall())
             if len(rows) < limit:
                 seen = {r["id"] for r in rows}
-                for r in con.execute(sql, (any_of, any_of, any_of, limit)).fetchall():
+                for r in con.execute(sql, (any_of, any_of, limit)).fetchall():
                     if r["id"] not in seen:
                         rows.append(r)
                         seen.add(r["id"])
@@ -1202,63 +1232,12 @@ def _page_meta(urls: Sequence[str], ids: Sequence[int] = ()) -> Dict[str, Dict[s
         return {}
 
 
-async def retrieve(
-    query: str,
-    *,
-    level: Freshness = Freshness.RECENT,
-    top_k: int = 5,
-    use_cache: bool = True,
-    effort: str = "fast",
-    verdict: Optional[Any] = None,
-) -> Retrieval:
-    """Best local evidence for `query`, ranked for the freshness it needs.
-
-    Hybrid by construction: the dense index supplies semantic candidates, the
-    PostgreSQL text index supplies exact-surface-form ones, and both are scored
-    on the same scale so they can be merged instead of concatenated. Then the
-    cross-encoder judges whether each candidate ANSWERS (ADR-0001 D4), and
-    supersession runs only among passages that do (D5).
-
-    `use_cache=False` is for a caller that just wrote to the store and is
-    reading back (the Fast lookup). `effort` only sets how long stage 1 may
-    wait for a reranker slot.
-    """
-    out = Retrieval(query=query, freshness=level)
-    if not settings.web_memory_enabled or not (query or "").strip():
-        return out
-
-    cache_key = _cache_key(query, level, top_k)
-    if use_cache:
-        cached = _cache_get(cache_key)
-        if cached is not None and await _cache_entry_still_servable(cached):
-            return cached
-        if cached is not None:
-            # A page in the entry has been quarantined or purged since it was
-            # computed. Drop it and recompute rather than serving a shortened
-            # list: the caller asked for `top_k` sources, not for whatever
-            # survived.
-            _cache.pop(cache_key, None)
-
-    # Dense and lexical halves run CONCURRENTLY (they touch different
-    # services); both over-fetch because the ranking below reorders a lot.
-    want = max(top_k * 3, 12)
-
-    async def _dense() -> List[dict]:
-        try:
-            return await web_index.retrieve(query, top_k=want)
-        except Exception:  # noqa: BLE001
-            log.debug("dense web recall unavailable", exc_info=True)
-            return []
-
-    async def _lexical() -> List[Dict[str, Any]]:
-        started = time.perf_counter()
-        try:
-            return await db.run_in_thread(_lexical_candidates, query, max(want, 24))
-        finally:
-            metrics.observe("knowledge_stage_seconds", time.perf_counter() - started, stage="lexical")
-
-    dense_hits, lexical_rows = await asyncio.gather(_dense(), _lexical())
-
+def _merge_candidates(
+    query: str, dense_hits: Sequence[dict], lexical_rows: Sequence[Dict[str, Any]]
+) -> Dict[str, Evidence]:
+    """Dense hits and lexical rows merged by PAGE, each lexical row cut to its
+    question-centred window. Pure CPU; `retrieve` runs it via _run_cpu so
+    windowing a large page never stalls the event loop."""
     # Merge by PAGE, not by URL string: PostgreSQL rewrites `url` on refetch
     # and dedupes on url_key, so a dense hit and a lexical row for the same
     # page can spell the URL differently.
@@ -1310,6 +1289,117 @@ async def retrieve(
             origin=row.get("origin") or "search",
             page_id=row.get("id"),
         )
+    return by_key
+
+
+def _rank_candidates(query: str, candidates: List[Evidence], level: Freshness) -> List[Evidence]:
+    """Hybrid score, best first, near-duplicates collapsed. Pure CPU; run via
+    _run_cpu from `retrieve`."""
+    ranked = sorted(
+        (_score(query, ev, level) for ev in candidates),
+        key=lambda e: e.score,
+        reverse=True,
+    )
+    return _collapse_duplicates(ranked, query)
+
+
+#: RETRIEVAL CPU RUNS ONE JOB AT A TIME, OFF THE LOOP (2026-09-13).
+#: Moving _merge_candidates/_rank_candidates into anyio's shared pool (plan
+#: item 3b) took the event-loop stall away — worst gap 1,864 -> 392 ms at 8
+#: concurrent retrieves — but made each retrieve SLOWER: the windowing is
+#: pure Python, and N threads fighting for the GIL at the 5 ms switch
+#: interval cost more than doing the same work in a row. scratchpad
+#: relay/stall_p95.py, 24 lexical rows of 200,000 chars, 5 runs, per-request
+#: wall p95: HEAD 1,969 ms at 8 / 4,012 ms at 16; unbounded threads 3,060 /
+#: 6,337 ms. One dedicated slot serialises the CPU like HEAD did but keeps it
+#: off the loop: p95 2,044 / 4,049 ms (2,002 / 3,987 without the 1 ms
+#: heartbeat) with a worst stall of 48 / 43 ms; two slots already regress
+#: (3,644 / 6,164 ms). Its own limiter also keeps these jobs from taking
+#: slots in anyio's default one (40), which the sync routes and every
+#: db.run_in_thread share.
+_CPU_SLOTS = 1
+_cpu_limiters: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+async def _run_cpu(fn, *args):
+    """Run pure-CPU retrieval work in a worker thread, at most _CPU_SLOTS at a
+    time per event loop (a limiter is bound to the loop that made it)."""
+    import anyio
+
+    loop = asyncio.get_running_loop()
+    limiter = _cpu_limiters.get(loop)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_CPU_SLOTS)
+        _cpu_limiters[loop] = limiter
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=limiter)
+
+
+async def retrieve(
+    query: str,
+    *,
+    level: Freshness = Freshness.RECENT,
+    top_k: int = 5,
+    use_cache: bool = True,
+    effort: str = "fast",
+    verdict: Optional[Any] = None,
+    cache_store: bool = True,
+) -> Retrieval:
+    """Best local evidence for `query`, ranked for the freshness it needs.
+
+    Hybrid by construction: the dense index supplies semantic candidates, the
+    PostgreSQL text index supplies exact-surface-form ones, and both are scored
+    on the same scale so they can be merged instead of concatenated. Then the
+    cross-encoder judges whether each candidate ANSWERS (ADR-0001 D4), and
+    supersession runs only among passages that do (D5).
+
+    `use_cache=False` is for a caller that just wrote to the store and is
+    reading back (the Fast lookup). `effort` only sets how long stage 1 may
+    wait for a reranker slot. `cache_store=False` reads the cache but never
+    writes it: for a speculative run whose verdict is still a guess
+    (living_knowledge.prepare, which stores a reused result itself through
+    `cache_result`).
+    """
+    out = Retrieval(query=query, freshness=level)
+    if not settings.web_memory_enabled or not (query or "").strip():
+        return out
+
+    cache_key = _cache_key(query, level, top_k)
+    if use_cache:
+        cached = _cache_get(cache_key)
+        if cached is not None and await _cache_entry_still_servable(cached):
+            return cached
+        if cached is not None:
+            # A page in the entry has been quarantined or purged since it was
+            # computed. Drop it and recompute rather than serving a shortened
+            # list: the caller asked for `top_k` sources, not for whatever
+            # survived.
+            _cache.pop(cache_key, None)
+
+    # Dense and lexical halves run CONCURRENTLY (they touch different
+    # services); both over-fetch because the ranking below reorders a lot.
+    want = max(top_k * 3, 12)
+
+    async def _dense() -> List[dict]:
+        try:
+            return await web_index.retrieve(query, top_k=want)
+        except Exception:  # noqa: BLE001
+            log.debug("dense web recall unavailable", exc_info=True)
+            return []
+
+    async def _lexical() -> List[Dict[str, Any]]:
+        started = time.perf_counter()
+        try:
+            return await db.run_in_thread(_lexical_candidates, query, max(want, 24))
+        finally:
+            metrics.observe("knowledge_stage_seconds", time.perf_counter() - started, stage="lexical")
+
+    dense_hits, lexical_rows = await asyncio.gather(_dense(), _lexical())
+
+    # Merging runs in a worker thread (2026-09-13, plan item 3b): it windows
+    # up to 24 lexical rows of up to 200,000 chars each, which on the event
+    # loop stalled every in-flight stream (8 concurrent Fast: TTFT 11.7 s vs
+    # 2.3 s with the pre-pass off, 2026-09-05).
+    by_key = await _run_cpu(_merge_candidates, query, dense_hits, lexical_rows)
 
     if not by_key:
         return out
@@ -1347,12 +1437,9 @@ async def retrieve(
             ev.authority = min(ev.authority, AUTHORITY_NEUTRAL)
         candidates.append(ev)
 
-    ranked = sorted(
-        (_score(query, ev, level) for ev in candidates),
-        key=lambda e: e.score,
-        reverse=True,
-    )
-    ranked = _collapse_duplicates(ranked, query)
+    # Scoring tokenises title + 4,000 chars per candidate and the duplicate
+    # collapse shingles every passage: off the loop too (plan item 3b).
+    ranked = await _run_cpu(_rank_candidates, query, candidates, level)
     if settings.knowledge_rerank:
         ranked, out.degraded = await _answerability(query, ranked, level=level, effort=effort)
     if verdict is None:
@@ -1371,7 +1458,7 @@ async def retrieve(
     # Cache only a judged, non-empty result: a miss is cheap to repeat and
     # would otherwise hide pages the indexer adds within the TTL; a degraded
     # verdict must never be served as a judged one.
-    if out.evidence and not out.degraded:
+    if cache_store and out.evidence and not out.degraded:
         _cache_put(cache_key, out)
 
     # Demand signal for the refresh scheduler. Fire-and-forget: a counter must
@@ -1383,6 +1470,14 @@ async def retrieve(
         except RuntimeError:  # pragma: no cover — no running loop (tests)
             pass
     return out
+
+
+def cache_result(query: str, *, level: Freshness, top_k: int, result: Retrieval) -> None:
+    """Store a retrieval computed with `cache_store=False` once its verdict is
+    known to be the real one, under the rule `retrieve` applies to its own:
+    only a judged, non-empty result."""
+    if result.evidence and not result.degraded:
+        _cache_put(_cache_key(query, level, top_k), result)
 
 
 def _rerank_text(ev: Evidence) -> str:

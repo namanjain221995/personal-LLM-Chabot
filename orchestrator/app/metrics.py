@@ -39,11 +39,32 @@ _BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
 #: §13.4). Ends at the queue window plus the long recovery window.
 _WAIT_BUCKETS = (1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0)
 
-#: Histograms whose observations are engine waits use the wide buckets.
+#: Seconds, for what a person waits before the answer starts. The default set
+#: jumps from 1.0 to 2.5, and the owner's goal (2026-09-13) is "answers start
+#: within 1-2 seconds": measured Fast/chat is p50 1.46 s / p95 6.16 s with
+#: 78.4% of turns at or under 2 s (usage_events, n=431, 7 days), so almost
+#: every turn that matters landed in the one bucket that cannot say whether it
+#: met the goal. 1.5 and 2.0 are inserted; every default edge is kept, so the
+#: existing le= series of chat_ttft_seconds carry on unchanged and only the
+#: two new series start at the deploy (compare windows either side of it for
+#: those, not across it).
+_TTFT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 30.0)
+
+#: Per-metric bucket sets. A global change would break histogram_quantile
+#: continuity for every retrieval histogram on the default set; an entry here
+#: moves only the metric named.
 _BUCKETS_BY_METRIC = {
+    # Histograms whose observations are engine waits use the wide buckets.
     "llm_engine_wait_seconds": _WAIT_BUCKETS,
     "llm_queue_wait_seconds": _WAIT_BUCKETS,
     "llm_admission_wait_seconds": _WAIT_BUCKETS,
+    # The 1-2 s goal, read directly (performance plan item 1a, 2026-09-13).
+    "chat_ttft_seconds": _TTFT_BUCKETS,
+    "chat_first_visible_seconds": _TTFT_BUCKETS,
+    # The knowledge pre-pass is the largest share of that wait (web_memory
+    # retrieve p50 0.72 s / p90 2.09 s), so its whole-prepare time is read on
+    # the same edges as the TTFT it is being subtracted from.
+    "knowledge_prepare_seconds": _TTFT_BUCKETS,
 }
 
 
@@ -57,6 +78,12 @@ _ALLOWED = {
     "rule": {
         "lexical:realtime", "lexical:office", "lexical:recent", "lexical:static",
         "router", "default", "empty",
+        # freshness.TIMELESS_TASK_REASON (2026-09-13): a Fast question settled
+        # STATIC without the router because it is a timeless task with no
+        # live-value signal. Its own rule so a wrong skip is countable; the
+        # first version's "no_time_signal" did not survive review (it
+        # answered "euro to dollar" from weights) and is not listed.
+        "timeless_task",
     },
     # `result` is shared by every counter that reports an outcome, so it is
     # the union of their vocabularies. V29 (2026-09-10) added the upload
@@ -176,13 +203,116 @@ _ALLOWED_BY_METRIC: Dict[str, Dict[str, set]] = {
     # The durability ledger's counter (main._attempt_record): the CONTRACT
     # §8.4 terminal vocabulary.
     "chat_request_attempts_total": {"terminal_state": {"completed", "interrupted", "failed", "cancelled"}},
+    # The knowledge retrieval stages (web_memory.py: lexical, meta, rerank;
+    # web_index.py: embed, dense_scan, servable). They were emitted into the
+    # global `stage` vocabulary before it was narrowed to the video pipeline
+    # in 2c51487 (2026-09-09); since then every one of them folded to "other"
+    # (385 samples in 3 days, all stage="other"), so per-stage attribution of
+    # the pre-pass has been blind. Bounded HERE rather than in _ALLOWED
+    # ["stage"]: that set is pinned equal to the video and artifact pipeline
+    # stages (test_video_understanding), and a knowledge stage has no business
+    # being a valid video stage.
+    "knowledge_stage_seconds": {
+        "stage": {"lexical", "dense_scan", "embed", "meta", "rerank", "servable"},
+    },
+    # main.py's escalation counter reports the two ways a Think/Max turn
+    # escalates; it folded to "other" for the same reason.
+    "knowledge_escalation_total": {"stage": {"local_first", "search"}},
 }
+
+
+# ---------------------------------------------------------------------------
+# Latency histograms of the 1-2 s programme (performance plan item 1c,
+# 2026-09-13). Their label NAMES are closed as well as their values: a label
+# key a call site passes that is not declared here is DROPPED, so a user id,
+# an API key id or a conversation id can never become a series, even by
+# accident (these are observed on every chat turn — the busiest path there is).
+# ---------------------------------------------------------------------------
+
+#: Every route the engines put in the final meta (app/engines/*, main.py's
+#: "unknown" default). A new engine folds to "other" until it is listed.
+CHAT_ROUTES = frozenset({
+    "agent", "artifact", "chat", "clarify", "crawl", "dataset",
+    "dataset_report", "deep_research", "document", "live_sf", "ocr", "rag",
+    "repo", "report", "search", "sf_intel", "sql", "url", "video", "vision",
+    "unknown",
+})
+
+#: ChatRequest.effort's Literal (main.py), legacy names included.
+CHAT_EFFORTS = frozenset({"fast", "think", "max", "low", "medium", "high", "extra_high"})
+
+#: What the person saw first: a reasoning token (Think/Max stream reasoning
+#: before the answer — a trivial probe spent 2.47 s reasoning), a status line
+#: that carries content, or an answer token.
+FIRST_VISIBLE_KINDS = frozenset({"reasoning", "status", "answer"})
+
+#: living_knowledge._decided's vocabulary, for the prepare histogram.
+KNOWLEDGE_DECISIONS = frozenset({
+    "static_model", "static_topical", "degraded_busy", "local",
+    "stale_offline", "escalate_search", "fast_lookup", "fast_lookup_failed",
+})
+
+#: How a timed step ended. `deadline` is a budget that fired and the turn went
+#: on without the step; `skipped` is a step not run at all (Fast never asks
+#: the orchestrate router).
+STEP_OUTCOMES = frozenset({"ok", "deadline", "skipped", "error"})
+
+#: engines/orchestrate.Plan, flattened.
+DECIDE_PLANS = frozenset({"none", "agent", "search", "agent_search"})
+
+#: What living_knowledge._topical_precheck said about a Fast timeless question
+#: before its retrieval finished: a page CAN pass the topical gate (hit), none
+#: can (miss), or it could not tell (fail — no testable term, a DB error).
+#: A high fail share means Fast is waiting the pre-change time on those turns.
+TOPICAL_PRECHECK_RESULTS = frozenset({"hit", "miss", "fail"})
+
+#: Why the in-conversation recall block was left out of a prompt (recall.py,
+#: team RELAY, 2026-09-13): the embedding call behind it moved from
+#: embed_texts (90 s batch timeout) to embed_query (1 s semaphore wait, 4 s
+#: timeout), so under an embedding burst or a sidecar restart the block now
+#: disappears instead of holding the turn. Counted so that prompt change is
+#: visible, not silent. Call site contract:
+#:     metrics.inc("recall_block_dropped_total", reason="embed_busy")
+RECALL_DROP_REASONS = frozenset({"embed_busy", "embed_timeout", "embed_error"})
+
+_ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
+
+#: metric -> {label name: closed value set}. Only these label NAMES survive.
+_LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
+    "chat_first_visible_seconds": {**_ROUTE_EFFORT, "kind": set(FIRST_VISIBLE_KINDS)},
+    "knowledge_prepare_seconds": {
+        "effort": set(CHAT_EFFORTS),
+        "decision": set(KNOWLEDGE_DECISIONS),
+        "outcome": set(STEP_OUTCOMES),
+    },
+    # The route is not known yet while the context is assembled; `mode` is
+    # ChatRequest.mode's Literal.
+    "context_assembly_seconds": {
+        "effort": set(CHAT_EFFORTS),
+        "mode": {"salesforce", "assistant"},
+    },
+    "orchestrate_decide_seconds": {
+        "effort": set(CHAT_EFFORTS),
+        "plan": set(DECIDE_PLANS),
+        "outcome": set(STEP_OUTCOMES),
+    },
+    # Engine first token to the SSE write that carries it — the part of the
+    # 105 -> 88 tok/s relay loss that is time, not throughput.
+    "relay_overhead_seconds": dict(_ROUTE_EFFORT),
+    # Counters of the same programme, closed the same way (names AND values).
+    "knowledge_topical_precheck_total": {"result": set(TOPICAL_PRECHECK_RESULTS)},
+    "recall_block_dropped_total": {"reason": set(RECALL_DROP_REASONS)},
+}
+_ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 
 
 def _clean(labels: Dict[str, str], name: str = "") -> Tuple[Tuple[str, str], ...]:
     out = []
     per_metric = _ALLOWED_BY_METRIC.get(name, {})
+    closed_names = _LABELS_BY_METRIC.get(name)
     for key, value in sorted(labels.items()):
+        if closed_names is not None and key not in closed_names:
+            continue  # an undeclared label name on a closed metric is dropped
         allowed = per_metric.get(key, _ALLOWED.get(key))
         v = str(value)
         if allowed is not None and v not in allowed:
@@ -296,6 +426,104 @@ def corpus_gauges(pages: int, pending: int, due: int) -> None:
     set_gauge(
         "techsara_web_refresh_queue_depth", due, "Pages past their refresh deadline."
     )
+
+
+# ---------------------------------------------------------------------------
+# The 1-2 s programme's call sites, named once (performance plan item 1c).
+# The instrumenting code in main.py, living_knowledge.py and
+# engines/orchestrate.py belongs to other owners; these helpers are the
+# contract they call, so a metric name or a label cannot be misspelt there.
+# ---------------------------------------------------------------------------
+
+
+def chat_first_visible(seconds: float, *, route: str, effort: str, kind: str) -> None:
+    observe(
+        "chat_first_visible_seconds",
+        seconds,
+        "Request start to the first thing the person sees: a reasoning token, "
+        "a status line with content, or an answer token.",
+        route=route,
+        effort=effort,
+        kind=kind,
+    )
+
+
+def knowledge_prepare(seconds: float, *, effort: str, decision: str, outcome: str = "ok") -> None:
+    observe(
+        "knowledge_prepare_seconds",
+        seconds,
+        "Whole living-knowledge pre-pass (classify, router, retrieve) per turn.",
+        effort=effort,
+        decision=decision,
+        outcome=outcome,
+    )
+
+
+def context_assembly(seconds: float, *, effort: str, mode: str) -> None:
+    observe(
+        "context_assembly_seconds",
+        seconds,
+        "Mode resolved to context assembled: facts, recall, documents, history.",
+        effort=effort,
+        mode=mode,
+    )
+
+
+def orchestrate_decide(seconds: float, *, effort: str, plan: str, outcome: str = "ok") -> None:
+    observe(
+        "orchestrate_decide_seconds",
+        seconds,
+        "The orchestrate router's agent/search decision.",
+        effort=effort,
+        plan=plan,
+        outcome=outcome,
+    )
+
+
+def plan_label(agent: bool, search: bool) -> str:
+    """engines/orchestrate.Plan as one bounded label value."""
+    if agent and search:
+        return "agent_search"
+    return "agent" if agent else ("search" if search else "none")
+
+
+def topical_precheck(result: str) -> None:
+    """One answer of the Fast topical pre-check: hit, miss or fail."""
+    inc(
+        "knowledge_topical_precheck_total",
+        _TOPICAL_PRECHECK_HELP,
+        result=result,
+    )
+
+
+def recall_block_dropped(reason: str) -> None:
+    """The in-conversation recall block was left out: embed_busy,
+    embed_timeout or embed_error. Same series as calling inc() directly."""
+    inc("recall_block_dropped_total", _RECALL_DROPPED_HELP, reason=reason)
+
+
+def relay_overhead(seconds: float, *, route: str, effort: str) -> None:
+    observe(
+        "relay_overhead_seconds",
+        seconds,
+        "Engine first token received to the SSE write that carries it.",
+        route=route,
+        effort=effort,
+    )
+
+
+_TOPICAL_PRECHECK_HELP = (
+    "Fast topical pre-check answers before retrieval finished: hit (a page can "
+    "pass the gate), miss (none can), fail (could not tell)."
+)
+_RECALL_DROPPED_HELP = (
+    "In-conversation recall blocks left out of the prompt because the "
+    "embedding call was busy, timed out or failed."
+)
+# Declared at import, so the HELP text is right whichever call site — the
+# helper or a bare inc() with no help text — reaches the registry first.
+_declare("knowledge_topical_precheck_total", "counter", _TOPICAL_PRECHECK_HELP)
+_declare("recall_block_dropped_total", "counter", _RECALL_DROPPED_HELP)
 
 
 # ---------------------------------------------------------------------------

@@ -116,11 +116,15 @@ export function ConsoleHeader({
           <p className="mt-1 max-w-2xl text-sm text-muted">{description}</p>
         )}
       </div>
+      {/* The group may not grow past the header: a select sizes itself to
+          its longest option, and a long model id pushed a 360px phone's
+          <main> to 658px (re-audit, 2026-09-13). Clamped like the console's
+          SELECT_FIT, each select truncates its label instead. */}
       {children && (
         <div
           role="group"
           aria-label="Filters"
-          className="flex shrink-0 flex-wrap items-center gap-2"
+          className="flex min-w-0 max-w-full shrink-0 flex-wrap items-center gap-2 [&>div]:max-w-full [&_select]:max-w-full [&_select]:truncate"
         >
           {children}
         </div>

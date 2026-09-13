@@ -42,6 +42,18 @@ The one thing this module adds to the pump is the cancel check between
 chunks, which is why it iterates `Generation.stream()` itself instead of
 calling `run_to_completion`.
 
+QUEUED FOR CAPACITY (2026-09-13). A job whose model sits on a shared engine
+(the router, OCR) or whose footprint needs the one-at-a-time long gate of the
+main model (`spec.gate_engine`) takes that gate INSIDE this task, while its
+row still says `queued` — for up to PUBLIC_API_BACKGROUND_GATE_WAIT_S (1 h),
+then `failed` with the retry-safe `model_unavailable` "at capacity". The 202
+never waits on capacity, a cancel while queued is honoured without the model
+ever being asked, and the gate is given back when the job ends however it
+ends. Nothing but the generation's own wall clock ends a RUNNING job: there is
+no time-based lease on background work, so a 1,000,000-token answer runs its
+hours. What does end one is an orchestrator restart (every auto-deploy), which
+fails it as the retry-safe `model_unavailable` below.
+
 WHY THE TASK IS HELD IN A MODULE-LEVEL SET. `asyncio.create_task` returns the
 only strong reference to a task; the event loop keeps a weak one. A task whose
 last reference is dropped can be collected mid-await — a documented CPython
@@ -72,7 +84,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 from .. import db
 from ..apiplatform import quotas
 from ..apiplatform.resolver import ApiCaller
-from . import errors, streaming
+from . import capacity, errors, streaming
 
 log = logging.getLogger(__name__)
 
@@ -240,6 +252,9 @@ async def start(
                 fingerprint=fingerprint,
                 instructions_present=instructions_present,
                 metadata=dict(metadata or {}),
+                # V35: the PLANNED ceiling, so the 202 already says what the
+                # job will be allowed; the recorder writes the applied one.
+                max_output_tokens=spec.planned,
             )
         except BaseException:
             # The slot is a promise about work that is about to start. If the
@@ -277,6 +292,50 @@ async def _cancelled_in_db(job: _Job) -> bool:
     return bool(row and row.get("cancel_requested"))
 
 
+async def _watch_cancel_column(job: _Job) -> None:
+    """While a job waits for capacity, a cancel written by ANOTHER process
+    (a blue/green overlap) reaches it through the column, as it does between
+    chunks. Sets the in-memory event, which is what the gate wait watches."""
+    while not job.cancel.is_set():
+        await asyncio.sleep(max(0.05, CANCEL_POLL_SECONDS))
+        try:
+            if await _cancelled_in_db(job):
+                job.cancel.set()
+                return
+        except Exception:  # noqa: BLE001 - a failed poll is retried
+            log.debug("cancel poll failed for %s", job.response_id, exc_info=True)
+
+
+async def _take_capacity(
+    job: _Job, spec: streaming.GenerationSpec, stack: contextlib.AsyncExitStack
+) -> bool:
+    """Hold the job's capacity gate on `stack`. False when it was cancelled
+    while queued. Raises the 503 `ApiError` when the wait runs out."""
+    if not spec.gate_engine:
+        return True
+    watcher = asyncio.ensure_future(_watch_cancel_column(job))
+    try:
+        await stack.enter_async_context(
+            capacity.hold(
+                spec.gate_engine,
+                weight_tokens=spec.gate_weight_tokens,
+                wait_s=capacity.background_wait_s(),
+                yield_to_chat=spec.yield_to_chat,
+                abandon=job.cancel,
+                # A main gate admits the answer into admission's LONG_OUTPUT
+                # lane while the row is still `queued` (capacity.py).
+                work=spec,
+            )
+        )
+    except capacity.Abandoned:
+        return False
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(BaseException):
+            await watcher
+    return True
+
+
 async def _run(
     job: _Job,
     spec: streaming.GenerationSpec,
@@ -285,20 +344,30 @@ async def _run(
     """The detached task. Never raises — every exit writes a terminal row."""
     started = time.monotonic()
     outcome = streaming.StreamOutcome(
-        response_id=spec.response_id, model=spec.model, created_at=spec.created_at
+        response_id=spec.response_id,
+        model=spec.model,
+        created_at=spec.created_at,
+        max_output_tokens=spec.planned,
+        keep_text=True,
     )
     pieces: List[str] = []
     generation: Any = None
     last_poll = time.monotonic()
+    held = contextlib.AsyncExitStack()
 
     try:
-        await db.run_in_thread(
-            db.update_api_response, job.response_id, job.project_id, status="in_progress"
-        )
+        # Still `queued` while it waits: the gate is the reason nothing has
+        # started, and `in_progress` would be a claim that something has.
+        if not await _take_capacity(job, spec, held):
+            outcome.status = "cancelled"
+        else:
+            await db.run_in_thread(
+                db.update_api_response, job.response_id, job.project_id, status="in_progress"
+            )
         # A cancel that arrived while the row was still `queued` must be
         # honoured before the model is ever asked — otherwise the cheapest
         # thing to cancel is the one thing a cancel cannot stop.
-        if job.cancel.is_set() or await _cancelled_in_db(job):
+        if outcome.status == "cancelled" or job.cancel.is_set() or await _cancelled_in_db(job):
             outcome.status = "cancelled"
         else:
             generation = _generation_factory()(spec)
@@ -369,6 +438,10 @@ async def _run(
             # measured 2026-09-13 — so the consumer asks.
             with contextlib.suppress(BaseException):
                 await generation.aclose()
+        # The capacity gate, given back however the job ended. Its release
+        # is synchronous (capacity.py), so a teardown cannot strand it.
+        with contextlib.suppress(BaseException):
+            await held.aclose()
         _jobs.pop(job.response_id, None)
 
     _finalise(outcome, generation, pieces, started)
@@ -379,7 +452,7 @@ async def _run(
         # controller says a reload is in progress, `timeout` for a wall-clock
         # kill — which a flat `internal_error` would have hidden.
         outcome.status = "failed"
-        outcome.error = streaming.engine_error(generation.error)
+        outcome.error = streaming.engine_error(generation.error, spec.engine)
     await _settle(job, outcome, on_finish)
 
 
@@ -397,6 +470,12 @@ def _finalise(
     first_token_at = getattr(generation, "first_token_at", None)
     if first_token_at is not None:
         outcome.ttft_ms = int((first_token_at - started) * 1000)
+    if generation is not None:
+        outcome.finish_reason = getattr(generation, "finish_reason", None)
+        applied = getattr(generation, "applied_max_output_tokens", None)
+        if callable(applied):
+            with contextlib.suppress(Exception):
+                outcome.max_output_tokens = int(applied())
 
 
 async def _settle(
@@ -417,21 +496,26 @@ async def _settle(
     else:
         await _record_outcome(job, outcome)
 
-    if outcome.text:
-        # The ONE place output text is stored, and only for a background
-        # response: its caller has no stream to read it from (SCHEMA-V34, and
-        # pruned by the project's retention window). Written even for a
-        # cancelled job — throwing away half an answer because somebody
-        # pressed stop is what people report as data loss.
-        with contextlib.suppress(Exception):
-            await db.run_in_thread(
+    row = await db.run_in_thread(db.get_api_response, job.response_id, job.project_id)
+    if outcome.text and row is not None and not row.get("output_text"):
+        # A REPAIR, not the normal path. The text normally lands in the same
+        # UPDATE as the terminal status (`persisted_generation_fields`), which
+        # is what keeps a poller from ever reading a finished row with no
+        # output. It is missing here only when that write did not happen — the
+        # hook raised before it, or a hook that does not use the shared fields
+        # — and throwing away half an answer because a ledger was down is what
+        # people report as data loss. Written even for a cancelled job.
+        try:
+            row = await db.run_in_thread(
                 db.update_api_response,
                 job.response_id,
                 job.project_id,
                 output_text=outcome.text,
+            ) or row
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "background response %s could not store its text", job.response_id, exc_info=True
             )
-
-    row = await db.run_in_thread(db.get_api_response, job.response_id, job.project_id)
     if row is not None:
         await _notify(row, job.workspace_id)
 
@@ -453,6 +537,7 @@ async def _record_outcome(job: _Job, outcome: streaming.StreamOutcome) -> None:
     if outcome.error is not None:
         fields["error_code"] = outcome.error.code
         fields["error_message"] = errors.redact(outcome.error.message)
+    fields.update(persisted_generation_fields(outcome))
     try:
         await db.run_in_thread(
             db.update_api_response, job.response_id, job.project_id, **fields
@@ -462,6 +547,27 @@ async def _record_outcome(job: _Job, outcome: streaming.StreamOutcome) -> None:
             "background response %s could not record its result",
             job.response_id, exc_info=True,
         )
+
+
+def persisted_generation_fields(outcome: streaming.StreamOutcome) -> Dict[str, Any]:
+    """The V35 columns for an outcome: the applied ceiling, and the finish
+    reason when it is one the column (and the wire) knows. Our own wall-clock
+    stop is a failure recorded in `error_code`, never a finish.
+
+    And, for a background response (`keep_text`), `output_text` — the ONE
+    place output text is stored (SCHEMA-V34, pruned by the project's retention
+    window). It rides in the same UPDATE as the terminal status on purpose: a
+    separate, later write left a window in which `GET /v1/responses/{id}`
+    answered `failed` with `output: []` for a response that had produced text
+    (reproduced 2026-09-14 by delaying only that write)."""
+    fields: Dict[str, Any] = {}
+    if outcome.keep_text and outcome.text:
+        fields["output_text"] = outcome.text
+    if outcome.max_output_tokens is not None and int(outcome.max_output_tokens) >= 1:
+        fields["max_output_tokens"] = int(outcome.max_output_tokens)
+    if outcome.finish_reason in ("stop", "length"):
+        fields["finish_reason"] = outcome.finish_reason
+    return fields
 
 
 async def _notify(row: Mapping[str, Any], workspace_id: str) -> None:

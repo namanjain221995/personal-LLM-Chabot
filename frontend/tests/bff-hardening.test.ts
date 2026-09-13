@@ -676,6 +676,11 @@ describe('the middleware matcher', () => {
     ['/v1/models', false, 'all of it'],
     ['/_next/static/x.js', false, 'the build output'],
     ['/favicon.ico', false, 'a dotted asset, which must load on /login'],
+    ['/illustrator/login.webp', false, 'and the sign-in artwork (2026-09-13 allowlist)'],
+    ['/admin/members/1.x', true, 'a dot in a gated page path is NOT an asset'],
+    ['/admin/members/1.x/conversations/2.y', true, 'at any depth'],
+    ['/api.json', true, 'nor a page path dressed with an extension'],
+    ['/admin/members/1.png', true, 'nor an asset extension below the root'],
   ])('%s is gated: %s', (path, gated) => {
     expect(matcher.test(path)).toBe(gated);
   });

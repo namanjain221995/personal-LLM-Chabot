@@ -415,7 +415,7 @@ export function AccountMenu({ fetchFn = fetch, navigate }: AccountMenuProps) {
           {initial}
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-sm text-ink">{displayName}</span>
+          <span className="block truncate text-[15px] leading-[22px] text-ink">{displayName}</span>
           {email && (
             <span className="block truncate text-xs text-faint">{email}</span>
           )}

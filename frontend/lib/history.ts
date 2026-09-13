@@ -58,6 +58,7 @@ import {
 import {
   isPersistableMessage,
   localOnlyTail,
+  withLocalBranches,
 } from './threadReconcile';
 
 const STORAGE_KEY = 'techsara.history.v1';
@@ -127,6 +128,18 @@ export interface ServerHistoryStore extends HistoryStore {
    */
   load(id: string, opts?: { force?: boolean }): Promise<Conversation | null>;
   /**
+   * true when the latest server read of `id` answered 404 and this browser
+   * held no copy of it — the conversation does not exist for this account (a
+   * missing id and someone else's are the same 404, orchestrator history.py
+   * §3c). `load()` answers null for that AND for a network failure; only this
+   * tells them apart, so a ?c= deep link to a deleted chat can say so instead
+   * of opening a silent New Chat under the bad id (fe audit 2026-09-13).
+   *
+   * Optional so a partial test double need not provide it; the browser store
+   * always does.
+   */
+  wasNotFound?(id: string): boolean;
+  /**
    * V3 §2: the conversation as a downloadable Markdown file (loading its
    * messages first). null = the conversation is gone.
    */
@@ -165,6 +178,18 @@ export interface ServerHistoryStore extends HistoryStore {
   generateTitle(conversationId: string): Promise<void>;
   /** Await all in-flight background pushes (used by tests). */
   flush(): Promise<void>;
+  /**
+   * 2026-09-13: be told when the SYNC replaced a conversation's cached thread
+   * with the server's copy — a refused (409) whole-thread PUT adopts server
+   * truth. The view must hear about that at once: until it did, the cache
+   * held the server's answers while the screen showed the tab's own copy for
+   * up to one 8-second poll, and a "Try again" in that window acted on a
+   * thread that no longer existed. Returns the unsubscribe.
+   *
+   * Optional so a partial test double need not provide it; the browser store
+   * always does.
+   */
+  subscribe?(listener: (conversationId: string) => void): () => void;
 }
 
 export function titleFromFirstMessage(text: string): string {
@@ -764,6 +789,21 @@ export function createServerHistoryStore(
   const local = storeOverCache(cache);
   const api = options.api ?? createHistoryApi();
 
+  /** Ids whose latest uncached server read was a 404 (see wasNotFound). */
+  const notFound = new Set<string>();
+
+  /** See ServerHistoryStore.subscribe. */
+  const adopted = new Set<(conversationId: string) => void>();
+  function publishAdopted(id: string): void {
+    for (const listener of [...adopted]) {
+      try {
+        listener(id);
+      } catch {
+        // A view's bug must not break the sync that told it.
+      }
+    }
+  }
+
   /** Per-conversation push chains keep background syncs ordered. */
   const chains = new Map<string, Promise<void>>();
   const inFlight = new Set<Promise<void>>();
@@ -934,18 +974,25 @@ export function createServerHistoryStore(
         const server = await loadConversation(conv.id, true, true);
         if (!server || reconciled) {
           markDirty(conv.id);
+          if (server) publishAdopted(conv.id);
           return;
         }
         const tail = localOnlyTail(before, server.messages);
-        if (tail.length === 0) {
+        // 2026-09-13: an answer the server stored WITHOUT the tree position
+        // this tab gave it gets that position back (withLocalBranches) — the
+        // dedupe above must not be what turns a version into a stacked copy.
+        const repaired = withLocalBranches(before, server.messages);
+        if (tail.length === 0 && repaired === server.messages) {
           mutateSync((s) => {
             s.dirty = s.dirty.filter((d) => d !== conv.id);
           });
+          publishAdopted(conv.id);
           return;
         }
         // local.saveMessages, not the store's: the re-push happens right
         // here, and marking the conversation dirty would start the sync over.
-        local.saveMessages(conv.id, [...server.messages, ...tail]);
+        local.saveMessages(conv.id, [...repaired, ...tail]);
+        publishAdopted(conv.id);
         const fresh = local.get(conv.id);
         if (fresh) await pushAll(fresh, true);
         return;
@@ -953,10 +1000,22 @@ export function createServerHistoryStore(
       if (isConflict(err)) {
         // The server holds MORE than we do: our copy is stale, not canonical.
         // Pull its version down rather than destroying it.
-        await loadConversation(conv.id, true);
+        const pulled = await loadConversation(conv.id, true);
         mutateSync((s) => {
           s.dirty = s.dirty.filter((d) => d !== conv.id);
         });
+        if (!pulled) return;
+        // The same repair as the conversation-changed path: a server copy of
+        // an answer that lacks the branch this tab gave it takes it back.
+        const repaired = withLocalBranches(conv.messages, pulled.messages);
+        if (repaired !== pulled.messages && !reconciled) {
+          local.saveMessages(conv.id, repaired);
+          publishAdopted(conv.id);
+          const fresh = local.get(conv.id);
+          if (fresh) await pushAll(fresh, true);
+          return;
+        }
+        publishAdopted(conv.id);
         return;
       }
       throw err;
@@ -1094,6 +1153,7 @@ export function createServerHistoryStore(
     }
     try {
       const server = await api.get(id);
+      notFound.delete(id);
       if (
         force &&
         !adoptServer &&
@@ -1122,11 +1182,16 @@ export function createServerHistoryStore(
         ...(m.role === 'user' ? {} : { status: 'done' as const }),
         createdAt: now - (server.messages.length - i),
       }));
+      // A conversation this browser never cached takes the SERVER's
+      // updated_at, not "now": stamping the load time moved every deep-linked
+      // chat to the top of Recents, where it stayed after a reload even
+      // though nothing in it had changed (fe audit 2026-09-13).
+      const serverUpdatedAt = toEpoch(server.updatedAt, now);
       const conv: Conversation = {
         id,
         title: server.title || cached?.title || 'Conversation',
-        createdAt: cached?.createdAt ?? now,
-        updatedAt: cached?.updatedAt ?? now,
+        createdAt: cached?.createdAt ?? serverUpdatedAt,
+        updatedAt: cached?.updatedAt ?? serverUpdatedAt,
         ...(cached?.pinned !== undefined ? { pinned: cached.pinned } : {}),
         ...(cached?.archived !== undefined ? { archived: cached.archived } : {}),
         messages,
@@ -1141,7 +1206,11 @@ export function createServerHistoryStore(
         else delete st.stamps[id];
       });
       return conv;
-    } catch {
+    } catch (err) {
+      // Remembered only with nothing cached: a cached copy is still served,
+      // exactly as before, and a network failure is not a verdict.
+      if (!cached && isNotFound(err)) notFound.add(id);
+      else notFound.delete(id);
       return cached; // offline — serve the cached copy (may be stale)
     }
   }
@@ -1468,6 +1537,15 @@ export function createServerHistoryStore(
     },
 
     load: (id, opts) => loadConversation(id, opts?.force === true),
+
+    wasNotFound: (id) => notFound.has(id),
+
+    subscribe(listener) {
+      adopted.add(listener);
+      return () => {
+        adopted.delete(listener);
+      };
+    },
 
     async flush() {
       while (inFlight.size > 0) {

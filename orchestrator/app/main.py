@@ -9,6 +9,7 @@ import logging
 import mimetypes
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import AsyncIterator, List, Literal, Optional
@@ -46,7 +47,9 @@ from .history import foldable_counts, router as history_router
 from .memory_api import router as memory_router
 from .uploads import router as uploads_router
 from .memory import memory
-from .sse import HEARTBEAT_SECONDS, sse_comment, sse_event
+from . import metrics as _latency_metrics
+from . import sse as _sse
+from .sse import HEARTBEAT_SECONDS, STREAMED_EVENTS as _STREAMED_EVENTS, sse_comment, sse_event
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -211,6 +214,11 @@ async def lifespan(_app: FastAPI):
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()
+        # The reranker's pooled client (rerank.py, 2026-09-13) is per loop and
+        # must be closed on the loop that owns its sockets, which is this one.
+        from . import rerank as _rerank
+
+        await _rerank.close_rerank_client()
         await db.run_in_thread(db.close_pool)
 
 
@@ -325,6 +333,14 @@ _CONVERSATION_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: A send intent (V29): browser-minted, one per press of Send, re-sent on
 #: every retry of that message. Same alphabet as a conversation id.
 _INTENT_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: 2026-09-13 (the duplicate answers): where a regenerate, an edit or a send
+#: in a conversation with versions asks its ANSWER to be stored in the
+#: browser's conversation tree (frontend/lib/branching.ts). `self` is the
+#: answer's branch id (the browser derives it from the intent); `parent` is the
+#: question's — its own branch id, or the positional `#<index>` a message
+#: without one is known by.
+_ANSWER_BRANCH_SELF_RE = _re.compile(r"^b-[A-Za-z0-9_-]{1,64}$")
+_ANSWER_BRANCH_PARENT_RE = _re.compile(r"^(?:b-[A-Za-z0-9_-]{1,64}|#[0-9]{1,6})$")
 #: A bare call's session label. SAME shape rule as a conversation id since
 #: 2026-09-12 (F034): it is half of the synthetic conversation key below, so an
 #: unvalidated session_id was an unvalidated conversation key — free to contain
@@ -575,6 +591,34 @@ def _public_api_max_body_bytes() -> int:
         return _MIB
 
 
+def _public_api_body_cap(method: str, path: str) -> int:
+    """The `/v1` cap for one request line, from the public API's own table.
+
+    INTEGRATED 2026-09-13 (the six-model wave). CONTRACT §8/§12 now give the
+    two generating routes 20 MiB (`PUBLIC_API_MAX_MEDIA_BODY_BYTES`, image
+    parts) and `POST /v1/audio/transcriptions` 26 MiB
+    (`PUBLIC_API_MAX_AUDIO_BODY_BYTES`); every other `/v1` line keeps the
+    1 MiB of `PUBLIC_API_MAX_BODY_BYTES`. The Next edge enforces the same
+    table, and before this the middleware capped every `/v1` path at 1 MiB,
+    so an image request or an audio upload over 1 MiB was refused before the
+    router saw it. `publicapi.models.body_cap_for` is the one table; this
+    only asks it. Anonymous and signed-in are the same number on `/v1`, which
+    never reads the session cookie — the router's key check and its own text
+    limit (`ResponsesRequest.text_bytes`, 1 MiB) still apply after parsing.
+
+    Same defensive import as `_public_api_max_body_bytes`: a broken sibling
+    falls back to the small cap, never to no cap and never to an unmounted
+    `/chat`.
+    """
+    try:
+        from .publicapi.models import body_cap_for as public_body_cap_for
+
+        cap = int(public_body_cap_for(method, path))
+    except Exception:  # noqa: BLE001 — a missing sibling must not unmount /chat
+        return _public_api_max_body_bytes()
+    return cap if cap > 0 else _public_api_max_body_bytes()
+
+
 def body_cap_for(method: str, path: str) -> BodyCap:
     """The cap for one request line. Separate from the middleware so a test can
     assert the table without building a request.
@@ -586,9 +630,10 @@ def body_cap_for(method: str, path: str) -> BodyCap:
     method = (method or "GET").upper()
     default = _max_request_body_bytes()
     if _is_public_api_path(path):
-        # Not session-gated: `/v1` never reads the cookie (CONTRACT-3 §1), and
-        # its cap is already the small one.
-        public = _public_api_max_body_bytes()
+        # Not session-gated: `/v1` never reads the cookie (CONTRACT-3 §1). The
+        # per-route public table decides (20 MiB images, 26 MiB audio, else
+        # 1 MiB) — see `_public_api_body_cap`.
+        public = _public_api_body_cap(method, path)
         return BodyCap("public-api", public, public)
     if method == "POST" and path == "/chat":
         return BodyCap("chat", default, _chat_max_body_bytes())
@@ -962,6 +1007,7 @@ app = FastAPI(
 # needs to read the status, instead of surfacing as an opaque network error.
 app.add_middleware(RequestBodySizeLimitMiddleware)
 
+
 # Local platform: ONLY the local Next.js frontend origins are allowed. A
 # wildcard here would let any web page the user visits cross-origin read
 # /reports and drive /chat against the synced Salesforce data (§1/§12).
@@ -985,6 +1031,58 @@ app.add_middleware(
 # Next.js proxy strips Origin (server-to-server), so proxied traffic passes
 # untouched, and GET/HEAD (including every SSE stream) is never affected.
 _TRUSTED_ORIGINS = set(settings.cors_allow_origins)
+
+
+# CROSS-CHAT RECALL CACHE, KEPT HONEST (2026-09-13). memory_semantic caches a
+# user's 500 recall candidates — message text AND conversation title — for
+# CROSS_CHAT_EMBEDDINGS_CACHE_S (60 s), and checks each hit against a
+# fingerprint of message_embeddings (count, max id, max created_at). That
+# fingerprint sees new vectors and every DELETE (a conversation deleted, a
+# thread truncated or replaced: the vectors cascade away), but NOT a rename,
+# a generated title, or an in-place UPDATE of messages.content, which leave
+# message_embeddings untouched — so another chat could recall an old title, or
+# a partial answer the finished one replaced, for up to a minute (prover,
+# 2026-09-13). Those writes invalidate: the three history routes matched
+# below, and main._overwrite_persisted_answer at its call sites. POST
+# .../messages (an append, on every turn) is deliberately NOT one: a new
+# message has no vector yet, and invalidating per turn would empty the cache.
+#
+# Checked inside _reject_cross_site_writes, after the route answered, rather
+# than in a middleware of its own: the middleware stack is pinned
+# (tests/test_publicapi_mount.py), that function already sees every write,
+# and a GET — every /chat stream included — never reaches the check.
+_RECALL_CACHE_WRITES = _re.compile(r"^/history/conversations/[^/]+(?P<title>/title)?/?$")
+
+
+def _is_recall_cache_write(method: str, path: str) -> bool:
+    """A rename/pin/archive (PUT), a delete (DELETE) or a generated title
+    (POST .../title) of one conversation."""
+    match = _RECALL_CACHE_WRITES.match(path or "")
+    if match is None:
+        return False
+    if match.group("title"):
+        return method == "POST"
+    return method in ("PUT", "PATCH", "DELETE")
+
+
+def _invalidate_cross_chat_recall(user_id: Optional[int]) -> None:
+    """Forget cached recall candidates for this user (everyone when the user
+    is unknown — correctness over a cache hit). Never raises."""
+    try:
+        from . import memory_semantic
+
+        memory_semantic.invalidate_message_embeddings(int(user_id) if user_id is not None else None)
+    except Exception:  # noqa: BLE001 — a cache must never fail a write
+        logging.getLogger(__name__).warning("cross-chat recall cache invalidation failed", exc_info=True)
+
+
+def _after_recall_cache_write(request: Request) -> None:
+    """Invalidate for the signed-in user: the principal auth resolution cached
+    on the request state (shared with the route through the scope)."""
+    from .authn import principal as _principal_mod
+
+    principal = getattr(request.state, _principal_mod._STATE_KEY, None)
+    _invalidate_cross_chat_recall(getattr(principal, "user_id", None))
 
 
 @app.middleware("http")
@@ -1012,6 +1110,11 @@ async def _reject_cross_site_writes(request: Request, call_next):
             return JSONResponse(
                 status_code=403, content={"detail": "cross-site request refused"}
             )
+        if _is_recall_cache_write(request.method, request.url.path):
+            response = await call_next(request)
+            if 200 <= response.status_code < 400:
+                _after_recall_cache_write(request)
+            return response
     return await call_next(request)
 
 
@@ -1140,6 +1243,7 @@ async def _http_exception_in_the_surfaces_own_envelope(
 
 app.include_router(auth_router)
 app.include_router(history_router)
+
 app.include_router(uploads_router)
 # Speech to text for the composer. Its own router because it is the only
 # route that takes audio, and the only one gated on Feature.VOICE_INPUT.
@@ -1276,6 +1380,10 @@ class LiveGeneration:
         self.intent_id: Optional[str] = None
         self.attempt: int = 1
         self.persisted = False
+        # 2026-09-13: the tree position the request asked this answer to be
+        # stored under (ChatRequest.answer_branch), written onto the stored
+        # row's meta.branch. None = an ordinary send, stored exactly as before.
+        self.answer_branch: Optional[dict] = None
         # The last status written to the chat_requests row, and the failure
         # text a 'failed' row records — the same sentence the error event
         # carried, never an upstream body.
@@ -1299,9 +1407,23 @@ class LiveGeneration:
         # resumer (continuity.LeaseLost): the turn ends without answering
         # and without touching the row, which is theirs now.
         self.lease_lost = False
+        # The buffer index and perf_counter stamp of the first token or
+        # reasoning event (publish), and whether its relay time was reported.
+        self.first_output_index: Optional[int] = None
+        self.first_output_at: Optional[float] = None
+        self.relay_overhead_s: Optional[float] = None
+        self._relay_observed = False
+        #: ChatRequest.effort, for the relay histogram's label.
+        self.effort = ""
 
     async def publish(self, event: str, data: dict) -> None:
         async with self.cond:
+            if event in _STREAMED_EVENTS and self.first_output_index is None:
+                # Where the engine's first visible output entered the buffer,
+                # and when: `follow` reports how long it took to reach the
+                # wire (relay_overhead_seconds, plan item 1, 2026-09-13).
+                self.first_output_index = len(self.events)
+                self.first_output_at = time.perf_counter()
             self.events.append((event, data))
             self.cond.notify_all()
 
@@ -1309,6 +1431,32 @@ class LiveGeneration:
         async with self.cond:
             self.done = True
             self.cond.notify_all()
+
+    def _observe_relay(self, start: int, end: int, backlog: int) -> None:
+        """Stamp relay_overhead_seconds: the first answer/reasoning event's
+        time from `publish` to the write that carries it — once per
+        generation, and only for a LIVE reader (a re-attach replaying the
+        buffer would report its own lateness, not the relay's)."""
+        first = self.first_output_index
+        if self.relay_overhead_s is not None or first is None or first < backlog or not start <= first < end:
+            return
+        self.relay_overhead_s = time.perf_counter() - float(self.first_output_at or 0.0)
+        if self.final_meta is not None:
+            self.report_relay()  # the route is known: this write came late
+
+    def report_relay(self) -> None:
+        """Observe the stamped relay time once, under the answer's route.
+        The first token is written long before the route is known (it rides
+        the final meta), so the worker reports it after `done`; a reader
+        still draining by then reports it itself."""
+        if self.relay_overhead_s is None or self._relay_observed:
+            return
+        self._relay_observed = True
+        _latency_metrics.relay_overhead(
+            self.relay_overhead_s,
+            route=str((self.final_meta or {}).get("route") or "unknown"),
+            effort=self.effort,
+        )
 
     async def follow(self) -> AsyncIterator[str]:
         """Replay buffered events, then stream live ones until the end.
@@ -1324,12 +1472,37 @@ class LiveGeneration:
         connection is alive. The frame is yielded OUTSIDE the condition's lock
         — holding it across a yield would block publish() for as long as the
         consumer takes to drain.
+
+        COALESCING (2026-09-13, sse.COALESCE_SECONDS). Live token/reasoning
+        events that arrive within the frame window of the previous write
+        share ONE write: the reader sleeps out the rest of the window, then
+        takes everything buffered. The first event after a quiet spell is
+        written at once, a pending status/meta/done/error flushes at once,
+        and the buffered backlog a re-attach replays is still written one
+        frame per yield. The bytes are the per-event frames concatenated,
+        unchanged.
+
+        The hold applies ONLY behind a write that itself carried a streamed
+        event, and only to kinds this reader has already been sent. So the
+        first reasoning token and the first answer token are never held —
+        not behind a status line ("Reading your documents…" 3 ms earlier),
+        and not behind the reasoning that precedes the answer. Measured
+        2026-09-13 before this rule: both first tokens waited 22.3 ms, a
+        delay chat_ttft_seconds cannot see (it is stamped before publish).
         """
         self.subscribers += 1
         try:
             index = 0
+            backlog = len(self.events)
+            # When the last write that ENDED on a token/reasoning event went
+            # out (None after any other write), and the streamed kinds this
+            # reader has been sent: together they decide whether a hold may
+            # apply (see the docstring).
+            last_write: Optional[float] = None
+            sent_kinds: set = set()
             while True:
-                frame: Optional[str] = None
+                chunk: Optional[str] = None
+                ends_streamed = False
                 async with self.cond:
                     while index >= len(self.events) and not self.done:
                         try:
@@ -1338,13 +1511,40 @@ class LiveGeneration:
                             )
                         except asyncio.TimeoutError:
                             break  # idle — fall through and send a keep-alive
-                    if index < len(self.events):
-                        event, data = self.events[index]
-                        index += 1
-                        frame = sse_event(event, data)
-                    elif self.done:
+                    window = float(_sse.COALESCE_SECONDS)
+                    hold = 0.0
+                    if (
+                        index < len(self.events)
+                        and index >= backlog
+                        and window > 0
+                        and last_write is not None
+                        and not self.done
+                        and all(e in sent_kinds for e, _ in self.events[index:])
+                    ):
+                        hold = window - (time.perf_counter() - last_write)
+                    if index < len(self.events) and hold <= 0:
+                        start = index
+                        if index < backlog:
+                            chunk = sse_event(*self.events[index])
+                            index += 1
+                        else:
+                            end = len(self.events)
+                            chunk = "".join(sse_event(e, d) for e, d in self.events[index:end])
+                            index = end
+                        written = self.events[start:index]
+                        sent_kinds.update(e for e, _ in written if e in _STREAMED_EVENTS)
+                        ends_streamed = written[-1][0] in _STREAMED_EVENTS
+                        self._observe_relay(start, index, backlog)
+                    elif index >= len(self.events) and self.done:
                         break  # done and fully drained
-                yield frame if frame is not None else sse_comment()
+                if hold > 0:
+                    # Outside the lock: publish() keeps filling the buffer
+                    # while this reader waits out the frame window.
+                    await asyncio.sleep(hold)
+                    continue
+                if chunk is not None and index > backlog:
+                    last_write = time.perf_counter() if ends_streamed else None
+                yield chunk if chunk is not None else sse_comment()
         finally:
             self.subscribers -= 1
 
@@ -1362,6 +1562,335 @@ _shutting_down = False
 # Detached background-compaction tasks. Held so the event loop keeps a strong
 # reference (an unreferenced task can be garbage-collected mid-run).
 _background_tasks: set = set()
+
+
+# ---------------------------------------------------------------- context reads
+#
+# CONTEXT ASSEMBLY, READ CONCURRENTLY (2026-09-13, performance plan item 4).
+# Between MODE_RESOLVED and CONTEXT_ASSEMBLED the worker awaited about a dozen
+# independent reads one after another — saved facts, cross-chat recall (a
+# candidate scan plus a query embedding), repo keys, stored pages, documents,
+# videos, uploads, in-conversation recall, the rolling summary — and that
+# section cost p50 209 ms / p95 352 ms / max 443 ms even for 1-3 message
+# histories (query_trace_events, n=46, 2026-09-11..13). None of those reads
+# depends on another's result, so they now START together and the prompt is
+# still built by the same sequential code, in the same order, from the same
+# values: each call site asks `get` for its result instead of awaiting the
+# read itself. The golden test (tests/test_context_assembly_golden.py) builds
+# the assembled messages both ways and requires identical bytes.
+#
+# A read is only ever STARTED under a condition that is a superset of the
+# one its call site checks, with the exact arguments that call site uses (one
+# factory serves both), so a read the turn turns out not to need is wasted
+# work, never different context. A call site whose read was not started — the
+# flag off, or a condition the start could not foresee — reads inline, as it
+# always did. Exceptions surface at the call site, inside the same try.
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """config.py's `_bool`, for tunables this module reads itself until the
+    integration lead moves them into Settings."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    """config.py's `_int` (blank means the default)."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def _context_concurrent_reads_enabled() -> bool:
+    """CONTEXT_CONCURRENT_READS (default on). Off restores the one-at-a-time
+    reads exactly, which is also how the golden test builds its reference.
+    A Settings attribute of the same name wins (config.py)."""
+    return bool(getattr(settings, "context_concurrent_reads", _env_bool("CONTEXT_CONCURRENT_READS", True)))
+
+
+def _context_reads_concurrency() -> int:
+    """CONTEXT_READS_CONCURRENCY (default 6): reads one turn runs AHEAD at once."""
+    return max(1, int(getattr(settings, "context_reads_concurrency", _env_int("CONTEXT_READS_CONCURRENCY", 6))))
+
+
+def _context_reads_process_limit() -> int:
+    """CONTEXT_READS_PROCESS_LIMIT (default 6): reads ALL turns run ahead at once."""
+    return max(1, int(getattr(settings, "context_reads_process_limit", _env_int("CONTEXT_READS_PROCESS_LIMIT", 6))))
+
+
+def _context_reads_max_turns() -> int:
+    """CONTEXT_READS_CONCURRENT_MAX_TURNS (default 0 = no limit): a turn runs
+    its reads ahead only while fewer than this many turns already do."""
+    return int(getattr(settings, "context_reads_concurrent_max_turns", _env_int("CONTEXT_READS_CONCURRENT_MAX_TURNS", 0)))
+
+
+#: Turns whose reads may run ahead right now (opened, not yet closed). Weak:
+#: a turn object that is gone without its `close` can never hold a slot.
+import weakref as _weakref  # noqa: E402
+
+_turns_reading_ahead: "_weakref.WeakSet" = _weakref.WeakSet()
+
+#: One process-wide semaphore per event loop (a semaphore binds to its loop).
+_process_read_slots: dict = {}
+
+
+def _process_read_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    entry = _process_read_slots.get(id(loop))
+    if entry is None or entry[0] is not loop:
+        _process_read_slots.clear()  # a finished test loop's semaphore is garbage
+        entry = (loop, asyncio.Semaphore(_context_reads_process_limit()))
+        _process_read_slots[id(loop)] = entry
+    return entry[1]
+
+
+class _ContextReads:
+    """The context reads of ONE chat turn, started early and collected in order.
+
+    Bounded twice. Per turn by CONTEXT_READS_CONCURRENCY (default 6): every
+    read holds a pooled PostgreSQL connection (APP_DB_POOL_MAX 16) and an
+    anyio worker thread (40, shared with the sync routes) while it runs.
+
+    And across the PROCESS by CONTEXT_READS_PROCESS_LIMIT (default 6), added
+    2026-09-13 after the second prover pass: with only the per-turn bound, 16
+    concurrent Fast turns asked for ~96 reads against 16 connections and 40
+    threads, and TTFT at c=16 was WORSE than HEAD (cached p50 601.9 -> 700.5
+    ms, p95 915.9 -> 1009.9 ms, slower in 9 of 9 paired rounds; with the
+    reads sequential it was back at 580.9 / 882.6 ms). A read started ahead
+    that has not got a process slot by the time its call site asks for it is
+    dropped and read inline, exactly as one-at-a-time did — so under a burst
+    each turn degrades to HEAD's shape plus at most the shared slots, never
+    to a queue behind other turns' reads.
+    """
+
+    def __init__(self, concurrent: bool) -> None:
+        limit = _context_reads_max_turns() if concurrent else 0
+        #: Read one at a time because enough turns already read ahead.
+        self.load_shed = bool(concurrent and limit > 0 and len(_turns_reading_ahead) >= limit)
+        self.concurrent = concurrent and not self.load_shed
+        if self.concurrent:
+            _turns_reading_ahead.add(self)
+        self._tasks: dict = {}
+        self._slots: Optional[asyncio.Semaphore] = None
+        #: Reads that fell back to inline because no process slot came in time.
+        self.inline_fallbacks = 0
+
+    def start(self, key: str, factory) -> None:
+        if not self.concurrent or key in self._tasks:
+            return
+        if self._slots is None:
+            self._slots = asyncio.Semaphore(_context_reads_concurrency())
+        slots = self._slots
+        process = _process_read_semaphore()
+        state = {"running": False}
+
+        async def bounded():
+            async with slots:
+                async with process:
+                    state["running"] = True
+                    return await factory()
+
+        task = asyncio.ensure_future(bounded())
+        # A read nobody collects (the turn went another way, or failed first)
+        # must not log "Task exception was never retrieved".
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        self._tasks[key] = (task, state)
+
+    async def get(self, key: str, factory):
+        entry = self._tasks.pop(key, None)
+        if entry is None:
+            return await factory()
+        task, state = entry
+        if not state["running"] and not task.done():
+            # One loop turn to take a free slot: a read started just now has
+            # not been scheduled yet, which is not the same as waiting.
+            await asyncio.sleep(0)
+        if not state["running"] and not task.done():
+            task.cancel()
+            self.inline_fallbacks += 1
+            return await factory()
+        return await task
+
+    def close(self) -> None:
+        """Drop whatever was started and never collected."""
+        for task, _state in self._tasks.values():
+            if not task.done():
+                task.cancel()
+        self._tasks.clear()
+        _turns_reading_ahead.discard(self)
+
+
+class _OrderedTraceWriter:
+    """Runs a generation's trace writes one after another, behind the answer.
+
+    Every trace write was an awaited INSERT on the path to the first token —
+    the root row, REQUEST_RECEIVED, MODE_RESOLVED, CONTEXT_ASSEMBLED — about
+    10-25 ms of a Fast turn (plan item 4, 2026-09-13). They now run on one
+    background task in the order they were made, so sequence numbers and the
+    root-before-events rule hold exactly as before. Traces are diagnostics
+    (core/tracing.py: "persistence is best-effort"); a crash can lose the
+    tail of one, which is acceptable for a trace and is why NOTHING the
+    upload-reliability contract depends on (the chat_requests row, the
+    answer) goes through here. The worker drains the queue before the stream
+    closes, so a trace is complete by the time its response is.
+    """
+
+    def __init__(self) -> None:
+        from collections import deque
+
+        self._jobs = deque()
+        self._task: Optional[asyncio.Task] = None
+
+    def submit(self, job) -> None:
+        self._jobs.append(job)
+        if self._task is None or self._task.done():
+            self._task = asyncio.ensure_future(self._drain())
+            _background_tasks.add(self._task)
+            self._task.add_done_callback(_background_tasks.discard)
+
+    async def _drain(self) -> None:
+        while self._jobs:
+            job = self._jobs.popleft()
+            try:
+                await job()
+            except Exception:  # noqa: BLE001 — a trace must never fail a turn
+                logging.getLogger(__name__).warning("queued trace write failed", exc_info=True)
+
+    async def flush(self) -> None:
+        while self._task is not None and not self._task.done():
+            await asyncio.shield(self._task)
+
+
+#: How long `done` may wait for the clarification cancel a turn started
+#: beside its answer (sf_intel_state.cancel_pending: two UPDATEs, single-digit
+#: ms on a healthy pool). Past it the stream ends anyway and the write lands
+#: on its own; 2 s is far above a healthy write and far below the patience
+#: of a person whose answer is already on screen (2026-09-13).
+_CLARIFICATION_CANCEL_BOUND_S = 2.0
+
+
+#: How long the end of a turn waits for its queued trace writes before the
+#: stream closes anyway (2026-09-13). They keep landing on their own task; a
+#: healthy INSERT is single-digit ms, and the answer is already on screen.
+_TRACE_FLUSH_BOUND_S = 2.0
+
+
+class _TurnEnd:
+    """The end-of-turn bookkeeping, proof against a second cancellation.
+
+    Each step runs as its own task behind `shield`, so a CancelledError that
+    reaches the worker while it waits cannot stop the step, and is recorded
+    here instead of unwinding the rest of the `finally`. The caller re-raises
+    it once `_finalize_generation` has run. Exceptions from a step are the
+    step's own business, as `contextlib.suppress(Exception)` made them.
+    """
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    async def step(self, awaitable, *, bound: Optional[float] = None) -> None:
+        task = asyncio.ensure_future(awaitable)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        try:
+            if bound is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), timeout=bound)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if bound is None and not task.done():
+                # Unbounded steps (the row's status, the finalize) must finish
+                # before the next one starts, as they did in sequence before.
+                await self._until_done(task)
+        except Exception:  # noqa: BLE001 — each step is best-effort, as before
+            pass
+
+    async def _until_done(self, task: "asyncio.Task") -> None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001
+                return
+
+
+async def _settle_clarification_cancel(task: Optional["asyncio.Task"]) -> None:
+    """Wait, bounded, for a turn's clarification cancel to land. A task still
+    running at the bound keeps running (shielded, strongly referenced)."""
+    if task is None or task.done():
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_CLARIFICATION_CANCEL_BOUND_S)
+    except asyncio.TimeoutError:
+        logging.getLogger(__name__).warning(
+            "clarification cancel still running after %.1fs; the turn ends without it",
+            _CLARIFICATION_CANCEL_BOUND_S,
+        )
+    except Exception:  # noqa: BLE001 — _cancel_pending_clarification already suppresses
+        pass
+
+
+def _trace_snapshot(details: Optional[dict]) -> Optional[dict]:
+    """Details as they are NOW: a queued write runs later, and the dicts a
+    caller passes (context_state, a meta) keep changing after the call."""
+    if details is None:
+        return None
+    import copy
+
+    try:
+        return copy.deepcopy(details)
+    except Exception:  # noqa: BLE001 — uncopyable: the bounded, JSON-safe form
+        from .core.tracing import sanitize
+
+        return sanitize(details)
+
+
+class _QueuedTraceRecorder(TraceRecorder):
+    """TraceRecorder whose writes go through `_OrderedTraceWriter`.
+
+    `start`, `event` and `finish` return at once; the parent's own methods do
+    the writing, in call order, on the writer's task — the sequence counter
+    and the finished flag advance there, in that same order. Engines that
+    record through `core.tracing.event` reach this recorder through the
+    context variable and are queued the same way.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.writer = _OrderedTraceWriter()
+
+    async def start(self, **kwargs) -> None:  # type: ignore[override]
+        self.writer.submit(lambda: TraceRecorder.start(self, **kwargs))
+
+    async def event(self, stage: str, **kwargs) -> None:  # type: ignore[override]
+        if "details" in kwargs:
+            kwargs["details"] = _trace_snapshot(kwargs["details"])
+        self.writer.submit(lambda: TraceRecorder.event(self, stage, **kwargs))
+
+    def event_when_ready(self, stage: str, build, **kwargs) -> None:
+        """Queue an event whose details are only complete later: `build` is
+        awaited on the writer's task, in this event's place in the order."""
+
+        async def job() -> None:
+            await TraceRecorder.event(self, stage, details=_trace_snapshot(await build()), **kwargs)
+
+        self.writer.submit(job)
+
+    async def finish(self, status: str, **kwargs) -> None:  # type: ignore[override]
+        if "meta" in kwargs:
+            kwargs["meta"] = _trace_snapshot(kwargs["meta"])
+        self.writer.submit(lambda: TraceRecorder.finish(self, status, **kwargs))
+
+    async def flush(self) -> None:
+        await self.writer.flush()
 
 
 def _spawn_background_compaction(
@@ -1649,6 +2178,15 @@ class ChatRequest(BaseModel):
     # starting another (docs/upload-reliability/API.md). Absent from old
     # clients: the server mints one and keeps the event shapes they expect.
     intent_id: Optional[str] = None
+    # 2026-09-13 (the duplicate answers): {"self": "b-…", "parent": "b-…"|"#N"}
+    # — where the answer belongs in the browser's conversation tree. Since V29
+    # the SERVER stores the answer (before `done`), so a position the browser
+    # only held locally was lost: an untagged row attaches to whatever row
+    # precedes it, which for "Try again" is the previous answer — stacked
+    # copies instead of versions. Written onto the stored answer's
+    # `meta.branch`; kept in the request snapshot, so a resume files its answer
+    # in the same place. Absent = today's behaviour, byte for byte.
+    answer_branch: Optional[dict] = None
     # Supplied only by the offline evaluation runner. The application receives
     # the stable case identifier, never the expected plan, query or answer.
     test_case_id: Optional[str] = None
@@ -1666,6 +2204,23 @@ class ChatRequest(BaseModel):
         if value is not None and not _INTENT_ID_RE.fullmatch(value):
             raise ValueError("intent_id must be 1-64 characters of [A-Za-z0-9_-]")
         return value
+
+    @field_validator("answer_branch")
+    @classmethod
+    def _valid_answer_branch(cls, value: Optional[dict]) -> Optional[dict]:
+        if value is None:
+            return None
+        if set(value) - {"self", "parent"}:
+            raise ValueError("answer_branch may carry only self and parent")
+        branch_self = value.get("self")
+        parent = value.get("parent")
+        if not isinstance(branch_self, str) or not _ANSWER_BRANCH_SELF_RE.fullmatch(branch_self):
+            raise ValueError("answer_branch.self must be b- and 1-64 characters of [A-Za-z0-9_-]")
+        if parent is not None and (
+            not isinstance(parent, str) or not _ANSWER_BRANCH_PARENT_RE.fullmatch(parent)
+        ):
+            raise ValueError("answer_branch.parent must be a branch id or #<index>")
+        return {"self": branch_self, **({"parent": parent} if parent is not None else {})}
 
     @field_validator("session_id")
     @classmethod
@@ -2295,6 +2850,10 @@ async def _store_failure(gen: "LiveGeneration", partial: str, *, resumable: bool
         "generation_id": gen.generation_id,
         "intent_id": gen.intent_id,
         "attempt": gen.attempt,
+        # Under the same tree position as the answer a retry will store, so
+        # the browser reads the record as that answer's failed attempt, not
+        # as a version of its own (frontend/lib/branching.ts buildTree).
+        **({"branch": dict(gen.answer_branch)} if gen.answer_branch else {}),
         "error": {
             "message": gen.error,
             "code": gen.error_code,
@@ -2310,6 +2869,7 @@ async def _store_failure(gen: "LiveGeneration", partial: str, *, resumable: bool
             await db.run_in_thread(
                 _overwrite_persisted_answer, gen.conversation_id, gen.generation_id, partial, meta
             )
+            _invalidate_cross_chat_recall(gen.user_id)  # an in-place content edit
     except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
         logging.getLogger(__name__).warning(
             "failed to persist the failure record for conversation %s: %s: %s",
@@ -2397,6 +2957,11 @@ async def _store_answer(gen: "LiveGeneration") -> None:
         return
     meta = dict(gen.final_meta or {})
     meta.setdefault("generation_id", gen.generation_id)
+    if gen.answer_branch:
+        # The request said where this answer belongs in the conversation tree
+        # (a "Try again", an edit): store it THERE. Without it the row attaches
+        # to whatever precedes it — the previous answer, for a regenerate.
+        meta["branch"] = dict(gen.answer_branch)
     log = logging.getLogger(__name__)
     try:
         stored = await db.run_in_thread(
@@ -2423,6 +2988,8 @@ async def _store_answer(gen: "LiveGeneration") -> None:
                 gen.answer,
                 meta,
             )
+            # An in-place content edit: the fingerprint cannot see it.
+            _invalidate_cross_chat_recall(gen.user_id)
     except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
         log.warning(
             "failed to persist the answer for conversation %s: %s: %s",
@@ -2884,6 +3451,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
     gen = LiveGeneration(request.conversation_id, viewer)
     gen.intent_id = intent_id
+    gen.answer_branch = request.answer_branch
+    gen.effort = str(request.effort or "")
     row = await db.run_in_thread(
         db.create_chat_request,
         intent_id,
@@ -3026,11 +3595,22 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     superseded, conv_key_outer, intent_id,
                 )
 
+    if request.answer_branch and not resumed and not sweep_caller:
+        # A new VERSION of an answer was asked for (a "Try again", an edit, a
+        # send after a fork). Ids only, never content: the next incident about
+        # answers that stack or vanish can be read from here.
+        logging.getLogger(__name__).info(
+            "answer_branch intent=%s conversation=%s self=%s parent=%s",
+            intent_id,
+            conv_key_outer,
+            request.answer_branch["self"],
+            request.answer_branch.get("parent", ""),
+        )
     _live_generations[conv_key_outer] = gen
     _resuming.pop(gen.generation_id, None)
     # One correlation envelope per HTTP attempt. `test_case_id` is only a
     # join key; golden expectations remain in the offline evaluator.
-    query_trace = TraceRecorder(
+    query_trace = _QueuedTraceRecorder(
         gen.generation_id,
         test_case_id=request.test_case_id,
         versions={
@@ -3103,7 +3683,44 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # Wall clock for the route-mix / TTFT metrics stamped on meta.
     from time import perf_counter as _perf_counter
 
-    _timing: dict = {"started": _perf_counter(), "first_token": None}
+    _timing: dict = {
+        "started": _perf_counter(),
+        "first_token": None,
+        "first_visible": None,
+        "first_visible_kind": "",
+        "first_visible_observed": False,
+    }
+
+    def _observe_first_visible(route: str) -> None:
+        if _timing["first_visible"] is None or _timing["first_visible_observed"]:
+            return
+        _timing["first_visible_observed"] = True
+        _latency_metrics.chat_first_visible(
+            _timing["first_visible"],
+            route=route,
+            effort=str(request.effort or ""),
+            kind=_timing["first_visible_kind"],
+        )
+    # The meter's exact prompt count when compaction deferred it behind the
+    # answer (compaction.prepare_deferred): folded into context_state before
+    # anything reads it.
+    context_pending: dict = {"task": None}
+
+    async def _settle_context() -> dict:
+        task = context_pending["task"]
+        if task is not None:
+            try:
+                context_state.update(await asyncio.shield(task))
+            except asyncio.CancelledError:
+                # The count itself was cancelled (a turn that ended without
+                # its meta): the details already known stand. A cancellation
+                # of THIS coroutine still propagates.
+                if not task.cancelled():
+                    raise
+            except Exception:  # noqa: BLE001 — the meter is never worth a turn
+                pass
+            context_pending["task"] = None
+        return context_state
 
     async def emit(event: str, data: dict) -> None:
         nonlocal provenance_recorded
@@ -3146,6 +3763,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             trimmed = context.get_trim_notice()
             if trimmed:
                 data["input_trimmed"] = trimmed
+            if context_pending["task"] is not None:
+                await _settle_context()
             if context_state:
                 data["context"] = dict(context_state)
             if orchestration_state:
@@ -3220,6 +3839,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 _metrics.observe(
                     "chat_ttft_seconds", _timing["first_token"], route=route, effort=str(request.effort or "")
                 )
+            _observe_first_visible(route)
             _metrics.observe(
                 "chat_total_seconds", _pc() - _timing["started"], route=route, effort=str(request.effort or "")
             )
@@ -3228,6 +3848,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             from time import perf_counter as _pc
 
             _timing["first_token"] = _pc() - _timing["started"]
+        if _timing.get("first_visible") is None and event in ("token", "reasoning", "status"):
+            # chat_first_visible_seconds (plan item 1, 2026-09-13): the first
+            # thing a person can READ — an answer token, a reasoning token,
+            # or a status line with words in it. chat_ttft_seconds only sees
+            # answer tokens, so Think and Max looked 9-38 s slow while their
+            # reasoning was already on screen. Stamped now, observed with
+            # the route at meta — or as "unknown" from the worker's
+            # `finally`, so a turn stopped before its meta still counts.
+            piece = data.get("text")
+            if isinstance(piece, str) and piece.strip():
+                _timing["first_visible"] = _perf_counter() - _timing["started"]
+                _timing["first_visible_kind"] = "answer" if event == "token" else event
         await gen.publish(event, data)
 
     async def worker() -> None:
@@ -3270,6 +3902,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             str(signed_in.get("email") or ""),
             str(signed_in.get("workspace_name") or ""),
         )
+        reads = _ContextReads(_context_concurrent_reads_enabled())
+        cancel_pending_task: Optional[asyncio.Task] = None
         try:
             await _mark_chat_request(gen, "running")
             await query_trace.start(
@@ -3301,6 +3935,129 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # downgraded one. Said once per turn, never as an error.
                 await emit("status", {"text": access_notice})
             history = request.history_messages or memory.history(scoped_session)
+
+            # CONTEXT READS START HERE (see _ContextReads). Before decide():
+            # none of them depends on the plan, and at Think/Max the plan is
+            # a router round trip the reads no longer wait behind.
+            conv_key = request.conversation_id or scoped_session
+            plain_text_turn = bool(request.text and not request.pdf_data and not request.image_data)
+
+            def read_facts():
+                return db.run_in_thread(db.list_user_facts, viewer, settings.memory_max_facts)
+
+            async def read_cross_chat():
+                # For a question that needs EVIDENCE (an office holder,
+                # a price, a release) the assistant's own earlier answers
+                # are not evidence: the audit found one being repeated
+                # and cited against sources that never contained it,
+                # while a colleague asking the same thing got "not in
+                # the sources". What the USER said earlier still counts.
+                from .freshness import classify_offline
+
+                needs_evidence = classify_offline(
+                    request.text, now_year=datetime.now(timezone.utc).year
+                ).needs_evidence
+                return await memory_semantic.cross_chat_block(
+                    viewer,
+                    request.text,
+                    request.conversation_id,
+                    include_assistant=(
+                        settings.recall_assistant_answers_for_facts
+                        or not needs_evidence
+                    ),
+                )
+
+            def read_keyword_recall():
+                return db.run_in_thread(
+                    recall_block,
+                    viewer,
+                    request.text,
+                    request.conversation_id,
+                )
+
+            def read_repo_keys():
+                return db.run_in_thread(db.get_repo_keys, conv_key)
+
+            def read_crawl_hits():
+                from .engines.crawl import site_hits_for
+
+                return site_hits_for(conv_key, request.text)
+
+            def read_url_documents():
+                return db.run_in_thread(db.get_url_documents, conv_key)
+
+            def read_documents():
+                return db.run_in_thread(db.get_documents, conv_key)
+
+            def read_videos():
+                return db.run_in_thread(db.get_conversation_videos, conv_key)
+
+            def read_uploads():
+                return db.run_in_thread(db.get_uploads, conv_key)
+
+            def read_recall():
+                from . import recall as _recall
+
+                return _recall.retrieve_block(
+                    conv_key, text, effort=llm.normalize_effort(str(request.effort or ""))
+                )
+
+            def read_summary():
+                return db.run_in_thread(db.get_summary, conv_key)
+
+            def read_artifacts():
+                from .engines import artifact as _artifact_engine
+
+                return db.run_in_thread(_artifact_engine.adb.list_artifacts, viewer, conv_key)
+
+            if reads.concurrent and request.text:
+                if request.mode == "assistant":
+                    reads.start("facts", read_facts)
+                    reads.start("cross_chat", read_cross_chat)
+                else:
+                    reads.start("keyword_recall", read_keyword_recall)
+                if settings.repo_analysis_enabled and plain_text_turn:
+                    reads.start("repo_keys", read_repo_keys)
+                if (
+                    settings.web_crawl_enabled
+                    and plain_text_turn
+                    and request.conversation_id
+                    and request.web_search != "on"
+                    and not request.agent
+                ):
+                    from .engines.crawl import _URL_RE as _crawl_url_re, detect_crawl, detect_resume
+                    from .engines.search import _FRESH_RE as _fresh_re
+
+                    if (
+                        detect_crawl(request.text) is None
+                        and not detect_resume(request.text)
+                        and not _crawl_url_re.search(request.text)
+                        and not _fresh_re.search(request.text)
+                    ):
+                        reads.start("crawl_hits", read_crawl_hits)
+                if settings.url_analysis_enabled and plain_text_turn:
+                    reads.start("url_documents", read_url_documents)
+                if plain_text_turn:
+                    reads.start("documents", read_documents)
+                if (
+                    settings.video_analysis_enabled
+                    and not request.video_uploads
+                    and not request.pdf_data
+                    and not request.pdf_uploads
+                    and not request.image_data
+                ):
+                    reads.start("videos", read_videos)
+                if settings.dataset_uploads_enabled and plain_text_turn:
+                    reads.start("uploads", read_uploads)
+                if (
+                    settings.artifacts_enabled
+                    and not request.video_uploads
+                    and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
+                ):
+                    reads.start("artifacts", read_artifacts)
+            if reads.concurrent and request.conversation_id:
+                reads.start("recall", read_recall)
+                reads.start("summary", read_summary)
             # Phase 1: decide whether to run web search (never for attachments).
             # AUTO-ORCHESTRATION (2026-07-28): with no Agent toggle in the UI,
             # one cheap non-thinking call decides whether this request deserves
@@ -3324,9 +4081,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.video_uploads
                 and not request.agent
             ):
-                from .engines.orchestrate import decide
+                from .engines.orchestrate import allowances as _allowances, decide
 
+                decide_started = _perf_counter()
                 auto_plan = await decide(request.text, history, request.effort)
+                _allowed = _allowances(request.effort)
+                _latency_metrics.orchestrate_decide(
+                    _perf_counter() - decide_started,
+                    effort=str(request.effort or ""),
+                    plan=_latency_metrics.plan_label(auto_plan.agent, auto_plan.search),
+                    # decide() asks the router only when the effort permits
+                    # agent or search at all; Fast never does.
+                    outcome="ok" if (_allowed["agent"] or _allowed["search"]) else "skipped",
+                )
 
             want_agent = request.agent or bool(auto_plan and auto_plan.agent)
 
@@ -3495,6 +4262,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     },
                 )
 
+            # context_assembly_seconds starts where the MODE_RESOLVED trace
+            # event is written, so it reads against the 2026-09-13 baseline
+            # (MODE_RESOLVED -> CONTEXT_ASSEMBLED, p50 209 ms).
+            assembly_started = _perf_counter()
             if signed_in is not None and request.text:
                 user_id = int(signed_in["id"])
                 if request.mode == "assistant":
@@ -3527,9 +4298,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                         fact_task.add_done_callback(_facts_done)
                     # 2. Saved facts, injected verbatim (their memory).
-                    saved_facts = await db.run_in_thread(
-                        db.list_user_facts, user_id, settings.memory_max_facts
-                    )
+                    saved_facts = await reads.get("facts", read_facts)
                     facts_text = facts.facts_block(saved_facts)
                     if facts_text:
                         history = [
@@ -3537,39 +4306,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             *history,
                         ]
                     # 3. Semantic + keyword recall over other conversations,
-                    #    merged into one block.
-                    # For a question that needs EVIDENCE (an office holder,
-                    # a price, a release) the assistant's own earlier answers
-                    # are not evidence: the audit found one being repeated
-                    # and cited against sources that never contained it,
-                    # while a colleague asking the same thing got "not in
-                    # the sources". What the USER said earlier still counts.
-                    from .freshness import classify_offline
-
-                    needs_evidence = classify_offline(
-                        request.text, now_year=datetime.now(timezone.utc).year
-                    ).needs_evidence
-                    block = await memory_semantic.cross_chat_block(
-                        user_id,
-                        request.text,
-                        request.conversation_id,
-                        include_assistant=(
-                            settings.recall_assistant_answers_for_facts
-                            or not needs_evidence
-                        ),
-                    )
+                    #    merged into one block (read_cross_chat, above).
+                    block = await reads.get("cross_chat", read_cross_chat)
                 else:
                     # Salesforce mode keeps the original keyword-only recall.
-                    block = await db.run_in_thread(
-                        recall_block,
-                        user_id,
-                        request.text,
-                        request.conversation_id,
-                    )
+                    block = await reads.get("keyword_recall", read_keyword_recall)
                 if block:
                     history = [{"role": "system", "content": block}, *history]
-
-            conv_key = request.conversation_id or scoped_session
 
             # Phase 3: GitHub repo analysis. A repo URL → clone/index/overview;
             # a follow-up when a repo is already indexed → code Q&A.
@@ -3592,11 +4335,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     github_ref = None
                 if github_ref is None:
                     try:
-                        from . import db as _dbr
-
-                        repo_followup = bool(
-                            await db.run_in_thread(_dbr.get_repo_keys, conv_key)
-                        )
+                        repo_followup = bool(await reads.get("repo_keys", read_repo_keys))
                     except Exception:
                         repo_followup = False
 
@@ -3621,7 +4360,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _URL_RE,
                     detect_crawl,
                     detect_resume,
-                    site_hits_for,
                 )
 
                 crawl_url = detect_crawl(request.text)
@@ -3664,8 +4402,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             # embed + a scoped flat scan, ~60 ms) and decisive
                             # — no hits above the relevance floor means normal
                             # routing proceeds.
-                            crawl_site_hits, crawl_site_host = await site_hits_for(
-                                conv_key, request.text
+                            crawl_site_hits, crawl_site_host = await reads.get(
+                                "crawl_hits", read_crawl_hits
                             )
                         except Exception:
                             crawl_site_hits = []
@@ -3684,7 +4422,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and github_ref is None
                 and crawl_url is None
             ):
-                from . import db as _db
                 from .core.urls import (
                     extract_urls,
                     links_are_the_request,
@@ -3706,9 +4443,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     url_list = []
                 if not url_list:
                     try:
-                        stored = await db.run_in_thread(
-                            _db.get_url_documents, conv_key
-                        )
+                        stored = await reads.get("url_documents", read_url_documents)
                     except Exception:
                         stored = []  # best-effort — never break chat on a DB hiccup
                     if stored:
@@ -3736,7 +4471,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .core.urls import select_relevant as _doc_select
 
                 try:
-                    stored_docs = await db.run_in_thread(db.get_documents, conv_key)
+                    stored_docs = await reads.get("documents", read_documents)
                 except Exception:
                     stored_docs = []  # best-effort
                 if stored_docs:
@@ -3777,9 +4512,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
             ):
                 try:
-                    conversation_videos = await db.run_in_thread(
-                        db.get_conversation_videos, conv_key
-                    )
+                    conversation_videos = await reads.get("videos", read_videos)
                 except Exception:
                     conversation_videos = []  # best-effort
                 if conversation_videos:
@@ -3824,7 +4557,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # this conversation a dataset conversation.
                     dataset_ready = any(
                         (u.get("notes") or "") not in ("document", "video")
-                        for u in await db.run_in_thread(db.get_uploads, conv_key)
+                        for u in await reads.get("uploads", read_uploads)
                     )
                 except Exception:
                     dataset_ready = False
@@ -3834,29 +4567,55 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # the already-compacted prompt would mis-count them.
             full_history = list(history)
             if signed_in is not None and request.conversation_id:
-                from . import compaction, recall
+                from . import compaction
 
                 base_url, _key, model_id = llm.resolve_model_choice(request.model)
-                retrieved = await recall.retrieve_block(conv_key, text)
-                history, info = await compaction.prepare(
-                    conv_key,
-                    full_history,
-                    text,
-                    base_url=base_url,
-                    model=model_id,
-                    emit=emit,
-                    retrieved=retrieved,
-                )
-                context_state.update(info)
-            await query_trace.event(
+                retrieved = await reads.get("recall", read_recall)
+                if reads.concurrent:
+                    history, info, context_pending["task"] = await compaction.prepare_deferred(
+                        conv_key,
+                        full_history,
+                        text,
+                        base_url=base_url,
+                        model=model_id,
+                        emit=emit,
+                        retrieved=retrieved,
+                        summary_reader=lambda: reads.get("summary", read_summary),
+                    )
+                else:
+                    history, info = await compaction.prepare(
+                        conv_key,
+                        full_history,
+                        text,
+                        base_url=base_url,
+                        model=model_id,
+                        emit=emit,
+                        retrieved=retrieved,
+                    )
+                if info is not None:
+                    context_state.update(info)
+            assembled_details = {
+                "input_history_messages": len(full_history),
+                "effective_history_messages": len(history),
+                "context": context_state,
+                "input_trimmed": context.get_trim_notice() or {},
+            }
+
+            async def _assembled_details() -> dict:
+                # The meter's count may still be on its way (prepare_deferred):
+                # the event waits for it in its own place in the trace queue.
+                await _settle_context()
+                return assembled_details
+
+            query_trace.event_when_ready(
                 "CONTEXT_ASSEMBLED",
+                _assembled_details,
                 component="orchestrator.app.compaction",
-                details={
-                    "input_history_messages": len(full_history),
-                    "effective_history_messages": len(history),
-                    "context": context_state,
-                    "input_trimmed": context.get_trim_notice() or {},
-                },
+            )
+            _latency_metrics.context_assembly(
+                _perf_counter() - assembly_started,
+                effort=str(request.effort or ""),
+                mode=str(request.mode or ""),
             )
 
             # SALESFORCE INTELLIGENCE MODE (2026-08-11).
@@ -3988,8 +4747,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # until something cancels it.
                 from .core.sf_intel import state as sf_intel_state
 
-                with contextlib.suppress(Exception):
-                    await sf_intel_state.cancel_pending(conv_key)
+                # Not on the path to the answer (plan item 4, 2026-09-13): no
+                # engine this turn reads the clarification it cancels, so the
+                # write runs beside the rest of the turn and the worker's
+                # `finally` waits for it — done before the turn is.
+                async def _cancel_pending_clarification() -> None:
+                    with contextlib.suppress(Exception):
+                        await sf_intel_state.cancel_pending(conv_key)
+
+                cancel_pending_task = asyncio.ensure_future(_cancel_pending_clarification())
 
             # LOCAL FIRST / ESCALATION (ADR-0001 D6). The knowledge pre-pass
             # ran concurrently with everything above; its verdict now sets
@@ -4055,9 +4821,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines import artifact as artifact_engine_mod
 
                 try:
-                    _existing = await db.run_in_thread(
-                        artifact_engine_mod.adb.list_artifacts, viewer, conv_key
-                    )
+                    _existing = await reads.get("artifacts", read_artifacts)
                 except Exception:  # noqa: BLE001 — no list means "create" semantics
                     _existing = []
                 # Only a PUBLISHED artifact can be edited, so only one counts
@@ -4448,6 +5212,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     ),
                 },
             )
+            # The clarification this turn cancelled is gone BEFORE `done`
+            # (restored 2026-09-13, prover): HEAD awaited the cancel inline,
+            # so a follow-up sent the instant the answer ended could never
+            # find the stale card — and the partial unique index allows one
+            # pending question per conversation, so a stale one blocks the
+            # follow-up's own. The cancel still runs beside the answer (the
+            # first token does not wait for it); only `done` does, bounded.
+            await _settle_clarification_cancel(cancel_pending_task)
             await gen.publish("done", {"session_id": request.session_id})
 
             # Background compaction: fold early so the next turn almost never
@@ -4589,32 +5361,62 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 error=exc,
             )
         finally:
+            reads.close()
+            # Every await below goes through `ending.step`, which absorbs a
+            # SECOND cancellation (a double Stop, a Stop then a resend) until
+            # `_finalize_generation` has run, and re-raises it after. Without
+            # it a cancel landing in the trace flush skipped the finalize: the
+            # stream never ended and the generation stayed registered until
+            # the process restarted (prover probe test_zz_double_stop.py,
+            # second Stop 250 ms after the first, 2026-09-13).
+            ending = _TurnEnd()
+            # The meter's exact count (compaction.prepare_deferred) is read by
+            # the meta, and a turn that got here without one never needs it:
+            # cancelled, so the queued CONTEXT_ASSEMBLED write records what is
+            # known instead of holding the stream open for /tokenize (up to
+            # TOKENIZE_TIMEOUT; a Stop ended 2.94 s after the click with a 3 s
+            # count, where HEAD ended in 0.01 s).
+            pending_count = context_pending["task"]
+            if pending_count is not None and not pending_count.done():
+                pending_count.cancel()
             # A turn that left before its route was decided (an error, a
             # cancel) still lets the message be remembered, as it always
             # was; only a decided artifact turn says no.
             _release_facts(True)
             # V29: the row's terminal status — cancelled, failed, or
             # interrupted when the loop is tearing this process down.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(_settle_chat_request(gen))
+            await ending.step(_settle_chat_request(gen))
             # V18 telemetry. HERE rather than in emit(): this block is the one
             # that runs for every outcome, so a cancelled or failed turn is
             # counted as cancelled or failed instead of vanishing from the
             # numbers — which is how error rates come to read as zero.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(
-                    _record_usage_event(
-                        gen,
-                        _timing,
-                        principal.workspace_id,
-                        str(request.effort or ""),
-                    )
+            await ending.step(
+                _record_usage_event(
+                    gen,
+                    _timing,
+                    principal.workspace_id,
+                    str(request.effort or ""),
                 )
-            # shield: finishing the bookkeeping must survive the cancellation
-            # that may still be propagating through this task.
+            )
+            # The clarification cancel this turn started beside its answer,
+            # for the turns that ended without `done` (an error, a Stop).
+            # Bounded like the wait before `done`: a wedged write must not
+            # hold the stream open; the task finishes on its own.
+            await ending.step(_settle_clarification_cancel(cancel_pending_task))
+            # Latency histograms whose route label only the final meta knows.
             with contextlib.suppress(Exception):
-                await asyncio.shield(_finalize_generation(conv_key_outer, gen))
+                _observe_first_visible(str((gen.final_meta or {}).get("route") or "unknown"))
+                gen.report_relay()
+            # The queued trace writes land before the stream closes, so a
+            # trace read after its response is complete — they ran behind
+            # the answer, and the `done` frame went out ahead of them.
+            # Bounded: a slow trace INSERT must not hold the stream open; the
+            # writes still land, on their own task.
+            await ending.step(query_trace.flush(), bound=_TRACE_FLUSH_BOUND_S)
+            await ending.step(_finalize_generation(conv_key_outer, gen))
             query_trace.deactivate(trace_context)
+            if ending.cancelled:
+                raise asyncio.CancelledError()
 
     gen.task = asyncio.create_task(worker())
 

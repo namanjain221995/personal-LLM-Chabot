@@ -77,7 +77,10 @@ const config: Config = {
         admin: '1180px',
       },
       width: {
-        sidebar: '260px',
+        // --ts-sidebar-w in app/globals.css: 288px from md, 300px from xl
+        // (1280), 320px from 2xl (1536), and a 320px drawer on a phone that
+        // always leaves 56px to tap out on.
+        sidebar: 'var(--ts-sidebar-w)',
       },
       /* `h-dvh` / `min-h-dvh` emitted `100dvh` ALONE. An engine that does not
          know the unit drops the whole declaration and the shell falls back to

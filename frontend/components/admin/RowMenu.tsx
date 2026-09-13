@@ -107,7 +107,10 @@ export function RowMenu({
         aria-expanded={open}
         aria-label={label}
         title="Actions"
-        className={`rounded-md p-1 text-faint transition-colors duration-ts hover:bg-border hover:text-ink ${
+        // 32×32 hit area (it was 23px: the only way to reach Revoke, Disable
+        // or Remove on a phone). -m-1 keeps the row's geometry: the cell it
+        // sits in was sized for the old 24px footprint.
+        className={`-m-1 inline-flex h-8 w-8 items-center justify-center rounded-md align-middle text-faint transition-colors duration-ts hover:bg-border hover:text-ink ${
           open ? 'bg-border text-ink' : ''
         }`}
       >

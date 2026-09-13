@@ -16,8 +16,11 @@
  * a resolution this ledger does not have.
  *
  * A DAY WITH NO ROW IS NOT DRAWN AS ZERO. The server lists only days the
- * ledger holds, so the chart plots those days and nothing between them
- * rather than inventing a floor.
+ * ledger holds; the chart's x axis is every day of the window the server
+ * reports (`range.start`…`range.end`), and a day with no row is a GAP in the
+ * line rather than an invented floor. Until 2026-09-13 the axis was only the
+ * days that had rows, so traffic on the 1st and the 30th drew as two
+ * consecutive points joined by a line (responsive audit).
  */
 
 import { useEffect, useState } from 'react';
@@ -32,7 +35,7 @@ import {
 } from '@/components/admin/analytics/ui';
 import { compact } from '@/components/admin/analytics/format';
 import { AdminSelect, AdminToolbar } from '@/components/admin/controls';
-import { ConsoleEmpty, useProjects } from './shared';
+import { ConsoleEmpty, SELECT_FIT, useProjects } from './shared';
 import { useConsole } from './useConsole';
 import { consolePaths } from './paths';
 import { useConsoleStatus } from './status';
@@ -44,6 +47,53 @@ export const USAGE_WINDOWS = [
   { days: 30, label: 'Last 30 days' },
   { days: 90, label: 'Last 90 days' },
 ] as const;
+
+/** One calendar day after `day` (YYYY-MM-DD), computed in UTC so no zone moves it. */
+function nextDay(day: string): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The chart's axis and values: every day from `range.start` to `range.end`
+ * inclusive, with `null` — a gap — for a day the ledger has no row for.
+ *
+ * Labels are LOCAL midnight (`YYYY-MM-DDT00:00:00`), not the bare date: the
+ * bare form parses as UTC midnight, which a viewer west of Greenwich reads as
+ * the evening before, so every bar sat under the previous day's name.
+ *
+ * A report without a usable range (an older orchestrator) falls back to the
+ * days it listed, which is what the chart drew before.
+ */
+export function usageDays(report: Pick<UsageReport, 'range' | 'series'> | null): {
+  labels: string[];
+  requests: (number | null)[];
+  errors: (number | null)[];
+} {
+  const series = report?.series ?? [];
+  const byDay = new Map(series.map((point) => [point.day, point]));
+  const start = report?.range?.start;
+  const end = report?.range?.end;
+  let days: string[];
+  if (start && end && DAY.test(start) && DAY.test(end) && start <= end) {
+    days = [];
+    // Bounded by the router's own 93-day ceiling, with room to spare, so a
+    // malformed range can never spin this loop.
+    for (let day = start; day <= end && days.length < 400; day = nextDay(day)) {
+      days.push(day);
+    }
+  } else {
+    days = series.map((point) => point.day);
+  }
+  return {
+    labels: days.map((day) => (DAY.test(day) ? `${day}T00:00:00` : day)),
+    requests: days.map((day) => byDay.get(day)?.requests ?? null),
+    errors: days.map((day) => byDay.get(day)?.errors ?? null),
+  };
+}
 
 export function UsagePanel() {
   const projectsQuery = useProjects();
@@ -60,7 +110,7 @@ export function UsagePanel() {
 
   const report = usage.data;
   const totals = report?.totals;
-  const series = report?.series ?? [];
+  const axis = usageDays(report);
   const hasTraffic = (totals?.requests ?? 0) > 0;
   const figure = (value: number | undefined) =>
     value === undefined ? (usage.loading ? '…' : '—') : compact(value);
@@ -78,8 +128,8 @@ export function UsagePanel() {
   }, [usage.loading, usage.error, report, hasTraffic, totals?.requests, announce]);
 
   const requestSeries: Series[] = [
-    { name: 'Requests', data: series.map((p) => p.requests), area: true },
-    { name: 'Errors', data: series.map((p) => p.errors), tone: 'danger' },
+    { name: 'Requests', data: axis.requests, area: true },
+    { name: 'Errors', data: axis.errors, tone: 'danger' },
   ];
 
   if (!projectsQuery.loading && !projectsQuery.error && projects.length === 0) {
@@ -102,24 +152,28 @@ export function UsagePanel() {
       />
 
       <AdminToolbar>
-        <AdminSelect
-          value={projectId}
-          onChange={setProjectId}
-          label="Project"
-          options={[
-            { value: '', label: 'All projects' },
-            ...projects.map((p) => ({
-              value: p.id,
-              label: `${p.name} · ${ENVIRONMENT_LABEL[p.environment] ?? p.environment}`,
-            })),
-          ]}
-        />
-        <AdminSelect
-          value={String(days)}
-          onChange={(next) => setDays(Number(next))}
-          label="Time range"
-          options={USAGE_WINDOWS.map((w) => ({ value: String(w.days), label: w.label }))}
-        />
+        <div data-testid="usage-project-select" className={SELECT_FIT}>
+          <AdminSelect
+            value={projectId}
+            onChange={setProjectId}
+            label="Project"
+            options={[
+              { value: '', label: 'All projects' },
+              ...projects.map((p) => ({
+                value: p.id,
+                label: `${p.name} · ${ENVIRONMENT_LABEL[p.environment] ?? p.environment}`,
+              })),
+            ]}
+          />
+        </div>
+        <div className={SELECT_FIT}>
+          <AdminSelect
+            value={String(days)}
+            onChange={(next) => setDays(Number(next))}
+            label="Time range"
+            options={USAGE_WINDOWS.map((w) => ({ value: String(w.days), label: w.label }))}
+          />
+        </div>
       </AdminToolbar>
 
       <Section title="Totals" first>
@@ -143,7 +197,7 @@ export function UsagePanel() {
           onRetry={usage.reload}
         >
           <AnalyticsChart
-            labels={series.map((point) => point.day)}
+            labels={axis.labels}
             bucket="day"
             series={requestSeries}
             ariaLabel="API requests and errors per day"
@@ -151,19 +205,25 @@ export function UsagePanel() {
         </ChartFrame>
       </Section>
 
-      <Section title="By project">
-        <BarList
-          loading={usage.loading && report === null}
-          rows={(report?.projects ?? [])
-            .filter((row) => row.requests > 0)
-            .map((row) => ({
-              label: row.name,
-              sublabel: `${compact(row.output_tokens)} output tokens`,
-              value: row.requests,
-            }))}
-          emptyMessage="No project has served a request in this window."
-        />
-      </Section>
+      {/* Not drawn when the report failed: an empty list there read "No
+          project has served a request in this window" beside the chart's
+          error — a measurement nobody made (audit, 2026-09-13). The chart
+          above carries the error and its Retry. */}
+      {!(usage.error && report === null) && (
+        <Section title="By project">
+          <BarList
+            loading={usage.loading && report === null}
+            rows={(report?.projects ?? [])
+              .filter((row) => row.requests > 0)
+              .map((row) => ({
+                label: row.name,
+                sublabel: `${compact(row.output_tokens)} output tokens`,
+                value: row.requests,
+              }))}
+            emptyMessage="No project has served a request in this window."
+          />
+        </Section>
+      )}
     </div>
   );
 }

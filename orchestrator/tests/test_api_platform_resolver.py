@@ -545,10 +545,17 @@ def test_a_good_key_resolves_to_the_identity_contract_section_four_names(
     assert caller.service_account_id is None
     assert caller.environment == "live"
     assert caller.public_id == created.key["public_id"]
+    # A key minted without scopes carries the DEFAULT set. Spelled out rather
+    # than read from DEFAULT_SCOPES, so a silent change to the defaults fails
+    # here too (2026-09-13: the three new write scopes joined them, owner
+    # request; `usage.read` stays opt-in).
     assert caller.scopes == {
         Scope.MODELS_READ,
         Scope.RESPONSES_READ,
         Scope.RESPONSES_WRITE,
+        Scope.EMBEDDINGS_WRITE,
+        Scope.RERANK_WRITE,
+        Scope.AUDIO_WRITE,
     }
     assert caller.limits.rpm == 60 and caller.limits.daily_token_quota == 2_000_000
     assert caller.ip == "203.0.113.9"

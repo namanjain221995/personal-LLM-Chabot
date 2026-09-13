@@ -4,7 +4,9 @@
  * The one switch in the admin area.
  *
  * A real `<button role="switch">`, not a styled checkbox: the control is
- * 44×24 with a 20px thumb, which is a finger-sized target and reads as
+ * 44×24 with a 20px thumb (its hit area is 44×40: a transparent ::before
+ * extends it 8px above and below, since 24px is under the 32px a phone
+ * needs), which is a finger-sized target and reads as
  * on/off to a screen reader without a visually-hidden input to keep in sync.
  * `aria-checked` carries the state, `disabled` carries the reason it cannot
  * be moved, and the focus ring is offset from the page background so it
@@ -39,7 +41,7 @@ export function Switch({
       aria-describedby={describedBy}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border border-transparent transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg ${
+      className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full before:absolute before:-inset-y-2 before:inset-x-0 before:content-[''] border border-transparent transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg ${
         disabled ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'
       } ${checked ? 'bg-accent-strong' : 'bg-[var(--admin-switch-off)]'}`}
     >

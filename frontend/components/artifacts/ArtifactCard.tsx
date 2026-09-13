@@ -150,7 +150,7 @@ export function ArtifactCard({
             id={`artifact-status-${artifact.artifact_id}-v${Math.trunc(artifact.version)}`}
             onClick={(e) => onOpen(artifact, (e.currentTarget as HTMLButtonElement).id, '')}
             aria-label={`${working ? 'Show progress of' : 'Show details of'} ${artifact.title}`}
-            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted max-sm:min-h-8 [@media(pointer:coarse)]:min-h-8 transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
             data-testid="artifact-open-status"
           >
             {working ? 'Progress' : 'Details'}
@@ -162,7 +162,7 @@ export function ArtifactCard({
             download
             aria-label={`Download all ${zipCount} files as ZIP`}
             title={`Download all ${zipCount} files as ZIP`}
-            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted max-sm:min-h-8 [@media(pointer:coarse)]:min-h-8 transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
             data-testid="artifact-download-all"
           >
             <IconPackage size={14} />

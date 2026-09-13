@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * Left sidebar (§9 + V2 §4a + V3 §2 + V4 §2): 260px, collapsible (mobile:
+ * Left sidebar (§9 + V2 §4a + V3 §2 + V4 §2): --ts-sidebar-w (288/300/320px), collapsible (mobile:
  * slide-over drawer). Header (mark · search icon · collapse icon) · New chat
  * · conversation list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
  * disclosure that lazily pulls `?archived=true` — each row carrying the "⋯"
@@ -128,8 +128,25 @@ function SidebarImpl({
    */
   const drawerOwnedFocus = useRef(false);
 
+  /**
+   * The drawer is never part of the server HTML (fe audit 2026-09-13).
+   *
+   * ChatApp starts with the sidebar open — right for a desktop — and only
+   * learns it is on a phone after hydration. Rendering the drawer on the
+   * server therefore painted a modal overlay of placeholders ("No
+   * conversations yet.") as a phone's first frame, and the focus-restore
+   * below then parked a visible focus ring on "Show sidebar" on every load.
+   * Gated on mount, the first client render matches the server (no drawer),
+   * and ChatApp's matchMedia close lands in the same batch as this flag, so
+   * a phone never mounts the drawer at all unless someone opens it.
+   */
+  const [mounted, setMounted] = useState(false);
   useEffect(() => {
-    if (!open) return;
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!open || !mounted) return;
     openerRef.current = document.activeElement as HTMLElement | null;
     drawerOwnedFocus.current = false;
     // preventScroll for the same reason the palette does it: focusing inside a
@@ -148,7 +165,7 @@ function SidebarImpl({
       }
       drawerOwnedFocus.current = false;
     };
-  }, [open, restoreFocusRef]);
+  }, [open, mounted, restoreFocusRef]);
 
   function onDrawerKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
     const drawer = drawerRef.current;
@@ -211,7 +228,7 @@ function SidebarImpl({
               }
             }}
             aria-label="Rename conversation"
-            className="w-full rounded-lg border border-accent/60 bg-bg px-2.5 py-1.5 text-sm focus:outline-none"
+            className="w-full rounded-lg border border-accent/60 bg-bg px-2.5 py-1.5 text-[15px] leading-[22px] focus:outline-none"
           />
         ) : (
           <>
@@ -219,7 +236,7 @@ function SidebarImpl({
               type="button"
               onClick={() => onSelect(c.id)}
               aria-current={activeId === c.id ? 'true' : undefined}
-              className={`flex w-full items-center gap-1.5 rounded-lg py-1.5 pl-2.5 pr-9 text-left text-sm transition-colors duration-ts ${
+              className={`flex w-full items-center gap-1.5 rounded-lg py-[7px] pl-2.5 pr-9 text-left [@media(pointer:coarse)]:pr-10 text-[15px] leading-[22px] transition-colors duration-ts ${
                 activeId === c.id
                   ? 'bg-surface-2 text-ink'
                   // Full --ts-text, same as the active row: a conversation
@@ -286,13 +303,13 @@ function SidebarImpl({
     <div className="flex h-full w-sidebar flex-col bg-sidebar">
       <div className="flex items-center gap-2 px-3 pb-2 pt-3">
         <TechSaraMark size={28} />
-        <span className="flex-1 truncate text-sm font-semibold">TechSara</span>
+        <span className="flex-1 truncate text-[15px] font-semibold">TechSara</span>
         <button
           type="button"
           onClick={onOpenSearch}
           aria-label="Search chats"
           title="Search chats (Ctrl K)"
-          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+          className="rounded-lg p-1.5 text-icon max-md:p-2 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
         >
           <IconSearch size={16} />
         </button>
@@ -313,7 +330,7 @@ function SidebarImpl({
           type="button"
           onClick={onClose}
           aria-label="Close sidebar"
-          className="rounded-lg p-1.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
+          className="rounded-lg p-1.5 text-icon max-md:p-2 transition-colors duration-ts hover:bg-surface-2 hover:text-ink md:hidden"
         >
           <IconX size={16} />
         </button>
@@ -323,11 +340,13 @@ function SidebarImpl({
         <button
           type="button"
           onClick={onNewChat}
-          className="flex w-full items-center gap-2 rounded-ts border border-border bg-surface-2/60 px-3 py-2 text-sm font-medium transition-colors duration-ts hover:bg-surface-2"
+          className="flex w-full items-center gap-2 rounded-ts border border-border bg-surface-2/60 px-3 py-2 text-[15px] leading-[22px] font-medium transition-colors duration-ts hover:bg-surface-2"
         >
           <IconPlus size={15} className="text-accent" />
           New chat
-          <kbd className="ml-auto rounded border border-border px-1.5 py-px font-mono text-[10px] text-faint">
+          {/* A keyboard chord means nothing on a phone: the drawer copy is only
+              ever visible below md, where this stays hidden. */}
+          <kbd className="ml-auto hidden rounded border border-border px-1.5 py-px font-mono text-[11px] text-faint md:inline">
             {NEW_CHAT_SHORTCUT_LABEL}
           </kbd>
         </button>
@@ -349,7 +368,7 @@ function SidebarImpl({
           <section aria-labelledby={id('pinned')}>
             <h2
               id={id('pinned')}
-              className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-faint"
+              className="px-2.5 pb-1 pt-1.5 text-[12px] font-medium uppercase tracking-wide text-faint"
             >
               Pinned
             </h2>
@@ -362,7 +381,7 @@ function SidebarImpl({
             {pinned.length > 0 && (
               <h2
                 id={id('recents')}
-                className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint"
+                className="px-2.5 pb-1 pt-3 text-[12px] font-medium uppercase tracking-wide text-faint"
               >
                 Recents
               </h2>
@@ -379,7 +398,7 @@ function SidebarImpl({
                 onClick={toggleArchived}
                 aria-expanded={archivedOpen}
                 aria-controls={id('archived-list')}
-                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
+                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
               >
                 <IconChevronRight
                   size={13}
@@ -438,7 +457,7 @@ function SidebarImpl({
       </aside>
 
       {/* Mobile: slide-over drawer — a modal overlay, and now says so (L-03) */}
-      {open && (
+      {open && mounted && (
         <div className="fixed inset-0 z-50 md:hidden">
           {/* Click-outside-to-close. It is deliberately NOT a tab stop: a
               full-screen button ahead of the panel is a phantom stop for

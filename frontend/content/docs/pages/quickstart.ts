@@ -75,11 +75,14 @@ The answer comes back in the response envelope:
       "content": [{ "type": "output_text", "text": "…" }]
     }
   ],
+  "max_output_tokens": 8192,
+  "incomplete_details": null,
   "usage": { "input_tokens": 37, "output_tokens": 112, "total_tokens": 149 }
 }
 ~~~
 
 \`usage\` is \`null\` — never \`0\` — when the engine did not report counts.
+\`max_output_tokens\` is the output ceiling applied — 8,192 when you do not ask.
 Zero would be a lie, and an under-charge.
 
 ## 4. Do it from your language
@@ -134,6 +137,8 @@ immediately.
   validated against.
 * [Streaming](/docs/streaming) — server-sent events, and the one terminal event.
 * [Background responses](/docs/background) — for work longer than a request.
+* [The model reference](/docs/models) — the other five models: vision, OCR,
+  embeddings, reranking and speech to text.
 * [Errors](/docs/errors) — the codes, and which of them are safe to retry.
 `.trim(),
 };

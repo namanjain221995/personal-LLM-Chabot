@@ -30,20 +30,41 @@ THREE THINGS THE LOOP GUARANTEES
    and one project with a dead endpoint could fill every batch and hold back
    every other tenant's webhooks (the adversarial review's cross-tenant
    starvation finding).
-3. IT DOES NOT SPIN. An empty sweep sleeps the full interval; a full one comes
-   straight back, because a backlog draining at one batch per interval would
-   take minutes to clear. The interval carries a little jitter, and — the part
+3. IT DOES NOT SPIN. An empty sweep sleeps the full interval; one that claimed
+   anything comes back after the short busy interval, because a backlog
+   draining at one batch per interval would take minutes to clear. Until
+   2026-09-13 only a FULL batch counted as busy, and with the per-project
+   share of two a single project's backlog never filled one, so it drained at
+   two rows per five seconds — slow enough that ordinary backlogs aged past an
+   hour, and slow enough that the per-endpoint pending cap (`queue.py`) would
+   have been reachable by a consumer that was keeping up. Every claimed row
+   leaves the due set (its attempt is recorded, or its lease holds), so a
+   non-empty sweep is always progress, never a spin. The interval carries a
+   little jitter, and — the part
    that actually makes a blue/green overlap safe — each row is claimed with
    `FOR UPDATE SKIP LOCKED` and a lease, so two sweeps never send the same
    delivery or double-count its attempt.
+4. THE TABLE STAYS BOUNDED (2026-09-13, security review). Between sweeps the
+   loop settles `pending` rows that can no longer be sent (an endpoint disabled
+   past its grace window, or a row older than the retention window) and prunes
+   settled rows older than `PUBLIC_API_WEBHOOK_DELIVERY_RETENTION_DAYS`. Before
+   this, deliveries left behind by disabling an endpoint stayed `pending`, and
+   no prune would touch them, until the endpoint was deleted. Both jobs are
+   batched with a per-pass budget and run off the event loop, so a large
+   backlog costs a few short transactions per pass, never one long lock, and
+   never holds up the next delivery sweep for long. The two jobs fail
+   independently and a failed job waits its normal interval before trying
+   again, so a settle that keeps timing out neither stops the prune nor runs
+   a statement-timeout-length query on every cycle.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import random
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ... import db
 from ...config import settings
@@ -68,8 +89,27 @@ BATCH_SIZE = 20
 #: whole sweep.
 MAX_CONCURRENT_DELIVERIES = 4
 
+#: How often the loop settles pending rows that can no longer be sent. The
+#: statement is cheap when nothing qualifies, and a disabled endpoint's rows
+#: should not outlive their grace window by much more than this.
+SETTLE_INTERVAL_SECONDS = 30.0
+
+#: How often the loop prunes settled rows. Retention is measured in days, so
+#: ten minutes is plenty; a pass that used its whole batch budget brings the
+#: next one forward to the next cycle, so a large backlog still drains steadily.
+PRUNE_INTERVAL_SECONDS = 600.0
+
+#: Per-pass batch budgets. A pass that uses its whole budget is due again on
+#: the next cycle instead of after the interval.
+SETTLE_MAX_BATCHES = 20
+PRUNE_MAX_BATCHES = 10
+
 _task: Optional[asyncio.Task] = None
 _wake: Optional[asyncio.Event] = None
+
+#: Monotonic deadlines for the next settle / prune pass (0 = due now).
+_next_settle_at = 0.0
+_next_prune_at = 0.0
 
 
 def enabled() -> bool:
@@ -148,6 +188,71 @@ async def run_once(
     return counts
 
 
+async def maintain(
+    *,
+    now: Optional[datetime] = None,
+    force: bool = False,
+    clock: Callable[[], float] = time.monotonic,
+) -> Dict[str, int]:
+    """Settle what can no longer be sent, then prune what is past retention.
+
+    Returns counts: `endpoint_disabled` and `expired` rows settled, `pruned`
+    rows deleted. Each job runs only when its interval has elapsed, unless
+    `force`. A job that raises is logged, counts zero, and is next tried
+    after its normal interval; it never stops the other job. Every batch is its own transaction on a worker thread, so the
+    event loop and the other in-flight deliveries keep moving. A job that used
+    its whole per-pass budget is due again on the next cycle rather than after
+    the full interval, so a large backlog drains without one long pass.
+
+    Public and awaitable on its own for the same reason as `run_once`: the
+    tests drive it without starting the loop.
+    """
+    global _next_settle_at, _next_prune_at
+    counts = {"endpoint_disabled": 0, "expired": 0, "pruned": 0}
+    tick = clock()
+    # Each job in its own try (2026-09-13 review): they used to share one, so
+    # a settle that raised skipped the prune AND left its own deadline where
+    # it was, retrying on every five-second cycle. A failure now waits the
+    # job's normal interval — the backoff — and the other job still runs.
+    if force or tick >= _next_settle_at:
+        _next_settle_at = tick + SETTLE_INTERVAL_SECONDS
+        try:
+            settled = await db.run_in_thread(
+                queue.settle_stale_pending, now=now, max_batches=SETTLE_MAX_BATCHES
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — retention failing must not stop delivery
+            log.warning("webhook maintenance: settling failed", exc_info=True)
+        else:
+            counts["endpoint_disabled"] = int(settled.get("endpoint_disabled", 0))
+            counts["expired"] = int(settled.get("expired", 0))
+            budget = SETTLE_MAX_BATCHES * queue.SETTLE_BATCH_SIZE
+            if max(counts["endpoint_disabled"], counts["expired"]) >= budget:
+                _next_settle_at = tick
+    if force or tick >= _next_prune_at:
+        _next_prune_at = tick + PRUNE_INTERVAL_SECONDS
+        try:
+            pruned = await db.run_in_thread(
+                queue.prune_settled_deliveries, now=now, max_batches=PRUNE_MAX_BATCHES
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — see above
+            log.warning("webhook maintenance: pruning failed", exc_info=True)
+        else:
+            counts["pruned"] = int(pruned)
+            if counts["pruned"] >= PRUNE_MAX_BATCHES * queue.PRUNE_BATCH_SIZE:
+                _next_prune_at = tick
+    if any(counts.values()):
+        log.info(
+            "webhook maintenance: settled endpoint_disabled=%(endpoint_disabled)d "
+            "expired=%(expired)d, pruned=%(pruned)d",
+            counts,
+        )
+    return counts
+
+
 async def _loop() -> None:
     global _wake
     _wake = asyncio.Event()
@@ -159,7 +264,7 @@ async def _loop() -> None:
         busy = False
         try:
             counts = await run_once()
-            busy = counts["due"] >= BATCH_SIZE
+            busy = counts["due"] > 0
             if counts["due"]:
                 log.info(
                     "webhook sweep: due=%(due)d delivered=%(delivered)d "
@@ -170,6 +275,12 @@ async def _loop() -> None:
             raise
         except Exception:  # noqa: BLE001 — the loop outlives any one cycle
             log.warning("webhook sweep failed", exc_info=True)
+        try:
+            await maintain()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — retention failing must not stop delivery
+            log.warning("webhook maintenance failed", exc_info=True)
         interval = BUSY_INTERVAL_SECONDS if busy else POLL_INTERVAL_SECONDS
         # A little jitter so a blue/green overlap does not sweep in lockstep.
         await _sleep_or_kick(interval * random.uniform(0.85, 1.15))
@@ -227,8 +338,11 @@ __all__ = [
     "BUSY_INTERVAL_SECONDS",
     "MAX_CONCURRENT_DELIVERIES",
     "POLL_INTERVAL_SECONDS",
+    "PRUNE_INTERVAL_SECONDS",
+    "SETTLE_INTERVAL_SECONDS",
     "enabled",
     "kick",
+    "maintain",
     "run_once",
     "running",
     "start",

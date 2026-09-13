@@ -28,7 +28,11 @@ export function AuthLayout({ children }: { children: ReactNode }) {
         </div>
       </main>
 
-      <aside className="hidden p-4 lg:block lg:flex-1">
+      {/* min-w-0: as a flex item the aside's min-content width was the
+          illustration's 560 px + the card's padding (672 px), which beside
+          main's 440 px floor overflowed every viewport from lg (1024) to
+          1112 px wide. It now takes what main leaves; the image scales. */}
+      <aside className="hidden min-w-0 p-4 lg:block lg:flex-1">
         <IllustrationPanel />
       </aside>
     </div>

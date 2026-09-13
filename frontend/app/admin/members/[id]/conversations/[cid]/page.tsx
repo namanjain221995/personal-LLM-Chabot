@@ -89,7 +89,7 @@ export default function AdminConversationViewerPage() {
     <div className="mx-auto w-full max-w-thread">
       <Link
         href={`/admin/members/${memberId}`}
-        className="inline-flex items-center gap-1.5 text-sm text-muted transition-colors duration-ts hover:text-ink"
+        className="-my-1.5 inline-flex min-h-8 items-center gap-1.5 text-sm text-muted transition-colors duration-ts hover:text-ink"
       >
         <IconArrowLeft size={15} />
         Back to member

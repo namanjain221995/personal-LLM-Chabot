@@ -1301,6 +1301,10 @@ def test_an_in_flight_claim_abandoned_by_a_dead_process_is_reclaimed_after_its_l
     caller, monkeypatch
 ):
     monkeypatch.setattr(settings, "public_api_idempotency_in_flight_lease_seconds", 600.0)
+    # The lease is at least 2 x the PUBLIC wall clock + the background gate
+    # wait (2026-09-13); both shrunk here so the configured 600 s decides.
+    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 200.0, raising=False)
+    monkeypatch.setattr(settings, "public_api_background_gate_wait_s", 100.0, raising=False)
     idempotency.claim(caller.project_id, "v1_responses", "orphan", {"input": "x"}, now=NOON)
 
     within = idempotency.claim(
@@ -1323,6 +1327,33 @@ def test_an_in_flight_claim_abandoned_by_a_dead_process_is_reclaimed_after_its_l
         now=NOON + timedelta(seconds=601),
     )
     assert retaken.claimed is True
+
+
+def test_a_retry_while_a_one_million_token_generation_still_runs_does_not_take_over_its_claim(
+    caller, monkeypatch
+):
+    """2026-09-13: a 1,000,000-token answer runs ~3-6 h. The old lease (2 x
+    the chat app's 4,200 s wall clock = 2 h 20 m) let a client retrying after
+    that take over the claim of a generation that was STILL RUNNING and start
+    a second one. The lease now covers 2 x PUBLIC_API_GEN_WALL_CLOCK_S (6 h)
+    plus the background capacity wait (1 h): 13 h."""
+    monkeypatch.setattr(settings, "public_api_idempotency_in_flight_lease_seconds", 8400.0)
+    monkeypatch.delenv("PUBLIC_API_GEN_WALL_CLOCK_S", raising=False)
+    monkeypatch.delenv("PUBLIC_API_BACKGROUND_GATE_WAIT_S", raising=False)
+    assert idempotency.in_flight_lease_seconds() == 46_800.0
+
+    idempotency.claim(caller.project_id, "v1_responses", "long", {"input": "x"}, now=NOON)
+    three_hours_later = idempotency.claim(
+        caller.project_id, "v1_responses", "long", {"input": "x"},
+        now=NOON + timedelta(hours=3),
+    )
+    assert three_hours_later.claimed is False and three_hours_later.in_progress is True
+
+    after_the_lease = idempotency.claim(
+        caller.project_id, "v1_responses", "long", {"input": "x"},
+        now=NOON + timedelta(hours=13, seconds=1),
+    )
+    assert after_the_lease.claimed is True
 
 
 def test_two_simultaneous_retries_of_a_failed_request_rerun_the_work_once(caller):

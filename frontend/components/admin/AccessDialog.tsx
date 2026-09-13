@@ -21,7 +21,7 @@ import {
   applyFeatureRules,
   type MemberAccess,
 } from './api';
-import { AdminDialog } from './AdminDialog';
+import { AdminDialog, DIALOG_FOOTER } from './AdminDialog';
 import { ADMIN_PRIMARY_BUTTON, ADMIN_SECONDARY_BUTTON } from './controls';
 import { FeatureToggles } from './FeatureToggles';
 import { SkeletonLine } from './ui';
@@ -141,7 +141,7 @@ export function AccessDialog({
               )
             }
           />
-          <div className="mt-4 flex justify-end gap-2">
+          <div className={DIALOG_FOOTER}>
             <button
               type="button"
               onClick={onClose}

@@ -2368,3 +2368,637 @@ def test_with_the_limits_off_a_playground_allowance_of_zero_still_runs(
     assert response.status_code == 200, response.text
     assert "RateLimit" not in response.headers
     assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Every model TechSara runs, and 1,000,000 output tokens (owner request,
+# 2026-09-13)
+# ---------------------------------------------------------------------------
+#
+# The registry's catalogue and `/v1`'s planner and capacity gates are built by
+# another team in the same wave, so these tests pin the CONSOLE's side of the
+# seam with stand-ins in the published shapes: `registry.catalogue()` entries
+# with `to_wire()`, a `planning` module with `plan_generation` and
+# `applied_max_output_tokens`, and a `capacity` module with `hold` and
+# `sync_wait_s`. Each stand-in is installed on the seam the console reads
+# (`registry.catalogue`, `console_api._planning`, `console_api._capacity`), so
+# the tests hold in either merge order.
+
+
+class CatalogueStub:
+    """A catalogue entry: what `registry.catalogue()` yields, nothing more."""
+
+    def __init__(self, model_id: str, wire: Dict[str, Any], *, internal: str = "", engine: str = ""):
+        self.id = model_id
+        self.status = wire.get("status", "available")
+        self.kind = wire.get("kind")
+        self.internal = internal
+        self.engine = engine
+        self._wire = {"id": model_id, "object": "model", "owned_by": "techsara", **wire}
+
+    def to_wire(self) -> Dict[str, Any]:
+        return dict(self._wire)
+
+
+def _caps(**on: bool) -> Dict[str, bool]:
+    flags = ("chat", "streaming", "vision", "tools", "embeddings", "rerank",
+             "audio_transcription", "ocr", "background")
+    return {flag: bool(on.get(flag, False)) for flag in flags}
+
+
+def _six_models() -> Tuple[CatalogueStub, ...]:
+    chat_endpoints = ["/v1/responses", "/v1/chat/completions"]
+    return (
+        CatalogueStub("techsara-35b", {
+            "kind": "chat", "status": "available",
+            "capabilities": _caps(chat=True, streaming=True, vision=True, background=True),
+            "endpoints": chat_endpoints, "context_window": 1_000_000,
+            "max_input_tokens": 999_232, "max_output_tokens": 1_000_000,
+            "default_max_output_tokens": 8192, "limits": {"max_images_per_request": 16},
+        }, internal="Qwen/Qwen3.6-35B-A3B-NVFP4", engine="main"),
+        CatalogueStub("techsara-8b-vision", {
+            "kind": "chat", "status": "available",
+            "capabilities": _caps(chat=True, streaming=True, vision=True, background=True),
+            "endpoints": chat_endpoints, "context_window": 24_576,
+            "max_input_tokens": 24_320, "max_output_tokens": 24_576,
+            "default_max_output_tokens": 8192, "limits": {"max_images_per_request": 8},
+        }, internal="Qwen/Qwen3-VL-8B-Instruct-FP8", engine="router"),
+        CatalogueStub("techsara-ocr", {
+            "kind": "chat", "status": "available",
+            "capabilities": _caps(chat=True, streaming=True, vision=True, ocr=True, background=True),
+            "endpoints": chat_endpoints, "context_window": 8192,
+            "max_input_tokens": 7936, "max_output_tokens": 8192,
+            "default_max_output_tokens": 8192, "limits": {"max_images_per_request": 1},
+        }, internal="baidu/Unlimited-OCR", engine="ocr"),
+        CatalogueStub("techsara-embed", {
+            "kind": "embedding", "status": "available",
+            "capabilities": _caps(embeddings=True), "endpoints": ["/v1/embeddings"],
+            "context_window": 4096, "max_input_tokens": 4096, "max_output_tokens": None,
+            "default_max_output_tokens": None,
+            "limits": {"max_inputs_per_request": 256, "embedding_dimensions": 1024},
+        }, internal="Qwen/Qwen3-Embedding-0.6B", engine="embed"),
+        CatalogueStub("techsara-rerank", {
+            "kind": "rerank", "status": "available",
+            "capabilities": _caps(rerank=True), "endpoints": ["/v1/rerank"],
+            "context_window": 4096, "max_input_tokens": 4096, "max_output_tokens": None,
+            "default_max_output_tokens": None, "limits": {"max_documents_per_request": 100},
+        }, internal="Qwen/Qwen3-Reranker-0.6B", engine="rerank"),
+        CatalogueStub("techsara-whisper", {
+            "kind": "transcription", "status": "not_configured",
+            "capabilities": _caps(audio_transcription=True),
+            "endpoints": ["/v1/audio/transcriptions"], "context_window": None,
+            "max_input_tokens": None, "max_output_tokens": None,
+            "default_max_output_tokens": None,
+            "limits": {"max_audio_seconds": 300, "max_audio_bytes": 26_214_400,
+                       "response_formats": ["json", "text", "verbose_json"]},
+        }, internal="openai/whisper-large-v3", engine="asr"),
+    )
+
+
+@pytest.fixture()
+def six_models(monkeypatch):
+    models = _six_models()
+    monkeypatch.setattr(registry, "catalogue", lambda: models, raising=False)
+    return models
+
+
+def test_the_model_list_offers_every_catalogued_model_with_its_kind_capabilities_endpoints_and_ceilings(
+    admin, root, six_models
+):
+    """All six models the platform runs, not only techsara-35b — including one
+    this deployment has not configured, listed as such rather than hidden —
+    each with the ceilings the Models page draws. techsara-35b's output ceiling
+    is its whole 1,000,000-token window."""
+    body = admin.get("/admin/api/developers/models").json()
+    by_id = {entry["id"]: entry for entry in body["models"]}
+
+    assert [entry["id"] for entry in body["models"]] == [m.id for m in six_models]
+    main = by_id["techsara-35b"]
+    assert main["kind"] == "chat"
+    assert (main["context_window"], main["max_input_tokens"], main["max_output_tokens"],
+            main["default_max_output_tokens"]) == (1_000_000, 999_232, 1_000_000, 8192)
+    assert main["endpoints"] == ["/v1/responses", "/v1/chat/completions"]
+    assert main["capabilities"]["vision"] is True and main["capabilities"]["tools"] is False
+    assert by_id["techsara-ocr"]["capabilities"]["ocr"] is True
+    assert by_id["techsara-embed"]["limits"] == {"max_inputs_per_request": 256, "embedding_dimensions": 1024}
+    assert by_id["techsara-embed"]["max_output_tokens"] is None
+    assert by_id["techsara-rerank"]["kind"] == "rerank"
+    whisper = by_id["techsara-whisper"]
+    assert whisper["status"] == "not_configured"
+    assert whisper["capabilities"]["audio_transcription"] is True
+    assert whisper["limits"]["max_audio_seconds"] == 300
+    assert whisper["limits"]["response_formats"] == ["json", "text", "verbose_json"]
+    assert all(entry["enabled"] is True for entry in body["models"])
+
+    # The publish switch works on any of them, configured or not.
+    assert root.put(
+        "/admin/api/developers/models/techsara-whisper", json={"enabled": False}
+    ).status_code == 200
+    after = {e["id"]: e for e in admin.get("/admin/api/developers/models").json()["models"]}
+    assert after["techsara-whisper"]["enabled"] is False
+    assert after["techsara-35b"]["enabled"] is True
+    assert root.put(
+        "/admin/api/developers/models/techsara-nothing", json={"enabled": False}
+    ).status_code == 404
+
+
+def test_a_catalogue_entry_carries_no_internal_name_engine_key_or_url_even_if_the_registry_leaks_one(
+    admin, monkeypatch
+):
+    """CONTRACT §15: internal checkpoint names and engine URLs never leave the
+    server. The console builds each entry from an allow-list, so a `to_wire()`
+    that ever carried one by mistake still stops here."""
+    leaky = CatalogueStub("techsara-8b-vision", {
+        "kind": "chat",
+        "capabilities": {**_caps(chat=True, streaming=True), "router_url": "http://vllm-router:30002/v1"},
+        "endpoints": ["/v1/responses", "http://vllm-router:30002/v1/chat/completions", "//vllm-router/v1/x"],
+        "context_window": 24_576, "max_input_tokens": 24_320, "max_output_tokens": 24_576,
+        "default_max_output_tokens": 8192,
+        "limits": {"max_images_per_request": 8, "engine_base_url": "http://vllm-router:30002/v1"},
+        "internal": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+        "engine": "router",
+        "base_url": "http://vllm-router:30002/v1",
+    }, internal="Qwen/Qwen3-VL-8B-Instruct-FP8", engine="router")
+    monkeypatch.setattr(registry, "catalogue", lambda: (leaky,), raising=False)
+
+    response = admin.get("/admin/api/developers/models")
+    text = response.text
+    entry = response.json()["models"][0]
+
+    for secret in ("Qwen3-VL-8B", "vllm-router", "30002", '"engine"', '"internal"', "base_url"):
+        assert secret not in text
+    assert entry["endpoints"] == ["/v1/responses"]
+    assert entry["limits"] == {"max_images_per_request": 8}
+    assert set(entry["capabilities"]) == set(console_api.CONSOLE_CAPABILITY_FLAGS)
+
+
+def test_a_project_allowlist_may_name_any_catalogued_model_but_not_an_unknown_one(admin, six_models):
+    project = _make_project(admin)
+    path = f"/admin/api/developers/projects/{project['id']}"
+    accepted = admin.patch(path, json={"allowed_models": ["techsara-ocr", "techsara-whisper"]})
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["project"]["allowed_models"] == ["techsara-ocr", "techsara-whisper"]
+    assert admin.patch(path, json={"allowed_models": ["techsara-ocr-2"]}).status_code == 422
+
+
+def _declare(monkeypatch, *extra: CatalogueStub) -> Any:
+    """Serve the real techsara-35b plus stand-ins through `/v1`'s resolution."""
+    real = registry.declared_models()[0]
+    declared = (real, *extra)
+    monkeypatch.setattr(registry, "declared_models", lambda: declared)
+    monkeypatch.setattr(registry, "catalogue", lambda: declared, raising=False)
+    return real
+
+
+def test_the_playground_refuses_a_model_that_is_not_a_chat_model_with_the_v1_sentence(
+    admin, fake_model, monkeypatch
+):
+    """The playground targets every CHAT model; an embeddings model on
+    `/v1/responses` is a 400 naming `model` — but only for a caller who may use
+    it. Outside the project's allowlist the same id is the 404, first."""
+    embed = _six_models()[3]
+    real = _declare(monkeypatch, embed)
+    fake = fake_model()
+
+    refused = admin.post(PLAYGROUND, json={"model": "techsara-embed", "input": "hi"})
+    assert refused.status_code == 400
+    error = refused.json()["error"]
+    assert error["param"] == "model"
+    assert error["message"] == "The model `techsara-embed` does not support /v1/responses."
+
+    project = _make_project(admin)
+    assert admin.patch(
+        f"/admin/api/developers/projects/{project['id']}", json={"allowed_models": [real.id]}
+    ).status_code == 200
+    hidden = admin.post(
+        f"{PLAYGROUND}?project_id={project['id']}", json={"model": "techsara-embed", "input": "hi"}
+    )
+    assert hidden.status_code == 404
+    assert hidden.json()["error"]["code"] == "model_not_found"
+    assert fake.calls == []
+
+
+class FakePlan:
+    """A `planning.GenerationPlan` in its published attribute names, for a
+    techsara-35b request asking for the whole window."""
+
+    def __init__(self, messages, **overrides):
+        from types import SimpleNamespace
+
+        self.model = SimpleNamespace(
+            id=registry.PUBLIC_MODEL_IDS[0], engine="main",
+            context_window=1_000_000, context_reserve=512,
+        )
+        self.engine = "main"
+        self.context_reserve = 512
+        self.messages = list(messages)
+        self.requested_max_output_tokens = 1_000_000
+        self.planned_max_output_tokens = 999_000
+        self.max_tokens_for_engine = 1_000_000
+        self.estimated_input_tokens = 7
+        self.bounded_input_tokens = 12
+        self.footprint_tokens = 999_007
+        self.wall_clock_s = 20_900.0
+        self.temperature = 0.2
+        self.clamped = True
+        self.gate_engine = None
+        self.gate_weight_tokens = 0
+        self.yield_to_chat = False
+        self.explicit_max_output_tokens = True
+        self.image_count = 0
+        for name, value in overrides.items():
+            setattr(self, name, value)
+
+
+class FakePlanning:
+    """`publicapi.planning`'s two entry points the playground calls."""
+
+    def __init__(self, **plan_overrides):
+        self.plan_overrides = plan_overrides
+        self.calls: List[Dict[str, Any]] = []
+        self.raises: Optional[Exception] = None
+
+    def plan_generation(self, request_model, model, *, project_max_output_tokens=None, **_):
+        self.calls.append({"model": model.id, "project_max_output_tokens": project_max_output_tokens,
+                           "max_output_tokens": request_model.max_output_tokens})
+        if self.raises is not None:
+            raise self.raises
+        return FakePlan(request_model.chat_messages(), **self.plan_overrides)
+
+    def reservation_output_tokens(self, plan, *, limits_enforced):
+        return plan.planned_max_output_tokens if limits_enforced else min(plan.planned_max_output_tokens, 8192)
+
+
+class FakeCapacity:
+    """`publicapi.capacity`: records every hold and whether it was let go."""
+
+    def __init__(self, refuse: Optional[Exception] = None):
+        self.refuse = refuse
+        self.holds: List[Dict[str, Any]] = []
+        self.released = 0
+
+    def sync_wait_s(self) -> float:
+        return 30.0
+
+    def hold(self, engine, *, weight_tokens=0, wait_s, yield_to_chat=False):
+        capacity = self
+
+        class _Hold:
+            async def __aenter__(self):
+                capacity.holds.append({"engine": engine, "weight_tokens": weight_tokens,
+                                       "wait_s": wait_s, "yield_to_chat": yield_to_chat})
+                if capacity.refuse is not None:
+                    raise capacity.refuse
+                return self
+
+            async def __aexit__(self, *exc):
+                capacity.released += 1
+                return False
+
+        return _Hold()
+
+
+def _usage_meta() -> Dict[str, Any]:
+    with db.connection() as con:
+        rows = con.execute("SELECT meta FROM usage_events WHERE route = %s",
+                           (console_api.PLAYGROUND_ROUTE,)).fetchall()
+    assert len(rows) == 1
+    return rows[0]["meta"]
+
+
+def test_the_playground_plans_a_long_output_through_the_public_planner_and_records_the_applied_ceiling(
+    admin, fake_model, monkeypatch
+):
+    """A 1,000,000-token request: the planner decides the ceiling (not the
+    console), the engine is sent what the plan says, and the ledger and the
+    response carry what was asked for, what was applied, whether the window
+    clamped it and the wall clock it was given."""
+    planning = FakePlanning()
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    fake = fake_model()
+
+    response = admin.post(
+        PLAYGROUND,
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "Write the long one.",
+              "max_output_tokens": 1_000_000},
+    )
+
+    assert response.status_code == 200, response.text
+    assert planning.calls == [{"model": registry.PUBLIC_MODEL_IDS[0],
+                               "project_max_output_tokens": None,
+                               "max_output_tokens": 1_000_000}]
+    assert fake.calls[0]["max_tokens"] == 1_000_000
+    assert fake.calls[0]["messages"] == [{"role": "user", "content": "Write the long one."}]
+    body = response.json()
+    meta = _usage_meta()
+    # The applied ceiling is the pump's (the planned 999,000 before the engine
+    # ran, the window less the REPORTED prompt after), relayed and recorded as
+    # one number — never the requested 1,000,000 passed off as applied.
+    assert 999_000 <= body["max_output_tokens"] < 1_000_000
+    assert meta["max_output_tokens_applied"] == body["max_output_tokens"]
+    assert body["incomplete_details"] is None
+    assert (meta["max_output_tokens_requested"], meta["clamped"], meta["wall_clock_s"]) == (
+        1_000_000, True, 20_900.0,
+    )
+
+
+def test_the_applied_ceiling_is_the_pumps_value_and_the_planned_one_only_when_the_pump_has_none():
+    from types import SimpleNamespace
+
+    plan = FakePlan([])
+    assert console_api._applied_max_output_tokens(plan, SimpleNamespace(max_output_tokens=999_477)) == 999_477
+    assert console_api._applied_max_output_tokens(plan, SimpleNamespace(max_output_tokens=None)) == 999_000
+    assert console_api._applied_max_output_tokens(plan, SimpleNamespace()) == 999_000
+
+
+def test_a_sync_playground_response_says_when_the_generation_stopped_at_its_ceiling(
+    admin, fake_model, monkeypatch
+):
+    from app import llm
+
+    fake_model()
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "length")
+    response = admin.post(
+        PLAYGROUND,
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "max_output_tokens": 2},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert response.json()["status"] == "completed"
+    assert response.json()["max_output_tokens"] == 2
+
+
+def test_a_planner_refusal_is_the_v1_envelope_and_nothing_is_reserved_or_generated(
+    admin, fake_model, monkeypatch
+):
+    from app.publicapi import errors as api_errors
+
+    planning = FakePlanning()
+    planning.raises = api_errors.context_length_exceeded(requested=2_000_000, limit=999_232, upper_bound=True)
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    fake = fake_model()
+
+    response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "context_length_exceeded"
+    assert fake.calls == []
+    assert _playground_ledger(store.default_workspace()["id"]) == {"daily": 0, "minute": 0}
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+def test_a_playground_run_on_a_gated_engine_holds_that_engines_capacity_gate_and_gives_it_back(
+    admin, fake_model, monkeypatch, stream
+):
+    """The same gate `/v1` waits at: named by the plan, weighted by the
+    footprint, bounded by the synchronous wait, yielding to chat when the plan
+    says so — and released once the run ends, streamed or not."""
+    planning = FakePlanning(gate_engine="router", gate_weight_tokens=6_100, yield_to_chat=True)
+    capacity = FakeCapacity()
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    monkeypatch.setattr(console_api, "_capacity", lambda: capacity)
+    fake_model()
+
+    response = admin.post(
+        PLAYGROUND,
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "stream": stream},
+    )
+
+    assert response.status_code == 200, response.text
+    if stream:
+        assert "response.completed" in response.text
+    assert capacity.holds == [{"engine": "router", "weight_tokens": 6_100, "wait_s": 30.0,
+                               "yield_to_chat": True}]
+    assert capacity.released == 1
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
+@pytest.mark.usefixtures("limits_enforced")
+def test_a_playground_run_refused_at_capacity_is_the_v1_503_with_retry_after_and_gives_everything_back(
+    admin, fake_model, monkeypatch, stream
+):
+    """Never a 429 and never a dead stream: a real 503 `model_unavailable`
+    with its Retry-After, before any status line, the estimate handed back
+    and the project slot released."""
+    from app.publicapi import errors as api_errors
+
+    planning = FakePlanning(gate_engine="router", planned_max_output_tokens=512)
+    capacity = FakeCapacity(refuse=api_errors.model_at_capacity(5))
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    monkeypatch.setattr(console_api, "_capacity", lambda: capacity)
+    fake = fake_model()
+
+    response = admin.post(
+        PLAYGROUND,
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "stream": stream},
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "model_unavailable"
+    assert fake.calls == []
+    assert _playground_ledger(store.default_workspace()["id"]) == {"daily": 0, "minute": 0}
+    # `quotas.in_flight` counts per PROJECT, and the allowance row's id is
+    # derived from the workspace, so no key or principal is needed to ask.
+    from types import SimpleNamespace
+
+    allowance = SimpleNamespace(
+        project_id=console_api.playground_project_id(store.default_workspace()["id"])
+    )
+    assert quotas.in_flight(allowance) == 0
+
+
+def test_a_plan_that_names_a_gate_with_no_capacity_module_fails_closed_with_a_503(
+    admin, fake_model, monkeypatch
+):
+    monkeypatch.setattr(console_api, "_planning", lambda: FakePlanning(gate_engine="router"))
+    monkeypatch.setattr(console_api, "_capacity", lambda: None)
+    fake = fake_model()
+    response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_unavailable"
+    assert fake.calls == []
+
+
+def test_the_capacity_gate_comes_back_even_if_a_streamed_body_never_starts():
+    """A client gone before the first byte never starts the body generator;
+    the response object gives the shared engine's gate back as well as the
+    project slot."""
+    import asyncio
+    import contextlib
+
+    released: List[str] = []
+    gate = contextlib.AsyncExitStack()
+
+    async def let_go() -> None:
+        released.append("gate")
+
+    gate.push_async_callback(let_go)
+    slot = console_api._Slot(contextlib.ExitStack(), gate)
+
+    async def frames():
+        yield "data: never\n\n"
+
+    async def gone_before_the_status_line(message):
+        raise OSError("client went away")
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    response = console_api._SlotStreamingResponse(frames(), slot=slot)
+    with contextlib.suppress(Exception):
+        asyncio.run(response({"type": "http", "asgi": {"spec_version": "2.4"}},
+                             receive, gone_before_the_status_line))
+    assert released == ["gate"]
+
+
+def test_the_playground_sends_text_only_and_refuses_an_image_part_by_name(admin, fake_model):
+    """`/v1` takes image parts for vision models; the playground reads the
+    1 MiB text cap and has no image picker, so a part that is not text is
+    refused naming where it is, although the public parser accepts it."""
+    fake = fake_model()
+    payload = {
+        "model": registry.PUBLIC_MODEL_IDS[0],
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "What is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="},
+        ]}],
+    }
+    # The premise: the public request type itself accepts this body.
+    console_api.api_models.parse_responses_request(payload)
+
+    response = admin.post(PLAYGROUND, json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "input.0.content"
+    assert "text only" in response.json()["error"]["message"]
+    assert fake.calls == []
+
+    text_parts = admin.post(PLAYGROUND, json={
+        "model": registry.PUBLIC_MODEL_IDS[0],
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Just text."}]}],
+    })
+    assert text_parts.status_code == 200, text_parts.text
+
+
+@pytest.mark.parametrize("enforced, reserved", [(False, 8192), (True, 1_000_000)],
+                         ids=["unlimited", "enforced"])
+@pytest.mark.parametrize("planner", [False, True], ids=["legacy", "planner"])
+def test_a_long_output_reserves_at_most_the_default_while_limits_are_off(
+    monkeypatch, enforced, reserved, planner
+):
+    """A running 1,000,000-token generation must not show a million output
+    tokens in today's usage for the hours it runs when nothing enforces a
+    limit; with limits on, the reservation is the real planned ceiling. The
+    planner's rule is used when it exists, the same cap otherwise."""
+    monkeypatch.setattr(settings, "public_api_enforce_limits", enforced)
+    monkeypatch.setattr(settings, "public_api_default_max_output_tokens", 8192)
+    monkeypatch.setattr(console_api, "_planning", (lambda: FakePlanning()) if planner else (lambda: None))
+    if planner:
+        plan: Any = FakePlan([], planned_max_output_tokens=1_000_000)
+    else:
+        plan = console_api._LegacyPlan(
+            messages=[], requested_max_output_tokens=1_000_000,
+            planned_max_output_tokens=1_000_000, max_tokens_for_engine=1_000_000,
+            estimated_input_tokens=1, footprint_tokens=1_000_001, temperature=0.2,
+        )
+    assert console_api._reserved_output_tokens(plan) == reserved
+
+
+# ---- against the real catalogue, planner and gates ---------------------------
+
+
+def test_with_the_real_catalogue_the_console_lists_all_six_and_a_million_output_tokens_on_techsara_35b(
+    admin, monkeypatch
+):
+    """No stand-ins: the registry this deployment builds. With the main
+    engine's window at 1,000,000 (MAIN_MODEL_MAX_LEN on the DGX), techsara-35b
+    may generate the whole window — and no checkpoint name, engine key or URL
+    from settings reaches the page."""
+    monkeypatch.setattr(settings, "model_max_context", 1_000_000)
+    response = admin.get("/admin/api/developers/models")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    by_id = {entry["id"]: entry for entry in body["models"]}
+
+    assert [entry["id"] for entry in body["models"]] == list(registry.PUBLIC_MODEL_IDS)
+    assert len(registry.PUBLIC_MODEL_IDS) == 6
+    main = by_id["techsara-35b"]
+    assert (main["context_window"], main["max_output_tokens"]) == (1_000_000, 1_000_000)
+    assert main["default_max_output_tokens"] == 8192
+    assert {entry["kind"] for entry in body["models"]} == {"chat", "embedding", "rerank", "transcription"}
+    assert all(entry["status"] in ("available", "not_configured") for entry in body["models"])
+    for name in ("llm_model", "router_model", "embed_model", "rerank_model", "ocr_model", "asr_model",
+                 "openai_base_url", "router_base_url", "embed_base_url", "rerank_base_url", "ocr_base_url"):
+        value = str(getattr(settings, name, "") or "").strip()
+        if value:
+            assert value not in response.text, name
+
+
+def test_the_playground_runs_techsara_8b_vision_on_its_own_engine_through_the_real_planner_and_gate(
+    admin, monkeypatch
+):
+    """Any chat model, not only techsara-35b: the vision model's request is
+    planned against ITS window, sent to ITS engine with the planned ceiling,
+    held at the router's public gate while it runs, and let go after."""
+    from app import llm
+    from app.publicapi import capacity, engines
+
+    if registry.TECHSARA_8B_VISION not in {m.id for m in registry.declared_models()}:
+        pytest.skip("this test configuration runs no router engine")
+    capacity.reset_for_tests()
+    seen: List[Dict[str, Any]] = []
+    in_flight_while_running: List[int] = []
+
+    async def fake_router(resolved, messages, *, max_tokens, temperature, wall_clock_s):
+        seen.append({"engine": resolved.key, "messages": list(messages), "max_tokens": max_tokens,
+                     "temperature": temperature, "wall_clock_s": wall_clock_s})
+        in_flight_while_running.append(capacity.snapshot()["router"]["in_flight"])
+        yield "token", "A red "
+        yield "token", "square."
+
+    def main_must_not_run(*args, **kwargs):
+        raise AssertionError("techsara-8b-vision must not reach the main engine")
+
+    monkeypatch.setattr(engines, "stream_chat", fake_router)
+    monkeypatch.setattr(llm, "stream_chat_events", main_must_not_run)
+
+    response = admin.post(PLAYGROUND, json={
+        "model": registry.TECHSARA_8B_VISION, "input": "Describe the picture.", "max_output_tokens": 1000,
+    })
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["model"] == registry.TECHSARA_8B_VISION
+    assert body["output"][0]["content"][0]["text"] == "A red square."
+    assert body["max_output_tokens"] == 1000
+    assert len(seen) == 1 and seen[0]["engine"] == "router"
+    assert seen[0]["max_tokens"] == 1000
+    assert seen[0]["messages"] == [{"role": "user", "content": "Describe the picture."}]
+    assert in_flight_while_running == [1]
+    assert capacity.snapshot()["router"]["in_flight"] == 0
+    meta = _usage_meta()
+    assert meta["public_model"] == registry.TECHSARA_8B_VISION
+    assert meta["max_output_tokens_applied"] == 1000
+
+
+def test_the_playground_refuses_more_output_than_techsara_8b_vision_can_generate(admin, monkeypatch):
+    from app.publicapi import engines
+
+    if registry.TECHSARA_8B_VISION not in {m.id for m in registry.declared_models()}:
+        pytest.skip("this test configuration runs no router engine")
+    calls: List[Any] = []
+
+    async def fake_router(*args, **kwargs):
+        calls.append(kwargs)
+        yield "token", "x"
+
+    monkeypatch.setattr(engines, "stream_chat", fake_router)
+    ceiling = {m.id: m for m in registry.declared_models()}[registry.TECHSARA_8B_VISION].max_output_tokens
+    response = admin.post(PLAYGROUND, json={
+        "model": registry.TECHSARA_8B_VISION, "input": "hi", "max_output_tokens": int(ceiling) + 1,
+    })
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "max_output_tokens"
+    assert calls == []

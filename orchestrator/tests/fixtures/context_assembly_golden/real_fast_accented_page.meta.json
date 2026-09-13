@@ -1,0 +1,30 @@
+{
+  "context": {
+    "fraction": 0.0009,
+    "reserved_output": 8192,
+    "summarized_turns": 2,
+    "tokens_used": 937,
+    "usable_budget": 991296,
+    "window": 1000000
+  },
+  "knowledge": {
+    "decision": "static_topical",
+    "freshness": "static",
+    "from_local_memory": true
+  },
+  "route": "chat",
+  "sources": [
+    {
+      "cited": false,
+      "domain": "food.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 1,
+      "origin": "search",
+      "read": true,
+      "snippet": "To finish a crème brûlée, scatter a thin layer of sugar and caramelise it with a torch until it turns amber. The crust sets as it cools. To finish a crème brûlée, scatter a thin layer of sugar and caramelise it with a torch until it turns amber. The crust sets as it cools. To finish a crème brûlée, scatter a thin layer of sugar and caramelise it with a torch until it turns amber. The crust sets as",
+      "title": "Crème brûlée: caramelising the sugar crust",
+      "url": "https://food.test/creme-brulee"
+    }
+  ]
+}

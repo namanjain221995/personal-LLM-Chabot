@@ -20,6 +20,16 @@
  * with its number and the deltas are collapsed into one counted row rather
  * than five hundred lines nobody can scroll.
  *
+ * EVERY CHAT MODEL (2026-09-13). The picker offers each published chat-kind
+ * model the deployment runs — techsara-35b, techsara-8b-vision and, listed but
+ * not selectable, techsara-ocr, which reads exactly one image and the
+ * playground sends text only this wave. Embeddings, rerank and speech models
+ * have their own endpoints and are not offered. The max-output field is
+ * bounded by the chosen model's ceiling (1,000,000 on techsara-35b), and the
+ * terminal event's applied ceiling is shown with the usage, because a request
+ * whose input and output would overflow the window is clamped rather than
+ * refused.
+ *
  * SSE parsing is `lib/sse.ts` — the same spec-compliant incremental parser the
  * chat uses, handling \n, \r\n and events split across chunks. A second
  * hand-rolled parser is how two surfaces come to disagree about what a frame
@@ -33,6 +43,7 @@ import { IconAlert, IconPlay, IconStop } from '@/components/icons';
 import { SSEParser } from '@/lib/sse';
 import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { Section, Stat, StatRow } from '@/components/admin/analytics/ui';
+import { ErrorPanel } from '@/components/admin/ui';
 import { NOT_MEASURED, compact } from '@/components/admin/analytics/format';
 import {
   ADMIN_PRIMARY_BUTTON,
@@ -50,7 +61,13 @@ import {
   SNIPPET_LANGUAGES,
   type SnippetLanguage,
 } from './snippets';
-import type { ModelList } from './types';
+import {
+  longAnswerHours,
+  modelConfigured,
+  modelKind,
+  type ConsoleModel,
+  type ModelList,
+} from './types';
 
 interface Frame {
   /** The `sequence_number` the server stamped, or null when it sent none. */
@@ -64,6 +81,70 @@ interface Usage {
   input_tokens: number | null;
   output_tokens: number | null;
   total_tokens: number | null;
+}
+
+/**
+ * The output ceiling the generation ran under and whether it stopped there,
+ * from a terminal event's response object (2026-09-13). `max_output_tokens` is
+ * null when the server did not say — an orchestrator that predates the field —
+ * and the panel then says nothing rather than repeating the requested number
+ * as if it had been applied.
+ */
+export interface AppliedCeiling {
+  maxOutputTokens: number | null;
+  stoppedAtCeiling: boolean;
+}
+
+export function readAppliedCeiling(payload: Record<string, unknown>): AppliedCeiling {
+  const response =
+    (payload.response as Record<string, unknown> | undefined) ?? payload;
+  const max = response.max_output_tokens;
+  const details = response.incomplete_details as { reason?: unknown } | null | undefined;
+  return {
+    maxOutputTokens: typeof max === 'number' && Number.isFinite(max) ? max : null,
+    stoppedAtCeiling: details?.reason === 'max_output_tokens',
+  };
+}
+
+/**
+ * Why a published chat model cannot be picked here, or null when it can. OCR
+ * needs exactly one image per request, and the playground sends text only
+ * (2026-09-13): offering it would be a Run button that can only ever 400.
+ */
+export function playgroundUnsupported(model: ConsoleModel): string | null {
+  if (model.capabilities?.ocr) return 'needs an image — not in the playground yet';
+  return null;
+}
+
+/** The chat models the playground lists: published, configured, chat-kind. */
+export function playgroundModels(models: ConsoleModel[]): ConsoleModel[] {
+  return models.filter((m) => m.enabled && modelConfigured(m) && modelKind(m) === 'chat');
+}
+
+/**
+ * The max-output field's problem, or null when the value is sendable: a whole
+ * number from 1 to the chosen model's ceiling. Checked here as well as on the
+ * server so the person sees the bound before pressing Run; the server's 400
+ * still stands behind it.
+ */
+export function maxOutputProblem(raw: string, ceiling: number | null | undefined): string | null {
+  const value = Number(raw);
+  const bound = typeof ceiling === 'number' && ceiling > 0 ? ceiling : null;
+  const range = bound ? `from 1 to ${bound.toLocaleString()}` : 'of at least 1';
+  if (!raw.trim() || !Number.isInteger(value) || value < 1 || (bound !== null && value > bound)) {
+    return `Enter a whole number ${range}.`;
+  }
+  return null;
+}
+
+/** What the max-output field says when its value is fine. */
+export function maxOutputHint(model: string, ceiling: number | null): string {
+  if (!ceiling) return 'The model’s ceiling was not reported; the server checks the value.';
+  const long =
+    ceiling > 100_000
+      ? ` The answer streams as it is written: ${ceiling.toLocaleString()} tokens is ${longAnswerHours(ceiling)}.`
+      : '';
+  return `Up to ${ceiling.toLocaleString()} for ${model}.${long} Input and output share the context window, so a request that would overflow it is clamped and the applied ceiling is shown with the usage.`;
 }
 
 function readUsage(payload: Record<string, unknown>): Usage | null {
@@ -89,7 +170,8 @@ export function PlaygroundPanel() {
   const models = useConsole<ModelList>(consolePaths.models());
   const { announce } = useConsoleStatus();
 
-  const available = (models.data?.models ?? []).filter((m) => m.enabled);
+  const listed = playgroundModels(models.data?.models ?? []);
+  const available = listed.filter((m) => playgroundUnsupported(m) === null);
   const [model, setModel] = useState('');
   const [instructions, setInstructions] = useState('');
   const [input, setInput] = useState('');
@@ -101,11 +183,15 @@ export function PlaygroundPanel() {
   const [output, setOutput] = useState('');
   const [frames, setFrames] = useState<Frame[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
+  const [applied, setApplied] = useState<AppliedCeiling | null>(null);
   const [requestId, setRequestId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abort = useRef<AbortController | null>(null);
 
   const chosen = model || available[0]?.id || '';
+  const chosenModel = available.find((m) => m.id === chosen) ?? null;
+  const outputCeiling = chosenModel?.max_output_tokens ?? null;
+  const outputProblem = maxOutputProblem(maxOutputTokens, outputCeiling);
 
   // HYDRATION #418, 2026-09-13 visual QA. The snippet used to read
   // `window.location.origin` during render: '' on the server, the real origin
@@ -143,13 +229,14 @@ export function PlaygroundPanel() {
   }
 
   async function run() {
-    if (running || !input.trim() || !chosen) return;
+    if (running || !input.trim() || !chosen || outputProblem) return;
     const controller = new AbortController();
     abort.current = controller;
     setRunning(true);
     setOutput('');
     setFrames([]);
     setUsage(null);
+    setApplied(null);
     setRequestId(null);
     setError(null);
     announce('Running against the API.');
@@ -244,6 +331,7 @@ export function PlaygroundPanel() {
             name === 'error'
           ) {
             setUsage(readUsage(payload));
+            setApplied(readAppliedCeiling(payload));
             if (name !== 'response.completed') {
               // `error` carries its sentence at the top level
               // (ApiError.stream_payload); `response.failed` carries it on
@@ -271,13 +359,25 @@ export function PlaygroundPanel() {
     }
   }
 
-  if (!models.loading && available.length === 0) {
+  // A failed model list is an error with a Retry, not "no chat model is
+  // published": an orchestrator restart read as a deployment with no models
+  // (audit, 2026-09-13).
+  if (models.error && models.data === null) {
+    return (
+      <div>
+        <ConsoleHeader title="Playground" />
+        <ErrorPanel message={models.error} onRetry={models.reload} />
+      </div>
+    );
+  }
+
+  if (!models.loading && !models.error && available.length === 0) {
     return (
       <div>
         <ConsoleHeader title="Playground" />
         <ConsoleEmpty
-          title="No model is published"
-          body="The playground calls the same models the public API offers. When none is published there is nothing to call — the Models tab lists what this deployment declares."
+          title="No chat model is published"
+          body="The playground calls the same chat models the public API offers. When none is published and configured there is nothing to call — the Models tab lists every model and what this deployment runs."
         />
       </div>
     );
@@ -290,8 +390,13 @@ export function PlaygroundPanel() {
         description="Send a request the way your application will, and watch the stream frame by frame. It runs on your session — the playground never asks for, stores or sends an API key."
       />
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <section aria-label="Request">
+      {/* `minmax(0,1fr)` below lg too, and `min-w-0` on both columns. An
+          implicit grid track grows to its content's min-content width, so
+          one unbroken token in the answer (a URL, a base64 string) made the
+          track — and the whole page — 1680px wide on a 360px phone
+          (responsive audit, 2026-09-13). */}
+      <div className="grid grid-cols-[minmax(0,1fr)] gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <section aria-label="Request" className="min-w-0">
           <h2 className="text-sm font-medium text-ink">Request</h2>
           <div className="mt-3 space-y-3">
             <Field label="Model">
@@ -300,11 +405,14 @@ export function PlaygroundPanel() {
                 onChange={(e) => setModel(e.target.value)}
                 className={FIELD_INPUT}
               >
-                {available.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.id}
-                  </option>
-                ))}
+                {listed.map((m) => {
+                  const why = playgroundUnsupported(m);
+                  return (
+                    <option key={m.id} value={m.id} disabled={why !== null}>
+                      {why ? `${m.id} (${why})` : m.id}
+                    </option>
+                  );
+                })}
               </select>
             </Field>
             <Field label="Instructions (optional)">
@@ -342,12 +450,23 @@ export function PlaygroundPanel() {
                 <input
                   type="number"
                   min="1"
+                  max={outputCeiling ?? undefined}
+                  step="1"
                   value={maxOutputTokens}
                   onChange={(e) => setMaxOutputTokens(e.target.value)}
+                  aria-invalid={outputProblem ? true : undefined}
+                  aria-describedby="playground-max-output-hint"
                   className={FIELD_INPUT}
                 />
               </Field>
             </div>
+            <p
+              id="playground-max-output-hint"
+              data-testid="playground-max-output-hint"
+              className={`text-xs ${outputProblem ? 'text-danger' : 'text-faint'}`}
+            >
+              {outputProblem ?? maxOutputHint(chosen, outputCeiling)}
+            </p>
             <div className="flex items-center gap-2">
               {running ? (
                 <button type="button" onClick={stop} className={ADMIN_SECONDARY_BUTTON}>
@@ -358,7 +477,7 @@ export function PlaygroundPanel() {
                 <button
                   type="button"
                   onClick={() => void run()}
-                  disabled={!input.trim()}
+                  disabled={!input.trim() || outputProblem !== null}
                   className={ADMIN_PRIMARY_BUTTON}
                 >
                   <IconPlay size={15} />
@@ -383,17 +502,27 @@ export function PlaygroundPanel() {
           </div>
         </section>
 
-        <section aria-label="Response">
+        <section aria-label="Response" className="min-w-0">
           <h2 className="text-sm font-medium text-ink">Response</h2>
           {error && (
             <p role="alert" className="mt-3 flex items-start gap-1.5 text-sm text-danger">
               <IconAlert size={15} className="mt-0.5 shrink-0" />
-              {error}
+              {/* Its own shrinkable item: as a bare text child of the flex
+                  line, a URL in the server's sentence ran past the column. */}
+              <span
+                data-testid="playground-error"
+                className="min-w-0 [overflow-wrap:anywhere]"
+              >
+                {error}
+              </span>
             </p>
           )}
+          {/* `overflow-wrap: anywhere`, not `break-words`: only `anywhere`
+              lowers the min-content width, which is what the grid track
+              sizes to. */}
           <pre
             data-testid="playground-output"
-            className="mt-3 max-h-72 min-h-[120px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-bg p-3 font-mono text-xs text-ink"
+            className="mt-3 max-h-72 min-h-[120px] overflow-auto whitespace-pre-wrap rounded-lg border border-border bg-bg p-3 font-mono text-xs text-ink [overflow-wrap:anywhere]"
           >
             {output || (running ? '' : 'The answer appears here.')}
           </pre>
@@ -454,10 +583,28 @@ export function PlaygroundPanel() {
                 }
               />
             </StatRow>
+            {applied && applied.maxOutputTokens !== null && (
+              <p data-testid="playground-applied-ceiling" className="mt-3 text-xs text-muted">
+                Output ceiling applied:{' '}
+                <span className="tabular-nums text-ink">
+                  {applied.maxOutputTokens.toLocaleString()} tokens
+                </span>
+                {applied.stoppedAtCeiling
+                  ? ' — the answer stopped because it reached this ceiling.'
+                  : '.'}
+              </p>
+            )}
+            {applied && applied.maxOutputTokens === null && applied.stoppedAtCeiling && (
+              <p data-testid="playground-applied-ceiling" className="mt-3 text-xs text-muted">
+                The answer stopped because it reached its output ceiling.
+              </p>
+            )}
             <p className="mt-2 text-xs text-faint">
               Request id:{' '}
               {requestId ? (
-                <code className="font-mono text-muted">{requestId}</code>
+                <code className="font-mono text-muted [overflow-wrap:anywhere]">
+                  {requestId}
+                </code>
               ) : (
                 <span className="text-faint">
                   not yet — it arrives with the response

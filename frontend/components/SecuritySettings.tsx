@@ -320,7 +320,7 @@ export function SessionsSection({ fetchFn = fetch }: { fetchFn?: FetchLike }) {
                   type="button"
                   disabled={busy}
                   onClick={() => setPending({ kind: 'one', id: s.id })}
-                  className="shrink-0 rounded-md border border-border px-2.5 py-1 text-xs text-danger transition-colors duration-ts hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-35"
+                  className="shrink-0 rounded-md border border-border px-2.5 py-1 text-xs text-danger max-sm:min-h-8 [@media(pointer:coarse)]:min-h-8 transition-colors duration-ts hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-35"
                 >
                   Sign out
                 </button>

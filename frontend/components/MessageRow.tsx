@@ -829,7 +829,7 @@ function MessageRowImpl({
                 }}
                 rows={1}
                 aria-label="Edit your message"
-                className="block w-full resize-none bg-transparent text-[15px] leading-relaxed text-ink focus:outline-none"
+                className="block w-full resize-none bg-transparent text-base leading-relaxed text-ink focus:outline-none"
               />
               <div className="mt-2 flex items-center justify-end gap-2">
                 <button
@@ -858,7 +858,7 @@ function MessageRowImpl({
                 <div
                   data-chat-message-id={message.id}
                   data-chat-message-role="user"
-                  className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed"
+                  className="whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-base leading-relaxed"
                 >
                   {message.content}
                 </div>
@@ -1140,13 +1140,15 @@ function MessageRowImpl({
               card wins; nothing is lost, because the text is still in
               `message.content` and still goes to the model on the next turn. */}
           {message.content && !clarification && (
-            /* No font-size override: the body inherits --ts-fs-base (16px).
-               It used to be hardcoded to 15px, which is why assistant prose
-               read dimmer than it should — thin stems at 15px on pure black
-               lose weight to greyscale antialiasing, and #ffffff stops
-               looking white. It also left `.md h3`/`h4` (16px) rendering
-               LARGER than the body they head. */
+            /* `chat-answer` sets the reading size: --ts-fs-chat, 17px from md
+               up and 16px on a phone, line height 1.7 (globals.css). It was
+               hardcoded to 15px once, which is why assistant prose read
+               dimmer than it should — thin stems at 15px on pure black lose
+               weight to greyscale antialiasing, and #ffffff stops looking
+               white. The headings inside it are em-sized, so an h3 never
+               renders smaller than the body it heads. */
             <div
+              className="chat-answer"
               data-chat-message-id={message.id}
               data-chat-message-role="assistant"
             >

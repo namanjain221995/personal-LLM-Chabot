@@ -1,0 +1,30 @@
+{
+  "context": {
+    "fraction": 0.0011,
+    "reserved_output": 8192,
+    "summarized_turns": 2,
+    "tokens_used": 1066,
+    "usable_budget": 991296,
+    "window": 1000000
+  },
+  "knowledge": {
+    "decision": "static_topical",
+    "freshness": "static",
+    "from_local_memory": true
+  },
+  "route": "chat",
+  "sources": [
+    {
+      "cited": false,
+      "domain": "docs.test",
+      "fetched_at": "2026-08-30T06:00:00+00:00",
+      "from_store": true,
+      "n": 1,
+      "origin": "search",
+      "read": true,
+      "snippet": "Badger setts are ventilated by their many entrances; air enters the lower tunnels and leaves through the higher ones. Badger setts are ventilated by their many entrances; air enters the lower tunnels and leaves through the higher ones. Badger setts are ventilated by their many entrances; air enters the lower tunnels and leaves through the higher ones. Badger setts are ventilated by their many entr",
+      "title": "How badger setts breathe",
+      "url": "https://docs.test/badger-setts"
+    }
+  ]
+}

@@ -18,6 +18,7 @@ import { Loader, LOADER_POSTER, LOADER_SRC } from '@/components/Loader';
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 /** jsdom has no matchMedia; the component must survive that, and honour it. */
@@ -96,10 +97,14 @@ describe('accessibility', () => {
 describe('reduced motion', () => {
   it('holds the artwork on a single frame instead of looping', () => {
     stubReducedMotion(true);
+    // jsdom implements no media playback and logs "Not implemented" for
+    // pause(); the stub keeps the output clean and lets the call be checked.
+    const pause = vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => undefined);
     render(<Loader rate={1.25} />);
     const el = loader();
     expect(el.hasAttribute('autoplay')).toBe(false);
     expect(el.playbackRate).toBe(0);
+    expect(pause).toHaveBeenCalled();
     // Still present, still showing the artwork — an indicator that vanishes
     // entirely reads as "nothing is happening".
     expect(el.getAttribute('poster')).toBe(LOADER_POSTER);

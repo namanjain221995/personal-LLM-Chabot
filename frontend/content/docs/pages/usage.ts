@@ -76,7 +76,27 @@ Each row carries:
 * the final status and, on a failure, the error code;
 * the project, the key and the request id.
 
-Prompts and generated text are **not** part of it. Request logs keep metadata
+### What each endpoint adds
+
+| Endpoint | Requests | Input tokens | Output tokens |
+| --- | --- | --- | --- |
+| \`/v1/responses\`, \`/v1/chat/completions\` | 1 | The prompt, images included | The answer |
+| \`/v1/embeddings\` | 1 | The inputs | 0 — an embedding generates no text |
+| \`/v1/rerank\` | 1 | The query and documents | 0 |
+| \`/v1/audio/transcriptions\` | 1 | none — no token counts exist | none |
+| Every read (\`GET\`), and a cancel | 1 | — | — |
+
+A transcription's length in seconds is recorded with the request, but
+\`GET /v1/usage\` reports requests, tokens and errors only, so **audio seconds
+are not in it**. A request refused before it ran — a \`400\`, or a \`503\` from
+a full [capacity queue](/docs/rate-limits#capacity-queues-per-engine) — still
+counts as a request and spends no tokens.
+
+A very long generation is counted when it finishes. While a million-token
+background response is running, today's counters do not show a million output
+tokens it has not produced yet; they show what it spent once it ends.
+
+Prompts and generated text are **not** part of it. Nor are images or audio. Request logs keep metadata
 only; the one exception is a [background response](/docs/background), whose
 output is retained for your project's retention window so you can fetch it.
 

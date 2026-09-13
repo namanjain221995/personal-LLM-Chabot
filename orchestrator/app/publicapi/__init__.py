@@ -5,14 +5,18 @@ tsk_live_…` and nothing else. It never reads the `ts_session` cookie: a route
 that accepted both credentials would be a confused deputy, drivable by any
 page on the internet with a signed-in visitor's cookie (CONTRACT §1).
 
-This wave ships the CONTRACT TYPES only — no routes are mounted yet, and
-nothing here imports FastAPI. The next wave builds the router on top of them.
+The package root imports the CONTRACT TYPES only and nothing here imports
+FastAPI; the routes live in `router.py` (and `endpoints.py`, which it mounts).
 
     models.py     the §8 request and the §9 success shapes, pydantic v2,
                   `extra="forbid"` so an unhonourable field is a 400
     errors.py     the one error envelope, one `ApiError`, one factory per code
     events.py     the §10 SSE grammar and the Chat Completions framing
-    registry.py   which models exist publicly, and which never can
+    registry.py   which models exist publicly (six since 2026-09-13), which
+                  engine each resolves to, and what can never be published
+    planning.py   what one generation may be: output clamp, wall clock, gate
+    capacity.py   the per-engine gates that keep public work off chat's back
+    engines.py    the sidecar chat path (router, OCR) and its error mapping
 
 Four properties hold across all four modules, and each is pinned by a test in
 `tests/test_publicapi_contract.py`:
@@ -51,6 +55,8 @@ from .registry import (
     PUBLIC_MODEL_IDS,
     InternalTargetError,
     PublicModel,
+    catalogue,
+    declared_models,
     public_models,
     resolve_public_model,
 )
@@ -72,6 +78,8 @@ __all__ = [
     "StreamProtocolError",
     "TERMINAL_EVENTS",
     "Usage",
+    "catalogue",
+    "declared_models",
     "errors",
     "events",
     "models",

@@ -1,0 +1,4 @@
+# Run output (screenshots, results.json, generated upload fixtures) and the
+# pinned install. Both are reproducible from package-lock.json and a run.
+out/
+node_modules

@@ -22,6 +22,7 @@ import {
 /** useLayoutEffect on the client, useEffect on the server (no SSR warning). */
 const useIsomorphicLayoutEffect =
   typeof window !== 'undefined' ? useLayoutEffect : useEffect;
+import { DEFAULT_APP_NAME } from '@/lib/appName';
 import { fetchMe, handleSessionEnd, userScopeKey } from '@/lib/auth';
 import { copyForCategory, toClientError, type ClientError } from '@/lib/errorTypes';
 import { downloadMarkdown } from '@/lib/exportMarkdown';
@@ -57,6 +58,7 @@ import {
 import { uploadDocumentFile } from '@/lib/uploadDocument';
 import type { SendOptions } from './Composer';
 import {
+  answerBranchFor,
   branchForAppend,
   branchForVersion,
   hasBranches,
@@ -69,7 +71,7 @@ import {
   type BranchSelection,
 } from '@/lib/branching';
 import type { MessageFeedback } from '@/lib/feedback';
-import { truncateFailure } from '@/lib/historyApi';
+import { intentAnswered, planRegenerate } from '@/lib/regenerate';
 import ChatErrorPage from './ChatErrorPage';
 import { shortcutAction } from '@/lib/searchPalette';
 import {
@@ -80,7 +82,6 @@ import {
   getLiveStream,
   isStreaming,
   markClarificationSubmitted,
-  messagesDiscardedByRegenerate,
   startStream,
   stopStream,
   streamingIds,
@@ -119,7 +120,6 @@ import type { SelectionCandidate } from '@/lib/selectedContext';
 import { Composer, type Attachment, type ComposerHandle } from './Composer';
 import { SelectionAsk } from './SelectionAsk';
 import { SalesforceStarterCard } from './SalesforceStarterCard';
-import { ConfirmDialog } from './ConfirmDialog';
 import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { ArtifactPanel } from './artifacts/ArtifactPanel';
@@ -133,6 +133,41 @@ const PANEL_MIN_PCT = 45;
 const PANEL_MAX_PCT = 55;
 const PANEL_MIN_PX = 520;
 const PANEL_MAX_PX = 960;
+/**
+ * 2026-09-13 (fe audit, chat HIGH): the conversation beside an open panel is
+ * never narrower than this. Without a floor, a 768–1024 px screen with the
+ * sidebar still open left the thread 187–284 px wide: card titles collapsed
+ * to 0 px, the composer's controls broke onto two rows. 360 px is a phone's
+ * width, where the thread and composer are already known to work.
+ */
+const THREAD_MIN_PX = 360;
+/** The divider's width (`w-1.5`), part of the row the floor is carved from. */
+const DIVIDER_PX = 6;
+/**
+ * Between `md` (where the panel becomes a column) and this width, opening a
+ * file hides the sidebar so the thread keeps a readable column; closing the
+ * panel puts it back. At 1280 px and up both fit beside the panel.
+ */
+const PANEL_SIDEBAR_AUTOCLOSE =
+  '(min-width: 768px) and (max-width: 1279px)';
+/**
+ * The panel column's min-width. The 520 px floor yields to 62 % of the row
+ * (see artifactPanelPct) AND to whatever keeps THREAD_MIN_PX for the thread,
+ * but never below the 45 % clamp, which is what the divider can reach.
+ */
+const PANEL_MIN_WIDTH_CSS = `max(${PANEL_MIN_PCT}%, min(${PANEL_MIN_PX}px, 62%, calc(100% - ${
+  THREAD_MIN_PX + DIVIDER_PX
+}px)))`;
+/**
+ * The panel column's max-width: 960 px, AND never so wide that the thread
+ * keeps less than THREAD_MIN_PX — the divider's 55 % otherwise walked past the
+ * floor with the sidebar open on a 768–1279 px screen (measured 338 px at
+ * 1024 with the old 260 px sidebar, 325 px with the 288 px one). The 45 % term
+ * keeps the ceiling from ever dropping below the floor's own min-width.
+ */
+const PANEL_MAX_WIDTH_CSS = `min(${PANEL_MAX_PX}px, max(${PANEL_MIN_PCT}%, calc(100% - ${
+  THREAD_MIN_PX + DIVIDER_PX
+}px)))`;
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
 import {
@@ -144,11 +179,8 @@ import { ClarificationCard } from './ClarificationCard';
 import { SearchPalette } from './SearchPalette';
 import { Sidebar } from './Sidebar';
 import { useToast } from './Providers';
-import { IconArrowDown, IconShare, IconSidebar } from './icons';
+import { IconAlert, IconArrowDown, IconShare, IconSidebar, IconX } from './icons';
 import { ShareDialog } from './ShareDialog';
-
-const APP_NAME =
-  process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
 
 /**
  * An attachment whose bytes started uploading when it was ATTACHED
@@ -229,6 +261,22 @@ export function intentForRetry(question: ChatMessage | undefined): string {
   return intent?.id && reusable.includes(intent.state)
     ? intent.id
     : newIntentId();
+}
+
+/**
+ * The intent a "Try again" of `question` sends — 2026-09-13.
+ *
+ * `intentForRetry`, except that an intent whose answer is already stored is
+ * never reused. The question's meta can be adopted from a server copy written
+ * before the answer landed (`accepted`), and the server REPLAYS the stored
+ * answer for a known intent: reusing it would turn "Try again" into a click
+ * that does nothing. An answered intent is finished, whatever its label says.
+ */
+export function intentForRegenerate(
+  all: ChatMessage[],
+  question: ChatMessage,
+): string {
+  return intentAnswered(all, question) ? newIntentId() : intentForRetry(question);
 }
 
 export function newIntentId(): string {
@@ -327,7 +375,22 @@ export function userTurnView(
   return legacy ? { ...base, kind: 'unsent' } : { ...base, kind: 'status_unknown' };
 }
 
-export function ChatApp() {
+/**
+ * `appName` is what the header calls the product when no conversation is
+ * open.
+ *
+ * It arrives as a PROP from app/page.tsx, never from `process.env` here. This
+ * is a client component: its browser bundle inlines NEXT_PUBLIC_APP_NAME as it
+ * was at BUILD time (the default, since no image passes it as a build arg),
+ * while the server renders it per request (app/layout.tsx reads headers() for
+ * the CSP nonce) with the RUNTIME value. Where the two differ — the e2e stack
+ * runs "TechSara AI (e2e)" — the h1's text did not match on hydration: React
+ * error #418 on every chat load, and the root re-render wiped the theme class
+ * off <html>, so a reader who chose light got dark (fe audit 2026-09-13).
+ * A prop is serialised once by the server, so both sides render one string.
+ * (DEFAULT_APP_NAME is only the fallback for a caller that passes nothing.)
+ */
+export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {}) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [archived, setArchived] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -365,6 +428,12 @@ export function ChatApp() {
     status: UploadStatus;
   } | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  /**
+   * The sidebar was hidden by opening a file (PANEL_SIDEBAR_AUTOCLOSE), not by
+   * the person — so closing the panel gives it back. Cleared the moment they
+   * reopen it themselves.
+   */
+  const sidebarAutoClosedRef = useRef(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
   const [prefs, setPrefs] = useState<ChatPrefs>(DEFAULT_PREFS);
@@ -394,6 +463,21 @@ export function ChatApp() {
    * Only a ?c= restore can collide with one, so a bare "/" never waits.
    */
   const [reconciling, setReconciling] = useState(false);
+  /**
+   * The ?c= id the mount effect is still reconciling, or null once it is done.
+   * The 8-second poll's first tick runs in the same commit as that effect and
+   * used to reconcile the SAME id a second time — before the cache had even
+   * hydrated — so every deep link asked /chat/active twice and fetched the
+   * conversation twice (two console 404s for a deleted one, fe audit
+   * 2026-09-13). The poll leaves that id to the mount effect until it is done.
+   */
+  const bootReconcileRef = useRef<string | null>(null);
+  /**
+   * A ?c= deep link named a conversation the server does not have (deleted, or
+   * another account's — the same 404). Shown over the new chat that replaced
+   * it, until the person moves on; the bad id is already gone from the URL.
+   */
+  const [missingConversation, setMissingConversation] = useState(false);
 
   // Set BEFORE first paint, so the composer is never briefly interactive.
   // A useState initializer cannot do this: it runs during SSR where there is
@@ -403,11 +487,6 @@ export function ChatApp() {
       setReconciling(true);
     }
   }, []);
-  /** Armed regenerate awaiting confirmation (it would discard later turns). */
-  const [pendingRegenerate, setPendingRegenerate] = useState<{
-    messageId: string;
-    discarded: number;
-  } | null>(null);
   /**
    * The user turn open for in-place editing, if any (ChatGPT-style).
    *
@@ -476,7 +555,7 @@ export function ChatApp() {
    * a 768 px thread column needs on a 1440 px screen to stay readable.
    *
    * Of the workspace, not the shell: measured against the whole shell the
-   * minimums summed to 0.95·W + 266 px (sidebar 260 + divider 6), which is
+   * minimums summed to 0.95·W + 266 px (the then 260 px sidebar + divider 6), which is
    * wider than every real screen (1440 px: 194 px over; 1920 px: 170 px
    * over), and `overflow-hidden` on the shell clipped exactly that much off
    * the panel's right edge — where Close, Download and the zoom buttons sit.
@@ -521,6 +600,16 @@ export function ChatApp() {
   const openArtifact = useCallback<OpenArtifact>(
     (ref: ArtifactRef, originId: string, fileKey: string, siblings: ArtifactRef[]) => {
       rememberThreadScroll();
+      if (
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia(PANEL_SIDEBAR_AUTOCLOSE).matches
+      ) {
+        setSidebarOpen((open) => {
+          // Idempotent, so a double-invoked updater (StrictMode) is harmless.
+          if (open) sidebarAutoClosedRef.current = true;
+          return false;
+        });
+      }
       setArtifactPanel({
         refs: siblings,
         artifactId: ref.artifact_id,
@@ -534,6 +623,17 @@ export function ChatApp() {
   const closeArtifactPanel = useCallback(() => {
     rememberThreadScroll();
     setArtifactPanel(null);
+    if (sidebarAutoClosedRef.current) {
+      sidebarAutoClosedRef.current = false;
+      // Not below `md`: there the sidebar is a modal drawer, and closing a
+      // file must not throw one over the thread.
+      if (
+        typeof window.matchMedia === 'function' &&
+        window.matchMedia('(min-width: 768px)').matches
+      ) {
+        setSidebarOpen(true);
+      }
+    }
   }, [rememberThreadScroll]);
   // Prev/next inside the panel: the column keeps its width, so the thread's
   // scroll position is left alone — only the marked card changes.
@@ -993,6 +1093,7 @@ export function ChatApp() {
     // truth (plus any still-running generation) is reconciled after that.
     const wanted = new URLSearchParams(window.location.search).get('c');
     if (wanted) {
+      bootReconcileRef.current = wanted;
       setActiveId(wanted);
       activeIdRef.current = wanted;
       setPrefs(loadPrefs(window.localStorage, wanted));
@@ -1123,6 +1224,28 @@ export function ChatApp() {
           // the poll and with reopening a chat, so the three can no longer
           // disagree about what "no stream in this tab" means.
           await reconcileConversation(wanted);
+          if (
+            !cancelled &&
+            activeIdRef.current === wanted &&
+            !isStreaming(wanted) &&
+            store.get(wanted) === null &&
+            store.wasNotFound?.(wanted) === true
+          ) {
+            // The server answered 404 and nothing of it is cached: there is no
+            // such conversation for this account. Keeping the id on screen
+            // opened a silent New Chat under it — a first message would have
+            // been sent into a conversation that does not exist, and a reload
+            // repeated the whole thing. Say so, drop the id from the URL, and
+            // start the chat that is actually on screen from the defaults.
+            setMessages([]);
+            setActiveId(null);
+            activeIdRef.current = null;
+            setLoadingId(null);
+            setUrlConversation(null);
+            setPrefs({ ...DEFAULT_PREFS });
+            savePrefs(window.localStorage, null, DEFAULT_PREFS);
+            setMissingConversation(true);
+          }
         }
       } finally {
         settleReconcile();
@@ -1133,7 +1256,13 @@ export function ChatApp() {
         // loader itself on delivery.
         if (wanted && !cancelled && !isStreaming(wanted)) settleLoading(wanted);
       }
-    })();
+    })().finally(() => {
+      // Every exit, early returns included, hands the id back to the poll.
+      // Not after a cleanup: a StrictMode re-run has claimed it again.
+      if (!cancelled && bootReconcileRef.current === wanted) {
+        bootReconcileRef.current = null;
+      }
+    });
     return () => {
       cancelled = true;
     };
@@ -1198,6 +1327,21 @@ export function ChatApp() {
     });
   }, [refreshList]);
 
+  // 2026-09-13: a refused whole-thread PUT adopts the SERVER's copy into the
+  // cache (lib/history pushAll). Folded into the view at once, rather than on
+  // the next 8-second poll: until then the screen showed this tab's copy
+  // while the cache held the server's, and "Try again" in that window acted
+  // on a thread that no longer existed. A conversation with a stream in this
+  // tab is left to the stream, which owns the screen until it ends.
+  useEffect(() => {
+    const store = getHistoryStore();
+    return store.subscribe?.((id) => {
+      if (id !== activeIdRef.current || isStreaming(id)) return;
+      const cached = store.get(id);
+      if (cached) adoptServerMessages(id, cached.messages);
+    });
+  }, [adoptServerMessages]);
+
   // Poll for generations still running server-side: powers the sidebar
   // spinner across reloads and pulls in answers that finished while this
   // conversation wasn't on screen.
@@ -1206,6 +1350,8 @@ export function ChatApp() {
     async function tick() {
       if (document.hidden) return;
       const id = activeIdRef.current;
+      // The mount effect is reconciling this deep link right now.
+      if (id && bootReconcileRef.current === id) return;
       if (!id) {
         // No conversation open: the sidebar still wants the busy set, and a
         // failure to get it is not news worth showing anywhere.
@@ -1677,6 +1823,7 @@ export function ChatApp() {
         const title = text || first?.name || '';
         const conv = getHistoryStore().create(title);
         conversationId = conv.id;
+        setMissingConversation(false);
         setActiveId(conv.id);
         activeIdRef.current = conv.id;
         // The draft prefs become this conversation's prefs (V2 §4c).
@@ -1842,7 +1989,18 @@ export function ChatApp() {
       // is the single path the model is sent.
       const turns = [...messagesRef.current, userMessage];
       const context = [...threadRef.current, userMessage];
-      const answerBranch = branchForAppend(turns, context);
+      // 2026-09-13: in a conversation that already has versions the answer's
+      // tree position is also sent to the server (`answer_branch`), which
+      // stores it on the row. A row without one attaches to whatever precedes
+      // it, and after a fork that is not reliably this question. An ordinary
+      // linear send keeps its byte-identical body.
+      const announceBranch = hasBranches(messagesRef.current);
+      const answerBranch = announceBranch
+        ? answerBranchFor(turns, userMessage, intentId)
+        : branchForAppend(turns, context);
+      // Recorded WITH the intent, so a retry of this send — even one that
+      // never reached startStream (an upload that failed) — sends the same.
+      const intentBranch = announceBranch ? { answer_branch: answerBranch } : {};
       persist(conversationId, turns);
       // H-01: the turn goes on screen HERE, not as a side effect of opening a
       // stream. `persist` only writes the store and the sidebar, so a dataset
@@ -1868,13 +2026,13 @@ export function ChatApp() {
         // once it has. Moved on at every step below.
         userMessage.meta = {
           ...(userMessage.meta ?? {}),
-          intent: { id: intentId, state: 'waiting_for_attachments' },
+          intent: { id: intentId, state: 'waiting_for_attachments', ...intentBranch },
         };
         persist(conversationId, turns);
       } else {
         userMessage.meta = {
           ...(userMessage.meta ?? {}),
-          intent: { id: intentId, state: 'submitting' },
+          intent: { id: intentId, state: 'submitting', ...intentBranch },
         };
         persist(conversationId, turns);
         setStreaming(true);
@@ -2050,6 +2208,7 @@ export function ChatApp() {
               ...(userMessage.meta ?? {}),
               intent: {
                 id: intentId,
+                ...intentBranch,
                 state: 'unsent',
                 reason:
                   failed.length === 1
@@ -2069,7 +2228,7 @@ export function ChatApp() {
           // that says the request is on its way — with an id to ask about.
           userMessage.meta = {
             ...(userMessage.meta ?? {}),
-            intent: { id: intentId, state: 'submitting' },
+            intent: { id: intentId, state: 'submitting', ...intentBranch },
           };
           persist(conversationId, turns);
           pendingSendRef.current.delete(conversationId);
@@ -2080,6 +2239,7 @@ export function ChatApp() {
             turns,
             context,
             assistantBranch: answerBranch,
+            announceBranch,
             prefs: prefsRef.current,
             // NEW-14: the file itself does not travel — it is already on the
             // server, keyed by this conversation. Saying so is what lets the
@@ -2139,6 +2299,7 @@ export function ChatApp() {
         turns,
         context,
         assistantBranch: answerBranch,
+        announceBranch,
         prefs: prefsRef.current,
         // 2026-09-02: images accompany documents now ("compare the chart to
         // the report") — the document engine takes them as extra_images.
@@ -2269,35 +2430,31 @@ export function ChatApp() {
       // Never a default: sending a subset without being asked is precisely
       // the silent loss the notice exists to prevent.
 
-      // In a conversation that has versions, truncating would delete the
-      // OTHER branches too — they live in the same flat list. So the retry is
-      // appended as a newer answer to the same question instead, and the one
-      // it supersedes stays reachable. A conversation that has never been
-      // edited has no branches to protect and keeps the original behaviour
-      // exactly: confirmed truncate, then re-stream.
-      let turns = context;
-      if (hasBranches(all)) {
-        turns = all;
-      } else if (all.length > context.length + 1) {
-        // The sync path cannot shrink a thread (that guard is what stops a
-        // stale cache from destroying history), so this intentional shrink
-        // goes through the dedicated truncate endpoint — reached ONLY from
-        // here, and only after the user confirmed.
-        try {
-          await getHistoryStore().truncateMessages(id, context.length);
-        } catch (err) {
-          const { message, reload } = truncateFailure(err);
-          toast(message, 'error');
-          if (reload) {
-            const conv = await getHistoryStore()
-              .load(id, { force: true })
-              .catch(() => null);
-            if (conv && activeIdRef.current === id) setMessages(conv.messages);
-          }
-          return;
-        }
-        setMessages(context);
-      }
+      // EVERY regenerate is a VERSION (2026-09-13, the duplicate answers).
+      //
+      // This used to replace the old answer: in a conversation without
+      // versions it truncated through the history endpoint, but ONLY when
+      // this tab showed more than one answer under the question — and since
+      // V29 the server stores each answer itself, so whether that was true
+      // depended on whether an 8-second poll had loaded the server's rows.
+      // One click deleted every earlier answer without a confirmation (the
+      // dialog counted only the rows BELOW the button); the next, with no
+      // poll in between, stacked a copy. Now nothing is removed and nothing
+      // depends on what this tab has loaded: the new answer is a sibling of
+      // the old ones (`‹ 2 / 2 ›`), and the request tells the server where
+      // it goes (lib/regenerate).
+      const question = view[userIdx];
+      const intentId = intentForRegenerate(all, question);
+      const plan = planRegenerate(all, question, intentId);
+      // Land on the new version, the way an edit lands on `2 / 2` — including
+      // when an OLDER version is on screen, whose selection would otherwise
+      // keep it there while the new answer streams out of sight.
+      const fork = plan.assistantBranch.parent ?? ROOT;
+      setBranchSelection((prev) =>
+        prev[fork] === undefined
+          ? prev
+          : selectVersion(plan.turns, prev, fork, plan.assistantBranch.self),
+      );
 
       setStreaming(true);
       setEditingMessageId(null);
@@ -2305,12 +2462,13 @@ export function ChatApp() {
         // The SAME send when this is a retry of one that never landed, a new
         // one when the person is asking for a different answer to a question
         // that already has one.
-        intentId: intentForRetry(view[userIdx]),
-        intentMessageId: view[userIdx].id,
+        intentId,
+        intentMessageId: question.id,
         conversationId: id,
-        turns,
+        turns: plan.turns,
         context,
-        assistantBranch: branchForAppend(turns, context),
+        assistantBranch: plan.assistantBranch,
+        announceBranch: plan.announceBranch,
         prefs: prefsRef.current,
         images: resend.images,
         pdf: resend.pdf,
@@ -2428,7 +2586,12 @@ export function ChatApp() {
         ...(at === -1 ? [] : threadRef.current.slice(0, at)),
         edited,
       ];
-      const answerBranch = branchForAppend(turns, context);
+      // A rewrite is a DIFFERENT question, so it is a different send: a new
+      // intent, on the new version's own turn — and its answer's place in the
+      // tree travels with the request, so the row the server stores is filed
+      // under the edit and not under whatever it happens to follow.
+      const intentId = newIntentId();
+      const answerBranch = answerBranchFor(turns, edited, intentId);
 
       setEditingMessageId(null);
       // The new version remembers what the original remembered — every image
@@ -2448,14 +2611,13 @@ export function ChatApp() {
       setUnreachable(false);
       setStreaming(true);
       void startStream({
-        // A rewrite is a DIFFERENT question, so it is a different send: a new
-        // intent, on the new version's own turn.
-        intentId: newIntentId(),
+        intentId,
         intentMessageId: edited.id,
         conversationId: id,
         turns,
         context,
         assistantBranch: answerBranch,
+        announceBranch: true,
         prefs: prefsRef.current,
         images: resend.images,
         pdf: resend.pdf,
@@ -2471,26 +2633,15 @@ export function ChatApp() {
   );
 
   /**
-   * Regenerating an OLDER answer restarts the thread from that point and
-   * discards every later turn. That is destructive and irreversible, so it
-   * asks first; regenerating the last answer runs straight away.
+   * "Try again" on any answer, the last or an older one.
+   *
+   * There is nothing to confirm (2026-09-13): a regenerate adds a version and
+   * removes nothing, so the dialog that warned "This will delete all messages
+   * after this point" would describe something that no longer happens. The
+   * later turns stay reachable under the version they were asked on.
    */
   const regenerate = useCallback(
     (messageId: string) => {
-      // Once a conversation has versions, a retry adds an answer beside the
-      // old one and removes nothing — so there is nothing to warn about.
-      if (hasBranches(messagesRef.current)) {
-        void runRegenerate(messageId);
-        return;
-      }
-      const discarded = messagesDiscardedByRegenerate(
-        threadRef.current,
-        messageId,
-      );
-      if (discarded > 0) {
-        setPendingRegenerate({ messageId, discarded });
-        return;
-      }
       void runRegenerate(messageId);
     },
     [runRegenerate],
@@ -2520,8 +2671,8 @@ export function ChatApp() {
       // a `1 / 2` with nothing to navigate between. Re-asking as-is is what
       // Regenerate is for, so that is what it does (owner request 2026-09-03):
       // the SAME user turn, a new answer beside the old one, exactly as the
-      // "Try again" button would — confirmation for an older answer included,
-      // because the same rows are at stake. The comparison is the editor's own
+      // "Try again" button would — a version, never a deletion (2026-09-13).
+      // The comparison is the editor's own
       // normalisation (outer trim only): "Read these" → "Read these carefully"
       // and a moved line break are both real edits.
       if (next === (original.content ?? '').trim()) {
@@ -2586,17 +2737,22 @@ export function ChatApp() {
     setUnreachable(false);
     setStreaming(true);
     const context = view.slice(0, userIdx + 1);
+    const question = view[userIdx];
+    // A retry of a send that failed is the same send (F14): the server
+    // attaches to what it has rather than starting a second generation — and
+    // it re-sends the same `answer_branch` its first POST carried, so every
+    // attempt files its answer in one place (lib/regenerate). Nothing else is
+    // dropped from storage: only this send's own failure record.
+    const intentId = intentForRegenerate(all, question);
+    const plan = planRegenerate(all, question, intentId);
     void startStream({
-      // A retry of a send that failed is the same send (F14): the server
-      // attaches to what it has rather than starting a second generation.
-      intentId: intentForRetry(view[userIdx]),
-      intentMessageId: view[userIdx].id,
+      intentId,
+      intentMessageId: question.id,
       conversationId: id,
-      // Retrying must not drop the other branches from storage, so a branched
-      // conversation keeps its whole list and the answer is appended.
-      turns: hasBranches(all) ? all : context,
+      turns: plan.turns,
       context,
-      assistantBranch: branchForAppend(hasBranches(all) ? all : context, context),
+      assistantBranch: plan.assistantBranch,
+      announceBranch: plan.announceBranch,
       prefs: prefsRef.current,
       images: resend.images,
       pdf: resend.pdf,
@@ -2612,6 +2768,7 @@ export function ChatApp() {
   // answer is saved to history when it finishes.
   const newChat = useCallback(() => {
     setSearchOpen(false);
+    setMissingConversation(false);
     setActiveId(null);
     activeIdRef.current = null;
     setMessages([]);
@@ -2629,6 +2786,7 @@ export function ChatApp() {
   const selectConversation = useCallback(
     (id: string) => {
       const store = getHistoryStore();
+      setMissingConversation(false);
       setActiveId(id);
       activeIdRef.current = id;
       setPrefs(loadPrefs(window.localStorage, id));
@@ -3130,21 +3288,6 @@ export function ChatApp() {
         onClose={() => setSummaryOpen(false)}
       />
 
-      <ConfirmDialog
-        open={pendingRegenerate !== null}
-        title="Regenerate this response?"
-        body={`This will delete all messages after this point (${
-          pendingRegenerate?.discarded ?? 0
-        } message${pendingRegenerate?.discarded === 1 ? '' : 's'}).`}
-        confirmLabel="Regenerate"
-        onConfirm={() => {
-          const target = pendingRegenerate;
-          setPendingRegenerate(null);
-          if (target) void runRegenerate(target.messageId);
-        }}
-        onCancel={() => setPendingRegenerate(null)}
-      />
-
       {/* Portals to <body> — see the note in SearchPalette.tsx. */}
       <SearchPalette
         open={searchOpen}
@@ -3206,7 +3349,10 @@ export function ChatApp() {
                 // re-mounted the button and re-attached it (see Sidebar).
                 ref={sidebarToggleRef}
                 type="button"
-                onClick={() => setSidebarOpen(true)}
+                onClick={() => {
+                  sidebarAutoClosedRef.current = false;
+                  setSidebarOpen(true);
+                }}
                 aria-label="Show sidebar"
                 aria-expanded={false}
                 title="Show sidebar"
@@ -3215,7 +3361,7 @@ export function ChatApp() {
                 <IconSidebar size={17} />
               </button>
             )}
-            <h1 className="sr-only">{activeId ? activeTitle : APP_NAME}</h1>
+            <h1 className="sr-only">{activeId ? activeTitle : appName}</h1>
             {/* Share (2026-09-05). The header's one deliberate addition since
                 the engine badge was removed: an ACTION, not a passive label.
                 It appears only for a conversation that exists and has finished
@@ -3282,7 +3428,41 @@ export function ChatApp() {
                 <p className="text-sm text-muted">Loading conversation…</p>
               </div>
             ) : thread.length === 0 ? (
-              <EmptyState />
+              missingConversation && activeId === null ? (
+                <div className="relative h-full">
+                  {/* Over the greeting, not instead of it: the screen really
+                      is a new chat now, and says why it is not the one the
+                      link asked for. */}
+                  <div className="absolute inset-x-0 top-3 z-10 flex justify-center px-4">
+                    <div
+                      role="status"
+                      data-testid="conversation-not-found"
+                      className="flex w-full max-w-md items-start gap-2.5 rounded-ts border border-border bg-surface py-2.5 pl-3.5 pr-2 text-sm shadow-lg"
+                    >
+                      <IconAlert size={16} className="mt-0.5 shrink-0 text-muted" />
+                      <div className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                        <p className="font-medium text-ink">Conversation not found</p>
+                        <p className="mt-0.5 text-muted">
+                          That link is to a chat that was deleted or belongs to
+                          another account. This is a new chat.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setMissingConversation(false)}
+                        aria-label="Dismiss notice"
+                        title="Dismiss"
+                        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                      >
+                        <IconX size={14} />
+                      </button>
+                    </div>
+                  </div>
+                  <EmptyState />
+                </div>
+              ) : (
+                <EmptyState />
+              )
             ) : (
               <div className="mx-auto w-full max-w-thread space-y-6 px-4 py-6">
                 {thread.map((m, i) => {
@@ -3488,8 +3668,8 @@ export function ChatApp() {
               className="contents md:block md:h-full md:min-w-0"
               style={{
                 flexBasis: `${artifactPanelPct}%`,
-                minWidth: `min(${PANEL_MIN_PX}px, 62%)`,
-                maxWidth: `${PANEL_MAX_PX}px`,
+                minWidth: PANEL_MIN_WIDTH_CSS,
+                maxWidth: PANEL_MAX_WIDTH_CSS,
               }}
             >
               <ArtifactPanel

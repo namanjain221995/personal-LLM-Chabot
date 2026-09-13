@@ -127,7 +127,7 @@ export function AccessRemoved({
       <h1 className="mt-5 text-[30px] font-bold leading-[1.15] tracking-tight">
         {copy.title}
       </h1>
-      <p className="mt-3 text-sm leading-relaxed text-ink">
+      <p className="mt-3 text-sm leading-relaxed text-ink [overflow-wrap:anywhere]">
         {copy.lead}
         {when ? (
           <>
@@ -146,7 +146,7 @@ export function AccessRemoved({
         {contacts.length > 0 ? (
           <ul className="mt-3 space-y-1.5">
             {contacts.map((c) => (
-              <li key={c.email} className="text-sm">
+              <li key={c.email} className="text-sm [overflow-wrap:anywhere]">
                 <a
                   href={`mailto:${c.email}?subject=${encodeURIComponent(
                     `${APP_NAME} access`,

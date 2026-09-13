@@ -4,6 +4,8 @@ import {
   EXAMPLE_RESPONSE_ID,
   MODEL_ID,
   EXAMPLE_STATUS,
+  OCR_MODEL_ID,
+  VISION_MODEL_ID,
 } from '../samples';
 
 export const responses: DocPage = {
@@ -21,7 +23,11 @@ export const responses: DocPage = {
 POST /v1/responses
 ~~~
 
-Requires the \`responses.write\` scope.
+Requires the \`responses.write\` scope. Three models generate here —
+\`${MODEL_ID}\`, \`${VISION_MODEL_ID}\` and \`${OCR_MODEL_ID}\` — and one
+scope covers all of them; which of them your key may use is your project's
+model allowlist. The other models have endpoints of their own: see the
+[model reference](/docs/models).
 
 ~~~json
 {
@@ -40,17 +46,18 @@ Requires the \`responses.write\` scope.
 
 | Field | Type | Rule |
 | --- | --- | --- |
-| \`model\` | string | Required. A public model id your key may use. Otherwise \`404 model_not_found\`. |
-| \`input\` | string, or a list of messages | Required, non-empty. Over the model's input ceiling is \`400 context_length_exceeded\`. |
+| \`model\` | string | Required. A chat model id your key may use. Otherwise \`404 model_not_found\`; a model of another kind, such as an embeddings model, is a \`400\` naming \`model\`. |
+| \`input\` | string, or a list of messages | Required, non-empty. Over the model's input ceiling is \`400 context_length_exceeded\`. A \`user\` message may carry [images](/docs/images). |
 | \`instructions\` | string | Optional. Must not be blank when present. |
 | \`stream\` | boolean | Default \`false\`. See [streaming](/docs/streaming). |
 | \`background\` | boolean | Default \`false\`. See [background responses](/docs/background). |
-| \`max_output_tokens\` | integer | Optional, at least 1, at most the model's ceiling. |
-| \`temperature\` | number | Optional, \`0.0\` to \`2.0\`. Defaults to \`0.2\`, which is what the chat application asks for. |
+| \`max_output_tokens\` | integer | Optional, at least 1, at most the model's ceiling — 1,000,000 on \`${MODEL_ID}\`. Clamped to what your prompt leaves in the window; see below. |
+| \`temperature\` | number | Optional, \`0.0\` to \`2.0\`. Defaults to \`0.2\`, which is what the chat application asks for — except on \`${OCR_MODEL_ID}\`, where it defaults to \`0.0\`. |
 | \`metadata\` | object of strings | Optional. At most 16 keys; keys ≤ 64 characters, values ≤ 512 characters; strings only. |
 
-The whole body must be at most **1 MiB**, which is checked before it is
-parsed — over it is \`413 request_too_large\`.
+The whole body must be at most **20 MiB** — room for images — and all of the
+*text* in it together at most **1 MiB**. The body size is checked before it is
+parsed; either one over is \`413 request_too_large\`.
 
 \`stream\` and \`background\` cannot both be true. A background response is
 delivered by \`GET /v1/responses/{id}\` and by a webhook; there is no stream
@@ -75,8 +82,27 @@ an explicit conversation:
 ~~~
 
 The roles are \`system\`, \`user\` and \`assistant\`, and \`content\` is a
-string. \`instructions\`, when you send it, becomes the first system message,
-ahead of anything in \`input\`.
+string — or, on a \`user\` message to a model that accepts images, a list of
+\`input_text\` and \`input_image\` parts:
+
+~~~json
+{
+  "model": "${VISION_MODEL_ID}",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "input_text", "text": "What does this chart show?" },
+        { "type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo…" }
+      ]
+    }
+  ]
+}
+~~~
+
+Images are sent as \`data:\` URLs only, never as links; the rules and limits
+are on [images and OCR](/docs/images). \`instructions\`, when you send it,
+becomes the first system message, ahead of anything in \`input\`.
 
 The API is stateless: it remembers nothing between requests. A conversation
 is whatever you send in \`input\`.
@@ -110,11 +136,23 @@ limits or audit policy either. Those come from the key, and a hopeful
 
 ### \`max_output_tokens\`, precisely
 
-* Send a value: it must be between 1 and the model's ceiling. Above it is a
-  \`400\` — we will not silently clamp an explicit 100,000 down and then bill
-  you for an answer you believe is complete.
 * Send nothing: you get the platform default of **8,192**, clamped to the
   model's ceiling if that is lower.
+* Send a value above the model's ceiling — 1,000,000 on \`${MODEL_ID}\`,
+  24,576 on \`${VISION_MODEL_ID}\`, 8,192 on \`${OCR_MODEL_ID}\` — or above your
+  project's own ceiling: a \`400\`. That value could never be honoured.
+* Send a value within the ceiling that is more than your prompt leaves in the
+  context window: it is **clamped** to the room that is left. Input and output
+  share the window, so this is the only answer that is both honest and useful.
+* Either way the response says what was applied, in its own
+  \`max_output_tokens\` field, and \`incomplete_details\` says whether the
+  answer stopped because it reached it. Nothing is clamped silently.
+
+A long answer takes a long time — a million tokens is hours — and a
+synchronous request that runs past about 100 seconds can be cut off on the way
+to you. Above about 5,000 output tokens, [stream](/docs/streaming) or use
+[background](/docs/background). [Long outputs](/docs/long-output) has the
+numbers.
 
 ## The response
 
@@ -132,6 +170,8 @@ limits or audit policy either. Those come from the key, and a hopeful
       "content": [{ "type": "output_text", "text": "…" }]
     }
   ],
+  "max_output_tokens": 8192,
+  "incomplete_details": null,
   "usage": { "input_tokens": 37, "output_tokens": 112, "total_tokens": 149 }
 }
 ~~~
@@ -141,6 +181,8 @@ limits or audit policy either. Those come from the key, and a hopeful
 | \`id\` | \`resp_\` and 24 hex characters. Keep it: it is how you read, cancel and correlate the response. |
 | \`status\` | One of \`queued\`, \`in_progress\`, \`completed\`, \`failed\`, \`cancelled\`. |
 | \`output\` | A list, always. One assistant message today; it stays a list so a future item kind does not change the shape. |
+| \`max_output_tokens\` | The output ceiling **applied** to this generation, after any clamping. \`null\` only on a response created before 2026-09-13. |
+| \`incomplete_details\` | \`{"reason": "max_output_tokens"}\` when the answer stopped because it reached that ceiling, otherwise \`null\`. \`status\` is still \`completed\`: check this field to learn whether the text was cut. |
 | \`usage\` | \`null\` when the engine reported no counts. Never \`0\` for "not measured". |
 | \`error\` | Present only on a failed response, carrying the same \`code\` vocabulary as the HTTP envelope. |
 

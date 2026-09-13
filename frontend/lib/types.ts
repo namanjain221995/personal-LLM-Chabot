@@ -380,6 +380,15 @@ export interface SendIntent {
   attempt?: number;
   /** Why the intent is failed/unsent, in the SAFE public sentence. */
   reason?: string;
+  /**
+   * 2026-09-13: where this send's ANSWER belongs in the tree, as the POST
+   * told the server (`answer_branch`). Present only on sends that announce
+   * it — a regenerate, an edit, a send in a conversation that already has
+   * versions. Kept on the intent because a retry of the same intent must
+   * send the identical branch: the server files every attempt's answer under
+   * it, so a second value would make the retry a different version.
+   */
+  answer_branch?: BranchMeta;
 }
 
 /**
@@ -560,6 +569,13 @@ export interface Meta {
    * exactly once (the server dedupes appends carrying a known id).
    */
   generation_id?: string;
+  /**
+   * The send (V29 intent) this answer was generated for, as the server wrote
+   * it on the final meta and on the stored row. Read, never written, by the
+   * browser: it is how "Try again" knows a question's intent already has its
+   * answer, so a retry of it would only replay that answer (lib/regenerate).
+   */
+  intent_id?: string;
   /**
    * Set when the prompt had to be shortened to fit the model's window —
    * old turns dropped and/or an oversized message clipped. Surfaced inline so

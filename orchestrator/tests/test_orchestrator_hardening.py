@@ -542,8 +542,21 @@ def test_a_signed_in_upload_still_parses_its_form(alice, tmp_path, monkeypatch):
 
 def test_the_public_api_body_cap_is_the_contracts_one_mebibyte(probe_routes):
     """CONTRACT-3 §8/§12. Enforced here as well as in the router, so the cap
-    holds however the public surface evolves."""
-    assert app_main.body_limit_for_path("/v1/responses") == 1024 * 1024
+    holds however the public surface evolves.
+
+    Since the 2026-09-13 integration the middleware asks the public table
+    (`publicapi.models.body_cap_for`): 1 MiB for every `/v1` line except the
+    two generating routes (20 MiB, image parts) and transcriptions (26 MiB).
+    A route nobody named — this file's probe — stays at 1 MiB."""
+    from app.publicapi import models as public_models
+
+    assert app_main.body_limit_for_path("/v1/__hardening_probe") == 1024 * 1024
+    assert app_main.body_limit_for_path("/v1/embeddings") == 1024 * 1024
+    assert app_main.body_limit_for_path("/v1/responses", "GET") == 1024 * 1024
+    assert app_main.body_limit_for_path("/v1/responses") == public_models.max_media_body_bytes()
+    assert app_main.body_limit_for_path("/v1/audio/transcriptions") == (
+        public_models.max_audio_body_bytes()
+    )
 
 
 def test_an_oversize_v1_body_is_refused_in_the_public_error_envelope(probe_routes):

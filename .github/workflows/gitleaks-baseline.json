@@ -44,7 +44,18 @@
     "  * orchestrator/tests/test_api_platform_webhooks.py, commit 0d7093b, line 116",
     "                            - an assert naming the SECRET variable; no value on the line;",
     "  * docs/developer-platform/STANDARDS.md, commit 7ff6e15, lines 707 and 803",
-    "                            - the IETF Idempotency-Key draft's own example UUID."
+    "                            - the IETF Idempotency-Key draft's own example UUID.",
+    "",
+    "2026-09-14 (reviewed, three entropy hits from the PR-A integration series, none a credential):",
+    "  * orchestrator/tests/test_api_platform_webhook_growth.py, commit 1a866fc, line 46",
+    "                            - SECRET, a deliberately patterned fake webhook signing",
+    "                              fixture (`whsec_` + a readable phrase + counting hex);",
+    "  * frontend/content/docs/pages/longOutput.ts, commit 3c39f38, line 228",
+    "                            - a documentation example Idempotency-Key UUID, the same",
+    "                              shape as the background.ts and idempotency.ts entries;",
+    "  * frontend/tests/fe-audit-chat-responsive.test.tsx, commit af2f925, line 137",
+    "                            - an example.com URL whose query string ends in a placeholder",
+    "                              `token=`, used to test that a long URL wraps in a dialog."
   ],
   "reviewed": "2026-09-13",
   "findings": [

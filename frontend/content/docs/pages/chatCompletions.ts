@@ -1,5 +1,11 @@
 import type { DocPage } from '../types';
-import { API_BASE_URL, MODEL_ID, EXAMPLE_STATUS } from '../samples';
+import {
+  API_BASE_URL,
+  MODEL_ID,
+  EXAMPLE_STATUS,
+  OCR_MODEL_ID,
+  VISION_MODEL_ID,
+} from '../samples';
 
 export const chatCompletions: DocPage = {
   slug: 'chat-completions',
@@ -36,10 +42,11 @@ surface this platform develops; compatibility is for code you already have.
 
 | Field | Notes |
 | --- | --- |
-| \`model\` | Required. \`${MODEL_ID}\`. |
-| \`messages\` | Required. \`{role, content}\` turns; \`role\` is \`system\`, \`user\` or \`assistant\` and \`content\` is a string. |
+| \`model\` | Required. \`${MODEL_ID}\`, \`${VISION_MODEL_ID}\` or \`${OCR_MODEL_ID}\`. |
+| \`messages\` | Required. \`{role, content}\` turns; \`role\` is \`system\`, \`user\` or \`assistant\` and \`content\` is a string — or, on a \`user\` turn, a list of \`text\` and \`image_url\` parts (see [images](/docs/images)). |
 | \`stream\` | Optional. See below. |
-| \`max_tokens\` | Optional. The older spelling of \`max_output_tokens\`, and mapped to it. |
+| \`max_tokens\` | Optional. The older spelling of \`max_output_tokens\`, and mapped to it — up to the model's ceiling, clamped to what the prompt leaves in the window. |
+| \`max_completion_tokens\` | Optional. The newer spelling of the same thing. Send one or the other; both at once is a \`400\`. |
 | \`temperature\` | Optional, \`0.0\`–\`2.0\`. |
 | \`stream_options\` | Optional, and only \`{"include_usage": true}\`. |
 
@@ -56,10 +63,17 @@ express it.
 * **Unsupported parameters are rejected, not ignored.** The rule holds
   everywhere on \`/v1\`: if this platform cannot honour a field, you get a
   \`400\` naming it. Porting a client usually means deleting a few fields.
-* **The model list is short.** \`${MODEL_ID}\` is the id; a model your key may
-  not use is \`404\`, never \`403\`.
-* **Content is text.** A message's \`content\` is a string. Multimodal part
-  lists are not accepted.
+* **The model list is ours.** \`${MODEL_ID}\`, \`${VISION_MODEL_ID}\` and
+  \`${OCR_MODEL_ID}\` generate here; a model your key may not use is \`404\`,
+  never \`403\`. Embeddings, reranking and transcription have their own
+  endpoints — see the [model reference](/docs/models).
+* **Images are \`data:\` URLs.** An \`image_url\` part must carry the image
+  itself; a link to an image is refused, never fetched. Audio parts are not
+  accepted.
+* **The applied ceiling is reported.** The \`chat.completion\` object, and the
+  streamed chunk that carries \`finish_reason\`, add a top-level
+  \`max_output_tokens\`: the output ceiling applied after clamping.
+  \`finish_reason\` is \`length\` when the answer reached it.
 * **No tools.** See [tool calling](/docs/tools).
 * **Errors are TechSara's envelope.** \`code\`, \`type\`, \`param\`,
   \`request_id\` — see [errors](/docs/errors).
@@ -96,6 +110,7 @@ curl ${API_BASE_URL}/chat/completions \\
       "finish_reason": "stop"
     }
   ],
+  "max_output_tokens": 8192,
   "usage": { "prompt_tokens": 37, "completion_tokens": 112, "total_tokens": 149 }
 }
 ~~~
@@ -114,7 +129,8 @@ dialect, which is **not** the Responses event grammar:
   \`chat.completion.chunk\`;
 * the first chunk's delta announces the assistant role;
 * a chunk carrying \`finish_reason\` says why generation ended — \`stop\`, or
-  \`length\` when the answer hit its token ceiling;
+  \`length\` when the answer hit its token ceiling — and carries the applied
+  \`max_output_tokens\`;
 * the stream ends with the literal line \`data: [DONE]\`;
 * with \`"stream_options": {"include_usage": true}\`, exactly one extra chunk
   goes out before \`[DONE]\`, with an empty \`choices\` array and the usage
@@ -126,7 +142,7 @@ data: {"id":"…","object":"chat.completion.chunk","choices":[{"index":0,"delta"
 
 data: {"id":"…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"rieval"},"finish_reason":null}],"usage":null}
 
-data: {"id":"…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}
+data: {"id":"…","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"max_output_tokens":8192,"usage":null}
 
 data: [DONE]
 ~~~
@@ -142,8 +158,9 @@ data: {"id":"…","object":"chat.completion.chunk","choices":[],"usage":null,"er
 data: [DONE]
 ~~~
 
-A heartbeat comment (\`: ping\`) may appear between chunks so an idle proxy
-does not close the connection. Every conforming SSE parser drops comments;
+A heartbeat comment (\`: ping\`) goes out at least every 15 seconds while the
+model is quiet — for the whole of a long answer, hours if need be — so an idle
+proxy does not close the connection. Every conforming SSE parser drops comments;
 if you wrote your own, drop them too.
 
 ## Idempotency

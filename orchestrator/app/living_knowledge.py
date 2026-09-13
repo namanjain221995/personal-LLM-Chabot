@@ -31,29 +31,156 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import os
+import re
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, List, Optional, Sequence
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
 from . import db, metrics
 from .config import settings
-from .freshness import Freshness, Verdict, classify
+from .freshness import (
+    Freshness,
+    Verdict,
+    classify,
+    classify_offline,
+    clearly_timeless,
+    router_would_be_asked,
+    static_timeless_task,
+)
 from .web_memory import (
     Retrieval,
     _stale_after,
     as_sources,
+    cache_result,
     claims_block,
     claims_for,
     grounding_block,
     retrieve,
     staleness_note,
+    supersession_allowed,
     topical_block,
 )
 
 log = logging.getLogger(__name__)
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+
+# ---------------------------------------------------------------------------
+# Fast-effort pre-pass budget (performance plan item 2, 2026-09-13).
+#
+# Measured over 7 days before this: Fast/chat time to first token p50 1.46 s /
+# p95 6.16 s against an engine TTFT of 0.05-0.2 s. The pre-pass here was the
+# largest single share of the difference: the static-question retrieval cost
+# p50 0.72 s / p90 2.09 s (techsara_web_memory_seconds, n=462) and found
+# nothing on 282 of 308 static turns (92%); the freshness router added a mean
+# 0.216 s on 72% of turns, BEFORE retrieval started.
+#
+# These tunables are read here with config.py's own parsing rules until they
+# move into Settings under the same names; a Settings attribute of that name,
+# once it exists, wins. Think and Max read none of them.
+#
+# Revised 2026-09-13 after the prover's FIX_FIRST: with retrieval at 0.6 s the
+# flat 0.3 s deadline took prepare_fast answer@5 from 0.900 to 0.300 on the
+# web_eval harness (7 real topical hits answered from weights), and the router
+# skip answered "euro to dollar" / "is AWS down" from weights (live lookup 0/4
+# where HEAD made 4/4). The deadline now applies only while the pre-check has
+# not cleared the question, and the router skip is an allowlist of timeless
+# tasks (freshness.clearly_timeless).
+#
+# Revised again 2026-09-13 (closing engineer, second prover pass): BOTH
+# wall-clock bounds are now OFF by default. Under load they drop the very hits
+# they were tuned to keep: conc_eval at a 0.72 s retrieval with 24x200k-char
+# lexical pages answered 8/24 at c=8 and 15/48 at c=16 (HEAD 24/24, 48/48),
+# every loss topical_hit_budget or topical_deadline, and 24/24 with the budget
+# at 0. A bound measured from turn start cannot tell a slow hit under load
+# from a miss. What stays on is the one skip that loses nothing: the
+# pre-check proving that no stored page can pass the gate.
+# ---------------------------------------------------------------------------
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in _TRUTHY
+
+
+#: KNOWLEDGE_FAST_TOPICAL_DEADLINE_S — OPT-IN, default 0 (off). How long a
+#: Fast timeless question may wait for topical grounding while the pre-check
+#: has NOT yet said a page can pass the gate. 0 or below = no short deadline
+#: AND no hit budget: the whole wait as before 2026-09-13 (a proven miss still
+#: ends early). Setting it trades answers for latency under load (see above).
+_FAST_TOPICAL_DEADLINE_S = _env_float("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", 0.0)
+#: KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S — OPT-IN, default 0 (off); only read
+#: when the deadline above is on. How long the wait may run, from the start of
+#: the topical retrieval, once the pre-check HAS said a page can pass the
+#: gate. 1.5 s kept answer@5 at 0.900 one turn at a time and dropped 16 of
+#: 24 hits at c=8 (2026-09-13). 0 or below = no bound once cleared.
+_FAST_TOPICAL_HIT_BUDGET_S = _env_float("KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S", 0.0)
+#: KNOWLEDGE_FAST_TOPICAL_PRECHECK — ask the page vocabulary whether ANY page
+#: could pass the topical gate before waiting on the full hybrid retrieval.
+_FAST_TOPICAL_PRECHECK = _env_bool("KNOWLEDGE_FAST_TOPICAL_PRECHECK", True)
+#: FRESHNESS_FAST_SKIP_ROUTER — OPT-IN, default false (off; 2026-09-14). When
+#: on, settle a Fast question that is clearly a timeless task
+#: (freshness.clearly_timeless) as STATIC instead of asking the router. Off,
+#: every undecided Fast question asks the router as before: the allowlist
+#: still let 13 of 50 live-value questions in timeless-task shapes skip it.
+_FAST_SKIP_ROUTER = _env_bool("FRESHNESS_FAST_SKIP_ROUTER", False)
+#: KNOWLEDGE_FAST_CONCURRENT_RETRIEVE — start the time-sensitive retrieval
+#: while the router is still deciding, instead of after it.
+_FAST_CONCURRENT_RETRIEVE = _env_bool("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", True)
+
+
+def fast_topical_deadline_s() -> float:
+    return float(getattr(settings, "knowledge_fast_topical_deadline_s", _FAST_TOPICAL_DEADLINE_S))
+
+
+def fast_topical_hit_budget_s() -> float:
+    return float(getattr(settings, "knowledge_fast_topical_hit_budget_s", _FAST_TOPICAL_HIT_BUDGET_S))
+
+
+def fast_topical_precheck() -> bool:
+    return bool(getattr(settings, "knowledge_fast_topical_precheck", _FAST_TOPICAL_PRECHECK))
+
+
+def fast_skip_router() -> bool:
+    return bool(getattr(settings, "freshness_fast_skip_router", _FAST_SKIP_ROUTER))
+
+
+def fast_concurrent_retrieve() -> bool:
+    return bool(getattr(settings, "knowledge_fast_concurrent_retrieve", _FAST_CONCURRENT_RETRIEVE))
+
+
+def _quiet(fut: "asyncio.Future") -> "asyncio.Future":
+    """Mark an abandoned future's outcome as read, so a speculative run that
+    failed after it stopped mattering does not log 'exception never retrieved'."""
+    fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+    return fut
+
+
+#: Why a Fast answer went on without topical grounding it was still waiting
+#: for. Rides on Prepared.degraded (meta.knowledge.degraded) and on
+#: knowledge_degraded_total{reason}, next to rerank_busy and prepare_timeout.
+TOPICAL_DEADLINE = "topical_deadline"
+#: Why a Fast answer went on without grounding the pre-check had said a page
+#: COULD supply: the longer hit budget ran out too. Kept apart from
+#: TOPICAL_DEADLINE because this one is a likely real hit dropped — the
+#: failure the budget exists to prevent — and must be countable on its own.
+TOPICAL_HIT_BUDGET = "topical_hit_budget"
 
 
 def today_iso() -> str:
@@ -219,7 +346,354 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
     return f"{text} {' '.join(extra[:_CONTEXT_TERMS])}"
 
 
-async def _topical(question: str, out: Prepared) -> Prepared:
+#: The lexical floor BOTH topical gates share: `_topical_hit` below and the
+#: STATIC pre-gate in `web_memory._answerability`, without which the
+#: cross-encoder never judges a timeless question. A test pins the three
+#: literals together.
+_TOPICAL_LEXICAL_FLOOR = 0.34
+
+
+# ---------------------------------------------------------------------------
+# The pre-check's page vocabulary (2026-09-13, closing engineer).
+#
+# WHY NOT POSTGRESQL'S search_tsv ANY MORE. The first pre-check asked the GIN
+# index whether any page carried enough of the question's words. The prover
+# showed it was not sound, and on this box it is wrong in more ways than the
+# two it demonstrated, because search_tsv and the gate tokenise differently:
+#   - accents: the gate's `_WORD` splits "crème" into "cr" + "me", search_tsv
+#     holds 'crème' ("explain crème brûlée caramelising": pre-check False,
+#     HEAD grounded the answer);
+#   - length: search_tsv covers the first 200,000 chars; the dense index
+#     reaches 717,200 and a lexical window can sit anywhere ("orion-9 kestrel
+#     reasoning suite", answer at char 205,000: pre-check False, HEAD grounded);
+#   - the parser: on the 55432 test server to_tsvector keeps
+#     '/usr/local/bin/python', 'user@example.com', 'ab’cd' and 'cost…' as
+#     single lexemes, where `_WORD` yields "python", "example.com", "ab", "cost";
+#   - stemming: `_stem` meets "lens"/"lenses" at 'lens', snowball keeps
+#     'len' and 'lens' apart.
+# Each turns a page the gate accepts into a pre-check "no page can", and the
+# Fast answer is then given from weights where HEAD cited the page.
+#
+# SO THE PRE-CHECK NOW READS THE SAME TOKENS THE GATE READS. Every page's
+# title and full text go through `web_memory._terms`' own rules once per
+# process, and the set of stems is kept as a Bloom filter (no false
+# negatives: a wrong "maybe" only costs the pre-change wait). A page whose
+# vectors are waiting for a re-index (indexed_at IS NULL) also keeps the
+# stems of its previous version, which the dense index may still serve.
+# PostgreSQL is asked only for a one-row fingerprint of the corpus per turn,
+# and the vocabulary is brought up to date before any answer is given from
+# it; until then the pre-check says "could not tell".
+#
+# WHAT IS STILL NOT COVERED, measured as nothing and argued as rare: a
+# LanceDB chunk for a page that no longer exists in PostgreSQL (retrieve keeps
+# a dense hit without metadata), a title changed without a content change
+# while the index kept the old one, and a word fragment made by a chunk or
+# window edge ("configur|ation" cut into "configur").
+# ---------------------------------------------------------------------------
+
+#: Bloom filter shape. 16 bits and 4 hashes per stem: a false "maybe" on
+#: about 0.24% of stems at the minimum fill, which only ever means waiting.
+_VOCAB_BITS_PER_STEM = 16
+_VOCAB_HASHES = 4
+_VOCAB_MIN_BITS = 1 << 12
+_VOCAB_MAX_BITS = 1 << 24
+#: Tokenise in slices this long, cut at whitespace, yielding the GIL between
+#: them: one `findall` over a 2,367,944-char page otherwise holds it for
+#: about 80 ms, which every stream on the event loop would feel.
+_VOCAB_SLICE_CHARS = 65_536
+#: Pages read per query while (re)building.
+_VOCAB_FETCH_BATCH = 16
+#: Past these the vocabulary is not kept and the pre-check says "could not
+#: tell" (the pre-change wait), rather than grow without bound. The live
+#: corpus is 2,209 servable pages (2026-09-07).
+_VOCAB_MAX_PAGES = 100_000
+_VOCAB_MAX_TEXT_BYTES = 4 * 1024 * 1024 * 1024
+_VOCAB_MAX_BYTES = 256 * 1024 * 1024
+_UINT64 = (1 << 64) - 1
+_WHITESPACE = re.compile(r"\s")
+
+_VOCAB_FINGERPRINT_SQL = """
+    SELECT count(*) AS n, coalesce(max(id), 0) AS top,
+           coalesce(sum(hashtext(
+               coalesce(content_hash, '') || ':' || coalesce(octet_length(text), 0) || ':' ||
+               coalesce(title, '') || ':' || (indexed_at IS NULL)::text
+           )::bigint), 0) AS h
+      FROM web_pages"""
+
+
+def _page_stems(*texts: str) -> set:
+    """The set `web_memory._terms` would produce over `texts`, computed over
+    distinct words (a stem per word, not per occurrence)."""
+    from .web_memory import _STOP, _WORD, _stem
+
+    words: set = set()
+    for text in texts:
+        low = (text or "").lower()
+        pos, size = 0, len(low)
+        while pos < size:
+            end = size
+            if size - pos > _VOCAB_SLICE_CHARS:
+                cut = _WHITESPACE.search(low, pos + _VOCAB_SLICE_CHARS)
+                end = cut.start() if cut else size
+            words.update(_WORD.findall(low, pos, end))
+            pos = end
+            if pos < size:
+                time.sleep(0)
+    return {_stem(w) for w in words if w not in _STOP and len(w) > 1}
+
+
+def _stem_hashes(stems) -> List[int]:
+    return [hash(s) & _UINT64 for s in stems]
+
+
+def _bloom(stems: set) -> "tuple[int, bytes]":
+    import numpy as np
+
+    bits = _VOCAB_MIN_BITS
+    while bits < len(stems) * _VOCAB_BITS_PER_STEM and bits < _VOCAB_MAX_BITS:
+        bits <<= 1
+    field = np.zeros(bits, dtype=bool)
+    if stems:
+        h = np.array(_stem_hashes(stems), dtype=np.uint64)
+        h1, h2 = h & np.uint64(0xFFFFFFFF), (h >> np.uint64(32)) | np.uint64(1)
+        for i in range(_VOCAB_HASHES):
+            field[(h1 + np.uint64(i) * h2) & np.uint64(bits - 1)] = True
+    return bits, np.packbits(field, bitorder="little").tobytes()
+
+
+@dataclass
+class _VocabState:
+    fingerprint: tuple
+    #: page id -> (listing key, bits, filter bytes)
+    pages: Dict[int, tuple]
+    #: [(bits, uint8 matrix pages x bits/8)], one per filter size
+    matrices: list
+    #: Over a bound: kept so the same corpus is not measured again every turn.
+    disabled: bool = False
+
+    def could_pass(self, stems: set, need: int) -> bool:
+        """Does any page hold at least `need` of `stems`? Never a false no."""
+        import numpy as np
+
+        hashes = _stem_hashes(stems)
+        n = len(hashes)
+        for bits, matrix in self.matrices:
+            mask = bits - 1
+            pos = [((h & 0xFFFFFFFF) + i * ((h >> 32) | 1)) & mask for h in hashes for i in range(_VOCAB_HASHES)]
+            cols = np.fromiter((p >> 3 for p in pos), dtype=np.intp, count=len(pos))
+            bit = np.fromiter((1 << (p & 7) for p in pos), dtype=np.uint8, count=len(pos))
+            present = ((matrix[:, cols] & bit) != 0).reshape(matrix.shape[0], n, _VOCAB_HASHES).all(axis=2)
+            if bool((present.sum(axis=1) >= need).any()):
+                return True
+        return False
+
+
+def _matrices(pages: Dict[int, tuple]) -> list:
+    import numpy as np
+
+    by_size: Dict[int, List[bytes]] = {}
+    for _key, bits, blob in pages.values():
+        by_size.setdefault(bits, []).append(blob)
+    return [
+        (bits, np.frombuffer(b"".join(blobs), dtype=np.uint8).reshape(len(blobs), bits // 8))
+        for bits, blobs in sorted(by_size.items())
+    ]
+
+
+class _PageVocabulary:
+    """Per-process stems of every stored page, kept in step with PostgreSQL."""
+
+    def __init__(self) -> None:
+        self.state: Optional[_VocabState] = None
+        self._sync_lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._sync_lock:
+            self.state = None
+
+    def current(self) -> Optional[_VocabState]:
+        """The vocabulary as of the corpus right now, or None when it cannot
+        be had without waiting (another thread is building it) or at all.
+        Blocking; no pooled connection is held while pages are tokenised."""
+        with db.connection() as con:
+            row = con.execute(_VOCAB_FINGERPRINT_SQL).fetchone()
+        fingerprint = (int(row["n"]), int(row["top"]), int(row["h"]))
+        state = self.state
+        if state is None or state.fingerprint != fingerprint:
+            if fingerprint[0] > _VOCAB_MAX_PAGES:
+                return None
+            if not self._sync_lock.acquire(blocking=False):
+                return None
+            try:
+                state = self.state
+                if state is None or state.fingerprint != fingerprint:
+                    state = self._sync(fingerprint, state)
+                    self.state = state
+            finally:
+                self._sync_lock.release()
+        return None if state.disabled else state
+
+    def _sync(self, fingerprint: tuple, old: Optional[_VocabState]) -> Optional[_VocabState]:
+        with db.connection() as con:
+            listing = con.execute(
+                """SELECT id, content_hash, octet_length(text) AS len,
+                          md5(coalesce(title, '')) AS th, (indexed_at IS NULL) AS pending
+                     FROM web_pages"""
+            ).fetchall()
+        if sum(int(r["len"] or 0) for r in listing) > _VOCAB_MAX_TEXT_BYTES:
+            log.warning("topical pre-check: corpus text over %d bytes; pre-check says 'could not tell'", _VOCAB_MAX_TEXT_BYTES)
+            return _VocabState(fingerprint=fingerprint, pages={}, matrices=[], disabled=True)
+        previous = old.pages if old is not None else {}
+        pages: Dict[int, tuple] = {}
+        todo: Dict[int, tuple] = {}
+        for r in listing:
+            key = (r["content_hash"], r["len"], r["th"], bool(r["pending"]))
+            kept = previous.get(int(r["id"]))
+            if kept is not None and kept[0] == key:
+                pages[int(r["id"])] = kept
+            else:
+                todo[int(r["id"])] = key
+        ids = list(todo)
+        size = sum(len(p[2]) for p in pages.values())
+        for start in range(0, len(ids), _VOCAB_FETCH_BATCH):
+            batch = ids[start : start + _VOCAB_FETCH_BATCH]
+            pending = [i for i in batch if todo[i][3]]
+            versions = {}
+            with db.connection() as con:
+                rows = con.execute(
+                    "SELECT id, title, text FROM web_pages WHERE id = ANY(%s)", (batch,)
+                ).fetchall()
+                if pending:
+                    versions = {
+                        int(v["page_id"]): v
+                        for v in con.execute(
+                            """SELECT DISTINCT ON (page_id) page_id, title, text
+                                 FROM web_page_versions WHERE page_id = ANY(%s)
+                                ORDER BY page_id, superseded_at DESC""",
+                            (pending,),
+                        ).fetchall()
+                    }
+            for r in rows:
+                pid = int(r["id"])
+                prior = versions.get(pid) or {}
+                stems = _page_stems(r["title"] or "", r["text"] or "", prior.get("title") or "", prior.get("text") or "")
+                bits, blob = _bloom(stems)
+                pages[pid] = (todo[pid], bits, blob)
+                size += len(blob)
+                if size > _VOCAB_MAX_BYTES:
+                    log.warning("topical pre-check: vocabulary over %d bytes; pre-check says 'could not tell'", _VOCAB_MAX_BYTES)
+                    return _VocabState(fingerprint=fingerprint, pages={}, matrices=[], disabled=True)
+        return _VocabState(fingerprint=fingerprint, pages=pages, matrices=_matrices(pages))
+
+
+_page_vocabulary = _PageVocabulary()
+
+
+def _topical_precheck(question: str) -> Optional[bool]:
+    """Could ANY stored page pass the topical gate? False only when none can.
+
+    Sync; runs in the DB thread.
+
+    WHY IT IS SOUND. A topical hit needs `lexical >= 0.34` on some candidate:
+    directly in `_topical_hit`, and through `_answerability`, which judges a
+    STATIC question only when a candidate already clears dense >= 0.35 AND
+    lexical >= 0.34. `_lexical_score` counts at most 1 per distinct stem of
+    `_terms(question)` found in the candidate's title or passage (title 1,
+    body 0.5), so 0.34 over n stems needs at least ceil(0.34 * n) of them in
+    the title or passage — and both are text of one stored page, whose stems
+    `_page_vocabulary` holds in full (see the block comment above for what it
+    does not hold).
+
+    None = could not tell (the vocabulary is being built by another turn, is
+    over its bounds, or the database failed): the caller must not skip on it.
+    """
+    from .web_memory import _terms
+
+    stems = set(_terms(question))
+    n = len(stems)
+    if n == 0:
+        return False  # lexical is 0 for every page; neither gate can pass
+    need = math.ceil(_TOPICAL_LEXICAL_FLOOR * n - 1e-9)
+    try:
+        state = _page_vocabulary.current()
+        if state is None:
+            return None
+        return state.could_pass(stems, need)
+    except Exception:  # noqa: BLE001 — a pre-check must never cost grounding
+        log.debug("topical pre-check unavailable", exc_info=True)
+        return None
+
+
+async def _fast_topical_retrieval(question: str, out: Prepared) -> Optional[Retrieval]:
+    """The STATIC retrieval under Fast's budget, or None when it was skipped.
+
+    The pre-check runs BESIDE the retrieval, not ahead of it, so a question
+    that does have a strong page pays nothing extra for it. How long the
+    retrieval may take depends on what the pre-check has said so far:
+
+      "no page can"     -> skip now: a proven miss, not a degraded answer
+      "a page can"      -> the pre-change wait, unless the opt-in hit budget
+                           (KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S) is on:
+                           measured from the start, never shorter than the
+                           short deadline
+      not answered yet  -> the pre-change wait, unless the opt-in short
+                           deadline (KNOWLEDGE_FAST_TOPICAL_DEADLINE_S) is on
+      could not tell    -> the pre-change wait: no bound here at all (the
+                           caller's KNOWLEDGE_PREPARE_DEADLINE_S still holds)
+      pre-check off     -> the pre-change wait: without it a deadline cannot
+                           tell a hit from a miss, and dropping hits is the
+                           failure measured on 2026-09-13 (answer@5 0.9 -> 0.3)
+
+    Whichever bound fires first, the model answers without grounding and the
+    miss is recorded on Prepared.degraded and knowledge_degraded_total.
+    """
+    short = fast_topical_deadline_s()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    task = asyncio.ensure_future(retrieve(question, level=Freshness.STATIC, top_k=4))
+    pre: Optional[asyncio.Future] = None
+    if fast_topical_precheck():
+        pre = _quiet(asyncio.ensure_future(db.run_in_thread(_topical_precheck, question)))
+    # The bound in force: (absolute end or None, the reason recorded if it fires).
+    ends: Optional[float] = start + short if (pre is not None and short > 0) else None
+    reason = TOPICAL_DEADLINE
+    try:
+        while True:
+            waiting = {task} if pre is None else {task, pre}
+            timeout = None if ends is None else max(0.0, ends - loop.time())
+            done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            if pre is not None and pre in done:
+                try:
+                    could = pre.result()
+                except Exception:  # noqa: BLE001
+                    could = None
+                pre = None
+                metrics.topical_precheck("miss" if could is False else "hit" if could else "fail")
+                if could is False:
+                    return None
+                if could:
+                    # A short deadline of 0 is the documented rollback to the
+                    # pre-change wait, so it switches the hit budget off too.
+                    budget = fast_topical_hit_budget_s()
+                    ends = start + max(budget, short) if (budget > 0 and short > 0) else None
+                    reason = TOPICAL_HIT_BUDGET
+                else:
+                    ends = None  # could not tell: wait as before 2026-09-13
+                continue
+            # A bound fired. The model answers from its own knowledge, exactly
+            # as a static_model turn does, and the miss is countable.
+            out.degraded = reason
+            metrics.inc("knowledge_degraded_total", reason=reason)
+            return None
+    finally:
+        for pending in (task, pre):
+            if pending is not None and not pending.done():
+                pending.cancel()
+
+
+async def _topical(question: str, out: Prepared, *, effort: str = "") -> Prepared:
     """A timeless question answered from a STRONG local match, or nothing.
 
     This is what makes an indexed site a knowledge base: "how do I enable X"
@@ -227,9 +701,19 @@ async def _topical(question: str, out: Prepared) -> Prepared:
     documentation, cited, in any conversation and any mode. The gate is
     deliberately high — a strong hybrid score AND topical relevance — so an
     ordinary question never drags in a loosely related page.
+
+    At Fast effort the retrieval is bounded (`_fast_topical_retrieval`);
+    Think and Max wait for it as they always have.
     """
     started = time.perf_counter()
-    result = await retrieve(question, level=Freshness.STATIC, top_k=4)
+    if effort == "fast":
+        fetched = await _fast_topical_retrieval(question, out)
+        if fetched is None:
+            _decided(out, "static_model")
+            return out
+        result = fetched
+    else:
+        result = await retrieve(question, level=Freshness.STATIC, top_k=4)
     out.retrieval = result
     # BOTH signals, not a high blend. Measured on the live corpus
     # (2026-09-02): the right documentation page scored 0.44-0.61 — a dense
@@ -245,7 +729,7 @@ async def _topical(question: str, out: Prepared) -> Prepared:
             return True
         return (
             e.dense >= 0.35
-            and e.lexical >= 0.34
+            and e.lexical >= _TOPICAL_LEXICAL_FLOOR
             and e.score >= settings.living_knowledge_topical_min_score
         )
 
@@ -299,25 +783,85 @@ async def prepare(
     question = resolve_from_history(question, history)
 
     now = datetime.now(timezone.utc)
-    verdict = await classify(
-        question,
-        now_year=now.year,
-        allow_router=settings.freshness_router_enabled,
-    )
-    out.verdict = verdict
-    metrics.freshness_classified(verdict.requirement.value, verdict.reason)
-
-    if not verdict.needs_evidence:
-        # Timeless. The model's own knowledge is the right source — unless
-        # this platform has already read something that answers it closely.
-        if settings.living_knowledge_topical:
-            return await _topical(question, out)
-        return out
-
+    fast = effort == "fast"
+    router_on = bool(settings.freshness_router_enabled)
+    # A time-sensitive retrieval started while the router decides (Fast only).
+    speculative: Optional[asyncio.Future] = None
+    speculative_verdict: Optional[Verdict] = None
     started = time.perf_counter()
-    result = await retrieve(
-        question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
-    )
+    try:
+        if fast and router_on and router_would_be_asked(question, now_year=now.year):
+            if fast_skip_router() and clearly_timeless(question, now_year=now.year):
+                # OPT-IN (FRESHNESS_FAST_SKIP_ROUTER, default off). A timeless
+                # task with no live-value signal in it ("write me a haiku",
+                # "hello, how are you?"): no router round trip. Any doubt goes
+                # to the router below, as it did before. With the default,
+                # every Fast question takes the router branch.
+                verdict = static_timeless_task()
+            else:
+                if fast_concurrent_retrieve():
+                    # The router answers RECENT for a question that carries a
+                    # recency word far more often than anything else, so the
+                    # retrieval that answer needs starts NOW, from the offline
+                    # verdict re-labelled as the router's. It is used only if
+                    # the real verdict reads it identically (below).
+                    # It never WRITES the evidence cache (2026-09-13, second
+                    # prover pass): the key carries no verdict, so a partition
+                    # computed under a guessed 'router' reason that HEAD would
+                    # never have computed could otherwise be served to a later
+                    # turn whose router timed out ('default', no supersession).
+                    # A reused result is cached below, under the real verdict.
+                    speculative_verdict = replace(
+                        classify_offline(question, now_year=now.year), reason="router"
+                    )
+                    speculative = _quiet(asyncio.ensure_future(
+                        retrieve(
+                            question,
+                            level=speculative_verdict.requirement,
+                            top_k=5,
+                            effort=effort,
+                            verdict=speculative_verdict,
+                            cache_store=False,
+                        )
+                    ))
+                verdict = await classify(question, now_year=now.year, allow_router=True)
+        else:
+            verdict = await classify(question, now_year=now.year, allow_router=router_on)
+        out.verdict = verdict
+        metrics.freshness_classified(verdict.requirement.value, verdict.reason)
+
+        # `retrieve` reads the verdict for ONE thing: whether supersession may
+        # run. Same level, same answer to that, same retrieval.
+        reusable = (
+            speculative is not None
+            and speculative_verdict is not None
+            and verdict.requirement is speculative_verdict.requirement
+            and supersession_allowed(verdict.requirement, verdict)
+            == supersession_allowed(speculative_verdict.requirement, speculative_verdict)
+        )
+        if speculative is not None and not reusable:
+            speculative.cancel()
+
+        if not verdict.needs_evidence:
+            # Timeless. The model's own knowledge is the right source — unless
+            # this platform has already read something that answers it closely.
+            if settings.living_knowledge_topical:
+                return await _topical(question, out, effort=effort)
+            return out
+
+        if reusable:
+            result = await speculative  # type: ignore[misc]
+            cache_result(question, level=verdict.requirement, top_k=5, result=result)
+        else:
+            # The call Think/Max always made. A cancelled or diverging
+            # speculative run never wrote the cache, so reading it is safe.
+            started = time.perf_counter()
+            result = await retrieve(
+                question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
+            )
+    finally:
+        if speculative is not None and not speculative.done():
+            speculative.cancel()
     metrics.web_memory_query(
         hit=result.found,
         fresh=result.found and result.newest_age <= verdict.max_age_seconds,

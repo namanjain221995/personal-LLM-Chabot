@@ -594,6 +594,16 @@ class Settings:
         #: It exists to catch degenerate repetition loops only — at the
         #: measured 46.6 tok/s, 1800s ≈ 84k tokens, far past any real answer.
         self.gen_wall_clock_s: float = _float("GEN_WALL_CLOCK_S", 1800.0)
+        #: SSE_COALESCE_MS — how long the relay may hold a live token or
+        #: reasoning frame so the next ones share one HTTP body write
+        #: (app/sse.py, LiveGeneration.follow). 0 turns coalescing off.
+        #: Measured 2026-09-13: the engine decodes ~105 tok/s single-stream
+        #: while people SAW p50 87.6 tok/s (usage_events, n=13) — one ASGI
+        #: send per token through the proxy, Cloudflare and a React render
+        #: each. 25 ms carries two or three tokens: 300 tokens at 105 tok/s
+        #: went from 301 writes to 121 (stub run). Parsed as sse.py parses
+        #: it: blank means the default, a negative value clamps to 0.
+        self.sse_coalesce_ms: float = max(0.0, _float("SSE_COALESCE_MS", 25.0))
 
         # --- Thinking token budgets by effort (Phase 1, 2026-08-19) ---
         # ACTIVE ONLY when THINKING_BUDGET_MODE=client (see above). ---
@@ -702,6 +712,15 @@ class Settings:
         self.cross_chat_semantic_enabled: bool = _bool(
             "CROSS_CHAT_SEMANTIC_ENABLED", True
         )
+        # CROSS_CHAT_EMBEDDINGS_CACHE_S — seconds one user's recall candidate
+        # rows are reused (app/memory_semantic.py). Measured 2026-09-13: every
+        # assistant turn re-read the newest 500 message_embeddings rows WITH
+        # their content — 754 kB of text plus 2 MB of vectors for the owner
+        # (1,303 rows) — and lowercased and split every one on the event loop.
+        # A backfill write invalidates the entry and a delete moves the
+        # count/max fingerprint, so the accepted staleness is a rename or an
+        # in-place message edit showing for up to this long. 0 disables.
+        self.cross_chat_embeddings_cache_s: float = _float("CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
         # Cosine floor below which a candidate is noise, not a memory.
         # A hit must clear BOTH floors: this absolute one, and a fraction of
         # the best hit in the same query (below). The absolute floor alone
@@ -862,6 +881,54 @@ class Settings:
         # long before the answer proceeds without it. A wedged sidecar costs
         # a request this budget, never the generation wall clock.
         self.knowledge_prepare_deadline_s: float = _float("KNOWLEDGE_PREPARE_DEADLINE_S", 12.0)
+        # --- Fast pre-pass budget (performance plan item 2, 2026-09-13) ----
+        # Measured over the 7 days before: Fast/chat time to first token p50
+        # 1.46 s / p95 6.16 s against an engine TTFT of 0.05-0.2 s. The
+        # static-question retrieval cost p50 0.72 s / p90 2.09 s
+        # (techsara_web_memory_seconds, n=462) and found nothing on 282 of
+        # 308 static turns (92%); the freshness router added a mean 0.216 s
+        # on 72% of turns BEFORE retrieval started. Think and Max read none
+        # of these (app/living_knowledge.py).
+        #
+        # KNOWLEDGE_FAST_TOPICAL_DEADLINE_S — OPT-IN, default 0 (off). How
+        # long a Fast timeless question waits for topical grounding while the
+        # pre-check has NOT yet said a page can pass the gate. 0 or below =
+        # no short deadline and no hit budget (the behaviour before
+        # 2026-09-13). Off by default since the second prover pass the same
+        # day: under load a wall-clock bound drops real hits (conc_eval at a
+        # 0.72 s retrieval: 8/24 grounded at c=8 and 15/48 at c=16, HEAD
+        # 24/24 and 48/48).
+        self.knowledge_fast_topical_deadline_s: float = _float("KNOWLEDGE_FAST_TOPICAL_DEADLINE_S", 0.0)
+        # KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S — OPT-IN, default 0 (off);
+        # read only while the deadline above is on. How long that wait may
+        # run, from the start of the topical retrieval, once the pre-check
+        # HAS said a page can pass the gate. 1.5 s kept answer@5 at 0.900 one
+        # turn at a time and was every loss at c=8/16 (2026-09-13).
+        self.knowledge_fast_topical_hit_budget_s: float = _float("KNOWLEDGE_FAST_TOPICAL_HIT_BUDGET_S", 0.0)
+        # KNOWLEDGE_FAST_TOPICAL_PRECHECK — ask the per-process page
+        # vocabulary (the gate's own tokens) whether ANY page could pass the
+        # topical gate before waiting on the full hybrid retrieval; the 92%
+        # of static turns that find nothing stop there. It can only rule a
+        # question out, never add grounding.
+        self.knowledge_fast_topical_precheck: bool = _bool("KNOWLEDGE_FAST_TOPICAL_PRECHECK", True)
+        # FRESHNESS_FAST_SKIP_ROUTER — OPT-IN, default false (off): every
+        # Fast question the regex pass leaves undecided asks the router, as
+        # before 2026-09-13. When on, a Fast question that positively reads
+        # as a timeless task with no live-value signal
+        # (freshness.clearly_timeless) is settled STATIC without the router
+        # (mean 0.216 s, p95 0.483 s, 2026-09-13). Off by default since the
+        # re-prover of 2026-09-14: the allowlist's vetoes are word lists, and
+        # 13 of 50 new live-value questions in timeless-task shapes ("write a
+        # poem for our cji", "draft a letter to indigo about their baggage
+        # allowance", "write an essay on unemployment figures in india")
+        # still skipped the router and answered from weights where HEAD made
+        # the Fast live lookup (37/50 vs 50/50). Applies only while
+        # FRESHNESS_ROUTER_ENABLED is on.
+        self.freshness_fast_skip_router: bool = _bool("FRESHNESS_FAST_SKIP_ROUTER", False)
+        # KNOWLEDGE_FAST_CONCURRENT_RETRIEVE — start the time-sensitive
+        # retrieval while the router is still deciding instead of after it,
+        # so the router's 0.216 s mean no longer sits in front of it.
+        self.knowledge_fast_concurrent_retrieve: bool = _bool("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", True)
         self.knowledge_local_first_confidence: float = _float("KNOWLEDGE_LOCAL_FIRST_CONFIDENCE", 0.85)
         # Public-scope evidence cache: normalised question -> ranked evidence,
         # for a few seconds. Holds ONLY public web evidence (no user or
@@ -1232,6 +1299,34 @@ class Settings:
         # single-user box needs and leaves room for psql and the migration tool.
         self.app_db_pool_min: int = _int("APP_DB_POOL_MIN", 2)
         self.app_db_pool_max: int = _int("APP_DB_POOL_MAX", 16)
+        # CONTEXT_CONCURRENT_READS — start a chat turn's independent context
+        # reads (facts, cross-chat recall, repo keys, pages, documents,
+        # videos, uploads, recall, summary, artifacts) together; the prompt
+        # is still built by the same sequential code (app/main.py
+        # _ContextReads). Measured 2026-09-13: that section cost p50 209 ms /
+        # p95 352 ms even for 1-3 message histories (query_trace_events,
+        # n=46); a stub run with 12 ms reads and 30 ms embeddings went from
+        # p50 143.8 ms sequential to 47.6 ms concurrent. false restores the
+        # one-at-a-time reads exactly.
+        self.context_concurrent_reads: bool = _bool("CONTEXT_CONCURRENT_READS", True)
+        # CONTEXT_READS_CONCURRENCY — the most of those reads in flight per
+        # turn. Each holds one of the APP_DB_POOL_MAX connections above and
+        # an anyio thread (40, shared with the sync routes) for a few ms, so
+        # a burst of turns must not drain either; this is the lever when pool
+        # wait time rises. main.py floors it at 1 where it is used.
+        self.context_reads_concurrency: int = _int("CONTEXT_READS_CONCURRENCY", 6)
+        # CONTEXT_READS_PROCESS_LIMIT — the most of those reads running AHEAD
+        # of their call sites across ALL turns at once (2026-09-13, second
+        # prover pass). The per-turn bound alone let 16 turns ask for ~96
+        # reads and made c=16 TTFT worse than HEAD (cached p50 601.9 -> 700.5
+        # ms). A read that has no slot when its call site needs it is read
+        # inline, as before the concurrency, so a burst degrades to HEAD's
+        # shape plus these slots. main.py floors it at 1 where it is used.
+        self.context_reads_process_limit: int = _int("CONTEXT_READS_PROCESS_LIMIT", 6)
+        # CONTEXT_READS_CONCURRENT_MAX_TURNS — a turn runs its reads ahead
+        # only while fewer than this many turns already do; past it the turn
+        # reads one at a time, as before 2026-09-13. 0 = no limit.
+        self.context_reads_concurrent_max_turns: int = _int("CONTEXT_READS_CONCURRENT_MAX_TURNS", 0)
         # Seconds a caller waits for a free connection before giving up, and
         # the server-side statement timeout. Both exist so a pathological query
         # or an exhausted pool surfaces as an error instead of a hung request.
@@ -1409,6 +1504,119 @@ class Settings:
         self.public_api_idempotency_in_flight_lease_seconds: float = _float(
             "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS",
             max(3600.0, 2.0 * float(self.gen_wall_clock_s)),
+        )
+
+        # --- Every model on /v1, and 1,000,000 output tokens (2026-09-13) ---
+        # Declared here by the integration of the six-model wave. Until now
+        # each reader fell back to os.environ through `registry.setting_int` /
+        # `setting_float` (or `webhooks.queue._setting_number`) with THIS
+        # file's `_int` / `_float` rule, so the defaults below are the ones
+        # that were already in force; declaring them makes them visible and
+        # makes a malformed value fail at start-up like every other setting.
+        # The readers prefer the attribute, so a test that wants a different
+        # value sets `settings.<name>` (or deletes it to exercise the
+        # environment path). CONTRACT §8.3, §12.3, §12.4 are the reference.
+        #
+        # The public ceiling for `max_output_tokens` (owner decision): not the
+        # chat app's MODEL_MAX_OUTPUT, which `/v1` no longer reads.
+        self.public_api_max_output_tokens: int = _int("PUBLIC_API_MAX_OUTPUT_TOKENS", 1_000_000)
+        # Wall clock per generation: min(this, max(floor, prefill allowance +
+        # planned output / minimum decode rate)). The floor for techsara-35b
+        # is GEN_WALL_CLOCK_S; 900 s is the measured full-window prefill
+        # (878 s at 949,915 tokens, 2026-08-29) and 50 tok/s sits under the
+        # measured 71-101. A 1,000,000-token request gets 20,900 s.
+        self.public_api_gen_wall_clock_s: float = _float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)
+        self.public_api_main_prefill_allowance_s: float = _float(
+            "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0
+        )
+        self.public_api_main_min_decode_tokens_per_s: float = _float(
+            "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", 50.0
+        )
+        # Capacity gates (publicapi/capacity.py): one per shared engine, for
+        # every caller, first come first served; a refusal is 503
+        # model_unavailable with Retry-After, never 429. The main gates are
+        # chosen from the PLANNED OUTPUT only (integration 2026-09-13; the
+        # input + output footprint at the byte bound sent ordinary documents
+        # through `main.long`): `main.long` one at a time above
+        # PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS — two such answers are the whole KV
+        # pool — and `main.extended` above PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS,
+        # capped by admission's LONG_OUTPUT seats and KV budget.
+        # PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT is the gate's own count, used
+        # when admission does not take the answer into LONG_OUTPUT (a LONG
+        # prompt, or thresholds set apart) or has no front door.
+        self.public_api_main_solo_output_tokens: int = _int("PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS", 800_000)
+        self.public_api_main_long_max_concurrent: int = _int("PUBLIC_API_MAIN_LONG_MAX_CONCURRENT", 1)
+        # Defaults to the public default output (the public CEILING before
+        # 2026-09-13), read from its own setting as the reader does.
+        self.public_api_main_extended_output_tokens: int = _int(
+            "PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS", self.public_api_default_max_output_tokens
+        )
+        self.public_api_main_extended_max_concurrent: int = _int(
+            "PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT", 2
+        )
+        # How long a sync / streaming / embeddings / rerank / transcription
+        # request waits for its gate BEFORE the status line (under
+        # Cloudflare's 100 s origin timeout); a background job waits inside
+        # its task with the row `queued`; a gate that yields to chat waits for
+        # chat at most this long per attempt.
+        self.public_api_gate_wait_s: float = _float("PUBLIC_API_GATE_WAIT_S", 30.0)
+        self.public_api_background_gate_wait_s: float = _float(
+            "PUBLIC_API_BACKGROUND_GATE_WAIT_S", 3600.0
+        )
+        self.public_api_yield_to_chat_max_wait_s: float = _float(
+            "PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S", 10.0
+        )
+        # techsara-8b-vision (vllm-router): the public window is half the
+        # engine's 49,152, and raising it needs a larger router KV cache, not
+        # just this number.
+        self.public_api_router_context_tokens: int = _int("PUBLIC_API_ROUTER_CONTEXT_TOKENS", 24_576)
+        self.public_api_router_max_concurrent: int = _int("PUBLIC_API_ROUTER_MAX_CONCURRENT", 4)
+        self.public_api_router_kv_budget_tokens: int = _int(
+            "PUBLIC_API_ROUTER_KV_BUDGET_TOKENS", 24_576
+        )
+        # techsara-ocr (Unlimited-OCR on the worker Spark, max_model_len 8,192).
+        self.public_api_ocr_context_tokens: int = _int("PUBLIC_API_OCR_CONTEXT_TOKENS", 8192)
+        self.public_api_ocr_max_concurrent: int = _int("PUBLIC_API_OCR_MAX_CONCURRENT", 2)
+        # techsara-embed / techsara-rerank: the engines' own --max-model-len is
+        # 4,096 (not EMBED_/RERANKER_CONTEXT_LENGTH, which say 32,768).
+        self.public_api_embed_context_tokens: int = _int("PUBLIC_API_EMBED_CONTEXT_TOKENS", 4096)
+        self.public_api_embed_max_concurrent: int = _int("PUBLIC_API_EMBED_MAX_CONCURRENT", 2)
+        self.public_api_embed_kv_budget_tokens: int = _int("PUBLIC_API_EMBED_KV_BUDGET_TOKENS", 8192)
+        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 256)
+        self.public_api_rerank_context_tokens: int = _int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096)
+        self.public_api_rerank_max_concurrent: int = _int("PUBLIC_API_RERANK_MAX_CONCURRENT", 2)
+        self.public_api_rerank_kv_budget_tokens: int = _int(
+            "PUBLIC_API_RERANK_KV_BUDGET_TOKENS", 8192
+        )
+        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100)
+        # techsara-whisper: one public clip fleet-wide, yielding to dictation;
+        # 300 s of audio decodes in ~43 s, inside the 100 s origin timeout.
+        self.public_api_asr_max_concurrent: int = _int("PUBLIC_API_ASR_MAX_CONCURRENT", 1)
+        self.public_api_max_audio_seconds: int = _int("PUBLIC_API_MAX_AUDIO_SECONDS", 300)
+        # Body caps (app/main.py asks publicapi.models.body_cap_for): 25 MiB of
+        # audio in a 26 MiB multipart body; 20 MiB on the two generating
+        # routes, which carry image parts (each at most 10 MiB decoded). The
+        # text inside any body is still held to PUBLIC_API_MAX_BODY_BYTES.
+        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)
+        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 27_262_976)
+        self.public_api_max_media_body_bytes: int = _int("PUBLIC_API_MAX_MEDIA_BODY_BYTES", 20_971_520)
+        self.public_api_max_image_bytes: int = _int("PUBLIC_API_MAX_IMAGE_BYTES", 10_485_760)
+
+        # --- Webhook delivery growth (security fixes, 2026-09-13) ------------
+        # apiplatform/webhooks/queue.py clamps each at use (retention 1 day to
+        # its ceiling, grace 0 to the retention window, pending cap at least
+        # 1) and treats a non-finite value as malformed. History of a settled
+        # delivery is kept this many days; a disabled endpoint's pending
+        # queue survives this long before it is settled as dropped; an
+        # endpoint holds at most this many undelivered events.
+        self.public_api_webhook_delivery_retention_days: int = _int(
+            "PUBLIC_API_WEBHOOK_DELIVERY_RETENTION_DAYS", 30
+        )
+        self.public_api_webhook_disabled_grace_seconds: float = _float(
+            "PUBLIC_API_WEBHOOK_DISABLED_GRACE_SECONDS", 3600.0
+        )
+        self.public_api_webhook_max_pending_per_endpoint: int = _int(
+            "PUBLIC_API_WEBHOOK_MAX_PENDING_PER_ENDPOINT", 1000
         )
 
         # --- Conversation sharing (V20) ---
@@ -1645,6 +1853,15 @@ class Settings:
         # §8 /health: per-dependency probe timeout — short so /health answers
         # quickly even when every vLLM service is down.
         self.health_probe_timeout: float = _float("HEALTH_PROBE_TIMEOUT", 2.0)
+        # HEALTH_DEPENDENCY_CACHE_S — seconds one /health dependency fan-out
+        # (DuckDB, the app database, both LanceDB indexes, the reports volume
+        # and every model-server probe) answers repeat callers
+        # (app/health.py). The container healthcheck (30 s), the blackbox
+        # probe (15 s) and every deploy poll each re-ran it; py-spy put it at
+        # 8% of the orchestrator's CPU under 8 concurrent Fast requests
+        # (2026-09-05). The engine-availability overlay is still computed
+        # fresh on every call. 0 probes on every call. Added 2026-09-13.
+        self.health_dependency_cache_s: float = _float("HEALTH_DEPENDENCY_CACHE_S", 4.0)
 
         # --- Typed model/runtime capabilities ------------------------------
         # These defaults reproduce the current DGX/vLLM deployment. Platform

@@ -333,11 +333,12 @@ def _env(ctx: Dict[str, Any], extra: Optional[Dict[str, str]] = None) -> Dict[st
     return env
 
 
-def run_bash(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None) -> Run:
+def run_bash(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None, cwd: Optional[str] = None) -> Run:
     t = time.monotonic()
     full = CURL_WRAPPER + program
     try:
-        p = subprocess.run(["bash", "-c", full], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra))
+        p = subprocess.run(["bash", "-c", full], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra),
+                           cwd=cwd)
         return Run(p.returncode, p.stdout, p.stderr, time.monotonic() - t, program)
     except subprocess.TimeoutExpired as e:
         return Run(124, str(e.stdout or ""), f"timed out after {timeout}s", time.monotonic() - t, program)
@@ -360,13 +361,13 @@ def missing_python_imports(program: str) -> List[str]:
     return json.loads(r.stdout or "[]")
 
 
-def run_python(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None) -> Run:
+def run_python(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None, cwd: Optional[str] = None) -> Run:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(PY_PRELUDE + program)
         path = f.name
     t = time.monotonic()
     try:
-        p = subprocess.run([PY, path], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra))
+        p = subprocess.run([PY, path], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra), cwd=cwd)
         return Run(p.returncode, p.stdout, p.stderr, time.monotonic() - t, program)
     except subprocess.TimeoutExpired as e:
         return Run(124, str(e.stdout or ""), f"timed out after {timeout}s", time.monotonic() - t, program)
@@ -380,7 +381,7 @@ def ts_to_js(source: str) -> Tuple[Optional[str], str]:
     return (p.stdout if p.returncode == 0 else None), p.stderr
 
 
-def run_js(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None) -> Run:
+def run_js(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None, cwd: Optional[str] = None) -> Run:
     js, err = ts_to_js(JS_PRELUDE + program)
     if js is None:
         return Run(2, "", "esbuild could not compile the sample: " + err, 0.0, program)
@@ -389,12 +390,99 @@ def run_js(program: str, ctx: Dict[str, Any], timeout: int = 900, extra=None) ->
         path = f.name
     t = time.monotonic()
     try:
-        p = subprocess.run(["node", path], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra))
+        p = subprocess.run(["node", path], capture_output=True, text=True, timeout=timeout, env=_env(ctx, extra), cwd=cwd)
         return Run(p.returncode, p.stdout, p.stderr, time.monotonic() - t, program)
     except subprocess.TimeoutExpired as e:
         return Run(124, str(e.stdout or ""), f"timed out after {timeout}s", time.monotonic() - t, program)
     finally:
         os.unlink(path)
+
+
+# ================================================================= fixtures ==
+#
+# 2026-09-13 (six-model wave): the images, OCR and speech samples read a local
+# file by the name the page gives it (slide.png, page.png, standup.m4a). The
+# harness writes a generated file under that exact name into a fresh working
+# directory for the one sample, and records what it wrote in the evidence —
+# never a real person's image or recording.
+
+
+class FixtureUnavailable(RuntimeError):
+    """The host cannot generate this fixture; the sample is NOT RUN, never passed."""
+
+
+def _png_fixture(text: str) -> bytes:
+    """A readable PNG: dark text on white when Pillow is importable (the
+    orchestrator venv has it), else a plain valid 64x64 PNG."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io
+
+        img = Image.new("RGB", (896, 320), "white")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.load_default(size=44)
+        except TypeError:  # Pillow < 10.1: no size argument
+            font = ImageFont.load_default()
+        for i, line in enumerate(text.split("\n")):
+            draw.text((40, 40 + i * 70), line, fill="black", font=font)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except ImportError:
+        import struct
+        import zlib
+
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+        raw = b"".join(b"\x00" + b"\xff" * (64 * 3) for _ in range(64))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def _wav_tone(seconds: float = 3.0, rate: int = 16000) -> bytes:
+    import math
+    import struct
+
+    frames = int(seconds * rate)
+    pcm = b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(frames))
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+def _m4a_fixture() -> Tuple[bytes, str]:
+    """A real AAC-in-MP4 tone when ffmpeg is on PATH; otherwise the same tone
+    as WAV under the documented name (the transcription route checks the
+    declared part type, and the engine's decoder probes the bytes)."""
+    import shutil
+
+    wav = _wav_tone()
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = Path(tmp) / "t.wav", Path(tmp) / "t.m4a"
+            src.write_bytes(wav)
+            p = subprocess.run([ffmpeg, "-loglevel", "error", "-y", "-i", str(src), "-c:a", "aac", str(dst)],
+                               capture_output=True, text=True)
+            if p.returncode == 0 and dst.exists():
+                return dst.read_bytes(), "a generated 3 s 440 Hz tone, AAC in MP4 (ffmpeg)"
+    return wav, "a generated 3 s 440 Hz tone as 16 kHz WAV under the documented .m4a name (no ffmpeg on this host)"
+
+
+def fixture(name: str) -> Tuple[bytes, str]:
+    """(bytes, what they are) for a documented local file name."""
+    if name == "slide.png":
+        return _png_fixture("Quarterly results\nRevenue up 12 percent"), "a generated 896x320 PNG slide with two lines of text"
+    if name == "page.png":
+        return _png_fixture("Invoice 1182\nTotal due: 450.00"), "a generated 896x320 PNG page with two lines of text"
+    if name == "standup.m4a":
+        return _m4a_fixture()
+    raise FixtureUnavailable(f"no generator for {name}")
+
+
+#: The local files the documentation's samples open, by name.
+FIXTURE_NAMES = ("slide.png", "page.png", "standup.m4a")
 
 
 # =================================================================== judges ==
@@ -518,11 +606,15 @@ class Spec:
     ref: str = ""
     check: Optional[Callable[[Sample, Dict], Verdict]] = None
     post_path: str = "/responses"
+    fixtures: Tuple[str, ...] = ()
 
 
 PY_API = "api = client()\n"
 NE_HTTP = "an HTTP line, not a program — the same line is sent or checked by the executed samples"
 NE_NOFAIL = "a failure-path transcript: the stream failure cannot be provoked on demand against a healthy engine"
+NE_ELIDED_IMAGE = 'a request-body fragment whose image data is elided ("…")'
+NE_MILLION = ("starts a generation of up to 1,000,000 output tokens — hours of engine time the isolated stack "
+              "shares; the same request shape with the default ceiling is executed by the other samples")
 NE_WEBHOOK = ("webhook verification needs a delivery; the SSRF guard refuses a loopback receiver and the isolated "
               "stack has no public HTTPS endpoint — verified locally against the server's own signer instead")
 
@@ -567,12 +659,22 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
     S["responses", 3] = Spec("{", "post", reason="a request body — POSTed as documented", judge=ok_resp)
     S["responses", 4] = Spec("{", "shape", ref="error_top_p")
     S["responses", 5] = Spec("{", "shape", ref="response_completed")
-    S["responses", 6] = Spec("GET /v1/responses/{id}", "static", reason=NE_HTTP)
-    S["responses", 7] = Spec("export TECHSARA_API_KEY=", "run", ids="done",
+    # 2026-09-13 re-index: #6 is now the completed-response shape that shows
+    # max_output_tokens and incomplete_details; the old #6-#9 moved to #7-#10.
+    S["responses", 6] = Spec("{", "shape", ref="response_completed")
+    S["responses", 7] = Spec("GET /v1/responses/{id}", "static", reason=NE_HTTP)
+    S["responses", 8] = Spec("export TECHSARA_API_KEY=", "run", ids="done",
                              judge=j_curl([200], obj="response", status="completed"))
-    S["responses", 8] = Spec("POST /v1/responses/{id}/cancel", "static", reason=NE_HTTP)
-    S["responses", 9] = Spec("curl -X POST", "run", ids="fresh",
-                             judge=j_curl([200], obj="response", status="cancelled|queued|in_progress|completed"))
+    S["responses", 9] = Spec("POST /v1/responses/{id}/cancel", "static", reason=NE_HTTP)
+    S["responses", 10] = Spec("curl -X POST", "run", ids="fresh",
+                              judge=j_curl([200], obj="response", status="cancelled|queued|in_progress|completed"))
+
+    # Images and OCR (2026-09-13).
+    S["images", 1] = Spec("export TECHSARA_API_KEY=", "run", fixtures=("slide.png",),
+                          judge=j_curl([200], obj="response", status="completed"))
+    S["images", 2] = Spec("import base64", "run", fixtures=("slide.png",), judge=j_prog([200], stdout_nonempty=True))
+    S["images", 3] = Spec("{", "static", reason=NE_ELIDED_IMAGE)
+    S["images", 4] = Spec("{", "static", reason=NE_ELIDED_IMAGE)
 
     S["chat-completions", 1] = Spec("POST /v1/chat/completions", "static", reason=NE_HTTP)
     S["chat-completions", 2] = Spec("export TECHSARA_API_KEY=", "run", judge=j_curl([200], obj="chat.completion"))
@@ -589,11 +691,15 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                              check=chk_stream_transcript)
     S["streaming", 5] = Spec(": ping", "static", reason="the heartbeat comment line, sent only on a 15 s idle gap")
     S["streaming", 6] = Spec("event: response.failed", "static", reason=NE_NOFAIL)
-    S["streaming", 7] = Spec("event: error", "static", reason=NE_NOFAIL)
-    S["streaming", 8] = Spec("import json", "run",
+    # 2026-09-13 re-index: #7 is the new wall-clock `timeout` transcript; the
+    # old #7-#9 moved to #8-#10.
+    S["streaming", 7] = Spec("event: response.failed", "static",
+                             reason="a failure-path transcript: a wall-clock timeout takes hours to provoke")
+    S["streaming", 8] = Spec("event: error", "static", reason=NE_NOFAIL)
+    S["streaming", 9] = Spec("import json", "run",
                              judge=j_prog([200], stdout_has="usage:", check=lambda v: None if "input_tokens" in v
                                           else "usage line carries no input_tokens"))
-    S["streaming", 9] = Spec("const response = await fetch(", "run",
+    S["streaming", 10] = Spec("const response = await fetch(", "run",
                              head=f'const BASE_URL = "{EDGE}";\nconst apiKey = process.env.TECHSARA_API_KEY;\n',
                              judge=j_prog([200], stdout_has="input_tokens"))
 
@@ -606,6 +712,40 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                               judge=j_prog_polls("completed"))
     S["background", 5] = Spec("curl -X POST", "run", ids="fresh",
                               judge=j_curl([200], obj="response", status="cancelled|queued|in_progress|completed"))
+
+    S["long-output", 1] = Spec("applied max_output_tokens =", "static", reason="a formula, not a program")
+    S["long-output", 2] = Spec("{", "shape", ref="response_incomplete")
+    S["long-output", 3] = Spec("wall clock (seconds) =", "static", reason="a formula, not a program")
+    S["long-output", 4] = Spec("import json", "check", reason=NE_MILLION, check=chk_long_output_reader)
+    S["long-output", 5] = Spec("export TECHSARA_API_KEY=", "static", reason=NE_MILLION)
+
+    S["embeddings", 1] = Spec("POST /v1/embeddings", "static", reason=NE_HTTP)
+    S["embeddings", 2] = Spec("export TECHSARA_API_KEY=", "run", judge=j_curl([200], obj="list", contains='"embedding"'))
+    S["embeddings", 3] = Spec("{", "shape", ref="embeddings")
+    S["embeddings", 4] = Spec("import base64", "run",
+                              tail='\nimport struct as _struct\n'
+                                   'print("DECODED", decode(base64.b64encode(_struct.pack("<3f", 0.5, -1.0, 2.0)).decode()))\n',
+                              judge=j_prog([], stdout_has="DECODED [0.5, -1.0, 2.0]"))
+    S["embeddings", 5] = Spec("Instruct:", "static", reason="an instruction-prefixed query, shown as the text sent")
+    S["embeddings", 6] = Spec("import os", "run",
+                              tail='\nv = embed_all(["first passage", "second passage", "third passage"], batch=2)\n'
+                                   'print("VECTORS", len(v), len(v[0]))\n',
+                              judge=j_prog([200, 200], check=expect_tag("VECTORS", lambda x: x.split()[0] == "3",
+                                                                        "3 vectors from two batches")))
+
+    S["rerank", 1] = Spec("POST /v1/rerank", "static", reason=NE_HTTP)
+    S["rerank", 2] = Spec("export TECHSARA_API_KEY=", "run", judge=j_curl([200], obj="rerank"))
+    S["rerank", 3] = Spec("{", "shape", ref="rerank")
+    S["rerank", 4] = Spec("{", "post", reason="a request body — POSTed as documented", post_path="/rerank",
+                          judge=j_curl([200], obj="rerank"))
+
+    S["audio-transcriptions", 1] = Spec("POST /v1/audio/transcriptions", "static", reason=NE_HTTP)
+    S["audio-transcriptions", 2] = Spec("export TECHSARA_API_KEY=", "run", fixtures=("standup.m4a",),
+                                        judge=j_curl([200], contains='"text"'))
+    S["audio-transcriptions", 3] = Spec("{", "shape", ref="transcription")
+    S["audio-transcriptions", 4] = Spec("{", "shape", ref="transcription")
+    S["audio-transcriptions", 5] = Spec("{", "shape", ref="transcription_verbose")
+    S["audio-transcriptions", 6] = Spec("import os", "run", fixtures=("standup.m4a",), judge=j_prog([200]))
 
     S["webhooks", 1] = Spec("{", "static", reason=NE_WEBHOOK.split(" — ")[0])
     S["webhooks", 2] = Spec("TechSara-Signature:", "check", reason="a request header on a delivery",
@@ -657,6 +797,20 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                           tail='\nwith client() as api:\n    rid = summarise_in_background(api, "docs-run-{RUN}-python-page", "Summarise: the office is closed on Friday.")\nprint("ID", rid)\n',
                           judge=j_prog([202], check=expect_tag("ID", lambda v: v.startswith("resp_"), "a resp_ id")))
 
+    S["python", 8] = Spec("import base64", "run", pre=(("python", 2),), fixtures=("slide.png", "page.png"),
+                          tail='\nprint("DESCRIBED", describe("slide.png", "What is on this slide?")[:80].replace("\\n", " "))\n'
+                               'print("OCR", read_text("page.png")[:80].replace("\\n", " "))\n',
+                          judge=j_prog([200, 200], stdout_has="DESCRIBED "))
+    S["python", 9] = Spec("def embed(", "run", pre=(("python", 2),),
+                          tail='\nprint("DIMS", len(embed(["a passage", "another passage"])[0]))\n'
+                               'print("BEST", best("How do I rotate a key?", ["Keys rotate in the console.", "Webhooks are signed."], top_n=1))\n',
+                          judge=j_prog([200, 200], check=expect_tag("DIMS", lambda v: v.isdigit() and int(v) > 0,
+                                                                    "a positive dimension")))
+    S["python", 10] = Spec("def transcribe(", "run", pre=(("python", 2),), fixtures=("standup.m4a",),
+                           tail='\nprint("TEXT", repr(transcribe("standup.m4a")))\n',
+                           judge=j_prog([200], stdout_has="TEXT "))
+    S["python", 11] = Spec("import uuid", "check", reason=NE_MILLION, check=chk_write_book)
+
     S["javascript", 1] = Spec("// NEVER do this.", "static",
                               reason="an anti-pattern (a key in browser code) shown so the reader does not do it")
     S["javascript", 2] = Spec("export interface Usage", "check", reason="type declarations only",
@@ -676,6 +830,21 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                               head='const ticketId = crypto.randomUUID();\nconst text = "Summarise: the office is closed on Friday.";\n',
                               judge=j_prog([202]))
 
+    jpre = (("javascript", 2), ("javascript", 3))
+    S["javascript", 7] = Spec('import { readFile } from "node:fs/promises";', "run", pre=jpre, fixtures=("slide.png",),
+                              tail='\nconsole.log("DESCRIBED", (await describe("slide.png", "What is on this slide?")).slice(0, 80));\n',
+                              judge=j_prog([200], stdout_has="DESCRIBED "))
+    S["javascript", 8] = Spec("async function post(", "run", pre=jpre,
+                              tail='\nconst vectors = await embed(["a passage", "another passage"]);\n'
+                                   'console.log("VECTORS", vectors.length, vectors[0].length);\n'
+                                   'console.log("BEST", JSON.stringify(await rerank("How do I rotate a key?", '
+                                   '["Keys rotate in the console.", "Webhooks are signed."], 1)));\n',
+                              judge=j_prog([200, 200], check=expect_tag("VECTORS", lambda v: v.split()[0] == "2",
+                                                                        "2 vectors")))
+    S["javascript", 9] = Spec('import { readFile } from "node:fs/promises";', "run", pre=jpre, fixtures=("standup.m4a",),
+                              tail='\nconsole.log("TEXT", JSON.stringify(await transcribe("standup.m4a")));\n',
+                              judge=j_prog([200], stdout_has="TEXT "))
+
     S["curl", 1] = Spec('export TECHSARA_API_KEY="tsk_live_', "run",
                         tail='\ntest "$TECHSARA_BASE_URL" = "' + EDGE + '" && test "${#TECHSARA_API_KEY}" -gt 40 && echo ENV_SET\n',
                         judge=j_prog([], stdout_has="ENV_SET"))
@@ -688,17 +857,26 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
                         judge=j_curl([202, 200], obj="response", status="completed"))
     S["curl", 7] = Spec('curl -X POST "$TECHSARA_BASE_URL/responses/', "run", pre=cpre, ids="fresh",
                         judge=j_curl([200], obj="response", status="cancelled|queued|in_progress|completed"))
-    S["curl", 8] = Spec('curl "$TECHSARA_BASE_URL/usage"', "run", pre=cpre, judge=j_curl([200], obj="list"))
-    S["curl", 9] = Spec('curl "$TECHSARA_BASE_URL/openapi.json"', "run", pre=cpre, judge=j_curl([200], contains='"openapi"'))
+    # 2026-09-13 re-index: #8-#12 are new (a 1M background job, OCR, embeddings,
+    # rerank, speech); the old #8-#11 moved to #13-#16.
+    S["curl", 8] = Spec('curl "$TECHSARA_BASE_URL/responses"', "static", reason=NE_MILLION)
+    S["curl", 9] = Spec("printf '{\"model\": \"techsara-ocr\"", "run", pre=cpre, fixtures=("page.png",),
+                        judge=j_curl([200], obj="response", status="completed"))
+    S["curl", 10] = Spec('curl "$TECHSARA_BASE_URL/embeddings"', "run", pre=cpre, judge=j_curl([200], obj="list"))
+    S["curl", 11] = Spec('curl "$TECHSARA_BASE_URL/rerank"', "run", pre=cpre, judge=j_curl([200], obj="rerank"))
+    S["curl", 12] = Spec('curl "$TECHSARA_BASE_URL/audio/transcriptions"', "run", pre=cpre, fixtures=("standup.m4a",),
+                         judge=j_curl([200], contains='"segments"'))
+    S["curl", 13] = Spec('curl "$TECHSARA_BASE_URL/usage"', "run", pre=cpre, judge=j_curl([200], obj="list"))
+    S["curl", 14] = Spec('curl "$TECHSARA_BASE_URL/openapi.json"', "run", pre=cpre, judge=j_curl([200], contains='"openapi"'))
     # 2026-09-13, owner decision: with PUBLIC_API_ENFORCE_LIMITS off (the
     # default) no RateLimit header is sent — one would advertise a limit that
     # does not exist — so the page now says `-i` shows X-Request-Id and NO
     # RateLimit header, and the judge holds the server to both halves. A stack
     # still sending the headers fails this sample rather than passing it.
-    S["curl", 10] = Spec('curl -i "$TECHSARA_BASE_URL/models"', "run", pre=cpre,
+    S["curl", 15] = Spec('curl -i "$TECHSARA_BASE_URL/models"', "run", pre=cpre,
                          judge=j_curl([200], headers=("x-request-id",),
                                       absent_headers=("ratelimit", "ratelimit-policy")))
-    S["curl", 11] = Spec('curl -sS -i "$TECHSARA_BASE_URL/responses"', "run", pre=cpre,
+    S["curl", 16] = Spec('curl -sS -i "$TECHSARA_BASE_URL/responses"', "run", pre=cpre,
                          reason="demonstrates the documented 400 — judged by that outcome",
                          judge=j_curl([400], contains='"param":"top_p"'))
 
@@ -871,6 +1049,37 @@ console.log("WEBHOOK", JSON.stringify({
     return _webhook_verdict(run)
 
 
+def _python_parses(code: str) -> Optional[str]:
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return f"python does not parse: {exc}"
+    return None
+
+
+def chk_long_output_reader(sample: Sample, ctx: Dict) -> Verdict:
+    """long-output #4 is not run (NE_MILLION). What CAN be checked: it parses,
+    and every field it reads off the terminal response exists on a real one."""
+    problem = _python_parses(sample.code)
+    if problem:
+        return False, problem
+    body = ctx["refs"].get("response_incomplete", {}).get("body", {})
+    missing = [f for f in ("status", "max_output_tokens", "incomplete_details") if f not in body]
+    return not missing, ("parses; status, max_output_tokens and incomplete_details all occur on a real response"
+                         if not missing else f"a real response lacks {missing}")
+
+
+def chk_write_book(sample: Sample, ctx: Dict) -> Verdict:
+    """python #11 starts a 1,000,000-token background job, so it is not run.
+    It parses, and the field it prints is on a real 202 background body."""
+    problem = _python_parses(sample.code)
+    if problem:
+        return False, problem
+    ref = ctx["refs"].get("background_created", {})
+    ok = ref.get("status") == 202 and "max_output_tokens" in ref.get("body", {})
+    return ok, f"parses; a real background 202 (HTTP {ref.get('status')}) carries max_output_tokens: {ok}"
+
+
 def chk_ts_compiles(sample: Sample, ctx: Dict) -> Verdict:
     js, err = ts_to_js(sample.code)
     return js is not None, "esbuild compiles the declarations" if js is not None else f"esbuild: {err[:200]}"
@@ -908,7 +1117,8 @@ def provision(ctx: Dict) -> None:
     pid = r.json()["project"]["id"]
     ctx["project_id"] = pid
     r = c.post(f"{dev}/projects/{pid}/keys", json={
-        "name": "docs examples", "scopes": ["models.read", "responses.read", "responses.write", "usage.read"]})
+        "name": "docs examples", "scopes": ["models.read", "responses.read", "responses.write", "usage.read",
+                                            "embeddings.write", "rerank.write", "audio.write"]})
     if r.status_code not in (200, 201) or not r.json().get("secret"):
         raise SystemExit(f"key create failed: HTTP {r.status_code}")
     ctx["key"] = r.json()["secret"]
@@ -985,6 +1195,24 @@ def capture_refs(ctx: Dict) -> None:
     _ref_stream(ctx, "chat_stream", "/chat/completions",
                 {"model": MODEL, "messages": [{"role": "user", "content": "Name one planet."}], "stream": True})
     _ref_stream(ctx, "stream", "/responses", {"model": MODEL, "input": "Explain RAG.", "stream": True})
+    # 2026-09-13: the shapes of the six-model wave.
+    _ref(ctx, "response_incomplete", "POST", "/responses",
+         json={"model": MODEL, "input": "Write a long essay about rivers.", "max_output_tokens": 16})
+    _ref(ctx, "embeddings", "POST", "/embeddings",
+         json={"model": "techsara-embed", "input": ["Keys are rotated in the console.", "Webhooks are signed."]})
+    _ref(ctx, "rerank", "POST", "/rerank",
+         json={"model": "techsara-rerank", "query": "How do I rotate an API key?",
+               "documents": ["Webhooks are signed with HMAC-SHA256.", "Rotation mints a replacement key.",
+                             {"text": "Usage is recorded once per request."}],
+               "top_n": 2, "return_documents": True})
+    try:
+        audio, _ = fixture("standup.m4a")
+        for name, fmt in (("transcription", "json"), ("transcription_verbose", "verbose_json")):
+            _ref(ctx, name, "POST", "/audio/transcriptions",
+                 files={"file": ("standup.m4a", audio, "audio/mp4")},
+                 data={"model": "techsara-whisper", "response_format": fmt})
+    except FixtureUnavailable as exc:
+        print(f"  no transcription reference: {exc}")
     # Wait until the `done` id is terminal: the samples that read it back expect `completed`.
     import httpx
     with httpx.Client(timeout=60) as c:
@@ -1114,20 +1342,38 @@ def execute(samples: List[Sample], ctx: Dict, every: Optional[List[Sample]] = No
             run = run_bash(program, ctx)
         else:
             program, changes = assemble(s, spec, by_key, ctx)
+            workdir = tempfile.TemporaryDirectory(prefix="docs-sample-") if spec.fixtures else None
+            cwd = workdir.name if workdir else None
+            try:
+                for name in spec.fixtures:
+                    data, what = fixture(name)
+                    Path(cwd, name).write_bytes(data)
+                    changes.append(f"{name} → {what} ({len(data)} bytes), in the sample's own working directory")
+            except FixtureUnavailable as exc:
+                results.append(Result(s, NOT_RUN, f"fixture unavailable: {exc}", changes))
+                print(f"  {NOT_RUN:15} {label}")
+                workdir.cleanup()
+                continue
             if s.kind == "bash" or s.kind == "other":
-                run = run_bash(program, ctx)
+                run = run_bash(program, ctx, cwd=cwd)
             elif s.kind == "python":
                 missing = missing_python_imports(program)
                 if missing:
                     results.append(Result(s, NOT_RUN, f"imports a package that is not installed: {', '.join(missing)}", changes))
                     print(f"  {NOT_RUN:15} {label}")
+                    if workdir:
+                        workdir.cleanup()
                     continue
-                run = run_python(program, ctx)
+                run = run_python(program, ctx, cwd=cwd)
             elif s.kind == "javascript":
-                run = run_js(program, ctx)
+                run = run_js(program, ctx, cwd=cwd)
             else:
                 results.append(Result(s, NOT_RUN, f"no runner for {s.lang}", changes))
+                if workdir:
+                    workdir.cleanup()
                 continue
+            if workdir:
+                workdir.cleanup()
         ctx["runs"][(s.slug, s.n)] = run
         ok, ev = spec.judge(run, ctx) if spec.judge else (run.exit == 0, f"exit {run.exit}")
         ev = f"{ev} ({run.secs:.1f}s)"
@@ -1160,7 +1406,8 @@ def write_evidence(results: List[Result], ctx: Dict, started: dt.datetime, finis
         f"* **Tree:** branch `{branch}` at `{commit}`" + (" plus uncommitted changes in the working tree" if dirty else "") + " (the worktree the isolated stack was built from)",
         f"* **Stack:** the isolated e2e stack — public edge `{EDGE}` (frontend), orchestrator `{ORCH}`. Never production.",
         f"* **Identity:** signed in as `{EMAIL}`; project `{ctx.get('project_id')}` created for this run with one "
-        "`tsk_test_` key (models.read, responses.read, responses.write, usage.read) and one models.read-only key. "
+        "`tsk_test_` key (models.read, responses.read, responses.write, usage.read, embeddings.write, rerank.write, "
+        "audio.write) and one models.read-only key. "
         "Neither key is printed anywhere.",
         f"* **Samples found:** {len(results)} fenced blocks across {len({r.sample.slug for r in results})} pages "
         "(loaded as rendered: the page records bundled by esbuild and evaluated in node).",
@@ -1307,6 +1554,17 @@ def self_test() -> int:
     t("the stream judge passes events with a delta and one terminal", j_curl_stream(stream_ok, {})[0])
     t("the stream judge fails a 200 that carried no events",
       not j_curl_stream(Run(0, '{"object":"response"}\n@@HTTP 200@@\n', "", 1), {})[0])
+    for name in ("slide.png", "page.png"):
+        data, _ = fixture(name)
+        t(f"the {name} fixture is a PNG", data.startswith(b"\x89PNG\r\n\x1a\n"))
+    audio, what = fixture("standup.m4a")
+    t("the standup.m4a fixture is MP4 or WAV audio, and says which",
+      (audio[4:8] == b"ftyp" and "MP4" in what) or (audio[:4] == b"RIFF" and audio[8:12] == b"WAVE" and "WAV" in what), what)
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "slide.png").write_bytes(b"x")
+        ran = run_bash("ls slide.png", {}, 30, cwd=tmp)
+    t("a sample runs in the working directory that holds its fixtures", ran.exit == 0 and "slide.png" in ran.stdout,
+      ran.stderr)
     jp = j_prog([200], stdout_nonempty=True)
     t("the program judge fails a non-zero exit", not jp(Run(1, "x", "@@HTTP 200@@", 1), {})[0])
     t("the program judge reads statuses from stderr", jp(Run(0, "answer", "@@HTTP 200@@\n", 1), {})[0])
@@ -1327,6 +1585,12 @@ def self_test() -> int:
         t("every spec still matches its block's first line", not stale, ", ".join(stale))
         extra = [f"{k[0]}#{k[1]}" for k in specs if k not in {(s.slug, s.n) for s in samples}]
         t("no spec names a block that no longer exists", not extra, ", ".join(extra))
+        # 2026-09-13: a sample that opens a documented local file must be given
+        # it, or its run fails for a reason that has nothing to do with the API.
+        unfed = [f"{s.slug}#{s.n} ({name})" for s in samples if (s.slug, s.n) in specs
+                 and specs[s.slug, s.n].action == "run"
+                 for name in FIXTURE_NAMES if name in s.code and name not in specs[s.slug, s.n].fixtures]
+        t("every executed sample that opens a documented local file is given that fixture", not unfed, ", ".join(unfed))
     else:
         print("  SKIP the real-documentation checks — frontend/node_modules/.bin/esbuild is absent")
     print(f"self-test: {'all passed' if not fails else f'{fails} failed'}")

@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
 from ... import db
-from . import signer, ssrf
+from . import queue, signer, ssrf
 
 log = logging.getLogger(__name__)
 
@@ -301,6 +301,10 @@ async def emit_response_event(
     not be recorded as failed because a webhook row could not be written
     (2026-09-13: this is the ONLY call the response task makes after its own
     terminal update, and it is best-effort by design).
+
+    Queued through `queue.enqueue_delivery`, which holds each endpoint to a
+    pending-row cap (2026-09-13 security review): an endpoint at its cap
+    contributes no id, and the event is counted on its delivery history.
     """
     project_id = str(response.get("project_id") or "")
     response_id = str(response.get("id") or "")
@@ -327,7 +331,7 @@ async def emit_response_event(
         )
         try:
             row = await db.run_in_thread(
-                db.enqueue_webhook_delivery,
+                queue.enqueue_delivery,
                 endpoint["id"],
                 project_id,
                 event_type,
@@ -335,6 +339,7 @@ async def emit_response_event(
                 payload,
                 response_id=response_id,
                 max_attempts=MAX_ATTEMPTS,
+                now=now,
             )
         except Exception:  # noqa: BLE001 — see the docstring
             log.warning(
@@ -372,6 +377,10 @@ async def enqueue_test_delivery(
     works rather than the delivery path. Its `event_id` is unique per press,
     so pressing twice sends twice — that is what a person testing an endpoint
     expects, and it is the one place a non-deterministic event id is right.
+
+    Held to the same per-endpoint pending cap as a real event: None when the
+    endpoint is at it (the console reports `queued: false`), because a test
+    event behind a full backlog would not be sent for a long time anyway.
     """
     moment = _now(now)
     event_id = event_id_for(
@@ -385,13 +394,14 @@ async def enqueue_test_delivery(
         "data": {"endpoint_id": str(endpoint.get("id") or "")},
     }
     row = await db.run_in_thread(
-        db.enqueue_webhook_delivery,
+        queue.enqueue_delivery,
         endpoint["id"],
         endpoint["project_id"],
         EVENT_TEST,
         event_id,
         payload,
         max_attempts=MAX_ATTEMPTS,
+        now=moment,
     )
     if row is not None:
         _kick_worker()

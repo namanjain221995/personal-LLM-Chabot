@@ -535,10 +535,15 @@ def test_a_413_on_v1_carries_a_request_id_and_the_v1_cors_headers():
     """Wave-2 verifier: the 413 had no `X-Request-Id`, `request_id: null`, and
     no CORS headers (browser CORS skips `/v1`, and the router's `_decorate`
     never runs for a response the router did not produce) — a developer's
-    browser SDK saw an opaque failure instead of `request_too_large`."""
+    browser SDK saw an opaque failure instead of `request_too_large`.
+
+    Posted to `/v1/embeddings` since 2026-09-13: its cap is 1 MiB before AND
+    after main.py adopts the per-route public caps (`/v1/responses` becomes
+    20 MiB then, and this test would have turned into a 401 for a reason
+    that has nothing to do with what it pins — adversarial review)."""
     client = TestClient(app)
     response = client.post(
-        "/v1/responses",
+        "/v1/embeddings",
         content=b"x" * (2 * 1024 * 1024),
         headers={"content-type": "application/json", "origin": FOREIGN_ORIGIN},
     )
@@ -551,6 +556,152 @@ def test_a_413_on_v1_carries_a_request_id_and_the_v1_cors_headers():
     assert response.headers["access-control-allow-origin"] == FOREIGN_ORIGIN
     assert "X-Request-Id" in response.headers["access-control-expose-headers"]
     assert "access-control-allow-credentials" not in response.headers
+
+
+def _main_uses_the_public_per_route_caps() -> bool:
+    from app.publicapi import models as public_models
+
+    return all(
+        app_main.body_cap_for("POST", path).signed_in == public_models.body_cap_for("POST", path)
+        for path in ("/v1/responses", "/v1/chat/completions", "/v1/audio/transcriptions")
+    )
+
+
+def _png_of(padding: int) -> bytes:
+    import struct
+    import zlib
+
+    raw = b"\x89PNG\r\n\x1a\n"
+    header = struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0)
+    raw += struct.pack(">I", 13) + b"IHDR" + header + struct.pack(">I", zlib.crc32(b"IHDR" + header))
+    pad = b"\x00" * padding
+    return raw + struct.pack(">I", len(pad)) + b"tEXt" + pad + struct.pack(">I", zlib.crc32(b"tEXt" + pad))
+
+
+def test_main_py_asks_the_public_per_route_table_for_every_v1_cap():
+    """Integration 2026-09-13: `app.main.body_cap_for` delegates `/v1` to
+    `publicapi.models.body_cap_for` — one table, the one the edge mirrors."""
+    assert _main_uses_the_public_per_route_caps()
+    for method, path in (
+        ("POST", "/v1/embeddings"),
+        ("POST", "/v1/rerank"),
+        ("GET", "/v1/responses"),
+        ("POST", "/v1/responses/resp_x/cancel"),
+        ("GET", "/v1/models"),
+    ):
+        assert app_main.body_cap_for(method, path).signed_in == 1024 * 1024, (method, path)
+    # Anonymous and signed-in are one number on /v1: it never reads a cookie.
+    for path in ("/v1/responses", "/v1/audio/transcriptions"):
+        cap = app_main.body_cap_for("POST", path)
+        assert cap.anonymous == cap.signed_in and cap.family == "public-api"
+
+
+def test_the_v1_caps_follow_the_public_settings_and_a_broken_table_falls_back_to_one_mib(monkeypatch):
+    from app.publicapi import models as public_models
+
+    monkeypatch.setattr(settings, "public_api_max_media_body_bytes", 8 * 1024 * 1024, raising=False)
+    monkeypatch.setattr(settings, "public_api_max_audio_body_bytes", 12 * 1024 * 1024, raising=False)
+    assert app_main.body_cap_for("POST", "/v1/chat/completions").signed_in == 8 * 1024 * 1024
+    assert app_main.body_cap_for("POST", "/v1/audio/transcriptions").signed_in == 12 * 1024 * 1024
+
+    def broken(method, path):
+        raise RuntimeError("half-deployed sibling")
+
+    monkeypatch.setattr(public_models, "body_cap_for", broken)
+    assert app_main.body_cap_for("POST", "/v1/responses").signed_in == 1024 * 1024
+
+
+def test_the_mounted_app_lets_an_image_request_and_an_audio_upload_over_one_mib_reach_the_router():
+    """Adversarial review 2026-09-13: CONTRACT §8 advertises 20 MiB on the two
+    generation routes and 26 MiB on transcriptions, the Next edge enforces
+    those, and the router tests pass — but the application's middleware still
+    capped every `/v1` path at 1 MiB, so a 2 MiB image request and every audio
+    upload over 1 MiB were refused before the router saw them. Unauthenticated
+    on purpose: past the middleware the router answers 401, which is the
+    proof the body got through."""
+    import base64
+
+    client = TestClient(app)
+    image = base64.b64encode(_png_of(1_600_000)).decode()
+    body = {
+        "model": "techsara-35b",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "What is this?"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{image}"},
+                ],
+            }
+        ],
+    }
+    imaged = client.post("/v1/responses", json=body)
+    audio = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("clip.wav", b"\x00" * (3 * 1024 * 1024), "audio/wav")},
+        data={"model": "techsara-whisper"},
+    )
+    assert imaged.status_code == 401, imaged.text[:200]
+    assert audio.status_code == 401, audio.text[:200]
+
+
+def test_a_twenty_mib_audio_upload_and_a_large_image_request_pass_the_middleware_and_the_caps_still_hold():
+    """The integration's acceptance numbers through the mounted app: a 20 MiB
+    audio upload (under the 26 MiB transcription cap) and an image request of
+    about 6.5 MiB (under the 20 MiB generation cap) reach the router — 401,
+    because they carry no key — while one byte over each cap is still the
+    middleware's 413 in the public envelope."""
+    import base64
+
+    from app.publicapi import models as public_models
+
+    client = TestClient(app)
+    audio = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("standup.wav", b"\x00" * (20 * 1024 * 1024), "audio/wav")},
+        data={"model": "techsara-whisper"},
+    )
+    assert audio.status_code == 401, audio.text[:200]
+    assert audio.json()["error"]["code"] != "request_too_large"
+
+    image = base64.b64encode(_png_of(5 * 1024 * 1024)).decode()
+    imaged = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "techsara-8b-vision",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read the slide."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                    ],
+                }
+            ],
+        },
+    )
+    assert imaged.status_code == 401, imaged.text[:200]
+
+    for path, cap in (
+        ("/v1/audio/transcriptions", public_models.max_audio_body_bytes()),
+        ("/v1/responses", public_models.max_media_body_bytes()),
+    ):
+        over = client.post(path, content=b"x" * (cap + 1), headers={"content-type": "application/json"})
+        assert over.status_code == 413, (path, over.text[:200])
+        assert over.json()["error"]["code"] == "request_too_large"
+
+
+def test_a_body_over_one_mib_on_a_text_only_public_route_is_still_refused_by_the_middleware():
+    """The other half, true before and after the main.py integration: the
+    larger caps belong to the two generation routes and transcriptions only."""
+    client = TestClient(app)
+    for path in ("/v1/embeddings", "/v1/rerank"):
+        response = client.post(
+            path,
+            content=b"x" * (2 * 1024 * 1024),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413, (path, response.text[:200])
 
 
 def test_a_chunked_oversize_body_on_a_public_route_is_a_413_not_a_500():

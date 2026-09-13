@@ -597,13 +597,29 @@ export function InfraBlock<T>({
   state,
   what,
   skeletonHeight = 160,
+  error,
+  onRetry,
   children,
 }: {
   state: Infra<T> | undefined;
   what: string;
   skeletonHeight?: number;
+  /**
+   * The request's failure. Without it a failed load (a 404, a 500, offline)
+   * left `state` undefined for good and the block pulsed as "loading"
+   * forever, with no word and no Retry.
+   */
+  error?: string | null;
+  onRetry?: () => void;
   children: (value: T) => ReactNode;
 }) {
+  if (!state && error) {
+    return (
+      <ChartFrame height={skeletonHeight} error={error} onRetry={onRetry}>
+        {null}
+      </ChartFrame>
+    );
+  }
   if (!state) {
     return (
       <div

@@ -1128,7 +1128,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                     type="button"
                     onClick={() => removeAttachment(attachment.clientId)}
                     aria-label={`Remove attachment ${attachment.name}`}
-                    className="rounded-md p-1 text-faint transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
+                    className="rounded-md p-1 text-faint max-sm:p-2.5 transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
                   >
                     <IconX size={13} />
                   </button>
@@ -1180,8 +1180,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                       i === commandIndex ? 'bg-surface-2' : 'hover:bg-surface-2'
                     }`}
                   >
-                    <span className="font-medium text-ink">/{c.name}</span>
-                    <span className="text-xs text-faint">{c.argument}</span>
+                    <span className="shrink-0 whitespace-nowrap font-medium text-ink">/{c.name}</span>
+                    <span className="shrink-0 whitespace-nowrap text-xs text-faint">{c.argument}</span>
                     <span className="ml-auto min-w-0 truncate text-xs text-muted">
                       {c.hint}
                     </span>
@@ -1237,7 +1237,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                       : 'Ask anything…'))
               }
               aria-label="Message"
-              className="max-h-[240px] min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1.5 text-[15px] leading-6 placeholder:text-faint focus:outline-none disabled:cursor-not-allowed"
+              className="max-h-[240px] min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1.5 text-base leading-6 placeholder:text-faint focus:outline-none disabled:cursor-not-allowed"
               style={{ height: 24 }}
             />
 
@@ -1433,12 +1433,15 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
           <p
             className={`mt-2 text-center text-xs transition-opacity duration-ts ${
-              // Dimming marks the RELAXED state (Salesforce off, model may
-              // search). With search FORCED on this line is the strongest
-              // internet warning shown anywhere — never dim that one.
+              // The RELAXED state (Salesforce off, model may search) is the
+              // quieter one. With search FORCED on this line is the strongest
+              // internet warning shown anywhere, so it takes the brighter ink.
+              // A colour step, not `opacity-50`: half-opacity faint text was
+              // 2.19:1 on the dark page and 1.69:1 on white — this line is the
+              // privacy promise, and it was below AA in both themes.
               prefs.salesforce || prefs.webSearch === 'on'
-                ? 'text-faint'
-                : 'text-faint opacity-50'
+                ? 'text-muted'
+                : 'text-faint'
             }`}
           >
             {/* This line is the only place the privacy promise is made, and

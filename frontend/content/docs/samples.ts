@@ -15,8 +15,69 @@
  */
 export const API_BASE_URL = 'https://ai.techsarasolutions.com/v1';
 
-/** The one public model id the registry declares (CONTRACT §15). */
+/**
+ * The main chat model, and the id every generic example uses (CONTRACT §15).
+ * Kept as its own name because twenty pages were written against it and a
+ * reader's first request should be to the model that answers in the chat app.
+ */
 export const MODEL_ID = 'techsara-35b';
+
+/**
+ * EVERY PUBLIC MODEL ID (2026-09-13, owner request: /v1 offers every model
+ * TechSara runs). One place, so a page cannot spell an id the registry does
+ * not declare — tests/docs-site.test.tsx refuses any `"model": "…"` in a
+ * sample that is not one of these, and holds this list to CONTRACT §15.
+ *
+ * These are brand ids. The checkpoint behind each one is an operational
+ * detail that never leaves the server (CONTRACT §15), which is why no page on
+ * this site names it.
+ */
+export const VISION_MODEL_ID = 'techsara-8b-vision';
+export const OCR_MODEL_ID = 'techsara-ocr';
+export const EMBED_MODEL_ID = 'techsara-embed';
+export const RERANK_MODEL_ID = 'techsara-rerank';
+export const WHISPER_MODEL_ID = 'techsara-whisper';
+
+export const MODEL_IDS = [
+  MODEL_ID,
+  VISION_MODEL_ID,
+  OCR_MODEL_ID,
+  EMBED_MODEL_ID,
+  RERANK_MODEL_ID,
+  WHISPER_MODEL_ID,
+] as const;
+
+/**
+ * WHETHER A /v1 GENERATION CAN OUTLIVE THE CHAT APP'S WALL CLOCK — the second
+ * honesty switch, after EXAMPLES_EXECUTED.
+ *
+ * 2026-09-13: the public ceiling for `max_output_tokens` on techsara-35b is
+ * 1,000,000, and at 71-101 tok/s measured such an answer takes about three to
+ * four hours. The per-request wall clock that lets it finish (CONTRACT §8.3)
+ * is enforced inside `llm.stream_chat_events(wall_clock_s=…)`, and that
+ * parameter lands in orchestrator/app/llm.py through a separate integration.
+ * Until it does, every techsara-35b generation is still stopped at the chat
+ * application's clock — 4,200 s, roughly 300,000-420,000 tokens — and a page
+ * that promised a 1M answer as deliverable today would be the kind of stale
+ * claim the EXAMPLES_EXECUTED history above warns about.
+ *
+ * So the long-output page and the changelog render `WALL_CLOCK_PENDING_NOTE`
+ * while this is false, and tests/docs-site.test.tsx ties the value to llm.py
+ * itself: the day `stream_chat_events` accepts `wall_clock_s`, the test fails
+ * until this is flipped to `true` — nobody has to remember.
+ *
+ * Flipped 2026-09-13 in the change that landed `wall_clock_s` in llm.py.
+ */
+export const LONG_OUTPUT_WALL_CLOCK_LIVE: boolean = true;
+
+/** The caveat while the per-request wall clock is not yet enforced. */
+export const WALL_CLOCK_PENDING_NOTE =
+  '**Not yet deliverable end to end.** The 1,000,000 ceiling is accepted and ' +
+  'clamped exactly as described here, but until the per-request wall clock ' +
+  'ships, a techsara-35b generation is still stopped after 4,200 seconds ' +
+  '(70 minutes) — roughly 300,000 to 420,000 tokens at the measured decode ' +
+  'speed — and ends `failed` with code `timeout`, keeping the text it had ' +
+  'produced. This notice disappears when that changes.';
 
 /**
  * THE EXAMPLE KEYS — deliberately invalid, and invalid in the one way that

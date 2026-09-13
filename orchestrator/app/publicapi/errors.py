@@ -378,6 +378,21 @@ def request_too_large(limit_bytes: int) -> ApiError:
     )
 
 
+def request_text_too_large(limit_bytes: int) -> ApiError:
+    """The text of a request over CONTRACT §12's 1 MiB rule (2026-09-13).
+
+    A request that carries images may be up to PUBLIC_API_MAX_MEDIA_BODY_BYTES
+    on the wire, so the byte cap on the BODY no longer bounds the prompt. The
+    text inside it — instructions and every text part — still must fit the
+    original mebibyte, and the message says so rather than naming a body
+    limit the caller did not exceed."""
+    return ApiError(
+        "request_too_large",
+        f"The text in this request is larger than the {int(limit_bytes)} byte "
+        "limit. Images do not count towards it.",
+    )
+
+
 def context_length_exceeded(
     *,
     requested: Optional[int] = None,

@@ -11,9 +11,10 @@
  * ME_PAYLOAD from AdminMeContext instead of re-probing.
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { IconMenu, IconX } from '@/components/icons';
 import { Loader } from '@/components/Loader';
 import { TechSaraMark } from '@/components/TechSaraMark';
 import { AdminMeProvider } from '@/components/admin/AdminMeContext';
@@ -134,6 +135,10 @@ function navGroups(me: Me): NavGroup[] {
             label: 'Voice',
             icon: <IconMic size={15} />,
           },
+          // The page exists in git now. Its folder was swallowed by the root
+          // .gitignore's unanchored `models/` until 2026-09-13, so for a while
+          // this pointed at the Leaderboards Models tab instead; the page
+          // itself is the one with effort tiers and live engine cards.
           {
             href: '/admin/analytics/models',
             label: 'Models',
@@ -199,6 +204,31 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  // Below lg the rail is a drawer, opened from the slim header.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const railRef = useRef<HTMLElement | null>(null);
+
+  // A link in the drawer navigates; the drawer should not survive it.
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [pathname]);
+
+  // Escape closes the drawer and hands focus back to the toggle; opening it
+  // moves focus to the first link, so a keyboard reader lands in the list
+  // instead of behind the scrim.
+  useEffect(() => {
+    if (!drawerOpen) return undefined;
+    railRef.current?.querySelector<HTMLElement>('a[href]')?.focus({ preventScroll: true });
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setDrawerOpen(false);
+        toggleRef.current?.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [drawerOpen]);
 
   const load = useCallback(async () => {
     setError(null);
@@ -260,6 +290,7 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   const items = groups.flatMap((g) => g.items);
   const isActive = (item: NavItem) =>
     item.exact ? pathname === item.href : pathname.startsWith(item.href);
+  const current = items.find(isActive);
   // The console's charts and its leaderboard rail need width the settings
   // pages do not: 1180px is right for a roster, and cramped for a page with a
   // 336px rail beside a time series.
@@ -276,10 +307,29 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
   return (
     <AdminMeProvider me={me}>
       <div className="flex h-dvh overflow-hidden bg-bg text-ink">
-        {/* Desktop: fixed 240px admin rail. */}
+        {/* The scrim exists only while the drawer is open, and only below lg.
+            It starts under the 52px header so the toggle stays tappable. */}
+        {drawerOpen && (
+          <div
+            aria-hidden="true"
+            onClick={() => setDrawerOpen(false)}
+            className="fixed inset-x-0 bottom-0 top-[52px] z-40 bg-black/60 lg:hidden"
+          />
+        )}
+        {/* ONE rail: the fixed 240px column from lg up, a drawer below it.
+            It used to be a column from md plus a header strip of the same
+            links that scrolled sideways with no hint — at 390px "Back to
+            chat" and half the sections were off-screen, every link 22px
+            tall — and at 768px the column left a table 464px. */}
         <aside
+          id="admin-rail"
+          ref={railRef}
           aria-label="Admin navigation"
-          className="hidden w-60 shrink-0 flex-col border-r border-border bg-sidebar md:flex"
+          className={`${
+            drawerOpen
+              ? 'fixed bottom-0 left-0 top-[52px] z-50 flex w-72 max-w-[85vw] shadow-2xl'
+              : 'hidden'
+          } shrink-0 flex-col border-r border-border bg-sidebar lg:static lg:z-auto lg:flex lg:w-60 lg:max-w-none lg:shadow-none`}
         >
           <div className="flex items-center gap-2 px-3 pb-1 pt-3">
             <TechSaraMark size={28} />
@@ -336,24 +386,29 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          {/* Mobile: slim header with the same links. */}
-          <header className="flex h-[52px] shrink-0 items-center gap-3 overflow-x-auto border-b border-border px-3 md:hidden">
+          {/* Below lg: a slim header that names the section and opens the
+              rail as a drawer. */}
+          <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-border px-2 lg:hidden">
+            <button
+              ref={toggleRef}
+              type="button"
+              onClick={() => setDrawerOpen((open) => !open)}
+              aria-expanded={drawerOpen}
+              aria-controls="admin-rail"
+              aria-label={drawerOpen ? 'Close admin menu' : 'Open admin menu'}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+            >
+              {drawerOpen ? <IconX size={18} /> : <IconMenu size={18} />}
+            </button>
             <TechSaraMark size={24} />
-            {items.map((item) => (
-              <Link
-                key={item.href}
-                href={item.href}
-                aria-current={isActive(item) ? 'page' : undefined}
-                className={`shrink-0 text-sm transition-colors duration-ts ${
-                  isActive(item) ? 'font-medium text-ink' : 'text-muted hover:text-ink'
-                }`}
-              >
-                {item.label}
-              </Link>
-            ))}
-            <Link href="/" className="ml-auto shrink-0 text-sm text-muted hover:text-ink">
-              Back to chat
-            </Link>
+            <span className="rounded border border-border px-1.5 py-px text-[10px] font-medium uppercase tracking-wide text-faint">
+              Admin
+            </span>
+            {current && (
+              <span className="min-w-0 truncate text-sm font-medium text-ink">
+                {current.label}
+              </span>
+            )}
           </header>
 
           <main className="min-h-0 flex-1 overflow-y-auto">

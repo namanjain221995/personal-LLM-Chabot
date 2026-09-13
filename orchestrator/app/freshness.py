@@ -281,6 +281,336 @@ def _with_volatility(verdict: Verdict, question: str) -> Verdict:
     )
 
 
+#: The reason a Fast turn is settled STATIC without the router: the question
+#: is a timeless TASK (small talk, creative writing, a transformation of text
+#: the person supplied, a coding or maths exercise) with no live-value signal
+#: anywhere in it (see `clearly_timeless`). Its own rule, so a
+#: misclassification it causes is countable in
+#: techsara_freshness_classified_total instead of hiding under "router".
+TIMELESS_TASK_REASON = "timeless_task"
+
+# --------------------------------------------------------------------------
+# Fast effort's router skip (performance plan item 2, revised 2026-09-13).
+#
+# The first version skipped the router for any undecided question without a
+# _RECENT word. The prover measured what that cost: "euro to dollar", "is AWS
+# down", "Tesla share value" and "score of india vs australia" went from a
+# RECENT router verdict plus the Fast live lookup (4/4 on HEAD) to STATIC
+# answers from 2024 weights with no staleness note (0/4). No recency word is
+# not the same as timeless: live values are asked about with nouns ("rate",
+# "score", "down", "out"), currency pairs and product names, not with "now".
+#
+# So the skip is inverted into an ALLOWLIST. A question skips the router only
+# when it positively reads as a timeless task AND no live-value signal fires.
+# Everything else — including every question this code has no opinion on —
+# goes to the router exactly as before, bounded by ROUTER_DEADLINE_S with the
+# RECENT default on timeout. A wrong skip answers a live question from
+# weights; a wrong route costs one router call (mean 0.216 s, p95 0.483 s,
+# measured 2026-09-13), so every doubt resolves to the router.
+#
+# The skip itself is OPT-IN since 2026-09-14 (FRESHNESS_FAST_SKIP_ROUTER,
+# default false): the vetoes below are still word lists, and the re-prover's
+# 50 new live-value questions in timeless-task shapes skipped the router on 13
+# ("write a poem for our cji", "write an email to airtel about their unlimited
+# plan", "tell me a joke about elon musk"). With the default every Fast
+# question the regex pass leaves undecided asks the router, as on HEAD.
+# --------------------------------------------------------------------------
+
+#: A message that is ONLY small talk. Anchored at both ends: "hi, is AWS down"
+#: must not ride through on its greeting.
+_SMALL_TALK = re.compile(
+    r"^\W*(?:(?:hi|hello|hey|hiya|yo|greetings|good (?:morning|afternoon|evening|night)|"
+    r"thanks|thank you|thx|ty|ok(?:ay)?|cool|great|nice|awesome|bye|goodbye|see you|"
+    r"how are you(?: doing)?|how(?:'s| is) it going|what'?s up|sup|nice to meet you|"
+    r"there|again|so much|very much|a lot)[\s,!.?]*)+$",
+    re.I,
+)
+
+#: Programming and human languages, which are capitalised mid-sentence in the
+#: most ordinary timeless task ("how do I reverse a list in Python", "translate
+#: this into French") and are not live entities.
+_LANGUAGE_NAMES = (
+    r"python|javascript|typescript|java|kotlin|swift|rust|go|golang|ruby|php|perl|"
+    r"scala|haskell|elixir|erlang|clojure|lua|dart|julia|matlab|fortran|cobol|"
+    r"c|c\+\+|c#|bash|shell|powershell|sql|postgres|postgresql|mysql|sqlite|html|css|"
+    r"json|yaml|xml|csv|regex|excel|latex|markdown|linux|unix|"
+    r"english|french|spanish|german|italian|portuguese|dutch|russian|chinese|"
+    r"mandarin|cantonese|japanese|korean|arabic|hindi|gujarati|marathi|bengali|"
+    r"tamil|telugu|kannada|malayalam|punjabi|urdu|turkish|greek|latin|hebrew|"
+    r"persian|polish|swedish|norwegian|danish|finnish|thai|vietnamese|indonesian|swahili"
+)
+
+#: Timeless tasks, anchored at the start after an optional polite lead-in.
+_TIMELESS_TASK = re.compile(
+    r"^\W*(?:(?:please|pls|kindly|ok(?:ay)?|so|hey|hi|hello)[\s,!.]+)*"
+    r"(?:(?:can|could|would|will) you\s+(?:please\s+)?|i (?:want|need) you to\s+|help me\s+)?"
+    r"(?:"
+    # Creative writing.
+    r"(?:write|compose|draft|create|generate|make(?: up)?|give me|come up with)\s+"
+    r"(?:me\s+|us\s+)?(?:a|an|one|some|two|three|\d+|another|the)?\s*"
+    r"(?:(?:short|long|little|funny|cute|sad|happy|romantic|simple|rhyming|silly|"
+    r"heartfelt|formal|polite|professional|casual|creative|original|bedtime|"
+    r"birthday|cover|thank[- ]you|love|wedding|farewell|condolence|apology|"
+    r"resignation|welcome|anniversary|motivational|inspirational)\s+)*"
+    r"(?:poem|poems|haiku|haikus|limerick|limericks|sonnet|verse|rhyme|story|stories|"
+    r"tale|fable|song|lyrics|rap|joke|jokes|pun|puns|riddle|riddles|essay|letter|"
+    r"email|note|toast|speech|wish|wishes|greeting|message|caption|slogan|tagline|"
+    r"dialogue|script|scene|character|plot|metaphor|acrostic)\b"
+    r"|tell me (?:a|another|one more|some)\s+(?:(?:short|funny|good|bad|dad|silly|"
+    r"scary|bedtime)\s+)*(?:joke|jokes|story|riddle|pun|poem)\b"
+    # Brainstorming that needs no facts.
+    r"|(?:suggest|brainstorm|give me|list)\s+(?:me\s+)?(?:some|a few|\d+)?\s*"
+    r"(?:(?:cute|funny|creative|good|catchy|unique)\s+)*"
+    r"(?:names|nicknames|titles|slogans|taglines|captions|pickup lines|puns|rhymes|"
+    r"synonyms|antonyms|words)\b"
+    # Transforming text the person supplied.
+    r"|(?:translate|rephrase|paraphrase|reword|rewrite|re-write|proofread|"
+    r"spell ?check|polish|shorten|expand|simplify|summari[sz]e|tl;?dr|"
+    r"correct|fix)\s+(?:this|these|that|my|the following|the text|the sentence|"
+    r"the paragraph|the grammar|the spelling|it|below|following|"
+    r"the plot of|the story of)\b"
+    r"|translate\s+['\"]"
+    r"|make (?:this|it|my \w+) (?:sound )?(?:more |less )?"
+    r"(?:formal|informal|polite|professional|casual|friendly|concise|shorter|longer|"
+    r"clearer|simpler|better)\b"
+    # Coding exercises.
+    r"|(?:write|create|generate|give me|show me)\s+(?:me\s+)?(?:a|an|the|some)?\s*"
+    rf"(?:(?:{_LANGUAGE_NAMES}|simple|recursive|basic|small)\s+)*"
+    r"(?:function|method|class|script|program|snippet|regex|regular expression|"
+    r"query|loop|unit tests?|test case|algorithm|code)\b"
+    r"|(?:fix|debug|refactor|optimi[sz]e|review|comment|document|explain)\s+"
+    r"(?:this|my|the following|the)\s+(?:code|function|script|query|regex|snippet|"
+    r"program|class|method|loop|error|bug|stack ?trace)\b"
+    rf"|how (?:do|can|would|should|to) (?:i|you|we|one)?\s*.+\s(?:in|using|with) (?:{_LANGUAGE_NAMES})\W*$"
+    # Maths exercises.
+    r"|(?:solve|simplify|factori[sz]e|factor|integrate|differentiate|derive|prove|"
+    r"evaluate)\b"
+    r")",
+    re.I,
+)
+
+#: Anything that could make the answer a LIVE value. Deliberately wide: a hit
+#: here only costs a router call. Grouped by the kind of question it protects.
+#: Words that are overwhelmingly code vocabulary inside a timeless task ("the
+#: largest number", "update rows", "convert celsius") were left out on
+#: purpose; their live senses are caught by a neighbour in the same group
+#: (a currency name, a product, a state question).
+_LIVE_SIGNAL = re.compile(
+    r"\b(?:"
+    # Money and markets — prices, rates, currency pairs ("euro to dollar").
+    r"price[sd]?|pricing|costs?|fees?|rates?|valuation|worth|net worth|"
+    r"market|markets|stocks?|shares?|ticker|trading|crypto|bitcoin|btc|ethereum|"
+    r"dogecoin|solana|forex|currenc(?:y|ies)|exchange|inflation|interest|gdp|ipo|"
+    r"earnings|revenue|profits?|dividends?|salary|salaries|wages?|tax|taxes|loan|"
+    r"emi|mortgage|budget|cheap|cheapest|expensive|afford(?:able)?|deals|best deal|"
+    r"discount|sale|buy|sell|gold|silver|oil|petrol|diesel|"
+    r"dollars?|usd|euros?|eur|pounds?|gbp|sterling|yen|jpy|yuan|cny|renminbi|"
+    r"rupees?|inr|aud|cad|chf|francs?|pesos?|won(?!'t)|rubles?|roubles?|dirhams?|"
+    r"aed|riyals?|lira|baht|ringgit|sgd|hkd|nzd|"
+    # Sport, contests, rankings, benchmarks ("score of india vs australia").
+    r"scores?|scored|results?|(?<!to )(?<!that )(?<!which )(?<!will )match(?:es)?|"
+    r"fixtures?|standings|points table|league|tournament|world cup|finals|the final|"
+    r"semi-?finals?|playoffs?|vs|versus|beat|beats|won|wins?|winners?|lose|lost|"
+    r"leading|lineup|squad|roster|transfers?|ranking|rankings|ranked|leaderboard|"
+    r"benchmarks?|elo|ratings?|top(?: \d+| ten| five| three|-rated| rated| selling)|"
+    r"best|worst|richest|most popular|most valuable|world record|all-time high|"
+    r"ipl|nba|nfl|fifa|uefa|f1|formula 1|cricket|football|soccer|tennis|"
+    # Status, outages, schedules ("is AWS down" is also a state question below).
+    r"outages?|downtime|offline|status|incident|in stock|sold out|delay(?:ed)?|"
+    r"traffic|flights?|trains?|schedule|timetable|opening hours|business hours|"
+    r"weather|forecast|aqi|pollution|"
+    # Releases, versions, products ("upcoming iPhone release date").
+    r"release[sd]?|releasing|launch(?:ed|es|ing)?|upcoming|coming out|coming soon|"
+    r"out yet|announce[sd]?|unveil(?:ed)?|leaks?|rumou?rs?|eta|beta|preview|specs|"
+    r"specifications|model|models|install|upgrade|"
+    r"iphone|ipad|pixel|galaxy|android|ios|"
+    r"gpt|chatgpt|openai|anthropic|claude|gemini|llama|mistral|deepseek|qwen|grok|"
+    r"vllm|nvidia|gpu|gpus|tesla|google|microsoft|amazon|aws|azure|spacex|starlink|"
+    r"twitter|x\.com|"
+    # News, people, public statements, events, rules ("what did Sam Altman say").
+    r"news|headlines?|said|says|tweet(?:ed|s)?|posted|statement|interview|"
+    r"reacted|responded|controversy|scandal|lawsuit|sued|arrested|died|dead|alive|"
+    r"death|married|divorced?|pregnant|elections?|polls?|votes?|voting|war|attack|"
+    r"ceasefire|sanctions|protests?|strike|policy|policies|law|laws|bill|"
+    r"regulations?|ban|banned|visa|deadline|population|subscribers|followers|"
+    r"tomorrow|yesterday|tonight|soon|anymore|ago|"
+    r"new(?! (?:line|lines|list|array|file|files|object|instance|string|dict|"
+    r"dictionary|row|rows|column|columns|branch|folder|directory|variable|tab|"
+    r"paragraph|sentence|word|words|node|element|item|key|value|table|user|class))|"
+    r"(?:next|last|this|coming) (?:week|weekend|month|year|season|match|game|"
+    r"election|event|night|quarter|release|version|update)"
+    r")\b"
+    # Lookups of a person, organisation or event by name.
+    r"|\b(?:who(?:'s| is| are| was| were)|whos|tell me about|what happened|"
+    r"what'?s happening|when (?:is|does|will|was|are|did)|when'?s|where (?:is|are)|"
+    r"how much|how old|still (?:alive|open|available|working|running|in))\b"
+    # A yes/no about a state: "is the vLLM 0.12 out", "is AWS down",
+    # "are the banks open".
+    # Bounded to one clause of 120 characters: an unbounded `.*` here took
+    # 81.5 s on a 140,000-character paste (measured 2026-09-13).
+    r"|\b(?:is|are|was|were|has|have|did|does)\b[^.?!\n]{0,120}?\b(?:out|up|live|back|down|open|"
+    r"closed|working|broken|available|released|over|cancel(?:l)?ed|delayed)\b",
+    re.I,
+)
+
+#: A version or model token: o5, gpt-5.2, iphone17, h100, rtx5090, v2, 0.12.
+_VERSIONISH = re.compile(r"\b[a-z]+-?\d+(?:\.\d+)*[a-z]*\b|\b\d+\.\d+\b", re.I)
+
+#: A capitalised word that does not start a sentence: a name ("Sam Altman",
+#: "Tesla") when the person typed one in its case. Languages are exempt.
+_MID_SENTENCE_CAPITAL = re.compile(r"(?<![.!?:;]\s)(?<!^)(?<![\"'(\[])\b[A-Z][\w'-]*")
+_LANGUAGE_WORD = re.compile(rf"^(?:{_LANGUAGE_NAMES}|i|i'm|i've|i'll|i'd|ok|okay)$", re.I)
+
+
+def _names_something(question: str) -> bool:
+    for m in _MID_SENTENCE_CAPITAL.finditer(question.strip()):
+        if not _LANGUAGE_WORD.match(m.group(0)):
+            return True
+    return False
+
+
+def router_would_be_asked(question: str, *, now_year: int) -> bool:
+    """True when `classify` would consult the router for this question: the
+    deterministic pass could not decide. Lets a caller start work that does
+    not depend on the answer BEFORE the round trip, instead of after it."""
+    return _deterministic(question, now_year) is None
+
+
+# --------------------------------------------------------------------------
+# The OBJECT of a timeless task (second prover pass, 2026-09-13).
+#
+# The noun veto above is a list, and a list leaks. The prover wrapped 20
+# live values in timeless shapes with no word from it — "write a short poem
+# congratulating the chief justice of india", "draft a letter to the pope",
+# "write an email to my accountant about the gst on laptops", "write a toast
+# for the reigning miss universe", "give me some slogans for the ruling party
+# in bihar" — and 15 of 20 skipped the router and the Fast live lookup
+# (HEAD: 20/20 attempted). What they share is structural: the task is ABOUT
+# a definite thing in the world ("the pope", "india's chess world champion")
+# or a role, record, rate or incumbency whose holder changes. So:
+#   - a definite object ("the <noun>") vetoes, unless the noun is text the
+#     person supplied ("the following", "the paragraph"), code ("the
+#     function"), a timeless setting ("the ocean", "the night") or a maths
+#     object ("the sum", "the largest number");
+#   - a possessive of anything but a pronoun or a relative vetoes
+#     ("india's", "apple's"; not "my mom's");
+#   - a role, office, title, record, tax or incumbency word vetoes wherever
+#     it stands ("a poem for chief justice gavai").
+# Each costs one router call on a timeless task (mean 0.216 s); a leak costs
+# an answer from 2024 weights.
+# --------------------------------------------------------------------------
+
+_DEFINITE_OBJECT = re.compile(
+    r"\bthe\s+(?!(?:"
+    # Text the person supplied, and the parts of it a rewrite talks about.
+    r"following|above|below|text|sentence|sentences|paragraph|paragraphs|passage|grammar|spelling|"
+    r"punctuation|tone|wording|same|letter|email|message|note|poem|story|essay|draft|"
+    r"plot of|story of|"
+    # Code.
+    r"code|function|script|query|regex|snippet|program|class|method|loop|error|bug|stack ?trace|output|"
+    r"input|file|list|array|string|word|words|"
+    # Timeless settings of a creative task.
+    r"moon|sun|sky|stars|sea|ocean|rain|wind|night|morning|evening|forest|mountains?|river|beach|snow|"
+    r"seasons?|autumn|fall|winter|spring|summer|future|past|end|beginning|"
+    # Maths objects.
+    r"(?:largest|smallest|biggest|longest|shortest|highest|lowest)\s+(?:number|element|value|integer|word)|"
+    r"first|second|third|nth|kth|number|numbers|sum|average|mean|median|product|difference|square|cube|"
+    r"factorial|area|volume|perimeter|derivative|integral|roots?|equation"
+    r")\b)\w",
+    re.I,
+)
+
+#: A possessive of a name or a thing in the world. Pronouns, contractions and
+#: the people a personal note is usually for are not.
+_POSSESSIVE = re.compile(
+    r"\b(?!(?:it|that|what|let|here|there|he|she|who|where|how|when|why|one|mom|mum|dad|mother|father|"
+    r"wife|husband|son|daughter|brother|sister|friend|boss|cat|dog|baby|kid|child|teacher|grandma|"
+    r"grandpa|grandmother|grandfather|partner|girlfriend|boyfriend|fiance|fiancee|aunt|uncle|cousin|"
+    r"neighbou?r|colleague|coworker|team|company|everyone|someone|nobody|anyone)['’]s\b)[a-z0-9]+['’]s\b",
+    re.I,
+)
+
+#: Roles, offices, titles, records, taxes and incumbency: a holder or a value
+#: that changes. Superlatives that are maths vocabulary ("the largest number
+#: in a list") are left to the definite-object rule's exemption.
+_ROLE_RECORD_OR_RATE = re.compile(
+    r"\b(?:"
+    r"president|presidents|vice[- ]president|prime minister|ministers?|premier|chancellor|governor|mayor|"
+    r"senators?|congress(?:man|woman)|mps?|mlas?|meps?|ceo|cfo|coo|cto|chairman|chairwoman|chairperson|"
+    r"chief|justice|judges?|pope|speaker|secretary|ambassador|envoy|commissioner|attorney general|"
+    r"monarch|dalai lama|head coach|"
+    r"champions?|championship|titleholder|title holder|record holder|miss universe|miss world|miss india|"
+    r"mvp|ballon d'or|oscars?|grammys?|emmys?|nobel|laureate|"
+    r"tallest|richest|highest[- ]grossing|grossing|highest[- ]paid|best[- ]selling|bestsellers?|"
+    r"most[- ](?:followed|watched|subscribed|streamed|downloaded|searched|visited)|"
+    r"gst|vat|tariffs?|customs|duty|duties|levy|levies|cess|surcharges?|tolls?|fares?|premiums?|"
+    r"subsid(?:y|ies)|lottery|quota|repo rate|"
+    r"(?:ruling|opposition|political|governing) part(?:y|ies)|government|cabinet|parliament|congress|senate|"
+    r"lok sabha|rajya sabha|"
+    r"reigning|ruling|defending|incumbent|sitting|current|currently|serving|outgoing|newly|elected|"
+    r"appointed|nominees?"
+    r")\b",
+    re.I,
+)
+
+
+#: A transformation whose text follows a colon, a quote or a line break
+#: ("translate this paragraph: the cat sat on the mat"). The object rules
+#: read only the instruction before it: "the cat" is the person's text, not a
+#: thing in the world. The noun veto above still reads everything.
+_SUPPLIED_TEXT_LEAD = re.compile(
+    r"^\W*(?:(?:please|pls|kindly)\s+)?(?:(?:can|could|would) you\s+(?:please\s+)?)?"
+    r"(?:translate|rephrase|paraphrase|reword|rewrite|re-write|proofread|spell ?check|polish|shorten|expand|"
+    r"simplify|summari[sz]e|tl;?dr|correct|fix|improve)\b[^:\"'“‘\n]{0,60}[:\"'“‘\n]",
+    re.I,
+)
+
+
+def _live_signal(question: str) -> bool:
+    """Does anything in the question suggest its answer is a live value?"""
+    q = question or ""
+    if (
+        _RECENT.search(q)
+        or _YEAR.search(q)
+        or _LIVE_SIGNAL.search(q)
+        or _VERSIONISH.search(q)
+        or _names_something(q)
+    ):
+        return True
+    lead = _SUPPLIED_TEXT_LEAD.match(q)
+    instruction = q[: lead.end()] if lead else q
+    return bool(
+        _DEFINITE_OBJECT.search(instruction)
+        or _POSSESSIVE.search(instruction)
+        or _ROLE_RECORD_OR_RATE.search(instruction)
+    )
+
+
+#: Longer messages are not skip candidates. A long paste is exactly where a
+#: live value hides past the opening words, the router reads only the first
+#: 400 characters anyway, and the `.*` alternatives above must never scan an
+#: unbounded paste on the event loop (the composer has no size limit).
+_SKIP_MAX_CHARS = 500
+
+
+def clearly_timeless(question: str, *, now_year: int) -> bool:
+    """Undecided by the regex pass, positively a timeless task, and not one
+    live-value signal in it. The ONLY questions Fast may settle without the
+    router, and only while FRESHNESS_FAST_SKIP_ROUTER is on (default off);
+    see the block comment above for why the default is to ask."""
+    q = (question or "").strip()
+    if not q or len(q) > _SKIP_MAX_CHARS or not router_would_be_asked(q, now_year=now_year):
+        return False
+    if _live_signal(q):
+        return False
+    return bool(_SMALL_TALK.match(q) or _TIMELESS_TASK.match(q))
+
+
+def static_timeless_task() -> Verdict:
+    """The verdict a Fast turn gets when `clearly_timeless` holds."""
+    return Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], TIMELESS_TASK_REASON)
+
+
 async def classify(question: str, *, now_year: int, allow_router: bool = True) -> Verdict:
     """How fresh must the evidence behind this answer be?
 

@@ -328,11 +328,14 @@ def test_a_valid_key_lists_the_models_it_may_use(api, engine):
     assert response.status_code == 200
     payload = response.json()
     assert payload["object"] == "list"
-    assert [m["id"] for m in payload["data"]] == [registry.TECHSARA_35B]
+    # Every model this deployment runs (owner request 2026-09-13), flagship
+    # first — and nothing it does not run.
+    assert [m["id"] for m in payload["data"]] == [m.id for m in registry.declared_models()]
+    assert payload["data"][0]["id"] == registry.TECHSARA_35B
     # The internal target never leaves the server: which checkpoint answers is
     # an operational detail, and publishing it reads out our upgrade schedule.
-    assert "internal" not in payload["data"][0]
-    assert "Qwen" not in response.text
+    assert all("internal" not in m and "engine" not in m for m in payload["data"])
+    assert "Qwen" not in response.text and "whisper-large" not in response.text
 
 
 def test_an_unknown_model_and_a_forbidden_one_are_the_same_404(api, platform, engine):
@@ -899,16 +902,10 @@ def test_the_public_schema_is_served_without_a_credential(api):
 def test_the_public_schema_describes_no_internal_route(api):
     document = api.get("/v1/openapi.json").json()
 
-    assert set(document["paths"]) == {
-        "/v1/models",
-        "/v1/models/{model}",
-        "/v1/responses",
-        "/v1/responses/{id}",
-        "/v1/responses/{id}/cancel",
-        "/v1/chat/completions",
-        "/v1/usage",
-        "/v1/openapi.json",
-    }
+    # The EXACT path set moved to tests/test_publicapi_surface.py (2026-09-13),
+    # which owns the eleven-path surface once embeddings, rerank and speech
+    # are published; what stays here is that no internal route leaks in.
+    assert all(path.startswith("/v1/") for path in document["paths"])
     # Everything CONTRACT §7 deliberately does not expose. Each would need its
     # own product, scope and threat review.
     text = response_text = str(document)
@@ -1382,22 +1379,18 @@ def test_the_projects_input_ceiling_narrows_the_models_and_zero_means_zero(
     assert long_enough.json()["error"]["code"] == "context_length_exceeded"
     assert short.status_code == 200
 
-    # Zero means zero, only None inherits. Asserted on the router's own rule
-    # with a caller that CARRIES 0: `resolver._ceiling` currently folds a
-    # stored 0 into None before the router ever sees it (reported, not this
-    # file's to change).
-    import dataclasses
+    # Zero means zero, only None inherits. Asserted on the planner's own rule
+    # (which the router applies since 2026-09-13) with a ceiling that CARRIES
+    # 0: `resolver._ceiling` currently folds a stored 0 into None before the
+    # router ever sees it (reported, not this file's to change).
+    from app.publicapi import errors as api_errors, models as api_models, planning
 
-    caller = _caller()
-    zero = dataclasses.replace(
-        caller, limits=dataclasses.replace(caller.limits, max_input_tokens=0)
-    )
-    inherit = dataclasses.replace(
-        caller, limits=dataclasses.replace(caller.limits, max_input_tokens=None)
-    )
-    refusal = public_router._context_limit_error(zero, registry.TECHSARA_35B, 8)
-    assert refusal is not None and refusal.code == "context_length_exceeded"
-    assert public_router._context_limit_error(inherit, registry.TECHSARA_35B, 8) is None
+    request_model = api_models.parse_responses_request(_body(input="hi"))
+    flagship = registry.resolve_public_model(registry.TECHSARA_35B)
+    with pytest.raises(api_errors.ApiError) as refusal:
+        planning.plan_generation(request_model, flagship, project_max_input_tokens=0)
+    assert refusal.value.code == "context_length_exceeded"
+    assert planning.plan_generation(request_model, flagship, project_max_input_tokens=None)
 
 
 # ------------------------------------------------------ finish_reason --

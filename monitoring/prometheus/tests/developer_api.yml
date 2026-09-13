@@ -1,0 +1,708 @@
+# promtool unit tests for monitoring/prometheus/rules/developer-api.yml
+# (2026-09-13). Run from the repo root with the pinned image, like the
+# availability tests:
+#
+#   IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+#     test rules /p/tests/developer_api.yml
+#
+# promtool compares labels AND every annotation, so these tests also pin the
+# rendered wording and the `state_now` query template. Label sets are the
+# real scrape labels (prometheus.yml) so `on(node)` / `on(service)` joins run
+# against what production scrapes:
+#   node (head):   instance="host.docker.internal:9100",job="node",node="spark-1",role="head"
+#   node (worker): instance="worker:9100",job="node",node="spark-2",role="worker"
+#   vllm-main:     instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"
+#   vllm-aux:      instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"
+#   orchestrator:  instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"
+#   controller:    instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster"
+# (the worker instance is a placeholder; only `node` takes part in a join).
+#
+# Every "does not fire" case is a shape measured on this cluster that a
+# cruder rule got wrong: swap growth with memory to spare (daily on the head),
+# a 950K-token prefill (counters flat for 14 minutes while KV climbs), low
+# traffic with one error, at-capacity refusals counted as server failures.
+
+rule_files:
+  - ../rules/developer-api.yml
+
+evaluation_interval: 15s
+
+tests:
+  # ============================================================ node memory
+  - name: MemAvailable below 8 GiB for two minutes warns for that node only
+    interval: 15s
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '7516192768x40'
+      - series: 'node_memory_MemAvailable_bytes{instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '64424509440x40'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: NodeMemAvailableLow
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: NodeMemAvailableLow
+        exp_alerts:
+          - exp_labels: { severity: warning, service: host, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: only 7GiB of memory available"
+              description: "Below 8 GiB of MemAvailable on a unified-memory node, where model weights and KV cache are host memory. Two minutes of it means the OOM killer is one allocation burst away. Find the holder with a command that sees GPU memory, then free what costs nobody (pg-test, the e2e stack, a desktop session), then the expendable GPU holders (OCR, speech, auxiliary engines); never postgres or the main engine."
+              runbook: monitoring/developer-api/README.md#node-memory
+              safe_command: "free -g; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,rss,comm --sort=-rss | head -8"
+      - eval_time: 3m
+        alertname: NodeMemAvailableCritical
+        exp_alerts: []
+
+  - name: A one-minute dip below 8 GiB is not an alert
+    interval: 15s
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '7516192768x4 21474836480x30'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NodeMemAvailableLow
+        exp_alerts: []
+
+  - name: MemAvailable below 4 GiB for a minute is critical
+    interval: 15s
+    input_series:
+      - series: 'node_memory_MemAvailable_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '3758096384x20'
+    alert_rule_test:
+      - eval_time: 90s
+        alertname: NodeMemAvailableCritical
+        exp_alerts:
+          - exp_labels: { severity: critical, service: host, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: 3.5GiB of memory available — OOM kill imminent"
+              description: "Below 4 GiB. The kernel has OOM-killed an engine rank on this hardware before (worker, 2026-07-22); with ranks at the default oom_score_adj the engine is the likeliest victim. Free memory now, in the order of OPERATIONS.md §14: what costs nobody, then OCR, speech and the auxiliary engines."
+              runbook: monitoring/developer-api/README.md#node-memory
+              safe_command: "free -g; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv; ps -eo pid,rss,comm --sort=-rss | head -8"
+
+  - name: Swap growing 3 GiB in 15 minutes while under 16 GiB is available warns
+    interval: 15s
+    input_series:
+      # 40 GiB free, losing 3 GiB per 15 minutes (60 samples) from t=0. The
+      # 15-minute delta passes 2 GiB at about t=10m; for: 5m.
+      - series: 'node_memory_SwapFree_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '42949672960-53687091.2x120'
+      - series: 'node_memory_MemAvailable_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '12884901888x120'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: NodeSwapRisingUnderMemoryPressure
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: NodeSwapRisingUnderMemoryPressure
+        exp_alerts:
+          - exp_labels: { severity: warning, service: host, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: swap grew 3GiB in 15m with under 16 GiB available"
+              description: "Memory is draining into swap while available memory is already low: the working set no longer fits. On these nodes that is model memory being paged, so latency climbs before anything is killed."
+              runbook: monitoring/developer-api/README.md#node-memory
+              safe_command: "free -g; vmstat 5 3"
+
+  - name: The same swap growth with 40 GiB available is ordinary reclaim and does not warn
+    interval: 15s
+    input_series:
+      - series: 'node_memory_SwapFree_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '42949672960-53687091.2x120'
+      - series: 'node_memory_MemAvailable_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '42949672960x120'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: NodeSwapRisingUnderMemoryPressure
+        exp_alerts: []
+
+  - name: Swap above 80 percent for five minutes warns
+    interval: 15s
+    input_series:
+      - series: 'node_memory_SwapFree_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '8589934592x40'
+      - series: 'node_memory_SwapTotal_bytes{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '68719476736x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NodeSwapNearlyExhausted
+        exp_alerts:
+          - exp_labels: { severity: warning, service: host, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: swap 88% used"
+              description: "When swap is full the next shortfall goes straight to the OOM killer. Highest seen in 14 days was 72% on the head."
+              runbook: monitoring/developer-api/README.md#node-memory
+              safe_command: "free -g; swapon --show"
+
+  - name: A node with no swap configured never divides by zero into an alert
+    interval: 15s
+    input_series:
+      - series: 'node_memory_SwapFree_bytes{instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '0x40'
+      - series: 'node_memory_SwapTotal_bytes{instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: NodeSwapNearlyExhausted
+        exp_alerts: []
+
+  # ======================================================== engine pressure
+  - name: Main KV cache above 90 percent for 15 minutes is critical and names the live state
+    interval: 15s
+    input_series:
+      - series: 'vllm:kv_cache_usage_perc{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0.95x80'
+      - series: 'techsara_vllm_state{instance="host.docker.internal:9838",job="engine-controller",service="main",role="head",engine_scope="cluster",state="BUSY"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: VllmMainKvCacheSaturatedSustained
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: VllmMainKvCacheSaturatedSustained
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: DEGRADED }
+            exp_annotations:
+              summary: "Main engine KV cache 95% used for 15 minutes"
+              description: 'Sustained saturation on the one engine that answers both the chat app and techsara-35b. Look at what holds it: a long public generation (public_api_engine_in_flight{engine="main.long"}), a full-window chat prompt, or both.'
+              state_now: BUSY
+              runbook: monitoring/developer-api/README.md#kv-cache-saturated
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.signals.engine'"
+
+  - name: An auxiliary engine's KV cache above 90 percent for 10 minutes warns per engine
+    interval: 15s
+    input_series:
+      - series: 'vllm:kv_cache_usage_perc{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '0.93x60'
+      - series: 'vllm:kv_cache_usage_perc{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '0.2x60'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: VllmAuxKvCacheSaturatedSustained
+        exp_alerts:
+          - exp_labels: { severity: warning, service: router }
+            exp_annotations:
+              summary: "router engine KV cache 93% used for 10 minutes"
+              description: "The router's pool is 1.07 of its window, so one long public request can hold it while every chat turn needs it for classification. The public capacity gate bounds public use; if this fires, check the gate for this engine on the Developer API dashboard before raising any public setting."
+              runbook: monitoring/developer-api/README.md#kv-cache-saturated
+
+  - name: Preemptions above five per 15 minutes warn, a single preemption does not
+    interval: 15s
+    input_series:
+      # main: one preemption per minute. ocr: one preemption, once.
+      - series: 'vllm:num_preemptions_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0+0.25x100'
+      - series: 'vllm:num_preemptions_total{instance="worker:30004",job="vllm-aux",service="ocr",node="spark-2",role="worker"}'
+        values: '0x10 1x90'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EnginePreemptionsIncreasing
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main }
+            exp_annotations:
+              summary: "main engine preempted 15 requests in 15 minutes"
+              description: "vLLM is evicting running requests to make KV room and will recompute them. Users see this as latency, not errors. Pair it with the KV panel for the same engine."
+              runbook: monitoring/developer-api/README.md#preemptions
+
+  - name: Engine 5xx above 5 percent with enough traffic warns; one error on a quiet engine does not
+    interval: 15s
+    input_series:
+      # embed: 10 requests a minute succeed, 1 a minute fails -> 9.1%.
+      - series: 'http_requests_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head",handler="/v1/embeddings",method="POST",status="2xx"}'
+        values: '0+2.5x80'
+      - series: 'http_requests_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head",handler="/v1/embeddings",method="POST",status="5xx"}'
+        values: '0+0.25x80'
+      # reranker: 1 request in 10 minutes and it failed -> 100%, but < 20 requests.
+      - series: 'http_requests_total{instance="vllm-reranker:30005",job="vllm-aux",service="reranker",node="spark-1",role="head",handler="/score",method="POST",status="5xx"}'
+        values: '0x4 1x76'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: EngineHttp5xxRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: embed }
+            exp_annotations:
+              summary: "embed engine answered 9.1% of inference requests with 5xx over 10m"
+              description: "The engine itself is failing requests (not the orchestrator in front of it). Read the engine's own log for the handler named on the Developer API dashboard's engine 5xx panel."
+              runbook: monitoring/developer-api/README.md#engine-5xx
+
+  - name: One failure in every ten-minute window among twenty requests sits on the 5 percent line and does not warn
+    interval: 15s
+    input_series:
+      # The 2026-09-13 embed shape: ~2 requests a minute and a lone failure in
+      # each window, so the ratio hovers just above 5% (1.03 / 20.0 once
+      # increase() extrapolates). Without the two-failure guard this fires.
+      - series: 'http_requests_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head",handler="/v1/embeddings",method="POST",status="2xx"}'
+        values: '0+0.475x160'
+      - series: 'http_requests_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head",handler="/v1/embeddings",method="POST",status="5xx"}'
+        values: '0x40 1x40 2x40 3x40'
+    alert_rule_test:
+      - eval_time: 38m
+        alertname: EngineHttp5xxRatioHigh
+        exp_alerts: []
+
+  - name: Health and model-list polls do not dilute failed inference, so a quiet engine failing its real requests warns
+    interval: 15s
+    input_series:
+      # The 7-day median shapes per 10 minutes. main: 70 /v1/models polls and
+      # 10 completions, 3 of them failed — 3/80 = 3.75% counting the polls,
+      # 30% of inference. router: 20 polls and 2 completions (at 7m and 9m),
+      # both failed — under the old 20-request floor without the polls.
+      - series: 'http_requests_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",handler="/v1/models",method="GET",status="2xx"}'
+        values: '0+1.75x80'
+      - series: 'http_requests_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",handler="/v1/chat/completions",method="POST",status="2xx"}'
+        values: '0+0.175x80'
+      - series: 'http_requests_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster",handler="/v1/chat/completions",method="POST",status="5xx"}'
+        values: '0+0.075x80'
+      - series: 'http_requests_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head",handler="/v1/models",method="GET",status="2xx"}'
+        values: '0+0.5x80'
+      - series: 'http_requests_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head",handler="/v1/chat/completions",method="POST",status="5xx"}'
+        values: '0x28 1x8 2x44'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: EngineHttp5xxRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main }
+            exp_annotations:
+              summary: "main engine answered 30.0% of inference requests with 5xx over 10m"
+              description: "The engine itself is failing requests (not the orchestrator in front of it). Read the engine's own log for the handler named on the Developer API dashboard's engine 5xx panel."
+              runbook: monitoring/developer-api/README.md#engine-5xx
+          - exp_labels: { severity: warning, service: router }
+            exp_annotations:
+              summary: "router engine answered 100.0% of inference requests with 5xx over 10m"
+              description: "The engine itself is failing requests (not the orchestrator in front of it). Read the engine's own log for the handler named on the Developer API dashboard's engine 5xx panel."
+              runbook: monitoring/developer-api/README.md#engine-5xx
+
+  - name: Failing health probes alone are not failed inference
+    interval: 15s
+    input_series:
+      - series: 'http_requests_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head",handler="/health",method="GET",status="5xx"}'
+        values: '0+1x80'
+      - series: 'http_requests_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head",handler="/v1/models",method="GET",status="5xx"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: EngineHttp5xxRatioHigh
+        exp_alerts: []
+
+  # ================================================= engine wedge signature
+  - name: Main engine frozen with requests running fires without the controller
+    interval: 5s
+    input_series:
+      # Five minutes of healthy progress, then everything stops at t=300s
+      # with 9 requests still running (the 2026-09-11 22:15 shape).
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '9x200'
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0+500x60 30000+0x140'
+      - series: 'vllm:prompt_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0+1000x60 60000+0x140'
+      - series: 'vllm:iteration_tokens_total_count{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0+50x60 3000+0x140'
+      - series: 'vllm:kv_cache_usage_perc{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0.1+0.001x60 0.16+0x140'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: VllmWedgeSignatureFromEngineCounters
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: VllmWedgeSignatureFromEngineCounters
+        exp_alerts:
+          - exp_labels: { severity: critical, service: main, state: WEDGED }
+            exp_annotations:
+              summary: "Main engine: 9 request(s) running and nothing has moved for 3 minutes"
+              description: "No generated token, no prompt token, no scheduler iteration and no change in KV usage for three minutes while requests are running. That is a dead rank with the head blocked in a collective, with /health still green. If the controller is up it should already be recovering (state_now); if it is not, this is the only alert that can say so."
+              state_now: MONITORING_UNKNOWN
+              runbook: docs/availability/RUNBOOK.md#wedged
+              safe_command: "curl -s http://127.0.0.1:9838/state | jq '.state,.recovery'; scripts/cluster-status.sh"
+
+  - name: A 950K-token prefill keeps every counter flat but grows KV, and is not a wedge
+    interval: 5s
+    input_series:
+      # 2026-09-12 09:03Z: one request, generation/prompt/iteration counters
+      # flat for 12 minutes, kv_cache_usage_perc climbing 0.09 -> 0.56.
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '1x200'
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '22660x200'
+      - series: 'vllm:prompt_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '694469x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '3561x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0.0876+0.0025x200'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: VllmWedgeSignatureFromEngineCounters
+        exp_alerts: []
+
+  - name: An idle engine with nothing running is never a wedge
+    interval: 5s
+    input_series:
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0x200'
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '100x200'
+      - series: 'vllm:prompt_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '100x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '10x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: VllmWedgeSignatureFromEngineCounters
+        exp_alerts: []
+
+  - name: A frozen auxiliary engine warns by service name
+    interval: 5s
+    input_series:
+      - series: 'vllm:num_requests_running{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '3x200'
+      - series: 'vllm:generation_tokens_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '5000x200'
+      - series: 'vllm:prompt_tokens_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '9000x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '400x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '0.3x200'
+      # embed keeps moving beside it.
+      - series: 'vllm:num_requests_running{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '1x200'
+      - series: 'vllm:generation_tokens_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '0x200'
+      - series: 'vllm:prompt_tokens_total{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '0+40x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '0+1x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="vllm-embed:30003",job="vllm-aux",service="embed",node="spark-1",role="head"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AuxEngineWedgeSignature
+        exp_alerts:
+          - exp_labels: { severity: warning, service: router }
+            exp_annotations:
+              summary: "router engine: 3 request(s) running and nothing has moved for 3 minutes"
+              description: "The engine holds requests and makes no progress. The chat app degrades around a missing router, embedder or reranker, but public calls to this engine will hang until their read timeout. A restart of this one service is the usual remedy; it is an operator's call."
+              runbook: monitoring/developer-api/README.md#aux-engine-wedged
+
+  - name: Scheduler iterations that keep counting are progress even when every token counter is flat
+    interval: 5s
+    input_series:
+      # Tokens, prompt tokens and KV all flat, but iterations still move: the
+      # scheduler is stepping. Without the iteration witness this fires.
+      - series: 'vllm:num_requests_running{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '4x200'
+      - series: 'vllm:generation_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '5000x200'
+      - series: 'vllm:prompt_tokens_total{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '90000x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '100+2x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="host.docker.internal:8000",job="vllm-main",service="main",role="head",engine_scope="cluster"}'
+        values: '0.4x200'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: VllmWedgeSignatureFromEngineCounters
+        exp_alerts: []
+
+  - name: An auxiliary engine whose KV usage keeps changing is prefilling, not wedged
+    interval: 5s
+    input_series:
+      # The router's version of the 950K-prefill shape: every counter flat,
+      # KV climbing. Without the KV witness this warns.
+      - series: 'vllm:num_requests_running{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '1x200'
+      - series: 'vllm:generation_tokens_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '5000x200'
+      - series: 'vllm:prompt_tokens_total{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '9000x200'
+      - series: 'vllm:iteration_tokens_total_count{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '400x200'
+      - series: 'vllm:kv_cache_usage_perc{instance="vllm-router:30002",job="vllm-aux",service="router",node="spark-1",role="head"}'
+        values: '0.1+0.002x200'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AuxEngineWedgeSignature
+        exp_alerts: []
+
+  # ========================================================== developer api
+  - name: Generations waiting for an admission lane for five minutes warn
+    interval: 15s
+    input_series:
+      - series: 'llm_admission_waiting{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",lane="normal"}'
+        values: '2x40'
+      - series: 'llm_admission_waiting{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",lane="long"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LlmAdmissionWaitSustained
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main, lane: normal }
+            exp_annotations:
+              summary: "2 generation(s) waiting for the normal admission lane for 5 minutes"
+              description: "Requests are queued in the orchestrator before they reach the engine. Behind a LONG request holding the lane this is by design for up to the lane's wait bound; sustained, it is capacity."
+              runbook: monitoring/developer-api/README.md#capacity-waits
+
+  - name: Admission rejections warn by reason
+    interval: 15s
+    input_series:
+      - series: 'llm_admission_rejections_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="capacity"}'
+        values: '0x4 3x36'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: LlmAdmissionRejections
+        exp_alerts:
+          - exp_labels: { severity: warning, service: main, reason: capacity }
+            exp_annotations:
+              summary: "Admission lanes refused 3 generation(s) in 10 minutes (capacity)"
+              description: "Each is a chat turn or a /v1 call answered \"at capacity\". Nothing was lost — the caller was told to retry — but people were turned away."
+              runbook: monitoring/developer-api/README.md#capacity-waits
+
+  - name: Public requests waiting at a capacity gate for ten minutes warn per engine
+    interval: 15s
+    input_series:
+      - series: 'public_api_engine_waiting{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",engine="router"}'
+        values: '1x60'
+      - series: 'public_api_engine_waiting{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",engine="ocr"}'
+        values: '1x20 0x40'
+      # Background jobs queued behind one long generation: by design, never this alert.
+      - series: 'public_api_engine_waiting{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",engine="main.long"}'
+        values: '3x60'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: PublicApiGateWaitSustained
+        exp_alerts:
+          - exp_labels: { severity: warning, service: orchestrator, engine: router }
+            exp_annotations:
+              summary: "1 public request(s) waiting for the router capacity gate for 10 minutes"
+              description: "Public work on a shared engine is queued behind other public work. Sync and stream requests give up after the gate wait and answer 503 with Retry-After; background jobs wait up to an hour by design, so check the Developer API dashboard's background jobs panel before treating this as a capacity shortage."
+              runbook: monitoring/developer-api/README.md#capacity-waits
+
+  - name: More than five at-capacity refusals in ten minutes warn per engine
+    interval: 15s
+    input_series:
+      - series: 'public_api_capacity_refusals_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",engine="main.long"}'
+        values: '0+0.25x80'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PublicApiAtCapacityRefusals
+        exp_alerts:
+          - exp_labels: { severity: warning, service: orchestrator, engine: main.long }
+            exp_annotations:
+              summary: "10 public request(s) refused at capacity on main.long in 10 minutes"
+              description: "Callers are getting 503 model_unavailable \"at capacity\". Not a usage limit — the engine is shared with the chat app and full."
+              runbook: monitoring/developer-api/README.md#capacity-waits
+
+  - name: Server-side failures above 5 percent warn, counting in-band stream failures
+    interval: 15s
+    input_series:
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="responses",model="techsara-35b",status="200",error="none"}'
+        values: '0+2.5x80'
+      # A stream that failed after its 200.
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="responses",model="techsara-35b",status="200",error="internal_error"}'
+        values: '0+0.25x80'
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="embeddings",model="techsara-embed",status="503",error="at_capacity"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PublicApi5xxRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: orchestrator, model: techsara-35b }
+            exp_annotations:
+              summary: "Public API: techsara-35b failed 9.1% of requests server-side over 10 minutes"
+              description: "internal_error, timeout or model_unavailable (not at capacity) outcomes on /v1, including streams that failed after their 200. The orchestrator log line \"unhandled error on the public API (request_id=…)\" names each internal_error."
+              runbook: monitoring/developer-api/README.md#public-api-5xx
+
+  - name: At-capacity refusals and a restarting engine are not counted as server failures
+    interval: 15s
+    input_series:
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="responses",model="techsara-35b",status="200",error="none"}'
+        values: '0+1x80'
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="responses",model="techsara-35b",status="503",error="at_capacity"}'
+        values: '0+1x80'
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="responses",model="techsara-35b",status="503",error="model_recovering"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PublicApi5xxRatioHigh
+        exp_alerts: []
+
+  - name: Two server-side failures on one model, fewer than one caller's SDK retries, do not warn
+    interval: 15s
+    input_series:
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="rerank",model="techsara-rerank",status="200",error="none"}'
+        values: '0x4 13x76'
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="rerank",model="techsara-rerank",status="500",error="internal_error"}'
+        values: '0x4 2x76'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PublicApi5xxRatioHigh
+        exp_alerts: []
+
+  - name: A broken quiet model warns on its own even while a busy model beside it is healthy
+    interval: 15s
+    input_series:
+      # 1,000 good embeddings and 30 failed OCR calls in 10 minutes: 2.9%
+      # across both, 100% for techsara-ocr.
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="embeddings",model="techsara-embed",status="200",error="none"}'
+        values: '0+25x80'
+      - series: 'public_api_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",route="chat_completions",model="techsara-ocr",status="500",error="internal_error"}'
+        values: '0+0.75x80'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PublicApi5xxRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: orchestrator, model: techsara-ocr }
+            exp_annotations:
+              summary: "Public API: techsara-ocr failed 100.0% of requests server-side over 10 minutes"
+              description: "internal_error, timeout or model_unavailable (not at capacity) outcomes on /v1, including streams that failed after their 200. The orchestrator log line \"unhandled error on the public API (request_id=…)\" names each internal_error."
+              runbook: monitoring/developer-api/README.md#public-api-5xx
+
+  # ========================================================= speech to text
+  - name: Dictation failing a fifth of its transcriptions with two failures warns for the dictation path
+    interval: 15s
+    input_series:
+      # 6 attempts in 15 minutes, 3 failed; video clips healthy beside it.
+      - series: 'asr_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="ok"}'
+        values: '0x4 1x10 2x10 3x56'
+      - series: 'asr_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="fail"}'
+        values: '0x8 1x12 2x12 3x48'
+      - series: 'asr_batch_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="ok"}'
+        values: '0+1x80'
+      - series: 'asr_batch_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="fail"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: AsrFailureRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: asr, path: dictation }
+            exp_annotations:
+              summary: "Speech to text: 50% of dictation transcriptions failed over 15 minutes"
+              description: "The whisper replicas are failing the chat app's own transcriptions, so techsara-whisper callers are very likely failing too (they reach the same replicas by another path that these counters do not see). The orchestrator's GET /audio/health (an administrator session with analytics access) names each replica's state; the orchestrator log has the engine error."
+              runbook: monitoring/developer-api/README.md#speech-to-text
+              safe_command: "scripts/whisper.sh status"
+
+  - name: One failed video clip among a few is not a speech outage
+    interval: 15s
+    input_series:
+      - series: 'asr_batch_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="ok"}'
+        values: '0x4 1x10 2x10 3x56'
+      - series: 'asr_batch_requests_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",result="fail"}'
+        values: '0x8 1x72'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: AsrFailureRatioHigh
+        exp_alerts: []
+
+  - name: Transcriptions waiting for a slot for five minutes warn, a short wait does not
+    interval: 15s
+    input_series:
+      - series: 'asr_queue_depth{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x4 0x16 2x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: AsrQueueSustained
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: AsrQueueSustained
+        exp_alerts:
+          - exp_labels: { severity: warning, service: asr }
+            exp_annotations:
+              summary: "Speech to text: 2 transcription(s) waiting for a slot for 5 minutes"
+              description: "Every whisper slot has been busy for five minutes. Dictation callers are being told \"busy\" after an 8-second wait. whisper decodes one clip per replica, and public transcriptions yield to dictation, so public callers are waiting or getting 503 too."
+              runbook: monitoring/developer-api/README.md#speech-to-text
+
+  # ============================================================= host guard
+  - name: A missing packet filter table on a node whose check works is critical
+    interval: 15s
+    input_series:
+      - series: 'techsara_host_guard_table_present{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0x20'
+      - series: 'techsara_host_guard_check_ok{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '1x20'
+      - series: 'techsara_host_guard_check_timestamp_seconds{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+15x20'
+      - series: 'techsara_host_guard_table_present{source="nft",instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '1x20'
+      - series: 'techsara_host_guard_check_ok{source="nft",instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '1x20'
+      - series: 'techsara_host_guard_check_timestamp_seconds{instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '0+15x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HostGuardTableMissing
+        exp_alerts:
+          - exp_labels: { severity: critical, service: host, source: nft, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: the host packet filter table is not loaded (checked by nft)"
+              description: "The nftables table that limits who can reach the engine ports is gone — usually a reboot, since it is not persisted by default. Re-apply it with the documented procedure."
+              runbook: docs/developer-platform/OPERATIONS.md#13-the-host-packet-filter-on-the-engine-ports
+              safe_command: "scripts/host-guard.sh verify"
+      - eval_time: 3m
+        alertname: HostGuardSignalUnproven
+        exp_alerts: []
+
+  - name: The worker's missing table names the worker's own verify command
+    interval: 15s
+    input_series:
+      - series: 'techsara_host_guard_table_present{source="state_file",instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '0x20'
+      - series: 'techsara_host_guard_check_ok{source="state_file",instance="worker:9100",job="node",node="spark-2",role="worker"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: HostGuardTableMissing
+        exp_alerts:
+          - exp_labels: { severity: critical, service: host, source: state_file, instance: "worker:9100", job: node, node: spark-2, role: worker }
+            exp_annotations:
+              summary: "spark-2: the host packet filter table is not loaded (checked by state_file)"
+              description: "The nftables table that limits who can reach the engine ports is gone — usually a reboot, since it is not persisted by default. Re-apply it with the documented procedure."
+              runbook: docs/developer-platform/OPERATIONS.md#13-the-host-packet-filter-on-the-engine-ports
+              safe_command: "bash ~/.techsara-cluster/host-guard.sh verify --role worker"
+
+  - name: A check that could not run nft says unknown, never missing
+    interval: 15s
+    input_series:
+      - series: 'techsara_host_guard_table_present{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0x40'
+      - series: 'techsara_host_guard_check_ok{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0x40'
+      - series: 'techsara_host_guard_check_timestamp_seconds{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0+15x40'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HostGuardTableMissing
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: HostGuardSignalUnproven
+        exp_alerts:
+          - exp_labels: { severity: warning, service: host, cause: check_failed, source: nft, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: host packet filter state unknown (check_failed)"
+              description: "The textfile check could not run nft, or has not written for 15 minutes. The filter may be fine; monitoring cannot tell."
+              runbook: monitoring/developer-api/README.md#host-packet-filter
+
+  - name: A checker that stopped writing is stale after fifteen minutes
+    interval: 15s
+    input_series:
+      # node-exporter keeps serving the last file, so the gauges stay present
+      # while the stamp stops moving at t=0.
+      - series: 'techsara_host_guard_table_present{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '1x100'
+      - series: 'techsara_host_guard_check_ok{source="nft",instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '1x100'
+      - series: 'techsara_host_guard_check_timestamp_seconds{instance="host.docker.internal:9100",job="node",node="spark-1",role="head"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: HostGuardSignalUnproven
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: HostGuardSignalUnproven
+        exp_alerts:
+          - exp_labels: { severity: warning, service: host, cause: check_stale, instance: "host.docker.internal:9100", job: node, node: spark-1, role: head }
+            exp_annotations:
+              summary: "spark-1: host packet filter state unknown (check_stale)"
+              description: "The textfile check could not run nft, or has not written for 15 minutes. The filter may be fine; monitoring cannot tell."
+              runbook: monitoring/developer-api/README.md#host-packet-filter

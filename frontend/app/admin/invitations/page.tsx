@@ -56,7 +56,12 @@ export default function AdminInvitationsPage() {
       <div
         role="group"
         aria-label="Filter invitations"
-        className={`${CONTROL_HEIGHT} mt-6 flex w-fit items-center rounded-ts border border-border bg-[var(--admin-control)] p-1`}
+        // max-w-full + overflow: five filters are 347px, wider than a 360px
+        // phone's content column, and the group pushed <main> sideways.
+        // p-0.5 on touch: inside the 40px strip, p-1 left each filter 30px
+        // tall, under the 32px tap floor (re-audit 2026-09-13); 2px of inset
+        // makes them 34px without changing the strip's height.
+        className={`${CONTROL_HEIGHT} mt-6 flex w-fit max-w-full items-center overflow-x-auto rounded-ts border border-border bg-[var(--admin-control)] p-1 max-sm:p-0.5 [@media(pointer:coarse)]:p-0.5`}
       >
         {FILTERS.map(([value, label]) => (
           <button
@@ -64,7 +69,7 @@ export default function AdminInvitationsPage() {
             type="button"
             aria-pressed={status === value}
             onClick={() => setStatus(value)}
-            className={`h-full rounded-md px-3 text-xs font-medium transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+            className={`h-full shrink-0 rounded-md px-2.5 text-xs font-medium sm:px-3 transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
               status === value
                 ? 'bg-surface-2 text-ink'
                 : 'text-muted hover:text-ink'

@@ -4,9 +4,9 @@
  * The developer console's shell: rail, header, and the section on show.
  *
  * It is the admin shell's twin on purpose — same 240px rail, same 36px nav
- * rows, same mobile header that scrolls sideways, same content column — so
- * that moving between /admin and /api feels like moving between two rooms of
- * one building rather than two products. CONTRACT §17 asks for exactly that:
+ * rows, same drawer below lg, same content column — so that moving between
+ * /admin and /api feels like moving between two rooms of one building rather
+ * than two products. CONTRACT §17 asks for exactly that:
  * the console "reuses the admin design system so it looks like the product
  * rather than a bolted-on page".
  *
@@ -19,14 +19,25 @@
  *
  * The section lives in `?tab=`, not in component state, for the reason the
  * analytics filters do: a colleague can be sent the exact view being
- * discussed, and Back goes where Back should go.
+ * discussed, and Back goes where Back should go. So the URL must also say
+ * what is ON SCREEN: a `?tab=` this account cannot open (or that does not
+ * exist) is replaced with the Overview it renders, and the document title
+ * names the section, so browser history, tabs and a screen reader's page
+ * announcement can tell Keys from Logs (audit, 2026-09-13).
  */
 
-import type { ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import Link from 'next/link';
-import { useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { TechSaraMark } from '@/components/TechSaraMark';
-import { IconBook, IconFileText, IconPackage, IconPlay } from '@/components/icons';
+import {
+  IconBook,
+  IconFileText,
+  IconMenu,
+  IconPackage,
+  IconPlay,
+  IconX,
+} from '@/components/icons';
 import {
   IconArrowLeft,
   IconChart,
@@ -92,14 +103,122 @@ function Panel({ tab, me }: { tab: TabId; me: Me }) {
   }
 }
 
+/** The product name every console title ends with. */
+export const CONSOLE_TITLE = 'Developer platform · TechSara';
+
+/** The document title for a section: its label, then the console's name. */
+export function consoleTitle(label: string | undefined): string {
+  return label ? `${label} · ${CONSOLE_TITLE}` : CONSOLE_TITLE;
+}
+
+/**
+ * Keep the document title on the section on show.
+ *
+ * NOT a plain `document.title = …` in an effect (measured in Chrome,
+ * 2026-09-13). The layout's metadata owns a `<title>`, and on every soft
+ * navigation between tabs Next REMOVES that element and inserts a fresh one
+ * saying "Developer platform · TechSara" — after this component's effect has
+ * run. The assignment either landed on the element about to be removed, or,
+ * in the gap between the two, created a second `<title>` that the new first
+ * one then outranked: Keys → Request logs read "Developer platform ·
+ * TechSara" in the tab strip.
+ *
+ * So the title is re-applied whenever the head's titles change, by rewriting
+ * the TEXT of the first `<title>` in place (React keeps a reference to that
+ * text node; replacing the node would detach it). A `<title>` of this hook's
+ * own is created only when the document has none at all — never in a
+ * Next-rendered page — and removed as soon as another appears.
+ */
+function useConsoleTitle(label: string | undefined) {
+  useEffect(() => {
+    const wanted = consoleTitle(label);
+    const OWN = 'data-console-title';
+    const apply = () => {
+      const titles = Array.from(document.querySelectorAll('title'));
+      const theirs = titles.find((el) => !el.hasAttribute(OWN));
+      if (theirs) {
+        for (const el of titles) if (el.hasAttribute(OWN)) el.remove();
+        const text = theirs.firstChild;
+        if (text && text.nodeType === Node.TEXT_NODE) {
+          if (text.nodeValue !== wanted) text.nodeValue = wanted;
+        } else if (theirs.textContent !== wanted) {
+          theirs.textContent = wanted;
+        }
+        return;
+      }
+      // Only this hook's own title (a document with no other): update it.
+      if (titles[0] && titles[0].textContent !== wanted) titles[0].textContent = wanted;
+    };
+    apply();
+    if (document.querySelectorAll('title').length === 0) {
+      const own = document.createElement('title');
+      own.setAttribute(OWN, '');
+      own.textContent = wanted;
+      document.head.appendChild(own);
+    }
+    const observer = new MutationObserver(apply);
+    observer.observe(document.head, { childList: true, subtree: true, characterData: true });
+    return () => observer.disconnect();
+  }, [label]);
+}
+
 export function ConsoleShell({ me }: { me: Me }) {
   const params = useSearchParams();
-  const requested = tabFromQuery(params.get('tab'));
+  const router = useRouter();
+  const raw = params.get('tab');
+  const requested = tabFromQuery(raw);
   // A URL kept from before a demotion must not render a section this account
   // may no longer use. Overview is the honest landing place.
   const tab = tabAllowed(me, requested) ? requested : 'overview';
   const groups = consoleNav(me);
   const flat = groups.flatMap((g) => g.items);
+  const current = flat.find((item) => !item.external && item.id === tab);
+
+  // Below lg the rail is a drawer, opened from the slim header.
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const railRef = useRef<HTMLElement | null>(null);
+
+  // The URL says what is on screen. `?tab=limits` for an admin, or a
+  // `?tab=` that names nothing, used to render Overview under the old query
+  // — so a link copied from the address bar still named a section the page
+  // was not showing. Replaced, not pushed: Back must not return to it.
+  const search = params.toString();
+  useEffect(() => {
+    if (raw === null || raw === tab) return;
+    const next = new URLSearchParams(search);
+    next.delete('tab');
+    const rest = next.toString();
+    router.replace(`/api${rest ? `?${rest}` : ''}`, { scroll: false });
+  }, [raw, tab, search, router]);
+
+  useConsoleTitle(current?.label);
+
+  // A section change closes the drawer — whichever link caused it.
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [tab]);
+
+  // Escape closes the drawer and hands focus back to the toggle; opening it
+  // moves focus to the section on show, scrolled into view, so the drawer
+  // opens on "where am I" rather than on the top of a list.
+  useEffect(() => {
+    if (!drawerOpen) return undefined;
+    const rail = railRef.current;
+    const target =
+      rail?.querySelector<HTMLElement>('a[aria-current="page"]') ??
+      rail?.querySelector<HTMLElement>('a[href]');
+    target?.focus({ preventScroll: true });
+    target?.scrollIntoView?.({ block: 'nearest' });
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setDrawerOpen(false);
+        toggleRef.current?.focus();
+      }
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [drawerOpen]);
 
   const rowClass = (active: boolean) =>
     `flex h-9 w-full items-center gap-2.5 rounded-lg px-2.5 text-sm transition-colors duration-ts focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-sidebar ${
@@ -111,10 +230,32 @@ export function ConsoleShell({ me }: { me: Me }) {
   return (
     <ConsoleStatusProvider>
       <div className="flex h-dvh overflow-hidden bg-bg text-ink">
-        {/* Desktop: the same fixed 240px rail the admin area uses. */}
+        {/* The scrim exists only while the drawer is open, and only below lg.
+            It starts under the 52px header so the toggle stays tappable. */}
+        {drawerOpen && (
+          <div
+            aria-hidden="true"
+            data-testid="console-drawer-scrim"
+            onClick={() => setDrawerOpen(false)}
+            className="fixed inset-x-0 bottom-0 top-[52px] z-40 bg-black/60 lg:hidden"
+          />
+        )}
+        {/* ONE rail: the fixed 240px column from lg up, a drawer below it —
+            the admin area's pattern. Below md it used to be a header strip of
+            the same links that scrolled sideways with no hint: at 360px eight
+            of twelve links were off-screen, a deep link's section was never
+            scrolled into view, and every link was 22px tall (audit,
+            2026-09-13). The column started at md, which left a 768px tablet's
+            tables 464px. */}
         <aside
+          id="console-rail"
+          ref={railRef}
           aria-label="Developer console navigation"
-          className="hidden w-60 shrink-0 flex-col border-r border-border bg-sidebar md:flex"
+          className={`${
+            drawerOpen
+              ? 'fixed bottom-0 left-0 top-[52px] z-50 flex w-72 max-w-[85vw] shadow-2xl'
+              : 'hidden'
+          } shrink-0 flex-col border-r border-border bg-sidebar lg:static lg:z-auto lg:flex lg:w-60 lg:max-w-none lg:shadow-none`}
         >
           <div className="flex items-center gap-2 px-3 pb-1 pt-3">
             <TechSaraMark size={28} />
@@ -143,6 +284,9 @@ export function ConsoleShell({ me }: { me: Me }) {
                         key={item.id}
                         href={item.href}
                         aria-current={active ? 'page' : undefined}
+                        // The section already on show does not change `tab`,
+                        // so its own link closes the drawer by hand.
+                        onClick={() => setDrawerOpen(false)}
                         className={rowClass(active)}
                       >
                         <span
@@ -181,32 +325,32 @@ export function ConsoleShell({ me }: { me: Me }) {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          {/* Phone: the same links in a single scrolling row. */}
-          <header className="flex h-[52px] shrink-0 items-center gap-3 overflow-x-auto border-b border-border px-3 md:hidden">
-            <TechSaraMark size={24} />
-            {flat.map((item) => (
-              <Link
-                key={item.id}
-                href={item.href}
-                aria-current={!item.external && item.id === tab ? 'page' : undefined}
-                className={`shrink-0 text-sm transition-colors duration-ts ${
-                  !item.external && item.id === tab
-                    ? 'font-medium text-ink'
-                    : 'text-muted hover:text-ink'
-                }`}
-              >
-                {item.label}
-              </Link>
-            ))}
-            <Link
-              href="/admin"
-              className="ml-auto shrink-0 text-sm text-muted hover:text-ink"
+          {/* Below lg: a slim header that names the section on show and opens
+              the rail as a drawer. */}
+          <header className="flex h-[52px] shrink-0 items-center gap-2 border-b border-border px-2 lg:hidden">
+            <button
+              ref={toggleRef}
+              type="button"
+              onClick={() => setDrawerOpen((open) => !open)}
+              aria-expanded={drawerOpen}
+              aria-controls="console-rail"
+              aria-label={drawerOpen ? 'Close console menu' : 'Open console menu'}
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
             >
-              Admin
-            </Link>
-            <Link href="/" className="shrink-0 text-sm text-muted hover:text-ink">
-              Chat
-            </Link>
+              {drawerOpen ? <IconX size={18} /> : <IconMenu size={18} />}
+            </button>
+            <TechSaraMark size={24} />
+            <span className="rounded border border-border px-1.5 py-px text-[10px] font-medium uppercase tracking-wide text-faint">
+              Developer
+            </span>
+            {current && (
+              <span
+                data-testid="console-current-section"
+                className="min-w-0 truncate text-sm font-medium text-ink"
+              >
+                {current.label}
+              </span>
+            )}
           </header>
 
           <main className="min-h-0 flex-1 overflow-y-auto">

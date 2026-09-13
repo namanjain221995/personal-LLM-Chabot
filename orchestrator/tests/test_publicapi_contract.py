@@ -125,7 +125,9 @@ def test_a_message_role_outside_the_three_named_ones_is_refused():
             )
 
 
-def test_message_content_must_be_a_string_because_v1_exposes_no_image_input():
+def test_an_image_part_that_names_a_remote_url_is_refused_because_the_engine_would_fetch_it():
+    # 2026-09-13: image input exists now, but ONLY as a data: URL. vLLM would
+    # fetch an http(s) URL itself from inside the cluster network (SSRF).
     with pytest.raises(ValidationError):
         models.ResponsesRequest.model_validate(
             _body(
@@ -253,7 +255,15 @@ def test_the_documented_success_body_has_exactly_the_keys_of_the_contract():
         usage=models.Usage(input_tokens=37, output_tokens=112, total_tokens=149),
     )
     wire = response.to_wire()
-    assert list(wire) == ["id", "object", "created_at", "status", "model", "output", "usage"]
+    # 2026-09-13: `max_output_tokens` (the ceiling APPLIED, since a request
+    # may be clamped to what the context window leaves) and
+    # `incomplete_details` are always present, null when there is nothing to
+    # say — a client must find the field in every body, not discover it.
+    assert list(wire) == [
+        "id", "object", "created_at", "status", "model", "output", "usage",
+        "max_output_tokens", "incomplete_details",
+    ]
+    assert wire["max_output_tokens"] is None and wire["incomplete_details"] is None
     assert wire["object"] == "response"
     assert wire["output"] == [
         {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "…"}]}
@@ -744,15 +754,23 @@ def test_a_delta_after_the_finish_reason_chunk_is_refused():
 # ----------------------------------------------------- §15 the registry --
 
 
-def test_the_registry_declares_exactly_one_public_model_today():
-    declared = registry.declared_models()
-    assert [m.id for m in declared] == ["techsara-35b"]
-    assert registry.PUBLIC_MODEL_IDS == ("techsara-35b",)
-    model = declared[0]
+def test_the_registry_declares_the_six_public_ids_with_the_flagship_first():
+    # Owner request 2026-09-13: every model TechSara runs. The ORDER is the
+    # order of /v1/models and the flagship is what the OpenAPI examples use.
+    assert registry.PUBLIC_MODEL_IDS == (
+        "techsara-35b",
+        "techsara-8b-vision",
+        "techsara-ocr",
+        "techsara-embed",
+        "techsara-rerank",
+        "techsara-whisper",
+    )
+    model = registry.declared_models()[0]
+    assert model.id == "techsara-35b" and model.engine == "main"
     assert model.chat is True and model.streaming is True
     # Verified 2026-09-09: the main model IS a vision-language model.
     assert model.vision is True
-    # CONTRACT §7 exposes neither tools nor embeddings on /v1.
+    # CONTRACT §7 exposes no tools on /v1.
     assert model.tools is False and model.embeddings is False
     assert model.status == "available"
 
@@ -766,24 +784,43 @@ def test_the_internal_target_is_read_at_call_time_and_never_captured_at_import(m
     assert registry.resolve_public_model("techsara-35b").internal == "nvidia/Qwen4-99B-NVFP4"
 
 
-def test_the_public_rendering_never_names_the_checkpoint_behind_the_model():
+def test_the_public_rendering_never_names_the_checkpoint_or_the_engine_behind_any_model():
+    names = {
+        settings.llm_model, settings.router_model, settings.ocr_model,
+        settings.embed_model, settings.rerank_model, settings.asr_model,
+    }
+    for model in registry.catalogue():
+        wire = model.to_wire()
+        text = json.dumps(wire)
+        assert "internal" not in wire and "engine" not in wire
+        for name in names:
+            assert name not in text, (model.id, name)
+        for url in (settings.openai_base_url, settings.router_base_url, settings.ocr_base_url):
+            assert url.split("://", 1)[-1].split("/", 1)[0] not in text
     wire = registry.declared_models()[0].to_wire()
-    assert "internal" not in wire
-    assert settings.llm_model not in json.dumps(wire)
     assert wire["id"] == "techsara-35b" and wire["object"] == "model"
-    assert set(wire["capabilities"]) == {"chat", "streaming", "vision", "tools", "embeddings"}
+    assert set(wire["capabilities"]) == {
+        "chat", "streaming", "vision", "tools", "embeddings",
+        "rerank", "audio_transcription", "ocr", "background",
+    }
 
 
 def test_the_limits_come_from_settings_rather_than_a_number_copied_from_the_docs(monkeypatch):
-    model = registry.declared_models()[0]
-    assert model.max_input_tokens == settings.model_max_context
-    assert model.max_output_tokens == settings.model_max_output
     monkeypatch.setattr(settings, "model_max_context", 1_000_000)
-    monkeypatch.setattr(settings, "model_max_output", 4096)
+    monkeypatch.setattr(settings, "context_safety_margin", 512)
+    model = registry.declared_models()[0]
+    assert model.context_window == 1_000_000
+    # The prompt may never be so long that llm._fit would trim it: window,
+    # minus the safety margin, minus context.MIN_OUTPUT_TOKENS.
+    assert model.max_input_tokens == 1_000_000 - 512 - 256
+    # The owner's 1M: PUBLIC_API_MAX_OUTPUT_TOKENS, narrowed by the window —
+    # and NOT the chat app's MODEL_MAX_OUTPUT, which stays the chat app's.
+    monkeypatch.setattr(settings, "model_max_output", 4096, raising=False)
+    assert registry.declared_models()[0].max_output_tokens == 1_000_000
+    monkeypatch.setattr(settings, "model_max_context", 262_144)
     refreshed = registry.declared_models()[0]
-    assert refreshed.max_input_tokens == 1_000_000
-    assert refreshed.max_output_tokens == 4096
-    assert registry.default_max_output_tokens() == 4096
+    assert refreshed.max_output_tokens == 262_144
+    assert registry.default_max_output_tokens() == 8192
 
 
 def test_an_internal_engine_can_never_be_registered_as_a_public_model():
@@ -800,7 +837,7 @@ def test_an_internal_engine_can_never_be_registered_as_a_public_model():
             registry.guard_internal_target(target)
         with pytest.raises(registry.InternalTargetError):
             registry.PublicModel(
-                id="sneaky",
+                id="techsara-sneaky",
                 internal=target,
                 chat=True,
                 streaming=True,
@@ -825,23 +862,26 @@ def test_the_reranker_is_guarded_when_the_deployment_configures_one(monkeypatch)
 
 
 def test_a_database_override_may_disable_a_model_and_never_add_one():
-    assert [m.id for m in registry.public_models({"techsara-35b": False})] == []
+    declared = [m.id for m in registry.declared_models()]
+    remaining = [m.id for m in registry.public_models({"techsara-35b": False})]
+    assert remaining == [model_id for model_id in declared if model_id != "techsara-35b"]
     assert registry.resolve_public_model("techsara-35b", overrides={"techsara-35b": False}) is None
 
     # A row for an id the code does not declare is ignored: the database cannot
     # expose a model (CONTRACT §15, SCHEMA-V34 public_models).
     widened = registry.public_models({"vllm-router": True, "internal-ocr": True})
-    assert [m.id for m in widened] == ["techsara-35b"]
+    assert [m.id for m in widened] == declared
     assert registry.resolve_public_model("internal-ocr", overrides={"internal-ocr": True}) is None
     assert registry.resolve_public_model("vllm-router") is None
 
 
 def test_override_rows_are_read_as_the_database_returns_them():
-    rows = [{"id": "techsara-35b", "enabled": False}, {"id": "ghost", "enabled": True}]
+    rows = [{"id": model.id, "enabled": False} for model in registry.declared_models()]
+    rows.append({"id": "ghost", "enabled": True})
     assert registry.public_models(rows) == ()
-    assert [m.id for m in registry.public_models([{"id": "techsara-35b", "enabled": True}])] == [
-        "techsara-35b"
-    ]
+    assert [
+        m.id for m in registry.public_models([{"id": "techsara-35b", "enabled": True}])
+    ] == [m.id for m in registry.declared_models()]
 
 
 def test_a_key_allowlist_narrows_the_catalogue_and_an_empty_one_does_not():
@@ -1037,7 +1077,10 @@ def test_the_guard_still_permits_the_main_model_and_an_ordinary_public_id():
     # refused nothing, and `declared_models()` must keep building.
     assert registry.guard_internal_target(settings.llm_model) == settings.llm_model
     assert registry.guard_internal_target("techsara-35b") == "techsara-35b"
-    assert len(registry.declared_models()) == 1
+    # Each sidecar's own checkpoint is permitted under ITS engine key.
+    assert registry.guard_internal_target(settings.router_model, engine="router")
+    assert registry.guard_internal_target(settings.ocr_model, engine="ocr")
+    assert registry.declared_models()[0].id == "techsara-35b"
 
 
 def test_the_lifecycle_can_only_move_forward():

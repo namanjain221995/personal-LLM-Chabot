@@ -57,7 +57,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   return (
     <div className="code-block overflow-hidden rounded-ts border border-border bg-surface">
       <div className="flex items-center justify-between gap-2 border-b border-border bg-[color-mix(in_srgb,var(--ts-surface-2)_60%,transparent)] px-3 py-1.5">
-        <span className="font-mono text-[11px] uppercase tracking-wide text-faint">
+        <span className="font-mono text-[11px] uppercase tracking-wide text-muted">
           {language ?? 'text'}
         </span>
         <CopyButton text={code} label="Copy code" />
@@ -77,6 +77,12 @@ function CodeBlock({ children }: { children?: ReactNode }) {
  * keyboard focus. A "copy link" affordance that only appears on hover is
  * invisible to anyone navigating with a keyboard, which is the group most
  * likely to want a durable link in the first place.
+ *
+ * On a touch screen there is no hover, so the `#` never shows — yet it was
+ * still an 8x22 target beside the heading's last word, and a tap there
+ * silently rewrote the URL hash and jumped the page (re-audit, 2026-09-13).
+ * Where the primary pointer cannot hover it takes no taps; focus is
+ * unaffected, so a keyboard still reaches and reveals it.
  */
 function Heading({
   level,
@@ -94,7 +100,7 @@ function Heading({
       <a
         href={`#${id}`}
         aria-label={`Link to this section: ${text}`}
-        className="ml-1 inline-block align-baseline font-mono text-sm text-faint no-underline opacity-0 transition-opacity duration-ts hover:text-accent focus-visible:opacity-100 group-hover:opacity-100"
+        className="ml-1 inline-block align-baseline font-mono text-sm text-faint no-underline opacity-0 transition-opacity duration-ts hover:text-accent focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:pointer-events-none"
       >
         #
       </a>
@@ -163,7 +169,9 @@ const components: Components = {
 
 export const DocsMarkdown = memo(function DocsMarkdown({ body }: { body: string }) {
   return (
-    <div className="md">
+    // `md-docs`: documentation tables wrap their prose cells (globals.css);
+    // the chat's `.md` tables keep their one-line cells.
+    <div className="md md-docs">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         // detect:false — only fenced blocks with a language tag are

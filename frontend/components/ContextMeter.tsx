@@ -139,7 +139,7 @@ export function ContextMeter({
         aria-describedby={shown ? tipId : undefined}
         /* No `title`: the browser's own tooltip would duplicate the one below,
            at a different moment and in a different place. */
-        className="inline-flex shrink-0 items-center rounded-lg p-1.5 text-muted transition-colors duration-ts hover:bg-surface-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent aria-disabled:cursor-default"
+        className="inline-flex shrink-0 items-center rounded-lg p-1.5 text-muted max-sm:p-2 transition-colors duration-ts hover:bg-surface-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent aria-disabled:cursor-default"
       >
         <svg
           width={SIZE}

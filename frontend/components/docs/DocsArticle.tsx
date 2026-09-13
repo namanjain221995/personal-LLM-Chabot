@@ -127,7 +127,7 @@ export function DocsArticle({ page }: { page: DocPage }) {
                 href={docHref(previous.slug)}
                 className="rounded-ts border border-border bg-surface p-4 no-underline transition-colors duration-ts hover:border-accent/50"
               >
-                <span className="block text-xs uppercase tracking-wide text-faint">
+                <span className="block text-xs uppercase tracking-wide text-muted">
                   Previous
                 </span>
                 <span className="mt-1 block text-sm font-medium text-ink">
@@ -142,7 +142,7 @@ export function DocsArticle({ page }: { page: DocPage }) {
                 href={docHref(next.slug)}
                 className="rounded-ts border border-border bg-surface p-4 text-right no-underline transition-colors duration-ts hover:border-accent/50 sm:col-start-2"
               >
-                <span className="block text-xs uppercase tracking-wide text-faint">
+                <span className="block text-xs uppercase tracking-wide text-muted">
                   Next
                 </span>
                 <span className="mt-1 block text-sm font-medium text-ink">

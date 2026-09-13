@@ -27,12 +27,18 @@ synchronous CPU on the event loop, where it stalls every concurrent request.
 from __future__ import annotations
 
 import array
+import asyncio
+import hashlib
+import logging
 import math
 import operator
+import time
 from typing import List, Optional, Sequence
 
-from . import db, llm
+from . import db, llm, metrics
 from .config import settings
+
+log = logging.getLogger(__name__)
 
 # Folded turns are chunked so a long message can be retrieved in parts.
 _CHUNK_CHARS = 1200
@@ -205,14 +211,95 @@ RECALL_HEADER = (
 )
 
 
+#: EmbedUnavailable.reason -> the recall_block_dropped_total{reason} label.
+#: Anything that is not busy or a timeout is an error.
+_DROP_REASONS = {"busy": "embed_busy", "timeout": "embed_timeout"}
+
+#: The least budget worth a second attempt: one query embedding measures
+#: 20-60 ms on the sidecar (2026-09-13), so less than this left would only
+#: spend the rest of the budget on a call that cannot land.
+_RETRY_MIN_S = 0.05
+
+
+def _conversation_ref(conversation_id: str) -> str:
+    """What the log may say about a conversation: a short hash, never the id
+    (ids are joinable to a person's history)."""
+    return hashlib.sha256((conversation_id or "").encode("utf-8")).hexdigest()[:12]
+
+
+async def _embed_question_as_before(question: str) -> Optional[List[float]]:
+    """The call recall made before 2026-09-13, for Think and Max: the raw
+    question through `embed_texts`, which waits out a sidecar restart
+    (sidecar_recovery_s) instead of dropping the block."""
+    return (await llm.embed_texts([question]))[0]
+
+
+async def _embed_question(conversation_id: str, question: str) -> Optional[List[float]]:
+    """The question's vector, or None when the recall block must be dropped.
+
+    WHY (2026-09-13). In-conversation recall moved from `embed_texts` (a 90 s
+    batch timeout plus the sidecar recovery window) to the bounded
+    `embed_query` (EMBED_WAIT_S for a slot, EMBED_TIMEOUT_S for the call).
+    That took the recall embedding off the tail of time-to-first-token, but
+    it turned a burst or a sidecar blip into a block that silently vanished
+    from the prompt — the folded turns the summary dropped. So a drop is now
+    counted (recall_block_dropped_total{reason}) and logged at INFO with the
+    conversation's hash only, and a failure that leaves budget is tried once
+    more.
+
+    THE BUDGET is EMBED_WAIT_S (default 1.0 s) from the first attempt's
+    start — the wait `embed_query` already allows one caller — so the retry
+    never moves the first token past that mark: it only runs when at least
+    _RETRY_MIN_S is left, and it is cut off when the budget runs out. A busy
+    first attempt has, by definition, spent the wait, so it is not retried;
+    a fast failure (a pooled connection reset, a 503 in a restart) is.
+    """
+    budget = float(settings.embed_wait_s)
+    started = time.perf_counter()
+    try:
+        return await llm.embed_query(question, normalise=False)
+    except llm.EmbedUnavailable as exc:
+        failure = exc
+    retried = False
+    remaining = budget - (time.perf_counter() - started)
+    if failure.reason != "empty" and remaining >= _RETRY_MIN_S:
+        retried = True
+        try:
+            async with asyncio.timeout(remaining):
+                return await llm.embed_query(question, wait=remaining, timeout=remaining, normalise=False)
+        except llm.EmbedUnavailable as exc:
+            failure = exc
+        except TimeoutError:
+            failure = llm.EmbedUnavailable("recall embedding budget spent", reason="timeout")
+    reason = _DROP_REASONS.get(failure.reason, "embed_error")
+    metrics.inc("recall_block_dropped_total", reason=reason)
+    log.info(
+        "in-conversation recall block dropped: conversation=%s reason=%s retried=%s elapsed_ms=%.0f",
+        _conversation_ref(conversation_id),
+        reason,
+        retried,
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return None
+
+
 async def retrieve_block(
-    conversation_id: str, question: str, top_k: Optional[int] = None
+    conversation_id: str, question: str, top_k: Optional[int] = None, *, effort: str = ""
 ) -> Optional[str]:
     """The labelled block of folded chunks most relevant to `question`.
 
     None when recall is disabled, nothing has been folded yet, or the
     embedding service is unavailable — recall is an enhancement, never a
     precondition for answering.
+
+    WHICH EMBEDDING (second prover pass, 2026-09-13). Only a Fast turn takes
+    the bounded, cached `embed_query` path, whose budget is what keeps its
+    first token inside a second — and which, during a sidecar restart or
+    burst, drops the block (counted and logged) where the old call waited
+    through the recovery window. Think and Max are not on that clock, so they
+    keep the old call exactly (`_embed_question_as_before`): the raw question,
+    `embed_texts`, recovery included. Both embed the question unnormalised,
+    so the vector, and so the chunk ranking, is the one HEAD computed.
     """
     if not settings.semantic_recall_enabled or not (question or "").strip():
         return None
@@ -220,7 +307,17 @@ async def retrieve_block(
         chunks = await db.run_in_thread(db.get_conversation_chunks, conversation_id)
         if not chunks:
             return None
-        query = (await llm.embed_texts([question]))[0]
+        # The cached, single-flight query embedding (2026-09-13, plan item
+        # 4): cross-chat recall embeds this same question in the same turn,
+        # concurrently, and the uncached `embed_texts` paid a second sidecar
+        # round trip for an identical vector. A failure is retried once
+        # inside the budget, then counted and logged (_embed_question).
+        if effort == "fast":
+            query = await _embed_question(conversation_id, question)
+        else:
+            query = await _embed_question_as_before(question)
+        if query is None:
+            return None
         scores = cosine_many(query, [c["embedding"] for c in chunks])
         scored = list(zip(scores, chunks))
         scored.sort(key=lambda pair: pair[0], reverse=True)

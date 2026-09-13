@@ -50,7 +50,8 @@ Presenting one resolves, in order, before any work starts:
      request, token, daily or concurrency [limits](/docs/rate-limits);
    * the **model allowlist** — a model this key may not use is \`404\`, never
      \`403\`, so the API never confirms the existence of something you are
-     not allowed to see;
+     not allowed to see; a model you may use, sent to an endpoint it does not
+     serve, is a \`400\` naming \`model\`;
    * **validation** of the body — \`400\` or \`413\`.
 
 Rungs 1 to 5 all answer the **same** \`401 invalid_api_key\`, with the same
@@ -75,18 +76,34 @@ remember and none to get wrong.
 | \`responses.read\` | Read responses created by this project. | \`GET /v1/responses/{id}\` |
 | \`responses.write\` | Create and cancel responses. | \`POST /v1/responses\`, \`POST /v1/responses/{id}/cancel\`, \`POST /v1/chat/completions\` |
 | \`usage.read\` | Read this project's usage counters. | \`GET /v1/usage\` |
+| \`embeddings.write\` | Create embeddings. | \`POST /v1/embeddings\` |
+| \`rerank.write\` | Rerank documents against a query. | \`POST /v1/rerank\` |
+| \`audio.write\` | Transcribe audio. | \`POST /v1/audio/transcriptions\` |
 
-That is the whole vocabulary — four scopes, and no fifth can be spelled. An
+That is the whole vocabulary — seven scopes, and no eighth can be spelled. An
 unrecognised scope string is an error when a key is created, not an entry
 that is quietly dropped and then grants nothing.
+
+A scope names what a key may *call*, not which model it may use:
+\`responses.write\` covers every model that generates on \`/v1/responses\` and
+\`/v1/chat/completions\` — \`techsara-35b\`, \`techsara-8b-vision\` and
+\`techsara-ocr\`. Which models a key may use is the project's model allowlist.
 
 Webhooks are **not** in this list. They are configured by a person in the
 console, under the \`api.webhooks.manage\` capability, rather than by a
 machine credential — see [webhooks](/docs/webhooks).
 
-A key created without a choice gets \`models.read\`, \`responses.read\` and
-\`responses.write\` — enough to call the API, and nothing more. Reading usage
+A key created without a choice gets \`models.read\`, \`responses.read\`,
+\`responses.write\`, \`embeddings.write\`, \`rerank.write\` and
+\`audio.write\` — enough to call every model, and nothing more. Reading usage
 is a separate job, usually for a separate credential.
+
+**Keys created before 2026-09-13 do not have the three newest scopes.** A key
+keeps the scopes it was created with, so an older key answers
+\`403 insufficient_scope\` on \`/v1/embeddings\`, \`/v1/rerank\` and
+\`/v1/audio/transcriptions\` until you replace it with a new key that holds
+them. That is deliberate: a credential does not quietly gain new powers because
+the platform grew.
 
 Ask for less than you think you need. A key that can only do one thing is a
 key whose leak has one consequence.

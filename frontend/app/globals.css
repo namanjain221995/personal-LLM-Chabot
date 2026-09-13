@@ -40,14 +40,21 @@
   --ts-border: #262626;
   /* Pure white (owner request 2026-08-05) — #f5f5f5 read as dull grey. */
   --ts-text: #ffffff;
-  --ts-text-muted: #b3b3b3;
-  --ts-text-faint: #8a8a8a;
+  /* Secondary greys lifted 2026-09-13 (owner, side by side with ChatGPT:
+     "brighter text"). The primary ink was already #fff, so what read dim was
+     everything BELOW it. muted #b3b3b3 -> #c7c7c7 (10.0 -> 12.4:1 on #000);
+     faint #8a8a8a -> #a3a3a3, which also fixes two AA failures the old value
+     had — 4.16:1 on --ts-surface-2 and 3.82:1 on --ts-bubble; the new floor is
+     5.23:1 (on the bubble). Order is kept: text > icon > muted > faint. */
+  --ts-text-muted: #c7c7c7;
+  --ts-text-faint: #a3a3a3;
   /* Resting colour for ACTION ICONS (message row copy/thumbs/regenerate).
      Deliberately brighter than --ts-text-muted: an icon is a 1.5px stroke,
      not a block of text, so at the same hex it reads dimmer than the prose
      beside it. #cfcfcf is 13.1:1 on #000 and still clearly recedes from the
-     #ffffff it turns on hover. */
-  --ts-text-icon: #cfcfcf;
+     #ffffff it turns on hover. Lifted with muted (2026-09-13) so an icon still
+     reads brighter than the muted text beside it: #d9d9d9 is 14.9:1 on #000. */
+  --ts-text-icon: #d9d9d9;
   --ts-accent: #60a5fa; /* TechSara blue, lifted for AA on dark */
   /* Raw RGB channels of --ts-accent, for Tailwind's <alpha-value> slot: with
      `accent: 'var(--ts-accent)'` every `accent/NN` opacity modifier compiled
@@ -124,6 +131,24 @@
   --ts-fs-lg: 20px;
   --ts-fs-xl: 28px;
 
+  /* Chat reading size (2026-09-13, owner: bigger text in the chat). The
+     ANSWER is set at 17px from md up and 16px on a phone, with a 1.7 line
+     height; tables and code inside it step down from the same variable. It is
+     scoped to `.chat-answer` (MessageRow, SharedConversation), so the docs
+     site, settings and admin — which read --ts-fs-base — do not move. */
+  --ts-fs-chat: 16px;
+  --ts-lh-chat: 1.7;
+
+  /* Sidebar width (2026-09-13, owner: wider, like ChatGPT). Was a flat 260.
+     On a phone it is the drawer: 320px, but always leaving a 56px strip of
+     the thread to tap out on (304px at 360px). Then three steps, set in the
+     media blocks below: 288px at 768-1279 (the tablet range, where opening a
+     file auto-closes it), 300px from 1280 and 320px from 1536 — the owner
+     asked for "a little wider than 288, closer to ChatGPT" on a desktop.
+     Steps, not a vw clamp, so a 1280-1535 laptop gets exactly the width that
+     was checked against the 360px thread floor with the file panel open. */
+  --ts-sidebar-w: min(320px, calc(100vw - 56px));
+
   --ts-radius: 10px;
   --ts-hover-ms: 150ms;
 
@@ -149,6 +174,25 @@
      the white thumb disappears into it (caught in the light-mode pass). A
      tint of the faint ink reads as "off" against both grounds. */
   --admin-switch-off: color-mix(in srgb, var(--ts-text-faint) 38%, transparent);
+}
+
+@media (min-width: 768px) {
+  :root {
+    --ts-fs-chat: 17px;
+    --ts-sidebar-w: 288px;
+  }
+}
+
+@media (min-width: 1280px) {
+  :root {
+    --ts-sidebar-w: 300px;
+  }
+}
+
+@media (min-width: 1536px) {
+  :root {
+    --ts-sidebar-w: 320px;
+  }
 }
 
 /* `.auth-light` carries the SAME token overrides as light mode so the sign-in
@@ -177,7 +221,12 @@ html.light,
   --ts-border: #e3e3e3;
   --ts-text: #0d0d0d;
   --ts-text-muted: #5d5d5d;
-  --ts-text-faint: #8f8f8f;
+  /* #8f8f8f was 3.23:1 on white and 2.74:1 on --ts-surface-2 — below AA for
+     every piece of text that wore it (section labels, the account email, the
+     composer placeholder and trust line). #6b6b6b is 5.33:1 on white and
+     4.51:1 on #ececec, the darkest ground it sits on, and still lighter than
+     muted (2026-09-13). */
+  --ts-text-faint: #6b6b6b;
   /* Light mode inverts the reasoning: a thin dark stroke on paper needs to be
      DARKER than muted text to carry the same weight, not lighter. */
   --ts-text-icon: #444444;
@@ -506,6 +555,45 @@ a {
   border-top: 1px solid var(--ts-border);
 }
 
+/* The chat answer's reading size (2026-09-13). `--ts-fs-chat` is 16px on a
+   phone and 17px from md up (see :root). Headings switch to em so they stay
+   above the body at either size — `.md h3` at a fixed 16px rendered SMALLER
+   than a 17px paragraph. At a 16px body these em values are exactly the old
+   20/18/16px. Tables and code step down from the same variable: 15/14px on a
+   desktop, and the old 14/13px on a phone, where they already scroll. */
+.chat-answer {
+  font-size: var(--ts-fs-chat);
+}
+
+.chat-answer .md {
+  line-height: var(--ts-lh-chat);
+}
+
+.chat-answer .md h1 {
+  font-size: 1.25em;
+}
+
+.chat-answer .md h2 {
+  font-size: 1.125em;
+}
+
+.chat-answer .md h3,
+.chat-answer .md h4 {
+  font-size: 1em;
+}
+
+.chat-answer .md table {
+  font-size: calc(var(--ts-fs-chat) - 2px);
+}
+
+.chat-answer .md thead th {
+  font-size: calc(var(--ts-fs-chat) - 3px);
+}
+
+.chat-answer .code-block pre {
+  font-size: calc(var(--ts-fs-chat) - 3px);
+}
+
 .md .md-table-wrap {
   overflow-x: auto;
   border: 1px solid var(--ts-border);
@@ -524,6 +612,18 @@ a {
   padding: 8px 12px;
   border-bottom: 1px solid var(--ts-border);
   white-space: nowrap;
+}
+
+/* Documentation tables hold sentences, not values. At nowrap a table of
+   explanations grew to 1691px in an 830px column even at 1440x900, and
+   reading one cell meant scrolling the table sideways (responsive audit,
+   2026-09-13). Their body cells wrap; the 8rem floor keeps a column of
+   prose from collapsing to a word per line, and the wrapper still scrolls
+   when the floors add up to more than a phone. Header cells stay on one
+   line. Chat answers (`.md` without `.md-docs`) are unchanged. */
+.md.md-docs td {
+  white-space: normal;
+  min-width: 8rem;
 }
 
 .md thead th {

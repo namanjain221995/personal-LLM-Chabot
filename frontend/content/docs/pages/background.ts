@@ -44,6 +44,8 @@ You get **202 Accepted** and a response object whose \`status\` is
   "status": "queued",
   "model": "${MODEL_ID}",
   "output": [],
+  "max_output_tokens": 8192,
+  "incomplete_details": null,
   "usage": null
 }
 ~~~
@@ -53,16 +55,57 @@ work**. That ordering is the promise: if you hold an id, the work exists and
 will survive your disconnect — and a crash between "accepted" and "started"
 cannot lose a job you were told we had.
 
+\`max_output_tokens\` in the \`202\` is the ceiling the server planned from
+your request, already clamped to what your prompt leaves in the context window;
+the finished response carries the exact value it applied. See
+[long outputs](/docs/long-output).
+
 \`stream\` and \`background\` cannot both be true. There is no stream to
 attach to.
 
+Background work is offered on the three chat models — \`${MODEL_ID}\`,
+\`techsara-8b-vision\` and \`techsara-ocr\`. Embeddings, reranking and
+transcription are synchronous only.
+
 There is no cap on how many background responses a project runs at once —
 the API enforces no concurrency [limits](/docs/rate-limits). They share the
-engine with everything else, so a thousand submitted together are accepted
-together and then served as fast as the engine can serve them. A job that
-cannot get a place in the engine's shared queue ends \`failed\` with
+engines with everything else, so a thousand submitted together are accepted
+together and then served as fast as the engines can serve them. A job that
+cannot get a place in its engine's queue ends \`failed\` with
 \`model_unavailable\` — the engine's capacity, not a limit on your
 project — and can be submitted again.
+
+## Waiting for capacity
+
+Some engines have a small public queue in front of them, because the TechSara
+chat application uses them too and keeps priority: \`techsara-8b-vision\`,
+\`techsara-ocr\`, and \`${MODEL_ID}\` for a long generation (\`max_output_tokens\`
+of more than 8,192 tokens). A background job on
+one of them **waits in \`queued\` for its turn — for up to an hour** — rather
+than failing the moment the queue is full. A synchronous or streaming request
+waits only about 30 seconds before it is refused with \`503\`, which is one more
+reason to send long work in the background.
+
+A job that is still waiting after an hour ends \`failed\` with
+\`model_unavailable\`. Cancelling a job while it is \`queued\` stops it before
+it starts.
+
+## Long jobs and restarts
+
+A background response runs until it finishes, fails, is cancelled or reaches
+its wall clock — up to six hours for the longest answers. If it reaches the
+wall clock it ends \`failed\` with \`timeout\`, and **the text it had written
+is kept** in its \`output\`.
+
+**A service restart ends a running job.** When the service restarts — which is
+what deploying a new version does — a job that was \`queued\` or
+\`in_progress\` ends \`failed\` with \`model_unavailable\` and the message
+"The service restarted while this response was running." The failure is safe to
+retry: submit the job again **with a new \`Idempotency-Key\`** — the old key
+still names the failed job, and a request that repeats it is handed that job
+back rather than a new one. The longer a job runs, the likelier it is to meet a
+restart, so a client that submits hours-long work should treat this failure as
+routine and resubmit.
 
 ## Collecting the answer
 
@@ -78,7 +121,8 @@ curl ${API_BASE_URL}/responses/${EXAMPLE_RESPONSE_ID} \\
 object with the same \`code\` vocabulary as the [HTTP
 envelope](/docs/errors).
 
-Poll politely — a few seconds between attempts, with a ceiling — and
+Poll politely — a few seconds between attempts for a short job, a minute for
+one measured in hours, always with a ceiling — and
 remember that a poll is a request like any other: it is recorded in your
 [usage](/docs/usage), and a tight loop spends the engine's shared capacity
 on nothing.

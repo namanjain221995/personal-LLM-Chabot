@@ -45,6 +45,7 @@ import asyncio
 import logging
 import math
 import time
+import weakref
 from typing import List, Optional, Sequence
 
 import httpx
@@ -289,10 +290,90 @@ async def _post(query: str, documents: Sequence[str], instruction: Optional[str]
         "text_1": format_query(query, instruction),
         "text_2": [format_document(d) for d in documents],
     }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(score_url(settings.rerank_base_url), json=body, headers=headers)
-        resp.raise_for_status()
-        return parse_scores(resp.json(), len(documents))
+    # One pooled client per event loop, not one per call (2026-09-13, plan
+    # item 3d). A fresh AsyncClient per /score built a new connection pool,
+    # a new TCP connection and an SSL context on the loop for every rerank on
+    # the answer path -- the reranker is called once or more per Fast turn,
+    # and rerank p95 is 0.92 s (knowledge_stage_seconds, 7 d). context.py
+    # already keeps a per-loop client for /tokenize for the same reason. The
+    # per-call timeout rides on the request, so each caller keeps its own.
+    client = await _rerank_client()
+    resp = await client.post(
+        score_url(settings.rerank_base_url), json=body, headers=headers, timeout=timeout
+    )
+    resp.raise_for_status()
+    return parse_scores(resp.json(), len(documents))
+
+
+#: loop id -> {"loop": weakref, "factory", "client", "lock"}.
+#: Keyed by id() for the lookup but the loop is held WEAKLY and re-checked:
+#: CPython recycles ids once a loop is collected, and a client bound to a dead
+#: loop must never be handed to a new one (tests run hundreds of loops).
+_RERANK_CLIENTS: "dict[int, dict]" = {}
+_RERANK_CLIENTS_MAX = 8
+
+
+def _client_state(loop: asyncio.AbstractEventLoop) -> dict:
+    state = _RERANK_CLIENTS.get(id(loop))
+    factory = httpx.AsyncClient
+    if (
+        state is None
+        or state["loop"]() is not loop
+        # A swapped client class (a test's MockTransport, a reconfigured
+        # process) must not be served the pool built by the previous one.
+        or state["factory"] is not factory
+    ):
+        state = {
+            "loop": weakref.ref(loop),
+            "factory": factory,
+            "client": None,
+            "lock": asyncio.Lock(),
+        }
+        _RERANK_CLIENTS[id(loop)] = state
+        while len(_RERANK_CLIENTS) > _RERANK_CLIENTS_MAX:
+            oldest = next(iter(_RERANK_CLIENTS))
+            if oldest == id(loop):
+                break
+            # Dropped, not closed: its loop is gone or idle, and aclose()
+            # must run on the loop that owns the sockets.
+            _RERANK_CLIENTS.pop(oldest, None)
+    return state
+
+
+async def _rerank_client() -> httpx.AsyncClient:
+    """The current loop's shared HTTP pool for the reranker."""
+    loop = asyncio.get_running_loop()
+    state = _client_state(loop)
+    client = state["client"]
+    if client is not None and not getattr(client, "is_closed", False):
+        return client
+    async with state["lock"]:
+        client = state["client"]
+        if client is None or getattr(client, "is_closed", False):
+            factory = state["factory"]
+            # Off the loop: constructing an AsyncClient loads the CA bundle
+            # into an SSL context, which is blocking file and CPU work even
+            # though both stacks reach the reranker over plain HTTP today.
+            client = await asyncio.to_thread(factory)
+            state["client"] = client
+        return client
+
+
+async def close_rerank_client() -> None:
+    """Close this loop's pooled client. Application shutdown (main.lifespan)
+    calls it after the engine state stops, while the loop can still close
+    sockets. Never raises."""
+    loop = asyncio.get_running_loop()
+    state = _RERANK_CLIENTS.get(id(loop))
+    if state is None or state["loop"]() is not loop:
+        return
+    _RERANK_CLIENTS.pop(id(loop), None)
+    client = state.get("client")
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001 — shutdown must not raise
+            log.debug("closing the reranker client failed", exc_info=True)
 
 
 async def score(

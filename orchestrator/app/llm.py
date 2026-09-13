@@ -183,6 +183,90 @@ def get_finish_reason() -> Optional[str]:
     return _finish_reason.get()
 
 
+# ---------------------------------------------------------------------------
+# What the engine was ACTUALLY allowed to generate, and on whose clock
+# (2026-09-13, integration of the /v1 one-million-token output)
+#
+# `_fit` clamps the caller's ceiling against the engine's exact `/tokenize`
+# count, so only this module knows the `max_tokens` that was really sent.
+# `/v1` reports that number to its caller (CONTRACT §8.3/§9); without it the
+# public layer re-derived it from the prompt count the engine reported, which
+# is missing whenever a stream is cut before vLLM's final usage chunk. A
+# ContextVar for the same reason `_usage` and `_finish_reason` are: the value
+# belongs to the task that consumed the stream. Like `_finish_reason` it
+# describes the MOST RECENT call and does not accumulate.
+# ---------------------------------------------------------------------------
+
+_applied_max_tokens: ContextVar[Optional[int]] = ContextVar("_applied_max_tokens", default=None)
+
+
+def reset_applied_max_tokens() -> None:
+    _applied_max_tokens.set(None)
+
+
+def get_applied_max_tokens() -> Optional[int]:
+    """The `max_tokens` the last streamed call was sent after `_fit` (or the
+    forced-closure retry's), or None when no call got that far."""
+    return _applied_max_tokens.get()
+
+
+def _generation_clock() -> float:
+    """The monotonic clock the streaming wall-clock guard reads.
+
+    A named seam, not `time.monotonic` inline, so a test can drive a
+    five-hour generation through the guard in milliseconds without patching
+    the clock asyncio's own loop runs on."""
+    return time.monotonic()
+
+
+def _wall_clock_for_call(wall_clock_s: Optional[float]) -> float:
+    """The wall clock one streamed call is held to.
+
+    None (every chat-app caller) is GEN_WALL_CLOCK_S, exactly as before. A
+    per-call value (`/v1`, sized from the planned output by
+    `publicapi.planning.wall_clock_for`) replaces it for that call only — it
+    may be longer or shorter. A value that is not a positive finite number is
+    a caller bug and falls back to the application's clock rather than
+    removing the guard."""
+    default = float(settings.gen_wall_clock_s)
+    if wall_clock_s is None:
+        return default
+    try:
+        value = float(wall_clock_s)
+    except (TypeError, ValueError):
+        return default
+    if not (value > 0) or value == float("inf"):
+        log.warning("ignoring wall_clock_s=%r; using GEN_WALL_CLOCK_S (%.0fs)", wall_clock_s, default)
+        return default
+    return value
+
+
+def _transport_timeout_for(wall_clock_s: float):
+    """A per-request httpx timeout that keeps THE TRANSPORT INVARIANT for a
+    call whose wall clock is longer than LLM_REQUEST_TIMEOUT, or None when the
+    shared client's timeout already covers it.
+
+    The invariant (config.py, llm_request_timeout): the HTTP client must never
+    give up before the application's own wall clock does. LLM_REQUEST_TIMEOUT
+    defaults to GEN_WALL_CLOCK_S, and a `/v1` generation may now be given up
+    to PUBLIC_API_GEN_WALL_CLOCK_S (6 h). Passed per request (the SDK's
+    `timeout=` option) rather than by building a client with a longer read
+    timeout: `_client` caches clients by their timeout and closes the least
+    recently used, and one per distinct wall clock would evict — and close —
+    a client whose five-hour stream is still being read."""
+    configured = float(settings.llm_request_timeout or 0)
+    if configured >= wall_clock_s:
+        return None
+    import httpx
+
+    return httpx.Timeout(
+        connect=settings.llm_connect_timeout,
+        read=float(wall_clock_s),
+        write=settings.llm_write_timeout,
+        pool=settings.llm_write_timeout,
+    )
+
+
 def _set_finish_reason(reason: Optional[str]) -> None:
     if reason:
         _finish_reason.set(str(reason))
@@ -837,11 +921,23 @@ async def stream_chat_events(
     effort: str = "medium",
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
+    wall_clock_s: Optional[float] = None,
+    wall_clock_marker: bool = True,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Streaming completion from the selected model, yielding (kind, delta)
     pairs: ("reasoning", <delta.reasoning_content>) for vLLM thinking deltas
     and ("token", <delta.content>) for answer text (V2-DESIGN §3a).
+
+    `wall_clock_s` (2026-09-13): this call's own hang guard, replacing
+    GEN_WALL_CLOCK_S for it alone — `/v1` sizes it from the planned output so
+    a 1,000,000-token answer is not cut at the chat app's 70 minutes. None
+    keeps GEN_WALL_CLOCK_S. `wall_clock_marker=False` stops the guard from
+    appending its "[generation stopped …]" sentence to the answer; the finish
+    reason is WALL_CLOCK_FINISH either way.
     """
+    # Cleared before anything can fail, so a call that dies in sizing never
+    # leaves the previous call's ceiling standing for its caller to report.
+    reset_applied_max_tokens()
     base_url, api_key, model_id = resolve_model_choice(model_choice)
     thinking_on = wants_thinking(model_choice, effort)
     budget_tokens = thinking_budget(effort) if thinking_on else None
@@ -874,6 +970,7 @@ async def stream_chat_events(
         requested_max_tokens=requested,
         what="stream",
     )
+    _applied_max_tokens.set(budget)
     request = dict(
         model=model_id,
         messages=sized,
@@ -881,6 +978,12 @@ async def stream_chat_events(
         max_tokens=budget,
         stream=True,
     )
+    clock_s = _wall_clock_for_call(wall_clock_s)
+    transport_timeout = _transport_timeout_for(clock_s) if wall_clock_s is not None else None
+    if transport_timeout is not None:
+        # Only a per-call clock longer than LLM_REQUEST_TIMEOUT sends this, so
+        # every chat-app request is byte-for-byte what it was.
+        request["timeout"] = transport_timeout
     # THE picker's real mechanism on the DGX runtime: Smart thinks, Fast does
     # not. Other runtimes omit this vLLM-specific extension entirely.
     extra_body = reasoning_extra_body(capabilities, thinking_on)
@@ -905,20 +1008,18 @@ async def stream_chat_events(
     # Hang guard, NOT a budget: it exists to catch degenerate repetition
     # loops, and at the measured decode rate it only fires far past any real
     # answer. Applies in BOTH modes.
-    import time as _time
-
-    started = _time.monotonic()
+    started = _generation_clock()
     reset_finish_reason()
     async with _consume(await _open_stream(client, request)) as stream:
         async for chunk in stream:
             _capture_finish(chunk)
-            elapsed = _time.monotonic() - started
-            if elapsed > settings.gen_wall_clock_s:
+            elapsed = _generation_clock() - started
+            if elapsed > clock_s:
                 log.error(
                     "GENERATION WALL CLOCK EXCEEDED: %.0fs > %.0fs on %s "
                     "(effort %r, %d reasoning + %d answer chunks) — killing the "
                     "stream and returning what was produced",
-                    elapsed, settings.gen_wall_clock_s, model_id, effort,
+                    elapsed, clock_s, model_id, effort,
                     reasoning_seen, token_seen,
                 )
                 with contextlib.suppress(Exception):
@@ -927,11 +1028,12 @@ async def stream_chat_events(
                 # continuation loop must be able to tell those apart — one is
                 # worth resuming, the other means something is wrong.
                 _finish_reason.set(WALL_CLOCK_FINISH)
-                yield (
-                    "token",
-                    f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
-                    "guard; the text above is what was produced]",
-                )
+                if wall_clock_marker:
+                    yield (
+                        "token",
+                        f"\n\n[generation stopped after {int(elapsed)}s — wall-clock "
+                        "guard; the text above is what was produced]",
+                    )
                 return
             _capture_usage(chunk)
             if not chunk.choices:
@@ -966,6 +1068,7 @@ async def stream_chat_events(
                     retry["max_tokens"] = (
                         min(budget, max_tokens) if max_tokens is not None else budget
                     )
+                    _applied_max_tokens.set(retry["max_tokens"])
                     fb_extra = reasoning_extra_body(capabilities, False)
                     if fb_extra is not None:
                         retry["extra_body"] = fb_extra
@@ -997,7 +1100,7 @@ async def stream_chat_events(
         log.info(
             "generation usage: %d reasoning + %d answer chunks in %.1fs "
             "(effort %r, budget_mode %s)",
-            reasoning_seen, token_seen, _time.monotonic() - started,
+            reasoning_seen, token_seen, _generation_clock() - started,
             effort, settings.thinking_budget_mode,
         )
 
@@ -1378,7 +1481,34 @@ async def embed_texts(
 
 
 class EmbedUnavailable(RuntimeError):
-    """A query embedding did not happen (busy past the wait, or failed)."""
+    """A query embedding did not happen (busy past the wait, or failed).
+
+    `reason` says which (2026-09-13): "busy" (no slot inside the wait),
+    "timeout" (the sidecar call ran out of time), "error" (it failed or
+    returned nothing) or "empty" (nothing to embed). In-conversation recall
+    counts the block it drops by it and retries only what may pass on a
+    second try (recall.retrieve_block)."""
+
+    def __init__(self, message: str = "", *, reason: str = "error") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """A timeout anywhere in the failure's chain: the OpenAI client's
+    APITimeoutError, httpx's ReadTimeout, asyncio's, or resilience's
+    ModelUnavailable wrapping one of them (`.last`). Matched by class name
+    so this module needs neither client library to classify."""
+    seen = set()
+    node: Optional[BaseException] = exc
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        if isinstance(node, (TimeoutError, asyncio.TimeoutError)):
+            return True
+        if any("Timeout" in cls.__name__ for cls in type(node).__mro__):
+            return True
+        node = getattr(node, "last", None) or node.__cause__
+    return False
 
 
 #: Qwen3-Embedding is asymmetric: queries carry an instruction, documents do
@@ -1410,8 +1540,14 @@ async def embed_query(
     instruction: Optional[str] = None,
     wait: Optional[float] = None,
     timeout: Optional[float] = None,
+    normalise: bool = True,
 ) -> List[float]:
     """ONE embedding of a query, cached and bounded (ADR-0001 D10/D13).
+
+    `normalise=False` embeds `text` exactly as given (2026-09-13): for a
+    caller whose vector must stay byte-for-byte the one it computed before it
+    moved onto this bounded path (recall.retrieve_block at Fast). When the
+    text has no whitespace to collapse it is the same call, cache and flight.
 
     The same question was embedded up to three times per turn (recall, the
     dense half of retrieval, site Q&A). One LRU keyed on (model,
@@ -1422,13 +1558,93 @@ async def embed_query(
     """
     clean = " ".join((text or "").split())
     if not clean:
-        raise EmbedUnavailable("empty query")
+        raise EmbedUnavailable("empty query", reason="empty")
+    if not normalise:
+        clean = text
     key = (settings.embed_model, instruction or "", clean)
     hit = _EMBED_LRU.get(key)
     if hit is not None:
         _EMBED_LRU.move_to_end(key)
         metrics.inc("embed_requests_total", outcome="cache", kind="query")
         return list(hit)
+    # SINGLE-FLIGHT (2026-09-13, plan item 4). Context assembly now runs
+    # cross-chat recall and in-conversation recall concurrently, and both
+    # embed the SAME question with no instruction: the LRU above only helps
+    # the second caller once the first has finished, so without this the
+    # concurrency bought a second sidecar round trip for an identical
+    # vector. A caller that arrives while the vector is being made joins
+    # that call. The work runs in its own task and every caller waits on it
+    # through `shield`, so one caller's cancellation (a turn replaced by a
+    # newer message) never fails the others; the task still fills the LRU.
+    #
+    # Two corrections (2026-09-13, second prover pass, probe embed_probe.py):
+    #   - a flight nobody waits for any more is CANCELLED, which releases its
+    #     EMBED_MAX_INFLIGHT slot at once, as a cancelled caller did before
+    #     single-flight. The Fast topical path cancels retrieval on every
+    #     pre-check miss; abandoned flights held all the slots of a hung
+    #     sidecar and the next question failed 'busy' after 1.0 s (HEAD: ok
+    #     in 0.01 s);
+    #   - a caller joins only a flight with ITS OWN budget (wait, timeout):
+    #     a default-budget caller that joined recall's short-budget retry
+    #     failed 'busy' after 0.04 s (HEAD: ok in 0.291 s).
+    loop = asyncio.get_running_loop()
+    flight_key = (key, wait, timeout)
+    flight = _EMBED_INFLIGHT.get(flight_key)
+    if flight is not None and flight.loop is loop and not flight.task.done() and not flight.abandoned:
+        metrics.inc("embed_requests_total", outcome="cache", kind="query")
+        return list(await flight.wait())
+    task = loop.create_task(
+        _embed_query_uncached(key, instruction, clean, wait=wait, timeout=timeout)
+    )
+    flight = _EmbedFlight(loop, task)
+    _EMBED_INFLIGHT[flight_key] = flight
+
+    def _landed(done: "asyncio.Task", _key=flight_key) -> None:
+        current = _EMBED_INFLIGHT.get(_key)
+        if current is not None and current.task is done:
+            _EMBED_INFLIGHT.pop(_key, None)
+        if not done.cancelled():
+            done.exception()  # retrieved: a joiner may never have awaited it
+
+    task.add_done_callback(_landed)
+    return list(await flight.wait())
+
+
+class _EmbedFlight:
+    """One query embedding being made, and how many callers wait for it."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, task: "asyncio.Task") -> None:
+        self.loop = loop
+        self.task = task
+        self.waiters = 0
+        #: Cancelled because its last caller left; never joined again.
+        self.abandoned = False
+
+    async def wait(self) -> List[float]:
+        self.waiters += 1
+        try:
+            return await asyncio.shield(self.task)
+        finally:
+            self.waiters -= 1
+            if self.waiters == 0 and not self.task.done():
+                self.abandoned = True
+                self.task.cancel()
+
+
+#: (lru key, wait, timeout) -> _EmbedFlight for query embeddings being made
+#: right now. The loop is kept so a test's finished loop never hands its
+#: task on.
+_EMBED_INFLIGHT: dict = {}
+
+
+async def _embed_query_uncached(
+    key: tuple,
+    instruction: Optional[str],
+    clean: str,
+    *,
+    wait: Optional[float],
+    timeout: Optional[float],
+) -> List[float]:
     sem = _embed_semaphore()
     deadline = float(wait if wait is not None else settings.embed_wait_s)
     queued = time.perf_counter()
@@ -1437,7 +1653,7 @@ async def embed_query(
             await sem.acquire()
     except TimeoutError:
         metrics.inc("embed_requests_total", outcome="busy", kind="query")
-        raise EmbedUnavailable("embedding service busy") from None
+        raise EmbedUnavailable("embedding service busy", reason="busy") from None
     metrics.observe("embed_queue_seconds", time.perf_counter() - queued, kind="query")
     try:
         vectors = await embed_texts(
@@ -1446,11 +1662,11 @@ async def embed_query(
             kind="query",
         )
     except Exception as exc:  # noqa: BLE001 — one outcome for callers
-        raise EmbedUnavailable(str(exc)) from exc
+        raise EmbedUnavailable(str(exc), reason="timeout" if _is_timeout(exc) else "error") from exc
     finally:
         sem.release()
     if not vectors or not vectors[0]:
-        raise EmbedUnavailable("empty embedding")
+        raise EmbedUnavailable("empty embedding", reason="error")
     _EMBED_LRU[key] = list(vectors[0])
     _EMBED_LRU.move_to_end(key)
     while len(_EMBED_LRU) > _EMBED_LRU_MAX:
@@ -1460,3 +1676,4 @@ async def embed_query(
 
 def embed_cache_clear() -> None:
     _EMBED_LRU.clear()
+    _EMBED_INFLIGHT.clear()

@@ -22,13 +22,19 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import type { AdminColumn } from '@/components/admin/AdminTable';
 import { AdminSelect, AdminToolbar } from '@/components/admin/controls';
 import { ConsoleHeader } from '@/components/admin/analytics/filters';
 import { NOT_MEASURED, compact, duration } from '@/components/admin/analytics/format';
 import { CopyButton } from '@/components/CopyButton';
 import { formatRelative, formatWhen } from '@/lib/format';
-import { ConsoleEmpty, ConsoleTable, ProjectSelect, useProjects } from './shared';
+import {
+  ConsoleEmpty,
+  ConsoleTable,
+  ProjectSelect,
+  ProjectsLoadError,
+  useProjects,
+  type ConsoleColumn,
+} from './shared';
 import { useConsole } from './useConsole';
 import { consolePaths } from './paths';
 import { useConsoleStatus } from './status';
@@ -38,13 +44,32 @@ import type { RequestLogPage, RequestLogRow } from './types';
 export const LOG_LIMIT = 100;
 
 /** Status words, with the tone carried by text as well as colour. */
-function StatusCell({ row }: { row: RequestLogRow }) {
+export function StatusCell({ row }: { row: RequestLogRow }) {
   // `error_code` is "" on a request that did not fail — the router sends a
   // string, never null — so emptiness is the test, not null.
   const bad = row.status === 'failed' || row.error_code !== '';
+  const word = row.error_code || row.status;
+  // An error code is wider than the 88px a 120px track leaves inside its
+  // padding ("model_unavailable" is 111px), and the cell is nowrap, so it ran
+  // 23px into the next column — or past the table's edge between md and lg,
+  // where Status is the last column (responsive audit, 2026-09-13). It wraps
+  // after an underscore first, and anywhere only if a part is still too long.
+  const parts = word.split('_');
   return (
-    <span className={`text-xs ${bad ? 'text-danger' : 'text-muted'}`}>
-      {row.error_code || row.status}
+    <span
+      data-testid="log-status"
+      className={`block whitespace-normal text-xs [overflow-wrap:anywhere] ${bad ? 'text-danger' : 'text-muted'}`}
+    >
+      {parts.map((part, i) => (
+        <span key={i}>
+          {part}
+          {i < parts.length - 1 && (
+            <>
+              _<wbr />
+            </>
+          )}
+        </span>
+      ))}
     </span>
   );
 }
@@ -63,14 +88,18 @@ export function RequestLogsPanel() {
   );
   const { announce } = useConsoleStatus();
   const rows = logs.data?.requests ?? [];
+  // Before the project list arrives the log request has not been sent, so
+  // "no requests yet" is not known — the table's skeleton says so instead.
+  const projectsPending = projectsQuery.loading && projectsQuery.data === null;
 
   useEffect(() => {
-    if (logs.loading) announce('Loading request logs.');
+    if (projectsQuery.error) announce(projectsQuery.error);
+    else if (projectsPending || logs.loading) announce('Loading request logs.');
     else if (logs.error) announce(logs.error);
     else announce(`${rows.length} request${rows.length === 1 ? '' : 's'} listed.`);
-  }, [logs.loading, logs.error, rows.length, announce]);
+  }, [projectsQuery.error, projectsPending, logs.loading, logs.error, rows.length, announce]);
 
-  const columns: AdminColumn<RequestLogRow>[] = useMemo(
+  const columns: ConsoleColumn<RequestLogRow>[] = useMemo(
     () => [
       {
         key: 'request',
@@ -142,11 +171,16 @@ export function RequestLogsPanel() {
         key: 'key',
         label: 'Key',
         width: '140px',
-        hideBelowLg: true,
+        // Key and Duration fold below xl so the id and its status fit the
+        // 720px a 1024px laptop leaves (responsive audit, 2026-09-13).
+        hideBelow: 'xl',
         render: (r) =>
           r.key ? (
-            <span className="block truncate text-xs text-muted" title={r.key.name}>
-              {r.key.name} · …{r.key.last_four}
+            // The last four are what tell two keys apart, so the NAME is what
+            // truncates: "smoke key · …7ON6" lost its "7ON6" at 108px.
+            <span className="flex min-w-0 text-xs text-muted" title={r.key.name}>
+              <span className="min-w-0 truncate">{r.key.name}</span>
+              <span className="shrink-0">&nbsp;· …{r.key.last_four}</span>
             </span>
           ) : (
             <span className="text-faint">{NOT_MEASURED}</span>
@@ -157,7 +191,7 @@ export function RequestLogsPanel() {
         label: 'Duration',
         width: '90px',
         align: 'right',
-        hideBelowLg: true,
+        hideBelow: 'xl',
         render: (r) => (
           <span className="tabular-nums text-muted">{duration(r.duration_ms)}</span>
         ),
@@ -166,7 +200,9 @@ export function RequestLogsPanel() {
         key: 'shape',
         label: 'Shape',
         width: '100px',
-        hideBelowLg: true,
+        // At 1280px all eight tracks left the id 156px — three lines of a
+        // 36-character id. Shape is the cheapest thing to fold until 1536px.
+        hideBelow: '2xl',
         render: (r) => (
           <span className="text-xs text-faint">
             {r.background ? 'Background' : r.streamed ? 'Streamed' : 'Sync'}
@@ -177,7 +213,7 @@ export function RequestLogsPanel() {
     [],
   );
 
-  if (!projectsQuery.loading && projects.length === 0) {
+  if (!projectsQuery.loading && !projectsQuery.error && projects.length === 0) {
     return (
       <div>
         <ConsoleHeader title="Request logs" />
@@ -218,7 +254,9 @@ export function RequestLogsPanel() {
       </AdminToolbar>
 
       <div className="mt-5">
-        {!logs.loading && !logs.error && rows.length === 0 ? (
+        {projectsQuery.error ? (
+          <ProjectsLoadError query={projectsQuery} />
+        ) : !projectsPending && !logs.loading && !logs.error && rows.length === 0 ? (
           <ConsoleEmpty
             title={status ? 'No requests match this filter' : 'No requests yet'}
             body={
@@ -231,10 +269,13 @@ export function RequestLogsPanel() {
           <>
             <ConsoleTable
               columns={columns}
-              minWidth={1060}
+              // The fixed tracks shown from xl (720px) plus a 220px id column:
+              // no more than the ~960px a 1280px window gives the table once
+              // the page's scrollbar is counted.
+              minWidth={940}
               rows={rows}
               rowKey={(r) => r.id}
-              loading={logs.loading && logs.data === null}
+              loading={projectsPending || (logs.loading && logs.data === null)}
               empty="No requests yet."
               error={logs.error}
               onRetry={logs.reload}

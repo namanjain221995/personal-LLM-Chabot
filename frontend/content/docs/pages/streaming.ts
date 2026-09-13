@@ -60,7 +60,7 @@ with two more that can appear:
 
 * \`response.queued\` — the engine is recovering and your request is allowed
   to wait. It is emitted so you can see *why* nothing is arriving, rather
-  than deciding the connection is dead.
+  than deciding the connection is dead. Only \`${MODEL_ID}\` sends it.
 * \`response.failed\` and \`error\` — the two failure terminals.
 
 Each frame is an \`event:\` line naming the event and a \`data:\` line with a
@@ -69,7 +69,7 @@ JSON object. The object repeats the name in \`type\` and carries a
 
 ~~~text
 event: response.created
-data: {"type":"response.created","sequence_number":1,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"queued","model":"${MODEL_ID}","output":[],"usage":null}}
+data: {"type":"response.created","sequence_number":1,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"queued","model":"${MODEL_ID}","output":[],"max_output_tokens":8192,"incomplete_details":null,"usage":null}}
 
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_…","output_index":0,"content_index":0,"delta":"Retrieval"}
@@ -78,7 +78,7 @@ event: response.output_text.done
 data: {"type":"response.output_text.done","sequence_number":42,"item_id":"msg_…","output_index":0,"content_index":0,"text":"Retrieval-augmented generation …"}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":43,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"completed","model":"${MODEL_ID}","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Retrieval-augmented generation …"}]}],"usage":{"input_tokens":37,"output_tokens":112,"total_tokens":149}}}
+data: {"type":"response.completed","sequence_number":43,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"completed","model":"${MODEL_ID}","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Retrieval-augmented generation …"}]}],"max_output_tokens":8192,"incomplete_details":null,"usage":{"input_tokens":37,"output_tokens":112,"total_tokens":149}}}
 ~~~
 
 ## Four guarantees you can code against
@@ -97,6 +97,20 @@ data: {"type":"response.completed","sequence_number":43,"response":{"id":"${EXAM
 The object inside \`response.completed\` is byte for byte the body a
 non-streaming request would have returned, so one parser serves both modes.
 
+## The applied output ceiling
+
+Every response object in the stream carries \`max_output_tokens\` and
+\`incomplete_details\`. On \`response.created\` and \`response.in_progress\`
+\`max_output_tokens\` is the ceiling the server **planned** from your request —
+already clamped to what your prompt leaves in the context window. On the
+terminal event it is the exact ceiling **applied**, which on \`techsara-35b\`
+can be lower or higher once the engine has counted your prompt precisely (the
+plan counts about three characters per token; English prose is nearer four).
+\`incomplete_details\` is
+\`{"reason": "max_output_tokens"}\` on the terminal event when the answer
+stopped because it reached that ceiling, and \`null\` otherwise. See
+[long outputs](/docs/long-output).
+
 ## Heartbeats
 
 A comment frame goes out at least every 15 seconds while nothing else is
@@ -106,10 +120,16 @@ happening:
 : ping
 ~~~
 
-It keeps idle proxies from closing a long generation. It is a comment, not an
+It keeps idle proxies from closing a long generation, and it keeps going for
+the whole life of the stream on every model — through a slow first token on a
+long prompt, and through an answer that runs for hours. It is a comment, not an
 event: it carries no sequence number and every conforming parser drops it. If
 you hand-rolled a parser, make sure a line starting with \`:\` is ignored
 rather than fed to \`JSON.parse\`.
+
+The heartbeat covers the network. Your own client's read timeout is the one
+thing it cannot reach: leave it off for a stream (\`timeout=None\` in the Python
+sample below), or set it well above 15 seconds.
 
 ## Errors mid-stream
 
@@ -121,7 +141,15 @@ usage that was spent, and an \`error\` naming the code.
 
 ~~~text
 event: response.failed
-data: {"type":"response.failed","sequence_number":7,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"failed","model":"${MODEL_ID}","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Retrieval-augmented"}]}],"usage":null,"error":{"code":"model_recovering","message":"The model is restarting. This request is safe to retry."}}}
+data: {"type":"response.failed","sequence_number":7,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"failed","model":"${MODEL_ID}","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Retrieval-augmented"}]}],"max_output_tokens":8192,"incomplete_details":null,"usage":null,"error":{"code":"model_recovering","message":"The model is restarting. This request is safe to retry."}}}
+~~~
+
+A generation that reaches its wall clock ends with a \`response.failed\` too, with the code
+\`timeout\` — and still carries everything written up to that moment:
+
+~~~text
+event: response.failed
+data: {"type":"response.failed","sequence_number":406213,"response":{"id":"${EXAMPLE_RESPONSE_ID}","object":"response","created_at":1789200000,"status":"failed","model":"${MODEL_ID}","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Chapter 1 …"}]}],"max_output_tokens":1000000,"incomplete_details":null,"usage":{"input_tokens":412,"output_tokens":812344,"total_tokens":812756},"error":{"code":"timeout","message":"The response took longer than the 20900 second limit."}}}
 ~~~
 
 The grammar reserves one more terminal, \`error\`, for a failure that has no
@@ -224,9 +252,10 @@ for (;;) {
 ## When a stream is the wrong tool
 
 If your client cannot hold a connection for the length of the work — a
-serverless function with a short ceiling, a mobile app on a flaky network —
-use a [background response](/docs/background) and a
-[webhook](/docs/webhooks) instead.
+serverless function with a short ceiling, a mobile app on a flaky network, an
+answer of hundreds of thousands of tokens — use a
+[background response](/docs/background) and a [webhook](/docs/webhooks)
+instead.
 
 There is no resume. A dropped stream cannot be replayed, and the text of a
 non-background response is not retained after it ends — so a stream you

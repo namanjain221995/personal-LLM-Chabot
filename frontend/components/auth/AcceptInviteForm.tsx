@@ -37,6 +37,33 @@ type Phase =
   | { kind: 'offline' }
   | { kind: 'ready'; token: string; invite: Invite };
 
+/**
+ * Finish a response whose body the form has no use for.
+ *
+ * Left unread, the refused lookup never finished in Chrome's eyes: every
+ * networkidle navigation to a bad invite link timed out (fe audit
+ * 2026-09-13). Cancelling the stream fixed that but turned the request into a
+ * red `net::ERR_ABORTED` in DevTools beside the intended 404 (re-audit), so
+ * the body is now READ to its end — a few bytes of JSON — and the request
+ * completes normally. Cancelling stays as the fallback for a body that cannot
+ * be read. Not awaited: the verdict is on screen before the bytes arrive.
+ */
+function releaseBody(res: Response): void {
+  let reading: Promise<unknown>;
+  try {
+    reading = res.text();
+  } catch (error) {
+    reading = Promise.reject(error);
+  }
+  void reading.catch(() => {
+    try {
+      void res.body?.cancel().catch(() => undefined);
+    } catch {
+      // A body that is already locked or absent needs no release.
+    }
+  });
+}
+
 export interface AcceptInviteFormProps {
   /** Injected for tests; production defaults to a full navigation. */
   navigate?: (url: string) => void;
@@ -71,6 +98,7 @@ export function AcceptInviteForm({
     }
     if (!res.ok) {
       setPhase({ kind: 'invalid' });
+      releaseBody(res);
       return;
     }
 

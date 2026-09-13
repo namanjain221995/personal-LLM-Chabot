@@ -199,9 +199,13 @@ describe('the file panel splits the workspace, not the shell', () => {
     expect(panelColumn.className).toMatch(/(^|\s)md:block(\s|$)/);
     expect(panelColumn.className).toMatch(/(^|\s)md:min-w-0(\s|$)/);
     expect(panelColumn.className).not.toMatch(/min-\[900px\]/);
-    // …and the pixel clamp: never under 520 (yielding on a narrow row) nor over 960.
-    expect(panelColumn.style.minWidth).toBe('min(520px, 62%)');
-    expect(panelColumn.style.maxWidth).toBe('960px');
+    // …and the pixel clamp: never under 520 (yielding on a narrow row) nor over
+    // 960 — and, since 2026-09-13, never so wide that the thread beside it has
+    // less than 360 px (+ the 6 px divider), nor under the divider's 45 % clamp.
+    expect(panelColumn.style.minWidth).toBe(
+      'max(45%, min(520px, 62%, calc(100% - 366px)))',
+    );
+    expect(panelColumn.style.maxWidth).toBe('min(960px, max(45%, calc(100% - 366px)))');
     // The thread shrinks to what the panel leaves and never forces an overflow.
     const conversationColumn = document.querySelector('[data-file-drop-zone]')!;
     expect(conversationColumn.className).toMatch(/\bmin-w-0\b/);
@@ -245,6 +249,72 @@ describe('the file panel splits the workspace, not the shell', () => {
     });
     expect(screen.queryByTestId('artifact-panel-column')).toBeNull();
     expect(document.activeElement).toBe(screen.getByRole('button', { name: /Open Board deck \(PowerPoint/ }));
+  });
+
+  it('hides the sidebar on a tablet or small laptop while a file is open, and gives it back on close', async () => {
+    // fe audit 2026-09-13 (chat HIGH): at 768–1024 px the panel opened beside
+    // an open sidebar and crushed the thread to 187–284 px. Between md and xl
+    // the sidebar steps aside; the person's own reopen is never undone.
+    const queries: string[] = [];
+    vi.stubGlobal('matchMedia', (query: string) => {
+      queries.push(query);
+      return {
+        matches: query === '(min-width: 768px) and (max-width: 1279px)' || query === '(min-width: 768px)',
+        media: query,
+        onchange: null,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      };
+    });
+    const desktopSidebar = () => document.querySelector('aside[aria-label="Sidebar"]:not([role])')!;
+    await openDeck();
+    expect(queries).toContain('(min-width: 768px) and (max-width: 1279px)');
+    expect(desktopSidebar().getAttribute('aria-hidden')).toBe('true');
+    expect(screen.getByRole('button', { name: 'Show sidebar' })).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Close preview' }));
+    });
+    expect(screen.queryByTestId('artifact-panel-column')).toBeNull();
+    expect(desktopSidebar().getAttribute('aria-hidden')).toBe('false');
+    expect(screen.queryByRole('button', { name: 'Show sidebar' })).toBeNull();
+  });
+
+  it('leaves the sidebar alone when the person reopened it beside the panel', async () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query === '(min-width: 768px) and (max-width: 1279px)' || query === '(min-width: 768px)',
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    }));
+    const desktopSidebar = () => document.querySelector('aside[aria-label="Sidebar"]:not([role])')!;
+    await openDeck();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Show sidebar' }));
+    });
+    expect(desktopSidebar().getAttribute('aria-hidden')).toBe('false');
+    // Hide it again by hand, then close the file: it stays hidden.
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('button', { name: 'Hide sidebar' })[0]);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Close preview' }));
+    });
+    expect(desktopSidebar().getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('keeps the sidebar where it is at 1280 px and up', async () => {
+    // The default stub matches nothing: a wide screen.
+    await openDeck();
+    const desktopSidebar = document.querySelector('aside[aria-label="Sidebar"]:not([role])')!;
+    expect(desktopSidebar.getAttribute('aria-hidden')).toBe('false');
   });
 
   it('closes from the panel and the shell is back to sidebar + workspace', async () => {

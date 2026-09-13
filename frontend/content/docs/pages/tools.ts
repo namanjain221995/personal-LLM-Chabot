@@ -13,13 +13,17 @@ export const tools: DocPage = {
 ## Tool calling is not available
 
 The TechSara developer API does **not** offer tool calling, function calling
-or structured tool use. \`GET /v1/models\` says so in the only place that
-counts:
+or structured tool use, on any of its models. \`GET /v1/models\` says so in the
+only place that counts:
 
 ~~~json
 {
   "id": "${MODEL_ID}",
-  "capabilities": { "chat": true, "streaming": true, "vision": true, "tools": false, "embeddings": false }
+  "capabilities": {
+    "chat": true, "streaming": true, "vision": true, "tools": false,
+    "embeddings": false, "rerank": false, "audio_transcription": false,
+    "ocr": false, "background": true
+  }
 }
 ~~~
 
@@ -104,10 +108,13 @@ entirely under your control.
 
 ## Neither are these
 
-For completeness, so nothing here is a surprise: there is no embeddings
-endpoint, no image input (a message's \`content\` is a string), no file
-upload, no retrieval or web search, and no assistants or threads. See
-[the model reference](/docs/models) for what the one public model does and
-does not accept.
+For completeness, so nothing here is a surprise: there is no file upload, no
+retrieval or web search, and no assistants or threads. What the API does offer
+besides generation — [images](/docs/images) as \`data:\` URLs,
+[embeddings](/docs/embeddings), [reranking](/docs/rerank) and
+[speech to text](/docs/audio-transcriptions) — is in
+[the model reference](/docs/models), which is also the place to build your own
+retrieval from: embed your documents, rerank the candidates, and send the best
+passages in \`input\`.
 `.trim(),
 };

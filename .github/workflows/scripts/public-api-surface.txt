@@ -12,6 +12,13 @@
 # gate reports "not enforced yet" and passes; after it lands, this list is
 # binding with no further edit to the pipeline.
 #
+# 2026-09-13 (owner request, "every model TechSara runs"): CONTRACT §7 now
+# names ELEVEN operations — the eight of 2026-09-12 plus embeddings, rerank
+# and speech-to-text, each behind its own scope (`embeddings.write`,
+# `rerank.write`, `audio.write`), each a metered /v1 route that proxies to an
+# engine without publishing its port. Adding them here needs the owner's
+# approval at commit time, like every line in this file.
+#
 # What is DELIBERATELY absent, per CONTRACT-3 §7: Salesforce, RAG and web
 # search, deep research, uploads, artifacts, memory, conversation history and
 # admin analytics. Each would need its own product, scope and threat review,
@@ -34,6 +41,14 @@ POST /v1/responses/{id}/cancel
 
 # ---- compatibility shape, same engine path (§7) --------------------------
 POST /v1/chat/completions
+
+# ---- embeddings, rerank, speech (2026-09-13 owner request) ----
+# techsara-embed, techsara-rerank and techsara-whisper; all synchronous, all
+# held by the per-engine capacity gates of CONTRACT §12.3. The transcription
+# route takes multipart/form-data up to 26 MiB (§8.5, §12).
+POST /v1/embeddings
+POST /v1/rerank
+POST /v1/audio/transcriptions
 
 # ---- usage: project-scoped, bounded range (§7) ---------------------------
 GET /v1/usage

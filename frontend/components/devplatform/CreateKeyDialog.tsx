@@ -44,7 +44,16 @@ import { SCOPES, type CreatedKey, type Project } from './types';
  * quota has no business being able to spend it, and the restricted key is the
  * default path rather than the one you have to remember to ask for.
  */
-const DEFAULT_SCOPES = ['models.read', 'responses.read', 'responses.write'];
+const DEFAULT_SCOPES = [
+  'models.read',
+  'responses.read',
+  'responses.write',
+  // 2026-09-13, with their endpoints: each spends engine time exactly as
+  // responses.write does, which was already a default.
+  'embeddings.write',
+  'rerank.write',
+  'audio.write',
+];
 
 export function CreateKeyDialog({
   open,

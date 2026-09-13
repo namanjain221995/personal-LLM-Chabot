@@ -732,15 +732,17 @@ def test_a_naive_datetime_is_refused_rather_than_assumed_to_be_utc():
 # ---------------------------------------------------------------------------
 
 
-def test_the_scope_vocabulary_is_exactly_the_four_the_contract_names():
+def test_the_scope_vocabulary_is_exactly_the_seven_the_contract_names():
     """CONTRACT-3 §7's endpoint table, read literally.
 
-    It names four scopes. Wave 1 shipped six, calling them "the six the
-    contract names": `webhooks.read` and `webhooks.manage` appear NOWHERE in
-    CONTRACT.md, and the paragraph under §7's table puts webhooks among what
-    `/v1` deliberately does not expose. The only webhook string in the whole
-    document is `api.webhooks.manage`, a §6 BROWSER capability in the other
-    vocabulary. The contract is supposed to move first; it had not moved.
+    It names seven scopes since 2026-09-13, when `/v1/embeddings`, `/v1/rerank`
+    and `/v1/audio/transcriptions` arrived with `embeddings.write`,
+    `rerank.write` and `audio.write` (owner request: every model TechSara runs
+    on the public API). Before that it named four. Wave 1 once shipped six,
+    calling them "the six the contract names": `webhooks.read` and
+    `webhooks.manage` appear NOWHERE in CONTRACT.md, and the paragraph under
+    §7's table puts webhooks among what `/v1` deliberately does not expose.
+    The contract is supposed to move first, and this test is what makes it.
 
     Asserted against the document itself, not against a copy of it, so this
     test fails if either side changes alone.
@@ -756,6 +758,9 @@ def test_the_scope_vocabulary_is_exactly_the_four_the_contract_names():
         "responses.read",
         "responses.write",
         "usage.read",
+        "embeddings.write",
+        "rerank.write",
+        "audio.write",
     }
     for scope in scopes.ALL_SCOPES:
         assert f"`{scope.value}`" in section, f"{scope.value} is not in CONTRACT §7"
@@ -904,6 +909,27 @@ def test_the_default_scope_set_is_the_narrow_one():
     # A billing dashboard has no business being able to spend the quota it is
     # reading, so `usage.read` is opted into rather than granted by default.
     assert scopes.Scope.USAGE_READ not in scopes.DEFAULT_SCOPES
+
+
+def test_a_default_key_may_call_every_generating_endpoint_including_the_three_new_ones():
+    """2026-09-13: embeddings, rerank and transcription spend engine time the
+    way `responses.write` does, which was already a default. A default key
+    that 403s on `/v1/embeddings` would read as a broken product, not as a
+    narrow credential — and the new sentences are the ones the console shows
+    verbatim."""
+    for scope in (
+        scopes.Scope.RESPONSES_WRITE,
+        scopes.Scope.EMBEDDINGS_WRITE,
+        scopes.Scope.RERANK_WRITE,
+        scopes.Scope.AUDIO_WRITE,
+    ):
+        assert scope in scopes.DEFAULT_SCOPES, scope
+    assert scopes.SCOPE_DESCRIPTIONS[scopes.Scope.EMBEDDINGS_WRITE] == "Create embeddings."
+    assert (
+        scopes.SCOPE_DESCRIPTIONS[scopes.Scope.RERANK_WRITE]
+        == "Rerank documents against a query."
+    )
+    assert scopes.SCOPE_DESCRIPTIONS[scopes.Scope.AUDIO_WRITE] == "Transcribe audio."
 
 
 def test_a_scope_is_a_plain_string_for_storage_and_comparison():

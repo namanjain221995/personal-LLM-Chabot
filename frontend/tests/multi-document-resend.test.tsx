@@ -163,9 +163,16 @@ describe('COMBINATION · unchanged edit on a four-document turn', () => {
     await waitFor(() => expect(chatBodies.length).toBe(2));
     await waitForAnswers(1);
 
-    // No `1 / 2` — the same turn asked again.
+    // No `1 / 2` on the question — the same turn asked again. (The answer
+    // keeps its earlier version since 2026-09-13, so its row shows `2 / 2`.)
     expect(userTurns()).toHaveLength(1);
-    expect(screen.queryByText(/2 \/ 2/)).toBeNull();
+    const navigators = await screen.findAllByText(/^\d+ \/ \d+$/);
+    expect(navigators).toHaveLength(1);
+    let owner = navigators[0].parentElement;
+    while (owner && !owner.querySelector('[data-chat-message-role]')) owner = owner.parentElement;
+    expect(
+      owner?.querySelector('[data-chat-message-role]')?.getAttribute('data-chat-message-role'),
+    ).toBe('assistant');
     // All four, once each, in order.
     expect(ids(lastBody())).toEqual(original);
     expect(lastBody().pdf ?? null).toBeNull();

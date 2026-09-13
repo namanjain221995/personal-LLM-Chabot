@@ -110,7 +110,8 @@ describe('toolbar controls', () => {
         />
       </>,
     );
-    const heights = [...container.querySelectorAll('div, select')]
+    // The search box is a <label> (the whole 40px box focuses the field).
+    const heights = [...container.querySelectorAll('div, label, select')]
       .map((el) => (el as HTMLElement).className)
       .filter((c) => c.includes('h-10'));
     expect(heights.length).toBeGreaterThanOrEqual(2);

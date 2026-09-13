@@ -38,6 +38,13 @@ mockHistory();
 const { ChatApp } = await import('@/components/ChatApp');
 const { Providers } = await import('@/components/Providers');
 
+/** Whose row a `n / total` navigator sits in: the nearest message bubble up the tree. */
+function navigatorOwner(nav: Element): string | null {
+  let el = nav.parentElement;
+  while (el && !el.querySelector('[data-chat-message-role]')) el = el.parentElement;
+  return el?.querySelector('[data-chat-message-role]')?.getAttribute('data-chat-message-role') ?? null;
+}
+
 const lastUserContent = () =>
   lastBody().messages?.filter((m) => m.role === 'user').pop()?.content;
 
@@ -72,13 +79,21 @@ describe('EDIT-SAME · unchanged text regenerates', () => {
     expect(userTurns()).toHaveLength(1);
     expect(userTurns()[0].id).toBe(originalId);
     expect(lastUserContent()).toBe('Explain attention.');
-    expect(screen.queryByText(/2 \/ 2/)).toBeNull();
+    // No `1 / 2` on the QUESTION. Since 2026-09-13 a regenerate keeps the
+    // earlier answer as a version, so the `2 / 2` that does appear is the
+    // answer's — exactly what "Try again" shows.
+    const navigators = await screen.findAllByText(/^\d+ \/ \d+$/);
+    expect(navigators.map((n) => [n.textContent, navigatorOwner(n)])).toEqual([
+      ['2 / 2', 'assistant'],
+    ]);
+    expect(assistantTurns()).toHaveLength(2);
     // The editor closed and the page is back to one visible turn.
     expect(screen.queryByRole('textbox', { name: 'Edit your message' })).toBeNull();
   });
 
-  it('04 · behaves exactly like "Try again" — same stored shape after each', async () => {
+  it('04 · behaves exactly like "Try again" — each adds one answer version and no user turn', async () => {
     await send('Explain attention.');
+    const before = { users: userTurns().length, assistants: assistantTurns().length };
     await regenerateLast();
     await waitFor(() => expect(chatBodies.length).toBe(2));
     await waitForAnswers(1);
@@ -86,13 +101,18 @@ describe('EDIT-SAME · unchanged text regenerates', () => {
       users: userTurns().length,
       assistants: assistantTurns().length,
     };
+    expect(afterRegenerate).toEqual({ users: before.users, assistants: before.assistants + 1 });
 
     await editTo(null);
     await waitFor(() => expect(chatBodies.length).toBe(3));
     await waitForAnswers(1);
-    expect({ users: userTurns().length, assistants: assistantTurns().length }).toEqual(
-      afterRegenerate,
-    );
+    expect({ users: userTurns().length, assistants: assistantTurns().length }).toEqual({
+      users: afterRegenerate.users,
+      assistants: afterRegenerate.assistants + 1,
+    });
+    // Both requests said where the new answer goes, the same way.
+    expect(chatBodies[1].answer_branch?.parent).toBe(userTurns()[0].meta?.branch?.self);
+    expect(chatBodies[2].answer_branch?.parent).toBe(userTurns()[0].meta?.branch?.self);
   });
 
   it('04 · in a conversation WITH versions it appends an alternative answer', async () => {
@@ -123,6 +143,9 @@ describe('EDIT-SAME · unchanged text regenerates', () => {
     expect(lastUserContent()).toBe('Compare these files.');
     await waitForAnswers(1);
     expect(screen.getByText(/2 \/ 2/)).toBeTruthy();
+    // …and that navigator is the QUESTION's, which is what tells a real edit
+    // apart from the unchanged one above.
+    expect(navigatorOwner(screen.getByText(/2 \/ 2/))).toBe('user');
   });
 
   it('the comparison is the editor\'s trim, so a moved line break IS an edit', async () => {

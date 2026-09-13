@@ -41,6 +41,41 @@ function setToken(token: string) {
 }
 
 describe('invalid invitations', () => {
+  it('reads a refused lookup body to its end, so the request completes instead of aborting', async () => {
+    setToken('bogus-token-123');
+    const text = vi.fn(async () => '{"detail":"Not found"}');
+    const cancel = vi.fn(async () => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: false, status: 404, text, body: { cancel }, json: async () => ({}) })),
+    );
+    render(<AcceptInviteForm navigate={vi.fn()} />);
+    expect((await screen.findByRole('alert')).textContent).toContain('This invitation is no longer valid');
+    await waitFor(() => expect(text).toHaveBeenCalledTimes(1));
+    // Cancelling is what turned the request red (net::ERR_ABORTED) in DevTools.
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it('cancels the refused body only when it cannot be read', async () => {
+    setToken('bogus-token-123');
+    const cancel = vi.fn(async () => undefined);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: false,
+        status: 404,
+        text: async () => {
+          throw new TypeError('network error');
+        },
+        body: { cancel },
+        json: async () => ({}),
+      })),
+    );
+    render(<AcceptInviteForm navigate={vi.fn()} />);
+    expect((await screen.findByRole('alert')).textContent).toContain('This invitation is no longer valid');
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+  });
+
   it('shows the no-longer-valid state on 404', async () => {
     setToken('tok-dead');
     vi.stubGlobal(

@@ -111,7 +111,7 @@ export function LoginForm({
           required
         />
 
-        <label className="flex w-fit cursor-pointer items-center gap-2.5 pt-0.5 text-sm text-muted transition-colors duration-ts hover:text-ink">
+        <label className="flex min-h-8 w-fit cursor-pointer items-center gap-2.5 pt-0.5 text-sm text-muted transition-colors duration-ts hover:text-ink">
           <input
             type="checkbox"
             checked={remember}

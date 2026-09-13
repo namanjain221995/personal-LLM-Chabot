@@ -30,7 +30,7 @@ A project's settings are the cheapest security you will ever configure:
 
 | Setting | Turns a stolen key into |
 | --- | --- |
-| Model allowlist | A key that can only reach the models you named. |
+| Model allowlist | A key that can only reach the models you named. With it empty, a project can use every model — including ones added later. |
 | Origin allowlist | A key that browsers can only use from your own site. |
 | IP allowlist | A key that only works from your own servers. |
 | Retention window | A background output that stops existing sooner. |
@@ -41,7 +41,9 @@ A project's settings are the cheapest security you will ever configure:
   a fact from a database: validate it, escape it where it is rendered, and
   never pass it into a shell, a query or an action without a check.
 * **Do not send what you do not need to send.** Strip personal data from a
-  prompt when the task does not need it.
+  prompt when the task does not need it — and crop or blur an image, or cut a
+  recording, the same way. Images and audio are not stored, but they are
+  processed.
 * **Verify webhook signatures**, in constant time, with the timestamp
   tolerance. See [webhooks](/docs/webhooks#verifying-the-signature).
 * **Log \`request_id\`, never the key.** The public half of a key
@@ -72,8 +74,12 @@ So you know where the boundary is, and what you can rely on:
 * **Error bodies carry no machinery.** No traceback, SQL, environment value,
   container name, internal hostname, filesystem path or private IP address.
 * **Model exposure is decided in code**, and configuration may only narrow
-  it. Internal services — the router, embeddings, OCR, the reranker — are not
-  models, are not in the registry, and have no reachable path from \`/v1\`.
+  it. Every model is reached only through \`/v1\`, with a key, and every call
+  is recorded; the engines themselves are never reachable from outside, and
+  which checkpoint serves a model is not something the API reveals.
+* **The API never fetches a URL you send.** Images are accepted as \`data:\`
+  URLs only, so a request cannot make our servers reach into a network on your
+  behalf.
 * **Webhook deliveries are SSRF-checked**: HTTPS only, the resolved address
   validated and then connected to, private and metadata addresses refused, at
   most three re-validated redirects.

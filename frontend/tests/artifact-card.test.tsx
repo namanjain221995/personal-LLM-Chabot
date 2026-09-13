@@ -328,7 +328,16 @@ describe('ArtifactCard — Open and Download are distinct', () => {
       `/api/artifacts/${ID}/v/1/f/0123456789abcdef?disposition=attachment`,
     );
     expect(download.getAttribute('download')).toBe('quarterly-review-v1.pptx');
-    fireEvent.click(download);
+    // jsdom cannot follow a link and logs "Not implemented: navigation" when
+    // one is clicked. Cancelling the default in the capture phase keeps the
+    // run's output clean and still delivers the click to React's handlers.
+    const noNavigation = (e: Event) => e.preventDefault();
+    window.addEventListener('click', noNavigation, true);
+    try {
+      fireEvent.click(download);
+    } finally {
+      window.removeEventListener('click', noNavigation, true);
+    }
     expect(onOpen).not.toHaveBeenCalled();
   });
 

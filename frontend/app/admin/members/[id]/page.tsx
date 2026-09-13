@@ -371,24 +371,32 @@ function SessionsTab({
       render: (s) =>
         s.ip ? <span className="font-mono text-xs">{s.ip}</span> : em,
     },
+    // The three timestamps may wrap: at nowrap they made the table 859px,
+    // and "Expires / revoked" sat off-screen even at 1024px.
     {
       key: 'created',
       label: 'Created',
-      render: (s) => (s.created_at ? formatWhen(s.created_at) : em),
+      render: (s) =>
+        s.created_at ? <span className="whitespace-normal">{formatWhen(s.created_at)}</span> : em,
     },
     {
       key: 'seen',
       label: 'Last seen',
-      render: (s) => (s.last_seen_at ? formatWhen(s.last_seen_at) : em),
+      render: (s) =>
+        s.last_seen_at ? (
+          <span className="whitespace-normal">{formatWhen(s.last_seen_at)}</span>
+        ) : (
+          em
+        ),
     },
     {
       key: 'until',
       label: 'Expires / revoked',
       render: (s) =>
         s.revoked_at ? (
-          <span className="text-danger">Revoked {formatWhen(s.revoked_at)}</span>
+          <span className="whitespace-normal text-danger">Revoked {formatWhen(s.revoked_at)}</span>
         ) : s.expires_at ? (
-          `Expires ${formatWhen(s.expires_at)}`
+          <span className="whitespace-normal">Expires {formatWhen(s.expires_at)}</span>
         ) : (
           em
         ),
@@ -485,7 +493,7 @@ export default function AdminMemberDetailPage() {
   const stats = detail?.stats;
 
   const tabClass = (active: boolean) =>
-    `-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors duration-ts ${
+    `-mb-px shrink-0 border-b-2 px-2.5 py-2 text-sm font-medium transition-colors duration-ts sm:px-3 ${
       active
         ? 'border-accent text-ink'
         : 'border-transparent text-muted hover:text-ink'
@@ -495,7 +503,7 @@ export default function AdminMemberDetailPage() {
     <div>
       <Link
         href="/admin/members"
-        className="inline-flex items-center gap-1.5 text-sm text-muted transition-colors duration-ts hover:text-ink"
+        className="-my-1.5 inline-flex min-h-8 items-center gap-1.5 text-sm text-muted transition-colors duration-ts hover:text-ink"
       >
         <IconArrowLeft size={15} />
         Members
@@ -546,7 +554,9 @@ export default function AdminMemberDetailPage() {
               <div
                 role="tablist"
                 aria-label="Member content"
-                className="mt-6 flex gap-1 border-b border-border"
+                // Wraps rather than widening the page: four tabs are 375px
+                // on a 360px phone, and the row pushed <main> sideways.
+                className="mt-6 flex flex-wrap gap-x-1 border-b border-border"
               >
                 {tabs.map((t) => (
                   <button

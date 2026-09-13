@@ -226,7 +226,7 @@ export function FileCard({
           onClick={stopCardClick}
           aria-label={`Download ${file.filename}`}
           title={`Download ${file.filename}`}
-          className="absolute right-3 top-1/2 inline-flex -translate-y-1/2 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+          className="absolute right-3 top-1/2 inline-flex -translate-y-1/2 items-center gap-1 rounded-lg border border-border bg-surface px-2 py-1 text-xs max-sm:min-h-8 max-sm:min-w-8 max-sm:justify-center font-medium text-muted transition-colors duration-ts hover:border-accent/50 hover:bg-surface-2 hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
           data-testid="artifact-download"
         >
           <IconDownload size={14} />
