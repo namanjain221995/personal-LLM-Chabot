@@ -1350,21 +1350,36 @@ jobs:
           fi
           echo "- main model: **preserved** — running since \`${started_iso}\` (${uptime_min} min), older than this rollout" >> "$GITHUB_STEP_SUMMARY"
 
-      # THE BIND ASSERTION (audit F065 / N023, CI half). The launcher change
-      # that moved the engine off 0.0.0.0 only takes effect when the engine is
-      # recreated, and nothing else in CI can see a live listening socket: the
-      # compose tests read files, trivy reads images. This reads the kernel.
-      # It fails if anything on the engine port is bound to 0.0.0.0, ::, * or
-      # an address that is neither the configured one nor loopback, and if the
-      # generated configuration itself asks for a wildcard.
+      # THE EXPOSURE ASSERTION (audit F065 / N023, CI half). The raw vLLM API
+      # has no authentication, so the question is "can it be reached from
+      # outside the cluster?", and this step answers it by BEHAVIOUR.
       #
-      # It runs LAST and on `!cancelled()`, so a red bind never hides the
-      # endpoint evidence or the model-preservation verdict above it. Until
-      # OA-3 recreates the engine on the bridge gateway, production still
-      # listens on 0.0.0.0:8000 and this step is RED — the true state of the
-      # box, and the reason it exists.
-      - name: The main engine is not listening on every interface
+      # Under owner option A (2026-09-13) the cluster head listens on every
+      # interface on purpose: the worker's healthcheck and a second tenant
+      # dial it over the RoCE fabric, the orchestrator over the docker bridge,
+      # and a narrower bind takes the two-node engine down. The LAN and the
+      # tailnet are closed by the host packet filter (scripts/host-guard.sh).
+      # The old version of this step failed on any wildcard, so it was red
+      # with or without the filter and only an outage bind could turn it green.
+      #
+      # Now: a listener on a specific address that is neither loopback nor the
+      # configured one fails, as before. A wildcard listener (or a wildcard in
+      # generated.env) passes ONLY if, from the worker over ssh (BatchMode), a
+      # TCP connect to the head's cluster fabric address on the engine port
+      # succeeds AND a connect to every other global address the kernel lists
+      # on the head fails while the same address answers on a control port the
+      # filter never judges. ssh failing, the fabric connect failing, a missing
+      # tool, generated.env or worker: all FAIL, never pass. There is no
+      # advisory mode and no variable that turns it off. The report names
+      # roles and interface classes only -- this log is public, so no address,
+      # hostname or ssh target is ever printed.
+      #
+      # It runs LAST and on `!cancelled()`, so a red exposure never hides the
+      # endpoint evidence or the model-preservation verdict above it, and a
+      # failure here fails `verify`, which triggers the recovery diagnostics.
+      - name: The engine API cannot be reached from outside the cluster
         if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
+        timeout-minutes: 3
         run: |
           set -euo pipefail
           python3 .github/workflows/scripts/engine_bind.py check \
