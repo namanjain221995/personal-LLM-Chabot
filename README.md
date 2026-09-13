@@ -77,6 +77,7 @@ plain language. The platform:
 | "Write a report on Q3 placements" | Plans sections, fills them with SQL/RAG, renders charts, emits `.docx` + `.pdf` | `engines/report.py` |
 | Thumbs up on a SQL answer | That SQL becomes a **few-shot example** for similar future questions; a thumbs-down anywhere disqualifies it globally | `core/learned_examples.py` |
 | Chat across sessions | **Cross-chat memory**: durable facts extracted in the background, semantic + keyword recall over earlier conversations, rolling compaction so long threads never overflow the model window | `facts.py`, `memory_semantic.py`, `compaction.py` |
+| Call the model from your own code (2026-09-13) | The **developer platform**: `POST /v1/responses` (synchronous, streaming or background) and `POST /v1/chat/completions` with an `Authorization: Bearer tsk_…` API key, never the session cookie; per-project scopes, model allowlist, rate, token and concurrency limits in front of the shared admission lanes; idempotency keys; signed webhooks for background responses; one usage row per request. Projects and keys are managed in the console at `/api` and documented at `/docs`. Operator's manual, including what is not yet verified end to end: [`docs/developer-platform/OPERATIONS.md`](docs/developer-platform/OPERATIONS.md) | `publicapi/`, `apiplatform/`, `frontend/app/v1/` |
 
 UI features (all in [`frontend/`](frontend/)): ChatGPT-style shell with sidebar
 (pinned / recent / archived), search palette (`Ctrl/Cmd+K`), effort picker
@@ -166,6 +167,8 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 │   │                           chart_* (spec/decision/pipeline/profile/png), citations, exports,
 │   │                           pdf/docx, report_render, learned_examples, best_of, clarify, profile
 │   ├── core/sf_intel/          Salesforce Intelligence Mode: interpret → plan → validate → execute
+│   ├── publicapi/              the public developer API at /v1: router, models, error envelope, SSE, background, registry
+│   ├── apiplatform/            API keys, resolver, scopes, quotas, idempotency, webhooks, the console API
 │   ├── db.py                   PostgreSQL pool + 7 migrations
 │   ├── memory*.py, facts.py, recall.py, compaction.py, summarize.py, titling.py
 │   ├── history.py, uploads.py, memory_api.py, auth.py, health.py, sse.py, context.py
@@ -830,9 +833,12 @@ digest-pinned `node:20-alpine` image, non-root runtime.
 ## 19. Orchestrator API reference
 
 All under `http://<orchestrator>:8080`. **Every route except `/health`,
-`/auth/login|logout` and the token-gated invitation routes requires the
-`ts_session` cookie** (see §20 and [`docs/AUTH.md`](docs/AUTH.md)); the admin
-routes additionally require the matching workspace capability.
+`/auth/login|logout`, the token-gated invitation routes and the public
+developer API under `/v1` requires the `ts_session` cookie** (see §20 and
+[`docs/AUTH.md`](docs/AUTH.md)); the admin routes additionally require the
+matching workspace capability. `/v1/*` takes an API key in `Authorization` and
+ignores the cookie. FastAPI's own `/docs` and `/openapi.json` are off unless
+`ORCHESTRATOR_DEV_DOCS` is set.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -851,6 +857,8 @@ routes additionally require the matching workspace capability.
 | `GET/PUT` | `/auth/preferences` | per-user personalization blob |
 | `GET/POST` | `/auth/invitations/{token}` · `/auth/invitations/accept` | invitation info + one-use accept (creates the account, signs in) |
 | — | `/admin/api/*` | capability-gated workspace administration: overview, members (list/detail/role/status/remove/sessions/reset-password), audited content viewers (conversations, uploads, reports, downloads), invitations, audit log |
+| `GET/POST` | `/v1/models[/{model}]` · `/v1/responses` · `/v1/responses/{id}[/cancel]` · `/v1/chat/completions` · `/v1/usage` · `/v1/openapi.json` | the public developer API (2026-09-13): API-key authenticated, scoped per key, quota-limited per project; one JSON error envelope everywhere and SSE streaming. Reference: [`docs/developer-platform/API.md`](docs/developer-platform/API.md) |
+| — | `/admin/api/developers/*` | the developer console's API: projects, service accounts, keys (create/rotate/revoke), limits, request logs, usage, webhooks, model exposure, playground — gated on the `api.*` capabilities (404 without them) |
 
 `meta.route` values: `sql | rag | vision | report | chat | agent | search | deep_research | crawl | url | repo | dataset | clarify`.
 
@@ -990,13 +998,14 @@ error while the sync worker holds the single-writer lock — but `app_db` or the
 main model being down is fatal. A failed gate rolls back to the commit that was
 live before. `down -v` is never used, so no volume is ever destroyed.
 
-**Two repository variables** (Settings → Secrets and variables → Actions →
-Variables) control the parts you are most likely to want to change:
+**Two settings** control the parts you are most likely to want to change —
+`DEPLOY_FULL` is a repository variable (Settings → Secrets and variables →
+Actions → Variables); the checkout branch is derived by the pipeline:
 
 | Variable | Unset (default) | Set | What it costs |
 |---|---|---|---|
 | `DEPLOY_FULL` (`true`, `1`, `yes` or `on`) | `techsara up` recreates only the services whose definition changed. An app-only merge leaves `vllm`, `router`, `ocr`, `reranker` and `embed` running — correct, because those images are pinned upstream and contain none of this repo's code. Merge #17 took **55 s**. | `true` → `techsara down` first, so **every** container is recreated, models included. | **~17 min** end to end; the main model alone reloads in ~5.5 min for the 35B-A3B (the 27B took ~441 s). Volumes are preserved — you pay time, not data. |
-| `DEPLOY_BRANCH` | The checkout is left on a **detached HEAD** at the deployed commit. | e.g. `dev` → the checkout is left **on that branch**, fast-forwarded to the deployed commit. | Nothing. Use it because this checkout is also a working directory, and walking into "detached HEAD" after every merge is confusing. |
+| `DEPLOY_BRANCH` | **Not read from a repository variable** — a leftover `DEPLOY_BRANCH` variable is ignored and should be deleted. The job sets it to the ref being deployed — `main` on a push — so the checkout is left **on `main`**, fast-forwarded to the deployed commit. | Only the `branch` input of a manual run overrides it; `-` forces a detached HEAD. | Nothing. It exists because this checkout is also a working directory, and walking into "detached HEAD" after every merge is confusing. |
 
 **`DEPLOY_BRANCH` fast-forwards; it never rewrites.** If the branch is behind
 the deployed commit it is fast-forwarded onto it. If it holds commits the
@@ -1024,8 +1033,8 @@ and anything `git check-ref-format` rejects, abort the deploy with exit 1.
 **A one-off, from the Actions UI.** Actions → *Deploy* → *Run workflow*, which
 takes three inputs: `ref` (branch or SHA, default `main`), `full` (tick it to
 recreate every container for this run only), and `branch` (the branch to land
-the checkout on for this run; blank uses `DEPLOY_BRANCH`, and `-` forces a
-detached HEAD). The same knobs exist on the script:
+the checkout on for this run; blank uses the branch the run was started from,
+and `-` forces a detached HEAD). The same knobs exist on the script:
 
 ```bash
 scripts/deploy.sh --ref main --branch dev --full     # or --dry-run to just resolve
@@ -1041,6 +1050,7 @@ and whether every container was recreated or only the changed ones.
 Current (2026-08):
 
 - [`docs/AUTH.md`](docs/AUTH.md) — **authentication, workspaces, RBAC, audit**: sessions, persistent login, invitations, bootstrap, member privacy, admin surface
+- [`docs/developer-platform/`](docs/developer-platform/) — **the public developer API (2026-09-13)**: [`OPERATIONS.md`](docs/developer-platform/OPERATIONS.md) (settings, provisioning keys, quotas, retention, a leaked key, webhooks, monitoring, rollback), [`API.md`](docs/developer-platform/API.md) (every `/v1` endpoint and error code, read from the code), [`DISPOSITION.md`](docs/developer-platform/DISPOSITION.md) (what happened to each of the 111 audit findings, and the operator actions), [`AUDIT.md`](docs/developer-platform/AUDIT.md), [`CONTRACT.md`](docs/developer-platform/CONTRACT.md), [`SCHEMA-V34.md`](docs/developer-platform/SCHEMA-V34.md), [`STANDARDS.md`](docs/developer-platform/STANDARDS.md), [`OWNERSHIP.md`](docs/developer-platform/OWNERSHIP.md)
 - [`docs/MONITORING.md`](docs/MONITORING.md) — the Grafana/Prometheus observability platform for the two DGX Sparks
 - [`docs/availability/`](docs/availability/README.md) — **the main model's availability (2026-09-12)**: [`RUNBOOK.md`](docs/availability/RUNBOOK.md) (what to do when an alert fires), [`CONTRACT.md`](docs/availability/CONTRACT.md) (the binding states, signals, metrics), [`ARCHITECTURE.md`](docs/availability/ARCHITECTURE.md) (controller, sentinel, breaker, request continuity, admission lanes), [`INCIDENT-2026-09-11-vllm.md`](docs/availability/INCIDENT-2026-09-11-vllm.md), [`ADR-0002-high-availability.md`](docs/availability/ADR-0002-high-availability.md), [`SLO.md`](docs/availability/SLO.md), [`CANDIDATE-B.md`](docs/availability/CANDIDATE-B.md), [`MEMORY-BUDGET.md`](docs/availability/MEMORY-BUDGET.md), [`VLLM-UPGRADE-RESEARCH.md`](docs/availability/VLLM-UPGRADE-RESEARCH.md)
 - [`docs/FLOWS.md`](docs/FLOWS.md) — **every flow as a diagram**: the three answering modes, all five models, engine dispatch, crawler, web memory, citations, Salesforce, streaming
