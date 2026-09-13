@@ -44,9 +44,11 @@ export function AdminSearchInput({
   label: string;
   className?: string;
 }) {
+  // A <label>, not a <div>: the whole 40px box focuses the field. As a div
+  // only the 22px-tall input inside it took a tap on a phone.
   return (
-    <div
-      className={`${CONTROL_BASE} flex min-w-0 items-center gap-2 bg-[var(--admin-control)] px-3 focus-within:border-accent/70 ${className}`}
+    <label
+      className={`${CONTROL_BASE} flex min-w-0 cursor-text items-center gap-2 bg-[var(--admin-control)] px-3 focus-within:border-accent/70 ${className}`}
     >
       <IconSearch size={15} className="shrink-0 text-faint" />
       <input
@@ -55,9 +57,9 @@ export function AdminSearchInput({
         placeholder={placeholder}
         aria-label={label}
         type="search"
-        className="min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-faint focus:outline-none [&::-webkit-search-cancel-button]:appearance-none"
+        className="h-full min-w-0 flex-1 bg-transparent text-sm text-ink placeholder:text-faint focus:outline-none [&::-webkit-search-cancel-button]:appearance-none"
       />
-    </div>
+    </label>
   );
 }
 
@@ -147,6 +149,11 @@ export function AdminTabs({
  * The toolbar strip: filters on the left, the page's one action on the
  * right. Wraps to two lines below `sm` without either half losing its
  * internal alignment.
+ *
+ * The filter half has an 18rem flex basis: with a zero basis it stayed on
+ * the action's line at any width, and a phone squeezed the members search
+ * to 125px ("Search by name or e"). Now the action drops to its own line
+ * first.
  */
 export function AdminToolbar({
   children,
@@ -157,7 +164,7 @@ export function AdminToolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+      <div className="flex min-w-0 flex-[1_1_18rem] flex-wrap items-center gap-2">
         {children}
       </div>
       {action}

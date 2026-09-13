@@ -526,6 +526,18 @@ a {
   white-space: nowrap;
 }
 
+/* Documentation tables hold sentences, not values. At nowrap a table of
+   explanations grew to 1691px in an 830px column even at 1440x900, and
+   reading one cell meant scrolling the table sideways (responsive audit,
+   2026-09-13). Their body cells wrap; the 8rem floor keeps a column of
+   prose from collapsing to a word per line, and the wrapper still scrolls
+   when the floors add up to more than a phone. Header cells stay on one
+   line. Chat answers (`.md` without `.md-docs`) are unchanged. */
+.md.md-docs td {
+  white-space: normal;
+  min-width: 8rem;
+}
+
 .md thead th {
   font-weight: 600;
   color: var(--ts-text-muted);

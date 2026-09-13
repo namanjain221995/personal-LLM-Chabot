@@ -101,34 +101,56 @@ export function InvitesPanel({
   const smallButton =
     'inline-flex items-center gap-1.5 rounded-lg border border-border bg-[var(--admin-control)] px-2.5 py-1.5 text-xs font-medium text-muted transition-colors duration-ts hover:bg-[var(--admin-control-hover)] hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg';
 
+  // Declared widths (so the table is `table-fixed`): with auto layout the
+  // Email column sized itself to the longest address, and one 74-character
+  // invite made the table 1103px — Expires, Status and Revoke off-screen at
+  // 1024px. Now the address truncates (full text on hover) and the columns
+  // that are useful but not essential step aside below lg.
   const columns: AdminColumn<Invitation>[] = [
     {
       key: 'email',
       label: 'Email',
       render: (inv) => (
-        <span className="min-w-0">
-          <span className="block truncate font-medium text-ink">
+        <span className="block min-w-0">
+          <span className="block truncate font-medium text-ink" title={inv.email}>
             {inv.email}
           </span>
           {inv.name && (
-            <span className="block truncate text-xs text-muted">{inv.name}</span>
+            <span className="block truncate text-xs text-muted" title={inv.name}>
+              {inv.name}
+            </span>
           )}
         </span>
       ),
     },
-    { key: 'role', label: 'Role', render: (inv) => <RoleChip role={inv.role} /> },
+    {
+      key: 'role',
+      label: 'Role',
+      width: '130px',
+      render: (inv) => <RoleChip role={inv.role} />,
+    },
     {
       key: 'invited_by',
       label: 'Invited by',
+      width: '150px',
+      hideBelowLg: true,
       render: (inv) =>
-        inv.invited_by || <span className="text-faint">—</span>,
+        inv.invited_by ? (
+          <span className="block truncate" title={inv.invited_by}>
+            {inv.invited_by}
+          </span>
+        ) : (
+          <span className="text-faint">—</span>
+        ),
     },
     {
       key: 'expires',
       label: 'Expires',
+      width: '150px',
+      hideBelowLg: true,
       render: (inv) =>
         inv.expires_at ? (
-          formatWhen(inv.expires_at)
+          <span className="whitespace-normal">{formatWhen(inv.expires_at)}</span>
         ) : (
           <span className="text-faint">—</span>
         ),
@@ -136,11 +158,13 @@ export function InvitesPanel({
     {
       key: 'status',
       label: 'Status',
+      width: '110px',
       render: (inv) => <StatusChip status={inviteStatusOf(inv)} />,
     },
     {
       key: 'actions',
       label: '',
+      width: '124px',
       align: 'right',
       render: (inv) => {
         const status = inviteStatusOf(inv);
@@ -177,6 +201,8 @@ export function InvitesPanel({
     <>
       <AdminTable
         columns={columns}
+        // 664px of fixed columns + ~220px an address needs; 584px below lg.
+        minWidth={884}
         rows={invitations}
         rowKey={(inv) => inv.id}
         loading={loading}

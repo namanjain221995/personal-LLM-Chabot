@@ -114,6 +114,33 @@ describe('the admin landing page without analytics.read', () => {
   });
 });
 
+describe('the admin landing page for a plain admin', () => {
+  it('shows the workspace counters the admin may read, not a bare title', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        requested.push(String(url));
+        if (String(url).endsWith('/api/admin/overview')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              workspace: { id: 'w', name: 'Acme HQ' },
+              stats: { active_members: 7, pending_invites: 2, conversations: 41, live_sessions: 5 },
+            }),
+          } as unknown as Response;
+        }
+        return { ok: false, status: 404, json: async () => ({ detail: 'Not found' }) } as unknown as Response;
+      }),
+    );
+    mount(ADMIN);
+    expect(await screen.findByText('41')).toBeTruthy();
+    expect(screen.getByText('Active members')).toBeTruthy();
+    expect(screen.getByText('7')).toBeTruthy();
+    expect(requested.filter((u) => u.includes('analytics'))).toEqual([]);
+  });
+});
+
 describe('the admin landing page with analytics.read', () => {
   it('loads the analytics and shows the headline numbers as before', async () => {
     mount(SUPER_ADMIN);

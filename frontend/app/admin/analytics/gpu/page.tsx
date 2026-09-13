@@ -89,7 +89,13 @@ export default function GpuPage() {
       </ConsoleHeader>
 
       <Section first title="Right now">
-        <InfraBlock state={data?.nodes} what="GPU telemetry" skeletonHeight={260}>
+        <InfraBlock
+          state={data?.nodes}
+          what="GPU telemetry"
+          skeletonHeight={260}
+          error={error}
+          onRetry={reload}
+        >
           {() =>
             gpuNodes.length === 0 ? (
             <p className="rounded-lg border border-dashed border-[var(--admin-separator)] px-4 py-6 text-center text-xs text-faint">

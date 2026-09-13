@@ -194,6 +194,11 @@ export function IllustrationPanel() {
       <div className="relative flex w-full flex-1 items-center justify-center">
         {ILLUSTRATIONS.map((art, i) =>
           mounted.includes(i) ? (
+            // A plain <img> on purpose: every frame is mounted and cross-faded
+            // with its own onLoad/onError bookkeeping, and the artwork is a
+            // pre-sized static .webp — next/image's wrapper and lazy loading
+            // would fight both.
+            // eslint-disable-next-line @next/next/no-img-element
             <img
               key={art.slug}
               src={`/illustrator/${art.slug}.webp`}
@@ -210,7 +215,7 @@ export function IllustrationPanel() {
               onError={() =>
                 setFailed((prev) => (prev.includes(i) ? prev : [...prev, i]))
               }
-              className={`auth-illustration max-h-[58vh] w-auto max-w-[560px] select-none object-contain ${
+              className={`auth-illustration max-h-[58vh] w-auto max-w-[min(560px,100%)] select-none object-contain ${
                 i === shown ? 'is-current' : ''
               }`}
             />

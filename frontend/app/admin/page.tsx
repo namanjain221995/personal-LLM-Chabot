@@ -56,6 +56,53 @@ const TOOLS: { id: keyof AnalyticsMember; label: string; short: string }[] = [
   { id: 'links', label: 'Links and sites', short: 'Links' },
 ];
 
+interface WorkspaceOverview {
+  stats: {
+    active_members?: number;
+    pending_invites?: number;
+    conversations?: number;
+    live_sessions?: number;
+  };
+}
+
+/**
+ * The plain admin's landing: the workspace counters they MAY read
+ * (/api/admin/overview is WORKSPACE_READ). Before this the page was a title
+ * and nothing else (responsive audit, 2026-09-13). Quiet on failure — this
+ * is a courtesy summary, and an error panel on the landing page would say
+ * something is broken when every section in the rail still works.
+ */
+function WorkspaceCounts() {
+  const [overview, setOverview] = useState<WorkspaceOverview | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    adminJson<WorkspaceOverview>('overview')
+      .then((res) => {
+        if (!cancelled) setOverview(res);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (failed) return null;
+  const stats = overview?.stats;
+  const loading = overview === null;
+  return (
+    <div className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <StatTile label="Active members" value={stats?.active_members} loading={loading} />
+      <StatTile label="Pending invites" value={stats?.pending_invites} loading={loading} />
+      <StatTile label="Conversations" value={stats?.conversations} loading={loading} />
+      <StatTile label="Signed-in sessions" value={stats?.live_sessions} loading={loading} />
+    </div>
+  );
+}
+
 export default function AdminAnalyticsPage() {
   const me = useAdminMe();
   const [range, setRange] = useState<RangeKey>('1m');
@@ -190,6 +237,7 @@ export default function AdminAnalyticsPage() {
     return (
       <div>
         <PageHeader title="Overview" subtitle={me.workspace.name} />
+        <WorkspaceCounts />
       </div>
     );
   }
@@ -208,7 +256,10 @@ export default function AdminAnalyticsPage() {
             <div
               role="group"
               aria-label="Time range"
-              className={`${CONTROL_HEIGHT} flex items-center rounded-ts border border-border bg-[var(--admin-control)] p-1`}
+              // p-0.5 on phones and touch: inside the 40px strip, p-1 left
+              // each range 30px tall, under the 32px tap floor (re-audit
+              // 2026-09-13) — the same inset the invitations filter uses.
+              className={`${CONTROL_HEIGHT} flex items-center rounded-ts border border-border bg-[var(--admin-control)] p-1 max-sm:p-0.5 [@media(pointer:coarse)]:p-0.5`}
             >
               {RANGES.map((key) => (
                 <button

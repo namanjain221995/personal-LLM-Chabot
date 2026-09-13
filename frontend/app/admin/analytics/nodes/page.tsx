@@ -104,7 +104,7 @@ function NodeCard({ node }: { node: NodeState }) {
 }
 
 export default function NodesPage() {
-  const { data } = useAnalytics<Infrastructure>(
+  const { data, error, reload } = useAnalytics<Infrastructure>(
     'analytics/infrastructure',
     { hours: 6 },
   );
@@ -119,7 +119,13 @@ export default function NodesPage() {
       />
 
       <Section first title="Machines">
-        <InfraBlock state={data?.nodes} what="Node telemetry" skeletonHeight={320}>
+        <InfraBlock
+          state={data?.nodes}
+          what="Node telemetry"
+          skeletonHeight={320}
+          error={error}
+          onRetry={reload}
+        >
           {(block) => (
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
               {block.nodes.map((node) => (
@@ -134,7 +140,12 @@ export default function NodesPage() {
         title="Which engine runs where"
         hint="Each vLLM engine, the model it serves and the node it answers from."
       >
-        <InfraBlock state={data?.engines} what="Engine placement">
+        <InfraBlock
+          state={data?.engines}
+          what="Engine placement"
+          error={error}
+          onRetry={reload}
+        >
           {(block) =>
             block.engines.length === 0 ? (
               <p className="rounded-lg border border-dashed border-[var(--admin-separator)] px-4 py-6 text-center text-xs text-faint">

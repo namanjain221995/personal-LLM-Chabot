@@ -62,7 +62,13 @@ sf_dictionary.json
 orphaned-rows.json
 
 # Model weights and caches (see VLLM_MODELS_DIR — tens of GB)
-models/
+# Anchored: the weights directory is a ROOT-level path (VLLM_MODELS_DIR points
+# outside the repo by default, and a local `./models` sits beside compose).
+# Unanchored, `models/` matched a directory of that name at ANY depth and hid
+# frontend/app/admin/analytics/models/page.tsx from git, so the admin rail's
+# Models link shipped pointing at a page that was never committed. Weight
+# files anywhere are still caught by the extension rules below.
+/models/
 *.safetensors
 *.gguf
 hf-cache/
