@@ -644,7 +644,12 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         services = rendered["services"]
         env = services["engine-controller"]["environment"]
         self.assertEqual(env["SENTINEL_URL"], "http://192.168.100.2:9839")
-        self.assertEqual(env["HEAD_API_URL"], "http://127.0.0.1:8000")
+        # Audit F050 (2026-09-13): this was "http://127.0.0.1:8000", which is
+        # only where a head bound to 0.0.0.0 answers. That wildcard put the
+        # unauthenticated engine on the LAN, the tailnet and the rails; the
+        # head now binds the bridge gateway even with PUBLISH_MODEL_PORTS=true,
+        # and the controller must dial it there (loopback would see nothing).
+        self.assertEqual(env["HEAD_API_URL"], "http://172.17.0.1:8000")
         self.assertEqual(env["ROUTER_HEALTH_URL"], "http://127.0.0.1:8002/health")
         self.assertEqual(env["HEAD_GPU_EXPORTER_URL"], "http://127.0.0.1:9835/metrics")
         self.assertEqual(env["WORKER_GPU_EXPORTER_URL"], "", "no management address given: not observable, not invented")
@@ -846,18 +851,26 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         # answered 200 from any host on the office network). Nothing needs them
         # published: the orchestrator and Prometheus both reach them by service
         # name on the Docker network.
+        #
+        # Audit F050 (2026-09-13): the MAIN engine (and, on nvidia-large and
+        # local-minimal, every model) used to be expected at 0.0.0.0 here,
+        # because it still followed TECHSARA_BIND_ADDRESS. That pinned the
+        # finding: opening the app to the LAN opened the most expensive
+        # unauthenticated API of all to it. Every model port now follows
+        # TECHSARA_MODEL_BIND_ADDRESS, so with the app on 0.0.0.0 they all stay
+        # on loopback.
         expected = {
             "dgx-spark": {
-                "vllm": ("0.0.0.0", 8000, 30000),
+                "vllm": ("127.0.0.1", 8000, 30000),
                 "vllm-router": ("127.0.0.1", 8002, 30002),
                 "vllm-embed": ("127.0.0.1", 8003, 30003),
                 "vllm-ocr": ("127.0.0.1", 8004, 30004),
             },
             "nvidia-large": {
-                "vllm": ("0.0.0.0", 8000, 30000),
-                "vllm-embed": ("0.0.0.0", 8003, 30003),
+                "vllm": ("127.0.0.1", 8000, 30000),
+                "vllm-embed": ("127.0.0.1", 8003, 30003),
             },
-            "local-minimal": {"llama-cpp": ("0.0.0.0", 8000, 30000)},
+            "local-minimal": {"llama-cpp": ("127.0.0.1", 8000, 30000)},
         }
         for name, services in expected.items():
             with self.subTest(fixture=name):
@@ -1096,7 +1109,13 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         published_vllm = published["services"]["vllm"]
         self.assertEqual(published_vllm.get("network_mode"), "host")
         self.assertFalse(published_vllm.get("ports"))
-        self.assertIn("--host 0.0.0.0 --port 18000", " ".join(published_vllm["command"]))
+        # Audit F050 (2026-09-13): this was "--host 0.0.0.0 --port 18000".
+        # PUBLISH_MODEL_PORTS used to put the unauthenticated head on every
+        # host interface (reached from the LAN, the tailnet and both rails).
+        # The opt-in still moves the port; it no longer moves the bind.
+        published_command = " ".join(published_vllm["command"])
+        self.assertIn("--host 172.17.0.1 --port 18000", published_command)
+        self.assertNotIn("--host 0.0.0.0", published_command)
         self.assertEqual(
             published["services"]["orchestrator"]["environment"]["OPENAI_BASE_URL"],
             "http://vllm:18000/v1",

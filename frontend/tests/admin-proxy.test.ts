@@ -1,9 +1,13 @@
 /**
  * The /api/admin/* proxy: cookies and the query string travel upstream,
  * Set-Cookie travels back, and the two download endpoints keep their bytes
- * AND their download headers. content-disposition is the one header
- * proxyToOrchestrator drops — which is exactly why downloads bypass it, and
- * exactly what these tests pin.
+ * AND their download headers — which is what the dedicated download path
+ * exists for, and what these tests pin.
+ *
+ * (content-disposition used to be the header proxyToOrchestrator dropped, and
+ * the reason downloads bypass it. The 2026-09-12 hardening gave that proxy a
+ * response-header allowlist with content-disposition on it, so the bypass is
+ * now belt and braces rather than the only way a filename survives.)
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -90,7 +94,9 @@ describe('admin proxy — JSON passthrough', () => {
       ctx('invitations'),
     );
     expect(calls[0].init.method).toBe('POST');
-    expect(calls[0].init.body).toBe(
+    // Bodies travel as BYTES since 2026-09-12: the proxy used to round-trip
+    // them through a UTF-8 string, which corrupted anything that was not text.
+    expect(new TextDecoder().decode(calls[0].init.body as ArrayBuffer)).toBe(
       JSON.stringify({ email: 'ada@corp.com', role: 'member' }),
     );
     expect(
@@ -140,8 +146,8 @@ describe('admin proxy — downloads', () => {
     expect(isDownloadPath(['members', '7', 'reports', 'q3.xlsx'], 'GET')).toBe(
       true,
     );
-    // The usage CSV: without this it arrives as a nameless blob, because
-    // proxyToOrchestrator relays content-type and nothing else.
+    // The usage CSV: this is the path that gives it a filename rather than
+    // arriving as a nameless blob.
     expect(isDownloadPath(['analytics', 'export'], 'GET')).toBe(true);
     expect(isDownloadPath(['analytics'], 'GET')).toBe(false);
     expect(isDownloadPath(['analytics', 'export'], 'POST')).toBe(false);

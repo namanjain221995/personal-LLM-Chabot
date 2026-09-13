@@ -207,6 +207,15 @@ services:
       HEAD_GPU_EXPORTER_URL: ${TECHSARA_HEAD_GPU_EXPORTER_URL:-}
       WORKER_GPU_EXPORTER_URL: ${TECHSARA_WORKER_GPU_EXPORTER_URL:-}
       PARTICIPATION_MIN_UTIL: ${ENGINE_PARTICIPATION_MIN_UTIL:-30}
+      # Loopback only on a single node: the head is on the bridge there, the
+      # orchestrator's http://vllm:9838 names the vllm CONTAINER and cannot
+      # reach this host-network process anyway, and the healthcheck, the
+      # scripts and POST /recover (loopback-only) all dial 127.0.0.1. It was
+      # 0.0.0.0 until 2026-09-13 (developer-platform audit, beside F050).
+      # The dual-mode overlay adds the bridge gateway for the orchestrator
+      # and Prometheus; widen it here with ENGINE_CONTROLLER_BIND (a comma
+      # list of literal addresses) if a single node needs the scrape too.
+      CONTROLLER_BIND: ${ENGINE_CONTROLLER_BIND:-127.0.0.1}
       CONTROLLER_PORT: "9838"
       LOCK_DIR: /run/techsara/locks
       INCIDENTS_DIR: /run/techsara/incidents

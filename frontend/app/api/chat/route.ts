@@ -17,10 +17,32 @@ import {
   toOrchestratorChatRequest,
   type ChatRequestBody,
 } from '@/lib/orchestrator';
+import { declaredBodyOverLimit, readBoundedBody } from '@/lib/proxy';
 import { logProxyError, requestIdOf } from '@/lib/serverLog';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+/**
+ * The largest chat body this route will read, 128 MiB (2026-09-12).
+ *
+ * `req.json()` buffers whatever arrives, and nothing in front of this handler
+ * bounded it — one request with no Content-Length could hold this process open
+ * and grow until it died. The number is derived from what the composer can
+ * actually put in a body rather than picked, because a cap below the real
+ * client limit is a bug dressed up as a fix:
+ *
+ *   5 images   × MAX_IMAGE_BYTES  10 MiB  (Composer.tsx, MAX_IMAGES)
+ *   1 document × INLINE_DOC_BYTES 25 MiB  (anything larger streams to
+ *                                          /api/upload and travels by
+ *                                          reference, not in this body)
+ *   base64 inflates all of that by 4/3    ≈ 100 MiB
+ *   plus the visible transcript, which carries pasted text that has no cap of
+ *   its own anywhere on the input path (2026-09-05).
+ *
+ * 128 MiB leaves that its headroom and still refuses an unbounded body.
+ */
+export const MAX_CHAT_BODY_BYTES = 128 * 1024 * 1024;
 
 const SSE_HEADERS = {
   'Content-Type': 'text/event-stream; charset=utf-8',
@@ -233,9 +255,29 @@ function describeThrown(err: unknown): string {
 
 export async function POST(req: Request): Promise<Response> {
   const startedAt = Date.now();
+  // Bounded BEFORE it is read. A declared length over the cap is refused
+  // without touching the socket; a body that declares nothing (or lies) is
+  // measured chunk by chunk and cancelled the moment it goes over.
+  if (declaredBodyOverLimit(req, MAX_CHAT_BODY_BYTES)) {
+    return failure(req, {
+      status: 413,
+      category: categoryForStatus(413),
+      logMessage: `declared chat body over ${MAX_CHAT_BODY_BYTES} bytes`,
+      startedAt,
+    });
+  }
+  const raw = await readBoundedBody(req, MAX_CHAT_BODY_BYTES);
+  if (raw === null) {
+    return failure(req, {
+      status: 413,
+      category: categoryForStatus(413),
+      logMessage: `chat body over ${MAX_CHAT_BODY_BYTES} bytes`,
+      startedAt,
+    });
+  }
   let body: ChatRequestBody;
   try {
-    body = (await req.json()) as ChatRequestBody;
+    body = JSON.parse(new TextDecoder().decode(raw)) as ChatRequestBody;
   } catch {
     return failure(req, {
       status: 400,

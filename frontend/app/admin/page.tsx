@@ -19,6 +19,7 @@ import { useAdminMe } from '@/components/admin/AdminMeContext';
 import {
   AdminApiError,
   adminJson,
+  can,
   RANGE_LABEL,
   type Analytics,
   type AnalyticsMember,
@@ -62,8 +63,17 @@ export default function AdminAnalyticsPage() {
   const [data, setData] = useState<Analytics | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  // Per-person usage and its CSV export moved from WORKSPACE_READ to
+  // ANALYTICS_READ (super admin only) in the 2026-09-13 admin hardening wave
+  // (AUDIT F078 / N006). This page is every admin's landing, and asking
+  // anyway turned the server's 403 into "The analytics could not be loaded."
+  // for each plain ADMIN. Without the capability the page neither fetches
+  // nor links the export, and shows no error: nothing is broken, the
+  // numbers are simply not theirs to see. The server stays the authority.
+  const mayReadAnalytics = can(me, 'analytics.read');
 
   useEffect(() => {
+    if (!mayReadAnalytics) return;
     let cancelled = false;
     setError(null);
     setData(null);
@@ -82,7 +92,7 @@ export default function AdminAnalyticsPage() {
     return () => {
       cancelled = true;
     };
-  }, [range, attempt]);
+  }, [range, attempt, mayReadAnalytics]);
 
   const loading = data === null && error === null;
   const summary = data?.summary;
@@ -175,6 +185,14 @@ export default function AdminAnalyticsPage() {
         ? 'bg-surface-2 text-ink'
         : 'text-muted hover:text-ink'
     }`;
+
+  if (!mayReadAnalytics) {
+    return (
+      <div>
+        <PageHeader title="Overview" subtitle={me.workspace.name} />
+      </div>
+    );
+  }
 
   return (
     <div>

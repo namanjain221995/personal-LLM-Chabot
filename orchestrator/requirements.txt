@@ -1,6 +1,20 @@
 # Container requirements (Python 3.11 in-container).
 # NOTE: torch is provided by the nvcr.io/nvidia/pytorch base image — do NOT pin torch here.
-fastapi>=0.115
+# FLOORS THE CODE NEEDS, not the ones it was first written against
+# (2026-09-13). app/uploads.py `_read_form` passes `max_part_size` to
+# `Request.form`. Starlette 0.40.0 added that limit to the multipart PARSER
+# only; `Request.form(max_part_size=…)` itself arrived in 0.44.0 (checked by
+# unpacking the 0.40.0-0.45.0 wheels). FastAPI 0.115.7 is the first release
+# whose range admits starlette 0.44 (0.115.3-0.115.6 cap it below 0.42), so
+# `fastapi>=0.115` alone could resolve a Starlette on which every upload was a
+# 400. What the images actually run, checked the same day with `docker exec …
+# python -c "import fastapi, starlette"`: fastapi 0.136.1, starlette 0.52.1,
+# pydantic 2.13.4 (the nvcr vLLM base ships them; `pip install -r` keeps an
+# installed version that satisfies the floor). The orchestrator venv resolves
+# fastapi 0.141.1 / starlette 1.6.0. There is no lock file: /uv.lock is an
+# empty project's. tests/test_orchestrator_hardening.py asserts these floors.
+fastapi>=0.115.7
+starlette>=0.44.0
 # Phase 4: multipart dataset uploads (streamed, never base64 in the chat body)
 python-multipart>=0.0.9
 uvicorn[standard]>=0.30
@@ -28,7 +42,9 @@ pyarrow==25.0.1
 numpy>=1.26
 openpyxl>=3.1
 matplotlib>=3.8
-pydantic>=2.7
+# 2.8: `Field(fail_fast=True)`, which bounds the 422 of every list in the
+# chat and history bodies (app/history.py `read_validated_body`, 2026-09-13).
+pydantic>=2.8
 # V2 auth (V2-DESIGN §3c): argon2 password hashing + signed session cookies.
 argon2-cffi>=23.1
 itsdangerous>=2.1

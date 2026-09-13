@@ -80,7 +80,16 @@ KV_CACHE_MEMORY_GIB_RANGE = (2, 96)
 CLUSTER_KV_CACHE_DTYPE = "fp8"
 MINIMUM_MAX_NUM_BATCHED_TOKENS = 256
 DISTRIBUTED_TIMEOUT_SECONDS = 300
-DEFAULT_API_BIND_ADDRESS = "0.0.0.0"
+#: Where the host-network head listens when the Docker bridge gateway cannot
+#: be read. Loopback, never 0.0.0.0: the engine has no --api-key, so a wildcard
+#: bind is unauthenticated inference for every host that can route here. On
+#: 2026-09-13 the developer-platform audit (F050/F042/F012/F065) measured
+#: `GET /v1/models` answering 200 with no credential on the office LAN
+#: (192.168.9.54), the tailnet (100.94.16.2) and both RoCE rails, because
+#: PUBLISH_MODEL_PORTS=true selected this constant and it was "0.0.0.0". A
+#: loopback fallback fails CLOSED -- the orchestrator cannot reach the head and
+#: says so -- instead of failing open onto every interface.
+DEFAULT_API_BIND_ADDRESS = "127.0.0.1"
 #: ``--gdn-prefill-backend`` (candidate B, docs/availability/CANDIDATE-B.md).
 #: The flag is spelled the same in the pinned build and in the candidate
 #: ``vllm/vllm-openai@sha256:819ec9c0...`` (``engine/arg_utils.py``:
@@ -794,6 +803,10 @@ def resolve_cluster_settings(
     Called only for ``CLUSTER_MODE=dual``. Every failure is a ``TechSaraError``
     naming the .env key to fix; nothing here touches the host except through
     ``detectors``.
+
+    ``publish_model_ports`` is accepted and deliberately does NOT move the
+    head's bind address (audit F050, 2026-09-13): the head listens on the
+    Docker bridge gateway, or on loopback, either way.
     """
     if profile_id != CLUSTER_PROFILE_ID:
         raise TechSaraError("CLUSTER_MODE=dual is only supported on the dgx-spark profile")
@@ -864,10 +877,22 @@ def resolve_cluster_settings(
                 ifnames.append(second)
         hca = ",".join(detectors.hcas_for_ifnames(ifnames))
 
-    if publish_model_ports:
-        api_bind = DEFAULT_API_BIND_ADDRESS
-    else:
-        api_bind = detectors.docker_bridge_gateway() or DEFAULT_API_BIND_ADDRESS
+    # The head binds the Docker bridge gateway whether or not the model ports
+    # are published. That is the address every legitimate caller already
+    # dials: the orchestrator and sync-worker resolve `vllm` to it through
+    # `extra_hosts: vllm:host-gateway`, Prometheus through
+    # host.docker.internal, and the engine controller through the URL
+    # environment.engine_head_api_url derives from this value. A host on the
+    # LAN reaches it only by deliberately routing 172.17.0.0/16 through this
+    # machine (Linux accepts a packet for any local address on any NIC), so
+    # this narrows the exposure to hosts on the same segment that try; the
+    # host packet filter of audit F042 is the backstop that closes it.
+    # PUBLISH_MODEL_PORTS used to switch this to 0.0.0.0, which put the
+    # unauthenticated main engine on the LAN, the tailnet and the RoCE rails
+    # (audit F050, 2026-09-13); in dual mode the published overlay's port
+    # mapping is reset anyway, so the flag had no other effect on the head.
+    # It still publishes the auxiliary models.
+    api_bind = detectors.docker_bridge_gateway() or DEFAULT_API_BIND_ADDRESS
 
     engine_args = build_engine_arguments(
         context=context,

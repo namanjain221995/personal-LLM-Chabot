@@ -1,0 +1,10 @@
+Frontend baseline on feat/developer-platform-security @ 4e28fcc — 2026-09-12
+
+### tsc
+rc=0
+### lint
+✖ 1 problem (0 errors, 1 warning)
+rc=0
+### vitest
+ Test Files  134 passed (134)
+      Tests  2145 passed (2145)

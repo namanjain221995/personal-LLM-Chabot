@@ -6,14 +6,19 @@
 # address exposes unauthenticated model inference — and, through it, whatever
 # those models can be asked to do — to every host that can reach this machine.
 #
-# The AUXILIARY models below therefore follow TECHSARA_MODEL_BIND_ADDRESS
-# (default 127.0.0.1), NOT TECHSARA_BIND_ADDRESS. The two were one variable
-# until 2026-09-01, which meant opening the app to the LAN also opened four
+# EVERY model below therefore follows TECHSARA_MODEL_BIND_ADDRESS (default
+# 127.0.0.1), NOT TECHSARA_BIND_ADDRESS. The two were one variable until
+# 2026-09-01, which meant opening the app to the LAN also opened four
 # unauthenticated model APIs to it — measured: `curl 192.168.9.54:8002/v1/models`
-# answered 200 from any host on the office network. Nothing in the application
-# needs these published: the orchestrator reaches them by service name over the
-# `inference` network (ROUTER_BASE_URL=http://vllm-router:30002/v1), and
-# Prometheus scrapes them the same way. Publishing is for debugging only.
+# answered 200 from any host on the office network. That split left the MAIN
+# engine behind on TECHSARA_BIND_ADDRESS, the most expensive API of the five;
+# the developer-platform audit (F050, 2026-09-13) found it and it moved too.
+# Nothing in the application needs these published: the orchestrator reaches
+# them by service name over the `inference` network
+# (ROUTER_BASE_URL=http://vllm-router:30002/v1), Prometheus scrapes them the
+# same way, and on a single node the engine controller dials the head at
+# TECHSARA_MODEL_BIND_ADDRESS (environment.engine_head_api_url) -- which the
+# port below now agrees with. Publishing is for debugging only.
 #
 # Publishing also attaches these services to the routable `application`
 # network. Docker records a port binding for a container that is only on an
@@ -25,7 +30,7 @@ services:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
 
   vllm-router:
     networks:

@@ -66,6 +66,20 @@
 #     runner has ~14 GB free. The DGX builds it at deploy time instead; the
 #     `images` job proves the OTHER images build and that no Dockerfile has an
 #     x86 assumption in it, which is the part a hosted runner can prove.
+#
+# --------------------------------------------------------- JOB DISPLAY NAMES
+# Every job's `name:` is plain ASCII, and it stays that way: workflow_policy.py
+# P8 fails the run on a non-ASCII display name. A job name is not decoration.
+# It is the string branch protection matches a required check against, the
+# string the checks API and every notification integration report, and the
+# string an auditor reads in an exported run - none of which handle emoji
+# predictably, and none of which are improved by them. Status glyphs inside a
+# step's SUMMARY output are a different thing and are kept.
+#
+# The names were changed on 2026-09-12. `CI passed` was deliberately NOT
+# changed: it is the one name branch protection has to reference, and renaming
+# a required check silently un-protects the branch until somebody edits the
+# rule. See the header of the `ci-ok` job.
 name: Pipeline
 
 on:
@@ -104,10 +118,16 @@ jobs:
   # 1. VALIDATION, LINT AND TYPES
   # ==========================================================================
   policy:
-    name: "🔒 policy"
+    name: Policy validation
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Lint, static checks and the gate scripts' own tests: nothing here builds,
+    # pulls a large image or waits on a service, so a quarter of an hour is
+    # already generous. Every job in this file carries an explicit ceiling —
+    # one without it inherits GitHub's SIX HOUR default, and workflow_policy.py
+    # P7 fails the run if any job is missing one.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -172,17 +192,84 @@ jobs:
           done < <(git ls-files '*.sh' 'techsara')
           exit "$fail"
 
+      # The gate scripts are the only code in this repository whose failure
+      # mode is "everything looks green". They get tests like anything else,
+      # and they run in the FIRST job so a broken gate is caught before the
+      # suites it is supposed to be gating have finished.
+      #
+      # Run through unittest_gate.py rather than `unittest discover`, so this
+      # step is also the proof that the gate refuses an empty suite — the same
+      # protection the launcher job depends on, exercised on every commit.
+      #
+      # The floor counts tests that EXECUTED, not tests discovery collected
+      # (2026-09-13): 102 run today, and a module that skips itself at import
+      # no longer counts towards it.
+      - name: The CI gate scripts have tests, and they pass
+        run: |
+          python .github/workflows/scripts/unittest_gate.py \
+            --label "workflow scripts" \
+            --start .github/workflows/scripts/tests \
+            --min-tests 95
+
       - name: Migration table invariants (no database needed)
         run: |
           python -m pip install -q "psycopg[binary,pool]>=3.2,<4"
           python .github/workflows/scripts/schema_parity.py invariants
 
+      # ---------------------------------------------------------- ROLLBACK
+      # scripts/deploy-rollback.sh was reachable from nothing: `bash -n` above
+      # proved it PARSES, and the recovery job printed a hand-typed command
+      # that nobody had executed. A rollback path that CI never touches is a
+      # rollback path nobody finds out is broken until 3 a.m.
+      #
+      # 2026-09-12 this step ran `--help` and grepped the text for the flag
+      # names. That asserted the script's DOCUMENTATION: `--help` is an awk
+      # over the header comment, so deleting the `--dry-run)` case, deleting
+      # the dry run's `exit 0`, or softening the schema refusal into a warning
+      # all left it green (2026-09-13 CI review). rollback_rehearsal.py runs
+      # the REAL argument parsing and the REAL schema check against a sandboxed
+      # deploy root with a recorded release, `docker` and `curl` stubbed to
+      # answer only read verbs, and stdin closed. It asserts each scenario's
+      # exit code and the sentence that proves which branch ran, that no
+      # mutating docker verb was reached, and that no deploy lock was taken.
+      # Nothing it does can touch a machine. Its own tests (in the step above)
+      # prove it fails on each of those three mutations.
+      #
+      # The DGX half (the actual recorded releases) is in the `recovery` job,
+      # because only the box knows them.
+      - name: The rollback path parses its real arguments, and its dry run changes nothing
+        run: |
+          set -euo pipefail
+          python .github/workflows/scripts/rollback_rehearsal.py \
+            --script scripts/deploy-rollback.sh \
+            --summary "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Rollback"
+            echo ""
+            echo "| step | command |"
+            echo "| --- | --- |"
+            echo "| see what can be rolled back to | \`scripts/deploy-rollback.sh --list\` |"
+            echo "| rehearse one, changing nothing | \`scripts/deploy-rollback.sh --to <release> --dry-run\` |"
+            echo "| do it | \`scripts/deploy-rollback.sh --to <release> --yes\` |"
+            echo ""
+            echo "It restores **images only**. There are no down migrations, so it"
+            echo "refuses to roll back to code that predates a migration the database"
+            echo "has already applied, and it never restores a database dump — doing"
+            echo "that would delete every row written since the deploy."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ==========================================================================
-  # 2. TEST SUITES  (names below are load-bearing: branch protection and every
-  #    saved PR filter reference them. Do not rename.)
+  # 2. TEST SUITES
+  #
+  # The job IDs below (`launcher`, `orchestrator`, `sync-worker`, `frontend`)
+  # are load-bearing and do NOT change: `ci-ok` names them in `needs:` and
+  # passes the same list to ci_gate.py --require, and that script refuses to
+  # pass if the two lists ever disagree. The DISPLAY names were rewritten on
+  # 2026-09-12; only `CI passed` is referenced by branch protection, and it
+  # was left alone.
   # ==========================================================================
   launcher:
-    name: "🧪 launcher (${{ matrix.python }})"
+    name: Launcher tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -192,6 +279,7 @@ jobs:
         # The shim pins 3.12; 3.11 is what the containers run. The launcher is
         # standard-library only, so both must stay green.
         python: ["3.11", "3.12"]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -214,12 +302,28 @@ jobs:
         # deployed. tail also kept only 30 of ~90 traceback lines, so the log
         # named 2 of the 6 failures. Unpiped, a failure is the step's exit code
         # and every traceback survives; without -v a green run is ~60 lines.
+        #
+        # And it goes through unittest_gate.py rather than `unittest discover`,
+        # because `discover` reports OK on ZERO tests on Python 3.11 (3.12
+        # added the NO TESTS RAN exit code; 3.11, which is what the containers
+        # run, did not). This matrix runs both, so a discovery that stopped
+        # working was red on one leg and green on the other — which reads as
+        # flakiness, not as "the suite is gone". The floor is a real number,
+        # not 1: 535 tests execute today, and a whole module dropping out
+        # of discovery is the quiet version of the same failure. Lower it in
+        # the same commit if tests are deliberately deleted.
+        #
+        # Since 2026-09-13 the floor counts tests that EXECUTED, not tests
+        # that were collected: test_compose_overlays.py skips its whole module
+        # when Compose v2.24+ is missing, and a skipped test used to count
+        # towards the 450 exactly as a passing one did.
         run: |
           env -u TECHSARA_MODEL_CACHE PYTHONPATH=launcher \
-            python -m unittest discover -s launcher/tests
+            python .github/workflows/scripts/unittest_gate.py \
+              --label "launcher" --start launcher/tests --min-tests 450
 
   orchestrator:
-    name: "🧪 orchestrator"
+    name: Backend quality (orchestrator)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -245,6 +349,9 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U test -d techsara_orchestrator_test -q"
           --health-interval 5s --health-timeout 5s --health-retries 20
+    # The longest hosted job: apt for the WeasyPrint natives, the full dev
+    # requirements, then the whole orchestrator suite against a real Postgres.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -299,10 +406,11 @@ jobs:
           PY
 
   sync-worker:
-    name: "🧪 sync-worker"
+    name: Backend quality (sync worker)
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -315,10 +423,12 @@ jobs:
         run: python -m pytest tests -q
 
   frontend:
-    name: "🧪 frontend"
+    name: Frontend quality
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # npm ci, unit tests, eslint, tsc and a real `next build`.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -349,7 +459,7 @@ jobs:
   # 3. SCHEMA: a fresh install must land on the same schema as an upgrade
   # ==========================================================================
   schema:
-    name: "🗄️ schema"
+    name: Schema and migrations
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -374,6 +484,8 @@ jobs:
       PGPASSWORD: test
       FRESH_DSN: postgresql://test:test@127.0.0.1:5432/fresh_install_test
       UPGRADE_DSN: postgresql://test:test@127.0.0.1:5432/upgraded_from_old_test
+    # Four full migration runs against two databases.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -429,10 +541,13 @@ jobs:
   # 4. SUPPLY CHAIN: dependencies, secrets, container images
   # ==========================================================================
   security:
-    name: "🛡️ security"
+    name: Security scanning
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # gitleaks over the full history, two dependency audits and two trivy
+    # passes, each pulling its own scanner image.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -482,16 +597,40 @@ jobs:
       # ---- dependencies: ADVISORY. Reported every run, never a silent pass,
       #      but a transitive advisory with no fixed release must not be able
       #      to block a security fix from shipping. -----------------------------
+      # `continue-on-error: true` makes the step ADVISORY: `outcome` records
+      # what really happened, `conclusion` is forced to success, and the job
+      # carries on. That only works if the step can actually exit non-zero —
+      # and until 2026-09-12 it could not, because every pip-audit call ended
+      # in `|| echo "FINDINGS in $req"`, which is a successful echo. So the
+      # summary table below reported `success` for "advisory python deps" on
+      # every run ever, whether or not there were findings, which is the
+      # worst kind of green: one that is printed next to the word "outcome".
+      #
+      # Now the findings are collected and re-raised at the end of the step.
+      # The loop still visits BOTH requirement files (an early exit would hide
+      # the second one), and the job still does not fail: a transitive
+      # advisory with no fixed release must never be able to block a security
+      # fix from shipping.
       - name: Python dependency audit (advisory)
         id: pipaudit
         continue-on-error: true
         run: |
-          python -m pip install -q pip-audit==2.10.1
+          set -uo pipefail
+          python -m pip install -q pip-audit==2.10.1 || {
+            echo "pip-audit itself could not be installed"; exit 2; }
+          findings=0
           for req in orchestrator/requirements-dev.txt sync-worker/requirements.txt; do
             echo "::group::pip-audit $req"
-            pip-audit --progress-spinner off -r "$req" || echo "FINDINGS in $req"
+            if ! pip-audit --progress-spinner off -r "$req"; then
+              echo "FINDINGS in $req"
+              findings=1
+            fi
             echo "::endgroup::"
           done
+          if [ "$findings" -ne 0 ]; then
+            echo "::warning title=Python dependency advisories::pip-audit reported findings; see the group above. Advisory, not blocking."
+          fi
+          exit "$findings"
 
       - name: npm dependency audit (advisory)
         id: npmaudit
@@ -525,22 +664,35 @@ jobs:
 
       - name: Report what was advisory
         if: always()
+        env:
+          # Through `env:` rather than interpolated into the shell. These two
+          # are a fixed enum and carry no injection risk, but a `run:` body
+          # that reads `${{ }}` is the shape the policy job exists to keep out
+          # of this file, and a reviewer should not have to work out which
+          # instances are the safe ones.
+          PIPAUDIT: ${{ steps.pipaudit.outcome }}
+          NPMAUDIT: ${{ steps.npmaudit.outcome }}
         run: |
           {
             echo "### Supply chain"
             echo "| scan | policy | outcome |"
             echo "| --- | --- | --- |"
             echo "| secrets (gitleaks) | blocking | see above |"
-            echo "| python deps (pip-audit) | advisory | ${{ steps.pipaudit.outcome }} |"
-            echo "| npm deps (npm audit) | advisory | ${{ steps.npmaudit.outcome }} |"
+            echo "| python deps (pip-audit) | advisory | \`${PIPAUDIT}\` |"
+            echo "| npm deps (npm audit) | advisory | \`${NPMAUDIT}\` |"
             echo "| images/fs (trivy) | CRITICAL+fixed blocking | see above |"
+            echo ""
+            echo "An advisory scan reports \`failure\` here when it found something."
+            echo "That is information, not a broken build: the job is green either way,"
+            echo "on purpose, so an unfixable transitive advisory cannot block a"
+            echo "security fix from reaching the box."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
   # 5. IMAGES: they must build for aarch64, and carry the revision they are
   # ==========================================================================
   images:
-    name: "📦 images"
+    name: Container images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -640,6 +792,81 @@ jobs:
           exit "$fail"
 
   # ==========================================================================
+  # 6. THE PUBLIC API CONTRACT
+  #
+  # CONTRACT-3 §7 fixes what an API key can reach, and §7 also lists what is
+  # deliberately NOT exposed: Salesforce, RAG and web search, deep research,
+  # uploads, artifacts, memory, conversation history, admin analytics. The
+  # difference between those two lists is the whole security argument for the
+  # developer platform, and it is one careless `include_router` away from
+  # being wrong.
+  #
+  # So this job regenerates the PUBLIC OpenAPI document and asserts two things
+  # that nothing else in CI asserts:
+  #
+  #   * it is well-formed OpenAPI 3.1 — a client generator is the first thing
+  #     a developer points at it, and a document that is secretly still 3.0
+  #     (`nullable: true` is the tell) breaks at THEIR build, not ours;
+  #   * its operation set is exactly the one written down in
+  #     .github/workflows/scripts/public-api-surface.txt. Adding a public
+  #     endpoint means editing that file in the same commit, where a reviewer
+  #     reads the line.
+  #
+  # WHY IT IS A JOB AND NOT AN `if:`
+  # orchestrator/app/publicapi/ arrives partway through this programme, so the
+  # gate has to cope with not existing yet. A job that SKIPPED until then would
+  # be worse than nothing twice over: branch protection counts a skipped
+  # required check as satisfied, and ci_gate.py correctly treats a skipped
+  # dependency as a failure. So the job always RUNS and api_contract.py
+  # decides — with no package it prints a banner, raises a ::warning::
+  # annotation and writes "NOT ENFORCED YET" into the run summary, then
+  # passes. The moment the package lands it becomes blocking on its own, with
+  # no edit to this file and no switch for anyone to remember to flip.
+  #
+  # The corollary, so it is not a surprise on the day: between the package
+  # landing and it exposing `app.publicapi.openapi:public_openapi`, this job
+  # is RED. That is the intended reading of "the public surface is half-built"
+  # — and the failure names the exact entry point to add. The publicapi wave
+  # should land its document generator in the same change as its router.
+  # ==========================================================================
+  api-contract:
+    name: API contract (public OpenAPI)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: orchestrator/requirements-dev.txt
+
+      # The install is the expensive part, and it is pointless while the
+      # package is absent. This step is allowed to skip; the CHECK below is
+      # not, which is what keeps the job's own result honest.
+      - name: Is there a public API package to check yet?
+        id: probe
+        run: |
+          set -euo pipefail
+          if [ -d orchestrator/app/publicapi ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the orchestrator's dependencies
+        if: steps.probe.outputs.present == 'true'
+        run: python -m pip install -q -r orchestrator/requirements-dev.txt
+
+      - name: The public OpenAPI document is valid 3.1 and is the agreed surface
+        run: |
+          python .github/workflows/scripts/api_contract.py \
+            --orchestrator orchestrator \
+            --expected .github/workflows/scripts/public-api-surface.txt
+
+  # ==========================================================================
   # 7. THE AGGREGATE RELEASE GATE
   #
   # One required check to protect main with, instead of eleven. The NAME is
@@ -669,10 +896,13 @@ jobs:
   ci-ok:
     name: CI passed
     if: always()
-    needs: [policy, launcher, orchestrator, sync-worker, frontend, schema, security, images]
+    needs: [policy, launcher, orchestrator, sync-worker, frontend, schema, security, images, api-contract]
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # It reads a JSON payload and writes a table. If this takes ten minutes,
+    # something is wrong with the runner, not with the gate.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Every required suite must have reported success
@@ -683,7 +913,7 @@ jobs:
         run: |
           python3 .github/workflows/scripts/ci_gate.py \
             --title "CI passed" \
-            --require policy,launcher,orchestrator,sync-worker,frontend,schema,security,images
+            --require policy,launcher,orchestrator,sync-worker,frontend,schema,security,images,api-contract
 
       # A skipped job reports NO reason — GitHub shows "skipped" and nothing
       # else — so a deploy that does not happen is otherwise a guessing game.
@@ -728,7 +958,7 @@ jobs:
   #     still needs the `deploy` input ticked.
   # ==========================================================================
   deploy:
-    name: "🚀 Deploy (rolling, model-preserving)"
+    name: Deploy to production (rolling, model-preserving)
     needs: ci-ok
     # A push to main DEPLOYS (2026-09-08, at the owner's request): merging any
     # branch into main is the release action, so it should not also need a
@@ -774,6 +1004,12 @@ jobs:
       group: deploy-dgx-spark
       cancel-in-progress: false
     timeout-minutes: 45
+    # What `verify` needs in order to assert something real about the main
+    # model rather than printing its status and calling that a check.
+    # GITHUB_ENV does not cross a job boundary; job outputs do.
+    outputs:
+      was_full: ${{ steps.rollout.outputs.was_full }}
+      started_at: ${{ steps.rollout.outputs.started_at }}
     env:
       # The production checkout, NOT the runner workspace: that is where
       # .env, .runtime/ and the model cache live.
@@ -867,9 +1103,14 @@ jobs:
 
       # ------------------------------------------------------------ ROLLOUT
       - name: Deploy and health-gate
+        id: rollout
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
+          # Captured BEFORE anything is recreated. `verify` compares the main
+          # model container's start time against it to prove a rolling deploy
+          # really did leave the engine alone.
+          echo "started_at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
           FLAGS=""
           # Accept the spellings a human actually types into a repo variable.
           case "$(printf '%s' "${DEPLOY_FULL:-}" | tr '[:upper:]' '[:lower:]')" in
@@ -881,6 +1122,7 @@ jobs:
             echo "full restart requested (inputs.full or vars.DEPLOY_FULL) - the models WILL reload"
           fi
           echo "DEPLOY_WAS_FULL=${FLAGS:+true}" >> "$GITHUB_ENV"
+          echo "was_full=${FLAGS:+true}" >> "$GITHUB_OUTPUT"
           if [ "${DEPLOY_BRANCH:-}" = "-" ]; then DEPLOY_BRANCH=""; fi
           export DEPLOY_BRANCH
           echo "checkout will land on: ${DEPLOY_BRANCH:-<detached HEAD>}"
@@ -916,7 +1158,30 @@ jobs:
           docker ps --filter label=com.docker.compose.project=sf-local-ai \
             --format 'table {{.Names}}\t{{.Status}}' >> "$GITHUB_STEP_SUMMARY" || true
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -40 .runtime/logs/deploy-*.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+          # This was `tail -40 .runtime/logs/deploy-*.log`, and it printed
+          # NOTHING. GNU tail accepts the obsolescent `-N` form only with a
+          # single file operand; with a glob that matches two or more it exits
+          # 1 with "option used in invalid context -- 4", and the trailing
+          # `|| true` swallowed that. Every deploy after the second one
+          # therefore published a summary with no log in it — silently, which
+          # is the only reason it survived this long.
+          #
+          # `-n 40` is the portable spelling, and the log wanted here is THIS
+          # deploy's, not every deploy's concatenated. Same newest-first
+          # selection the recovery job uses.
+          newest="$(find .runtime/logs -maxdepth 1 -name 'deploy-*.log' -printf '%T@ %p\n' 2>/dev/null \
+                    | sort -rn | head -1 | cut -d' ' -f2-)"
+          if [ -n "$newest" ]; then
+            {
+              echo "### Deploy log — last 40 lines of \`$(basename "$newest")\`"
+              echo '```'
+              tail -n 40 "$newest"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "_no deploy log was written under .runtime/logs_" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   # --------------------------------------------------------------------------
   # SMOKE TESTS. Deliberately not "did the port answer": on 2026-09-02 this
@@ -926,7 +1191,7 @@ jobs:
   # counter advanced.
   # --------------------------------------------------------------------------
   verify:
-    name: "🔍 Verify production"
+    name: Verify production
     needs: deploy
     # Redundant with `needs` (a job with `needs` and no status function already
     # skips when its dependency fails) but stated anyway, because the `policy`
@@ -942,8 +1207,34 @@ jobs:
     env:
       TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
     steps:
+      # The main engine's address is READ, not assumed (audit F065, 2026-09-13).
+      # This job used to curl 127.0.0.1:8000, which answers identically whether
+      # the unauthenticated vLLM API is on loopback or on every interface — so
+      # the gate could not see the exposure — and which stops answering at all
+      # once the launcher binds the cluster head to the docker bridge gateway
+      # (CLUSTER_API_BIND_ADDRESS), so it would have failed a CORRECT bind.
+      #
+      # The gate script comes from a checkout of the commit being verified,
+      # the same way `deploy` runs its script: the production checkout may be
+      # on another commit (deploy.sh rolls it back when its own health gate
+      # fails), and a gate that is missing there must not be a gate that
+      # silently does not run. Only generated.env is read from the deploy root.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Where the main engine was told to listen
+        id: engine
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/engine_bind.py resolve \
+            --generated-env "$TECHSARA_DEPLOY_ROOT/.runtime/generated.env" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Every endpoint answers
         id: endpoints
+        env:
+          ENGINE_URL: ${{ steps.engine.outputs.url }}
         run: |
           set -u
           pass=0; fail=0
@@ -965,25 +1256,26 @@ jobs:
           echo "| --- | --- |" >> "$GITHUB_STEP_SUMMARY"
           check "frontend /login"        "http://127.0.0.1:3000/login"        200
           check "orchestrator /health"   "http://127.0.0.1:8080/health"       200
-          check "main model /v1/models"  "http://127.0.0.1:8000/v1/models"    200 9
+          check "main model /v1/models"  "${ENGINE_URL}/v1/models"    200 9
           check "grafana /api/health"    "http://127.0.0.1:3300/api/health"   200
           check "prometheus /-/healthy"  "http://127.0.0.1:9090/-/healthy"    200
           [ "$fail" -eq 0 ]
 
       - name: The model actually generates (not just answers /health)
+        env:
+          ENGINE_URL: ${{ steps.engine.outputs.url }}
         run: |
           set -euo pipefail
           gen="$TECHSARA_DEPLOY_ROOT/.runtime/generated.env"
-          port="$(grep -m1 '^VLLM_PORT=' "$gen" | cut -d= -f2)"
           model="$(grep -m1 '^MAIN_MODEL=' "$gen" | cut -d= -f2)"
           counter() {
-            curl -fsS -m 15 "http://127.0.0.1:${port}/metrics" \
+            curl -fsS -m 15 "${ENGINE_URL}/metrics" \
               | awk '/^vllm:generation_tokens_total/ {s+=$2} END {printf "%.0f", s+0}'
           }
           before="$(counter)"
           reply="$(curl -fsS -m 180 -H 'Content-Type: application/json' \
             -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: READY.\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
-            "http://127.0.0.1:${port}/v1/chat/completions" \
+            "${ENGINE_URL}/v1/chat/completions" \
             | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip()[:40])')"
           after="$(counter)"
           echo "reply=${reply@Q}  generation_tokens_total ${before} -> ${after}"
@@ -1001,12 +1293,83 @@ jobs:
             exit 1
           }
 
+      # This step used to read the container's status into a variable, echo it
+      # into the summary next to the words "a routine deploy must NOT have
+      # reset this clock", and exit 0 — unconditionally, including when the
+      # container was missing entirely (`|| echo '?'` saw to that). It claimed
+      # to check the single property the whole rolling-deploy design exists to
+      # deliver, and it could not fail. A step like that is worse than no step:
+      # it is a green tick standing where a check is supposed to be.
+      #
+      # Now it asserts. `deploy` publishes the moment its rollout began and
+      # whether `--full` was asked for; the engine's own start time decides.
       - name: A rolling deploy did not restart the main model
+        env:
+          DEPLOY_WAS_FULL: ${{ needs.deploy.outputs.was_full }}
+          DEPLOY_STARTED_AT: ${{ needs.deploy.outputs.started_at }}
+          VLLM_CONTAINER: sf-local-ai-vllm-1
         run: |
-          set -u
-          vllm_status="$(docker ps --filter name=sf-local-ai-vllm-1 --format '{{.Status}}' || echo '?')"
-          echo "- main model container: \`${vllm_status}\` — a routine deploy must NOT have reset this clock" >> "$GITHUB_STEP_SUMMARY"
-          echo "$vllm_status"
+          set -euo pipefail
+
+          started_iso="$(docker inspect -f '{{.State.StartedAt}}' "$VLLM_CONTAINER" 2>/dev/null || true)"
+          running="$(docker inspect -f '{{.State.Running}}' "$VLLM_CONTAINER" 2>/dev/null || echo false)"
+          if [ -z "$started_iso" ] || [ "$running" != "true" ]; then
+            echo "- main model container \`${VLLM_CONTAINER}\`: **not running**" >> "$GITHUB_STEP_SUMMARY"
+            echo "the main model container is not running after a deploy that reported success"
+            exit 1
+          fi
+
+          started_at="$(date -u -d "$started_iso" +%s)"
+          now="$(date -u +%s)"
+          uptime_min=$(( (now - started_at) / 60 ))
+          echo "container started at ${started_iso} (${uptime_min} min ago); rollout began at ${DEPLOY_STARTED_AT:-<not published>}"
+
+          if [ "${DEPLOY_WAS_FULL:-}" = "true" ]; then
+            # `--full` reloads the models on purpose. Asserting the clock did
+            # not move would be asserting the opposite of what was asked for,
+            # so the assertion here is only that the engine came back.
+            echo "- main model: **deliberately reloaded** (\`--full\`), up ${uptime_min} min" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -z "${DEPLOY_STARTED_AT:-}" ]; then
+            # The deploy job publishes this before it touches a container. An
+            # empty value means the rollout step never ran or its output was
+            # lost, and passing on a missing input is how a check quietly stops
+            # being one.
+            echo "the deploy job published no rollout start time, so preservation cannot be proved"
+            exit 1
+          fi
+
+          if [ "$started_at" -ge "$DEPLOY_STARTED_AT" ]; then
+            echo "- main model: **RESTARTED during a rolling deploy** — up only ${uptime_min} min" >> "$GITHUB_STEP_SUMMARY"
+            echo "the main model container started at ${started_iso}, which is AFTER this"
+            echo "rollout began. TECHSARA_PRESERVE_MAIN_MODEL did not hold: a routine deploy"
+            echo "took the 35B engine down and cost 15-25 minutes of reload."
+            exit 1
+          fi
+          echo "- main model: **preserved** — running since \`${started_iso}\` (${uptime_min} min), older than this rollout" >> "$GITHUB_STEP_SUMMARY"
+
+      # THE BIND ASSERTION (audit F065 / N023, CI half). The launcher change
+      # that moved the engine off 0.0.0.0 only takes effect when the engine is
+      # recreated, and nothing else in CI can see a live listening socket: the
+      # compose tests read files, trivy reads images. This reads the kernel.
+      # It fails if anything on the engine port is bound to 0.0.0.0, ::, * or
+      # an address that is neither the configured one nor loopback, and if the
+      # generated configuration itself asks for a wildcard.
+      #
+      # It runs LAST and on `!cancelled()`, so a red bind never hides the
+      # endpoint evidence or the model-preservation verdict above it. Until
+      # OA-3 recreates the engine on the bridge gateway, production still
+      # listens on 0.0.0.0:8000 and this step is RED — the true state of the
+      # box, and the reason it exists.
+      - name: The main engine is not listening on every interface
+        if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/engine_bind.py check \
+            --generated-env "$TECHSARA_DEPLOY_ROOT/.runtime/generated.env" 2>&1 \
+            | tee -a "$GITHUB_STEP_SUMMARY"
 
   # --------------------------------------------------------------------------
   # RECOVERY. It DIAGNOSES; it does not act.
@@ -1022,7 +1385,7 @@ jobs:
   # everything a human needs, print the exact command, and stop.
   # --------------------------------------------------------------------------
   recovery:
-    name: "🩺 Recovery diagnostics"
+    name: Recovery diagnostics
     needs: [deploy, verify]
     if: >-
       always() &&
@@ -1040,7 +1403,7 @@ jobs:
           set -u
           cd "$TECHSARA_DEPLOY_ROOT" || exit 0
           {
-            echo "## 🩺 Deploy/verify failed — diagnostics"
+            echo "## Deploy/verify failed — diagnostics"
             echo ""
             echo "- deploy: \`${{ needs.deploy.result }}\`  ·  verify: \`${{ needs.verify.result }}\`"
             echo "- checkout HEAD: \`$(git rev-parse --short HEAD 2>/dev/null || echo '?')\` on \`$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')\`"
@@ -1074,6 +1437,36 @@ jobs:
             echo "cd $TECHSARA_DEPLOY_ROOT"
             echo "scripts/deploy.sh --ref <last-good-sha>      # health-gated, rolls itself back on failure"
             echo "scripts/cluster-status.sh                    # two-node fabric"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The line above says "<last-good-sha>", which at 3 a.m. is a question,
+      # not an instruction. Only the box knows what was recorded, so ask it
+      # here and print the real answers. `--list` is read-only: it does not
+      # take the deploy lock, touch a container or move a tag.
+      #
+      # `|| true` throughout, deliberately. This job's contract is to collect
+      # evidence and stop; a rollback listing that fails must not replace the
+      # diagnostics above with a shell error.
+      - name: What can actually be rolled back to
+        if: always()
+        run: |
+          set -u
+          cd "$TECHSARA_DEPLOY_ROOT" || exit 0
+          {
+            echo "### Recorded releases (\`scripts/deploy-rollback.sh --list\`)"
+            echo '```'
+            scripts/deploy-rollback.sh --list 2>&1 | head -30 || true
+            echo '```'
+            echo "Images only. There are no down migrations, so the script refuses"
+            echo "to roll back to code that predates a migration this database has"
+            echo "already applied, and it never restores a dump — that would delete"
+            echo "every row written since the deploy."
+            echo ""
+            echo '```bash'
+            echo "cd $TECHSARA_DEPLOY_ROOT"
+            echo "scripts/deploy-rollback.sh --to <release-from-the-table> --dry-run"
+            echo "scripts/deploy-rollback.sh --to <release-from-the-table> --yes"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

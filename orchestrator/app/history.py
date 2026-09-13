@@ -16,13 +16,15 @@ GET    /history/search?q=<query>&limit=<n>  → {results: [{id, title, updated_a
 """
 from __future__ import annotations
 
+import email.message
 import re
 import uuid
-from typing import List, Literal, Optional, Sequence
+from typing import List, Literal, Optional, Sequence, Type, TypeVar
 
 from fastapi.responses import JSONResponse
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import db, titling
 from .auth import UserRow, require_user
@@ -47,6 +49,16 @@ def _cancel_pending_clarification(conversation_id: str) -> None:
 
 # Client-supplied conversation ids (the frontend uses its own uuids).
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+#: The SYNTHETIC key a bare /chat call falls back to, `u<user id>-<session id>`
+#: (app/main.py `_SYNTHETIC_CONV_KEY_RE`, app/uploads.py the same). F034 of the
+#: 2026-09-12 audit: it shares a namespace with client-chosen ids, so creating a
+#: conversation with id `u7-default` made the creator the OWNER of user 7's
+#: bare-call key — their extracted PDF text, fetched pages and Salesforce
+#: state. /chat and the upload rail refused the shape on 2026-09-12; this route
+#: still accepted it (wave-2 verifier, 2026-09-13), and it was the one door
+#: that stayed open. Spelled out rather than imported: `main` imports this
+#: module to mount its router. If one changes, change all three.
+_SYNTHETIC_CONV_KEY_RE = re.compile(r"^u\d+-")
 _MAX_TITLE_LENGTH = 200
 _MAX_QUERY_LENGTH = 100  # V4-DESIGN §2: q is 1-100 characters after trimming
 
@@ -93,7 +105,9 @@ class SyncedMessageIn(MessageIn):
 class MessagesReplaceIn(BaseModel):
     """Whole-thread replace used by the client's offline sync."""
 
-    messages: List[SyncedMessageIn]
+    # fail_fast: one bad element is a 422, not one error per element — see
+    # `read_validated_body` for the 26 GB this cost on 2026-09-13.
+    messages: List[SyncedMessageIn] = Field(fail_fast=True)
     # V29: the conversation's `updated_at` the client last loaded. When
     # present, the replace happens only if the thread has not moved since;
     # otherwise 409 with the server's value, and the client reconciles.
@@ -109,6 +123,127 @@ def _clean_title(title: str) -> str:
 
 def _not_found() -> HTTPException:
     return HTTPException(status_code=404, detail="conversation not found")
+
+
+# ---------------------------------------------------------------------------
+# Bodies that are parsed only AFTER the caller is known (2026-09-13)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. FastAPI json-decodes and validates a declared body model
+# BEFORE it resolves any dependency and before the handler runs, so a route
+# that checks the session or the owner inside its body pays for the parse
+# first. The wave-3 re-verifier (2026-09-13) measured what that costs through
+# the per-element 422: a cookie-less 1 MiB `{"message":"hi","images":[{},…]}`
+# to POST /chat answered a 33 MiB 422 and grew RSS by 429 MiB (16 concurrent:
+# +4980 MiB), and a member's PUT of 32 MiB of `{"messages":[{},…]}` to a
+# conversation she did not own grew RSS by ~26 GB before its 404.
+#
+# The large-body routes therefore declare NO body parameter (so FastAPI
+# never touches the stream), establish the principal — and for a
+# conversation, its owner — and only then call `read_validated_body`. It
+# keeps the three things callers relied on from FastAPI: the same strict
+# JSON content-type rule, a `RequestValidationError` (so the app's one 422
+# handler renders it), and `loc` beginning with "body".
+#
+# And it is BOUNDED even for a signed-in caller: every list in these models
+# is `fail_fast`, so pydantic stops at the first bad element instead of
+# building one error per element (measured, 32 MiB of `[{},…]`: 11,184,811
+# errors and +12 GB without it, 1 error and +310 MiB with it), and at most
+# `MAX_VALIDATION_ERRORS` are ever handed on.
+
+#: The most validation errors any 422 carries. A caller fixes the first few;
+#: the total rides beside them so nothing is hidden.
+MAX_VALIDATION_ERRORS = 20
+#: A pydantic `msg` is a sentence; a custom validator's could be anything.
+MAX_VALIDATION_MESSAGE_CHARS = 200
+#: `loc` of a nested model is a handful of names and indices.
+MAX_LOC_PARTS = 8
+MAX_LOC_PART_CHARS = 64
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def bounded_validation_errors(errors: Sequence[dict]) -> List[dict]:
+    """At most `MAX_VALIDATION_ERRORS` entries of `{type, loc, msg}`, each of
+    bounded size, NEVER the input (`input`/`ctx`/`url` are dropped: the
+    first two carry the caller's value, the third fingerprints the library)."""
+    safe: List[dict] = []
+    for error in list(errors[:MAX_VALIDATION_ERRORS]):
+        if not isinstance(error, dict):
+            continue
+        loc = error.get("loc") or ()
+        if isinstance(loc, (str, bytes)):
+            loc = (loc,)
+        safe.append(
+            {
+                "type": str(error.get("type") or "value_error")[:MAX_LOC_PART_CHARS],
+                # Every element stringified: `loc` holds ints for list indices.
+                "loc": [str(part)[:MAX_LOC_PART_CHARS] for part in list(loc)[:MAX_LOC_PARTS]],
+                "msg": str(error.get("msg") or "invalid value")[:MAX_VALIDATION_MESSAGE_CHARS],
+            }
+        )
+    return safe
+
+
+def _is_json_content_type(value: Optional[str]) -> bool:
+    """FastAPI's own strict rule (fastapi/routing.py, strict_content_type):
+    application/json or application/*+json, and a MISSING header is not JSON.
+    Kept identical so moving a route onto this reader does not widen what it
+    accepts — a `text/plain` body is a CORS-simple request, and /chat must not
+    start taking those."""
+    if not value:
+        return False
+    message = email.message.Message()
+    message["content-type"] = value
+    if message.get_content_maintype() != "application":
+        return False
+    subtype = message.get_content_subtype()
+    return subtype == "json" or subtype.endswith("+json")
+
+
+async def read_validated_body(request: Request, model: Type[_ModelT]) -> _ModelT:
+    """Read and validate this request's JSON body as `model`. Call it only
+    after authentication (and ownership, where there is an owner)."""
+    if not _is_json_content_type(request.headers.get("content-type")):
+        # What FastAPI answers for a body it would not decode as JSON.
+        exc = RequestValidationError(
+            [
+                {
+                    "type": "model_attributes_type",
+                    "loc": ("body",),
+                    "msg": "Input should be a valid JSON object sent as application/json",
+                }
+            ]
+        )
+        exc.error_total = 1  # type: ignore[attr-defined]
+        raise exc
+    raw = await request.body()
+    try:
+        # Parsed in pydantic-core straight from the bytes: no intermediate
+        # Python dict tree (json.loads of the same 32 MiB grew RSS by 770 MiB).
+        return model.model_validate_json(raw)
+    except ValidationError as error:
+        total = error.error_count()
+        shown = error.errors(include_url=False, include_context=False, include_input=False)
+        exc = RequestValidationError(
+            bounded_validation_errors(
+                [{**e, "loc": ("body", *tuple(e.get("loc") or ()))} for e in shown[:MAX_VALIDATION_ERRORS]]
+            )
+        )
+        exc.error_total = total  # type: ignore[attr-defined]
+        raise exc from None
+
+
+async def require_owned_conversation(conversation_id: str, user: UserRow) -> None:
+    """404 unless `user` owns `conversation_id` — BEFORE its body is read.
+
+    One pooled connection, checked out and returned inside the thread; nothing
+    is held while the body is read afterwards. The write that follows re-checks
+    ownership in its own statement, so this is the cheap early refusal, not the
+    authorization of record."""
+    owner = await db.run_in_thread(db.conversation_owner, conversation_id)
+    if owner is None or owner != int(user["id"]):
+        raise _not_found()
 
 
 @router.get("/conversations")
@@ -128,6 +263,15 @@ def create_conversation(
         raise HTTPException(
             status_code=400,
             detail="conversation id must be 1-64 characters from A-Z a-z 0-9 _ -",
+        )
+    # Shape-only, and for the caller's own user id too — the rule main.py
+    # applies (a rule with an exception is a rule somebody finds the edge of).
+    # 400 like the alphabet check above: this route's refusal vocabulary. The
+    # browser never mints this shape (`newId()` is a UUID, a branch `b-<uuid>`).
+    if _SYNTHETIC_CONV_KEY_RE.match(conversation_id):
+        raise HTTPException(
+            status_code=400,
+            detail="conversation id must not begin with u<digits>- (reserved)",
         )
     title = _clean_title(body.title)
     try:
@@ -178,16 +322,21 @@ def update_conversation(
 
 
 @router.post("/conversations/{conversation_id}/messages")
-def add_message(
+async def add_message(
     conversation_id: str,
-    body: MessageIn,
+    request: Request,
     user: UserRow = Depends(require_user),
 ) -> dict:
+    # Owner first, body second (2026-09-13): this route shares the 32 MiB
+    # conversation-sync cap, and a `meta` of millions of tiny objects is just
+    # as expensive to decode for someone else's id as for one's own.
+    await require_owned_conversation(conversation_id, user)
+    body = await read_validated_body(request, MessageIn)
     role = body.role.strip()
     if not role or len(role) > 32:
         raise HTTPException(status_code=400, detail="role must be 1-32 characters")
-    message = db.add_message(
-        int(user["id"]), conversation_id, role, body.content, body.meta
+    message = await db.run_in_thread(
+        db.add_message, int(user["id"]), conversation_id, role, body.content, body.meta
     )
     if message is None:  # missing OR someone else's → 404 (§3c)
         raise _not_found()
@@ -195,9 +344,9 @@ def add_message(
 
 
 @router.put("/conversations/{conversation_id}/messages")
-def replace_messages(
+async def replace_messages(
     conversation_id: str,
-    body: MessagesReplaceIn,
+    request: Request,
     user: UserRow = Depends(require_user),
 ) -> dict:
     """Replace a conversation's whole thread, atomically and never shrinking.
@@ -207,7 +356,14 @@ def replace_messages(
     conversations whenever the local copy was empty or stale. A shorter
     incoming thread is a bug on the caller's side, so it is refused with 409
     rather than silently applied; the client then pulls server truth.
+
+    AUTHENTICATED, THEN OWNED, THEN PARSED (2026-09-13, wave-3 re-verifier):
+    with `body: MessagesReplaceIn` declared, FastAPI validated the whole
+    32 MiB body before `require_user` ran — any member could spend ~26 GB of
+    RSS on an id they did not own and be told 404 afterwards.
     """
+    await require_owned_conversation(conversation_id, user)
+    body = await read_validated_body(request, MessagesReplaceIn)
     for m in body.messages:
         role = m.role.strip()
         if not role or len(role) > 32:
@@ -215,7 +371,8 @@ def replace_messages(
                 status_code=400, detail="role must be 1-32 characters"
             )
     try:
-        result = db.replace_messages(
+        result = await db.run_in_thread(
+            db.replace_messages,
             int(user["id"]),
             conversation_id,
             [

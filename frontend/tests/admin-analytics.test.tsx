@@ -18,7 +18,12 @@ import type { Me } from '@/components/admin/api';
 const ME: Me = {
   user: { id: 1, name: 'Root', email: 'root@x.test' },
   workspace: { id: 'w', name: 'Acme HQ', role: 'super_admin' },
-  capabilities: ['workspace.read', 'members.read'],
+  // A super admin holds every capability. The per-person analytics and its
+  // export moved from workspace.read to analytics.read (2026-09-13, finding
+  // F078): this page is what a super admin sees, so the fixture carries the
+  // capability a real super admin has. The plain-admin view is pinned in
+  // tests/admin-landing-analytics-gate.test.tsx.
+  capabilities: ['workspace.read', 'members.read', 'analytics.read'],
   features: {},
 };
 

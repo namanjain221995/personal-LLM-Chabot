@@ -125,7 +125,10 @@ describe('/api/auth/login — Set-Cookie is the whole point', () => {
     expect(res.headers.get('set-cookie')).toContain('ts_session=fresh');
     expect(calls[0].url).toBe('http://orchestrator:8080/auth/login');
     expect(calls[0].init?.method).toBe('POST');
-    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
+    // Bodies travel as BYTES since 2026-09-12 (the old UTF-8 round trip
+    // corrupted every payload that was not text), so decode before parsing.
+    const sent = new TextDecoder().decode(calls[0].init?.body as ArrayBuffer);
+    expect(JSON.parse(sent)).toEqual({
       email: 'naman@techsara.test',
       password: 'x',
     });

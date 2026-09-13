@@ -231,6 +231,26 @@ const PUBLIC_PAGES = new Set(['/login', '/accept-invite', '/access-removed']);
  */
 const PUBLIC_PREFIXES = ['/share/'] as const;
 
+/**
+ * WHY /docs IS NOT IN THE LIST ABOVE (2026-09-12, CONTRACT §17).
+ *
+ * The developer documentation is for signed-in people: "signed-in users may
+ * read the documentation" is the whole of what the contract grants, and it
+ * grants it to every member — reading /docs needs no capability, unlike the
+ * console at /api, which needs `api.console.access`. So /docs takes the
+ * ordinary road through `authRedirect`: a signed-in visitor is let through at
+ * any depth, a signed-out one goes to /login like every other page.
+ *
+ * That is a decision, not an oversight, and the alternative was considered.
+ * Adding '/docs/' to PUBLIC_PREFIXES would publish the documentation to the
+ * internet, and it would do so INCONSISTENTLY, because the depth guard below
+ * admits exactly one segment: /docs/quickstart would be public while
+ * /docs/guides/webhooks bounced to sign-in. A gate that depends on how deep a
+ * page happens to sit is worse than either answer. Should the documentation
+ * ever be published, it needs a prefix rule with no depth guard, its own
+ * review, and a note here saying so.
+ */
+
 function isPublicPrefixPage(page: string): boolean {
   return PUBLIC_PREFIXES.some(
     (prefix) =>
@@ -248,13 +268,32 @@ function isPublicPrefixPage(page: string): boolean {
  * through a 401). /api/* must answer with statuses rather than redirects,
  * and /_next/* plus dotted static assets have to load on /login itself.
  *
+ * The three exclusions are the middleware matcher's, spelled the same way and
+ * for the same reasons — including the SLASH after `api`, which is what keeps
+ * the developer console PAGE at /api gated while the route handlers beneath it
+ * are not (2026-09-12), and `/v1`, which is key-authenticated and cookie-blind
+ * (CONTRACT §1) and must never be handed a redirect to a sign-in page.
+ *
+ * THE BARE `/v1` IS PART OF THAT NAMESPACE (2026-09-13). This used to test
+ * `startsWith('/v1/')` alone, so `/v1` itself — the root of the optional
+ * catch-all at app/v1/[[...path]]/route.ts, and a path that really is served —
+ * reached the gate below and came back '/login' without a cookie and null with
+ * one. A surface the contract describes as reading "exactly one credential"
+ * must not answer differently depending on a second one, even by redirect, so
+ * the namespace is excluded as a whole: its root and everything under it.
+ *
  * Returns where to redirect, or null to let the request through.
  */
 export function authRedirect(
   pathname: string,
   hasSessionCookie: boolean,
 ): '/login' | '/' | null {
-  if (pathname.startsWith('/api/') || pathname.startsWith('/_next/')) {
+  if (
+    pathname.startsWith('/api/') ||
+    pathname.startsWith('/_next/') ||
+    pathname === '/v1' ||
+    pathname.startsWith('/v1/')
+  ) {
     return null;
   }
   const lastSegment = pathname.slice(pathname.lastIndexOf('/') + 1);

@@ -1,5 +1,163 @@
 # Changelog
 
+## The model becomes something other programs can call: a keyed `/v1` API with quotas, streaming, background responses and signed webhooks — and the audit's security fixes that had to come first (2026-09-13)
+
+Until this release the only way to use the main model was to sign in and type.
+Teams that wanted it inside their own tools had two bad options: drive the chat
+application with somebody's session cookie, or call the unauthenticated vLLM
+port on the LAN, which skips the login, the feature gates, the admission lanes,
+the usage ledger and the audit log all at once. This release adds the third
+option the product needed: **a public developer API at `/v1`, authenticated by
+API keys that belong to projects**, served by the same orchestrator and the
+same model, and bounded so that no key can take the chat application's lanes
+away from the people using it. The contract is
+`docs/developer-platform/CONTRACT.md`; the operator's manual is
+`OPERATIONS.md`; the endpoint reference, read from the code, is `API.md`.
+
+The programme started with a read-only audit of 300 first-party files
+(`AUDIT.md`): 82 defects from eight readers, re-read by eight skeptics who
+corrected 46 of them and found 29 more — **111 findings, two P0s**. Every one of
+them now has a row in `DISPOSITION.md` saying whether it is fixed in this
+branch, partly fixed, deferred to a named owner, or an operator action with the
+exact command. Totals as that document records them: **40 fixed, 28 partly
+fixed, 27 deferred, 16 operator actions.** Neither P0 is closed by code alone
+(below).
+
+**The API.** `GET /v1/models`, `POST /v1/responses` (synchronous, streaming as
+`response.created → … → response.completed` server-sent events numbered from 1,
+or `background: true` returning 202 with an id), `GET` and
+`POST …/cancel` on a response, `POST /v1/chat/completions` in the compatibility
+shape, `GET /v1/usage`, and `GET /v1/openapi.json`, a hand-built OpenAPI 3.1
+document of the public surface only. The credential is
+`Authorization: Bearer tsk_live_<public_id>_<secret><checksum>` and nothing
+else: `/v1` never reads the session cookie, so a web page cannot drive it with
+a signed-in visitor's browser. Every failure — an unknown path and a wrong method
+included — is one five-key JSON envelope from a closed table of sixteen codes,
+with an `X-Request-Id`, scrubbed of tracebacks, SQL, paths, private
+addresses and key material; every unknown, revoked, expired or disabled key gets
+the same 401, charged the same HMAC, so a key holder cannot learn whether a key
+exists. A parameter the platform cannot honour — `top_p`, `tools`, `n`, a
+`workspace_id` — is a 400 naming it, never silently dropped. `usage` is `null`,
+never 0, when the engine did not report counts. Requests run at effort `fast`
+through `llm.stream_chat_events` and nothing lower; the router, embeddings,
+OCR, reranker and speech engines have no path from `/v1`, and the model
+registry refuses at construction to expose one.
+
+**Keys, projects and limits.** A key's secret is 256 random bits, shown once and
+stored as `HMAC-SHA256(API_KEY_PEPPER, secret)`; scopes are a closed set of four
+(`models.read`, `responses.read`, `responses.write`, `usage.read`), keys expire
+after 90 days by default, and revocation is one row update that the resolver
+reads on the next request. Each project carries its allowed models, allowed
+browser origins, IP allowlist, retention and limits — 60 requests and 200,000
+input / 60,000 output tokens a minute, 2,000,000 tokens a day, 4 in flight by
+default, optionally tightened per key — decided atomically per project under a
+PostgreSQL advisory lock and enforced **before** a request reaches the ten
+admission lanes it shares with chat, with `RateLimit`/`RateLimit-Policy` headers and a jittered
+`Retry-After` on every 429 and 503. `Idempotency-Key` makes a retried POST
+return the first answer instead of running the model twice, and a request that
+failed or was refused leaves its key free to retry. Rotating a key keeps the old
+one working for a chosen overlap (seven days by default, zero for a leak). Background
+responses are durable rows; when they finish, a webhook signed
+`TechSara-Signature: t=…,v1=HMAC-SHA256(secret, "t.body")` is delivered through
+an SSRF-checked client (HTTPS only, private and metadata addresses refused,
+redirects re-checked), with up to six attempts spread over about five minutes. Every
+request writes one `usage_events` row (`mode` `api`) and never stores the
+prompt; a sweep inside the orchestrator enforces each project's retention every
+30 minutes. Ten `api.*` browser capabilities gate the console at `/api` — admins
+may run projects and keys; only a super admin may change which models are
+public or raise a project's ceilings — and `/docs` documents the API for any
+signed-in person. The same-origin edge `frontend/app/v1/[[...path]]/route.ts`
+carries `Authorization` upstream, drops `Cookie`, and streams without
+buffering.
+
+**Migration V34** adds eleven tables (`api_projects`, `api_service_accounts`,
+`api_keys`, `api_responses`, `api_idempotency`, `api_usage_minute`,
+`api_usage_daily`, `api_webhook_endpoints`, `api_webhook_deliveries`,
+`public_models`, `platform_secrets`) and thirty indexes, and alters nothing that
+exists: every foreign key a cascade walks is indexed, the allow-list columns are
+constrained to JSON arrays and the limits to non-negative numbers. Rolling back
+the images leaves the tables in place and the previous code never touches them,
+so `scripts/deploy-rollback.sh --i-accept-schema-drift` is safe for this
+migration; `/v1` disappears until the release returns.
+
+**The security fixes, in the application.** FastAPI's `/docs`, `/redoc` and
+`/openapi.json`, which mapped all 94 routes for anyone on the LAN, are off unless
+`ORCHESTRATOR_DEV_DOCS` is set (F013/F026/F053/F076). A 422 no longer echoes the
+request body — conversation, images and all — back to the caller (F015). Bodies
+are capped before they are read, 1 MiB on `/v1`, the largest upload limit on
+`/uploads`, 128 MiB elsewhere, and the frontend's proxies are bounded too
+(F016/F033/F001/N028). A client can no longer name or claim the synthetic
+`u<id>-<session>` conversation key another user's bare calls fall back to, which
+had allowed reading and deleting their documents and Salesforce questions
+(F034/N004/N005), and the Salesforce context and cancel routes fail closed on an
+id the caller does not own (N010). An admin can no longer read a super admin's
+or a peer admin's conversations, uploads, reports or sessions (F029/N007), nor
+take over a removed or disabled account by inviting its address (F028 — on the
+issuing side; invitations issued before this release must be revoked, OA-9).
+The per-member usage report and its export are super-admin only and audited, and
+the export neutralises spreadsheet formulas in display names (F078/N006/N027).
+The frontend proxies stop laundering a caller's `Cf-Connecting-IP` into a trusted
+`X-Forwarded-For` (F002), relay `Retry-After` and the rate-limit headers (F005),
+forward bytes unchanged (F010) and abort and time out upstream calls (F006); the
+page middleware now gates `/api` and never redirects `/v1` (F003/F004/F032/F081).
+In the inference path, a non-streaming LONG request can no longer hold the
+NORMAL lane closed for its whole generation (F044), a non-Latin or image-heavy
+prompt can no longer slip into the NORMAL lane (N013/F046), `json_completion`
+records the tokens it used (F045), one refused usage option no longer switches
+token telemetry off until restart (N014), and evicted HTTP clients are closed
+(F048). CI gained a timeout on every job enforced by policy (F072), a launcher
+leg that fails on zero tests (F070), a deploy verification that fails when a
+rolling deploy restarted the main model (F068), a working log tail (F069), an
+honest pip-audit outcome (F071), a rollback script the pipeline actually
+exercises (F074, partly), and a gate that fails the build when the public
+OpenAPI document stops being valid 3.1 or its operations differ from
+`public-api-surface.txt`.
+
+**The security fixes, in the infrastructure — written, not yet live.** The
+launcher no longer puts the main engine on `0.0.0.0` when model ports are
+published; published model ports follow `TECHSARA_MODEL_BIND_ADDRESS` on every
+overlay; the engine controller and node-exporter default to loopback and the
+Docker bridge gateway; the speech engine refuses to start without an explicit
+bind (F050/F042/F012/F055/F056/F051). None of that reaches the running engine
+until it is recreated, which is a main-model restart in a production window
+(OA-3); the host packet filter in OA-4 closes the LAN exposure today without
+one.
+
+**What the owner must do, because code cannot.** F064, the other P0: a fork pull
+request runs its own copy of `pipeline.yml`, so it can schedule a job on the
+self-hosted runner that deploys production, as a user in the `docker` group.
+Require approval for all external contributors now (OA-1), and move the runner
+off the public repository (OA-2). Set `API_KEY_PEPPER` before the first key and
+never change it; set `TRUSTED_CLIENT_IP_HEADER=cf-connecting-ip` on the frontend
+service, or every sign-in and audit event records the frontend container's
+address (OA-19); keep `:8080` off the LAN, because the orchestrator still
+believes any peer's `X-Forwarded-For`, which makes a project's IP allowlist
+advisory for the browser (OA-8); set `PUBLIC_API_TRUSTED_PROXIES` to the
+frontend's network so a project's IP allowlist sees the real caller (OA-22).
+`DISPOSITION.md` lists all twenty-two actions with their commands.
+
+**Not finished in this tree, said plainly.** A webhook's signing secret is shown
+once at creation but cannot be rotated. A background response orphaned by a
+restart is repaired only when someone reads it; there is no start-up sweep.
+Cancel stops background work only, and a stream abandoned mid-way is recorded
+`completed`. None of the new settings is in `.env.example`, and
+`TRUSTED_CLIENT_IP_HEADER` and `PUBLIC_API_TRUSTED_PROXIES` are set in no compose
+file. `API.md` §12 lists the twelve places where the code and the contract still
+disagree. Four gaps found while this entry was being written — the console API
+unmounted, its BFF on the wrong prefix, the webhook secret never revealed, the
+retention sweep never called — were fixed by other teams before it was finished.
+
+**Evidence.** Run while writing this entry: `api_contract.py` — `OpenAPI 3.1.0:
+well-formed, 8 operation(s), all matching`; `workflow_policy.py` —
+`workflow policy: OK (P1-P8)`; an import of `app.main` probed with `TestClient`
+(re-run at 02:49 IST) showed `/v1` and the console API mounted, a 401 envelope
+that ignores the session cookie, a 204 preflight without
+`Access-Control-Allow-Credentials`, 404/405/413 in the envelope with
+`X-Request-Id`, and `GET /docs` → 404. **Not run for this entry:** the orchestrator and frontend
+test suites, `scripts/devapi_smoke.py`, and any end-to-end run on the isolated
+stack; the branch was uncommitted and still being edited by other teams when
+this was written, and nothing here has been deployed.
+
 ## The main model's outage is detected in seconds, recovered in order, and every request that arrives meanwhile is kept and resumed by the same model (2026-09-12)
 
 On 2026-09-11 at 22:15:50Z the worker rank of the TP=2 main engine died in a

@@ -221,6 +221,48 @@ services:
       # `docker inspect` of this container shows the key empty whatever .env
       # says (review round 2). Nothing in the orchestrator reads it.
       CLUSTER_SENTINEL_TOKEN: ""
+      # The developer platform: `/v1`, API keys, the console (CONTRACT-3,
+      # docs/developer-platform/). Documented one by one in .env.example.
+      #
+      # WIRED EXPLICITLY, 2026-09-13, because a setting nobody lists is a
+      # setting nobody sets: the wave-3 re-verifier found
+      # PUBLIC_API_TRUSTED_PROXIES in config.py and NOWHERE in a deployment,
+      # so the ip_allowlist saw the frontend container for every call through
+      # the edge. Every one defaults to BLANK here, never to a number: blank
+      # makes the code use its own default (config.py `_int`/`_float`,
+      # main.py `_positive_int_setting`, console_api `_env_limit`), so there
+      # is ONE copy of each default and a change to it cannot be silently
+      # overridden by a stale literal in this file.
+      #
+      # API_KEY_PEPPER IS DELIBERATELY NOT LISTED. It lives in
+      # .runtime/secrets.env and reaches this container through `env_file`
+      # above. `environment:` OVERRIDES `env_file`, so `${API_KEY_PEPPER:-}`
+      # here would be BLANK on any recreate whose interpolation lacks the
+      # secrets layer (a plain `docker compose up` reads only .env) -- and a
+      # blank pepper switches HMAC keys to the in-database fallback, which
+      # stops every existing API key verifying at once, with no error beyond
+      # a wall of 401 invalid_api_key.
+      PUBLIC_API_TRUSTED_PROXIES: ${PUBLIC_API_TRUSTED_PROXIES:-}
+      PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
+      PUBLIC_API_IDEMPOTENCY_TTL_HOURS: ${PUBLIC_API_IDEMPOTENCY_TTL_HOURS:-}
+      PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS: ${PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS:-}
+      PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS: ${PUBLIC_API_KEY_ROTATION_OVERLAP_HOURS:-}
+      PUBLIC_API_DEFAULT_RPM: ${PUBLIC_API_DEFAULT_RPM:-}
+      PUBLIC_API_DEFAULT_INPUT_TPM: ${PUBLIC_API_DEFAULT_INPUT_TPM:-}
+      PUBLIC_API_DEFAULT_OUTPUT_TPM: ${PUBLIC_API_DEFAULT_OUTPUT_TPM:-}
+      PUBLIC_API_DEFAULT_MAX_CONCURRENCY: ${PUBLIC_API_DEFAULT_MAX_CONCURRENCY:-}
+      PUBLIC_API_DEFAULT_DAILY_TOKEN_QUOTA: ${PUBLIC_API_DEFAULT_DAILY_TOKEN_QUOTA:-}
+      PUBLIC_API_RATELIMIT_JITTER_SECONDS: ${PUBLIC_API_RATELIMIT_JITTER_SECONDS:-}
+      PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS: ${PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS:-}
+      PUBLIC_API_QUOTA_GATE_WAIT_SECONDS: ${PUBLIC_API_QUOTA_GATE_WAIT_SECONDS:-}
+      API_PLAYGROUND_RPM: ${API_PLAYGROUND_RPM:-}
+      API_PLAYGROUND_INPUT_TPM: ${API_PLAYGROUND_INPUT_TPM:-}
+      API_PLAYGROUND_OUTPUT_TPM: ${API_PLAYGROUND_OUTPUT_TPM:-}
+      API_PLAYGROUND_MAX_CONCURRENCY: ${API_PLAYGROUND_MAX_CONCURRENCY:-}
+      API_PLAYGROUND_DAILY_TOKEN_QUOTA: ${API_PLAYGROUND_DAILY_TOKEN_QUOTA:-}
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-}
+      CHAT_MAX_REQUEST_BODY_BYTES: ${CHAT_MAX_REQUEST_BODY_BYTES:-}
+      ORCHESTRATOR_DEV_DOCS: ${ORCHESTRATOR_DEV_DOCS:-}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads
@@ -307,6 +349,19 @@ services:
       ORCHESTRATOR_URL: http://orchestrator:8080
       MOCK_MODE: ${MOCK_MODE:-false}
       NEXT_PUBLIC_APP_NAME: ${NEXT_PUBLIC_APP_NAME:-TechSara AI}
+      # The public edge (frontend/app/v1, lib/proxy.ts), 2026-09-13. This
+      # service's only env_file is generated.env, so NOTHING in .env reaches
+      # it unless it is named here -- before this, TRUSTED_CLIENT_IP_HEADER
+      # could not be set in any deployment at all. Blank is the safe default
+      # for all three (see .env.example, "Developer platform").
+      #
+      # PUBLIC_API_MAX_BODY_BYTES is the SAME variable the orchestrator gets
+      # above, on purpose: the edge cap and the server cap must be equal
+      # (app/v1 route.ts `publicApiBodyBytes`), and one source is how they
+      # stay equal.
+      TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-}
+      TRUSTED_FORWARDED_PROTO: ${TRUSTED_FORWARDED_PROTO:-}
+      PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     networks:

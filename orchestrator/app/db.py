@@ -1830,6 +1830,510 @@ CREATE INDEX IF NOT EXISTS idx_chat_requests_open
 """
 
 
+_MIGRATION_V34 = """
+-- V34 (2026-09-12): the developer platform — API projects, service accounts,
+-- keys, responses, idempotency claims, the usage ledgers, webhooks, the
+-- public-model overrides and the platform secret store
+-- (docs/developer-platform/SCHEMA-V34.md, CONTRACT-3 §5, §12-§15).
+--
+-- TENANCY IS EXPLICIT, and that is the point of the shape below. Every row a
+-- caller can address by id carries `workspace_id` NEXT TO the foreign key it
+-- could have been derived from. The 2026-09-12 audit found that workspace
+-- scoping in this codebase is reconstructed by join at read time, which is
+-- fine for a page that forgets to do it (it shows nothing) and fatal for a
+-- key resolver that forgets to do it (it authorises the wrong tenant). A
+-- stored column lets every accessor put the tenant in the WHERE clause, so
+-- the check can only be written wrongly, never left out. The ledgers
+-- (`api_usage_minute`, `api_usage_daily`), the idempotency claims and the
+-- deliveries hang off `project_id` instead: they are never addressed by a
+-- caller-supplied id, they are read only through a project the resolver has
+-- already proved, and their primary keys are what make the atomic
+-- counter upsert possible. `platform_secrets` is deployment-wide and has no
+-- tenant at all. `public_models` USED to be deployment-wide too, and the
+-- 2026-09-13 review showed why that was wrong: the console's model switch is
+-- held by a super admin of ONE workspace, and flipping it wrote a row every
+-- workspace's `/v1/models` read — one tenant's administrator could switch a
+-- model off for every other customer. It is keyed by workspace now.
+--
+-- EVERY FOREIGN KEY A CASCADE WALKS GETS AN INDEX. V29 and V30 forgot it and
+-- V31 wrote it down as the rule: deleting a workspace here walks workspaces
+-- -> api_projects -> api_service_accounts / api_keys / api_responses ->
+-- api_idempotency, and without these indexes each parent row costs a
+-- sequential scan of every child table. The rule covers ON DELETE SET NULL
+-- as well as ON DELETE CASCADE, because the nulling UPDATE has to find the
+-- child rows by exactly the same scan — deleting one departing colleague's
+-- user row rewrites `created_by` across every project, key, service account,
+-- webhook endpoint and model override in the deployment.
+--
+-- This paragraph stated the rule from the day it was written and the DDL
+-- below broke it in five places; the independent verifier of 2026-09-12 found
+-- them by asking PostgreSQL rather than by reading the list
+-- (`pg_constraint contype = 'f'` joined to `pg_index` on `indkey[0]`), which
+-- is now how `test_api_platform_db.py` asks too. The five that were missing:
+-- `api_webhook_deliveries.project_id` and `api_webhook_endpoints.workspace_id`
+-- (both CASCADE), and `api_service_accounts.created_by`,
+-- `api_webhook_endpoints.created_by` and `public_models.updated_by` (SET
+-- NULL). A hardcoded list of index names cannot notice a sixth.
+--
+-- NO COLUMN HOLDS A PLAINTEXT KEY. `key_hash` is HMAC-SHA256 under a pepper
+-- (CONTRACT-3 §5) and `last_four` exists only so a person can recognise which
+-- key a row is about. The one piece of generated text stored anywhere is
+-- `api_responses.output_text`, which exists so a BACKGROUND response can be
+-- collected after the connection that asked for it has gone, and which
+-- `prune_api_platform` clears on the project's retention day.
+--
+-- A JSONB COLUMN AN AUTHORIZATION DECISION IS READ FROM DECLARES ITS SHAPE.
+-- `allowed_models`, `allowed_origins`, `ip_allowlist`, `scopes` and `events`
+-- are allow-lists: each of them is the thing that says "no" on a request
+-- path, and bare `jsonb` accepts a string, a number or an object just as
+-- happily as the array the reader expects. The 2026-09-12 verifier measured
+-- exactly that — `update_api_project(pid, ws, allowed_models='techsara-35b')`
+-- stored `{"raw": "techsara-35b"}` and `create_api_project(...,
+-- allowed_models='abc')` stored `["a","b","c"]` — and a reader written as
+-- `model in row["allowed_models"]` answers both of those wrongly, in the
+-- permissive direction for the second. The accessors refuse a non-list before
+-- they ever get here; the CHECK is what makes the rule true for every writer
+-- that reaches this table, psql included. The object-shaped columns
+-- (`metadata`, `payload`) get the same declaration, because a list stored in
+-- `metadata` is a KeyError in whichever console page reads it next.
+--
+-- A LIMIT IS A NUMBER THAT CANNOT BE NEGATIVE. Same review: a
+-- `retention_days` of -5 was accepted, and every response created afterwards
+-- was born already expired — `create_api_response` computes `now() +
+-- make_interval(days => p.retention_days)` — so a background response
+-- vanished on the next `prune_api_platform` sweep before the caller that
+-- started it could ever fetch it. Zero is legal for all of these and means
+-- frozen (no requests, no tokens, nothing retained); below zero is not a
+-- tighter limit, it is a corrupted one. The nullable ceilings are the
+-- exception only in that NULL is legal there, and NULL means "inherit". ZERO
+-- MEANS ZERO EVERYWHERE, the ceilings included: an earlier draft of this
+-- paragraph made `max_input_tokens` and `max_output_tokens` refuse 0 as
+-- "configuration that looks like refusal", and the 2026-09-13 review found the
+-- resolver reading that same argument the other way round for `rpm` — a stored
+-- 0 silently became the 60 default and let 60 requests through a project an
+-- operator had frozen. One rule, stated once, for every limit column: NULL
+-- inherits, 0 allows nothing, below 0 is refused by the schema.
+--
+-- A LEDGER COUNTER CANNOT GO BELOW ZERO EITHER (2026-09-13). The columns the
+-- quota is actually decided from — `api_usage_minute.*` and
+-- `api_usage_daily.*` — had no CHECK, and `bump_usage_daily(requests=-100,
+-- input_tokens=-1_000_000)` was measured leaving the day at -90 requests: a
+-- quota refund one careless caller away, guarded only by a `max(0, ...)` in
+-- `quotas.py`. The accessors refuse a negative increment (a CHECK on a running
+-- total cannot see a partial refund that leaves it positive); the CHECK is the
+-- backstop for every writer that is not those accessors.
+--
+-- AN ALLOW-LIST IS BOUNDED (2026-09-13). 5,000 entries of 1,000 characters
+-- were accepted into `allowed_models`, and the resolver reads the whole
+-- project row on every `/v1` request. 256 entries is far beyond any real
+-- model, origin, network or scope list; `_json_array` also caps each entry at
+-- 512 characters, which a CHECK cannot express cheaply. The CASE is not
+-- decoration: PostgreSQL does not promise to evaluate `a AND b` left to right,
+-- and `jsonb_array_length` RAISES on a non-array, so the plain conjunction
+-- could answer a scalar with an error instead of a constraint violation.
+--
+-- All of these rule families were added to V34 IN PLACE on 2026-09-13 rather than as
+-- a V35. V34 exists in no commit on `main` and in no database outside this
+-- branch's test runs, so amending it is the honest record rather than a
+-- rewrite of history. The day after it ships, the same change costs an ALTER
+-- TABLE ... ADD CONSTRAINT with a validation scan of every tenant's rows.
+--
+-- Statement timeout is 15 s per connection and the whole migration runs in
+-- one transaction, but every index below is on a table created empty in the
+-- same statement batch, so there is nothing for it to time out on.
+CREATE TABLE IF NOT EXISTS api_projects (
+    id                text        PRIMARY KEY,
+    workspace_id      text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name              text        NOT NULL,
+    environment       text        NOT NULL
+                      CONSTRAINT api_projects_environment CHECK
+                      (environment IN ('test', 'live')),
+    status            text        NOT NULL DEFAULT 'active'
+                      CONSTRAINT api_projects_status CHECK
+                      (status IN ('active', 'disabled')),
+    allowed_models    jsonb       NOT NULL DEFAULT '[]'::jsonb
+                      CONSTRAINT api_projects_allowed_models CHECK
+                      (CASE WHEN jsonb_typeof(allowed_models) = 'array' THEN jsonb_array_length(allowed_models) <= 256 ELSE false END),
+    allowed_origins   jsonb       NOT NULL DEFAULT '[]'::jsonb
+                      CONSTRAINT api_projects_allowed_origins CHECK
+                      (CASE WHEN jsonb_typeof(allowed_origins) = 'array' THEN jsonb_array_length(allowed_origins) <= 256 ELSE false END),
+    ip_allowlist      jsonb       NOT NULL DEFAULT '[]'::jsonb
+                      CONSTRAINT api_projects_ip_allowlist CHECK
+                      (CASE WHEN jsonb_typeof(ip_allowlist) = 'array' THEN jsonb_array_length(ip_allowlist) <= 256 ELSE false END),
+    rpm               integer     NOT NULL DEFAULT 60
+                      CONSTRAINT api_projects_rpm CHECK (rpm >= 0),
+    input_tpm         bigint      NOT NULL DEFAULT 200000
+                      CONSTRAINT api_projects_input_tpm CHECK (input_tpm >= 0),
+    output_tpm        bigint      NOT NULL DEFAULT 60000
+                      CONSTRAINT api_projects_output_tpm CHECK (output_tpm >= 0),
+    max_concurrency   integer     NOT NULL DEFAULT 4
+                      CONSTRAINT api_projects_max_concurrency CHECK (max_concurrency >= 0),
+    daily_token_quota bigint      NOT NULL DEFAULT 2000000
+                      CONSTRAINT api_projects_daily_token_quota CHECK (daily_token_quota >= 0),
+    max_input_tokens  integer
+                      CONSTRAINT api_projects_max_input_tokens CHECK
+                      (max_input_tokens IS NULL OR max_input_tokens >= 0),
+    max_output_tokens integer
+                      CONSTRAINT api_projects_max_output_tokens CHECK
+                      (max_output_tokens IS NULL OR max_output_tokens >= 0),
+    retention_days    integer     NOT NULL DEFAULT 30
+                      CONSTRAINT api_projects_retention_days CHECK (retention_days >= 0),
+    metadata          jsonb       NOT NULL DEFAULT '{}'::jsonb
+                      CONSTRAINT api_projects_metadata CHECK
+                      (jsonb_typeof(metadata) = 'object'),
+    created_by        integer     REFERENCES users(id) ON DELETE SET NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    disabled_at       timestamptz,
+    -- THE CONSOLE PLAYGROUND'S ALLOWANCE ROW (2026-09-13). The playground is
+    -- metered as a per-workspace project that no person created and no
+    -- person may edit, list or key. It used to be recognised by an id prefix
+    -- and a `metadata.system` mark, and it had to take a NAME under the
+    -- per-workspace unique index below — so an admin who created projects
+    -- called "Console playground" and "Console playground <suffix>" (the id
+    -- is derivable from the workspace id /overview returns) made every
+    -- playground run in the workspace a 500. A column no accessor lets a
+    -- request body write is the mark; the name index ignores marked rows,
+    -- and a second index allows exactly one marked row per workspace, so a
+    -- concurrent first run races on that index instead of on a name.
+    is_playground     boolean     NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_api_projects_workspace
+    ON api_projects (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_projects_created_by
+    ON api_projects (created_by);
+-- One project name per workspace, folded. The console offers a project by
+-- name and the database is the only place that can make that unambiguous
+-- while two admins are creating one at the same moment. The playground row is
+-- outside it: it is never offered by name, and a customer's name must not be
+-- able to block it (see `is_playground`).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_projects_name
+    ON api_projects (workspace_id, lower(name)) WHERE NOT is_playground;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_projects_one_playground
+    ON api_projects (workspace_id) WHERE is_playground;
+
+CREATE TABLE IF NOT EXISTS api_service_accounts (
+    id             text        PRIMARY KEY,
+    project_id     text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    workspace_id   text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name           text        NOT NULL,
+    description    text        NOT NULL DEFAULT '',
+    status         text        NOT NULL DEFAULT 'active'
+                   CONSTRAINT api_service_accounts_status CHECK
+                   (status IN ('active', 'disabled')),
+    scopes         jsonb       NOT NULL DEFAULT '[]'::jsonb
+                   CONSTRAINT api_service_accounts_scopes CHECK
+                   (CASE WHEN jsonb_typeof(scopes) = 'array' THEN jsonb_array_length(scopes) <= 256 ELSE false END),
+    allowed_models jsonb       NOT NULL DEFAULT '[]'::jsonb
+                   CONSTRAINT api_service_accounts_allowed_models CHECK
+                   (CASE WHEN jsonb_typeof(allowed_models) = 'array' THEN jsonb_array_length(allowed_models) <= 256 ELSE false END),
+    created_by     integer     REFERENCES users(id) ON DELETE SET NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    last_used_at   timestamptz,
+    disabled_at    timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_service_accounts_project
+    ON api_service_accounts (project_id);
+CREATE INDEX IF NOT EXISTS idx_api_service_accounts_workspace
+    ON api_service_accounts (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_service_accounts_created_by
+    ON api_service_accounts (created_by);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id                  text        PRIMARY KEY,
+    public_id           text        NOT NULL UNIQUE,
+    key_hash            text        NOT NULL,
+    last_four           text        NOT NULL,
+    project_id          text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    service_account_id  text        REFERENCES api_service_accounts(id) ON DELETE CASCADE,
+    workspace_id        text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    environment         text        NOT NULL
+                        CONSTRAINT api_keys_environment CHECK
+                        (environment IN ('test', 'live')),
+    name                text        NOT NULL,
+    scopes              jsonb       NOT NULL DEFAULT '[]'::jsonb
+                        CONSTRAINT api_keys_scopes CHECK
+                        (CASE WHEN jsonb_typeof(scopes) = 'array' THEN jsonb_array_length(scopes) <= 256 ELSE false END),
+    allowed_models      jsonb       NOT NULL DEFAULT '[]'::jsonb
+                        CONSTRAINT api_keys_allowed_models CHECK
+                        (CASE WHEN jsonb_typeof(allowed_models) = 'array' THEN jsonb_array_length(allowed_models) <= 256 ELSE false END),
+    -- NULL means "inherit the project's limit", which is not the same as 0:
+    -- 0 is a key that may make no request at all, which is a legitimate way
+    -- to park an integration without revoking its credential.
+    rpm                 integer
+                        CONSTRAINT api_keys_rpm CHECK (rpm IS NULL OR rpm >= 0),
+    max_concurrency     integer
+                        CONSTRAINT api_keys_max_concurrency CHECK
+                        (max_concurrency IS NULL OR max_concurrency >= 0),
+    status              text        NOT NULL DEFAULT 'active'
+                        CONSTRAINT api_keys_status CHECK
+                        (status IN ('active', 'revoked')),
+    expires_at          timestamptz,
+    created_by          integer     REFERENCES users(id) ON DELETE SET NULL,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    last_used_at        timestamptz,
+    last_used_ip        text,
+    revoked_at          timestamptz,
+    revoked_by          integer     REFERENCES users(id) ON DELETE SET NULL,
+    -- ROTATION, and which row each column is about (settled 2026-09-13).
+    -- `rotated_from` sits on the NEW key and names the public id of the key it
+    -- replaced — history, read by the console, never by an authorization
+    -- decision. `rotation_expires_at` sits on the OLD key and is the moment
+    -- THAT key stops working; the resolver refuses a key whose own deadline
+    -- has passed and `expire_rotated_keys` revokes it. An earlier draft put
+    -- the deadline on the successor and had the sweep join successor to
+    -- predecessor by `rotated_from = public_id` across the whole table, which
+    -- let a key minted in workspace B name workspace A's public id and get A's
+    -- live key revoked; it also disagreed with the resolver, so no overlap was
+    -- ever enforced. A column that is about its own row cannot reach another
+    -- tenant's, and `create_api_key` refuses a `rotated_from` that is not a
+    -- key of the same project.
+    rotated_from        text,
+    rotation_expires_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_project
+    ON api_keys (project_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_workspace
+    ON api_keys (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_service_account
+    ON api_keys (service_account_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_created_by
+    ON api_keys (created_by);
+CREATE INDEX IF NOT EXISTS idx_api_keys_revoked_by
+    ON api_keys (revoked_by);
+-- The resolver's index: every /v1 request looks a key up by public_id, and
+-- the overwhelming majority of rows it will ever read are active ones.
+CREATE INDEX IF NOT EXISTS idx_api_keys_active
+    ON api_keys (public_id) WHERE status = 'active';
+-- The rotation sweep's index: only live keys that carry a deadline, which is
+-- a handful of rows in a table that grows with every key ever issued.
+CREATE INDEX IF NOT EXISTS idx_api_keys_rotation_due
+    ON api_keys (rotation_expires_at)
+    WHERE status = 'active' AND rotation_expires_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS api_responses (
+    id                   text        PRIMARY KEY,
+    project_id           text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    key_id               text        REFERENCES api_keys(id) ON DELETE SET NULL,
+    workspace_id         text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    model                text        NOT NULL,
+    status               text        NOT NULL DEFAULT 'queued'
+                         CONSTRAINT api_responses_status CHECK
+                         (status IN ('queued', 'in_progress', 'completed', 'failed', 'cancelled')),
+    background           boolean     NOT NULL DEFAULT false,
+    streamed             boolean     NOT NULL DEFAULT false,
+    request_id           text        NOT NULL,
+    fingerprint          text        NOT NULL DEFAULT '',
+    instructions_present boolean     NOT NULL DEFAULT false,
+    -- NULL means NOT MEASURED, never zero: llm.get_usage() returns None when
+    -- the engine reported no counts, and a zero there is both a lie and an
+    -- under-charge (CONTRACT-3 §9). Below zero is neither: these two are what
+    -- the daily ledger is bumped from, so a negative count is a quota refund
+    -- nobody authorised.
+    input_tokens         integer
+                         CONSTRAINT api_responses_input_tokens CHECK
+                         (input_tokens IS NULL OR input_tokens >= 0),
+    output_tokens        integer
+                         CONSTRAINT api_responses_output_tokens CHECK
+                         (output_tokens IS NULL OR output_tokens >= 0),
+    ttft_ms              integer,
+    duration_ms          integer,
+    error_code           text,
+    error_message        text,
+    output_text          text,
+    cancel_requested     boolean     NOT NULL DEFAULT false,
+    metadata             jsonb       NOT NULL DEFAULT '{}'::jsonb
+                         CONSTRAINT api_responses_metadata CHECK
+                         (jsonb_typeof(metadata) = 'object'),
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    started_at           timestamptz,
+    completed_at         timestamptz,
+    expires_at           timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_responses_project
+    ON api_responses (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_responses_workspace
+    ON api_responses (workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_responses_key
+    ON api_responses (key_id);
+-- The two sweeps: what is still running (a restart has to finish or fail it)
+-- and what retention is due to remove.
+CREATE INDEX IF NOT EXISTS idx_api_responses_open
+    ON api_responses (status, created_at) WHERE status IN ('queued', 'in_progress');
+CREATE INDEX IF NOT EXISTS idx_api_responses_expires
+    ON api_responses (expires_at) WHERE expires_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS api_idempotency (
+    id          bigint      GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    project_id  text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    endpoint    text        NOT NULL,
+    idem_key    text        NOT NULL,
+    fingerprint text        NOT NULL,
+    response_id text        REFERENCES api_responses(id) ON DELETE CASCADE,
+    state       text        NOT NULL DEFAULT 'in_flight'
+                CONSTRAINT api_idempotency_state CHECK
+                (state IN ('in_flight', 'completed')),
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at  timestamptz NOT NULL
+);
+-- The claim. `INSERT ... ON CONFLICT DO NOTHING RETURNING id` against this
+-- unique index is the race-free primitive the whole idempotency contract
+-- rests on (CONTRACT-3 §13): zero rows back means somebody else claimed it,
+-- with no window between a SELECT and an INSERT for a second request to
+-- squeeze the model call through.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_idempotency_claim
+    ON api_idempotency (project_id, endpoint, idem_key);
+CREATE INDEX IF NOT EXISTS idx_api_idempotency_expires
+    ON api_idempotency (expires_at);
+CREATE INDEX IF NOT EXISTS idx_api_idempotency_response
+    ON api_idempotency (response_id);
+
+CREATE TABLE IF NOT EXISTS api_usage_minute (
+    project_id    text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    key_id        text        NOT NULL,
+    bucket        timestamptz NOT NULL,
+    requests      integer     NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_minute_requests CHECK (requests >= 0),
+    input_tokens  bigint      NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_minute_input_tokens CHECK (input_tokens >= 0),
+    output_tokens bigint      NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_minute_output_tokens CHECK (output_tokens >= 0),
+    PRIMARY KEY (project_id, key_id, bucket)
+);
+-- Pruning reads by bucket alone; the primary key cannot serve that.
+CREATE INDEX IF NOT EXISTS idx_api_usage_minute_bucket
+    ON api_usage_minute (bucket);
+
+CREATE TABLE IF NOT EXISTS api_usage_daily (
+    project_id    text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    day           date        NOT NULL,
+    requests      integer     NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_daily_requests CHECK (requests >= 0),
+    input_tokens  bigint      NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_daily_input_tokens CHECK (input_tokens >= 0),
+    output_tokens bigint      NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_daily_output_tokens CHECK (output_tokens >= 0),
+    errors        integer     NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_daily_errors CHECK (errors >= 0),
+    rate_limited  integer     NOT NULL DEFAULT 0
+                  CONSTRAINT api_usage_daily_rate_limited CHECK (rate_limited >= 0),
+    PRIMARY KEY (project_id, day)
+);
+CREATE INDEX IF NOT EXISTS idx_api_usage_daily_day
+    ON api_usage_daily (day);
+
+CREATE TABLE IF NOT EXISTS api_webhook_endpoints (
+    id                         text        PRIMARY KEY,
+    project_id                 text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    workspace_id               text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    url                        text        NOT NULL,
+    events                     jsonb       NOT NULL DEFAULT '[]'::jsonb
+                               CONSTRAINT api_webhook_endpoints_events CHECK
+                               (CASE WHEN jsonb_typeof(events) = 'array' THEN jsonb_array_length(events) <= 256 ELSE false END),
+    status                     text        NOT NULL DEFAULT 'active'
+                               CONSTRAINT api_webhook_endpoints_status CHECK
+                               (status IN ('active', 'disabled')),
+    -- The signing secret is stored, not hashed, because the SERVER computes
+    -- the signature on every delivery and therefore needs the value back. It
+    -- is shown once in the console and returned by no API.
+    secret                     text        NOT NULL,
+    previous_secret            text,
+    previous_secret_expires_at timestamptz,
+    include_output             boolean     NOT NULL DEFAULT false,
+    created_by                 integer     REFERENCES users(id) ON DELETE SET NULL,
+    created_at                 timestamptz NOT NULL DEFAULT now(),
+    last_delivery_at           timestamptz,
+    last_delivery_status       text,
+    consecutive_failures       integer     NOT NULL DEFAULT 0
+                               CONSTRAINT api_webhook_endpoints_consecutive_failures CHECK
+                               (consecutive_failures >= 0),
+    disabled_at                timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_webhook_endpoints_project
+    ON api_webhook_endpoints (project_id);
+-- `workspace_id` here is not only the cascade path from `workspaces`: it is
+-- the tenancy predicate of `list_webhook_endpoints`, `update_webhook_endpoint`
+-- and `delete_webhook_endpoint`, so every console read of this table uses it.
+CREATE INDEX IF NOT EXISTS idx_api_webhook_endpoints_workspace
+    ON api_webhook_endpoints (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_webhook_endpoints_created_by
+    ON api_webhook_endpoints (created_by);
+
+CREATE TABLE IF NOT EXISTS api_webhook_deliveries (
+    id              text        PRIMARY KEY,
+    event_id        text        NOT NULL,
+    endpoint_id     text        NOT NULL REFERENCES api_webhook_endpoints(id) ON DELETE CASCADE,
+    project_id      text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    event_type      text        NOT NULL,
+    response_id     text,
+    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb
+                    CONSTRAINT api_webhook_deliveries_payload CHECK
+                    (jsonb_typeof(payload) = 'object'),
+    status          text        NOT NULL DEFAULT 'pending'
+                    CONSTRAINT api_webhook_deliveries_status CHECK
+                    (status IN ('pending', 'delivered', 'failed', 'dropped')),
+    attempt         integer     NOT NULL DEFAULT 0
+                    CONSTRAINT api_webhook_deliveries_attempt CHECK (attempt >= 0),
+    -- At least one: `due_webhook_deliveries` selects on `attempt <
+    -- max_attempts`, so a delivery queued with 0 is never due and never
+    -- fails — it is silently dropped, which is the one outcome a delivery
+    -- history exists to make impossible (CONTRACT-3 §14).
+    max_attempts    integer     NOT NULL DEFAULT 6
+                    CONSTRAINT api_webhook_deliveries_max_attempts CHECK (max_attempts >= 1),
+    http_status     integer,
+    error           text,
+    next_attempt_at timestamptz,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    delivered_at    timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_webhook_deliveries_endpoint
+    ON api_webhook_deliveries (endpoint_id, created_at DESC);
+-- Deleting a project cascades to its deliveries, and this is the only index
+-- that leads with `project_id` — the endpoint index above cannot serve it.
+CREATE INDEX IF NOT EXISTS idx_api_webhook_deliveries_project
+    ON api_webhook_deliveries (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_webhook_deliveries_due
+    ON api_webhook_deliveries (next_attempt_at) WHERE status = 'pending';
+-- `event_id` is what makes a consumer able to be idempotent, so the same
+-- event must never be queued to the same endpoint twice — a retry that lost
+-- its acknowledgement enqueues nothing rather than a duplicate.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_webhook_deliveries_event
+    ON api_webhook_deliveries (endpoint_id, event_id);
+
+-- The database may only NARROW the code-level model registry (CONTRACT-3
+-- §15). A row here can disable a model the code declares; a row for an id the
+-- code does not declare is ignored by `public_model_overrides`, so no amount
+-- of database access can publish an internal model.
+--
+-- PER WORKSPACE (2026-09-13). `id` alone was the primary key, so the one row
+-- for `techsara-35b` was every workspace's row, and a super admin whose
+-- authority is one workspace's could disable the model for all of them. The
+-- workspace leads the primary key, which is also the index the ON DELETE
+-- CASCADE from `workspaces` walks. `id` keeps its name because it is the
+-- public model id the registry declares, not a surrogate key.
+CREATE TABLE IF NOT EXISTS public_models (
+    workspace_id text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    id           text        NOT NULL,
+    enabled      boolean     NOT NULL DEFAULT true,
+    updated_by   integer     REFERENCES users(id) ON DELETE SET NULL,
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, id)
+);
+CREATE INDEX IF NOT EXISTS idx_public_models_updated_by
+    ON public_models (updated_by);
+
+-- Holds the generated API-key pepper when API_KEY_PEPPER is not configured,
+-- so a fresh install works without a deploy-time secret. This is documented
+-- as the WEAKER of the two options: the pepper then lives in the same
+-- database as the digests it protects, which buys nothing against an
+-- attacker who has the whole database (CONTRACT-3 §5, STANDARDS.md).
+CREATE TABLE IF NOT EXISTS platform_secrets (
+    name       text        PRIMARY KEY,
+    value      text        NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -1864,6 +2368,7 @@ _MIGRATIONS: tuple = (
     (31, _MIGRATION_V31),
     (32, _MIGRATION_V32),
     (33, _MIGRATION_V33),
+    (34, _MIGRATION_V34),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -6149,3 +6654,2241 @@ def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
         trace["events"].append(event)
     return trace
 
+
+# ---------------------------------------------------------------------------
+# V34: the developer platform — projects, service accounts, keys, responses,
+# idempotency, usage ledgers, webhooks, model overrides, platform secrets
+#
+# TWO RULES HOLD FOR EVERY FUNCTION BELOW, and both are about tenancy.
+#
+# 1. A read that takes a caller-supplied id ALSO takes the workspace (or the
+#    project) that must own it, and the owner goes in the WHERE clause rather
+#    than into an `if` after the fetch. OWASP API1 is explicit that the check
+#    belongs inside the function that does the lookup: a handler that forgets
+#    to call a guard is the single most common way one tenant reads another's
+#    row, and a predicate cannot be forgotten by a handler that does not know
+#    it exists. A row that belongs to somebody else is therefore
+#    indistinguishable here from a row that does not exist — which is also the
+#    404-not-403 rule the public surface needs (CONTRACT-3 §9).
+# 2. A write that attaches a child to a parent derives the parent's tenancy
+#    from the parent row IN THE SAME STATEMENT (`INSERT ... SELECT ... FROM
+#    api_projects p WHERE p.id = %s AND p.workspace_id = %s`), so a caller
+#    cannot create a key in project A carrying workspace B's id, and there is
+#    no window between a check and an insert for the project to be deleted.
+#
+# `api_key_by_public_id` is the one CALLER-REACHABLE read with no tenant
+# argument, and it is the exception that proves the rule: `public_id` IS the
+# credential the caller presented, not an id it chose, and resolving it is how
+# the tenant gets decided in the first place (CONTRACT-3 §4).
+#
+# Three more functions take no tenant, and none of them is reachable from a
+# request: `due_webhook_deliveries` and `expire_rotated_keys` are the server's
+# own sweeps over its own queues, and `prune_api_platform` is retention. They
+# are deployment-scheduled, they take no caller-supplied id at all, and each
+# says so in its docstring. A sweep with no tenant is only safe if every row
+# it acts on decides its OWN fate: `expire_rotated_keys` once joined one key
+# to another by a public id a different workspace could write, and revoked
+# the other workspace's key (2026-09-13); it now reads a deadline off the
+# very row it revokes. `touch_api_key` takes a bare key id as well, and is
+# safe for a different reason — the id it is given is the one the RESOLVER
+# just proved by verifying the presented secret, never one a caller named;
+# no console route may call it. `record_webhook_attempt` sits between the two
+# worlds — the sweep calls it with a bare delivery id, a console retry button
+# must pass `project_id` — so the predicate is optional there and the
+# docstring says which caller owes it. This paragraph used to claim there was
+# exactly one unscoped accessor, which the 2026-09-12 verifier read as a
+# promise and found untrue; a rule stated more simply than the code follows it
+# is worse than no rule, because the next author trusts it.
+# ---------------------------------------------------------------------------
+
+
+def _api_id(prefix: str) -> str:
+    """`proj_<24 hex>` — the id shapes SCHEMA-V34 fixes for each table.
+
+    CSPRNG, not a sequence: these ids travel in customer code, request logs
+    and webhook payloads, and a guessable one turns every path parameter into
+    an enumeration oracle (OWASP API1). `secrets` is imported here rather than
+    at module scope for the same reason `anyio` is in `run_in_thread` — this
+    module is imported by everything and its import list is deliberately flat.
+    """
+    import secrets
+
+    return f"{prefix}_{secrets.token_hex(12)}"
+
+
+def _api_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """`_row`, plus the daily ledger's `day`.
+
+    psycopg returns a `date` for a `date` column, which `_iso` leaves alone
+    because it is not a `datetime`; every caller of the usage API wants the
+    same ISO string it gets for every other temporal column.
+    """
+    if row is None:
+        return None
+    out = _row(row) or {}
+    day = out.get("day")
+    if day is not None and not isinstance(day, str) and hasattr(day, "isoformat"):
+        out["day"] = day.isoformat()
+    return out
+
+
+def _api_rows(rows: Sequence[Any]) -> List[dict]:
+    return [_api_row(row) for row in rows]  # type: ignore[misc]
+
+
+def _minute_bucket(at: Optional[datetime] = None) -> datetime:
+    """The minute a usage bump belongs to, truncated in Python.
+
+    Truncated here rather than with `date_trunc(... now())` so a test can pin
+    a bucket and so two statements in one request cannot straddle a minute
+    boundary between them.
+    """
+    moment = at or _now()
+    return moment.replace(second=0, microsecond=0)
+
+
+def _as_day(value: Any) -> Any:
+    """A `date` from a date, a datetime or an ISO string; ValueError otherwise."""
+    if isinstance(value, datetime):
+        return value.date()
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        return value
+    return datetime.fromisoformat(str(value)[:10]).date()
+
+
+#: What `_json_array` will accept. A `str` is deliberately absent even though
+#: it is iterable: `list("techsara-35b")` is a 12-element allowlist of single
+#: characters, and that is not a typo anybody catches by reading the row back.
+_JSON_ARRAY_TYPES = (list, tuple, set, frozenset)
+#: The bound on every allow-list column. The entry count matches the CHECK in
+#: `_MIGRATION_V34`; change both or neither.
+_JSON_ARRAY_MAX_ITEMS = 256
+_JSON_ARRAY_MAX_ITEM_CHARS = 512
+
+
+def _json_array(column: str, value: Any) -> Jsonb:
+    """A jsonb ARRAY of strings, or ValueError — never a reshaped value.
+
+    Every column this guards is an allow-list that an authorization decision
+    is read from: `allowed_models`, `allowed_origins`, `ip_allowlist`,
+    `scopes`, `events`. The generic `_json_param` is wrong for all of them,
+    because its job is to keep arbitrary metadata addressable — a string that
+    will not parse as JSON becomes `{"raw": …}` rather than being lost. Doing
+    that to an allowlist turns `model in row["allowed_models"]` into a test
+    against an object's KEYS, and doing `list(value)` to it turns a model id
+    into its letters. The 2026-09-12 verifier measured both. The DDL now
+    refuses a non-array too; this is the half that gives the caller a sentence
+    naming the column instead of an IntegrityError naming a constraint.
+
+    A set is accepted because `apiplatform.scopes.parse_scopes` returns a
+    frozenset and making every caller remember `scope_names()` would be a
+    trap, but it is SORTED on the way in: a console that renders scopes must
+    not reorder them between two page loads, and a test that asserts on the
+    stored row must not depend on a hash seed.
+
+    The types are checked BEFORE the sort (2026-09-13): `sorted({"a", 1})`
+    raises TypeError, so a mixed set used to escape as a 500 instead of the
+    ValueError a route maps to 400. The size is bounded too — at most
+    `_JSON_ARRAY_MAX_ITEMS` entries of `_JSON_ARRAY_MAX_ITEM_CHARS` characters
+    — because 5,000 thousand-character model ids were accepted and the
+    resolver reads the project row on every `/v1` request. The DDL holds the
+    entry count as well; only the per-entry length lives here alone.
+    """
+    if not isinstance(value, _JSON_ARRAY_TYPES):
+        raise ValueError(
+            f"{column} must be a list of strings, not {type(value).__name__} — "
+            "an allowlist is read as an array on every request path"
+        )
+    raw = list(value)
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(
+                f"{column} may only contain strings; got {type(item).__name__}"
+            )
+        if len(item) > _JSON_ARRAY_MAX_ITEM_CHARS:
+            raise ValueError(
+                f"{column} entries may be at most {_JSON_ARRAY_MAX_ITEM_CHARS} characters"
+            )
+    if len(raw) > _JSON_ARRAY_MAX_ITEMS:
+        raise ValueError(
+            f"{column} may hold at most {_JSON_ARRAY_MAX_ITEMS} entries; got {len(raw)}"
+        )
+    items = sorted(raw) if isinstance(value, (set, frozenset)) else raw
+    return Jsonb([str(item) for item in items], dumps=_dumps_jsonb)
+
+
+def _json_object(column: str, value: Any) -> Jsonb:
+    """A jsonb OBJECT, or ValueError. The mirror of `_json_array` for the
+    columns the schema declares as objects (`metadata`, `payload`): a list
+    stored in one of them is a KeyError in whichever page reads it next, and
+    a non-string key is a TypeError inside `json.dumps` — a 500 at write time
+    for a value the caller could have been told about."""
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"{column} must be an object, not {type(value).__name__}"
+        )
+    for key in value:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"{column} keys must be strings; got {type(key).__name__}"
+            )
+    return Jsonb(value, dumps=_dumps_jsonb)
+
+
+def _insert_optional(
+    columns: List[str], params: List[Any], values: Dict[str, Any]
+) -> None:
+    """Append the values a caller actually supplied.
+
+    A column the caller left as None is omitted from the INSERT so the DDL's
+    DEFAULT applies. Spelling the defaults again in Python would mean two
+    places to change the day a limit moves, and the one that is wrong is
+    always the one that is not in the migration.
+    """
+    for column, value in values.items():
+        if value is None:
+            continue
+        columns.append(column)
+        params.append(value)
+
+
+#: Columns the console may change on a project. `environment` is deliberately
+#: absent: keys are minted `tsk_live_` / `tsk_test_` from it, and flipping it
+#: under issued keys would make a live key present itself as a test key
+#: (CONTRACT-3 §5). `workspace_id` is absent for the obvious reason.
+_API_PROJECT_UPDATABLE = frozenset({
+    "name", "status", "allowed_models", "allowed_origins", "ip_allowlist",
+    "rpm", "input_tpm", "output_tpm", "max_concurrency", "daily_token_quota",
+    "max_input_tokens", "max_output_tokens", "retention_days", "metadata",
+})
+#: Split by SHAPE, not just by "this one is jsonb": the three allow-lists are
+#: arrays an authorization decision is read from and `metadata` is a free-form
+#: object, so they are validated by different guards.
+_API_PROJECT_JSON_ARRAYS = frozenset({"allowed_models", "allowed_origins", "ip_allowlist"})
+_API_PROJECT_JSON_OBJECTS = frozenset({"metadata"})
+_API_PROJECT_JSON = _API_PROJECT_JSON_ARRAYS | _API_PROJECT_JSON_OBJECTS
+
+_API_RESPONSE_UPDATABLE = frozenset({
+    "status", "streamed", "input_tokens", "output_tokens", "ttft_ms",
+    "duration_ms", "error_code", "error_message", "output_text",
+    "cancel_requested", "metadata", "started_at", "completed_at", "expires_at",
+})
+_API_RESPONSE_JSON = frozenset({"metadata"})
+_API_RESPONSE_TEXT = frozenset({"error_code", "error_message", "output_text"})
+_API_RESPONSE_TERMINAL = ("completed", "failed", "cancelled")
+
+#: The columns a LIST read of `api_keys` returns. Spelled out rather than
+#: `SELECT *` because `key_hash` must not be in it: it is the HMAC digest the
+#: resolver compares against, and the 2026-09-12 verifier found every row of
+#: `list_api_keys` carrying it under a docstring that claimed "no secret
+#: material beyond last_four is ever readable". Nothing leaked, because no
+#: route consumed the function yet — the finding is that the layer was telling
+#: the next wave's author it was safe to serialise the dict straight out to a
+#: console page.
+#:
+#: An explicit list is also the safer failure: the day somebody adds a column
+#: to this table, forgetting to add it here shows up as a missing field in a
+#: page, while a `SELECT *` would have published it. `api_key_by_public_id`
+#: keeps the full row, because verifying a presented secret against the digest
+#: is the one thing that genuinely needs it.
+_API_KEY_PUBLIC_COLUMNS = (
+    "id", "public_id", "last_four", "project_id", "service_account_id",
+    "workspace_id", "environment", "name", "scopes", "allowed_models", "rpm",
+    "max_concurrency", "status", "expires_at", "created_by", "created_at",
+    "last_used_at", "last_used_ip", "revoked_at", "revoked_by", "rotated_from",
+    "rotation_expires_at",
+)
+
+#: The same rule for webhook endpoints, and here the column really is a live
+#: secret rather than a digest: `secret` and `previous_secret` are stored in
+#: clear because the SERVER signs every delivery with them (SCHEMA-V34.md says
+#: of that column "it is shown once in the console and returned by no API",
+#: which `list_webhook_endpoints` was contradicting). `previous_secret_expires_at`
+#: stays — a date is not a credential, and the console has to show when an
+#: overlap ends. `due_webhook_deliveries` keeps the full read, because it is
+#: the sweep that computes the signature; it is the ONLY accessor that returns
+#: a secret, and create/update project through this list too (2026-09-13).
+#: A consumer reads `has_secret` / `has_previous_secret`, never
+#: `row.get("secret")` — which is falsy on every row this module returns.
+_WEBHOOK_ENDPOINT_PUBLIC_COLUMNS = (
+    "id", "project_id", "workspace_id", "url", "events", "status",
+    "previous_secret_expires_at", "include_output", "created_by", "created_at",
+    "last_delivery_at", "last_delivery_status", "consecutive_failures",
+    "disabled_at",
+)
+
+#: …plus the FACT of a secret, which is not the secret. The console shows
+#: "this endpoint is signed" and "a rotation is in flight" without any page
+#: ever holding a forgery primitive — a signing secret in a response body lets
+#: whoever reads it post a perfectly signed "your job finished" event to the
+#: customer's endpoint. Derived in SQL rather than in Python precisely so that
+#: the value itself never leaves PostgreSQL on this path.
+_WEBHOOK_ENDPOINT_SECRET_FLAGS = (
+    "(secret IS NOT NULL AND secret <> '') AS has_secret, "
+    "(previous_secret IS NOT NULL AND previous_secret <> '') AS has_previous_secret"
+)
+_WEBHOOK_ENDPOINT_PUBLIC_SELECT = (
+    ", ".join(_WEBHOOK_ENDPOINT_PUBLIC_COLUMNS) + ", " + _WEBHOOK_ENDPOINT_SECRET_FLAGS
+)
+
+_WEBHOOK_ENDPOINT_UPDATABLE = frozenset({
+    "url", "events", "status", "secret", "previous_secret",
+    "previous_secret_expires_at", "include_output",
+})
+_WEBHOOK_ENDPOINT_JSON = frozenset({"events"})
+
+_API_ENVIRONMENTS = ("test", "live")
+
+
+# --- projects ---------------------------------------------------------------
+
+
+def create_api_project(
+    workspace_id: str,
+    name: str,
+    environment: str = "live",
+    *,
+    project_id: Optional[str] = None,
+    created_by: Optional[int] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    allowed_origins: Optional[Sequence[str]] = None,
+    ip_allowlist: Optional[Sequence[str]] = None,
+    rpm: Optional[int] = None,
+    input_tpm: Optional[int] = None,
+    output_tpm: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
+    daily_token_quota: Optional[int] = None,
+    max_input_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    retention_days: Optional[int] = None,
+    metadata: Optional[dict] = None,
+    is_playground: bool = False,
+) -> dict:
+    """Create a project in `workspace_id`; returns the stored row.
+
+    Raises ValueError for an unknown environment and db.IntegrityError for a
+    name already taken in this workspace (unique on `lower(name)`), a second
+    playground row in the same workspace, or a workspace that does not exist.
+
+    `is_playground=True` marks the workspace's console-playground allowance
+    row (V34 `api_projects.is_playground`). Only server code that mints that
+    row may pass it: it is a keyword a route has to spell out, it is not in
+    `_API_PROJECT_UPDATABLE`, so no PATCH body can set or clear it, and the
+    row it marks is outside the name index, so a customer project's name can
+    never collide with it.
+    """
+    if environment not in _API_ENVIRONMENTS:
+        raise ValueError(f"api_projects.environment must be one of {_API_ENVIRONMENTS}")
+    columns = ["id", "workspace_id", "name", "environment"]
+    params: List[Any] = [
+        project_id or _api_id("proj"), workspace_id, _text(name), environment,
+    ]
+    _insert_optional(columns, params, {
+        "allowed_models":
+            _json_array("api_projects.allowed_models", allowed_models)
+            if allowed_models is not None else None,
+        "allowed_origins":
+            _json_array("api_projects.allowed_origins", allowed_origins)
+            if allowed_origins is not None else None,
+        "ip_allowlist":
+            _json_array("api_projects.ip_allowlist", ip_allowlist)
+            if ip_allowlist is not None else None,
+        "rpm": None if rpm is None else int(rpm),
+        "input_tpm": None if input_tpm is None else int(input_tpm),
+        "output_tpm": None if output_tpm is None else int(output_tpm),
+        "max_concurrency": None if max_concurrency is None else int(max_concurrency),
+        "daily_token_quota": None if daily_token_quota is None else int(daily_token_quota),
+        "max_input_tokens": None if max_input_tokens is None else int(max_input_tokens),
+        "max_output_tokens": None if max_output_tokens is None else int(max_output_tokens),
+        "retention_days": None if retention_days is None else int(retention_days),
+        "metadata":
+            _json_object("api_projects.metadata", metadata)
+            if metadata is not None else None,
+        "created_by": None if created_by is None else int(created_by),
+        "is_playground": True if is_playground is True else None,
+    })
+    placeholders = ", ".join(["%s"] * len(columns))
+    with connection() as con:
+        row = con.execute(
+            f"INSERT INTO api_projects ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) RETURNING *",
+            params,
+        ).fetchone()
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def get_api_project(project_id: str, workspace_id: str) -> Optional[dict]:
+    """One project, or None — including when it belongs to another workspace."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM api_projects WHERE id = %s AND workspace_id = %s",
+            (project_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def list_api_projects(
+    workspace_id: str,
+    *,
+    include_disabled: bool = True,
+    include_playground: bool = True,
+    limit: int = 100,
+) -> List[dict]:
+    """A workspace's projects, newest first. `limit` is clamped server-side:
+    a client-supplied page size is a denial-of-service primitive (OWASP API4).
+
+    `include_playground=False` leaves out the console-playground allowance
+    row, filtered in SQL so the page size counts customer projects only. The
+    default stays True so no existing caller's result changes."""
+    bounded = max(1, min(int(limit), 500))
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM api_projects WHERE workspace_id = %s "
+            "AND (%s OR status = 'active') AND (%s OR NOT is_playground) "
+            "ORDER BY created_at DESC, id LIMIT %s",
+            (workspace_id, bool(include_disabled), bool(include_playground), bounded),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+def get_playground_project(workspace_id: str) -> Optional[dict]:
+    """The workspace's console-playground allowance row, or None before its
+    first run. At most one exists (`idx_api_projects_one_playground`)."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM api_projects WHERE workspace_id = %s AND is_playground",
+            (workspace_id,),
+        ).fetchone()
+    return _api_row(row)
+
+
+def update_api_project(project_id: str, workspace_id: str, /, **fields: Any) -> Optional[dict]:
+    """Change allow-listed project columns; None when it is not this
+    workspace's project.
+
+    Raises ValueError for a column that may not be set, and for a value whose
+    SHAPE is wrong — an `allowed_models` that is not a list of strings, a
+    `metadata` that is not an object. `**fields` is what a route builds from a
+    request body, so "it arrived as a string" is the normal case rather than
+    the exotic one, and the old behaviour (store `{"raw": "techsara-35b"}` and
+    carry on) left the project with an allowlist no reader can evaluate.
+    Raises db.IntegrityError for a value the schema refuses — a negative
+    `retention_days` or `rpm` — which is the constraint answering, not this
+    function, so the same refusal holds for psql.
+    """
+    # The tenancy arguments are POSITIONAL-ONLY on purpose. `**fields` is what
+    # a caller builds from a request body, and a body carrying its own
+    # `workspace_id` would otherwise collide with the argument that scopes the
+    # statement — a TypeError at best, and at worst a reviewer believing the
+    # tenancy value came from the caller's session when it came from the body.
+    # After the `/`, such a key lands in `fields` and is refused as not
+    # updatable, which is the honest answer.
+    sets: List[str] = []
+    params: List[Any] = []
+    for key, value in fields.items():
+        if key not in _API_PROJECT_UPDATABLE:
+            raise ValueError(f"api_projects.{key} is not updatable")
+        if key in _API_PROJECT_JSON_ARRAYS:
+            # None means "clear it", which is not the same as a bad shape: an
+            # explicit null from a PATCH empties the list, which each reader
+            # already has a defined meaning for (CONTRACT-3 §3: an empty
+            # `allowed_origins` restricts nothing). A string or an object has
+            # no defined meaning at all, which is why one is refused and the
+            # other is not.
+            value = _json_array(f"api_projects.{key}", value if value is not None else [])
+        elif key in _API_PROJECT_JSON_OBJECTS:
+            value = _json_object(f"api_projects.{key}", value if value is not None else {})
+        elif key == "name":
+            value = _text(value)
+        sets.append(f"{key} = %s")
+        params.append(value)
+    if not sets:
+        return get_api_project(project_id, workspace_id)
+    if "status" in fields:
+        # The moment of disabling is evidence, so it is recorded here rather
+        # than left to whichever caller remembers; re-disabling keeps the
+        # first timestamp.
+        sets.append(
+            "disabled_at = CASE WHEN %s = 'disabled' "
+            "THEN COALESCE(disabled_at, now()) ELSE NULL END"
+        )
+        params.append(fields["status"])
+    params.extend([project_id, workspace_id])
+    with connection() as con:
+        row = con.execute(
+            f"UPDATE api_projects SET {', '.join(sets)} "
+            "WHERE id = %s AND workspace_id = %s RETURNING *",
+            params,
+        ).fetchone()
+    return _api_row(row)
+
+
+# --- service accounts -------------------------------------------------------
+
+
+def create_service_account(
+    project_id: str,
+    workspace_id: str,
+    name: str,
+    *,
+    description: str = "",
+    scopes: Optional[Sequence[str]] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    created_by: Optional[int] = None,
+    service_account_id: Optional[str] = None,
+) -> dict:
+    """Create a service account inside a project this workspace owns.
+
+    The workspace on the new row is copied from the project row in the same
+    statement, so the two can never disagree. Raises ValueError when the
+    project is not this workspace's.
+    """
+    columns = ["id", "project_id", "workspace_id", "name", "description"]
+    selects = ["%s", "p.id", "p.workspace_id", "%s", "%s"]
+    params: List[Any] = [
+        service_account_id or _api_id("svc"), _text(name), _text(description) or "",
+    ]
+    optional = {
+        "scopes":
+            _json_array("api_service_accounts.scopes", scopes)
+            if scopes is not None else None,
+        "allowed_models":
+            _json_array("api_service_accounts.allowed_models", allowed_models)
+            if allowed_models is not None else None,
+        "created_by": None if created_by is None else int(created_by),
+    }
+    for column, value in optional.items():
+        if value is None:
+            continue
+        columns.append(column)
+        selects.append("%s")
+        params.append(value)
+    params.extend([project_id, workspace_id])
+    with connection() as con:
+        row = con.execute(
+            f"INSERT INTO api_service_accounts ({', '.join(columns)}) "
+            f"SELECT {', '.join(selects)} FROM api_projects p "
+            "WHERE p.id = %s AND p.workspace_id = %s RETURNING *",
+            params,
+        ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"create_service_account: no api_project {project_id!r} in this workspace"
+        )
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def list_service_accounts(project_id: str, workspace_id: str) -> List[dict]:
+    """A project's service accounts, oldest first. Both predicates are load
+    bearing: `project_id` alone would show another workspace's accounts to
+    anybody who could guess a project id."""
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM api_service_accounts WHERE project_id = %s AND workspace_id = %s "
+            "ORDER BY created_at, id",
+            (project_id, workspace_id),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+def get_service_account(service_account_id: str, workspace_id: str) -> Optional[dict]:
+    """One service account, or None — including when it is another
+    workspace's."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM api_service_accounts WHERE id = %s AND workspace_id = %s",
+            (service_account_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def set_service_account_status(
+    service_account_id: str, workspace_id: str, status: str
+) -> Optional[dict]:
+    """Disable or re-enable a service account; None when it is not this
+    workspace's.
+
+    This is the switch an operator reaches for when an integration misbehaves
+    at three in the morning: CONTRACT-3 §4 resolves the service account on
+    every single `/v1` request and answers 401 when it is disabled, so the
+    flip stops every key that hangs off the account at once, with no cached
+    state anywhere and nothing to restart. It does NOT revoke those keys, and
+    that is the point — re-enabling brings the same integration back without
+    a customer having to redeploy a new credential. A COMPROMISE is the other
+    operation: revoke each key (`revoke_api_key`), because a disabled account
+    whose keys are still valid is one careless re-enable away from being live
+    again.
+
+    `disabled_at` is stamped here rather than left to the caller, and a second
+    disable keeps the first timestamp — the same rule `update_api_project`
+    follows, because the moment it happened is evidence.
+    """
+    if status not in ("active", "disabled"):
+        raise ValueError(
+            "set_service_account_status: status must be 'active' or 'disabled'"
+        )
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_service_accounts SET status = %s, "
+            "    disabled_at = CASE WHEN %s = 'disabled' "
+            "                       THEN COALESCE(disabled_at, now()) ELSE NULL END "
+            "WHERE id = %s AND workspace_id = %s RETURNING *",
+            (status, status, service_account_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+# --- keys -------------------------------------------------------------------
+
+
+def create_api_key(
+    project_id: str,
+    workspace_id: str,
+    name: str,
+    public_id: str,
+    key_hash: str,
+    last_four: str,
+    *,
+    service_account_id: Optional[str] = None,
+    scopes: Optional[Sequence[str]] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    rpm: Optional[int] = None,
+    max_concurrency: Optional[int] = None,
+    expires_at: Optional[datetime] = None,
+    created_by: Optional[int] = None,
+    key_id: Optional[str] = None,
+    environment: Optional[str] = None,
+    rotated_from: Optional[str] = None,
+) -> dict:
+    """Store a minted key. `key_hash` is HMAC-SHA256(pepper, secret) — the
+    plaintext secret is never passed to this module, let alone stored.
+
+    The environment is taken from the PROJECT, not from the caller: a key
+    whose prefix says `tsk_test_` while its project is live would be a lie
+    told by whichever caller assembled the string. Passing `environment`
+    asserts what the caller believes it to be and raises ValueError if the
+    project disagrees. A service account, when given, must belong to the same
+    project (ValueError otherwise).
+
+    `rotated_from`, when given, must be the public id of a key IN THE SAME
+    PROJECT, checked in the INSERT's own WHERE clause exactly like the service
+    account (rule 2 above); ValueError otherwise. On 2026-09-13 the verifier
+    minted a key in workspace B naming workspace A's public id — which CONTRACT
+    §5 calls safe to log — and the rotation sweep revoked A's live key. The
+    sweep no longer reads this column at all, and this check is what keeps the
+    history it records honest.
+
+    THERE IS NO `rotation_expires_at` ARGUMENT, and its absence is the fix.
+    That column is the deadline of the row that carries it (the resolver reads
+    it that way), so the only row a rotation may date is the OLD one — through
+    `update_api_key_rotation`. Written here, onto the replacement, a zero-
+    overlap rotation would have refused the brand-new key the instant it was
+    minted. A caller that still passes it gets a TypeError, not a silent
+    success.
+
+    The returned row carries no `key_hash` (see `_API_KEY_PUBLIC_COLUMNS`):
+    this is the row a show-once console flow is most likely to serialise, and
+    the caller already holds the plaintext it needs to show.
+    """
+    if environment is not None and environment not in _API_ENVIRONMENTS:
+        raise ValueError(f"api_keys.environment must be one of {_API_ENVIRONMENTS}")
+    columns = [
+        "id", "public_id", "key_hash", "last_four", "project_id",
+        "workspace_id", "environment", "name", "service_account_id",
+    ]
+    selects = ["%s", "%s", "%s", "%s", "p.id", "p.workspace_id", "p.environment", "%s", "%s"]
+    params: List[Any] = [
+        key_id or _api_id("key"), public_id, key_hash, _text(last_four) or "",
+        _text(name), service_account_id,
+    ]
+    optional = {
+        "scopes":
+            _json_array("api_keys.scopes", scopes) if scopes is not None else None,
+        "allowed_models":
+            _json_array("api_keys.allowed_models", allowed_models)
+            if allowed_models is not None else None,
+        "rpm": None if rpm is None else int(rpm),
+        "max_concurrency": None if max_concurrency is None else int(max_concurrency),
+        "expires_at": expires_at,
+        "created_by": None if created_by is None else int(created_by),
+        "rotated_from": rotated_from,
+    }
+    for column, value in optional.items():
+        if value is None:
+            continue
+        columns.append(column)
+        selects.append("%s")
+        params.append(value)
+    params.extend([
+        project_id, workspace_id,
+        environment, environment,
+        service_account_id, service_account_id,
+        rotated_from, rotated_from,
+    ])
+    with connection() as con:
+        row = con.execute(
+            f"INSERT INTO api_keys ({', '.join(columns)}) "
+            f"SELECT {', '.join(selects)} FROM api_projects p "
+            "WHERE p.id = %s AND p.workspace_id = %s "
+            "  AND (%s::text IS NULL OR p.environment = %s) "
+            "  AND (%s::text IS NULL OR EXISTS ("
+            "        SELECT 1 FROM api_service_accounts sa "
+            "         WHERE sa.id = %s AND sa.project_id = p.id)) "
+            "  AND (%s::text IS NULL OR EXISTS ("
+            "        SELECT 1 FROM api_keys prev "
+            "         WHERE prev.public_id = %s AND prev.project_id = p.id "
+            "           AND prev.workspace_id = p.workspace_id)) "
+            f"RETURNING {', '.join(_API_KEY_PUBLIC_COLUMNS)}",
+            params,
+        ).fetchone()
+    if row is None:
+        project = get_api_project(project_id, workspace_id)
+        if project is None:
+            raise ValueError(
+                f"create_api_key: no api_project {project_id!r} in this workspace"
+            )
+        if environment is not None and environment != project["environment"]:
+            raise ValueError(
+                f"create_api_key: project {project_id!r} is "
+                f"{project['environment']!r}, not {environment!r}"
+            )
+        account = (
+            get_service_account(service_account_id, workspace_id)
+            if service_account_id is not None else None
+        )
+        if service_account_id is not None and (
+            account is None or account.get("project_id") != project_id
+        ):
+            raise ValueError(
+                f"create_api_key: service account {service_account_id!r} does not "
+                f"belong to project {project_id!r}"
+            )
+        # The same sentence whether the public id belongs to another project,
+        # another workspace or nobody: which of the three it is would be an
+        # existence oracle for another tenant's key.
+        raise ValueError(
+            f"create_api_key: rotated_from {rotated_from!r} is not a key of "
+            f"project {project_id!r}"
+        )
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def api_key_by_public_id(public_id: str) -> Optional[dict]:
+    """The resolver's read: one key by the id its bearer presented, with the
+    project and service account it hangs off already attached under
+    `project` / `service_account`.
+
+    No tenant argument, because this call is what DECIDES the tenant
+    (CONTRACT-3 §4). It returns revoked and expired keys too: the caller must
+    answer 401 identically for unknown, revoked and expired, and it cannot do
+    that if this function hides two of the three.
+
+    The three reads see ONE SNAPSHOT. This docstring promised that from the
+    start, and on 2026-09-13 the verifier pointed out that the pool runs READ
+    COMMITTED, where every statement takes a fresh snapshot — a project
+    disabled between the key read and the project read was half seen. The
+    transaction is now REPEATABLE READ, set as its first statement, so the
+    key, its project and its service account are the state of one instant. A
+    change committed a moment later is seen by the NEXT request, which is the
+    immediacy CONTRACT §5 promises; what this rules out is a principal
+    assembled from two different moments.
+    """
+    with connection() as con:
+        con.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        row = con.execute(
+            "SELECT * FROM api_keys WHERE public_id = %s", (public_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        project = con.execute(
+            "SELECT * FROM api_projects WHERE id = %s", (row["project_id"],)
+        ).fetchone()
+        service_account = None
+        if row["service_account_id"]:
+            service_account = con.execute(
+                "SELECT * FROM api_service_accounts WHERE id = %s",
+                (row["service_account_id"],),
+            ).fetchone()
+    out = _api_row(row) or {}
+    out["project"] = _api_row(project)
+    out["service_account"] = _api_row(service_account)
+    return out
+
+
+def list_api_keys(
+    project_id: str, workspace_id: str, *, include_revoked: bool = True
+) -> List[dict]:
+    """A project's keys, newest first, WITHOUT `key_hash`.
+
+    The plaintext secret is never stored at all (CONTRACT-3 §5), and the
+    digest that is stored is not selected here — see
+    `_API_KEY_PUBLIC_COLUMNS`. So the rows this returns are safe to hand to a
+    console page whole, which is what the console will do, and `last_four` is
+    the only thing in them that is about the credential itself.
+    """
+    with connection() as con:
+        rows = con.execute(
+            f"SELECT {', '.join(_API_KEY_PUBLIC_COLUMNS)} FROM api_keys "
+            "WHERE project_id = %s AND workspace_id = %s "
+            "AND (%s OR status = 'active') ORDER BY created_at DESC, id",
+            (project_id, workspace_id, bool(include_revoked)),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+def touch_api_key(key_id: str, ip: Optional[str] = None) -> None:
+    """Record that a key was used, and from where.
+
+    Written once per request, never per token. `last_used_ip` is the single
+    reason the platform can answer "where is this leaked key being used
+    from"; a None leaves the previous value rather than erasing it. The
+    service account's own `last_used_at` moves with it so the console can
+    show a dormant integration.
+    """
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_keys SET last_used_at = now(), "
+            "last_used_ip = COALESCE(%s, last_used_ip) WHERE id = %s "
+            "RETURNING service_account_id",
+            (_text(ip), key_id),
+        ).fetchone()
+        if row is not None and row["service_account_id"]:
+            con.execute(
+                "UPDATE api_service_accounts SET last_used_at = now() WHERE id = %s",
+                (row["service_account_id"],),
+            )
+
+
+def revoke_api_key(
+    key_id: str, workspace_id: str, *, revoked_by: Optional[int] = None
+) -> Optional[dict]:
+    """Revoke a key, idempotently; None when it is not this workspace's key.
+
+    The first revocation's timestamp and actor are kept: a second call is a
+    no-op that still answers 200 at the surface (RFC 7009), and rewriting
+    `revoked_by` would destroy the only record of who actually did it. The
+    resolver reads the row on every request, so this takes effect at once —
+    there is no cached key state anywhere (CONTRACT-3 §5).
+
+    Returns the same columns as `list_api_keys`, digest excluded: this row
+    goes back to a console that has just pressed "revoke", and there is no
+    version of that page which needs the HMAC of a key it is destroying.
+    """
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_keys SET status = 'revoked', "
+            "revoked_at = COALESCE(revoked_at, now()), "
+            "revoked_by = COALESCE(revoked_by, %s) "
+            "WHERE id = %s AND workspace_id = %s "
+            f"RETURNING {', '.join(_API_KEY_PUBLIC_COLUMNS)}",
+            (None if revoked_by is None else int(revoked_by), key_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def update_api_key_rotation(
+    key_id: str, workspace_id: str, rotation_expires_at: Optional[datetime]
+) -> Optional[dict]:
+    """Date a rotated-out key: after `rotation_expires_at` it stops working.
+
+    Written on the OLD key — the one the deadline is about. The resolver
+    refuses a key whose own `rotation_expires_at` has passed, and
+    `expire_rotated_keys` turns that refusal into a revocation, so this one
+    UPDATE is the whole of "rotate with an overlap window" (CONTRACT-3 §5).
+    Until 2026-09-13 no accessor could write it, and a rotated-out key lived
+    until somebody remembered to revoke it by hand.
+
+    None CLEARS the deadline (an operator cancelling a planned cut-over). The
+    status is never touched: dating a revoked key does not bring it back, and
+    a deadline in the past on an active key is refused at the very next
+    request by the resolver even before the sweep runs.
+
+    Scoped like `revoke_api_key`: None when the key is not this workspace's.
+    Returns the digest-free public columns.
+    """
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_keys SET rotation_expires_at = %s "
+            "WHERE id = %s AND workspace_id = %s "
+            f"RETURNING {', '.join(_API_KEY_PUBLIC_COLUMNS)}",
+            (rotation_expires_at, key_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def expire_rotated_keys(
+    *, now: Optional[datetime] = None, limit: int = 500
+) -> List[dict]:
+    """Revoke every active key whose own rotation deadline has passed; returns
+    what it revoked.
+
+    WHICH ROW CARRIES THE DEADLINE. `rotation_expires_at` is written on the
+    OLD key by `update_api_key_rotation` and read off that same row here and
+    by the resolver. The previous version of this sweep read it off the
+    SUCCESSOR and joined `successor.rotated_from = previous.public_id` across
+    the whole table, which had two consequences found on 2026-09-13: it
+    disagreed with the resolver, so nothing it looked for was ever written and
+    no overlap was ever enforced; and a key created in workspace B naming
+    workspace A's public id got A's live key revoked. With no join, every row
+    decides only its own fate, and the only way to put a deadline on a row is
+    the workspace-scoped accessor above — so the sweep needs no tenant
+    argument to be tenant-safe.
+
+    WHY IT HAS TO EXIST AT ALL. An overlap is two live credentials by
+    construction — that is what makes a rotation deployable without an outage
+    — and the resolver already refuses a key past its deadline. What the sweep
+    adds is the RECORD: the key shows as revoked in the console and in
+    `list_api_keys(include_revoked=False)` instead of looking live forever.
+
+    Idempotent: a second run finds nothing because the first one moved the
+    rows to `revoked`. `revoked_by` is left NULL, which is the honest record —
+    no person did this — and `revoked_at` is stamped like any other
+    revocation.
+    """
+    moment = now or _now()
+    bounded = max(1, min(int(limit), 5000))
+    with connection() as con:
+        rows = con.execute(
+            "UPDATE api_keys SET status = 'revoked', "
+            "    revoked_at = COALESCE(revoked_at, now()) "
+            " WHERE id IN ("
+            "        SELECT id FROM api_keys "
+            "         WHERE status = 'active' "
+            "           AND rotation_expires_at IS NOT NULL "
+            "           AND rotation_expires_at <= %s "
+            "         ORDER BY rotation_expires_at "
+            "         LIMIT %s) "
+            "   AND status = 'active' "
+            f"RETURNING {', '.join(_API_KEY_PUBLIC_COLUMNS)}",
+            (moment, bounded),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+# --- responses --------------------------------------------------------------
+
+
+def create_api_response(
+    project_id: str,
+    workspace_id: str,
+    model: str,
+    request_id: str,
+    *,
+    response_id: Optional[str] = None,
+    key_id: Optional[str] = None,
+    status: str = "queued",
+    background: bool = False,
+    streamed: bool = False,
+    fingerprint: str = "",
+    instructions_present: bool = False,
+    metadata: Optional[dict] = None,
+    expires_at: Optional[datetime] = None,
+) -> dict:
+    """The durable row a `/v1/responses` request gets BEFORE any expensive
+    work, so a background request survives the client that asked for it.
+
+    `expires_at` defaults to the project's own retention window, computed from
+    the project row in the same statement — retention that depends on a
+    caller remembering to pass a date is not retention.
+    """
+    columns = [
+        "id", "project_id", "workspace_id", "key_id", "model", "status",
+        "background", "streamed", "request_id", "fingerprint",
+        "instructions_present", "expires_at",
+    ]
+    selects = [
+        "%s", "p.id", "p.workspace_id", "%s", "%s", "%s", "%s", "%s", "%s",
+        "%s", "%s",
+        "COALESCE(%s::timestamptz, now() + make_interval(days => p.retention_days))",
+    ]
+    params: List[Any] = [
+        response_id or _api_id("resp"), key_id, _text(model), status,
+        bool(background), bool(streamed), _text(request_id) or "",
+        _text(fingerprint) or "", bool(instructions_present), expires_at,
+    ]
+    if metadata is not None:
+        columns.append("metadata")
+        selects.append("%s")
+        params.append(_json_object("api_responses.metadata", metadata))
+    params.extend([project_id, workspace_id])
+    with connection() as con:
+        row = con.execute(
+            f"INSERT INTO api_responses ({', '.join(columns)}) "
+            f"SELECT {', '.join(selects)} FROM api_projects p "
+            "WHERE p.id = %s AND p.workspace_id = %s RETURNING *",
+            params,
+        ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"create_api_response: no api_project {project_id!r} in this workspace"
+        )
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def get_api_response(response_id: str, project_id: str) -> Optional[dict]:
+    """One response, scoped to the project whose key asked for it. Another
+    project's id reads as missing, which is exactly the 404 the surface owes
+    (`response_not_found`)."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT * FROM api_responses WHERE id = %s AND project_id = %s",
+            (response_id, project_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def update_api_response(response_id: str, project_id: str, /, **fields: Any) -> Optional[dict]:
+    """Advance a response row; None when it is not this project's.
+
+    `started_at` and `completed_at` follow the status unless the caller sets
+    them explicitly, because a duration computed from a timestamp somebody
+    forgot to write is worse than no duration at all. Raises ValueError for a
+    column that may not be set — `project_id`, `workspace_id` and `key_id`
+    are not among them: nothing in a request body may move a response between
+    tenants.
+    """
+    sets: List[str] = []
+    params: List[Any] = []
+    for key, value in fields.items():
+        if key not in _API_RESPONSE_UPDATABLE:
+            raise ValueError(f"api_responses.{key} is not updatable")
+        if key in _API_RESPONSE_JSON:
+            value = _json_object(
+                f"api_responses.{key}", value if value is not None else {}
+            )
+        elif key in _API_RESPONSE_TEXT:
+            value = _text(value) if value is not None else None
+        sets.append(f"{key} = %s")
+        params.append(value)
+    if not sets:
+        return get_api_response(response_id, project_id)
+    status = fields.get("status")
+    if status == "in_progress" and "started_at" not in fields:
+        sets.append("started_at = COALESCE(started_at, now())")
+    if status in _API_RESPONSE_TERMINAL and "completed_at" not in fields:
+        sets.append("completed_at = COALESCE(completed_at, now())")
+    params.extend([response_id, project_id])
+    with connection() as con:
+        row = con.execute(
+            f"UPDATE api_responses SET {', '.join(sets)} "
+            "WHERE id = %s AND project_id = %s RETURNING *",
+            params,
+        ).fetchone()
+    return _api_row(row)
+
+
+def list_api_responses(
+    project_id: str, *, status: Optional[str] = None, limit: int = 50
+) -> List[dict]:
+    """A project's recent responses, newest first, page size clamped."""
+    bounded = max(1, min(int(limit), 200))
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM api_responses WHERE project_id = %s "
+            "AND (%s::text IS NULL OR status = %s) "
+            "ORDER BY created_at DESC, id LIMIT %s",
+            (project_id, status, status, bounded),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+# --- idempotency ------------------------------------------------------------
+
+
+#: The claim, as ONE statement on the DATABASE clock. Every time comparison
+#: in it is against `now()`, which PostgreSQL fixes at the start of the
+#: transaction — so a `get_idempotency` run in the SAME transaction (see
+#: `claim_or_get_idempotency`) compares against the identical instant.
+_CLAIM_IDEMPOTENCY_SQL = (
+    "INSERT INTO api_idempotency "
+    "    (project_id, endpoint, idem_key, fingerprint, expires_at) "
+    "VALUES (%(project)s, %(endpoint)s, %(key)s, %(fingerprint)s, "
+    "        now() + make_interval(secs => %(ttl)s)) "
+    "ON CONFLICT (project_id, endpoint, idem_key) DO UPDATE SET "
+    # A NEW id for the new holder, so `claim_id` on finish/release tells the
+    # request that crashed apart from the one that took its key over; keeping
+    # the old id would make them the same claim.
+    "    id = nextval(pg_get_serial_sequence('api_idempotency', 'id')), "
+    "    fingerprint = excluded.fingerprint, "
+    "    state = 'in_flight', "
+    "    response_id = NULL, "
+    "    created_at = now(), "
+    "    expires_at = excluded.expires_at "
+    "WHERE api_idempotency.expires_at <= now() "
+    "   OR (api_idempotency.fingerprint = excluded.fingerprint "
+    "       AND ((%(lease)s::double precision IS NOT NULL "
+    "             AND api_idempotency.state = 'in_flight' "
+    "             AND api_idempotency.created_at "
+    "                 <= now() - make_interval(secs => %(lease)s::double precision)) "
+    "         OR (%(reclaim_failed)s "
+    "             AND api_idempotency.state = 'completed' "
+    "             AND api_idempotency.response_id IS NULL))) "
+    "RETURNING *"
+)
+
+_GET_IDEMPOTENCY_SQL = (
+    "SELECT * FROM api_idempotency "
+    "WHERE project_id = %s AND endpoint = %s AND idem_key = %s "
+    "  AND expires_at > now()"
+)
+
+
+def _claim_params(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    fingerprint: str,
+    ttl_hours: float,
+    lease_seconds: Optional[float],
+    reclaim_failed: bool,
+) -> Dict[str, Any]:
+    return {
+        "project": project_id,
+        "endpoint": _text(endpoint),
+        "key": _text(idem_key),
+        "fingerprint": _text(fingerprint) or "",
+        "ttl": float(ttl_hours) * 3600.0,
+        "lease": None if lease_seconds is None else max(0.0, float(lease_seconds)),
+        "reclaim_failed": bool(reclaim_failed),
+    }
+
+
+def claim_idempotency(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    fingerprint: str,
+    *,
+    ttl_hours: float = 24.0,
+    lease_seconds: Optional[float] = None,
+    reclaim_failed: bool = False,
+    con: Optional[psycopg.Connection] = None,
+) -> Optional[dict]:
+    """Claim `(project, endpoint, key)` for this request, or None.
+
+    `INSERT ... ON CONFLICT` is the whole point: zero rows back means somebody
+    else holds the claim, decided by the unique index rather than by a
+    SELECT-then-INSERT with a window in the middle for a retry to get the
+    model invoked twice (CONTRACT-3 §13). The loser reads `get_idempotency`
+    and either replays the stored response or answers 409 when the
+    fingerprint differs — prefer `claim_or_get_idempotency`, which does both
+    on one connection and one clock.
+
+    AN EXPIRED CLAIM IS NOT A CLAIM (2026-09-13). The conflict used to be DO
+    NOTHING whatever the existing row's age, and nothing but an unscheduled
+    prune ever removed one — so a request that crashed between claim and
+    finish pinned its Idempotency-Key at 429 "still running" forever, and the
+    "retained 24 h" of §13 had no end. The conflict now TAKES OVER a row whose
+    `expires_at` has passed, resetting it to a fresh in-flight claim for this
+    caller. The takeover is still a single statement: ON CONFLICT DO UPDATE
+    locks the conflicting row, and a second claimant that queued behind that
+    lock re-evaluates the WHERE against the row the first one just renewed,
+    finds it unexpired and gets zero rows — exactly one winner, which
+    `test_api_platform_db.py` proves with twelve concurrent claimants.
+
+    THE TWO OTHER TAKEOVERS the request path needs (`apiplatform/idempotency.py`
+    decides them), both only for the SAME fingerprint, both off by default:
+    `lease_seconds` — an `in_flight` claim created longer ago than this has
+    outlived any generation its owner could still be running; and
+    `reclaim_failed` — a `completed` claim with no response is an original
+    that failed and left nothing to replay.
+
+    ONE CLOCK (2026-09-13). Every comparison here and in `get_idempotency` is
+    against the DATABASE's `now()`. The request path used to decide the
+    takeover against a Python moment and read the survivor against `now()`:
+    a row expiring between the two was neither taken over nor visible, the
+    retry reused the stale moment, and the request answered 500. Pass `con`
+    to run inside the caller's transaction, where `now()` is one instant.
+    """
+    with _on(con) as c:
+        row = c.execute(
+            _CLAIM_IDEMPOTENCY_SQL,
+            _claim_params(
+                project_id, endpoint, idem_key, fingerprint, ttl_hours,
+                lease_seconds, reclaim_failed,
+            ),
+        ).fetchone()
+    return _api_row(row)
+
+
+def claim_or_get_idempotency(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    fingerprint: str,
+    *,
+    ttl_hours: float = 24.0,
+    lease_seconds: Optional[float] = None,
+    reclaim_failed: bool = False,
+    con: Optional[psycopg.Connection] = None,
+) -> Tuple[bool, Optional[dict]]:
+    """Claim the key, or read who holds it — `(claimed, row)` — on ONE
+    connection, in ONE transaction, against ONE `now()`.
+
+    `(True, row)`: this call owns the work; `row["id"]` is the `claim_id` to
+    pass to `finish_idempotency` / `release_idempotency`, so a request whose
+    claim was later taken over cannot finish or release the new holder's.
+    `(False, row)`: the live claim somebody else holds — compare its
+    fingerprint (409) and replay or attach. `(False, None)` only when the
+    store neither accepted the claim nor shows a holder twice in a row,
+    which is a broken store, not a race.
+
+    WHY ONE TRANSACTION (2026-09-13). PostgreSQL's `now()` is the start of
+    the transaction, so the claim's "is it expired" and the read's "is it
+    live" are the exact complement of each other: a row the claim declined to
+    take over is, by construction, a row the read returns. Two autocommitted
+    statements each had their own `now()`, and the request path's own Python
+    moment made the gap wide enough to answer 500 (reverify-database, wave 3).
+    The one case the read can still miss is a row DELETED between the two
+    statements (a release or a prune committed in between); the claim is then
+    retried once in the same transaction, where the INSERT simply succeeds.
+
+    One pooled connection for the whole exchange — never a second one while
+    the first is held (the 2026-09-13 pool-exhaustion rule).
+    """
+    params = _claim_params(
+        project_id, endpoint, idem_key, fingerprint, ttl_hours,
+        lease_seconds, reclaim_failed,
+    )
+    with _on(con) as c:
+        for _attempt in range(2):
+            won = c.execute(_CLAIM_IDEMPOTENCY_SQL, params).fetchone()
+            if won is not None:
+                return True, _api_row(won)
+            held = c.execute(
+                _GET_IDEMPOTENCY_SQL,
+                (project_id, _text(endpoint), _text(idem_key)),
+            ).fetchone()
+            if held is not None:
+                return False, _api_row(held)
+    return False, None
+
+
+def finish_idempotency(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    response_id: Optional[str],
+    *,
+    claim_id: Optional[int] = None,
+) -> Optional[dict]:
+    """Attach the finished response to its claim so a retry can replay it.
+
+    Only a LIVE claim can be finished: once `expires_at` has passed the claim
+    may already belong to somebody else (see `claim_idempotency`), and a
+    request that woke up late must not stamp its response onto the new
+    holder's key. Pass `claim_id` — the `id` of the row `claim_idempotency`
+    returned — to pin the write to exactly the claim this request won; None
+    when the claim is gone, expired or not this project's.
+    """
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_idempotency SET state = 'completed', response_id = %s "
+            "WHERE project_id = %s AND endpoint = %s AND idem_key = %s "
+            "  AND expires_at > now() "
+            "  AND (%s::bigint IS NULL OR id = %s) "
+            "RETURNING *",
+            (
+                response_id, project_id, _text(endpoint), _text(idem_key),
+                claim_id, claim_id,
+            ),
+        ).fetchone()
+    return _api_row(row)
+
+
+def release_idempotency(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    *,
+    claim_id: Optional[int] = None,
+) -> bool:
+    """Give an IN-FLIGHT claim back, for the failure path; True if one was
+    released.
+
+    A request that fails before it produces anything worth replaying (a
+    validation error after the claim, a quota refusal, an engine that never
+    answered) should not make the client wait out the 24 hours to retry with
+    the same key. A COMPLETED claim is never released: deleting it would let
+    the same key invoke the model a second time, which is the one thing §13
+    exists to prevent. `claim_id` pins the release to the claim this request
+    won, so a late failure handler cannot release a claim another request has
+    since taken over.
+    """
+    with connection() as con:
+        row = con.execute(
+            "DELETE FROM api_idempotency "
+            "WHERE project_id = %s AND endpoint = %s AND idem_key = %s "
+            "  AND state = 'in_flight' "
+            "  AND (%s::bigint IS NULL OR id = %s) "
+            "RETURNING id",
+            (project_id, _text(endpoint), _text(idem_key), claim_id, claim_id),
+        ).fetchone()
+    return row is not None
+
+
+def get_idempotency(
+    project_id: str,
+    endpoint: str,
+    idem_key: str,
+    *,
+    con: Optional[psycopg.Connection] = None,
+) -> Optional[dict]:
+    """The existing LIVE claim, scoped to its project: one tenant's
+    idempotency key must never resolve to another tenant's response.
+
+    An expired claim reads as absent (2026-09-13), for the same reason
+    `claim_idempotency` takes one over: §13 retains a key for 24 hours, and a
+    read that ignored `expires_at` turned "retained 24 h" into "retained until
+    a prune nobody schedules" — including a crashed request's claim answering
+    429 "still running" indefinitely.
+
+    "Expired" is decided by the DATABASE clock, the same `now()` the claim
+    uses; a caller that decided anything against its own clock and then reads
+    here has two clocks and a gap between them (the wave-3 500). Pass `con`
+    to read in the transaction that claimed, or use
+    `claim_or_get_idempotency`, which does exactly that."""
+    with _on(con) as c:
+        row = c.execute(
+            _GET_IDEMPOTENCY_SQL,
+            (project_id, _text(endpoint), _text(idem_key)),
+        ).fetchone()
+    return _api_row(row)
+
+
+# --- usage ledgers ----------------------------------------------------------
+
+
+@contextmanager
+def _on(con: Optional[psycopg.Connection]) -> Iterator[psycopg.Connection]:
+    """The caller's transaction when it passes one, a pooled one otherwise.
+
+    What lets the quota engine compose the ledger accessors below inside ONE
+    transaction that holds `lock_api_project_usage` — read the window, decide,
+    bump — instead of each accessor committing on its own connection with a
+    window between them (CONTRACT-3 §12; the 2026-09-13 burst of 12 concurrent
+    requests through an rpm=1 project was exactly that window)."""
+    if con is not None:
+        yield con
+        return
+    with connection() as own:
+        yield own
+
+
+#: THE one advisory-lock key form for "usage decisions of one project". Every
+#: path that reads a project's window and then bumps its ledgers takes THIS
+#: lock and no other, because two different key derivations for the same
+#: project do not exclude each other: on 2026-09-13 the re-verifier found
+#: `quotas.reserve` locking a two-int4 key while this module locked a bigint
+#: one, so a caller mixing the two re-opened the burst race the lock exists to
+#: close. Single-bigint space (objsubid 1), derived in SQL so no Python hash
+#: has to agree with it; it cannot collide with a two-int4 lock at all.
+API_PROJECT_USAGE_LOCK_SQL = (
+    "SELECT pg_advisory_xact_lock(hashtextextended('api_project_usage:' || %s, 0))"
+)
+
+#: Process-local serialisation per project, taken BEFORE a pooled connection is
+#: checked out. Refcounted so the dict holds only projects someone is using.
+_usage_locks: Dict[str, List[Any]] = {}
+_usage_locks_guard = threading.Lock()
+
+
+@contextmanager
+def api_project_usage_process_lock(
+    project_id: str, *, timeout: Optional[float] = None
+) -> Iterator[None]:
+    """Serialise this process's usage decisions for one project WITHOUT
+    holding a database connection while waiting.
+
+    THE POOL RULE (2026-09-13). The app has one psycopg pool (16) shared with
+    chat. A request that checks out a connection and THEN waits on
+    `pg_advisory_xact_lock` parks that connection for as long as the queue in
+    front of it: 40 requests for one busy project park all 16, and every chat
+    turn, login and history read in the process waits behind them — and if
+    the lock holder needs a second pooled connection for anything, nobody
+    ever gets one until PoolTimeout (reverify-console-api, wave 3: 9 of 24
+    requests failed after 10 s). Waiting HERE first means at most one
+    connection per project is ever parked on the advisory lock from this
+    process; the advisory lock still serialises against OTHER processes.
+
+    Different projects never wait for each other. `timeout` (seconds) raises
+    TimeoutError instead of waiting longer — the caller's cue for a 429.
+    """
+    with _usage_locks_guard:
+        entry = _usage_locks.get(project_id)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _usage_locks[project_id] = entry
+        entry[1] += 1
+    lock: threading.Lock = entry[0]
+    try:
+        acquired = lock.acquire(timeout=-1 if timeout is None else max(0.0, float(timeout)))
+        if not acquired:
+            raise TimeoutError(f"usage lock for project {project_id!r} not acquired in time")
+        try:
+            yield
+        finally:
+            lock.release()
+    finally:
+        with _usage_locks_guard:
+            entry[1] -= 1
+            if entry[1] <= 0 and _usage_locks.get(project_id) is entry:
+                del _usage_locks[project_id]
+
+
+def lock_api_project_usage(
+    project_or_con: Any = None,
+    project_id: Optional[str] = None,
+    *,
+    con: Optional[psycopg.Connection] = None,
+) -> None:
+    """Serialise every usage decision for one project until `con` commits.
+
+    Call it INSIDE the one connection that does all the work:
+
+        with db.api_project_usage_process_lock(pid):   # before the checkout
+            with db.connection() as con:
+                db.lock_api_project_usage(pid, con=con)
+                ...read the window, decide, bump — every statement on `con`
+
+    or simply `with db.api_project_usage_transaction(pid) as con:`, which is
+    exactly that. The original `lock_api_project_usage(con, pid)` spelling is
+    still accepted.
+
+    `pg_advisory_xact_lock` inside the caller's transaction: a second request
+    for the same project blocks here until the first has read the window,
+    decided and bumped the counters, and then reads the counters the first
+    one wrote. Different projects never wait for each other. Released by
+    COMMIT or ROLLBACK — there is no unlock to forget, and a crashed request
+    cannot leave a project locked.
+
+    WITHOUT A CONNECTION THIS REFUSES (TypeError) rather than open one: a
+    transaction-scoped lock on a connection of its own would be released the
+    moment this function returned, and the caller would believe it held a
+    lock that no longer exists.
+    """
+    if isinstance(project_or_con, psycopg.Connection):
+        if con is not None:
+            raise TypeError("lock_api_project_usage: pass the connection once")
+        con, pid = project_or_con, project_id
+    elif project_or_con is None:
+        pid = project_id  # lock_api_project_usage(project_id=..., con=...)
+    else:
+        if project_id is not None:
+            raise TypeError("lock_api_project_usage(project_id, con=con)")
+        pid = project_or_con
+    if con is None:
+        raise TypeError(
+            "lock_api_project_usage needs the connection that does the work "
+            "(con=...); use db.api_project_usage_transaction(project_id) to "
+            "get one safely"
+        )
+    if not isinstance(pid, str) or not pid:
+        raise TypeError("lock_api_project_usage: project_id must be a non-empty str")
+    con.execute(API_PROJECT_USAGE_LOCK_SQL, (pid,))
+
+
+@contextmanager
+def api_project_usage_transaction(
+    project_id: str, *, timeout: Optional[float] = None
+) -> Iterator[psycopg.Connection]:
+    """One connection, one transaction, holding the project's usage lock.
+
+    In this order, which is the whole point: the process-local lock (no
+    connection held while waiting), then ONE pooled connection, then the
+    advisory lock on it (correctness across processes). Do every read and
+    write of the decision on the yielded connection — pass it as `con=` to
+    `usage_window`, `bump_usage_minute`, `bump_usage_daily`. Never call an
+    accessor without `con=` inside the block: that checks out a second pooled
+    connection while this one is held, which is the stall this exists to
+    prevent. Commits on a clean exit, rolls back on an exception.
+    """
+    with api_project_usage_process_lock(project_id, timeout=timeout):
+        with connection() as con:
+            lock_api_project_usage(project_id, con=con)
+            yield con
+
+
+def _increments(fn: str, **values: Any) -> List[int]:
+    """Ledger increments as ints, refusing a negative one.
+
+    The ledgers are additive, so the CHECK on the running total cannot see a
+    partial refund that leaves it positive — `requests=-5` against a total of
+    40 passes any row CHECK and hands five requests back. On 2026-09-13
+    `bump_usage_daily(requests=-100, input_tokens=-1_000_000)` was measured
+    leaving the day at -90 requests. A counter only ever moves up; a
+    correction is a different operation that nobody has needed yet."""
+    out: List[int] = []
+    for name, value in values.items():
+        number = int(value)
+        if number < 0:
+            raise ValueError(f"{fn}: {name} may not be negative (got {number})")
+        out.append(number)
+    return out
+
+
+def bump_usage_minute(
+    project_id: str,
+    key_id: str,
+    *,
+    requests: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    at: Optional[datetime] = None,
+    con: Optional[psycopg.Connection] = None,
+) -> dict:
+    """Add to this minute's counters for a project+key, atomically.
+
+    ONE statement, no read first. Two requests finishing in the same minute
+    from two threads would each read 7 and each write 8 if this were a SELECT
+    followed by an UPDATE — the classic lost update, and the lost one is
+    always somebody's quota. `excluded` carries the values this call brought
+    and the row keeps the running total, so the increment happens inside the
+    row lock PostgreSQL already takes.
+
+    ValueError for a negative increment. Pass `con` to bump inside the
+    caller's transaction (see `lock_api_project_usage`).
+    """
+    counts = _increments(
+        "bump_usage_minute",
+        requests=requests, input_tokens=input_tokens, output_tokens=output_tokens,
+    )
+    with _on(con) as c:
+        row = c.execute(
+            "INSERT INTO api_usage_minute "
+            "    (project_id, key_id, bucket, requests, input_tokens, output_tokens) "
+            "VALUES (%s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (project_id, key_id, bucket) DO UPDATE SET "
+            "    requests = api_usage_minute.requests + excluded.requests, "
+            "    input_tokens = api_usage_minute.input_tokens + excluded.input_tokens, "
+            "    output_tokens = api_usage_minute.output_tokens + excluded.output_tokens "
+            "RETURNING *",
+            (project_id, key_id, _minute_bucket(at), *counts),
+        ).fetchone()
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def bump_usage_daily(
+    project_id: str,
+    *,
+    requests: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    errors: int = 0,
+    rate_limited: int = 0,
+    day: Optional[Any] = None,
+    con: Optional[psycopg.Connection] = None,
+) -> dict:
+    """Add to today's project counters, atomically — the same single-statement
+    upsert as `bump_usage_minute`, and for the same reason. This is the ledger
+    the daily quota and `/v1/usage` read, so it must survive a restart and a
+    concurrent writer identically. ValueError for a negative increment."""
+    counts = _increments(
+        "bump_usage_daily",
+        requests=requests, input_tokens=input_tokens, output_tokens=output_tokens,
+        errors=errors, rate_limited=rate_limited,
+    )
+    with _on(con) as c:
+        row = c.execute(
+            "INSERT INTO api_usage_daily "
+            "    (project_id, day, requests, input_tokens, output_tokens, errors, rate_limited) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (project_id, day) DO UPDATE SET "
+            "    requests = api_usage_daily.requests + excluded.requests, "
+            "    input_tokens = api_usage_daily.input_tokens + excluded.input_tokens, "
+            "    output_tokens = api_usage_daily.output_tokens + excluded.output_tokens, "
+            "    errors = api_usage_daily.errors + excluded.errors, "
+            "    rate_limited = api_usage_daily.rate_limited + excluded.rate_limited "
+            "RETURNING *",
+            (
+                project_id, _as_day(day) if day is not None else _now().date(),
+                *counts,
+            ),
+        ).fetchone()
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def _counters(row: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "requests": int(row["requests"]) if row else 0,
+        "input_tokens": int(row["input_tokens"]) if row else 0,
+        "output_tokens": int(row["output_tokens"]) if row else 0,
+    }
+
+
+def usage_window(
+    project_id: str,
+    key_id: str,
+    *,
+    at: Optional[datetime] = None,
+    con: Optional[psycopg.Connection] = None,
+) -> dict:
+    """What the quota gate needs: this minute and the one before it for the
+    key AND for the whole project, and today for the project.
+
+    A counter with no row is reported as 0, not None. That is the opposite of
+    `api_responses.input_tokens`, where NULL means "the engine did not tell
+    us" — here the absence of a row is positive knowledge that nothing has
+    been spent in this window yet.
+
+    THE PROJECT TOTALS (`project_minute`, `project_previous`) ARE THE LIMIT.
+    Limits are enforced per project and a key may only tighten its own share
+    (CONTRACT-3 §12). On 2026-09-13 ten keys in one rpm=60 project were
+    measured admitting 600 requests in a minute, because the only minute
+    counters this returned were the calling key's. The project figures are
+    summed over every key's row for the two buckets, in the same statement
+    that reads the key's own, so the two can never come from different
+    moments.
+
+    THE PREVIOUS BUCKET IS WHAT MAKES THE WINDOW SLIDE. CONTRACT-3 §12 says
+    the per-minute limits are enforced as a "sliding window, durable", and V34
+    stores fixed minute buckets — which look like a disagreement and are not.
+    The standard approximation reads both buckets and weights the older one by
+    how much of it is still inside the window:
+
+        elapsed  = seconds since the current bucket started
+        estimate = current.requests
+                 + previous.requests * (60 - elapsed) / 60
+
+    The weighting belongs in the quota engine, not here: this function
+    reports what was spent, and policy decides what that means. Pass `con` to
+    read inside the caller's locked transaction.
+    """
+    moment = at or _now()
+    bucket = _minute_bucket(moment)
+    earlier = bucket - timedelta(minutes=1)
+    with _on(con) as c:
+        rows = c.execute(
+            "WITH spent AS ("
+            "    SELECT bucket, (key_id = %s) AS mine, requests, input_tokens, output_tokens "
+            "      FROM api_usage_minute "
+            "     WHERE project_id = %s AND bucket IN (%s, %s)) "
+            "SELECT bucket, mine, sum(requests) AS requests, "
+            "       sum(input_tokens) AS input_tokens, sum(output_tokens) AS output_tokens "
+            "  FROM spent GROUP BY bucket, mine",
+            (key_id, project_id, bucket, earlier),
+        ).fetchall()
+        daily = c.execute(
+            "SELECT requests, input_tokens, output_tokens, errors, rate_limited "
+            "FROM api_usage_daily WHERE project_id = %s AND day = %s",
+            (project_id, moment.date()),
+        ).fetchone()
+    key_rows: Dict[Any, Dict[str, Any]] = {}
+    project_totals: Dict[Any, Dict[str, int]] = {}
+    for row in rows:
+        if row["mine"]:
+            key_rows[row["bucket"]] = row
+        total = project_totals.setdefault(
+            row["bucket"], {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+        )
+        for name, value in _counters(row).items():
+            total[name] += value
+    empty = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+    return {
+        "project_id": project_id,
+        "key_id": key_id,
+        "bucket": _iso(bucket),
+        "previous_bucket": _iso(earlier),
+        # How far into the current bucket `at` falls, which is the only other
+        # number the sliding-window estimate needs. Reported rather than left
+        # to the caller because the caller would have to re-derive the bucket
+        # boundary to compute it, and the two must agree.
+        "elapsed_seconds": (moment - bucket).total_seconds(),
+        "day": moment.date().isoformat(),
+        "minute": _counters(key_rows.get(bucket)),
+        "previous": _counters(key_rows.get(earlier)),
+        "project_minute": dict(project_totals.get(bucket, empty)),
+        "project_previous": dict(project_totals.get(earlier, empty)),
+        "daily": {
+            "requests": int(daily["requests"]) if daily else 0,
+            "input_tokens": int(daily["input_tokens"]) if daily else 0,
+            "output_tokens": int(daily["output_tokens"]) if daily else 0,
+            "errors": int(daily["errors"]) if daily else 0,
+            "rate_limited": int(daily["rate_limited"]) if daily else 0,
+        },
+    }
+
+
+def read_usage_daily(
+    project_id: str, start_day: Any, end_day: Any, *, max_days: int = 93
+) -> List[dict]:
+    """A project's daily rows over a BOUNDED, inclusive range, oldest first.
+
+    The bound is not politeness: `/v1/usage` and the console both put this
+    range on the wire, and an unbounded one is a client-supplied result size
+    — the denial-of-service shape OWASP API4 names directly. Raises ValueError
+    for a reversed range or one longer than `max_days`.
+    """
+    first, last = _as_day(start_day), _as_day(end_day)
+    if last < first:
+        raise ValueError("read_usage_daily: end_day is before start_day")
+    span = (last - first).days + 1
+    if span > int(max_days):
+        raise ValueError(
+            f"read_usage_daily: {span} days requested, the maximum is {int(max_days)}"
+        )
+    with connection() as con:
+        rows = con.execute(
+            "SELECT * FROM api_usage_daily WHERE project_id = %s AND day BETWEEN %s AND %s "
+            "ORDER BY day",
+            (project_id, first, last),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+# --- webhooks ---------------------------------------------------------------
+
+
+def create_webhook_endpoint(
+    project_id: str,
+    workspace_id: str,
+    url: str,
+    events: Sequence[str],
+    secret: str,
+    *,
+    include_output: bool = False,
+    created_by: Optional[int] = None,
+    endpoint_id: Optional[str] = None,
+) -> dict:
+    """Register a delivery target for a project's events.
+
+    HTTPS only, refused here as well as at delivery time: a plaintext target
+    would put the signed payload — and the fact that a particular customer is
+    calling this API at all — on the wire in clear. The SSRF checks that
+    matter run per delivery, against the RESOLVED address, because a hostname
+    that is safe today can point at 169.254.169.254 tomorrow (CONTRACT-3 §14).
+
+    The returned row carries NO `secret` or `previous_secret`, like every
+    other read of this table except the delivery sweep (2026-09-13). An
+    earlier version argued the creator "already holds it" and returned the
+    value; the review's answer is that a row which sometimes carries the
+    forgery primitive is a row nobody can safely serialise, and the caller
+    that generated the secret has it in a local variable for the show-once
+    response. The ONE rule is now: no accessor that returns a row to a
+    request path returns a secret.
+
+    `has_secret` and `has_previous_secret` ride along on EVERY path — this
+    one, the update, the list and the scoped read — so a console page has one
+    spelling for "is this endpoint signed / is a rotation in flight", rather
+    than a truth test on a value that is present here and absent there.
+    """
+    if not str(url).lower().startswith("https://"):
+        raise ValueError("create_webhook_endpoint: the url must be https://")
+    columns = ["id", "project_id", "workspace_id", "url", "events", "secret", "include_output"]
+    selects = ["%s", "p.id", "p.workspace_id", "%s", "%s", "%s", "%s"]
+    params: List[Any] = [
+        endpoint_id or _api_id("whe"), _text(url),
+        _json_array("api_webhook_endpoints.events", events),
+        secret, bool(include_output),
+    ]
+    if created_by is not None:
+        columns.append("created_by")
+        selects.append("%s")
+        params.append(int(created_by))
+    params.extend([project_id, workspace_id])
+    with connection() as con:
+        row = con.execute(
+            f"INSERT INTO api_webhook_endpoints ({', '.join(columns)}) "
+            f"SELECT {', '.join(selects)} FROM api_projects p "
+            "WHERE p.id = %s AND p.workspace_id = %s "
+            f"RETURNING {_WEBHOOK_ENDPOINT_PUBLIC_SELECT}",
+            params,
+        ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"create_webhook_endpoint: no api_project {project_id!r} in this workspace"
+        )
+    return _api_row(row)  # type: ignore[return-value]
+
+
+def list_webhook_endpoints(project_id: str, workspace_id: str) -> List[dict]:
+    """A project's endpoints, oldest first, WITHOUT the signing secrets.
+
+    `secret` and `previous_secret` are excluded at the SELECT (see
+    `_WEBHOOK_ENDPOINT_PUBLIC_COLUMNS`), so no console route can leak one by
+    serialising these rows — which is what a route does with a list by
+    default. Both tenancy predicates are load bearing: `project_id` alone
+    would list another workspace's endpoints, secrets or not.
+    """
+    with connection() as con:
+        rows = con.execute(
+            f"SELECT {_WEBHOOK_ENDPOINT_PUBLIC_SELECT} "
+            "FROM api_webhook_endpoints "
+            "WHERE project_id = %s AND workspace_id = %s ORDER BY created_at, id",
+            (project_id, workspace_id),
+        ).fetchall()
+    return _api_rows(rows)
+
+
+def get_webhook_endpoint(endpoint_id: str, workspace_id: str) -> Optional[dict]:
+    """One endpoint, or None — including when it is another workspace's.
+    Scrubbed of the signing secrets exactly like `list_webhook_endpoints`."""
+    with connection() as con:
+        row = con.execute(
+            f"SELECT {_WEBHOOK_ENDPOINT_PUBLIC_SELECT} "
+            "FROM api_webhook_endpoints WHERE id = %s AND workspace_id = %s",
+            (endpoint_id, workspace_id),
+        ).fetchone()
+    return _api_row(row)
+
+
+def update_webhook_endpoint(
+    endpoint_id: str, workspace_id: str, /, **fields: Any
+) -> Optional[dict]:
+    """Change an endpoint, including rotating its secret with an overlap
+    (`previous_secret` + `previous_secret_expires_at`). None when it is not
+    this workspace's endpoint; ValueError for a column that may not be set.
+
+    NO CHANGES REQUESTED IS NOT NOT-FOUND. This used to return None for both,
+    so a route mapping None to 404 would have 404'd an endpoint that exists
+    and is owned by the caller, purely because the PATCH body happened to be
+    empty — the sibling `update_api_project` has always fallen through to a
+    scoped read instead, and the 2026-09-12 verifier found the pair disagreeing
+    with neither branch tested. The empty case now answers exactly what
+    `get_webhook_endpoint` would: the current row, secrets excluded. It is
+    therefore not a back door to the signing secret.
+
+    NO PATH RETURNS THE SECRET (2026-09-13). This docstring used to say only a
+    rotation echoed it back, while the statement was `RETURNING *` — so a
+    PATCH of `status` or `events` handed out the live signing secret and the
+    previous one, which is the forgery primitive for every delivery to that
+    endpoint. Every update now returns `_WEBHOOK_ENDPOINT_PUBLIC_SELECT`; a
+    rotation's caller generated the new value and already holds it.
+
+    `url` is refused unless it is https://, here as well as at creation: a
+    PATCH is the obvious way around a check that only guards the POST.
+    """
+    sets: List[str] = []
+    params: List[Any] = []
+    for key, value in fields.items():
+        if key not in _WEBHOOK_ENDPOINT_UPDATABLE:
+            raise ValueError(f"api_webhook_endpoints.{key} is not updatable")
+        if key == "url" and value is not None and not str(value).lower().startswith("https://"):
+            raise ValueError("update_webhook_endpoint: the url must be https://")
+        if key in _WEBHOOK_ENDPOINT_JSON:
+            value = _json_array(
+                f"api_webhook_endpoints.{key}", value if value is not None else []
+            )
+        elif key == "url":
+            value = _text(value)
+        sets.append(f"{key} = %s")
+        params.append(value)
+    if not sets:
+        return get_webhook_endpoint(endpoint_id, workspace_id)
+    if "status" in fields:
+        sets.append(
+            "disabled_at = CASE WHEN %s = 'disabled' "
+            "THEN COALESCE(disabled_at, now()) ELSE NULL END"
+        )
+        params.append(fields["status"])
+    params.extend([endpoint_id, workspace_id])
+    with connection() as con:
+        row = con.execute(
+            f"UPDATE api_webhook_endpoints SET {', '.join(sets)} "
+            "WHERE id = %s AND workspace_id = %s "
+            f"RETURNING {_WEBHOOK_ENDPOINT_PUBLIC_SELECT}",
+            params,
+        ).fetchone()
+    return _api_row(row)
+
+
+def delete_webhook_endpoint(endpoint_id: str, workspace_id: str) -> bool:
+    """Remove an endpoint and its delivery history (FK CASCADE). False when
+    it is not this workspace's endpoint — including when it never existed."""
+    with connection() as con:
+        row = con.execute(
+            "DELETE FROM api_webhook_endpoints WHERE id = %s AND workspace_id = %s "
+            "RETURNING id",
+            (endpoint_id, workspace_id),
+        ).fetchone()
+    return row is not None
+
+
+def enqueue_webhook_delivery(
+    endpoint_id: str,
+    project_id: str,
+    event_type: str,
+    event_id: str,
+    payload: Optional[dict] = None,
+    *,
+    response_id: Optional[str] = None,
+    max_attempts: int = 6,
+    delivery_id: Optional[str] = None,
+    next_attempt_at: Optional[datetime] = None,
+) -> Optional[dict]:
+    """Queue one delivery; None when this `event_id` is already queued to this
+    endpoint.
+
+    The duplicate case is a normal outcome, not an error: the same event may
+    be enqueued twice by a retried caller, and the unique index is what makes
+    the consumer's idempotency promise true. Raises ValueError only when the
+    endpoint is not this project's.
+    """
+    with connection() as con:
+        row = con.execute(
+            "INSERT INTO api_webhook_deliveries "
+            "    (id, event_id, endpoint_id, project_id, event_type, response_id, "
+            "     payload, max_attempts, next_attempt_at) "
+            "SELECT %s, %s, e.id, e.project_id, %s, %s, %s, %s, COALESCE(%s::timestamptz, now()) "
+            "  FROM api_webhook_endpoints e "
+            " WHERE e.id = %s AND e.project_id = %s "
+            "ON CONFLICT (endpoint_id, event_id) DO NOTHING "
+            "RETURNING *",
+            (
+                delivery_id or _api_id("whd"), _text(event_id), _text(event_type),
+                response_id,
+                _json_object(
+                    "api_webhook_deliveries.payload",
+                    payload if payload is not None else {},
+                ),
+                int(max_attempts), next_attempt_at, endpoint_id, project_id,
+            ),
+        ).fetchone()
+        if row is None:
+            known = con.execute(
+                "SELECT 1 FROM api_webhook_endpoints WHERE id = %s AND project_id = %s",
+                (endpoint_id, project_id),
+            ).fetchone()
+    if row is None and known is None:
+        raise ValueError(
+            f"enqueue_webhook_delivery: no webhook endpoint {endpoint_id!r} in "
+            f"project {project_id!r}"
+        )
+    return _api_row(row)
+
+
+def due_webhook_deliveries(limit: int = 20, *, now: Optional[datetime] = None) -> List[dict]:
+    """The deliveries whose next attempt is due, oldest first, each with the
+    endpoint it must be sent to attached under `endpoint`.
+
+    Not tenant-scoped, and could not be: this is the server's own sweep, not
+    a caller's read. A delivery whose endpoint has been disabled is skipped
+    rather than dropped, so re-enabling an endpoint resumes its queue instead
+    of losing it.
+    """
+    bounded = max(1, min(int(limit), 200))
+    with connection() as con:
+        rows = con.execute(
+            "SELECT d.*, e.url AS endpoint_url, e.secret AS endpoint_secret, "
+            "       e.previous_secret AS endpoint_previous_secret, "
+            "       e.previous_secret_expires_at AS endpoint_previous_secret_expires_at, "
+            "       e.include_output AS endpoint_include_output, "
+            "       e.events AS endpoint_events "
+            "  FROM api_webhook_deliveries d "
+            "  JOIN api_webhook_endpoints e ON e.id = d.endpoint_id "
+            " WHERE d.status = 'pending' AND e.status = 'active' "
+            "   AND d.attempt < d.max_attempts "
+            "   AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= %s) "
+            " ORDER BY d.next_attempt_at NULLS FIRST, d.created_at, d.id "
+            " LIMIT %s",
+            (now or _now(), bounded),
+        ).fetchall()
+    out: List[dict] = []
+    for row in rows:
+        delivery = _api_row(row) or {}
+        endpoint = {
+            "id": delivery["endpoint_id"],
+            "url": delivery.pop("endpoint_url"),
+            "secret": delivery.pop("endpoint_secret"),
+            "previous_secret": delivery.pop("endpoint_previous_secret"),
+            "previous_secret_expires_at": delivery.pop("endpoint_previous_secret_expires_at"),
+            "include_output": delivery.pop("endpoint_include_output"),
+            "events": delivery.pop("endpoint_events"),
+        }
+        delivery["endpoint"] = endpoint
+        out.append(delivery)
+    return out
+
+
+def record_webhook_attempt(
+    delivery_id: str,
+    *,
+    status: str,
+    http_status: Optional[int] = None,
+    error: str = "",
+    next_attempt_at: Optional[datetime] = None,
+    project_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Record the outcome of one attempt and schedule (or stop) the next.
+
+    The attempt counter moves here and nowhere else, so a retry loop cannot
+    run forever by forgetting to increment it. The endpoint's own health
+    columns move with it: `consecutive_failures` is what lets the console
+    show a dead endpoint and what an auto-disable policy would read, and it
+    is reset by a delivery rather than by time.
+
+    PASS `project_id` FROM ANY REQUEST HANDLER. Without it this is a write
+    addressed by a bare id, which rule 1 at the top of this section says
+    should not exist. The delivery sweep is allowed to call it that way
+    because the sweep is the server acting on its own queue, not a caller
+    acting on a row it named; a console "retry this delivery" button IS a
+    caller naming a row, and it must pass the project the session already
+    proved, so that another tenant's delivery id reads as missing (None)
+    instead of being retried. Delivery ids are CSPRNG (`_api_id`), which makes
+    the difference hard to exploit and does not make it correct.
+    """
+    if status not in ("pending", "delivered", "failed", "dropped"):
+        raise ValueError(
+            "record_webhook_attempt: status must be pending, delivered, failed or dropped"
+        )
+    with connection() as con:
+        row = con.execute(
+            "UPDATE api_webhook_deliveries SET attempt = attempt + 1, status = %s, "
+            "    http_status = %s, error = %s, next_attempt_at = %s, "
+            "    delivered_at = CASE WHEN %s = 'delivered' THEN now() ELSE delivered_at END "
+            "WHERE id = %s AND (%s::text IS NULL OR project_id = %s) RETURNING *",
+            (
+                status, None if http_status is None else int(http_status),
+                _text(error) or "", next_attempt_at, status, delivery_id,
+                project_id, project_id,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        con.execute(
+            "UPDATE api_webhook_endpoints SET last_delivery_at = now(), "
+            "    last_delivery_status = %s, "
+            "    consecutive_failures = CASE WHEN %s = 'delivered' THEN 0 "
+            "                                ELSE consecutive_failures + 1 END "
+            "WHERE id = %s",
+            (status, status, row["endpoint_id"]),
+        )
+    return _api_row(row)
+
+
+# --- public model overrides -------------------------------------------------
+
+
+def _workspace_arg(fn: str, workspace_id: Any) -> str:
+    """The workspace a model override belongs to, or TypeError.
+
+    Both model accessors took no tenant until 2026-09-13, and the old call
+    shapes are still plausible — `public_model_overrides(declared_ids)` would
+    otherwise pass a tuple where the workspace goes and quietly match
+    nothing. A loud TypeError at the first call is the migration path."""
+    if not isinstance(workspace_id, str) or not workspace_id:
+        raise TypeError(
+            f"{fn}: the first argument is the workspace id (a non-empty str), "
+            f"not {type(workspace_id).__name__} — model overrides are per workspace"
+        )
+    return workspace_id
+
+
+def public_model_overrides(
+    workspace_id: str, declared: Optional[Sequence[str]] = None
+) -> Dict[str, bool]:
+    """One workspace's view of which public models are enabled.
+
+    PER WORKSPACE (2026-09-13). The table used to hold one row per model for
+    the whole deployment, so a super admin of one workspace disabling a model
+    disabled it for every customer. The `/v1` path passes the CALLER's
+    workspace and the console passes the principal's; another workspace's
+    rows are invisible to both.
+
+    WITH `declared` (the ids the code-level registry actually declares), the
+    result carries ONLY entries that DISABLE one of them: a row for an id the
+    code does not declare is dropped, and a row that merely re-enables a
+    declared model is a no-op that is dropped too. That is the narrowing rule
+    of CONTRACT-3 §15 expressed where it cannot be skipped — with this
+    argument, no row in this table and no amount of database access can make
+    a model public that the code did not publish.
+
+    Without it, the raw mapping is returned for the console, which has to be
+    able to see a row before it can fix it.
+    """
+    workspace = _workspace_arg("public_model_overrides", workspace_id)
+    with connection() as con:
+        rows = con.execute(
+            "SELECT id, enabled FROM public_models WHERE workspace_id = %s ORDER BY id",
+            (workspace,),
+        ).fetchall()
+    stored = {str(row["id"]): bool(row["enabled"]) for row in rows}
+    if declared is None:
+        return stored
+    allowed = set(declared)
+    return {
+        model_id: False
+        for model_id, enabled in stored.items()
+        if model_id in allowed and not enabled
+    }
+
+
+def set_public_model_enabled(
+    workspace_id: str,
+    model_id: str,
+    enabled: bool,
+    *,
+    updated_by: Optional[int] = None,
+) -> dict:
+    """Record one workspace administrator's decision about one public model
+    id, for THAT workspace only. db.IntegrityError when the workspace does not
+    exist."""
+    workspace = _workspace_arg("set_public_model_enabled", workspace_id)
+    with connection() as con:
+        row = con.execute(
+            "INSERT INTO public_models (workspace_id, id, enabled, updated_by, updated_at) "
+            "VALUES (%s, %s, %s, %s, now()) "
+            "ON CONFLICT (workspace_id, id) DO UPDATE SET enabled = excluded.enabled, "
+            "    updated_by = excluded.updated_by, updated_at = excluded.updated_at "
+            "RETURNING *",
+            (
+                workspace, _text(model_id), bool(enabled),
+                None if updated_by is None else int(updated_by),
+            ),
+        ).fetchone()
+    return _api_row(row)  # type: ignore[return-value]
+
+
+# --- platform secrets -------------------------------------------------------
+
+
+def get_platform_secret(name: str) -> Optional[str]:
+    """The stored value, or None. Never logged, never returned by any API."""
+    with connection() as con:
+        row = con.execute(
+            "SELECT value FROM platform_secrets WHERE name = %s", (name,)
+        ).fetchone()
+    return None if row is None else str(row["value"])
+
+
+def set_platform_secret(name: str, value: str) -> str:
+    """Store a secret ONCE and return whatever is stored — which may be
+    somebody else's value.
+
+    This is write-once by design, and the design is the whole safety
+    property. The API-key pepper is generated on first use when
+    `API_KEY_PEPPER` is unset (CONTRACT-3 §5); if two workers generate one at
+    the same moment and the second overwrote the first, every key digest
+    already written under the first pepper would stop verifying and every
+    customer's key would 401 with nothing in the logs to explain it. `ON
+    CONFLICT DO NOTHING` plus a read-back makes the loser adopt the winner's
+    value instead.
+    """
+    with connection() as con:
+        con.execute(
+            "INSERT INTO platform_secrets (name, value) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO NOTHING",
+            (name, value),
+        )
+        row = con.execute(
+            "SELECT value FROM platform_secrets WHERE name = %s", (name,)
+        ).fetchone()
+    return str(row["value"])
+
+
+# --- retention --------------------------------------------------------------
+
+
+def prune_api_platform(
+    *,
+    now: Optional[datetime] = None,
+    minute_retention_days: int = 7,
+    delivery_retention_days: int = 30,
+    batch_size: int = 5000,
+    max_batches: int = 200,
+) -> Dict[str, int]:
+    """Enforce retention across the platform tables; returns what it removed.
+
+    Six separate jobs, deliberately in one function so a deployment has one
+    thing to schedule:
+
+      * idempotency claims past `expires_at` — they are a 24 h promise, not a
+        record (reads already treat an expired claim as absent; this reclaims
+        the space);
+      * minute counters older than `minute_retention_days` — the daily ledger
+        is the durable one, and the minute table exists to answer "right now";
+      * responses past their own `expires_at`, which was computed from the
+        project's `retention_days` when the row was created;
+      * generated text on responses that are still inside their retention
+        window but whose PROJECT has since shortened it — the text goes, the
+        metadata row stays, because the usage record must outlive the content
+        (CONTRACT-3 §16);
+      * FINISHED webhook deliveries older than `delivery_retention_days`. A
+        `pending` delivery is never pruned, however old: it is a promise to a
+        customer that has not been kept yet, and deleting it is the silent
+        drop the delivery history exists to rule out;
+      * active keys past their own `rotation_expires_at`, revoked by
+        `expire_rotated_keys` so the console's record matches what the
+        resolver already refuses (`api_keys_rotated_out`).
+
+    BATCHED, ONE TRANSACTION PER BATCH (2026-09-13). All five used to run as
+    unbounded statements inside one transaction under the 15 s
+    `statement_timeout`; on a table large enough to need pruning, one timeout
+    rolled every job back and retention silently never made progress. Each
+    job now deletes `batch_size` rows at a time by `ctid`, commits, and goes
+    again until a batch comes back short, so a slow table costs only its own
+    last batch and every earlier commit stands. `max_batches` bounds one run;
+    the next scheduled run continues where this one stopped.
+
+    `rowcount` rather than RETURNING: a prune can touch a great many rows and
+    there is no reason to bring any of them back.
+    """
+    moment = now or _now()
+    size = max(1, int(batch_size))
+    batches = max(1, int(max_batches))
+    jobs: Tuple[Tuple[str, str, Tuple[Any, ...]], ...] = (
+        (
+            "api_idempotency",
+            # The DATABASE clock unless a caller drives it (2026-09-13): the
+            # claim and the read decide "expired" against `now()`, and a
+            # Python moment ahead of it could delete a claim both of them
+            # still consider live.
+            "DELETE FROM api_idempotency WHERE ctid IN ("
+            " SELECT ctid FROM api_idempotency "
+            "  WHERE expires_at < COALESCE(%s::timestamptz, now()) LIMIT %s)",
+            (now,),
+        ),
+        (
+            "api_usage_minute",
+            "DELETE FROM api_usage_minute WHERE ctid IN ("
+            " SELECT ctid FROM api_usage_minute WHERE bucket < %s LIMIT %s)",
+            (moment - timedelta(days=int(minute_retention_days)),),
+        ),
+        (
+            "api_responses",
+            "DELETE FROM api_responses WHERE ctid IN ("
+            " SELECT ctid FROM api_responses "
+            "  WHERE expires_at IS NOT NULL AND expires_at < %s LIMIT %s)",
+            (moment,),
+        ),
+        (
+            "api_responses_output_text",
+            "UPDATE api_responses SET output_text = NULL WHERE ctid IN ("
+            " SELECT r.ctid FROM api_responses r JOIN api_projects p ON p.id = r.project_id "
+            "  WHERE r.output_text IS NOT NULL "
+            "    AND r.created_at < %s - make_interval(days => p.retention_days) "
+            "  LIMIT %s)",
+            (moment,),
+        ),
+        (
+            "api_webhook_deliveries",
+            "DELETE FROM api_webhook_deliveries WHERE ctid IN ("
+            " SELECT ctid FROM api_webhook_deliveries "
+            "  WHERE status IN ('delivered', 'failed', 'dropped') AND created_at < %s "
+            "  LIMIT %s)",
+            (moment - timedelta(days=int(delivery_retention_days)),),
+        ),
+    )
+    counts: Dict[str, int] = {}
+    for name, statement, params in jobs:
+        total = 0
+        for _ in range(batches):
+            with connection() as con:
+                touched = con.execute(statement, (*params, size)).rowcount
+            total += max(0, int(touched))
+            if touched < size:
+                break
+        counts[name] = total
+    # The rotation sweep rides along (2026-09-13). `expire_rotated_keys` was
+    # fixed and never scheduled — main.py schedules only this function — so a
+    # rotated-out key past its deadline was refused by the resolver but listed
+    # as `active` forever. This function is the one thing a deployment
+    # schedules, so the record is kept here, in bounded batches like the rest.
+    rotated = 0
+    for _ in range(batches):
+        revoked = len(expire_rotated_keys(now=now, limit=size))
+        rotated += revoked
+        if revoked < min(size, 5000):
+            break
+    counts["api_keys_rotated_out"] = rotated
+    return counts

@@ -1,6 +1,8 @@
 # OPT-IN ONLY — layered after compose.nvidia.yaml when PUBLISH_MODEL_PORTS is
 # true in .env. See compose.published-dgx-spark.yaml for the exposure warning:
-# these model APIs are unauthenticated.
+# these model APIs are unauthenticated, so they follow
+# TECHSARA_MODEL_BIND_ADDRESS (default 127.0.0.1) and never the application's
+# TECHSARA_BIND_ADDRESS (audit F050, 2026-09-13).
 #
 # The generic NVIDIA overlay defines only `vllm` and `vllm-embed`; its tiers
 # share the main model for routing and declare no OCR service.
@@ -15,11 +17,11 @@ services:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:30000"
 
   vllm-embed:
     networks:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${VLLM_EMBED_PORT:-8003}:30003"

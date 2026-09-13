@@ -1,6 +1,8 @@
 # OPT-IN ONLY — layered after compose.cpu.yaml when PUBLISH_MODEL_PORTS is true
 # in .env. See compose.published-dgx-spark.yaml for the exposure warning: this
-# model API is unauthenticated.
+# model API is unauthenticated, so it follows TECHSARA_MODEL_BIND_ADDRESS
+# (default 127.0.0.1) and never the application's TECHSARA_BIND_ADDRESS
+# (audit F050, 2026-09-13).
 #
 # Publishing also attaches these services to the routable `application`
 # network. Docker records a port binding for a container that is only on an
@@ -12,4 +14,4 @@ services:
       - inference
       - application
     ports:
-      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${LLAMA_CPP_PORT:-8000}:30000"
+      - "${TECHSARA_MODEL_BIND_ADDRESS:-127.0.0.1}:${LLAMA_CPP_PORT:-8000}:30000"

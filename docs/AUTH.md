@@ -53,12 +53,29 @@ roles to capabilities:
 | sessions.manage | – | ✓ | ✓ |
 | roles.manage | – | – | ✓ |
 | audit.read | – | – | ✓ |
+| analytics.read (per-member usage table and its export — since 2026-09-13) | – | – | ✓ |
 | workspace.manage / settings.manage | – | – | ✓ |
+| api.console.access (the developer console at `/api`) | – | ✓ | ✓ |
+| api.projects.read / api.projects.manage | – | ✓ | ✓ |
+| api.keys.create / api.keys.revoke | – | ✓ | ✓ |
+| api.usage.read / api.logs.read / api.webhooks.manage | – | ✓ | ✓ |
+| api.models.manage (which models `/v1` exposes) | – | – | ✓ |
+| api.limits.manage (a project's rate, token and concurrency ceilings) | – | – | ✓ |
+
+The `api.*` capabilities (2026-09-13) gate the developer platform's **browser**
+side only. A request to the public API at `/v1` carries an API key, which
+resolves to a project and a set of scopes — never to a person or a capability —
+so a leaked key cannot be mistaken for an administrator. See
+[`docs/developer-platform/OPERATIONS.md`](developer-platform/OPERATIONS.md).
 
 Guard-rails baked into the API (not the UI):
 
 - An admin can never manage an equal-or-higher role (no deactivating,
   removing, resetting or revoking another admin or a super admin).
+- Since 2026-09-13 the same rank rule applies to **reading**: an admin gets 404
+  for a super admin's or a peer admin's sessions, conversations, uploads and
+  reports, and the member detail withholds their usage counts. Reading your own
+  is always allowed.
 - The workspace can never lose its last active super admin — demotion,
   deactivation and removal all answer 409.
 - Nobody can deactivate or remove themselves.
@@ -77,7 +94,8 @@ so downloads are authorised by the `report_files` ownership table, not by
 knowing a filename.
 
 Administrative access is the one exception, and it is: read-only, behind
-`workspace_content.read`, and **audited** — every viewed conversation and
+`workspace_content.read`, limited to accounts the viewer outranks (or their
+own), and **audited** — every viewed conversation and
 downloaded file writes an `audit_events` row (admin, target, resource,
 timestamp, source address). There is no impersonation: nothing lets an admin
 act *as* a member or feed a member's content into their own model context.
@@ -185,6 +203,17 @@ expire after `AUTH_INVITATION_TTL_DAYS`, are stored hashed, and can be
 revoked from the Pending invites tab. Re-inviting an address revokes the
 earlier pending invite.
 
+Inviting an address that **already has an account** re-onboards that account
+rather than creating a new one, so since 2026-09-13 it follows the rank rule:
+an active member is a 409 ("already a member"); a deactivated account may be
+invited only by someone who outranks its role; a removed account, whose former
+role is no longer known, only by a super admin. A refusal that stopped someone
+reaching an account above their rank is audited as `invitation_refused`
+(`orchestrator/app/authn/invites.py`). The rule is applied when an invitation is
+**issued**; an invitation issued before that date is not re-checked when it is
+accepted, so revoke any still pending for an existing account (the query is in
+`docs/developer-platform/DISPOSITION.md`, OA-9).
+
 ## Feature access — which tools a person may use
 
 Two different questions, deliberately two different mechanisms:
@@ -232,7 +261,16 @@ message chart, which tools were run, and one row per member — including
 members who used nothing, which is usually why the page is open. Windows are
 7D/1M/3M/6M/12M; seat counts do not move with the window, only the usage
 below them. **Export** downloads the same per-member table as CSV and records
-an `analytics_exported` audit event. It reads `messages.meta->>'route'`, so
+an `analytics_exported` audit event.
+
+Since 2026-09-13 the report and its export (`GET /admin/api/analytics`,
+`/admin/api/analytics/export`) require `analytics.read`, which only a super
+admin holds — per-person consumption was already meant to be super-admin-only,
+and an ordinary admin could reach it through `workspace.read`. Opening the
+report is audited as `analytics_viewed`. Every text cell in the CSV passes
+through the same formula neutraliser the artifact CSV writer uses, so a display
+name beginning with `=`, `+`, `-` or `@` arrives as text, prefixed with an
+apostrophe. It reads `messages.meta->>'route'`, so
 the tool columns are what actually ran, not what was requested.
 
 ## Login protection
@@ -257,14 +295,49 @@ POSTs; the orchestrator additionally refuses any state-changing request whose
 `Origin` header is present but not an allowed origin. SSE streams are GETs
 and unaffected.
 
+**The one exemption is `/v1`** (2026-09-13). The public developer API reads the
+`Authorization` header and never the cookie, so there is no ambient credential
+for a hostile page to ride and the cross-site check does not apply; a
+developer's browser app sends its own `Origin` on every call and would
+otherwise be refused before its key was read. The exemption matches `/v1` and
+`/v1/…` only, never a longer name such as `/v1beta`. `/v1` answers its own CORS:
+a preflight from any origin gets 204, the actual request is checked against the
+project's `allowed_origins`, and `Access-Control-Allow-Credentials` is never
+sent. The browser CORS allowlist (`CORS_ALLOW_ORIGINS`, credentials allowed) is
+unchanged and is not applied to `/v1`.
+
 ## Endpoint classification
 
 - **Public**: `/health` (deploy gates and container healthchecks depend on
-  it), `/auth/login`, `/auth/logout`, `/auth/invitations/*` (token-gated).
+  it), `/auth/login`, `/auth/logout`, `/auth/invitations/*` (token-gated),
+  and `/v1/openapi.json` (the public developer API's schema, which describes
+  only `/v1`).
 - **Authenticated**: everything else — `/chat*`, `/history/*`, `/uploads/*`,
   `/memory/*`, `/reports*`, `/auth/me|password|sessions|preferences`.
 - **Capability-gated**: `/admin/api/*` (404 to anyone without the
-  capability, so the surface does not confirm its own existence).
+  capability, so the surface does not confirm its own existence). The developer
+  console's API, `/admin/api/developers/*`, follows the same rule with the
+  `api.*` capabilities.
+- **API-key authenticated**: `/v1/*` (2026-09-13). `Authorization: Bearer
+  tsk_live_…` or `tsk_test_…` only; a `ts_session` cookie is ignored, and a
+  request with no key is `401 invalid_api_key` whatever cookies it carries.
+  Every refusal of a key — unknown, revoked, expired, disabled project or
+  workspace, address outside the project's IP allowlist — is the same 401.
+  Reference: [`docs/developer-platform/API.md`](developer-platform/API.md).
+
+Three rules apply to every route since 2026-09-13:
+
+- **FastAPI's own `/docs`, `/redoc` and `/openapi.json` are not served** unless
+  `ORCHESTRATOR_DEV_DOCS` is on. They described every internal route, the admin
+  surface included, to anyone who could reach the port.
+- **Request bodies are capped before they are read**: 1 MiB on `/v1`
+  (`PUBLIC_API_MAX_BODY_BYTES`), the largest upload limit plus 1 MiB on
+  `/uploads*`, 128 MiB everywhere else (`MAX_REQUEST_BODY_BYTES`). Over the cap
+  is a 413, whether the body declared its length or not. The frontend's proxies
+  apply their own caps (32 MiB on the shared proxy, 128 MiB on `/api/chat`).
+- **A 422 no longer echoes the request**: the body names each failing field's
+  location and reason and drops pydantic's `input`, so a malformed chat request
+  cannot reflect its conversation or attachments back.
 
 ## Serving it publicly (Cloudflare Tunnel)
 
@@ -292,8 +365,30 @@ Behind TLS the app needs three settings (already in `.env`):
 `AUTH_COOKIE_SECURE=true` — `auto` inspects the scheme the *orchestrator* sees,
 which is plain HTTP inside Docker, so cookies would lose the Secure flag;
 `AUTH_TRUST_PROXY_HEADERS=true` so audit events record the employee's real
-address (the frontend proxy forwards Cloudflare's `cf-connecting-ip`); and the
-public origin in `CORS_ALLOW_ORIGINS`.
+address; and the public origin in `CORS_ALLOW_ORIGINS`.
+
+**The frontend must be told which header carries that address** (2026-09-13).
+The proxies used to copy `cf-connecting-ip` off every request into
+`X-Forwarded-For`, which let anyone who reached port 3000 directly — the LAN,
+the tailnet — choose the address the orchestrator recorded and dodge the
+per-address login lockout. Now they forward exactly one header, named by
+`TRUSTED_CLIENT_IP_HEADER`, and nothing when it is unset. Set
+`TRUSTED_CLIENT_IP_HEADER: cf-connecting-ip` (and `TRUSTED_FORWARDED_PROTO:
+https`) in the **frontend service's `environment:`** in `compose.yaml` — the
+frontend container does not read `.env` — or every session and audit event
+records the frontend container's address. Cloudflare overwrites
+`cf-connecting-ip` at its edge, so it is trustworthy for traffic that came
+through the tunnel. For sessions, audit and the login lockout the orchestrator
+still believes `X-Forwarded-For` from any peer while
+`AUTH_TRUST_PROXY_HEADERS=true`, so keep `:8080` off the LAN
+(`docs/developer-platform/DISPOSITION.md`, OA-8). The `/v1` surface does not
+use that switch: it believes a forwarded address only from a peer listed in
+`PUBLIC_API_TRUSTED_PROXIES`, which should name the frontend's Docker network.
+
+The public developer API rides the same hostname: `https://ai.techsarasolutions.com/v1/…`
+reaches `frontend:3000`, whose `/v1` route handler forwards it to the
+orchestrator with the `Authorization` header and without cookies. No tunnel
+change is needed for it.
 
 **Known limit — the one thing the tunnel cannot do.** `UPLOAD_MAX_MB` is
 102400 (100 GB) and the orchestrator genuinely handles it: uploads stream to
@@ -322,7 +417,14 @@ AUTH_COOKIE_SECURE=auto           AUTH_COOKIE_NAME=ts_session
 AUTH_LOGIN_MAX_FAILS=8            AUTH_LOGIN_WINDOW_SECONDS=900
 AUTH_LOGIN_LOCK_SECONDS=300       AUTH_INVITATION_TTL_DAYS=7
 AUTH_TRUST_PROXY_HEADERS=false    WORKSPACE_NAME="TechSara's Workspace"
+ORCHESTRATOR_DEV_DOCS=            MAX_REQUEST_BODY_BYTES=134217728
 ```
+
+The frontend's `TRUSTED_CLIENT_IP_HEADER` and `TRUSTED_FORWARDED_PROTO` are set
+on the frontend service, not in `.env` (above). The developer platform's own
+settings — `API_KEY_PEPPER`, `PUBLIC_API_MAX_BODY_BYTES` and the
+`PUBLIC_API_DEFAULT_*` limits — are described in
+[`docs/developer-platform/OPERATIONS.md`](developer-platform/OPERATIONS.md) §2.
 
 ## Schema
 
@@ -339,6 +441,15 @@ see above). Migration **V17** adds the two feature-access layers:
 `workspaces.feature_defaults` and `workspace_memberships.features`, both
 `jsonb NOT NULL DEFAULT '{}'`. Additive with defaults, so the previous
 release's statements keep working and a code rollback needs no schema change.
+
+Migration **V34** (2026-09-13) adds the developer platform's eleven tables —
+`api_projects`, `api_service_accounts`, `api_keys`, `api_responses`,
+`api_idempotency`, `api_usage_minute`, `api_usage_daily`,
+`api_webhook_endpoints`, `api_webhook_deliveries`, `public_models`,
+`platform_secrets` — and alters no existing table. `api_keys` stores
+`HMAC-SHA256(pepper, secret)`, never a key; the pepper is `API_KEY_PEPPER`, or a
+generated value in `platform_secrets` when that is unset. Column list:
+[`docs/developer-platform/SCHEMA-V34.md`](developer-platform/SCHEMA-V34.md).
 
 ## Operational notes
 

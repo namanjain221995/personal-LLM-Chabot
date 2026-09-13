@@ -62,8 +62,9 @@ OCR_GPU_MEMORY_UTILIZATION="${OCR_GPU_MEMORY_UTILIZATION:-0.10}"
 # How long `up` waits for /v1/models: weights are read from disk and the
 # vision encoder is compiled on a first start, which takes a few minutes.
 OCR_READY_TIMEOUT_S="${OCR_READY_TIMEOUT_S:-600}"
-# The worker's management interface; its address is what the engine binds.
-OCR_MANAGEMENT_IFNAME="${OCR_MANAGEMENT_IFNAME:-enP7s7}"
+# The worker engine binds CLUSTER_WORKER_IP (the RoCE rail), not the address
+# of a management interface: see ocr_bind_address. OCR_MANAGEMENT_IFNAME is
+# no longer read (audit F043/F051, 2026-09-13).
 REMOTE_DIR="${WORKER_REMOTE_DIR:-\$HOME/.techsara-cluster}"
 #: Which node carries the engine: "worker" or "head". Defaults to the worker
 #: in dual mode -- the head is the loaded machine -- and the head otherwise.
@@ -108,16 +109,31 @@ run_on() { # run_on <node> — script on stdin
   fi
 }
 
-# The address the engine binds. The orchestrator reaches the worker from the
-# other node, so it must be the MANAGEMENT address -- never 0.0.0.0, and never
-# a 10.100.x RoCE address, which belongs to the fabric the main model's
-# tensor-parallel shards talk over.
+# The address the engine binds. On the worker: CLUSTER_WORKER_IP, the RoCE
+# rail-A address -- never 0.0.0.0, and no longer the management LAN.
+#
+# WHY THE RAIL (audit F043/F051, 2026-09-13). This used to read the worker's
+# enP7s7 address over ssh, on the reasoning that the rails belong to the main
+# model's tensor-parallel traffic. The audit measured what that bought:
+# `GET http://192.168.9.68:30004/v1/models` answered 200 with no credential
+# from anywhere on the office LAN and the tailnet -- a full, unauthenticated
+# OpenAI-compatible VLM server on the GPU the TP=2 pair shares, so free
+# inference for anyone there and a denial of service against chat. The rail
+# is a point-to-point link between the two Sparks: the head (and every
+# container on it, through the host's routing) reaches the worker there and
+# nothing on the LAN does. OCR's traffic is a few page images a minute, noise
+# on a 200 Gb/s link, and it also takes users' document images off the 1 GbE
+# office segment (N016). The worker sentinel already binds the same address
+# (compose/compose.cluster-worker.yaml, SENTINEL_BIND). No ssh round-trip, no
+# interface name to guess, and no silent fallback: a missing or wildcard
+# CLUSTER_WORKER_IP stops here rather than binding somewhere wider.
 ocr_bind_address() {
-  local address
   if [ "$1" = worker ] && is_dual_mode; then
-    address="$(ssh_worker "ip -4 -br addr show $OCR_MANAGEMENT_IFNAME 2>/dev/null | awk '{print \$3}' | cut -d/ -f1" </dev/null)"
-    [ -n "$address" ] || die "could not read the worker's $OCR_MANAGEMENT_IFNAME address over ssh ($CLUSTER_WORKER_SSH); set OCR_MANAGEMENT_IFNAME if its management interface is named differently"
-    printf '%s' "$address"
+    case "${CLUSTER_WORKER_IP:-}" in
+      "") die "CLUSTER_WORKER_IP is not set in .env; the worker's OCR engine binds that RoCE rail address and nothing wider" ;;
+      0.0.0.0|::|"[::]") die "CLUSTER_WORKER_IP is '$CLUSTER_WORKER_IP'; it must be the worker's RoCE rail address, never a wildcard (audit F043/F051)" ;;
+    esac
+    printf '%s' "$CLUSTER_WORKER_IP"
   else
     # The head's engine is reached by the orchestrator over the docker bridge,
     # so it binds the gateway address rather than loopback, which a container
@@ -357,8 +373,8 @@ case "$cmd" in
     ;;
 esac
 
-# Resolved once, after the command is known to be one: reading the worker's
-# management address is an ssh round-trip, and a typo should not pay for it.
+# Resolved once, after the command is known to be one, so a typo prints the
+# usage rather than a bind-address error.
 node="$(ocr_node)"
 bind="$(ocr_bind_address "$node")"
 url="http://$bind:$OCR_PORT/v1"

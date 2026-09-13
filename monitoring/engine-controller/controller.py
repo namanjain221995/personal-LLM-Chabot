@@ -285,9 +285,40 @@ def canary_engine_fault_kind(res: "CanaryResult") -> str:
 REQUIRED_ENGINE_SERIES = ("requests_running", "requests_waiting", "generation_tokens_total", "prompt_tokens_total")
 
 
+#: Where /state, /metrics and POST /recover listen when CONTROLLER_BIND is
+#: unset. The process is host-network, so 0.0.0.0 -- the default until
+#: 2026-09-13 -- put the engine's state, its recovery budget and the incident
+#: timeline on the office LAN and the tailnet (developer-platform audit,
+#: beside F050). The compose overlays pass loopback plus, in dual mode, the
+#: Docker bridge gateway the orchestrator and Prometheus dial.
+DEFAULT_CONTROLLER_BIND = "127.0.0.1"
+
+
+def controller_bind_addresses(raw: str) -> List[str]:
+    """``CONTROLLER_BIND`` as the ordered, de-duplicated addresses to listen on.
+
+    A comma list, because the legitimate callers sit on two addresses no
+    single bind covers: loopback (the healthcheck, scripts/cluster-*.sh, and
+    POST /recover, which refuses any other peer) and the bridge gateway
+    (``vllm:host-gateway`` from the orchestrator, ``host.docker.internal``
+    from Prometheus). ``0.0.0.0`` anywhere in the list wins alone: it already
+    covers every address, and binding it beside ``127.0.0.1`` on the same
+    port fails with EADDRINUSE -- which is exactly what an older
+    generated.env (CLUSTER_API_BIND_ADDRESS=0.0.0.0) would otherwise render.
+    """
+    addresses: List[str] = []
+    for part in (raw or "").split(","):
+        address = part.strip()
+        if address and address not in addresses:
+            addresses.append(address)
+    if "0.0.0.0" in addresses:
+        return ["0.0.0.0"]
+    return addresses or [DEFAULT_CONTROLLER_BIND]
+
+
 @dataclass
 class Config:
-    bind: str = "0.0.0.0"
+    bind: str = DEFAULT_CONTROLLER_BIND
     port: int = 9838
     head_container: str = "sf-local-ai-vllm-1"
     head_api_url: str = "http://127.0.0.1:8000"
@@ -353,7 +384,7 @@ class Config:
     def from_env(cls) -> "Config":
         lock_dir = env_str("LOCK_DIR", "/run/techsara/locks")
         return cls(
-            bind=env_str("CONTROLLER_BIND", "0.0.0.0"),
+            bind=env_str("CONTROLLER_BIND", DEFAULT_CONTROLLER_BIND),
             port=env_int("CONTROLLER_PORT", 9838),
             head_container=env_str("HEAD_CONTAINER", "sf-local-ai-vllm-1"),
             head_api_url=env_str("HEAD_API_URL", "http://127.0.0.1:8000").rstrip("/"),
@@ -3246,14 +3277,24 @@ def main() -> int:
     docker = DockerClient(cfg.docker_socket, cfg.docker_api_version)
     ctl = Controller(cfg, docker, clock)
     Handler.controller = ctl
-    server = ThreadingHTTPServer((cfg.bind, cfg.port), Handler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, name="http", daemon=True).start()
+    # One server per address (see controller_bind_addresses). A bind that
+    # fails raises here and the process exits, exactly as the single bind
+    # did: a controller the orchestrator cannot reach must not look healthy
+    # on loopback alone.
+    bind_addresses = controller_bind_addresses(cfg.bind)
+    servers: List[ThreadingHTTPServer] = []
+    for address in bind_addresses:
+        server = ThreadingHTTPServer((address, cfg.port), Handler)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, name=f"http-{address}", daemon=True).start()
+        servers.append(server)
+    if "0.0.0.0" in bind_addresses:
+        log.warning("CONTROLLER_BIND includes 0.0.0.0: /state and /metrics answer on every interface, the LAN included")
     log.info(
         "listening on %s:%d; head=%s api=%s sentinel=%s token=%s router=%s gpu_exporters=head:%s worker:%s "
         "lock=%s incidents=%s canary=%.0fs/%.0fs timeout=%.0fs frozen=%.0fs cold_start=%.0fs budget=%d/%.0fs "
         "cooldown=%.0fs poll=%.0fs participation>=%.0f%% x%d head_min_mem=%s dry_run=%s",
-        cfg.bind, cfg.port, cfg.head_container, cfg.head_api_url, cfg.sentinel_url or "(single node)",
+        ",".join(bind_addresses), cfg.port, cfg.head_container, cfg.head_api_url, cfg.sentinel_url or "(single node)",
         "set" if cfg.sentinel_token else "unset", cfg.router_health_url or "(not configured)",
         "set" if cfg.head_gpu_exporter_url else "unset", "set" if cfg.worker_gpu_exporter_url else "unset (skipped)",
         cfg.lock_path, cfg.incident_dir, cfg.canary_interval_s, cfg.canary_interval_fast_s, cfg.canary_timeout_s,
@@ -3280,7 +3321,8 @@ def main() -> int:
         run_periodically(ctl.tick, cfg.poll_s, clock, stop, log, "controller")
     finally:
         ctl.shutdown()
-        server.shutdown()
+        for server in servers:
+            server.shutdown()
     return 0
 
 

@@ -29,6 +29,19 @@ reaches vLLM:
              bound: it is never refused with `timeout` for a wait it did
              not choose.
 
+THE CLOSURE IS BOUNDED (F044, 2026-09-13). A non-streaming call has no first
+token to observe — it returns when the whole generation is done — so until
+this date a LONG json_completion (an Artifact Studio compose over a large
+upload, a Deep Research step) kept NORMAL closed for its entire generation,
+up to the 4200 s wall clock, and the waiters behind it, whose bound is
+deferred during a closure, waited all of it. Now every LONG admission arms a
+prefill grace sized from the prompt (`closure_grace_s`: a floor plus the
+tokens at a prefill rate below the slowest one measured, capped at
+LONG_CLOSURE_MAX_S) and reopens NORMAL when it expires, first token or not.
+And a waiter defers its bound for at most LONG_CLOSURE_MAX_S of closure in
+total — so no NORMAL wait, however many LONG requests close the lane in
+turn, is longer than its own bound plus that ceiling.
+
 The second tenant's raw-port traffic is outside these lanes (it does not
 pass through this process); that is documented, not solved, here.
 
@@ -42,12 +55,15 @@ deep refuses newcomers at once — `capacity` — rather than promising a
 wait it cannot keep.
 
 SIZING. The lane is chosen from the prompt as it will be sent (the sized
-messages `context.fit_request` returns). The count is `context`'s own
-character estimate — no second /tokenize round trip for the ordinary
-prompt, which was the CPU-bound pre-pass finding of 2026-09-05 — and the
-exact count from /tokenize only for a prompt whose estimate is within a
-factor of two of the threshold, where the estimate could pick the wrong
-lane.
+messages `context.fit_request` returns). When fit_request measured those very
+messages exactly, that count decides — no second /tokenize round trip, which
+was the CPU-bound pre-pass finding of 2026-09-05. Otherwise a prompt is
+NORMAL at once only when `context.upper_bound_messages` (bytes, which no
+script can game) is under half the threshold, LONG at once when the
+estimate is over twice it, and /tokenize decides the band between. Until
+2026-09-13 the "certainly small" verdict came from the three-characters-per-
+token estimate, and a non-Latin prompt of ~190,000 real tokens passed it
+into the NORMAL lane (N013).
 
 Per event loop, like the breaker registry: a lane is asyncio state and
 the test suite runs a loop per test.
@@ -81,6 +97,26 @@ NORMAL_LINE = "Waiting for a free slot on the main model ({n} ahead)."
 #: How often a waiter re-reads the lane and the engine sample while it
 #: waits. In-memory; the lane's condition wakes it earlier.
 _POLL_S = 1.0
+
+#: The LONG closure's prefill grace (module docstring, THE CLOSURE IS
+#: BOUNDED). Sized from the A/B run of 2026-09-12 (docs/availability/ab/
+#: B-20260912T0859Z-SUMMARY.md): a 128k prompt prefilled at ~5,200 tok/s
+#: (~25 s) and the 950k needle at ~1,190 tok/s (~800 s). A fixed 30-60 s
+#: grace would reopen NORMAL half-way through any prefill above ~250k tokens
+#: and rebuild the very mix the closure prevents; charging every token at
+#: 1,000 tok/s — slower than the slowest measured — covers the 950k prefill
+#: with ~30 % to spare. The ceiling is the most any closure, and any NORMAL
+#: waiter's deferral, can last. Module constants rather than settings only
+#: because config.py is held by another workstream in this programme.
+_CLOSURE_FLOOR_S = 60.0
+_CLOSURE_PREFILL_TOKENS_PER_S = 1000.0
+LONG_CLOSURE_MAX_S = 1200.0
+
+
+def closure_grace_s(tokens: int) -> float:
+    """How long a LONG request may keep NORMAL closed without a first token."""
+    grace = _CLOSURE_FLOOR_S + max(0, int(tokens)) / _CLOSURE_PREFILL_TOKENS_PER_S
+    return min(float(LONG_CLOSURE_MAX_S), grace)
 
 
 class AdmissionRejected(RuntimeError):
@@ -145,6 +181,7 @@ class Lane:
         self._publish()
         told = False
         last = started
+        deferred = 0.0
         try:
             async with self.cond:
                 while not self.free():
@@ -155,7 +192,12 @@ class Lane:
                     if self.closed:
                         # A LONG request holds the lane: that time is its
                         # wait, not this caller's — the bound is deferred.
-                        started += now - last
+                        # For at most LONG_CLOSURE_MAX_S in total: an
+                        # unbounded deferral let a waiter behind a closure
+                        # that never lifted wait forever (F044, 2026-09-13).
+                        step = min(now - last, max(0.0, float(LONG_CLOSURE_MAX_S) - deferred))
+                        deferred += step
+                        started += step
                     last = now
                     remaining = timeout - (now - started)
                     if remaining <= 0:
@@ -209,9 +251,14 @@ def lanes() -> Lanes:
 
 async def prompt_tokens(messages: Sequence[dict], *, base_url: str, model: str) -> int:
     """The prompt's size for the lane decision (module docstring, SIZING)."""
-    estimate = context.estimate_messages(messages)
+    measured = context.measured_prompt_tokens(messages, base_url)
+    if measured is not None:
+        return int(measured)
     threshold = max(1, int(settings.admission_long_threshold_tokens))
-    if estimate < threshold // 2 or estimate > threshold * 2:
+    estimate = context.estimate_messages(messages)
+    # "Certainly small" only from a bound the text cannot game (N013); an
+    # over-estimate may skip the round trip, it only errs toward LONG.
+    if context.upper_bound_messages(messages) < threshold // 2 or estimate > threshold * 2:
         return estimate
     exact, _window = await context.count_tokens(base_url, model, messages)
     return int(exact)
@@ -271,7 +318,7 @@ async def _wait_for_idle(deadline: float, ls: "Lanes") -> bool:
 class _Ticket:
     """What one admitted call holds, and how it lets go."""
 
-    __slots__ = ("lane", "lanes", "long_holds_normal", "released", "waited_s")
+    __slots__ = ("lane", "lanes", "long_holds_normal", "released", "waited_s", "_closure_timer")
 
     def __init__(self, lane: str, lanes_: Lanes) -> None:
         self.lane = lane
@@ -279,10 +326,31 @@ class _Ticket:
         self.long_holds_normal = False
         self.released = False
         self.waited_s = 0.0
+        self._closure_timer: Optional[asyncio.Task] = None
+
+    def bound_closure(self, seconds: float) -> None:
+        """Reopen NORMAL after `seconds` if no first token has (F044)."""
+        if not self.long_holds_normal or self._closure_timer is not None:
+            return
+
+        async def expire() -> None:
+            await asyncio.sleep(max(0.0, seconds))
+            if not self.long_holds_normal:
+                return
+            metrics.inc("llm_admission_closure_expired_total",
+                        "LONG requests whose prefill grace ran out before a first token reopened the NORMAL lane.")
+            log.warning("admission: long request held the normal lane %.0fs without a first token; reopening it",
+                        seconds)
+            await self.first_token()
+
+        self._closure_timer = asyncio.get_running_loop().create_task(expire())
 
     async def first_token(self) -> None:
-        """A LONG request's first token: the large prefill is done, the
-        NORMAL lane may take new work again."""
+        """A LONG request's first token (or its grace running out): the large
+        prefill is done, the NORMAL lane may take new work again."""
+        timer = self._closure_timer
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
         if self.long_holds_normal:
             self.long_holds_normal = False
             await self.lanes.normal.set_closed(False)
@@ -400,7 +468,8 @@ async def run(
     recovering engine must not hold a lane slot for the whole reload). A
     non-streaming call holds its slot until it returns; a streaming call
     returns a stream that holds the slot until it ends and, for the LONG
-    lane, keeps the NORMAL lane closed until its first chunk.
+    lane, keeps the NORMAL lane closed until its first chunk. Either way the
+    closure lasts at most `closure_grace_s(tokens)` (module docstring).
     """
     tokens = await prompt_tokens(messages, base_url=base_url, model=model)
     lane = lane_for(tokens)
@@ -410,6 +479,7 @@ async def run(
         await _say(line.format(n=ahead))
 
     ticket = await _admit(lane, on_wait)
+    ticket.bound_closure(closure_grace_s(tokens))
     if ticket.waited_s > 0:
         metrics.observe("llm_admission_wait_seconds", ticket.waited_s,
                         "Seconds a request waited for its admission lane.", lane=lane)

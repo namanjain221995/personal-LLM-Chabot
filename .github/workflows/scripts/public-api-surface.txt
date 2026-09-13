@@ -1,0 +1,46 @@
+# The PUBLIC developer API surface, one `METHOD /path` per line.
+#
+# This file is the reviewed answer to "what can an API key reach?".
+# .github/workflows/scripts/api_contract.py diffs it against the operations in
+# the generated public OpenAPI document on every commit, and any difference —
+# in either direction — is a red build. That is the whole point: a route
+# appears on the public surface only when somebody edits this file in the same
+# commit and a reviewer reads the line.
+#
+# Taken verbatim from docs/developer-platform/CONTRACT.md §7 on 2026-09-12,
+# before orchestrator/app/publicapi/ existed. Until that package lands the
+# gate reports "not enforced yet" and passes; after it lands, this list is
+# binding with no further edit to the pipeline.
+#
+# What is DELIBERATELY absent, per CONTRACT-3 §7: Salesforce, RAG and web
+# search, deep research, uploads, artifacts, memory, conversation history and
+# admin analytics. Each would need its own product, scope and threat review,
+# so each must arrive here as its own reviewed line, never as a side effect of
+# mounting a router.
+#
+# Comments (`#`) and blank lines are ignored. Order does not matter; the
+# comparison is on sets.
+
+# ---- models: only the models this key may use (CONTRACT-3 §7, §15) --------
+GET /v1/models
+GET /v1/models/{model}
+
+# ---- responses: the one generation path (§8, §11) ------------------------
+# Sync, streaming and background all arrive through POST /v1/responses; the
+# background and cancel routes are how a client that disconnected catches up.
+POST /v1/responses
+GET /v1/responses/{id}
+POST /v1/responses/{id}/cancel
+
+# ---- compatibility shape, same engine path (§7) --------------------------
+POST /v1/chat/completions
+
+# ---- usage: project-scoped, bounded range (§7) ---------------------------
+GET /v1/usage
+
+# ---- the schema itself (§7: "the public schema only") --------------------
+# If the document deliberately does not describe its own schema endpoint,
+# delete this line and say so in the commit message — a considered decision is
+# exactly what this file is for. Do not "fix" the red build by loosening the
+# comparison.
+GET /v1/openapi.json

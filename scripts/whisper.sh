@@ -115,14 +115,28 @@ run_on() { # run_on <node> — script on stdin
   fi
 }
 
-# The address the engine binds. The orchestrator reaches the worker from the
-# other node, so it must be the MANAGEMENT address — never 0.0.0.0, and never
-# a 10.100.x RoCE address, which belongs to the fabric the main model's
-# tensor-parallel shards talk over.
+# The address the engine binds. On the worker: CLUSTER_WORKER_IP, the RoCE
+# rail-A address — never 0.0.0.0, and no longer the management LAN.
+#
+# WHY THE RAIL (audit F051, 2026-09-13). This used to read the worker's enP7s7
+# address over ssh, on the reasoning that the rails belong to the main model's
+# tensor-parallel traffic. The audit measured what that bought:
+# `GET http://192.168.9.68:30007/health` answered 200 from the office LAN, and
+# the server has no authentication, so anyone there could upload audio and
+# burn the worker GPU the TP=2 pair shares. The rail is a point-to-point link
+# between the two Sparks: the head and its containers reach the worker there,
+# nothing on the LAN does, and a few dictated clips are noise on it. The
+# worker sentinel already binds the same address (SENTINEL_BIND in
+# compose/compose.cluster-worker.yaml). The old ssh read also had a quieter
+# fault: when it failed it printed NOTHING and the engine was started with an
+# empty WHISPER_BIND. Now a missing or wildcard address stops here.
 whisper_bind_address() {
   if [ "$1" = worker ] && is_dual_mode; then
-    ssh -o BatchMode=yes ${CLUSTER_WORKER_SSH_OPTS:-} "$CLUSTER_WORKER_SSH" \
-      "ip -4 -br addr show enP7s7 2>/dev/null | awk '{print \$3}' | cut -d/ -f1" </dev/null
+    case "${CLUSTER_WORKER_IP:-}" in
+      "") die "CLUSTER_WORKER_IP is not set in .env; the worker's speech engine binds that RoCE rail address and nothing wider" ;;
+      0.0.0.0|::|"[::]") die "CLUSTER_WORKER_IP is '$CLUSTER_WORKER_IP'; it must be the worker's RoCE rail address, never a wildcard (audit F051)" ;;
+    esac
+    printf '%s' "$CLUSTER_WORKER_IP"
   else
     # The head's engine is reached by the orchestrator over the docker bridge,
     # so it binds the gateway address rather than loopback, which a container

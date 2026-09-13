@@ -41,10 +41,20 @@ def ensure_identity_baseline() -> None:
     """Workspace + memberships exist for every user. Safe to run always."""
     workspace = store.ensure_workspace(settings.workspace_name)
     with db.connection() as con:
+        # ACTIVE orphans only (2026-09-13). Removing a member deletes the
+        # membership and disables the account (admin_api.remove_member), so a
+        # disabled account with no membership IS a removed account. This pass
+        # used to hand it a fresh 'member' row on every restart — and a
+        # disabled member is exactly what an admin outranks, so after one
+        # restart a plain admin could invite and claim a removed former super
+        # admin, re-opening the takeover the invitation fix (F028) closed on
+        # both the issuing and the accepting side. The baseline exists to adopt
+        # accounts that predate memberships, which are active; it has no
+        # reason ever to resurrect a disabled one.
         orphans = con.execute(
             """SELECT u.id FROM users u
                LEFT JOIN workspace_memberships m ON m.user_id = u.id
-               WHERE m.user_id IS NULL"""
+               WHERE m.user_id IS NULL AND u.status = 'active'"""
         ).fetchall()
     for row in orphans:
         store.upsert_membership(workspace["id"], int(row["id"]), Role.MEMBER.value)

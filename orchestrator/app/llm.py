@@ -80,9 +80,18 @@ log = logging.getLogger(__name__)
 
 _usage: ContextVar[Optional[dict]] = ContextVar("_usage", default=None)
 
-#: Turned off for the process the first time a server rejects the option, so
-#: an unsupporting runtime costs one failed stream, not every stream.
-_ASK_FOR_USAGE = {"enabled": True}
+#: Turned off when a server is SHOWN not to know the option (see
+#: `_open_stream`), so an unsupporting runtime costs one failed stream, not
+#: every stream. `disabled_at` is the monotonic time it was turned off: the
+#: option is asked for again after `_USAGE_RETRY_S`, so even a wrong call
+#: costs a bounded gap in the ledger rather than every turn until a restart.
+_ASK_FOR_USAGE: dict = {"enabled": True, "disabled_at": None}
+
+#: How long a refusal of `stream_options` is believed before it is asked
+#: again. Ten minutes: one extra 400-and-retry per ten minutes on a runtime
+#: that really cannot report usage, against at most ten minutes of "not
+#: measured" if the refusal was misread (N014, 2026-09-13).
+_USAGE_RETRY_S = 600.0
 
 
 def reset_usage() -> None:
@@ -110,15 +119,23 @@ def _record_usage(prompt: int, completion: int) -> None:
 
 
 def _capture_usage(chunk) -> None:
-    """Read the usage chunk vLLM sends last. It carries no choices, so every
-    streaming loop here already skips it for text purposes."""
+    """Read the usage a response reports: the usage chunk vLLM sends last on
+    a stream (it carries no choices, so every streaming loop here already
+    skips it for text purposes), or the `usage` of a non-streaming response.
+
+    A usage object that carries NEITHER count is not a measurement, and is
+    not recorded: counting it as a call of zero tokens would turn "not
+    measured" into a zero, which the analytics console and the per-key
+    quotas would both read as a real number (2026-09-13, F045).
+    """
     usage = getattr(chunk, "usage", None)
     if usage is None:
         return
-    _record_usage(
-        getattr(usage, "prompt_tokens", 0) or 0,
-        getattr(usage, "completion_tokens", 0) or 0,
-    )
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if prompt is None and completion is None:
+        return
+    _record_usage(prompt or 0, completion or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -245,8 +262,9 @@ async def _open_stream(client, request: dict):
 
     `stream_options` is an OpenAI-API extension. A server that does not know
     it answers 400, which would otherwise turn a telemetry nicety into a total
-    outage — so the first refusal drops the option for the whole process and
-    the request is retried exactly as it would have been sent before.
+    outage — so a 400 is retried once exactly as the request would have been
+    sent before, and only a retry that SUCCEEDS proves the option was the
+    problem and drops it (for `_USAGE_RETRY_S`, not for the process).
 
     The stream comes back wrapped (resilience.GuardedStream): its first
     chunk is what tells the breaker the engine served, and a body that
@@ -255,6 +273,12 @@ async def _open_stream(client, request: dict):
     """
     base_url = str(getattr(client, "base_url", "") or settings.openai_base_url)
     if not _ASK_FOR_USAGE["enabled"]:
+        disabled_at = _ASK_FOR_USAGE.get("disabled_at")
+        if disabled_at is not None and time.monotonic() - disabled_at >= _USAGE_RETRY_S:
+            _ASK_FOR_USAGE["enabled"] = True
+            _ASK_FOR_USAGE["disabled_at"] = None
+            log.info("asking for stream_options.include_usage again after %.0fs", _USAGE_RETRY_S)
+    if not _ASK_FOR_USAGE["enabled"]:
         request.pop("stream_options", None)
         return await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
     ask = dict(request)
@@ -262,22 +286,35 @@ async def _open_stream(client, request: dict):
     try:
         return await _primary_send(client, ask, what="stream", base_url=base_url, stream=True)
     except _bad_request_error() as exc:
-        # ONLY a 400 is "the server does not know this option". Until
+        # ONLY a 400 can mean "the server does not know this option". Until
         # 2026-09-11 this caught every exception, so the first streamed call
         # during an engine outage (a connection error) permanently switched
         # token telemetry off for the process and mis-reported the outage as
         # a refused option. A transport error now propagates as itself, and
         # the resilient wrapper above has already waited on it.
-        if not _ASK_FOR_USAGE["enabled"]:
-            raise
-        _ASK_FOR_USAGE["enabled"] = False
-        log.warning(
-            "this runtime refused stream_options.include_usage (%s: %s); "
-            "token telemetry will read 'not measured' until restart",
-            type(exc).__name__, exc,
-        )
+        #
+        # And a 400 is not proof either. Until 2026-09-13 ANY 400 latched the
+        # option off for the process (N014): a corrupt image — a data: URL
+        # vision passes through unchecked — is a 400 any signed-in person can
+        # send, and one of them turned streaming token accounting off for
+        # every user until a restart. So the request is re-sent without the
+        # option first: if THAT is refused too, the request itself was bad,
+        # its 400 propagates, and measurement stays on for everyone else.
         request.pop("stream_options", None)
-        return await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
+        opened = await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
+        if _ASK_FOR_USAGE["enabled"]:
+            _ASK_FOR_USAGE["enabled"] = False
+            _ASK_FOR_USAGE["disabled_at"] = time.monotonic()
+            metrics.inc(
+                "llm_usage_option_refused_total",
+                "Times a server refused stream_options.include_usage and streaming token telemetry was paused.",
+            )
+            log.warning(
+                "this runtime refused stream_options.include_usage (%s: %s) and served the "
+                "same request without it; token telemetry will read 'not measured' for %.0fs",
+                type(exc).__name__, exc, _USAGE_RETRY_S,
+            )
+        return opened
 
 
 @contextlib.asynccontextmanager
@@ -361,7 +398,41 @@ def normalize_system(messages: Sequence[dict]) -> List[dict]:
 #: every embedding, router and generation request; under concurrency that
 #: is connection churn against four vLLM sidecars. Keyed by loop because an
 #: httpx pool is bound to the loop that created it (tests run many).
-_CLIENTS: dict = {}
+#:
+#: THE KEY MUST NEVER CARRY A CALLER-SUPPLIED VALUE (a per-request API key, a
+#: per-caller timeout): the cache is bounded at `_CLIENT_CACHE_MAX`, and a key
+#: a caller controls turns that bound into constant eviction and a new
+#: connection pool per request (F048, 2026-09-13).
+#:
+#: Least recently used first, and an evicted client is CLOSED — until
+#: 2026-09-13 the whole dict was `.clear()`ed and the clients merely dropped,
+#: so their httpx pools and sockets waited on the garbage collector. The close
+#: is scheduled, never awaited inline, so the call that evicts is not held up
+#: by it; recency makes a client in active use the last candidate.
+_CLIENTS: "OrderedDict[tuple, Any]" = OrderedDict()
+_CLIENT_CACHE_MAX = 64
+#: Close tasks in flight, held so the loop cannot collect one half-way.
+_CLOSING: set = set()
+
+
+def _schedule_close(closer, loop_key) -> None:
+    """Close an evicted client on its own loop, in the background. A client
+    whose loop is not the running one is only dropped: its pool is bound to
+    that loop, and closing it from another would raise, not release."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if loop_key is not None and id(loop) != loop_key:
+        return
+
+    async def close() -> None:
+        with contextlib.suppress(Exception):
+            await closer()
+
+    task = loop.create_task(close())
+    _CLOSING.add(task)
+    task.add_done_callback(_CLOSING.discard)
 
 
 def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optional[float] = None):
@@ -377,6 +448,7 @@ def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optio
     if loop_key is not None:
         cached = _CLIENTS.get(key)
         if cached is not None:
+            _CLIENTS.move_to_end(key)
             return cached
     client = AsyncOpenAI(
         base_url=base_url,
@@ -395,19 +467,21 @@ def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optio
         max_retries=settings.llm_max_retries,
     )
     if loop_key is not None:
-        if len(_CLIENTS) > 64:  # tests: many loops; production: a handful
-            _CLIENTS.clear()
         _CLIENTS[key] = client
+        # Tests: many loops; production: a handful of base URLs on one loop.
+        while len(_CLIENTS) > _CLIENT_CACHE_MAX:
+            old_key, old = _CLIENTS.popitem(last=False)
+            _schedule_close(old.close, old_key[0])
     return client
 
 
 def _openai_client():
-    """Client for the main model (gpt-oss-120b) on OPENAI_BASE_URL."""
+    """Client for the main model (`settings.llm_model`) on OPENAI_BASE_URL."""
     return _client(settings.openai_base_url, settings.openai_api_key)
 
 
 # ---------------------------------------------------------------------------
-# gpt-oss-120b (main model)
+# The main model (`settings.llm_model`)
 # ---------------------------------------------------------------------------
 
 async def chat_completion(
@@ -516,6 +590,9 @@ async def chat_completion_with_reasoning(
         raise RuntimeError(
             f"generation exceeded the {int(settings.gen_wall_clock_s)}s wall clock"
         ) from None
+    # Best-of-N candidates were invisible to usage_events until 2026-09-13
+    # (F045); recorded exactly as chat_completion records it.
+    _capture_usage(resp)
     return split_reasoning(resp.choices[0].message, settings.main_capabilities)
 
 
@@ -774,7 +851,9 @@ async def stream_chat_events(
     # client) adds the budget on top of the caller's answer ceiling.
     # UNBOUNDED mode (the default) floors the request at MAX_OUTPUT_TOKENS
     # (65,536) whenever thinking is on, so however long the model thinks the
-    # answer always has room — the 262k window is the only wall above that.
+    # answer always has room — the serving engine's own window (read from its
+    # /tokenize `max_model_len` by `context.model_window`, never a number
+    # written here) is the only wall above that.
     requested = max_tokens
     if thinking_on:
         if budget_tokens and max_tokens is not None:
@@ -1122,6 +1201,7 @@ async def json_completion(
         }
         try:
             resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
+            _capture_usage(resp)
             _note_truncation(resp, schema_name, budget)
             return resp.choices[0].message.content or ""
         except _bad_request_error() as exc:
@@ -1138,6 +1218,11 @@ async def json_completion(
             )
 
     resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
+    # Until 2026-09-13 neither json_completion branch recorded usage (F045):
+    # every Deep Research step, sf_intel plan, artifact compose and video
+    # fusion spent main-model tokens the ledger and the per-key quotas never
+    # saw. Recorded exactly as chat_completion records it.
+    _capture_usage(resp)
     _note_truncation(resp, schema_name, budget)
     return resp.choices[0].message.content or ""
 
