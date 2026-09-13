@@ -1,0 +1,858 @@
+# Standards basis for the TechSara developer API
+
+Researched 2026-09-12 from primary sources only (OWASP, NIST, IETF, the OpenAPI
+Specification, official framework docs, and public vendor API reference pages for
+wire SHAPES only). No repository code, configuration or data was sent to any
+research tool. Each rule below carries the source it came from; where a rule is our
+inference from a source rather than a sentence in it, it says so.
+
+## api-security
+
+- **Generate every API secret from a CSPRNG with at least 256 bits of entropy (32 random bytes). Never derive it from a UUID, a counter, a timestamp, or a non-cryptographic PRNG. In Python use `secrets.token_bytes(32)` / `secrets.token_urlsafe(32)`.**
+  - why: 256 bits is far above the 112-bit NIST security-strength floor that decides whether a secret may be stored under a plain one-way hash instead of a slow password hash, so choosing 256 bits at generation time is what unlocks the cheap, indexable storage scheme below. OWASP forbids non-CSPRNG sources outright and explicitly warns off UUIDv4.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html
+- **Treat 64 bits of entropy as the absolute floor for any bearer credential and 112 bits as the operational floor for an API key. Do not ship a key whose random portion, after encoding, carries less than 112 bits.**
+  - why: OWASP sets 64 bits as the minimum for session identifiers; NIST uses 112 bits as the line below which a secret must be protected by a slow salted password hash. Below 112 bits you inherit the whole Argon2/PBKDF2 cost and lookup problem for no benefit.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html
+- **Store a keyed digest (HMAC-SHA-256 under a server-side pepper key), not a slow salted password hash, for the high-entropy API secret. Store `key_hash = HMAC-SHA256(pepper, secret)` and look the record up by that digest.** _(inferred)_
+  - why: NIST's category for a high-entropy machine-generated bearer secret is the look-up secret, and it requires only an approved one-way hash once the secret is at or above 112 bits; the salted-password-hashing-scheme requirement is scoped to secrets BELOW that strength. Argon2id/PBKDF2 exist to slow dictionary attacks against guessable human input, which does not apply to 256 random bits. Applying the look-up-secret rule to an API key is my inference; the entropy threshold itself is stated.
+  - source: https://pages.nist.gov/800-63-4/sp800-63b.html
+- **Use HMAC rather than a bare SHA-256, and keep the HMAC pepper key in a separate store from the digest column — a KMS, HSM, or at minimum a secret the database role cannot read.**
+  - why: The keyed step is exactly NIST's 'additional iteration of a keyed hashing operation' for verifiers: an attacker who exfiltrates only the table cannot test candidate keys at all without the pepper. The separation requirement is normative (SHALL); a pepper stored in the same database buys nothing.
+  - source: https://pages.nist.gov/800-63-4/sp800-63b.html
+- **Make the HMAC pepper key at least 112 bits; use 256 bits. Do not exceed the hash's input block size (64 bytes for SHA-256) — there is no security gain past that.**
+  - why: NIST 800-131A disallows HMAC generation keys under 112 bits outright. 800-107 caps the effective strength at min(strength of K, 2C), and notes an over-long K is simply hashed down first, so a 64-byte pepper is the practical maximum useful size.
+  - source: https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-131Ar2.pdf
+- **Compare the presented digest to the stored digest with a constant-time comparison (`hmac.compare_digest` in Python), never `==`.**
+  - why: A byte-by-byte early-exit comparison leaks the matching prefix length through timing. compare_digest is the documented, OpenSSL-backed primitive for this.
+  - source: https://docs.python.org/3/library/hmac.html
+- **Give every key a fixed, unique, greppable prefix that encodes product, environment and key class, e.g. `tsk_live_`, `tsk_test_`, `tspk_live_`. Never let a live and a test key be distinguishable only by their random portion.**
+  - why: GitHub's secret-scanning partner program requires a uniquely defined prefix for a token type to be detectable; GitHub measured false positives dropping to ~0.5% from the prefix alone. Stripe encodes environment in the prefix (`sk_test_` vs `sk_live_`) so a leaked test key is instantly distinguishable from a production one.
+  - source: https://docs.github.com/en/code-security/secret-scanning/secret-scanning-partnership-program/secret-scanning-partner-program
+- **Append a 32-bit CRC32 checksum of the random portion, Base62-encoded into the last 6 characters of the key. Validate the checksum before touching the database, and reject on mismatch with the same generic 401 as any other bad key.**
+  - why: The checksum lets your own gateway (and a scanner) discard malformed candidates offline, eliminating a DB round trip and most scanning false positives. It is not a security control — an attacker can compute it — so the rejection path must be indistinguishable from a wrong-key rejection.
+  - source: https://github.blog/engineering/platform-security/behind-githubs-new-authentication-token-formats/
+- **Show the full secret exactly once, at creation. Afterwards expose only prefix + last 4 characters, a key id, name, scopes, created_at and last_used_at.**
+  - why: If the plaintext is never recoverable, a compromise of the console, the support tooling or a database backup cannot yield working keys. Stripe states the one-time-reveal rule explicitly and pairs it with 'rotate or delete and create another' when lost.
+  - source: https://docs.stripe.com/keys
+- **Accept keys only in `Authorization: Bearer <key>`. Reject a key supplied in a query string, a URL path segment, or a fragment with 400, and never log the full Authorization header.**
+  - why: Two independent IETF documents prohibit this: RFC 6750 SHOULD NOT for page URLs, and RFC 9700 (OAuth 2.0 Security BCP) escalates it to MUST NOT for URI query parameters. URLs land in access logs, Referer headers, browser history and proxy logs.
+  - source: https://www.rfc-editor.org/rfc/rfc6750.html
+- **Return 401 with a `WWW-Authenticate: Bearer` challenge whenever the credential is missing, malformed, unknown, revoked or expired — one generic body for all five cases.**
+  - why: RFC 9110 makes the challenge header mandatory on 401, and RFC 6750 maps expired/revoked/invalid tokens to 401 `invalid_token`. Collapsing the five cases into one response denies an attacker an oracle for 'this key exists but is revoked' vs 'this key was never issued'.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html
+- **Return 403 with `WWW-Authenticate: Bearer error="insufficient_scope", scope="<required scope>"` when the key is valid and the caller's tenant owns the resource but the key lacks the scope. Name the required scope — this is not an information leak, the caller already owns the object.**
+  - why: RFC 6750 defines exactly this code and status, and returning the required scope is the documented, machine-actionable way for a client to know which scope to request. RFC 9110 confirms 403 means credentials were understood but judged insufficient.
+  - source: https://www.rfc-editor.org/rfc/rfc6750.html
+- **Return 404 — not 403 — when an authenticated caller references an object id that exists but belongs to another tenant. Make the 404 body byte-identical to the body for an id that does not exist anywhere, and keep the handling paths timing-comparable.**
+  - why: RFC 9110 explicitly sanctions substituting 404 to conceal a forbidden resource's existence, and both 404 definitions are written to cover 'not willing to disclose'. This is the single most effective wire-level mitigation for BOLA enumeration: a distinguishable 403 turns any id parameter into an existence oracle.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html
+- **Run the object-level authorization check inside every function that reads a record by a client-supplied id — in the query predicate (`WHERE id = :id AND tenant_id = :caller_tenant`), not as a separate check after the fetch.**
+  - why: OWASP API1:2023 is the #1 API risk and requires the check in every such function, driven by user policy and hierarchy rather than ad-hoc per-handler code. Putting the tenant predicate in the query makes the check unbypassable by a handler that forgets to call the guard.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa1-broken-object-level-authorization/
+- **Use random, unpredictable identifiers (UUIDv4 or a random-suffixed id like `msg_<22 random chars>`) for every externally addressable resource. Treat this as defense in depth layered on top of the authorization check, never as a substitute for it.**
+  - why: OWASP recommends unpredictable GUIDs precisely because sequential integers make BOLA trivially automatable. The 'not a substitute' framing is mine but follows from API1's own requirement that the check exist in every function regardless.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa1-broken-object-level-authorization/
+- **Write automated tests for the authorization matrix — tenant A's key against tenant B's object id, for every (resource, method) pair — and make them blocking in CI.**
+  - why: OWASP states this as a distinct prevention bullet with an explicit gate on deployment. Authorization regressions are invisible in functional tests because the happy path still passes.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa1-broken-object-level-authorization/
+- **Deny by default at the routing layer: every route requires an explicit scope declaration, and a route with no declaration fails closed (500/403 at startup or request time) rather than being treated as public.**
+  - why: This is the core API5:2023 requirement. A fail-open default means every newly added handler is publicly reachable until someone remembers to guard it — the exact mechanism behind most BFLA findings.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa5-broken-function-level-authorization/
+- **Authorize the (method, path) pair, not the path. `GET /v1/keys/{id}` and `DELETE /v1/keys/{id}` must resolve to different required scopes, and unlisted methods must return 405.**
+  - why: OWASP names method-swapping (GET→DELETE) as a primary BFLA probe and warns against inferring privilege from the URL path. OWASP REST adds the allowlist-and-405 rule; API8:2023 requires disabling all other verbs.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa5-broken-function-level-authorization/
+- **Name scopes as space-delimited, case-sensitive tokens drawn from the printable ASCII set excluding space, double-quote and backslash, e.g. `chat:read chat:write keys:read admin:keys:write`. Store them as an array; serialize on the wire as a single space-delimited string.**
+  - why: This is RFC 6749's exact scope grammar; following it means OAuth clients, OpenAPI tooling and RFC 7662 introspection consumers all interoperate without a custom parser. Comma-delimited scope strings are a common and gratuitous incompatibility.
+  - source: https://www.rfc-editor.org/rfc/rfc6749.html
+- **Ship restricted, per-integration keys as the default creation path and make the unrestricted key the exception. Scope each key to (a) a permission set and (b) a resource set, and encourage one key per deployment/service rather than one key per account.**
+  - why: Stripe's public position is that unrestricted secret keys should not be used for new use cases at all, and that many narrowly-permissioned keys limit blast radius. Cloudflare's model shows the two-axis shape: permission group crossed with a specific resource.
+  - source: https://docs.stripe.com/keys
+- **Model each scope as read-vs-write over a named resource group, where read implies list. Do not invent a third tier unless a real caller needs it.**
+  - why: Cloudflare's two-level model (Edit = full CRUDL, Read = read + list) is a proven, comprehensible granularity for a public developer API; finer tiers tend to be mis-assigned by integrators, which is itself a BFLA source.
+  - source: https://developers.cloudflare.com/fundamentals/api/get-started/create-token/
+- **Do not use an API key as a user identity. Bind each key to a tenant and to a service principal, and carry the acting user separately if the API acts on behalf of humans.**
+  - why: OWASP API2:2023 states this flatly. Conflating the two means every BOLA check silently degrades to a tenant check, and per-user audit trails become unreconstructible.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa2-broken-authentication/
+- **Implement rotation as: issue a second active key on the same key record, keep both valid for a bounded overlap window (7 days is a defensible default), surface `last_used_at` per key, and only then expire the old one.**
+  - why: Stripe documents exactly this flow with a 7-day grace period and a monitor-then-revoke step, which is the only way to rotate a server-to-server credential without a coordinated deploy. The 'watch request volume go to zero first' step is what makes the revocation safe.
+  - source: https://docs.stripe.com/keys
+- **Offer scheduled/expiring keys (an explicit `expires_at`) in addition to manual rotation, and default new keys to a finite lifetime rather than infinite.**
+  - why: OWASP's rationale for rotation is bounding the useful life of a stolen credential; a key with no expiry defeats that regardless of your rotation policy. Cloudflare exposes TTL on token creation as a first-class field.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+- **Rotate immediately — with zero overlap — on compromise, and on personnel change. Distinguish 'rotate with grace period' from 'revoke now' as two separate operations in the API and the console.**
+  - why: OWASP Cryptographic Storage lists suspected compromise as a rotate trigger independent of the cryptoperiod; Stripe lists both the compromise case and the departing-team-member case, and its `Expiry: Now` option deletes the old key outright. A single 'rotate' verb with a built-in grace period cannot serve the compromise case.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html
+- **Bound every in-process cache of key validity and scopes with an explicit, short TTL (target ≤30s), and publish that TTL as the documented maximum revocation lag. Do not cache a validated key for the lifetime of the process.**
+  - why: RFC 7662 names this exact failure: a protected resource relying on a cached authorization decision keeps honouring a token that has already been revoked. The TTL is therefore not a performance knob, it IS your revocation SLA, and it must be stated as such.
+  - source: https://www.rfc-editor.org/rfc/rfc7662.html
+- **For true immediate revocation across instances, add a revocation epoch or pub/sub invalidation: the revoke call bumps a per-tenant counter that every instance checks (or is pushed) before honouring a cached decision. Design the cache TTL as the fallback bound if the channel is down.** _(inferred)_
+  - why: This follows from the RFC 7662 caching warning combined with the operational reality that a cache TTL alone cannot give 'immediate'. The mechanism itself is not specified by any of the sources I read — it is an inference from the stated risk.
+  - source: https://www.rfc-editor.org/rfc/rfc7662.html
+- **Make the revoke endpoint idempotent: return 200 whether the key existed, was already revoked, or was never issued. Do not return 404 for an unknown key on the revoke path.**
+  - why: RFC 7009 is explicit on both points — 200 for a successfully revoked token AND for an invalid one — and gives the reason: the caller has no sensible recovery from the error. It also removes a key-existence oracle from the revoke endpoint.
+  - source: https://www.rfc-editor.org/rfc/rfc7009.html
+- **Cascade revocation: revoking a parent credential (a key record, an integration, a tenant) invalidates every derived or child credential and session issued under it.**
+  - why: RFC 7009 establishes the pattern for refresh→access tokens as a SHOULD. The same reasoning applies to any credential hierarchy: a partial revoke leaves a working path in.
+  - source: https://www.rfc-editor.org/rfc/rfc7009.html
+- **Enforce per-key rate limits as a first-class security control, not a billing feature: a request budget per window, a concurrency cap, a wall-clock execution timeout, a maximum request body size, a maximum array length, and a server-side cap on any client-supplied page size.**
+  - why: API4:2023 lists each of these as a distinct missing-limit vulnerability, and specifically calls out server-side validation of the parameter that controls how many records are returned — a client-controlled `limit=1000000` is a DoS primitive regardless of your request-rate limit.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa4-unrestricted-resource-consumption/
+- **Rate-limit the key-management endpoints themselves (create/rotate/revoke/list) more tightly than the data plane, and apply anti-brute-force throttling to any endpoint that validates a credential.**
+  - why: API2:2023 requires anti-brute-force on authentication endpoints and treats credential-recovery endpoints as login endpoints for this purpose; a key-mint endpoint is functionally a credential endpoint. NIST additionally caps consecutive failed attempts against a single account at 100.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa2-broken-authentication/
+- **Return 429 with a `Retry-After` header (integer seconds, minimum 1) and a machine-readable error body when a limit is exceeded. Clients must be able to back off without parsing prose.**
+  - why: RFC 6585 defines 429 and the Retry-After affordance; OWASP REST names 429 explicitly for APIs; OpenAI's public spec shows the exact shape a compatibility-minded client expects, including the integer-seconds schema with `minimum: 1`.
+  - source: https://www.rfc-editor.org/rfc/rfc6585.html
+- **If you advertise quota in headers, use the current IETF draft fields `RateLimit-Policy` and `RateLimit` with parameters q/qu/w/pk and r/t/pk — not the obsolete `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` triple. Pin the draft version you implement and document it.**
+  - why: The three-header form was dropped from the working-group draft; implementing from older blog posts produces headers no current client library expects. The draft is still an Internet-Draft (not an RFC), so the format can change again before publication.
+  - source: https://www.ietf.org/archive/id/draft-ietf-httpapi-ratelimit-headers-11.html
+- **Do not emit quota state on unauthenticated, 401 or 403 responses, and do not let failed-auth requests decrement a shared quota an attacker can observe.**
+  - why: The draft's Security Considerations name this precise leak: if error responses consume quota, a malicious client can probe an endpoint and infer another user's traffic. It is the rate-limiting equivalent of the 403-vs-404 existence oracle.
+  - source: https://www.ietf.org/archive/id/draft-ietf-httpapi-ratelimit-headers-11.html
+- **Add jitter to the advertised window end, and cap the ratio between advertised available quota and the effective window. Never advertise a quota you cannot serve if every client spends it immediately.**
+  - why: Both are explicit requirements in the draft — one a MUST NOT / SHOULD pair, the other a stated stampede risk with a worked example (all clients returning at 18:00:00 sharp).
+  - source: https://www.ietf.org/archive/id/draft-ietf-httpapi-ratelimit-headers-11.html
+- **If both `Retry-After` and `RateLimit` are sent, ensure `Retry-After` never points earlier than the end of the effective window.**
+  - why: Stated as a SHOULD NOT in the draft; violating it tells the client to retry into a window that is still exhausted, guaranteeing a second 429.
+  - source: https://www.ietf.org/archive/id/draft-ietf-httpapi-ratelimit-headers-11.html
+- **Put a second rate-limiting layer at the edge (Cloudflare rate limiting rules) keyed on IP/ASN/JA4 for unauthenticated and pre-auth traffic, and keep the per-key limiter in the application. The edge layer must not be the only one.**
+  - why: Edge rules can group by characteristics the application cannot see cheaply, and they absorb load before it reaches origin; but the draft is explicit that advertising limits does not stop clients, so the origin must still enforce. Counting periods are a fixed enumeration, so pick from the supported list.
+  - source: https://developers.cloudflare.com/waf/rate-limiting-rules/
+- **Return errors as `application/problem+json` (RFC 9457) with `type`, `title`, `status`, `detail`, `instance`, plus a stable `code`. Never put a stack trace, a SQL fragment, an internal hostname or an ORM exception string in `detail`.**
+  - why: RFC 9457 gives the standard shape and warns directly against exposing implementation details through the HTTP interface; OWASP API8 and OWASP REST both require enforcing a response schema on error paths specifically so exception traces cannot escape.
+  - source: https://www.rfc-editor.org/rfc/rfc9457.html
+- **Keep an immutable audit record for every key lifecycle event (create, reveal, rotate, scope change, revoke) and for every authorization failure, recording who, what key id, from where, when — and never the secret or its digest.**
+  - why: OWASP Secrets Management defines the minimum audit set; OWASP REST adds that token validation errors specifically should be logged to detect attacks, and that log data must be sanitized against log injection.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html
+- **Declare the scheme in OpenAPI as `type: http, scheme: bearer` with a `bearerFormat`, define every scope in the document, and never leave an empty security requirement `{}` on an operation unless that operation is genuinely public.**
+  - why: OpenAPI's semantics make `{}` mean 'security is optional' for that operation — a one-character way to silently disable auth in generated servers, gateways and docs. Multiple schemes in one requirement object are AND; an array of requirement objects is OR.
+  - source: https://spec.openapis.org/oas/v3.1.0.html
+- **Terminate every API path over TLS only, including calls to internal downstream components, and restrict each route to an explicit verb allowlist.**
+  - why: API8:2023 lists missing TLS as a vulnerability indicator and requires encryption for downstream/upstream hops too — not just the client edge — plus disabling every verb a route does not implement.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa8-security-misconfiguration/
+- **Allowlist response properties explicitly per endpoint (an explicit serializer/response_model), and allowlist writable properties on input. Never serialize an ORM object wholesale, and never bind a request body straight onto a model.**
+  - why: API3:2023 collapses the old Excessive Data Exposure and Mass Assignment items into one root cause: no authorization check at the property level. A wholesale serializer is how `is_admin`, `tenant_id` and internal key digests leak; generic binding is how they get overwritten.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa3-broken-object-property-level-authorization/
+- **Version the public API in the path (`/v1/`), maintain an inventory of every deployed version and environment with who may reach it, and retire old versions rather than leaving them running unpatched.**
+  - why: API9:2023 makes inventory and version retirement the mitigation, and specifically warns that security tooling must cover every exposed version, not just current production. An unretired `/v0/` without the new authorization checks is a complete bypass of the new ones.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa9-improper-inventory-management/
+- **In FastAPI, implement the credential as a single dependency that returns a resolved principal (tenant id, key id, scope set) or raises; never let a route read the Authorization header itself. Raise `HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})` so the RFC 9110 challenge requirement is met.**
+  - why: FastAPI's own security dependencies already return 401 for a missing or non-Bearer Authorization header before the handler runs; centralizing on one dependency is what gives you the deny-by-default property API5 requires, and the explicit headers kwarg is how the mandatory challenge gets emitted.
+  - source: https://fastapi.tiangolo.com/tutorial/security/first-steps/
+- **Offer an optional per-key network restriction (IP/CIDR allowlist, or ASN+country) and recommend it for production keys, blocking and alerting on a request from outside the policy.**
+  - why: This turns a stolen key into a key that only works from the customer's own infrastructure, and the block event is itself a high-fidelity compromise signal. Stripe recommends it on all live keys for exactly that reason; Cloudflare exposes the same control on tokens.
+  - source: https://docs.stripe.com/keys
+- **For high-value or first-party integrations, consider sender-constraining the credential (mTLS per RFC 8705, or DPoP per RFC 9449) rather than relying on a pure bearer secret.**
+  - why: RFC 9700 (OAuth 2.0 Security BCP) raises this to a SHOULD for access tokens because a bearer credential is replayable by anyone who obtains it — which is precisely the API-key threat model. This is a later-stage option, not a v1 requirement.
+  - source: https://www.rfc-editor.org/rfc/rfc9700.html
+- **Apply bot/abuse controls to sensitive business flows that a key can drive at machine speed (key minting, bulk export, anything metered and billable), independently of the generic request-rate limit.**
+  - why: API6:2023 is specifically about flows that are individually legitimate but harmful in volume, and it names securing APIs consumed directly by machines — i.e. exactly a developer API — as a required mitigation.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/
+- **Add secret-scanning detection for your own prefix: publish the regex, and — if you enroll in GitHub's partner program — stand up the webhook receiver that auto-revokes and notifies on a leaked-key match.**
+  - why: The program requires a revocation-and-notification capability as a participation component, and the prefix+checksum format above is what makes the detection precise. This closes the loop between 'a key leaked into a public repo' and 'the key is dead'.
+  - source: https://docs.github.com/en/code-security/secret-scanning/secret-scanning-partnership-program/secret-scanning-partner-program
+
+### Wire shapes to copy
+
+- Credential transport: `Authorization: Bearer <key>` — RFC 6750 §2.1 grammar `credentials = "Bearer" 1*SP b64token`, `b64token = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="`. Note `~` and `.` are legal, so a `tsk_live_<base62>.<crc>` shape is wire-legal.
+- Challenge on 401: `WWW-Authenticate: Bearer realm="api", error="invalid_token", error_description="..."` (RFC 6750 §3). Mandatory: RFC 9110 — "A server generating a 401 response MUST send at least one WWW-Authenticate header field."
+- Challenge on 403: `WWW-Authenticate: Bearer error="insufficient_scope", scope="keys:write"` — RFC 6750 defines `scope` as an optional attribute of the challenge and maps `insufficient_scope` to HTTP 403.
+- RFC 6750 error → status mapping to copy exactly: `invalid_request` → 400, `invalid_token` → 401, `insufficient_scope` → 403.
+- Status semantics: 401 = no/invalid credential; 403 = valid credential, insufficient privilege; 404 = hide existence (RFC 9110: "A server that wishes to hide the existence of a forbidden target resource MAY instead respond with a status code of 404 (Not Found)."); 405 = verb not in the route allowlist (OWASP REST); 429 = rate limited (RFC 6585).
+- Error body media type: `Content-Type: application/problem+json` with members `type` (URI reference), `title`, `status` (int), `detail`, `instance` — RFC 9457. `application/problem+xml` also registered.
+- OpenAI-compatible error envelope (from the public openai-openapi spec, components.schemas.ErrorResponse → Error): `{"error": {"message": str, "type": str, "param": str|null, "code": str|null}}` with all four of type/message/param/code REQUIRED. Example values seen in the spec: `"type": "rate_limit_error"`, `"code": "slow_down"`; `"type": "service_unavailable_error"`, `"code": "server_is_overloaded"`.
+- OpenAI-compatible 429: response description "The request was rejected because a rate limit was exceeded." with header `Retry-After`, `schema: {type: integer, minimum: 1}`, described as "The minimum number of seconds to wait before retrying."
+- OpenAI securitySchemes (public spec): `ApiKeyAuth: {type: http, scheme: bearer}` and `AdminApiKeyAuth: {type: http, scheme: bearer}` — i.e. HTTP bearer, not OpenAPI `type: apiKey`.
+- Current IETF quota headers (draft-ietf-httpapi-ratelimit-headers-11, NOT yet an RFC): `RateLimit-Policy: "burst";q=100;w=60,"daily";q=1000;w=86400` and `RateLimit: "default";r=50;t=30`. Policy params: `q` (quota, required), `qu` (quota unit, default "requests"), `w` (window seconds), `pk` (partition key, byte sequence). RateLimit params: `r` (remaining, required), `t` (effective window seconds), `pk`. Partition-key example: `RateLimit-Policy: "peruser";q=100;w=60;pk=:cHsdsRa894==:`
+- Obsolete — do NOT implement: `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` (removed from the current draft).
+- De-facto vendor rate-limit headers if you want GitHub-style compatibility: `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-used`, `x-ratelimit-reset` (UTC epoch seconds), `x-ratelimit-resource`, plus `retry-after`. GitHub returns 403 OR 429 on primary limit exhaustion.
+- Backoff header: `Retry-After` (RFC 6585 / RFC 9110), delay-seconds or HTTP-date. RateLimit draft: when both are present, `Retry-After` SHOULD NOT point earlier than the end of the effective window.
+- Scope wire format (RFC 6749 §3.3): space-delimited, case-sensitive. `scope = scope-token *( SP scope-token )`, `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )` (printable ASCII minus SP, `"`, `\`). Suggested names: `chat:read chat:write keys:read keys:write admin:*`.
+- Introspection-style response fields worth mirroring in an internal key-resolution payload (RFC 7662): `active` (bool, REQUIRED), `scope` (space-separated string), `client_id`, `sub`, `aud`, `iss`, `exp`, `iat`, `nbf`, `jti`.
+- Revocation endpoint (RFC 7009): POST params `token` (REQUIRED), `token_type_hint` (OPTIONAL; values `access_token`, `refresh_token`). Returns 200 both on success and on an invalid token.
+- Key material shape to adopt: `<prefix>_<env>_<base62 random>` + 6-char Base62 CRC32 checksum. GitHub precedent: `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`; 178 bits of entropy for OAuth tokens; "a 32 bit checksum in the last 6 digits of each token" via CRC32, Base62-encoded with leading-zero padding. Stripe precedent: `pk_test_`/`rk_test_`/`sk_test_` vs `pk_live_`/`rk_live_`/`sk_live_`, plus `sk_org_` for org-level.
+- Storage columns: `key_id` (public, e.g. `key_01H…`), `prefix` (e.g. `tsk_live_`), `last4`, `key_hash` = HMAC-SHA256(pepper, full_secret) hex/bytea with a UNIQUE index for O(1) lookup, `tenant_id`, `scopes text[]`, `created_at`, `expires_at`, `revoked_at`, `last_used_at`. Pepper key lives outside the database.
+- OpenAPI 3.1 declaration: `components.securitySchemes.BearerAuth: {type: http, scheme: bearer, bearerFormat: "TechsaraAPIKey"}`. Security Requirement semantics: multiple schemes inside one object = AND; multiple objects in the array = OR; `{}` in the array = security OPTIONAL (never ship this unintentionally).
+- FastAPI: `raise HTTPException(status_code=401, detail="Invalid authentication credentials", headers={"WWW-Authenticate": "Bearer"})`; constant-time check via `hmac.compare_digest(computed, stored)`.
+- NIST thresholds to encode as constants: 112 bits = minimum security strength (SP 800-131A Rev 2) and the entropy line above which a plain approved hash suffices for a look-up secret (SP 800-63B §3.1.2.2); ≥112-bit HMAC keys required for HMAC generation; salt ≥32 bits if a password hashing scheme is ever used; ≤100 consecutive failed authentication attempts per account.
+
+### Pitfalls
+
+- The RateLimit header spec is still an Internet-Draft (draft-ietf-httpapi-ratelimit-headers-11, expires 24 November 2026, IESG state 'I-D Exists'). Most blog posts and several server libraries still emit the removed `RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset` triple. If you implement from a secondary source you will ship headers no current client expects — and the field format may still change before publication. Pin the draft revision in your docs.
+- Emitting quota headers on 401/403, or letting failed-auth requests decrement a shared quota, is an information leak the draft names explicitly: a malicious client can probe an endpoint and infer another user's traffic volume. This is the rate-limiting twin of the 403-vs-404 existence oracle.
+- Using Argon2id/bcrypt/PBKDF2 for API keys forces a table scan or a separate plaintext-derived lookup index, because a salted hash is not deterministic. Teams usually fix this by storing a second unsalted hash 'just for lookup' — which reintroduces exactly the property the slow hash was meant to remove. For a ≥112-bit CSPRNG secret the slow hash buys nothing anyway.
+- Storing the HMAC pepper in the same database as the digests voids the entire benefit. NIST's requirement is normative and structural: 'The secret key value SHALL be stored separately from the hashed passwords.' A pepper in an env var on the same host that the DB dump came from is a partial mitigation at best.
+- Rotating the pepper is a migration, not a config change: every digest must be recomputed, and you cannot recompute from the stored digest. Plan for a `pepper_version` column from day one or you will be unable to rotate it without invalidating every customer key.
+- Returning 403 for a cross-tenant object id and 404 for a nonexistent one turns every id parameter into an enumeration oracle — the classic BOLA amplifier. Conversely, blanket-404 must be applied consistently: a differing response body, a differing header set, or a measurably different latency between the two paths reopens the oracle.
+- OWASP is explicit that 'API keys should not be used for user authentication.' If a key is treated as an identity, every object-level check silently degrades to a tenant-level check and per-user attribution in the audit log becomes unreconstructible after the fact.
+- The embedded CRC32 checksum is not authentication. It saves a database lookup and helps scanners; an attacker computes it trivially. A checksum-fail must return the same generic 401 as any other bad key, on a timing-comparable path.
+- Caching a validated key's scopes for the process lifetime (a module-level dict, a warm Lambda, a long-lived worker) makes revocation silently ineffective — RFC 7662 names this failure directly. Whatever TTL you pick IS your published revocation SLA; if you don't bound it, you have no revocation guarantee to publish.
+- GitHub returns 403 *or* 429 for primary rate limit exhaustion. If you document only 429 and a client library treats 403 as fatal-non-retryable, integrators will see hard failures where you intended backoff. Pick one status and hold to it.
+- UUIDv4 is not a safe key: OWASP warns its CSPRNG backing is implementation-dependent, and the fixed version/variant bits mean a 36-char string carries ~122 bits, not 128 — with none of the prefix/checksum benefits.
+- An empty OpenAPI security requirement `{}` on an operation means security is OPTIONAL for it. Two characters in a spec file silently make a route public in generated servers, gateways and docs.
+- Scope strings must be space-delimited and case-sensitive per RFC 6749. Comma-delimited scopes, or case-insensitive matching, break OAuth client libraries and OpenAPI tooling for no gain.
+- OWASP API9 warns that security tooling must cover every exposed version, not just current production. A surviving `/v0/` or a staging host reachable from the internet without the new object-level checks is a complete bypass of the authorization work you just did.
+- Rotation-with-grace and revoke-now are different operations with opposite safety properties. If you ship one 'rotate' verb that always grants a 7-day overlap, a customer responding to a live compromise cannot actually cut the attacker off.
+- A client-controlled page-size parameter with no server-side cap is a DoS primitive that your per-key request-rate limiter will not catch — API4:2023 calls this out as its own vulnerability class, separate from rate limiting.
+
+### Open questions for the design
+
+- Does the target audience require FIPS-mode or formal NIST alignment? None of the sources defines an 'API key' category — I mapped it onto NIST's look-up secret (high-entropy, machine-generated, bearer). That analogy is sound but is my inference, not a stated NIST position. If an auditor must sign off, the safer posture is HMAC-SHA-256 with an HSM-held pepper, which satisfies the stricter password-verifier language too.
+- What overlap window for rotation? Stripe's public answer is 7 days with a monitor-then-expire step. Shorter is safer, longer is kinder to integrators who deploy monthly. Needs a product call, and it should be configurable per key rather than global.
+- Should quota headers be emitted to unauthenticated callers at all? The draft's Security Considerations argue against exposing operational capacity to untrusted parties; the usability argument runs the other way. A reasonable split is: RateLimit on authenticated 2xx only, Retry-After on 429 always.
+- Sender-constraining (mTLS per RFC 8705 or DPoP per RFC 9449) is a SHOULD in RFC 9700 and would materially change the threat model, but it raises the integration bar substantially for a public developer API. Is it in scope now, or a later tier for enterprise customers?
+- 403-vs-404 policy needs to be decided per resource class and written into the public docs. Blanket-404 is safest against enumeration but produces confusing developer experience when someone genuinely lacks a scope on their own object. My recommendation — 404 for cross-tenant, 403 insufficient_scope for same-tenant-but-unscoped — needs confirmation.
+- Enrolling in GitHub's secret-scanning partner program requires standing up a webhook receiver and committing to automatic revocation plus user notification. That is real operational surface. Worth it for a public key prefix, or defer and just publish the regex?
+- Which rate-limit dimensions are the product's actual scarce resource? The public docs give the mechanics but not the numbers. For an inference-backed API the binding constraint is usually concurrent in-flight generations and token throughput, not requests per minute — so `qu="tokens"` (the draft's quota-unit parameter) may model it better than request counts.
+- Does the pepper live in a KMS with a network call on every request, or is it loaded into process memory at boot? The first is stronger and satisfies NIST's hardware-protected-area SHOULD; the second is faster. NIST does not settle the latency trade-off for a high-QPS API.
+
+## streaming
+
+- **Serve the stream as `Content-Type: text/event-stream` with no charset parameter, and write every byte as UTF-8. Do not emit a BOM.**
+  - why: The media type registration allows `charset` only for legacy compatibility and says it serves no purpose; the stream is always UTF-8. Only ONE leading BOM is stripped by the decoder, so any BOM you emit per-event becomes data corruption.
+  - source: https://html.spec.whatwg.org/multipage/iana.html#text/event-stream
+- **Terminate every field line with a single LF (`\n`) and separate events with a blank line (`\n\n`). Never close the response without emitting the blank line after the final event.**
+  - why: Dispatch happens only on a blank line; an event not followed by a blank line is silently discarded, so a stream that ends mid-event loses its last event (typically the terminal/usage event).
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+- **Write `data: ` with exactly one space after the colon, and put the entire payload in a single `data:` line by JSON-encoding it (JSON escapes newlines, so no multi-line data is ever needed).**
+  - why: The parser strips exactly one leading U+0020 from the value; a second space survives as payload. Multi-line `data` is joined with LF and the trailing LF removed, which is an easy source of off-by-one whitespace bugs.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+- **Only four field names are meaningful: `event`, `data`, `id`, `retry`. Compare them literally (no case folding). Put every product-specific field inside the JSON `data` payload, never as a new SSE top-level field.**
+  - why: Unknown fields are silently ignored by conforming parsers, so a custom SSE field is invisible to browsers, SDKs and OpenAPI 3.2 tooling.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+- **Emit a comment heartbeat line (`:` followed by anything, e.g. `: ping`) at an interval of 15 seconds or less whenever no real event has been sent.**
+  - why: This is the spec's own remedy for intermediaries that drop idle HTTP connections, and 15s is comfortably under nginx's 60s default `proxy_read_timeout`.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
+- **The stream MUST be served with HTTP status exactly 200 and Content-Type exactly `text/event-stream`. Anything else is a permanent, non-retryable failure for an EventSource client.**
+  - why: A non-200 status or wrong content type makes the UA 'fail the connection', after which it never reconnects — so a 302 to a login page or a 200 `application/json` error body kills the client silently.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#the-eventsource-interface
+- **Return `204 No Content` when a client must stop reconnecting permanently (e.g. the stream's resource is gone, or the account is disabled), and a 5xx when you are shedding load.**
+  - why: 204 is the spec's documented 'stop reconnecting' signal; the media type registration explicitly recommends 5xx for capacity problems because it stops the automatic reconnect loop that would otherwise amplify an outage.
+  - source: https://html.spec.whatwg.org/multipage/iana.html#text/event-stream
+- **Send an explicit `retry: <milliseconds>` (ASCII digits only) as one of the first lines of every stream; do not rely on the client default.**
+  - why: The initial reconnection time is implementation-defined ('a few seconds') and differs per browser, so backoff is not under your control unless you set it. A non-digit value is ignored outright.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#the-eventsource-interface
+- **If you emit `id:`, accept and honour the `Last-Event-ID` request header on reconnect, and resume from the event AFTER that id. Values must not contain NUL, LF or CR.**
+  - why: This is the only standard resume mechanism; without it a dropped connection restarts generation and double-bills the caller. The value space is constrained by the spec.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header
+- **If you do NOT support resume, omit `id:` entirely rather than sending ids you will ignore.** _(inferred)_
+  - why: An `id:` sets the client's last event ID buffer permanently and will be replayed to you as `Last-Event-ID`; advertising ids you ignore invites clients to assume resume works. (The spec defines the mechanism; the decision to omit is our design inference.)
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
+- **Set the response headers `Content-Type: text/event-stream`, `Cache-Control: no-cache` and `Connection: keep-alive` on HTTP/1.1 SSE responses.**
+  - why: This exact triad is what Cloudflare's own SSE reference implementation specifies, and is the de-facto interoperable set.
+  - source: https://developers.cloudflare.com/agents/api-reference/http-sse/
+- **Never emit `Connection`, `Keep-Alive`, `Transfer-Encoding` or `Upgrade` on an HTTP/2 (or HTTP/3) response. Set them conditionally on the negotiated protocol version.**
+  - why: HTTP/2 treats any message containing connection-specific header fields as malformed; a hardcoded `Connection: keep-alive` can get the whole stream reset by a strict peer.
+  - source: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.2.2
+- **Add `Cache-Control: no-store, no-transform` to streaming responses (in addition to or instead of `no-cache`).**
+  - why: `no-store` forbids any cache retaining the tokens; `no-transform` forbids intermediaries recompressing or otherwise rewriting the body, which is the standards-based way to stop an edge from buffering-to-compress.
+  - source: https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2.6
+- **Emit `X-Accel-Buffering: no` from the application on every streaming response.**
+  - why: nginx buffers proxied responses by default; this response header turns buffering off per-response without needing a config change in every deployment's nginx.
+  - source: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffering
+- **In nginx, set `proxy_buffering off;` on the streaming location. Do not rely on the default.**
+  - why: The directive defaults to ON, in which case nginx reads the whole response into buffers (spilling to disk) before forwarding — which destroys token-by-token delivery.
+  - source: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffering
+- **Raise nginx `proxy_read_timeout` above your worst-case gap between chunks, or guarantee a heartbeat more often than the timeout. The default is 60s.**
+  - why: The timeout is measured between two successive reads; a long prefill or a stalled engine with no heartbeat closes the connection at 60s. A 15s heartbeat satisfies the default without any config change.
+  - source: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_read_timeout
+- **Pin `proxy_http_version 1.1;` (or 2) explicitly on the streaming location.**
+  - why: The default was 1.0 before nginx 1.29.7, and 1.0 breaks upstream keepalive; the docs recommend 1.1 or 2 for keepalive connections. Pinning makes behaviour identical across nginx versions.
+  - source: https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_http_version
+- **Behind Cloudflare Tunnel, the `Content-Type: text/event-stream` response header is load-bearing: it is the only thing that disables cloudflared's default buffering.**
+  - why: Tunnel buffers proxied traffic by default; if your origin mislabels the stream (e.g. `text/plain` or `application/x-ndjson`), the entire answer arrives at once at the end.
+  - source: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/troubleshoot-tunnels/common-errors/
+- **Budget time-to-first-byte under 125 seconds behind Cloudflare, and make sure the first SSE bytes (a `retry:` line plus a `response.created`-style event) are flushed immediately rather than after prefill completes.**
+  - why: Cloudflare returns Error 524 if the origin does not provide an HTTP response within the default 125s read timeout (30s write timeout). Only Enterprise can raise it.
+  - source: https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/
+- **Do not rely on Cloudflare leaving `text/event-stream` uncompressed by accident — send `cache-control: no-transform` if compression must not be applied.**
+  - why: `text/event-stream` is absent from Cloudflare's default-compressed content-type list, and `no-transform` is the documented way to prevent Cloudflare altering compression.
+  - source: https://developers.cloudflare.com/speed/optimization/content/compression/
+- **Do not set `Content-Length` on a stream; let the server use chunked transfer coding on HTTP/1.1.**
+  - why: Chunked is defined precisely for content streams of unknown size and lets the recipient know when the message is complete; a Content-Length you cannot know in advance is unsatisfiable.
+  - source: https://www.rfc-editor.org/rfc/rfc9112.html#section-7.1
+- **Treat 'stream ended without a terminal event' as a hard client-side error, and document that contract. Do not let clients infer success from EOF.**
+  - why: At the HTTP layer a truncated chunked body is only detectable by the missing zero-sized chunk, and many client stacks surface that as a clean EOF. An application-level terminal event is the only reliable completion signal.
+  - source: https://www.rfc-editor.org/rfc/rfc9112.html#section-8
+- **Detect client disconnect via the ASGI `http.disconnect` receive event and abort generation immediately; assume any further `send()` will raise.**
+  - why: This is the protocol-level disconnect signal every ASGI server (uvicorn/hypercorn) delivers, and the ASGI spec explicitly names early-close cleanup as its purpose.
+  - source: https://asgi.readthedocs.io/en/latest/specs/www.html
+- **Ensure the streaming generator hits an `await` at least once per chunk (a real await on the engine queue counts) so that asyncio cancellation can actually land.**
+  - why: FastAPI documents that a generator with no await cannot be cancelled and may keep running — i.e. keep occupying a GPU slot — after the client is gone.
+  - source: https://fastapi.tiangolo.com/advanced/custom-response/
+- **Prefer FastAPI's built-in SSE support (`fastapi.sse.EventSourceResponse` / `ServerSentEvent`) over hand-rolled `StreamingResponse` string formatting.**
+  - why: It sets `media_type='text/event-stream'` and `charset='utf-8'`, models `data`/`raw_data`/`event`/`id`/`retry`/`comment` with the spec's single-line and no-NUL constraints, and ships `listen_for_disconnect(receive)` — removing a whole class of framing bugs.
+  - source: https://fastapi.tiangolo.com/reference/sse/
+- **On disconnect, propagate cancellation all the way to the inference backend (for an OpenAI-compatible vLLM backend, `POST /v1/responses/{response_id}/cancel`), not just to the HTTP handler.**
+  - why: Aborting the FastAPI task frees the socket but not necessarily the engine slot; vLLM exposes an explicit cancel endpoint for Responses.
+  - source: https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server.html
+- **Give each SSE event BOTH an `event:` name and a matching `"type"` field inside the JSON `data`.**
+  - why: The `event:` name lets `EventSource.addEventListener` and OpenAPI 3.2 `oneOf`-on-`event` discriminate without parsing; the duplicated `type` lets non-EventSource clients (fetch + manual parser, server-side SDKs) discriminate from the JSON alone. Both major public LLM APIs do exactly this.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Adopt the Responses-style lifecycle vocabulary verbatim: `response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`.**
+  - why: This is the exact, ordered sequence in the public OpenAI OpenAPI example; matching it lets existing OpenAI client SDKs and agent frameworks consume our stream unmodified.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Put a required integer `sequence_number` on EVERY streaming event, monotonically increasing from the first event of the stream (including on the `error` event).**
+  - why: It is a required field on the public event schemas and is the only in-band way for a client to detect a gap or reordering; it also gives a resume cursor that pairs naturally with `Last-Event-ID`.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Text deltas carry exactly `item_id` (string), `output_index` (int), `content_index` (int), `delta` (string) alongside `type` and `sequence_number`. Do not invent alternative names.**
+  - why: These are the field names in the public schema; the two indices are what let a client reassemble multiple concurrent output items and content parts.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Define exactly three success-path terminal events — `response.completed`, `response.incomplete`, `response.failed` — each carrying the full `response` object, plus `response.queued` for admission.**
+  - why: This gives a client one place to read final state and distinguishes 'hit a limit' from 'errored', which a single `[DONE]` sentinel cannot express.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Return token usage only in the terminal event, as `response.usage = {input_tokens, output_tokens, output_tokens_details:{reasoning_tokens}, total_tokens}`. Every earlier event carries `usage: null`.**
+  - why: That is the exact shape and placement in the public wire example; a single authoritative usage object avoids clients summing deltas.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Do NOT emit a `data: [DONE]` sentinel on the Responses-style endpoint. Reserve `[DONE]` for a Chat-Completions-compatible endpoint if we ship one.**
+  - why: The public Responses wire example terminates with `response.completed` and no sentinel; `[DONE]` is documented only for Completions/Chat Completions and Assistants runs.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **If we ship a Chat-Completions-compatible endpoint, implement `stream_options: {"include_usage": true}` exactly: one extra chunk before `data: [DONE]` whose `choices` is `[]` and whose `usage` is populated; all other chunks carry `usage: null`.**
+  - why: Existing OpenAI SDKs and LiteLLM-style proxies key off this precise shape; deviating breaks cost accounting silently.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Document explicitly that an interrupted or cancelled stream may not deliver the usage-bearing terminal event, and bill/meter from a server-side record keyed by the response id rather than from what the client received.**
+  - why: The public docs state this caveat for their own API; the same physics applies to ours, and metering from the wire would under-count every disconnect.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Surface mid-stream failures as a typed `event: error` whose data is `{"type":"error","code":<string|null>,"message":<string>,"param":<string|null>,"sequence_number":<int>}`, then close the stream. Never change the HTTP status after the first byte.**
+  - why: The 200 status and headers are already committed once streaming begins (RFC 9112 §8 makes truncation the only other signal), so the error must travel in-band. This is the exact required field set in the public schema.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **In the mid-stream error payload, name the error class that would have been the HTTP status in non-stream mode (e.g. `overloaded_error` for what would be a 503/529), so a client can apply the same retry policy either way.**
+  - why: A public vendor reference does exactly this and documents the correspondence, giving clients a single retry table for both modes.
+  - source: https://platform.claude.com/docs/en/build-with-claude/streaming
+- **Failures detected BEFORE the first byte must use real HTTP status codes with a JSON error body — 429 for rate limits and 503 for overload — each with an integer `Retry-After` header (minimum 1).**
+  - why: A pre-stream 429/503 is retryable machine-readably; an in-band error event is not. The public spec types `Retry-After` as `integer, minimum: 1` on exactly these two inference responses.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Publish the versioning promise that new event types and new fields may be added at any time, and that clients MUST ignore unknown event types and unknown JSON fields rather than erroring.**
+  - why: Both the SSE parser (which ignores unknown fields) and public vendor policy assume this; without the stated promise we cannot add events without a breaking-change review.
+  - source: https://platform.claude.com/docs/en/build-with-claude/streaming
+- **Expose streaming and non-streaming as ONE operation with one request body (a `stream: boolean` flag) and two 200 response media types — `application/json` and `text/event-stream`.**
+  - why: This is how the public spec models it, and it is what makes parity checkable: one schema pair, one operation id, one set of error responses.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Enforce parity by construction: the non-stream JSON body MUST be byte-identical to the `response` object inside the terminal `response.completed` event for the same inputs. Add a contract test that runs both modes and diffs them.** _(inferred)_
+  - why: The public spec points both media types at `Response`-shaped payloads, so parity is a schema-level invariant, not a nicety. (The test strategy is our inference.)
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Describe the stream in OpenAPI 3.2 with `itemSchema` (not `schema`) under `text/event-stream`, and use `oneOf` discriminated on a `const` value of the `event` field.**
+  - why: `itemSchema` is applied to each event independently, which is what lets tooling validate and generate incremental consumers; `schema` would describe the whole stream as an array.
+  - source: https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.2.0.md#streaming-sequential-media-types
+- **In the OpenAPI event schema, model the SSE event as `{data: string (required), event: string, id: string, retry: integer minimum 0}` and describe the JSON payload with `contentMediaType: application/json` + `contentSchema` on `data`.**
+  - why: This is the generic schema the OpenAPI 3.2 spec itself publishes for `text/event-stream`, plus its stated technique for typed JSON inside `data`.
+  - source: https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.2.0.md#special-considerations-for-server-sent-events
+- **Document that SSE field values are strings at the wire level — numbers inside `data` are only numbers after JSON parsing — and that comments and unknown fields never reach schema validation.**
+  - why: OpenAPI 3.2 mandates that implementations parse per the WHATWG spec first and treats untyped fields as strings, which is the behaviour our SDKs and mocks must match.
+  - source: https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.2.0.md#special-considerations-for-server-sent-events
+- **Batch N decoded tokens per SSE event (configurable, default small, per-request override), but always flush the first and last chunks immediately.**
+  - why: vLLM exposes exactly this knob (`--stream-interval` / per-request `stream_interval`) because per-token SSE framing is measurable overhead; the first/last exception preserves TTFT and terminal-event delivery.
+  - source: https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server.html
+- **Offer an opt-out padding field (e.g. `obfuscation`) on delta events that normalizes streamed chunk sizes, defaulted ON, with a `stream_options.include_obfuscation: false` escape hatch.**
+  - why: Variable SSE chunk lengths leak token-length information to a network observer even under TLS; the public API treats this as a real side-channel and pads by default.
+  - source: https://github.com/openai/openai-openapi/blob/master/openapi.yaml
+- **Cap concurrent open streams per API key and enforce a hard wall-clock execution timeout on every stream, returning a terminal `response.incomplete` (not a silent close) when the cap is hit.** _(inferred)_
+  - why: OWASP API4:2023 names per-client operation throttling and resource limits as the prevention for unrestricted resource consumption; a long-lived stream is the extreme case. (The choice of `response.incomplete` as the signal is our inference from the event vocabulary.)
+  - source: https://api-security.owasp.org/editions/2023/en/0xa4-unrestricted-resource-consumption/
+- **Prefer HTTP/2 or HTTP/3 for the public streaming endpoint, and document that browsers running many simultaneous streams to one origin over HTTP/1.1 will stall.** _(inferred)_
+  - why: The SSE spec itself warns about the per-server connection limit and offers only awkward workarounds; HTTP/2 multiplexing removes the constraint. (That HTTP/2 is the fix is our inference.)
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#authoring-notes
+- **Design for POST-initiated streams consumed by `fetch` + a manual SSE parser, not by `EventSource`; reserve `EventSource` compatibility for a GET-based resume endpoint.** _(inferred)_
+  - why: `EventSource` has no method or body parameter — its request is a plain credentialed/CORS GET — so a chat request with a JSON body cannot use it. Browser clients must parse the SSE framing themselves, which is why strict spec conformance matters.
+  - source: https://html.spec.whatwg.org/multipage/server-sent-events.html#the-eventsource-interface
+- **In a Next.js Route Handler, return a `ReadableStream` from a `TextEncoder`-fed async iterator and set the SSE headers on the `Response` yourself; never buffer the iterator into a string first.**
+  - why: Next.js documents the raw Web Streams pattern for LLM streaming and does not set any streaming headers for you.
+  - source: https://nextjs.org/docs/app/api-reference/file-conventions/route
+
+### Wire shapes to copy
+
+- Response status/headers for a stream: `HTTP/1.1 200 OK`, `Content-Type: text/event-stream` (no charset param), `Cache-Control: no-store, no-cache, no-transform`, `Connection: keep-alive` (HTTP/1.1 only — forbidden on h2/h3), `X-Accel-Buffering: no`, chunked framing with no `Content-Length`.
+- Request headers a conforming client sends: `Accept: text/event-stream`; on reconnect `Last-Event-ID: <last id seen>` (UTF-8, no NUL/LF/CR).
+- SSE frame grammar: `stream = [bom] *event`; `event = *( comment / field ) end-of-line`; `comment = colon *any-char end-of-line`; `field = 1*name-char [ colon [ space ] *any-char ] end-of-line`; `end-of-line = ( cr lf / cr / lf )`. Only `event`, `data`, `id`, `retry` are meaningful; everything else is ignored.
+- Heartbeat line: `: ping\n\n` (or `:\n\n`), at least every 15 s.
+- Retry directive: `retry: 3000\n` — ASCII digits only, milliseconds; anything non-digit is ignored.
+- Responses-style wire frame (event name + duplicated `type`):
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"msg_…","output_index":0,"content_index":0,"delta":"Hi","sequence_number":7}
+- Full lifecycle event-name sequence: response.created → response.in_progress → response.output_item.added → response.content_part.added → response.output_text.delta (×N) → response.output_text.done → response.content_part.done → response.output_item.done → response.completed. Admission: response.queued. Terminals: response.completed | response.incomplete | response.failed. Out-of-band: error.
+- Other delta event names worth mirroring: response.refusal.delta / .done, response.function_call_arguments.delta / .done, response.reasoning_text.delta / .done, response.reasoning_summary_text.delta / .done, response.output_text.annotation.added, response.custom_tool_call_input.delta / .done.
+- Required field set on every event: `type` (string const) + `sequence_number` (integer, monotonic from 1). Delta events add `item_id`, `output_index`, `content_index`, `delta`. `*.done` events carry the completed `text` / `part` / `item` instead of `delta`.
+- Terminal usage object: `response.usage = {"input_tokens":37,"output_tokens":11,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":48}`; `usage` is `null` on every non-terminal event.
+- Mid-stream error frame:
+event: error
+data: {"type":"error","code":"ERR_SOMETHING","message":"Something went wrong","param":null,"sequence_number":42}
+Required: type, code, message, param, sequence_number.
+- Pre-stream error responses: `429` + `Retry-After: <integer ≥ 1>` with body `{"error":{"message":…,"type":"rate_limit_error","param":null,"code":"slow_down"}}`; `503` + `Retry-After` with `{"error":{…,"type":"service_unavailable_error","code":"server_is_overloaded"}}`.
+- Chat-Completions compatibility mode: request `"stream": true`, `"stream_options": {"include_usage": true, "include_obfuscation": false}`; final data chunk has `"choices": []` and a populated `"usage"`; stream ends with the literal line `data: [DONE]`.
+- Side-channel padding field on delta chunks: `"obfuscation": "<random chars>"` — present by default, suppressed by `stream_options.include_obfuscation: false`.
+- OpenAPI 3.2 declaration:
+responses:
+  "200":
+    content:
+      application/json: { schema: { $ref: '#/components/schemas/Response' } }
+      text/event-stream: { itemSchema: { $ref: '#/components/schemas/ResponseStreamEvent' } }
+with the generic event schema `{data: string (required), event: string, id: string, retry: integer minimum 0}` and `data` typed via `contentMediaType: application/json` + `contentSchema`.
+- Alternative vendor event vocabulary (message-block shaped) if we ever need a second surface: message_start → content_block_start → content_block_delta (×N) → content_block_stop → message_delta → message_stop, plus `ping` and `error`; blocks keyed by `index`; `usage` on message_start (input) and cumulative on message_delta (output).
+- nginx location block for the streaming route: `proxy_buffering off; proxy_cache off; proxy_http_version 1.1; proxy_set_header Connection ''; proxy_read_timeout <≥ wall-clock>;` — or rely on the origin's `X-Accel-Buffering: no`.
+- vLLM knobs: server `--stream-interval N`; per-request `"stream_interval": N` (≥1, clamped up to the server value, first/last chunk always immediate); `X-Request-Id` and `X-Vllm-Priority` request headers; cancel via `POST /v1/responses/{response_id}/cancel`.
+
+### Pitfalls
+
+- Closing the response without a trailing blank line silently discards the last event — which in a Responses-style stream is the terminal event carrying `usage`. The client sees a clean EOF and no error.
+- A non-200 status or a Content-Type other than `text/event-stream` makes a conforming EventSource *fail the connection permanently* — it will not reconnect. A 302 to a login page, or a 200 JSON error body, therefore looks to the user like a dead app rather than an auth failure.
+- Emitting `Connection: keep-alive` unconditionally breaks HTTP/2: RFC 9113 §8.2.2 says any message with connection-specific header fields MUST be treated as malformed.
+- nginx `proxy_buffering` defaults to ON and `proxy_read_timeout` defaults to 60 s. Both defaults are wrong for LLM streaming; the first turns a stream into a single blob, the second cuts long prefills. `X-Accel-Buffering: no` fixes the first from the app but does nothing about the second.
+- Cloudflare Tunnel buffers *everything* by default and only streams when the origin's `Content-Type` is literally `text/event-stream`. Mislabelling the stream (e.g. `application/x-ndjson`, `text/plain`) produces 'works locally, batches in production'.
+- Cloudflare Error 524 fires at 125 s if no HTTP response has been produced — so a long prefill that doesn't flush headers+first bytes early dies at the edge, and only Enterprise can raise the limit (to 6000 s).
+- `text/event-stream` is not in Cloudflare's default compression list, but nothing guarantees no intermediary compresses it; without `cache-control: no-transform` a compressing proxy can reintroduce buffering.
+- An async generator with no `await` inside the loop cannot be cancelled — FastAPI documents this explicitly — so a disconnected client can leave a GPU slot generating to completion. Disconnect detection at the HTTP layer is not enough; cancellation must reach the engine (`/v1/responses/{id}/cancel`).
+- Billing from what the client received under-counts every disconnect: the public docs warn the final usage chunk may never arrive on an interrupted stream. Meter server-side, keyed by response id.
+- Two spaces after `data:` is not two spaces on arrival — exactly one leading U+0020 is stripped. Likewise a raw newline inside `data` splits the value across lines and the parser rejoins with `\n`. JSON-encode to sidestep both.
+- Only ONE leading BOM is stripped from the whole stream. A per-event BOM (easy to produce with some encoders) corrupts every event after the first.
+- `retry:` with a non-digit value (e.g. `retry: 3.5` or `retry: 3000ms`) is silently ignored, leaving the browser's implementation-defined default.
+- Sending `id:` without implementing `Last-Event-ID` resume means clients will replay an id you ignore and quietly re-bill the user for a regenerated response.
+- `EventSource` is GET-only with no request body, so a POST /responses stream cannot be consumed by it. Browser clients must hand-roll the SSE parser over `fetch`, which makes exact spec conformance (blank lines, single-space stripping, CRLF/CR/LF) load-bearing rather than academic.
+- Variable SSE chunk sizes leak token-length information to an on-path observer even under TLS — hence the `obfuscation` padding field in the public API. Omitting padding is a silent privacy regression.
+- Chunked transfer coding applied by a layer that doesn't understand the timing requirements can itself break SSE reliability — the spec warns about exactly this, and a truncated chunked body is only detectable by the missing zero-sized chunk.
+- A `[DONE]` sentinel copied from Chat Completions into a Responses-style stream will confuse OpenAI-SDK-derived clients, which look for `response.completed` on that surface and for `[DONE]` on the other.
+
+### Open questions for the design
+
+- Stream resume: the public OpenAI OpenAPI snapshot I read contains no `starting_after` / background-mode resume parameter, and the Responses streaming guide page I fetched did not mention resumption. Cloudflare's Agents doc recommends the `Last-Event-ID` pattern, but there is no public vendor precedent I could verify for resuming an LLM generation mid-stream. We need to decide our own contract: does `Last-Event-ID` replay buffered events from a store, or re-run generation?
+- Exact `sequence_number` semantics: the spec says 'used to order streaming events' and marks it required, but does not state the start value (0 or 1), whether it is contiguous with no gaps, or whether it is per-response or per-connection. If we want gap detection we must specify contiguity ourselves.
+- Whether `response.output_text.done` / `.delta` and the alias pair `ResponseTextDeltaEvent`/`ResponseTextDoneEvent` are ever both emitted — the schema names differ from the `type` constants and I could not confirm from the spec alone whether any client depends on the schema title.
+- Cloudflare edge (non-Tunnel) buffering: I could not retrieve a working Cloudflare page stating the proxy's buffering behaviour for `text/event-stream` on a normal orange-clouded hostname (the 'Response Buffering' network-settings pages I fetched returned unrelated content). The Tunnel behaviour is documented; the plain-proxy behaviour is not verified here.
+- Cloudflare 524 during an already-flowing stream: the 524 doc describes the 125 s read timeout as time to provide an HTTP response and a separate 30 s Proxy Write Timeout, but does not say whether SSE heartbeats reset either timer. Needs an empirical test against a staging hostname before we rely on heartbeats to survive long generations at the edge.
+- Whether `text/event-stream` is exempt from Cloudflare compression in all cases, or merely absent from the default-compressed content-type list (Compression Rules could still be configured to include it).
+- vLLM's Responses-API streaming event coverage: the docs page confirms `/v1/responses` and `/v1/responses/{id}/cancel` exist and documents `stream_interval`, but I could not confirm from official docs which subset of the OpenAI Responses event names vLLM actually emits, nor whether it populates `sequence_number`. Needs verification against the pinned build.
+- HTTP status to use for 'model overloaded' pre-stream: the public OpenAI spec uses 503 (`server_is_overloaded`); the other vendor reference uses 529. We need to pick one and document it, since clients' retry tables key off the number.
+- OWASP/NIST have no streaming-specific guidance I could find — the API4:2023 controls are generic resource-consumption advice. Concrete numbers for max concurrent streams per key and max stream wall-clock have no public standard to anchor to and must come from our own capacity data.
+
+## webhooks-ssrf
+
+- **Send three lowercase headers on every delivery: `webhook-id`, `webhook-timestamp`, `webhook-signature`. Do not invent a bespoke header set.**
+  - why: Standard Webhooks is the only cross-vendor public spec for this, and OpenAI already ships exactly these three headers, so consumer libraries (standardwebhooks for JS/Python/Go/Rust) verify our deliveries with zero custom code.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Compute the signature over the concatenation `{webhook-id}.{webhook-timestamp}.{raw request body}` using the exact `.` (full-stop) delimiter. Never sign the body alone.**
+  - why: Signing id+timestamp+body binds the replay-protection metadata into the MAC, so an attacker cannot alter the timestamp or event id without invalidating the signature. Signing only the body leaves both fields attacker-mutable.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Emit the signature as a version-prefixed token `v1,<base64(HMAC-SHA256)>`, and make `webhook-signature` a SPACE-delimited list of such tokens. Reserve `v1a` for a future ed25519 scheme.**
+  - why: The version prefix is what makes the scheme upgradable without breaking consumers, and the space-delimited list is the mechanism that makes zero-downtime secret rotation possible (below).
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Document that consumers MUST ignore any signature token whose version prefix they do not recognise, and MUST NOT fall back to an older/weaker scheme when the expected version is absent.**
+  - why: Stripe states this explicitly as anti-downgrade guidance. Without it, adding a `v0`/test or legacy scheme to the list creates a downgrade path.
+  - source: https://docs.stripe.com/webhooks
+- **Generate signing secrets as 32 random bytes (within the 24–64 byte band), serialise base64 with a `whsec_` prefix, and use one unique secret per endpoint — never per customer or per account.**
+  - why: Reusing a secret across endpoints means one compromised consumer forges events for all of them. The prefix lets consumer libraries auto-detect the scheme. 32 bytes = 256 bits, far above the NIST floor.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Enforce a hard minimum of 14 bytes (112 bits) of HMAC key material at secret-generation and at secret-import time; reject anything shorter.**
+  - why: NIST SP 800-131A Rev 2 Table 9 makes sub-112-bit HMAC keys 'Disallowed' for generation. This is the citable floor if we ever let customers supply their own secret.
+  - source: https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-131Ar2.pdf
+- **Do not truncate the HMAC output. Send the full 32-byte SHA-256 digest base64-encoded.**
+  - why: FIPS 198-1 permits truncation but defers the security analysis to SP 800-107, which sets a 32-bit floor. There is no bandwidth reason to truncate a webhook signature, so full-length removes the question entirely.
+  - source: https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-107r1.pdf
+- **Generate `webhook-id` server-side only, from a charset that excludes `.` (e.g. `evt_` + base62). Never let a customer-supplied string reach the id or timestamp position.**
+  - why: The signed string is delimited by `.`, so a `.` inside the id lets an attacker shift the field boundaries and produce a colliding signed string.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Verify with a constant-time comparison on both sides, and say so in the consumer docs by naming the function per language (`hmac.compare_digest` in Python, `crypto.timingSafeEqual` in Node).**
+  - why: Both Standard Webhooks and GitHub call out that a plain `==` turns the consumer into a signing oracle via timing.
+  - source: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+- **Reject a delivery whose `webhook-timestamp` differs from local time by more than 300 seconds (±5 minutes). Make the tolerance configurable but forbid 0.**
+  - why: ±5 min is the convergent default across Stripe and Slack. A tolerance of 0 disables the recency check entirely rather than tightening it, because clock skew makes exact equality unreachable.
+  - source: https://docs.stripe.com/webhooks
+- **Regenerate the timestamp AND the signature on every retry attempt, while keeping `webhook-id` constant across all attempts of the same event.**
+  - why: A fresh timestamp keeps a day-3 retry inside the consumer's 5-minute window; a stable id is what makes the consumer's idempotency key work. These two must move independently.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Document that delivery is at-least-once and unordered, and instruct consumers to de-duplicate on `webhook-id` with a store retained for at least the tolerance window (5 minutes minimum; a day is safer).**
+  - why: Standard Webhooks names the 5-minute Redis retention explicitly; Stripe warns that event `created` timestamps collide and must not be used for ordering or dedup.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Implement rotation as dual-secret: on rotate, keep the old secret active for a bounded grace window and sign each delivery with BOTH, emitting two space-delimited tokens. Let the operator choose immediate expiry or a delay of up to 24 hours.**
+  - why: This is the only zero-downtime rotation path — the consumer tries each token until one matches, so it can redeploy at its leisure. Stripe's 24h ceiling is a concrete, defensible grace window.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **State in the docs that signing with an extra (even compromised) key does not weaken the scheme, so consumers need not panic during a rotation window.**
+  - why: Pre-empts the obvious support question. The security property holds because the consumer still requires one valid signature under a key it trusts.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Treat only 2xx (200–299) as delivery success. Everything else — non-2xx, timeout, connection reset, TLS failure — is a failure that enters the retry schedule.**
+  - why: Unambiguous success criterion; avoids the classic bug where a 3xx or a 204-with-body is scored inconsistently.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Give these status codes distinct handling rather than a uniform retry: `410 Gone` → disable the endpoint and stop sending; `429` → throttle; `502`/`504` → throttle; `3xx` → failure, do not follow.**
+  - why: 410 is the consumer's explicit unsubscribe signal and honouring it prevents us from hammering dead endpoints for three days. 429/502/504 mean 'slow down', not 'the event is bad'.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Parse `Retry-After` on failure responses and clamp the next attempt to at least that value. Accept both ABNF forms: `delay-seconds` (non-negative integer) and `HTTP-date`.**
+  - why: RFC 9110 defines both forms; handling only the integer form silently ignores the date form that some consumers send with 503.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after
+- **Use truncated exponential backoff with jitter: `delay = min(base * 2^n + random(0, 1000ms), max_backoff)` with `max_backoff` of 32–64 s for the early attempts, then a published fixed long-tail schedule.**
+  - why: Google Cloud gives the exact formula and the 32/64 s cap; the random term is what prevents every failed delivery for one downed consumer from retrying in lockstep.
+  - source: https://docs.cloud.google.com/memorystore/docs/redis/exponential-backoff
+- **Bound the total retry envelope and publish the exact schedule. Adopt the Standard Webhooks table: immediate, 5s, 5min, 30min, 2h, 5h, 10h, 14h, 20h, 24h — 10 attempts ending at 75:35:05 (~3.15 days).**
+  - why: A published table lets consumers reason about their own recovery window. ~3 days matches Stripe; OpenAI uses 72h. Unbounded retry is both a cost and an amplification hazard.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Set the per-attempt HTTP timeout to 20 s (inside the 15–30 s band), applied as a total-request deadline, not just a connect timeout.**
+  - why: Too short and slow-but-healthy consumers are punished; too long and a hung consumer ties up a delivery worker. 15–30 s is the spec's stated band.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **After the full schedule is exhausted repeatedly over a long period, auto-disable the endpoint AND notify the customer through a second channel (email / in-app), not only by a webhook they cannot receive.**
+  - why: Notifying a broken webhook endpoint about its own brokenness is a no-op. The spec calls for the out-of-band channel explicitly.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Keep payloads under ~20 KB; for anything larger send a thin payload (ids + a resource URL) and let the consumer fetch.**
+  - why: Large payloads impose load on consumers who may not even want the event, and they make the signature computation and delivery-history storage costs scale badly.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Ship a delivery-history API and UI listing per-attempt: HTTP status code, attempt timestamp, duration, truncated response body, error class, and the scheduled time of the next attempt.**
+  - why: Without it consumers cannot debug their own outage. Stripe's 'Event deliveries' tab (Delivered/Pending/Failed + status code + next delivery time) is the shape to copy.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Provide manual replay: resend a single event by id, and bulk-replay a time range, with a retention window (Stripe: 15 days via UI, 30 days via CLI). Document that a manual resend does not cancel the automatic schedule.**
+  - why: Range replay is the only way a consumer recovers from a multi-hour outage without data loss. The 'manual resend does not dismiss automatic retries' caveat is a real footgun Stripe documents.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Back the delivery queue with Postgres using `SELECT ... FOR UPDATE SKIP LOCKED` to claim due attempts, so multiple delivery workers never contend or double-send.**
+  - why: PostgreSQL documents SKIP LOCKED as the queue-table primitive. It is the correct claim mechanism for a due-attempt poller and avoids an extra broker dependency.
+  - source: https://www.postgresql.org/docs/current/sql-select.html
+- **In consumer docs, lead with: read the RAW body bytes before any JSON parsing, verify, and only then parse. Show `await request.body()` (FastAPI), `await req.text()` (Next.js route handler), `request.data` (Flask).**
+  - why: The single most common verification failure is a framework re-serialising JSON, which changes whitespace/key order and breaks the MAC. Both Stripe and Standard Webhooks flag it as the top failure mode.
+  - source: https://docs.stripe.com/webhooks
+- **Tell consumers to decode the body as UTF-8 explicitly and to ensure no proxy or load balancer rewrites the body or headers before verification.**
+  - why: GitHub documents both: unicode in payloads plus an intermediary that re-encodes will produce a valid-but-failing signature that looks like our bug.
+  - source: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+- **Tell consumers to return 2xx before doing work — enqueue and process asynchronously — and to exempt the webhook route from CSRF middleware.**
+  - why: Synchronous processing causes our 20 s timeout to fire and triggers a spurious retry storm at month-end spikes. CSRF middleware silently 403s legitimate POSTs in Django/Rails.
+  - source: https://docs.stripe.com/webhooks
+- **Declare every event type in the OpenAPI document under the top-level `webhooks` field (OAS 3.1+), keyed by event type name, with a Path Item Object describing the POST body and expected responses. In FastAPI this is `@app.webhooks.post("event.name")`.**
+  - why: Gives consumers machine-readable schemas and generated types for free, and the key is the event name rather than a path — which matches the fact that the consumer chooses the URL.
+  - source: https://spec.openapis.org/oas/latest.html
+- **Use hierarchical full-stop-delimited event type names restricted to `[a-zA-Z0-9_]` per segment (e.g. `chat.completed`, `document.indexed`), and let customers subscribe per endpoint to a subset, filtering on our side.**
+  - why: Producer-side filtering removes unnecessary load from consumers and lets us reason about fanout volume. The charset restriction keeps type names safe as map keys and OpenAPI `webhooks` keys.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Require `https` scheme and reject every other scheme at registration: no `http`, `file`, `gopher`, `ftp`, `dict`, `data`, `phar`, `smb`. Allow only port 443 (optionally a small allow-list of high ports).**
+  - why: OWASP's validation flow calls for a protocol allow-list, and notes SSRF is not limited to HTTP. HTTPS-only also protects payload confidentiality, which the signature does not.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Reject any registration URL containing a userinfo component (`user@`, `user:pass@`) with a 400 naming the field. Never store or echo it.**
+  - why: RFC 3986 deprecates the form, and OWASP WSTG lists `https://expected-domain@attacker-domain` as a primary filter-bypass. Rejecting outright is simpler than trying to strip it safely.
+  - source: https://www.rfc-editor.org/rfc/rfc3986.txt
+- **Also reject the fragment-and-encoding bypass shapes the WSTG lists: URLs with a `#` fragment, and any host that is a non-dotted-decimal IPv4 literal (`2130706433`, `017700000001`, `127.1`). Parse the host with a strict library (Python `ipaddress`, JS `ip-address`) and re-check the canonical integer, not the string.**
+  - why: Substring or regex checks against '127.0.0.1' miss every one of these. Canonicalising to an integer/`IPv4Address` then range-checking is the only reliable form.
+  - source: https://github.com/OWASP/wstg/blob/master/document/4-Web_Application_Security_Testing/07-Input_Validation_Testing/19-Testing_for_Server-Side_Request_Forgery.md
+- **Resolve BOTH A and AAAA records for the hostname and require EVERY returned address to be globally routable. One private address in the answer set rejects the whole URL.**
+  - why: Checking only the first A record misses an attacker who publishes one public A and one private AAAA (or vice versa) and lets the resolver pick. OWASP specifies A+AAAA explicitly.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Block, at minimum, these IPv4 blocks: 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32.**
+  - why: These are the IANA special-purpose registry entries. Prefer a library `is_global` check over a hand-maintained list, but pin this list in tests so a library upgrade cannot silently widen the surface.
+  - source: https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
+- **Block these IPv6 blocks: ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 64:ff9b:1::/48, 100::/64, 2001::/32 (Teredo), 2001:db8::/32, 3fff::/20, 2002::/16 (6to4), 5f00::/16, fc00::/7, fe80::/10, ff00::/8.**
+  - why: `::ffff:0:0/96`, `64:ff9b::/96` (NAT64), `2002::/16` (6to4) and `2001::/32` (Teredo) are the embedding families — an IPv6 literal in any of them can carry an embedded IPv4 loopback or RFC1918 address past a naive IPv6-only check.
+  - source: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+- **For any address inside an embedding prefix (::ffff:0:0/96, 64:ff9b::/96, 64:ff9b:1::/48, 2002::/16, 2001::/32), extract the embedded IPv4 address and run the full IPv4 deny-list against it as well. Do not treat the outer prefix block as sufficient.** _(inferred)_
+  - why: Blocking ::ffff:0:0/96 wholesale is correct, but a stack that normalises `::ffff:127.0.0.1` to `127.0.0.1` before the check, or one that only blocks ::1, will pass it. Checking both the wrapper and the payload is belt-and-braces.
+  - source: https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+- **Block cloud metadata endpoints by address AND by hostname: 169.254.169.254 (AWS/GCP/Azure/Oracle/DO), fd00:ec2::254 (AWS IPv6 IMDS), fd20:ce::254 (GCP IPv6), `metadata.amazonaws.com`, `metadata.google.internal`, and 100.100.100.200 (Alibaba).**
+  - why: 169.254.0.0/16 covers the IPv4 case, but the IPv6 metadata addresses sit in fc00::/7 (ULA) which a permissive 'is it global' check may or may not reject depending on library — pin them explicitly.
+  - source: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-metadata-v2-how-it-works.html
+- **Defeat DNS rebinding by resolving once, validating every returned address, then connecting to a PINNED validated IP (custom socket resolver / `sess.mount` with a pinned-IP adapter), sending the original hostname in the `Host` header and in TLS SNI so certificate validation still works.**
+  - why: Validate-then-connect leaves a TOCTOU gap: the attacker's DNS TTL=0 record answers public on the check and 169.254.169.254 on the connect. OWASP names this 'DNS pinning' and gives it as the reason to re-resolve and re-check.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Re-run the full resolve-validate-pin sequence on EVERY delivery attempt, not only at endpoint registration. Registration-time validation alone is worthless against a record the customer changes an hour later.**
+  - why: A webhook URL is validated once but used for months. The DNS answer at registration time says nothing about the answer at attempt 7 on day 3.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Disable redirect following in the delivery HTTP client entirely (`allow_redirects=False` / `redirect: 'manual'`) and score any 3xx as a delivery failure, surfacing the `Location` in delivery history so the customer can fix their registration.**
+  - why: Following redirects re-opens every SSRF check you just passed. All four sources agree: OWASP says disable, OWASP API7 says disable, Standard Webhooks and OpenAI both score 3xx as failure.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **If a redirect-following mode is ever added, it must re-run the full scheme + host + DNS + range validation on each hop and cap the chain at 3 hops; a redirect that changes scheme away from https is an immediate abort.** _(inferred)_
+  - why: This is the fallback design if product insists. It is strictly worse than not following, and is only safe if the per-hop check is identical to the initial one.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **Cap the response we read from a consumer at 64 KB and abort the stream past that; store at most the first 4 KB in delivery history. Never return the consumer's raw response body verbatim to any other API caller.**
+  - why: OWASP API7 specifies not sending raw responses to clients — an unbounded, echoed response body turns a blocked SSRF into a working data-exfil oracle, and an unbounded read is a memory DoS from a hostile endpoint.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa7-server-side-request-forgery
+- **Run delivery workers (or an egress proxy such as smokescreen) in a dedicated subnet whose egress firewall permits only public destinations, so the application-layer check is not the only control.**
+  - why: Defence in depth: every application-layer SSRF check has been bypassed by someone. A network that physically cannot route to the internal VPC makes a parser bug non-exploitable.
+  - source: https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md
+- **On any host that runs delivery workers, enforce IMDSv2-only (`HttpTokens=required`) and keep the metadata hop limit at 1.**
+  - why: IMDSv2's PUT-then-GET session plus hop limit 1 means even a successful SSRF to 169.254.169.254 cannot mint credentials, because the attacker cannot issue the PUT through a one-way fetch.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Use a well-tested URL parser (Python `urllib.parse` + `ipaddress`, or WHATWG-URL in JS) and never hand-rolled regex for URL decomposition; validate the parsed components, then rebuild the request URL from the validated components only.**
+  - why: Orange Tsai's parser-differential work is the reason OWASP says not to accept complete URLs. Rebuilding from validated parts closes the gap between what the validator parsed and what the HTTP client parses.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa7-server-side-request-forgery
+- **Require an ownership proof before a new endpoint URL goes live: send a challenge event and require the consumer to echo a server-generated token (e.g. `[a-zA-Z0-9]{20}`) back, or accept a pre-shared header the customer configures.**
+  - why: Prevents a customer from pointing our sender at a third party's endpoint (reflected DoS / unsolicited traffic). OWASP recommends exactly this token pattern; Cloudflare's `cf-webhook-auth` is the shared-header variant.
+  - source: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
+- **Optionally support a customer-configured static auth header alongside the signature (pattern: `cf-webhook-auth`), and document that its absence or mismatch is grounds for the consumer to reject.**
+  - why: Some enterprise consumers sit behind a gateway that can only do header matching, not HMAC. This is a compatibility affordance, never a replacement for the signature.
+  - source: https://developers.cloudflare.com/notifications/get-started/configure-webhooks/
+- **Publish and maintain a static list of sender egress IPs so consumers can firewall-allowlist us, and document it as a complement to (not a substitute for) signature verification.**
+  - why: Both Stripe and Standard Webhooks note corporate consumers require this. Stripe frames IP allowlisting and signature verification as 'both of these protections', not either/or.
+  - source: https://docs.stripe.com/webhooks
+- **If a future version wants an IETF-standard scheme instead of the vendor-convergent one, the target is RFC 9421 HTTP Message Signatures: `Signature-Input` + `Signature` headers, `@method`/`@target-uri`/`@authority` derived components, `created`/`expires`/`nonce`/`keyid`/`alg` parameters, and a `Content-Digest` header to cover the body.**
+  - why: RFC 9421 is the only IETF Standards-Track answer here, and it covers the body only indirectly via Content-Digest — which is a meaningful design difference from the id.timestamp.body scheme. Worth knowing but not worth shipping first, since almost no webhook consumer library supports it.
+  - source: https://www.rfc-editor.org/rfc/rfc9421.html
+
+### Wire shapes to copy
+
+- Request headers (Standard Webhooks; OpenAI ships these verbatim): `webhook-id: msg_2KWPBgLlAfxdpx2AI54pPJ85f4W`, `webhook-timestamp: 1674087231`, `webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=`
+- Signed string: `{webhook-id}.{webhook-timestamp}.{raw_body}` — literal `.` separators, raw body bytes exactly as transmitted, no re-serialisation
+- Signature token grammar: `<version>,<base64(sig)>` where version is `v1` (HMAC-SHA256) or `v1a` (ed25519). `webhook-signature` is a SPACE-delimited list of tokens during rotation: `v1,<new> v1,<old>`
+- Secret serialisation prefixes: `whsec_` (HMAC secret), `whsk_` (ed25519 private), `whpk_` (ed25519 public) — all base64 after the prefix
+- Alternative vendor shapes for reference — Stripe: `Stripe-Signature: t=1492774577,v1=<hex>,v0=<hex>` with signed_payload = `{t}.{body}`, comma-separated, hex not base64. GitHub: `X-Hub-Signature-256: sha256=<hex>` over the body alone (legacy `X-Hub-Signature` = HMAC-SHA1). Slack: `X-Slack-Request-Timestamp` + `X-Slack-Signature: v0=<hex>` over `v0:{timestamp}:{body}`. Cloudflare: `cf-webhook-auth: <shared secret>`
+- Event body (OpenAI/Standard Webhooks convergent): `{"id": "evt_...", "object": "event", "type": "chat.completed", "created_at": 1740000000, "data": {...}}` — `type` is hierarchical full-stop delimited, segments from `[a-zA-Z0-9_]`; Standard Webhooks additionally recommends an ISO 8601 `timestamp` field for the EVENT time, distinct from the ATTEMPT time in the header
+- Status code semantics for the sender: 2xx (200-299) = success; 3xx = failure, do not follow; 410 Gone = disable endpoint permanently; 429 = throttle; 502/504 = throttle; everything else = retryable failure
+- `Retry-After = HTTP-date / delay-seconds` (RFC 9110 §10.2.3) — parse both forms on 429/503
+- Retry schedule to publish (Standard Webhooks): immediate, +5s, +5min, +30min, +2h, +5h, +10h, +14h, +20h, +24h → cumulative 00:00:00, 00:00:05, 00:05:05, 00:35:05, 02:35:05, 07:35:05, 17:35:05, 31:35:05, 51:35:05, 75:35:05
+- Backoff formula (Google Cloud): `min(((2^n) + random_number_milliseconds), maximum_backoff)` with random_number_milliseconds ≤ 1000 and maximum_backoff typically 32 or 64 seconds
+- Per-attempt request timeout: 15–30 s (Standard Webhooks). Payload target: < 20 KB
+- Cloud metadata endpoints to deny: `169.254.169.254`, `[fd00:ec2::254]` (AWS IPv6 IMDS), `[fd20:ce::254]` (GCP IPv6), `metadata.google.internal`, `metadata.amazonaws.com`, `100.100.100.200` (Alibaba). AWS IMDSv2 headers: `X-aws-ec2-metadata-token-ttl-seconds` (PUT) then `X-aws-ec2-metadata-token` (GET); GCP requires `Metadata-Flavor: Google`; Azure requires `Metadata: true`
+- IPv4 deny prefixes (IANA special-purpose registry): 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.0.2.0/24, 192.88.99.0/24, 192.168.0.0/16, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24, 224.0.0.0/4, 240.0.0.0/4, 255.255.255.255/32
+- IPv6 deny prefixes (IANA special-purpose registry): ::/128, ::1/128, ::ffff:0:0/96, 64:ff9b::/96, 64:ff9b:1::/48, 100::/64, 2001::/32, 2001:db8::/32, 2002::/16, 3fff::/20, 5f00::/16, fc00::/7, fe80::/10, ff00::/8
+- IPv4 literal bypass forms to reject at parse (OWASP WSTG): `2130706433` (decimal), `017700000001` (octal), `127.1` (shortened), `https://expected-domain@attacker-domain` (userinfo), `https://attacker-domain#expected-domain` (fragment)
+- OpenAPI 3.1 documentation shape: top-level `webhooks: Map[string, Path Item Object]`, keyed by event type name. FastAPI: `@app.webhooks.post("chat.completed")` — the string is an event identifier, not a path
+
+### Pitfalls
+
+- Signing only the body, not `id.timestamp.body`. The timestamp then travels as an unauthenticated header and an attacker rewrites it freely, which silently defeats the entire replay window.
+- Letting a framework parse JSON before verification. Re-serialising changes whitespace and key order, and the MAC fails on legitimate deliveries — this is the single most reported webhook integration bug in both the Stripe and Standard Webhooks docs.
+- Allowing a user-controlled string into `webhook-id`. Because `.` is the delimiter in the signed string, an id containing `.` lets an attacker shift field boundaries and construct a colliding pre-image.
+- Setting the timestamp tolerance to 0 to be 'strict'. Stripe warns this DISABLES the recency check rather than tightening it, since clock skew makes exact equality unreachable.
+- Keeping the same timestamp and signature across retries. A retry on day 3 then arrives outside every consumer's 5-minute window and is rejected as a replay — the timestamp must be regenerated per attempt while the id stays fixed.
+- Validating the URL only at registration. The customer's DNS record at registration says nothing about the record at delivery attempt 7, three days later — the resolve-validate-pin sequence must run on every attempt.
+- Validate-then-connect without pinning the IP. This is a live TOCTOU: a TTL=0 record answers public to the validator and 169.254.169.254 to the HTTP client microseconds later. The connection must be made to the exact address that was validated.
+- Checking only the first A record. An attacker publishes one public A and one private AAAA; a dual-stack resolver may pick either. Every address in the A+AAAA answer set has to pass.
+- Blocking `::1` and `fe80::/10` but not `::ffff:0:0/96`, `64:ff9b::/96`, `2002::/16` or `2001::/32`. Those four families embed an IPv4 address inside an IPv6 literal, so `::ffff:169.254.169.254` sails past an IPv6-only range check.
+- Relying on a language's `is_private`/`isPrivate` helper alone. Coverage of shared address space (100.64.0.0/10), benchmarking (198.18.0.0/15), SRv6 (5f00::/16) and the newer documentation block (3fff::/20) varies by library and version — pin the explicit prefix list in a test so a dependency bump cannot widen the surface silently.
+- Substring or regex matching against '127.0.0.1' / 'localhost'. `2130706433`, `017700000001` and `127.1` all resolve to loopback and match none of them; canonicalise to an integer address object first.
+- Following redirects 'just one hop' for convenience. The redirect target is fetched with none of the checks that the original URL passed, which is the canonical SSRF bypass. Stripe, OpenAI and Standard Webhooks all score 3xx as a plain delivery failure instead.
+- Echoing the consumer's raw response body back through our API or into an unbounded delivery-history field. That converts a blocked SSRF into a working read oracle, and an unbounded read from a hostile endpoint is a memory DoS.
+- Retrying a 410 Gone. It is the consumer's explicit unsubscribe signal; retrying it for three days is both wasted work and an abuse complaint waiting to happen.
+- Exponential backoff with no jitter. Every failed delivery for one downed consumer retries in lockstep, so the consumer's recovery is met with a synchronised thundering herd.
+- Treating IP allowlisting as an alternative to signature verification. Stripe frames them as 'both of these protections' — an IP allowlist proves network origin, not message integrity, and says nothing about replay.
+- Reusing one signing secret across a customer's endpoints. One compromised consumer then forges events to all of the customer's other endpoints.
+- Rotating a secret by swapping it atomically. Without the dual-signature grace window every in-flight delivery fails until the consumer redeploys; the space-delimited list exists precisely to avoid this.
+- Assuming the customer's framework passes headers through unmodified. GitHub documents that a proxy or load balancer rewriting the body or headers produces a valid-but-failing signature that looks like our bug, not theirs.
+- Forgetting that HMAC authenticates but does not encrypt. The payload is readable in transit, so HTTPS-only enforcement is a separate requirement, not one the signature covers.
+
+### Open questions for the design
+
+- Standard Webhooks does not name a concrete timestamp tolerance — it only says 'within some allowable tolerance'. The ±5 minutes I am recommending comes from Stripe and Slack, both of which state it explicitly. We should pick 300 s and document it as OUR number rather than citing it as spec-mandated.
+- Neither Standard Webhooks nor any vendor doc I found states a maximum response-body size a sender should read. The 64 KB read cap / 4 KB stored cap is my inference from OWASP API7's 'do not send raw responses to clients' plus ordinary DoS hygiene — no primary source sets a number.
+- OWASP's cheat sheet gives the DNS-pinning countermeasure (resolve all A+AAAA and re-check) but does NOT explicitly prescribe connecting to the pinned IP with Host/SNI preserved. That implementation shape is my inference from the stated TOCTOU problem; it is standard practice but I could not find it stated in an OWASP or IETF document.
+- RFC 6890 is the base document for the special-purpose registries, but the IANA registries are the live authority and have diverged (3fff::/20, 5f00::/16, 100:0:0:1::/64 are in IANA and not in RFC 6890's tables). RFC 6890 was also updated by RFC 8190. Decide whether we pin to the IANA snapshot in a test fixture or track it; I recommend pinning with a scheduled review.
+- Cloud metadata IPv6 addresses (fd00:ec2::254, fd20:ce::254) fall inside fc00::/7 ULA, so a correct ULA block already covers them — but whether a given library's global-address check treats ULA as non-global is version-dependent. Worth an explicit test rather than trusting the library.
+- I did not find an official Cloudflare doc stating egress-IP behaviour or SSRF guidance for outbound fetches from our tunnel/edge setup. If deliveries egress through Cloudflare, the static-source-IP promise to consumers needs verifying against a Cloudflare primary source before we publish an IP list.
+- OpenAI's public webhook docs do not state a timestamp tolerance even though they use the Standard Webhooks header set; their library presumably enforces one. Treat the 5-minute figure as vendor-convergent rather than universal.
+- Whether to offer ed25519 (`v1a`) at launch. The spec says 'Prefer asymmetric signature schemes over symmetric ones', but consumer-library support for v1a is thinner than for v1, and it costs more CPU per delivery. Recommend shipping v1 first with the header format already list-shaped so v1a can be added without a breaking change.
+
+## openapi-contract
+
+- **Emit `openapi: "3.1.1"` (or 3.1.0) plus `info.title` and `info.version` — all three are REQUIRED. Put the PRODUCT/API version in `info.version`; never conflate it with the `openapi` field.**
+  - why: These are the only hard-required top-level fields; validators reject the document without them, and the spec explicitly warns the two version fields are unrelated, which is the most common source of a spec that claims to be 'v2' of the API while advertising OAS 2.0 tooling semantics.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Either omit `jsonSchemaDialect` and accept the OAS dialect, or set it explicitly to `https://spec.openapis.org/oas/3.1/dialect/base`. Do NOT set it to the bare JSON Schema 2020-12 meta-schema unless you also stop using OAS-only keywords (`discriminator`, `xml`, `externalDocs`, `example`).**
+  - why: The OAS dialect is 2020-12 plus the OAS base vocabulary; silently defaulting is fine, but a spec that declares the plain 2020-12 dialect while emitting `discriminator` is self-inconsistent for strict validators.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Write request/response models with JSON Schema 2020-12 keywords directly (`type` as a string OR an array for nullables, `const`, `prefixItems`, `$defs`, `contentMediaType`, `contentEncoding`, `examples` as an ARRAY). Do not use OAS 3.0-isms: `nullable: true`, `example` (singular) inside a Schema Object, or `exclusiveMinimum: true`.**
+  - why: OAS 3.1 Schema Objects are a superset of 2020-12; `nullable` no longer exists and Schema-Object `example` is formally deprecated, so 3.0-era generators produce a document that is valid-looking but wrong.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Put wire-format examples in the Media Type Object's `examples` map (Example Objects with `summary`/`description`/`value`), not in the schema. Never set both `example` and `examples` on the same Media Type or Parameter Object.**
+  - why: Media-Type-level examples represent the serialized form and are referenceable ($ref-able) and named, which is what doc renderers and SDK test fixtures consume; the two fields are mutually exclusive and silently override the schema's.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Every key under `components/*` (schemas, securitySchemes, responses, parameters, examples, headers) MUST match `^[a-zA-Z0-9\.\-_]+$`. Sanitize generated schema names — no spaces, no `[`/`]`, no `/`.**
+  - why: Pydantic/FastAPI generic models produce names like `PaginatedResponse[Item]` which violate this regex and break strict validators and several SDK generators.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Declare the bearer API key as `components.securitySchemes.<name> = {"type": "http", "scheme": "bearer", "bearerFormat": "<opaque-token-format-hint>"}`. Use `type: apiKey` with REQUIRED `name` and `in` only if the key travels in a non-Authorization header (e.g. `X-API-Key`) or a query/cookie parameter.**
+  - why: These are the two exact shapes the spec defines; `bearerFormat` is a documentation-only hint, so a value like "opaque" or "tsk_*" is legitimate and useful to SDK authors.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Set a document-level `security: [{"bearerAuth": []}]` so auth is the default, and override per-operation only for genuinely public endpoints. Mark a public endpoint with `security: [{}]` (anonymous allowed) or `security: []` (auth removed) — do not just omit the field.**
+  - why: Omitting `security` on an operation inherits the root requirement; the empty-object and empty-array forms are the only two spec-defined ways to say 'no auth here', and getting this wrong makes generated SDKs send or withhold credentials incorrectly.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **List each security scheme name in a Security Requirement Object only if it is declared under `components.securitySchemes`; multiple names inside ONE object mean AND (all must be satisfied), multiple objects in the array mean OR (any one).**
+  - why: AND/OR is encoded purely by nesting depth; a rate-limit-key + bearer-key combination must be written as one object with two properties, not two objects.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Declare `servers` explicitly with the absolute public base URL including the version segment (e.g. `{"url": "https://api.example.com/v1", "description": "Production"}`). If you template it, every `{variable}` MUST have a Server Variable Object with a REQUIRED `default`.**
+  - why: If `servers` is absent or empty the spec defaults to `url: "/"`, which produces SDKs that only work same-origin; and a templated URL without `default` is invalid.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Declare a root-level `tags` array of Tag Objects (REQUIRED `name`, plus `description` and optional `externalDocs`); each root tag `name` MUST be unique, and the array order is what doc UIs render.**
+  - why: Undeclared tags are legal but 'MAY be organized randomly', i.e. your endpoint grouping becomes tool-dependent — declaring them is the only way to control section order and give each group prose.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Assign a stable, hand-chosen `operationId` to every public operation (e.g. `createCompletion`, `listKeys`). It MUST be unique across the whole document and is case-sensitive. Treat it as a frozen part of the public contract.**
+  - why: `operationId` becomes the SDK method name in every generator; letting FastAPI auto-generate it (function name + path + method) means a refactor silently renames a public SDK method.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Every operation's Responses Object MUST have at least one entry, and you should document the full error set per operation: 400, 401, 403, 404, 409, 413, 422, 429, 503 — with a shared `$ref` to a components-level error response.**
+  - why: The spec requires at least one code and expects known errors to be covered; a components-level error Response Object keeps the 9 codes consistent across dozens of operations.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Do not define two paths whose templates differ only in variable name (`/keys/{id}` and `/keys/{keyId}`) — they are identical and invalid. Concrete paths are matched before templated ones.**
+  - why: This is an explicit MUST NOT and a real hazard when public and internal routers are merged into one document.
+  - source: https://spec.openapis.org/oas/v3.1.1.html
+- **Put `$schema` only at a schema resource root; do not sprinkle it into nested subschemas. Unknown/`x-` keywords are carried as annotations, so custom metadata is safe but must not be relied on for validation.**
+  - why: JSON Schema 2020-12 forbids `$schema` in non-resource-root schema objects, and tooling that treats unknown keywords as assertions is non-conformant.
+  - source: https://json-schema.org/draft/2020-12/json-schema-core.html
+- **Serve the public OpenAPI document from a versioned, cacheable URL (e.g. `/v1/openapi.json`) by constructing a separate `FastAPI()` instance for the public surface and `app.mount("/v1", public_app)` — each mounted sub-app gets its own independent OpenAPI document and docs UI, and FastAPI propagates the mount prefix via ASGI `root_path` automatically.**
+  - why: A separate sub-app is the only FastAPI-native way to guarantee that no internal route can ever leak into the public document, because the internal routes are registered on a different app object rather than filtered out after the fact.
+  - source: https://fastapi.tiangolo.com/advanced/sub-applications/
+- **On the INTERNAL app, pass `FastAPI(openapi_url=None)` in production. That disables the schema endpoint and both docs UIs in one setting.**
+  - why: This is the documented single switch; it removes /openapi.json, /docs and /redoc together, so there is no partial exposure.
+  - source: https://fastapi.tiangolo.com/tutorial/metadata/
+- **For any route that must stay off the public document but still live on the public app, decorate it with `include_in_schema=False`. Apply it at the router level via `include_in_schema` on `FastAPI()`/`include_router` when a whole internal router is mounted on the public app.**
+  - why: This is the documented per-operation exclusion switch; it removes the operation from the generated schema and therefore from all docs UIs and generated SDKs.
+  - source: https://fastapi.tiangolo.com/advanced/path-operation-advanced-configuration/
+- **Override the generated document with a custom `openapi()` built on `fastapi.openapi.utils.get_openapi(title=..., version=..., summary=..., description=..., routes=app.routes)`, mutate the returned dict (inject `servers`, `components.securitySchemes`, root `security`, `jsonSchemaDialect`, `x-` extensions), cache it in `app.openapi_schema`, then assign `app.openapi = custom_openapi`.**
+  - why: This is the officially documented extension point; the `app.openapi_schema` cache check must come first or the document is rebuilt on every /openapi.json request.
+  - source: https://fastapi.tiangolo.com/how-to/extending-openapi/
+- **Set `FastAPI(separate_input_output_schemas=False)` for the public API, or accept and freeze the `Model-Input` / `Model-Output` names. Decide once, before publishing, because flipping it renames every component.**
+  - why: The default True splits each Pydantic model into two components because fields with defaults are optional on input but always present on output; the split is more correct but changes every `$ref` and every generated SDK type name.
+  - source: https://fastapi.tiangolo.com/how-to/separate-openapi-schemas/
+- **Pass `servers=[{"url": "https://api.example.com/v1", "description": "Production"}]` to `FastAPI()`, and set `root_path_in_servers=False` when a proxy prefix is already baked into that URL.**
+  - why: Without an explicit list FastAPI emits either the root_path or nothing; with both root_path and an explicit servers list you get a duplicated/wrong prefix in the published document.
+  - source: https://fastapi.tiangolo.com/reference/fastapi/
+- **Group the public surface with `APIRouter(prefix="/keys", tags=["keys"], responses={429: {...}, 503: {...}})` and mount with `app.include_router(router)`. The `prefix` MUST NOT end in `/`.**
+  - why: Router-level `responses` is the cheapest way to attach the shared error codes to every operation in a group; the trailing-slash rule is an explicit documented constraint.
+  - source: https://fastapi.tiangolo.com/tutorial/bigger-applications/
+- **Document non-2xx responses with the `responses={429: {"model": Problem, "description": "...", "headers": {"Retry-After": {...}, "RateLimit": {...}}}}` shape, including a `headers` map for Retry-After / RateLimit / RateLimit-Policy.**
+  - why: `headers` is the only way the rate-limit headers appear in the machine-readable contract; without it SDK generators do not expose them and clients hardcode header names.
+  - source: https://fastapi.tiangolo.com/advanced/additional-responses/
+- **Generate the bearer securityScheme from code, not by hand: `HTTPBearer(bearerFormat="...", scheme_name="bearerAuth", description="...")` used as a dependency, or `APIKeyHeader(name="X-API-Key", scheme_name="apiKeyAuth")`. Set `auto_error=False` only for genuinely optional auth.**
+  - why: `scheme_name` is exactly the components.securitySchemes key, so pinning it keeps the key stable across refactors; auto_error=True is what makes a missing credential a 403 rather than a silent None.
+  - source: https://fastapi.tiangolo.com/reference/security/
+- **Use `openapi_extra={...}` on a path operation for anything FastAPI cannot infer — notably documenting the `Idempotency-Key` request header as a parameter on POST creation endpoints, and per-operation `x-` extensions. It is deeply merged into the generated operation.**
+  - why: Idempotency-Key is handled by middleware, not by a signature parameter, so it otherwise never reaches the published contract.
+  - source: https://fastapi.tiangolo.com/advanced/path-operation-advanced-configuration/
+- **Name the idempotency header exactly `Idempotency-Key` and require its value to be a quoted Structured Fields String on the wire: `Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"`. Accept (and document) that the quotes are part of the syntax.**
+  - why: The draft defines it as an Item Structured Header whose value MUST be a String, so a bare unquoted token is technically malformed — but every major vendor sends it unquoted, so parse leniently and emit strictly.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Key the idempotency store on a COMPOSITE key = (authenticated principal / API key id, operation, client-supplied idempotency key) — never on the client key alone.**
+  - why: The draft's security section states this directly as the mitigation for cross-tenant cache-entry theft; it also removes any need to trust client key uniqueness across tenants.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Store an idempotency FINGERPRINT alongside the key — a checksum (e.g. SHA-256) of the canonicalized request payload — and compare it on every replay.**
+  - why: The fingerprint is what lets you distinguish a legitimate retry (replay the stored response) from key misuse (422); without it you cannot detect that the same key now carries a different body.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Implement exactly four idempotency outcomes: (a) first-time key+fingerprint → process normally; (b) key+fingerprint seen AND original completed → replay the stored status code and body, success OR error; (c) key seen AND original still in flight → `409 Conflict`; (d) key seen with a DIFFERENT fingerprint → `422 Unprocessable Content`.**
+  - why: These are the draft's enforcement rules and status codes verbatim; note 409 is the only one the client need not 'correct' before retrying.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Return `400 Bad Request` when `Idempotency-Key` is absent on an endpoint documented as requiring it, and include a `Link: <https://docs.example.com/idempotency>; rel="describedby"; type="text/html"` header or a `type` URI in the problem body.**
+  - why: The draft specifies 400 for the missing-header case and shows both the problem+json and Link forms of pointing the developer at the docs.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Publish a concrete idempotency retention window in the API docs and enforce it (24h is the established vendor norm). After expiry, a reused key MUST be treated as a brand-new request.**
+  - why: The draft makes publishing the expiry policy a SHOULD on the resource; Stripe's 24-hour prune is the de-facto precedent clients already expect.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-idempotency-key-header-07
+- **Accept idempotency keys on POST (and PATCH) only; ignore the header on GET/PUT/DELETE. Recommend UUIDv4 in the docs, cap the key at 255 characters, reject low-entropy keys, and tell clients not to put PII in the key.**
+  - why: The draft scopes itself to non-idempotent methods and recommends UUIDs; the 255-char cap and the no-sensitive-data guidance come from the dominant public vendor implementation, and low-entropy keys are the draft's named data-leak vector.
+  - source: https://docs.stripe.com/api/idempotent_requests
+- **Do NOT persist the idempotent result when the request fails input validation before the handler begins, or when it loses a concurrency race — leave those retryable.**
+  - why: Caching a 422-from-validation against the key would permanently poison that key for a client that simply fixed its payload; the vendor precedent states this explicitly.
+  - source: https://docs.stripe.com/api/idempotent_requests
+- **Back the idempotency store with a UNIQUE index on the composite key and claim the key with `INSERT ... ON CONFLICT (principal_id, operation, idem_key) DO NOTHING RETURNING id`. An empty RETURNING result means the key was already claimed → branch to replay-or-409.**
+  - why: ON CONFLICT DO NOTHING gives an atomic, single-round-trip claim with no advisory lock; and RETURNING deliberately yields no row when the insert was suppressed, which is exactly the signal needed.
+  - source: https://www.postgresql.org/docs/current/sql-insert.html
+- **Emit the two modern IETF rate-limit fields, not the legacy `X-RateLimit-*` triplet: `RateLimit-Policy: "burst";q=100;w=60, "daily";q=1000;w=86400` (static-ish quota description) and `RateLimit: "burst";r=42;t=17` (live remaining + effective window). `q` and `r` are REQUIRED in their respective items.**
+  - why: These are the exact field names, parameter names and value types in the current draft; splitting static policy from dynamic state is the whole point of the two-field design.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **For token-metered LLM endpoints, advertise the unit explicitly with `qu`: `RateLimit-Policy: "tokens";q=150000;qu="content-bytes";w=60`. Only `requests`, `content-bytes` and `concurrent-requests` are registered units — if you meter LLM tokens, either map to one of these or register/prefix a vendor-specific parameter.**
+  - why: The draft enumerates exactly three quota units and requires implementation-specific parameters to carry a vendor prefix, so an invented `qu="tokens"` is non-conformant today.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **If quotas are partitioned per API key / per project, expose `pk` as a Structured Fields Byte Sequence (`pk=:cHsdsRa894==:`) and DOCUMENT the derivation algorithm — but derive it only from request-visible data and never from anything that identifies the end user.**
+  - why: Documenting the derivation is what lets a client predict whether a future request has quota; the draft also warns that identifying partition keys enable impersonation and traffic-inference attacks.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **Return `429 Too Many Requests` for quota exhaustion, with `Retry-After: <delay-seconds>` and a `Content-Type: application/problem+json` body of type `https://iana.org/assignments/http-problem-types#quota-exceeded` carrying `violated-policies: ["daily"]`. Set `Cache-Control: no-store` on it.**
+  - why: 429 is the registered rate-limit code, the problem type and its `violated-policies` extension member are defined by the draft, and RFC 6585 forbids caching 429 responses.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **When Retry-After and RateLimit are both present, ensure `Retry-After` is NOT earlier than the end of the effective window `t`. Clients are required to let Retry-After win.**
+  - why: A Retry-After shorter than `t` guarantees the client retries into another 429; the draft makes the server-side constraint a SHOULD NOT and the client-side precedence a MUST.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **Format `Retry-After` as `delay-seconds` (a non-negative decimal integer, `1*DIGIT`), not as an HTTP-date. Both are legal; seconds are immune to clock skew.**
+  - why: RFC 9110 defines `Retry-After = HTTP-date / delay-seconds`; the RateLimit draft chose integer seconds for `t` for exactly the clock-skew and thundering-herd reasons, and the same logic applies to Retry-After.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3
+- **Return `413 Content Too Large` when the request body exceeds the documented maximum, and add `Retry-After` only if the limit is temporary (it usually is not). Enforce the limit by streaming/counting bytes, not by trusting Content-Length.**
+  - why: 413 is the RFC 9110 code for this exact condition and Retry-After is explicitly the temporary-condition signal; the OWASP cheat sheet independently names 413 for request size.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.14
+- **Set the documented max body size BELOW whatever your edge/CDN enforces, and document the edge's own limit and status code. Cloudflare returns 413 at 100 MB on Free/Pro, 200 MB on Business.**
+  - why: If the edge limit is lower than the app limit the client gets an edge-generated 413 with no problem+json body and no request id, which is undebuggable; publish the effective number.
+  - source: https://developers.cloudflare.com/workers/platform/limits/
+- **Return `503 Service Unavailable` + `Retry-After` when your own upstream (model/inference backend) is saturated or down and the condition is expected to clear. Use `502 Bad Gateway` only for an INVALID upstream response and `504 Gateway Timeout` only for an upstream that did not answer in time.**
+  - why: RFC 9110 draws these three distinctions precisely; collapsing them into 500 destroys the client's ability to decide whether retrying is sane.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4
+- **Use `503` (not 429) with problem type `https://iana.org/assignments/http-problem-types#temporary-reduced-capacity` when the client is within quota but the SERVICE has shrunk, and optionally ship a temporarily lowered `RateLimit-Policy` with it.**
+  - why: This separates 'you overused' from 'we shrank', which the draft models as distinct problem types on distinct status codes — important when a GPU node drops out and per-key quotas did not change.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+- **Return every error as `Content-Type: application/problem+json` (RFC 9457) with `type`, `title`, `status`, `detail`, `instance`, plus a stable machine `code` extension and the request id. Document that clients MUST ignore unknown extension members.**
+  - why: Both IETF drafts you are implementing already emit problem+json, and RFC 9457's forward-compatibility rule is what lets you add fields later without a breaking change.
+  - source: https://www.rfc-editor.org/rfc/rfc9457.html
+- **Signal version retirement with `Deprecation: @<unix-timestamp>` (a Structured Fields Date) and `Sunset: <HTTP-date>`, plus `Link: <https://docs.example.com/deprecation>; rel="deprecation"; type="text/html"`. Sunset MUST NOT be earlier than Deprecation. Mirror it in the spec with `deprecated: true` on the operation.**
+  - why: RFC 9745 + RFC 8594 are the standardized machine-readable deprecation signals; the two date formats genuinely differ and getting them backwards is a spec violation.
+  - source: https://www.rfc-editor.org/rfc/rfc9745.html
+- **Maintain and publish an inventory of every live API version and environment, and keep security controls (auth, rate limits, payload caps) on RETIRED-but-still-reachable versions at parity with current. Do not leave a `/v0` reachable with weaker controls.**
+  - why: This is OWASP API9:2023's core failure mode — old versions with inconsistent controls — and it is the single most common way a versioned public API gets breached.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa9-improper-inventory-management
+- **Put explicit numeric bounds in the published schema for every input: `maxLength` on strings, `maxItems` on arrays, `maximum` on any count/limit parameter, and a documented max body size. Validate the pagination `limit` server-side.**
+  - why: OWASP API4:2023 requires these as declared limits; expressing them in JSON Schema means the spec, the validator and the SDK all enforce the same number.
+  - source: https://api-security.owasp.org/editions/2023/en/0xa4-unrestricted-resource-consumption
+- **Reject requests whose `Content-Type` is missing or unexpected with `415 Unsupported Media Type`, and requests using a method outside the allowlist with `405`. Use `422` only for syntactically valid but semantically unprocessable content.**
+  - why: RFC 9110 separates 415 (format the server won't service) from 422 (understood format, well-formed syntax, bad instructions); OWASP names the same codes.
+  - source: https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.21
+- **Store API keys salted-and-hashed with a one-way KDF; keep only a short non-secret prefix in the clear for lookup and display. Generate the secret portion from an approved RNG with ample entropy (128 bits / 22 base62 chars is a safe modern floor).** _(inferred)_
+  - why: NIST requires offline-attack-resistant storage for verifier-held secrets; the specific 128-bit figure is my inference — NIST's stated numbers (20-bit look-up secrets, 64-bit nonces, 112-bit security strength) are floors for different authenticator classes, not an API-key rule.
+  - source: https://pages.nist.gov/800-63-3/sp800-63b.html
+- **If you also ship OpenAI-compatible endpoints, mirror their header names verbatim on those routes ONLY — `x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests` (value `1s` / `6m0s`), `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`, `x-ratelimit-reset-tokens` — while serving the IETF `RateLimit`/`RateLimit-Policy` fields on your own native routes.**
+  - why: Existing OpenAI SDK retry logic reads those exact lowercase names and the `6m0s` duration format; emitting both sets costs nothing and keeps the native surface standards-clean.
+  - source: https://developers.openai.com/api/docs/guides/rate-limits
+- **Document that unsuccessful requests still consume quota, and tell clients to honour Retry-After then ramp back gradually rather than retrying at full rate.**
+  - why: Without this stated, well-meaning clients hammer 429s in a tight loop; it is also the vendor-documented behaviour clients already expect.
+  - source: https://developers.openai.com/api/docs/guides/rate-limits
+- **Never emit `RateLimit`/`RateLimit-Policy` in a trailer section, and have clients ignore them on any response served from cache (positive current_age) and ignore malformed values entirely rather than failing.**
+  - why: All three are explicit normative rules in the draft; the cache one matters because a CDN-cached response carries stale quota numbers.
+  - source: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+
+### Wire shapes to copy
+
+- OpenAPI root (minimum viable public doc): {"openapi": "3.1.1", "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base", "info": {"title": "...", "version": "1.4.0"}, "servers": [{"url": "https://api.example.com/v1", "description": "Production"}], "tags": [{"name": "chat", "description": "..."}], "security": [{"bearerAuth": []}], "paths": {...}, "components": {...}}
+- Bearer securityScheme: components.securitySchemes.bearerAuth = {"type": "http", "scheme": "bearer", "bearerFormat": "opaque"}
+- Header API-key securityScheme: {"type": "apiKey", "name": "X-API-Key", "in": "header"}  — `name` and `in` are both REQUIRED; `in` ∈ {"query","header","cookie"}
+- Security requirement semantics: [{"a": [], "b": []}] = a AND b; [{"a": []}, {"b": []}] = a OR b; [{}] = anonymous allowed; [] = removes the inherited root requirement
+- Components key regex (all of schemas/responses/parameters/examples/headers/securitySchemes): ^[a-zA-Z0-9\.\-_]+$
+- OAS 3.1 dialect id: https://spec.openapis.org/oas/3.1/dialect/base  (used when jsonSchemaDialect is absent)
+- Example Object fields: {"summary": "...", "description": "...", "value": <any>}  — `value` and `externalValue` are mutually exclusive; lives under mediaType.examples.<name>
+- Tag Object: {"name": "<required>", "description": "...", "externalDocs": {"description": "...", "url": "<required>"}}
+- Server Variable Object: {"enum": ["v1","v2"], "default": "v1", "description": "..."}  — `default` REQUIRED, must be in `enum` when `enum` is present, `enum` MUST NOT be empty
+- Request header (idempotency), Structured Fields String — quotes are part of the syntax: Idempotency-Key: "8e03978e-40d5-43e8-bc93-6894a57f9324"
+- Rate limit policy header (static): RateLimit-Policy: "burst";q=100;w=60, "daily";q=1000;w=86400
+- Rate limit policy with partition key + unit: RateLimit-Policy: "peruser";q=65535;qu="content-bytes";w=10;pk=:sdfjLJUOUH==:
+- Rate limit live state header: RateLimit: "burst";r=42;t=17     (r = REQUIRED available quota, t = effective window in seconds, pk = Byte Sequence partition key)
+- Registered quota units for `qu`: "requests" (default), "content-bytes", "concurrent-requests"
+- Retry-After ABNF (RFC 9110 §10.2.3): Retry-After = HTTP-date / delay-seconds ; delay-seconds = 1*DIGIT  — e.g. `Retry-After: 120`
+- 429 problem body: HTTP/1.1 429 Too Many Requests / Content-Type: application/problem+json / {"type": "https://iana.org/assignments/http-problem-types#quota-exceeded", "title": "Request cannot be satisfied as assigned quota has been exceeded", "violated-policies": ["daily","bandwidth"]}
+- 503 capacity problem body: {"type": "https://iana.org/assignments/http-problem-types#temporary-reduced-capacity", "title": "Request cannot be satisfied due to temporary server capacity constraints", "violated-policies": ["hourly"]}
+- Abuse problem type: https://iana.org/assignments/http-problem-types#abnormal-usage-detected (returned with 429)
+- RFC 9457 problem details members: type (default "about:blank"), status, title, detail, instance — media types application/problem+json and application/problem+xml
+- Idempotency error bodies: 400 {"title": "Idempotency-Key is missing"} / 422 {"title": "Idempotency-Key is already used"} / 409 {"title": "A request is outstanding for this Idempotency-Key"} — each Content-Type: application/problem+json, optionally Link: <https://docs.example.com/idempotency>; rel="describedby"; type="text/html"
+- Deprecation signalling: Deprecation: @1688169599  (Structured Fields Date, RFC 9745) + Sunset: Sun, 30 Jun 2024 23:59:59 UTC  (HTTP-date, RFC 8594) + Link: <https://docs.example.com/deprecation>; rel="deprecation"; type="text/html"
+- Status code map for this API: 400 malformed / missing required idempotency key; 405 method not in allowlist; 409 idempotent request still in flight; 413 Content Too Large (body over cap); 415 unexpected or missing Content-Type; 422 valid syntax, unprocessable (incl. idempotency key reused with different payload); 429 Too Many Requests (quota); 502 invalid upstream response; 503 upstream/model unavailable or reduced capacity; 504 upstream timed out
+- Cache directive required on rate-limited responses: Cache-Control: no-store  (RFC 6585: "Responses with the 429 status code MUST NOT be stored by a cache.")
+- OpenAI-compat header set (only on compat routes): x-ratelimit-limit-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-requests, x-ratelimit-remaining-tokens, x-ratelimit-reset-requests, x-ratelimit-reset-tokens (Go-duration-style values like `1s`, `6m0s`), plus Retry-After
+- FastAPI custom document: from fastapi.openapi.utils import get_openapi; get_openapi(title=..., version=..., summary=..., description=..., routes=app.routes) -> dict; cache on app.openapi_schema; assign app.openapi = custom_openapi
+- FastAPI per-route exclusion: @router.post("/internal", include_in_schema=False)  /  whole-app disable: FastAPI(openapi_url=None)
+- FastAPI split public surface: public = FastAPI(title=..., openapi_url="/openapi.json", servers=[...], separate_input_output_schemas=False); app.mount("/v1", public)  -> docs at /v1/docs, schema at /v1/openapi.json
+- FastAPI documented error response with headers: responses={429: {"model": Problem, "description": "Rate limited", "content": {"application/problem+json": {}}, "headers": {"Retry-After": {"schema": {"type": "integer"}}, "RateLimit": {"schema": {"type": "string"}}}}}
+- FastAPI securityScheme generators: HTTPBearer(bearerFormat="opaque", scheme_name="bearerAuth", description=..., auto_error=True) and APIKeyHeader(name="X-API-Key", scheme_name="apiKeyAuth", auto_error=True) — scheme_name IS the components.securitySchemes key
+- Postgres idempotency claim: INSERT INTO idempotency (principal_id, operation, idem_key, fingerprint, state) VALUES (...) ON CONFLICT (principal_id, operation, idem_key) DO NOTHING RETURNING id;  -- zero rows returned == key already claimed
+- Pydantic v2 split schema names when separate_input_output_schemas=True (the FastAPI default): Item-Input / Item-Output
+
+### Pitfalls
+
+- The idempotency draft I read is draft-ietf-httpapi-idempotency-key-header-07, dated 15 October 2025 with 'Expires: 18 April 2026' — it is an EXPIRED Internet-Draft as of today (2026-09-12), not an RFC. Cite it as a draft in developer docs, pin the exact draft number in any internal ADR, and expect the 400/422/409 codes to be stable but not yet IANA-blessed. (The Idempotency-Key field name itself is only proposed for the HTTP Field Name Registry by that draft.)
+- The RateLimit draft has REPLACED its header names across revisions. Older drafts (and most blog posts, and most of the web) use RateLimit-Limit / RateLimit-Remaining / RateLimit-Reset. draft-11 (23 May 2026) defines only two fields — RateLimit-Policy and RateLimit — with Structured-Fields parameters q/qu/w/pk and r/t/pk. Implementing from a stale tutorial gives you a header set no conformant client parses.
+- Structured Fields quoting bites twice: Idempotency-Key values MUST be quoted Strings, and policy names inside RateLimit/RateLimit-Policy are quoted Strings while `pk` is a Byte Sequence wrapped in colons (pk=:base64==:). Naive string concatenation produces malformed fields, and the draft says clients MUST ignore malformed RateLimit fields — so your headers silently vanish rather than erroring.
+- Scoping the idempotency key by the client-supplied key alone is a cross-tenant data-leak vector the draft names explicitly: a low-entropy or guessed key lets one client fetch another's cached response. The composite key (principal + operation + key) is not optional in practice.
+- Caching the idempotent result too early poisons keys. If you record the response before the handler starts, a request that fails schema validation permanently binds that key to a 422, and the client can never retry with a corrected payload under the same key.
+- 429 and 409 are different failures and clients treat them differently: per the draft, 409 (concurrent in-flight) is the one case where the client need NOT correct anything before retrying. Returning 409 for quota, or 429 for an in-flight duplicate, breaks client retry logic.
+- Retry-After shorter than the RateLimit effective window `t` guarantees a retry storm into another 429. The draft makes Retry-After authoritative for clients, so an inconsistent pair is worse than omitting one.
+- Emitting exact remaining-quota numbers on 401/403 responses lets an unauthenticated attacker probe another tenant's traffic volume — the draft's §8.2 information-disclosure warning. Decide deliberately whether error responses consume and report quota.
+- FastAPI's separate_input_output_schemas defaults to True, so every Pydantic model becomes Model-Input and Model-Output in components.schemas. Flipping this flag after SDKs ship renames every generated type. Choose before first publish.
+- FastAPI generic/parameterized Pydantic models produce component keys like `Page[Item]`, which violate the OAS components key regex ^[a-zA-Z0-9\.\-_]+$. Validate the published document in CI with a strict 3.1 validator, not just by eyeballing /docs.
+- Auto-generated operationIds are derived from function name + path + method. A pure refactor (renaming a handler, reordering a router) silently renames public SDK methods. Pin operation_id by hand, or pin generate_unique_id_function, and diff operationIds in CI.
+- Setting both root_path and an explicit servers list without root_path_in_servers=False yields a duplicated prefix (https://api.example.com/v1/v1/...) in the published servers entry.
+- include_in_schema=False hides a route from the document but does NOT make it unreachable — it is a documentation switch, not an authorization control. Internal routes still need auth; the separate mounted app is the structural fix.
+- Schema-Object `example` (singular) is deprecated in 3.1 and `nullable: true` no longer exists. Anything ported from a 3.0 document or generated by a 3.0-era tool will validate loosely and mislead SDK generators.
+- An edge/CDN body-size limit below your app's limit produces a 413 generated by the edge — no problem+json, no request id, no trace. Publish the effective (smaller) number and test the boundary end to end, not just in the app.
+- OpenAPI 3.2.1 was published 10 September 2026 (two days ago). Pinning 3.1.x is the right call for tooling maturity right now, but the document you ship should say which minor it targets, because patch versions within 3.1.* are meant to be treated as equivalent while 3.2 is not.
+- FastAPI's `openapi_version` attribute defaults to '3.1.0'; some downstream tools still reject 3.1.x. Overriding it to lie about the version while emitting 3.1 constructs (type arrays, examples arrays) produces a document that is invalid under the version it claims.
+
+### Open questions for the design
+
+- Idempotency retention window: the draft only requires that you publish one. 24h is the dominant vendor precedent (Stripe), but for expensive LLM generations a longer window costs storage while a shorter one makes legitimate long-retry clients duplicate work. Needs a product decision tied to the max wall-clock duration of a single generation.
+- Whether to gate idempotency behind a REQUIRED header on POST creation endpoints (400 when absent, per the draft) or treat it as optional-but-honoured. Requiring it is safer but is a breaking change for any existing client; optional means duplicates are the client's problem.
+- How to meter LLM tokens under the RateLimit draft: `qu` has only three registered units (requests, content-bytes, concurrent-requests). Do we map tokens onto content-bytes with a documented conversion, register a new quota unit, or carry tokens in a vendor-prefixed parameter? The draft permits the vendor-prefix route but clients won't understand it.
+- Whether the partition key (pk) should be exposed at all. It improves client-side prediction but the draft warns it can leak client/user identity. If exposed, what is the derivation — an HMAC of the API key id? That needs a written, published algorithm.
+- Which status code for 'model backend saturated but client is within quota': 503 + temporary-reduced-capacity is the standards-correct answer, but many LLM clients' retry logic special-cases 429 only. May need to emit 503 natively and 429 on OpenAI-compat routes.
+- Streaming (SSE) responses complicate all of this: rate-limit and idempotency headers must be committed before the first byte, and the RateLimit fields MUST NOT appear in a trailer. How do we report a token-metered quota whose final value is only known at stream end?
+- Whether idempotent replay of a STREAMING response is in scope at all — replaying a stored status+body works for JSON, but replaying an SSE event stream byte-for-byte is a different storage and semantics problem the draft does not address.
+- Versioning strategy itself: URL path segment (/v1/) vs media-type/header negotiation. Every source here (servers URL templating, OWASP inventory guidance) is compatible with both; nothing in the fetched primary sources prescribes one. Needs an explicit ADR.
+- API key entropy and format: NIST's stated numbers (20-bit look-up secrets, 64-bit nonces, 112-bit security strength) are floors for specific authenticator classes, none of which is exactly 'long-lived API bearer key'. The 128-bit recommendation above is my inference, not a cited requirement.
+- Whether to publish the OpenAPI document as a versioned immutable artifact (e.g. /v1/openapi.json pinned per release, plus a git-tagged copy) so SDK regeneration is reproducible, and whether spec diffs should gate merges in CI.
+
