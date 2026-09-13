@@ -161,10 +161,14 @@ def test_assistant_mode_never_touches_the_warehouse(spy):
 
 
 def test_the_gate_is_keyed_on_mode_not_on_a_flag_that_could_drift():
+    import importlib
     import inspect
 
-    src = inspect.getsource(app.routes[0].endpoint.__module__ and __import__(
-        "app.main", fromlist=["main"]))
+    # The module is imported by name. This used to reach it through
+    # `app.routes[0].endpoint`, which only worked while the first registered
+    # route was a plain endpoint; mounting the developer platform routers
+    # (2026-09-13) put an included router first. The assertion is unchanged.
+    src = inspect.getsource(importlib.import_module("app.main"))
     assert 'auto_web_search_allowed = request.mode == "assistant"' in src
 
 
