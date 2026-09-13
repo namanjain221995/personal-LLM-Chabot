@@ -131,11 +131,13 @@ export function SharedConversation({ token }: { token: string }) {
                 {m.role === 'user' ? 'Question' : 'Answer'}
               </h2>
               {m.role === 'user' ? (
-                <p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed">
+                <p className="whitespace-pre-wrap break-words text-base leading-relaxed">
                   {m.content}
                 </p>
               ) : (
-                <Markdown text={m.content} />
+                <div className="chat-answer">
+                  <Markdown text={m.content} />
+                </div>
               )}
 
               {m.sources && m.sources.length > 0 && (

@@ -468,7 +468,7 @@ describe('L — the existing UI is unchanged', () => {
     renderRow(user({ content: 'hello' }));
     const bubble = screen.getByText('hello');
     expect(bubble.className).toBe(
-      'whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-[15px] leading-relaxed',
+      'whitespace-pre-wrap break-words rounded-[20px] bg-bubble px-4 py-2.5 text-base leading-relaxed',
     );
   });
 

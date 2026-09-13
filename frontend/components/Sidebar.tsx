@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * Left sidebar (§9 + V2 §4a + V3 §2 + V4 §2): 260px, collapsible (mobile:
+ * Left sidebar (§9 + V2 §4a + V3 §2 + V4 §2): --ts-sidebar-w (288/300/320px), collapsible (mobile:
  * slide-over drawer). Header (mark · search icon · collapse icon) · New chat
  * · conversation list in ChatGPT's sections — Pinned, Recents, and a collapsed Archived
  * disclosure that lazily pulls `?archived=true` — each row carrying the "⋯"
@@ -228,7 +228,7 @@ function SidebarImpl({
               }
             }}
             aria-label="Rename conversation"
-            className="w-full rounded-lg border border-accent/60 bg-bg px-2.5 py-1.5 text-sm focus:outline-none"
+            className="w-full rounded-lg border border-accent/60 bg-bg px-2.5 py-1.5 text-[15px] leading-[22px] focus:outline-none"
           />
         ) : (
           <>
@@ -236,7 +236,7 @@ function SidebarImpl({
               type="button"
               onClick={() => onSelect(c.id)}
               aria-current={activeId === c.id ? 'true' : undefined}
-              className={`flex w-full items-center gap-1.5 rounded-lg py-1.5 pl-2.5 pr-9 text-left [@media(pointer:coarse)]:pr-10 text-sm transition-colors duration-ts ${
+              className={`flex w-full items-center gap-1.5 rounded-lg py-[7px] pl-2.5 pr-9 text-left [@media(pointer:coarse)]:pr-10 text-[15px] leading-[22px] transition-colors duration-ts ${
                 activeId === c.id
                   ? 'bg-surface-2 text-ink'
                   // Full --ts-text, same as the active row: a conversation
@@ -303,7 +303,7 @@ function SidebarImpl({
     <div className="flex h-full w-sidebar flex-col bg-sidebar">
       <div className="flex items-center gap-2 px-3 pb-2 pt-3">
         <TechSaraMark size={28} />
-        <span className="flex-1 truncate text-sm font-semibold">TechSara</span>
+        <span className="flex-1 truncate text-[15px] font-semibold">TechSara</span>
         <button
           type="button"
           onClick={onOpenSearch}
@@ -340,13 +340,13 @@ function SidebarImpl({
         <button
           type="button"
           onClick={onNewChat}
-          className="flex w-full items-center gap-2 rounded-ts border border-border bg-surface-2/60 px-3 py-2 text-sm font-medium transition-colors duration-ts hover:bg-surface-2"
+          className="flex w-full items-center gap-2 rounded-ts border border-border bg-surface-2/60 px-3 py-2 text-[15px] leading-[22px] font-medium transition-colors duration-ts hover:bg-surface-2"
         >
           <IconPlus size={15} className="text-accent" />
           New chat
           {/* A keyboard chord means nothing on a phone: the drawer copy is only
               ever visible below md, where this stays hidden. */}
-          <kbd className="ml-auto hidden rounded border border-border px-1.5 py-px font-mono text-[10px] text-faint md:inline">
+          <kbd className="ml-auto hidden rounded border border-border px-1.5 py-px font-mono text-[11px] text-faint md:inline">
             {NEW_CHAT_SHORTCUT_LABEL}
           </kbd>
         </button>
@@ -368,7 +368,7 @@ function SidebarImpl({
           <section aria-labelledby={id('pinned')}>
             <h2
               id={id('pinned')}
-              className="px-2.5 pb-1 pt-1.5 text-[11px] font-medium uppercase tracking-wide text-faint"
+              className="px-2.5 pb-1 pt-1.5 text-[12px] font-medium uppercase tracking-wide text-faint"
             >
               Pinned
             </h2>
@@ -381,7 +381,7 @@ function SidebarImpl({
             {pinned.length > 0 && (
               <h2
                 id={id('recents')}
-                className="px-2.5 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint"
+                className="px-2.5 pb-1 pt-3 text-[12px] font-medium uppercase tracking-wide text-faint"
               >
                 Recents
               </h2>
@@ -398,7 +398,7 @@ function SidebarImpl({
                 onClick={toggleArchived}
                 aria-expanded={archivedOpen}
                 aria-controls={id('archived-list')}
-                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-xs text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
+                className="flex w-full items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-left text-sm text-icon transition-colors duration-ts hover:bg-surface-2/60 hover:text-ink"
               >
                 <IconChevronRight
                   size={13}

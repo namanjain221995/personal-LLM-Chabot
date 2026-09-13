@@ -159,6 +159,16 @@ const PANEL_SIDEBAR_AUTOCLOSE =
 const PANEL_MIN_WIDTH_CSS = `max(${PANEL_MIN_PCT}%, min(${PANEL_MIN_PX}px, 62%, calc(100% - ${
   THREAD_MIN_PX + DIVIDER_PX
 }px)))`;
+/**
+ * The panel column's max-width: 960 px, AND never so wide that the thread
+ * keeps less than THREAD_MIN_PX — the divider's 55 % otherwise walked past the
+ * floor with the sidebar open on a 768–1279 px screen (measured 338 px at
+ * 1024 with the old 260 px sidebar, 325 px with the 288 px one). The 45 % term
+ * keeps the ceiling from ever dropping below the floor's own min-width.
+ */
+const PANEL_MAX_WIDTH_CSS = `min(${PANEL_MAX_PX}px, max(${PANEL_MIN_PCT}%, calc(100% - ${
+  THREAD_MIN_PX + DIVIDER_PX
+}px)))`;
 import { EmptyState } from './EmptyState';
 import { Loader } from './Loader';
 import {
@@ -535,7 +545,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * a 768 px thread column needs on a 1440 px screen to stay readable.
    *
    * Of the workspace, not the shell: measured against the whole shell the
-   * minimums summed to 0.95·W + 266 px (sidebar 260 + divider 6), which is
+   * minimums summed to 0.95·W + 266 px (the then 260 px sidebar + divider 6), which is
    * wider than every real screen (1440 px: 194 px over; 1920 px: 170 px
    * over), and `overflow-hidden` on the shell clipped exactly that much off
    * the panel's right edge — where Close, Download and the zoom buttons sit.
@@ -3640,7 +3650,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
               style={{
                 flexBasis: `${artifactPanelPct}%`,
                 minWidth: PANEL_MIN_WIDTH_CSS,
-                maxWidth: `${PANEL_MAX_PX}px`,
+                maxWidth: PANEL_MAX_WIDTH_CSS,
               }}
             >
               <ArtifactPanel

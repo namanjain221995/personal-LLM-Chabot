@@ -233,9 +233,11 @@ describe('COLOR-11 · nothing but the accent moved', () => {
     '--ts-surface-2': '#2a2a2a',
     '--ts-border': '#262626',
     '--ts-text': '#ffffff',
-    '--ts-text-muted': '#b3b3b3',
-    '--ts-text-faint': '#8a8a8a',
-    '--ts-text-icon': '#cfcfcf',
+    // Lifted 2026-09-13 at the owner's request ("brighter text"): the three
+    // secondary inks moved, the primary ink and every surface did not.
+    '--ts-text-muted': '#c7c7c7',
+    '--ts-text-faint': '#a3a3a3',
+    '--ts-text-icon': '#d9d9d9',
     '--ts-danger': '#ef5a5f',
     '--ts-warn': '#f0a92e',
     '--ts-engine-sql': '#b7791f',
@@ -535,4 +537,34 @@ describe('SELECT-COLOR · the text-selection highlight', () => {
     // stops the app's stronger highlight leaking onto it.
     expect(AUTH['--ts-selection']).toBe('rgba(26, 36, 128, 0.1)');
   });
+});
+
+// ------------------------------------------- secondary inks (2026-09-13)
+
+describe('the secondary inks are brighter and still clear AA', () => {
+  /**
+   * Owner, side by side with ChatGPT: "brighter text". The primary ink was
+   * already #fff, so the lift went into the three greys below it. Every
+   * surface a grey label can sit on is checked — the old dark faint was
+   * 3.82:1 on the bubble and the old light faint 2.74:1 on surface-2, both
+   * below AA, and neither may come back.
+   */
+  const SURFACES = ['--ts-bg', '--ts-sidebar', '--ts-surface', '--ts-surface-2', '--ts-bubble'];
+  const INKS = ['--ts-text-muted', '--ts-text-faint', '--ts-text-icon'];
+
+  for (const { name, tokens } of THEMES) {
+    for (const ink of INKS) {
+      it.each(SURFACES)(`${name} ${ink} on %s clears AA`, (surface) => {
+        expect(contrast(tokens[ink], tokens[surface])).toBeGreaterThanOrEqual(4.5);
+      });
+    }
+
+    it(`${name} keeps the order text > icon > muted > faint`, () => {
+      const ground = tokens['--ts-bg'];
+      const c = (t: string) => contrast(tokens[t], ground);
+      expect(c('--ts-text')).toBeGreaterThan(c('--ts-text-icon'));
+      expect(c('--ts-text-icon')).toBeGreaterThan(c('--ts-text-muted'));
+      expect(c('--ts-text-muted')).toBeGreaterThan(c('--ts-text-faint'));
+    });
+  }
 });

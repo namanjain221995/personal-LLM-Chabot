@@ -205,7 +205,7 @@ describe('the file panel splits the workspace, not the shell', () => {
     expect(panelColumn.style.minWidth).toBe(
       'max(45%, min(520px, 62%, calc(100% - 366px)))',
     );
-    expect(panelColumn.style.maxWidth).toBe('960px');
+    expect(panelColumn.style.maxWidth).toBe('min(960px, max(45%, calc(100% - 366px)))');
     // The thread shrinks to what the panel leaves and never forces an overflow.
     const conversationColumn = document.querySelector('[data-file-drop-zone]')!;
     expect(conversationColumn.className).toMatch(/\bmin-w-0\b/);

@@ -1237,7 +1237,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                       : 'Ask anything…'))
               }
               aria-label="Message"
-              className="max-h-[240px] min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1.5 text-[15px] leading-6 placeholder:text-faint focus:outline-none disabled:cursor-not-allowed"
+              className="max-h-[240px] min-h-[24px] w-full resize-none bg-transparent px-1.5 py-1.5 text-base leading-6 placeholder:text-faint focus:outline-none disabled:cursor-not-allowed"
               style={{ height: 24 }}
             />
 
@@ -1433,12 +1433,15 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
           <p
             className={`mt-2 text-center text-xs transition-opacity duration-ts ${
-              // Dimming marks the RELAXED state (Salesforce off, model may
-              // search). With search FORCED on this line is the strongest
-              // internet warning shown anywhere — never dim that one.
+              // The RELAXED state (Salesforce off, model may search) is the
+              // quieter one. With search FORCED on this line is the strongest
+              // internet warning shown anywhere, so it takes the brighter ink.
+              // A colour step, not `opacity-50`: half-opacity faint text was
+              // 2.19:1 on the dark page and 1.69:1 on white — this line is the
+              // privacy promise, and it was below AA in both themes.
               prefs.salesforce || prefs.webSearch === 'on'
-                ? 'text-faint'
-                : 'text-faint opacity-50'
+                ? 'text-muted'
+                : 'text-faint'
             }`}
           >
             {/* This line is the only place the privacy promise is made, and
