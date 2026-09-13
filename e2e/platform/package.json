@@ -1,0 +1,17 @@
+{
+  "name": "techsara-platform-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Release regression suite for the whole TechSara platform: headless Chrome plus HTTP checks against one base URL.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "e2e": "node run.js",
+    "test": "node --test tests/"
+  },
+  "dependencies": {
+    "puppeteer-core": "23.11.1"
+  }
+}
