@@ -1,5 +1,9 @@
 import type { DocPage } from '../types';
-import { EXAMPLE_STATUS } from '../samples';
+import {
+  EXAMPLE_STATUS,
+  LONG_OUTPUT_WALL_CLOCK_LIVE,
+  WALL_CLOCK_PENDING_NOTE,
+} from '../samples';
 
 export const changelog: DocPage = {
   slug: 'changelog',
@@ -10,6 +14,56 @@ export const changelog: DocPage = {
   body: `
 Dates are the date of the change in this repository. Anything that alters
 behaviour on \`/v1\` appears here.
+
+## 2026-09-13 — every model on the API, and answers up to 1,000,000 tokens
+
+* **Six models instead of one.** \`/v1\` now offers every model TechSara runs:
+  \`techsara-35b\` (the chat model), \`techsara-8b-vision\` (a smaller
+  vision-language model), \`techsara-ocr\` (reads text out of an image),
+  \`techsara-embed\` (embeddings), \`techsara-rerank\` (reranking) and
+  \`techsara-whisper\` (speech to text). \`GET /v1/models\` lists the ones this
+  deployment runs and your key may use. See the [model reference](/docs/models).
+* **Three new endpoints, three new scopes.** [\`POST /v1/embeddings\`](/docs/embeddings)
+  (\`embeddings.write\`), [\`POST /v1/rerank\`](/docs/rerank) (\`rerank.write\`)
+  and [\`POST /v1/audio/transcriptions\`](/docs/audio-transcriptions)
+  (\`audio.write\`). New keys get all three by default. **Keys created before
+  this change do not have them** and answer \`403 insufficient_scope\` on those
+  endpoints; create a new key.
+* **Existing projects can reach the new chat models.** A project whose model
+  allowlist is empty — the default — can now use \`techsara-8b-vision\` and
+  \`techsara-ocr\` with its existing \`responses.write\` keys, and every other
+  new model with a key that holds the matching scope. Set an allowlist if that is
+  not what you want.
+* **Images on the two generation endpoints.** A \`user\` message may carry image
+  parts, as \`data:\` URLs only — a link is refused, never fetched. The body limit
+  on \`/v1/responses\` and \`/v1/chat/completions\` is 20 MiB; all the text in it is
+  still limited to 1 MiB. See [images and OCR](/docs/images).
+* **\`max_output_tokens\` up to 1,000,000 on \`techsara-35b\`.** Input and output
+  share the context window, so a value within the model's ceiling that is more
+  than the prompt leaves is now **clamped** instead of refused; above the ceiling
+  is still a \`400\`. Every response object gains \`max_output_tokens\` (the ceiling
+  applied) and \`incomplete_details\` (set when the answer reached it), and
+  \`chat.completion\` gains \`max_output_tokens\`. Chat Completions accepts
+  \`max_completion_tokens\` as an alias of \`max_tokens\`. The default when you
+  send nothing is still 8,192. See [long outputs](/docs/long-output), which also
+  explains why a long answer needs streaming or background.
+* **The wall clock follows the request.** A generation's time limit is now sized to
+  its \`max_output_tokens\`, up to six hours, and a generation that reaches it
+  keeps the text it had written.
+${LONG_OUTPUT_WALL_CLOCK_LIVE ? '' : `* ${WALL_CLOCK_PENDING_NOTE}\n`}* **Capacity queues per engine.** The engines are shared with the TechSara chat
+  application, which keeps priority. Public requests to each wait in a small
+  queue; one that cannot start in time is \`503 model_unavailable\` with
+  \`Retry-After\` — capacity shared by every caller, never a \`429\` and never a
+  limit on your key. A background response waits in \`queued\` for up to an hour.
+  See [rate limits](/docs/rate-limits#capacity-queues-per-engine).
+* **What did not change**: no usage limits, the error codes (every refusal above
+  uses a code that already existed), the event names, the 8,192 default, the
+  webhook events, and usage recorded once per request. \`Idempotency-Key\` is
+  still accepted on \`/v1/responses\` and \`/v1/chat/completions\`, and refused on
+  the three new endpoints.
+* **Examples are still marked as not executed.** The new pages and examples have
+  not been run against a running deployment yet; the notice on every page says
+  so.
 
 ## 2026-09-13 — usage limits removed
 

@@ -8,21 +8,26 @@
  * published, and the test that walks every internal link catches the first
  * link that points at it.
  */
+import { audioTranscriptions } from './pages/audioTranscriptions';
 import { authentication } from './pages/authentication';
 import { background } from './pages/background';
 import { changelog } from './pages/changelog';
 import { chatCompletions } from './pages/chatCompletions';
 import { curl } from './pages/curl';
+import { embeddings } from './pages/embeddings';
 import { errors } from './pages/errors';
 import { idempotency } from './pages/idempotency';
+import { images } from './pages/images';
 import { javascript } from './pages/javascript';
 import { keySecurity } from './pages/keySecurity';
+import { longOutput } from './pages/longOutput';
 import { migration } from './pages/migration';
 import { models } from './pages/models';
 import { overview } from './pages/overview';
 import { python } from './pages/python';
 import { quickstart } from './pages/quickstart';
 import { rateLimits } from './pages/rateLimits';
+import { rerank } from './pages/rerank';
 import { responses } from './pages/responses';
 import { security } from './pages/security';
 import { status } from './pages/status';
@@ -43,6 +48,14 @@ export {
   EXAMPLE_RESPONSE_ID,
   EXAMPLE_TEST_KEY,
   MODEL_ID,
+  MODEL_IDS,
+  VISION_MODEL_ID,
+  OCR_MODEL_ID,
+  EMBED_MODEL_ID,
+  RERANK_MODEL_ID,
+  WHISPER_MODEL_ID,
+  LONG_OUTPUT_WALL_CLOCK_LIVE,
+  WALL_CLOCK_PENDING_NOTE,
   EXAMPLE_STATUS,
   EXAMPLES_EXECUTED,
   EXECUTED_NOTE,
@@ -65,8 +78,13 @@ export const DOC_SECTIONS: DocSection[] = [
       models,
       responses,
       chatCompletions,
+      images,
       streaming,
       background,
+      longOutput,
+      embeddings,
+      rerank,
+      audioTranscriptions,
       webhooks,
       errors,
       rateLimits,

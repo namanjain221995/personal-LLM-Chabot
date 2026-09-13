@@ -1,9 +1,13 @@
 import type { DocPage } from '../types';
 import {
   API_BASE_URL,
+  EMBED_MODEL_ID,
   EXAMPLE_RESPONSE_ID,
   MODEL_ID,
   EXAMPLE_STATUS,
+  OCR_MODEL_ID,
+  RERANK_MODEL_ID,
+  WHISPER_MODEL_ID,
 } from '../samples';
 
 export const curl: DocPage = {
@@ -91,6 +95,64 @@ curl "$TECHSARA_BASE_URL/responses/${EXAMPLE_RESPONSE_ID}" \\
 curl -X POST "$TECHSARA_BASE_URL/responses/${EXAMPLE_RESPONSE_ID}/cancel" \\
   -H "Authorization: Bearer $TECHSARA_API_KEY"
 ~~~
+
+## A long answer
+
+~~~bash
+curl "$TECHSARA_BASE_URL/responses" \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -H "Idempotency-Key: $(uuidgen)" \\
+  -d '{"model": "${MODEL_ID}", "input": "Write the full handbook.", "max_output_tokens": 1000000, "background": true}'
+~~~
+
+The \`202\` carries the planned \`max_output_tokens\`, already clamped to the
+window. A million tokens takes hours — see [long outputs](/docs/long-output).
+
+## Read text out of an image
+
+~~~bash
+printf '{"model": "${OCR_MODEL_ID}", "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,%s"}]}]}' \\
+  "$(base64 < page.png | tr -d '\\n')" > ocr.json
+
+curl "$TECHSARA_BASE_URL/responses" \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  --data-binary @ocr.json
+~~~
+
+No text part: the server adds the instruction this model reads best with. See
+[images and OCR](/docs/images).
+
+## Embeddings
+
+~~~bash
+curl "$TECHSARA_BASE_URL/embeddings" \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${EMBED_MODEL_ID}", "input": ["first passage", "second passage"]}'
+~~~
+
+## Rerank
+
+~~~bash
+curl "$TECHSARA_BASE_URL/rerank" \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"model": "${RERANK_MODEL_ID}", "query": "How do I rotate a key?", "documents": ["Keys rotate in the console.", "Webhooks are signed."], "top_n": 1}'
+~~~
+
+## Transcribe audio
+
+~~~bash
+curl "$TECHSARA_BASE_URL/audio/transcriptions" \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -F "file=@standup.m4a;type=audio/mp4" \\
+  -F "model=${WHISPER_MODEL_ID}" \\
+  -F "response_format=verbose_json"
+~~~
+
+Name the file's type with \`;type=\`; an untyped part is refused.
 
 ## Usage
 

@@ -27,7 +27,16 @@ curl ${API_BASE_URL}/responses \\
 ~~~
 
 Supported on [\`POST /v1/responses\`](/docs/responses) and
-[\`POST /v1/chat/completions\`](/docs/chat-completions).
+[\`POST /v1/chat/completions\`](/docs/chat-completions) — the two endpoints
+where a retry could run a generation twice.
+
+**Not accepted on** [\`POST /v1/embeddings\`](/docs/embeddings),
+[\`POST /v1/rerank\`](/docs/rerank) or
+[\`POST /v1/audio/transcriptions\`](/docs/audio-transcriptions): the header
+there is a \`400 invalid_request_error\` with \`param\` \`Idempotency-Key\`.
+Those calls store nothing a retry could be matched against, so a key would be
+a promise the server cannot keep — and they return the same result for the
+same input, so a plain retry is already safe.
 
 ## The rules
 
@@ -64,8 +73,20 @@ guessing which would be worse than refusing.
 
 The still-running case is the second most important. Telling you to come back
 in a couple of seconds is honest and cheap; running the model a second time
-would be neither. This \`429\` is not a usage limit — the API enforces
+would be neither. This \`409\` is not a usage limit — the API enforces
 none — so honour \`Retry-After\` and retry with the same key, and you will get the original response.
+
+**Long generations stay "still running" for as long as they run.** A request for
+hundreds of thousands of output tokens can take hours, and every retry with its
+key gets the \`409\` until it ends. That is the key doing its job: without it,
+a client that gave up after two hours and retried would start a second
+multi-hour generation. The one case the key cannot see is the service
+restarting under the original: the claim is then only released after 13 hours
+(well inside the 24-hour retention), so a retry with the same key can keep
+answering \`409\` until then. When a stream dropped or a background response
+failed with "The service restarted while this response was running.", retry
+with a **new** key. For work that long, prefer [background](/docs/background):
+its \`202\` hands you the response id straight away.
 
 ## Choosing a key
 

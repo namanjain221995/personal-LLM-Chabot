@@ -30,7 +30,9 @@ curl -i -sS "${API_BASE_URL}/models" \\
 
 \`GET /v1/models\` is the cheapest authenticated call on the platform: it
 generates nothing and touches no engine. A \`200\` means the API is up and
-your key, service account, project and workspace are all live.
+your key, service account, project and workspace are all live. A model missing
+from the list is not an outage signal: the list shows what this deployment runs
+and what your key may use.
 
 Do not treat it as a generation health check. The API answering does not
 prove the model is currently serving — that is what the two 503 codes below
@@ -42,7 +44,7 @@ are for. And do not poll it every second: a probe is a request, recorded in your
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | \`model_recovering\` | The engine is restarting. The request is retry-safe. | Wait for \`Retry-After\` and retry. |
-| \`model_unavailable\` | The engine is down. | Back off harder, alert, and retry with a ceiling. |
+| \`model_unavailable\` | The engine is down — or, when the message says so, at capacity: its public queue did not free a place in time. | Back off harder, alert if it persists, and retry with a ceiling. |
 
 Both carry \`Retry-After\` in seconds. Honour it and add jitter — a fleet
 that retries on the same tick recreates the spike.
@@ -63,6 +65,10 @@ Two things that are not outages and look like one:
 * **A slow first token.** A long prompt takes real time to read before the
   first token appears. [Stream](/docs/streaming), so you can see the
   difference between slow and stuck.
+* **A \`503\` "at capacity" from one model while the others answer.** Each
+  engine the chat application also uses has its own small public queue, and the
+  chat application keeps priority. One busy engine says nothing about the rest —
+  see [capacity queues](/docs/rate-limits#capacity-queues-per-engine).
 
 ## Where to look
 

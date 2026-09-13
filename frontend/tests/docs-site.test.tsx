@@ -20,7 +20,7 @@
  *      resolve to headings that exist.
  */
 
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,14 +53,22 @@ import { DocsShell } from '@/components/docs/DocsShell';
 import {
   DOC_PAGES,
   DOC_SECTIONS,
+  EMBED_MODEL_ID,
   EXAMPLE_KEYS,
   EXAMPLE_STATUS,
   EXAMPLES_EXECUTED,
   EXECUTED_NOTE,
   NOT_EXECUTED_NOTE,
   EXAMPLE_LIVE_KEY,
+  LONG_OUTPUT_WALL_CLOCK_LIVE,
   MODEL_ID,
+  MODEL_IDS,
+  OCR_MODEL_ID,
   OVERVIEW_SLUG,
+  RERANK_MODEL_ID,
+  VISION_MODEL_ID,
+  WALL_CLOCK_PENDING_NOTE,
+  WHISPER_MODEL_ID,
   docHref,
   findDocPage,
   neighboursOf,
@@ -97,6 +105,9 @@ function proseUnitsOf(body: string): string[] {
 const CONTRACT = repoFile('docs', 'developer-platform', 'CONTRACT.md');
 const REGISTRY_PY = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
 const KEYS_PY = repoFile('orchestrator', 'app', 'apiplatform', 'keys.py');
+
+/** The changelog heading of the all-models / 1M-output change (2026-09-13). */
+const ALL_MODELS_ENTRY = '2026-09-13 — every model on the API, and answers up to 1,000,000 tokens';
 
 // -------------------------------------------------------------- tailwind --
 
@@ -167,7 +178,8 @@ function normalisePath(path: string): string {
       if (!segment) return segment;
       if (/^\{.*\}$/.test(segment)) return '{}';
       if (/^(resp|msg|proj|svc|key|whe|whd)_/.test(segment)) return '{}';
-      if (segment === MODEL_ID) return '{}';
+      // Any of the six public ids fills `/v1/models/{model}` (2026-09-13).
+      if ((MODEL_IDS as readonly string[]).includes(segment)) return '{}';
       return segment;
     })
     .join('/');
@@ -181,6 +193,37 @@ function routesMentionedIn(body: string): string[] {
     found.add(normalisePath(cleaned));
   }
   return [...found];
+}
+
+/** The six public ids, in the order CONTRACT §15's registry table lists them. */
+function contractModelIds(): string[] {
+  const section = contractSection('## 15. Model registry', '## 16. Recording');
+  return [...section.matchAll(/^\|\s*`(techsara-[a-z0-9-]+)`\s*\|\s*`[a-z]+`\s*\|/gm)].map((m) => m[1]);
+}
+
+/** One `## ` section of the contract, from its heading to the next one named. */
+function contractSection(start: string, end: string): string {
+  const from = CONTRACT.indexOf(start);
+  const to = CONTRACT.indexOf(end, from + 1);
+  expect(from, start).toBeGreaterThanOrEqual(0);
+  expect(to, end).toBeGreaterThan(from);
+  return CONTRACT.slice(from, to);
+}
+
+/** The scope table of CONTRACT §7: scope -> the sentence the server shows. */
+function contractScopes(): Map<string, string> {
+  const section = contractSection('## 7. Public endpoints', '## 8. Request contract');
+  return new Map(
+    [...section.matchAll(/^\|\s*`([a-z]+\.[a-z]+)`\s*\|\s*([^|]+?)\s*\|\s*(?:yes|no)/gm)].map(
+      (m) => [m[1], m[2]],
+    ),
+  );
+}
+
+/** `12,345` -> 12345, `none` -> null. */
+function numberOrNull(cell: string): number | null {
+  const match = /^([\d,]+)/.exec(cell.trim());
+  return match ? Number(match[1].replace(/,/g, '')) : null;
 }
 
 // ------------------------------------------------------------------ keys --
@@ -319,25 +362,41 @@ describe('the documented API surface', () => {
     expect(missing).toEqual([]);
   });
 
-  it('uses the one model id the registry declares', () => {
+  it('uses only the model ids the contract registry declares, and every one of them', () => {
+    // 2026-09-13, owner request: six public ids, not one. The contract's §15
+    // table is the list the code builds against; samples.ts must equal it,
+    // and no sample may send an id outside it.
     expect(REGISTRY_PY).toContain('TECHSARA_35B = "techsara-35b"');
     expect(MODEL_ID).toBe('techsara-35b');
+    const contractIds = contractModelIds();
+    expect(contractIds).toHaveLength(6);
+    expect([...MODEL_IDS]).toEqual(contractIds);
 
-    // No page may invent a second model id in a JSON sample.
     const invented: string[] = [];
     for (const page of DOC_PAGES) {
       for (const match of page.body.matchAll(/"model":\s*"([^"]+)"/g)) {
-        if (match[1] !== MODEL_ID) invented.push(`${page.slug}: ${match[1]}`);
+        if (!(MODEL_IDS as readonly string[]).includes(match[1])) {
+          invented.push(`${page.slug}: ${match[1]}`);
+        }
       }
     }
     expect(invented).toEqual([]);
+
+    // The registry may declare fewer ids than the contract while its wave is
+    // landing, never an id the contract and these pages do not know.
+    const registryIds = [...REGISTRY_PY.matchAll(/"(techsara-[a-z0-9-]+)"/g)].map((m) => m[1]);
+    expect(registryIds).toContain(MODEL_ID);
+    for (const id of registryIds) expect(MODEL_IDS as readonly string[]).toContain(id);
   });
 
   it('states plainly that tool calling is not offered, because the registry says tools=False', () => {
     // The registry is the authority (CONTRACT §15). If it ever declares
     // tools=True this assertion fails first, which is the moment to rewrite
-    // the page rather than the moment a customer discovers the gap.
-    expect(REGISTRY_PY).toContain('tools=False');
+    // the page rather than the moment a customer discovers the gap. Matched
+    // as `tools=False` or a dataclass default `tools: bool = False`, because
+    // the registry is being reshaped for six models (2026-09-13).
+    expect(REGISTRY_PY).toMatch(/\btools\s*(?::\s*bool\s*)?=\s*False\b/);
+    expect(REGISTRY_PY).not.toMatch(/\btools\s*(?::\s*bool\s*)?=\s*True\b/);
 
     const tools = findDocPage('tools');
     expect(tools).toBeDefined();
@@ -528,21 +587,40 @@ describe('the error and scope vocabularies', () => {
   });
 
   it('documents every scope the platform defines, and invents none', () => {
+    // 2026-09-13: the vocabulary grows from four to seven, and the CONTRACT
+    // moves first (§7's scope table) while scopes.py follows in the same
+    // wave. So a scope is legitimate when the contract names it; scopes.py
+    // may never define one the contract does not; and the authentication
+    // page must carry each one with the contract's sentence, verbatim — the
+    // sentence the console and the OpenAPI document show.
     const scopesPy = repoFile('orchestrator', 'app', 'apiplatform', 'scopes.py');
     const defined = new Set(
       [...scopesPy.matchAll(/^\s{4}[A-Z_]+ = "([a-z.]+)"$/gm)].map((m) => m[1]),
     );
     expect(defined.size).toBeGreaterThanOrEqual(4);
+    const contract = contractScopes();
+    expect([...contract.keys()].sort()).toEqual(
+      ['audio.write', 'embeddings.write', 'models.read', 'rerank.write', 'responses.read', 'responses.write', 'usage.read'],
+    );
+    for (const scope of defined) expect(contract.has(scope), `${scope} is not in CONTRACT §7`).toBe(true);
 
     const authentication = findDocPage('authentication')!.body;
-    for (const scope of defined) {
+    for (const scope of new Set([...defined, ...contract.keys()])) {
       expect(authentication, `${scope} must be documented`).toContain(`\`${scope}\``);
+    }
+    for (const [scope, sentence] of contract) {
+      expect(authentication).toContain(`| \`${scope}\` | ${sentence} |`);
+      // Where scopes.py already describes the scope, it says the same thing.
+      const described = new RegExp(`Scope\\.${scope.toUpperCase().replace('.', '_')}: "([^"]+)"`).exec(scopesPy);
+      if (described) expect(described[1]).toBe(sentence);
     }
 
     const invented: string[] = [];
     for (const page of DOC_PAGES) {
-      for (const match of page.body.matchAll(/`((?:models|responses|usage|webhooks)\.[a-z]+)`/g)) {
-        if (!defined.has(match[1])) invented.push(`${page.slug}: ${match[1]}`);
+      for (const match of page.body.matchAll(
+        /`((?:models|responses|usage|webhooks|embeddings|rerank|audio)\.[a-z]+)`/g,
+      )) {
+        if (!contract.has(match[1]) && !defined.has(match[1])) invented.push(`${page.slug}: ${match[1]}`);
       }
     }
     expect(invented).toEqual([]);
@@ -672,7 +750,15 @@ describe('the shipped router', () => {
     expect(end).toBeGreaterThan(start);
     const section = page.slice(start, end);
     const documented = [...section.matchAll(/^\|\s*`([a-z_]+)`\s*\|/gm)].map((m) => m[1]);
-    expect([...documented].sort()).toEqual([...fields].sort());
+    // 2026-09-13: `max_completion_tokens` is in CONTRACT §8.2 and lands in
+    // router.py's _CHAT_FIELDS in the same wave as this page. It is allowed
+    // here ONLY while the contract names it and the router has not caught
+    // up; once the router lists it, this line adds nothing.
+    const contractChat = contractSection('### 8.2 `POST /v1/chat/completions`', '### 8.3');
+    const pending = ['max_completion_tokens'].filter(
+      (field) => contractChat.includes(`\`${field}\``) && !fields.includes(field),
+    );
+    expect([...documented].sort()).toEqual([...fields, ...pending].sort());
 
     // Anywhere else on the page, a sampling knob the router refuses may only
     // be named inside the refusal the router sends — never in a request body,
@@ -696,8 +782,18 @@ describe('the shipped router', () => {
   it('names the same generation defaults the router applies', () => {
     // A default is the most quietly wrong thing a document can carry: nobody
     // sends the field, so nobody discovers the number moved.
-    const maxOutput = /^DEFAULT_MAX_OUTPUT_TOKENS = (\d+)$/m.exec(ROUTER_PY)?.[1];
-    const temperature = /^DEFAULT_TEMPERATURE = ([\d.]+)$/m.exec(ROUTER_PY)?.[1];
+    //
+    // 2026-09-13: the planning of a generation moves into
+    // publicapi/planning.py in the all-models wave; the constant is read from
+    // whichever of the two files defines it, so the move is not a docs bug.
+    const planningPath = join(REPO_ROOT, 'orchestrator', 'app', 'publicapi', 'planning.py');
+    const planningPy = existsSync(planningPath) ? readFileSync(planningPath, 'utf8') : '';
+    const maxOutput =
+      /^DEFAULT_MAX_OUTPUT_TOKENS = (\d+)$/m.exec(ROUTER_PY)?.[1] ??
+      /^DEFAULT_MAX_OUTPUT_TOKENS = (\d+)$/m.exec(planningPy)?.[1];
+    const temperature =
+      /^DEFAULT_TEMPERATURE = ([\d.]+)$/m.exec(ROUTER_PY)?.[1] ??
+      /^DEFAULT_TEMPERATURE = ([\d.]+)$/m.exec(planningPy)?.[1];
     expect(maxOutput).toBe('8192');
     expect(temperature).toBe('0.2');
 
@@ -984,7 +1080,9 @@ describe('the unlimited API (owner decision, 2026-09-13)', () => {
   it('records the removal in the changelog, dated 2026-09-13, as a decision, newest first', () => {
     const changelog = findDocPage('changelog')!.body;
     const headings = docHeadingsOf(changelog).map((heading) => heading.text);
-    expect(headings[0]).toBe('2026-09-13 — usage limits removed');
+    // Newest first: the all-models entry of the same day came after it.
+    expect(headings[0]).toBe(ALL_MODELS_ENTRY);
+    expect(headings[1]).toBe('2026-09-13 — usage limits removed');
     const entry = sectionOf(changelog, '2026-09-13 — usage limits removed');
     expect(entry).toContain('by decision');
     expect(entry).toContain('`PUBLIC_API_ENFORCE_LIMITS`, off by default');
@@ -999,6 +1097,425 @@ describe('the unlimited API (owner decision, 2026-09-13)', () => {
     expect(runner).not.toMatch(/^def chk_ratelimit\(/m);
     expect(runner).not.toMatch(/^\s+S\["rate-limits", \d+\] = Spec\(/m);
     expect(findDocPage('rate-limits')!.body).not.toContain('~~~');
+  });
+});
+
+/**
+ * Every model TechSara runs, on /v1, and output up to 1,000,000 tokens
+ * (owner request and owner decision, 2026-09-13).
+ *
+ * The pages were written while the code for the same wave was being built in
+ * parallel, so they are held to CONTRACT.md — the document that wave builds
+ * against — and to the primary sources that already exist (audio_api.py,
+ * llm.py, config.py). Where a code file is still catching up, the test says
+ * so in a comment and tightens itself the day it lands.
+ */
+describe('every model on the API (owner request, 2026-09-13)', () => {
+  const NEW_ROUTES: [string, string, string, string, string][] = [
+    ['POST', '/v1/embeddings', 'embeddings.write', 'embeddings', EMBED_MODEL_ID],
+    ['POST', '/v1/rerank', 'rerank.write', 'rerank', RERANK_MODEL_ID],
+    ['POST', '/v1/audio/transcriptions', 'audio.write', 'audio-transcriptions', WHISPER_MODEL_ID],
+  ];
+  const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+
+  /** CONTRACT §12.2's per-model ceilings table. */
+  function contractCeilings() {
+    const section = contractSection('### 12.2 Technical ceilings', '### 12.3');
+    const rows = [
+      ...section.matchAll(
+        /^\| `(techsara-[a-z0-9-]+)` \| ([a-z]+) \| ([^|]+) \| ([^|]+) \| ([^|]+) \| ([^|]+) \| ([^|]+) \|$/gm,
+      ),
+    ];
+    return new Map(
+      rows.map((m) => [
+        m[1],
+        {
+          kind: m[2],
+          context: numberOrNull(m[3]),
+          input: numberOrNull(m[4]),
+          output: numberOrNull(m[5]),
+          defaultOutput: numberOrNull(m[6]),
+          other: m[7],
+        },
+      ]),
+    );
+  }
+
+  /** Every fenced json block on a page that parses. */
+  function jsonSamples(body: string): unknown[] {
+    const out: unknown[] = [];
+    for (const match of body.matchAll(/^~~~json\n([\s\S]*?)^~~~$/gm)) {
+      try {
+        out.push(JSON.parse(match[1]));
+      } catch {
+        // A request fragment with an elided value is prose, not a sample.
+      }
+    }
+    return out;
+  }
+
+  it('publishes the three new routes in CONTRACT §7 with exactly one scope each, eleven routes in all', () => {
+    expect(contractRoutes().size).toBe(11);
+    for (const [method, path, scope] of NEW_ROUTES) {
+      expect(CONTRACT).toMatch(
+        new RegExp(`^\\| ${method} \\| \`${escapeRe(path)}\` \\| \`${escapeRe(scope)}\` \\|`, 'm'),
+      );
+    }
+  });
+
+  it('gives each new endpoint its own reference page, naming its scope, its model and the refusal of Idempotency-Key', () => {
+    const reference = DOC_SECTIONS.find((section) => section.title === 'API reference')!;
+    for (const [method, path, scope, slug, model] of NEW_ROUTES) {
+      const page = findDocPage(slug);
+      expect(page, slug).toBeDefined();
+      expect(reference.pages).toContain(page);
+      expect(page!.body).toContain(`${method} ${path}`);
+      expect(page!.body).toContain(`\`${scope}\``);
+      expect(page!.body).toContain(model);
+      expect(page!.body).toContain('Keys created before 2026-09-13');
+      expect(page!.body).toMatch(/`Idempotency-Key` (?:header|is refused)/);
+    }
+    for (const slug of ['images', 'long-output']) {
+      expect(reference.pages).toContain(findDocPage(slug));
+    }
+  });
+
+  it('lists all six models on the models page, with the ceilings CONTRACT §12.2 publishes', () => {
+    const ceilings = contractCeilings();
+    expect([...ceilings.keys()]).toEqual([...MODEL_IDS]);
+
+    const page = findDocPage('models')!.body;
+    const catalogue = jsonSamples(page).find(
+      (sample) => (sample as { object?: string }).object === 'list',
+    ) as {
+      data: {
+        id: string;
+        kind: unknown;
+        context_window: unknown;
+        max_input_tokens: unknown;
+        max_output_tokens: unknown;
+        default_max_output_tokens: unknown;
+        capabilities: { tools: unknown };
+        endpoints: string[];
+        limits: Record<string, number | undefined>;
+      }[];
+    };
+    expect(catalogue.data.map((model) => model.id)).toEqual([...MODEL_IDS]);
+
+    const routes = contractRoutes();
+    for (const model of catalogue.data) {
+      const row = ceilings.get(model.id)!;
+      expect(model.kind, model.id).toBe(row.kind);
+      expect(model.context_window, model.id).toBe(row.context);
+      expect(model.max_input_tokens, model.id).toBe(row.input);
+      expect(model.max_output_tokens, model.id).toBe(row.output);
+      expect(model.default_max_output_tokens, model.id).toBe(row.defaultOutput);
+      expect(model.capabilities.tools).toBe(false);
+      for (const endpoint of model.endpoints) expect(routes).toContain(endpoint);
+
+      const count = (pattern: RegExp) => Number((pattern.exec(row.other)?.[1] ?? 'NaN').replace(/,/g, ''));
+      if (model.limits.max_images_per_request !== undefined) {
+        expect(model.limits.max_images_per_request).toBe(count(/(\d+) images? per request/));
+      }
+      if (model.limits.max_inputs_per_request !== undefined) {
+        expect(model.limits.max_inputs_per_request).toBe(count(/(\d+) inputs/));
+        expect(model.limits.embedding_dimensions).toBe(count(/([\d,]+) dimensions/));
+      }
+      if (model.limits.max_documents_per_request !== undefined) {
+        expect(model.limits.max_documents_per_request).toBe(count(/(\d+) documents/));
+      }
+      if (model.limits.max_audio_seconds !== undefined) {
+        expect(model.limits.max_audio_seconds).toBe(count(/(\d+) s\b/));
+        expect(model.limits.max_audio_bytes).toBe(count(/(\d+) MiB/) * 1024 * 1024);
+      }
+      // A heading of its own, so a link can point at the model.
+      expect(page).toContain(`\n### ${model.id}\n`);
+    }
+  });
+
+  it('names no internal checkpoint, engine, host or port on any page', () => {
+    // CONTRACT §15: internal checkpoint names and engine URLs never leave the
+    // server — and a documentation site is the widest-read place they could.
+    const configPy = repoFile('orchestrator', 'app', 'config.py');
+    const checkpoints = [
+      ...new Set(
+        [...configPy.matchAll(/"((?:Qwen|nvidia|baidu|openai)\/[A-Za-z0-9._-]+)"/g)].map((m) => m[1]),
+      ),
+    ];
+    expect(checkpoints.length).toBeGreaterThanOrEqual(4);
+    const tails = checkpoints.map((name) => name.split('/')[1].toLowerCase());
+    const machinery = [
+      /qwen/i, /unlimited-ocr/i, /whisper-large/i, /\bvllm\b/i, /nvfp4/i, /\bbaidu\b/i,
+      /sf-local-ai/i, /\b192\.168\.\d+\.\d+/, /:30\d{3}\b/,
+    ];
+    const offenders: string[] = [];
+    for (const page of DOC_PAGES) {
+      const text = `${page.title}\n${page.summary}\n${page.body}`;
+      for (const tail of tails) if (text.toLowerCase().includes(tail)) offenders.push(`${page.slug}: ${tail}`);
+      for (const pattern of machinery) if (pattern.test(text)) offenders.push(`${page.slug}: ${pattern}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('lists exactly the audio types audio_api.py accepts', () => {
+    const audioPy = repoFile('orchestrator', 'app', 'audio_api.py');
+    const block = /^ALLOWED_TYPES = \{([\s\S]*?)^\}/m.exec(audioPy);
+    expect(block).not.toBeNull();
+    const allowed = [...block![1].matchAll(/"([a-z0-9.+-]+\/[a-z0-9.+-]+)"/g)].map((m) => m[1]).sort();
+    expect(allowed.length).toBeGreaterThan(10);
+
+    const fields = sectionOf(findDocPage('audio-transcriptions')!.body, 'The fields');
+    const listing = fields.slice(fields.indexOf('Accepted audio types'));
+    const listed = [...listing.matchAll(/`([a-z0-9.+-]+\/[a-z0-9.+-]+)`/g)].map((m) => m[1]).sort();
+    expect(listed).toEqual(allowed);
+    expect(CONTRACT).toContain('`audio_api.ALLOWED_TYPES`');
+  });
+
+  it('states the image rules the contract fixes: data URLs only, four types, the three byte caps and the per-model counts', () => {
+    const rules = contractSection('### 8.1 `POST /v1/responses`', '### 8.2');
+    const page = findDocPage('images')!.body;
+    for (const type of ['image/png', 'image/jpeg', 'image/webp', 'image/gif']) {
+      expect(rules).toContain(`\`${type}\``);
+      expect(page).toContain(`\`${type}\``);
+    }
+    for (const cap of ['20 MiB', '10 MiB', '1 MiB']) {
+      expect(rules).toContain(cap);
+      expect(page).toContain(`**${cap}**`);
+    }
+    expect(page).toContain('`https://`, `http://`, `file:` and every other scheme are refused');
+    expect(rules).toContain('a test proves an `http://` URL never reaches the stub engine');
+
+    const ceilings = contractCeilings();
+    const counts: [string, RegExp][] = [
+      [MODEL_ID, /\| `techsara-35b` \| up to (\d+) \|/],
+      [VISION_MODEL_ID, /\| `techsara-8b-vision` \| up to (\d+) \|/],
+      [OCR_MODEL_ID, /\| `techsara-ocr` \| exactly (\d+) \|/],
+    ];
+    for (const [id, row] of counts) {
+      const documented = row.exec(page)?.[1];
+      const contracted = /(\d+) images? per request/.exec(ceilings.get(id)!.other)?.[1];
+      expect(documented, id).toBeDefined();
+      expect(documented, id).toBe(contracted);
+    }
+  });
+
+  it('computes every wall clock and duration on the long-output page from the contract formula', () => {
+    const contract = contractSection('### 8.3 The output ceiling', '### 8.4');
+    expect(contract).toContain('`PUBLIC_API_GEN_WALL_CLOCK_S` defaults to 21,600 s');
+    expect(contract).toContain('`PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S` 900 s');
+    expect(contract).toContain('`PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S` 50');
+    expect(contract).toContain('`GEN_WALL_CLOCK_S` (4,200 s in `.env`)');
+    expect(contract).toContain('reserve 512 (`CONTEXT_SAFETY_MARGIN`)');
+
+    const page = findDocPage('long-output')!.body;
+    expect(page).toContain('min(21600, max(4200, 900 + planned_max_output_tokens / 50))');
+
+    const clock = sectionOf(page, 'The wall clock');
+    const rows = [...clock.matchAll(/^\| ([\d,]+)(?: \(the default\))? \| ([\d,]+) s — /gm)];
+    expect(rows).toHaveLength(4);
+    for (const [, tokens, seconds] of rows) {
+      const n = Number(tokens.replace(/,/g, ''));
+      expect(Number(seconds.replace(/,/g, '')), tokens).toBe(
+        Math.min(21600, Math.max(4200, Math.round(900 + n / 50))),
+      );
+    }
+
+    // The clamp example: 1,000,000 window − 300,000 prompt − 512 reserve.
+    expect(page).toContain(`about ${(1_000_000 - 300_000 - 512).toLocaleString('en-GB')}`);
+
+    const phrase = (seconds: number): string => {
+      if (seconds < 100) return `${Math.round(seconds)} seconds`;
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes} minutes`;
+      return `${Math.floor(minutes / 60)} hours ${minutes % 60} minutes`;
+    };
+    const durations = sectionOf(page, 'How long it takes');
+    const durationRows = [...durations.matchAll(/^\| ([\d,]+) \| ([^|]+) \| ([^|]+) \|$/gm)];
+    expect(durationRows).toHaveLength(4);
+    for (const [, tokens, at100, at70] of durationRows) {
+      const n = Number(tokens.replace(/,/g, ''));
+      expect(at100.trim(), tokens).toBe(phrase(n / 100));
+      expect(at70.trim(), tokens).toBe(phrase(n / 70));
+    }
+  });
+
+  it('says a synchronous request is unsuitable above about 5,000 output tokens, with the two timeouts behind it', () => {
+    const contract = contractSection('### 8.3 The output ceiling', '### 8.4');
+    expect(contract).toContain('response timeout is 100 s (HTTP 524)');
+    expect(contract).toContain('default 300 s header and body timeouts');
+
+    const page = sectionOf(findDocPage('long-output')!.body, 'Choose the mode before you choose the size');
+    expect(page).toContain('**100 seconds**');
+    expect(page).toContain('HTTP `524`');
+    expect(page).toContain('300 seconds');
+    expect(page).toContain('about **5,000 tokens**');
+    expect(page).toContain('`"stream": true`');
+    expect(page).toContain('`"background": true`');
+    expect(findDocPage('responses')!.body).toContain('Above about 5,000 output tokens');
+  });
+
+  it('ties the wall-clock caveat to llm.py itself, so it goes the day the per-request clock ships', () => {
+    // The 1,000,000 ceiling is only deliverable once llm.stream_chat_events
+    // accepts a per-call wall clock (CONTRACT §8.3, a separate integration).
+    // Until then the pages say so; the day the parameter appears this fails
+    // until LONG_OUTPUT_WALL_CLOCK_LIVE is flipped, and the caveat goes.
+    const llmPy = repoFile('orchestrator', 'app', 'llm.py');
+    const start = llmPy.indexOf('async def stream_chat_events(');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const signature = llmPy.slice(start, llmPy.indexOf('->', start));
+    expect(LONG_OUTPUT_WALL_CLOCK_LIVE).toBe(/\bwall_clock_s\b/.test(signature));
+
+    for (const slug of ['long-output', 'changelog']) {
+      const body = findDocPage(slug)!.body;
+      expect(body.includes(WALL_CLOCK_PENDING_NOTE), slug).toBe(!LONG_OUTPUT_WALL_CLOCK_LIVE);
+    }
+    expect(WALL_CLOCK_PENDING_NOTE).toContain('4,200 seconds');
+  });
+
+  it('describes capacity refusals as a 503 per engine, shared by every caller, with the Retry-After the contract sets', () => {
+    const gates = contractSection('### 12.3 Capacity gates', '### 12.4');
+    const gateRows = new Map(
+      [...gates.matchAll(/^\| `([a-z.]+)` \| (\d+)[^|]* \| [^|]+ \| [^|]+ \| [^|]+ \| (\d+) s \|$/gm)].map(
+        (m) => [m[1], { concurrency: m[2], retryAfter: m[3] }],
+      ),
+    );
+    // Seven since 2026-09-13's adversarial review added `main.extended`.
+    expect(gateRows.size).toBe(7);
+    expect(gateRows.get('main.extended')?.retryAfter).toBe(gateRows.get('main.long')?.retryAfter);
+
+    const section = sectionOf(findDocPage('rate-limits')!.body, 'Capacity queues, per engine');
+    expect(section).toContain('never a `429`');
+    expect(section).toContain('**They belong to the engine, not to you.**');
+    const byModel: [string, string, RegExp | null][] = [
+      [MODEL_ID, 'main.long', null],
+      [VISION_MODEL_ID, 'router', /\| (\d+), and a bounded share/],
+      [OCR_MODEL_ID, 'ocr', /\| (\d+), stepping aside/],
+      [EMBED_MODEL_ID, 'embed', /\| (\d+), and a bounded share/],
+      [RERANK_MODEL_ID, 'rerank', /\| (\d+), and a bounded share/],
+      [WHISPER_MODEL_ID, 'asr', /\| (\d+) across the whole deployment/],
+    ];
+    for (const [id, gate, concurrency] of byModel) {
+      const row = new RegExp(`^\\| \`${escapeRe(id)}\` \\|[^\\n]*$`, 'm').exec(section)?.[0];
+      expect(row, id).toBeDefined();
+      expect(row, id).toContain(`\`Retry-After\` ${gateRows.get(gate)!.retryAfter} s`);
+      if (concurrency) expect(concurrency.exec(row!)?.[1], id).toBe(gateRows.get(gate)!.concurrency);
+    }
+    // The pre-decision sentence that called a full queue a 429 is gone.
+    for (const page of DOC_PAGES) {
+      expect(page.body, page.slug).not.toContain('Treat a `429 concurrency_limit_exceeded` from a full');
+    }
+  });
+
+  it('refuses Idempotency-Key on exactly the three new endpoints, and leases a running claim for 13 hours', () => {
+    const contract = contractSection('## 13. Idempotency', '## 14.');
+    expect(contract).toContain('`POST /v1/responses` and `POST /v1/chat/completions` **only**');
+    for (const [, path] of NEW_ROUTES) expect(contract).toContain(`\`${path}\``);
+    expect(contract).toContain('`param: Idempotency-Key`');
+    // 2 × PUBLIC_API_GEN_WALL_CLOCK_S (21,600) + PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600).
+    expect(contract).toContain(`${(2 * 21600 + 3600).toLocaleString('en-GB')} s`);
+    expect(2 * 21600 + 3600).toBe(13 * 3600);
+
+    const page = findDocPage('idempotency')!.body;
+    expect(page).toContain('**Not accepted on**');
+    expect(page).toContain('`400 invalid_request_error` with `param` `Idempotency-Key`');
+    for (const slug of ['embeddings', 'rerank', 'audio-transcriptions']) {
+      expect(page).toContain(`](/docs/${slug})`);
+    }
+    expect(page).toContain('13 hours');
+    // The still-running refusal is a 409 since the limits were removed.
+    expect(page).not.toContain('This `429` is not a usage limit');
+  });
+
+  it('tells holders of older keys the three new scopes are not theirs, and lists the defaults scopes.py grants', () => {
+    const authentication = findDocPage('authentication')!.body;
+    expect(authentication).toContain('**Keys created before 2026-09-13 do not have the three newest scopes.**');
+    expect(contractSection('## 7. Public endpoints', '## 8.')).toContain('A key created before 2026-09-13');
+    expect(sectionOf(findDocPage('changelog')!.body, ALL_MODELS_ENTRY)).toContain(
+      '**Keys created before\n  this change do not have them**',
+    );
+
+    const defaults = [...contractScopes().keys()].filter((scope) =>
+      new RegExp(`^\\| \`${escapeRe(scope)}\` \\| [^|]+ \\| yes \\|$`, 'm').test(CONTRACT),
+    );
+    expect(defaults).toHaveLength(6);
+    const paragraph = authentication.slice(authentication.indexOf('A key created without a choice gets'));
+    const sentence = paragraph.slice(0, paragraph.indexOf('\n\n'));
+    for (const scope of defaults) expect(sentence).toContain(`\`${scope}\``);
+    expect(sentence).not.toContain('`usage.read`');
+
+    // Whatever scopes.py grants by default today is a subset of that sentence.
+    const scopesPy = repoFile('orchestrator', 'app', 'apiplatform', 'scopes.py');
+    const block = /^DEFAULT_SCOPES[^=]*= frozenset\(\s*\{([^}]*)\}/m.exec(scopesPy);
+    expect(block).not.toBeNull();
+    for (const member of block![1].matchAll(/Scope\.([A-Z_]+)/g)) {
+      expect(sentence).toContain(`\`${member[1].toLowerCase().replace('_', '.')}\``);
+    }
+  });
+
+  it('prints max_output_tokens and incomplete_details on every response object, and the applied ceiling on a chat completion', () => {
+    const offenders: string[] = [];
+    for (const page of DOC_PAGES) {
+      const objects: Record<string, unknown>[] = [];
+      for (const sample of jsonSamples(page.body)) {
+        if ((sample as { object?: string }).object === 'response') objects.push(sample as Record<string, unknown>);
+      }
+      for (const match of page.body.matchAll(/^data: (\{.*\})$/gm)) {
+        const frame = JSON.parse(match[1]);
+        if (frame.response) objects.push(frame.response);
+      }
+      for (const object of objects) {
+        if (!('max_output_tokens' in object) || !('incomplete_details' in object)) {
+          offenders.push(`${page.slug}: ${JSON.stringify(object).slice(0, 60)}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    expect(contractSection('## 9. Response and error envelope', '## 10.')).toContain(
+      '"max_output_tokens": 8192,\n  "incomplete_details": null,',
+    );
+
+    const chat = findDocPage('chat-completions')!.body;
+    const completion = jsonSamples(chat).find(
+      (sample) => (sample as { object?: string }).object === 'chat.completion',
+    ) as Record<string, unknown>;
+    expect(completion.max_output_tokens).toBe(8192);
+    const finishChunk = [...chat.matchAll(/^data: (\{.*\})$/gm)]
+      .map((m) => JSON.parse(m[1]))
+      .find((frame) => frame.choices?.[0]?.finish_reason);
+    expect(finishChunk.max_output_tokens).toBe(8192);
+  });
+
+  it('warns that a forced language translates, and that the OCR model reads best with no prompt at all', () => {
+    // The contract wraps its prose at 80 columns; compare it as running text.
+    const prose = (text: string) => text.replace(/\s+/g, ' ');
+    expect(prose(contractSection('### 8.6', '## 9.'))).toContain('translates rather than transcribes');
+    expect(prose(contractSection('### 8.1', '### 8.2'))).toContain('the server appends the text part `OCR`');
+    for (const slug of ['models', 'audio-transcriptions']) {
+      const body = findDocPage(slug)!.body;
+      expect(body, slug).toMatch(/`en`[^.]*translation/);
+    }
+    for (const slug of ['models', 'images']) {
+      const body = findDocPage(slug)!.body;
+      expect(body, slug).toMatch(/the server adds the (?:plain|one-word) instruction `OCR`/);
+    }
+  });
+
+  it('keeps audio seconds out of GET /v1/usage, as the contract records them', () => {
+    expect(contractSection('## 16. Recording', '## 17.')).toContain('Audio seconds are **not** in');
+    expect(findDocPage('usage')!.body).toContain('**audio seconds\nare not in it**');
+  });
+
+  it('records the change in the changelog, dated 2026-09-13, as the newest entry', () => {
+    const changelog = findDocPage('changelog')!.body;
+    expect(docHeadingsOf(changelog)[0].text).toBe(ALL_MODELS_ENTRY);
+    const entry = sectionOf(changelog, ALL_MODELS_ENTRY);
+    for (const id of MODEL_IDS) expect(entry).toContain(`\`${id}\``);
+    for (const [method, path] of NEW_ROUTES) expect(entry).toContain(`\`${method} ${path}\``);
+    expect(entry).toContain('`max_output_tokens` up to 1,000,000');
+    expect(entry).toContain('**clamped** instead of refused');
+    expect(entry).toContain('`incomplete_details`');
+    expect(entry).toContain('never a `429`');
+    expect(entry).toContain('**Examples are still marked as not executed.**');
   });
 });
 
@@ -1288,6 +1805,13 @@ describe('the honesty of the examples (CONTRACT §17)', () => {
     }
   });
 });
+
+/** Answer the docs shell's console-access question, and nothing else. */
+function serveConsoleAccess(body: { allowed: boolean }) {
+  const fetchMock = vi.fn(async (_url: string) => ({ ok: true, status: 200, json: async () => body }));
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
 
 describe('the shell', () => {
   it('offers a skip link, a menu toggle and the API status page', () => {

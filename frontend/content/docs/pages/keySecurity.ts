@@ -59,8 +59,12 @@ anything.
    repository, a CI log, a screenshot, or a support message.
 2. **One key per deployed service.** Revoking the payments worker's key
    should not take down the support bot.
-3. **Least scope.** Give a key the scopes its job needs and no others. See
-   [scopes](/docs/authentication#scopes).
+3. **Least scope.** Give a key the scopes its job needs and no others — a
+   search indexer needs \`embeddings.write\`, not \`responses.write\`. See
+   [scopes](/docs/authentication#scopes). A key never gains a scope after it
+   is created: keys made before 2026-09-13 lack \`embeddings.write\`,
+   \`rerank.write\` and \`audio.write\`, and the fix is a new key, not an
+   edit to the old one.
 4. **Narrow the project.** A model allowlist, an origin allowlist and an IP
    allowlist each turn a stolen key into a key that only works from somewhere
    you named.

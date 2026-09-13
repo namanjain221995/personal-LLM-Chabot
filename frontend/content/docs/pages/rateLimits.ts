@@ -9,6 +9,13 @@ import { EXAMPLE_STATUS } from '../samples';
 // did not go away (context window, output ceiling, body size, the engine's
 // shared queue), and describes the enforced mode only as what an operator
 // gets by turning PUBLIC_API_ENFORCE_LIMITS on — off by default.
+//
+// 2026-09-13, later the same day (owner request: every model on /v1): the
+// router, OCR, embeddings, reranker and speech engines are shared with the
+// chat application, which keeps priority. Each gets a public capacity queue
+// PER ENGINE — shared by every caller, bounded wait, refused as 503 with
+// Retry-After, never 429 — and this page names it as a capacity fact, not a
+// limit (CONTRACT §12.3).
 export const rateLimits: DocPage = {
   slug: 'rate-limits',
   title: 'Rate limits',
@@ -37,15 +44,49 @@ they apply to every request:
 | Limit | Value | What you see |
 | --- | --- | --- |
 | Body bytes | 1 MiB | \`413 request_too_large\`, checked before the body is parsed. |
-| Input tokens | The model's context window | \`400 context_length_exceeded\`, refused before admission. |
-| Output tokens | 8,192 by default | The default is clamped to the [model's ceiling](/docs/models); asking for more than the ceiling is a \`400\`. |
-| The engine's queue | Shared with the TechSara chat application | A request waits its turn; one that cannot get a place is \`503 model_unavailable\` with \`Retry-After\` — the engine's capacity, not a count of your requests. |
+| Body bytes with images | 20 MiB on \`/v1/responses\` and \`/v1/chat/completions\`, of which text at most 1 MiB | \`413 request_too_large\`. See [images](/docs/images). |
+| Body bytes with audio | 26 MiB on \`/v1/audio/transcriptions\`: a 25 MiB file, 300 seconds of audio | \`413 request_too_large\`. See [audio transcriptions](/docs/audio-transcriptions). |
+| Input tokens | The model's input ceiling | \`400 context_length_exceeded\`, refused before admission. |
+| Output tokens | 8,192 by default; up to 1,000,000 on \`techsara-35b\` | Asking for more than the [model's ceiling](/docs/models) is a \`400\`; asking for more than your prompt leaves in the window is clamped, and the response says what was applied. See [long outputs](/docs/long-output). |
+| Per request | Images, inputs, documents: the model's \`limits\` | \`400\`, before anything runs. |
+| The engine's queue | Shared with the TechSara chat application | A request waits its turn; one that cannot get a place is \`503 model_unavailable\` with \`Retry-After\` — the engine's capacity, not a count of your requests. See [capacity queues](#capacity-queues-per-engine). |
 
 The last row is what "unlimited" does not mean: there is one engine behind
-the API, and a thousand requests at once are served as fast as that engine
+each model, and a thousand requests at once are served as fast as that engine
 can serve them, not a thousand times faster. Sending more in parallel than it
 can generate makes each answer wait longer — [stream](/docs/streaming) so
 your users see output as soon as it exists.
+
+## Capacity queues, per engine
+
+Every model on this API runs on an engine the TechSara chat application also
+uses, and **the chat application keeps priority**: a person typing into TechSara
+AI never waits behind API traffic. To make that true, public requests to each
+engine pass through a small queue of their own:
+
+| Model | Public requests at once | A request that cannot start |
+| --- | --- | --- |
+| \`techsara-35b\` | Shared with chat in the engine's own queue; answers planned above 8,192 tokens two at a time, and very long generations (prompt plus \`max_output_tokens\` over about 131,000 tokens) one at a time — both stepping aside while a large chat document is waiting | \`503\`, \`Retry-After\` 60 s for a long generation |
+| \`techsara-8b-vision\` | 4, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-ocr\` | 2, stepping aside briefly while someone is chatting | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-embed\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-rerank\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-whisper\` | 1 across the whole deployment, stepping aside for chat and dictation | \`503\`, \`Retry-After\` 5 s |
+
+What makes these capacity and not limits:
+
+* **They belong to the engine, not to you.** Every project and every key shares
+  the same queue. There is no count of *your* requests anywhere in it, and no
+  amount of spreading work across keys changes it.
+* **They wait before they refuse.** A synchronous or streaming request waits up
+  to about 30 seconds for a place, before any response is sent; a
+  [background response](/docs/background#waiting-for-capacity) waits in
+  \`queued\` for up to an hour.
+* **The refusal is a \`503\`, never a \`429\`**: \`model_unavailable\`, "at
+  capacity", retry-safe, with \`Retry-After\`.
+
+The numbers are the deployment's, chosen so public traffic cannot starve the
+chat application, and they can change as the engines do.
 
 ## Usage is still recorded
 
@@ -58,12 +99,12 @@ are not counted:
 
 ## Backing off on 503
 
-The one refusal you should still plan for is the model restarting. While it
-does, requests are answered with \`503 model_recovering\` — safe to send
-again — or, if the engine is down rather than restarting,
-\`503 model_unavailable\`. Both carry \`Retry-After\` in whole seconds, never
-less than \`1\`. Treat a \`429 concurrency_limit_exceeded\` from a full
-engine queue the same way.
+The refusals you should still plan for are the model restarting and an engine at
+capacity. While a model restarts, requests are answered with
+\`503 model_recovering\` — safe to send again — or, if the engine is down rather
+than restarting, \`503 model_unavailable\`. An engine whose queue is full
+answers \`503 model_unavailable\` too, with a message saying it is at capacity.
+All of them carry \`Retry-After\` in whole seconds, never less than \`1\`.
 
 * **Honour \`Retry-After\`.** It is the server's estimate of when the retry
   can succeed; retrying sooner only adds to the queue the restart has to

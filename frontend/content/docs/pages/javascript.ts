@@ -1,5 +1,13 @@
 import type { DocPage } from '../types';
-import { API_BASE_URL, MODEL_ID, EXAMPLE_STATUS } from '../samples';
+import {
+  API_BASE_URL,
+  EMBED_MODEL_ID,
+  EXAMPLE_STATUS,
+  MODEL_ID,
+  RERANK_MODEL_ID,
+  VISION_MODEL_ID,
+  WHISPER_MODEL_ID,
+} from '../samples';
 
 export const javascript: DocPage = {
   slug: 'javascript',
@@ -60,6 +68,10 @@ export interface TechSaraResponse {
   status: ResponseStatus;
   model: string;
   output: OutputMessage[];
+  /** The output ceiling applied to this generation, after clamping. */
+  max_output_tokens: number | null;
+  /** Set when the answer stopped because it reached max_output_tokens. */
+  incomplete_details: { reason: "max_output_tokens" } | null;
   /** null — never 0 — when the engine reported no counts. */
   usage: Usage | null;
   error?: { code: string; message: string };
@@ -246,5 +258,95 @@ await fetch(\`\${BASE_URL}/responses\`, {
 See [idempotency](/docs/idempotency), [background
 responses](/docs/background) and [webhooks](/docs/webhooks), which has a
 Node verification example.
+
+## Images
+
+~~~typescript
+import { readFile } from "node:fs/promises";
+
+export async function describe(path: string, question: string, mime = "image/png") {
+  const dataUrl = \`data:\${mime};base64,\${(await readFile(path)).toString("base64")}\`;
+  const response = await fetch(\`\${BASE_URL}/responses\`, {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${process.env.TECHSARA_API_KEY}\`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "${VISION_MODEL_ID}",
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: question },
+          { type: "input_image", image_url: dataUrl },
+        ],
+      }],
+    }),
+  });
+  if (!response.ok) throw new Error(\`describe failed: \${response.status}\`);
+  const body = (await response.json()) as TechSaraResponse;
+  return body.output[0]?.content[0]?.text ?? "";
+}
+~~~
+
+The image travels inside the request as a \`data:\` URL; a link is refused. See
+[images and OCR](/docs/images).
+
+## Embeddings and rerank
+
+~~~typescript
+async function post(path: string, payload: unknown) {
+  const response = await fetch(\`\${BASE_URL}\${path}\`, {
+    method: "POST",
+    headers: {
+      Authorization: \`Bearer \${process.env.TECHSARA_API_KEY}\`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(\`\${path} failed: \${response.status}\`);
+  return response.json();
+}
+
+export async function embed(texts: string[]): Promise<number[][]> {
+  const body = await post("/embeddings", { model: "${EMBED_MODEL_ID}", input: texts });
+  return [...body.data]
+    .sort((a: { index: number }, b: { index: number }) => a.index - b.index)
+    .map((row: { embedding: number[] }) => row.embedding);
+}
+
+export async function rerank(query: string, documents: string[], topN = 3) {
+  const body = await post("/rerank", { model: "${RERANK_MODEL_ID}", query, documents, top_n: topN });
+  return body.results.map((r: { index: number; relevance_score: number }) => ({
+    score: r.relevance_score,
+    text: documents[r.index],
+  }));
+}
+~~~
+
+## Speech to text
+
+~~~typescript
+import { readFile } from "node:fs/promises";
+
+export async function transcribe(path: string, mime = "audio/mp4"): Promise<string> {
+  const form = new FormData();
+  // The part's type must be an accepted audio type, so it is set explicitly.
+  form.append("file", new Blob([await readFile(path)], { type: mime }), "clip");
+  form.append("model", "${WHISPER_MODEL_ID}");
+
+  const response = await fetch(\`\${BASE_URL}/audio/transcriptions\`, {
+    method: "POST",
+    // No Content-Type header: fetch writes the multipart boundary itself.
+    headers: { Authorization: \`Bearer \${process.env.TECHSARA_API_KEY}\` },
+    body: form,
+  });
+  if (!response.ok) throw new Error(\`transcription failed: \${response.status}\`);
+  return ((await response.json()) as { text: string }).text;
+}
+~~~
+
+See [embeddings](/docs/embeddings), [rerank](/docs/rerank) and
+[audio transcriptions](/docs/audio-transcriptions).
 `.trim(),
 };

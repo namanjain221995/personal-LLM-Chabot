@@ -27,10 +27,14 @@ Then run it and read the \`400\`s. They are the list of things to remove.
 | --- | --- |
 | Sending \`top_p\`, \`n\`, \`seed\`, \`logit_bias\`, \`presence_penalty\`… | Rejected with \`400\` and the field in \`param\`. Remove them. |
 | Sending \`tools\` / \`functions\` | Rejected. [Tool calling](/docs/tools) is not offered. |
-| Sending image or audio parts in \`content\` | Rejected. \`content\` is a string. |
-| Expecting several models | One public model; a model your key may not use is \`404\`. |
+| Sending image parts in \`content\` | Accepted on the vision models as \`data:\` URLs only; an image *link* is rejected. See [images](/docs/images). |
+| Sending audio parts in \`content\` | Rejected. Use [\`/v1/audio/transcriptions\`](/docs/audio-transcriptions). |
+| Expecting several models | Six, with TechSara ids — see the [model reference](/docs/models); a model your key may not use is \`404\`. |
+| Sending \`max_completion_tokens\` | Accepted, as an alias of \`max_tokens\`; both at once is a \`400\`. |
 | Expecting \`usage\` to be \`0\` when unmeasured | It is \`null\`. Never treat \`null\` as zero. |
-| Relying on assistants, threads, files or embeddings | None of those exist on this platform. |
+| Relying on assistants, threads or files | None of those exist on this platform. [Embeddings](/docs/embeddings) do. |
+| Expecting \`dimensions\` on embeddings | Rejected; vectors always have 1,024 dimensions. |
+| Expecting \`srt\`, \`vtt\`, \`prompt\` or \`temperature\` on transcriptions | Rejected; \`json\`, \`text\` and \`verbose_json\` only. |
 | Parsing a vendor-specific error body | The envelope is \`{"error": {message, type, code, param, request_id}}\`. See [errors](/docs/errors). |
 
 Everything else — \`messages\`, \`stream\`, \`temperature\`, the
@@ -55,7 +59,7 @@ for code you already have. The move is small:
 | --- | --- |
 | \`messages: [{role, content}]\` | \`input\`: the same list, or a plain string for one user turn |
 | a system message | \`instructions\`, which becomes the first system message |
-| \`max_tokens\` | \`max_output_tokens\` |
+| \`max_tokens\` or \`max_completion_tokens\` | \`max_output_tokens\` |
 | \`choices[0].message.content\` | \`output[0].content[0].text\` |
 | \`data:\` chunks, then \`[DONE]\` | named lifecycle events, ending at \`response.completed\` |
 | — | \`background: true\`, with a webhook when it finishes |
@@ -68,7 +72,8 @@ anything this platform adds later will live.
 * **The version is in the path.** \`/v1\` is the contract you are coding
   against.
 * **Additive changes can happen inside \`/v1\`** — a new optional field, a new
-  event name, a new model id. Write clients that ignore fields and events they
+  event name, a new model id, a new endpoint (2026-09-13 added three endpoints,
+  five model ids and two response fields this way). Write clients that ignore fields and events they
   do not recognise, and none of those will reach you.
 * **Behaviour is defined in one place.** Every route, field, error code and
   event on this surface comes from the developer-platform contract in this

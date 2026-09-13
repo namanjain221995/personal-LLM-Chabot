@@ -1,5 +1,14 @@
 import type { DocPage } from '../types';
-import { API_BASE_URL, MODEL_ID, EXAMPLE_STATUS } from '../samples';
+import {
+  API_BASE_URL,
+  EMBED_MODEL_ID,
+  EXAMPLE_STATUS,
+  MODEL_ID,
+  OCR_MODEL_ID,
+  RERANK_MODEL_ID,
+  VISION_MODEL_ID,
+  WHISPER_MODEL_ID,
+} from '../samples';
 
 export const python: DocPage = {
   slug: 'python',
@@ -175,6 +184,113 @@ def summarise_in_background(api: httpx.Client, ticket_id: str, text: str) -> str
 
 See [idempotency](/docs/idempotency) and
 [background responses](/docs/background).
+
+## An image
+
+~~~python
+import base64
+
+def _data_url(path: str, mime: str) -> str:
+    with open(path, "rb") as fh:
+        return f"data:{mime};base64," + base64.b64encode(fh.read()).decode("ascii")
+
+def describe(path: str, question: str, mime: str = "image/png") -> str:
+    with client() as api:
+        response = api.post("/responses", json={
+            "model": "${VISION_MODEL_ID}",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": question},
+                {"type": "input_image", "image_url": _data_url(path, mime)},
+            ]}],
+        })
+        response.raise_for_status()
+        return response.json()["output"][0]["content"][0]["text"]
+
+def read_text(path: str, mime: str = "image/png") -> str:
+    # OCR one image. No text part at all, so the server adds the instruction
+    # this model reads best with.
+    with client() as api:
+        response = api.post("/responses", json={
+            "model": "${OCR_MODEL_ID}",
+            "input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": _data_url(path, mime)},
+            ]}],
+        })
+        response.raise_for_status()
+        return response.json()["output"][0]["content"][0]["text"]
+~~~
+
+Images are always sent as \`data:\` URLs; a link is refused. See
+[images and OCR](/docs/images).
+
+## Search: embed, then rerank
+
+~~~python
+def embed(texts: list[str]) -> list[list[float]]:
+    with client() as api:
+        response = api.post("/embeddings", json={"model": "${EMBED_MODEL_ID}", "input": texts})
+        response.raise_for_status()
+        rows = sorted(response.json()["data"], key=lambda row: row["index"])
+        return [row["embedding"] for row in rows]
+
+def best(query: str, passages: list[str], top_n: int = 3) -> list[tuple[float, str]]:
+    with client() as api:
+        response = api.post("/rerank", json={
+            "model": "${RERANK_MODEL_ID}",
+            "query": query,
+            "documents": passages,
+            "top_n": top_n,
+        })
+        response.raise_for_status()
+        return [(r["relevance_score"], passages[r["index"]]) for r in response.json()["results"]]
+~~~
+
+Embed your passages once and store the vectors; at query time, find candidates
+by cosine similarity, then rerank the top few dozen. See
+[embeddings](/docs/embeddings) and [rerank](/docs/rerank).
+
+## Speech to text
+
+~~~python
+def transcribe(path: str, mime: str = "audio/mp4") -> str:
+    with client() as api, open(path, "rb") as audio:
+        response = api.post(
+            "/audio/transcriptions",
+            files={"file": (os.path.basename(path), audio, mime)},
+            data={"model": "${WHISPER_MODEL_ID}"},
+        )
+        response.raise_for_status()
+        return response.json()["text"]
+~~~
+
+Leave \`language\` unset unless every clip is in one known language: forcing it
+translates. Clips are at most 300 seconds. See
+[audio transcriptions](/docs/audio-transcriptions).
+
+## A very long answer
+
+~~~python
+import uuid
+
+def write_book(api: httpx.Client, brief: str) -> str:
+    body = api.post(
+        "/responses",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={
+            "model": MODEL,
+            "input": brief,
+            "max_output_tokens": 1_000_000,
+            "background": True,
+        },
+    ).json()
+    print("planned max_output_tokens:", body["max_output_tokens"])
+    return body["id"]        # poll slowly, or wait for the webhook
+~~~
+
+A million tokens takes hours: only background or streaming suit it. The
+finished response's \`max_output_tokens\` is the ceiling applied, and
+\`incomplete_details\` says whether the answer reached it. See
+[long outputs](/docs/long-output).
 
 ## Using an OpenAI-shaped client
 

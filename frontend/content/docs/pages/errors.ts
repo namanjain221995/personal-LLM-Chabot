@@ -40,21 +40,21 @@ The same value is on every response as \`X-Request-Id\`, success included.
 
 | Code | Status | When |
 | --- | --- | --- |
-| \`invalid_request_error\` | 400 | Malformed, out of range, or a field we cannot honour. |
-| \`context_length_exceeded\` | 400 | The prompt is over the model's input ceiling. |
+| \`invalid_request_error\` | 400 | Malformed, out of range, or a field we cannot honour — including a model sent to an endpoint it does not serve (\`param\` \`model\`) and an image that is not an accepted \`data:\` URL. |
+| \`context_length_exceeded\` | 400 | The prompt is over the model's input ceiling, or one [embeddings](/docs/embeddings) input or [rerank](/docs/rerank) document is too long (\`param\` names it). |
 | \`invalid_api_key\` | 401 | Missing, malformed, unknown, revoked or expired key — or a live key whose service account, project or workspace is disabled, or which was sent from outside the project's IP allowlist. |
 | \`insufficient_scope\` | 403 | The key is valid but lacks the scope. |
 | \`origin_not_allowed\` | 403 | Browser \`Origin\` outside the project's allowlist. |
-| \`model_not_found\` | 404 | Unknown model, or one this key may not use. |
+| \`model_not_found\` | 404 | Unknown model, one this key may not use, or one this deployment does not run. |
 | \`response_not_found\` | 404 | Not this project's response. |
 | \`idempotency_conflict\` | 409 | Same \`Idempotency-Key\`, different body — or the same body while the first request with that key is still running, which carries \`Retry-After\`. |
-| \`request_too_large\` | 413 | Body over 1 MiB. |
+| \`request_too_large\` | 413 | Body over its endpoint's limit — 1 MiB, 20 MiB with images, 26 MiB with audio — or text over 1 MiB, audio over 25 MiB or 300 seconds. An image over 10 MiB is a \`400\`, like every other image rule. |
 | \`rate_limit_error\` | 429 | Only if an operator has [enabled limits](/docs/rate-limits#if-an-operator-enables-limits): requests or tokens per minute exceeded. |
 | \`quota_exceeded\` | 429 | Only if an operator has enabled limits: the daily token quota is exhausted. |
 | \`concurrency_limit_exceeded\` | 429 | Only if an operator has enabled limits: too many of the project's requests in flight. |
 | \`model_recovering\` | 503 | The engine is restarting. Retry-safe. |
-| \`model_unavailable\` | 503 | The engine is down, or at capacity: its queue, shared with the chat application, is full. Retry-safe. |
-| \`timeout\` | 504 | Generation exceeded the wall clock. |
+| \`model_unavailable\` | 503 | The engine is down, or at capacity: its queue, shared with the chat application, did not free a place in time. Retry-safe. |
+| \`timeout\` | 504 | Generation exceeded its wall clock, or an engine did not answer in time. |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
 
 A path under \`/v1\` that is not one of the published endpoints answers
@@ -75,7 +75,13 @@ and neither is spelled as one: an [idempotency key](/docs/idempotency) whose
 first request is still running is a \`409 idempotency_conflict\` with
 \`Retry-After\` — "come back in two seconds for the answer" — and an engine
 whose shared queue is too deep to join is a \`503 model_unavailable\` — the
-engine's capacity, the same for every caller. The three \`429\` codes
+engine's capacity, the same for every caller. That \`503\` can come from any of
+the six models: each engine the TechSara chat application also uses has a small
+public queue in front of it, the chat application keeps priority, and a request
+that does not get a place within about 30 seconds is refused with
+\`Retry-After\` — a few seconds for most engines, a minute for a very long
+generation on \`techsara-35b\` (see
+[capacity queues](/docs/rate-limits#capacity-queues-per-engine)). The three \`429\` codes
 stay in the vocabulary for deployments whose operator turns limits on, and
 share the \`rate_limit_error\` type on purpose: your reaction to every one of
 them is the same — wait for \`Retry-After\`, then retry — so one type means
@@ -97,7 +103,9 @@ never less than \`1\`. Honour it, add jitter, and cap your attempts.
 of wall clock, so back off on your own schedule — and before you retry,
 consider [streaming](/docs/streaming) or a
 [background response](/docs/background), which a long generation suits
-better.
+better. A stream or a background response that times out **keeps the text it
+had written** and reports the tokens it spent, so you may not need to retry the
+whole of it — see [long outputs](/docs/long-output#the-wall-clock).
 
 Do **not** retry a \`400\`, \`401\`, \`403\`, \`404\`, \`413\` or a
 \`409\` without \`Retry-After\` unchanged: nothing about the next identical attempt will be different. Fix
