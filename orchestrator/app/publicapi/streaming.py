@@ -665,8 +665,19 @@ class Generation:
                         return
                     wait = min(wait, remaining)
                 try:
-                    item = await asyncio.wait_for(self._queue.get(), wait)
-                except asyncio.TimeoutError:
+                    # asyncio.timeout, not asyncio.wait_for (2026-09-14). On
+                    # Python 3.11 wait_for swallows a cancellation that lands
+                    # in the same loop pass as the queue item it was waiting
+                    # for (fixed in 3.12), so cancelling a busy stream — a
+                    # client disconnect, a job cancel — could leave this loop
+                    # consuming forever. It hung CI (Python 3.11) at
+                    # test_a_chat_document_beside_a_decoding_public_1m_answer_
+                    # follows_the_owner_policy[proceed]; the CPU image runs
+                    # 3.11 too. asyncio.timeout propagates the cancellation on
+                    # both versions.
+                    async with asyncio.timeout(wait):
+                        item = await self._queue.get()
+                except TimeoutError:
                     if deadline is not None and time.monotonic() >= deadline:
                         continue
                     yield _HEARTBEAT
