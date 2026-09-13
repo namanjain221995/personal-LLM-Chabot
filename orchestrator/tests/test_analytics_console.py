@@ -17,7 +17,7 @@ Three properties are load-bearing and each has a test here:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 import pytest
 
@@ -48,8 +48,10 @@ def _event(
     ttft_ms: int | None = 900,
     duration_ms: int | None = 8000,
     status: str = "ok",
+    at: datetime | None = None,
 ) -> None:
-    """One usage event, as app/usage.py would have written it."""
+    """One usage event, as app/usage.py would have written it — `hours_ago`
+    before the real clock, or exactly `at`."""
     from app import usage
 
     usage.record(
@@ -66,8 +68,38 @@ def _event(
         ttft_ms=ttft_ms,
         duration_ms=duration_ms,
         status=status,
-        created_at=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
+        created_at=(
+            at if at is not None
+            else datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        ),
     )
+
+
+@pytest.fixture()
+def frozen_clock(monkeypatch):
+    """Pin the clock the analytics API resolves its windows from.
+
+    `Window` reads `datetime.now()` once per REQUEST. A test that reads the
+    clock itself, plants data relative to that reading and then asserts which
+    bucket the server's window ends in is racing the server's own reading:
+    let an hour (or a day) turn over between the two and the server is
+    legitimately one bucket ahead of the test. Freezing the API's clock at the
+    instant the test chose makes both sides read the same time, and lets a
+    test put that instant exactly where a boundary bites.
+    """
+    from app.authn import analytics_api
+
+    def _freeze(at: datetime) -> datetime:
+        class _Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                # datetime.now() semantics: aware in `tz`, or naive local time.
+                return at.astimezone(tz) if tz is not None else at.astimezone().replace(tzinfo=None)
+
+        monkeypatch.setattr(analytics_api, "datetime", _Frozen)
+        return at
+
+    return _freeze
 
 
 @pytest.fixture()
@@ -208,25 +240,45 @@ def test_the_series_has_one_point_per_bucket_with_no_gaps(console):
     assert all("bucket" in p for p in points)
 
 
-def test_the_series_reaches_the_bucket_the_window_ends_in(console):
+@pytest.mark.parametrize(
+    "clock",
+    [
+        # Thirty seconds into an hour — when CI ran this on 2026-09-11, and an
+        # event "about a minute ago" belonged to the PREVIOUS hour.
+        "03:00:30",
+        # The ordinary case: an event a minute old, in the middle of an hour.
+        "14:30:00",
+        # The last moment of a day: the reading that meets the hour AND the
+        # day boundary, where a test clock and a server clock read even
+        # milliseconds apart disagree about both.
+        "23:59:59.990",
+    ],
+)
+def test_the_series_reaches_the_bucket_the_window_ends_in(console, frozen_clock, clock):
     """The classic off-by-one that makes a dashboard say nobody used it today.
 
     `until` is exclusive, so a series that stops one whole bucket before it
     drops the CURRENT hour on a 24-hour view and TODAY on a 30-day one.
     """
     root, _admin, _member = console
-    from datetime import datetime, timezone
 
-    # The event has to land in the CURRENT hour, and "about a minute ago" only
-    # does that after the first minute of one. Run this suite at 03:00:30 — CI
-    # did, on 2026-09-11 — and a 72-second-old event sits in the 02:00 bucket,
-    # the 03:00 bucket is legitimately empty, and the off-by-one this test
-    # guards looks like a regression. Clamp the offset to the top of this hour
-    # and read the clock ONCE, so the assertion and the data agree.
-    now = datetime.now(timezone.utc)
+    # "Now" is an instant the test chooses (today's date, the time above), and
+    # the API reads exactly that instant — never the wall clock at whatever
+    # moment CI happens to reach this line. The event has to land in the
+    # CURRENT hour: about a minute ago, but never before the top of it.
+    now = frozen_clock(
+        datetime.combine(
+            datetime.now(timezone.utc).date(),
+            time.fromisoformat(clock),
+            tzinfo=timezone.utc,
+        )
+    )
     now_hour = now.replace(minute=0, second=0, microsecond=0)
-    seconds_into_hour = now.minute * 60 + now.second
-    _event(_uid("mo"), hours_ago=min(72, seconds_into_hour) / 3600.0, output_tokens=7)
+    _event(
+        _uid("mo"),
+        at=max(now_hour, now - timedelta(seconds=72)),
+        output_tokens=7,
+    )
 
     hourly = root.get(
         "/admin/api/analytics/overview", params={"range": "24h"}
@@ -238,18 +290,19 @@ def test_the_series_reaches_the_bucket_the_window_ends_in(console):
     daily = root.get(
         "/admin/api/analytics/overview", params={"range": "30d"}
     ).json()
-    today = now.date()  # the same reading, for the same reason
+    today = now.date()
     assert datetime.fromisoformat(daily["series"]["usage"][-1]["bucket"]).date() == today
     assert daily["series"]["usage"][-1]["requests"] >= 1
 
 
-def test_every_series_on_every_page_ends_today(console):
+def test_every_series_on_every_page_ends_today(console, frozen_clock):
     """The same bound, on all six of them — they are separate queries and
     only one of them had a test."""
     root, _admin, _member = console
-    from datetime import datetime, timezone
 
-    today = datetime.now(timezone.utc).date()
+    # Six requests, six window resolutions: frozen, so a midnight that falls
+    # between the first and the last cannot move "today" under the assertion.
+    today = frozen_clock(datetime.now(timezone.utc)).date()
     pages = [
         ("chat", lambda d: d["series"]),
         ("research", lambda d: d["series"]),
