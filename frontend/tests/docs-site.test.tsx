@@ -79,6 +79,7 @@ import {
 } from '@/content/docs';
 import { SIDECARS_NO_TIMEOUT_LIVE } from '@/content/docs/pages/sidecarsLive';
 import type { DocPage, DocSection } from '@/content/docs';
+import { FILES_API_PUBLISHED } from '@/content/docs/pages/files';
 
 afterEach(cleanup);
 
@@ -225,23 +226,29 @@ function contractRoutes(): Set<string> {
  * it is a concrete value, so both collapse to `{}` before comparison.
  */
 function normalisePath(path: string): string {
-  return path
-    .split('/')
-    .map((segment) => {
-      if (!segment) return segment;
-      if (/^\{.*\}$/.test(segment)) return '{}';
-      if (/^(resp|msg|proj|svc|key|whe|whd)_/.test(segment)) return '{}';
-      // Any of the six public ids fills `/v1/models/{model}` (2026-09-13).
-      if ((MODEL_IDS as readonly string[]).includes(segment)) return '{}';
-      return segment;
-    })
-    .join('/');
+  const segments = path.split('/');
+  const normalised = segments.map((segment, i) => {
+    if (!segment) return segment;
+    if (/^\{.*\}$/.test(segment)) return '{}';
+    if (/^(resp|msg|proj|svc|key|whe|whd)_/.test(segment)) return '{}';
+    // Any of the six public ids fills `/v1/models/{model}` (2026-09-13).
+    if ((MODEL_IDS as readonly string[]).includes(segment)) return '{}';
+    // The Files pages (2026-09-14): an example file, upload or part id, a
+    // shell variable (`$UPLOAD_ID`) and a derived output's name
+    // (`/derived/transcript.vtt`) each fill a parameter too, as in
+    // tests/docs-files.test.tsx.
+    if (/^(?:file-|upload_|part_)[0-9a-f]+$/.test(segment) || /^\$/.test(segment)) return '{}';
+    if (i > 0 && segments[i - 1] === 'derived') return '{}';
+    return segment;
+  });
+  while (normalised.length > 2 && normalised[normalised.length - 1] === '') normalised.pop();
+  return normalised.join('/');
 }
 
 /** Every `/v1/...` path mentioned anywhere in a page's prose or samples. */
 function routesMentionedIn(body: string): string[] {
   const found = new Set<string>();
-  for (const match of body.matchAll(/\/v1\/[A-Za-z0-9_\-{}./]+/g)) {
+  for (const match of body.matchAll(/\/v1\/[A-Za-z0-9_\-{}./$]+/g)) {
     const cleaned = match[0].replace(/[.]+$/, '');
     found.add(normalisePath(cleaned));
   }
@@ -420,7 +427,17 @@ describe('the documented API surface', () => {
   it('documents every route the contract publishes, somewhere', () => {
     const documented = new Set(DOC_PAGES.flatMap((page) => routesMentionedIn(page.body)));
     const missing = [...contractRoutes()].filter((route) => !documented.has(route));
-    expect(missing).toEqual([]);
+    // 2026-09-14: CONTRACT §7 lists the Files routes, and their pages are
+    // written, but FILES_API_PUBLISHED holds those pages back until a run
+    // through the public URL is recorded (pages/files.ts). So the routes the
+    // live site does not document must be exactly the Files routes, and the
+    // site as it publishes with them must document every contract route.
+    const filesRoute = (route: string) => route.startsWith('/v1/files') || route.startsWith('/v1/uploads');
+    expect(missing.filter((route) => !filesRoute(route))).toEqual([]);
+    if (FILES_API_PUBLISHED) expect(missing).toEqual([]);
+    const withFiles = docSectionsFor({ noTimeout: NO_TIMEOUT_LIVE, filesPublished: true }).flatMap((section) => section.pages);
+    const documentedWithFiles = new Set(withFiles.flatMap((page) => routesMentionedIn(page.body)));
+    expect([...contractRoutes()].filter((route) => !documentedWithFiles.has(route))).toEqual([]);
   });
 
   it('uses only the model ids the contract registry declares, and every one of them', () => {
@@ -1225,8 +1242,14 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     return out;
   }
 
-  it('publishes the three new routes in CONTRACT §7 with exactly one scope each, eleven routes in all', () => {
-    expect(contractRoutes().size).toBe(11);
+  it('publishes the three new routes in CONTRACT §7 with exactly one scope each, twenty-five operations in all', () => {
+    // Eleven operations of 2026-09-13 and the fourteen Files operations of
+    // 2026-09-14 — the count public-api-surface.txt holds. Counted with the
+    // method: 25 operations share 23 paths.
+    const operations = [...CONTRACT.matchAll(/^\|\s*(GET|POST|PUT|PATCH|DELETE)\s*\|\s*`(\/v1\/[^`]+)`/gm)].map((m) => `${m[1]} ${m[2]}`);
+    expect(new Set(operations).size).toBe(25);
+    expect(operations).toHaveLength(25);
+    expect(contractRoutes().size).toBe(23);
     for (const [method, path, scope] of NEW_ROUTES) {
       expect(CONTRACT).toMatch(
         new RegExp(`^\\| ${method} \\| \`${escapeRe(path)}\` \\| \`${escapeRe(scope)}\` \\|`, 'm'),

@@ -256,9 +256,22 @@ other code raises:
 | `model_unavailable` | 503 | `service_unavailable_error` | yes | the same, when the controller reports DOWN or WEDGED; the shared admission lanes refusing (`AdmissionRejected` → `Retry-After: 5`, "at capacity"); also the code a restart-orphaned background response is failed with |
 | `timeout` | 504 | `timeout_error` | yes | an `asyncio.TimeoutError` out of the generation |
 | `internal_error` | 500 | `server_error` | no | anything else, including a deployment with no usable API-key pepper (§12) |
+| `file_not_found` | 404 | `invalid_request_error` | no | `files/wire.file_not_found`, `apifiles/service.file_not_found`: absent, malformed, deleted, expired or another project's file id; an unknown derived name (§15) |
+| `upload_not_found` | 404 | `invalid_request_error` | no | `files/wire.upload_not_found` |
+| `file_not_ready` | 409 | `invalid_request_error` | yes | `files/wire.file_not_ready`: bytes still assembling, derived data while assembling, queued or processing (a file in `error` is a `400` on `file_id` from `routes._require_derived_ready`); `service.file_not_ready` for a bounded synchronous prepare |
+| `upload_state_conflict` | 409 | `invalid_request_error` | no (`x-should-retry: false`) | `files/wire.upload_state_conflict`; a `complete` meeting another in progress says `Retry-After: 2`, `x-should-retry: true` |
+| `checksum_mismatch` | 400 | `invalid_request_error` | no | `files/wire.checksum_mismatch`: a part's `sha256` / `X-Part-SHA256` / `Content-Digest` |
+| `incomplete_body` | 408 | `invalid_request_error` | yes | `files/wire.incomplete_body`: the client closed mid-body; nothing recorded |
+| `storage_unavailable` | 503 | `api_error` | only when `x-should-retry: true` | `files/wire.storage_unavailable` (free space below the watermark, `false`), `storage_busy` (a purge of the same bytes, `true`) |
 
 Every 429 and 503 carries `Retry-After`; the constructor refuses to build one
 without it.
+
+The seven Files rows joined `_CODES` on 2026-09-14. `files/wire.FILE_CODES`
+restates each one's status and type only beside its `x-should-retry` default,
+and `FilesApiError` reads status and type from `_CODES` (a `status=` override
+gives `invalid_request_error` its `411` and `416`);
+`tests/test_publicapi_files_publication.py` fails if the two tables disagree.
 
 ## 6. Endpoints
 
@@ -926,3 +939,33 @@ and number.
 19. **The public documentation** shows the no-timeout pages only once
     `NO_TIMEOUT_LIVE` (`frontend/content/docs/pages/longOutput.ts`) is true;
     `tests/docs-files.test.tsx` ties it to `keepalive.py` and the resume route.
+
+## 15. The Files API (2026-09-14) — read from the code
+
+Published in CONTRACT §7 and §8.7 on 2026-09-14. The customer pages
+(`frontend/content/docs/pages/{files,uploads,fileInputs}.ts`) stay off the site
+until `FILES_API_PUBLISHED` is true, which `frontend/tests/docs-files.test.tsx`
+ties to four facts: CONTRACT §7 lists `POST /v1/files`; the router registers the
+file routes fully wired; the public edge carries PUT, DELETE, 64 MiB parts and
+the download headers; and `FILES_EDGE_PROBE` records a passing run through the
+public URL. The first three hold on this tree; the probe is a hand-recorded
+operator run.
+
+| what | where |
+|---|---|
+| the fourteen handlers, their scope (`SCOPE_READ` / `SCOPE_WRITE`) and admission kind (`KIND_READ` / `KIND_SYNC` / `KIND_STREAM`) | `app/publicapi/files/routes.py` (`_Handlers`, `register`) |
+| registration with `processing_view`, `derived`, `events`, `purge_blob` | `router._register_files()`, `router.FILES_MOUNTED`, `FILES_DEPENDENCIES` |
+| the File, Upload, part and list objects; the Files codes' retry defaults; filename, purpose and `expires_after` rules | `app/publicapi/files/wire.py` |
+| download headers, `Range`, `If-None-Match` | `app/publicapi/files/content.py` |
+| streamed multipart to disk for `POST /v1/files` and `POST …/parts` | `app/publicapi/files/multipart_disk.py` |
+| per-route body caps (65 MiB / 64 MiB / 1 MiB) | `routes.body_cap_for`, read by `models.body_cap_for` and `main._public_api_body_cap` |
+| the fourteen operations, their schemas and the file model-input parts in the OpenAPI document, described exactly while `FILES_MOUNTED` | `app/publicapi/files/openapi_doc.py` (`extend`), hooked by `openapi.public_openapi` |
+| files as model input: lift, `files.read` before lookup, readiness, context, citations | `app/publicapi/file_inputs.py`, `app/apifiles/service.py`, `app/apifiles/citations.py` |
+| file processing events (`file.processing`, `file.processed`, `file.failed`) | `app/apifiles/events.py` |
+| the console Files tab (`/api?tab=files`): list, detail, uploads, delete; no byte route | `app/apiplatform/console_api.py`, `console_files.py`; `frontend/components/devplatform/Files.tsx`, `files-api.ts` |
+
+The surface gate: `api_contract.py` now reports
+`OpenAPI 3.1.0: well-formed, 25 operation(s), all matching …public-api-surface.txt`,
+and `tests/test_publicapi_files_publication.py` holds CONTRACT §7, the surface
+file and the served document to the same twenty-five operations and CONTRACT §9
+to `errors._CODES`.

@@ -381,7 +381,7 @@ Citations into a recording are timestamps: \`[standup.mp4 42:10]\`, or
 \`h:mm:ss\` past the first hour.
 
 **\`input_audio\`** on Chat Completions is for a short clip that is not worth
-uploading: base64 WAV or MP3 of at most 300 seconds, inside the 20 MiB request
+uploading: base64 WAV or MP3 of up to 300 seconds, inside the 20 MiB request
 body — about 15 MiB of audio. It is transcribed and the transcript is put in
 the prompt, marked as a transcript. Anything longer, upload as a file.
 ${syncAudio(noTimeout)}
@@ -470,6 +470,11 @@ Where the annotations are:
   them all.
 * **Chat Completions:** \`choices[0].message.annotations\`, and in a stream on
   the last chunk's \`delta.annotations\`.
+* **A response read back later:** a response fetched with
+  \`GET /v1/responses/{id}\` — which is how a background request's answer is
+  delivered — has no annotations. The labels are still in its text, but they
+  have not been checked against what the model was given, so do not link
+  them as citations.
 
 The SDKs type annotations as a union, and a \`file_citation\` has no
 \`url_citation\` field: always branch on \`annotation.type\`.
