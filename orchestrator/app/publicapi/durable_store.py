@@ -1230,17 +1230,21 @@ def fail_interrupted_foreground(
     with db.connection() as con:
         rows = con.execute(
             """
-            UPDATE api_responses SET status = 'failed', error_code = %s, error_message = %s,
-                   completed_at = COALESCE(completed_at, now())
-            WHERE id IN (
+            WITH due AS MATERIALIZED (
+                -- evaluated once: a rescanned `IN (... SKIP LOCKED)` subquery
+                -- skips the rows this statement already updated and returns
+                -- the next batch (webhooks.queue.prune_settled_deliveries)
                 SELECT id FROM api_responses
                 WHERE status IN ('queued', 'in_progress') AND NOT background
                   AND NOT COALESCE(resumable, false) AND created_at < %s
                 ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED
             )
-            RETURNING id
+            UPDATE api_responses r SET status = 'failed', error_code = %s, error_message = %s,
+                   completed_at = COALESCE(r.completed_at, now())
+              FROM due WHERE r.id = due.id
+            RETURNING r.id
             """,
-            (error_code, error_message, created_before, int(limit)),
+            (created_before, int(limit), error_code, error_message),
         ).fetchall()
     return [str(r["id"]) for r in rows]
 

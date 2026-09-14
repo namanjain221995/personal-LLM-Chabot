@@ -465,10 +465,13 @@ def expire_api_uploads(limit: int) -> List[str]:
     caller removes their parts directories."""
     with db.connection() as con:
         rows = con.execute(
-            "UPDATE api_uploads SET status = 'expired', updated_at = now() "
-            " WHERE id IN (SELECT id FROM api_uploads WHERE status = 'pending' AND expires_at <= now() "
+            # A MATERIALIZED CTE, evaluated once: see
+            # webhooks.queue.prune_settled_deliveries for the rescan hazard.
+            "WITH due AS MATERIALIZED (SELECT id FROM api_uploads WHERE status = 'pending' AND expires_at <= now() "
             "              ORDER BY expires_at LIMIT %s FOR UPDATE SKIP LOCKED) "
-            "RETURNING id",
+            "UPDATE api_uploads u SET status = 'expired', updated_at = now() "
+            "  FROM due WHERE u.id = due.id "
+            "RETURNING u.id",
             (max(1, int(limit)),),
         ).fetchall()
     return [str(row["id"]) for row in rows]
@@ -479,13 +482,14 @@ def purge_api_upload_records(older_than_s: float, limit: int) -> List[str]:
     30 days). Never one whose file is still assembling."""
     with db.connection() as con:
         rows = con.execute(
-            "DELETE FROM api_uploads WHERE id IN ("
+            "WITH doomed AS MATERIALIZED ("
             "  SELECT id FROM api_uploads "
             "   WHERE status IN ('completed','cancelled','expired','failed') "
             "     AND assembly_part_numbers IS NULL "
             "     AND updated_at < now() - make_interval(secs => %s::float8) "
             "   ORDER BY updated_at LIMIT %s FOR UPDATE SKIP LOCKED) "
-            "RETURNING id",
+            "DELETE FROM api_uploads u USING doomed WHERE u.id = doomed.id "
+            "RETURNING u.id",
             (float(older_than_s), max(1, int(limit))),
         ).fetchall()
     return [str(row["id"]) for row in rows]

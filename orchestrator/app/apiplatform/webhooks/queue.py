@@ -584,11 +584,19 @@ def prune_settled_deliveries(
     removed = 0
     for _ in range(max(1, int(max_batches))):
         with db.connection() as con:
+            # MATERIALIZED, not `id IN (SELECT ... LIMIT ... SKIP LOCKED)`: a
+            # plan that rescans that subquery (a Nested Loop Semi Join without
+            # a Materialize) re-runs LockRows, which skips the rows this very
+            # statement already deleted and hands back the NEXT batch, so one
+            # statement deleted every due row (7000 with a 1000 batch, seen in
+            # the suite 2026-09-14 and reproduced with enable_material=off).
+            # A materialized CTE is evaluated exactly once.
             touched = con.execute(
-                "DELETE FROM api_webhook_deliveries WHERE id IN ("
+                "WITH doomed AS MATERIALIZED ("
                 " SELECT id FROM api_webhook_deliveries "
                 "  WHERE status IN ('delivered', 'failed', 'dropped') AND created_at < %s "
-                "  LIMIT %s FOR UPDATE SKIP LOCKED)",
+                "  LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "DELETE FROM api_webhook_deliveries d USING doomed WHERE d.id = doomed.id",
                 (cutoff, size),
             ).rowcount
         touched = max(0, int(touched))

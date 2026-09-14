@@ -169,10 +169,14 @@ def test_the_site_is_unbound_before_the_connection_goes_back_to_the_pool():
         held = con
     assert held._techsara_site is None
     # Outside a checkout the cursor records nothing (the pool's liveness check
-    # and reset run here).
+    # and reset run here). Since the pool has a reset hook (db.py, 2026-09-14)
+    # it returns a connection through a worker thread, so `held` must not be
+    # used after its block: a connection is borrowed from the pool directly.
     before = _count(db_metrics.STATEMENT, site="other")
-    held.execute("SELECT 1")
-    held.rollback()
+    with db.pool().connection() as raw:
+        raw.cursor_factory = db_metrics.TimedCursor
+        assert getattr(raw, "_techsara_pending", None) is None
+        raw.execute("SELECT 1").fetchone()
     assert _count(db_metrics.STATEMENT, site="other") == before
 
 
