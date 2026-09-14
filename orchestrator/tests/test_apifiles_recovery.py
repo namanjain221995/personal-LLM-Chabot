@@ -257,6 +257,7 @@ def test_simultaneous_re_uploads_of_a_failed_blob_all_join_it_and_re_queue_it_on
     assert blob_ids == {str(_blob_of(first["id"])["id"])}
     blob = _blob_of(first["id"])
     assert (blob["status"], blob["attempt"], blob["error_code"]) == ("queued", 0, None)
+    assert blob["progress"]["recoveries"] == 1, "one recovery, so one new usage key, however many uploads raced"
 
 
 # ============================================================ derived routes ==
