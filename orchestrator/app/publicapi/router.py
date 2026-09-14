@@ -126,6 +126,8 @@ from ..apiplatform.scopes import InsufficientScopeError, Scope, requires
 from . import (
     background,
     capacity,
+    durable,
+    durable_store,
     engines,
     errors,
     events,
@@ -1041,12 +1043,21 @@ async def create_response(request: Request, caller: ApiCaller = Depends(resolve_
 async def get_response(
     id: str, request: Request, caller: ApiCaller = Depends(resolve_caller)
 ) -> Response:
-    """Project-scoped. Another project's id reads as missing (CONTRACT §9)."""
+    """Project-scoped. Another project's id reads as missing (CONTRACT §9).
+
+    With `stream` or `starting_after` in the query it is the resume route
+    (CONTRACT §10.3, `_resume_stream`), whose checks run in the contract's
+    order. Before 2026-09-14 both parameters were ignored and the JSON object
+    came back with a 200, so an SDK resume loop iterated an empty stream for
+    ever (verifier)."""
+    if RESUME_STREAM_PARAM in request.query_params or RESUME_AFTER_PARAM in request.query_params:
+        return await _resume_stream(id, request, caller)
     await _authorize(request, caller, "get_response")
     await _admit(request, caller, kind=KIND_READ)
     row = await _response_row(caller, id)
     # A background job a restart cut off is closed here, where its poller
-    # looks, rather than left `in_progress` for ever.
+    # looks, rather than left `in_progress` for ever — and, since 2026-09-14,
+    # a non-durable foreground response (`store: false`) too.
     row = await background.repair_if_orphaned(row) or row
     return JSONResponse(_row_to_wire(row))
 
@@ -1136,6 +1147,7 @@ async def _generate(
     route = "v1_chat_completions" if chat else "v1_responses"
     request_id = _request_id(request)
     tag = gateway_tag(request)
+    file_run: Optional[file_inputs.FileRun] = None
     try:
         await _resolve_model(caller, request_model.model)
         if parsed.plan_error is not None:
@@ -1154,20 +1166,52 @@ async def _generate(
         )
         if file_run is not None:
             await file_run.authorize(request, authorize_scope)
+        durable_on = durable_generation_on(request_model)
+        if request_model.stream and request_model.background and not durable_on:
+            # A stream of a background job follows its event log; a process
+            # whose durable runtime is not running has none to follow. An
+            # operational fault, so the retryable 503 rather than a 400 that
+            # would call a valid request invalid.
+            raise errors.model_unavailable(retry_after=streaming.UNAVAILABLE_RETRY_AFTER)
+        # ATTACH ORDER (CONTRACT §13): the gateway's attempt, the
+        # Idempotency-Key, implicit attach — each before anything launches.
+        if durable_on and tag.tagged:
+            attached = await _attach_gateway_attempt(request, caller, chat=chat, parsed=parsed)
+            if attached is not None:
+                await _nothing_ran(caller, reservation, None)
+                if file_run is not None:
+                    file_run.cleanup()
+                return attached
         _refuse_unattachable_reattach(tag)
         held = await _claim_idempotency(request, caller, route, parsed.payload)
         if held is not None and not held.claimed:
             await _nothing_ran(caller, reservation, None)
+            if file_run is not None:
+                file_run.cleanup()
+            attached = None
+            if durable_on:
+                attached = await _attach_idempotent(request, caller, held, chat=chat, parsed=parsed)
+            if attached is not None:
+                return attached
             return await _replay(
                 caller, held, request_model, chat=chat, include_usage=parsed.include_usage
             )
+        if held is None and durable_on:
+            attached = await _attach_implicitly(request, caller, chat=chat, parsed=parsed)
+            if attached is not None:
+                await _nothing_ran(caller, reservation, None)
+                if file_run is not None:
+                    file_run.cleanup()
+                return attached
     except BaseException:
         await _nothing_ran(caller, reservation, None)
         raise
 
     try:
         response_id = _new_response_id()
-        if RUNS_ATTACHABLE:
+        if durable_on:
+            # The run's name for the gateway (§19). `store: false` keeps the
+            # default `none`: nothing of it can be re-attached.
             name_run(request, response_id=response_id)
         created = int(time.time())
         spec = streaming.spec_from_plan(plan, response_id=response_id, created_at=created)
@@ -1186,15 +1230,30 @@ async def _generate(
             on_finish = file_run.wrap_finish(on_finish)
 
         if request_model.background:
-            start = functools.partial(
-                background.start,
-                caller=caller,
-                on_finish=on_finish,
-                request_id=request_id,
-                metadata=dict(request_model.metadata or {}),
-                instructions_present=bool(request_model.instructions),
-                fingerprint=(held.fingerprint if held is not None else ""),
+            digest = await _body_digest(request)
+            ref = _recorder_ref(
+                caller, route=route, request_id=request_id, streamed=bool(request_model.stream),
+                held=held, reservation=reservation, plan=plan,
             )
+
+            async def start(final: streaming.GenerationSpec) -> Dict[str, Any]:
+                # Called with the final spec: at once, or after a request's
+                # files resolved — which is when their citation index exists.
+                return await background.start(
+                    final,
+                    caller=caller,
+                    on_finish=on_finish,
+                    request_id=request_id,
+                    metadata=dict(request_model.metadata or {}),
+                    instructions_present=bool(request_model.instructions),
+                    fingerprint=(held.fingerprint if held is not None else ""),
+                    recorder_ref=ref,
+                    extra=_file_extra(file_run),
+                    retain_hook=file_run is not None,
+                    attempt_token=(tag.attempt if tag.tagged else None),
+                    body_sha256=digest,
+                )
+
             if file_run is not None:
                 # Files (senior fix 2026-09-14): the row and the 202 NOW; the
                 # file wait, the context and the second plan in a detached task
@@ -1217,16 +1276,47 @@ async def _generate(
             # The 202 IS the outcome a retry should replay; the job's own end
             # re-finishes the claim through `on_finish`.
             await _finish_claim(held, str(row["id"]))
+            if request_model.stream:
+                # Stream AND background (CONTRACT §14): the job is the queued
+                # durable row; this connection follows its log and leaving it
+                # cancels nothing.
+                name_run(request, response_id=str(row["id"]))
+                return _FollowStream(_background_follow_frames(str(row["id"]), tagged=tag.tagged))
             return JSONResponse(status_code=202, content=_row_to_wire(row))
 
         if request_model.stream:
             gate_failure = _GateFailure()
             recorded = gate_failure.recording(on_finish)
+            annotate = _stream_annotator(file_run)
+            if durable_on and file_run is None:
+                lease = quotas.take_slot(caller, KIND_STREAM)
+                place: Optional[_Place] = None
+                try:
+                    place = _place_for(_plan_gates(plan))
+                    handle = await _launch_durable(
+                        request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat,
+                        held=held, reservation=reservation, on_finish=on_finish, file_run=None,
+                        slot=lease, place=place,
+                    )
+                except BaseException:
+                    if place is not None:
+                        place.release()
+                    lease.release()
+                    raise
+                chat_args = (
+                    _chat_render_args(response_id=response_id, model=spec.model, created=created,
+                                      include_usage=parsed.include_usage)
+                    if chat else None
+                )
+                return _FollowStream(
+                    _follow_frames(handle, after=0, tagged=tag.tagged, chat=chat_args, opener=chat)
+                )
             launch = _stream_launch(
                 chat=chat,
                 completion_id=_completion_id(response_id),
                 include_usage=parsed.include_usage,
                 on_finish=recorded,
+                annotate=annotate,
             )
             files_frames = None
             if file_run is not None:
@@ -1235,9 +1325,17 @@ async def _generate(
                 # the stream, with heartbeats (file_inputs.stream_with_files).
                 # The gate is THIS router's patient gate and the generation is
                 # started by THIS router's launch (senior fix 2026-09-14): no
-                # capacity wait of a file stream ends on a clock, and the day
-                # streams launch durably, file streams do too.
+                # capacity wait of a file stream ends on a clock. A DURABLE
+                # file stream (2026-09-14) passes no gate — the durable runner
+                # holds the plan's gates — and launches through the durable
+                # runtime once its files resolved.
                 await file_run.precheck()
+                if durable_on:
+                    launch = _durable_stream_launch(
+                        request, caller, parsed=parsed, request_model=request_model, chat=chat, held=held,
+                        reservation=reservation, on_finish=recorded, file_run=file_run,
+                        include_usage=parsed.include_usage,
+                    )
                 files_frames = file_inputs.stream_with_files(
                     file_run,
                     chat=chat,
@@ -1246,7 +1344,7 @@ async def _generate(
                     replan=functools.partial(_replan, parsed, caller),
                     completion_id=_completion_id(response_id),
                     include_usage=parsed.include_usage,
-                    gate=_patient_gate,
+                    gate=(_no_router_gate if durable_on else _patient_gate),
                     launch=launch,
                 )
             if chat:
@@ -1306,6 +1404,10 @@ async def _generate(
                 refusal_frames=refusal_frames,
                 gate_failure=gate_failure,
                 tag=tag,
+                # A durable file stream's frames carry the log's own
+                # `: ts-seq=N` (record numbers, which a re-attach resumes
+                # from); numbering them again by frame would disagree.
+                number_frames=not durable_on,
             )
     except BaseException:
         if file_run is not None:
@@ -1317,6 +1419,32 @@ async def _generate(
     # body: a failure after the commit still reports the partial output and
     # the usage the engine produced.
     partial = streaming.new_outcome(spec)
+    if durable_on:
+        durable_work = functools.partial(
+            _run_durable_synchronous,
+            request=request,
+            caller=caller,
+            request_model=request_model,
+            plan=plan,
+            spec=spec,
+            outcome=partial,
+            on_finish=on_finish,
+            reservation=reservation,
+            held=held,
+            chat=chat,
+        )
+        if file_run is not None:
+            durable_work = functools.partial(
+                _run_durable_synchronous_with_files, file_run=file_run, parsed=parsed, **durable_work.keywords
+            )
+        return keepalive.CommittedJSONResponse(
+            durable_work,
+            failure_mode=keepalive.FAILURE_BODY,
+            failed_body=functools.partial(
+                _durable_failed_body, spec=spec, chat=chat, request_id=request_id, outcome=partial
+            ),
+            request_id=request_id,
+        )
     work = functools.partial(
         _run_synchronous,
         request=request,
@@ -1345,28 +1473,26 @@ async def _generate(
     )
 
 
-#: SEAM (assembler, 2026-09-13). Whether a generation launched here can be
-#: re-attached by the gateway. False until the router launches through T2's
-#: `durable.launch` / `durable.attach`: this build keeps no event log, so a
-#: gateway that re-POSTed after an orchestrator restart would get a SECOND
-#: generation spliced onto the first client's stream. With False, tagged
-#: generations answer `X-TechSara-Run: none` — the gateway then never re-POSTs
-#: a generation it may already have delivered — and a re-attach is a 404.
-#: The commit that routes generations through `durable` sets it True (and
-#: replaces `_refuse_unattachable_reattach` with `durable.attach`).
-RUNS_ATTACHABLE = False
+#: Whether a generation launched here can be re-attached by the gateway.
+#: True since 2026-09-14: `_generate` launches every `store: true` generation
+#: through `durable.launch` and attaches a gateway re-POST through
+#: `_attach_gateway_attempt` (the durable section below). A `store: false`
+#: generation still answers `X-TechSara-Run: none`.
+RUNS_ATTACHABLE = True
 
 
 def _refuse_unattachable_reattach(tag: gateway_protocol.GatewayTag) -> None:
-    """A gateway re-attach this build cannot serve → 404, before any work.
+    """A gateway re-attach nothing here can serve → 404, before any work.
 
+    Reached only when `_attach_gateway_attempt` found no run for the attempt
+    (or the request is `store: false`, or the durable runtime is not running).
     The design's rule (deploy_survival, INTERNAL ATTACH PROTOCOL 5): a run that
-    exists but cannot be replayed answers 404, and the gateway aborts its
-    client (gateway/lib/reattach.cjs treats 404 as final). Without the durable
-    layer nothing can be replayed, and a Resume-After or Attach-Job only ever
-    arrives AFTER the gateway relayed part of a run — launching fresh would
-    hand the client a second, different answer from byte N+1."""
-    if tag.reattach and not RUNS_ATTACHABLE:
+    cannot be replayed answers 404, and the gateway aborts its client
+    (gateway/lib/reattach.cjs treats 404 as final). A Resume-After or
+    Attach-Job only ever arrives AFTER the gateway relayed part of a run —
+    launching fresh would hand the client a second, different answer from
+    byte N+1."""
+    if tag.reattach:
         raise errors.response_not_found()
 
 
@@ -1602,18 +1728,24 @@ def _stream_launch(
     completion_id: str,
     include_usage: bool,
     on_finish: streaming.OnFinish,
+    annotate: Optional[streaming.Annotator] = None,
 ) -> Callable[[streaming.GenerationSpec], AsyncIterator[str]]:
     """THE stream launch of this router, for a stream with files and without
     (senior fix 2026-09-14). One function, so the commit that starts streams
     through the durable runtime (`RUNS_ATTACHABLE`) changes both at once — a
-    file stream is never the one generation left without resume."""
+    file stream is never the one generation left without resume.
+
+    Since 2026-09-14 this is the NON-durable launch (`store: false`, or no
+    durable runtime); `_durable_stream_launch` is the durable one. `annotate`
+    gives a file stream its `file_citation` annotation events."""
 
     def launch(spec: streaming.GenerationSpec) -> AsyncIterator[str]:
         if chat:
             return streaming.chat_completions_sse(
-                spec, completion_id=completion_id, include_usage=include_usage, on_finish=on_finish
+                spec, completion_id=completion_id, include_usage=include_usage, on_finish=on_finish,
+                annotate=annotate,
             )
-        return streaming.responses_sse(spec, on_finish=on_finish)
+        return streaming.responses_sse(spec, on_finish=on_finish, annotate=annotate)
 
     return launch
 
@@ -2160,6 +2292,7 @@ class _SlotStream(StreamingResponse):
         heartbeat_s: Optional[float] = None,
         reserve_place: Optional[Callable[[], _Place]] = None,
         patient: bool = False,
+        number_frames: bool = True,
     ) -> None:
         super().__init__(frames, media_type="text/event-stream", headers=streaming.SSE_HEADERS)
         self._frames = frames
@@ -2184,7 +2317,7 @@ class _SlotStream(StreamingResponse):
         self._patient = patient
         self.started = False
         body: AsyncIterator[str] = self._tracked()
-        if tag.tagged:
+        if tag.tagged and number_frames:
             body = gateway_protocol.tag_frames(body)
         self.body_iterator = body
 
@@ -2377,6 +2510,828 @@ async def _record_abandoned(spec: streaming.GenerationSpec, on_finish: streaming
         duration_ms=0,
     )
     await on_finish(outcome)
+
+
+# ------------------------------------------------ durable foreground runs --
+#
+# EVERY GENERATION IS DURABLE UNLESS IT SAYS `store: false` (no-timeout
+# design deploy_survival, CONTRACT §14; built 2026-09-14). Until this section
+# only background jobs went through `publicapi/durable.py`: a synchronous or
+# streaming /v1 generation lived in the coroutine of its connection, so an
+# orchestrator deploy cut it (the gateway saw `X-TechSara-Run: none` and gave
+# up), an SDK retry started a second generation, and
+# `GET /v1/responses/{id}?stream=true&starting_after=N` answered 200 JSON and
+# ignored both parameters — a client following the documented resume loop
+# spun for ever on an empty iterator (verifier, restart-gateway-TERM).
+#
+# Now a generation with `store` true (the default), in a process whose
+# durable runtime is running, is LAUNCHED as a durable run: the row, the
+# spec, a lease and a write-ahead event log; the connection FOLLOWS the log.
+# What that buys, in the order a request meets it:
+#
+# * ATTACH BEFORE LAUNCH (CONTRACT §13 "Attach order"): the gateway's attempt
+#   id (§19), then the Idempotency-Key, then implicit attach
+#   (`x-stainless-retry-count` ≥ 1, same key, route and raw body). An attach
+#   answers in the request's own shape — a stream replays from the gateway's
+#   resume point (or from the start) and tails; a synchronous call waits with
+#   whitespace and returns the body; a background request gets its 202 — and
+#   never runs the model again.
+# * A CLIENT THAT LEAVES DETACHES, it does not cancel: the run keeps
+#   generating for its orphan grace (600 s keyed / Responses streams, 120 s
+#   otherwise) so the retry can attach.
+# * A SIGTERM SUSPENDS the run (`durable.suspend_all`) and ends every reader
+#   WITHOUT a terminal frame, so the gateway sees an incomplete read and
+#   re-attaches to the replacement process, which resumes the answer by
+#   continuation.
+# * RECORDING: the request's own `on_finish` when this process settles the
+#   run; the serialisable `router.v1` recorder (`_router_recorder_factory`)
+#   when another process does — the same usage row, the quota settlement,
+#   and the Idempotency-Key released on failure.
+#
+# `store: false` keeps the pre-durable path exactly: cancelled on disconnect
+# and on a restart, never resumable, `X-TechSara-Run: none`.
+
+#: The name the router's serialisable recorder is registered under.
+ROUTER_RECORDER = "router.v1"
+
+#: The resume route's query parameters (CONTRACT §10.3).
+RESUME_STREAM_PARAM = "stream"
+RESUME_AFTER_PARAM = "starting_after"
+
+
+class _RunSuspended(errors.ApiError):
+    """A durable run was suspended under a reader (SIGTERM, a lease loss).
+
+    Before a committed synchronous response has sent its status line this is
+    a real 503 with a short Retry-After — the SDK retries and implicitly
+    attaches to the suspended run in the replacement process. After the
+    commit `_durable_failed_body` refuses to build a body for it, so the
+    connection is dropped mid-body: the gateway re-attaches, a direct SDK
+    retries."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "model_unavailable",
+            "The service is restarting; retry to continue this response.",
+            retry_after=2,
+        )
+
+
+def durable_generation_on(request_model: models.ResponsesRequest) -> bool:
+    """Whether this generation runs durably: `store` true and a running
+    durable runtime (main.py's lifespan starts it; a process whose schema
+    check failed keeps it off and serves the pre-durable path)."""
+    return bool(request_model.store) and durable.is_active()
+
+
+async def _body_digest(request: Request) -> str:
+    """sha256 of the RAW request body (`gateway_protocol.body_sha256`): the
+    identity implicit and gateway attach compare. The body was already read
+    by `_json_body` (Starlette caches it); a large one is hashed off the loop."""
+    raw = await request.body()
+    if len(raw) > OFF_LOOP_BODY_BYTES:
+        return await asyncio.to_thread(gateway_protocol.body_sha256, raw)
+    return gateway_protocol.body_sha256(raw)
+
+
+def _dialect(chat: bool) -> str:
+    return durable.DIALECT_CHAT if chat else durable.DIALECT_RESPONSES
+
+
+def _file_extra(file_run: Optional[file_inputs.FileRun]) -> Dict[str, Any]:
+    """What a durable run's spec carries for its files: the citation index
+    the answer's `file_citation` annotations resolve against (durable.py,
+    FILE CITATIONS ON A DURABLE RUN). Empty for a request without files or
+    whose context has nothing to cite."""
+    if file_run is None:
+        return {}
+    try:
+        prepared = getattr(file_run, "prepared", None)
+        context_ = getattr(prepared, "context", None)
+        index = getattr(context_, "citations", None)
+        data = durable.citation_index_to_json(index)
+    except Exception:  # noqa: BLE001 - citations never fail an answer
+        log.warning("the citation index of %s was not stored", file_run.request_id, exc_info=True)
+        return {}
+    return {durable.FILE_CITATIONS_KEY: data} if data else {}
+
+
+def _recorder_ref(
+    caller: ApiCaller,
+    *,
+    route: str,
+    request_id: str,
+    streamed: bool,
+    held: Optional[idempotency.Claim],
+    reservation: Any,
+    plan: Optional[planning.GenerationPlan],
+) -> durable.RecorderRef:
+    """The JSON a process that did not launch the run records it from: ids,
+    the route, the Idempotency-Key claim, the quota reservation's numbers and
+    the plan's requested ceiling — never the prompt."""
+    args: Dict[str, Any] = {
+        "project_id": caller.project_id,
+        "workspace_id": caller.workspace_id,
+        "key_id": caller.key_id or None,
+        "route": route,
+        "request_id": request_id,
+        "streamed": bool(streamed),
+    }
+    if held is not None and held.claimed:
+        args["idempotency"] = {
+            "project_id": held.project_id, "endpoint": held.endpoint,
+            "idem_key": held.idem_key, "fingerprint": held.fingerprint,
+        }
+    at = getattr(reservation, "at", None)
+    if reservation is not None and at is not None:
+        args["reservation"] = {
+            "at": at.isoformat(),
+            "input": int(getattr(reservation, "reserved_input_tokens", 0) or 0),
+            "output": int(getattr(reservation, "reserved_output_tokens", 0) or 0),
+        }
+    if plan is not None:
+        args["requested_max_output_tokens"] = plan.requested_max_output_tokens
+    return durable.RecorderRef(ROUTER_RECORDER, args)
+
+
+class _StoredReservation:
+    """A quota reservation rebuilt from a recorder ref: the numbers
+    `quotas.record_usage` gives back. Settled at most once, like the real one
+    (the process that made the real one is gone, so this is the only one)."""
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        from datetime import datetime
+
+        self.at = datetime.fromisoformat(str(data["at"]))
+        self.reserved_input_tokens = int(data.get("input") or 0)
+        self.reserved_output_tokens = int(data.get("output") or 0)
+        self._settled = False
+
+    def _claim_settlement(self) -> bool:
+        if self._settled:
+            return False
+        self._settled = True
+        return True
+
+
+def _router_recorder_factory(args: Mapping[str, Any]) -> Callable[[Dict[str, Any], streaming.StreamOutcome], Awaitable[None]]:
+    """`router.v1`: the request recorder for a durable run settled by a
+    process that did not launch it (a deploy in between, a lease taken over).
+
+    WHY (verifier, 2026-09-14). Without a registered factory such a run was
+    recorded by `durable.default_recorder`: a usage row, but no quota
+    settlement and — the one a client notices — its Idempotency-Key was never
+    released after a FAILURE, so a retry with the same key replayed the
+    failure until the key expired. This does what `_recorder` does, from JSON.
+    The row itself was already settled by `durable_store.finish`."""
+    from types import SimpleNamespace
+
+    async def record(row: Dict[str, Any], outcome: streaming.StreamOutcome) -> None:
+        counted = outcome.usage_model()
+        failed = outcome.status == "failed"
+        meta = row.get("metadata") or {}
+        requested = args.get("requested_max_output_tokens")
+        await usage_ledger.record_async(
+            user_id=None,
+            workspace_id=str(args.get("workspace_id") or row.get("workspace_id") or "") or None,
+            conversation_id=None,
+            generation_id=str(row["id"]),
+            route=str(args.get("route") or ("v1_chat_completions" if row.get("dialect") == durable.DIALECT_CHAT else "v1_responses")),
+            effort=streaming.PUBLIC_EFFORT,
+            model=str(row.get("model") or outcome.model),
+            mode="api",
+            input_tokens=None if counted is None else counted.input_tokens,
+            output_tokens=None if counted is None else counted.output_tokens,
+            ttft_ms=outcome.ttft_ms,
+            duration_ms=outcome.duration_ms,
+            status=usage_ledger.ERROR if failed else usage_ledger.OK,
+            error_kind=(outcome.error.code if outcome.error is not None else ""),
+            meta={
+                "api_key_id": args.get("key_id"),
+                "project_id": args.get("project_id"),
+                "request_id": args.get("request_id"),
+                "streamed": bool(args.get("streamed")),
+                "usage_source": None if outcome.usage is None else str(outcome.usage.get("source") or "engine"),
+                "max_output_tokens_requested": requested,
+                "max_output_tokens_applied": outcome.max_output_tokens,
+                "clamped": bool(
+                    requested is not None and outcome.max_output_tokens is not None
+                    and int(outcome.max_output_tokens) < int(requested)
+                ),
+                "resume_count": meta.get("resume_count"),
+                "recomputed_prompt_tokens": meta.get("recomputed_prompt_tokens"),
+                "settled_by": "durable",
+            },
+        )
+        caller = SimpleNamespace(project_id=str(args.get("project_id") or ""), key_id=args.get("key_id"))
+        stored = args.get("reservation")
+        try:
+            reservation = _StoredReservation(stored) if stored else None
+            await db.run_in_thread(
+                functools.partial(
+                    quotas.record_usage, caller,
+                    None if counted is None else counted.input_tokens,
+                    None if counted is None else counted.output_tokens,
+                    outcome.status, reservation=reservation,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("token usage for %s was not recorded", row.get("id"), exc_info=True)
+        claim = args.get("idempotency")
+        if claim:
+            held = idempotency.Claim(
+                project_id=str(claim["project_id"]), endpoint=str(claim["endpoint"]),
+                idem_key=str(claim["idem_key"]), fingerprint=str(claim.get("fingerprint") or ""), claimed=True,
+            )
+            await _finish_claim(held, None if failed else str(row["id"]))
+
+    return record
+
+
+durable.register_recorder(ROUTER_RECORDER, _router_recorder_factory)
+
+
+def _place_for(gates: List[str]) -> Optional[_Place]:
+    return _GATE_LINE.reserve(gates) if gates else None
+
+
+def _release_on_admission(handle: durable.Handle, place: Optional[_Place]) -> None:
+    """Give the waiter-bound place back when the run holds its gates (or
+    ends): the bound counts WAITING generations, not running ones."""
+    if place is None:
+        return
+    run = handle.run
+    if run is None:
+        place.release()
+        return
+    run.on_admitted(place.release)
+
+
+async def _launch_durable(
+    request: Request,
+    caller: ApiCaller,
+    *,
+    spec: streaming.GenerationSpec,
+    plan: planning.GenerationPlan,
+    request_model: models.ResponsesRequest,
+    chat: bool,
+    held: Optional[idempotency.Claim],
+    reservation: Any,
+    on_finish: streaming.OnFinish,
+    file_run: Optional[file_inputs.FileRun],
+    slot: Any,
+    place: Optional[_Place],
+) -> durable.Handle:
+    """`durable.launch` for a foreground generation, and the two things that
+    must follow it at once: the Idempotency-Key is BOUND to the run (so a
+    retry with the key attaches to it while it runs, CONTRACT §13 "a claim
+    bound to a response is live while the run is open") and the waiter place
+    is handed to the run. `slot` and `place` belong to the caller until this
+    returns; on a raise the caller releases them."""
+    tag = gateway_tag(request)
+    route = "v1_chat_completions" if chat else "v1_responses"
+    handle = await durable.launch(
+        spec,
+        caller=durable.caller_of(caller),
+        dialect=_dialect(chat),
+        background=False,
+        streamed=bool(request_model.stream),
+        keyed=held is not None,
+        attempt_token=(tag.attempt if tag.tagged else None),
+        body_sha256=await _body_digest(request),
+        on_finish=on_finish,
+        request_id=_request_id(request),
+        metadata=dict(request_model.metadata or {}),
+        instructions_present=bool(request_model.instructions),
+        fingerprint=(held.fingerprint if held is not None else ""),
+        extra=_file_extra(file_run),
+        slot=slot,
+        recorder_ref=_recorder_ref(
+            caller, route=route, request_id=_request_id(request), streamed=bool(request_model.stream),
+            held=held, reservation=reservation, plan=plan,
+        ),
+    )
+    await _finish_claim(held, handle.id)
+    _release_on_admission(handle, place)
+    return handle
+
+
+def _follow_frames(
+    handle: durable.Handle,
+    *,
+    after: int,
+    tagged: bool,
+    chat: Optional[Dict[str, Any]] = None,
+    opener: bool = False,
+) -> AsyncIterator[str]:
+    """The SSE body that follows a durable run: `: ping` first when asked
+    (a chat stream has no opening event; an attach may wait a heartbeat for
+    its first committed record), then `durable.sse_frames`.
+
+    `chat` = {completion_id, model, created, include_usage} renders the
+    Chat Completions dialect from the same log. A suspend PROPAGATES
+    `durable.FollowerAborted` out of the body — the connection ends without
+    a terminal frame, which is what tells the gateway (and an SDK) that the
+    answer did not end."""
+    renderer = None
+    if chat is not None:
+        renderer = durable.ChatRenderer(
+            completion_id=chat["completion_id"], model=chat["model"], created=int(chat["created"]),
+            include_usage=bool(chat["include_usage"]),
+        )
+
+    async def frames() -> AsyncIterator[str]:
+        if opener:
+            yield events.SequencedEvents().heartbeat()
+        async for frame in durable.sse_frames(handle, after=after, tagged=tagged, chat=renderer):
+            yield frame
+
+    return frames()
+
+
+class _FollowStream(StreamingResponse):
+    """A durable run's SSE response. The run is not this response's to
+    cancel: a client that leaves only removes its reader (the orphan grace
+    then runs), so nothing here closes more than the follower."""
+
+    def __init__(self, frames: AsyncIterator[str]) -> None:
+        super().__init__(frames, media_type="text/event-stream", headers=streaming.SSE_HEADERS)
+
+
+def _chat_render_args(
+    *, response_id: str, model: str, created: int, include_usage: bool
+) -> Dict[str, Any]:
+    return {
+        "completion_id": _completion_id(response_id), "model": model, "created": int(created),
+        "include_usage": bool(include_usage),
+    }
+
+
+def _durable_body(
+    outcome: streaming.StreamOutcome,
+    *,
+    chat: bool,
+    file_run: Optional[file_inputs.FileRun] = None,
+) -> Dict[str, Any]:
+    """The synchronous body of a settled durable run, in the request's
+    dialect, with the files' annotations."""
+    if not chat:
+        wire = outcome.response().to_wire()
+        return file_run.response_wire(wire, outcome.text) if file_run is not None else wire
+    body = _chat_body(
+        completion_id=_completion_id(outcome.response_id),
+        created=outcome.created_at,
+        model=outcome.model,
+        content=outcome.text,
+        finish_reason=outcome.chat_finish_reason(),
+        usage=outcome.usage_model(),
+        max_output_tokens=outcome.max_output_tokens,
+    )
+    return file_run.chat_body(body, outcome.text) if file_run is not None else body
+
+
+async def _await_durable_outcome(
+    handle: durable.Handle,
+    *,
+    held: Optional[idempotency.Claim],
+    partial: Optional[streaming.StreamOutcome] = None,
+) -> streaming.StreamOutcome:
+    """Wait for a durable run's end under a committed response. A suspend
+    becomes `_RunSuspended`; a failed run raises its error (a 5xx without an
+    Idempotency-Key says `x-should-retry: false`); a cancelled or completed
+    run returns its outcome. `partial` is filled for the failed body."""
+    try:
+        outcome = await handle.result()
+    except durable.FollowerAborted:
+        raise _RunSuspended() from None
+    if partial is not None:
+        for name in ("status", "text", "usage", "error", "ttft_ms", "duration_ms", "finish_reason", "max_output_tokens"):
+            setattr(partial, name, getattr(outcome, name))
+    if outcome.status == "failed":
+        raise _generation_failure(outcome.error or errors.model_unavailable(), held)
+    return outcome
+
+
+def _durable_failed_body(
+    exc: BaseException,
+    *,
+    spec: streaming.GenerationSpec,
+    chat: bool,
+    request_id: str,
+    outcome: Optional[streaming.StreamOutcome],
+) -> Optional[Dict[str, Any]]:
+    """`_committed_failure_body`, except for a suspend: None drops the
+    committed connection so the answer is re-attached, not reported failed."""
+    if isinstance(exc, _RunSuspended):
+        return None
+    return _committed_failure_body(exc, spec=spec, chat=chat, request_id=request_id, outcome=outcome)
+
+
+async def _run_durable_synchronous(
+    *,
+    request: Request,
+    caller: ApiCaller,
+    request_model: models.ResponsesRequest,
+    plan: planning.GenerationPlan,
+    spec: streaming.GenerationSpec,
+    outcome: streaming.StreamOutcome,
+    on_finish: streaming.OnFinish,
+    reservation: Any,
+    held: Optional[idempotency.Claim],
+    chat: bool,
+    file_run: Optional[file_inputs.FileRun] = None,
+    slot_held: bool = False,
+) -> Response:
+    """The work of a durable synchronous generation, run by
+    `CommittedJSONResponse`: the slot and the waiter place (real 429/503
+    inside the commit window), the launch, then the wait. A client that
+    leaves cancels THIS task only — the run keeps its orphan grace, so the
+    SDK's retry attaches instead of generating again."""
+    lease = None if slot_held else quotas.take_slot(caller, KIND_SYNC)
+    place: Optional[_Place] = None
+    try:
+        place = _place_for(_plan_gates(plan))
+        handle = await _launch_durable(
+            request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat, held=held,
+            reservation=reservation, on_finish=on_finish, file_run=file_run, slot=lease, place=place,
+        )
+    except BaseException:
+        if place is not None:
+            place.release()
+        if lease is not None:
+            lease.release()
+        if file_run is not None:
+            # Nothing launched, so no settle will run `wrap_finish`'s cleanup.
+            file_run.cleanup()
+        await _nothing_ran(caller, reservation, held)
+        raise
+    began = time.monotonic()
+    try:
+        finished = await _await_durable_outcome(handle, held=held, partial=outcome)
+    except asyncio.CancelledError:
+        # The client left: this task ends, the run does not (its orphan grace
+        # keeps it for the SDK's retry to attach to).
+        _note_client_gone(request, time.monotonic() - began)
+        raise
+    return JSONResponse(_durable_body(finished, chat=chat, file_run=file_run))
+
+
+async def _run_durable_synchronous_with_files(
+    *,
+    file_run: file_inputs.FileRun,
+    parsed: "_Parsed",
+    **work: Any,
+) -> Response:
+    """`_run_synchronous_with_files` for a durable run: the slot, the file
+    wait and the second plan inside the committed response, then the durable
+    launch on the final spec (its citation index travels with the spec)."""
+    caller, spec = work["caller"], work["spec"]
+    slot = contextlib.ExitStack()
+    try:
+        slot.enter_context(quotas.concurrency_slot(caller, KIND_SYNC))
+        await file_run.prepare(file_inputs.DELIVERY_SYNC, no_deadline=True)
+        plan = await _replan(parsed, caller, await file_run.planning_inputs())
+    except BaseException:
+        slot.close()
+        file_run.cleanup()
+        await _nothing_ran(caller, work["reservation"], work["held"])
+        raise
+    final = streaming.spec_from_plan(plan, response_id=spec.response_id, created_at=spec.created_at)
+    with slot:
+        return await _run_durable_synchronous(
+            **{**work, "plan": plan, "spec": final}, file_run=file_run, slot_held=True
+        )
+
+
+@contextlib.asynccontextmanager
+async def _no_router_gate(plan: planning.GenerationPlan) -> AsyncIterator[None]:
+    """The gate a durable file stream passes to `file_inputs.stream_with_files`:
+    none — the durable runner holds the plan's gates itself (`_take_gates`),
+    and holding them here too would admit the answer twice."""
+    yield
+
+
+def _durable_stream_launch(
+    request: Request,
+    caller: ApiCaller,
+    *,
+    parsed: "_Parsed",
+    request_model: models.ResponsesRequest,
+    chat: bool,
+    held: Optional[idempotency.Claim],
+    reservation: Any,
+    on_finish: streaming.OnFinish,
+    file_run: Optional[file_inputs.FileRun],
+    include_usage: bool,
+) -> Callable[[streaming.GenerationSpec], AsyncIterator[str]]:
+    """The stream launch a file stream calls with its final spec: launch
+    durably (the files' context is in the spec now), then follow the log."""
+
+    def launch(final: streaming.GenerationSpec) -> AsyncIterator[str]:
+        async def frames() -> AsyncIterator[str]:
+            assert parsed.plan is not None
+            plan = parsed.plan  # the recorder ref reads the requested ceiling only
+            try:
+                handle = await _launch_durable(
+                    request, caller, spec=final, plan=plan, request_model=request_model, chat=chat, held=held,
+                    reservation=reservation, on_finish=on_finish, file_run=file_run, slot=None, place=None,
+                )
+            except Exception as exc:  # noqa: BLE001 - after the status line, a failure is a frame
+                # The launch itself failed (the disk guard, the database): the
+                # stream's status line is long gone, so this is its terminal
+                # frame, recorded like any failure that ran nothing.
+                failure = errors.from_unexpected(exc, request_id=_request_id(request))
+                await streaming.settle(on_finish, streaming.StreamOutcome(
+                    response_id=final.response_id, model=final.model, created_at=final.created_at,
+                    status="failed", error=failure, duration_ms=0, max_output_tokens=final.planned,
+                ))
+                if file_run is not None:
+                    file_run.cleanup()
+                if chat:
+                    for frame in _chat_gate_refusal_frames(
+                        failure, completion_id=_completion_id(final.response_id), model=final.model,
+                        created=final.created_at, include_usage=include_usage,
+                    ):
+                        yield frame
+                else:
+                    emitter = events.SequencedEvents(item_id=final.item_id)
+                    yield emitter.created(streaming._wire(final, "queued"))
+                    yield emitter.failed(streaming._wire(final, "failed", error=failure))
+                return
+            chat_args = (
+                _chat_render_args(response_id=final.response_id, model=final.model, created=final.created_at,
+                                  include_usage=include_usage)
+                if chat else None
+            )
+            async for frame in _follow_frames(handle, after=0, tagged=gateway_tag(request).tagged, chat=chat_args):
+                yield frame
+
+        return frames()
+
+    return launch
+
+
+# -- attach -----------------------------------------------------------------
+
+
+async def _run_row_for(response_id: str) -> Optional[Dict[str, Any]]:
+    return await db.run_in_thread(durable_store.get_run, response_id)
+
+
+def _placeholder_spec(row: Mapping[str, Any]) -> streaming.GenerationSpec:
+    """Enough of a spec to render a failed body for a run this request did
+    not launch (an attach): ids, model, created, ceiling."""
+    ceiling = int(row.get("max_output_tokens") or 1)
+    return streaming.GenerationSpec(
+        response_id=str(row["id"]), model=str(row.get("model") or ""), messages=[], max_tokens=max(1, ceiling),
+        temperature=0.0, created_at=_row_created(row),
+    )
+
+
+async def _serve_attached(
+    request: Request,
+    handle: durable.Handle,
+    *,
+    request_model: models.ResponsesRequest,
+    chat: bool,
+    include_usage: bool,
+    after: int = 0,
+    held: Optional[idempotency.Claim] = None,
+) -> Response:
+    """Answer a request that ATTACHED to an existing run, in its own shape:
+    a stream follows from `after`, a synchronous call waits and returns the
+    body, a background request gets the 202 of the job it attached to."""
+    row = await _run_row_for(handle.id)
+    if row is None:  # pragma: no cover - attach read it a moment ago
+        raise errors.response_not_found()
+    name_run(request, response_id=handle.id)
+    tag = gateway_tag(request)
+    if request_model.stream:
+        chat_args = (
+            _chat_render_args(response_id=handle.id, model=str(row.get("model") or ""), created=_row_created(row),
+                              include_usage=include_usage)
+            if chat else None
+        )
+        return _FollowStream(_follow_frames(handle, after=after, tagged=tag.tagged, chat=chat_args, opener=True))
+    if row.get("background"):
+        return JSONResponse(status_code=202, content=_row_to_wire(row))
+    spec = _placeholder_spec(row)
+    partial = streaming.new_outcome(spec)
+    request_id = _request_id(request)
+
+    async def work() -> Response:
+        outcome = await _await_durable_outcome(handle, held=held, partial=partial)
+        return JSONResponse(_durable_body(outcome, chat=chat))
+
+    return keepalive.CommittedJSONResponse(
+        work,
+        failure_mode=keepalive.FAILURE_BODY,
+        failed_body=functools.partial(_durable_failed_body, spec=spec, chat=chat, request_id=request_id, outcome=partial),
+        request_id=request_id,
+    )
+
+
+async def _attach_gateway_attempt(
+    request: Request, caller: ApiCaller, *, chat: bool, parsed: "_Parsed"
+) -> Optional[Response]:
+    """INTERNAL ATTACH PROTOCOL step 5 (CONTRACT §19): a trusted gateway
+    re-POST of an attempt that already launched a run attaches to it when
+    the attempt token, the key and the raw body's sha256 all match. None when
+    no run carries the attempt (a first POST, or a pre-commit retry of one
+    that never arrived: launched fresh, safe because no event is ever sent
+    before its row exists). A run that exists but cannot be attached —
+    another key or body, `store: false`, events past retention — is 404, and
+    the gateway aborts its client."""
+    tag = gateway_tag(request)
+    existing = await db.run_in_thread(durable_store.find_by_attempt, caller.project_id, tag.attempt or "")
+    if existing is None:
+        return None
+    request_model = parsed.request_model
+    assert request_model is not None
+    try:
+        handle = await durable.RUNTIME.attach_attempt(existing, durable.caller_of(caller), await _body_digest(request))
+    except (durable.AttachForbidden, durable.NotStreamable):
+        raise errors.response_not_found() from None
+    return await _serve_attached(
+        request, handle, request_model=request_model, chat=chat, include_usage=parsed.include_usage,
+        after=int(tag.resume_after or 0),
+    )
+
+
+async def _attach_idempotent(
+    request: Request,
+    caller: ApiCaller,
+    held: idempotency.Claim,
+    *,
+    chat: bool,
+    parsed: "_Parsed",
+) -> Optional[Response]:
+    """CONTRACT §13: the same Idempotency-Key and body as a run that is still
+    open, or finished with its events retained, ATTACHES — a stream replays
+    from the start and tails, a synchronous call waits for the same body.
+    Only for the run's creator (the same key, or a key of its service
+    account): anyone else is `409 idempotency_conflict` with
+    `x-should-retry: false`. None hands the replay back to `_replay` (a
+    row that is not durable, or whose events have expired)."""
+    if not held.response_id:
+        return None
+    row = await _run_row_for(held.response_id)
+    if row is None or str(row.get("project_id")) != caller.project_id:
+        return None
+    if not durable.Runtime.creator_allows(row, durable.caller_of(caller)):
+        raise errors.no_retry(errors.idempotency_conflict())
+    request_model = parsed.request_model
+    assert request_model is not None
+    if not row.get("resumable"):
+        return None
+    try:
+        handle = await durable.RUNTIME.attach_row(row, durable.caller_of(caller))
+    except durable.NotStreamable:
+        return None
+    except durable.AttachForbidden:  # pragma: no cover - creator checked above
+        raise errors.no_retry(errors.idempotency_conflict()) from None
+    return await _serve_attached(
+        request, handle, request_model=request_model, chat=chat, include_usage=parsed.include_usage,
+    )
+
+
+async def _attach_implicitly(
+    request: Request, caller: ApiCaller, *, chat: bool, parsed: "_Parsed"
+) -> Optional[Response]:
+    """CONTRACT §13 implicit attach: an SDK retry (`x-stainless-retry-count`
+    ≥ 1) with no Idempotency-Key, from the same key, on the same route, with
+    the same raw body as a run that is orphaned or suspended and was created
+    within PUBLIC_API_IMPLICIT_ATTACH_WINDOW_S, attaches instead of running
+    the model a second time. A retry count of 0 or a different body launches."""
+    retry = _header_number(request, SDK_RETRY_COUNT_HEADER)
+    if not retry or retry < 1 or not caller.key_id:
+        return None
+    try:
+        handle = await durable.attach_implicit(
+            caller=durable.caller_of(caller), dialect=_dialect(chat), body_sha256=await _body_digest(request),
+            retry_count=int(retry),
+        )
+    except (durable.AttachForbidden, durable.NotStreamable):
+        return None
+    if handle is None:
+        return None
+    request_model = parsed.request_model
+    assert request_model is not None
+    with contextlib.suppress(Exception):
+        from .. import metrics
+
+        metrics.inc("public_api_implicit_attach_total", "SDK retries that attached to a running /v1 generation")
+    return await _serve_attached(
+        request, handle, request_model=request_model, chat=chat, include_usage=parsed.include_usage,
+    )
+
+
+def _stream_annotator(file_run: Optional[file_inputs.FileRun]) -> Optional[streaming.Annotator]:
+    """The `file_citation` annotations of a NON-durable file stream's answer
+    (`streaming.responses_sse(annotate=…)`); a durable stream's come from the
+    citation index stored with its spec."""
+    if file_run is None:
+        return None
+
+    def annotate(text: str) -> List[Dict[str, Any]]:
+        annotated = file_run.note_output(text)
+        return list(getattr(annotated, "annotations", None) or [])
+
+    return annotate
+
+
+def _background_follow_frames(response_id: str, *, tagged: bool) -> AsyncIterator[str]:
+    """The SSE body of `stream: true` + `background: true`: `: ping` at once
+    (the job's `response.created` is written when the dispatcher claims it),
+    then the job's log. A job that ended before it ever launched — a request
+    whose files failed while it waited — has no log; its row is rendered as
+    `response.created` + its terminal event instead of an empty stream."""
+
+    async def frames() -> AsyncIterator[str]:
+        yield events.SequencedEvents().heartbeat()
+        sent = False
+        async for frame in durable.sse_frames(durable.handle_for(response_id), after=0, tagged=tagged):
+            if gateway_protocol.is_data_frame(frame):
+                sent = True
+            yield frame
+        if not sent:
+            row = await _run_row_for(response_id)
+            if row is not None and str(row.get("status") or "") in durable_store.TERMINAL_STATUSES:
+                async for frame in _replay_frames(row, chat=False, include_usage=False):
+                    yield frame
+
+    return frames()
+
+
+def _stream_flag(value: Optional[str]) -> Optional[bool]:
+    """`?stream=` as a boolean (`true`/`false`, as both SDKs send it), None
+    when absent; anything else is a 400 naming the parameter."""
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("true", "1"):
+        return True
+    if text in ("false", "0"):
+        return False
+    raise errors.invalid_request("stream must be true or false.", param=RESUME_STREAM_PARAM)
+
+
+def _starting_after(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    text = value.strip()
+    if not text.isdigit() or len(text) > 16:
+        raise errors.invalid_request(
+            "starting_after must be a non-negative integer sequence number.", param=RESUME_AFTER_PARAM
+        )
+    return int(text)
+
+
+async def _resume_stream(response_id: str, request: Request, caller: ApiCaller) -> Response:
+    """`GET /v1/responses/{id}?stream=true[&starting_after=N]` (CONTRACT §10.3).
+
+    THE ORDER IS THE CONTRACT'S, and it is a security order:
+    1. the project-scoped lookup — another project's id, or none, is 404;
+    2. scope `responses.read` (and the browser origin);
+    3. the creator check — the run's own key, or a key of the same service
+       account — else the SAME 404, so a second key of the project cannot
+       tell a response it may not replay from one that does not exist;
+    4. streamability — `store: false`, a non-durable row, or events past
+       retention: 400, `param: stream`;
+    5. `starting_after` without `stream=true`: 400.
+    Then the events after N are replayed from the log, the run is tailed live
+    with `: ping`, and the stream closes after the terminal event (at once
+    for a finished run, whatever N)."""
+    row = await _response_row(caller, response_id)
+    await _authorize(request, caller, "get_response")
+    await _admit(request, caller, kind=KIND_READ)
+    run_row = await _run_row_for(response_id)
+    who = durable.caller_of(caller)
+    if run_row is None or not durable.Runtime.creator_allows(run_row, who):
+        raise errors.response_not_found(response_id)
+    stream = _stream_flag(request.query_params.get(RESUME_STREAM_PARAM))
+    after = _starting_after(request.query_params.get(RESUME_AFTER_PARAM))
+    if not stream:
+        if after is not None:
+            raise errors.invalid_request(
+                "starting_after is only valid with stream=true.", param=RESUME_AFTER_PARAM
+            )
+        row = await background.repair_if_orphaned(row) or row
+        return JSONResponse(_row_to_wire(row))
+    try:
+        handle = await durable.RUNTIME.attach_row(run_row, who)
+    except durable.NotStreamable:
+        raise errors.invalid_request(
+            "This response cannot be streamed: it was created with store set to false, "
+            "or its events are no longer retained.",
+            param=RESUME_STREAM_PARAM,
+        ) from None
+    except durable.AttachForbidden:  # pragma: no cover - creator checked above
+        raise errors.response_not_found(response_id) from None
+    name_run(request, response_id=response_id)
+    return _FollowStream(
+        _follow_frames(handle, after=int(after or 0), tagged=gateway_tag(request).tagged, opener=True)
+    )
 
 
 async def _response_row(caller: ApiCaller, response_id: str) -> Dict[str, Any]:
@@ -2655,6 +3610,7 @@ _CHAT_FIELDS = (
     "model",
     "messages",
     "stream",
+    "store",
     "max_tokens",
     "max_completion_tokens",
     "temperature",
@@ -2758,6 +3714,10 @@ def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]
         "input": messages,
         "stream": bool(payload.get("stream", False)),
     }
+    if "store" in payload:
+        # CONTRACT §8.2: `store` has §8.1's meaning (OpenAI's name on both
+        # dialects); validated as a strict boolean by the one validator.
+        body["store"] = payload["store"]
     ceiling = payload.get("max_tokens")
     if ceiling is None:
         ceiling = payload.get("max_completion_tokens")

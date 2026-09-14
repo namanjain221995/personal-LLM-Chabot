@@ -28,7 +28,7 @@ import binascii
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
 from typing_extensions import Annotated
 
 from ..config import settings
@@ -329,6 +329,12 @@ class ResponsesRequest(_Strict):
     instructions: Optional[str] = None
     stream: bool = False
     background: bool = False
+    #: CONTRACT §8.1 (2026-09-14): `true` (the default) makes the generation
+    #: durable — its spec and events are stored while it runs, it survives a
+    #: restart and can be resumed by `GET /v1/responses/{id}?stream=true`;
+    #: `false` opts out (cancelled on disconnect and on a restart, never
+    #: resumable). Strict: a string "false" is a 400, never a truthy value.
+    store: StrictBool = True
     #: The ceiling is per model and is checked in `resolve_max_output_tokens`,
     #: which knows which model the key resolved to. Only the floor is here.
     max_output_tokens: Optional[int] = Field(default=None, ge=1)
@@ -388,15 +394,13 @@ class ResponsesRequest(_Strict):
                 )
         return value
 
-    @model_validator(mode="after")
-    def _stream_and_background_are_exclusive(self) -> "ResponsesRequest":
-        """CONTRACT §8: both true is refused. A background response is
-        delivered by `GET /v1/responses/{id}` and a webhook; there is no
-        stream to attach to, so honouring `stream` would be a lie and
-        ignoring it would be the silent-drop failure rule 1 forbids."""
-        if self.stream and self.background:
-            raise ValueError("stream and background cannot both be true")
-        return self
+    # STREAM AND BACKGROUND TOGETHER (2026-09-14). Refused until now because
+    # a background job had no stream to attach to. Every background job is a
+    # durable run with a write-ahead event log now, so the request's
+    # connection follows that log (CONTRACT §14): the job survives the client
+    # leaving, and a broken stream resumes by §10.3. What is still refused is
+    # `background` with `store: false` — a job nobody may read back and that
+    # a restart would silently drop (`parse_responses_request`).
 
     # ---------------------------------------------------------- helpers --
 
@@ -487,6 +491,10 @@ def parse_responses_request(payload: Any) -> ResponsesRequest:
             message,
             param=_param_from_loc(chosen.get("loc") or ()),
         ) from None
+    if request.background and not request.store:
+        # OpenAI's rule too: a background response is read back later, which
+        # is exactly what `store: false` forbids keeping.
+        raise errors.invalid_request("background requires store to be true.", param="store")
     # CONTRACT §12's text rule survives the larger media body (2026-09-13).
     limit = max_body_bytes()
     if request.text_bytes() > limit:
