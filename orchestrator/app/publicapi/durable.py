@@ -432,6 +432,15 @@ def file_annotations(extra: Mapping[str, Any], text: str) -> List[Dict[str, Any]
         return []
 
 
+async def file_annotations_off_loop(extra: Mapping[str, Any], text: str) -> List[Dict[str, Any]]:
+    """`file_annotations`, on a worker thread for a long answer
+    (`streaming.ANNOTATE_OFF_LOOP_CHARS`): settling a million-token run must
+    not stall every other stream on the loop while its labels are scanned."""
+    if streaming.off_loop(text):
+        return await asyncio.to_thread(file_annotations, extra, text)
+    return file_annotations(extra, text)
+
+
 class RecordBuilder:
     """The CONTRACT §10 Responses grammar as log records. SHIM(T3): T3's
     events.to_record (with output_item/content_part events) may replace the
@@ -2470,7 +2479,7 @@ class Runtime:
                 run.item_open = True
                 records.append(run.builder.item_added())
                 records.append(run.builder.part_added())
-            annotations = file_annotations(run.extra, text)
+            annotations = await file_annotations_off_loop(run.extra, text)
             records.append(run.builder.text_done(text))
             for index, annotation in enumerate(annotations):
                 records.append(run.builder.annotation_added(index, annotation))

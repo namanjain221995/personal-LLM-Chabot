@@ -3233,8 +3233,8 @@ def _stream_annotator(file_run: Optional[file_inputs.FileRun]) -> Optional[strea
     if file_run is None:
         return None
 
-    def annotate(text: str) -> List[Dict[str, Any]]:
-        annotated = file_run.note_output(text)
+    async def annotate(text: str) -> List[Dict[str, Any]]:
+        annotated = await file_run.note_output_off_loop(text)
         return list(getattr(annotated, "annotations", None) or [])
 
     return annotate

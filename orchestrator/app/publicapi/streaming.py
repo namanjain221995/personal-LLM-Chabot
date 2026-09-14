@@ -74,7 +74,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from .. import llm
 from ..config import settings
@@ -1037,19 +1037,41 @@ settle = _settle
 
 
 #: What a stream calls with the finished text to get its `file_citation`
-#: annotations (Files design §5.6; `file_inputs.FileRun.note_output`). Never
-#: expected to raise; an empty list means none.
-Annotator = Callable[[str], Sequence[Mapping[str, Any]]]
+#: annotations (Files design §5.6; `file_inputs.FileRun.note_output_off_loop`).
+#: A plain function or a coroutine function. Never expected to raise; an
+#: empty list means none.
+Annotator = Callable[[str], Union[Sequence[Mapping[str, Any]], Awaitable[Sequence[Mapping[str, Any]]]]]
+
+#: An answer at least this long is scanned for citation labels on a worker
+#: thread, not on the event loop every other stream shares. The scan is
+#: linear, but a million-token answer is megabytes of text: measured on
+#: Python 3.11 (2026-09-14), `citations.annotate` held its thread 52-93 ms for
+#: 1 MiB and 216-314 ms for 4 MiB, a stall of every other stream on the loop.
+ANNOTATE_OFF_LOOP_CHARS = 256_000
 
 
-def annotations_for(annotate: Optional[Annotator], text: str) -> List[Dict[str, Any]]:
+def off_loop(text: Optional[str]) -> bool:
+    """Whether scanning `text` for citations belongs on a worker thread."""
+    return len(text or "") >= ANNOTATE_OFF_LOOP_CHARS
+
+
+async def annotations_for(annotate: Optional[Annotator], text: str) -> List[Dict[str, Any]]:
     """`annotate(text)`, as a list of dicts; a failure is "no annotations"
     (a citation that cannot be computed is plain text, never a failed
-    answer)."""
-    if annotate is None:
+    answer). A plain annotator runs on a worker thread for a long text; a
+    coroutine annotator decides that itself."""
+    if annotate is None or not text:
         return []
     try:
-        return [dict(a) for a in (annotate(text) or ())]
+        if inspect.iscoroutinefunction(annotate):
+            found = await annotate(text)
+        elif off_loop(text):
+            found = await asyncio.to_thread(annotate, text)
+        else:
+            found = annotate(text)
+            if inspect.isawaitable(found):
+                found = await found
+        return [dict(a) for a in (found or ())]
     except Exception:  # noqa: BLE001
         log.warning("file citations were not computed for a stream", exc_info=True)
         return []
@@ -1114,7 +1136,7 @@ async def responses_sse(
                 yield emitter.output_item_added()
                 yield emitter.content_part_added()
             yield emitter.output_text_done(text)
-            annotations = annotations_for(annotate, text)
+            annotations = await annotations_for(annotate, text)
             for index, annotation in enumerate(annotations):
                 yield emitter.annotation_added(index, annotation)
             yield emitter.content_part_done(text, annotations)
@@ -1238,7 +1260,7 @@ async def chat_completions_sse(
             yield chunks.stop(
                 chat_finish_reason(generation.finish_reason),
                 max_output_tokens=outcome.max_output_tokens,
-                annotations=annotations_for(annotate, outcome.text),
+                annotations=await annotations_for(annotate, outcome.text),
             )
             if include_usage:
                 yield chunks.usage_chunk(_completion_usage(generation.usage))
