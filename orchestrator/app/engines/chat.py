@@ -55,9 +55,39 @@ SALESFORCE_CHAT_SYSTEM = (
 )
 
 
+def _lane_messages(message: str, history: Sequence[dict]) -> List[dict]:
+    """The Fast small-talk lane's prompt (app/fast_lane.py): the persona, who
+    is being assisted, the saved facts when main.py found them in time, and
+    the last two exchanges clipped — no diagram or code rules, no grounding.
+    Only THIS prompt is short; the stored conversation is untouched."""
+    from .. import fast_lane
+    from ..facts import FACTS_HEADER
+    from ..identity import identity_line
+
+    system = ASSISTANT_SYSTEM + identity_line()
+    # main.py pins the saved-facts block as a system message; it is the one
+    # system block the lane keeps. Recall and document blocks are never
+    # assembled for a lane turn, and any other system message is dropped.
+    for m in history:
+        content = m.get("content")
+        if m.get("role") == "system" and isinstance(content, str) and content.startswith(FACTS_HEADER):
+            system = system + "\n\n" + content
+            break
+    turns = [
+        {"role": m.get("role"), "content": str(m.get("content") or "")[: fast_lane.FAST_LANE_TURN_CHARS]}
+        for m in recent_turns(
+            [m for m in history if m.get("role") != "system"],
+            fast_lane.FAST_LANE_HISTORY_TURNS * 2,
+        )
+    ]
+    return [{"role": "system", "content": system}, *turns, {"role": "user", "content": message}]
+
+
 def _messages(
-    message: str, history: Sequence[dict], mode: str, grounding: str = ""
+    message: str, history: Sequence[dict], mode: str, grounding: str = "", lane: str = ""
 ) -> List[dict]:
+    if lane:
+        return _lane_messages(message, history)
     # Salesforce-mode "chat" is greetings/small talk — a diagram would never
     # belong there, so only assistant mode carries the diagram capability.
     from ..identity import identity_line
@@ -129,8 +159,13 @@ async def run_chat_engine(
     model_choice: str = "smart",
     effort: str = "medium",
     grounding: str = "",
+    lane: str = "",
 ) -> str:
     """Stream a plain completion from the selected model; meta route=chat.
+
+    `lane` is the Fast small-talk lane's category (app/fast_lane.py) when
+    main.py sent the turn down it: a short prompt, one call of at most
+    FAST_LANE_MAX_TOKENS, thinking off (Fast), no grounding.
 
     `grounding` is the living-knowledge block (app/web_memory.py): source-backed
     passages this platform already read from the public web, plus today's date.
@@ -139,6 +174,8 @@ async def run_chat_engine(
     belong to the caller.
     """
     effort = llm.normalize_effort(effort)
+    if lane:
+        return await _run_lane(message, history, emit, model_choice=model_choice, effort=effort, lane=lane)
     # --- effort_policy (answer quality) begin ---
     # The thinking model spends a large, variable share of its budget on
     # reasoning before emitting a single answer token — a small ceiling makes
@@ -281,3 +318,41 @@ async def run_chat_engine(
         }
     await emit("meta", meta)
     return guard.shown
+
+
+async def _run_lane(
+    message: str,
+    history: Sequence[dict],
+    emit: Emit,
+    *,
+    model_choice: str,
+    effort: str,
+    lane: str,
+) -> str:
+    """One short streamed completion for a small-talk lane turn."""
+    from .. import fast_lane
+
+    async def _out(kind: str, text: str) -> None:
+        if kind == "reasoning":
+            await emit("reasoning", {"text": text})
+        else:
+            await emit("token", {"text": text})
+
+    # Segment cap == total cap: one call, no continuation seam to hold back,
+    # so every delta streams straight through. Thinking follows the effort,
+    # and the lane only admits Fast, where llm.wants_thinking is False.
+    long = await continuation.stream_long_completion(
+        _messages(message, history, "assistant", lane=lane),
+        on_delta=_out,
+        model_choice=model_choice,
+        effort=effort,
+        temperature=0.6,
+        segment_max_tokens=fast_lane.FAST_LANE_MAX_TOKENS,
+        total_max_tokens=fast_lane.FAST_LANE_MAX_TOKENS,
+        deadline_s=settings.continuation_deadline_s or None,
+    )
+    meta = {"route": "chat"}
+    if long.segment_count > 1 or long.truncated:
+        meta["continuation"] = long.as_meta()
+    await emit("meta", meta)
+    return long.text

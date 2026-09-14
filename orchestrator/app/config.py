@@ -1022,6 +1022,42 @@ class Settings:
         # retrieval while the router is still deciding instead of after it,
         # so the router's 0.216 s mean no longer sits in front of it.
         self.knowledge_fast_concurrent_retrieve: bool = _bool("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", True)
+        # --- Pre-pass latency round (2026-09-14) ----------------------------
+        # KNOWLEDGE_FAST_SPECULATIVE_SALVAGE — when the router's verdict has
+        # the speculative run's level but a different supersession rule (the
+        # router timed out: 'default' instead of 'router'), re-partition the
+        # speculative run's judged candidates under the real verdict instead
+        # of running the whole retrieval (embed, dense, lexical, merge, rank,
+        # rerank) a second time. Partition is the only verdict-dependent step
+        # after the rerank, so the result equals the recomputation.
+        self.knowledge_fast_speculative_salvage: bool = _bool("KNOWLEDGE_FAST_SPECULATIVE_SALVAGE", True)
+        # KNOWLEDGE_FAST_RERANK_WEAK_GATE — OPT-IN, default off. At Fast, skip
+        # the cross-encoder for a time-sensitive question when no candidate has
+        # dense >= 0.35 or lexical >= 0.34. Off: only the shadow counter
+        # knowledge_rerank_shadow_total{would="skip_weak"} is kept. Enabling
+        # needs production shadow counts and an owner-approved rag_eval run.
+        self.knowledge_fast_rerank_weak_gate: bool = _bool("KNOWLEDGE_FAST_RERANK_WEAK_GATE", False)
+        # KNOWLEDGE_FAST_RERANK_MAX_DOCS — OPT-IN, 0 = off. At Fast, judge at
+        # most this many passages for a time-sensitive question (top N-2 by
+        # blend + the best dense + the best lexical). Off: only the shadow
+        # counter knowledge_rerank_shadow_total{would="cap_drop"} (for 8).
+        # A gated or capped result is never written to the evidence cache.
+        self.knowledge_fast_rerank_max_docs: int = _int("KNOWLEDGE_FAST_RERANK_MAX_DOCS", 0)
+        # KNOWLEDGE_SOURCE_FLOOR — OPT-IN, default off. Drop a cited source of
+        # a short (<= 2 content stems), Latin-script question that the
+        # cross-encoder called relevant but that has neither lexical >= 0.34
+        # nor dense >= 0.35. Off: only knowledge_source_floor_total{would="drop"}.
+        self.knowledge_source_floor: bool = _bool("KNOWLEDGE_SOURCE_FLOOR", False)
+        # KNOWLEDGE_PLEASANTRY_RULE — a message made only of greeting, thanks,
+        # farewell or laughter words (closed token set, no digits, no
+        # non-Latin letters, previous turn answered) is served static_model:
+        # no router, no retrieval, no sources, and resolve_from_history does
+        # not glue the previous question onto it.
+        self.knowledge_pleasantry_rule: bool = _bool("KNOWLEDGE_PLEASANTRY_RULE", True)
+        # MESSAGE_BACKFILL_DELAY_S — how long the background message-embedding
+        # backfill waits before its batch embed, so it lands after the turn's
+        # own query embed and rerank instead of beside them.
+        self.message_backfill_delay_s: float = _float("MESSAGE_BACKFILL_DELAY_S", 3.0)
         self.knowledge_local_first_confidence: float = _float("KNOWLEDGE_LOCAL_FIRST_CONFIDENCE", 0.85)
         # Public-scope evidence cache: normalised question -> ranked evidence,
         # for a few seconds. Holds ONLY public web evidence (no user or

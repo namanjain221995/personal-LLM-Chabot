@@ -253,6 +253,19 @@ FIRST_VISIBLE_KINDS = frozenset({"reasoning", "status", "answer"})
 KNOWLEDGE_DECISIONS = frozenset({
     "static_model", "static_topical", "degraded_busy", "local",
     "stale_offline", "escalate_search", "fast_lookup", "fast_lookup_failed",
+    # main.py's Fast small-talk lane (app/fast_lane.py): no pre-pass at all.
+    "small_talk_lane",
+})
+
+#: app/fast_lane.py's vocabulary, for fast_lane_total. Literal here so this
+#: module imports nothing; tests/test_fast_lane_classifier.py pins the two
+#: lists together.
+FAST_LANE_RESULTS = frozenset({"entered", "vetoed"})
+FAST_LANE_CATEGORIES = frozenset({"greeting", "thanks", "farewell", "laughter", "emoji", "none"})
+FAST_LANE_VETOES = frozenset({
+    "none", "disabled", "not_fast", "not_assistant", "too_long", "digit", "url",
+    "attachment", "flags", "sf", "artifact_intent", "live_signal", "cue",
+    "unanswered_previous", "pending_offer", "not_lexicon",
 })
 
 #: How a timed step ended. `deadline` is a budget that fired and the turn went
@@ -311,6 +324,11 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     "fast_adaptive_thinking_total": {
         "decision": {"think", "direct"},
         "reason": set(_effort_policy.REASONS),
+    },
+    "fast_lane_total": {
+        "result": set(FAST_LANE_RESULTS),
+        "category": set(FAST_LANE_CATEGORIES),
+        "veto": set(FAST_LANE_VETOES),
     },
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)

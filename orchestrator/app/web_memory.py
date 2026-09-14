@@ -1463,6 +1463,10 @@ async def retrieve(
     by_key = await _run_cpu(_merge_candidates, query, dense_hits, lexical_rows)
 
     if not by_key:
+        if not cache_store:
+            # Nothing to judge: the salvage in living_knowledge.prepare may
+            # re-partition this (empty) list under the real verdict.
+            out._judged = []  # type: ignore[attr-defined]
         return out
 
     # One trip to PostgreSQL fills in truthful timestamps, authority and
@@ -1501,8 +1505,14 @@ async def retrieve(
     # Scoring tokenises title + 4,000 chars per candidate and the duplicate
     # collapse shingles every passage: off the loop too (plan item 3b).
     ranked = await _run_cpu(_rank_candidates, query, candidates, level)
+    #: Set by _answerability when an opt-in Fast rerank limit left part of the
+    #: head unjudged. The cache key has no effort, so such a result must never
+    #: be served to a later Think or Max turn as a fully judged one.
+    fast_limits: Set[str] = set()
     if settings.knowledge_rerank:
-        ranked, out.degraded = await _answerability(query, ranked, level=level, effort=effort)
+        ranked, out.degraded = await _answerability(
+            query, ranked, level=level, effort=effort, limits=fast_limits
+        )
     if verdict is None:
         # The freshness verdict's REASON decides whether supersession may run
         # at all (see supersession_allowed); a caller that has one passes it,
@@ -1516,10 +1526,19 @@ async def retrieve(
     out.superseded = superseded[:3]
     out.conflict = conflict
     out.newest_age = min((e.age_seconds for e in out.evidence), default=float("inf"))
+    if fast_limits:
+        out._no_cache = True  # type: ignore[attr-defined]
+    if not cache_store:
+        # The judged list, before the verdict-dependent partition, for a
+        # speculative caller whose real verdict may partition differently
+        # (living_knowledge.prepare -> repartition). Not a dataclass field:
+        # never copied by the cache, never serialised, and only ever set on a
+        # result that is not cached here.
+        out._judged = ranked  # type: ignore[attr-defined]
     # Cache only a judged, non-empty result: a miss is cheap to repeat and
     # would otherwise hide pages the indexer adds within the TTL; a degraded
     # verdict must never be served as a judged one.
-    if cache_store and out.evidence and not out.degraded:
+    if cache_store and out.evidence and not out.degraded and not fast_limits:
         _cache_put(cache_key, out)
 
     # Demand signal for the refresh scheduler. Fire-and-forget: a counter must
@@ -1536,9 +1555,41 @@ async def retrieve(
 def cache_result(query: str, *, level: Freshness, top_k: int, result: Retrieval) -> None:
     """Store a retrieval computed with `cache_store=False` once its verdict is
     known to be the real one, under the rule `retrieve` applies to its own:
-    only a judged, non-empty result."""
-    if result.evidence and not result.degraded:
+    only a judged, non-empty result, and never one an opt-in Fast rerank
+    limit left partly unjudged."""
+    if result.evidence and not result.degraded and not getattr(result, "_no_cache", False):
         _cache_put(_cache_key(query, level, top_k), result)
+
+
+def repartition(result: Retrieval, level: Freshness, verdict: Optional[Any], top_k: int) -> Retrieval:
+    """A speculative retrieval's judged candidates, partitioned under the
+    REAL verdict (living_knowledge.prepare's salvage, 2026-09-14).
+
+    `retrieve` reads the verdict for one thing only: `_partition`, after the
+    rerank. So partitioning the same judged list again under another verdict
+    gives what running the whole retrieval again would give, without the
+    second embed, dense scan, lexical query, merge, rank and rerank.
+
+    The result is built from COPIES of the judged items (as `_cache_get`
+    hands out copies): prepare filters evidence and the search path trims
+    `text`, and neither may edit the list another reader holds. Requires a
+    result `retrieve` returned with `cache_store=False` (it carries
+    `_judged`); the caller falls back to a full retrieve otherwise.
+    """
+    judged = [replace(e) for e in getattr(result, "_judged")]
+    kept, superseded, conflict = _partition(judged, level, verdict=verdict)
+    out = Retrieval(
+        query=result.query,
+        freshness=level,
+        evidence=kept[:top_k],
+        superseded=superseded[:3],
+        conflict=conflict,
+        degraded=result.degraded,
+    )
+    out.newest_age = min((e.age_seconds for e in out.evidence), default=float("inf"))
+    if getattr(result, "_no_cache", False):
+        out._no_cache = True  # type: ignore[attr-defined]
+    return out
 
 
 def _rerank_text(ev: Evidence) -> str:
@@ -1590,8 +1641,36 @@ def _degraded_reason(exc: Exception) -> str:
     return "rerank_error"
 
 
+#: The Fast rerank limits measured in shadow (2026-09-14): the candidate
+#: floors of the weak-candidate gate, and the cap the shadow counter
+#: evaluates while KNOWLEDGE_FAST_RERANK_MAX_DOCS is 0.
+_WEAK_DENSE = 0.35
+_WEAK_LEXICAL = 0.34
+_SHADOW_CAP_DOCS = 8
+
+
+def _fast_cap(ranked: List[Evidence], cap: int) -> List[Evidence]:
+    """The capped judged set: the top `cap - 2` by blend, then the best
+    dense and the best lexical candidate not already in it."""
+    picked = list(ranked[: max(1, cap - 2)])
+    seen = {id(e) for e in picked}
+    for key in ("dense", "lexical"):
+        for e in sorted(ranked, key=lambda x: getattr(x, key), reverse=True):
+            if id(e) in seen or getattr(e, key) <= 0:
+                continue
+            picked.append(e)
+            seen.add(id(e))
+            break
+    return picked
+
+
 async def _answerability(
-    query: str, ranked: List[Evidence], *, level: Freshness, effort: str
+    query: str,
+    ranked: List[Evidence],
+    *,
+    level: Freshness,
+    effort: str,
+    limits: Optional[Set[str]] = None,
 ) -> Tuple[List[Evidence], str]:
     """Judge the top hybrid candidates: does each one ANSWER the question?
 
@@ -1610,7 +1689,25 @@ async def _answerability(
     pre-gate finds a candidate at all (most timeless questions have none and
     pay nothing), and then at most 8 passages; a time-sensitive one at most
     `knowledge_rerank_candidates` (12 ≈ 95 ms measured).
+
+    FAST SHADOW LIMITS (2026-09-14, default off). For a time-sensitive
+    question at Fast two cheaper rules are COUNTED on
+    knowledge_rerank_shadow_total without changing anything: `skip_weak`
+    (no candidate has dense >= 0.35 or lexical >= 0.34) and `cap_drop` (a
+    relevant passage lies outside an 8-passage cap). With
+    KNOWLEDGE_FAST_RERANK_WEAK_GATE / KNOWLEDGE_FAST_RERANK_MAX_DOCS set they
+    apply, and `limits` (the caller's set) is filled so the result is never
+    cached: the cache key carries no effort.
     """
+    fast_shadow = (effort or "fast") == "fast" and level is not Freshness.STATIC
+    if fast_shadow and ranked and not any(
+        e.dense >= _WEAK_DENSE or e.lexical >= _WEAK_LEXICAL for e in ranked
+    ):
+        metrics.inc("knowledge_rerank_shadow_total", would="skip_weak")
+        if getattr(settings, "knowledge_fast_rerank_weak_gate", False):
+            if limits is not None:
+                limits.add("weak_gate")
+            return ranked, ""
     if level is Freshness.STATIC:
         pre = [e for e in ranked if e.dense >= 0.35 and e.lexical >= 0.34]
         if not pre:
@@ -1629,6 +1726,19 @@ async def _answerability(
             if id(e) not in seen and getattr(e, key) > 0:
                 head.append(e)
                 seen.add(id(e))
+    shadow_cap: Optional[List[Evidence]] = None
+    max_docs = int(getattr(settings, "knowledge_fast_rerank_max_docs", 0) or 0) if fast_shadow else 0
+    # The cap chooses among the head only, in blend order.
+    in_blend_order = [e for e in ranked if id(e) in seen] if (max_docs > 0 or fast_shadow) else []
+    if max_docs > 0 and len(head) > max_docs:
+        capped = _fast_cap(in_blend_order, max_docs)
+        if len(capped) < len(head):
+            head = capped
+            seen = {id(e) for e in head}
+            if limits is not None:
+                limits.add("rerank_cap")
+    elif fast_shadow and len(head) > _SHADOW_CAP_DOCS:
+        shadow_cap = _fast_cap(in_blend_order, _SHADOW_CAP_DOCS)
     tail = [e for e in ranked if id(e) not in seen]
     if not head:
         return ranked, ""
@@ -1657,6 +1767,10 @@ async def _answerability(
     for ev, prob in zip(head, scores):
         ev.answer = max(0.0, min(1.0, float(prob)))
         ev.score = 0.7 * ev.answer + 0.3 * ev.score
+    if shadow_cap is not None:
+        inside = {id(e) for e in shadow_cap}
+        if any(id(e) not in inside and e.answer >= _relevant_threshold() for e in head):
+            metrics.inc("knowledge_rerank_shadow_total", would="cap_drop")
     head.sort(key=lambda e: e.score, reverse=True)
     return head + tail, ""
 

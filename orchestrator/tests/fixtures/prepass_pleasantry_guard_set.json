@@ -1,0 +1,1650 @@
+{
+ "_README": "Self-written labelled set for the pleasantry rule (living_knowledge Rule 1) and the Fast lane, 2026-09-14. Derived from scratchpad fast1s/map-quality-guard/fast_lane_guard_set.json (190 items, no production messages), re-labelled so every acknowledgement (ok, got it, sounds good, noted, 👍, 🙏 alone, theek hai, accha) is FULL_PATH this round, plus near misses. expected=FAST_LANE means the message needs no retrieval; Rule 1 may still leave it to the full path (its token set is narrower). expected=FULL_PATH must NEVER be a pleasantry.",
+ "counts": {
+  "total": 205,
+  "FAST_LANE": 73,
+  "FULL_PATH": 132
+ },
+ "items": [
+  {
+   "id": "q001",
+   "text": "hi",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q002",
+   "text": "hello",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q003",
+   "text": "hey there",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q004",
+   "text": "hi ??",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q005",
+   "text": "good morning",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q006",
+   "text": "hiya!",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q007",
+   "text": "hello!!",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q008",
+   "text": "hey 👋",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q009",
+   "text": "yo",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q010",
+   "text": "hello?",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q011",
+   "text": "hi techsara",
+   "category": "greeting",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q012",
+   "text": "thanks",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q013",
+   "text": "thank you so much!",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q014",
+   "text": "thx",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q015",
+   "text": "ty",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q016",
+   "text": "much appreciated",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q017",
+   "text": "cheers mate",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q018",
+   "text": "thanks a lot 🙏",
+   "category": "thanks",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q019",
+   "text": "ok",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q020",
+   "text": "okay cool",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q021",
+   "text": "got it",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q022",
+   "text": "sounds good",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q023",
+   "text": "perfect 👍",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q024",
+   "text": "alright",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q025",
+   "text": "noted",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q026",
+   "text": "k thx",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q027",
+   "text": "nice",
+   "category": "ack_full_path_this_round",
+   "lang": "en",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q028",
+   "text": "lol",
+   "category": "laughter",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q029",
+   "text": "haha",
+   "category": "laughter",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q030",
+   "text": "hahaha that's funny",
+   "category": "laughter",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q031",
+   "text": "lmao",
+   "category": "laughter",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q032",
+   "text": "😂😂",
+   "category": "laughter",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q033",
+   "text": "👍",
+   "category": "ack_full_path_this_round",
+   "lang": "none",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q034",
+   "text": "🙏",
+   "category": "ack_full_path_this_round",
+   "lang": "none",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q035",
+   "text": "❤️",
+   "category": "emoji_only",
+   "lang": "none",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q036",
+   "text": "😊",
+   "category": "emoji_only",
+   "lang": "none",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q037",
+   "text": "👋👋",
+   "category": "emoji_only",
+   "lang": "none",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q038",
+   "text": "bye",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q039",
+   "text": "see you later",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q040",
+   "text": "good night!",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q041",
+   "text": "take care",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q042",
+   "text": "ttyl",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q043",
+   "text": "thanks, bye!",
+   "category": "farewell",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q044",
+   "text": "how are you?",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q045",
+   "text": "how's it going",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q046",
+   "text": "what's up",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q047",
+   "text": "nice to meet you",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q048",
+   "text": "you're awesome",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q049",
+   "text": "i'm good, you?",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q050",
+   "text": "are you there?",
+   "category": "chit_chat",
+   "lang": "en",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q051",
+   "text": "namaste",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q052",
+   "text": "namaste ji",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q053",
+   "text": "kaise ho?",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q054",
+   "text": "dhanyavaad",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q055",
+   "text": "shukriya",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q056",
+   "text": "theek hai",
+   "category": "ack_full_path_this_round",
+   "lang": "hi-Latn",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q057",
+   "text": "accha",
+   "category": "ack_full_path_this_round",
+   "lang": "hi-Latn",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q058",
+   "text": "alvida",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q059",
+   "text": "suprabhat",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q060",
+   "text": "haan ji theek hai",
+   "category": "ack_full_path_this_round",
+   "lang": "hi-Latn",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q061",
+   "text": "bahut badhiya",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q062",
+   "text": "नमस्ते",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q063",
+   "text": "धन्यवाद",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q064",
+   "text": "शुक्रिया",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q065",
+   "text": "आप कैसे हैं?",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q066",
+   "text": "ठीक है",
+   "category": "ack_full_path_this_round",
+   "lang": "hi-Deva",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q067",
+   "text": "शुभ रात्रि",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q068",
+   "text": "अच्छा",
+   "category": "ack_full_path_this_round",
+   "lang": "hi-Deva",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q069",
+   "text": "हाहा",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hi-Deva",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q070",
+   "text": "kem cho",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q071",
+   "text": "majama",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q072",
+   "text": "aabhar",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q073",
+   "text": "saru",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q074",
+   "text": "aavjo",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q075",
+   "text": "jai shree krishna",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q076",
+   "text": "kem cho, majama?",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Latn",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q077",
+   "text": "કેમ છો?",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q078",
+   "text": "આભાર",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q079",
+   "text": "મજામાં",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q080",
+   "text": "આવજો",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q081",
+   "text": "સરસ",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q082",
+   "text": "જય શ્રી કૃષ્ણ",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "gu-Gujr",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q083",
+   "text": "thanks bhai",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q084",
+   "text": "ok ji",
+   "category": "ack_full_path_this_round",
+   "lang": "hinglish",
+   "why": "acknowledgements answer offers ('Shall I check today's gold rate?'); full path this round",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q085",
+   "text": "hello bhai kaise ho",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q086",
+   "text": "arre wah, mast",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q087",
+   "text": "thank you ji 🙏",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q088",
+   "text": "chalo bye",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q089",
+   "text": "haha sahi hai",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q090",
+   "text": "good morning ji",
+   "category": "greeting_thanks_chit_chat",
+   "lang": "hinglish",
+   "why": "",
+   "expected": "FAST_LANE"
+  },
+  {
+   "id": "q091",
+   "text": "hi, what's the weather in Ahmedabad?",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q092",
+   "text": "hello can you explain GST input credit",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q093",
+   "text": "hey, is AWS down?",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q094",
+   "text": "good morning! what's the sensex at",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q095",
+   "text": "thanks, and what about Tesla?",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q096",
+   "text": "hi 👋 summarize the pdf I uploaded",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q097",
+   "text": "hello, who is the CM of Gujarat",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q098",
+   "text": "thanks! can you make that a table?",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q099",
+   "text": "hi, I'm Ravi from the finance team",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q100",
+   "text": "bye, and email me the report",
+   "category": "greeting_plus_question",
+   "lang": "en",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q101",
+   "text": "namaste, aaj sone ka bhav kya hai?",
+   "category": "greeting_plus_question",
+   "lang": "hi-Latn",
+   "why": "live value after a greeting",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q102",
+   "text": "kem cho, aaje petrol no bhav shu che?",
+   "category": "greeting_plus_question",
+   "lang": "gu-Latn",
+   "why": "live value after a greeting",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q103",
+   "text": "bitcoin price",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q104",
+   "text": "weather today",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q105",
+   "text": "india vs pakistan score",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q106",
+   "text": "latest news",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q107",
+   "text": "what's today's date",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q108",
+   "text": "usd to inr",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q109",
+   "text": "gold rate",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q110",
+   "text": "sensex",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q111",
+   "text": "is it raining in mumbai",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q112",
+   "text": "who won yesterday",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q113",
+   "text": "HI sales tax rate",
+   "category": "live_value",
+   "lang": "en",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q114",
+   "text": "nifty kaisa hai aaj",
+   "category": "live_value",
+   "lang": "hinglish",
+   "why": "live value in Hinglish",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q115",
+   "text": "petrol ka rate kitna hai delhi mein",
+   "category": "live_value",
+   "lang": "hinglish",
+   "why": "live value in Hinglish",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q116",
+   "text": "and the second one?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q117",
+   "text": "why",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q118",
+   "text": "why?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q119",
+   "text": "how so?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q120",
+   "text": "what about the other one",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q121",
+   "text": "tell me more",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q122",
+   "text": "go on",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q123",
+   "text": "can you elaborate",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q124",
+   "text": "and in 2025?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q125",
+   "text": "same for Pune",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q126",
+   "text": "??",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q127",
+   "text": "🤔?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q128",
+   "text": "lol what",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q129",
+   "text": "ok but why?",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q130",
+   "text": "nice, now do the same for 2024",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q131",
+   "text": "thanks for nothing, that answer was wrong",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q132",
+   "text": "😂 that's wrong, the capital is Canberra",
+   "category": "follow_up",
+   "lang": "en",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q133",
+   "text": "aur?",
+   "category": "follow_up",
+   "lang": "hi-Latn",
+   "why": "Hindi follow-up to earlier turns",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q134",
+   "text": "kyu?",
+   "category": "follow_up",
+   "lang": "hi-Latn",
+   "why": "Hindi follow-up to earlier turns",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q135",
+   "text": "aur detail mein batao",
+   "category": "follow_up",
+   "lang": "hi-Latn",
+   "why": "Hindi follow-up to earlier turns",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q136",
+   "text": "biju shu?",
+   "category": "follow_up",
+   "lang": "gu-Latn",
+   "why": "Gujarati follow-up to earlier turns",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q137",
+   "text": "kem?",
+   "category": "follow_up",
+   "lang": "gu-Latn",
+   "why": "Gujarati follow-up to earlier turns",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q138",
+   "text": "yes",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q139",
+   "text": "no",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q140",
+   "text": "go ahead",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q141",
+   "text": "do it",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q142",
+   "text": "yes please",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q143",
+   "text": "the first one",
+   "category": "answer_to_assistant_question",
+   "lang": "en",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q144",
+   "text": "haan kar do",
+   "category": "answer_to_assistant_question",
+   "lang": "hinglish",
+   "why": "answers the assistant's last question",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q145",
+   "text": "nahi, doosra wala",
+   "category": "answer_to_assistant_question",
+   "lang": "hinglish",
+   "why": "answers the assistant's last question",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q146",
+   "text": "summarize the file",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q147",
+   "text": "what's in my upload",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q148",
+   "text": "what did the pdf say about penalties",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q149",
+   "text": "remember my name is Ravi",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q150",
+   "text": "what do you remember about me",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q151",
+   "text": "forget that",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q152",
+   "text": "show my open opportunities",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q153",
+   "text": "salesforce accounts in pune",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q154",
+   "text": "my last invoice",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q155",
+   "text": "what did I ask you yesterday",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q156",
+   "text": "what happens at 12:30 in the video",
+   "category": "uploads_memory_salesforce",
+   "lang": "en",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q157",
+   "text": "inflation",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q158",
+   "text": "GST",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q159",
+   "text": "AAPL",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q160",
+   "text": "photosynthesis",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q161",
+   "text": "Kubernetes",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q162",
+   "text": "RBI",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q163",
+   "text": "Modi",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q164",
+   "text": "IPL",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q165",
+   "text": "vLLM",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q166",
+   "text": "Ahmedabad",
+   "category": "one_word_topic",
+   "lang": "en",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q167",
+   "text": "summarize",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q168",
+   "text": "translate this",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q169",
+   "text": "translate to hindi",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q170",
+   "text": "make it shorter",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q171",
+   "text": "rewrite",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q172",
+   "text": "explain",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q173",
+   "text": "continue",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q174",
+   "text": "make a pdf of this",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q175",
+   "text": "create a chart",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q176",
+   "text": "fix it",
+   "category": "command",
+   "lang": "en",
+   "why": "an instruction acting on earlier content or asking for an artifact",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q177",
+   "text": "भारत के प्रधानमंत्री कौन हैं?",
+   "category": "question",
+   "lang": "hi-Deva",
+   "why": "a real question/request in Hindi (Devanagari)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q178",
+   "text": "आज मौसम कैसा है?",
+   "category": "question",
+   "lang": "hi-Deva",
+   "why": "a real question/request in Hindi (Devanagari)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q179",
+   "text": "GST क्या है?",
+   "category": "question",
+   "lang": "hi-Deva",
+   "why": "a real question/request in Hindi (Devanagari)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q180",
+   "text": "मुझे एक ईमेल लिखो",
+   "category": "question",
+   "lang": "hi-Deva",
+   "why": "a real question/request in Hindi (Devanagari)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q181",
+   "text": "ગુજરાતના મુખ્યમંત્રી કોણ છે?",
+   "category": "question",
+   "lang": "gu-Gujr",
+   "why": "a real question/request in Gujarati script",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q182",
+   "text": "આજે સોનાનો ભાવ શું છે?",
+   "category": "question",
+   "lang": "gu-Gujr",
+   "why": "a real question/request in Gujarati script",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q183",
+   "text": "મને પાયથન શીખવો",
+   "category": "question",
+   "lang": "gu-Gujr",
+   "why": "a real question/request in Gujarati script",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q184",
+   "text": "bharat ki rajdhani kya hai?",
+   "category": "question",
+   "lang": "hi-Latn",
+   "why": "a real question/request in Hindi (Latin)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q185",
+   "text": "mujhe resume banana hai",
+   "category": "question",
+   "lang": "hi-Latn",
+   "why": "a real question/request in Hindi (Latin)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q186",
+   "text": "sone ka bhav kya hai",
+   "category": "question",
+   "lang": "hi-Latn",
+   "why": "a real question/request in Hindi (Latin)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q187",
+   "text": "aaje hawaman kevu che?",
+   "category": "question",
+   "lang": "gu-Latn",
+   "why": "a real question/request in Gujarati (Latin)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q188",
+   "text": "mane excel shikhvado",
+   "category": "question",
+   "lang": "gu-Latn",
+   "why": "a real question/request in Gujarati (Latin)",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q189",
+   "text": "who are you?",
+   "category": "about_assistant",
+   "lang": "en",
+   "why": "conservative: a real question; answerable from the persona but kept on the full path",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "q190",
+   "text": "what can you do?",
+   "category": "about_assistant",
+   "lang": "en",
+   "why": "conservative: a real question; answerable from the persona but kept on the full path",
+   "expected": "FULL_PATH"
+  },
+  {
+   "id": "p191",
+   "text": "again",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "a bare 'again' is a regenerate command"
+  },
+  {
+   "id": "p192",
+   "text": "a lot",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "answers a question ('how much did it help?')"
+  },
+  {
+   "id": "p193",
+   "text": "so much",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "answers a question"
+  },
+  {
+   "id": "p194",
+   "text": "there",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "not a greeting on its own"
+  },
+  {
+   "id": "p195",
+   "text": "okay",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "answers an offer"
+  },
+  {
+   "id": "p196",
+   "text": "cool",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "answers an offer"
+  },
+  {
+   "id": "p197",
+   "text": "lol?",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "confusion or sarcasm, not laughter"
+  },
+  {
+   "id": "p198",
+   "text": "thanks?",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "confusion or sarcasm"
+  },
+  {
+   "id": "p199",
+   "text": "hi hi is the market open",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "greeting plus a live-value question"
+  },
+  {
+   "id": "p200",
+   "text": "hello, what is the dollar rate",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "greeting plus a live-value question"
+  },
+  {
+   "id": "p201",
+   "text": "HI sales tax",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "the state abbreviation, not a greeting"
+  },
+  {
+   "id": "p202",
+   "text": "hi claude can you check aws status",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "greeting plus a live-status request"
+  },
+  {
+   "id": "p203",
+   "text": "you there",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "no greeting, thanks, farewell or laughter anchor"
+  },
+  {
+   "id": "p204",
+   "text": "good",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "no anchor"
+  },
+  {
+   "id": "p205",
+   "text": "see",
+   "expected": "FULL_PATH",
+   "category": "near_miss_added_prepass",
+   "lang": "en",
+   "why": "no anchor"
+  }
+ ]
+}

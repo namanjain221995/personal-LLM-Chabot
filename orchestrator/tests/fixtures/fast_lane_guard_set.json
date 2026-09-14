@@ -1,0 +1,1972 @@
+{
+ "_README": "Hand-written labelled set for the Fast small-talk lane (app/fast_lane.py). Derived from the 2026-09-14 map-quality-guard set (190 self-written items) and re-labelled for this round: every acknowledgement is FULL_PATH (category ack_full_path_this_round), pleasantries outside the closed lexicon are FULL_PATH (not_in_lexicon_this_round), and near-misses were added (x###). FAST_LANE items carry `lane_category`, the category the lane must report. No production messages.",
+ "counts": {
+  "total": 212,
+  "FAST_LANE": 54,
+  "FULL_PATH": 158
+ },
+ "items": [
+  {
+   "id": "q001",
+   "text": "hi",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q002",
+   "text": "hello",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q003",
+   "text": "hey there",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q004",
+   "text": "hi ??",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q005",
+   "text": "good morning",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q006",
+   "text": "hiya!",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q007",
+   "text": "hello!!",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q008",
+   "text": "hey 👋",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q009",
+   "text": "yo",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q010",
+   "text": "hello?",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q011",
+   "text": "hi techsara",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q012",
+   "text": "thanks",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "thanks",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q013",
+   "text": "thank you so much!",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "thanks",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q014",
+   "text": "thx",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "thanks",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q015",
+   "text": "ty",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q016",
+   "text": "much appreciated",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "thanks",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q017",
+   "text": "cheers mate",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q018",
+   "text": "thanks a lot 🙏",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "thanks",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q019",
+   "text": "ok",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q020",
+   "text": "okay cool",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q021",
+   "text": "got it",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q022",
+   "text": "sounds good",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q023",
+   "text": "perfect 👍",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q024",
+   "text": "alright",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q025",
+   "text": "noted",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q026",
+   "text": "k thx",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q027",
+   "text": "nice",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q028",
+   "text": "lol",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "laughter",
+   "lane_category": "laughter",
+   "why": ""
+  },
+  {
+   "id": "q029",
+   "text": "haha",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "laughter",
+   "lane_category": "laughter",
+   "why": ""
+  },
+  {
+   "id": "q030",
+   "text": "hahaha that's funny",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q031",
+   "text": "lmao",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "laughter",
+   "lane_category": "laughter",
+   "why": ""
+  },
+  {
+   "id": "q032",
+   "text": "😂😂",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "laughter",
+   "lane_category": "emoji",
+   "why": ""
+  },
+  {
+   "id": "q033",
+   "text": "👍",
+   "lang": "none",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q034",
+   "text": "🙏",
+   "lang": "none",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q035",
+   "text": "❤️",
+   "lang": "none",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "emoji_only",
+   "lane_category": "emoji",
+   "why": ""
+  },
+  {
+   "id": "q036",
+   "text": "😊",
+   "lang": "none",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "emoji_only",
+   "lane_category": "emoji",
+   "why": ""
+  },
+  {
+   "id": "q037",
+   "text": "👋👋",
+   "lang": "none",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "emoji_only",
+   "lane_category": "emoji",
+   "why": ""
+  },
+  {
+   "id": "q038",
+   "text": "bye",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "farewell",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q039",
+   "text": "see you later",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "farewell",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q040",
+   "text": "good night!",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "farewell",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q041",
+   "text": "take care",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "farewell",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q042",
+   "text": "ttyl",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "farewell",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q043",
+   "text": "thanks, bye!",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q044",
+   "text": "how are you?",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q045",
+   "text": "how's it going",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q046",
+   "text": "what's up",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q047",
+   "text": "nice to meet you",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q048",
+   "text": "you're awesome",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q049",
+   "text": "i'm good, you?",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q050",
+   "text": "are you there?",
+   "lang": "en",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q051",
+   "text": "namaste",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q052",
+   "text": "namaste ji",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q053",
+   "text": "kaise ho?",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q054",
+   "text": "dhanyavaad",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q055",
+   "text": "shukriya",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q056",
+   "text": "theek hai",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q057",
+   "text": "accha",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q058",
+   "text": "alvida",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q059",
+   "text": "suprabhat",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q060",
+   "text": "haan ji theek hai",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q061",
+   "text": "bahut badhiya",
+   "lang": "hi-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q062",
+   "text": "नमस्ते",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q063",
+   "text": "धन्यवाद",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q064",
+   "text": "शुक्रिया",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q065",
+   "text": "आप कैसे हैं?",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q066",
+   "text": "ठीक है",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q067",
+   "text": "शुभ रात्रि",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q068",
+   "text": "अच्छा",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q069",
+   "text": "हाहा",
+   "lang": "hi-Deva",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "laughter",
+   "why": ""
+  },
+  {
+   "id": "q070",
+   "text": "kem cho",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q071",
+   "text": "majama",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q072",
+   "text": "aabhar",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q073",
+   "text": "saru",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q074",
+   "text": "aavjo",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q075",
+   "text": "jai shree krishna",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q076",
+   "text": "kem cho, majama?",
+   "lang": "gu-Latn",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q077",
+   "text": "કેમ છો?",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q078",
+   "text": "આભાર",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q079",
+   "text": "મજામાં",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q080",
+   "text": "આવજો",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "farewell",
+   "why": ""
+  },
+  {
+   "id": "q081",
+   "text": "સરસ",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q082",
+   "text": "જય શ્રી કૃષ્ણ",
+   "lang": "gu-Gujr",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q083",
+   "text": "thanks bhai",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q084",
+   "text": "ok ji",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q085",
+   "text": "hello bhai kaise ho",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q086",
+   "text": "arre wah, mast",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "ack_full_path_this_round",
+   "why": "an acknowledgement or an answer to an offer: needs the full path and an uncapped answer this round"
+  },
+  {
+   "id": "q087",
+   "text": "thank you ji 🙏",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "thanks",
+   "why": ""
+  },
+  {
+   "id": "q088",
+   "text": "chalo bye",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q089",
+   "text": "haha sahi hai",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FULL_PATH",
+   "category": "not_in_lexicon_this_round",
+   "why": "a pleasantry the closed lexicon does not list; a miss costs only latency"
+  },
+  {
+   "id": "q090",
+   "text": "good morning ji",
+   "lang": "hinglish",
+   "original_label": "FAST_LANE",
+   "expected": "FAST_LANE",
+   "category": "greeting_thanks_chit_chat",
+   "lane_category": "greeting",
+   "why": ""
+  },
+  {
+   "id": "q091",
+   "text": "hi, what's the weather in Ahmedabad?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q092",
+   "text": "hello can you explain GST input credit",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q093",
+   "text": "hey, is AWS down?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q094",
+   "text": "good morning! what's the sensex at",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q095",
+   "text": "thanks, and what about Tesla?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q096",
+   "text": "hi 👋 summarize the pdf I uploaded",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q097",
+   "text": "hello, who is the CM of Gujarat",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q098",
+   "text": "thanks! can you make that a table?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q099",
+   "text": "hi, I'm Ravi from the finance team",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q100",
+   "text": "bye, and email me the report",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "the greeting is a lead-in; the rest is a real request (live value, upload, follow-up, memory or artifact)"
+  },
+  {
+   "id": "q101",
+   "text": "namaste, aaj sone ka bhav kya hai?",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "live value after a greeting"
+  },
+  {
+   "id": "q102",
+   "text": "kem cho, aaje petrol no bhav shu che?",
+   "lang": "gu-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "greeting_plus_question",
+   "why": "live value after a greeting"
+  },
+  {
+   "id": "q103",
+   "text": "bitcoin price",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q104",
+   "text": "weather today",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q105",
+   "text": "india vs pakistan score",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q106",
+   "text": "latest news",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q107",
+   "text": "what's today's date",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q108",
+   "text": "usd to inr",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q109",
+   "text": "gold rate",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q110",
+   "text": "sensex",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q111",
+   "text": "is it raining in mumbai",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q112",
+   "text": "who won yesterday",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q113",
+   "text": "HI sales tax rate",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "answer changes over hours/days; must reach the freshness router and the live lookup"
+  },
+  {
+   "id": "q114",
+   "text": "nifty kaisa hai aaj",
+   "lang": "hinglish",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "live value in Hinglish"
+  },
+  {
+   "id": "q115",
+   "text": "petrol ka rate kitna hai delhi mein",
+   "lang": "hinglish",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "live_value",
+   "why": "live value in Hinglish"
+  },
+  {
+   "id": "q116",
+   "text": "and the second one?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q117",
+   "text": "why",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q118",
+   "text": "why?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q119",
+   "text": "how so?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q120",
+   "text": "what about the other one",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q121",
+   "text": "tell me more",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q122",
+   "text": "go on",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q123",
+   "text": "can you elaborate",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q124",
+   "text": "and in 2025?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q125",
+   "text": "same for Pune",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q126",
+   "text": "??",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q127",
+   "text": "🤔?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q128",
+   "text": "lol what",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q129",
+   "text": "ok but why?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q130",
+   "text": "nice, now do the same for 2024",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q131",
+   "text": "thanks for nothing, that answer was wrong",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q132",
+   "text": "😂 that's wrong, the capital is Canberra",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "refers to earlier turns: needs history-aware resolution (resolve_from_history) and the full context"
+  },
+  {
+   "id": "q133",
+   "text": "aur?",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "Hindi follow-up to earlier turns"
+  },
+  {
+   "id": "q134",
+   "text": "kyu?",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "Hindi follow-up to earlier turns"
+  },
+  {
+   "id": "q135",
+   "text": "aur detail mein batao",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "Hindi follow-up to earlier turns"
+  },
+  {
+   "id": "q136",
+   "text": "biju shu?",
+   "lang": "gu-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "Gujarati follow-up to earlier turns"
+  },
+  {
+   "id": "q137",
+   "text": "kem?",
+   "lang": "gu-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "follow_up",
+   "why": "Gujarati follow-up to earlier turns"
+  },
+  {
+   "id": "q138",
+   "text": "yes",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q139",
+   "text": "no",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q140",
+   "text": "go ahead",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q141",
+   "text": "do it",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q142",
+   "text": "yes please",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q143",
+   "text": "the first one",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "a bare yes/no/choice answers the assistant's last question (clarification, artifact offer)"
+  },
+  {
+   "id": "q144",
+   "text": "haan kar do",
+   "lang": "hinglish",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "answers the assistant's last question"
+  },
+  {
+   "id": "q145",
+   "text": "nahi, doosra wala",
+   "lang": "hinglish",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "answer_to_assistant_question",
+   "why": "answers the assistant's last question"
+  },
+  {
+   "id": "q146",
+   "text": "summarize the file",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q147",
+   "text": "what's in my upload",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q148",
+   "text": "what did the pdf say about penalties",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q149",
+   "text": "remember my name is Ravi",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q150",
+   "text": "what do you remember about me",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q151",
+   "text": "forget that",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q152",
+   "text": "show my open opportunities",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q153",
+   "text": "salesforce accounts in pune",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q154",
+   "text": "my last invoice",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q155",
+   "text": "what did I ask you yesterday",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q156",
+   "text": "what happens at 12:30 in the video",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "uploads_memory_salesforce",
+   "why": "needs uploads, documents, videos, saved facts, cross-chat memory or Salesforce data"
+  },
+  {
+   "id": "q157",
+   "text": "inflation",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q158",
+   "text": "GST",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q159",
+   "text": "AAPL",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q160",
+   "text": "photosynthesis",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q161",
+   "text": "Kubernetes",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q162",
+   "text": "RBI",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q163",
+   "text": "Modi",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q164",
+   "text": "IPL",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q165",
+   "text": "vLLM",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q166",
+   "text": "Ahmedabad",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "one_word_topic",
+   "why": "a bare topic is a question: may need evidence, the stored corpus or a live value"
+  },
+  {
+   "id": "q167",
+   "text": "summarize",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q168",
+   "text": "translate this",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q169",
+   "text": "translate to hindi",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q170",
+   "text": "make it shorter",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q171",
+   "text": "rewrite",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q172",
+   "text": "explain",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q173",
+   "text": "continue",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q174",
+   "text": "make a pdf of this",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q175",
+   "text": "create a chart",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q176",
+   "text": "fix it",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "command",
+   "why": "an instruction acting on earlier content or asking for an artifact"
+  },
+  {
+   "id": "q177",
+   "text": "भारत के प्रधानमंत्री कौन हैं?",
+   "lang": "hi-Deva",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Devanagari)"
+  },
+  {
+   "id": "q178",
+   "text": "आज मौसम कैसा है?",
+   "lang": "hi-Deva",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Devanagari)"
+  },
+  {
+   "id": "q179",
+   "text": "GST क्या है?",
+   "lang": "hi-Deva",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Devanagari)"
+  },
+  {
+   "id": "q180",
+   "text": "मुझे एक ईमेल लिखो",
+   "lang": "hi-Deva",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Devanagari)"
+  },
+  {
+   "id": "q181",
+   "text": "ગુજરાતના મુખ્યમંત્રી કોણ છે?",
+   "lang": "gu-Gujr",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Gujarati script"
+  },
+  {
+   "id": "q182",
+   "text": "આજે સોનાનો ભાવ શું છે?",
+   "lang": "gu-Gujr",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Gujarati script"
+  },
+  {
+   "id": "q183",
+   "text": "મને પાયથન શીખવો",
+   "lang": "gu-Gujr",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Gujarati script"
+  },
+  {
+   "id": "q184",
+   "text": "bharat ki rajdhani kya hai?",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Latin)"
+  },
+  {
+   "id": "q185",
+   "text": "mujhe resume banana hai",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Latin)"
+  },
+  {
+   "id": "q186",
+   "text": "sone ka bhav kya hai",
+   "lang": "hi-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Hindi (Latin)"
+  },
+  {
+   "id": "q187",
+   "text": "aaje hawaman kevu che?",
+   "lang": "gu-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Gujarati (Latin)"
+  },
+  {
+   "id": "q188",
+   "text": "mane excel shikhvado",
+   "lang": "gu-Latn",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "question",
+   "why": "a real question/request in Gujarati (Latin)"
+  },
+  {
+   "id": "q189",
+   "text": "who are you?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "about_assistant",
+   "why": "conservative: a real question; answerable from the persona but kept on the full path"
+  },
+  {
+   "id": "q190",
+   "text": "what can you do?",
+   "lang": "en",
+   "original_label": "FULL_PATH",
+   "expected": "FULL_PATH",
+   "category": "about_assistant",
+   "why": "conservative: a real question; answerable from the persona but kept on the full path"
+  },
+  {
+   "id": "x001",
+   "text": "again",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "a bare 'again' is a regenerate command"
+  },
+  {
+   "id": "x002",
+   "text": "a lot",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "answers a question ('how much did it help?')"
+  },
+  {
+   "id": "x003",
+   "text": "so much",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "answers a question"
+  },
+  {
+   "id": "x004",
+   "text": "there",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "not a greeting on its own"
+  },
+  {
+   "id": "x005",
+   "text": "ok",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "accepts the assistant's last offer"
+  },
+  {
+   "id": "x006",
+   "text": "okay",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "accepts the assistant's last offer"
+  },
+  {
+   "id": "x007",
+   "text": "cool",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "an acknowledgement"
+  },
+  {
+   "id": "x008",
+   "text": "🙏",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "alone it means 'yes please'"
+  },
+  {
+   "id": "x009",
+   "text": "👌",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "alone it means 'yes please'"
+  },
+  {
+   "id": "x010",
+   "text": "lol?",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "confusion or sarcasm about the last answer"
+  },
+  {
+   "id": "x011",
+   "text": "thanks?",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "sarcasm about the last answer"
+  },
+  {
+   "id": "x012",
+   "text": "hi hi is the market open",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "greeting plus a live-value question"
+  },
+  {
+   "id": "x013",
+   "text": "hello, what is the dollar rate",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "greeting plus a live-value question"
+  },
+  {
+   "id": "x014",
+   "text": "HI sales tax",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "a live value (Hawaii sales tax)"
+  },
+  {
+   "id": "x015",
+   "text": "hi claude can you check aws status",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "greeting plus a live status question"
+  },
+  {
+   "id": "x016",
+   "text": "thanks, and who won the match yesterday?",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "thanks plus a live-value question"
+  },
+  {
+   "id": "x017",
+   "text": "hi, summarize this https://example.com/report",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "greeting plus a URL request"
+  },
+  {
+   "id": "x018",
+   "text": "hello, make a pdf of this",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "greeting plus an artifact request"
+  },
+  {
+   "id": "x019",
+   "text": "hi 2",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "a digit is never a pleasantry"
+  },
+  {
+   "id": "x020",
+   "text": "…",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "an ellipsis alone asks about the last turn"
+  },
+  {
+   "id": "x021",
+   "text": "🤔",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "a thinking face asks about the last turn"
+  },
+  {
+   "id": "x022",
+   "text": "?",
+   "lang": "en",
+   "original_label": "",
+   "expected": "FULL_PATH",
+   "category": "added_near_miss",
+   "why": "a question mark alone asks about the last turn"
+  }
+ ]
+}

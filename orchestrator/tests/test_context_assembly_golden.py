@@ -602,6 +602,9 @@ def test_the_engine_is_handed_the_pre_change_prompt_byte_for_byte_with_the_reads
     scenario, concurrent_reads, offline_turn, monkeypatch
 ):
     monkeypatch.setenv("CONTEXT_CONCURRENT_READS", concurrent_reads)
+    # These goldens pin the FULL path's prompt; "hello there" at Fast would
+    # take the small-talk lane (app/fast_lane.py, tests/test_fast_lane_*.py).
+    monkeypatch.setenv("FAST_LANE_ENABLED", "false")
     # main.py prefers the Settings attribute since 2026-09-13; pin both.
     monkeypatch.setattr(settings, "context_concurrent_reads", concurrent_reads == "true", raising=False)
     # The flag must really reach the turn, or the "true" run is the "false"

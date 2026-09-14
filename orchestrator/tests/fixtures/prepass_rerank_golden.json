@@ -1,0 +1,3608 @@
+{
+ "changing-fact-fresh-wins": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "ef9b24baf1388175",
+      "db8ca18bf3a17686",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "71c53f700378e2da",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "443068641d32355b",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "6bee8cdf73f86896"
+     ],
+     [
+      2,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "fd06d0526aa9448e"
+     ],
+     [
+      3,
+      "https://eval5.example.org/leaderboard_long.html",
+      "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+      "80e72b7c8472a879"
+     ],
+     [
+      4,
+      "https://eval1.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "6ab344fc89e1bd83"
+     ],
+     [
+      5,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "ef9b24baf1388175",
+      "db8ca18bf3a17686",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "71c53f700378e2da",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "443068641d32355b",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "6bee8cdf73f86896"
+     ],
+     [
+      2,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "fd06d0526aa9448e"
+     ],
+     [
+      3,
+      "https://eval5.example.org/leaderboard_long.html",
+      "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+      "80e72b7c8472a879"
+     ],
+     [
+      4,
+      "https://eval1.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "6ab344fc89e1bd83"
+     ],
+     [
+      5,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "df289009f6295f4a",
+      0.687697
+     ],
+     [
+      "https://eval5.example.org/leaderboard_long.html",
+      "e52b6e74ae204bc2",
+      0.656933
+     ],
+     [
+      "https://eval1.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.455642
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "71c53f700378e2da",
+      "db8ca18bf3a17686",
+      "8bdea4fab798bdce",
+      "8966d11f300f4eb2",
+      "5a621c28349cad3b",
+      "1fe0c462daefa47e",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "13e9b7ca84b628c1",
+      "e34c65dfab641ee1",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": [
+     "https://filler9.example.net/notes",
+     "https://filler11.example.net/notes",
+     "https://filler7.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "df289009f6295f4a",
+      0.687697
+     ],
+     [
+      "https://eval5.example.org/leaderboard_long.html",
+      "e52b6e74ae204bc2",
+      0.656933
+     ],
+     [
+      "https://eval1.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.455642
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "db8ca18bf3a17686",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "71c53f700378e2da",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "443068641d32355b",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": [
+     "https://filler9.example.net/notes",
+     "https://filler11.example.net/notes",
+     "https://filler7.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler9.example.net/notes",
+      "35d495f7abaa51b2",
+      0.905289
+     ],
+     [
+      "https://filler11.example.net/notes",
+      "4a9bad220bcb021f",
+      0.898835
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://eval5.example.org/leaderboard_long.html",
+      "e52b6e74ae204bc2",
+      0.656933
+     ],
+     [
+      "https://eval1.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "db8ca18bf3a17686",
+      "8bdea4fab798bdce",
+      "71c53f700378e2da",
+      "8966d11f300f4eb2",
+      "5a621c28349cad3b",
+      "1fe0c462daefa47e",
+      "4602fb8237cdfe5a",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "changing-fact-new-row": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "fbadee3f3c532a00",
+      "236a6bdade7f9f78",
+      "db8ca18bf3a17686",
+      "a195ca98ae8012ea",
+      "1d5c6ba460293c88",
+      "2640514a97684996",
+      "b0d86c23cd789706",
+      "8340662821234b47",
+      "8966d11f300f4eb2",
+      "ef9b24baf1388175",
+      "5f36077b5b1f12f3",
+      "3c629da3017d32cd"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "ea3bd766958a3a32"
+     ],
+     [
+      2,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      3,
+      "https://filler17.example.net/notes",
+      "Background notes 17",
+      "0d76729900aa6460"
+     ],
+     [
+      4,
+      "https://eval0.example.org/pricing_v1.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "79616a47b18d6813"
+     ],
+     [
+      5,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "c0518475370c3b6f"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "fbadee3f3c532a00",
+      "236a6bdade7f9f78",
+      "db8ca18bf3a17686",
+      "a195ca98ae8012ea",
+      "1d5c6ba460293c88",
+      "2640514a97684996",
+      "b0d86c23cd789706",
+      "8340662821234b47",
+      "8966d11f300f4eb2",
+      "ef9b24baf1388175",
+      "5f36077b5b1f12f3",
+      "3c629da3017d32cd"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "ea3bd766958a3a32"
+     ],
+     [
+      2,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      3,
+      "https://filler17.example.net/notes",
+      "Background notes 17",
+      "0d76729900aa6460"
+     ],
+     [
+      4,
+      "https://eval0.example.org/pricing_v1.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "79616a47b18d6813"
+     ],
+     [
+      5,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "c0518475370c3b6f"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      0.822204
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.535014
+     ],
+     [
+      "https://filler17.example.net/notes",
+      "7b72b17534055a24",
+      0.513265
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "e17c1872907efd3a",
+      0.48539
+     ],
+     [
+      "https://filler19.example.net/notes",
+      "4b07f99c34dc0f2d",
+      0.385739
+     ]
+    ],
+    "rerank": [
+     [
+      "a195ca98ae8012ea",
+      "236a6bdade7f9f78",
+      "b0d86c23cd789706",
+      "8340662821234b47",
+      "fbadee3f3c532a00",
+      "8966d11f300f4eb2",
+      "5f36077b5b1f12f3",
+      "1d5c6ba460293c88",
+      "db8ca18bf3a17686",
+      "3c629da3017d32cd",
+      "2640514a97684996",
+      "69111d180a60c1d8"
+     ]
+    ],
+    "superseded": [
+     "https://filler15.example.net/notes",
+     "https://filler13.example.net/notes",
+     "https://filler18.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      0.822204
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.535014
+     ],
+     [
+      "https://filler17.example.net/notes",
+      "7b72b17534055a24",
+      0.513265
+     ],
+     [
+      "https://eval0.example.org/pricing_v1.html",
+      "79616a47b18d6813",
+      0.508774
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "e17c1872907efd3a",
+      0.48539
+     ]
+    ],
+    "rerank": [
+     [
+      "fbadee3f3c532a00",
+      "236a6bdade7f9f78",
+      "db8ca18bf3a17686",
+      "a195ca98ae8012ea",
+      "1d5c6ba460293c88",
+      "2640514a97684996",
+      "b0d86c23cd789706",
+      "8340662821234b47",
+      "8966d11f300f4eb2",
+      "ef9b24baf1388175",
+      "5f36077b5b1f12f3",
+      "3c629da3017d32cd"
+     ]
+    ],
+    "superseded": [
+     "https://filler15.example.net/notes",
+     "https://filler18.example.net/notes",
+     "https://filler13.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler15.example.net/notes",
+      "517735130fa53de2",
+      0.881083
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      0.822204
+     ],
+     [
+      "https://filler18.example.net/notes",
+      "268656d2d1c88e99",
+      0.804583
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.535014
+     ],
+     [
+      "https://filler17.example.net/notes",
+      "7b72b17534055a24",
+      0.513265
+     ]
+    ],
+    "rerank": [
+     [
+      "a195ca98ae8012ea",
+      "236a6bdade7f9f78",
+      "fbadee3f3c532a00",
+      "b0d86c23cd789706",
+      "8340662821234b47",
+      "8966d11f300f4eb2",
+      "5f36077b5b1f12f3",
+      "1d5c6ba460293c88"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "coverage-gap-not-absence": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "583e911055bd02e0",
+      "2640514a97684996",
+      "db8ca18bf3a17686",
+      "de9521615547f1ef",
+      "8966d11f300f4eb2",
+      "e0adaa1179bb8018",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "98a64aacaac31a9c",
+      "8340662821234b47",
+      "69111d180a60c1d8",
+      "86f1dcaf2d1c4d53",
+      "21e6b90dc75a5897",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler11.example.net/notes",
+      "Background notes 11",
+      "06fb69687b4f91e8"
+     ],
+     [
+      2,
+      "https://filler9.example.net/notes",
+      "Background notes 9",
+      "d10a242a1555db8b"
+     ],
+     [
+      3,
+      "https://filler16.example.net/notes",
+      "Background notes 16",
+      "246d023fa4198780"
+     ],
+     [
+      4,
+      "https://filler5.example.net/notes",
+      "Background notes 5",
+      "7e1635a8b7ef93e6"
+     ],
+     [
+      5,
+      "https://eval3.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "6b9e3ca7c1c7ba94"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "583e911055bd02e0",
+      "2640514a97684996",
+      "db8ca18bf3a17686",
+      "de9521615547f1ef",
+      "8966d11f300f4eb2",
+      "e0adaa1179bb8018",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "98a64aacaac31a9c",
+      "8340662821234b47",
+      "69111d180a60c1d8",
+      "86f1dcaf2d1c4d53",
+      "21e6b90dc75a5897",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler5.example.net/notes",
+      "Background notes 5",
+      "7e1635a8b7ef93e6"
+     ],
+     [
+      2,
+      "https://eval3.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "6b9e3ca7c1c7ba94"
+     ],
+     [
+      3,
+      "https://eval4.example.org/leaderboard_long.html",
+      "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+      "697745128a68fba7"
+     ],
+     [
+      4,
+      "https://filler18.example.net/notes",
+      "Background notes 18",
+      "46ab6a27a9e5b865"
+     ],
+     [
+      5,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "c0518475370c3b6f"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval5.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.926679
+     ],
+     [
+      "https://eval3.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.893818
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "c6df0c7820f4921b",
+      0.810716
+     ],
+     [
+      "https://eval4.example.org/leaderboard_long.html",
+      "a14f7ebe1795128a",
+      0.774492
+     ],
+     [
+      "https://filler18.example.net/notes",
+      "268656d2d1c88e99",
+      0.566215
+     ]
+    ],
+    "rerank": [
+     [
+      "583e911055bd02e0",
+      "e0adaa1179bb8018",
+      "8966d11f300f4eb2",
+      "2640514a97684996",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "de9521615547f1ef",
+      "8340662821234b47",
+      "98a64aacaac31a9c",
+      "69111d180a60c1d8",
+      "ef9b24baf1388175",
+      "86f1dcaf2d1c4d53",
+      "21e6b90dc75a5897",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "superseded": [
+     "https://filler11.example.net/notes",
+     "https://filler9.example.net/notes",
+     "https://filler16.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler5.example.net/notes",
+      "c6df0c7820f4921b",
+      0.810716
+     ],
+     [
+      "https://eval3.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.893818
+     ],
+     [
+      "https://eval4.example.org/leaderboard_long.html",
+      "a14f7ebe1795128a",
+      0.774492
+     ],
+     [
+      "https://filler18.example.net/notes",
+      "268656d2d1c88e99",
+      0.566215
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "e17c1872907efd3a",
+      0.498915
+     ]
+    ],
+    "rerank": [
+     [
+      "583e911055bd02e0",
+      "2640514a97684996",
+      "db8ca18bf3a17686",
+      "de9521615547f1ef",
+      "8966d11f300f4eb2",
+      "e0adaa1179bb8018",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "98a64aacaac31a9c",
+      "8340662821234b47",
+      "69111d180a60c1d8",
+      "86f1dcaf2d1c4d53",
+      "21e6b90dc75a5897",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "superseded": [
+     "https://filler11.example.net/notes",
+     "https://filler9.example.net/notes",
+     "https://filler16.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler11.example.net/notes",
+      "4a9bad220bcb021f",
+      0.902431
+     ],
+     [
+      "https://filler9.example.net/notes",
+      "35d495f7abaa51b2",
+      0.886068
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "1009e130038c35a3",
+      0.818505
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "c6df0c7820f4921b",
+      0.810716
+     ],
+     [
+      "https://eval4.example.org/leaderboard_long.html",
+      "a14f7ebe1795128a",
+      0.774492
+     ]
+    ],
+    "rerank": [
+     [
+      "583e911055bd02e0",
+      "2640514a97684996",
+      "8966d11f300f4eb2",
+      "e0adaa1179bb8018",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "de9521615547f1ef",
+      "8340662821234b47",
+      "21e6b90dc75a5897",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "definition-list-values": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "db8ca18bf3a17686",
+      "9382dfa17c45c78e",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109",
+      "443068641d32355b",
+      "98a64aacaac31a9c",
+      "eef823206b0c51a0",
+      "4602fb8237cdfe5a",
+      "6c5312f18c4957f7",
+      "b0d86c23cd789706"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      2,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      3,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "16ceafd5f9bf0212"
+     ],
+     [
+      4,
+      "https://filler5.example.net/notes",
+      "Background notes 5",
+      "6aa2609e87646505"
+     ],
+     [
+      5,
+      "https://filler6.example.net/notes",
+      "Background notes 6",
+      "ef91498af8baeec8"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "db8ca18bf3a17686",
+      "9382dfa17c45c78e",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109",
+      "443068641d32355b",
+      "98a64aacaac31a9c",
+      "eef823206b0c51a0",
+      "4602fb8237cdfe5a",
+      "6c5312f18c4957f7",
+      "b0d86c23cd789706"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      2,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      3,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "16ceafd5f9bf0212"
+     ],
+     [
+      4,
+      "https://filler5.example.net/notes",
+      "Background notes 5",
+      "6aa2609e87646505"
+     ],
+     [
+      5,
+      "https://filler6.example.net/notes",
+      "Background notes 6",
+      "ef91498af8baeec8"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.993429
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.603201
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "e302c23e0a143eaf",
+      0.573871
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      0.525113
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.365124
+     ]
+    ],
+    "rerank": [
+     [
+      "9382dfa17c45c78e",
+      "3c629da3017d32cd",
+      "db8ca18bf3a17686",
+      "eef823206b0c51a0",
+      "28eefeb7fa6c1109",
+      "6c5312f18c4957f7",
+      "4602fb8237cdfe5a",
+      "b0d86c23cd789706",
+      "98a64aacaac31a9c",
+      "443068641d32355b",
+      "1d5c6ba460293c88",
+      "8966d11f300f4eb2",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "superseded": [
+     "https://filler16.example.net/notes",
+     "https://filler17.example.net/notes",
+     "https://filler18.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.993429
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.603201
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "e302c23e0a143eaf",
+      0.573871
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      0.525113
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.365124
+     ]
+    ],
+    "rerank": [
+     [
+      "db8ca18bf3a17686",
+      "9382dfa17c45c78e",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109",
+      "443068641d32355b",
+      "98a64aacaac31a9c",
+      "eef823206b0c51a0",
+      "4602fb8237cdfe5a",
+      "6c5312f18c4957f7",
+      "b0d86c23cd789706"
+     ]
+    ],
+    "superseded": [
+     "https://filler16.example.net/notes",
+     "https://filler17.example.net/notes",
+     "https://filler18.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      -1.0
+     ],
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      -1.0
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      -1.0
+     ],
+     [
+      "https://filler15.example.net/notes",
+      "d07e083dbf0edc07",
+      -1.0
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "e2b682b5c72c5081",
+      -1.0
+     ]
+    ],
+    "rerank": [],
+    "superseded": []
+   }
+  }
+ },
+ "exact-score-cards": {
+  "prepare": {
+   "router_down": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval2.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      3,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      4,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   },
+   "router_recent": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval2.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      3,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      4,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval3.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ],
+     [
+      "https://eval0.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.430836
+     ]
+    ],
+    "rerank": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "f159efcbac81d9da",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "5862bb66bbea1c70",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "6c5312f18c4957f7",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://eval4.example.org/no_answer.html"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval3.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ],
+     [
+      "https://eval0.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.430836
+     ]
+    ],
+    "rerank": [
+     [
+      "71d4a334f54c95a9",
+      "21e6b90dc75a5897",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "bedbee9dc694db11",
+      "443068641d32355b",
+      "af8718fddc53816d",
+      "f159efcbac81d9da",
+      "9382dfa17c45c78e",
+      "a195ca98ae8012ea",
+      "b0d86c23cd789706",
+      "3c629da3017d32cd",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://eval4.example.org/no_answer.html",
+     "https://filler19.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.870067
+     ],
+     [
+      "https://filler15.example.net/notes",
+      "517735130fa53de2",
+      0.816119
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "b090852d4993ee74",
+      0.769614
+     ]
+    ],
+    "rerank": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "exact-score-long-page": {
+  "prepare": {
+   "router_down": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval2.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      3,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      4,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   },
+   "router_recent": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval2.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      3,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      4,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval0.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ],
+     [
+      "https://eval3.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.430836
+     ]
+    ],
+    "rerank": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "f159efcbac81d9da",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "5862bb66bbea1c70",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "6c5312f18c4957f7",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://eval4.example.org/no_answer.html"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval0.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ],
+     [
+      "https://eval3.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.430836
+     ]
+    ],
+    "rerank": [
+     [
+      "71d4a334f54c95a9",
+      "21e6b90dc75a5897",
+      "5862bb66bbea1c70",
+      "a4e0cd692c4ab29d",
+      "bedbee9dc694db11",
+      "443068641d32355b",
+      "af8718fddc53816d",
+      "f159efcbac81d9da",
+      "9382dfa17c45c78e",
+      "a195ca98ae8012ea",
+      "b0d86c23cd789706",
+      "3c629da3017d32cd",
+      "28eefeb7fa6c1109"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://eval4.example.org/no_answer.html",
+     "https://filler19.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.870067
+     ],
+     [
+      "https://filler15.example.net/notes",
+      "517735130fa53de2",
+      0.816119
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "b090852d4993ee74",
+      0.769614
+     ]
+    ],
+    "rerank": [
+     [
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "exact-score-table": {
+  "prepare": {
+   "router_down": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "28eefeb7fa6c1109",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "21e6b90dc75a5897",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      2,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      4,
+      "https://filler16.example.net/notes",
+      "Background notes 16",
+      "029b86ada167ea3d"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   },
+   "router_recent": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "28eefeb7fa6c1109",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "21e6b90dc75a5897",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      2,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      4,
+      "https://filler16.example.net/notes",
+      "Background notes 16",
+      "029b86ada167ea3d"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.870067
+     ],
+     [
+      "https://eval0.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval3.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "f159efcbac81d9da",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "5862bb66bbea1c70",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "6c5312f18c4957f7",
+      "3c629da3017d32cd",
+      "21e6b90dc75a5897",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://filler15.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval0.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.870067
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.606958
+     ],
+     [
+      "https://eval3.example.org/leaderboard_long.html",
+      "217a25fdf8606577",
+      0.58113
+     ]
+    ],
+    "rerank": [
+     [
+      "71d4a334f54c95a9",
+      "28eefeb7fa6c1109",
+      "5862bb66bbea1c70",
+      "21e6b90dc75a5897",
+      "bedbee9dc694db11",
+      "443068641d32355b",
+      "af8718fddc53816d",
+      "f159efcbac81d9da",
+      "9382dfa17c45c78e",
+      "a195ca98ae8012ea",
+      "b0d86c23cd789706",
+      "3c629da3017d32cd",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": [
+     "https://filler5.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://filler15.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.870067
+     ],
+     [
+      "https://filler15.example.net/notes",
+      "517735130fa53de2",
+      0.816119
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.789903
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "b090852d4993ee74",
+      0.769614
+     ],
+     [
+      "https://eval0.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.88354
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "bedbee9dc694db11",
+      "af8718fddc53816d",
+      "443068641d32355b",
+      "71d4a334f54c95a9",
+      "a195ca98ae8012ea",
+      "f159efcbac81d9da",
+      "5862bb66bbea1c70",
+      "21e6b90dc75a5897",
+      "a4e0cd692c4ab29d"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "followup-bare-pronoun": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "e7d468db0ee87704",
+      "a3a94a55726c689b",
+      "db8ca18bf3a17686",
+      "28eefeb7fa6c1109",
+      "9382dfa17c45c78e",
+      "42730e5a232f6728",
+      "3a69c4e8d094b6f2",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "21e6b90dc75a5897",
+      "86f1dcaf2d1c4d53",
+      "8bdea4fab798bdce",
+      "f159efcbac81d9da"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval0.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "16ceafd5f9bf0212"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "7c9ea0f2c70c4495"
+     ],
+     [
+      4,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "890e715de8a2e473"
+     ],
+     [
+      5,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "c06e1e49f633c304"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "e7d468db0ee87704",
+      "a3a94a55726c689b",
+      "db8ca18bf3a17686",
+      "28eefeb7fa6c1109",
+      "9382dfa17c45c78e",
+      "42730e5a232f6728",
+      "3a69c4e8d094b6f2",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "21e6b90dc75a5897",
+      "86f1dcaf2d1c4d53",
+      "8bdea4fab798bdce",
+      "f159efcbac81d9da"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval0.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      2,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "16ceafd5f9bf0212"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "7c9ea0f2c70c4495"
+     ],
+     [
+      4,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "890e715de8a2e473"
+     ],
+     [
+      5,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "c06e1e49f633c304"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "e302c23e0a143eaf",
+      0.849933
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "bcbbe14a4a2bd7c3",
+      0.589104
+     ],
+     [
+      "https://filler8.example.net/notes",
+      "4dec5d055259bf3e",
+      0.578446
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "afe1db1adec02d38",
+      0.480097
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.465129
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "42730e5a232f6728",
+      "3a69c4e8d094b6f2",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "db8ca18bf3a17686",
+      "e7d468db0ee87704",
+      "443068641d32355b",
+      "8bdea4fab798bdce",
+      "86f1dcaf2d1c4d53",
+      "a3a94a55726c689b",
+      "f159efcbac81d9da"
+     ]
+    ],
+    "superseded": [
+     "https://filler18.example.net/notes",
+     "https://eval3.example.org/leaderboard_long.html",
+     "https://filler3.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval0.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.972245
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "e302c23e0a143eaf",
+      0.849933
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "bcbbe14a4a2bd7c3",
+      0.589104
+     ],
+     [
+      "https://filler8.example.net/notes",
+      "4dec5d055259bf3e",
+      0.578446
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "afe1db1adec02d38",
+      0.480097
+     ]
+    ],
+    "rerank": [
+     [
+      "e7d468db0ee87704",
+      "a3a94a55726c689b",
+      "db8ca18bf3a17686",
+      "28eefeb7fa6c1109",
+      "9382dfa17c45c78e",
+      "42730e5a232f6728",
+      "3a69c4e8d094b6f2",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "21e6b90dc75a5897",
+      "86f1dcaf2d1c4d53",
+      "8bdea4fab798bdce",
+      "f159efcbac81d9da"
+     ]
+    ],
+    "superseded": [
+     "https://filler18.example.net/notes",
+     "https://filler7.example.net/notes",
+     "https://filler9.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler18.example.net/notes",
+      "b8c987cdb781a4dc",
+      0.966937
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "e302c23e0a143eaf",
+      0.849933
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "bcbbe14a4a2bd7c3",
+      0.589104
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      0.451667
+     ],
+     [
+      "https://filler6.example.net/notes",
+      "9c27cd4dfef492f0",
+      0.465129
+     ]
+    ],
+    "rerank": [
+     [
+      "42730e5a232f6728",
+      "28eefeb7fa6c1109",
+      "3a69c4e8d094b6f2",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "db8ca18bf3a17686",
+      "e7d468db0ee87704",
+      "443068641d32355b",
+      "f159efcbac81d9da"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "followup-exact-variant": {
+  "prepare": {
+   "router_down": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "71d4a334f54c95a9",
+      "e34c65dfab641ee1",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "5862bb66bbea1c70",
+      "eb86f0dde21833fd",
+      "1ed63303990fbbcd",
+      "4462fe908a464df3",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "4602fb8237cdfe5a",
+      "69111d180a60c1d8"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "3bd55164c68d4253"
+     ],
+     [
+      2,
+      "https://filler12.example.net/notes",
+      "Background notes 12",
+      "e50fddc646924ad6"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      4,
+      "https://filler14.example.net/notes",
+      "Background notes 14",
+      "fecf85fd8e86dc4d"
+     ],
+     [
+      5,
+      "https://filler13.example.net/notes",
+      "Background notes 13",
+      "0c2a573b1c7c6f67"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "71d4a334f54c95a9",
+      "e34c65dfab641ee1",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "5862bb66bbea1c70",
+      "eb86f0dde21833fd",
+      "1ed63303990fbbcd",
+      "4462fe908a464df3",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "4602fb8237cdfe5a",
+      "69111d180a60c1d8"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "3bd55164c68d4253"
+     ],
+     [
+      2,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      3,
+      "https://eval1.example.org/hosting_costs.html",
+      "Nimbus Cloud \u2014 accelerator price list",
+      "bd1003762c6e0114"
+     ],
+     [
+      4,
+      "https://filler9.example.net/notes",
+      "Background notes 9",
+      "5efff1e193101c25"
+     ],
+     [
+      5,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "579518fbbcd8f33c"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler2.example.net/notes",
+      "e065b869dfa63a59",
+      0.94943
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.740482
+     ],
+     [
+      "https://eval1.example.org/hosting_costs.html",
+      "bd1003762c6e0114",
+      0.642258
+     ],
+     [
+      "https://filler9.example.net/notes",
+      "0f2908b494e742de",
+      0.600724
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "579518fbbcd8f33c",
+      0.571626
+     ]
+    ],
+    "rerank": [
+     [
+      "e34c65dfab641ee1",
+      "eb86f0dde21833fd",
+      "1ed63303990fbbcd",
+      "4462fe908a464df3",
+      "71d4a334f54c95a9",
+      "1d5c6ba460293c88",
+      "5ff1866dfb038a9d",
+      "b0d86c23cd789706",
+      "5862bb66bbea1c70",
+      "4602fb8237cdfe5a",
+      "5f36077b5b1f12f3",
+      "69111d180a60c1d8"
+     ]
+    ],
+    "superseded": [
+     "https://filler12.example.net/notes",
+     "https://filler14.example.net/notes",
+     "https://filler13.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler2.example.net/notes",
+      "e065b869dfa63a59",
+      0.94943
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.740482
+     ],
+     [
+      "https://eval1.example.org/hosting_costs.html",
+      "bd1003762c6e0114",
+      0.642258
+     ],
+     [
+      "https://filler9.example.net/notes",
+      "0f2908b494e742de",
+      0.600724
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "579518fbbcd8f33c",
+      0.571626
+     ]
+    ],
+    "rerank": [
+     [
+      "71d4a334f54c95a9",
+      "e34c65dfab641ee1",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "5862bb66bbea1c70",
+      "eb86f0dde21833fd",
+      "1ed63303990fbbcd",
+      "4462fe908a464df3",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "4602fb8237cdfe5a",
+      "69111d180a60c1d8"
+     ]
+    ],
+    "superseded": [
+     "https://filler12.example.net/notes",
+     "https://filler14.example.net/notes",
+     "https://filler13.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "579518fbbcd8f33c",
+      -1.0
+     ],
+     [
+      "https://filler9.example.net/notes",
+      "0f2908b494e742de",
+      -1.0
+     ],
+     [
+      "https://filler12.example.net/notes",
+      "50daf629a8120e45",
+      -1.0
+     ],
+     [
+      "https://filler14.example.net/notes",
+      "953c4d373c656519",
+      -1.0
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      -1.0
+     ]
+    ],
+    "rerank": [],
+    "superseded": []
+   }
+  }
+ },
+ "missing-evidence": {
+  "prepare": {
+   "router_down": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "28eefeb7fa6c1109",
+      "15ddb58af5195076",
+      "76636822aa26c720",
+      "4602fb8237cdfe5a",
+      "3c629da3017d32cd",
+      "443068641d32355b",
+      "b0d86c23cd789706",
+      "fbadee3f3c532a00",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      2,
+      "https://filler19.example.net/notes",
+      "Background notes 19",
+      "babd339b6da4b833"
+     ],
+     [
+      3,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      4,
+      "https://filler16.example.net/notes",
+      "Background notes 16",
+      "246d023fa4198780"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   },
+   "router_recent": {
+    "decision": "static_topical",
+    "rerank_distinct": [
+     [
+      "28eefeb7fa6c1109",
+      "15ddb58af5195076",
+      "76636822aa26c720",
+      "4602fb8237cdfe5a",
+      "3c629da3017d32cd",
+      "443068641d32355b",
+      "b0d86c23cd789706",
+      "fbadee3f3c532a00",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      2,
+      "https://filler19.example.net/notes",
+      "Background notes 19",
+      "babd339b6da4b833"
+     ],
+     [
+      3,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      4,
+      "https://filler16.example.net/notes",
+      "Background notes 16",
+      "246d023fa4198780"
+     ]
+    ],
+    "verdict": [
+     "static",
+     "lexical:static"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.912223
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.845616
+     ],
+     [
+      "https://filler13.example.net/notes",
+      "a8704e537723abf5",
+      0.397322
+     ],
+     [
+      "https://eval4.example.org/leaderboard_long.html",
+      "4bae35b3575e126c",
+      0.34234
+     ],
+     [
+      "https://filler11.example.net/notes",
+      "32b9ee7ad611da02",
+      0.189298
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "15ddb58af5195076",
+      "76636822aa26c720",
+      "4602fb8237cdfe5a",
+      "b0d86c23cd789706",
+      "443068641d32355b",
+      "fbadee3f3c532a00",
+      "eef823206b0c51a0",
+      "9382dfa17c45c78e",
+      "9713f72982a24629",
+      "8bdea4fab798bdce",
+      "86f1dcaf2d1c4d53",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "superseded": [
+     "https://filler15.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://filler10.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.912223
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.845616
+     ],
+     [
+      "https://filler13.example.net/notes",
+      "a8704e537723abf5",
+      0.397322
+     ],
+     [
+      "https://eval4.example.org/leaderboard_long.html",
+      "4bae35b3575e126c",
+      0.34234
+     ],
+     [
+      "https://filler11.example.net/notes",
+      "32b9ee7ad611da02",
+      0.189298
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "fbadee3f3c532a00",
+      "15ddb58af5195076",
+      "76636822aa26c720",
+      "443068641d32355b",
+      "4602fb8237cdfe5a",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "86f1dcaf2d1c4d53",
+      "eef823206b0c51a0",
+      "9713f72982a24629",
+      "8bdea4fab798bdce",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "superseded": [
+     "https://filler15.example.net/notes",
+     "https://filler19.example.net/notes",
+     "https://filler5.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler15.example.net/notes",
+      "d07e083dbf0edc07",
+      0.983387
+     ],
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.912223
+     ],
+     [
+      "https://filler19.example.net/notes",
+      "4b07f99c34dc0f2d",
+      0.896177
+     ],
+     [
+      "https://filler16.example.net/notes",
+      "e2b682b5c72c5081",
+      0.748581
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.845616
+     ]
+    ],
+    "rerank": [
+     [
+      "28eefeb7fa6c1109",
+      "15ddb58af5195076",
+      "76636822aa26c720",
+      "4602fb8237cdfe5a",
+      "443068641d32355b",
+      "b0d86c23cd789706",
+      "fbadee3f3c532a00",
+      "eef823206b0c51a0",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "multi-source-comparison": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "fbadee3f3c532a00",
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "1d5c6ba460293c88",
+      "236a6bdade7f9f78",
+      "2b58f85f3694b080",
+      "3c629da3017d32cd",
+      "1ed63303990fbbcd",
+      "6f5d274aff7dfe2d",
+      "bedbee9dc694db11",
+      "eef823206b0c51a0",
+      "42730e5a232f6728",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      2,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      3,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "ea3bd766958a3a32"
+     ],
+     [
+      4,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      5,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "9bd507af9a397312"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "fbadee3f3c532a00",
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "1d5c6ba460293c88",
+      "236a6bdade7f9f78",
+      "2b58f85f3694b080",
+      "3c629da3017d32cd",
+      "1ed63303990fbbcd",
+      "6f5d274aff7dfe2d",
+      "bedbee9dc694db11",
+      "eef823206b0c51a0",
+      "42730e5a232f6728",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler1.example.net/notes",
+      "Background notes 1",
+      "e942bf8af4f85b26"
+     ],
+     [
+      2,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      3,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "ea3bd766958a3a32"
+     ],
+     [
+      4,
+      "https://eval6.example.org/pricing_v1.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "5eaf2b985e5b92e1"
+     ],
+     [
+      5,
+      "https://eval2.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "aa976b602333f3df"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.922084
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.904653
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      0.909557
+     ],
+     [
+      "https://eval6.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.776227
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "aa976b602333f3df",
+      0.6355
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "fbadee3f3c532a00",
+      "2b58f85f3694b080",
+      "1ed63303990fbbcd",
+      "3c629da3017d32cd",
+      "6f5d274aff7dfe2d",
+      "db8ca18bf3a17686",
+      "bedbee9dc694db11",
+      "eef823206b0c51a0",
+      "42730e5a232f6728",
+      "1d5c6ba460293c88",
+      "6c5312f18c4957f7",
+      "236a6bdade7f9f78",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "superseded": [
+     "https://filler15.example.net/notes",
+     "https://filler8.example.net/notes",
+     "https://filler10.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.922084
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.904653
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      0.909557
+     ],
+     [
+      "https://eval6.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.776227
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "aa976b602333f3df",
+      0.6355
+     ]
+    ],
+    "rerank": [
+     [
+      "fbadee3f3c532a00",
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "1d5c6ba460293c88",
+      "236a6bdade7f9f78",
+      "2b58f85f3694b080",
+      "3c629da3017d32cd",
+      "1ed63303990fbbcd",
+      "6f5d274aff7dfe2d",
+      "bedbee9dc694db11",
+      "eef823206b0c51a0",
+      "42730e5a232f6728",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "superseded": [
+     "https://filler8.example.net/notes",
+     "https://filler15.example.net/notes",
+     "https://filler10.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler1.example.net/notes",
+      "c4999584750488fb",
+      0.922084
+     ],
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.916485
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.904653
+     ],
+     [
+      "https://eval6.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.776227
+     ],
+     [
+      "https://eval2.example.org/leaderboard.html",
+      "aa976b602333f3df",
+      0.6355
+     ]
+    ],
+    "rerank": [
+     [
+      "fbadee3f3c532a00",
+      "ef9b24baf1388175",
+      "2b58f85f3694b080",
+      "1ed63303990fbbcd",
+      "3c629da3017d32cd",
+      "db8ca18bf3a17686",
+      "bedbee9dc694db11",
+      "6f5d274aff7dfe2d",
+      "5ff1866dfb038a9d",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "multi-source-negative": {
+  "prepare": {
+   "router_down": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "71d4a334f54c95a9",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "6f5d274aff7dfe2d",
+      "13e9b7ca84b628c1",
+      "ef9b24baf1388175",
+      "8340662821234b47",
+      "9382dfa17c45c78e",
+      "236a6bdade7f9f78",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "5a621c28349cad3b"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler6.example.net/notes",
+      "Background notes 6",
+      "1e5f67b25cbf793c"
+     ],
+     [
+      2,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      3,
+      "https://eval6.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "9bb8064a0ac62045"
+     ],
+     [
+      4,
+      "https://filler15.example.net/notes",
+      "Background notes 15",
+      "b7393aa6027f2148"
+     ],
+     [
+      5,
+      "https://filler17.example.net/notes",
+      "Background notes 17",
+      "0d76729900aa6460"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "71d4a334f54c95a9",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "6f5d274aff7dfe2d",
+      "13e9b7ca84b628c1",
+      "ef9b24baf1388175",
+      "8340662821234b47",
+      "9382dfa17c45c78e",
+      "236a6bdade7f9f78",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "5a621c28349cad3b"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "6d96cb9838e950b4"
+     ],
+     [
+      2,
+      "https://eval5.example.org/pricing_v1.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "5eaf2b985e5b92e1"
+     ],
+     [
+      3,
+      "https://eval1.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "aa976b602333f3df"
+     ],
+     [
+      4,
+      "https://filler5.example.net/notes",
+      "Background notes 5",
+      "6aa2609e87646505"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.835878
+     ],
+     [
+      "https://eval3.example.org/leaderboard_long.html",
+      "7b0289961af5434e",
+      0.78826
+     ],
+     [
+      "https://eval5.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.737179
+     ],
+     [
+      "https://eval1.example.org/leaderboard.html",
+      "aa976b602333f3df",
+      0.627844
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      0.589946
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "8340662821234b47",
+      "236a6bdade7f9f78",
+      "a195ca98ae8012ea",
+      "1d5c6ba460293c88",
+      "6f5d274aff7dfe2d",
+      "13e9b7ca84b628c1",
+      "9382dfa17c45c78e",
+      "71d4a334f54c95a9",
+      "5a621c28349cad3b",
+      "db45a3df958c1ea1",
+      "0ae3da7d54b0d28c",
+      "5ff1866dfb038a9d"
+     ]
+    ],
+    "superseded": [
+     "https://filler6.example.net/notes",
+     "https://eval6.example.org/pricing_v2.html",
+     "https://filler15.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler0.example.net/notes",
+      "debd2644efd411e0",
+      0.835878
+     ],
+     [
+      "https://eval5.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      0.737179
+     ],
+     [
+      "https://eval1.example.org/leaderboard.html",
+      "aa976b602333f3df",
+      0.627844
+     ],
+     [
+      "https://filler5.example.net/notes",
+      "ed554793834a7051",
+      0.589946
+     ],
+     [
+      "https://eval0.example.org/hosting_costs.html",
+      "69e3e6151091bde7",
+      0.094747
+     ]
+    ],
+    "rerank": [
+     [
+      "71d4a334f54c95a9",
+      "5ff1866dfb038a9d",
+      "1d5c6ba460293c88",
+      "6f5d274aff7dfe2d",
+      "13e9b7ca84b628c1",
+      "ef9b24baf1388175",
+      "8340662821234b47",
+      "9382dfa17c45c78e",
+      "236a6bdade7f9f78",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "5a621c28349cad3b"
+     ]
+    ],
+    "superseded": [
+     "https://filler6.example.net/notes",
+     "https://eval6.example.org/pricing_v2.html",
+     "https://filler15.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler17.example.net/notes",
+      "7b72b17534055a24",
+      -1.0
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "ca33296577868e0f",
+      -1.0
+     ],
+     [
+      "https://eval5.example.org/pricing_v1.html",
+      "5eaf2b985e5b92e1",
+      -1.0
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "837032109449f0e6",
+      -1.0
+     ],
+     [
+      "https://filler15.example.net/notes",
+      "517735130fa53de2",
+      -1.0
+     ]
+    ],
+    "rerank": [],
+    "superseded": []
+   }
+  }
+ },
+ "stable-fact": {
+  "prepare": {
+   "router_down": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "e7d468db0ee87704",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d",
+      "21e6b90dc75a5897",
+      "f159efcbac81d9da",
+      "db45a3df958c1ea1",
+      "3c629da3017d32cd",
+      "3823e850bc285be2",
+      "a195ca98ae8012ea",
+      "b1f58a035012ccee",
+      "3a69c4e8d094b6f2",
+      "9713f72982a24629",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler10.example.net/notes",
+      "Background notes 10",
+      "fdcce1b87a35c01c"
+     ],
+     [
+      2,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "6b9e3ca7c1c7ba94"
+     ],
+     [
+      3,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      4,
+      "https://eval4.example.org/no_answer.html",
+      "BenchLM \u2014 About the benchmark",
+      "363f8357b8641c7c"
+     ],
+     [
+      5,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "7c9ea0f2c70c4495"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "default"
+    ]
+   },
+   "router_recent": {
+    "decision": "local",
+    "rerank_distinct": [
+     [
+      "e7d468db0ee87704",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d",
+      "21e6b90dc75a5897",
+      "f159efcbac81d9da",
+      "db45a3df958c1ea1",
+      "3c629da3017d32cd",
+      "3823e850bc285be2",
+      "a195ca98ae8012ea",
+      "b1f58a035012ccee",
+      "3a69c4e8d094b6f2",
+      "9713f72982a24629",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://eval2.example.org/leaderboard_cards.html",
+      "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+      "6b9e3ca7c1c7ba94"
+     ],
+     [
+      2,
+      "https://filler8.example.net/notes",
+      "Background notes 8",
+      "1ba1744282ab1c91"
+     ],
+     [
+      3,
+      "https://filler0.example.net/notes",
+      "Background notes 0",
+      "7c9ea0f2c70c4495"
+     ],
+     [
+      4,
+      "https://eval0.example.org/leaderboard.html",
+      "BenchLM Reasoning Leaderboard \u2014 March 2026",
+      "c187ba9a3c10095c"
+     ],
+     [
+      5,
+      "https://eval6.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "9bb8064a0ac62045"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "router"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.754802
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.719918
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "837032109449f0e6",
+      0.69536
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "bcbbe14a4a2bd7c3",
+      0.663631
+     ],
+     [
+      "https://filler12.example.net/notes",
+      "b0e837c41c7b08fd",
+      0.650158
+     ]
+    ],
+    "rerank": [
+     [
+      "a4e0cd692c4ab29d",
+      "28eefeb7fa6c1109",
+      "f159efcbac81d9da",
+      "3823e850bc285be2",
+      "3c629da3017d32cd",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "b1f58a035012ccee",
+      "3a69c4e8d094b6f2",
+      "e7d468db0ee87704",
+      "9713f72982a24629",
+      "236a6bdade7f9f78",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "superseded": [
+     "https://filler10.example.net/notes",
+     "https://eval4.example.org/no_answer.html",
+     "https://filler4.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.719918
+     ],
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.754802
+     ],
+     [
+      "https://filler0.example.net/notes",
+      "bcbbe14a4a2bd7c3",
+      0.663631
+     ],
+     [
+      "https://eval0.example.org/leaderboard.html",
+      "f9f485fd47a9df0c",
+      0.64411
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "837032109449f0e6",
+      0.69536
+     ]
+    ],
+    "rerank": [
+     [
+      "e7d468db0ee87704",
+      "28eefeb7fa6c1109",
+      "a4e0cd692c4ab29d",
+      "21e6b90dc75a5897",
+      "f159efcbac81d9da",
+      "db45a3df958c1ea1",
+      "3c629da3017d32cd",
+      "3823e850bc285be2",
+      "a195ca98ae8012ea",
+      "b1f58a035012ccee",
+      "3a69c4e8d094b6f2",
+      "9713f72982a24629",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": [
+     "https://filler10.example.net/notes",
+     "https://eval4.example.org/no_answer.html",
+     "https://filler4.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler8.example.net/notes",
+      "f755e4e8c7027824",
+      0.754802
+     ],
+     [
+      "https://eval2.example.org/leaderboard_cards.html",
+      "1fb3e6efd95e1d80",
+      0.719918
+     ],
+     [
+      "https://eval4.example.org/no_answer.html",
+      "667c11ba89753ec3",
+      0.740454
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "837032109449f0e6",
+      0.69536
+     ],
+     [
+      "https://filler12.example.net/notes",
+      "b0e837c41c7b08fd",
+      0.650158
+     ]
+    ],
+    "rerank": [
+     [
+      "a4e0cd692c4ab29d",
+      "28eefeb7fa6c1109",
+      "f159efcbac81d9da",
+      "3823e850bc285be2",
+      "3c629da3017d32cd",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "b1f58a035012ccee",
+      "236a6bdade7f9f78",
+      "21e6b90dc75a5897"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ },
+ "stale-stored-page": {
+  "prepare": {
+   "router_down": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "5ff1866dfb038a9d",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "f159efcbac81d9da",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "6bee8cdf73f86896"
+     ],
+     [
+      2,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "fd06d0526aa9448e"
+     ],
+     [
+      3,
+      "https://eval6.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "6ab344fc89e1bd83"
+     ],
+     [
+      4,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      5,
+      "https://filler12.example.net/notes",
+      "Background notes 12",
+      "e50fddc646924ad6"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   },
+   "router_recent": {
+    "decision": "stale_offline",
+    "rerank_distinct": [
+     [
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "5ff1866dfb038a9d",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "f159efcbac81d9da",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "sources": [
+     [
+      1,
+      "https://filler3.example.net/notes",
+      "Background notes 3",
+      "6bee8cdf73f86896"
+     ],
+     [
+      2,
+      "https://filler4.example.net/notes",
+      "Background notes 4",
+      "fd06d0526aa9448e"
+     ],
+     [
+      3,
+      "https://eval6.example.org/pricing_v2.html",
+      "Orbital Compute \u2014 GPU pricing",
+      "6ab344fc89e1bd83"
+     ],
+     [
+      4,
+      "https://filler2.example.net/notes",
+      "Background notes 2",
+      "9f835689dc324e4b"
+     ],
+     [
+      5,
+      "https://filler12.example.net/notes",
+      "Background notes 12",
+      "e50fddc646924ad6"
+     ]
+    ],
+    "verdict": [
+     "recent",
+     "lexical:recent"
+    ]
+   }
+  },
+  "retrieve": {
+   "realtime": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "df289009f6295f4a",
+      0.687697
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.455642
+     ],
+     [
+      "https://filler12.example.net/notes",
+      "50daf629a8120e45",
+      0.448301
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "5ff1866dfb038a9d",
+      "db8ca18bf3a17686",
+      "8bdea4fab798bdce",
+      "8966d11f300f4eb2",
+      "5a621c28349cad3b",
+      "1fe0c462daefa47e",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "f159efcbac81d9da",
+      "98a64aacaac31a9c",
+      "13e9b7ca84b628c1",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": [
+     "https://filler9.example.net/notes",
+     "https://filler11.example.net/notes",
+     "https://filler7.example.net/notes"
+    ]
+   },
+   "recent": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://filler4.example.net/notes",
+      "df289009f6295f4a",
+      0.687697
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.455642
+     ],
+     [
+      "https://filler12.example.net/notes",
+      "50daf629a8120e45",
+      0.448301
+     ]
+    ],
+    "rerank": [
+     [
+      "db8ca18bf3a17686",
+      "ef9b24baf1388175",
+      "5ff1866dfb038a9d",
+      "1fe0c462daefa47e",
+      "8bdea4fab798bdce",
+      "5a621c28349cad3b",
+      "8966d11f300f4eb2",
+      "13e9b7ca84b628c1",
+      "4602fb8237cdfe5a",
+      "1ed63303990fbbcd",
+      "98a64aacaac31a9c",
+      "f159efcbac81d9da",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": [
+     "https://filler9.example.net/notes",
+     "https://filler11.example.net/notes",
+     "https://filler7.example.net/notes"
+    ]
+   },
+   "static": {
+    "conflict": false,
+    "evidence": [
+     [
+      "https://filler9.example.net/notes",
+      "35d495f7abaa51b2",
+      0.905289
+     ],
+     [
+      "https://filler11.example.net/notes",
+      "4a9bad220bcb021f",
+      0.898835
+     ],
+     [
+      "https://filler3.example.net/notes",
+      "bbb48436c2c77e77",
+      0.864203
+     ],
+     [
+      "https://eval6.example.org/pricing_v2.html",
+      "5cb741fc950eef55",
+      0.686658
+     ],
+     [
+      "https://filler2.example.net/notes",
+      "08c56bf74cf93077",
+      0.455642
+     ]
+    ],
+    "rerank": [
+     [
+      "ef9b24baf1388175",
+      "db8ca18bf3a17686",
+      "8bdea4fab798bdce",
+      "5ff1866dfb038a9d",
+      "8966d11f300f4eb2",
+      "5a621c28349cad3b",
+      "1fe0c462daefa47e",
+      "4602fb8237cdfe5a",
+      "236a6bdade7f9f78"
+     ]
+    ],
+    "superseded": []
+   }
+  }
+ }
+}
