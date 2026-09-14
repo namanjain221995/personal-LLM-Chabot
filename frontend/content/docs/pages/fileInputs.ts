@@ -424,6 +424,16 @@ ${syncReadiness(noTimeout)}
 | \`"stream": true\` | Starts at once and waits inside the stream, however long processing takes, with comments showing progress — \`: file ${EXAMPLE_FILE_ID} transcript 40%\`. Every SSE client ignores comments. |
 | \`"background": true\` | Answers \`202\` at once; the response stays \`queued\` until its files are ready. Cancelling it stops the wait. |
 
+If the service restarts while a request is still waiting for its files — a
+new version being deployed — the request ends with \`model_unavailable\` and
+"The service restarted while this request's files were being prepared.
+Nothing was generated or charged; send the request again." A stream receives it
+as \`response.failed\` after its \`response.created\`; a synchronous call's
+connection is closed, which both SDKs retry on their own; a background response
+ends \`failed\`. The file keeps processing through the restart, so sending the
+request again picks up where processing is. Once the answer is being
+generated, a restart no longer ends it.
+
 A file that ends in \`error\` — or was \`unsupported\` from the start — is a
 \`400\` naming its part, with the fixed sentence of its code from
 [the processing errors](/docs/files#errors). That is the file's

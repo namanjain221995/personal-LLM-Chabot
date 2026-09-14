@@ -55,9 +55,19 @@ READINESS PER DELIVERY, AS WIRED.
   ONCE; the wait, the build and the second plan run in a detached task while the
   row is still `queued`, then the job starts through the router's own
   `background.start`. A cancel while it waits stops it; nothing ran, nothing is
-  charged. RESIDUAL (stated): a deploy during that wait fails the row with the
-  retry-safe "service restarted" code — the file wait is in memory, not in the
-  durable run log, which holds only launched generations.
+  charged. RESIDUAL (stated, CONTRACT §14): a restart during that wait fails
+  the row at SIGTERM with `errors.preparation_interrupted` (retry-safe, the
+  `response.failed` webhook sent) — the file wait is in memory, not in the
+  durable run log, which holds only launched generations
+  (`suspend_background_waits`, a durable suspend hook).
+
+A DURABLE sync or stream request (`store` true, the default) does not use the
+stream and sync paths above: the router launches it as a durable run at once
+and prepares its files in the runner (`router._file_preparer`,
+`durable.launch(prepare=...)`), so it has its id, slot and waiter place from
+the start; a restart during the preparation settles it failed, retry-safe,
+because what a second process would need to prepare it again (the body, the
+credential) is not stored.
 
 ONE LAUNCH PATH. The generation itself is started by a function the ROUTER
 passes in (`launch` for streams; the router's own synchronous work for sync;
@@ -67,10 +77,13 @@ launch here.
 
 ANNOTATIONS. Synchronous Responses carry `file_citation` annotations on the
 `output_text` part and Chat Completions on `choices[0].message.annotations`.
-Streams and background rows record the citation counts in usage meta but do
-not yet carry the annotation events: `response.output_text.annotation.added` is
-not in `publicapi/events.EVENT_NAMES` (the stream grammar's closed set, owned
-by the wire team), and `citations.splice_annotation_events` is ready for it.
+Streams carry them as `response.output_text.annotation.added` events after the
+final text, repeated on `response.completed` (Chat: on the final chunk's
+`delta.annotations`) — a durable stream from the citation index stored with its
+spec, a non-durable one through `streaming.responses_sse(annotate=...)` — and a
+stream resumed across a restart keeps them. A response read back with
+`GET /v1/responses/{id}` (the way a background response is delivered) carries
+none: its row keeps the text and the citation counts only (CONTRACT §8.7).
 """
 from __future__ import annotations
 
@@ -1192,6 +1205,33 @@ async def _watch_cancel(project_id: str, response_id: str, cancel: asyncio.Event
             log.debug("cancel poll failed for %s", response_id, exc_info=True)
 
 
+async def suspend_background_waits(reason: str = "restart") -> int:
+    """SIGTERM, as a durable suspend hook (router.py registers it): end every
+    background request of this process still waiting for its files, NOW, while
+    the database is open.
+
+    WHY (release review 2026-09-14, medium). The wait lives in this process's
+    memory only. Left alone at SIGTERM it ran on through uvicorn's drain and
+    died at the loop's teardown, after the pool had closed, so its failure was
+    never written: the row sat `queued` until the next read repaired it, and
+    no webhook was sent. Ended here it is settled `failed` with
+    `errors.preparation_interrupted` — retry-safe, nothing charged, the
+    Idempotency-Key released — and its `response.failed` webhook is queued.
+    Returns how many waits it ended; bounded by the caller's own wait."""
+    loop = asyncio.get_running_loop()
+    # This loop's waits only: the set is module-wide, and a task of another
+    # (a test's closed) loop can be neither cancelled nor awaited from here.
+    tasks = [task for task in _BACKGROUND_WAITS if not task.done() and task.get_loop() is loop]
+    # A caller's cancel sets the wait's own event first; a bare task cancel
+    # is what `_wait_then_start` records as a restart.
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.wait(tasks)
+        log.info("ended %d background file wait(s) for a %s", len(tasks), reason)
+    return len(tasks)
+
+
 async def _wait_then_start(
     run: FileRun,
     *,
@@ -1217,11 +1257,15 @@ async def _wait_then_start(
             final = streaming.spec_from_plan(plan, response_id=spec.response_id, created_at=spec.created_at)
         except asyncio.CancelledError:
             if not cancel.is_set():
-                # The loop is going away (a deploy): retry-safe, like a
-                # running background job cut off the same way.
-                outcome = _terminal(spec, started, "failed", errors.model_unavailable())
+                # A restart (`suspend_background_waits`) or the loop going
+                # away: retry-safe, nothing ran. Recorded and announced here,
+                # because this task ends with the cancel.
+                outcome = _terminal(spec, started, "failed", errors.preparation_interrupted())
                 with contextlib.suppress(BaseException):
                     await streaming.settle(on_finish, outcome)
+                run.cleanup()
+                with contextlib.suppress(BaseException):
+                    await _notify_terminal(caller, spec.response_id)
                 raise
             outcome = _terminal(spec, started, "cancelled", None)
         except errors.ApiError as refusal:
@@ -1291,6 +1335,7 @@ __all__ = [
     "FileRun",
     "SharedReadiness",
     "background_waits",
+    "suspend_background_waits",
     "has_files",
     "lift",
     "patient_engines",

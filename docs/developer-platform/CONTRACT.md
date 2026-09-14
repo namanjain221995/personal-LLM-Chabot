@@ -683,7 +683,12 @@ full | retrieval, max_tokens}`. A `file_id` needs `files.read` in addition to
 `file_data` needs no file scope. A request naming a file that is still
 processing waits for it; a file that failed or is unsupported is `400
 invalid_request_error`, `param` naming the part, with its code's fixed
-sentence. Citations that resolve to content the model was shown become
+sentence. A durable request (`store` true) waits as a run (§14, "Requests with
+files"): its `response.created`, concurrency slot and waiter place come first,
+and progress reaches its stream as comments. A restart during that wait ends
+it retry-safe — `model_unavailable`, "The service restarted while this
+request's files were being prepared. Nothing was generated or charged; send
+the request again." — while the files keep processing. Citations that resolve to content the model was shown become
 `file_citation` annotations (`type`, `file_id`, `filename`, `index` in UTF-16
 code units, and `page` or `timestamp_s`): on the `output_text` part and on
 `choices[0].message.annotations` of the answer to the request itself. A
@@ -1353,6 +1358,34 @@ and its row is closed `failed` (`model_unavailable`, "The service restarted
 while this response was running.") by the next read or the durable sweep if a
 restart cut it before its recorder wrote.
 
+**Requests with files** (release review 2026-09-14). A sync or stream request
+with input files is launched at once, before its files are ready, and the run
+prepares them before its first gate (`durable.launch(prepare=…)`,
+`router._file_preparer`): the wait for processing, the context build, the plan
+with the file text. So its `response.created` is the stream's first event, the
+run holds the project's concurrency slot and its place in the gates' waiter
+lines (moved to the final plan's gates once the file text is known) for its
+whole life, a client that leaves detaches as from any run, and progress
+reaches the run's followers in this process as comments
+(`: file file-… transcript 40%`). **What a restart does to it is the stated
+residual**: until its files are prepared the run has no spec — what another
+process would need to prepare them again (the request body, the credential) is
+not stored — so it cannot be resumed. At SIGTERM it is settled at once, inside
+the suspend's own bound, `failed` with `model_unavailable`, "The service
+restarted while this request's files were being prepared. Nothing was generated
+or charged; send the request again.", `Retry-After: 2`: a stream receives that
+`response.failed` after its `response.created` and ends cleanly; a synchronous
+call gets a `503` inside the commit window and, after it, a dropped connection,
+so both SDKs retry; the Idempotency-Key is released; nothing is charged. A
+background request still waiting for its files (`file_inputs.start_background`,
+not a run yet) is failed the same way at SIGTERM, with its `response.failed`
+webhook. The files themselves keep processing across the restart, so the retry
+continues from where processing is. A preparing run's plan-before-files is
+never written as its spec; a process that crashed (no SIGTERM) leaves one that
+the claimer settles `failed` retry-safe. Once the files are prepared the run is
+like any other: its spec is written (at once when keyed or gateway-tagged,
+otherwise at the suspend) and a restart resumes the answer.
+
 1. **Launch** writes the `api_responses` row (resumable, dialect, `key_id`,
    `attempt_token`, `body_sha256`, `enqueued_at`), the idempotency claim's
    response id, and the spec (messages, plan, tokens, temperature, gate) to
@@ -1376,8 +1409,11 @@ restart cut it before its recorder wrote.
    only after commit. Unwritten events above `PUBLIC_API_PENDING_EVENTS_MAX_BYTES`
    suspend the largest run with reason `store`.
 5. **Suspend on SIGTERM**: the chained handler calls `durable.suspend_all("restart")`
-   — close engine streams, flush, write missing specs, release leases, abort every
-   `/v1` reader with an incomplete read. Chat keeps its 90 s grace.
+   — close engine streams, settle the runs still preparing their files (above)
+   and fail the Files background waits, flush, write missing specs, release
+   leases, abort every other `/v1` reader with an incomplete read. A run
+   launched after the suspend is refused `503` before any row. Chat keeps its
+   90 s grace.
 6. **Claim** takes `FOR UPDATE` on the row and resumes from `max(sequence_number)`
    and the logged text; authorisation is re-checked before dispatch.
 7. **Resume.** Background runs resume after start-up one per
@@ -1582,7 +1618,9 @@ derived download rides a cookie, so a download is a `/v1` call with a key.
   continuously; `PUBLIC_API_RESUME_MAX_STALLED_ATTEMPTS` (3) stalled attempts on a
   proven-serving engine; a second engine incident implicating the same run; a
   revoked key; the orchestrator unreachable from the gateway for 30 min; a client
-  absent beyond the orphan grace; `store: false` during a restart. A tunnel drop
+  absent beyond the orphan grace; `store: false` during a restart; a restart
+  while a request's files are still being prepared (retry-safe, §14 "Requests
+  with files"). A tunnel drop
   or a gateway recreate cuts a client without a resume loop or SDK retries, and
   openai-node ≥ 7.5 gives up on a sync call after 3 × its own timeout.
 * It does not change the chat application's behaviour for people who never touch

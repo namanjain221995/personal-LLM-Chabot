@@ -539,6 +539,42 @@ def model_unavailable(retry_after: float = 30) -> ApiError:
     )
 
 
+#: The one sentence of a request whose input files were still being prepared
+#: when the service restarted (`preparation_interrupted`). Matched by value
+#: nowhere: the durable runtime marks its own run, the file wait its own row.
+PREPARATION_INTERRUPTED_MESSAGE = (
+    "The service restarted while this request's files were being prepared. "
+    "Nothing was generated or charged; send the request again."
+)
+
+#: What that failure tells the caller to wait: the new process is usually up
+#: within the ~97 s restart window, and every hop in front retries a refused
+#: connect for 110 s, so a short hint is enough.
+PREPARATION_INTERRUPTED_RETRY_AFTER_S = 2
+
+
+def preparation_interrupted() -> ApiError:
+    """A request ended by a restart BEFORE it generated anything: its files
+    (a wait for processing, the context build) were still being prepared.
+
+    WHY A FAILURE AND NOT A RESUME (release review 2026-09-14). A durable run
+    resumes from its stored spec, and the spec of a request with files exists
+    only once the files are prepared: what the next process would need to
+    prepare them again (the request body, the caller's credential) is not
+    stored. So the restart ends it at once, retry-safe (`model_unavailable`,
+    `x-should-retry` left to the status: nothing ran, the Idempotency-Key is
+    released), instead of holding the old process's shutdown for its full
+    grace and then cutting the connection with nothing said. The files keep
+    processing across the restart, so the retry continues from there."""
+    error = ApiError(
+        "model_unavailable",
+        PREPARATION_INTERRUPTED_MESSAGE,
+        retry_after=PREPARATION_INTERRUPTED_RETRY_AFTER_S,
+    )
+    error.should_retry = True
+    return error
+
+
 #: How long a caller is told to wait when the platform's own database is out.
 #: Short: a pool that timed out under a burst is usually back within seconds,
 #: and a longer figure turns a blip into minutes of refused traffic.

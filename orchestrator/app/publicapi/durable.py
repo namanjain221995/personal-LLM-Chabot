@@ -276,6 +276,37 @@ Record = Tuple[int, str, Dict[str, Any]]
 HEARTBEAT = object()
 
 
+class Note:
+    """A progress comment a LOCAL follower relays while a run prepares its
+    input files (`Run.note`): `: file file-… transcript 40%`. Never logged —
+    it says how the wait is going, not what the answer is — so a follower
+    served from the log (another process, a replay) simply does not see it."""
+
+    __slots__ = ("text",)
+
+    def __init__(self, text: str) -> None:
+        self.text = str(text)
+
+
+#: A run's input preparation (`launch(prepare=...)`): called once, in the
+#: runner, before any gate; returns the FINAL spec and the `extra` it adds
+#: (the files' citation index). Raises ApiError to fail the run.
+Preparer = Callable[["Run"], Awaitable[Tuple[streaming.GenerationSpec, Mapping[str, Any]]]]
+
+#: What `suspend_all` also runs at SIGTERM, before any lease is released:
+#: in-process waits that are not runs yet but must end promptly and on the
+#: record while the database is still open (router.py registers the Files
+#: background waits). Module-level so a runtime swapped by `reset_for_tests`
+#: keeps them. Each is `async (reason) -> None` and bounded by the caller.
+_SUSPEND_HOOKS: List[Callable[[str], Awaitable[Any]]] = []
+
+
+def add_suspend_hook(hook: Callable[[str], Awaitable[Any]]) -> None:
+    """Register `hook` once (idempotent by identity)."""
+    if hook not in _SUSPEND_HOOKS:
+        _SUSPEND_HOOKS.append(hook)
+
+
 def public_data(data: Mapping[str, Any]) -> Dict[str, Any]:
     """A stored record's data without the private `_`-prefixed keys."""
     return {k: v for k, v in data.items() if not str(k).startswith("_")}
@@ -665,6 +696,22 @@ class Run:
         #: (PUBLIC_API_GATE_MAX_WAITERS) gives its place back there.
         self._admitted_callbacks: List[Callable[[], None]] = []
         self.admitted = False
+        #: Input preparation still to run before the first gate (files), and
+        #: whether it is running now. While `preparing`, `spec` is the plan
+        #: made BEFORE the files resolved: it is never stored (a resume from it
+        #: would answer without the files) — `suspend_all` skips it, and the
+        #: final spec is written when preparation ends.
+        self.preparer: Optional[Preparer] = None
+        self.preparing = False
+        #: Write the final spec as soon as preparation ends (keyed or gateway
+        #: tagged: a same-key or gateway attach may need to resume it).
+        self.write_spec_after_prepare = False
+        #: Settled because a restart arrived during preparation (the route
+        #: drops a synchronous connection so the SDK retries, CONTRACT §14).
+        self.preparation_interrupted = False
+        #: The latest progress comment (`note`) and its counter.
+        self.note_text = ""
+        self.note_seq = 0
 
     # -- log ------------------------------------------------------------
 
@@ -774,6 +821,13 @@ class Run:
     def abort_readers(self) -> None:
         self.aborted = True
         self.abort_event.set()
+        self.wake()
+
+    def note(self, text: str) -> None:
+        """A progress comment for local followers (`Note`); only the latest
+        one matters, so a slow follower skips the ones it missed."""
+        self.note_text = str(text)
+        self.note_seq += 1
         self.wake()
 
 
@@ -889,6 +943,11 @@ async def sse_frames(
     async for item in handle.follow(after, heartbeat=heartbeat):
         if item is HEARTBEAT:
             yield events.SequencedEvents().heartbeat()
+            continue
+        if isinstance(item, Note):
+            text = " ".join(item.text.split())
+            if text:
+                yield f": {text}\n\n"
             continue
         if chat is not None:
             frame = chat.render(item, tagged=tagged)
@@ -1263,6 +1322,9 @@ class Runtime:
         runs = [run for run in self.runs.values() if not run.terminal]
         for run in runs:
             run.request_stop(reason)
+        # The in-process waits that are not runs yet (router-registered), at
+        # the same moment and under the same bound as the runners below.
+        hooks = [asyncio.ensure_future(hook(reason)) for hook in list(_SUSPEND_HOOKS)]
         closes = [self._close_generation(run) for run in runs]
         if closes:
             await asyncio.gather(*closes, return_exceptions=True)
@@ -1273,13 +1335,28 @@ class Runtime:
         # run then settled with `resume_count: 0` and without the first
         # attempt's prompt count, under-reporting the re-prefill. Bounded: a
         # runner stuck on an unreachable database must not hold a SIGTERM.
+        #
+        # A run still PREPARING its input files settles here too, inside the
+        # same bound: `_prepare_run` sees the stop, cancels the preparation and
+        # settles the run failed, retry-safe (`errors.preparation_interrupted`)
+        # — its followers get that terminal event rather than an incomplete
+        # read with nothing to resume (release review 2026-09-14, medium).
         runners = [run.task for run in runs if run.task is not None and not run.task.done()]
-        if runners:
-            await asyncio.wait(runners, timeout=SUSPEND_RECORD_WAIT_S)
+        if runners or hooks:
+            await asyncio.wait([*runners, *hooks], timeout=SUSPEND_RECORD_WAIT_S)
+        for hook in hooks:
+            if not hook.done():
+                hook.cancel()
+            elif not hook.cancelled() and hook.exception() is not None:
+                log.warning("a durable suspend hook failed", exc_info=hook.exception())
         released: Set[str] = set()
         try:
             await self.flush(runs)
-            missing = [run for run in runs if not run.spec_written and run.lease_held]
+            # Never the spec of a run still preparing: it is the plan made
+            # before the files resolved, and a resume from it would answer
+            # without them. Claimed elsewhere, that run has no spec and
+            # settles failed retry-safe (`_claim_and_resume`).
+            missing = [run for run in runs if not run.spec_written and run.lease_held and not run.preparing]
             for run in missing:
                 await self._write_spec(run)
             held = [run.id for run in runs if run.lease_held]
@@ -1338,8 +1415,16 @@ class Runtime:
         slot: Any = None,
         recorder_ref: Optional[RecorderRef] = None,
         retain_hook: bool = False,
+        prepare: Optional[Preparer] = None,
     ) -> Handle:
         """Launch a durable run. Raises ApiError (disk guard) before any row.
+
+        `prepare` (foreground only) runs in the runner before any gate and
+        returns the final spec: a request with input files is a run — with
+        its id, its `response.created`, its slot, its waiter place and its
+        attach identity — from the moment it arrives, while the files are
+        still being waited for (release review 2026-09-14, medium). `spec` is
+        then the plan made before the files resolved; it is not stored.
 
         If a run with the same gateway `attempt_token` already exists in the
         project, the existing run is attached instead (creator rule applies).
@@ -1354,6 +1439,13 @@ class Runtime:
         files: its closure also removes the request's inline file renders,
         which a recorder rebuilt from JSON cannot), the ref then being the
         recorder of a run settled elsewhere."""
+        if prepare is not None and background:
+            raise ValueError("a background launch cannot prepare in the launching process")
+        if self.stopping:
+            # SIGTERM already suspended this process's runs: a run launched
+            # now would be neither suspended nor resumed. Before any row, so
+            # the caller's refusal is still a real, retryable status.
+            raise errors.model_unavailable(retry_after=errors.PREPARATION_INTERRUPTED_RETRY_AFTER_S)
         if not self.started:
             await self.start()
             if not self.started:
@@ -1382,6 +1474,10 @@ class Runtime:
         )
         run.on_finish = on_finish
         run.recorder_ref = recorder_ref.to_json() if recorder_ref is not None else None
+        if prepare is not None:
+            run.preparer = prepare
+            run.preparing = True
+            run.write_spec_after_prepare = bool(keyed or attempt_token)
         owner = None if background else self.owner
         import psycopg
 
@@ -1403,7 +1499,7 @@ class Runtime:
             return await self._attach_attempt(existing, caller, body_sha256)
         if marked is None:
             raise errors.internal_error()
-        if background or keyed or attempt_token:
+        if (background or keyed or attempt_token) and prepare is None:
             await self._write_spec(run)
         if background:
             # Rows only: the dispatcher claims it when its gate has room.
@@ -1884,6 +1980,8 @@ class Runtime:
                 self.forget_local(run.id)
 
     async def _drive_inner(self, run: Run) -> None:
+        if run.preparing and not await self._prepare_run(run):
+            return
         view = self._view()
         grace = liveness.EngineDownGrace(view, clock=self.clock)
         in_progress_sent = run.committed_seq > 0 and run.resumed
@@ -1937,6 +2035,79 @@ class Runtime:
                 outcome = await self._after_interrupt(run, grace)
             if outcome == "done":
                 return
+
+    async def _prepare_run(self, run: Run) -> bool:
+        """Run `run.preparer` (the request's input files) before any gate.
+        True: the final spec is in place and the runner goes on. False: the
+        run settled (a refusal, a cancel, a restart) or lost its lease.
+
+        A stop while preparing is final, never a suspend: there is no stored
+        spec to resume from. A restart settles it failed, retry-safe
+        (`errors.preparation_interrupted`); a cancel or an orphaned run
+        `cancelled`; a revoked key as revoked; a lost lease leaves it to the
+        claimer, which finds no spec and settles it the same retry-safe way.
+        Yield and store stops do not apply to a run that holds no gate and
+        writes no deltas, and are cleared."""
+        preparer = run.preparer
+        assert preparer is not None
+        task = asyncio.ensure_future(preparer(run))
+        try:
+            while not task.done():
+                if run.stop_reason in ("yield", "store"):
+                    run.clear_stop()
+                if run.stop_reason is not None:
+                    break
+                stop = asyncio.ensure_future(run.stop_event.wait())
+                try:
+                    await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    stop.cancel()
+        finally:
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+        reason = run.stop_reason
+        if reason is not None and reason not in ("yield", "store") and (task.cancelled() or task.exception() is None):
+            # Stopped while preparing (or in the same instant it finished:
+            # the stop wins, because a restart must not launch a run it is
+            # about to abandon).
+            run.preparing = False
+            if reason in ("cancel", "orphaned"):
+                await self._settle(run, "cancelled")
+            elif reason == "revoked":
+                await self._settle_revoked(run)
+            elif reason == "lease_lost":
+                pass
+            else:
+                run.preparation_interrupted = True
+                await self._settle(run, "failed", error=errors.preparation_interrupted())
+            return False
+        if task.cancelled():
+            run.preparing = False
+            await self._settle(run, "failed", error=errors.preparation_interrupted())
+            return False
+        failure = task.exception()
+        if failure is not None:
+            run.preparing = False
+            if not isinstance(failure, errors.ApiError):
+                log.warning("durable run %s failed while preparing its input", run.id, exc_info=failure)
+            error = failure if isinstance(failure, errors.ApiError) else errors.from_unexpected(failure)
+            await self._settle(run, "failed", error=error)
+            return False
+        spec, extra = task.result()
+        # The ids the log already announced (`response.created`, the row's
+        # item id) are the run's; the preparer's plan only fills the rest.
+        spec = dataclasses.replace(
+            spec, response_id=run.spec.response_id, created_at=run.spec.created_at, item_id=run.spec.item_id
+        )
+        run.spec = spec
+        run.extra.update(dict(extra or {}))
+        run.preparer = None
+        run.preparing = False
+        if run.write_spec_after_prepare and run.lease_held:
+            await self._write_spec(run)
+        return True
 
     def _attempt_shape(self, run: Run) -> Tuple[List[Dict[str, Any]], Optional[int], bool]:
         spec = run.spec
@@ -2751,6 +2922,8 @@ class Runtime:
 
     async def _follow_local(self, run: Run, position: int, beat: float) -> AsyncIterator[Any]:
         reader = self._add_reader(run.id, run, "follow")
+        #: Notes posted before this follower arrived are stale.
+        seen_note = run.note_seq
         try:
             while True:
                 changed = run._changed
@@ -2775,6 +2948,10 @@ class Runtime:
                         raise FollowerAborted()
                     yield _SWITCH
                     return
+                if run.note_seq > seen_note:
+                    seen_note = run.note_seq
+                    yield Note(run.note_text)
+                    continue
                 try:
                     async with asyncio.timeout(beat):
                         await changed.wait()
@@ -3214,6 +3391,9 @@ __all__ = [
     "FollowerEvicted",
     "HEARTBEAT",
     "Handle",
+    "Note",
+    "Preparer",
+    "add_suspend_hook",
     "NotStreamable",
     "OWNER",
     "RecordBuilder",

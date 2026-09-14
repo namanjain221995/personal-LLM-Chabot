@@ -112,6 +112,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -1207,6 +1208,10 @@ async def _generate(
         await _nothing_ran(caller, reservation, None)
         raise
 
+    #: Set just before `_launch_durable`, which from then on owns the file
+    #: run, the reservation and the claim (it releases them itself when the
+    #: launch fails — or when it fails after this request was cancelled).
+    launch_owned = False
     try:
         response_id = _new_response_id()
         if durable_on:
@@ -1288,21 +1293,32 @@ async def _generate(
             gate_failure = _GateFailure()
             recorded = gate_failure.recording(on_finish)
             annotate = _stream_annotator(file_run)
-            if durable_on and file_run is None:
+            if durable_on:
+                # With or without files, ONE durable stream (release review
+                # 2026-09-14, medium): the run is launched before the status
+                # line and the connection follows its log from
+                # `response.created`. A request with files is a run while its
+                # files are still being waited for — `_file_preparer` runs in
+                # the runner, before its gates — so it has its id at once, its
+                # concurrency slot and its waiter place belong to the run, and
+                # a restart settles it with a retry-safe terminal event instead
+                # of cutting a stream that had said nothing.
+                if file_run is not None:
+                    # The 404 / failed-file 400 before the status line.
+                    await file_run.precheck()
                 lease = quotas.take_slot(caller, KIND_STREAM)
-                place: Optional[_Place] = None
                 try:
-                    place = _place_for(_plan_gates(plan))
-                    handle = await _launch_durable(
-                        request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat,
-                        held=held, reservation=reservation, on_finish=on_finish, file_run=None,
-                        slot=lease, place=place,
-                    )
+                    place = _MovablePlace(_place_for(_plan_gates(plan)))
                 except BaseException:
-                    if place is not None:
-                        place.release()
                     lease.release()
                     raise
+                launch_owned = True
+                handle = await _launch_durable(
+                    request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat,
+                    held=held, reservation=reservation, on_finish=on_finish, file_run=file_run,
+                    slot=lease, place=place,
+                    prepare=(_file_preparer(parsed, caller, file_run, place=place) if file_run is not None else None),
+                )
                 chat_args = (
                     _chat_render_args(response_id=response_id, model=spec.model, created=created,
                                       include_usage=parsed.include_usage)
@@ -1320,22 +1336,14 @@ async def _generate(
             )
             files_frames = None
             if file_run is not None:
-                # The 404 / failed-file 400 before the status line; the wait,
-                # the context, the second plan and the capacity gate inside
-                # the stream, with heartbeats (file_inputs.stream_with_files).
-                # The gate is THIS router's patient gate and the generation is
-                # started by THIS router's launch (senior fix 2026-09-14): no
-                # capacity wait of a file stream ends on a clock. A DURABLE
-                # file stream (2026-09-14) passes no gate — the durable runner
-                # holds the plan's gates — and launches through the durable
-                # runtime once its files resolved.
+                # NON-durable (`store: false`): the 404 / failed-file 400
+                # before the status line; the wait, the context, the second
+                # plan and the capacity gate inside the stream, with
+                # heartbeats (file_inputs.stream_with_files). The gate is THIS
+                # router's patient gate and the generation is started by THIS
+                # router's launch (senior fix 2026-09-14): no capacity wait of
+                # a file stream ends on a clock.
                 await file_run.precheck()
-                if durable_on:
-                    launch = _durable_stream_launch(
-                        request, caller, parsed=parsed, request_model=request_model, chat=chat, held=held,
-                        reservation=reservation, on_finish=recorded, file_run=file_run,
-                        include_usage=parsed.include_usage,
-                    )
                 files_frames = file_inputs.stream_with_files(
                     file_run,
                     chat=chat,
@@ -1344,7 +1352,7 @@ async def _generate(
                     replan=functools.partial(_replan, parsed, caller),
                     completion_id=_completion_id(response_id),
                     include_usage=parsed.include_usage,
-                    gate=(_no_router_gate if durable_on else _patient_gate),
+                    gate=_patient_gate,
                     launch=launch,
                 )
             if chat:
@@ -1404,15 +1412,12 @@ async def _generate(
                 refusal_frames=refusal_frames,
                 gate_failure=gate_failure,
                 tag=tag,
-                # A durable file stream's frames carry the log's own
-                # `: ts-seq=N` (record numbers, which a re-attach resumes
-                # from); numbering them again by frame would disagree.
-                number_frames=not durable_on,
             )
     except BaseException:
-        if file_run is not None:
-            file_run.cleanup()
-        await _nothing_ran(caller, reservation, held)
+        if not launch_owned:
+            if file_run is not None:
+                file_run.cleanup()
+            await _nothing_ran(caller, reservation, held)
         raise
 
     # One outcome, filled in place by the generation and read by the failed
@@ -1432,11 +1437,9 @@ async def _generate(
             reservation=reservation,
             held=held,
             chat=chat,
+            file_run=file_run,
+            parsed=parsed,
         )
-        if file_run is not None:
-            durable_work = functools.partial(
-                _run_durable_synchronous_with_files, file_run=file_run, parsed=parsed, **durable_work.keywords
-            )
         return keepalive.CommittedJSONResponse(
             durable_work,
             failure_mode=keepalive.FAILURE_BODY,
@@ -1736,7 +1739,7 @@ def _stream_launch(
     file stream is never the one generation left without resume.
 
     Since 2026-09-14 this is the NON-durable launch (`store: false`, or no
-    durable runtime); `_durable_stream_launch` is the durable one. `annotate`
+    durable runtime); a durable stream follows its run's log (`_follow_frames`). `annotate`
     gives a file stream its `file_citation` annotation events."""
 
     def launch(spec: streaming.GenerationSpec) -> AsyncIterator[str]:
@@ -2749,10 +2752,90 @@ def _router_recorder_factory(args: Mapping[str, Any]) -> Callable[[Dict[str, Any
 
 
 durable.register_recorder(ROUTER_RECORDER, _router_recorder_factory)
+# SIGTERM ends the Files background waits at once, on the record, while the
+# database is still open (file_inputs.suspend_background_waits).
+durable.add_suspend_hook(file_inputs.suspend_background_waits)
 
 
 def _place_for(gates: List[str]) -> Optional[_Place]:
     return _GATE_LINE.reserve(gates) if gates else None
+
+
+class _MovablePlace:
+    """A durable run's place in its gates' lines (PUBLIC_API_GATE_MAX_WAITERS)
+    from its launch until it holds its gates, which can MOVE once: a request
+    with files is counted in the lines of the plan made before its files
+    resolved, and its final plan (the file text added) may name other gates —
+    a normal answer becomes a long one. `move_to` reserves the new lines
+    before giving the old ones back, so the request is never counted in
+    neither; a full line there fails the run `model_at_capacity`. `release`
+    is idempotent and final (a move after it does nothing)."""
+
+    __slots__ = ("place", "released")
+
+    def __init__(self, place: Optional[_Place]) -> None:
+        self.place = place
+        self.released = False
+
+    def move_to(self, gates: List[str]) -> None:
+        if self.released:
+            return
+        wanted = tuple(dict.fromkeys(gates))
+        current = self.place._gates if self.place is not None else ()
+        if wanted == current:
+            return
+        moved = _GATE_LINE.reserve(list(wanted)) if wanted else None
+        previous, self.place = self.place, moved
+        if previous is not None:
+            previous.release()
+
+    def release(self) -> None:
+        self.released = True
+        if self.place is not None:
+            self.place.release()
+
+
+def _file_preparer(
+    parsed: "_Parsed",
+    caller: ApiCaller,
+    file_run: file_inputs.FileRun,
+    *,
+    place: _MovablePlace,
+) -> durable.Preparer:
+    """The input preparation a durable run with files performs in its runner,
+    before any gate (`durable.launch(prepare=...)`): wait for the files with no
+    deadline and patient engines, build the context, plan again with the
+    file text, move the run's waiter place to the final plan's gates, and hand
+    back the final spec with the citation index its annotations resolve
+    against. Progress reaches the run's local followers as comments
+    (`: file file-… transcript 40%`). A refusal (a file that failed while
+    waited for, an input rule) raises and fails the run with it."""
+
+    async def prepare(run: durable.Run) -> Tuple[streaming.GenerationSpec, Dict[str, Any]]:
+        async def progress(text: str) -> None:
+            run.note(text)
+
+        # The stream delivery for every durable run: no deadline, patient
+        # engines, the lenient inline OCR rule (FileRun.prepare) — exactly
+        # what a synchronous call inside the committed response had.
+        await file_run.prepare(file_inputs.DELIVERY_STREAM, on_progress=progress)
+        plan = await _replan(parsed, caller, await file_run.planning_inputs())
+        place.move_to(_plan_gates(plan))
+        final = streaming.spec_from_plan(plan, response_id=run.id, created_at=run.spec.created_at)
+        return final, _file_extra(file_run)
+
+    return prepare
+
+
+#: Launches whose request was cancelled while they were in flight (a client
+#: that disconnected), held strongly until they finish on their own.
+_DETACHED_LAUNCHES: Set["asyncio.Task[durable.Handle]"] = set()
+
+
+def _forget_detached_launch(task: "asyncio.Task[durable.Handle]") -> None:
+    _DETACHED_LAUNCHES.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.info("a /v1 launch whose client had left failed: %s", type(task.exception()).__name__)
 
 
 def _release_on_admission(handle: durable.Handle, place: Optional[_Place]) -> None:
@@ -2780,40 +2863,78 @@ async def _launch_durable(
     on_finish: streaming.OnFinish,
     file_run: Optional[file_inputs.FileRun],
     slot: Any,
-    place: Optional[_Place],
+    place: Optional[_MovablePlace],
+    prepare: Optional[durable.Preparer] = None,
 ) -> durable.Handle:
     """`durable.launch` for a foreground generation, and the two things that
     must follow it at once: the Idempotency-Key is BOUND to the run (so a
     retry with the key attaches to it while it runs, CONTRACT §13 "a claim
     bound to a response is live while the run is open") and the waiter place
-    is handed to the run. `slot` and `place` belong to the caller until this
-    returns; on a raise the caller releases them."""
+    is handed to the run.
+
+    OWNERSHIP, from the moment this is called: `slot`, `place`, `file_run`,
+    the quota `reservation` and the claim `held` belong to the launch. A
+    launch that fails releases every one of them itself (nothing ran). The
+    caller releases nothing after calling.
+
+    WHY THE LAUNCH IS SHIELDED (durable-resume review 2026-09-14, medium). A
+    committed synchronous response cancels its work when the client
+    disconnects, and a cancel that landed between the row's write and the
+    runner's start left the row `queued` — neither run nor failed — until the
+    next restart, with the claim unbound and the waiter place never given
+    back. The launch now runs in its own task and finishes however the
+    request ends: launched, the run owns everything and its orphan grace ends
+    it if nobody attaches; failed, it released everything."""
     tag = gateway_tag(request)
     route = "v1_chat_completions" if chat else "v1_responses"
-    handle = await durable.launch(
-        spec,
-        caller=durable.caller_of(caller),
-        dialect=_dialect(chat),
-        background=False,
-        streamed=bool(request_model.stream),
-        keyed=held is not None,
-        attempt_token=(tag.attempt if tag.tagged else None),
-        body_sha256=await _body_digest(request),
-        on_finish=on_finish,
-        request_id=_request_id(request),
-        metadata=dict(request_model.metadata or {}),
-        instructions_present=bool(request_model.instructions),
-        fingerprint=(held.fingerprint if held is not None else ""),
-        extra=_file_extra(file_run),
-        slot=slot,
-        recorder_ref=_recorder_ref(
-            caller, route=route, request_id=_request_id(request), streamed=bool(request_model.stream),
-            held=held, reservation=reservation, plan=plan,
-        ),
-    )
-    await _finish_claim(held, handle.id)
-    _release_on_admission(handle, place)
-    return handle
+
+    async def launch_and_bind() -> durable.Handle:
+        try:
+            handle = await durable.launch(
+                spec,
+                caller=durable.caller_of(caller),
+                dialect=_dialect(chat),
+                background=False,
+                streamed=bool(request_model.stream),
+                keyed=held is not None,
+                attempt_token=(tag.attempt if tag.tagged else None),
+                body_sha256=await _body_digest(request),
+                on_finish=on_finish,
+                request_id=_request_id(request),
+                metadata=dict(request_model.metadata or {}),
+                instructions_present=bool(request_model.instructions),
+                fingerprint=(held.fingerprint if held is not None else ""),
+                # A preparing run's citation index arrives with its final spec.
+                extra=({} if prepare is not None else _file_extra(file_run)),
+                slot=slot,
+                recorder_ref=_recorder_ref(
+                    caller, route=route, request_id=_request_id(request), streamed=bool(request_model.stream),
+                    held=held, reservation=reservation, plan=plan,
+                ),
+                prepare=prepare,
+            )
+        except BaseException:
+            if place is not None:
+                place.release()
+            if slot is not None:
+                slot.release()
+            if file_run is not None:
+                # Nothing launched, so no settle will run `wrap_finish`'s cleanup.
+                file_run.cleanup()
+            await _nothing_ran(caller, reservation, held)
+            raise
+        await _finish_claim(held, handle.id)
+        _release_on_admission(handle, place)
+        return handle
+
+    task = asyncio.ensure_future(launch_and_bind())
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            _DETACHED_LAUNCHES.add(task)
+            task.add_done_callback(_forget_detached_launch)
+        raise
 
 
 def _follow_frames(
@@ -2904,6 +3025,14 @@ async def _await_durable_outcome(
         outcome = await handle.result()
     except durable.FollowerAborted:
         raise _RunSuspended() from None
+    run = handle.run
+    if outcome.status == "failed" and run is not None and run.preparation_interrupted:
+        # A restart arrived while the request's files were being prepared: the
+        # run settled retry-safe with nothing generated. Treated like a suspend
+        # — a real 503 inside the commit window, a dropped connection after
+        # it — so both SDKs retry on their own instead of handing the caller a
+        # failed object (release review 2026-09-14, medium).
+        raise _RunSuspended() from None
     if partial is not None:
         for name in ("status", "text", "usage", "error", "ttft_ms", "duration_ms", "finish_reason", "max_output_tokens"):
             setattr(partial, name, getattr(outcome, name))
@@ -2940,31 +3069,45 @@ async def _run_durable_synchronous(
     held: Optional[idempotency.Claim],
     chat: bool,
     file_run: Optional[file_inputs.FileRun] = None,
-    slot_held: bool = False,
+    parsed: Optional["_Parsed"] = None,
 ) -> Response:
     """The work of a durable synchronous generation, run by
-    `CommittedJSONResponse`: the slot and the waiter place (real 429/503
-    inside the commit window), the launch, then the wait. A client that
-    leaves cancels THIS task only — the run keeps its orphan grace, so the
-    SDK's retry attaches instead of generating again."""
-    lease = None if slot_held else quotas.take_slot(caller, KIND_SYNC)
-    place: Optional[_Place] = None
+    `CommittedJSONResponse`: the files' quick refusals, the slot and the
+    waiter place (real 404/400/429/503 inside the commit window), the launch,
+    then the wait. A client that leaves cancels THIS task only — the run keeps
+    its orphan grace, so the SDK's retry attaches instead of generating again.
+
+    A request with files launches at once and prepares them in the run
+    (`_file_preparer`): the run's slot is held for as long as the run lives,
+    not just while this connection does (durable-resume review 2026-09-14,
+    medium: a client that left gave the project's slot back while the run
+    went on)."""
     try:
-        place = _place_for(_plan_gates(plan))
-        handle = await _launch_durable(
-            request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat, held=held,
-            reservation=reservation, on_finish=on_finish, file_run=file_run, slot=lease, place=place,
-        )
-    except BaseException:
-        if place is not None:
-            place.release()
-        if lease is not None:
-            lease.release()
         if file_run is not None:
-            # Nothing launched, so no settle will run `wrap_finish`'s cleanup.
+            await file_run.precheck()
+        lease = quotas.take_slot(caller, KIND_SYNC)
+    except BaseException:
+        if file_run is not None:
             file_run.cleanup()
         await _nothing_ran(caller, reservation, held)
         raise
+    try:
+        place = _MovablePlace(_place_for(_plan_gates(plan)))
+    except BaseException:
+        lease.release()
+        if file_run is not None:
+            file_run.cleanup()
+        await _nothing_ran(caller, reservation, held)
+        raise
+    prepare = None
+    if file_run is not None:
+        assert parsed is not None
+        prepare = _file_preparer(parsed, caller, file_run, place=place)
+    handle = await _launch_durable(
+        request, caller, spec=spec, plan=plan, request_model=request_model, chat=chat, held=held,
+        reservation=reservation, on_finish=on_finish, file_run=file_run, slot=lease, place=place,
+        prepare=prepare,
+    )
     began = time.monotonic()
     try:
         finished = await _await_durable_outcome(handle, held=held, partial=outcome)
@@ -2974,101 +3117,6 @@ async def _run_durable_synchronous(
         _note_client_gone(request, time.monotonic() - began)
         raise
     return JSONResponse(_durable_body(finished, chat=chat, file_run=file_run))
-
-
-async def _run_durable_synchronous_with_files(
-    *,
-    file_run: file_inputs.FileRun,
-    parsed: "_Parsed",
-    **work: Any,
-) -> Response:
-    """`_run_synchronous_with_files` for a durable run: the slot, the file
-    wait and the second plan inside the committed response, then the durable
-    launch on the final spec (its citation index travels with the spec)."""
-    caller, spec = work["caller"], work["spec"]
-    slot = contextlib.ExitStack()
-    try:
-        slot.enter_context(quotas.concurrency_slot(caller, KIND_SYNC))
-        await file_run.prepare(file_inputs.DELIVERY_SYNC, no_deadline=True)
-        plan = await _replan(parsed, caller, await file_run.planning_inputs())
-    except BaseException:
-        slot.close()
-        file_run.cleanup()
-        await _nothing_ran(caller, work["reservation"], work["held"])
-        raise
-    final = streaming.spec_from_plan(plan, response_id=spec.response_id, created_at=spec.created_at)
-    with slot:
-        return await _run_durable_synchronous(
-            **{**work, "plan": plan, "spec": final}, file_run=file_run, slot_held=True
-        )
-
-
-@contextlib.asynccontextmanager
-async def _no_router_gate(plan: planning.GenerationPlan) -> AsyncIterator[None]:
-    """The gate a durable file stream passes to `file_inputs.stream_with_files`:
-    none — the durable runner holds the plan's gates itself (`_take_gates`),
-    and holding them here too would admit the answer twice."""
-    yield
-
-
-def _durable_stream_launch(
-    request: Request,
-    caller: ApiCaller,
-    *,
-    parsed: "_Parsed",
-    request_model: models.ResponsesRequest,
-    chat: bool,
-    held: Optional[idempotency.Claim],
-    reservation: Any,
-    on_finish: streaming.OnFinish,
-    file_run: Optional[file_inputs.FileRun],
-    include_usage: bool,
-) -> Callable[[streaming.GenerationSpec], AsyncIterator[str]]:
-    """The stream launch a file stream calls with its final spec: launch
-    durably (the files' context is in the spec now), then follow the log."""
-
-    def launch(final: streaming.GenerationSpec) -> AsyncIterator[str]:
-        async def frames() -> AsyncIterator[str]:
-            assert parsed.plan is not None
-            plan = parsed.plan  # the recorder ref reads the requested ceiling only
-            try:
-                handle = await _launch_durable(
-                    request, caller, spec=final, plan=plan, request_model=request_model, chat=chat, held=held,
-                    reservation=reservation, on_finish=on_finish, file_run=file_run, slot=None, place=None,
-                )
-            except Exception as exc:  # noqa: BLE001 - after the status line, a failure is a frame
-                # The launch itself failed (the disk guard, the database): the
-                # stream's status line is long gone, so this is its terminal
-                # frame, recorded like any failure that ran nothing.
-                failure = errors.from_unexpected(exc, request_id=_request_id(request))
-                await streaming.settle(on_finish, streaming.StreamOutcome(
-                    response_id=final.response_id, model=final.model, created_at=final.created_at,
-                    status="failed", error=failure, duration_ms=0, max_output_tokens=final.planned,
-                ))
-                if file_run is not None:
-                    file_run.cleanup()
-                if chat:
-                    for frame in _chat_gate_refusal_frames(
-                        failure, completion_id=_completion_id(final.response_id), model=final.model,
-                        created=final.created_at, include_usage=include_usage,
-                    ):
-                        yield frame
-                else:
-                    emitter = events.SequencedEvents(item_id=final.item_id)
-                    yield emitter.created(streaming._wire(final, "queued"))
-                    yield emitter.failed(streaming._wire(final, "failed", error=failure))
-                return
-            chat_args = (
-                _chat_render_args(response_id=final.response_id, model=final.model, created=final.created_at,
-                                  include_usage=include_usage)
-                if chat else None
-            )
-            async for frame in _follow_frames(handle, after=0, tagged=gateway_tag(request).tagged, chat=chat_args):
-                yield frame
-
-        return frames()
-
-    return launch
 
 
 # -- attach -----------------------------------------------------------------

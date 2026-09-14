@@ -44,6 +44,7 @@ from app.publicapi import (
     capacity,
     durable,
     durable_store,
+    errors,
     events,
     gateway_protocol,
     registry,
@@ -770,15 +771,271 @@ def test_a_durable_file_stream_announces_its_citations_and_so_do_a_durable_file_
     assert final["choices"][0]["delta"]["annotations"] == [annotation]
 
 
-def test_the_disk_guard_refuses_a_durable_stream_before_its_status_line_and_ends_a_file_stream_with_a_failed_event(port, files_world, monkeypatch):
+def test_the_disk_guard_refuses_a_durable_stream_before_its_status_line_with_or_without_files(port, files_world, monkeypatch):
+    """A durable stream with files is launched before its status line like any
+    other (release review 2026-09-14), so the disk guard's refusal is the same
+    real 503 for both, and neither leaves a row behind."""
     monkeypatch.setattr(blobs, "min_free_disk_bytes", lambda: 1 << 62)
     fid = files_world["file_id"]
 
     plain = httpx.post(_url(port, "/v1/responses"), json=_responses_body(stream=True), headers=_auth(), timeout=30)
-    with_file = read_sse("POST", _url(port, "/v1/responses"), headers=_auth(), json_body=_file_body(fid, stream=True))
+    with_file = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid, stream=True), headers=_auth(), timeout=30)
 
-    assert plain.status_code == 503 and plain.headers["retry-after"]
-    assert with_file.status == 200 and with_file.error is None
-    assert _names(with_file.records) == ["response.created", "response.failed"]
-    response_id = _response_id(with_file.records)
-    _wait_for(lambda: db.get_api_response(response_id, files_world["project_id"])["status"] == "failed")
+    for refused in (plain, with_file):
+        assert refused.status_code == 503 and refused.headers["retry-after"], refused.text
+    assert db.list_api_responses(files_world["project_id"]) == []
+    assert files_world["engine"].messages == []
+
+
+# ---------------------------------------- files still being prepared --
+#
+# Release review 2026-09-14 (medium): a durable request whose files were still
+# being prepared was not a run yet. A restart held the old process's shutdown
+# for its whole grace and then cut the stream with ZERO events (no id to
+# resume), the synchronous call failed with a connection error, the run gave
+# its project slot back when its client left, and it was never counted in the
+# gates' waiter lines. Now it is launched at once and prepares in the runner.
+
+
+def _stream_in_thread(url: str, *, headers: Dict[str, str], json_body: Any) -> "tuple[threading.Thread, Wire]":
+    """`read_sse` on a thread, filling the returned Wire as frames arrive."""
+    wire = Wire()
+
+    def run() -> None:
+        with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+            try:
+                with client.stream("POST", url, headers=headers, json=json_body) as response:
+                    wire.status = response.status_code
+                    wire.headers = dict(response.headers)
+                    buffer = ""
+                    for chunk in response.iter_text():
+                        wire.text += chunk
+                        buffer += chunk
+                        while "\n\n" in buffer:
+                            block, buffer = buffer.split("\n\n", 1)
+                            parsed = events.parse_frames(block + "\n\n")
+                            if parsed:
+                                wire.records.extend(parsed)
+            except httpx.HTTPError as exc:
+                wire.error = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, wire
+
+
+def _preparing_runs() -> List[durable.Run]:
+    return [run for run in list(durable.RUNTIME.runs.values()) if run.preparing]
+
+
+def _in_flight(project_id: str) -> int:
+    from app.apiplatform import quotas
+
+    return int(quotas._in_flight.get(project_id, 0))
+
+
+def test_a_durable_file_stream_has_its_id_slot_and_place_while_its_file_processes_then_answers(port, files_world):
+    store, fid, project_id = files_world["store"], files_world["file_id"], files_world["project_id"]
+    store.update(project_id, fid, blob_status="processing", blob_stage="index", blob_progress={"percent": 10})
+
+    thread, wire = _stream_in_thread(_url(port, "/v1/responses"), headers=_auth(), json_body=_file_body(fid, stream=True))
+    _wait_for(lambda: wire.records)
+    assert _names(wire.records) == ["response.created"]
+    response_id = _response_id(wire.records)
+    assert _preparing_runs() and _preparing_runs()[0].id == response_id
+    # The run holds the project's slot and its place in the gates' lines.
+    assert _in_flight(project_id) == 1
+    assert sum(public_router._GATE_LINE.waiting.values()) >= 1
+    store.update(project_id, fid, blob_progress={"percent": 40})
+    _wait_for(lambda: f": file {fid}" in wire.text)
+    store.update(project_id, fid, blob_status="processed", blob_stage="finalize", blob_progress={"percent": 100})
+    thread.join(30)
+
+    assert wire.error is None and wire.status == 200
+    assert wire.records[-1]["event"] == "response.completed"
+    assert _seqs(wire.records) == list(range(1, len(wire.records) + 1))
+    assert "AZURE-42" in _text(wire.records)
+    added = [r for r in wire.records if r["event"] == "response.output_text.annotation.added"]
+    assert added and added[0]["data"]["annotation"]["file_id"] == fid
+    assert len(files_world["engine"].messages) == 1
+    assert "AZURE-42" in json.dumps(files_world["engine"].messages[0])
+    _wait_for(lambda: _in_flight(project_id) == 0 and not public_router._GATE_LINE.waiting)
+    assert durable_store.get_run(response_id)["status"] == "completed"
+
+
+def test_a_restart_while_files_are_prepared_ends_streams_and_calls_at_once_retry_safe_and_the_retry_answers(port, platform, files_world):
+    store, fid, project_id = files_world["store"], files_world["file_id"], files_world["project_id"]
+    store.update(project_id, fid, blob_status="processing", blob_stage="index", blob_progress={"percent": 10})
+    keyed = _auth(extra={"Idempotency-Key": "prepared-across-a-restart"})
+    stream_thread, wire = _stream_in_thread(_url(port, "/v1/responses"), headers=keyed, json_body=_file_body(fid, stream=True))
+    result: Dict[str, Any] = {}
+
+    def sync_call() -> None:
+        try:
+            result["response"] = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid), headers=_auth(), timeout=30)
+        except httpx.HTTPError as exc:
+            result["error"] = exc
+
+    sync_thread = threading.Thread(target=sync_call, daemon=True)
+    sync_thread.start()
+    _wait_for(lambda: len(_preparing_runs()) == 2 and wire.records)
+    ids = sorted(run.id for run in _preparing_runs())
+    time.sleep(0.5)  # the synchronous call is committed (PUBLIC_API_SYNC_COMMIT_S 0.3)
+
+    began = time.monotonic()
+    _post_restart(port)
+    stream_thread.join(15)
+    sync_thread.join(15)
+    elapsed = time.monotonic() - began
+
+    assert elapsed < 10, "a restart must not wait for a file still being prepared"
+    # The stream: its id at once, then ONE terminal event that says what to do.
+    assert wire.error is None and _names(wire.records) == ["response.created", "response.failed"]
+    failure = wire.records[-1]["data"]["response"]["error"]
+    assert failure["code"] == "model_unavailable"
+    assert failure["message"] == errors.PREPARATION_INTERRUPTED_MESSAGE
+    # The committed synchronous call: its connection dropped, so an SDK retries.
+    assert "error" in result, result.get("response") and result["response"].text
+    for response_id in ids:
+        row = durable_store.get_run(response_id)
+        assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
+    # The plan made before the files resolved is never stored as a spec.
+    assert durable_store.has_spec(ids) in (set(), [], {})
+    assert files_world["engine"].messages == []
+    _wait_for(lambda: _in_flight(project_id) == 0 and not public_router._GATE_LINE.waiting)
+    with db.connection() as con:
+        claim = con.execute(
+            "SELECT response_id FROM api_idempotency WHERE idem_key = %s", ("prepared-across-a-restart",)
+        ).fetchone()
+    assert claim is None or claim["response_id"] is None, "a failure that ran nothing releases its key"
+
+    # The files kept processing; the SDK's retry answers in the new process.
+    store.update(project_id, fid, blob_status="processed", blob_stage="finalize", blob_progress={"percent": 100})
+    retry = httpx.post(
+        _url(port, "/v1/responses"), json=_file_body(fid),
+        headers=_auth(extra={"x-stainless-retry-count": "1"}), timeout=30,
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] not in ids and "AZURE-42" in retry.json()["output"][0]["content"][0]["text"]
+    assert len(files_world["engine"].messages) == 1
+
+
+def test_a_synchronous_file_call_whose_client_left_keeps_its_slot_until_its_run_ends(port, files_world, monkeypatch):
+    set_setting(monkeypatch, "PUBLIC_API_UNKEYED_ORPHAN_GRACE_S", "3")
+    store, fid, project_id = files_world["store"], files_world["file_id"], files_world["project_id"]
+    store.update(project_id, fid, blob_status="processing", blob_stage="index", blob_progress={"percent": 10})
+
+    with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+        with client.stream("POST", _url(port, "/v1/responses"), headers=_auth(), json=_file_body(fid)) as response:
+            assert response.status_code == 200
+            next(response.iter_bytes())  # the committed response's first space
+    run = _wait_for(lambda: (_preparing_runs() or [None])[0])
+    _wait_for(lambda: not run.readers, timeout=5)
+
+    # The client is gone and the run still prepares: its slot is still counted.
+    assert run.preparing and _in_flight(project_id) == 1
+    _wait_for(lambda: durable_store.get_run(run.id)["status"] == "cancelled", timeout=15)
+    _wait_for(lambda: _in_flight(project_id) == 0 and not public_router._GATE_LINE.waiting)
+    assert files_world["engine"].messages == []
+
+
+def test_a_client_that_leaves_while_its_run_is_being_launched_never_leaves_the_row_queued(port, platform, monkeypatch):
+    """Durable-resume review 2026-09-14 (medium): a committed call cancelled
+    between the row's write and the runner's start left the row `queued`, the
+    claim unbound and the waiter place taken, until the next restart."""
+    set_setting(monkeypatch, "PUBLIC_API_STREAM_ORPHAN_GRACE_S", "0.5")
+    engine = FakeMainEngine(answer_tokens=400, delay_s=0.02).install(monkeypatch)
+    real_mark = durable_store.mark_durable
+    slowed = threading.Event()
+
+    def slow_mark(*args: Any, **kwargs: Any) -> Any:
+        slowed.set()
+        time.sleep(1.0)
+        return real_mark(*args, **kwargs)
+
+    monkeypatch.setattr(durable_store, "mark_durable", slow_mark)
+    keyed = _auth(extra={"Idempotency-Key": "left-during-launch"})
+    with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+        with client.stream("POST", _url(port, "/v1/responses"), headers=keyed, json=_responses_body()) as response:
+            assert response.status_code == 200
+            next(response.iter_bytes())
+            assert slowed.wait(5)
+    rows = _wait_for(lambda: db.list_api_responses(platform["project"]["id"]))
+    response_id = rows[0]["id"]
+
+    row = _wait_for(
+        lambda: (lambda r: r if r and r["status"] in durable_store.TERMINAL_STATUSES else None)(durable_store.get_run(response_id)),
+        timeout=20,
+    )
+    assert row["resumable"] is True and row["status"] == "cancelled"
+    with db.connection() as con:
+        claim = con.execute("SELECT response_id FROM api_idempotency WHERE idem_key = %s", ("left-during-launch",)).fetchone()
+    assert claim is not None and claim["response_id"] == response_id, "the launch bound the key to its run"
+    _wait_for(lambda: _in_flight(platform["project"]["id"]) == 0 and not public_router._GATE_LINE.waiting)
+    assert len(engine.calls) <= 1
+
+
+def test_a_restart_ends_a_background_request_still_waiting_for_its_file_on_the_record(port, files_world, monkeypatch):
+    notified: List[str] = []
+
+    async def record_notify(row: Any, workspace_id: Any) -> None:
+        notified.append(str(row["id"]))
+
+    monkeypatch.setattr(background, "_notify", record_notify)
+    store, fid, project_id = files_world["store"], files_world["file_id"], files_world["project_id"]
+    store.update(project_id, fid, blob_status="processing", blob_stage="index", blob_progress={"percent": 10})
+    accepted = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid, background=True), headers=_auth(), timeout=30)
+    assert accepted.status_code == 202, accepted.text
+    response_id = accepted.json()["id"]
+    time.sleep(0.3)
+
+    _post_restart(port)
+
+    row = db.get_api_response(response_id, project_id)
+    assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
+    assert row["error_message"] == errors.PREPARATION_INTERRUPTED_MESSAGE
+    assert notified == [response_id]
+    assert files_world["engine"].messages == []
+
+
+def test_a_keyed_file_stream_cut_mid_answer_resumes_from_the_spec_its_files_produced(port, files_world, monkeypatch):
+    """The spec a preparing run stores is the FINAL one, written when its files
+    resolved: a restart during the answer resumes with the file text, never
+    from the plan made before the files were read."""
+    engine = FakeMainEngine(answer_tokens=60, delay_s=0.01).install(monkeypatch)
+    fid = files_world["file_id"]
+    keyed = _auth(extra={"Idempotency-Key": "file-stream-resumed"})
+    restarted = threading.Event()
+
+    def restart_once(deltas: int) -> None:
+        if deltas == 5 and not restarted.is_set():
+            restarted.set()
+            threading.Thread(target=_post_restart, args=(port,), daemon=True).start()
+
+    cut = read_sse("POST", _url(port, "/v1/responses"), headers=keyed, json_body=_file_body(fid, stream=True),
+                   on_delta=restart_once)
+    response_id = _response_id(cut.records)
+    assert cut.error is not None and restarted.is_set()
+    _wait_for(lambda: durable_store.get_run(response_id)["lease_owner"] is None)
+    resumed = read_sse(
+        "GET", _url(port, f"/v1/responses/{response_id}"), headers=_auth(),
+        params={"stream": "true", "starting_after": cut.records[-1]["data"]["sequence_number"]},
+    )
+
+    assert resumed.records[-1]["event"] == "response.completed"
+    assert _text(cut.records + resumed.records) == expected_text(60)
+    assert len(engine.calls) == 2 and engine.calls[1].kwargs["continue_final_message"] is True
+    assert "AZURE-42" in json.dumps(engine.calls[0].messages) and "AZURE-42" in json.dumps(engine.calls[1].messages)
+
+
+def test_a_waiter_place_moves_to_the_final_plans_gates_and_is_counted_in_exactly_one_line():
+    public_router._GATE_LINE.reset_for_tests()
+    holder = public_router._MovablePlace(public_router._place_for(["main.normal"]))
+    assert public_router._GATE_LINE.waiting == {"main.normal": 1}
+    holder.move_to(["main.normal"])
+    assert public_router._GATE_LINE.waiting == {"main.normal": 1}
+    holder.move_to(["main.long"])
+    assert public_router._GATE_LINE.waiting == {"main.long": 1}
+    holder.release()
+    holder.move_to(["main.normal"])
+    assert public_router._GATE_LINE.waiting == {}
