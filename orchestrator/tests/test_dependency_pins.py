@@ -59,3 +59,29 @@ def test_shared_lancedb_library_versions_match_across_containers(name):
     assert len(set(versions.values())) == 1, (
         f"{name} differs between the containers that share /data/lancedb: {versions}"
     )
+
+
+# 2026-09-15 security scan: the vLLM base image ships older copies of these,
+# and `pip install -r` keeps an installed version whenever it satisfies the
+# floor, so a floor below the fixed release is a vulnerable production image.
+_SECURITY_FLOORS = {
+    "starlette": (1, 3, 1),  # GHSA-82w8-qh3p-5jfq
+    "python-multipart": (0, 0, 31),  # GHSA-5rvq-cxj2-64vf, GHSA-v9pg-7xvm-68hf
+    "pillow": (12, 3, 0),  # GHSA-6r8x-57c9-28j4 and the rest of the 12.3.0 batch
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SECURITY_FLOORS))
+def test_orchestrator_requirement_floor_is_at_or_above_the_security_fix(name):
+    pins = _pins(_FILES["orchestrator"])
+    assert name in pins, f"orchestrator: {name} is missing"
+    op, version, line = pins[name]
+    assert op in (">=", "=="), f"orchestrator: {name} needs a floor, got {line!r}"
+    got = tuple(int(part) for part in version.split("."))
+    assert got >= _SECURITY_FLOORS[name], f"orchestrator: {line!r} is below the fixed release"
+
+
+def test_sync_worker_cryptography_floor_is_at_or_above_the_security_fix():
+    op, version, line = _pins(_FILES["sync-worker"])["cryptography"]
+    assert op in (">=", "=="), line
+    assert tuple(int(part) for part in version.split(".")) >= (50, 0, 0), line

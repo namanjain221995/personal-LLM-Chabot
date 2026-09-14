@@ -2,7 +2,12 @@
 # Ranged pins: latest compatible patch/minor is fine; majors are capped.
 httpx>=0.27,<1
 PyJWT>=2.8,<3
-cryptography>=42,<47
+# Floor 50.0.0 (2026-09-15 security scan): <47 resolved 46.0.7, which pip-audit
+# flags for GHSA-537c-gmf6-5ccf (bundled OpenSSL, fixed 48.0.1),
+# GHSA-jwv3-5hgf-82ww and GHSA-m2h6-j472-rp4c (fixed 49.0.0) and
+# GHSA-g6cj-pr64-35w5 (fixed 50.0.0). PyJWT uses it for the RS256 signature
+# of the Salesforce JWT bearer grant (syncworker/sf_auth.py).
+cryptography>=50.0.0,<51
 duckdb>=1.0,<2
 pyarrow==25.0.1
 pandas>=2.2,<3

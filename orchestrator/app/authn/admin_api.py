@@ -1,8 +1,9 @@
 """The workspace administration surface (/admin/api/*).
 
 Every route is capability-gated (RBAC), not role-string-gated. Content
-inspection — reading a member's conversations, uploads, reports — exists ONLY
-here, is READ-ONLY, and records an audit event per access. There is no
+inspection — reading a member's conversations, uploads, reports, sessions and
+usage counts — exists ONLY here, is READ-ONLY, and records an audit event per
+access to ANOTHER member (lists and stats included, `_audit_member_read`). There is no
 impersonation: nothing on this surface can act AS another user, start a chat
 in their name, or feed their content into a model context.
 
@@ -95,6 +96,45 @@ async def _inspectable_member(principal: Principal, user_id: int) -> Dict[str, A
     return target
 
 
+# How long an IDENTICAL list/stats read is folded into the event already
+# written for it. The key is the whole event — actor, action, target, meta
+# (page offset, limit, result counts) and source address — so paging to
+# another page, a changed result count or a new address always writes a new
+# row; only a re-render, a retry or a tab switch back within the window does
+# not. The page does not poll today; this is what keeps it from flooding the
+# log if it ever does. Single-item reads (a conversation opened, a file
+# downloaded) are never folded: each is its own event.
+READ_AUDIT_COALESCE_S = 60
+
+
+async def _audit_member_read(
+    principal: Principal,
+    request: Optional[Request],
+    action: str,
+    user_id: int,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Audit a list or stats read of ANOTHER member's content or sessions.
+
+    Called only after the read succeeded (a refused read is a 404 raised
+    before it, and leaves no event). Reading your own is not oversight and
+    writes nothing. `meta` carries paging and counts only — never titles,
+    filenames, addresses or content.
+    """
+    if user_id == principal.user_id:
+        return
+    await db.run_in_thread(
+        lambda: audit(
+            principal,
+            request,
+            action,
+            target_user_id=user_id,
+            meta=meta,
+            coalesce_seconds=READ_AUDIT_COALESCE_S,
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------------
@@ -169,6 +209,7 @@ async def members(
 @router.get("/members/{user_id}")
 async def member_detail(
     user_id: int,
+    request: Request,
     principal: Principal = Depends(require_capability(Cap.MEMBERS_READ)),
 ) -> dict:
     row = await _target_member(principal, user_id)
@@ -188,6 +229,10 @@ async def member_detail(
     stats = (
         await db.run_in_thread(store.admin_user_overview, user_id) if inspectable else None
     )
+    if stats is not None:
+        # The counts are the same inspection the content tabs are; audited
+        # the same way. Withheld stats read nothing and write nothing.
+        await _audit_member_read(principal, request, "admin_viewed_member_stats", user_id)
     return {"member": _member_payload(row), "stats": stats, "may_inspect": inspectable}
 
 
@@ -330,11 +375,17 @@ async def remove_member(
 @router.get("/members/{user_id}/sessions")
 async def member_sessions(
     user_id: int,
+    request: Request,
     principal: Principal = Depends(require_capability(Cap.SESSIONS_MANAGE)),
 ) -> dict:
     await _inspectable_member(principal, user_id)
     rows = await db.run_in_thread(
         lambda: store.list_sessions(user_id, live_only=False)
+    )
+    shown = rows[:50]
+    # The list carries IPs and user agents; the event carries only the count.
+    await _audit_member_read(
+        principal, request, "admin_listed_sessions", user_id, {"returned": len(shown)}
     )
     return {
         "sessions": [
@@ -347,7 +398,7 @@ async def member_sessions(
                 "user_agent": r["user_agent"] or "",
                 "ip": r["ip"] or "",
             }
-            for r in rows[:50]
+            for r in shown
         ]
     }
 
@@ -421,6 +472,7 @@ async def reset_member_password(
 @router.get("/members/{user_id}/conversations")
 async def member_conversations(
     user_id: int,
+    request: Request,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
@@ -428,6 +480,13 @@ async def member_conversations(
     await _inspectable_member(principal, user_id)
     rows, total = await db.run_in_thread(
         lambda: store.admin_user_conversations(user_id, limit=limit, offset=offset)
+    )
+    await _audit_member_read(
+        principal,
+        request,
+        "admin_listed_conversations",
+        user_id,
+        {"offset": offset, "limit": limit, "returned": len(rows), "total": int(total)},
     )
     return {
         "conversations": [
@@ -508,6 +567,13 @@ async def member_uploads(
     rows, total = await db.run_in_thread(
         lambda: store.admin_user_uploads(user_id, limit=limit, offset=offset)
     )
+    await _audit_member_read(
+        principal,
+        request,
+        "admin_listed_uploads",
+        user_id,
+        {"offset": offset, "limit": limit, "returned": len(rows), "total": int(total)},
+    )
     return {
         "uploads": [
             {
@@ -528,10 +594,14 @@ async def member_uploads(
 @router.get("/members/{user_id}/reports")
 async def member_reports(
     user_id: int,
+    request: Request,
     principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
 ) -> dict:
     await _inspectable_member(principal, user_id)
     rows = await db.run_in_thread(store.list_report_files, user_id)
+    await _audit_member_read(
+        principal, request, "admin_listed_reports", user_id, {"returned": len(rows)}
+    )
     return {
         "reports": [
             {

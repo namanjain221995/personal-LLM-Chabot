@@ -14,9 +14,23 @@
 # fastapi 0.141.1 / starlette 1.6.0. There is no lock file: /uv.lock is an
 # empty project's. tests/test_orchestrator_hardening.py asserts these floors.
 fastapi>=0.115.7
-starlette>=0.44.0
+# SECURITY FLOORS (2026-09-15 scan). `pip install -r` keeps whatever the vLLM
+# base image already has when it satisfies a floor, so the floors ARE the
+# production versions: pip-audit of sf-local-ai-orchestrator:cuda found
+# starlette 0.52.1 (GHSA-82w8-qh3p-5jfq, HIGH: request.form() ignores
+# max_fields/max_part_size for an x-www-form-urlencoded body, which is what
+# app/uploads.py `_read_form` relies on; fixed 1.3.1), python-multipart 0.0.27
+# (GHSA-5rvq-cxj2-64vf, HIGH: quadratic querystring parsing, fixed 0.0.30;
+# GHSA-v9pg-7xvm-68hf fixed 0.0.31) and pillow 12.2.0 (heap out-of-bounds
+# writes and decompression-bomb bypasses on decode, fixed 12.3.0). This line
+# subsumes the 0.44.0 floor described above. fastapi 0.136.1 (the image) to 0.141.1 declare
+# `starlette>=0.46.0` with no upper bound, so the fastapi floor does not move;
+# an older fastapi that caps starlette is upgraded by the resolver. The CI
+# venv already runs fastapi 0.141.1, starlette 1.6.0, python-multipart 0.0.32
+# and pillow 12.3.0.
+starlette>=1.3.1
 # Phase 4: multipart dataset uploads (streamed, never base64 in the chat body)
-python-multipart>=0.0.9
+python-multipart>=0.0.31
 uvicorn[standard]>=0.30
 langgraph>=0.2
 openai>=1.50
@@ -65,7 +79,7 @@ transformers>=4.51
 # while the venv passed. Move the pin deliberately, with the renderer suites.
 weasyprint==70.0
 pypdfium2>=4.30
-pillow>=10.0
+pillow>=12.3.0
 trafilatura>=1.12
 # Video understanding (2026-09-09). Voice-activity detection cuts a recording
 # into transcription windows at pauses. `webrtcvad-wheels` is the maintained
