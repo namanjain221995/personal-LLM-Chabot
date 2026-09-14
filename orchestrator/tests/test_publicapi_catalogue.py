@@ -200,7 +200,9 @@ def test_models_that_generate_nothing_have_null_output_ceilings_never_zero(monke
     assert embed["limits"]["embedding_dimensions"] == 1024
     assert embed["endpoints"] == ["/v1/embeddings"] and embed["kind"] == "embedding"
     assert whisper["context_window"] is None and whisper["max_input_tokens"] is None
-    assert whisper["limits"]["max_audio_seconds"] == 300
+    # Any duration (no-timeout design, 2026-09-14): no seconds limit exists.
+    assert "max_audio_seconds" not in whisper["limits"]
+    assert whisper["limits"]["max_audio_bytes"] == 93_323_264
     assert whisper["endpoints"] == ["/v1/audio/transcriptions"]
 
 

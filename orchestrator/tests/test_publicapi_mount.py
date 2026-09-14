@@ -536,14 +536,14 @@ def test_a_413_on_v1_carries_a_request_id_and_the_v1_cors_headers():
     never runs for a response the router did not produce) — a developer's
     browser SDK saw an opaque failure instead of `request_too_large`.
 
-    Posted to `/v1/embeddings` since 2026-09-13: its cap is 1 MiB before AND
-    after main.py adopts the per-route public caps (`/v1/responses` becomes
-    20 MiB then, and this test would have turned into a 401 for a reason
-    that has nothing to do with what it pins — adversarial review)."""
+    Posted to `/v1/embeddings` since 2026-09-13, one byte over its cap —
+    8 MiB since the no-timeout sidecar work (CONTRACT §8.4, 2026-09-14)."""
+    from app.publicapi import endpoint_models
+
     client = TestClient(app)
     response = client.post(
         "/v1/embeddings",
-        content=b"x" * (2 * 1024 * 1024),
+        content=b"x" * (endpoint_models.max_pooling_body_bytes() + 1),
         headers={"content-type": "application/json", "origin": FOREIGN_ORIGIN},
     )
     assert response.status_code == 413, response.text
@@ -581,9 +581,9 @@ def test_main_py_asks_the_public_per_route_table_for_every_v1_cap():
     """Integration 2026-09-13: `app.main.body_cap_for` delegates `/v1` to
     `publicapi.models.body_cap_for` — one table, the one the edge mirrors."""
     assert _main_uses_the_public_per_route_caps()
+    for path in ("/v1/embeddings", "/v1/rerank"):
+        assert app_main.body_cap_for("POST", path).signed_in == 8 * 1024 * 1024, path
     for method, path in (
-        ("POST", "/v1/embeddings"),
-        ("POST", "/v1/rerank"),
         ("GET", "/v1/responses"),
         ("POST", "/v1/responses/resp_x/cancel"),
         ("GET", "/v1/models"),
@@ -690,14 +690,17 @@ def test_a_twenty_mib_audio_upload_and_a_large_image_request_pass_the_middleware
         assert over.json()["error"]["code"] == "request_too_large"
 
 
-def test_a_body_over_one_mib_on_a_text_only_public_route_is_still_refused_by_the_middleware():
-    """The other half, true before and after the main.py integration: the
-    larger caps belong to the two generation routes and transcriptions only."""
+def test_a_body_over_its_cap_on_a_json_only_public_route_is_still_refused_by_the_middleware():
+    """The other half: embeddings and rerank carry 8 MiB of JSON (2,048 inputs,
+    1,000 documents; CONTRACT §8.4/§8.5, 2026-09-14) and not a byte more, and
+    the media and audio caps are not theirs."""
+    from app.publicapi import endpoint_models
+
     client = TestClient(app)
     for path in ("/v1/embeddings", "/v1/rerank"):
         response = client.post(
             path,
-            content=b"x" * (2 * 1024 * 1024),
+            content=b"x" * (endpoint_models.max_pooling_body_bytes() + 1),
             headers={"content-type": "application/json"},
         )
         assert response.status_code == 413, (path, response.text[:200])

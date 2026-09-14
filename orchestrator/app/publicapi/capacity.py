@@ -6,7 +6,8 @@ physical fact: the router, the OCR engine, the embeddings model, the reranker
 and whisper are SHARED with the chat application, and a public caller must
 never be able to starve the product of them. So public work on each shared
 engine passes through ONE gate per engine — shared by every project and key,
-first come first served, with a bounded wait that ends in the existing
+first come first served. On /v1 that wait has no limit (NO CLOCK ENDS A /v1
+WAIT, below); only a caller passing a finite wait can get the
 `503 model_unavailable` "at capacity" with a `Retry-After`. Never a 429, and
 never a number attached to a caller.
 
@@ -59,8 +60,11 @@ architecture review of 2026-09-13 from the engines' own logs):
 NO CLOCK ENDS A /v1 WAIT (no-timeout design, 2026-09-13). `hold(wait_s=None)`
 waits until admitted, abandoned, or the caller's own physical guards say
 otherwise; only a caller passing a FINITE `wait_s` can ever get
-`model_at_capacity`, and no durable /v1 caller does (the legacy synchronous
-path keeps PUBLIC_API_GATE_WAIT_S until T3's committed responses land). A
+`model_at_capacity`, and no /v1 route does: the generations wait inside
+their streams and committed responses, and since 2026-09-14 so do
+`/v1/embeddings`, `/v1/rerank` and `/v1/audio/transcriptions` (sidecars.py,
+audio_jobs.py). The one finite caller left is the bounded synchronous file
+preparation (`sync_wait_s`). A
 waiter can ask for `on_wait(position, waited_s)` — on entry, whenever its
 place in line changes, and at least every 15 s — which is how a stream says
 `response.queued` and a committed sync body writes its whitespace.
@@ -171,10 +175,11 @@ def _config(engine: str) -> GateConfig:
 
 
 def sync_wait_s() -> float:
-    """PUBLIC_API_GATE_WAIT_S (30 s): how long a synchronous, streaming,
-    embeddings, rerank or transcription request may wait for its gate. It
-    waits BEFORE the status line, so the refusal is a real HTTP 503 — and the
-    silent pre-header wait stays well under Cloudflare's 100 s origin timeout."""
+    """PUBLIC_API_GATE_WAIT_S (30 s, retired): the gate budget of the one
+    caller that still waits BEFORE its status line with a clock — the bounded
+    synchronous file preparation (`file_inputs.bounded_engines`, and the
+    retrieval reranker through `sidecars.BOUNDED_DEFAULT`). No /v1 route reads
+    it any more; `config.STILL_READ_RETIRED_SETTINGS` names the readers."""
     return max(0.0, registry.setting_float("PUBLIC_API_GATE_WAIT_S", 30.0))
 
 

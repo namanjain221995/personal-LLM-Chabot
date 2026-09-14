@@ -95,8 +95,9 @@ _DEFAULT_MAX_MEDIA_BODY_BYTES = 20 * 1024 * 1024
 #: resolution the processor downsamples anyway, and ten of them would be
 #: most of the body.
 _DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
-#: 25 MiB of audio plus multipart overhead (`POST /v1/audio/transcriptions`).
-_DEFAULT_MAX_AUDIO_BODY_BYTES = 27_262_976
+#: 89 MiB of audio plus multipart overhead (`POST /v1/audio/transcriptions`,
+#: CONTRACT §8.6); `endpoint_models` owns the number.
+_DEFAULT_MAX_AUDIO_BODY_BYTES = 94_371_840
 
 
 def max_media_body_bytes() -> int:
@@ -111,7 +112,7 @@ def max_image_bytes() -> int:
 
 
 def max_audio_body_bytes() -> int:
-    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (26 MiB): the wire cap on speech."""
+    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (90 MiB): the wire cap on speech."""
     return max(max_body_bytes(), _setting_int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", _DEFAULT_MAX_AUDIO_BODY_BYTES))
 
 
@@ -144,12 +145,17 @@ def body_cap_for(method: str, path: str) -> int:
         files_cap = None
     if files_cap is not None:
         return int(files_cap)
+    # The sidecar routes (2026-09-14): 8 MiB on embeddings and rerank, 90 MiB
+    # on transcriptions — read from the module whose handlers enforce them,
+    # so the middleware's outer cap and the route's own reader agree.
+    from .endpoint_models import body_cap_for as _sidecar_body_cap_for
+
+    sidecar_cap = _sidecar_body_cap_for(method, path)
+    if sidecar_cap is not None:
+        return int(sidecar_cap)
     normalised = "/" + str(path or "").strip("/")
-    if str(method or "").upper() == "POST":
-        if normalised in _MEDIA_ROUTES:
-            return max_media_body_bytes()
-        if normalised in _AUDIO_ROUTES:
-            return max_audio_body_bytes()
+    if str(method or "").upper() == "POST" and normalised in _MEDIA_ROUTES:
+        return max_media_body_bytes()
     return max_body_bytes()
 
 

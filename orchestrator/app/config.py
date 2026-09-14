@@ -82,11 +82,11 @@ RETIRED_PUBLIC_API_SETTINGS = {
 #: Delete an entry in the change that removes its last reader.
 STILL_READ_RETIRED_SETTINGS = {
     "PUBLIC_API_GEN_WALL_CLOCK_S": "apiplatform/idempotency.py (the Idempotency-Key in-flight lease)",
-    "PUBLIC_API_GATE_WAIT_S": "publicapi/sidecars.py (/v1/embeddings, /v1/rerank, /v1/audio/transcriptions) "
-    "and the bounded file preparation of a synchronous request",
+    "PUBLIC_API_GATE_WAIT_S": "publicapi/capacity.py sync_wait_s, for the bounded file preparation of a "
+    "synchronous request (file_inputs.bounded_engines, and the retrieval reranker through sidecars' "
+    "BOUNDED_DEFAULT); the embeddings, rerank and transcription routes stopped reading it 2026-09-14",
     "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "apifiles/ocr_pages.py and apifiles/vectors.py (Files processing jobs) "
     "and the legacy background path while the durable runtime is not running",
-    "PUBLIC_API_MAX_AUDIO_SECONDS": "publicapi/endpoint_models.py (/v1/audio/transcriptions)",
     "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS": "apiplatform/idempotency.py",
 }
 
@@ -1636,25 +1636,28 @@ class Settings:
         self.public_api_embed_context_tokens: int = _int("PUBLIC_API_EMBED_CONTEXT_TOKENS", 4096)
         self.public_api_embed_max_concurrent: int = _int("PUBLIC_API_EMBED_MAX_CONCURRENT", 2)
         self.public_api_embed_kv_budget_tokens: int = _int("PUBLIC_API_EMBED_KV_BUDGET_TOKENS", 8192)
-        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 256)
+        # Request SHAPE, not usage (no-timeout design, 2026-09-14): OpenAI's
+        # own 2,048 inputs and 1,000 documents; the JSON body of both routes
+        # is PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB, endpoint_models).
+        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 2048)
         self.public_api_rerank_context_tokens: int = _int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096)
         self.public_api_rerank_max_concurrent: int = _int("PUBLIC_API_RERANK_MAX_CONCURRENT", 2)
         self.public_api_rerank_kv_budget_tokens: int = _int(
             "PUBLIC_API_RERANK_KV_BUDGET_TOKENS", 8192
         )
-        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100)
-        # techsara-whisper: one public clip fleet-wide, yielding to dictation;
-        # 300 s of audio decodes in ~43 s, inside the 100 s origin timeout.
+        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 1000)
+        # techsara-whisper: one public window fleet-wide, yielding to dictation.
         self.public_api_asr_max_concurrent: int = _int("PUBLIC_API_ASR_MAX_CONCURRENT", 1)
-        # PUBLIC_API_MAX_AUDIO_SECONDS (300) is retired (audio of any length is
-        # transcribed in windows) and not declared; endpoint_models still reads
-        # it from the environment in this build (STILL_READ_RETIRED_SETTINGS).
-        # Body caps (app/main.py asks publicapi.models.body_cap_for): 25 MiB of
-        # audio in a 26 MiB multipart body; 20 MiB on the two generating
-        # routes, which carry image parts (each at most 10 MiB decoded). The
-        # text inside any body is still held to PUBLIC_API_MAX_BODY_BYTES.
-        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)
-        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 27_262_976)
+        # PUBLIC_API_MAX_AUDIO_SECONDS (300) is retired and read by nothing:
+        # audio of any length is transcribed in windows (publicapi/audio_jobs.py).
+        # Body caps (app/main.py asks publicapi.models.body_cap_for): 89 MiB of
+        # audio streamed to disk in a 90 MiB multipart body (the same bytes the
+        # edge and the gateway allow; longer recordings go through the Files
+        # API); 20 MiB on the two generating routes, which carry image parts
+        # (each at most 10 MiB decoded). The text inside any body is still held
+        # to PUBLIC_API_MAX_BODY_BYTES.
+        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 93_323_264)
+        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 94_371_840)
         self.public_api_max_media_body_bytes: int = _int("PUBLIC_API_MAX_MEDIA_BODY_BYTES", 20_971_520)
         self.public_api_max_image_bytes: int = _int("PUBLIC_API_MAX_IMAGE_BYTES", 10_485_760)
 
@@ -1809,14 +1812,14 @@ class Settings:
         #
         # SIDECARS AND AUDIO (publicapi/engines.py, sidecars.py, audio_jobs.py).
         # The input caps PUBLIC_API_EMBED_MAX_INPUTS / PUBLIC_API_RERANK_MAX_DOCUMENTS
-        # and PUBLIC_API_DECODE_CONCURRENCY (2) are NOT defined here on purpose:
-        # `registry.setting_int` and audio_jobs read this object before the
-        # environment, so a value here would override the sidecar team's code
-        # default (and its run-time environment tests) before its changes land.
+        # are declared above (2,048 / 1,000). PUBLIC_API_DECODE_CONCURRENCY (2)
+        # and PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB) are NOT defined here:
+        # audio_jobs and endpoint_models read them from the environment at call
+        # time with their own defaults.
         #: Router/OCR stream silence used only when every witness is unknown. 1800 s.
         self.public_api_sidecar_silence_s: float = _float("PUBLIC_API_SIDECAR_SILENCE_S", 1800.0)
-        #: Embeddings/rerank read timeout; what happens after it is decided by
-        #: the witness verdict, not the clock. 600 s.
+        #: Embeddings/rerank: how long one engine call may be silent before the
+        #: engine's /metrics witness decides what happens (sidecars.py). 600 s.
         self.public_api_pooling_silence_s: float = _float("PUBLIC_API_POOLING_SILENCE_S", 600.0)
         warn_retired_settings()
 

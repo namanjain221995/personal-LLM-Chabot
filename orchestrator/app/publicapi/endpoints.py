@@ -33,28 +33,43 @@ WHAT THESE ROUTES DO NOT DO, DELIBERATELY.
   being busy with public work — the capacity gate — and that is
   `503 model_unavailable` with `Retry-After`, never a 429.
 
-THE AUDIO BODY IS READ ONCE, INTO MEMORY, UNDER ITS OWN CAP. `request.form()`
-would spool a clip over 1 MB to a temporary file (see `multipart.py`), and the
-JSON routes' 1 MiB cap would refuse every real recording. The file part lands
-in one `bytearray` while the body streams in, and is streamed out to the
-engine from that same buffer.
+NO CLOCK ON THESE ROUTES (no-timeout design, 2026-09-14). Each request
+checks its shape and lengths BEFORE any wait — so a refusal is a real status —
+and then answers through `keepalive.CommittedJSONResponse(failure_mode=
+"abort")`: the real status and body when the work finishes within the commit
+window, otherwise `200`, a space at once and one every heartbeat, then the
+object. The capacity gate waits with no limit and an engine is judged by its
+own evidence (`sidecars`), so a long queue or a slow engine is bytes, never a
+`503` "at capacity" or a `504`. A failure after the commit drops the
+connection so the SDK retries (embeddings and rerank recompute; a
+transcription's finished windows are cached).
+
+THE AUDIO BODY GOES TO DISK AS IT ARRIVES. `request.form()` would spool it to
+an unbounded temporary file; the JSON routes' cap would refuse every real
+recording. `multipart.read_form` hands the file part to a `disk_ledger.DiskSink`
+chunk by chunk (sha256 on the way, 0600, under the disk ledger), and
+`audio_jobs` transcribes it in windows — any duration, up to 89 MiB per
+request, larger recordings by Files API `file_id`.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, AsyncIterator, Dict, Mapping, Optional, Set
 
 from fastapi import APIRouter, Depends, Request, Response
+from starlette.responses import StreamingResponse
 
 from ..apiplatform.resolver import ApiCaller
 from ..apiplatform.scopes import Scope, ScopeRequirement, requires
-from . import endpoint_models, errors, multipart, sidecars
+from . import audio_jobs, disk_ledger, endpoint_models, errors, keepalive, multipart, sidecars
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +80,10 @@ SCOPES: Dict[str, ScopeRequirement] = {
     "create_rerank": requires(Scope.RERANK_WRITE),
     "create_transcription": requires(Scope.AUDIO_WRITE),
 }
+
+#: A transcription that names a Files API file also needs `files.read`
+#: (Files design §2.1: "may use" is "may read"), checked before the id is.
+FILE_ID_SCOPE: ScopeRequirement = requires(Scope.FILES_READ)
 
 #: The public path of each operation, as the registry's `endpoints` spell it.
 PATHS: Dict[str, str] = {
@@ -89,13 +108,18 @@ ID_PREFIXES: Dict[str, str] = {
     "create_transcription": "asr",
 }
 
-#: Above this, JSON is decoded in a worker thread: a 1 MiB body of 256 inputs
-#: decoded on the event loop stalls every chat stream in the process for the
-#: length of the parse (the 2026-09-05 Fast-mode lesson: TTFT 0.7 → 11.7 s was
-#: the orchestrator's own loop).
+#: Above this, JSON is decoded in a worker thread: a large body decoded on the
+#: event loop stalls every chat stream in the process for the length of the
+#: parse (the 2026-09-05 Fast-mode lesson: TTFT 0.7 → 11.7 s was the
+#: orchestrator's own loop).
 _OFF_LOOP_JSON_BYTES = 64 * 1024
 
 KIND_SYNC = "sync"
+
+#: Transcription settlements waiting for a job whose client left (so a job
+#: that finishes after its request is still metered once). Referenced here so
+#: the tasks are not collected mid-wait.
+_SETTLING: Set["asyncio.Task[None]"] = set()
 
 
 def _rt():
@@ -167,9 +191,10 @@ async def _model_for(caller: ApiCaller, model_id: str, operation: str) -> Any:
 # -------------------------------------------------------------- bodies --
 
 
-async def _read_json(request: Request) -> Any:
-    """The JSON body under the §12 cap, counted while it arrives."""
-    limit = endpoint_models.max_json_body_bytes()
+async def _read_json(request: Request, *, limit: Optional[int] = None) -> Any:
+    """The JSON body under its cap (the route's, else the §12 JSON rule),
+    counted while it arrives."""
+    limit = endpoint_models.max_json_body_bytes() if limit is None else int(limit)
     declared = request.headers.get("content-length")
     if declared and declared.strip().isdigit() and int(declared) > limit:
         raise errors.request_too_large(limit)
@@ -377,6 +402,11 @@ def _request_id(request: Request) -> str:
 # -------------------------------------------------------------- routes --
 
 
+def _committed(request: Request, work: Any, *, response_class: type = keepalive.CommittedJSONResponse) -> Response:
+    """The byte-invariant answer of a sidecar route (module docstring)."""
+    return response_class(work, failure_mode=keepalive.FAILURE_ABORT, request_id=_request_id(request))
+
+
 async def create_embedding(request: Request, caller: ApiCaller = Depends(_caller)) -> Response:
     """OpenAI-shaped embeddings on `techsara-embed` (1,024 dimensions)."""
     operation = "create_embedding"
@@ -385,7 +415,9 @@ async def create_embedding(request: Request, caller: ApiCaller = Depends(_caller
     deferred: Optional[errors.ApiError] = None
     estimate = 0
     try:
-        parsed = endpoint_models.parse_embeddings_request(await _read_json(request))
+        parsed = endpoint_models.parse_embeddings_request(
+            await _read_json(request, limit=endpoint_models.max_pooling_body_bytes())
+        )
         from .. import context
 
         estimate = sum(context.estimate_tokens(text) for text in parsed.inputs())
@@ -403,44 +435,60 @@ async def create_embedding(request: Request, caller: ApiCaller = Depends(_caller
         model = await _model_for(caller, parsed.model, operation)
         ledger.model_id = model.id
         inputs = parsed.inputs()
-        outcome = await sidecars.embed(inputs, single_string=isinstance(parsed.input, str))
-    except sidecars.SidecarError as failure:
-        await ledger.failed(failure, meta={"inputs": len(parsed.inputs()) if parsed else 0})
-        raise failure.error from None
+        single = isinstance(parsed.input, str)
+        # Before any gate and before the commit clock: an over-length input
+        # is a real 400 however long the queue is.
+        lengths = await sidecars.check_embed_lengths(inputs, single_string=single)
     except BaseException:
         await ledger.nothing_ran()
         raise
-
     base64_wanted = parsed.encoding_format == "base64"
 
-    def build() -> Dict[str, Any]:
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "object": "embedding",
-                    "index": index,
-                    "embedding": sidecars.encode_base64(vector) if base64_wanted else vector,
-                }
-                for index, vector in enumerate(outcome.vectors)
-            ],
-            "model": model.id,
-            "usage": (
-                None
-                if outcome.prompt_tokens is None
-                else {"prompt_tokens": outcome.prompt_tokens, "total_tokens": outcome.prompt_tokens}
-            ),
-        }
+    async def work() -> Response:
+        try:
+            # wait_s=None: no clock on the route (module docstring).
+            outcome = await sidecars.embed(inputs, single_string=single, lengths=lengths, wait_s=None)
+        except sidecars.SidecarError as failure:
+            await ledger.failed(failure, meta={"inputs": len(inputs)})
+            raise failure.error from None
+        except BaseException:
+            await ledger.nothing_ran()
+            raise
 
-    body = await asyncio.to_thread(build) if base64_wanted else build()
-    await ledger.completed(
-        input_tokens=outcome.prompt_tokens,
-        # 0, not None: a pooling pass generates nothing, and that is measured.
-        output_tokens=0,
-        quota_input=outcome.prompt_tokens,
-        meta={"inputs": len(inputs), "engine_calls": outcome.engine_calls},
-    )
-    return await _json_response(body)
+        def build() -> Dict[str, Any]:
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "object": "embedding",
+                        "index": index,
+                        "embedding": sidecars.encode_base64(vector) if base64_wanted else vector,
+                    }
+                    for index, vector in enumerate(outcome.vectors)
+                ],
+                "model": model.id,
+                "usage": (
+                    None
+                    if outcome.prompt_tokens is None
+                    else {"prompt_tokens": outcome.prompt_tokens, "total_tokens": outcome.prompt_tokens}
+                ),
+            }
+
+        body = await asyncio.to_thread(build) if base64_wanted else build()
+        await ledger.completed(
+            input_tokens=outcome.prompt_tokens,
+            # 0, not None: a pooling pass generates nothing, and that is measured.
+            output_tokens=0,
+            quota_input=outcome.prompt_tokens,
+            meta={"inputs": len(inputs), "engine_calls": outcome.engine_calls, **_resend_meta(outcome.resends)},
+        )
+        return await _json_response(body)
+
+    return _committed(request, work)
+
+
+def _resend_meta(resends: Mapping[str, int]) -> Dict[str, Any]:
+    return {"resends": dict(resends)} if resends else {}
 
 
 async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) -> Response:
@@ -451,7 +499,9 @@ async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) 
     deferred: Optional[errors.ApiError] = None
     estimate = 0
     try:
-        parsed = endpoint_models.parse_rerank_request(await _read_json(request))
+        parsed = endpoint_models.parse_rerank_request(
+            await _read_json(request, limit=endpoint_models.max_pooling_body_bytes())
+        )
         from .. import context
 
         query_tokens = context.estimate_tokens(parsed.query)
@@ -468,122 +518,383 @@ async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) 
         model = await _model_for(caller, parsed.model, operation)
         ledger.model_id = model.id
         texts = parsed.texts()
-        outcome = await sidecars.rerank_scores(parsed.query, texts, instruction=parsed.instruction)
-    except sidecars.SidecarError as failure:
-        await ledger.failed(failure, meta={"documents": len(parsed.texts()) if parsed else 0})
-        raise failure.error from None
+        lengths = await sidecars.check_rerank_lengths(
+            sidecars.rerank_query_text(parsed.query, parsed.instruction),
+            [sidecars.rerank_document_text(text) for text in texts],
+        )
     except BaseException:
         await ledger.nothing_ran()
         raise
 
-    results = endpoint_models.ranked(
-        outcome.scores, texts, top_n=parsed.top_n, return_documents=parsed.return_documents
-    )
-    body = endpoint_models.RerankResponse(
-        id=ledger.generation_id,
-        model=model.id,
-        results=results,
-        usage=(
-            None
-            if outcome.input_tokens is None
-            else endpoint_models.RerankUsage(
-                input_tokens=outcome.input_tokens, total_tokens=outcome.input_tokens
+    async def work() -> Response:
+        try:
+            outcome = await sidecars.rerank_scores(
+                parsed.query, texts, instruction=parsed.instruction, lengths=lengths, wait_s=None
             )
-        ),
-    ).to_wire()
-    await ledger.completed(
-        input_tokens=outcome.input_tokens,
-        output_tokens=0,
-        quota_input=outcome.input_tokens,
-        meta={
-            "documents": len(texts),
-            "top_n": parsed.top_n,
-            "engine_calls": outcome.engine_calls,
-        },
-    )
-    return await _json_response(body)
+        except sidecars.SidecarError as failure:
+            await ledger.failed(failure, meta={"documents": len(texts)})
+            raise failure.error from None
+        except BaseException:
+            await ledger.nothing_ran()
+            raise
+        results = endpoint_models.ranked(
+            outcome.scores, texts, top_n=parsed.top_n, return_documents=parsed.return_documents
+        )
+        body = endpoint_models.RerankResponse(
+            id=ledger.generation_id,
+            model=model.id,
+            results=results,
+            usage=(
+                None
+                if outcome.input_tokens is None
+                else endpoint_models.RerankUsage(
+                    input_tokens=outcome.input_tokens, total_tokens=outcome.input_tokens
+                )
+            ),
+        ).to_wire()
+        await ledger.completed(
+            input_tokens=outcome.input_tokens,
+            output_tokens=0,
+            quota_input=outcome.input_tokens,
+            meta={
+                "documents": len(texts),
+                "top_n": parsed.top_n,
+                "engine_calls": outcome.engine_calls,
+                **_resend_meta(outcome.resends),
+            },
+        )
+        return await _json_response(body)
+
+    return _committed(request, work)
+
+
+# -------------------------------------------------------- transcription --
+
+
+class _CommittedText(keepalive.CommittedJSONResponse):
+    """`response_format=text` after a commit: the whitespace heartbeats, then
+    the transcript, as `text/plain` (CONTRACT §8.6: the documentation tells
+    callers to strip the leading spaces; the gateway recognises a committed
+    text transcript by this content type)."""
+
+    media_type = "text/plain; charset=utf-8"
+
+    def _committed_start(self) -> dict:
+        start = super()._committed_start()
+        start["headers"] = [
+            (name, b"text/plain; charset=utf-8" if name == b"content-type" else value)
+            for name, value in start["headers"]
+        ]
+        return start
+
+
+#: The run name a tagged transcription answers with carries the response
+#: format after the job key: a gateway re-attach sends an EMPTY body, and a
+#: `json` and a `text` request share one job (the key's format CLASS), so the
+#: format the client asked for travels in the name the gateway echoes back.
+_RUN_FORMATS = tuple(endpoint_models.TRANSCRIPTION_FORMATS)
+
+
+def _run_key(job_key: str, response_format: str) -> str:
+    return f"{job_key}-{response_format}"
+
+
+def _parse_run_key(value: str) -> Optional[tuple]:
+    key, _, response_format = str(value or "").rpartition("-")
+    if not key or response_format not in _RUN_FORMATS:
+        return None
+    return key, response_format
+
+
+class _AudioIngest:
+    """`multipart.FileWriter` into the job registry's incoming directory,
+    under the disk ledger: the file part is on disk, hashed, before any gate."""
+
+    def __init__(self, jobs: audio_jobs.AudioJobs) -> None:
+        self.jobs = jobs
+        self.sink: Optional[disk_ledger.DiskSink] = None
+        self.part: Optional[multipart.FilePart] = None
+
+    async def start(self, part: multipart.FilePart) -> None:
+        if part.name != "file":
+            return
+        self.part = part
+        self.sink = disk_ledger.DiskSink(
+            os.path.join(self.jobs.root, "incoming"),
+            cap_bytes=endpoint_models.max_audio_bytes(),
+            ledger=self.jobs.ledger,
+            purpose="asr-ingest",
+        )
+        await self.sink.__aenter__()
+
+    async def write(self, data: bytes) -> None:
+        if self.sink is not None:
+            try:
+                await self.sink.write(data)
+            except disk_ledger.CapExceeded as exc:
+                raise errors.request_too_large(exc.cap_bytes) from None
+
+    async def commit(self) -> audio_jobs.AudioSource:
+        assert self.sink is not None
+        final = os.path.join(self.jobs.root, "incoming", f"src.{secrets.token_hex(12)}")
+        stored = await self.sink.commit(final)
+        self.sink = None
+        return audio_jobs.AudioSource(path=stored.path, bytes=stored.bytes, sha256=stored.sha256, owned=True)
+
+    async def abort(self) -> None:
+        sink, self.sink = self.sink, None
+        if sink is not None:
+            with contextlib.suppress(Exception):
+                await sink.abort()
+
+
+async def _file_source(request: Request, caller: ApiCaller, file_id: str) -> audio_jobs.AudioSource:
+    """A Files API file of THIS project as the audio, used in place.
+
+    `files.read` first (a key without it learns nothing about ids), then one
+    lookup whose 404 is the same for a malformed, deleted, expired or foreign
+    id (Files design §7.2 rule 2)."""
+    from .. import db
+    from ..apifiles import ids, schema, service, storage
+    from .files import wire
+
+    await _rt().authorize_scope(request, caller, FILE_ID_SCOPE)
+    lookup = file_id if ids.is_file_id(file_id) else "file-" + "0" * 24
+    row = await db.run_in_thread(schema.get_api_file, caller.project_id, lookup)
+    if row is None or lookup != file_id:
+        raise wire.file_not_found("file_id")
+    if row.get("error_code"):
+        raise wire.invalid_request(
+            "This file has no content: " + wire.default_processing_view(row)["status_details"], param="file_id"
+        )
+    if row.get("blob_id") is None or not row.get("blob_sha256"):
+        raise wire.file_not_ready(
+            5, "This file's bytes are still being assembled. Retry after the Retry-After interval."
+        )
+    record = service.record_from_row(row)
+    if record is not None and record.kind not in ("unknown", "") and not record.media:
+        raise errors.invalid_request("file_id must name an audio or video file.", param="file_id")
+    path = storage.original_path(caller.project_id, str(row["blob_sha256"]))
+    return await audio_jobs.AudioSource.from_path(path, sha256=str(row["blob_sha256"]), owned=False)
+
+
+def _media_type(content_type: Optional[str]) -> str:
+    return str(content_type or "").split(";")[0].strip().lower()
 
 
 async def create_transcription(request: Request, caller: ApiCaller = Depends(_caller)) -> Response:
-    """OpenAI-shaped speech-to-text on `techsara-whisper`, multipart/form-data."""
+    """OpenAI-shaped speech-to-text on `techsara-whisper`, any duration."""
     operation = "create_transcription"
     path = PATHS[operation]
     await _authorize(request, caller, operation)
-    # Counted BEFORE the body is read, unlike the JSON routes: there is no
-    # token estimate to reserve (whisper reports no tokens), and a refused
-    # request should not have made this process hold 26 MiB first.
+    tag = _rt().gateway_tag(request)
+    if tag.attach_job is not None:
+        return await _reattach_transcription(request, caller, tag)
+    # Counted BEFORE the body is read: whisper reports no tokens to estimate,
+    # and a refused request should not have made this process store the file.
     reservation = await _admit(request, caller, estimated_input_tokens=0)
     ledger = _Ledger(caller, reservation, operation, _request_id(request))
-    form_request: Optional[endpoint_models.TranscriptionRequest] = None
-    audio: Optional[multipart.FilePart] = None
+    jobs = audio_jobs.jobs()
+    ingest = _AudioIngest(jobs)
+    source: Optional[audio_jobs.AudioSource] = None
+    parsed: Optional[endpoint_models.TranscriptionRequest] = None
     try:
         _refuse_idempotency_key(request, path)
-        form = await multipart.read_form(
-            request.stream(),
-            request.headers.get("content-type"),
-            max_body_bytes=endpoint_models.max_audio_body_bytes(),
-            max_file_bytes=endpoint_models.max_audio_bytes(),
-            declared_length=request.headers.get("content-length"),
-        )
-        form_request = endpoint_models.parse_transcription_form(form.fields)
-        audio = form.file("file")
-        if audio is None:
-            raise errors.invalid_request("file is required.", param="file")
-        if audio.content_type not in sidecars.allowed_audio_types():
-            raise errors.invalid_request(
-                "The file's Content-Type must be a supported audio type, such as audio/mpeg, "
-                "audio/wav, audio/webm or audio/mp4.",
-                param="file",
+        content_type = request.headers.get("content-type")
+        file_part: Optional[multipart.FilePart] = None
+        if _media_type(content_type) == "application/json":
+            parsed = endpoint_models.parse_transcription_json(await _read_json(request))
+        else:
+            form = await multipart.read_form(
+                request.stream(),
+                content_type,
+                max_body_bytes=endpoint_models.max_audio_body_bytes(),
+                max_file_bytes=endpoint_models.max_audio_bytes(),
+                declared_length=request.headers.get("content-length"),
+                file_writer=ingest,
             )
-        if audio.size == 0:
-            raise errors.invalid_request("The audio file is empty.", param="file")
-        model = await _model_for(caller, form_request.model, operation)
+            parsed = endpoint_models.parse_transcription_form(form.fields)
+            file_part = form.file("file")
+        if file_part is not None and parsed.file_id is not None:
+            raise errors.invalid_request("Send either file or file_id, not both.", param="file_id")
+        if file_part is None and parsed.file_id is None:
+            raise errors.invalid_request("file is required.", param="file")
+        if file_part is not None:
+            if file_part.content_type not in sidecars.allowed_audio_types():
+                raise errors.invalid_request(
+                    "The file's Content-Type must be a supported audio type, such as audio/mpeg, "
+                    "audio/wav, audio/webm or audio/mp4.",
+                    param="file",
+                )
+            if file_part.size == 0:
+                raise errors.invalid_request("The audio file is empty.", param="file")
+        model = await _model_for(caller, parsed.model, operation)
         ledger.model_id = model.id
-        outcome = await sidecars.transcribe(
-            audio.data,
-            content_type=audio.content_type,
-            language=form_request.language,
-            verbose=form_request.verbose,
+        if file_part is not None:
+            source = await ingest.commit()
+        else:
+            source = await _file_source(request, caller, str(parsed.file_id))
+        spec = audio_jobs.JobSpec.for_request(
+            project_id=caller.project_id,
+            sha256=source.sha256,
+            language=parsed.language,
+            response_format=parsed.response_format,
         )
-        limit = endpoint_models.max_audio_seconds()
-        if outcome.duration_s is not None and outcome.duration_s > limit + 0.5:
-            # The probe could not read this container from a pipe, so the
-            # engine measured it. Refused anyway: a documented ceiling that
-            # holds only for the formats ffprobe can read is not a ceiling.
-            raise sidecars.SidecarError(sidecars.audio_too_long(limit), engine_calls=1)
-    except sidecars.SidecarError as failure:
-        await ledger.failed(
-            failure,
-            token_counted=False,
-            meta={"response_format": getattr(form_request, "response_format", None)},
-        )
-        raise failure.error from None
+        joined = await jobs.attach(spec.key(), caller.project_id)
+        if joined is None:
+            # Before the status line: a decode that could not be reserved now
+            # is a real 503 Retry-After 60, not a job that fails later.
+            await jobs.preflight_decode(source)
+        job = await jobs.start(spec, source)
+        source = None  # the job owns (or has discarded) it now
+    except disk_ledger.DiskFull as full:
+        await ledger.nothing_ran()
+        raise full.api_error() from None
     except BaseException:
         await ledger.nothing_ran()
         raise
     finally:
-        # The audio is dropped when the request ends, whatever happened —
-        # nothing about it is kept (CONTRACT §16).
-        if audio is not None:
-            audio.data = bytearray()
+        await ingest.abort()
+        if source is not None and source.owned:
+            with contextlib.suppress(FileNotFoundError):
+                await asyncio.to_thread(os.unlink, source.path)
+    _rt().name_run(request, job_key=_run_key(job.key, parsed.response_format))
+    settlement = _Settlement(ledger, parsed, joined=joined is not None)
+    settlement.settle_when_finished(job)
+    return _transcription_response(request, job, parsed, settlement=settlement, tag=tag, start_after=0)
 
-    body = endpoint_models.transcription_body(outcome.reply, form_request)
-    await ledger.completed(
-        # Whisper reports no tokens: NOT MEASURED, never 0, in usage_events;
-        # the token ledgers get 0 so they stay token-true.
-        input_tokens=None,
-        output_tokens=None,
-        quota_input=0,
-        meta={
-            "audio_seconds": outcome.duration_s,
-            "processing_ms": outcome.processing_ms,
-            "response_format": form_request.response_format,
-            "language_forced": form_request.language is not None,
-        },
+
+async def _reattach_transcription(request: Request, caller: ApiCaller, tag: Any) -> Response:
+    """A v1-gateway re-attach (`X-TechSara-Attach-Job`, trusted peer only,
+    empty body): follow the job this project started, from where the gateway
+    left off. Not counted again and not metered again — it is the same client
+    call. A job this process does not hold, running or stored, is a 404, which
+    the gateway treats as final."""
+    parsed_key = _parse_run_key(str(tag.attach_job))
+    job = None
+    if parsed_key is not None:
+        job = await audio_jobs.jobs().attach(parsed_key[0], caller.project_id)
+    if job is None or parsed_key is None:
+        raise errors.response_not_found()
+    from . import registry
+
+    request_shape = endpoint_models.TranscriptionRequest(
+        model=registry.TECHSARA_WHISPER,
+        response_format=parsed_key[1],
+        stream=tag.resume_after is not None,
     )
-    if isinstance(body, str):
-        return Response(content=body, media_type="text/plain; charset=utf-8")
-    return await _json_response(body)
+    _rt().name_run(request, job_key=_run_key(job.key, parsed_key[1]))
+    return _transcription_response(
+        request, job, request_shape, settlement=None, tag=tag, start_after=int(tag.resume_after or 0)
+    )
+
+
+@dataclass
+class _Settlement:
+    """One transcription request's ledger write, exactly once, when its job
+    ends — inline when the response saw the end, or from a background wait
+    when the client left first (the job runs on for its orphan grace)."""
+
+    ledger: "_Ledger"
+    request: endpoint_models.TranscriptionRequest
+    joined: bool = False
+    started: float = field(default_factory=time.perf_counter)
+
+    _write: Optional["asyncio.Future[None]"] = None
+
+    async def settle(self, job: audio_jobs.AudioJob) -> None:
+        """Write the ledger once. Every caller awaits the SAME write, so the
+        response that saw the end never returns before its row exists, even
+        when the background waiter started the write first."""
+        if self._write is None:
+            self._write = asyncio.ensure_future(self._settle(job))
+        await asyncio.shield(self._write)
+
+    async def _settle(self, job: audio_jobs.AudioJob) -> None:
+        if self.ledger.settled:
+            return
+        result = job.result
+        if job.state == "done" and result is not None:
+            dispatch = result.report.get("dispatch") if isinstance(result.report, Mapping) else None
+            await self.ledger.completed(
+                # Whisper reports no tokens: NOT MEASURED, never 0, in
+                # usage_events; the token ledgers get 0 so they stay token-true.
+                input_tokens=None,
+                output_tokens=None,
+                quota_input=0,
+                meta={
+                    "audio_seconds": int(result.usage_seconds),
+                    "processing_ms": result.report.get("engine_ms") if isinstance(result.report, Mapping) else None,
+                    "response_format": self.request.response_format,
+                    "language_forced": self.request.language is not None,
+                    "windows": result.report.get("windows") if isinstance(result.report, Mapping) else None,
+                    "engine_calls": (dispatch or {}).get("engine_calls") if isinstance(dispatch, Mapping) else None,
+                    **({"joined": True} if self.joined else {}),
+                },
+            )
+            return
+        error = job.error or errors.internal_error()
+        # The decoder or an engine did work unless the job never left its queue.
+        calls = 0 if (error.code in ("invalid_request_error", "request_too_large") and not self.joined) else 1
+        await self.ledger.failed(
+            sidecars.SidecarError(error, engine_calls=calls),
+            token_counted=False,
+            meta={"response_format": self.request.response_format},
+        )
+
+    def settle_when_finished(self, job: audio_jobs.AudioJob) -> None:
+        async def wait() -> None:
+            try:
+                await job.settled()
+                await self.settle(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - metering never fails a transcript
+                log.warning("a transcription was not metered", exc_info=True)
+
+        task = asyncio.ensure_future(wait())
+        _SETTLING.add(task)
+        task.add_done_callback(_SETTLING.discard)
+
+
+def _transcription_response(
+    request: Request,
+    job: audio_jobs.AudioJob,
+    parsed: endpoint_models.TranscriptionRequest,
+    *,
+    settlement: Optional[_Settlement],
+    tag: Any,
+    start_after: int,
+) -> Response:
+    if parsed.stream:
+        from . import gateway_protocol, streaming
+
+        async def frames() -> AsyncIterator[str]:
+            async for chunk in audio_jobs.sse_stream(
+                job, heartbeat_s=keepalive.heartbeat_s(), start_after=start_after
+            ):
+                yield chunk.decode("utf-8")
+            if settlement is not None and job.terminal:
+                await settlement.settle(job)
+
+        body: AsyncIterator[str] = frames()
+        if getattr(tag, "tagged", False):
+            body = gateway_protocol.tag_frames(body, start_after=start_after)
+        return StreamingResponse(body, media_type="text/event-stream", headers=streaming.SSE_HEADERS)
+
+    async def work() -> Response:
+        try:
+            result = await job.wait()
+        finally:
+            if settlement is not None and job.terminal:
+                await settlement.settle(job)
+        body = endpoint_models.transcription_body(result, parsed)
+        if isinstance(body, str):
+            return Response(content=body, media_type="text/plain; charset=utf-8")
+        return await _json_response(body)
+
+    response_class = _CommittedText if parsed.response_format == "text" else keepalive.CommittedJSONResponse
+    return _committed(request, work, response_class=response_class)
 
 
 # ---------------------------------------------------------- registration --
