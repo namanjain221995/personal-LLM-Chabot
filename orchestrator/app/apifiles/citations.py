@@ -324,9 +324,15 @@ def _floats(values: Any, n: int) -> Tuple[float, ...]:
         raise ValueError("a citation state span has the wrong shape")
     out = []
     for value in values:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("a citation state time must be a finite number")
-        out.append(float(value))
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError("a citation state time must be a finite number") from None
+        if not math.isfinite(number):
+            raise ValueError("a citation state time must be a finite number")
+        out.append(number)
     return tuple(out)
 
 
@@ -406,7 +412,10 @@ def annotate_from_state(text: str, state: Any) -> Annotated:
     citation state was lost."""
     try:
         index = CitationIndex.from_state(state)
-    except (ValueError, TypeError, KeyError):
+    except Exception:  # noqa: BLE001 - the contract above: a bad state annotates nothing
+        # Not only ValueError/TypeError/KeyError: `float(10**400)` raises
+        # OverflowError, and this runs at a durable run's terminal event in
+        # another process, where a raise would fail a finished answer.
         index = CitationIndex()
     return annotate(text, index)
 

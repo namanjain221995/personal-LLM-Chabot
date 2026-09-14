@@ -84,8 +84,9 @@ STILL_READ_RETIRED_SETTINGS = {
     "PUBLIC_API_GEN_WALL_CLOCK_S": "apiplatform/idempotency.py (the Idempotency-Key in-flight lease)",
     "PUBLIC_API_GATE_WAIT_S": "publicapi/sidecars.py (/v1/embeddings, /v1/rerank, /v1/audio/transcriptions) "
     "and the bounded file preparation of a synchronous request",
-    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "apifiles/ocr_pages.py and apifiles/vectors.py (Files processing jobs) "
-    "and the legacy background path while the durable runtime is not running",
+    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "publicapi/capacity.py for the legacy background path while the durable "
+    "runtime is not running, and apiplatform/idempotency.py (the in-flight claim lease); Files processing jobs "
+    "no longer read it",
     "PUBLIC_API_MAX_AUDIO_SECONDS": "publicapi/endpoint_models.py (/v1/audio/transcriptions)",
     "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS": "apiplatform/idempotency.py",
 }

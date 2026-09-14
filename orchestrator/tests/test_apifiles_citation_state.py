@@ -77,6 +77,8 @@ def _one_file(**overrides) -> dict:
     _one_file(numbers=[[1]]),
     _one_file(numbers=[["1", 1]]),
     _one_file(spans=[[math.nan, 1.0]]),
+    _one_file(spans=[[0, 10**400]]),  # float() of it raises OverflowError, not ValueError (review, 2026-09-14)
+    _one_file(unit="time", numbers=[], spans=[[-(10**400), 5]]),
     _one_file(row_blocks=[[1, 2]]),
     {"v": 1, "files": [_one_file()["files"][0], _one_file(filename="b.pdf")["files"][0]]},
     {"v": 1, "files": [_one_file()["files"][0]] * (cite.MAX_STATE_FILES + 1)},
