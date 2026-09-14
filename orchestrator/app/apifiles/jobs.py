@@ -462,7 +462,13 @@ async def stage_index(ctx: JobContext) -> StageResult:
             if isinstance(exc, OSError):
                 raise Deferred("the vector file could not be written") from exc
             raise
-        probe = await _probe_embed(embed) if outage.needs_probe(kind) else None
+        try:
+            probe = await _probe_embed(embed) if outage.needs_probe(kind) else None
+        except capacity.Abandoned:
+            # Raised inside this handler, so the `except capacity.Abandoned`
+            # above cannot see it: without this a job abandoned while its
+            # probe waited at the gate failed `internal_error`.
+            raise StopJob(await ctx.runner._why_not_held(ctx)) from None
         counted = outage.counts_attempt(kind, probe=probe, progressed=progressed)
         raise Deferred(f"the embedding engine is unavailable ({kind}, probe {probe})", counted=counted, kind=kind) from exc
     facts: Dict[str, Any] = {"chunks_indexed": int(info.rows), "index_truncated": bool(info.truncated)}
@@ -1406,6 +1412,11 @@ def processing_view(blob_row: Optional[Mapping[str, Any]], *, file_row: Optional
         elif wire == "failed":
             current = current or name
         listed.append(item)
+    if current is None and state != "processed":
+        # Nothing running: the next step is the first one not done. A blob a
+        # re-upload re-queued still carries `finalize` from its failed run in
+        # `stage` and `progress.stage` (schema._requeue_recoverable_blob).
+        current = next((item["name"] for item in listed if item["status"] != "done"), None)
     if state == "processed":
         stage_name, step, percent = "finalize", len(steps), 100
     else:

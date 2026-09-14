@@ -35,7 +35,8 @@ TEXT = b"The escrow agent is Halden Trust, and the closing date is the third of 
 @pytest.fixture()
 def api():
     caller = make_caller()
-    app = build_app(StubAuth(caller), derived=derived)
+    # The production wiring of `router.mount_files` for the two seams read here.
+    app = build_app(StubAuth(caller), derived=derived, processing_view=jobs.file_processing_view)
     with TestClient(app) as client:
         yield client, caller
 
@@ -110,6 +111,7 @@ def test_uploading_the_same_bytes_again_re_queues_a_file_whose_processing_failed
     second = _post(client, caller)
     assert second["status"] == "uploaded", "the new file does not inherit the failure"
     assert second["processing"]["error"] is None and second["status_details"] is None
+    assert second["processing"]["stage"] == "index", "the view names the step still to run, not the failed run's finalize"
     blob = _blob_of(second["id"])
     assert blob["id"] == failed_blob["id"], "still one blob per (project, sha256)"
     assert (blob["status"], blob["error_code"], blob["attempt"], blob["not_before"]) == ("queued", None, 0, None)

@@ -370,6 +370,25 @@ def test_a_run_that_wrote_vectors_before_the_engine_died_spends_nothing_and_the_
     assert sum(len(c) for c in calls) == total - written > 0, "only the rows without a vector were embedded again"
 
 
+def test_a_job_abandoned_while_its_probe_waits_at_the_gate_stops_instead_of_failing_internal_error(tmp_path):
+    import openai
+
+    tenant = J.new_project()
+    row = J.insert_blob(tenant, TEXT)
+    httpx = llm._openai_httpx_module()
+
+    async def embed(texts):
+        if list(texts) == [jobs.PROBE_TEXT]:
+            raise capacity.Abandoned()  # the lease went while the probe queued
+        request = httpx.Request("POST", "http://embed/v1/embeddings")
+        raise openai.InternalServerError("boom", response=httpx.Response(500, request=request), body=None)
+
+    outcomes = asyncio.run(J.runner(embed_documents=embed).run_once())
+    assert [o.outcome for o in outcomes] == ["stopped"]
+    after = J.blob(row["id"])
+    assert after["status"] != "failed" and after["error_code"] is None
+
+
 def test_a_bug_in_the_index_stage_still_fails_internal_error_instead_of_being_retried_for_ever(tmp_path):
     tenant = J.new_project()
     row = J.insert_blob(tenant, TEXT)
