@@ -694,6 +694,22 @@ class Settings:
         #: when tools are attached (a server-side cut inside a <think> block
         #: can corrupt tool-call arguments).
         self.server_thinking_budget: bool = _bool("SERVER_THINKING_BUDGET", False)
+        #: ADAPTIVE THINKING at Fast (core/effort_policy.py, 2026-09-15). Fast
+        #: answers with the reasoning pass off; a prompt the deterministic
+        #: classifier recognises as multi-step reasoning (puzzles, maths and
+        #: word problems, logic, ratios, code debugging, proofs) thinks
+        #: instead of reasoning — and looping — inside the answer. Off returns
+        #: every Fast turn to thinking-off.
+        self.fast_adaptive_thinking: bool = _bool("FAST_ADAPTIVE_THINKING", True)
+        #: Thinking tokens such a turn may spend. ADDED to the answer ceiling
+        #: (reasoning and answer share one max_tokens pool), enforced
+        #: client-side at budget x THINKING_BUDGET_GRACE, after which the
+        #: thought is closed and the same engine writes the answer from it
+        #: with thinking off. Sized from the live evaluation (2026-09-15, 15
+        #: checkable puzzles and word problems): median 616 and max 1,733
+        #: reasoning tokens, all inside the 3,000 cap; ~6 s median to the
+        #: first answer token at ~100 tok/s.
+        self.fast_thinking_budget: int = max(1, _int("FAST_THINKING_BUDGET", 2400))
         #: Best-of-N at extra_high: candidates generated CONCURRENTLY, a
         #: thinking-off guided-JSON judge picks the winner (core/best_of.py).
         #: 1 keeps the extra_high thinking budget but skips the sampling.

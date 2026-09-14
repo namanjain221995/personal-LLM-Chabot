@@ -35,6 +35,8 @@ from . import breaker as _breaker
 from . import context, engine_state, metrics
 from .config import settings
 from .context import clip_message_contents
+from .core import answer_sampling
+from .core import effort_policy as _effort_policy
 from .model_capabilities import ModelCapabilities, ReasoningField
 from .resilience import ModelUnavailable, resilient, sidecar_recovery_s, wait_admitted  # noqa: F401 — re-exported for callers
 
@@ -1178,6 +1180,14 @@ def apply_reasoning_effort(
     return list(messages)
 
 
+def _accepts_sampling_extensions(capabilities: ModelCapabilities) -> bool:
+    """Whether top_k/min_p/repetition_penalty may ride in extra_body."""
+    return any(
+        capabilities.allows_extra_body(name)
+        for name in ("chat_template_kwargs", "top_k", "min_p", "repetition_penalty")
+    )
+
+
 #: "Not passed": the chat default for `wall_clock_s` and `read_timeout_s`.
 #: A sentinel rather than None because None is a meaningful value for both
 #: (no-timeout /v1: no wall clock, no read timeout).
@@ -1217,6 +1227,7 @@ async def stream_chat_events(
     admission_patient: bool = False,
     on_dispatch: Optional[Callable[[], None]] = None,
     admission_run_id: Optional[str] = None,
+    answer_plan: Optional[Any] = None,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Streaming completion from the selected model, yielding (kind, delta)
     pairs: ("reasoning", <delta.reasoning_content>) for vLLM thinking deltas
@@ -1253,6 +1264,28 @@ async def stream_chat_events(
       registered with `admission.register_yield` (None: this context's
       `admission.set_run_id`, if any).
 
+    THE ANSWER-PLAN KEYWORD (answer-quality design C2/C6, 2026-09-14). Chat's
+    sampling decision for this one call, duck-typed: only `.sampling` (a
+    mapping of the keys to send) and `.enable_thinking` (True/False to
+    override the effort's thinking switch, None to keep it) are read. None —
+    the default, and every /v1 call, since publicapi/streaming.py never passes
+    it — sends byte-identical requests. With a plan:
+
+    - `.sampling` is placed by `answer_sampling.place_sampling`: temperature,
+      top_p and presence_penalty top-level (overriding `temperature`), top_k,
+      min_p and repetition_penalty inside extra_body beside
+      chat_template_kwargs, and only for a backend that takes vLLM's
+      extensions. Never a seed.
+    - `.enable_thinking` True turns the reasoning pass on for the smart model
+      only; False turns it off.
+    - a plan whose `.enable_thinking` is True or False sizes the call itself:
+      thinking-on is NOT floored at MAX_OUTPUT_TOKENS and the client-side
+      THINKING_BUDGET_MODE enforcement is off (reasoning budget + answer
+      ceiling are in `max_tokens`; the caller owns the budget). A
+      sampling-only plan (`.enable_thinking` None, the default Fast plan)
+      changes sampling keys and nothing else: thinking switch, budget and
+      floor are exactly as without a plan.
+
     `engine_state.note_chunk()` is called on every engine chunk: a chunk on
     any stream is serving evidence for every silent one.
     """
@@ -1261,7 +1294,32 @@ async def stream_chat_events(
     reset_applied_max_tokens()
     base_url, api_key, model_id = resolve_model_choice(model_choice)
     thinking_on = wants_thinking(model_choice, effort)
-    budget_tokens = thinking_budget(effort) if thinking_on else None
+    plan_thinking = getattr(answer_plan, "enable_thinking", None) if answer_plan is not None else None
+    if plan_thinking is not None:
+        thinking_on = bool(plan_thinking) and model_choice == "smart"
+    # Only a plan that DECIDES thinking sizes the call itself; a sampling-only
+    # plan must not disturb a thinking decision made elsewhere.
+    plan_sizes_call = plan_thinking is not None
+    plan_sampling = (getattr(answer_plan, "sampling", None) or {}) if answer_plan is not None else {}
+    # Validated before anything is sent: a key this layer never sends (a seed)
+    # is a caller bug, not a request to forward.
+    plan_sampling = answer_sampling.validate_sampling(plan_sampling)
+    budget_tokens = thinking_budget(effort) if thinking_on and not plan_sizes_call else None
+    # ADAPTIVE THINKING (core/effort_policy.py): a thinking-off turn the chat
+    # engine judged to need reasoning runs inside a grant. It thinks, always
+    # BOUNDED whatever THINKING_BUDGET_MODE says — the budget is added to the
+    # answer ceiling below, and an overrun closes the thought and answers from
+    # it (the forced closure). The grant covers the FIRST call only: the
+    # continuation segments of a long answer write text from the thought
+    # already had (effort_policy.claim_grant). No grant (every caller but
+    # that engine — /v1, JSON and tool calls, best-of included): nothing
+    # changes. A plan that decides thinking itself (`plan_sizes_call`) is
+    # authoritative and leaves any grant unclaimed; a sampling-only plan (the
+    # Fast default) does not, and the granted call keeps its plan sampling.
+    grant = None if (thinking_on or plan_sizes_call) else _effort_policy.claim_grant()
+    granted = grant is not None
+    if granted:
+        thinking_on, budget_tokens = True, grant.budget_tokens
     # Sizing: reasoning and answer draw from one max_tokens pool, and the
     # documented failure mode is the model spending the whole allowance
     # thinking and streaming nothing. Budgeted mode (THINKING_BUDGET_MODE=
@@ -1272,7 +1330,7 @@ async def stream_chat_events(
     # /tokenize `max_model_len` by `context.model_window`, never a number
     # written here) is the only wall above that.
     requested = max_tokens
-    if thinking_on:
+    if thinking_on and not plan_sizes_call:
         if budget_tokens and max_tokens is not None:
             requested = max_tokens + budget_tokens
         elif budget_tokens is None:
@@ -1337,6 +1395,14 @@ async def stream_chat_events(
             # mechanism whenever tools are attached.
             extra_body["chat_template_kwargs"]["thinking_token_budget"] = budget_tokens
         request["extra_body"] = extra_body
+    if plan_sampling:
+        # A backend that takes vLLM's chat_template_kwargs is vLLM, and takes
+        # its sampling extensions too; capabilities may also name them.
+        answer_sampling.place_sampling(
+            request,
+            plan_sampling,
+            vllm_extensions=_accepts_sampling_extensions(capabilities),
+        )
     if continue_final_message:
         # vLLM's continuation contract: the final assistant message is left
         # open and extended, and no new assistant header is appended.
@@ -1354,6 +1420,9 @@ async def stream_chat_events(
     cap = int(budget_tokens * settings.thinking_budget_grace) if budget_tokens else None
     reasoning_seen = 0
     token_seen = 0
+    # An adaptive-thinking turn keeps its thought, so an overrun can be CLOSED
+    # and answered from rather than thrown away (see the forced closure).
+    thought: Optional[List[str]] = [] if granted else None
     # Hang guard, NOT a budget: it exists to catch degenerate repetition
     # loops, and at the measured decode rate it only fires far past any real
     # answer. Applies in BOTH modes.
@@ -1440,12 +1509,37 @@ async def stream_chat_events(
                         retry["extra_body"] = fb_extra
                     else:
                         retry.pop("extra_body", None)
+                    if thought is not None and fb_extra is not None and not continue_final_message:
+                        # ADAPTIVE THINKING overrun: the prompts that get a
+                        # grant are the ones a blind thinking-off answer
+                        # reasons out loud and loops on (measured 2026-09-15:
+                        # the 2:5 water puzzle's thinking-off retry did exactly
+                        # that and ran out of room). So the thought so far is
+                        # CLOSED and the answer is written from it: the same
+                        # prompt, an assistant turn holding the closed <think>
+                        # block, extended with thinking off.
+                        retry["messages"] = list(request["messages"]) + [{
+                            "role": "assistant",
+                            "content": "<think>\n" + "".join(thought).strip() + _effort_policy.THOUGHT_CLOSURE + "\n</think>\n\n",
+                        }]
+                        fb_body = dict(retry["extra_body"])
+                        fb_body["continue_final_message"] = True
+                        fb_body["add_generation_prompt"] = False
+                        retry["extra_body"] = fb_body
                     if continue_final_message:
                         # The retry extends the same assistant prefix.
                         fb_body = dict(retry.get("extra_body") or {})
                         fb_body["continue_final_message"] = True
                         fb_body["add_generation_prompt"] = False
                         retry["extra_body"] = fb_body
+                    if plan_sampling:
+                        # extra_body was rebuilt above; a plan's vLLM sampling
+                        # extensions (top_k, min_p) belong to this retry too.
+                        answer_sampling.place_sampling(
+                            retry,
+                            plan_sampling,
+                            vllm_extensions=_accepts_sampling_extensions(capabilities),
+                        )
                     reset_finish_reason()
                     async with _consume(await _open_stream(client, retry, **send)) as fb_stream:
                         async for fb_chunk in fb_stream:
@@ -1461,6 +1555,8 @@ async def stream_chat_events(
                             if fb_content:
                                 yield "token", str(fb_content)
                     return
+                if thought is not None:
+                    thought.append(reasoning)
                 yield "reasoning", reasoning
             content = _delta_value(delta, "content")
             if content:

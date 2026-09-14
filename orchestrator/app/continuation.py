@@ -119,6 +119,22 @@ CONTINUE_INSTRUCTION = (
 )
 
 
+class StopGeneration(Exception):
+    """Raised by an `on_delta` consumer to end the run ON PURPOSE.
+
+    Not a failure: the run ends with `reason` as its stop reason, nothing is
+    logged as an error, and the upstream stream is closed by the same
+    `finally` that closes it when a user presses Stop. Whatever the consumer
+    was handed before raising stays in `LongResult.text`; what the person
+    actually saw is the consumer's business (engines/chat.py's loop guard
+    keeps its own copy).
+    """
+
+    def __init__(self, reason: str = STOP_REPETITION) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass
 class Segment:
     """One model call inside a long generation."""
@@ -258,6 +274,7 @@ async def stream_long_completion(
     tail_chars: Optional[int] = None,
     deadline_s: Optional[float] = None,
     on_segment: Optional[Callable[[LongResult], Awaitable[None]]] = None,
+    answer_plan: Optional[Any] = None,
 ) -> LongResult:
     """Produce one text across as many calls as the budget allows.
 
@@ -269,7 +286,12 @@ async def stream_long_completion(
     `on_segment` is called after every completed segment with the result so
     far. That is the checkpoint hook: it is where a caller persists state so a
     six-hour run survives a restart.
+
+    `answer_plan` (chat's per-call sampling, see llm.stream_chat_events) is
+    handed to every segment's call unchanged, and not passed at all when None,
+    so a caller without one sends exactly what it always sent.
     """
+    plan_kwargs = {} if answer_plan is None else {"answer_plan": answer_plan}
     segment_cap = segment_max_tokens or settings.model_max_output
     total_cap = total_max_tokens or settings.model_max_output
     segments_cap = max_segments or settings.continuation_max_segments
@@ -319,6 +341,8 @@ async def stream_long_completion(
         seg_chars_before = len(produced)
         previous_tail = produced[-tail:]
         seg_tokens_before = _completion_tokens()
+        #: Set when the consumer raised StopGeneration during this segment.
+        halted: Optional[str] = None
 
         # STREAMING GRANULARITY IS NOT NEGOTIABLE. Buffering a whole segment to
         # strip its seam would deliver the answer in one lump per call, which
@@ -399,6 +423,7 @@ async def stream_long_completion(
             effort=effort,
             temperature=temperature,
             max_tokens=ask,
+            **plan_kwargs,
         )
         try:
             async for kind, delta in stream:
@@ -417,6 +442,8 @@ async def stream_long_completion(
                         break
                     continue
                 await _push(delta)
+        except StopGeneration as halt:
+            halted = halt.reason
         except Exception as exc:  # noqa: BLE001 — recorded, not swallowed
             errors.append(f"segment {index}: {type(exc).__name__}: {exc}")
             log.exception("long generation failed in segment %d", index)
@@ -439,20 +466,33 @@ async def stream_long_completion(
             with contextlib.suppress(Exception):
                 await stream.aclose()
 
-        # A segment shorter than the hold never reached the release above.
-        if holding and not repeated:
-            await _release()
-
         reason = llm.get_finish_reason()
-        # The held fragment is a real ending only when nothing follows it. If
-        # this segment is going to be continued, the fragment is an
-        # interrupted word and the next call rewrites it from a clean
-        # boundary — so it is dropped rather than shown.
-        if pending and reason not in _CONTINUABLE:
-            produced += pending
-            await on_delta("token", pending)
-            pending = ""
+        if halted is None:
+            try:
+                # A segment shorter than the hold never reached the release above.
+                if holding and not repeated:
+                    await _release()
+
+                # The held fragment is a real ending only when nothing follows it. If
+                # this segment is going to be continued, the fragment is an
+                # interrupted word and the next call rewrites it from a clean
+                # boundary — so it is dropped rather than shown.
+                if pending and reason not in _CONTINUABLE:
+                    produced += pending
+                    await on_delta("token", pending)
+                    pending = ""
+            except StopGeneration as halt:
+                halted = halt.reason
         produced_here = produced[seg_chars_before:]
+
+        if halted is not None:
+            # The consumer ended the run (e.g. the answer loop guard). The
+            # segment is recorded as far as it got; no further call is made.
+            segs.append(
+                Segment(index, len(produced_here), None, reason, stripped, time.monotonic() - seg_started)
+            )
+            stop = halted
+            break
 
         if repeated:
             log.warning(
