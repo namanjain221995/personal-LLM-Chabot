@@ -138,6 +138,36 @@ def outranks(actor: Role | str, target: Role | str) -> bool:
         return False
 
 
+def may_inspect(actor: Role | str, target: Role | str, *, self_view: bool) -> bool:
+    """True when `actor` may READ `target`'s sessions and content.
+
+    The one rule behind every admin read of a member's sessions, conversations,
+    uploads, reports and usage counts (admin_api `_inspectable_member` and the
+    `member_detail` stats), so the two can never drift:
+
+    - reading your own is always allowed;
+    - a SUPER_ADMIN may inspect every member of the workspace, including other
+      super admins (owner decision, 2026-09-14). Those reads keep their audit
+      events, and the audit log is readable by super admins, so access between
+      super admins stays accountable;
+    - anyone else needs to strictly `outranks` the target, so an ADMIN never
+      reads a super admin's or a peer admin's sessions or content (AUDIT.md
+      F029/N007, 2026-09-13).
+
+    Management actions are NOT governed by this: they keep `outranks`, so a
+    super admin still cannot deactivate, remove or revoke a peer super admin.
+    Fails closed on an unknown actor role, like `outranks`.
+    """
+    if self_view:
+        return True
+    try:
+        if Role(actor) is Role.SUPER_ADMIN:
+            return True
+    except ValueError:
+        return False
+    return outranks(actor, target)
+
+
 def assignable_roles(actor: Role | str) -> FrozenSet[Role]:
     """Roles the actor may hand out (inviting or changing roles).
 

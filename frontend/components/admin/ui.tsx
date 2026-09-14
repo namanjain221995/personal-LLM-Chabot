@@ -8,6 +8,7 @@
  */
 
 import type { ReactNode } from 'react';
+import { IconShield } from './icons';
 
 export function SkeletonLine({ className = 'w-24' }: { className?: string }) {
   return (
@@ -22,19 +23,32 @@ export function StatTile({
   label,
   value,
   loading,
+  withheld,
 }: {
   label: string;
   value: number | string | undefined;
   loading?: boolean;
+  /** The count exists but this viewer's role may not see it (a higher or
+   *  equal role's usage). Reads "Private", never a dash, which would mean
+   *  "no number to show". */
+  withheld?: boolean;
 }) {
+  const isWithheld = Boolean(withheld) && !loading;
   return (
-    <div className="rounded-ts border border-border bg-surface p-4">
+    <div
+      className="rounded-ts border border-border bg-surface p-4"
+      {...(isWithheld
+        ? { role: 'group', 'aria-label': `${label}: private` }
+        : {})}
+    >
       <div className="text-[11px] font-medium uppercase tracking-wide text-faint">
         {label}
       </div>
       <div className="mt-1.5 text-xl font-semibold tabular-nums text-ink">
         {loading ? (
           <SkeletonLine className="w-12" />
+        ) : isWithheld ? (
+          <span className="text-base font-medium text-faint">Private</span>
         ) : value === undefined ? (
           <span className="text-faint">—</span>
         ) : (
@@ -42,6 +56,32 @@ export function StatTile({
         )}
       </div>
     </div>
+  );
+}
+
+/** The neutral sentence for a member whose sessions and content this viewer's
+ *  role may not read (an admin opening a super admin or a peer admin). */
+export const PRIVATE_CONTENT_MESSAGE =
+  "This member's conversations, uploads, reports and sessions are private to higher roles.";
+
+/**
+ * A calm, non-error notice. The server refuses these reads by design, so the
+ * page says so plainly instead of drawing a red failure with a Retry that can
+ * never succeed. Same visual weight as the console's other status notes.
+ */
+export function PrivateContentNotice({
+  message = PRIVATE_CONTENT_MESSAGE,
+}: {
+  message?: string;
+}) {
+  return (
+    <p
+      role="status"
+      className="flex items-center gap-2 rounded-ts border border-border bg-surface px-4 py-2.5 text-sm text-muted"
+    >
+      <IconShield size={14} className="shrink-0 text-faint" />
+      {message}
+    </p>
   );
 }
 

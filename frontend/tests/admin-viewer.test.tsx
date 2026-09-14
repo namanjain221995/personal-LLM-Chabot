@@ -56,22 +56,58 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+const MEMBER_ROW = {
+  id: 7,
+  name: 'Fixture Member',
+  email: 'member@example.test',
+  role: 'member',
+  status: 'active',
+  joined_at: null,
+  last_active_at: null,
+};
+
+type Reply = { status: number; body: unknown };
+
+/** A fetch stub answering by URL; records every call in order. */
+function routeFetch(routes: Record<string, Reply>) {
+  const calls: string[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      const reply = routes[url] ?? { status: 404, body: { detail: 'Not found.' } };
+      return {
+        ok: reply.status >= 200 && reply.status < 300,
+        status: reply.status,
+        json: async () => reply.body,
+      };
+    }),
+  );
+  return calls;
+}
+
+const INSPECTABLE: Reply = {
+  status: 200,
+  body: { member: MEMBER_ROW, stats: { conversations: 1 }, may_inspect: true },
+};
+
 describe('the read-only transcript viewer', () => {
   it('renders the transcript with chips, timestamps and the audit notice', async () => {
-    const calls: string[] = [];
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (input: RequestInfo | URL) => {
-        calls.push(String(input));
-        return { ok: true, status: 200, json: async () => PAYLOAD };
-      }),
-    );
+    const calls = routeFetch({
+      '/api/admin/members/7': INSPECTABLE,
+      '/api/admin/members/7/conversations/c-1': { status: 200, body: PAYLOAD },
+    });
     render(<AdminConversationViewerPage />);
 
     await waitFor(() =>
       expect(screen.getByText('Quarterly numbers')).toBeTruthy(),
     );
-    expect(calls).toEqual(['/api/admin/members/7/conversations/c-1']);
+    // The rank rule is asked first, then the transcript.
+    expect(calls).toEqual([
+      '/api/admin/members/7',
+      '/api/admin/members/7/conversations/c-1',
+    ]);
 
     // Both messages, with the user's line breaks preserved, not markdownified.
     const userBubble = screen.getByText(/Show me Q3/);
@@ -97,18 +133,54 @@ describe('the read-only transcript viewer', () => {
   });
 
   it('shows the failure, not a blank page, when the load is refused', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async () => ({
-        ok: false,
+    routeFetch({
+      '/api/admin/members/7': INSPECTABLE,
+      '/api/admin/members/7/conversations/c-1': {
         status: 404,
-        json: async () => ({ detail: 'No such conversation.' }),
-      })),
-    );
+        body: { detail: 'No such conversation.' },
+      },
+    });
     render(<AdminConversationViewerPage />);
     await waitFor(() =>
       expect(screen.getByText('No such conversation.')).toBeTruthy(),
     );
+    expect(screen.getByRole('alert')).toBeTruthy();
+  });
+
+  it('still shows an error when the member itself is gone', async () => {
+    const calls = routeFetch({
+      '/api/admin/members/7': { status: 404, body: { detail: 'No such member.' } },
+    });
+    render(<AdminConversationViewerPage />);
+    await waitFor(() => expect(screen.getByText('No such member.')).toBeTruthy());
+    expect(screen.getByRole('alert')).toBeTruthy();
+    expect(calls).toEqual(['/api/admin/members/7']);
+  });
+
+  it('shows the calm privacy notice for a member this role may not inspect, without asking for the transcript', async () => {
+    const calls = routeFetch({
+      '/api/admin/members/7': {
+        status: 200,
+        body: {
+          member: { ...MEMBER_ROW, role: 'super_admin' },
+          stats: null,
+          may_inspect: false,
+        },
+      },
+    });
+    render(<AdminConversationViewerPage />);
+    await waitFor(() =>
+      expect(
+        screen.getByText(
+          "This member's conversations, uploads, reports and sessions are private to higher roles.",
+        ),
+      ).toBeTruthy(),
+    );
+    expect(calls).toEqual(['/api/admin/members/7']);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    // The way back stays.
+    expect(screen.getByText('Back to member')).toBeTruthy();
   });
 });
 

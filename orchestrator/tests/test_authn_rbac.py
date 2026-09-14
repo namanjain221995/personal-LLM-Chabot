@@ -87,6 +87,50 @@ def test_admin_cannot_deactivate_or_remove_equal_or_higher_roles(login_client, a
     assert resp.json() == {"ok": True, "status": "disabled"}
 
 
+def test_a_super_admin_still_cannot_manage_a_peer_super_admin(login_client, as_user):
+    """The 2026-09-14 owner decision lets a super admin INSPECT a peer super
+    admin (rbac.may_inspect); it must not leak into management, which keeps
+    the strict `outranks` rule for everyone."""
+    root = login_client("root", role="super_admin")
+    boss = int(as_user("boss", role="super_admin")["id"])
+
+    assert root.get(f"/admin/api/members/{boss}").json()["may_inspect"] is True
+    assert root.post(
+        f"/admin/api/members/{boss}/status", json={"disabled": True}
+    ).status_code == 403
+    assert root.delete(f"/admin/api/members/{boss}").status_code == 403
+    assert root.post(
+        f"/admin/api/members/{boss}/reset-password",
+        json={"new_password": "another-long-enough-passphrase"},
+    ).status_code == 403
+    assert root.post(f"/admin/api/members/{boss}/sessions/revoke").status_code == 403
+    assert root.put(
+        f"/admin/api/members/{boss}/access", json={"features": {}}
+    ).status_code == 403
+    listed = root.get("/admin/api/members", params={"role": "super_admin"}).json()
+    assert {m["id"]: m["status"] for m in listed["members"]}[boss] == "active"
+
+
+def test_the_rank_rules_as_a_truth_table():
+    """Pure: `outranks` (management) is unchanged and strict; `may_inspect`
+    (reading sessions and content) adds self and, since the 2026-09-14 owner
+    decision, super admin -> anyone. Both fail closed on an unknown role."""
+    from app.authn.rbac import may_inspect, outranks
+
+    roles = ("member", "admin", "super_admin")
+    rank = {r: i for i, r in enumerate(roles)}
+    for actor in roles:
+        for target in roles:
+            assert outranks(actor, target) is (rank[actor] > rank[target])
+            expected = actor == "super_admin" or rank[actor] > rank[target]
+            assert may_inspect(actor, target, self_view=False) is expected, (actor, target)
+            assert may_inspect(actor, target, self_view=True) is True
+    assert may_inspect("owner", "member", self_view=False) is False
+    assert may_inspect("owner", "member", self_view=True) is True
+    assert may_inspect("super_admin", "owner", self_view=False) is True
+    assert may_inspect("admin", "owner", self_view=False) is False
+
+
 def test_disabling_a_member_kills_their_live_sessions(login_client):
     admin = login_client("adm", role="admin")
     victim = login_client("victim")

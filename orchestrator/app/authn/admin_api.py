@@ -26,7 +26,7 @@ from . import features as feature_access
 from . import invites, passwords, store
 from .api import _token_hash
 from .principal import Principal, audit, require_capability
-from .rbac import Cap, Role, assignable_roles, outranks
+from .rbac import Cap, Role, assignable_roles, may_inspect, outranks
 
 router = APIRouter(prefix="/admin/api", tags=["admin"])
 
@@ -78,9 +78,19 @@ async def _inspectable_member(principal: Principal, user_id: int) -> Dict[str, A
     N007, 2026-09-13). Reading your own is always allowed. The refusal is 404,
     not 403: this surface never confirms which objects exist to someone who
     may not see them.
+
+    Owner decision, 2026-09-14: a SUPER ADMIN may inspect every member,
+    including other super admins; the audited reads (conversation view, upload
+    and report downloads) still write their events, and super admins can read
+    that log, so access between super admins stays accountable. An admin still
+    needs to outrank the target. The rule lives in `rbac.may_inspect`, shared
+    with `member_detail` so the stats and these routes never disagree; the
+    management routes keep plain `outranks`.
     """
     target = await _target_member(principal, user_id)
-    if user_id != principal.user_id and not outranks(principal.role, target["role"]):
+    if not may_inspect(
+        principal.role, target["role"], self_view=user_id == principal.user_id
+    ):
         raise HTTPException(status_code=404, detail="No such member.")
     return target
 
@@ -170,11 +180,15 @@ async def member_detail(
     # how many there were (found in the F078 sweep, 2026-09-13). `None`, never
     # zeros — a withheld count must not read as "used nothing", and the page
     # already renders a missing count as a dash.
-    may_inspect = user_id == principal.user_id or outranks(principal.role, row["role"])
-    stats = (
-        await db.run_in_thread(store.admin_user_overview, user_id) if may_inspect else None
+    # `may_inspect` is the same rule as `_inspectable_member`; the page uses
+    # it to skip the content routes it would be refused and say so calmly.
+    inspectable = may_inspect(
+        principal.role, row["role"], self_view=user_id == principal.user_id
     )
-    return {"member": _member_payload(row), "stats": stats}
+    stats = (
+        await db.run_in_thread(store.admin_user_overview, user_id) if inspectable else None
+    )
+    return {"member": _member_payload(row), "stats": stats, "may_inspect": inspectable}
 
 
 class RoleChangeRequest(BaseModel):

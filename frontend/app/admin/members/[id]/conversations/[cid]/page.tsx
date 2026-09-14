@@ -7,6 +7,13 @@
  * composer — just whitespace-preserved text in plain bubbles with
  * timestamps and the model/mode chips the message meta carries. Every load
  * is audited server-side, and the page says so out loud.
+ *
+ * A deep link can land here for a member this viewer's role may not inspect
+ * (an admin opening a super admin or a peer admin). The page asks
+ * GET members/{id} first and fetches the transcript only when `may_inspect`
+ * is true; otherwise it shows the console's calm privacy notice, not a red
+ * "No such member." with a Retry that can never succeed. A genuine 404 (the
+ * member or the conversation is gone) still renders the error.
  */
 
 import { useEffect, useState } from 'react';
@@ -16,9 +23,14 @@ import { formatWhen } from '@/lib/format';
 import {
   AdminApiError,
   adminJson,
+  mayInspectMember,
 } from '@/components/admin/api';
 import { IconArrowLeft, IconShield } from '@/components/admin/icons';
-import { ErrorPanel, SkeletonLine } from '@/components/admin/ui';
+import {
+  ErrorPanel,
+  PrivateContentNotice,
+  SkeletonLine,
+} from '@/components/admin/ui';
 
 interface Message {
   id: number | string;
@@ -59,15 +71,25 @@ export default function AdminConversationViewerPage() {
 
   const [data, setData] = useState<ConversationPayload | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [withheld, setWithheld] = useState(false);
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    adminJson<ConversationPayload>(
-      `members/${memberId}/conversations/${encodeURIComponent(conversationId)}`,
-    )
-      .then((res) => {
+    // Sequential on purpose: the transcript route is never called for a
+    // member the viewer may not inspect.
+    adminJson<{ stats: unknown; may_inspect?: boolean }>(`members/${memberId}`)
+      .then(async (detail) => {
+        if (cancelled) return;
+        if (!mayInspectMember(detail)) {
+          setWithheld(true);
+          return;
+        }
+        setWithheld(false);
+        const res = await adminJson<ConversationPayload>(
+          `members/${memberId}/conversations/${encodeURIComponent(conversationId)}`,
+        );
         if (!cancelled) setData(res);
       })
       .catch((err) => {
@@ -83,7 +105,7 @@ export default function AdminConversationViewerPage() {
     };
   }, [memberId, conversationId, attempt]);
 
-  const loading = data === null && error === null;
+  const loading = data === null && error === null && !withheld;
 
   return (
     <div className="mx-auto w-full max-w-thread">
@@ -98,6 +120,10 @@ export default function AdminConversationViewerPage() {
       {error ? (
         <div className="mt-4">
           <ErrorPanel message={error} onRetry={() => setAttempt((n) => n + 1)} />
+        </div>
+      ) : withheld ? (
+        <div className="mt-4">
+          <PrivateContentNotice />
         </div>
       ) : (
         <>
