@@ -1034,7 +1034,21 @@ def _schemas() -> Dict[str, Any]:
                 "background": {
                     "type": "boolean",
                     "default": False,
-                    "description": "`stream` and `background` both true is refused.",
+                    "description": (
+                        "Run detached and return 202. With `stream: true` too, the "
+                        "connection follows the job's events instead, and leaving it "
+                        "cancels nothing. Requires `store: true`."
+                    ),
+                },
+                "store": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "`true`: the generation is durable — it survives a service "
+                        "restart and can be resumed with `GET /v1/responses/{id}"
+                        "?stream=true&starting_after=N`. `false`: nothing is stored; "
+                        "it is cancelled if the connection or the service goes away."
+                    ),
                 },
                 "max_output_tokens": {
                     "type": ["integer", "null"],
@@ -1163,6 +1177,11 @@ def _schemas() -> Dict[str, Any]:
                     "items": {"$ref": "#/components/schemas/ChatMessage"},
                 },
                 "stream": {"type": "boolean", "default": False},
+                "store": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "As on /v1/responses: `false` opts out of the durable event log.",
+                },
                 "max_tokens": {
                     "type": ["integer", "null"],
                     "minimum": 1,
@@ -1266,7 +1285,10 @@ def _stream_description() -> str:
         "`event: <name>` plus a JSON `data` whose `type` repeats the name and "
         "whose `sequence_number` starts at 1 and increases by exactly 1:\n\n"
         "`response.created` → `response.in_progress` → "
+        "`response.output_item.added` → `response.content_part.added` → "
         "`response.output_text.delta` (×N) → `response.output_text.done` → "
+        "`response.output_text.annotation.added` (×K, only for `file_citation`s) → "
+        "`response.content_part.done` → `response.output_item.done` → "
         "`response.completed`\n\n"
         "`response.queued` appears when the model is restarting and the request "
         "is waiting. The terminals are `response.completed`, `response.failed` "
@@ -1277,7 +1299,10 @@ def _stream_description() -> str:
         "`incomplete_details` saying whether it was reached. A comment line "
         "(`: ping`) arrives at least every 15 seconds for the whole life of the "
         "stream — hours, for a long generation — so an idle proxy cannot close "
-        "the connection; ignore it, as every conforming SSE parser already does."
+        "the connection; ignore it, as every conforming SSE parser already does. "
+        "A stream that ends without a terminal event did not finish: resume it "
+        "with `GET /v1/responses/{id}?stream=true&starting_after=<last "
+        "sequence_number>`."
     )
 
 
@@ -1337,8 +1362,9 @@ def _paths() -> Dict[str, Any]:
                     f"Scope `responses.write`. {_stream_description()}\n\n"
                     "`background: true` returns **202** with a response id "
                     "before the work starts; read it back with "
-                    "`GET /v1/responses/{id}`. `stream` and `background` "
-                    "cannot both be true."
+                    "`GET /v1/responses/{id}`. With `stream: true` as well the "
+                    "response is the job's event stream. Every generation with "
+                    "`store: true` (the default) survives a service restart."
                 ),
                 "security": [{"bearerAuth": []}],
                 "parameters": [
@@ -1381,10 +1407,19 @@ def _paths() -> Dict[str, Any]:
             "get": {
                 "tags": ["Responses"],
                 "operationId": "getResponse",
-                "summary": "Read a response",
+                "summary": "Read a response, or resume its stream",
                 "description": (
                     "Scope `responses.read`. Scoped to the project the key "
-                    "belongs to; another project's id reads as missing."
+                    "belongs to; another project's id reads as missing.\n\n"
+                    "With `stream=true` the body is the response's event stream: "
+                    "the events after `starting_after` (all of them without it) "
+                    "are replayed, a running response is followed live, and the "
+                    "stream closes after the terminal event. Only the key that "
+                    "created the response (or a key of the same service account) "
+                    "may stream it; any other key gets the same 404 as a missing "
+                    "id. A response created with `store: false`, or whose events "
+                    "are past retention, is a 400 on `stream`; `starting_after` "
+                    "without `stream=true` is a 400."
                 ),
                 "security": [{"bearerAuth": []}],
                 "parameters": [
@@ -1394,11 +1429,32 @@ def _paths() -> Dict[str, Any]:
                         "required": True,
                         "schema": {"type": "string"},
                         "example": "resp_3f8a1c",
-                    }
+                    },
+                    {
+                        "name": "stream",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "boolean"},
+                        "description": "Stream the response's events (Server-Sent Events).",
+                    },
+                    {
+                        "name": "starting_after",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer", "minimum": 0},
+                        "description": "Replay only the events whose `sequence_number` is greater.",
+                    },
                 ],
                 "responses": {
-                    "200": json_ok("#/components/schemas/Response"),
-                    **_error_responses(*_always(), "response_not_found"),
+                    "200": {
+                        "description": "OK — the Response object, or its event stream with `stream=true`.",
+                        "headers": _request_id_header(),
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/Response"}},
+                            "text/event-stream": {"schema": {"type": "string"}},
+                        },
+                    },
+                    **_error_responses(*_always(), "invalid_request_error", "response_not_found"),
                 },
             }
         },

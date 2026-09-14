@@ -45,6 +45,7 @@ const S_THE_FIELDS_THIS_ENDPOINT_ACCEPTS = `
 | \`model\` | Required. \`${MODEL_ID}\`, \`${VISION_MODEL_ID}\` or \`${OCR_MODEL_ID}\`. |
 | \`messages\` | Required. \`{role, content}\` turns; \`role\` is \`system\`, \`user\` or \`assistant\` and \`content\` is a string — or, on a \`user\` turn, a list of \`text\` and \`image_url\` parts (see [images](/docs/images)). |
 | \`stream\` | Optional. See below. |
+| \`store\` | Optional, default \`true\`. \`false\` keeps nothing while the request runs: it is then cancelled when its client disconnects, and a restart of the service ends it. |
 | \`max_tokens\` | Optional. The older spelling of \`max_output_tokens\`, and mapped to it — up to the model's ceiling, clamped to what the prompt leaves in the window. |
 | \`max_completion_tokens\` | Optional. The newer spelling of the same thing. Send one or the other; both at once is a \`400\`. |
 | \`temperature\` | Optional, \`0.0\`–\`2.0\`. |

@@ -90,7 +90,6 @@ def test_a_parameter_the_platform_cannot_honour_is_rejected_and_never_ignored():
         ("seed", 7),
         ("logit_bias", {}),
         ("stream_options", {"include_usage": True}),
-        ("store", True),
         ("previous_response_id", "resp_1"),
     ):
         with pytest.raises(errors.ApiError) as raised:
@@ -188,14 +187,30 @@ def test_metadata_is_bounded_in_keys_key_length_value_length_and_type():
     assert len(ok.metadata) == 16
 
 
-def test_stream_and_background_may_not_both_be_true():
-    with pytest.raises(errors.ApiError) as raised:
-        models.parse_responses_request(_body(stream=True, background=True))
-    assert raised.value.status == 400
-    assert "stream" in raised.value.message and "background" in raised.value.message
-    # Either one alone is ordinary.
+def test_stream_and_background_together_are_a_valid_request():
+    # CONTRACT §8.1 / §14 (2026-09-14): a background job is a durable run with
+    # an event log, so a stream can follow it. Refused until then.
+    both = models.parse_responses_request(_body(stream=True, background=True))
+    assert both.stream is True and both.background is True
     assert models.ResponsesRequest.model_validate(_body(stream=True)).stream is True
     assert models.ResponsesRequest.model_validate(_body(background=True)).background is True
+
+
+def test_store_is_a_strict_boolean_that_defaults_to_true():
+    assert models.parse_responses_request(_body()).store is True
+    assert models.parse_responses_request(_body(store=False)).store is False
+    for bad in ("false", 0, None, {}):
+        with pytest.raises(errors.ApiError) as raised:
+            models.parse_responses_request(_body(store=bad))
+        assert raised.value.status == 400 and raised.value.param == "store"
+
+
+def test_background_with_store_false_is_refused_naming_store():
+    # A background response is read back later; `store: false` forbids
+    # keeping it. Refused, never a job a restart would silently drop.
+    with pytest.raises(errors.ApiError) as raised:
+        models.parse_responses_request(_body(background=True, store=False))
+    assert raised.value.status == 400 and raised.value.param == "store"
 
 
 def test_a_model_id_shaped_like_a_path_or_a_url_is_refused():

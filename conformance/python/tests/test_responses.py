@@ -78,10 +78,25 @@ def test_a_parameter_the_platform_cannot_honour_is_refused_by_name(client, targe
     assert error["param"] == "frobnicate" or "frobnicate" in error["message"], error
 
 
-def test_stream_and_background_together_are_refused(client, target):
-    with pytest.raises(openai.BadRequestError) as caught:
+@pytest.mark.feature("resumable_streams")
+def test_stream_and_background_together_stream_the_job_to_one_terminal_event(client, target):
+    # CONTRACT-3 §8.1 / §14 (2026-09-14): refused until the job had an event
+    # log to follow; with the durable runtime the connection follows it.
+    events = list(
         client.responses.create(
             model=target.models["chat"], input=PONG, max_output_tokens=target.small_output_tokens, stream=True, background=True
+        )
+    )
+    assert events and events[0].type == "response.created", [e.type for e in events[:3]]
+    assert sum(e.type in ("response.completed", "response.failed") for e in events) == 1
+    assert client.responses.retrieve(events[0].response.id).status in ("completed", "failed")
+
+
+def test_background_with_store_false_is_refused_naming_store(client, target):
+    with pytest.raises(openai.BadRequestError) as caught:
+        client.responses.create(
+            model=target.models["chat"], input=PONG, max_output_tokens=target.small_output_tokens, background=True,
+            extra_body={"store": False},
         )
     asserts.sdk_error(caught.value, code="invalid_request_error")
 

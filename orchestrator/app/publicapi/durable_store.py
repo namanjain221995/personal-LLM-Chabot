@@ -932,6 +932,40 @@ def purge_events(*, retention_s: float, batch: int = 5000, max_batches: int = 20
     return deleted
 
 
+def fail_interrupted_foreground(
+    *, created_before: Any, error_code: str, error_message: str, limit: int = 200
+) -> List[str]:
+    """Close NON-durable foreground rows a previous process left open.
+
+    WHY (verifier, 2026-09-14). A synchronous or streaming `/v1` request that
+    was not durable (`store: false`, or a process whose durable runtime was
+    not running) lives in the coroutine of its connection; a restart kills it
+    between the row's `queued` write and the recorder's terminal write, and
+    the row said `queued` for ever — `GET /v1/responses/{id}` told a client to
+    keep waiting for a generation nobody runs. A row created before THIS
+    process started cannot be running here (one orchestrator process owns
+    `/v1`), and a non-resumable row is nobody else's to resume. Background rows
+    are excluded: `background.repair_if_orphaned` closes those one at a time
+    because each owes its webhook. Bounded per call; `SKIP LOCKED` so two
+    sweeps never wait on each other."""
+    with db.connection() as con:
+        rows = con.execute(
+            """
+            UPDATE api_responses SET status = 'failed', error_code = %s, error_message = %s,
+                   completed_at = COALESCE(completed_at, now())
+            WHERE id IN (
+                SELECT id FROM api_responses
+                WHERE status IN ('queued', 'in_progress') AND NOT background
+                  AND NOT COALESCE(resumable, false) AND created_at < %s
+                ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED
+            )
+            RETURNING id
+            """,
+            (error_code, error_message, created_before, int(limit)),
+        ).fetchall()
+    return [str(r["id"]) for r in rows]
+
+
 def events_retained(response_id: str) -> bool:
     with db.connection() as con:
         row = con.execute(

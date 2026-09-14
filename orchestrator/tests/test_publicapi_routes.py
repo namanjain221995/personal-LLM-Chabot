@@ -395,14 +395,19 @@ def test_a_body_that_is_not_json_never_echoes_the_decoder_s_view_of_it(api, engi
     assert "secret prompt" not in response.text
 
 
-def test_stream_and_background_together_are_refused(api, engine):
+def test_stream_and_background_without_a_running_durable_runtime_is_a_retryable_503(api, engine):
+    # Valid since 2026-09-14 (CONTRACT §14): the stream follows the job's
+    # durable event log. This bare app never starts the durable runtime, so
+    # there is no log to follow — an operational fault, not a bad request.
+    # With the runtime running it streams (test_publicapi_foreground_durable).
     engine(["ok"])
     response = api.post(
         "/v1/responses", json=_body(stream=True, background=True), headers=_auth()
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request_error"
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_unavailable"
+    assert response.headers["retry-after"]
 
 
 def test_a_temperature_outside_the_documented_range_is_refused(api, engine):

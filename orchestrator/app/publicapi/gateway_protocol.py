@@ -57,9 +57,10 @@ protocol off and keeps requests safe. PUBLIC_API_TRUSTED_PROXIES keeps its one
 meaning; the gateway's address belongs in both.
 
 WHAT THIS MODULE DOES NOT DECIDE. Whether an attempt matches a run, what may
-be replayed, and to whom, is the durable layer's (T2 `durable.attach`, keyed
-by attempt token, key id and body sha256). This module parses, validates,
-renders and hashes; it holds no state.
+be replayed, and to whom, is the durable layer's (`durable.Runtime.attach_attempt`,
+keyed by attempt token, key id and body sha256, called from
+`router._attach_gateway_attempt` since 2026-09-14). This module parses,
+validates, renders and hashes; it holds no state.
 """
 from __future__ import annotations
 
@@ -358,6 +359,15 @@ async def tag_frames(
     stream it is the chunk ordinal, `data: [DONE]` included, which is what a
     replay from N+1 needs. A stream re-attached with Resume-After N passes
     `start_after=N` together with frames that begin at N+1.
+
+    WHERE IT IS STILL USED (2026-09-14). Only by NON-durable streams
+    (`store: false`), which answer `X-TechSara-Run: none` and are never
+    re-attached. A durable stream is rendered from its write-ahead log by
+    `durable.sse_frames(tagged=True)`, which appends the LOG RECORD's number
+    instead — on a Chat Completions stream that is not the chunk ordinal (the
+    lifecycle records render no chunk), and it is the number a re-attach with
+    Resume-After N replays from. Wrapping a durable stream here as well would
+    number it twice (`router._SlotStream(number_frames=False)`).
 
     The wrapped iterator is closed with this one: `async for` has no teardown
     of its own, and the stream it wraps holds the engine generator.

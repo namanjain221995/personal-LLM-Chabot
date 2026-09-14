@@ -561,3 +561,43 @@ def test_a_cancel_written_while_another_process_held_the_run_is_honoured_at_clai
     assert resumed is None and len(engine.calls) == calls
     row = durable_store.get_run(handle.id)
     assert row["status"] == "cancelled" and row["output_tokens"] >= 5
+
+
+def test_a_suspend_lets_the_stopped_attempt_be_recorded_before_the_lease_is_released(monkeypatch, tmp_path):
+    """`metadata.attempts` is written under the lease by the runner after its
+    attempt ends. A SIGTERM whose release won that race lost the entry, and
+    the resumed run settled with resume_count 0 (2026-09-14). A slow progress
+    write makes the race certain; the entry must still be stored."""
+    FakeMainEngine(answer_tokens=100_000, delay_s=0.002).install(monkeypatch)
+    tenant = make_tenant()
+    real_update = durable_store.update_progress
+
+    def slow_update(owner, response_id, **fields):
+        if fields.get("metadata", {}).get("attempts"):
+            time.sleep(0.3)
+        return real_update(owner, response_id, **fields)
+
+    monkeypatch.setattr(durable_store, "update_progress", slow_update)
+
+    async def scenario():
+        a = _runtime(tmp_path, "A")
+        await a.start()
+        try:
+            handle = await a.launch(make_spec(), caller=tenant.caller(), streamed=True, keyed=True)
+            seen = []
+            try:
+                async for item in handle.follow(0, heartbeat=0.05):
+                    if item is not durable.HEARTBEAT:
+                        seen.append(item)
+                    if len(seen) >= 6:
+                        await a.suspend_all("restart")
+            except durable.FollowerAborted:
+                pass
+            return durable_store.get_run(handle.id)
+        finally:
+            await a.stop()
+
+    row = asyncio.run(scenario())
+    assert row["lease_owner"] is None and row["suspend_reason"] == "restart"
+    attempts = row["metadata"].get("attempts") or []
+    assert [a["reason"] for a in attempts] == ["restart"] and attempts[0]["dispatched"] is True
