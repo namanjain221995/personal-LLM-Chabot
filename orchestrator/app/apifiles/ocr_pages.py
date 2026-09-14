@@ -13,9 +13,13 @@ THE READ. For each batch of pages the extraction child renders PNGs at
 `core/pdf.RENDER_SCALE` (`render.render_pages`), then two workers read them,
 one page per unit, each unit inside
 
-    capacity.hold("ocr", wait_s=capacity.background_wait_s(), yield_to_chat=True)
+    capacity.hold("ocr", wait_s=None, yield_to_chat=True, abandon=<the job's>)
 
-— the public side's FIFO gate, which steps aside while a chat turn is busy —
+— the public side's FIFO gate, which steps aside while a chat turn is busy.
+The wait has no limit (2026-09-14): until then each unit gave up after
+PUBLIC_API_BACKGROUND_GATE_WAIT_S and deferred the whole PDF for a gate that
+was only busy. It ends on admission, or when the job is abandoned (lease
+lost, blob being deleted) —
 through the chat app's own `engines.ocr.read_images(..., prompt="OCR")`.
 Why the prompt "OCR": measured 2026-09-11 on the production engine, the app's
 default "document parsing" looped on a real PDF page (16,775 characters at a
@@ -43,8 +47,8 @@ before its render is deleted, so a lost lease or a restart resumes with the
 next unread page instead of re-spending GPU on 900 pages already read. The
 merge into `pages.jsonl` happens once, at the end, atomically.
 
-WHEN THE ENGINE IS NOT THERE. A gate refusal (`model_at_capacity` after the
-background wait), or a batch with no success and at least one failure that
+WHEN THE ENGINE IS NOT THERE. A gate refusal (only a bounded gate refuses;
+the default one waits), or a batch with no success and at least one failure that
 may still succeed later (unreachable, or a page's first rejection), raises
 `EngineUnavailable`: the runner defers the blob (5 attempts, 300 s apart)
 with the pages already recorded kept. One failed page among good ones is only
@@ -65,6 +69,13 @@ does not run at all: every thin page keeps its text layer and is counted in
 (`final_attempt`), an engine that is still unreachable no longer fails the
 file: the stage completes with what was read, the rest counted in
 `ocr_failed_pages`.
+
+WHY AN OCR OUTAGE STILL SPENDS AN ATTEMPT (2026-09-14). An embedding outage no
+longer does (`apifiles/outage.py`): a file cannot be indexed without that
+engine, so it waits for as long as the outage lasts. A PDF can be finished
+without OCR, so here the count is the bound on how long a PDF waits for a
+missing OCR engine (~25 minutes), and the last attempt completes the file
+with its text layers instead of failing it.
 """
 from __future__ import annotations
 
@@ -161,10 +172,12 @@ def plan(thin_pages: Sequence[int], *, budget: int, already: Sequence[int] = ())
     return OcrPlan(pages=[p for p in within if p not in done], skipped=beyond, budget=budget)
 
 
-def default_gate() -> AsyncContextManager[None]:
+def default_gate(abandon: Optional[asyncio.Event] = None) -> AsyncContextManager[None]:
+    """The patient OCR gate (module docstring, THE READ). `abandon` ends the
+    wait with `capacity.Abandoned`."""
     from ..publicapi import capacity
 
-    return capacity.hold(capacity.GATE_OCR, wait_s=capacity.background_wait_s(), yield_to_chat=True)
+    return capacity.hold(capacity.GATE_OCR, wait_s=None, yield_to_chat=True, abandon=abandon)
 
 
 async def default_reader(images: Sequence[str]) -> Sequence[Any]:
@@ -352,8 +365,9 @@ async def run_stage(
                     async with gate():
                         reads = await read([image])
                 except ApiError as exc:
-                    # 503 at capacity after the background wait: not a verdict
-                    # about the page, and not something to retry in this attempt.
+                    # A bounded gate's 503 at capacity (an injected gate; the
+                    # default one waits): not a verdict about the page, and not
+                    # something to retry in this attempt.
                     raise EngineUnavailable("the OCR gate did not admit this unit") from exc
                 result = reads[0] if reads else None
                 status = str(getattr(result, "status", "failed") or "failed")

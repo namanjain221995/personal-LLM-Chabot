@@ -499,6 +499,52 @@ def purge_api_upload_records(older_than_s: float, limit: int) -> List[str]:
 #: delete/re-upload loop on the same bytes.
 _BLOB_VANISHED_RETRIES = 3
 
+#: A failed blob whose failure was NOT a verdict on its bytes: the same bytes
+#: uploaded again re-queue it (`_requeue_recoverable_blob`). `unsupported_file`,
+#: `file_corrupt` and `file_too_complex` are verdicts — identical bytes would
+#: only fail identically — and stay failed.
+RECOVERABLE_BLOB_ERRORS = ("processing_unavailable", "internal_error")
+
+
+def _requeue_recoverable_blob(con, project_id: str, sha256: str) -> Optional[dict]:
+    """Put a recoverably failed blob of (project, sha256) back in the queue.
+
+    WHY (verifier, 2026-09-14). A blob that failed while the embedding engine
+    was down kept `status = failed`, and `_lock_or_create_blob` joined every
+    later upload of the same bytes to it: the new file read `status: error`
+    0.0 s after its upload, with the engine back up, and no upload could ever
+    recover those bytes in that project. The chat app already treats a
+    re-upload as the natural "try again" (`db.upsert_video_analysis`).
+
+    What is reset: status, error code, the attempt count, the retry time and
+    the failed stage's marker in `stages`, so the File object shows the work
+    ahead again. What is kept: every finished stage's files and markers —
+    the runner resumes at the first stage without one, so a PDF whose index
+    failed does not extract its text again.
+
+    NOT re-queued: a blob failed by the crash-loop guard (`progress.crashes`
+    reached the attempt ceiling — its runs kept taking the process down, so a
+    re-upload must not buy another five), and the verdicts listed above.
+
+    Runs BEFORE the share-locking SELECT, in the same transaction: the UPDATE
+    takes the row lock first, so two concurrent re-uploads serialise on it and
+    the second finds `queued` and changes nothing (a share lock taken first
+    and upgraded by both would deadlock)."""
+    from . import limits
+
+    return _one(
+        con,
+        "UPDATE api_file_blobs SET status = 'queued', error_code = NULL, attempt = 0, not_before = NULL, "
+        "       lease_owner = NULL, lease_expires_at = NULL, processed_at = NULL, updated_at = now(), "
+        "       progress = progress - 'error_ceiling' - 'derived' - 'running_owner' - 'outage_retries', "
+        "       stages = COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(stages) e "
+        "                           WHERE e.value->>'status' IS DISTINCT FROM 'failed'), '{}'::jsonb) "
+        " WHERE project_id = %s AND sha256 = %s AND status = 'failed' AND error_code = ANY(%s) "
+        "   AND (CASE WHEN progress->>'crashes' ~ '^[0-9]{1,9}$' THEN (progress->>'crashes')::int ELSE 0 END) < %s "
+        "RETURNING id",
+        (project_id, sha256, list(RECOVERABLE_BLOB_ERRORS), max(1, int(limits.processing_max_attempts()))),
+    )
+
 
 def _lock_or_create_blob(
     con,
@@ -521,7 +567,11 @@ def _lock_or_create_blob(
     new live file). `place_bytes(row, created)` moves the caller's bytes to
     `original` while the row is locked: on a create, and on an existing row
     whose `original` is missing (a disk repair), so a committed blob row always
-    has its bytes."""
+    has its bytes.
+
+    A blob that failed for a reason other than its bytes is re-queued first
+    (`_requeue_recoverable_blob`): the returned row is then `queued`, and the
+    caller wakes the runner exactly as for a created one."""
     row = None
     created_row = None
     for _ in range(_BLOB_VANISHED_RETRIES):
@@ -532,6 +582,8 @@ def _lock_or_create_blob(
             "ON CONFLICT (project_id, sha256) DO NOTHING RETURNING id",
             (ids.new_blob_id(), project_id, workspace_id, sha256, int(bytes), kind, mime_type, lane),
         )
+        if created_row is None:
+            _requeue_recoverable_blob(con, project_id, sha256)
         row = _one(
             con,
             "SELECT * FROM api_file_blobs WHERE project_id = %s AND sha256 = %s FOR SHARE",

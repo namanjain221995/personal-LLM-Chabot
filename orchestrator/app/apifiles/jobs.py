@@ -33,12 +33,19 @@ WHAT ENDS A RUN.
   `file.processed` webhooks;
 * a verdict about the FILE (`extractors.ExtractError`: unsupported, corrupt,
   too complex) → `failed` with that code, `file.failed` webhooks;
-* the ENGINE or the DISK is not there (OCR/embed gate refusal, an OCR batch
+* the EMBEDDING ENGINE is down, or its state is unknown → deferred WITHOUT
+  spending an attempt, retried with exponential backoff (15 s doubling, capped
+  at the 300 s retry delay) for as long as the outage lasts: a file is never
+  failed because an engine is down (2026-09-14; the rule and its two
+  exceptions are `apifiles/outage.py`);
+* the engine is proven SERVING while this blob's call failed, or the ENGINE
+  or the DISK is not there in a way that can be about the blob (an OCR batch
   with no success, disk under the watermark, ENOSPC in the child, a child
   killed from outside, a sandbox that cannot be applied) → deferred: back to
   `queued`, finished stages kept, `attempt + 1`, not before now + 300 s; the
-  fifth deferral fails `processing_unavailable` (`queue.defer_blob`) — except
-  that OCR on the last attempt completes with the text layers instead;
+  fifth counted deferral fails `processing_unavailable` (`queue.defer_blob`)
+  — except that OCR on the last attempt completes with the text layers
+  instead, so an OCR outage never fails a file either;
 * shutdown → released to `queued` at once (no attempt counted), so the next
   process resumes without waiting 90 s for the lease to lapse;
 * a DELETE or a lost lease → the job stops and writes nothing more.
@@ -69,7 +76,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .. import db
-from . import events, limits, queue, schema, sniff, storage
+from . import events, limits, outage, queue, schema, sniff, storage
 from .extractors import (
     ERROR_CODES,
     ExtractError,
@@ -122,7 +129,15 @@ class StopJob(Exception):
 
 
 class Deferred(Exception):
-    """The engine or the disk is unavailable: defer, keep finished stages."""
+    """The engine or the disk is unavailable: defer, keep finished stages.
+
+    `counted=False` (an engine outage, `apifiles/outage.py`) re-queues the
+    blob with backoff and does not spend one of its attempts."""
+
+    def __init__(self, message: str = "", *, counted: bool = True, kind: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.counted = bool(counted)
+        self.kind = kind
 
 
 class ProcessingUnavailable(ExtractError):
@@ -162,6 +177,10 @@ class JobContext:
         self.stages: Dict[str, Any] = dict(_json_field(blob.get("stages")))
         self.progress_state: Dict[str, Any] = dict(_json_field(blob.get("progress")))
         self.lost = False
+        #: Set when the job must stop while it may be waiting at a capacity
+        #: gate (lease lost, blob being deleted): the patient gates have no
+        #: clock, so this is what ends their wait (`capacity.Abandoned`).
+        self.abandon = asyncio.Event()
         self.stop_reason: Optional[str] = None
         self._last_status_check = 0.0
         self.waited_for_capacity_s = float(self.progress_state.get("waited_for_capacity_s") or 0.0)
@@ -326,6 +345,7 @@ async def stage_text(ctx: JobContext) -> StageResult:
 
 async def stage_ocr(ctx: JobContext) -> StageResult:
     from . import ocr_pages, render
+    from ..publicapi import capacity
     from ..publicapi.errors import ApiError
 
     caps = ctx.caps()
@@ -348,13 +368,18 @@ async def stage_ocr(ctx: JobContext) -> StageResult:
             budget=int(budget),
             render=do_render,
             read=ctx.runner.ocr_reader,
-            gate=ctx.runner.ocr_gate,
+            gate=ctx.runner.ocr_gate or (lambda: ocr_pages.default_gate(abandon=ctx.abandon)),
             concurrency=2,
             checkpoint=ctx.checkpoint,
             progress=progress,
             final_attempt=final_attempt,
         )
+    except capacity.Abandoned:
+        raise StopJob(await ctx.runner._why_not_held(ctx)) from None
     except ocr_pages.EngineUnavailable as exc:
+        # Counted on purpose: on the last attempt the stage completes with the
+        # text layers, so the count bounds how long a PDF waits for a missing
+        # OCR engine (~25 min) and never fails the file (ocr_pages docstring).
         raise Deferred("OCR unavailable") from exc
     except ApiError as exc:
         raise Deferred("OCR gate refused") from exc
@@ -392,7 +417,7 @@ async def stage_index(ctx: JobContext) -> StageResult:
     audio/video the chunks are built here first, from the analysis's
     transcript and screen text (`chunks.chunk_media`, design §6.3)."""
     from . import chunks, vectors
-    from ..publicapi.errors import ApiError
+    from ..publicapi import capacity
 
     if ctx.kind in MEDIA_KINDS and not os.path.exists(os.path.join(ctx.derived_dir, chunks.CHUNKS_NAME)):
         content_hash = storage.api_video_hash(ctx.project_id, ctx.sha256)
@@ -403,13 +428,18 @@ async def stage_index(ctx: JobContext) -> StageResult:
         rows = chunks.chunk_media(transcript, screen)
         await asyncio.to_thread(chunks.write_chunks, rows, ctx.derived_dir)
 
+    progressed = False
+
     async def on_progress(done: int, total: int) -> None:
+        nonlocal progressed
+        progressed = True  # called only after a batch of vectors was written
         await ctx.progress("index", 100.0 * done / max(1, total))
 
+    embed = ctx.runner.embed_documents or _engine_embedder(ctx)
     try:
         info = await vectors.build_index(
             ctx.derived_dir,
-            embed_documents=ctx.runner.embed_documents,
+            embed_documents=embed,
             should_continue=ctx.should_continue,
             on_progress=on_progress,
         )
@@ -417,22 +447,67 @@ async def stage_index(ctx: JobContext) -> StageResult:
         if ctx.stop_reason:
             raise StopJob(ctx.stop_reason) from None
         raise
-    except (ApiError, ConnectionError) as exc:
-        raise Deferred("the embedding engine is unavailable") from exc
-    except (NotImplementedError, RecursionError, FileNotFoundError):
-        # Our bug, not an outage: retrying it for 25 minutes and then calling
-        # it `processing_unavailable` would hide it (review, 2026-09-13).
-        raise
-    except OSError as exc:
-        raise Deferred("the embedding engine is unavailable") from exc
-    except RuntimeError as exc:
-        raise Deferred("the embedding engine answered wrongly") from exc
+    except capacity.Abandoned:
+        raise StopJob(await ctx.runner._why_not_held(ctx)) from None
+    except Exception as exc:  # noqa: BLE001 — classified below; our own bugs re-raise
+        kind = outage.classify(exc)
+        if kind == outage.KIND_NOT_ENGINE:
+            if isinstance(exc, (NotImplementedError, RecursionError, FileNotFoundError)):
+                # Our bug, not an outage: retrying it for 25 minutes and then
+                # calling it `processing_unavailable` would hide it (review,
+                # 2026-09-13).
+                raise
+            if isinstance(exc, RuntimeError):
+                raise Deferred("the embedding engine answered wrongly") from exc
+            if isinstance(exc, OSError):
+                raise Deferred("the vector file could not be written") from exc
+            raise
+        probe = await _probe_embed(embed) if outage.needs_probe(kind) else None
+        counted = outage.counts_attempt(kind, probe=probe, progressed=progressed)
+        raise Deferred(f"the embedding engine is unavailable ({kind}, probe {probe})", counted=counted, kind=kind) from exc
     facts: Dict[str, Any] = {"chunks_indexed": int(info.rows), "index_truncated": bool(info.truncated)}
     if ctx.kind in MEDIA_KINDS:
         facts["chunks"] = int(info.chunks_total)
     if info.embed_input_tokens is not None:
         facts["embed_input_tokens"] = int(info.embed_input_tokens)
     return StageResult(facts=facts)
+
+
+#: The one input a probe embeds (`apifiles/outage.py`): tiny, fixed, and not
+#: any tenant's text.
+PROBE_TEXT = "probe"
+
+
+def _engine_embedder(ctx: JobContext) -> Callable[[Sequence[str]], Awaitable[Any]]:
+    """The production document embedder for one job: the patient gate, ended
+    by the job's `abandon`, adding its wait to `waited_for_capacity_s`."""
+    from . import vectors
+
+    async def embed(texts: Sequence[str]) -> Any:
+        base = ctx.waited_for_capacity_s
+
+        def on_wait(_position: int, waited_s: float) -> None:
+            ctx.waited_for_capacity_s = base + max(0.0, float(waited_s))
+
+        return await vectors.engine_embed_documents(
+            texts, abandon=ctx.abandon, on_wait=on_wait, on_admitted=lambda waited_s: on_wait(0, waited_s)
+        )
+
+    return embed
+
+
+async def _probe_embed(embed: Callable[[Sequence[str]], Awaitable[Any]]) -> str:
+    """One one-input call through the same embedder: does the engine answer
+    right now? (`outage.PROBE_*`)."""
+    from ..publicapi import capacity
+
+    try:
+        await embed([PROBE_TEXT])
+    except (asyncio.CancelledError, capacity.Abandoned):
+        raise
+    except Exception as exc:  # noqa: BLE001 — the verdict is the point
+        return outage.probe_verdict(exc)
+    return outage.PROBE_SERVING
 
 
 async def stage_media(ctx: JobContext) -> StageResult:
@@ -819,7 +894,9 @@ class JobRunner:
         self._last_renewal = time.monotonic()
         for blob_id in held_ids:
             if blob_id not in kept and blob_id in self._jobs:
-                self._jobs[blob_id][1].lost = True
+                job = self._jobs[blob_id][1]
+                job.lost = True
+                job.abandon.set()  # a job waiting at a patient gate stops now
         return True
 
     # -- one assembly -----------------------------------------------------
@@ -927,6 +1004,9 @@ class JobRunner:
             result = await fn(ctx)
             ms = int((time.monotonic() - started) * 1000)
             ctx.facts.update(result.facts or {})
+            # A stage finished: the engine outage that deferred this blob is
+            # over, so the next one backs off from the start again.
+            ctx.progress_state.pop("outage_retries", None)
             marker = {
                 "status": result.status,
                 "ms": ms,
@@ -1008,11 +1088,26 @@ class JobRunner:
         return outcome
 
     async def _defer(self, ctx: JobContext, exc: BaseException) -> RunOutcome:
-        log.info("files blob %s deferred at %s: %s", ctx.blob_id, ctx.current_stage, exc)
+        counted = bool(getattr(exc, "counted", True))
         ctx.progress_state.pop("running_owner", None)
+        if counted:
+            delay = self.retry_delay_s
+        else:
+            # An engine outage (apifiles/outage.py): no attempt is spent, and
+            # the retry backs off from 15 s up to the counted retry delay.
+            retries = int(ctx.progress_state.get("outage_retries") or 0)
+            cap = self.retry_delay_s if self.retry_delay_s is not None else limits.processing_retry_delay_s()
+            delay = outage.backoff_s(retries, cap)
+            ctx.progress_state["outage_retries"] = retries + 1
+        log.info(
+            "files blob %s deferred at %s (%s, retry in %s s): %s",
+            ctx.blob_id, ctx.current_stage, "counted" if counted else "outage, not counted",
+            "default" if delay is None else round(float(delay), 1), exc,
+        )
         await db.run_in_thread(_update_held, ctx.blob_id, self.owner, progress=ctx.progress_state, stages=ctx.stages, facts=ctx.facts)
         row = await db.run_in_thread(
-            queue.defer_blob, ctx.blob_id, owner=self.owner, delay_s=self.retry_delay_s, max_attempts=self.max_attempts
+            queue.defer_blob, ctx.blob_id, owner=self.owner, delay_s=delay, max_attempts=self.max_attempts,
+            count_attempt=counted,
         )
         if row is not None and row.get("status") == "failed":
             events.publish(ctx.blob_id, {"status": "failed"})
@@ -1020,7 +1115,7 @@ class JobRunner:
             outcome = RunOutcome(ctx.blob_id, "failed", "processing_unavailable")
         else:
             events.publish(ctx.blob_id, {"status": "queued"})
-            outcome = RunOutcome(ctx.blob_id, "deferred")
+            outcome = RunOutcome(ctx.blob_id, "deferred", None if counted else "outage")
         self.outcomes.append(outcome)
         return outcome
 

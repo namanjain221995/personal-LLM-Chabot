@@ -45,6 +45,7 @@ from fastapi.routing import APIRoute
 
 from ... import db
 from ...apifiles import accounting, ids, limits, queue, schema, storage
+from ...apifiles import derived as files_derived
 from ...core import partfile
 from .. import errors
 from . import content, multipart_disk, wire
@@ -77,6 +78,20 @@ class RouteUsage:
     meta: Dict[str, Any]
     reservation: Any = None
     http_status: int = 200
+
+
+def _require_derived_ready(row: Mapping[str, Any]) -> None:
+    """Routes 7-8 before processing finishes: `409 file_not_ready` with
+    Retry-After while the file is still assembling or processing; a `400` on
+    `file_id` carrying the File object's own sentence once processing has
+    FAILED, so a client does not retry a file that will never have derived
+    data (`apifiles.derived.readiness`, 2026-09-14)."""
+    ready = files_derived.readiness(row)
+    if ready.state == files_derived.READY:
+        return
+    if ready.state == files_derived.FAILED:
+        raise wire.invalid_request("This file has no derived data: " + str(ready.sentence), param="file_id")
+    raise wire.file_not_ready(5)
 
 
 class DerivedProvider(Protocol):
@@ -679,8 +694,7 @@ class _Handlers:
         try:
             row = await self._file_row(caller, file_id)
             call.generation_id = row["id"]
-            if row.get("blob_status") != "processed":
-                raise wire.file_not_ready(5)
+            _require_derived_ready(row)
             blob = await db.run_in_thread(schema.get_api_file_blob, row["blob_id"])
             names = self.deps.derived.list_names(blob or {})  # type: ignore[union-attr]
         except BaseException as exc:
@@ -694,8 +708,7 @@ class _Handlers:
         try:
             row = await self._file_row(caller, file_id)
             call.generation_id = row["id"]
-            if row.get("blob_status") != "processed":
-                raise wire.file_not_ready(5)
+            _require_derived_ready(row)
             blob = await db.run_in_thread(schema.get_api_file_blob, row["blob_id"])
             try:
                 path, media_type, _size = self.deps.derived.open_name(blob or {}, name)  # type: ignore[union-attr]

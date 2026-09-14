@@ -124,7 +124,10 @@ def ingest_single(
         place_bytes=_placer(tmp_path, project_id, sha256),
     )
     storage.discard(tmp_path)  # a dedupe hit left it; a create already moved it
-    if created:
+    if created or blob.get("status") == "queued":
+        # Queued without being created: a failed blob these bytes re-queued
+        # (`schema._requeue_recoverable_blob`), or one already waiting. The
+        # wake-up is only a doorbell, so an extra one costs a claim query.
         _notify_enqueued(blob)
     return Ingested(file=file_row, blob=blob, created=created, detection=detection)
 
@@ -232,11 +235,30 @@ def release_blob(blob_id: str, *, owner: str = OWNER, status: str, **fields) -> 
     return dict(row) if row else None
 
 
-def defer_blob(blob_id: str, *, owner: str = OWNER, delay_s: Optional[float] = None, max_attempts: Optional[int] = None) -> Optional[dict]:
-    """Engine or disk unavailable: back to `queued`, finished stages kept,
-    `attempt += 1`, not due before now + delay; after `max_attempts` it fails
-    with `processing_unavailable` (design §4.2)."""
+def defer_blob(
+    blob_id: str,
+    *,
+    owner: str = OWNER,
+    delay_s: Optional[float] = None,
+    max_attempts: Optional[int] = None,
+    count_attempt: bool = True,
+) -> Optional[dict]:
+    """Engine or disk unavailable: back to `queued`, finished stages kept, not
+    due before now + delay. A counted deferral does `attempt += 1`, and the
+    one that reaches `max_attempts` fails with `processing_unavailable`
+    (design §4.2). `count_attempt=False` — an engine outage
+    (`apifiles/outage.py`) — leaves `attempt` alone and can never fail the
+    blob. Only the lease holder can defer."""
     delay = float(delay_s if delay_s is not None else limits.processing_retry_delay_s())
+    if not count_attempt:
+        with db.connection() as con:
+            row = con.execute(
+                "UPDATE api_file_blobs SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, "
+                "       updated_at = now(), not_before = now() + make_interval(secs => %s::float8) "
+                " WHERE id = %s AND lease_owner = %s AND status = 'processing' RETURNING *",
+                (delay, blob_id, owner),
+            ).fetchone()
+        return dict(row) if row else None
     ceiling = int(max_attempts if max_attempts is not None else limits.processing_max_attempts())
     with db.connection() as con:
         row = con.execute(
@@ -613,8 +635,8 @@ def _attach_assembled(
     file_row, blob, created = attached
     storage.discard(dest)
     _remove_upload_dir(upload_id)
-    if created:
-        _notify_enqueued(blob)
+    if created or blob.get("status") == "queued":
+        _notify_enqueued(blob)  # a re-queued failed blob wakes the runner too
     return AssemblyResult("attached", upload_id, file=file_row, blob=blob, created=created, assembly_ms=elapsed_ms)
 
 

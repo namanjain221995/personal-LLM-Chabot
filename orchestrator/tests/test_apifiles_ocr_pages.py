@@ -236,7 +236,9 @@ def test_every_unit_passes_the_public_ocr_gate_with_yield_to_chat(tmp_path, monk
     run_stage(derived, source)
     assert len(seen) == len(STUB.calls) == 5
     assert all(c["engine"] == "ocr" and c["yield_to_chat"] is True for c in seen)
-    assert all(c["wait_s"] == capacity.background_wait_s() for c in seen)
+    # No clock on a processing job's gate wait (2026-09-14): it ends on
+    # admission or abandonment only.
+    assert all(c["wait_s"] is None for c in seen)
 
 
 def test_an_engine_that_is_down_defers_the_stage_and_records_nothing(tmp_path):

@@ -346,15 +346,35 @@ async def search(derived_dir: str, qvec: Sequence[float], *, top_k: int) -> List
 # ------------------------------------------------------ engine (production) --
 
 
-async def engine_embed_documents(texts: Sequence[str]) -> Tuple[List[List[float]], Optional[int]]:
-    """One packed call to the embed engine under the public `embed` gate,
-    waiting as long as a background job may (`capacity.background_wait_s`).
-    A refusal or engine failure raises: the processing runner defers the blob
-    and resumes from the rows already written."""
+async def engine_embed_documents(
+    texts: Sequence[str],
+    *,
+    abandon: Optional[asyncio.Event] = None,
+    on_wait: Optional[Callable[[int, float], object]] = None,
+    on_admitted: Optional[Callable[[float], None]] = None,
+) -> Tuple[List[List[float]], Optional[int]]:
+    """One packed call to the embed engine under the public `embed` gate.
+
+    The gate wait has NO limit (no-timeout design, 2026-09-14): a processing
+    job is already detached from any request, and until this date each call
+    gave up after PUBLIC_API_BACKGROUND_GATE_WAIT_S and deferred the whole
+    blob for a gate that was only busy. The wait ends on admission, or when
+    `abandon` is set — the runner sets it when the job loses its lease or the
+    blob is being deleted (`capacity.Abandoned`). `on_wait(position, waited_s)`
+    is the gate's progress callback; `on_admitted(waited_s)` gets the whole
+    wait once the call is admitted.
+
+    An engine failure raises the engine's own exception, unwrapped: the
+    processing runner classifies it (`apifiles.outage`) and defers the blob,
+    resuming from the rows already written."""
     from ..publicapi import capacity, sidecars
 
     weight = sum(min(4096, len(t.encode("utf-8", "surrogatepass")) + 2) for t in texts)
-    async with capacity.hold("embed", weight_tokens=weight, wait_s=capacity.background_wait_s()):
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    async with capacity.hold("embed", weight_tokens=weight, wait_s=None, abandon=abandon, on_wait=on_wait):
+        if on_admitted is not None:
+            on_admitted(loop.time() - started)
         return await sidecars._embed_call(list(texts))
 
 
