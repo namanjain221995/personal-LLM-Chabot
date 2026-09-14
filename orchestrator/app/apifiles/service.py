@@ -1221,6 +1221,55 @@ def annotate(text: str, model_input: ModelInput) -> cite.Annotated:
     return cite.annotate(text, model_input.context.citations)
 
 
+#: `citation_state` document version.
+RUN_STATE_VERSION = 1
+
+
+def citation_state(model_input: Optional[ModelInput]) -> Optional[Dict[str, Any]]:
+    """What a durable run stores to annotate its answer in any process
+    (`citations` module docstring, DURABLE RUNS): `{"v", "citations",
+    "usage_meta"}`, JSON-safe, no file text. None when the request has no
+    files. `usage_meta` is the Files design §5.7 meta the recorder adds, so
+    a resumed run's usage row carries the same file facts."""
+    if model_input is None:
+        return None
+    return {
+        "v": RUN_STATE_VERSION,
+        "citations": model_input.context.citations.to_state(),
+        "usage_meta": _json_safe(model_input.usage_meta()),
+    }
+
+
+def annotate_from_run_state(text: str, state: Any) -> cite.Annotated:
+    """`annotate` for a resumed run from its stored `citation_state`. Never
+    raises; a lost or foreign state annotates nothing."""
+    citations = state.get("citations") if isinstance(state, Mapping) and state.get("v") == RUN_STATE_VERSION else None
+    return cite.annotate_from_state(text, citations)
+
+
+def usage_meta_from_run_state(state: Any, annotated: Optional[cite.Annotated] = None) -> Dict[str, Any]:
+    """The file facts for a resumed run's usage row: the stored meta plus the
+    citation counts of `annotated`. Empty for a lost or foreign state."""
+    meta: Dict[str, Any] = {}
+    if isinstance(state, Mapping) and state.get("v") == RUN_STATE_VERSION and isinstance(state.get("usage_meta"), Mapping):
+        meta.update(state["usage_meta"])
+    if annotated is not None:
+        meta.update(annotated.meta())
+    return meta
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return str(value)
+
+
 @dataclass(frozen=True)
 class PlanningInputs:
     """What `planning.plan_generation` adds for files."""
