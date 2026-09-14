@@ -175,6 +175,38 @@ def test_a_tokenizer_that_answers_404_is_not_waited_for_and_the_engine_decides(a
     assert len(engine.tokenized) == 1 and engine.calls == 1
 
 
+def test_an_input_the_engine_refused_as_too_long_without_a_tokenizer_is_a_real_400_before_the_retrys_status_line(
+    api, monkeypatch
+):
+    """No /tokenize, so the engine's own 400 decides — possibly after the
+    commit, where it can only drop the connection. The refusal is remembered:
+    the retry is refused before its status line without reaching the engine."""
+
+    def engine(request, body):
+        if any(len(text) > 4096 for text in json.loads(body)["input"]):
+            return httpx.Response(400, json={"object": "error", "message": "maximum context length is 4096 tokens"})
+        return vllm_embeddings(body)
+
+    recorded = install_embed_engine(
+        monkeypatch, engine, tokenize=lambda prompt: httpx.Response(404, json={"detail": "Not Found"})
+    )
+    body = {"model": "techsara-embed", "input": ["short", LONG]}
+
+    first = api.post("/v1/embeddings", json=body, headers=auth())
+    assert first.status_code == 400 and first.json()["error"]["param"] == "input.1"
+    sent = recorded.calls
+
+    async def retry_check():
+        with pytest.raises(errors.ApiError) as refused:
+            await sidecars.check_embed_lengths(body["input"])
+        return refused.value
+
+    refusal = asyncio.run(retry_check())
+    assert (refusal.code, refusal.param) == ("context_length_exceeded", "input.1")
+    assert api.post("/v1/embeddings", json=body, headers=auth()).status_code == 400
+    assert recorded.calls == sent
+
+
 def test_a_tokenizer_that_answers_429_is_counted_again_rather_than_skipped(engines_configured, monkeypatch):
     answers = iter([httpx.Response(429), 700])
     _slow_tokenizer(monkeypatch, delay_s=0.0, count=lambda prompt: next(answers))

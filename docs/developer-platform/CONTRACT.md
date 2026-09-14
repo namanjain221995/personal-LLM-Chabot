@@ -453,7 +453,8 @@ Body (≤ 8 MiB, `PUBLIC_API_MAX_POOLING_BODY_BYTES`; `extra="forbid"`):
   skipped); counts are remembered by text sha256, so an over-length input
   found after the commit — which drops the connection — is a real `400` on
   the SDK's retry. A `4xx` from `/tokenize` (no tokenizer route) sends the
-  input at the window weight and the engine's own `400` names it. Inputs are
+  input at the window weight and the engine's own `400` names it; that refusal
+  is remembered the same way, so a retry is refused before its status line. Inputs are
   embedded as given: no query instruction is added and nothing is clipped.
 * **Memory guard, before the body is read**: accepted-but-unfinished
   embeddings and rerank work is charged against one process-wide budget,

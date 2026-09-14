@@ -707,6 +707,10 @@ async def _tokenize_count(client: httpx.AsyncClient, root: str, model: str, text
     return count
 
 
+def _count_scope(root: str, model: str) -> str:
+    return f"count:{root}:{model}"
+
+
 @dataclass
 class _Counted:
     counts: Dict[int, int] = field(default_factory=dict)
@@ -731,7 +735,7 @@ async def _count_long_items(
     result = _Counted()
     if not indices:
         return result
-    scope = f"count:{root}:{model}"
+    scope = _count_scope(root, model)
     keys: Dict[int, str] = {}
     todo: List[int] = []
     for index in indices:
@@ -1159,17 +1163,28 @@ async def _run_batches(
     field_name: str,
     single: bool,
     window: int,
+    count_scope: str,
 ) -> None:
     """Every packed call in order, with the two ways a call is re-sent one
     input at a time: the engine refused the batch with a 400 (the refusal
     then names the input), or an engine restart was implicated in it (a
-    second one then names — and quarantines — the input that crashes it)."""
+    second one then names — and quarantines — the input that crashes it).
+
+    An input the ENGINE refused as over-length is remembered as over the
+    window in the count cache, so the retry of a request whose refusal came
+    after its commit — an engine without `/tokenize` — is a real 400 before
+    its status line instead of the same dropped connection again."""
+
+    def refusal(index: int, refused: EngineRefusedInput) -> errors.ApiError:
+        if refused.over_length:
+            _COUNTS.put(_text_key(count_scope, text_of(index)), window + 1)
+        return _refusal_for(index, refused, single, field_name, window)
 
     async def alone(index: int, *, restarts: int) -> None:
         try:
             await run([index], restarts=restarts)
         except EngineRefusedInput as refused:
-            raise _refusal_for(index, refused, single, field_name, window) from None
+            raise refusal(index, refused) from None
         except _EngineCrashedOnCall:
             _quarantine(engine, text_of(index))
             raise _crashed_engine_error(_param_for(field_name, index, single)) from None
@@ -1179,7 +1194,7 @@ async def _run_batches(
             await run(batch)
         except EngineRefusedInput as refused:
             if len(batch) == 1:
-                raise _refusal_for(batch[0], refused, single, field_name, window) from None
+                raise refusal(batch[0], refused) from None
             for index in batch:
                 await alone(index, restarts=0)
         except _RestartUnderSeveral:
@@ -1320,6 +1335,7 @@ async def embed(
             field_name="input",
             single=single_string,
             window=embed_context_tokens(),
+            count_scope=_count_scope(root, str(getattr(settings, "embed_model", "") or "")),
         )
     except errors.ApiError as refusal:
         raise SidecarError(refusal, engine_calls=calls.sent, measured_tokens=outcome.partial_prompt_tokens) from None
@@ -1473,6 +1489,7 @@ async def rerank_scores(
             field_name="documents",
             single=False,
             window=window,
+            count_scope=_count_scope(root, str(getattr(settings, "rerank_model", "") or "")),
         )
     except errors.ApiError as refusal:
         raise SidecarError(refusal, engine_calls=calls.sent, measured_tokens=outcome.partial_input_tokens) from None
