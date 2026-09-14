@@ -108,6 +108,42 @@ downloaded file writes an `audit_events` row (admin, target, resource,
 timestamp, source address). There is no impersonation: nothing lets an admin
 act *as* a member or feed a member's content into their own model context.
 
+Since 2026-09-14 the **lists and the usage counts** are audited too, because a
+super admin may now inspect every member and a list already reveals titles,
+filenames and session addresses. Each read of ANOTHER member writes one event;
+reading your own writes none, and a refused read (404) writes none:
+
+| Route | Action | `meta` |
+|---|---|---|
+| `GET /admin/api/members/{id}/conversations` | `admin_listed_conversations` | `offset`, `limit`, `returned`, `total` |
+| `GET /admin/api/members/{id}/uploads` | `admin_listed_uploads` | `offset`, `limit`, `returned`, `total` |
+| `GET /admin/api/members/{id}/reports` | `admin_listed_reports` | `returned` |
+| `GET /admin/api/members/{id}/sessions` | `admin_listed_sessions` | `returned` |
+| `GET /admin/api/members/{id}` (stats shown) | `admin_viewed_member_stats` | none |
+| `GET /admin/api/members/{id}/conversations/{cid}` | `admin_viewed_conversation` | resource = conversation id |
+| upload / report download | `admin_downloaded_upload` / `admin_downloaded_report` | resource = upload id / report filename |
+
+The list events carry paging and counts only — never a title, filename, IP or
+user agent from the list. `target_user_id` names the member read. A member
+detail whose stats are withheld (`may_inspect: false`) read nothing and writes
+nothing.
+
+**Flood control.** A list or stats event is written with a 60-second coalescing
+window (`READ_AUDIT_COALESCE_S` in `authn/admin_api.py`, implemented by
+`store.record_audit(coalesce_seconds=...)`): if the same actor already has an
+event with the same action, target, `meta` and source address in the last 60
+seconds, the repeat is not written. So a re-render, a retry or switching back
+to a tab leaves one row, while every **distinct** page (another `offset` or
+`limit`), a changed result count or a new source address always writes its
+own. The check is one `INSERT … WHERE NOT EXISTS` statement, so it holds
+across orchestrator workers, and it looks back over at most the actor's newest
+200 events (`AUDIT_COALESCE_LOOKBACK_ROWS`, an index walk) so it stays cheap as
+the log grows; two identical requests that race can both write
+(it errs towards recording, never towards dropping a read). The member page
+does not poll today; the window is what keeps it from flooding the log if it
+ever does. Single-item reads — opening a conversation, downloading a file —
+are never coalesced.
+
 Users are told: the invitation-accept page carries the standard notice that
 workspace content may be accessible to authorized administrators in
 accordance with company policy.

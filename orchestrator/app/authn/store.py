@@ -736,6 +736,12 @@ def accept_invitation(
 # Audit
 # ---------------------------------------------------------------------------
 
+# How many of the actor's newest events the coalescing look-back examines. An
+# actor who wrote more than this inside the window simply gets the repeat
+# recorded again (over-recording, never a lost read).
+AUDIT_COALESCE_LOOKBACK_ROWS = 200
+
+
 def record_audit(
     *,
     workspace_id: Optional[str],
@@ -747,25 +753,86 @@ def record_audit(
     meta: Optional[Dict[str, Any]] = None,
     ip: str = "",
     user_agent: str = "",
-) -> None:
+    coalesce_seconds: int = 0,
+) -> bool:
+    """Append one audit event; True when a row was written.
+
+    `coalesce_seconds > 0` makes the write conditional: it is skipped when the
+    SAME actor already has an event with the same workspace, action, target,
+    resource, meta and source address newer than that many seconds. The admin
+    list reads use it so a re-render, a retry or a tab switch back does not
+    write a row per request — a repeat of an identical read inside the window
+    carries no new information. It never merges DIFFERENT reads (another page,
+    another result count, another address all differ in the key), and two
+    identical requests racing each other can both write: it errs towards
+    recording, never towards losing a read. One statement, so it holds across
+    orchestrator workers; the look-back reads at most
+    AUDIT_COALESCE_LOOKBACK_ROWS of the actor's newest rows via the actor index.
+    """
+    ip = ip[:100]
+    user_agent = user_agent[:400]
+    resource = str(resource_id)[:300] if resource_id is not None else None
+    meta_value = Jsonb(meta) if meta else None
     with db.connection() as con:
-        con.execute(
+        if coalesce_seconds <= 0:
+            con.execute(
+                """INSERT INTO audit_events
+                   (workspace_id, actor_user_id, action, target_user_id,
+                    resource_type, resource_id, meta, ip, user_agent)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    workspace_id,
+                    actor_user_id,
+                    action,
+                    target_user_id,
+                    resource_type,
+                    resource,
+                    meta_value,
+                    ip,
+                    user_agent,
+                ),
+            )
+            return True
+        cur = con.execute(
             """INSERT INTO audit_events
                (workspace_id, actor_user_id, action, target_user_id,
                 resource_type, resource_id, meta, ip, user_agent)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (
-                workspace_id,
-                actor_user_id,
-                action,
-                target_user_id,
-                resource_type,
-                str(resource_id)[:300] if resource_id is not None else None,
-                Jsonb(meta) if meta else None,
-                ip[:100],
-                user_agent[:400],
-            ),
+               SELECT %(ws)s, %(actor)s, %(action)s, %(target)s,
+                      %(rtype)s, %(rid)s, %(meta)s::jsonb, %(ip)s, %(ua)s
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM (
+                       -- Bounded look-back: the actor's newest rows only,
+                       -- walked on idx_audit_events_actor, so a first read
+                       -- never scans the actor's whole history.
+                       SELECT * FROM audit_events
+                       WHERE actor_user_id = %(actor)s
+                       ORDER BY id DESC
+                       LIMIT %(lookback)s
+                   ) recent
+                   WHERE action = %(action)s
+                     AND workspace_id IS NOT DISTINCT FROM %(ws)s
+                     AND target_user_id IS NOT DISTINCT FROM %(target)s
+                     AND resource_type IS NOT DISTINCT FROM %(rtype)s
+                     AND resource_id IS NOT DISTINCT FROM %(rid)s
+                     AND meta IS NOT DISTINCT FROM %(meta)s::jsonb
+                     AND ip IS NOT DISTINCT FROM %(ip)s
+                     AND created_at > now() - make_interval(secs => %(window)s)
+               )""",
+            {
+                "ws": workspace_id,
+                "actor": actor_user_id,
+                "action": action,
+                "target": target_user_id,
+                "rtype": resource_type,
+                "rid": resource,
+                "meta": meta_value,
+                "ip": ip,
+                "ua": user_agent,
+                "window": int(coalesce_seconds),
+                "lookback": AUDIT_COALESCE_LOOKBACK_ROWS,
+            },
         )
+        return cur.rowcount == 1
 
 
 def list_audit_events(

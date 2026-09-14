@@ -16,6 +16,8 @@ then the hole is back.
              inspect every member, peer super admins included (still audited);
              an admin still reads nothing of an equal or higher role, and the
              management routes keep the strict rank rule for everyone.
+             Since the same decision, every list read and the member detail's
+             usage counts of another member write an audit event too.
 """
 import csv
 import io
@@ -325,6 +327,20 @@ def content_of(tmp_path, monkeypatch):
     return _seed
 
 
+# Every event a read of another member's sessions or content writes: the
+# single-item reads, and (since 2026-09-14) the lists and the usage counts.
+AUDITED_READS = (
+    "admin_viewed_conversation",
+    "admin_downloaded_upload",
+    "admin_downloaded_report",
+    "admin_listed_conversations",
+    "admin_listed_uploads",
+    "admin_listed_reports",
+    "admin_listed_sessions",
+    "admin_viewed_member_stats",
+)
+
+
 def _content_routes(user_id, seeded):
     return [
         f"/admin/api/members/{user_id}/conversations",
@@ -358,14 +374,24 @@ def test_an_admin_cannot_read_a_super_admins_conversations_uploads_or_reports_bu
         assert resp.status_code == 404, path
         assert "private question" not in resp.text and b"%PDF" not in resp.content
 
-    # No refused read pretends to have happened in the audit log.
-    for action in ("admin_viewed_conversation", "admin_downloaded_upload", "admin_downloaded_report"):
-        assert _audit_rows(action) == []
+    # No refused read pretends to have happened in the audit log — the
+    # member detail is still answered (withheld stats), but it read nothing.
+    assert admin.get(f"/admin/api/members/{_uid('boss')}").json()["stats"] is None
+    assert admin.get(f"/admin/api/members/{_uid('boss')}/sessions").status_code == 404
+    for action in AUDITED_READS:
+        assert _audit_rows(action) == [], action
 
-    # The legitimate oversight read of a member still works, route by route.
+    # The legitimate oversight read of a member still works, route by route,
+    # and every read — the lists included — names the admin and the member.
     for path in _content_routes(_uid("bob"), bob_content):
         assert admin.get(path).status_code == 200, path
-    assert len(_audit_rows("admin_viewed_conversation")) == 1
+    assert admin.get(f"/admin/api/members/{_uid('bob')}/sessions").status_code == 200
+    assert admin.get(f"/admin/api/members/{_uid('bob')}").status_code == 200
+    for action in AUDITED_READS:
+        rows = _audit_rows(action)
+        assert len(rows) == 1, action
+        assert rows[0]["actor_user_id"] == _uid("adm"), action
+        assert rows[0]["target_user_id"] == _uid("bob"), action
 
 
 def test_the_member_detail_withholds_a_super_admins_usage_counts_from_an_admin_but_not_a_members(
@@ -405,15 +431,23 @@ def test_a_super_admin_reads_a_peer_super_admins_content_and_every_read_is_audit
     assert responses[4].content == b"hello"
     assert responses[5].content.startswith(b"%PDF")
 
-    for action in (
-        "admin_viewed_conversation",
-        "admin_downloaded_upload",
-        "admin_downloaded_report",
-    ):
+    assert root.get(f"/admin/api/members/{_uid('boss')}/sessions").status_code == 200
+    assert root.get(f"/admin/api/members/{_uid('boss')}").json()["stats"] is not None
+
+    for action in AUDITED_READS:
         rows = _audit_rows(action)
         assert len(rows) == 1, action
         assert rows[0]["actor_user_id"] == _uid("root"), action
         assert rows[0]["target_user_id"] == _uid("boss"), action
+    # The list events carry paging and counts, never a title or filename.
+    assert _audit_rows("admin_listed_conversations")[0]["meta"] == {
+        "offset": 0, "limit": 50, "returned": 1, "total": 1,
+    }
+    assert _audit_rows("admin_listed_uploads")[0]["meta"] == {
+        "offset": 0, "limit": 50, "returned": 1, "total": 1,
+    }
+    assert _audit_rows("admin_listed_reports")[0]["meta"] == {"returned": 1}
+    assert _audit_rows("admin_listed_sessions")[0]["meta"] == {"returned": 1}
 
 
 def test_the_member_detail_reports_may_inspect_and_withholds_stats_exactly_when_false(
@@ -459,5 +493,5 @@ def test_a_member_reads_no_ones_sessions_or_content(login_client, content_of):
             resp = member.get(path)
             assert resp.status_code == 404, path
             assert "private question" not in resp.text and b"%PDF" not in resp.content
-    for action in ("admin_viewed_conversation", "admin_downloaded_upload", "admin_downloaded_report"):
-        assert _audit_rows(action) == []
+    for action in AUDITED_READS:
+        assert _audit_rows(action) == [], action

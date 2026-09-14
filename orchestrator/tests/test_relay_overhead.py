@@ -266,6 +266,9 @@ def _no_router_calls(monkeypatch):
 def test_slow_trace_writes_do_not_hold_the_engine_back_and_the_trace_is_complete_when_the_stream_ends(
     monkeypatch,
 ):
+    # The full path's write count; a Fast "hello" would take the small-talk
+    # lane (app/fast_lane.py), which adds its own FAST_LANE event.
+    monkeypatch.setenv("FAST_LANE_ENABLED", "false")
     real_append = db.append_query_trace_event
     real_start = db.start_query_trace
 
@@ -279,6 +282,12 @@ def test_slow_trace_writes_do_not_hold_the_engine_back_and_the_trace_is_complete
 
     monkeypatch.setattr(db, "append_query_trace_event", slow_append)
     monkeypatch.setattr(db, "start_query_trace", slow_start)
+    # Every write here takes 0.3 s and the turn's rows commit as one batch,
+    # so a turn with seven rows needs 2.1 s: more than the 2 s production
+    # bound (_TRACE_FLUSH_BOUND_S), which assumes millisecond INSERTs. Give
+    # the end of the stream room for this test's own artificial slowness;
+    # the engine-start assertion below is unchanged.
+    monkeypatch.setattr(main, "_TRACE_FLUSH_BOUND_S", 10.0)
     monkeypatch.setattr(settings, "living_knowledge_enabled", False)
     monkeypatch.setattr(settings, "fact_extraction_enabled", False)
     started: dict = {}
@@ -303,6 +312,10 @@ def test_slow_trace_writes_do_not_hold_the_engine_back_and_the_trace_is_complete
 
 def test_the_context_assembled_trace_carries_the_exact_meter_count_even_when_it_was_deferred(monkeypatch):
     from app import context
+
+    # The meter is measured by the full path's compaction step, which the
+    # Fast small-talk lane (app/fast_lane.py) skips for a "hello".
+    monkeypatch.setenv("FAST_LANE_ENABLED", "false")
 
     async def count(base_url, model, messages):
         return 4242, 1_000_000

@@ -14,12 +14,17 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable, List, Sequence
+import contextlib
+import logging
+from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
-from .. import continuation, llm
+from .. import continuation, llm, metrics
 from ..config import settings
-from ..core import best_of
+from ..core import answer_sampling, best_of, effort_policy
+from ..core import tracing as query_tracing
+
+log = logging.getLogger(__name__)
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -50,9 +55,39 @@ SALESFORCE_CHAT_SYSTEM = (
 )
 
 
+def _lane_messages(message: str, history: Sequence[dict]) -> List[dict]:
+    """The Fast small-talk lane's prompt (app/fast_lane.py): the persona, who
+    is being assisted, the saved facts when main.py found them in time, and
+    the last two exchanges clipped — no diagram or code rules, no grounding.
+    Only THIS prompt is short; the stored conversation is untouched."""
+    from .. import fast_lane
+    from ..facts import FACTS_HEADER
+    from ..identity import identity_line
+
+    system = ASSISTANT_SYSTEM + identity_line()
+    # main.py pins the saved-facts block as a system message; it is the one
+    # system block the lane keeps. Recall and document blocks are never
+    # assembled for a lane turn, and any other system message is dropped.
+    for m in history:
+        content = m.get("content")
+        if m.get("role") == "system" and isinstance(content, str) and content.startswith(FACTS_HEADER):
+            system = system + "\n\n" + content
+            break
+    turns = [
+        {"role": m.get("role"), "content": str(m.get("content") or "")[: fast_lane.FAST_LANE_TURN_CHARS]}
+        for m in recent_turns(
+            [m for m in history if m.get("role") != "system"],
+            fast_lane.FAST_LANE_HISTORY_TURNS * 2,
+        )
+    ]
+    return [{"role": "system", "content": system}, *turns, {"role": "user", "content": message}]
+
+
 def _messages(
-    message: str, history: Sequence[dict], mode: str, grounding: str = ""
+    message: str, history: Sequence[dict], mode: str, grounding: str = "", lane: str = ""
 ) -> List[dict]:
+    if lane:
+        return _lane_messages(message, history)
     # Salesforce-mode "chat" is greetings/small talk — a diagram would never
     # belong there, so only assistant mode carries the diagram capability.
     from ..identity import identity_line
@@ -82,6 +117,39 @@ def _messages(
     )
 
 
+async def _adaptive_thinking(
+    message: str, model_choice: str, effort: str
+) -> Optional[effort_policy.ThinkingDecision]:
+    """Decide whether this thinking-off turn should think after all.
+
+    None when the policy does not apply: it is switched off, or the turn
+    already thinks (Think / Max). Every decision it does make — think or not —
+    is counted and recorded on the query trace, by reason and signal names
+    only, never the prompt.
+    """
+    if not settings.fast_adaptive_thinking or llm.wants_thinking(model_choice, effort):
+        return None
+    decision = effort_policy.classify(message)
+    budget = settings.fast_thinking_budget if decision.think else 0
+    metrics.inc(
+        "fast_adaptive_thinking_total",
+        "Fast turns by adaptive-thinking decision (think = bounded thinking on)",
+        decision="think" if decision.think else "direct",
+        reason=decision.reason,
+    )
+    await query_tracing.event(
+        "ADAPTIVE_THINKING",
+        component="orchestrator.app.engines.chat",
+        details={**decision.as_trace(), "effort": effort, "budget_tokens": budget},
+    )
+    if decision.think:
+        log.info(
+            "adaptive thinking: Fast turn thinks (reason=%s signals=%s budget=%d classify=%.2fms)",
+            decision.reason, ",".join(decision.signals), budget, decision.elapsed_ms,
+        )
+    return decision
+
+
 async def run_chat_engine(
     message: str,
     history: Sequence[dict],
@@ -91,8 +159,13 @@ async def run_chat_engine(
     model_choice: str = "smart",
     effort: str = "medium",
     grounding: str = "",
+    lane: str = "",
 ) -> str:
     """Stream a plain completion from the selected model; meta route=chat.
+
+    `lane` is the Fast small-talk lane's category (app/fast_lane.py) when
+    main.py sent the turn down it: a short prompt, one call of at most
+    FAST_LANE_MAX_TOKENS, thinking off (Fast), no grounding.
 
     `grounding` is the living-knowledge block (app/web_memory.py): source-backed
     passages this platform already read from the public web, plus today's date.
@@ -101,6 +174,9 @@ async def run_chat_engine(
     belong to the caller.
     """
     effort = llm.normalize_effort(effort)
+    if lane:
+        return await _run_lane(message, history, emit, model_choice=model_choice, effort=effort, lane=lane)
+    # --- effort_policy (answer quality) begin ---
     # The thinking model spends a large, variable share of its budget on
     # reasoning before emitting a single answer token — a small ceiling makes
     # longer asks (e.g. "draw a flowchart of X") come back EMPTY. max_tokens is
@@ -114,6 +190,21 @@ async def run_chat_engine(
     # Thinking levels are used for code and analysis, where 0.6 invents API
     # names and drifts. Fast/Low stay conversational.
     temperature = 0.3 if effort in ("think", "max") else 0.6
+    total_max_tokens = continuation.budget_for(effort)
+    # FAST (assistant and Salesforce): the sampling and length slice of the
+    # answer plan (core/answer_sampling.py). Sampling defaults to exactly the
+    # temperature above; the caps are one 8,000-token call for prose and up
+    # to 64,000 across segments for long-form and structured asks. None —
+    # Think, Max and every other mode — keeps the values above unchanged.
+    answer_plan = answer_sampling.fast_sampling_for(
+        message, history, mode=mode, effort=effort, model_choice=model_choice
+    )
+    if answer_plan is not None:
+        max_tokens = answer_plan.segment_max_tokens
+        temperature = answer_plan.sampling.get("temperature", temperature)
+        # An operator who set CONTINUATION_BUDGET_FAST lower still wins.
+        total_max_tokens = min(answer_plan.total_max_tokens, total_max_tokens)
+    # --- effort_policy (answer quality) end ---
 
     # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
     # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
@@ -154,32 +245,112 @@ async def run_chat_engine(
 
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
     # call and stays exactly that; the total an answer may run to is decided
-    # by the effort the person chose (continuation.budget_for). At Fast the
-    # two are equal, so that path makes one call and behaves as it always
-    # has — the loop only engages where somebody asked for depth.
+    # by the effort the person chose (continuation.budget_for) — except at
+    # Fast, where the answer plan sets it: equal to the call for prose, so a
+    # Fast reply is one call, and larger only for long-form and structured
+    # asks.
     #
     # The seams are invisible: deltas arrive here through `_out` in order,
     # with re-emitted openings already stripped, so the UI streams one answer.
+    #
+    # LOOP GUARD (core/answer_guard.py, 2026-09-15): every ANSWER delta passes
+    # through the guard, which shows ordinary text at once and holds back only
+    # text that re-treads what was already written. When the answer has begun
+    # looping it raises StopGeneration, which ends the upstream stream exactly
+    # as Stop does; the repeated tail is never shown, and what this returns —
+    # the text that is stored — is precisely the text that was streamed.
+    from ..core import answer_guard
+
+    # A repetition the person asked for ("write it 50 times") is not a loop.
+    guard = answer_guard.AnswerGuard(answer_guard.repetition_allowance(message))
+
+    async def _out(kind: str, text: str) -> None:
+        if kind == "reasoning":
+            await emit("reasoning", {"text": text})
+            return
+        for piece in guard.feed(text):
+            await emit("token", {"text": piece})
+        if guard.verdict is not None:
+            raise continuation.StopGeneration(continuation.STOP_REPETITION)
+
+    # ADAPTIVE THINKING (core/effort_policy.py). A Fast turn whose prompt is
+    # a multi-step reasoning task thinks — bounded by FAST_THINKING_BUDGET on
+    # top of the answer ceiling — instead of reasoning, and looping, inside
+    # the answer. The reasoning streams through `_out` as `reasoning` events
+    # like any Think turn's. The grant covers exactly this generation.
+    decision = await _adaptive_thinking(message, model_choice, effort)
+    thinks = decision is not None and decision.think
+    scope = (
+        effort_policy.grant(settings.fast_thinking_budget, decision.reason)
+        if thinks
+        else contextlib.nullcontext()
+    )
+    with scope:
+        long = await continuation.stream_long_completion(
+            _messages(message, history, mode, grounding),
+            on_delta=_out,
+            model_choice=model_choice,
+            effort=effort,
+            temperature=temperature,
+            segment_max_tokens=max_tokens,
+            total_max_tokens=total_max_tokens,
+            deadline_s=settings.continuation_deadline_s or None,
+            **({} if answer_plan is None else {"answer_plan": answer_plan}),
+        )
+    for piece in guard.finish():
+        await emit("token", {"text": piece})
+
+    # §10/V2 §2: the SINGLE final meta — no citations/sql keys on this route.
+    # `continuation` is added only when there was something to say: a
+    # one-segment answer looks exactly as it did before. A stopped loop says
+    # so through it (stop_reason "repetition": "This answer stops here: it had
+    # begun repeating itself.").
+    meta = {"route": "chat"}
+    if long.segment_count > 1 or long.truncated:
+        meta["continuation"] = long.as_meta()
+    if guard.verdict is not None:
+        meta["loop_guard"] = guard.verdict.as_meta()
+        await answer_guard.record(guard.verdict, effort=effort, route="chat")
+    if thinks:
+        meta["adaptive_thinking"] = {
+            "reason": decision.reason,
+            "budget_tokens": settings.fast_thinking_budget,
+        }
+    await emit("meta", meta)
+    return guard.shown
+
+
+async def _run_lane(
+    message: str,
+    history: Sequence[dict],
+    emit: Emit,
+    *,
+    model_choice: str,
+    effort: str,
+    lane: str,
+) -> str:
+    """One short streamed completion for a small-talk lane turn."""
+    from .. import fast_lane
+
     async def _out(kind: str, text: str) -> None:
         if kind == "reasoning":
             await emit("reasoning", {"text": text})
         else:
             await emit("token", {"text": text})
 
+    # Segment cap == total cap: one call, no continuation seam to hold back,
+    # so every delta streams straight through. Thinking follows the effort,
+    # and the lane only admits Fast, where llm.wants_thinking is False.
     long = await continuation.stream_long_completion(
-        _messages(message, history, mode, grounding),
+        _messages(message, history, "assistant", lane=lane),
         on_delta=_out,
         model_choice=model_choice,
         effort=effort,
-        temperature=temperature,
-        segment_max_tokens=max_tokens,
-        total_max_tokens=continuation.budget_for(effort),
+        temperature=0.6,
+        segment_max_tokens=fast_lane.FAST_LANE_MAX_TOKENS,
+        total_max_tokens=fast_lane.FAST_LANE_MAX_TOKENS,
         deadline_s=settings.continuation_deadline_s or None,
     )
-
-    # §10/V2 §2: the SINGLE final meta — no citations/sql keys on this route.
-    # `continuation` is added only when there was something to say: a
-    # one-segment answer looks exactly as it did before.
     meta = {"route": "chat"}
     if long.segment_count > 1 or long.truncated:
         meta["continuation"] = long.as_meta()

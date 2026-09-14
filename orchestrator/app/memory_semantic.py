@@ -241,6 +241,28 @@ async def ensure_message_embeddings(user_id: int) -> int:
 _backfills: dict = {}
 
 
+def message_backfill_delay_s() -> float:
+    """MESSAGE_BACKFILL_DELAY_S (default 3.0 s)."""
+    return max(0.0, float(getattr(settings, "message_backfill_delay_s", 3.0) or 0.0))
+
+
+async def _delayed_backfill(user_id: int) -> int:
+    """The backfill, after a short pause (2026-09-14).
+
+    It is started by the turn's own cross-chat read, so its batch embed (up
+    to 64 texts) used to land on the embedding sidecar in the same second as
+    that turn's query embed and rerank. The pause moves it behind them. The
+    task is still created (and registered in `_backfills`) at once, so the
+    one-in-flight rule holds and a later turn does not start a second one;
+    there is no per-user minimum interval, so a conversation that just ended
+    is recallable a few seconds later, as before.
+    """
+    delay = message_backfill_delay_s()
+    if delay > 0:
+        await asyncio.sleep(delay)
+    return await ensure_message_embeddings(user_id)
+
+
 def _backfill_in_background(user_id: int) -> None:
     """At most one backfill in flight per user; the task holds its own
     reference so it cannot be garbage-collected mid-flight."""
@@ -248,7 +270,7 @@ def _backfill_in_background(user_id: int) -> None:
     if task is not None and not task.done():
         return
     try:
-        task = asyncio.get_running_loop().create_task(ensure_message_embeddings(user_id))
+        task = asyncio.get_running_loop().create_task(_delayed_backfill(user_id))
     except RuntimeError:  # pragma: no cover — no running loop
         return
     _backfills[user_id] = task

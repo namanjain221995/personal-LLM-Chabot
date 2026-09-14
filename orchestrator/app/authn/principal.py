@@ -147,10 +147,14 @@ def audit(
     resource_type: Optional[str] = None,
     resource_id: Optional[str] = None,
     meta: Optional[Dict[str, Any]] = None,
+    coalesce_seconds: int = 0,
 ) -> None:
     """Record an audit event for an authenticated actor (sync; callers on the
     async path wrap in db.run_in_thread). Never raises — an audit failure must
-    not take the action down with it, but it is logged loudly."""
+    not take the action down with it, but it is logged loudly.
+
+    `coalesce_seconds` skips an identical repeat inside that window
+    (`store.record_audit`); the default 0 records every call."""
     import logging
 
     ip, user_agent = ("", "")
@@ -167,6 +171,7 @@ def audit(
             meta=meta,
             ip=ip,
             user_agent=user_agent,
+            coalesce_seconds=coalesce_seconds,
         )
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).exception("audit event %s was not recorded", action)

@@ -43,6 +43,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 from . import db, metrics
 from .config import settings
 from .freshness import (
+    _MAX_AGE,
     Freshness,
     Verdict,
     classify,
@@ -51,6 +52,7 @@ from .freshness import (
     router_would_be_asked,
     static_timeless_task,
 )
+from . import web_memory as _web_memory
 from .web_memory import (
     Retrieval,
     _stale_after,
@@ -165,6 +167,16 @@ def fast_concurrent_retrieve() -> bool:
     return bool(getattr(settings, "knowledge_fast_concurrent_retrieve", _FAST_CONCURRENT_RETRIEVE))
 
 
+def fast_speculative_salvage() -> bool:
+    """KNOWLEDGE_FAST_SPECULATIVE_SALVAGE (default on): see `_salvage`."""
+    return bool(getattr(settings, "knowledge_fast_speculative_salvage", True))
+
+
+def source_floor_enabled() -> bool:
+    """KNOWLEDGE_SOURCE_FLOOR (default off): see `_source_floor`."""
+    return bool(getattr(settings, "knowledge_source_floor", False))
+
+
 def _quiet(fut: "asyncio.Future") -> "asyncio.Future":
     """Mark an abandoned future's outcome as read, so a speculative run that
     failed after it stopped mattering does not log 'exception never retrieved'."""
@@ -254,6 +266,133 @@ def _join(*parts: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+# ---------------------------------------------------------------------------
+# Pleasantries (Rule 1, pre-pass latency round, 2026-09-14).
+#
+# A Fast "hi ??" took 5.97 s in production and cited two pages (a Wikipedia
+# disambiguation page titled HI and a film trailer): the router was asked
+# whether a greeting is time-sensitive, a retrieval ran for the word "hi"
+# (with the previous question's words appended by resolve_from_history), and
+# the cross-encoder found "relevant" passages for it.
+#
+# A pleasantry here is a CLOSED token set, fullmatched: every token must be
+# in _PLEASANTRY_TOKENS and at least one must be a greeting, thanks, farewell
+# or laughter anchor, so "again", "a lot" and "so much" alone are not. It is
+# deliberately NOT freshness._SMALL_TALK, which fullmatches "ok", "cool" and
+# "again": an "ok" answers an offer ("Shall I check today's gold rate?") and
+# must keep the lookup. No acknowledgement (ok, okay, yes, sure, cool, great,
+# fine, why, 👍, 🙏 alone) is a pleasantry this round.
+#
+# A pleasantry typed after a turn that got NO answer ("hi ??" after a
+# generation died) means "are you there?": the unanswered question is still
+# in the model's history, so it keeps its evidence and its lookup.
+#
+# The fast lane (app/fast_lane.py) keeps its own, overlapping lexicon so the
+# two changes touch disjoint files; both exclude acknowledgements.
+# ---------------------------------------------------------------------------
+
+
+def pleasantry_rule() -> bool:
+    """KNOWLEDGE_PLEASANTRY_RULE (default on)."""
+    return bool(getattr(settings, "knowledge_pleasantry_rule", True))
+
+
+_PLEASANTRY_TOKENS = frozenset({
+    "hi", "hello", "hey", "hiya", "there",
+    "thanks", "thank", "you", "thx", "so", "much", "lot", "a", "again",
+    "bye", "goodbye", "good", "morning", "afternoon", "evening", "night",
+    "see", "take", "care",
+    "lol", "lmao", "haha", "hehe",
+    "namaste", "namaskar", "shukriya", "dhanyavaad", "alvida",
+})
+_GREETING_ANCHORS = frozenset({"hi", "hello", "hey", "hiya", "namaste", "namaskar"})
+_OTHER_ANCHORS = frozenset({
+    "thanks", "thank", "thx", "shukriya", "dhanyavaad",
+    "bye", "goodbye", "alvida",
+    "lol", "lmao", "haha", "hehe",
+})
+_GREETING_PAIRS = frozenset({("good", "morning"), ("good", "afternoon"), ("good", "evening")})
+_OTHER_PAIRS = frozenset({("good", "night"), ("see", "you"), ("take", "care")})
+#: Emoji a pleasantry may carry: wave, folded hands, smile, laughing, heart.
+#: Not thumbs-up / OK-hand: those mean "yes, do it".
+_PLEASANTRY_EMOJI = frozenset("\U0001F44B\U0001F64F\U0001F60A\U0001F602\U0001F923\u2764")
+#: Variation selector 16, zero-width joiner and the skin-tone modifiers.
+_EMOJI_MODIFIERS = frozenset("\uFE0F\u200D") | frozenset(chr(c) for c in range(0x1F3FB, 0x1F400))
+_PLEASANTRY_PUNCT = frozenset(" \t?!.,~'\u2019-")
+_PLEASANTRY_MAX_CHARS = 60
+_PLEASANTRY_WORD = re.compile(r"[a-z]+")
+_HAHA = re.compile(r"(?:ha){2,}h?")
+_HEHE = re.compile(r"(?:he){2,}h?")
+#: How a stopped or failed generation would say so, if its message carries meta.
+_FAILED_TURN_MARKERS = ("error", "interrupted", "cancelled", "canceled", "stopped", "failed")
+
+
+def previous_turn_unanswered(history: Sequence[dict]) -> bool:
+    """Did the last turn go without an answer?
+
+    True when the last user/assistant message is the user's (a failed
+    generation stores no answer, and ChatRequest.history_messages drops empty
+    messages, so a crash leaves the question last), when the last assistant
+    message is blank, or when its meta marks it failed, stopped or
+    interrupted. System messages (facts, recall blocks) are skipped.
+    """
+    for message in reversed(list(history or ())):
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        if role == "user":
+            return True
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return True
+        meta = message.get("meta")
+        if isinstance(meta, dict):
+            status = str(meta.get("status") or "").lower()
+            if status in _FAILED_TURN_MARKERS or any(meta.get(k) for k in _FAILED_TURN_MARKERS):
+                return True
+        return False
+    return False
+
+
+def pleasantry_words(text: str) -> Optional[List[str]]:
+    """The message's words when it is shaped like a pleasantry, else None:
+    the history-free half of `is_pleasantry`."""
+    raw = (text or "").strip()
+    if not raw or len(raw) > _PLEASANTRY_MAX_CHARS:
+        return None
+    for ch in raw:
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or ch in _PLEASANTRY_PUNCT:
+            continue
+        if ch in _PLEASANTRY_EMOJI or ch in _EMOJI_MODIFIERS:
+            continue
+        # A digit, a non-Latin letter (Devanagari, Gujarati, an accented
+        # word), any other symbol or emoji: not this rule's to decide.
+        return None
+    words = []
+    for w in _PLEASANTRY_WORD.findall(raw.lower()):
+        if _HAHA.fullmatch(w):
+            w = "haha"
+        elif _HEHE.fullmatch(w):
+            w = "hehe"
+        words.append(w)
+    if not words or any(w not in _PLEASANTRY_TOKENS for w in words):
+        return None
+    pairs = set(zip(words, words[1:]))
+    greeting = any(w in _GREETING_ANCHORS for w in words) or bool(pairs & _GREETING_PAIRS)
+    other = any(w in _OTHER_ANCHORS for w in words) or bool(pairs & _OTHER_PAIRS)
+    if not (greeting or other):
+        return None  # "again", "a lot", "so much", "you there"
+    if "?" in raw and not greeting:
+        return None  # "lol?", "thanks?": confusion or sarcasm
+    return words
+
+
+def is_pleasantry(text: str, history: Sequence[dict] = ()) -> bool:
+    """Rule 1: a greeting, thanks, farewell or laughter and nothing else,
+    typed after a turn that WAS answered."""
+    return pleasantry_words(text) is not None and not previous_turn_unanswered(history)
+
+
 #: A question this short is treated as a follow-up whose subject lives in the
 #: previous turn. Same threshold the search path uses for the same judgement.
 _TERSE_CONTENT_WORDS = 3
@@ -303,6 +442,12 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
     """
     text = (message or "").strip()
     if not text or not history:
+        return text
+    if pleasantry_rule() and is_pleasantry(text, history):
+        # "hi ??" after an answered turn is not a follow-up: gluing the last
+        # question's words onto it made a greeting retrieve (and cite) pages
+        # about that question. Acks ("ok", "yes", "👍") still resolve: they
+        # may be accepting an offer.
         return text
     from .engines import conversation_turns
     from .web_memory import _content_words
@@ -791,6 +936,16 @@ async def prepare(
     out = Prepared()
     if not settings.web_memory_enabled or not (question or "").strip():
         return out
+    if pleasantry_rule() and is_pleasantry(question, history):
+        # Rule 1 (2026-09-14): a greeting, thanks, farewell or laughter is
+        # answered by the model with nothing looked up (no router, no
+        # retrieval, no sources), at every effort. Evaluated on the RAW
+        # message, before resolve_from_history could append the previous
+        # question's words to it.
+        out.verdict = Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], "pleasantry")
+        metrics.inc("knowledge_pleasantry_total", effort=effort or "")
+        _decided(out, "static_model")
+        return out
     # A terse follow-up is resolved BEFORE retrieval, freshness classification
     # or any escalation decision — every one of them reads the question, and
     # all of them were reading a phrase with its subject missing.
@@ -799,6 +954,7 @@ async def prepare(
     now = datetime.now(timezone.utc)
     fast = effort == "fast"
     router_on = bool(settings.freshness_router_enabled)
+    prepare_started = time.perf_counter()
     # A time-sensitive retrieval started while the router decides (Fast only).
     speculative: Optional[asyncio.Future] = None
     speculative_verdict: Optional[Verdict] = None
@@ -846,14 +1002,20 @@ async def prepare(
 
         # `retrieve` reads the verdict for ONE thing: whether supersession may
         # run. Same level, same answer to that, same retrieval.
-        reusable = (
+        same_level = (
             speculative is not None
             and speculative_verdict is not None
             and verdict.requirement is speculative_verdict.requirement
-            and supersession_allowed(verdict.requirement, verdict)
+        )
+        reusable = same_level and (
+            supersession_allowed(verdict.requirement, verdict)
             == supersession_allowed(speculative_verdict.requirement, speculative_verdict)
         )
-        if speculative is not None and not reusable:
+        # Same level, different supersession rule (the router timed out, so
+        # 'default' where the speculative run guessed 'router'): the judged
+        # candidates are the same, only the partition differs (`_salvage`).
+        salvageable = same_level and not reusable and fast_speculative_salvage()
+        if speculative is not None and not reusable and not salvageable:
             speculative.cancel()
 
         if not verdict.needs_evidence:
@@ -867,12 +1029,20 @@ async def prepare(
             result = await speculative  # type: ignore[misc]
             cache_result(question, level=verdict.requirement, top_k=5, result=result)
         else:
-            # The call Think/Max always made. A cancelled or diverging
-            # speculative run never wrote the cache, so reading it is safe.
-            started = time.perf_counter()
-            result = await retrieve(
-                question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
-            )
+            salvaged: Optional[Retrieval] = None
+            if salvageable:
+                salvaged = await _salvage(
+                    question, speculative, verdict, deadline_at=prepare_started + float(settings.knowledge_prepare_deadline_s)
+                )
+            if salvaged is not None:
+                result = salvaged
+            else:
+                # The call Think/Max always made. A cancelled or diverging
+                # speculative run never wrote the cache, so reading it is safe.
+                started = time.perf_counter()
+                result = await retrieve(
+                    question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
+                )
     finally:
         if speculative is not None and not speculative.done():
             speculative.cancel()
@@ -929,6 +1099,7 @@ async def prepare(
         # critique warned about (every busy request escalating into the
         # search engine's own reranking). Answer from the labelled floor.
         if result.found or claims_text:
+            _source_floor(question, result)
             out.grounding = _join(
                 grounding_block(result, today_iso()),
                 staleness_note(result, verdict.max_age_seconds),
@@ -956,6 +1127,7 @@ async def prepare(
         # supplied.
         if any(e.relevant for e in result.evidence):
             result.evidence = [e for e in result.evidence if e.relevant]
+        _source_floor(question, result)
         out.grounding = _join(grounding_block(result, today_iso()), claims_text)
         if not out.grounding:
             out.grounding = f"Current date: {today_iso()}.\n" + claims_text
@@ -971,6 +1143,7 @@ async def prepare(
         # Fast with the search pill OFF still spent network — outside the
         # per-user rate limit and unattributed in the search log.)
         if result.found or claims_text:
+            _source_floor(question, result)
             out.grounding = _join(
                 grounding_block(result, today_iso()),
                 staleness_note(result, verdict.max_age_seconds),
@@ -989,6 +1162,7 @@ async def prepare(
         # about to search, which was false whenever the auto classifier had
         # decided not to.
         if result.found or claims_text:
+            _source_floor(question, result)
             out.grounding = _join(
                 grounding_block(result, today_iso()),
                 staleness_note(result, verdict.max_age_seconds),
@@ -1017,6 +1191,7 @@ async def prepare(
         out.searched = True
         if any(e.relevant for e in fresh.evidence):
             fresh.evidence = [e for e in fresh.evidence if e.relevant]
+        _source_floor(question, fresh)
         out.grounding = _join(grounding_block(fresh, today_iso()), claims_text)
         out.sources = as_sources(fresh.evidence)
         out.retrieval = fresh
@@ -1029,6 +1204,7 @@ async def prepare(
     # The lookup failed (offline, rate limit, deadline). Stale evidence with an
     # honest date beats a confident wrong answer from 2024 weights.
     if result.found or claims_text:
+        _source_floor(question, result)
         out.grounding = _join(
             grounding_block(result, today_iso()),
             staleness_note(result, verdict.max_age_seconds),
@@ -1037,6 +1213,132 @@ async def prepare(
         out.sources = as_sources(result.evidence)
     _decided(out, "fast_lookup_failed")
     return out
+
+
+#: Rule 2 (shadow): the short-question source floor. A question with at most
+#: this many content stems...
+_FLOOR_MAX_STEMS = 2
+#: ...whose cited source has neither the lexical nor the dense signal of the
+#: topical gate, only the cross-encoder's "relevant".
+_FLOOR_LEXICAL = 0.34
+_FLOOR_DENSE = 0.35
+
+
+def _source_floor(question: str, retrieval: Retrieval) -> None:
+    """Rule 2, SHADOW ONLY by default (2026-09-14).
+
+    The owner's "hi ??" cited a page titled HI and a film trailer: the
+    cross-encoder called both "relevant" to a one-word question that neither
+    the words nor the vectors tied to them. Counted here as
+    knowledge_source_floor_total{would="drop"} when the RESOLVED question has
+    at most two ASCII content stems, carries no non-Latin letter, and a
+    relevant, judged source has lexical < 0.34 and dense < 0.35.
+
+    Nothing is removed unless KNOWLEDGE_SOURCE_FLOOR is on (default off: the
+    rag_eval gate that would justify it needs the production corpus). Indic
+    script is never subject to it: the [a-z0-9] tokenizer gives it lexical 0
+    and the multilingual dense score is often below 0.35, so real Devanagari
+    and Gujarati evidence would be dropped.
+    """
+    evidence = retrieval.evidence
+    if not evidence:
+        return
+    if any(ch.isalpha() and not ch.isascii() for ch in question or ""):
+        return
+    if len(set(_web_memory._terms(question))) > _FLOOR_MAX_STEMS:
+        return
+    drop = [
+        e for e in evidence
+        if e.scored and e.relevant and e.lexical < _FLOOR_LEXICAL and e.dense < _FLOOR_DENSE
+    ]
+    if not drop:
+        return
+    metrics.inc("knowledge_source_floor_total", would="drop")
+    if source_floor_enabled():
+        gone = {id(e) for e in drop}
+        retrieval.evidence = [e for e in evidence if id(e) not in gone]
+
+
+async def _cached(question: str, level: Freshness, top_k: int) -> Optional[Retrieval]:
+    """The evidence cache under the REAL key, read exactly as `retrieve`
+    reads it (servability re-checked, a withdrawn entry dropped)."""
+    key = _web_memory._cache_key(question, level, top_k)
+    cached = _web_memory._cache_get(key)
+    if cached is None:
+        return None
+    if await _web_memory._cache_entry_still_servable(cached):
+        return cached
+    _web_memory._cache.pop(key, None)
+    return None
+
+
+async def _salvage(
+    question: str,
+    speculative: "asyncio.Future",
+    verdict: Verdict,
+    *,
+    deadline_at: float,
+) -> Optional[Retrieval]:
+    """The speculative Fast retrieval, re-partitioned under the real verdict,
+    or None when the caller must run the full retrieval as before.
+
+    WHY (2026-09-14). When the router times out, the verdict is 'default':
+    same level as the speculative run's 'router' guess, but supersession is
+    not allowed. HEAD cancelled the speculative run (often finished by then)
+    and ran the whole retrieval again: a second embed, dense scan, lexical
+    query, merge, rank and rerank, about 0.5-1.5 s. Everything in `retrieve`
+    up to and including the rerank ignores the verdict; `_partition` is the
+    only step that reads it. So the judged candidates are re-partitioned
+    instead (`web_memory.repartition`), which is what the recomputation
+    gives.
+
+    Order, each step what HEAD's second call would have seen:
+      (a) the cache under the real key first: a hit is served as HEAD's
+          retrieve would serve it, and the speculative run is cancelled;
+      (b) otherwise wait for the speculative run, no later than the prepare
+          deadline;
+      (c) a completed, non-degraded run carrying its judged list is
+          re-partitioned and cached under the real verdict by the rule
+          `retrieve` applies (non-empty, not degraded, not rerank-limited);
+      (d) anything else (failed, cancelled, degraded, a cache hit with no
+          judged list, another level, out of time) -> None: full retrieve.
+    """
+    level = verdict.requirement
+    try:
+        cached = await _cached(question, level, 5)
+    except Exception:  # noqa: BLE001 — the full retrieve reads it again
+        cached = None
+    if cached is not None:
+        speculative.cancel()
+        metrics.inc("knowledge_salvage_total", how="cache_hit")
+        return cached
+    remaining = deadline_at - time.perf_counter()
+    if not speculative.done():
+        if remaining <= 0:
+            speculative.cancel()
+            metrics.inc("knowledge_salvage_total", how="fallback_deadline")
+            return None
+        await asyncio.wait({speculative}, timeout=remaining)
+        if not speculative.done():
+            speculative.cancel()
+            metrics.inc("knowledge_salvage_total", how="fallback_deadline")
+            return None
+    if speculative.cancelled() or speculative.exception() is not None:
+        metrics.inc("knowledge_salvage_total", how="fallback_failed")
+        return None
+    spec = speculative.result()
+    if (
+        not isinstance(spec, Retrieval)
+        or spec.degraded
+        or spec.freshness is not level
+        or not hasattr(spec, "_judged")
+    ):
+        metrics.inc("knowledge_salvage_total", how="fallback_unjudged")
+        return None
+    result = _web_memory.repartition(spec, level, verdict, top_k=5)
+    cache_result(question, level=level, top_k=5, result=result)
+    metrics.inc("knowledge_salvage_total", how="salvaged")
+    return result
 
 
 async def _fast_lookup(

@@ -18,6 +18,8 @@ import threading
 from bisect import bisect_left
 from typing import Callable, Dict, List, Tuple
 
+from .core import effort_policy as _effort_policy
+
 _lock = threading.Lock()
 
 #: name -> {label-tuple: value}
@@ -251,6 +253,19 @@ FIRST_VISIBLE_KINDS = frozenset({"reasoning", "status", "answer"})
 KNOWLEDGE_DECISIONS = frozenset({
     "static_model", "static_topical", "degraded_busy", "local",
     "stale_offline", "escalate_search", "fast_lookup", "fast_lookup_failed",
+    # main.py's Fast small-talk lane (app/fast_lane.py): no pre-pass at all.
+    "small_talk_lane",
+})
+
+#: app/fast_lane.py's vocabulary, for fast_lane_total. Literal here so this
+#: module imports nothing; tests/test_fast_lane_classifier.py pins the two
+#: lists together.
+FAST_LANE_RESULTS = frozenset({"entered", "vetoed"})
+FAST_LANE_CATEGORIES = frozenset({"greeting", "thanks", "farewell", "laughter", "emoji", "none"})
+FAST_LANE_VETOES = frozenset({
+    "none", "disabled", "not_fast", "not_assistant", "too_long", "digit", "url",
+    "attachment", "flags", "sf", "artifact_intent", "live_signal", "cue",
+    "unanswered_previous", "pending_offer", "not_lexicon",
 })
 
 #: How a timed step ended. `deadline` is a budget that fired and the turn went
@@ -303,6 +318,18 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     # Counters of the same programme, closed the same way (names AND values).
     "knowledge_topical_precheck_total": {"result": set(TOPICAL_PRECHECK_RESULTS)},
     "recall_block_dropped_total": {"reason": set(RECALL_DROP_REASONS)},
+    # Fast adaptive thinking (engines/chat.py, 2026-09-15): every Fast chat
+    # turn the policy judged, by decision and the classifier's closed reason
+    # vocabulary (core/effort_policy.REASONS).
+    "fast_adaptive_thinking_total": {
+        "decision": {"think", "direct"},
+        "reason": set(_effort_policy.REASONS),
+    },
+    "fast_lane_total": {
+        "result": set(FAST_LANE_RESULTS),
+        "category": set(FAST_LANE_CATEGORIES),
+        "veto": set(FAST_LANE_VETOES),
+    },
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 

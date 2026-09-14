@@ -643,7 +643,14 @@ def test_a_router_timeout_that_changes_supersession_recomputes_uncached(monkeypa
     forbids supersession the router-labelled speculative run allowed. Its
     result must not be used. Revised 2026-09-13 (second prover pass): the
     speculative run never writes the level-keyed cache, so the recomputation
-    is exactly HEAD's call, cache read included."""
+    is exactly HEAD's call, cache read included.
+
+    Revised 2026-09-14 (pre-pass latency round): this is now the behaviour
+    with KNOWLEDGE_FAST_SPECULATIVE_SALVAGE OFF, and its assertions are
+    unchanged. With salvage on (the default) the speculative run's judged
+    candidates are re-partitioned instead of recomputed; the tests right
+    below prove that result equals this recomputation."""
+    monkeypatch.setattr(settings, "knowledge_fast_speculative_salvage", False)
 
     async def down(question):
         await asyncio.sleep(0)  # the connection attempt yields before it fails
@@ -662,6 +669,167 @@ def test_a_router_timeout_that_changes_supersession_recomputes_uncached(monkeypa
     assert prepared.verdict.reason == "default" and not prepared.verdict.volatile
     assert calls[-1] == ("default", True, True)
     assert calls[0] == ("router", True, False)
+
+
+# ── salvage: the router-timeout turn re-partitions instead of recomputing ────
+#
+# Added 2026-09-14 with KNOWLEDGE_FAST_SPECULATIVE_SALVAGE. A real retrieve
+# (real lexical SQL, merge, rank, _answerability and _partition) over two pages
+# that say the same thing 400 days apart: under the speculative 'router'
+# verdict supersession retires the older page; under the real 'default' verdict
+# it does not. Only the dense half and the cross-encoder are stubbed.
+
+SALVAGE_Q = "what is the cost of a used bicycle"
+_BIKE_OLD = ("https://bikes-a.example.org/used-bicycle-cost", "Used bicycle cost guide",
+             "A used bicycle costs about 150 dollars in most cities, depending on the frame.")
+_BIKE_NEW = ("https://bikes-b.example.org/used-bicycle-cost-2026", "Used bicycle cost today",
+             "A used bicycle costs about 180 dollars in most cities, depending on the frame.")
+
+
+def _seed_bicycles(monkeypatch, rerank_calls):
+    from app import rerank
+
+    _page("bikes/old", *_BIKE_OLD, age_days=400.0)
+    _page("bikes/new", *_BIKE_NEW, age_days=2.0)
+
+    async def dense(query, top_k=6, site_prefix=""):
+        await asyncio.sleep(0.01)
+        return [
+            {"url": _BIKE_OLD[0], "title": _BIKE_OLD[1], "text": _BIKE_OLD[2], "fetched_at": "", "score": 0.2},
+            {"url": _BIKE_NEW[0], "title": _BIKE_NEW[1], "text": _BIKE_NEW[2], "fetched_at": "", "score": 0.2},
+        ]
+
+    async def score(query, docs, **kw):
+        rerank_calls.append(list(docs))
+        await asyncio.sleep(0.01)
+        return [0.95 for _ in docs]
+
+    monkeypatch.setattr(web_index, "retrieve", dense)
+    monkeypatch.setattr(rerank, "score", score)
+    monkeypatch.setattr(settings, "knowledge_rerank", True)
+
+
+def _router_down(monkeypatch):
+    async def down(question):
+        # Fails after the speculative run finished, as a router past its
+        # 0.6 s deadline does against a ~0.5 s retrieval.
+        await asyncio.sleep(0.15)
+        raise RuntimeError("router unavailable")
+
+    monkeypatch.setattr(freshness, "_ask_router", down)
+
+
+def _shape(result):
+    return (
+        [e.page_id for e in result.evidence],
+        [e.page_id for e in result.superseded],
+        result.conflict,
+        [(round(e.answer, 6), round(e.score, 6)) for e in result.evidence],
+    )
+
+
+def _salvage_turn(monkeypatch, salvage: bool):
+    monkeypatch.setattr(settings, "knowledge_fast_speculative_salvage", salvage)
+    web_memory.cache_clear()
+    calls, rerank_calls = [], []
+    real = web_memory.retrieve
+
+    async def spy(q, **kw):
+        calls.append((kw["verdict"].reason, kw.get("cache_store", True)))
+        return await real(q, **kw)
+
+    monkeypatch.setattr(lk, "retrieve", spy)
+    prepared = run(_prepare(SALVAGE_Q))
+    return prepared, calls, rerank_calls
+
+
+def test_the_partition_really_differs_between_the_two_verdicts(monkeypatch):
+    """The premise: without it the equivalence below proves nothing."""
+    rerank_calls = []
+    _seed_bicycles(monkeypatch, rerank_calls)
+    offline = freshness.classify_offline(SALVAGE_Q, now_year=datetime.now(timezone.utc).year)
+    router = Verdict(offline.requirement, offline.max_age_seconds, "router")
+    default = Verdict(offline.requirement, offline.max_age_seconds, "default")
+    under_router = run(web_memory.retrieve(SALVAGE_Q, level=offline.requirement, top_k=5, verdict=router, use_cache=False))
+    under_default = run(web_memory.retrieve(SALVAGE_Q, level=offline.requirement, top_k=5, verdict=default, use_cache=False))
+    assert len(under_router.evidence) == 1 and len(under_router.superseded) == 1
+    assert len(under_default.evidence) == 2 and not under_default.superseded
+
+
+def test_with_salvage_a_router_timeout_turn_equals_heads_recomputation_with_one_retrieval(monkeypatch):
+    rerank_calls = []
+    _seed_bicycles(monkeypatch, rerank_calls)
+    _router_down(monkeypatch)
+
+    head, head_calls, _ = _salvage_turn(monkeypatch, salvage=False)
+    head_reranks = len(rerank_calls)
+    rerank_calls.clear()
+    salvaged, calls, _ = _salvage_turn(monkeypatch, salvage=True)
+
+    assert head.verdict.reason == salvaged.verdict.reason == "default"
+    assert head_calls == [("router", False), ("default", True)], "HEAD: speculative run, then the recomputation"
+    assert calls == [("router", False)], "salvage: the speculative run only"
+    assert head_reranks == 2 and len(rerank_calls) == 1
+    assert _shape(salvaged.retrieval) == _shape(head.retrieval)
+    assert len(salvaged.retrieval.evidence) == 2 and not salvaged.retrieval.superseded
+    assert abs(salvaged.retrieval.newest_age - head.retrieval.newest_age) < 60.0
+    assert salvaged.sources == head.sources
+    assert salvaged.grounding.split("\n", 1)[1:] == head.grounding.split("\n", 1)[1:]
+    assert salvaged.decision == head.decision
+
+
+def test_salvage_writes_the_cache_only_under_the_real_verdict(monkeypatch):
+    rerank_calls = []
+    _seed_bicycles(monkeypatch, rerank_calls)
+    _router_down(monkeypatch)
+    monkeypatch.setattr(settings, "knowledge_evidence_cache_ttl_s", 60.0)
+    salvaged, calls, _ = _salvage_turn(monkeypatch, salvage=True)
+    assert calls == [("router", False)]
+    entries = list(web_memory._cache.values())
+    assert len(entries) == 1, "one entry: the real verdict's partition"
+    cached = entries[0][1]
+    assert len(cached.evidence) == 2 and not cached.superseded, "the speculative 'router' partition was cached"
+    assert not hasattr(cached, "_judged")
+    # The next turn reads that entry: no retrieval work at all.
+    rerank_calls.clear()
+    again = run(_prepare(SALVAGE_Q))
+    assert rerank_calls == []
+    assert _shape(again.retrieval)[:3] == _shape(salvaged.retrieval)[:3]
+
+
+def test_salvage_prefers_a_cache_entry_stored_under_the_real_key_while_the_router_was_deciding(monkeypatch):
+    rerank_calls = []
+    _seed_bicycles(monkeypatch, rerank_calls)
+    monkeypatch.setattr(settings, "knowledge_evidence_cache_ttl_s", 60.0)
+    monkeypatch.setattr(settings, "knowledge_fast_speculative_salvage", True)
+    offline = freshness.classify_offline(SALVAGE_Q, now_year=datetime.now(timezone.utc).year)
+    stored = Retrieval(query=SALVAGE_Q, freshness=offline.requirement)
+
+    async def down_after_another_turn_cached(question):
+        # Another turn finished the same question meanwhile and cached it.
+        with db.connection() as con:
+            pid = con.execute("SELECT id FROM web_pages WHERE url = %s", (_BIKE_NEW[0],)).fetchone()["id"]
+        stored.evidence = [web_memory.Evidence(
+            url=_BIKE_NEW[0], title="cached by another turn", text=_BIKE_NEW[2], domain="bikes-b.example.org",
+            authority=web_memory.AUTHORITY_REFERENCE, fetched_at=datetime.now(timezone.utc), page_id=pid,
+            answer=0.99, lexical=0.9, dense=0.5, score=0.9,
+        )]
+        web_memory._cache_put(web_memory._cache_key(SALVAGE_Q, offline.requirement, 5), stored)
+        await asyncio.sleep(0)
+        raise RuntimeError("router unavailable")
+
+    monkeypatch.setattr(freshness, "_ask_router", down_after_another_turn_cached)
+    calls = []
+    real = web_memory.retrieve
+
+    async def spy(q, **kw):
+        calls.append(kw["verdict"].reason)
+        return await real(q, **kw)
+
+    monkeypatch.setattr(lk, "retrieve", spy)
+    prepared = run(_prepare(SALVAGE_Q))
+    assert calls == ["router"]
+    assert [e.title for e in prepared.retrieval.evidence] == ["cached by another turn"]
 
 
 # ── Think and Max are unchanged ──────────────────────────────────────────────

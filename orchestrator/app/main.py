@@ -48,6 +48,7 @@ from .memory_api import router as memory_router
 from .uploads import router as uploads_router
 from .memory import memory
 from . import metrics as _latency_metrics
+from . import fast_lane
 from . import sse as _sse
 from .sse import HEARTBEAT_SECONDS, STREAMED_EVENTS as _STREAMED_EVENTS, sse_comment, sse_event
 
@@ -3247,6 +3248,29 @@ async def _mark_chat_request(gen: "LiveGeneration", status: str, *, error: str =
         )
 
 
+def _previous_send_status(conversation_id: str, intent_id: str) -> Optional[str]:
+    """The durable status of the send before this one in the conversation,
+    or None when there is none (a first message, or history from before V29)."""
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT status FROM chat_requests WHERE conversation_id = %s AND intent_id <> %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (conversation_id, intent_id),
+        ).fetchone()
+    return str(row["status"]) if row is not None else None
+
+
+async def _previous_send_unfinished(conversation_id: str, intent_id: str) -> bool:
+    """For the small-talk lane: did the previous send end without a completed
+    answer (failed, stopped, interrupted, still queued or running)? A failed
+    lookup counts as unfinished — the lane then just takes the full path."""
+    try:
+        status = await db.run_in_thread(_previous_send_status, conversation_id, intent_id)
+    except Exception:  # noqa: BLE001 — the full path is always a safe answer
+        return True
+    return status is not None and status != "completed"
+
+
 async def _settle_chat_request(gen: "LiveGeneration") -> None:
     """The row's terminal status, from the worker's `finally` — so it runs
     for a completed answer, a cancelled one and a failed one alike."""
@@ -4182,6 +4206,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     "retrieved_source_count": len(data["sources"]),
                     "cited_source_count": len(cited),
                 }
+            # The Fast small-talk lane consulted no evidence at all and says
+            # so in the same provenance shape (source "model"). Only the lane
+            # sets this key, so every other turn's meta is unchanged.
+            if not data.get("provenance") and isinstance(knowledge_state.get("model_provenance"), dict):
+                data["provenance"] = dict(knowledge_state["model_provenance"])
             if isinstance(data.get("provenance"), dict) and not provenance_recorded:
                 provenance_recorded = True
                 await query_trace.event(
@@ -4301,6 +4330,26 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 await emit("status", {"text": access_notice})
             history = request.history_messages or memory.history(scoped_session)
 
+            # THE FAST SMALL-TALK LANE (app/fast_lane.py, 2026-09-14). A
+            # closed-lexicon pleasantry at Fast ("hi", "thanks", "bye") skips
+            # every pre-pass that cannot change its answer — the freshness
+            # router, retrieval, rerank, cross-chat recall, the stored
+            # documents and compaction — and gets a short prompt. Decided
+            # once, here, before any read starts; every later block that the
+            # lane skips carries `not lane.entered`. The stored conversation
+            # is untouched, so the next real question sees all of it.
+            lane = fast_lane.decide(
+                request, text=text, history=history, now_year=datetime.now(timezone.utc).year
+            )
+            if lane.entered and gen.intent_id and request.conversation_id:
+                # The browser sends a died or stopped answer back as plain
+                # text, so the history alone cannot tell "hi ??" after a
+                # crash from "hi ??" after an answer. The previous send's
+                # durable status can.
+                if await _previous_send_unfinished(conv_key_outer, gen.intent_id):
+                    lane = fast_lane.LaneDecision(False, lane.category, "unanswered_previous")
+            fast_lane.record(lane)
+
             # CONTEXT READS START HERE (see _ContextReads). Before decide():
             # none of them depends on the plan, and at Think/Max the plan is
             # a router round trip the reads no longer wait behind.
@@ -4375,7 +4424,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                 return db.run_in_thread(_artifact_engine.adb.list_artifacts, viewer, conv_key)
 
-            if reads.concurrent and request.text:
+            if reads.concurrent and request.text and lane.entered:
+                # The saved facts are the one read a greeting can use.
+                reads.start("facts", read_facts)
+            elif reads.concurrent and request.text:
                 if request.mode == "assistant":
                     reads.start("facts", read_facts)
                     reads.start("cross_chat", read_cross_chat)
@@ -4420,7 +4472,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
                 ):
                     reads.start("artifacts", read_artifacts)
-            if reads.concurrent and request.conversation_id:
+            if reads.concurrent and request.conversation_id and not lane.entered:
                 reads.start("recall", read_recall)
                 reads.start("summary", read_summary)
             # Phase 1: decide whether to run web search (never for attachments).
@@ -4479,6 +4531,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # client, not just the current UI. Turning the Salesforce
                 # toggle off is how you ask the web.
                 and auto_web_search_allowed
+                # A small-talk lane turn never searches, so it must not spend
+                # a slot of the per-user search rate limit either.
+                and not lane.entered
             ):
                 from .engines.search import rate_ok, should_search
 
@@ -4571,6 +4626,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not want_agent
                 and not (want_search and request.web_search == "on")
                 and not deep_research_on
+                and not lane.entered
             ):
                 knowledge_task = asyncio.ensure_future(
                     _prepare_knowledge(
@@ -4663,7 +4719,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                         fact_task.add_done_callback(_facts_done)
                     # 2. Saved facts, injected verbatim (their memory).
-                    saved_facts = await reads.get("facts", read_facts)
+                    if lane.entered:
+                        # A greeting waits for the facts only briefly: a
+                        # slow read costs this one reply the block, never
+                        # its speed.
+                        try:
+                            async with asyncio.timeout(fast_lane.FAST_LANE_FACTS_WAIT_S):
+                                saved_facts = await reads.get("facts", read_facts)
+                        except TimeoutError:
+                            saved_facts = []
+                    else:
+                        saved_facts = await reads.get("facts", read_facts)
                     facts_text = facts.facts_block(saved_facts)
                     if facts_text:
                         history = [
@@ -4672,7 +4738,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         ]
                     # 3. Semantic + keyword recall over other conversations,
                     #    merged into one block (read_cross_chat, above).
-                    block = await reads.get("cross_chat", read_cross_chat)
+                    block = None if lane.entered else await reads.get("cross_chat", read_cross_chat)
                 else:
                     # Salesforce mode keeps the original keyword-only recall.
                     block = await reads.get("keyword_recall", read_keyword_recall)
@@ -4683,7 +4749,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # a follow-up when a repo is already indexed → code Q&A.
             github_ref = None
             repo_followup = False
-            if settings.repo_analysis_enabled and not deep_research_on and request.text and not request.pdf_data and not request.image_data:
+            if settings.repo_analysis_enabled and not deep_research_on and request.text and not request.pdf_data and not request.image_data and not lane.entered:
                 from .core.repo import detect_github
 
                 from .core.urls import extract_urls as _extract, links_are_the_request
@@ -4720,6 +4786,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.pdf_data
                 and not request.image_data
                 and github_ref is None
+                and not lane.entered
             ):
                 from .engines.crawl import (
                     _URL_RE,
@@ -4786,6 +4853,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and github_ref is None
                 and crawl_url is None
+                and not lane.entered
             ):
                 from .core.urls import (
                     extract_urls,
@@ -4832,7 +4900,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # excerpts ride as a pinned system block on EVERY later turn, so
             # "what did that PDF say about X?" works ten turns later, in any
             # mode, whatever engine answers.
-            if request.text and not request.pdf_data and not request.image_data:
+            if request.text and not request.pdf_data and not request.image_data and not lane.entered:
                 from .core.urls import select_relevant as _doc_select
 
                 try:
@@ -4875,6 +4943,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.pdf_data
                 and not request.pdf_uploads
                 and not request.image_data
+                and not lane.entered
             ):
                 try:
                     conversation_videos = await reads.get("videos", read_videos)
@@ -4915,6 +4984,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and github_ref is None
                 and not url_list
+                and not lane.entered
             ):
                 try:
                     # Documents and videos share the uploads table but answer
@@ -4931,7 +5001,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # boundaries count turns in the whole thread, so measuring against
             # the already-compacted prompt would mis-count them.
             full_history = list(history)
-            if signed_in is not None and request.conversation_id:
+            # A lane turn's prompt is the last two exchanges (engines/chat.py),
+            # so there is nothing for compaction to fit; the background
+            # compaction after the answer still runs as for every turn.
+            if signed_in is not None and request.conversation_id and not lane.entered:
                 from . import compaction
 
                 base_url, _key, model_id = llm.resolve_model_choice(request.model)
@@ -4976,6 +5049,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 "CONTEXT_ASSEMBLED",
                 _assembled_details,
                 component="orchestrator.app.compaction",
+            )
+            # After CONTEXT_ASSEMBLED in the trace, so the stages every turn
+            # has keep their order; the decision itself was made before the
+            # reads started.
+            await query_trace.event(
+                "FAST_LANE",
+                status="success" if lane.entered else "skipped",
+                component="orchestrator.app.fast_lane",
+                details=lane.as_details(),
             )
             _latency_metrics.context_assembly(
                 _perf_counter() - assembly_started,
@@ -5181,6 +5263,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.video_uploads
                 and not (sf_outcome is not None and sf_outcome.handled)
                 and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
+                # fast_lane.decide already read the text with the strictest
+                # setting (has_artifacts=True) and found no file request.
+                and not lane.entered
             ):
                 from .artifacts import intent as artifact_intent_rules
                 from .engines import artifact as artifact_engine_mod
@@ -5458,6 +5543,32 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     emit,
                     model_choice=request.model,
                     effort=request.effort,
+                )
+            elif lane.entered:
+                # The small-talk lane (fast_lane above): no knowledge pre-pass,
+                # no grounding, no sources — the model and the saved facts.
+                from .engines.chat import run_chat_engine
+
+                knowledge_state["decision"] = "small_talk_lane"
+                # PROVENANCE_RECORDED still fires from emit(meta): the answer
+                # came from the model, with no retrieved source.
+                knowledge_state["model_provenance"] = {
+                    "source": "model",
+                    "retrieved_source_count": 0,
+                    "cited_source_count": 0,
+                }
+                _latency_metrics.knowledge_prepare(
+                    0.0, effort=str(request.effort or ""), decision="small_talk_lane", outcome="skipped"
+                )
+                answer = await run_chat_engine(
+                    text,
+                    history,
+                    emit,
+                    mode="assistant",
+                    model_choice=request.model,
+                    effort=request.effort,
+                    grounding="",
+                    lane=lane.category,
                 )
             elif request.mode == "assistant":
                 # V2 §3a: SKIP the router and data engines entirely.
