@@ -1366,3 +1366,286 @@ def test_a_synchronous_outcome_never_carries_text_into_the_row():
     assert "output_text" not in background.persisted_generation_fields(outcome)
     outcome.keep_text = True
     assert background.persisted_generation_fields(outcome)["output_text"] == "secret"
+# ------------------------------------------- durable background (T2) --
+#
+# No-timeout design (2026-09-13): with the durable runtime running, a
+# background job is a ROW with its spec — claimed by the dispatcher, resumed
+# after a deploy — never a coroutine that a restart fails.
+
+
+def test_with_the_durable_runtime_running_a_background_start_becomes_a_resumable_row(project, monkeypatch, tmp_path):
+    from app.publicapi import blobs, capacity, durable, durable_store
+    from tests.publicapi_fake_engine import FakeController, FakeMainEngine, expected_text, fast_durable_settings
+
+    fast_durable_settings(monkeypatch)
+    monkeypatch.setattr(blobs, "min_free_disk_bytes", lambda: 0)
+    capacity.reset_for_tests()
+    FakeMainEngine(answer_tokens=7).install(monkeypatch)
+    runtime = durable.Runtime()
+
+    async def allow(keys):
+        return set(keys)
+
+    runtime.configure(owner="test-bg", view=FakeController(time.monotonic), authoriser=allow,
+                      blob_store=blobs.BlobStore(tmp_path / "blobs"))
+    monkeypatch.setattr(durable, "RUNTIME", runtime)
+    spec = _spec(max_tokens=100, planned_max_output_tokens=100, context_window=1_000_000)
+    finished = []
+
+    async def on_finish(outcome):
+        finished.append(outcome.status)
+
+    async def scenario():
+        await runtime.start()
+        try:
+            row = await background.start(spec, caller=_caller(project), on_finish=on_finish)
+            assert background.active_ids() == ()  # no legacy task
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                current = durable_store.get_run(spec.response_id)
+                if current["status"] == "completed":
+                    return row, current
+            return row, durable_store.get_run(spec.response_id)
+        finally:
+            await runtime.stop()
+
+    row, final = asyncio.run(scenario())
+    assert row["status"] == "queued" and row["background"] is True
+    assert final["resumable"] is True and final["status"] == "completed"
+    assert final["output_text"] == expected_text(7)
+    assert finished == ["completed"]  # the launching process's recorder ran once
+
+
+# ---------------------------------------- adversarial review fixes (2026-09-14) --
+#
+# The durable background path skipped the project concurrency slot, and kept
+# every launch's `on_finish` closure — the router's captures the whole prompt
+# — in memory until the job ran, even after a cancel.
+
+
+def _durable_runtime(monkeypatch, tmp_path, owner="test-bg"):
+    from app.publicapi import blobs, capacity, durable
+    from tests.publicapi_fake_engine import FakeController, fast_durable_settings
+
+    fast_durable_settings(monkeypatch)
+    monkeypatch.setattr(blobs, "min_free_disk_bytes", lambda: 0)
+    capacity.reset_for_tests()
+    runtime = durable.Runtime()
+
+    async def allow(keys):
+        return set(keys)
+
+    runtime.configure(owner=owner, view=FakeController(time.monotonic), authoriser=allow,
+                      blob_store=blobs.BlobStore(tmp_path / "blobs"))
+    runtime.witnesses_enabled = False
+    monkeypatch.setattr(durable, "RUNTIME", runtime)
+    return runtime
+
+
+def _durable_spec(**overrides):
+    fields = dict(max_tokens=100, planned_max_output_tokens=100, context_window=1_000_000)
+    fields.update(overrides)
+    return _spec(**fields)
+
+
+@pytest.mark.usefixtures("limits_enforced")
+def test_a_project_cannot_queue_more_durable_background_jobs_than_its_limit(project, monkeypatch, tmp_path):
+    from app.publicapi import capacity, durable_store
+    from tests.publicapi_fake_engine import FakeMainEngine, set_setting
+
+    runtime = _durable_runtime(monkeypatch, tmp_path)
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", "1")
+    FakeMainEngine(answer_tokens=3).install(monkeypatch)
+    caller = _caller(project, max_concurrency=2)
+
+    async def scenario():
+        await runtime.start()
+        try:
+            async with capacity.hold("main.normal"):  # the engine is busy: jobs queue
+                first = await background.start(_durable_spec(), caller=caller)
+                second = await background.start(_durable_spec(), caller=caller)
+                with pytest.raises(errors.ApiError) as refused:
+                    await background.start(_durable_spec(), caller=caller)
+                counted = quotas.in_flight(caller, background.SLOT_KIND)
+                await background.request_cancel(second["id"], project["id"])
+                await asyncio.sleep(0.2)
+                after_cancel = quotas.in_flight(caller, background.SLOT_KIND)
+                third = await background.start(_durable_spec(), caller=caller)
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                rows = [durable_store.get_run(r["id"]) for r in (first, third)]
+                if all(r["status"] == "completed" for r in rows):
+                    break
+            await asyncio.sleep(0.1)
+            return refused.value, counted, after_cancel, rows, quotas.in_flight(caller)
+        finally:
+            await runtime.stop()
+
+    refusal, counted, after_cancel, rows, finally_in_flight = asyncio.run(scenario())
+    assert refusal.code == "concurrency_limit_exceeded" and refusal.status == 429
+    assert counted == 2 and after_cancel == 1
+    assert [r["status"] for r in rows] == ["completed", "completed"]
+    assert finally_in_flight == 0  # every slot came back
+    assert runtime.local_accounting() == {"hooks": 0, "hook_bytes": 0, "slots": 0, "launched_here": 0}
+
+
+def test_cancelling_queued_durable_jobs_releases_their_slots_and_the_prompts_their_hooks_hold(project, monkeypatch, tmp_path):
+    """The review's proof, inverted: five 4 MiB background launches while the
+    engine is busy, all cancelled — nothing of them is left in this process."""
+    import gc
+
+    from app.publicapi import capacity, durable_store
+    from tests.publicapi_fake_engine import FakeMainEngine, set_setting
+
+    runtime = _durable_runtime(monkeypatch, tmp_path)
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", "1")
+    FakeMainEngine(answer_tokens=3).install(monkeypatch)
+    caller = _caller(project, max_concurrency=2)
+
+    async def scenario():
+        await runtime.start()
+        try:
+            async with capacity.hold("main.normal"):
+                ids = []
+                for index in range(5):
+                    big = "x" * (4 * 1024 * 1024) + str(index)
+                    payload = {"plan_messages": [{"role": "user", "content": big}]}
+
+                    async def on_finish(outcome, _keep=payload):
+                        return None
+
+                    row = await background.start(
+                        _durable_spec(messages=[{"role": "user", "content": big}]), caller=caller, on_finish=on_finish
+                    )
+                    ids.append(row["id"])
+                    del big, payload, on_finish
+                queued = (quotas.in_flight(caller), runtime.local_accounting())
+                for rid in ids:
+                    await background.request_cancel(rid, project["id"])
+                for _ in range(100):
+                    if all(durable_store.get_run(rid)["status"] == "cancelled" for rid in ids):
+                        break
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.1)
+                gc.collect()
+                return queued, [durable_store.get_run(rid)["status"] for rid in ids], quotas.in_flight(caller), \
+                    runtime.local_accounting()
+        finally:
+            await runtime.stop()
+
+    (queued_in_flight, queued_accounting), statuses, in_flight, accounting = asyncio.run(scenario())
+    assert queued_in_flight == 5 and queued_accounting["hooks"] >= 4  # one is the gate's representative
+    assert statuses == ["cancelled"] * 5
+    assert in_flight == 0
+    assert accounting == {"hooks": 0, "hook_bytes": 0, "slots": 0, "launched_here": 0}
+
+
+def test_many_queued_background_launches_keep_their_retained_prompt_bytes_within_the_budget(project, monkeypatch, tmp_path):
+    """The design's memory promise for rows created THROUGH THE API: launches
+    whose real `on_finish` closures capture 256 KiB prompts keep at most
+    PUBLIC_API_RETAINED_HOOK_BYTES of them reachable, measured by
+    tracemalloc, not only by the runtime's own accounting."""
+    import gc
+    import tracemalloc
+
+    from app.publicapi import capacity
+    from tests.publicapi_fake_engine import FakeMainEngine, set_setting
+
+    runtime = _durable_runtime(monkeypatch, tmp_path)
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", "1")
+    set_setting(monkeypatch, "PUBLIC_API_RETAINED_HOOK_BYTES", str(8 * 1024 * 1024))
+    FakeMainEngine(answer_tokens=3).install(monkeypatch)
+    caller = _caller(project, max_concurrency=10_000)
+    launches, prompt = 300, 256 * 1024
+
+    async def scenario():
+        await runtime.start()
+        try:
+            async with capacity.hold("main.normal"):
+                await asyncio.sleep(0.05)
+                gc.collect()
+                tracemalloc.start()
+                before = tracemalloc.get_traced_memory()[0]
+                for index in range(launches):
+                    text = ("y" * prompt) + str(index)
+                    plan = {"messages": [{"role": "user", "content": text}]}
+
+                    async def on_finish(outcome, _plan=plan):
+                        return None
+
+                    await background.start(_durable_spec(messages=[{"role": "user", "content": text}]),
+                                           caller=caller, on_finish=on_finish)
+                    del text, plan, on_finish
+                gc.collect()
+                grown = tracemalloc.get_traced_memory()[0] - before
+                tracemalloc.stop()
+                accounting = dict(runtime.local_accounting())
+                not_retained = runtime.stats["hooks_not_retained"]
+                for run in list(runtime.runs.values()):
+                    runtime.cancel_local(run.id)
+                return grown, accounting, not_retained
+        finally:
+            await runtime.stop()
+
+    grown, accounting, not_retained = asyncio.run(scenario())
+    total = launches * prompt
+    assert accounting["hook_bytes"] <= 8 * 1024 * 1024
+    assert not_retained >= launches - 40
+    assert grown < 32 * 1024 * 1024, f"traced growth {grown} for {total} bytes of prompts"
+
+
+def test_a_recorder_ref_records_a_background_run_that_another_process_settled(project, monkeypatch, tmp_path):
+    """RecorderRef: the recorder is built at settle time from JSON stored with
+    the spec, so a queued launch keeps no closure AND the process that resumes
+    the job after a deploy records it with the same recorder."""
+    from app.publicapi import capacity, durable, durable_store
+    from tests.publicapi_fake_engine import FakeMainEngine, expected_text, set_setting
+
+    first = _durable_runtime(monkeypatch, tmp_path, owner="test-bg-A")
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", "1")
+    FakeMainEngine(answer_tokens=4).install(monkeypatch)
+    recorded = []
+
+    def factory(args):
+        async def record(row, outcome):
+            recorded.append((dict(args), row["id"], outcome.status, outcome.text))
+        return record
+
+    durable.register_recorder("test.recorder", factory)
+    closure_calls = []
+
+    async def on_finish(outcome):
+        closure_calls.append(outcome.status)
+
+    spec = _durable_spec()
+
+    async def scenario():
+        await first.start()
+        async with capacity.hold("main.normal"):
+            await first.launch(spec, caller=durable.caller_of(_caller(project)), background=True, on_finish=on_finish,
+                               recorder_ref=durable.RecorderRef("test.recorder", {"route": "v1_responses", "n": 7}))
+            await asyncio.sleep(0.2)
+            retained = first.local_accounting()["hooks"]
+            await first.suspend_all("restart")
+            await first.stop()
+        second = durable.Runtime()
+
+        async def allow(keys):
+            return set(keys)
+
+        second.configure(owner="test-bg-B", view=first.view, authoriser=allow, blob_store=first.blob_store)
+        await second.start()
+        try:
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if durable_store.get_run(spec.response_id)["status"] == "completed":
+                    break
+            await asyncio.sleep(0.1)
+        finally:
+            await second.stop()
+        return retained
+
+    retained = asyncio.run(scenario())
+    assert retained == 0
+    assert recorded == [({"route": "v1_responses", "n": 7}, spec.response_id, "completed", expected_text(4))]
+    assert closure_calls == []

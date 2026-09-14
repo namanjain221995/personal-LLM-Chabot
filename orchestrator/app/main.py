@@ -74,6 +74,17 @@ async def lifespan(_app: FastAPI):
     # a process that starts the app more than once (the test client does).
     global _shutting_down
     _shutting_down = False
+    # PHYSICAL GUARDS (no-timeout /v1, 2026-09-13; app/resources.py): Python
+    # never raises its own soft RLIMIT_NOFILE (measured 1024 against a hard
+    # 524288), and with no clock ending a public request every held connection
+    # is a descriptor. First thing, before any socket of this lifespan opens.
+    from . import resources as _resources
+
+    _resources.raise_nofile()
+    # A stale override of a retired /v1 timer is said once, not honoured.
+    from .config import warn_retired_settings
+
+    warn_retired_settings()
     await db.run_in_thread(db.wait_for_database)
     await db.run_in_thread(db.init_schema)
     # Identity baseline: the workspace exists and every user (including the
@@ -134,6 +145,17 @@ async def lifespan(_app: FastAPI):
     from . import engine_state
 
     engine_state.start()
+    # Durable /v1 generations (no-timeout design, revision 2): SIGTERM must
+    # reach them at +0 s — they suspend (flush, release leases, abort their
+    # readers) and the next process resumes them — while uvicorn keeps its
+    # 90 s grace for chat. The signal is CHAINED, never taken from uvicorn
+    # (app/shutdown_signals.py). After engine_state.start(): a resume decision
+    # reads the controller's verdict.
+    from . import shutdown_signals
+
+    durable = _durable_module()
+    shutdown_signals.install(_durable_signal_callback(durable))
+    await _maybe_await(durable.start())
     # A chunked upload left `finalizing` by a process that died mid-complete
     # would otherwise wait forever on a finaliser that no longer exists.
     reset_sessions = await _reset_stale_upload_finalisations()
@@ -191,9 +213,28 @@ async def lifespan(_app: FastAPI):
     api_prune_task = asyncio.get_running_loop().create_task(
         _api_platform_prune_loop(), name="api-platform-prune"
     )
+    # The Files API's durable workers (files-hookup, 2026-09-13): processing
+    # and assembly (`apifiles.jobs`, both lanes), purges and expiry
+    # (`apifiles.retention`), and the upload sweep. After the pool and the
+    # schema, like the webhook loop; their queues are PostgreSQL columns, so a
+    # restart resumes rather than forgets.
+    files_workers = await _start_files_workers()
     try:
         yield
     finally:
+        # FIRST: durable /v1 runs suspend while the pool is still open (their
+        # suspend writes leases and specs). The signal callback normally did
+        # this at SIGTERM; repeating it is idempotent and covers a shutdown
+        # that arrived without a signal (a test client, a lifespan error).
+        try:
+            await _maybe_await(durable.suspend_all("shutdown"))
+        except Exception:  # noqa: BLE001 — shutdown must continue
+            logging.getLogger(__name__).exception("durable suspend_all failed at shutdown")
+        try:
+            await _maybe_await(durable.stop())
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).exception("durable stop failed at shutdown")
+        shutdown_signals.uninstall()
         # Orderly shutdown (a deploy's rolling recreate) is the common way a
         # generation dies. The rows are marked interrupted BEFORE the pool
         # closes so the next process resumes them; the flag makes a worker
@@ -208,6 +249,10 @@ async def lifespan(_app: FastAPI):
             )
         sweep_task.cancel()
         api_prune_task.cancel()
+        # Before the pool closes: a job releases its blob (and an assembly its
+        # lease) to `queued` on the way out, so the next process resumes at
+        # once instead of waiting for a lease to lapse.
+        await _stop_files_workers(files_workers)
         await _stop_webhook_worker(webhook_worker)
         await video_pipeline.stop()
         await artifact_pipeline.stop()
@@ -220,6 +265,40 @@ async def lifespan(_app: FastAPI):
 
         await _rerank.close_rerank_client()
         await db.run_in_thread(db.close_pool)
+
+
+async def _maybe_await(value):
+    """Await `value` when it is awaitable; the durable interface may be sync
+    or async per method, and the lifespan must not care."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _durable_module():
+    """The durable /v1 generation runtime (`app/publicapi/durable.py`):
+    `request_suspend(reason)` (sync, callable from the signal callback on the
+    loop), `start()`, `suspend_all(reason)`, `stop()`.
+
+    WHY (assembler, 2026-09-14): T1's no-op stand-in for a missing module is
+    gone now that T2's module is in the tree. An import failure here is a bug
+    and fails start-up rather than silently disabling resumption. A function,
+    not an import at module scope, so the lifespan test can substitute it."""
+    from .publicapi import durable
+
+    return durable
+
+
+def _durable_signal_callback(durable):
+    """What SIGTERM/SIGINT schedule on the loop: suspend every durable run
+    for a restart. The signal NAME is logged, the reason is always 'restart'
+    (the V36 suspend_reason vocabulary)."""
+
+    def on_signal(name: str) -> None:
+        logging.getLogger(__name__).info("%s received: suspending durable /v1 runs for a restart", name)
+        durable.request_suspend("restart")
+
+    return on_signal
 
 
 def _configure_api_key_pepper() -> None:
@@ -299,6 +378,85 @@ async def _start_webhook_worker():
             exc,
         )
         return None
+
+
+def _limit_core_dumps_for_children() -> bool:
+    """RLIMIT_CORE = 1 for this process and every child it starts.
+
+    Files design §13.5 (2026-09-13): the media lane starts ffmpeg and ffprobe
+    on uploaded files, and a crashing child must not produce a core dump —
+    writing one is slow and none is ever read. 1, not 0: 1 is the value the
+    kernel treats as "no core" for every core handler, matching the compose
+    `ulimits: core: 1` the vLLM services already use. The extraction child
+    sets it itself; this covers the in-process ffmpeg children. Best effort:
+    a hard limit already below 1 is left as it is.
+    """
+    try:
+        import resource
+
+        _soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+        if hard != resource.RLIM_INFINITY and hard < 1:
+            return False
+        resource.setrlimit(resource.RLIMIT_CORE, (1, 1))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "RLIMIT_CORE could not be set for child processes: %s", type(exc).__name__
+        )
+        return False
+
+
+async def _start_files_workers():
+    """Start the Files API workers, or None when they cannot run here.
+
+    Guarded like the webhook loop: `app/apifiles/` is new this wave and must
+    not stop chat from starting. The storage root is created first; when it
+    cannot be (a development box without /data), the workers are NOT started —
+    every job would only fail on the disk — and the ERROR line says so, while
+    the routes answer `503 storage_unavailable` on their own.
+    Returns the three modules that started, for the shutdown half."""
+    log = logging.getLogger(__name__)
+    _limit_core_dumps_for_children()
+    try:
+        from .apifiles import jobs as files_jobs
+        from .apifiles import retention as files_retention
+        from .apifiles import storage as files_storage
+        from .apifiles import uploads_sweep as files_uploads_sweep
+    except Exception as exc:  # noqa: BLE001
+        log.error("the Files API workers were not started: %s", type(exc).__name__)
+        return None
+    try:
+        await db.run_in_thread(files_storage.ensure_dirs)
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "the Files API storage root is unusable (%s); processing, retention and "
+            "the upload sweep are not started",
+            type(exc).__name__,
+        )
+        return None
+    started = []
+    for name, module in (
+        ("processing jobs", files_jobs),
+        ("retention", files_retention),
+        ("upload sweep", files_uploads_sweep),
+    ):
+        try:
+            await module.start()
+            started.append(module)
+        except Exception as exc:  # noqa: BLE001
+            log.error("the Files API %s did not start: %s: %s", name, type(exc).__name__, exc)
+    return started
+
+
+async def _stop_files_workers(started) -> None:
+    """Stop what `_start_files_workers` started, last started first. Never raises."""
+    for module in reversed(list(started or ())):
+        try:
+            await module.stop()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "a Files API worker did not stop cleanly: %s: %s", type(exc).__name__, exc
+            )
 
 
 async def _stop_webhook_worker(worker) -> None:
@@ -578,7 +736,10 @@ def _audio_max_body_bytes() -> int:
 
 
 def _public_api_max_body_bytes() -> int:
-    """CONTRACT-3 §8/§12: 1 MiB on `/v1`, refused BEFORE parsing.
+    """CONTRACT-3 §8/§12: 1 MiB on `/v1`, refused BEFORE parsing — the
+    fallback of `_public_api_body_cap`, whose per-route table (images, audio,
+    and since the Files hookup the file routes' 65/64 MiB) is
+    `publicapi.models.body_cap_for`.
 
     Imported defensively because `app/publicapi/models.py` is another wave's
     file and this module must import cleanly whatever state that wave is in.
@@ -647,7 +808,21 @@ def body_cap_for(method: str, path: str) -> BodyCap:
         return BodyCap("upload", default, _single_shot_upload_max_body_bytes())
     if method == "PUT" and _CHUNKED_PART_PATH_RE.match(path):
         return BodyCap("upload-part", default, _chunked_part_max_body_bytes())
+    if method == "PUT" and _CONSOLE_FILE_PART_PATH_RE.match(path):
+        return BodyCap("console-file-part", default, _CONSOLE_FILE_PART_MAX_BODY_BYTES)
     return BodyCap("default", default, default)
+
+
+#: The developer console's Files tab uploads through the SAME upload handlers
+#: as `/v1`, in 8 MiB parts (`CONSOLE_PART_BYTES` in
+#: frontend/components/devplatform/files-api.ts, which the BFF also enforces).
+#: Exact path, PUT only, and — like every large cap here — only for a caller
+#: whose session resolved (files-hookup, 2026-09-13): without it every console
+#: part over 1 MiB was a 413 before the handler ran.
+_CONSOLE_FILE_PART_PATH_RE = _re.compile(
+    r"^/admin/api/developers/projects/[^/]+/uploads/[^/]+/parts/[^/]+$"
+)
+_CONSOLE_FILE_PART_MAX_BODY_BYTES = 8 * _MIB
 
 
 def body_limit_for_path(path: str, method: str = "POST") -> int:
@@ -747,6 +922,19 @@ class RequestBodySizeLimitMiddleware:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
         path = scope.get("path") or "/"
+        if _is_public_api_path(path) and (scope.get("method") or "GET") != "OPTIONS":
+            # PHYSICAL GUARD (no-timeout /v1, 2026-09-13; app/resources.py):
+            # above PUBLIC_API_FD_GUARD_RATIO of the open-file limit a NEW /v1
+            # request is refused before a byte of its body is read or a
+            # header is sent. Here, in the one middleware every request
+            # crosses, because the stack is pinned (test_publicapi_mount.py)
+            # and chat routes must never see this refusal. A preflight holds
+            # nothing and is left alone.
+            from . import resources as _resources
+
+            if _resources.fd_guard_tripped():
+                response = _fd_pressure_response(scope)
+                return await response(scope, receive, send)
         cap = body_cap_for(scope.get("method") or "GET", path)
         limit = cap.anonymous
         session_checked = cap.signed_in <= cap.anonymous
@@ -921,6 +1109,36 @@ def _too_large_response(scope, limit: int):
     )
 
 
+def _fd_pressure_response(scope):
+    """503 model_unavailable, Retry-After 30, in /v1's envelope."""
+    from fastapi.responses import JSONResponse
+
+    from . import resources as _resources
+
+    request_id, headers = _public_api_decoration(scope)
+    try:
+        from .publicapi import errors as _public_errors
+
+        api_error = _public_errors.model_unavailable(retry_after=_resources.FD_RETRY_AFTER_S)
+        headers.update(api_error.headers())
+        return JSONResponse(status_code=api_error.status, content=api_error.envelope(request_id), headers=headers)
+    except Exception:  # noqa: BLE001 — never fail to refuse
+        headers["Retry-After"] = str(_resources.FD_RETRY_AFTER_S)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": "The model is not available at the moment.",
+                    "type": "service_unavailable_error",
+                    "code": "model_unavailable",
+                    "param": None,
+                    "request_id": request_id,
+                }
+            },
+            headers=headers,
+        )
+
+
 class BrowserCorsExceptPublicApi:
     """`CORSMiddleware` for the chat application, and nothing at all for `/v1`.
 
@@ -1085,37 +1303,76 @@ def _after_recall_cache_write(request: Request) -> None:
     _invalidate_cross_chat_recall(getattr(principal, "user_id", None))
 
 
-@app.middleware("http")
-async def _reject_cross_site_writes(request: Request, call_next):
-    # CONTRACT-3 §3.1 — the ONE exemption. `/v1` is key-authenticated and
-    # cookie-blind: it reads `Authorization` and ignores `Cookie` entirely, so
-    # there is no ambient credential for a hostile page to ride and CSRF does
-    # not apply to it. Leaving it in would not have made anything safer, it
-    # would simply have broken the product: a developer's browser app sends its
-    # OWN origin on every `POST /v1/responses`, so every such call would be 403
-    # before the key was even read — a check that cannot distinguish an attack
-    # from the intended use is not a control.
-    #
-    # This is not a widening of authentication. A `/v1` request still proves
-    # who it is with a key the router resolves (CONTRACT-3 §4), and the
-    # project's own `allowed_origins` list is what decides whether a browser
-    # origin may use that key. Deliberately NOT extended to any other path.
-    if _is_public_api_path(request.url.path):
-        return await call_next(request)
-    if request.method not in ("GET", "HEAD", "OPTIONS"):
+class RejectCrossSiteWrites:
+    """The cross-site write refusal, as plain ASGI.
+
+    CONTRACT-3 §3.1 — the ONE exemption. `/v1` is key-authenticated and
+    cookie-blind: it reads `Authorization` and ignores `Cookie` entirely, so
+    there is no ambient credential for a hostile page to ride and CSRF does
+    not apply to it. Leaving it in would not have made anything safer, it
+    would simply have broken the product: a developer's browser app sends its
+    OWN origin on every `POST /v1/responses`, so every such call would be 403
+    before the key was even read — a check that cannot distinguish an attack
+    from the intended use is not a control.
+
+    This is not a widening of authentication. A `/v1` request still proves
+    who it is with a key the router resolves (CONTRACT-3 §4), and the
+    project's own `allowed_origins` list is what decides whether a browser
+    origin may use that key. Deliberately NOT extended to any other path.
+
+    WHY PLAIN ASGI AND NOT `@app.middleware("http")` (adversarial review of
+    T3-wire, 2026-09-14). That decorator is Starlette's BaseHTTPMiddleware,
+    which re-streams every body through a memory stream and, when the app
+    raises mid-body, ends that stream CLEANLY and re-raises only after the
+    outer response is complete. It was the outermost middleware, so it wrapped
+    `/v1` too: a committed synchronous response aborted after its status line
+    and an SSE stream whose generator raised both reached the caller as a
+    complete 200 (measured on uvicorn: `client_error=None`, where without it
+    the client gets `httpx.RemoteProtocolError`). An SDK then parses a
+    whitespace body as success instead of retrying, and the v1-gateway cannot
+    see the incomplete read it re-attaches on. Pinned through the whole app by
+    tests/test_publicapi_mount.py. Behaviour for every other path is the
+    decorator's: the same 403, and the recall cache invalidated once the route
+    answered 2xx/3xx — at its status line, before the body is sent, as
+    `call_next` returning did.
+    """
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:  # noqa: ANN001
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path") or "/"
+        if _is_public_api_path(path):
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method") or "GET")
+        if method in ("GET", "HEAD", "OPTIONS"):
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope, receive)
         origin = request.headers.get("origin")
         if origin and origin not in _TRUSTED_ORIGINS:
             from fastapi.responses import JSONResponse
 
-            return JSONResponse(
-                status_code=403, content={"detail": "cross-site request refused"}
-            )
-        if _is_recall_cache_write(request.method, request.url.path):
-            response = await call_next(request)
-            if 200 <= response.status_code < 400:
+            refusal = JSONResponse(status_code=403, content={"detail": "cross-site request refused"})
+            await refusal(scope, receive, send)
+            return
+        if not _is_recall_cache_write(method, path):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_after_invalidating(message) -> None:  # noqa: ANN001
+            if message.get("type") == "http.response.start" and 200 <= int(message.get("status") or 0) < 400:
                 _after_recall_cache_write(request)
-            return response
-    return await call_next(request)
+            await send(message)
+
+        await self.app(scope, receive, send_after_invalidating)
+
+
+app.add_middleware(RejectCrossSiteWrites)
 
 
 # F015 (audit 2026-09-12, confirmed P1): a 422 from POST /chat echoed the
@@ -2540,7 +2797,20 @@ async def health() -> dict:
         # the reports volume takes writes — computed by check_dependencies
         # like `work` above, and forwarded for the same reason.
         "artifacts": report.get("artifacts", {}),
+        # Additive (2026-09-13, no-timeout /v1): the open-file limit this
+        # process actually runs with and how close it is to the /v1 guard.
+        # In-memory and cached; `status` is untouched.
+        "resources": _resources_report(),
     }
+
+
+def _resources_report() -> dict:
+    try:
+        from . import resources as _resources
+
+        return _resources.describe()
+    except Exception:  # noqa: BLE001 — /health must answer
+        return {}
 
 
 @app.get("/metrics")

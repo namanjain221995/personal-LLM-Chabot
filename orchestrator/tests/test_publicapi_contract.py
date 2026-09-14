@@ -1259,3 +1259,222 @@ def test_a_full_engine_and_an_outstanding_idempotent_request_are_not_limit_error
     running = public_router._still_running()
     assert (running.code, running.status) == ("idempotency_conflict", 409)
     assert "still running" in running.message and int(running.headers()["Retry-After"]) >= 1
+
+
+# ----------------------------------- §10 the byte invariant (2026-09-13) --
+#
+# No-timeout design, edge_100s: "no generating route awaits capacity before
+# http.response.start". Pinned on the two response classes the generating
+# routes return, at the ASGI boundary, with a capacity gate that records
+# whether the status line had already left when it was entered.
+
+
+class _Wire:
+    def __init__(self) -> None:
+        self.messages = []
+
+    async def send(self, message) -> None:
+        self.messages.append(message)
+
+    @property
+    def started(self) -> bool:
+        return any(m["type"] == "http.response.start" for m in self.messages)
+
+
+async def _no_disconnect():
+    import asyncio
+
+    await asyncio.sleep(3600)
+    return {"type": "http.disconnect"}
+
+
+def test_a_stream_sends_its_status_line_and_first_frame_before_it_enters_any_capacity_gate(monkeypatch):
+    import asyncio
+    import contextlib
+    from types import SimpleNamespace
+
+    from app.apiplatform import quotas
+    from app.publicapi import router as public_router
+
+    monkeypatch.setattr(quotas, "concurrency_slot", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(events, "HEARTBEAT_SECONDS", 0.05)
+    wire = _Wire()
+    seen = {}
+
+    @contextlib.asynccontextmanager
+    async def gate():
+        seen["started_before_gate"] = wire.started
+        seen["frames_before_gate"] = [m.get("body", b"") for m in wire.messages if m["type"] == "http.response.body"]
+        await asyncio.sleep(0.2)  # a busy engine: the body must keep talking meanwhile
+        yield
+
+    async def frames():
+        yield "event: response.created\ndata: {}\n\n"
+        yield "data: token\n\n"
+
+    async def nothing():
+        return None
+
+    async def scenario():
+        request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        stream = public_router._SlotStream(
+            frames(),
+            caller=SimpleNamespace(project_id="p"),
+            request=request,
+            prepare=nothing,
+            on_refused=nothing,
+            on_abandoned=nothing,
+            capacity_for=gate,
+        )
+        scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+        await stream(scope, _no_disconnect, wire.send)
+
+    asyncio.run(scenario())
+    assert seen["started_before_gate"] is True
+    assert b"event: response.created" in b"".join(seen["frames_before_gate"])
+    bodies = b"".join(m.get("body", b"") for m in wire.messages if m["type"] == "http.response.body")
+    assert bodies.count(b": queued") >= 2
+    assert bodies.index(b"data: token") > bodies.index(b": queued")
+
+
+def test_a_synchronous_response_commits_its_status_line_while_its_work_is_still_waiting():
+    import asyncio
+
+    from app.publicapi import keepalive
+
+    wire = _Wire()
+    seen = {}
+
+    async def work():
+        await asyncio.sleep(0.3)  # waiting for capacity, inside the work
+        seen["started_while_waiting"] = wire.started
+        return {"object": "response", "status": "completed"}
+
+    async def scenario():
+        response = keepalive.CommittedJSONResponse(work, commit_s=0.05, heartbeat_s=0.05)
+        await response({"type": "http", "asgi": {"spec_version": "2.3"}}, _no_disconnect, wire.send)
+
+    asyncio.run(scenario())
+    assert seen["started_while_waiting"] is True
+    start = next(m for m in wire.messages if m["type"] == "http.response.start")
+    assert start["status"] == 200
+    body = b"".join(m.get("body", b"") for m in wire.messages if m["type"] == "http.response.body")
+    assert json.loads(body) == {"object": "response", "status": "completed"}
+
+
+def test_no_generating_route_waits_on_the_bounded_gate_or_watches_receive_itself():
+    import inspect
+
+    from app.publicapi import router as public_router
+
+    generate = inspect.getsource(public_router._generate) + inspect.getsource(public_router._run_synchronous)
+    assert "_capacity_gate(" not in generate
+    assert "run_to_completion_watching(" not in generate
+    assert "_patient_gate" in generate
+    assert "keepalive.CommittedJSONResponse" in inspect.getsource(public_router._generate)
+
+
+@pytest.mark.parametrize("chat", [False, True])
+def test_a_capacity_wait_that_fails_inside_a_stream_ends_it_with_one_terminal_and_records_the_failure(
+    monkeypatch, chat
+):
+    import asyncio
+    import contextlib
+    import functools
+    from types import SimpleNamespace
+
+    from app.apiplatform import quotas
+    from app.publicapi import router as public_router, streaming
+
+    monkeypatch.setattr(quotas, "concurrency_slot", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(events, "HEARTBEAT_SECONDS", 0.05)
+    wire = _Wire()
+    recorded = []
+    engine_called = []
+
+    @contextlib.asynccontextmanager
+    async def gate():
+        await asyncio.sleep(0.12)
+        raise errors.model_unavailable(retry_after=30)
+        yield  # pragma: no cover
+
+    spec = streaming.GenerationSpec(
+        response_id="resp_gatefail", model="techsara-35b", messages=[{"role": "user", "content": "hi"}],
+        max_tokens=10, temperature=0.2, created_at=1789300000,
+    )
+
+    async def record(outcome):
+        recorded.append((outcome.status, getattr(outcome.error, "code", None)))
+
+    failure = public_router._GateFailure()
+
+    async def engine_frames():
+        if not chat:
+            yield "event: response.created\ndata: {\"type\": \"response.created\", \"sequence_number\": 1}\n\n"
+        engine_called.append(True)
+        yield "data: never\n\n"
+
+    async def frames():
+        try:
+            async for frame in engine_frames():
+                yield frame
+        finally:
+            await failure.recording(record)(streaming.new_outcome(spec))
+
+    async def nothing():
+        return None
+
+    async def scenario():
+        refusal = (
+            functools.partial(public_router._chat_gate_refusal_frames, completion_id="chatcmpl_x",
+                              model=spec.model, created=spec.created_at, include_usage=False)
+            if chat
+            else functools.partial(public_router._responses_gate_refusal_frames, spec)
+        )
+        stream = public_router._SlotStream(
+            frames(),
+            caller=SimpleNamespace(project_id="p"),
+            request=SimpleNamespace(state=SimpleNamespace(), headers={}),
+            prepare=nothing,
+            on_refused=nothing,
+            # As the router wires it: an unstarted generation is recorded
+            # through the same failure-aware recorder.
+            on_abandoned=functools.partial(public_router._record_abandoned, spec, failure.recording(record)),
+            capacity_for=gate,
+            opener=public_router.OPEN_WITH_PING if chat else public_router.OPEN_WITH_FIRST_FRAME,
+            refusal_frames=refusal,
+            gate_failure=failure,
+        )
+        await stream({"type": "http", "asgi": {"spec_version": "2.3"}}, _no_disconnect, wire.send)
+
+    asyncio.run(scenario())
+    body = b"".join(m.get("body", b"") for m in wire.messages if m["type"] == "http.response.body").decode()
+    assert engine_called == []
+    assert recorded == [("failed", "model_unavailable")]
+    assert body.count(": queued") >= 1
+    if chat:
+        assert body.startswith(": ping\n\n")
+        data = [b for b in body.split("\n\n") if b.startswith("data: ")]
+        assert json.loads(data[0][6:])["error"]["code"] == "model_unavailable"
+        assert data[-1] == "data: [DONE]" and len(data) == 2
+    else:
+        records = events.parse_frames(body)
+        assert [r["event"] for r in records] == ["response.created", "response.failed"]
+        assert [r["data"]["sequence_number"] for r in records] == [1, 2]
+        assert records[1]["data"]["response"]["error"]["code"] == "model_unavailable"
+
+
+def test_x_should_retry_is_sent_only_when_decided_and_survives_a_subclass_that_skips_init():
+    plain = errors.internal_error()
+    assert "x-should-retry" not in plain.headers()
+    assert errors.no_retry(errors.internal_error()).headers() == {"x-should-retry": "false"}
+    retry = errors.model_unavailable(retry_after=30)
+    retry.should_retry = True
+    assert retry.headers() == {"Retry-After": "30", "x-should-retry": "true"}
+
+    class Bare(errors.ApiError):
+        def __init__(self) -> None:  # noqa: D401 - builds itself, like apifiles' pending codes
+            Exception.__init__(self, "x")
+            self.retry_after = None
+
+    assert Bare().headers() == {}

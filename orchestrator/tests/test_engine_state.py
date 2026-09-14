@@ -503,6 +503,25 @@ def test_engine_load_is_the_controllers_sample(clock):
     assert engine_state.engine_load() is None, "a stale sample is no sample"
 
 
+def test_engine_load_carries_the_samples_own_stamp_so_a_frozen_sample_is_visible(clock):
+    """Assembler, 2026-09-14: while /metrics is unavailable the controller
+    keeps publishing its LAST sample with a new generated_at. The sample's own
+    `signals.engine.observed_at` is what tells the /v1 'lost' rule the sample
+    is old; an older controller that omits it adds no key."""
+    controller = _Controller()
+    doc = _doc("DEGRADED")
+    taken = doc["generated_at"] - 120.0
+    doc["signals"]["engine"] = {"requests_running": 0, "requests_waiting": 0, "observed_at": taken}
+    controller.reply = (200, doc)
+    asyncio.run(_poll(controller))
+    load = engine_state.engine_load()
+    assert load["sample_observed_at"] == pytest.approx(taken)
+    assert load["generated_at"] - load["sample_observed_at"] == pytest.approx(120.0)
+    controller.reply = (200, _doc("BUSY"))
+    asyncio.run(_poll(controller))
+    assert "sample_observed_at" not in engine_state.engine_load()
+
+
 def test_controller_url_accepts_the_scripts_base_url_shape():
     from app.config import _controller_state_url
 
@@ -590,3 +609,231 @@ def test_health_reports_a_serving_engine_as_ok(clock, monkeypatch):
     for _ in range(3):
         brk.record_failure("connection", permit=brk.acquire())
     assert health.answer_engine_not_serving().startswith("breaker OPEN (3xconnection")
+
+
+# ---------------------------------------------------------------------------
+# No-timeout /v1 (2026-09-13): proven_not_serving, serving evidence, recovery
+# headroom, wait_not_bad. The public liveness guard must never cut a healthy
+# silent prefill, so unknown — including the controller's own cold start — is
+# never "down".
+# ---------------------------------------------------------------------------
+
+
+def _head(age_s: float, **extra) -> dict:
+    return {"head_container": {"running": True, "started_at": _time.time() - age_s,
+                               "engine_process_alive": True, **extra}}
+
+
+def test_a_controller_cold_start_starting_on_an_old_head_is_unknown_to_the_public_guard(clock):
+    controller = _Controller()
+    controller.reply = (200, _doc("STARTING", primary_ready=False, signals=_head(36_000.0)))
+    asyncio.run(_poll(controller))
+    assert engine_state.proven_not_serving() is None
+    assert engine_state.not_serving_since() is None
+
+
+def test_a_cold_start_timeout_down_on_an_old_head_that_served_is_unknown_not_down(clock):
+    """The 2026-09-13 hazard: the controller restarts during a 30-minute
+    prefill, never sees readiness, and publishes DOWN 'cold start timeout'
+    900 s later on a head that is ten hours old and fine."""
+    controller = _Controller()
+    controller.reply = (200, _doc("BUSY", signals=_head(36_000.0)))
+    asyncio.run(_poll(controller))  # this process saw the head serve
+    controller.reply = (200, _doc(
+        "DOWN", primary_ready=False, signals=_head(36_000.0),
+        reason="cold start timeout: readiness sequence not passed 36000s after container start",
+    ))
+    asyncio.run(_poll(controller))
+    assert engine_state.external_open() == "DOWN", "the breaker's reading is deliberately unchanged"
+    assert engine_state.proven_not_serving() is None
+
+
+def test_a_cold_start_timeout_with_no_evidence_in_this_process_is_taken_as_unknown(clock):
+    controller = _Controller()
+    controller.reply = (200, _doc("DOWN", primary_ready=False, signals=_head(36_000.0),
+                                  reason="cold start timeout: readiness sequence not passed"))
+    asyncio.run(_poll(controller))
+    assert engine_state.serving_evidence_at() is None
+    assert engine_state.proven_not_serving() is None
+
+
+def test_a_cold_start_timeout_on_a_head_this_process_never_saw_serve_is_proven_down(clock):
+    """Evidence older than the head's start: this process watched a NEW head
+    fail its cold start, which is a real failure, not the controller's."""
+    engine_state.note_chunk()  # the previous head served us
+    controller = _Controller()
+    controller.reply = (200, _doc("DOWN", primary_ready=False, signals=_head(1000.0),
+                                  reason="cold start timeout: readiness sequence not passed 1000s after container start"))
+    asyncio.run(_poll(controller))
+    assert engine_state._chunk_wall is not None and engine_state._chunk_wall > _time.time() - 1000.0
+    # note_chunk ran AFTER the head start the document claims (1000 s ago), so
+    # this process has seen THIS head serve: unknown.
+    assert engine_state.proven_not_serving() is None
+    engine_state._chunk_wall = _time.time() - 5000.0
+    assert engine_state.proven_not_serving() == "DOWN"
+
+
+def test_a_controller_restart_starting_on_a_young_head_this_process_saw_serve_is_unknown(clock):
+    """T1 review, 2026-09-14: the controller restarts ten minutes after a
+    recovery, during a silent public prefill. The head is 600 s old (so the
+    document's STARTING counts as real by age) but this process saw it serve
+    after it started: the guard must not cut that prefill 30 s later."""
+    controller = _Controller()
+    controller.reply = (200, _doc("BUSY", signals=_head(600.0)))
+    asyncio.run(_poll(controller))
+    engine_state.note_chunk()
+    controller.reply = (200, _doc("STARTING", primary_ready=False, signals=_head(600.0),
+                                  reason="readiness sequence not passed yet (600s since container start)"))
+    asyncio.run(_poll(controller))
+    assert engine_state.external_open() == "STARTING", "the breaker's reading is unchanged"
+    assert engine_state.proven_not_serving() is None
+    assert engine_state.not_serving_since() is None
+
+
+@pytest.mark.parametrize(
+    "why,engine_alive,incident,evidence_age_s",
+    [
+        ("no evidence in this process", True, None, None),
+        ("evidence older than the head start: a new head", True, None, 900.0),
+        ("an incident", True, {"id": "20260914T100000Z", "category": "head_engine_dead"}, 1.0),
+        ("engine process not reported alive", None, None, 1.0),
+    ],
+)
+def test_a_young_head_starting_stays_proven_without_positive_evidence(clock, why, engine_alive, incident, evidence_age_s):
+    # The head's start is taken NOW, not at collection: in the full suite this
+    # test runs ~15 minutes after collection, and a head "600 s old" at import
+    # was past STARTING_HEAD_AGE_S by then (the first v2 full run failed so).
+    signals = _head(600.0)
+    if engine_alive is None:
+        del signals["head_container"]["engine_process_alive"]
+    if evidence_age_s is not None:
+        engine_state._chunk_wall = _time.time() - evidence_age_s
+    controller = _Controller()
+    controller.reply = (200, _doc("STARTING", primary_ready=False, signals=signals, incident=incident,
+                                  reason="readiness sequence not passed yet"))
+    asyncio.run(_poll(controller))
+    assert engine_state.proven_not_serving() == "STARTING", why
+
+
+@pytest.mark.parametrize(
+    "state,extra",
+    [
+        ("WEDGED", {}),
+        ("RECOVERING", {"incident": {"id": "20260913T100000Z", "category": "worker_rank_dead"}}),
+        ("STARTING", {"incident": {"id": "20260913T100000Z", "category": "head_engine_dead"}}),
+        ("STARTING", {"signals": {"head_container": {"running": True, "started_at": None, "engine_process_alive": False}}}),
+        ("DOWN", {"reason": "head_engine_dead: engine process gone"}),
+        ("DOWN", {"reason": "recovery budget exhausted (3 in 3600s)"}),
+        ("DOWN", {"reason": "cold start timeout: readiness sequence not passed",
+                  "incident": {"id": "20260913T100000Z", "category": "cold_start_timeout"}}),
+    ],
+)
+def test_proven_bad_states_are_non_none_for_the_public_guard(clock, state, extra):
+    controller = _Controller()
+    doc = _doc(state, primary_ready=False)
+    doc.update(extra)
+    controller.reply = (200, doc)
+    asyncio.run(_poll(controller))
+    assert engine_state.proven_not_serving() == state
+    assert engine_state.not_serving_since() == clock.now
+
+
+@pytest.mark.parametrize("state", ["MONITORING_UNKNOWN", "QUEUEING", "READY", "BUSY", "DEGRADED"])
+def test_unknown_and_serving_states_are_never_proven_bad(clock, state):
+    controller = _Controller()
+    controller.reply = (200, _doc(state))
+    asyncio.run(_poll(controller))
+    assert engine_state.proven_not_serving() is None
+
+
+def test_a_stale_bad_verdict_is_unknown_and_an_unknown_read_restarts_the_streak(clock):
+    controller = _Controller()
+    controller.reply = (200, _doc("WEDGED", primary_ready=False))
+    asyncio.run(_poll(controller))
+    started = clock.now
+    clock.now += 10.0
+    asyncio.run(_poll(controller))
+    assert engine_state.not_serving_since() == started, "continuous across two bad polls"
+    controller.error = httpx.ConnectError("refused")
+    clock.now += 20.0  # past stale_after_s: the WEDGED read is no longer fresh
+    asyncio.run(_poll(controller))
+    assert engine_state.proven_not_serving() is None and engine_state.not_serving_since() is None
+    controller.error = None
+    asyncio.run(_poll(controller))
+    assert engine_state.not_serving_since() == clock.now, "the streak restarted after the unknown gap"
+
+
+def test_serving_evidence_is_the_later_of_a_serving_snapshot_and_an_engine_chunk(clock):
+    assert engine_state.serving_evidence_at() is None
+    controller = _Controller()
+    controller.reply = (200, _doc("READY"))
+    asyncio.run(_poll(controller))
+    assert engine_state.serving_evidence_at() == clock.now
+    clock.now += 42.0
+    engine_state.note_chunk()
+    assert engine_state.serving_evidence_at() == clock.now
+    clock.now += 1.0
+    controller.reply = (200, _doc("WEDGED", primary_ready=False))
+    asyncio.run(_poll(controller))
+    assert engine_state.serving_evidence_at() == clock.now - 1.0, "a bad snapshot is not evidence"
+
+
+def test_recovery_headroom_head_start_incident_and_frozen_seconds_are_parsed(clock):
+    controller = _Controller()
+    started = _time.time() - 7200.0
+    controller.reply = (200, _doc(
+        "BUSY",
+        recovery={"in_progress": False, "step": "idle", "attempts_in_window": 1, "budget": 3},
+        incident={"id": "20260913T101010Z"},
+        signals={"head_container": {"running": True, "started_at": started, "engine_process_alive": True},
+                 "engine": {"requests_running": 1, "requests_waiting": 0, "frozen_seconds": 12.5}},
+    ))
+    asyncio.run(_poll(controller))
+    assert engine_state.recovery_headroom() == 2
+    assert engine_state.head_started_at() == pytest.approx(started)
+    assert engine_state.incident_id() == "20260913T101010Z"
+    assert engine_state.frozen_seconds() == 12.5
+    load = engine_state.engine_load()
+    assert load["generated_at"] == pytest.approx(controller.reply[1]["generated_at"])
+    controller.reply = (200, _doc("BUSY", recovery={"attempts_in_window": 5, "budget": 3}))
+    asyncio.run(_poll(controller))
+    assert engine_state.recovery_headroom() == 0, "never below zero"
+    controller.reply = (200, _doc("BUSY"))  # an older controller: no budget published
+    asyncio.run(_poll(controller))
+    assert engine_state.recovery_headroom() is None
+    clock.now += 60.0
+    assert engine_state.head_started_at() is None and engine_state.recovery_headroom() is None
+
+
+def test_wait_not_bad_returns_after_two_polls_without_a_proven_bad_verdict():
+    # Real clock: the wait sleeps.
+    async def run():
+        engine_state._record(engine_state.parse_state_document(
+            _doc("WEDGED", primary_ready=False), observed_at=_time.monotonic()), "")
+        waiter = asyncio.ensure_future(engine_state.wait_not_bad(poll_s=0.02))
+        await asyncio.sleep(0.15)
+        assert not waiter.done(), "proven bad: still waiting"
+        engine_state._record(engine_state.parse_state_document(
+            _doc("MONITORING_UNKNOWN", primary_ready=False), observed_at=_time.monotonic()), "")
+        assert await asyncio.wait_for(waiter, 1.0) is True, "unknown is not bad"
+
+    asyncio.run(run())
+
+
+def test_wait_not_bad_returns_false_when_the_caller_abandons():
+    async def run():
+        engine_state._record(engine_state.parse_state_document(
+            _doc("RECOVERING", primary_ready=False), observed_at=_time.monotonic()), "")
+        gone = asyncio.Event()
+        waiter = asyncio.ensure_future(engine_state.wait_not_bad(gone, poll_s=5.0))
+        await asyncio.sleep(0.05)
+        gone.set()
+        assert await asyncio.wait_for(waiter, 1.0) is False
+
+        flag = {"left": False}
+        waiter = asyncio.ensure_future(engine_state.wait_not_bad(lambda: flag["left"], poll_s=0.02))
+        await asyncio.sleep(0.05)
+        flag["left"] = True
+        assert await asyncio.wait_for(waiter, 1.0) is False
+
+    asyncio.run(run())

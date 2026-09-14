@@ -87,7 +87,9 @@ class _FakeMain:
         self.chat = self
         self.completions = self
 
-    def client(self, base_url, api_key=None, *, read_timeout=None):
+    def client(self, base_url, api_key=None, *, read_timeout=None, **transport):
+        # `transport`: the no-timeout /v1 path asks for `unbounded_read=True`
+        # (llm._client's keep-alive client); the fake serves every shape.
         return self
 
     async def create(self, **request):
@@ -167,12 +169,34 @@ def _document(kilobytes: int) -> str:
     return (sentence * (kilobytes * 1000 // len(sentence) + 1))[: kilobytes * 1000]
 
 
+def _bounded_gate(plan):
+    """The plan's main gate held with the SYNCHRONOUS bound — what
+    `router._capacity_gate(plan)` was when these tests were written (PR #65).
+
+    The router itself no longer holds a bounded gate: since the no-timeout
+    release it waits through `router._patient_gate` (every gate of
+    `capacity.gates_for`, no time limit), which passes the same `work=plan`,
+    so the one accounting pinned here is the one the router uses
+    (`test_the_routers_patient_gate_admits_a_long_answer_once_with_no_bound`).
+    A FINITE caller still exists — the legacy background path and the sidecar
+    routes — and these tests pin the capacity/admission front door for it."""
+    import contextlib
+
+    if not plan.gate_engine:
+        return contextlib.nullcontext()
+    return capacity.hold(
+        plan.gate_engine,
+        weight_tokens=plan.gate_weight_tokens,
+        wait_s=capacity.sync_wait_s(),
+        yield_to_chat=plan.yield_to_chat,
+        work=plan,
+    )
+
+
 async def _public_sync(plan, rid: str, *, engine_tokens: int):
     """router._generate's synchronous shape: the plan's gate, then the
     generation inside it."""
-    from app.publicapi import router as public_router
-
-    async with public_router._capacity_gate(plan):
+    async with _bounded_gate(plan):
         return await streaming.run_to_completion(_spec(plan, rid, max_tokens=engine_tokens))
 
 
@@ -280,10 +304,9 @@ def test_a_gated_answer_is_admitted_once_into_the_long_output_lane_and_given_bac
     seen: List[tuple] = []
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             before_call = (lanes.long_output.active, lanes.ledger.committed, len(lanes.ledger))
             generation = streaming.Generation(_spec(plan, "resp_once", max_tokens=30))
             async for chunk in generation.stream():
@@ -311,11 +334,10 @@ def test_a_gated_answer_whose_generation_never_runs_gives_its_seat_and_charge_ba
     plan = _plan(100_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
         with pytest.raises(RuntimeError):
-            async with public_router._capacity_gate(plan):
+            async with _bounded_gate(plan):
                 assert lanes.long_output.active == 1
                 raise RuntimeError("the row could not be written")
         return lanes.long_output.active, lanes.ledger.committed, capacity.snapshot()["main.extended"]["in_flight"]
@@ -330,16 +352,15 @@ def test_the_third_long_answer_is_a_real_503_before_the_status_line_after_the_se
     plan = _plan(100_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         holders = []
         for _ in range(2):
-            gate = public_router._capacity_gate(plan)
+            gate = _bounded_gate(plan)
             await gate.__aenter__()
             holders.append(gate)
         started = time.monotonic()
         with pytest.raises(errors.ApiError) as refused:
-            async with public_router._capacity_gate(plan):
+            async with _bounded_gate(plan):
                 pass
         waited = time.monotonic() - started
         snap = capacity.snapshot()["main.extended"]
@@ -355,15 +376,56 @@ def test_the_third_long_answer_is_a_real_503_before_the_status_line_after_the_se
     assert after == 0
 
 
+def test_the_routers_patient_gate_admits_a_long_answer_once_with_no_bound(fake_main):
+    """The router's own gate since the no-timeout release, merged with PR #65's
+    one accounting (2026-09-14): `router._patient_gate` takes `main.extended`
+    — which pre-admits the answer into LONG_OUTPUT, patiently, because the
+    router passes no wait_s — then `main.normal`. Two answers fill the
+    LONG_OUTPUT seats; a third WAITS past the synchronous bound instead of the
+    503 above, and is admitted into the seat the first one gives back."""
+    from app.publicapi import router as public_router
+
+    plan = _plan(100_000)
+
+    async def scenario():
+        lanes = admission.lanes()
+        holders = []
+        for _ in range(2):
+            gate = public_router._patient_gate(plan)
+            await gate.__aenter__()
+            holders.append(gate)
+        inside = (lanes.long_output.active, capacity.snapshot()["main.normal"]["in_flight"])
+
+        async def third():
+            async with public_router._patient_gate(plan):
+                return lanes.long_output.active, capacity.snapshot()["main.normal"]["in_flight"]
+
+        task = asyncio.create_task(third())
+        await asyncio.sleep(1.2)  # more than twice the 0.5 s synchronous bound
+        still_waiting = not task.done()
+        await holders[0].__aexit__(None, None, None)
+        async with asyncio.timeout(5):
+            third_inside = await task
+        await holders[1].__aexit__(None, None, None)
+        return inside, still_waiting, third_inside, (
+            lanes.long_output.active, lanes.ledger.committed, capacity.snapshot()["main.normal"]["in_flight"],
+        )
+
+    inside, still_waiting, third_inside, after = asyncio.run(scenario())
+    assert inside == (2, 2)
+    assert still_waiting is True
+    assert third_inside == (2, 2)
+    assert after == (0, 0, 0)
+
+
 def test_a_background_cancel_while_waiting_for_the_lane_leaves_no_ticket_behind():
     plan = _plan(100_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         holders = []
         for _ in range(2):
-            gate = public_router._capacity_gate(plan)
+            gate = _bounded_gate(plan)
             await gate.__aenter__()
             holders.append(gate)
         gone = asyncio.Event()
@@ -395,10 +457,9 @@ def test_a_long_prompt_is_not_pre_admitted_the_long_lane_accounts_it_at_the_call
     seen: List[tuple] = []
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             in_gate = (lanes.long_output.active, lanes.ledger.committed)
             generation = streaming.Generation(_spec(plan, "resp_longprompt", max_tokens=5))
             async for chunk in generation.stream():
@@ -665,10 +726,9 @@ def test_at_800k_and_below_the_second_answer_is_admissions_kv_decision_not_a_pub
     assert plan.gate_engine == "main.extended"
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        first = public_router._capacity_gate(plan)
+        first = _bounded_gate(plan)
         await first.__aenter__()
         charge = lanes.ledger.committed
         pool = kv_budget.cached()
@@ -676,7 +736,7 @@ def test_at_800k_and_below_the_second_answer_is_admissions_kv_decision_not_a_pub
         if "managed_limit_tokens" in inspect.getsource(admission):  # does THIS admission bound all commits?
             limits.append(kv_budget.managed_limit_tokens(pool))
         expected = 2 if 2 * charge <= min(limits) else 1
-        second = public_router._capacity_gate(plan)
+        second = _bounded_gate(plan)
         try:
             await second.__aenter__()
             admitted = True
@@ -699,17 +759,16 @@ def test_at_the_default_reserve_a_second_800k_answer_waits_for_kv_not_for_a_publ
     plan = _plan(800_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
-        first = public_router._capacity_gate(plan)
+        first = _bounded_gate(plan)
         await first.__aenter__()
         with pytest.raises(errors.ApiError):
-            async with public_router._capacity_gate(plan):
+            async with _bounded_gate(plan):
                 pass
         lanes = admission.lanes()
         state = (lanes.long_output.active, lanes.long_output.waiting)
         # A 100k answer still fits beside it (806,960 + 213,792 <= 1,081,080).
-        async with public_router._capacity_gate(_plan(100_000)):
+        async with _bounded_gate(_plan(100_000)):
             beside = lanes.long_output.active
         await first.__aexit__(None, None, None)
         return state, beside
@@ -769,10 +828,9 @@ def test_a_retry_after_a_recoverable_engine_error_is_admitted_into_long_output_a
     assert plan.gate_engine == "main.extended"
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             task = asyncio.ensure_future(streaming.run_to_completion(_spec(plan, "resp_retry", max_tokens=400)))
             deadline = time.monotonic() + 3
             while not flaky_main.running and time.monotonic() < deadline:
@@ -796,12 +854,11 @@ def test_retried_long_answers_never_run_beyond_the_long_output_seats(flaky_main)
     plan = _plan(300_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         gates, tasks, refused = [], [], 0
         for i in range(3):
             flaky_main.fail_left = 1
-            gate = public_router._capacity_gate(plan)
+            gate = _bounded_gate(plan)
             try:
                 await gate.__aenter__()
             except errors.ApiError:
@@ -833,10 +890,9 @@ def test_a_gated_answer_with_a_long_prompt_is_kv_charged_for_its_prompt_and_its_
     assert plan.gate_engine == "main.extended"
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             task = asyncio.ensure_future(streaming.run_to_completion(_spec(plan, "resp_longkv", max_tokens=400)))
             deadline = time.monotonic() + 3
             while not fake_main.running and time.monotonic() < deadline:
@@ -948,10 +1004,9 @@ def test_a_call_in_another_context_never_uses_or_releases_a_ticket_a_generation_
         return _Held()
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             ticket = admission._preadmitted.get()
             gen = asyncio.ensure_future(streaming.run_to_completion(_spec(plan, "resp_claim", max_tokens=5_000)))
             deadline = time.monotonic() + 3
@@ -1077,10 +1132,9 @@ def test_a_chat_document_beside_a_decoding_public_1m_answer_follows_the_owner_po
     assert plan.gate_engine == "main.long"
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             job = asyncio.ensure_future(streaming.run_to_completion(_spec(plan, "resp_1m", max_tokens=100_000)))
             deadline = time.monotonic() + 3
             while not lanes.long_output.decoding and time.monotonic() < deadline:
@@ -1114,10 +1168,9 @@ def test_after_a_refused_chat_document_new_public_long_answers_are_held_until_a_
     document = [{"role": "user", "content": _document(430)}]
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        gate = public_router._capacity_gate(answer)
+        gate = _bounded_gate(answer)
         await gate.__aenter__()
         job = asyncio.ensure_future(streaming.run_to_completion(_spec(answer, "resp_job", max_tokens=100_000)))
         deadline = time.monotonic() + 3
@@ -1125,7 +1178,7 @@ def test_after_a_refused_chat_document_new_public_long_answers_are_held_until_a_
             await asyncio.sleep(0.01)
         refused = await _chat_document_outcome(document)
         with pytest.raises(errors.ApiError) as next_job:
-            async with public_router._capacity_gate(answer):
+            async with _bounded_gate(answer):
                 pass
         job.cancel()
         await asyncio.gather(job, return_exceptions=True)
@@ -1133,7 +1186,7 @@ def test_after_a_refused_chat_document_new_public_long_answers_are_held_until_a_
         held_after_job = lanes.v1_long_output_held()
         retried = await _chat_document_outcome(document)
         held_after_document = lanes.v1_long_output_held()
-        async with public_router._capacity_gate(answer):
+        async with _bounded_gate(answer):
             admitted = lanes.long_output.active
         return refused, next_job.value, held_after_job, retried, held_after_document, admitted
 
@@ -1153,10 +1206,9 @@ def test_the_hold_is_bounded_and_zero_turns_it_off(fake_main, monkeypatch, hold)
     answer = _plan(100_000)
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(answer):
+        async with _bounded_gate(answer):
             job = asyncio.ensure_future(streaming.run_to_completion(_spec(answer, "resp_h", max_tokens=100_000)))
             deadline = time.monotonic() + 3
             while not lanes.long_output.decoding and time.monotonic() < deadline:
@@ -1184,10 +1236,9 @@ def test_proceed_still_refuses_a_document_the_managed_limit_cannot_hold(fake_mai
     small = [{"role": "user", "content": "Write a long essay."}]
 
     async def scenario():
-        from app.publicapi import router as public_router
 
         lanes = admission.lanes()
-        async with public_router._capacity_gate(plan):
+        async with _bounded_gate(plan):
             job = asyncio.ensure_future(streaming.run_to_completion(_spec(plan, "resp_limit", max_tokens=100_000)))
             deadline = time.monotonic() + 3
             while not lanes.long_output.decoding and time.monotonic() < deadline:

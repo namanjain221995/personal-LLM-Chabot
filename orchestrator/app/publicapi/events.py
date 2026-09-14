@@ -114,7 +114,14 @@ _REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA,)
 #: SSE_HEARTBEAT_SECONDS, which an operator may set HIGHER for the chat app;
 #: the public contract is a promise to third parties, so it is capped here
 #: rather than inherited.
-HEARTBEAT_SECONDS: float = min(float(_chat_sse.HEARTBEAT_SECONDS), 15.0)
+#:
+#: Capped at 14, not 15 (2026-09-13, T3-wire). The promise is about the gap a
+#: CLIENT measures, and a 15 s timer is a 15 s floor: the real-time proof of
+#: the no-timeout wave measured 15.08 s between bytes of a silent stream with
+#: the cap at 15. One second of margin keeps a late timer, a busy loop and a
+#: relay hop inside the promise; a heartbeat is five bytes.
+HEARTBEAT_CEILING_S = 14.0
+HEARTBEAT_SECONDS: float = min(float(_chat_sse.HEARTBEAT_SECONDS), HEARTBEAT_CEILING_S)
 
 #: The literal last line of a Chat Completions stream. Reserved for that
 #: surface: an OpenAI-derived client reading `/v1/responses` waits for
@@ -156,6 +163,39 @@ class SequencedEvents:
         self._terminal: Optional[str] = None
         self._emitted: list[str] = []
         self.item_id = item_id or new_item_id()
+
+    @classmethod
+    def resume_from(
+        cls,
+        sequence_number: int,
+        last_event: str,
+        *,
+        item_id: Optional[str] = None,
+    ) -> "SequencedEvents":
+        """An emitter that continues a stream somebody else started.
+
+        WHY (2026-09-13, no-timeout design). A stream's opening frames are not
+        always framed by the object that must frame its end: the router sends
+        `response.created` from the generation's own emitter, then waits for
+        capacity in the body, and a refusal there has to be the NEXT event —
+        numbered after `created`, never a second opener. The same holds for a
+        re-attach that replays up to N and continues live. The grammar checks
+        (forward-only ranks, one terminal) apply from `last_event` exactly as
+        if this object had emitted everything before it.
+        """
+        number = int(sequence_number)
+        if number < 1:
+            raise StreamProtocolError("a stream can only be resumed after at least one event")
+        if last_event not in EVENT_NAMES:
+            raise StreamProtocolError(f"unknown public API event: {last_event!r}")
+        if last_event in TERMINAL_EVENTS:
+            raise StreamProtocolError(
+                f"a stream that ended with {last_event!r} cannot be resumed (CONTRACT §10)"
+            )
+        emitter = cls(item_id=item_id)
+        emitter._sequence = number
+        emitter._emitted = [last_event]
+        return emitter
 
     # -- state ------------------------------------------------------------
 
@@ -327,6 +367,40 @@ class SequencedEvents:
         including before the first event, and is dropped by every conforming
         parser."""
         return _chat_sse.sse_comment(note)
+
+
+#: Field names this API never writes (2026-09-13, no-timeout design
+#: sdk_and_docs): an `id:` line followed by a comment breaks openai-python's
+#: SSE decoder (measured), and a `retry:` line would hand a browser client a
+#: reconnect policy that bypasses the documented resume loop. Sequence numbers
+#: travel in the JSON only.
+RESERVED_FIELDS: Tuple[str, ...] = ("id", "retry")
+
+#: The note a stream sends while it waits for capacity (no-timeout design,
+#: edge_100s 1): a comment, so it costs no sequence number and every parser
+#: drops it, but a person reading the raw stream sees why nothing is arriving.
+QUEUED_NOTE = "queued"
+
+
+def queued_comment() -> str:
+    """`: queued`, one complete comment frame."""
+    return _chat_sse.sse_comment(QUEUED_NOTE)
+
+
+def reserved_field_lines(stream: str) -> list[str]:
+    """Every line of `stream` that sets a reserved SSE field (`id`, `retry`).
+
+    Empty for everything this module frames — the event name and the JSON are
+    the only fields, and `json.dumps` escapes a newline inside a string — and
+    used by the tests that prove it stays that way on every route."""
+    found = []
+    for line in str(stream).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line or line.startswith(":"):
+            continue
+        field = line.split(":", 1)[0]
+        if field in RESERVED_FIELDS:
+            found.append(line)
+    return found
 
 
 def parse_frames(stream: str) -> list[Dict[str, Any]]:

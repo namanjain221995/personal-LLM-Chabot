@@ -90,7 +90,9 @@ class _FakeMain:
         self.chat = self
         self.completions = self
 
-    def client(self, base_url, api_key=None, *, read_timeout=None):
+    def client(self, base_url, api_key=None, **options):
+        # Whatever client options llm.py passes (T1 adds `unbounded_read` and
+        # `transport` for the public path's no-read-timeout client).
         return self
 
     async def create(self, **request):
@@ -160,12 +162,14 @@ def _spec(plan, rid: str, **overrides):
 
 
 async def _public_sync(plan, rid: str, *, engine_tokens: int):
-    """The synchronous shape of router._generate: the plan's gate (waiting up
-    to PUBLIC_API_GATE_WAIT_S) around the generation."""
+    """The synchronous shape of router._run_synchronous (T3-wire, 2026-09-14):
+    every gate `capacity.gates_for` names, held with no deadline, around a
+    generation that waits in the admission lanes as a patient request."""
     from app.publicapi import router as public_router
 
-    async with public_router._capacity_gate(plan):
-        return await streaming.run_to_completion(_spec(plan, rid, max_tokens=engine_tokens))
+    async with public_router._patient_gate(plan):
+        with public_router.patient_admission():
+            return await streaming.run_to_completion(_spec(plan, rid, max_tokens=engine_tokens))
 
 
 async def _chat_first_token(messages, *, max_tokens=5) -> float:
@@ -263,10 +267,10 @@ def test_ten_public_long_answers_cannot_take_the_chat_apps_normal_slots(fake_mai
     """The review's M1, scaled: ten public requests with 130,000-token
     ceilings (each a ~22-minute hold in production; 20 s here), then a chat
     turn. Before the fix all ten took NORMAL slots and the chat turn was
-    refused after the (scaled) admission wait. Now two run, eight are refused
-    at the public gate, and the chat turn gets its first token at once."""
+    refused after the (scaled) admission wait. Now two run, the other eight
+    WAIT at the public gate — no /v1 wait ends on a clock (no-timeout design,
+    2026-09-13) — and the chat turn gets its first token at once."""
     monkeypatch.setattr(settings, "admission_normal_wait_s", 2.0)
-    monkeypatch.setattr(settings, "public_api_gate_wait_s", 0.2, raising=False)
     plan = _plan(130_000)
 
     async def scenario():
@@ -279,16 +283,17 @@ def test_ten_public_long_answers_cannot_take_the_chat_apps_normal_slots(fake_mai
             first = await asyncio.wait_for(
                 _chat_first_token([{"role": "user", "content": "hello"}]), 10
             )
-            refused = [t for t in public if t.done() and isinstance(t.exception(), errors.ApiError)]
-            return normal, first, len(refused)
+            waiting = capacity.snapshot()["main.extended"]["waiting"]
+            ended = [t for t in public if t.done()]
+            return normal, first, waiting, len(ended)
         finally:
             for task in public:
                 task.cancel()
             await asyncio.gather(*public, return_exceptions=True)
 
-    normal, first, refused = asyncio.run(scenario())
+    normal, first, waiting, ended = asyncio.run(scenario())
     assert normal["active"] <= 2, normal
-    assert refused == 8
+    assert waiting == 8 and ended == 0
     assert first < 1.0
 
 

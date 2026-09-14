@@ -22,16 +22,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import re
 import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextvars import ContextVar
-from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Callable, List, Optional, Sequence, Tuple
 
 from . import admission as _admission
 from . import breaker as _breaker
-from . import context, metrics
+from . import context, engine_state, metrics
 from .config import settings
 from .context import clip_message_contents
 from .model_capabilities import ModelCapabilities, ReasoningField
@@ -298,6 +299,7 @@ async def _fit(
     requested_max_tokens: Optional[int] = None,
     what: str,
     recovery_s: Optional[float] = None,
+    continuation: bool = False,
 ) -> Tuple[List[dict], int]:
     """`context.fit_request`, behind the breaker.
 
@@ -312,12 +314,182 @@ async def _fit(
     """
     if _is_primary(base_url) and not _breaker.main_allows():
         await wait_admitted(what=what, base_url=base_url, recovery_s=recovery_s)
+    if continuation:
+        return await _fit_continuation(
+            messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
+        )
     return await context.fit_request(
         messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
     )
 
 
-async def _primary_send(client, request: dict, *, what: str, base_url: str, stream: bool = False):
+class ContinuationRoomExhausted(RuntimeError):
+    """A continuation (`continue_final_message`) has too little room left in
+    the window to write MIN_OUTPUT_TOKENS more.
+
+    WHY AN EXCEPTION AND NOT A TRIM (no-timeout /v1, 2026-09-13). `fit_request`
+    makes room by dropping old turns and clipping the longest message. On a
+    resumed generation the longest message is the answer being extended, and
+    clipping it would send the engine a DIFFERENT prefix than the one the
+    client has already received — the resumed text would no longer extend
+    what was streamed. So a continuation is never trimmed: when it does not
+    fit, the caller (publicapi durable runs) settles the response as an
+    output-limit stop (`finish_reason` length) instead of failing it.
+    `room` is the completion budget that was left (window − prompt − margin,
+    floored at 0).
+    """
+
+    def __init__(self, room: int) -> None:
+        self.room = max(0, int(room))
+        super().__init__(f"continuation has {self.room} token(s) of room, below the minimum")
+
+
+#: /tokenize attempts for a continuation whose first count fell back to the
+#: estimate, and the pause before each retry (T1 review, 2026-09-14). Module
+#: constants: the timeout that matters is PUBLIC_API_CONTINUATION_TOKENIZE_TIMEOUT_S.
+_CONTINUATION_TOKENIZE_RETRIES = 2
+_CONTINUATION_TOKENIZE_BACKOFF_S = (1.0, 4.0)
+
+#: Did the last `_fit_continuation` in this task size on the character
+#: ESTIMATE rather than an exact /tokenize count? `stream_chat_events` then
+#: lets the engine size a request that its guessed max_tokens got refused.
+_continuation_estimated: ContextVar[bool] = ContextVar("_continuation_estimated", default=False)
+
+
+#: What the pinned vLLM says when a request's prompt plus max_tokens does not
+#: fit the window (renderers/params.py "This model's maximum context length is
+#: …", serve/utils/api_utils.py "… exceeds model's maximum context length",
+#: and "'max_tokens' … is too large"). Only such a refusal is re-sent with
+#: the engine sizing it: a 400 for anything else, re-sent without max_tokens,
+#: could be accepted and write past the caller's ceiling.
+_SIZE_REFUSAL = re.compile(r"context length|max_tokens|max_completion_tokens|too large", re.IGNORECASE)
+
+
+def _is_size_refusal(exc: BaseException) -> bool:
+    body = getattr(exc, "body", None)
+    text = f"{exc} {body if body is not None else ''}"
+    return bool(_SIZE_REFUSAL.search(text))
+
+
+def continuation_tokenize_timeout_s() -> float:
+    """PUBLIC_API_CONTINUATION_TOKENIZE_TIMEOUT_S (120 s)."""
+    return max(1.0, float(getattr(settings, "public_api_continuation_tokenize_timeout_s", 120.0) or 120.0))
+
+
+async def _count_continuation_patiently(
+    base_url: str, model: str, messages: Sequence[dict]
+) -> Tuple[Optional[int], Optional[int]]:
+    """Retry an exact /tokenize count for a continuation with the long
+    timeout. (count, max_model_len) when one succeeds, (None, None) when none
+    does. A 4xx is conclusive — the tokenizer cannot count this payload (a
+    multimodal one, say) — and is not retried; a timeout, a transport error
+    or a 5xx is."""
+    import httpx
+
+    payload = {"model": model, "messages": normalize_system(list(messages))}
+    url = f"{context.service_root(base_url)}/tokenize"
+    timeout = httpx.Timeout(continuation_tokenize_timeout_s())
+    for attempt in range(_CONTINUATION_TOKENIZE_RETRIES):
+        if attempt < len(_CONTINUATION_TOKENIZE_BACKOFF_S):
+            await asyncio.sleep(_CONTINUATION_TOKENIZE_BACKOFF_S[attempt])
+        try:
+            resp = await context._tokenize_client().post(url, json=payload, timeout=timeout)
+            resp.raise_for_status()
+            data = await context._tokenize_json(resp)
+            count = int(data["count"])
+            window = data.get("max_model_len")
+            window = int(window) if window else None
+            if window:
+                context._window_cache[base_url] = window
+            return count, window
+        except httpx.HTTPStatusError as exc:
+            status = getattr(exc.response, "status_code", 0) or 0
+            log.warning("continuation /tokenize attempt %d answered %s", attempt + 1, status)
+            if 400 <= int(status) < 500:
+                break
+        except Exception as exc:  # noqa: BLE001 — every other failure is worth one more try
+            log.warning("continuation /tokenize attempt %d failed: %s", attempt + 1, type(exc).__name__)
+    return None, None
+
+
+async def _fit_continuation(
+    messages: Sequence[dict],
+    *,
+    base_url: str,
+    model: str,
+    requested_max_tokens: Optional[int],
+) -> Tuple[List[dict], int]:
+    """Size a continuation WITHOUT changing a byte of it (see
+    ContinuationRoomExhausted). Same arithmetic as `context.fit_request`, and
+    the same `_measured` record so the admission lane does not ask /tokenize a
+    second time for the identical messages.
+
+    ONLY AN EXACT COUNT MAY END A RUN (T1 review, 2026-09-14). `count_tokens`
+    falls back to the three-characters-per-token estimate on any /tokenize
+    failure — TOKENIZE_TIMEOUT is 5 s, which a 700K-token continuation can
+    outrun — and the estimate said 1,050,015 tokens (room 0) for text the real
+    Qwen3.6 tokenizer counts at 700,001: the run was settled `length` with
+    ~300K tokens of room left. So an inexact count is retried with
+    PUBLIC_API_CONTINUATION_TOKENIZE_TIMEOUT_S, and ContinuationRoomExhausted
+    is raised only on an exact count. When no exact count can be had, the
+    request goes out with the caller's ceiling (at most the window less the
+    margin) and `_continuation_estimated` set: an engine refusal of that size
+    is answered by `stream_chat_events` once more with max_tokens left to the
+    engine, which sizes it to the room it actually has — a prompt with no room
+    at all is then refused by the engine and fails, it is never settled as a
+    length stop on a guess."""
+    window = await context.model_window(base_url, model)
+    margin = int(settings.context_safety_margin)
+    ceiling = requested_max_tokens or settings.model_max_output
+    msgs = list(messages)
+    context._last_count_exact.set(False)
+    _continuation_estimated.set(False)
+    prompt_tokens, served_window = await context.count_tokens(base_url, model, msgs)
+    exact = bool(context._last_count_exact.get())
+    if not exact:
+        counted, counted_window = await _count_continuation_patiently(base_url, model, msgs)
+        if counted is not None:
+            prompt_tokens, served_window, exact = counted, counted_window or served_window, True
+            context._last_count_exact.set(True)
+    if served_window:
+        window = served_window
+    context._measured.set((msgs, base_url, int(prompt_tokens)) if exact else None)
+    budget = int(window) - int(prompt_tokens) - margin
+    if exact:
+        if budget < context.MIN_OUTPUT_TOKENS:
+            raise ContinuationRoomExhausted(budget)
+        return msgs, max(1, min(int(ceiling), budget))
+    _continuation_estimated.set(True)
+    sent = max(1, min(int(ceiling), int(window) - margin))
+    metrics.inc("llm_continuation_sized_on_estimate_total",
+                "Continuations sent without an exact /tokenize count (the engine sizes them).")
+    log.warning("continuation sized without an exact count (estimate %d tokens, window %d): sending "
+                "max_tokens=%d and letting the engine size a refusal", int(prompt_tokens), int(window), sent)
+    return msgs, sent
+
+
+def _fire_dispatch(on_dispatch: Optional[Callable[[], None]]) -> None:
+    """Call a caller's dispatch hook; a hook that raises must never fail the
+    request it observes."""
+    if on_dispatch is None:
+        return
+    try:
+        on_dispatch()
+    except Exception:  # noqa: BLE001 — observation only
+        log.warning("llm on_dispatch hook raised; ignored", exc_info=True)
+
+
+async def _primary_send(
+    client,
+    request: dict,
+    *,
+    what: str,
+    base_url: str,
+    stream: bool = False,
+    on_dispatch: Optional[Callable[[], None]] = None,
+    patient: Optional[bool] = None,
+    run_id: Optional[str] = None,
+):
     """THE choke point for a call to the main model (module header).
 
     Per attempt, in order: the breaker (inside `resilient`, before anything
@@ -329,19 +501,26 @@ async def _primary_send(client, request: dict, *, what: str, base_url: str, stre
     """
 
     def create():
+        # DISPATCHED (no-timeout /v1, 2026-09-13): past the breaker and the
+        # admission lane, the request is being written to the engine now. A
+        # public liveness guard measures silence from here, never from before
+        # a wait it did not cause. Fired per attempt: a resilient re-open is a
+        # new dispatch.
+        _fire_dispatch(on_dispatch)
         return client.chat.completions.create(**request)
 
     if _is_primary(base_url):
         op = lambda: _admission.run(  # noqa: E731 — a named closure reads worse here
             create, messages=request.get("messages") or [], base_url=base_url,
             model=str(request.get("model") or settings.llm_model), stream=stream,
+            patient=patient, run_id=run_id,
         )
     else:
         op = create
     return await resilient(op, what=what, base_url=base_url, stream=stream)
 
 
-async def _open_stream(client, request: dict):
+async def _open_stream(client, request: dict, **send: Any):
     """Open a streamed completion, asking for usage when the server allows it.
 
     `stream_options` is an OpenAI-API extension. A server that does not know
@@ -364,11 +543,11 @@ async def _open_stream(client, request: dict):
             log.info("asking for stream_options.include_usage again after %.0fs", _USAGE_RETRY_S)
     if not _ASK_FOR_USAGE["enabled"]:
         request.pop("stream_options", None)
-        return await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
+        return await _primary_send(client, request, what="stream", base_url=base_url, stream=True, **send)
     ask = dict(request)
     ask["stream_options"] = {"include_usage": True}
     try:
-        return await _primary_send(client, ask, what="stream", base_url=base_url, stream=True)
+        return await _primary_send(client, ask, what="stream", base_url=base_url, stream=True, **send)
     except _bad_request_error() as exc:
         # ONLY a 400 can mean "the server does not know this option". Until
         # 2026-09-11 this caught every exception, so the first streamed call
@@ -385,7 +564,7 @@ async def _open_stream(client, request: dict):
         # option first: if THAT is refused too, the request itself was bad,
         # its 400 propagates, and measurement stays on for everyone else.
         request.pop("stream_options", None)
-        opened = await _primary_send(client, request, what="stream", base_url=base_url, stream=True)
+        opened = await _primary_send(client, request, what="stream", base_url=base_url, stream=True, **send)
         if _ASK_FOR_USAGE["enabled"]:
             _ASK_FOR_USAGE["enabled"] = False
             _ASK_FOR_USAGE["disabled_at"] = time.monotonic()
@@ -495,6 +674,34 @@ def normalize_system(messages: Sequence[dict]) -> List[dict]:
 #: by it; recency makes a client in active use the last candidate.
 _CLIENTS: "OrderedDict[tuple, Any]" = OrderedDict()
 _CLIENT_CACHE_MAX = 64
+
+#: The two transport kinds a cached client can have. KEEPALIVE (no-timeout
+#: /v1, 2026-09-13) is for a call with NO read timeout: a 30-minute silent
+#: prefill is legitimate, so silence cannot mean death — but a peer that
+#: vanished without a FIN (a host reboot, a dropped route) would then hold the
+#: stream forever. TCP keepalive answers that from the kernel: idle 60 s, then
+#: a probe every 15 s, 4 unanswered probes → the socket errors, about 2 min.
+#: A healthy engine ACKs the probes whether or not it is producing tokens, so
+#: a silent prefill is never cut by it.
+TRANSPORT_DEFAULT = "default"
+TRANSPORT_KEEPALIVE = "keepalive"
+KEEPALIVE_IDLE_S = 60
+KEEPALIVE_INTERVAL_S = 15
+KEEPALIVE_PROBES = 4
+
+
+def keepalive_socket_options() -> List[Tuple[int, int, int]]:
+    """The socket options of the KEEPALIVE transport, for the platforms
+    that have them (TCP_KEEPIDLE is Linux; the container is Linux)."""
+    import socket
+
+    opts: List[Tuple[int, int, int]] = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    for name, value in (("TCP_KEEPIDLE", KEEPALIVE_IDLE_S), ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+                        ("TCP_KEEPCNT", KEEPALIVE_PROBES)):
+        const = getattr(socket, name, None)
+        if const is not None:
+            opts.append((socket.IPPROTO_TCP, const, int(value)))
+    return opts
 #: Close tasks in flight, held so the loop cannot collect one half-way.
 _CLOSING: set = set()
 
@@ -519,21 +726,82 @@ def _schedule_close(closer, loop_key) -> None:
     task.add_done_callback(_CLOSING.discard)
 
 
-def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optional[float] = None):
+def _openai_httpx_module():
+    """The httpx package (`httpx` or `httpx2`) that openai's HTTP client class
+    derives from, so a custom transport is one that client accepts."""
+    import importlib
+
+    from openai import DefaultAsyncHttpxClient
+
+    for cls in DefaultAsyncHttpxClient.__mro__[1:]:
+        root = (getattr(cls, "__module__", "") or "").split(".")[0]
+        if root.startswith("httpx"):
+            return importlib.import_module(root)
+    import httpx
+
+    return httpx
+
+
+def _client(
+    base_url: str,
+    api_key: Optional[str] = None,
+    *,
+    read_timeout: Optional[float] = None,
+    unbounded_read: bool = False,
+    transport: str = TRANSPORT_DEFAULT,
+):
+    """The cached client for (loop, endpoint, key, read timeout, transport).
+
+    `read_timeout=None` keeps its historical meaning, LLM_REQUEST_TIMEOUT;
+    `unbounded_read=True` means NO read timeout (no-timeout /v1), and always
+    comes with the KEEPALIVE transport — an unbounded read on a socket that
+    cannot detect a vanished peer is a leak, not a feature."""
     import httpx
     from openai import AsyncOpenAI  # cheap, but keep out of module import path
 
-    read = float(read_timeout if read_timeout is not None else settings.llm_request_timeout)
+    read: Optional[float]
+    if unbounded_read:
+        read = None
+        transport = TRANSPORT_KEEPALIVE
+    else:
+        read = float(read_timeout if read_timeout is not None else settings.llm_request_timeout)
+    if transport not in (TRANSPORT_DEFAULT, TRANSPORT_KEEPALIVE):
+        raise ValueError(f"unknown transport {transport!r}")
     try:
         loop_key = id(asyncio.get_running_loop())
     except RuntimeError:
         loop_key = None
-    key = (loop_key, base_url, api_key or LOCAL_API_KEY, read)
+    key = (loop_key, base_url, api_key or LOCAL_API_KEY, read, transport)
     if loop_key is not None:
         cached = _CLIENTS.get(key)
         if cached is not None:
             _CLIENTS.move_to_end(key)
             return cached
+    timeout = httpx.Timeout(
+        connect=settings.llm_connect_timeout,
+        read=read,
+        write=settings.llm_write_timeout,
+        pool=settings.llm_write_timeout,
+    )
+    extra: dict = {}
+    if transport == TRANSPORT_KEEPALIVE:
+        from openai import DefaultAsyncHttpxClient
+
+        # WHY (assembler, 2026-09-14): the transport must come from the httpx
+        # package the installed openai client is built on. openai 3.x builds on
+        # `httpx2`, which rejects an `httpx.AsyncHTTPTransport` with an
+        # AssertionError surfaced as APIConnectionError — every no-read-timeout
+        # generation failed before a byte was sent. openai 1.x builds on `httpx`.
+        client_httpx = _openai_httpx_module()
+        extra["http_client"] = DefaultAsyncHttpxClient(
+            transport=client_httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
+            timeout=client_httpx.Timeout(
+                connect=settings.llm_connect_timeout,
+                read=read,
+                write=settings.llm_write_timeout,
+                pool=settings.llm_write_timeout,
+            ),
+        )
     client = AsyncOpenAI(
         base_url=base_url,
         api_key=api_key or LOCAL_API_KEY,
@@ -542,13 +810,9 @@ def _client(base_url: str, api_key: Optional[str] = None, *, read_timeout: Optio
         # `read`, which for a non-streaming completion IS the whole generation.
         # Splitting them lets a real outage fail fast while a legitimately long
         # generation runs to the app's own wall clock.
-        timeout=httpx.Timeout(
-            connect=settings.llm_connect_timeout,
-            read=read,
-            write=settings.llm_write_timeout,
-            pool=settings.llm_write_timeout,
-        ),
+        timeout=timeout,
         max_retries=settings.llm_max_retries,
+        **extra,
     )
     if loop_key is not None:
         _CLIENTS[key] = client
@@ -914,6 +1178,31 @@ def apply_reasoning_effort(
     return list(messages)
 
 
+#: "Not passed": the chat default for `wall_clock_s` and `read_timeout_s`.
+#: A sentinel rather than None because None is a meaningful value for both
+#: (no-timeout /v1: no wall clock, no read timeout).
+_DEFAULT: Any = object()
+
+
+def _wall_clock_for(wall_clock_s: Any) -> Optional[float]:
+    """GEN_WALL_CLOCK_S when not passed; None (no wall clock) for None or a
+    finite value ≤ 0 — the /v1 no-timeout path's explicit opt-out; the value
+    otherwise. A value that is not a number, NaN or infinity is a caller bug
+    and keeps GEN_WALL_CLOCK_S (`_wall_clock_for_call`): only a deliberate
+    None or ≤ 0 removes the guard."""
+    if wall_clock_s is _DEFAULT:
+        return float(settings.gen_wall_clock_s)
+    if wall_clock_s is None:
+        return None
+    try:
+        value = float(wall_clock_s)
+    except (TypeError, ValueError):
+        return _wall_clock_for_call(wall_clock_s)
+    if math.isfinite(value) and value <= 0:
+        return None
+    return _wall_clock_for_call(value)
+
+
 async def stream_chat_events(
     messages: Sequence[dict],
     *,
@@ -921,19 +1210,51 @@ async def stream_chat_events(
     effort: str = "medium",
     temperature: float = 0.2,
     max_tokens: Optional[int] = None,
-    wall_clock_s: Optional[float] = None,
+    wall_clock_s: Any = _DEFAULT,
     wall_clock_marker: bool = True,
+    read_timeout_s: Any = _DEFAULT,
+    continue_final_message: bool = False,
+    admission_patient: bool = False,
+    on_dispatch: Optional[Callable[[], None]] = None,
+    admission_run_id: Optional[str] = None,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Streaming completion from the selected model, yielding (kind, delta)
     pairs: ("reasoning", <delta.reasoning_content>) for vLLM thinking deltas
     and ("token", <delta.content>) for answer text (V2-DESIGN §3a).
 
-    `wall_clock_s` (2026-09-13): this call's own hang guard, replacing
-    GEN_WALL_CLOCK_S for it alone — `/v1` sizes it from the planned output so
-    a 1,000,000-token answer is not cut at the chat app's 70 minutes. None
-    keeps GEN_WALL_CLOCK_S. `wall_clock_marker=False` stops the guard from
-    appending its "[generation stopped …]" sentence to the answer; the finish
-    reason is WALL_CLOCK_FINISH either way.
+    THE NO-TIMEOUT KEYWORDS (2026-09-13, the /v1 no-timeout design, revision
+    2). Every one defaults to exactly what chat has always had, so a chat
+    caller that passes none of them sends byte-identical requests:
+
+    - `wall_clock_s`: not passed → GEN_WALL_CLOCK_S; None or ≤ 0 → no wall
+      clock at all (a 1M-token public answer is ~3 h of decode, and liveness
+      comes from engine evidence, not a clock); a positive number → that clock,
+      replacing GEN_WALL_CLOCK_S for this call alone (longer or shorter), sent
+      with a per-request transport timeout when it is longer than
+      LLM_REQUEST_TIMEOUT (`_transport_timeout_for`). A value that is not a
+      number, NaN or infinity is a caller bug and keeps GEN_WALL_CLOCK_S —
+      nonsense never removes the guard (PR #65, 2026-09-13).
+    - `wall_clock_marker`: False → when the wall clock does fire, stop without
+      yielding the in-band "[generation stopped …]" token (the finish reason
+      is still WALL_CLOCK_FINISH).
+    - `read_timeout_s`: not passed → LLM_REQUEST_TIMEOUT; None → no read
+      timeout, over a TCP-keepalive transport (see TRANSPORT_KEEPALIVE); a
+      number → that read timeout on the default transport.
+    - `continue_final_message`: the last message is an assistant message the
+      engine EXTENDS (vLLM `continue_final_message`, `add_generation_prompt`
+      false). The messages are never trimmed; too little room raises
+      ContinuationRoomExhausted before anything is sent.
+    - `admission_patient`: wait in the admission lanes with no time limit and
+      outside the chat waiting-depth bound (admission.patient).
+    - `on_dispatch`: called (synchronously, once per attempt) after admission
+      as the request is written to the engine.
+    - `admission_run_id`: the durable run this generation belongs to, so a
+      patient LONG ticket can be asked to yield through the callback that run
+      registered with `admission.register_yield` (None: this context's
+      `admission.set_run_id`, if any).
+
+    `engine_state.note_chunk()` is called on every engine chunk: a chunk on
+    any stream is serving evidence for every silent one.
     """
     # Cleared before anything can fail, so a call that dies in sizing never
     # leaves the previous call's ceiling standing for its caller to report.
@@ -961,7 +1282,20 @@ async def stream_chat_events(
     # The answer a person reads comes from the main model, whatever the
     # picker said (CONTRACT v2 §1): checked here, where it is produced.
     assert_answer_engine(base_url)
-    client = _client(base_url, api_key)
+    if read_timeout_s is _DEFAULT:
+        client = _client(base_url, api_key)
+    elif read_timeout_s is None:
+        client = _client(base_url, api_key, unbounded_read=True)
+    else:
+        client = _client(base_url, api_key, read_timeout=float(read_timeout_s))
+    clock = _wall_clock_for(wall_clock_s)
+    send: dict = {}
+    if on_dispatch is not None:
+        send["on_dispatch"] = on_dispatch
+    if admission_patient:
+        send["patient"] = True
+    if admission_run_id is not None:
+        send["run_id"] = str(admission_run_id)
     # Size the call to the window of the model that will actually serve it.
     sized, budget = await _fit(
         normalize_system(shaped_messages),
@@ -969,6 +1303,7 @@ async def stream_chat_events(
         model=model_id,
         requested_max_tokens=requested,
         what="stream",
+        continuation=bool(continue_final_message),
     )
     _applied_max_tokens.set(budget)
     request = dict(
@@ -978,8 +1313,15 @@ async def stream_chat_events(
         max_tokens=budget,
         stream=True,
     )
-    clock_s = _wall_clock_for_call(wall_clock_s)
-    transport_timeout = _transport_timeout_for(clock_s) if wall_clock_s is not None else None
+    # A positive per-call clock on the shared transport keeps THE TRANSPORT
+    # INVARIANT with a per-request read timeout when it outlasts
+    # LLM_REQUEST_TIMEOUT (PR #65). No clock, or a caller-chosen read timeout
+    # (`read_timeout_s`, the no-timeout path's None), sends no override.
+    transport_timeout = (
+        _transport_timeout_for(clock)
+        if wall_clock_s is not _DEFAULT and clock is not None and read_timeout_s is _DEFAULT
+        else None
+    )
     if transport_timeout is not None:
         # Only a per-call clock longer than LLM_REQUEST_TIMEOUT sends this, so
         # every chat-app request is byte-for-byte what it was.
@@ -995,6 +1337,13 @@ async def stream_chat_events(
             # mechanism whenever tools are attached.
             extra_body["chat_template_kwargs"]["thinking_token_budget"] = budget_tokens
         request["extra_body"] = extra_body
+    if continue_final_message:
+        # vLLM's continuation contract: the final assistant message is left
+        # open and extended, and no new assistant header is appended.
+        body = dict(request.get("extra_body") or {})
+        body["continue_final_message"] = True
+        body["add_generation_prompt"] = False
+        request["extra_body"] = body
 
     # Client-side budget enforcement — ACTIVE ONLY in budgeted mode. On this
     # deployment one streamed chunk is one token (verified:
@@ -1010,16 +1359,32 @@ async def stream_chat_events(
     # answer. Applies in BOTH modes.
     started = _generation_clock()
     reset_finish_reason()
-    async with _consume(await _open_stream(client, request)) as stream:
+    try:
+        opened = await _open_stream(client, request, **send)
+    except _bad_request_error() as exc:
+        if not (continue_final_message and _continuation_estimated.get() and _is_size_refusal(exc)):
+            raise
+        # ONLY AN EXACT COUNT MAY END A RUN (_fit_continuation): the max_tokens
+        # guessed without a count was refused, so ask once more with none and
+        # let the engine size the answer to the room it really has. A prompt
+        # that has no room is refused again, and that refusal propagates.
+        log.warning("continuation refused at max_tokens=%s without an exact count (%s); retrying with the "
+                    "engine sizing it", request.get("max_tokens"), type(exc).__name__)
+        request = dict(request)
+        request["max_tokens"] = None
+        budget = None
+        opened = await _open_stream(client, request, **send)
+    async with _consume(opened) as stream:
         async for chunk in stream:
+            engine_state.note_chunk()
             _capture_finish(chunk)
             elapsed = _generation_clock() - started
-            if elapsed > clock_s:
+            if clock is not None and elapsed > clock:
                 log.error(
                     "GENERATION WALL CLOCK EXCEEDED: %.0fs > %.0fs on %s "
                     "(effort %r, %d reasoning + %d answer chunks) — killing the "
                     "stream and returning what was produced",
-                    elapsed, clock_s, model_id, effort,
+                    elapsed, clock, model_id, effort,
                     reasoning_seen, token_seen,
                 )
                 with contextlib.suppress(Exception):
@@ -1066,7 +1431,8 @@ async def stream_chat_events(
                     # The retry only writes the ANSWER, so the caller's original
                     # ceiling is the honest budget for it.
                     retry["max_tokens"] = (
-                        min(budget, max_tokens) if max_tokens is not None else budget
+                        budget if budget is None
+                        else min(budget, max_tokens) if max_tokens is not None else budget
                     )
                     _applied_max_tokens.set(retry["max_tokens"])
                     fb_extra = reasoning_extra_body(capabilities, False)
@@ -1074,9 +1440,16 @@ async def stream_chat_events(
                         retry["extra_body"] = fb_extra
                     else:
                         retry.pop("extra_body", None)
+                    if continue_final_message:
+                        # The retry extends the same assistant prefix.
+                        fb_body = dict(retry.get("extra_body") or {})
+                        fb_body["continue_final_message"] = True
+                        fb_body["add_generation_prompt"] = False
+                        retry["extra_body"] = fb_body
                     reset_finish_reason()
-                    async with _consume(await _open_stream(client, retry)) as fb_stream:
+                    async with _consume(await _open_stream(client, retry, **send)) as fb_stream:
                         async for fb_chunk in fb_stream:
+                            engine_state.note_chunk()
                             _capture_usage(fb_chunk)
                             _capture_finish(fb_chunk)
                             if not fb_chunk.choices:

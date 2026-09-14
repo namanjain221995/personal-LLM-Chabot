@@ -732,13 +732,14 @@ def test_a_naive_datetime_is_refused_rather_than_assumed_to_be_utc():
 # ---------------------------------------------------------------------------
 
 
-def test_the_scope_vocabulary_is_exactly_the_seven_the_contract_names():
+def test_the_scope_vocabulary_is_exactly_the_nine_the_contract_names():
     """CONTRACT-3 §7's endpoint table, read literally.
 
-    It names seven scopes since 2026-09-13, when `/v1/embeddings`, `/v1/rerank`
-    and `/v1/audio/transcriptions` arrived with `embeddings.write`,
-    `rerank.write` and `audio.write` (owner request: every model TechSara runs
-    on the public API). Before that it named four. Wave 1 once shipped six,
+    It names nine scopes since 2026-09-13: `/v1/embeddings`, `/v1/rerank` and
+    `/v1/audio/transcriptions` arrived with `embeddings.write`, `rerank.write`
+    and `audio.write` (owner request: every model TechSara runs on the public
+    API), and `/v1/files` with `/v1/uploads` brought `files.read` and
+    `files.write` (Files design §10.2). Before that it named four. Wave 1 once shipped six,
     calling them "the six the contract names": `webhooks.read` and
     `webhooks.manage` appear NOWHERE in CONTRACT.md, and the paragraph under
     §7's table puts webhooks among what `/v1` deliberately does not expose.
@@ -761,6 +762,8 @@ def test_the_scope_vocabulary_is_exactly_the_seven_the_contract_names():
         "embeddings.write",
         "rerank.write",
         "audio.write",
+        "files.read",
+        "files.write",
     }
     for scope in scopes.ALL_SCOPES:
         assert f"`{scope.value}`" in section, f"{scope.value} is not in CONTRACT §7"

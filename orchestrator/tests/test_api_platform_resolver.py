@@ -556,6 +556,9 @@ def test_a_good_key_resolves_to_the_identity_contract_section_four_names(
         Scope.EMBEDDINGS_WRITE,
         Scope.RERANK_WRITE,
         Scope.AUDIO_WRITE,
+        # 2026-09-13, the Files API (owner decision D1, the design's proposal).
+        Scope.FILES_READ,
+        Scope.FILES_WRITE,
     }
     assert caller.limits.rpm == 60 and caller.limits.daily_token_quota == 2_000_000
     assert caller.ip == "203.0.113.9"

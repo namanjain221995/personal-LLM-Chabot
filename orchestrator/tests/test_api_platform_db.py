@@ -92,17 +92,19 @@ def _key(project_row, workspace_id, *, public_id="pub0000000000001", **kwargs) -
 # --------------------------------------------------------------- migration --
 
 
-def test_the_migration_list_ends_at_v35_and_the_test_database_is_fully_migrated():
+def test_the_migration_list_ends_at_v37_and_the_test_database_is_fully_migrated():
     versions = [version for version, _ddl in db._MIGRATIONS]
 
     # V35 (2026-09-13): api_responses.max_output_tokens and finish_reason.
-    assert versions == list(range(1, 36))
-    assert db.LATEST_SCHEMA_VERSION == 35
-    assert db.schema_version() == 35
+    # V36 (2026-09-13): durable /v1 generations (no-timeout design).
+    # V37 (2026-09-13): the Files API tables (files-hookup).
+    assert versions == list(range(1, 38))
+    assert db.LATEST_SCHEMA_VERSION == 37
+    assert db.schema_version() == 37
     # Applying an applied migration is a no-op, which is what makes the
     # startup path safe to run on every boot.
     db.init_schema()
-    assert db.schema_version() == 35
+    assert db.schema_version() == 37
 
 
 def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():
@@ -139,12 +141,14 @@ def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():
             highest = con.execute(
                 "SELECT MAX(version) FROM schema_migrations"
             ).fetchone()[0]
-        assert highest == 35
+        assert highest == db.LATEST_SCHEMA_VERSION
         assert {
             "api_projects", "api_service_accounts", "api_keys", "api_responses",
             "api_idempotency", "api_usage_minute", "api_usage_daily",
             "api_webhook_endpoints", "api_webhook_deliveries", "public_models",
             "platform_secrets",
+            # V36: the durable-run log, specs and blob references.
+            "api_response_events", "api_response_requests", "api_response_blobs",
         } <= tables
     finally:
         with psycopg.connect(admin_dsn, autocommit=True, connect_timeout=5) as admin:
@@ -2372,3 +2376,217 @@ def test_the_v35_migration_is_idempotent_on_a_database_that_already_has_it():
             ).fetchall()
         }
     assert {"max_output_tokens", "finish_reason"} <= columns
+
+
+# ------------------------------------------------------------------- V36 ----
+#
+# Durable /v1 generations (no-timeout design, revision 2, 2026-09-13). What is
+# pinned: the migration applies twice; a parked session holding a lock makes it
+# fail FAST (lock_timeout 3 s) instead of hanging start-up to statement_timeout,
+# and init_schema retries until the lock is released; the event log's key
+# refuses a duplicate sequence number; the NOT VALID constraints are not
+# validated yet still refuse new bad rows; every foreign key a cascade walks
+# leads an index; and the files tables are NOT created here (the Files design
+# owns tables of the same names with a different shape).
+
+V36_TABLES = ("api_response_events", "api_response_requests", "api_response_blobs")
+
+
+def _hold_lock_on_api_responses(seconds: float, started: threading.Event) -> threading.Thread:
+    """Another session: BEGIN; read api_responses (ACCESS SHARE); sit parked
+    for `seconds`; roll back — a pgAdmin tab, measured 2026-09."""
+
+    def hold():
+        with psycopg.connect(db.dsn(), autocommit=False, connect_timeout=5) as con:
+            con.execute("SELECT 1 FROM api_responses LIMIT 1").fetchall()
+            started.set()
+            threading.Event().wait(seconds)
+            con.rollback()
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    assert started.wait(10), "the lock holder never started"
+    return thread
+
+
+def test_v36_applies_twice_and_adds_the_durable_columns_and_tables():
+    for _ in range(2):
+        with db.connection() as con:
+            con.execute(db._MIGRATION_V36)
+    with db.connection() as con:
+        columns = {
+            row["column_name"]
+            for row in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'api_responses'"
+            ).fetchall()
+        }
+        tables = {
+            row["table_name"]
+            for row in con.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+            ).fetchall()
+        }
+    assert {
+        "resumable", "dialect", "item_id", "engine", "lease_owner", "lease_expires_at", "enqueued_at",
+        "attempt", "stalled_attempts", "engine_fault_attempts", "yields", "generated_tokens",
+        "recomputed_prompt_tokens", "suspend_reason", "suspended_at", "orphaned_at", "ever_followed",
+        "attempt_token", "body_sha256", "last_incident_id",
+    } <= columns
+    assert set(V36_TABLES) <= tables
+
+
+def test_v36_leaves_the_files_tables_to_the_files_design():
+    ddl_lines = [line for line in db._MIGRATION_V36.splitlines() if not line.lstrip().startswith("--")]
+    ddl = "\n".join(ddl_lines)
+    for name in ("api_files", "api_uploads", "api_upload_parts"):
+        assert name not in ddl, f"{name} belongs to the Files design's migration"
+
+
+def test_v36_fails_fast_on_a_held_lock_instead_of_hanging_to_the_statement_timeout():
+    import time as _time
+
+    started = threading.Event()
+    holder = _hold_lock_on_api_responses(6.0, started)
+    try:
+        begun = _time.monotonic()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            with db.connection() as con:
+                con.execute(db._MIGRATION_V36)
+        elapsed = _time.monotonic() - begun
+    finally:
+        holder.join(10)
+    assert 2.5 <= elapsed <= 4.5, elapsed
+
+
+def test_init_schema_retries_lock_not_available_and_succeeds_once_the_lock_is_released(monkeypatch, caplog):
+    import logging
+    import time as _time
+
+    with db.connection() as con:
+        con.execute("DELETE FROM schema_migrations WHERE version = 36")
+    monkeypatch.setattr(db, "INIT_SCHEMA_LOCK_BACKOFF_S", (0.2,))
+    started = threading.Event()
+    holder = _hold_lock_on_api_responses(4.0, started)
+    try:
+        begun = _time.monotonic()
+        with caplog.at_level(logging.WARNING, logger="app.db"):
+            db.init_schema()
+        elapsed = _time.monotonic() - begun
+    finally:
+        holder.join(10)
+        db.init_schema()  # whatever happened above, leave the database migrated
+    assert db.schema_version() == 37
+    assert elapsed >= 3.0, "the first attempt really met the lock"
+    assert any("could not take its lock" in r.getMessage() for r in caplog.records)
+
+
+def test_init_schema_gives_up_after_its_attempts_rather_than_forever(monkeypatch):
+    with db.connection() as con:
+        con.execute("DELETE FROM schema_migrations WHERE version = 36")
+    monkeypatch.setattr(db, "INIT_SCHEMA_LOCK_ATTEMPTS", 2)
+    monkeypatch.setattr(db, "INIT_SCHEMA_LOCK_BACKOFF_S", (0.1,))
+    started = threading.Event()
+    holder = _hold_lock_on_api_responses(9.0, started)
+    try:
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            db.init_schema()
+    finally:
+        holder.join(15)
+        db.init_schema()
+    assert db.schema_version() == 37
+
+
+def test_the_event_log_refuses_a_duplicate_sequence_number_and_a_zero_one(tenants, project):
+    response = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_1")
+    with db.connection() as con:
+        con.execute(
+            "INSERT INTO api_response_events (response_id, sequence_number, event, data) VALUES (%s, 1, 'x', '{}')",
+            (response["id"],),
+        )
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with db.connection() as con:
+            con.execute(
+                "INSERT INTO api_response_events (response_id, sequence_number, event, data) VALUES (%s, 1, 'y', '{}')",
+                (response["id"],),
+            )
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with db.connection() as con:
+            con.execute(
+                "INSERT INTO api_response_events (response_id, sequence_number, event, data) VALUES (%s, 0, 'z', '{}')",
+                (response["id"],),
+            )
+    with db.connection() as con:
+        inserted = con.execute(
+            "INSERT INTO api_response_events (response_id, sequence_number, event, data) VALUES (%s, 1, 'y', '{}') "
+            "ON CONFLICT (response_id, sequence_number) DO NOTHING RETURNING sequence_number",
+            (response["id"],),
+        ).fetchall()
+    assert inserted == [], "the writer's split-brain primitive: a conflict returns nothing"
+
+
+@pytest.mark.parametrize(
+    "column,value,constraint",
+    [
+        ("dialect", "grpc", "api_responses_dialect"),
+        ("attempt", -1, "api_responses_counters"),
+        ("stalled_attempts", -1, "api_responses_counters"),
+        ("generated_tokens", -5, "api_responses_counters"),
+        ("suspend_reason", "nap", "api_responses_suspend_reason"),
+    ],
+)
+def test_the_not_valid_constraints_still_refuse_new_bad_values(tenants, project, column, value, constraint):
+    response = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_1")
+    with pytest.raises(psycopg.errors.CheckViolation) as caught:
+        db.update_api_response(response["id"], project["id"], **{column: value})
+    assert constraint in str(caught.value)
+    with db.connection() as con:
+        validated = con.execute(
+            "SELECT convalidated FROM pg_constraint WHERE conname = %s", (constraint,)
+        ).fetchone()["convalidated"]
+    assert validated is False, "NOT VALID: no verification scan under the migration's lock"
+
+
+def test_the_durable_columns_are_updatable_and_the_tenant_columns_are_not(tenants, project):
+    response = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_1")
+    lease = datetime.now(timezone.utc) + timedelta(seconds=60)
+    updated = db.update_api_response(
+        response["id"], project["id"], resumable=True, dialect="responses", engine="main",
+        lease_owner="proc-a\x00", lease_expires_at=lease, attempt=2, stalled_attempts=1,
+        engine_fault_attempts=1, yields=3, generated_tokens=1234, recomputed_prompt_tokens=99_000,
+        suspend_reason="restart", ever_followed=True, attempt_token="att_1", body_sha256="ab" * 32,
+        last_incident_id="20260913T101010Z",
+    )
+    assert updated["resumable"] is True and updated["lease_owner"] == "proc-a", "NUL stripped"
+    assert (updated["attempt"], updated["yields"], updated["generated_tokens"]) == (2, 3, 1234)
+    for column in ("project_id", "workspace_id", "key_id"):
+        with pytest.raises(ValueError):
+            db.update_api_response(response["id"], project["id"], **{column: "other"})
+
+
+def test_the_gateway_attempt_token_is_unique_per_project(tenants, project):
+    first = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_1")
+    second = db.create_api_response(project["id"], tenants["a"], "techsara-35b", "req_2")
+    db.update_api_response(first["id"], project["id"], attempt_token="att_same")
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        db.update_api_response(second["id"], project["id"], attempt_token="att_same")
+
+
+def test_every_v36_foreign_key_leads_an_index_because_a_cascade_walks_it():
+    with db.connection() as con:
+        unindexed = con.execute(
+            "SELECT c.relname AS table_name, a.attname AS column_name "
+            "  FROM pg_constraint con "
+            "  JOIN pg_class c ON c.oid = con.conrelid "
+            "  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1] "
+            " WHERE con.contype = 'f' AND c.relname = ANY(%s) "
+            "   AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = con.conrelid "
+            "                    AND i.indkey[0] = con.conkey[1])",
+            (list(V36_TABLES),),
+        ).fetchall()
+        total = con.execute(
+            "SELECT count(*) AS n FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
+            "WHERE con.contype = 'f' AND c.relname = ANY(%s)",
+            (list(V36_TABLES),),
+        ).fetchone()["n"]
+    assert [(r["table_name"], r["column_name"]) for r in unindexed] == []
+    assert total == 3

@@ -2364,6 +2364,280 @@ ALTER TABLE api_responses
 """
 
 
+_MIGRATION_V36 = """
+-- V36 (2026-09-13): durable /v1 generations and gateway attempts (no-timeout
+-- design, revision 2).
+--
+-- WHAT IT HOLDS. Every main-model /v1 generation becomes a run that can
+-- outlive the process generating it: the request spec (api_response_requests),
+-- the content-addressed image blobs it references (api_response_blobs), and a
+-- write-ahead event log (api_response_events) a reader replays from any
+-- sequence number and a new process resumes from max(sequence_number). The
+-- new api_responses columns are the run's lease, its attempt counters (the
+-- liveness guard's stalled / engine-fault / yield counts), its suspension, and
+-- the gateway's attempt token and body hash (the internal attach protocol).
+--
+-- WHAT IT DELIBERATELY DOES NOT HOLD: the Files API tables. The no-timeout
+-- design sketched api_files / api_uploads / api_upload_parts here; the Files
+-- design (files-api-design.md §9) supersedes that team and defines tables of
+-- the SAME names with different columns (app/apifiles/schema.py). Creating
+-- either shape here would make whichever ran first win silently, so the files
+-- DDL takes its own migration number at integration.
+--
+-- LOCKING. lock_timeout 3 s for the rest of this transaction: ALTER TABLE on
+-- api_responses needs ACCESS EXCLUSIVE, and a parked session holding even
+-- ACCESS SHARE (a pgAdmin tab: the 2026-09 connection-exhaustion incident)
+-- would otherwise hold start-up until statement_timeout. init_schema retries
+-- lock_not_available with backoff instead of hanging.
+--
+-- CONSTRAINTS are NOT VALID: no verification scan under the lock, and they
+-- still apply to every new or updated row. VALIDATE CONSTRAINT is left to a
+-- later, off-peak migration. ADD COLUMN with a constant default is metadata
+-- only (PostgreSQL 11+). Every FK a cascade walks is indexed (V31 rule): both
+-- child tables' primary keys lead with response_id.
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE api_responses
+    ADD COLUMN IF NOT EXISTS resumable boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS dialect text,
+    ADD COLUMN IF NOT EXISTS item_id text,
+    ADD COLUMN IF NOT EXISTS engine text,
+    ADD COLUMN IF NOT EXISTS lease_owner text,
+    ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz,
+    ADD COLUMN IF NOT EXISTS enqueued_at timestamptz,
+    ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS stalled_attempts integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS engine_fault_attempts integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS yields integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS generated_tokens integer,
+    ADD COLUMN IF NOT EXISTS recomputed_prompt_tokens bigint,
+    ADD COLUMN IF NOT EXISTS suspend_reason text,
+    ADD COLUMN IF NOT EXISTS suspended_at timestamptz,
+    ADD COLUMN IF NOT EXISTS orphaned_at timestamptz,
+    ADD COLUMN IF NOT EXISTS ever_followed boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS attempt_token text,
+    ADD COLUMN IF NOT EXISTS body_sha256 text,
+    ADD COLUMN IF NOT EXISTS last_incident_id text;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_responses_dialect') THEN
+    ALTER TABLE api_responses ADD CONSTRAINT api_responses_dialect
+      CHECK (dialect IS NULL OR dialect IN ('responses','chat')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_responses_counters') THEN
+    ALTER TABLE api_responses ADD CONSTRAINT api_responses_counters
+      CHECK (attempt >= 0 AND stalled_attempts >= 0 AND engine_fault_attempts >= 0 AND yields >= 0
+             AND (generated_tokens IS NULL OR generated_tokens >= 0)) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_responses_suspend_reason') THEN
+    ALTER TABLE api_responses ADD CONSTRAINT api_responses_suspend_reason
+      CHECK (suspend_reason IS NULL OR suspend_reason IN
+             ('restart','shutdown','engine','liveness','lease_lost','yield','store')) NOT VALID;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_api_responses_resume
+    ON api_responses (lease_expires_at) WHERE resumable AND status IN ('queued','in_progress');
+CREATE INDEX IF NOT EXISTS idx_api_responses_dispatch
+    ON api_responses (engine, enqueued_at) WHERE status = 'queued' AND background;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_api_responses_attempt
+    ON api_responses (project_id, attempt_token) WHERE attempt_token IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_api_responses_implicit
+    ON api_responses (key_id, body_sha256, created_at)
+    WHERE body_sha256 IS NOT NULL AND status IN ('queued','in_progress');
+CREATE TABLE IF NOT EXISTS api_response_events (
+    response_id     text        NOT NULL REFERENCES api_responses(id) ON DELETE CASCADE,
+    sequence_number integer     NOT NULL CONSTRAINT api_response_events_seq CHECK (sequence_number >= 1),
+    event           text        NOT NULL,
+    data            jsonb       NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (response_id, sequence_number)
+);
+CREATE TABLE IF NOT EXISTS api_response_requests (
+    response_id text        PRIMARY KEY REFERENCES api_responses(id) ON DELETE CASCADE,
+    spec        jsonb       NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS api_response_blobs (
+    response_id text   NOT NULL REFERENCES api_responses(id) ON DELETE CASCADE,
+    sha256      text   NOT NULL,
+    bytes       bigint NOT NULL CHECK (bytes >= 0),
+    PRIMARY KEY (response_id, sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_api_response_blobs_sha ON api_response_blobs (sha256);
+"""
+
+
+_MIGRATION_V37 = """
+-- V37 (2026-09-13): the public Files API — content blobs per project, files, uploads and parts.
+--
+-- NUMBERING (files-hookup, 2026-09-13). origin/main and origin/dev end at V34 and
+-- the devapi worktree at V35. V36 is the no-timeout programme's durable-generation
+-- migration (T1/T2: api_responses columns, api_response_events/requests/blobs).
+-- The Files design supersedes that design's own api_files/api_uploads/
+-- api_upload_parts sketch, so the files tables are ONE migration of their own,
+-- here, and V36 must not create tables of those names. `init_schema` applies
+-- versions by set membership, so V37 landing before V36 still applies both.
+--
+-- THE SHAPE GUARD below exists for exactly that merge: `CREATE TABLE IF NOT
+-- EXISTS` would silently keep an `api_files` some earlier migration created in
+-- the no-timeout sketch's shape (no blob_id), and every file route would then
+-- fail at its first query instead of at start-up. A wrong shape refuses to
+-- migrate, which a deploy's health gate sees.
+--
+-- A BLOB is one project's copy of some bytes (unique per project+sha256; never global — a global key
+-- would tell one tenant another uploaded the same bytes). A FILE is a named reference to a blob; many
+-- files may share a blob; the bytes go when the last live file does. Every FK a cascade walks is indexed.
+-- The DDL is apifiles/schema.py's, moved verbatim; that module now reads it from here.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_name = 'api_files')
+     AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = current_schema() AND table_name = 'api_files'
+                        AND column_name = 'blob_id') THEN
+    RAISE EXCEPTION 'api_files exists without blob_id: a migration created the superseded no-timeout shape; drop that DDL before V37';
+  END IF;
+END $$;
+-- A BLOB is one project's copy of some bytes (unique per project+sha256; never global — a global key
+-- would tell one tenant another uploaded the same bytes). A FILE is a named reference to a blob; many
+-- files may share a blob; the bytes go when the last live file does. Every FK a cascade walks is indexed.
+SET LOCAL lock_timeout = '3s';
+CREATE TABLE IF NOT EXISTS api_file_blobs (
+    id                 text        PRIMARY KEY,
+    project_id         text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    workspace_id       text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    sha256             text        NOT NULL CONSTRAINT api_file_blobs_sha256 CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    bytes              bigint      NOT NULL CONSTRAINT api_file_blobs_bytes CHECK (bytes >= 0),
+    kind               text        NOT NULL DEFAULT 'unknown'
+                       CONSTRAINT api_file_blobs_kind CHECK (kind IN ('unknown','pdf','document','presentation',
+                       'spreadsheet','tabular','text','html','image','audio','video','unsupported')),
+    mime_type          text        NOT NULL DEFAULT 'application/octet-stream',
+    status             text        NOT NULL DEFAULT 'queued'
+                       CONSTRAINT api_file_blobs_status CHECK (status IN ('queued','processing','processed','failed','deleting')),
+    lane               text        NOT NULL DEFAULT 'cpu' CONSTRAINT api_file_blobs_lane CHECK (lane IN ('cpu','media')),
+    stage              text        NOT NULL DEFAULT 'sniff',
+    stages             jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_stages CHECK (jsonb_typeof(stages) = 'object'),
+    progress           jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_progress CHECK (jsonb_typeof(progress) = 'object'),
+    facts              jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_facts CHECK (jsonb_typeof(facts) = 'object'),
+    error_code         text        CONSTRAINT api_file_blobs_error_code CHECK (error_code IS NULL OR error_code IN
+                       ('unsupported_file','file_corrupt','file_too_complex','processing_unavailable','internal_error')),
+    attempt            integer     NOT NULL DEFAULT 0 CONSTRAINT api_file_blobs_attempt CHECK (attempt >= 0),
+    not_before         timestamptz,
+    pipeline_version   smallint    NOT NULL DEFAULT 1,
+    lease_owner        text,
+    lease_expires_at   timestamptz,
+    video_analysis_id  bigint      REFERENCES video_analyses(id) ON DELETE SET NULL,
+    derived_bytes      bigint      NOT NULL DEFAULT 0 CONSTRAINT api_file_blobs_derived_bytes CHECK (derived_bytes >= 0),
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    updated_at         timestamptz NOT NULL DEFAULT now(),
+    started_at         timestamptz,
+    processed_at       timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_file_blobs_project_sha ON api_file_blobs (project_id, sha256);
+CREATE INDEX IF NOT EXISTS idx_api_file_blobs_workspace ON api_file_blobs (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_file_blobs_due ON api_file_blobs (lane, status, not_before, updated_at)
+    WHERE status IN ('queued','processing','deleting');
+CREATE INDEX IF NOT EXISTS idx_api_file_blobs_video ON api_file_blobs (video_analysis_id) WHERE video_analysis_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS api_files (
+    id           text        PRIMARY KEY,
+    project_id   text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    workspace_id text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    key_id       text        REFERENCES api_keys(id) ON DELETE SET NULL,
+    blob_id      text        REFERENCES api_file_blobs(id) ON DELETE SET NULL,
+    assembling_upload_id text,
+    error_code   text        CONSTRAINT api_files_error_code CHECK (error_code IS NULL OR error_code IN ('checksum_mismatch','internal_error')),
+    filename     text        NOT NULL CONSTRAINT api_files_filename CHECK (char_length(filename) BETWEEN 1 AND 255),
+    purpose      text        NOT NULL CONSTRAINT api_files_purpose CHECK (purpose IN ('user_data','assistants','vision')),
+    bytes        bigint      NOT NULL CONSTRAINT api_files_bytes CHECK (bytes >= 0),
+    origin       text        NOT NULL DEFAULT 'file' CONSTRAINT api_files_origin CHECK (origin IN ('file','upload')),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz,
+    deleted_at   timestamptz,
+    CONSTRAINT api_files_live_state CHECK (deleted_at IS NOT NULL OR blob_id IS NOT NULL OR assembling_upload_id IS NOT NULL OR error_code IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_api_files_assembling ON api_files (assembling_upload_id) WHERE assembling_upload_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_api_files_project_live ON api_files (project_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_api_files_workspace ON api_files (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_files_key ON api_files (key_id);
+CREATE INDEX IF NOT EXISTS idx_api_files_blob ON api_files (blob_id);
+CREATE INDEX IF NOT EXISTS idx_api_files_expiry ON api_files (expires_at) WHERE deleted_at IS NULL AND expires_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_api_files_tombstones ON api_files (deleted_at) WHERE deleted_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS api_uploads (
+    id                         text        PRIMARY KEY,
+    project_id                 text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
+    workspace_id               text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    key_id                     text        REFERENCES api_keys(id) ON DELETE SET NULL,
+    filename                   text        NOT NULL CONSTRAINT api_uploads_filename CHECK (char_length(filename) BETWEEN 1 AND 255),
+    purpose                    text        NOT NULL CONSTRAINT api_uploads_purpose CHECK (purpose IN ('user_data','assistants','vision')),
+    mime_type                  text        NOT NULL DEFAULT '',
+    bytes                      bigint      NOT NULL CONSTRAINT api_uploads_bytes CHECK (bytes BETWEEN 0 AND 1099511627776),
+    status                     text        NOT NULL DEFAULT 'pending'
+                               CONSTRAINT api_uploads_status CHECK (status IN ('pending','finalizing','completed','cancelled','expired','failed')),
+    bytes_received             bigint      NOT NULL DEFAULT 0 CONSTRAINT api_uploads_bytes_received CHECK (bytes_received >= 0),
+    file_expires_after_seconds integer     CONSTRAINT api_uploads_expires_after CHECK
+                               (file_expires_after_seconds IS NULL OR file_expires_after_seconds BETWEEN 3600 AND 2592000),
+    file_id                    text        REFERENCES api_files(id) ON DELETE SET NULL,
+    result                     jsonb,
+    error_status               integer,
+    error_code                 text,
+    error_message              text,
+    assembly_part_numbers      integer[],
+    expected_md5               text        CONSTRAINT api_uploads_expected_md5 CHECK (expected_md5 IS NULL OR expected_md5 ~ '^[0-9a-f]{32}$'),
+    expected_sha256            text        CONSTRAINT api_uploads_expected_sha256 CHECK (expected_sha256 IS NULL OR expected_sha256 ~ '^[0-9a-f]{64}$'),
+    assembly_bytes_done        bigint      NOT NULL DEFAULT 0 CONSTRAINT api_uploads_assembly_bytes CHECK (assembly_bytes_done >= 0),
+    assembly_attempts          integer     NOT NULL DEFAULT 0 CONSTRAINT api_uploads_assembly_attempts CHECK (assembly_attempts >= 0),
+    assembly_lease_owner       text,
+    assembly_lease_expires_at  timestamptz,
+    created_at                 timestamptz NOT NULL DEFAULT now(),
+    updated_at                 timestamptz NOT NULL DEFAULT now(),
+    last_part_at               timestamptz,
+    expires_at                 timestamptz NOT NULL,
+    completed_at               timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_api_uploads_project ON api_uploads (project_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_api_uploads_workspace ON api_uploads (workspace_id);
+CREATE INDEX IF NOT EXISTS idx_api_uploads_key ON api_uploads (key_id);
+CREATE INDEX IF NOT EXISTS idx_api_uploads_file ON api_uploads (file_id);
+CREATE INDEX IF NOT EXISTS idx_api_uploads_open ON api_uploads (status, expires_at) WHERE status IN ('pending','finalizing');
+CREATE INDEX IF NOT EXISTS idx_api_uploads_assembly ON api_uploads (assembly_lease_expires_at, completed_at)
+    WHERE status = 'completed' AND assembly_part_numbers IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_api_uploads_terminal ON api_uploads (updated_at)
+    WHERE status IN ('completed','cancelled','expired','failed');
+
+CREATE TABLE IF NOT EXISTS api_upload_parts (
+    id           text        PRIMARY KEY,
+    upload_id    text        NOT NULL REFERENCES api_uploads(id) ON DELETE CASCADE,
+    part_number  integer     NOT NULL CONSTRAINT api_upload_parts_number CHECK (part_number BETWEEN 0 AND 9999),
+    bytes        bigint      NOT NULL CONSTRAINT api_upload_parts_bytes CHECK (bytes BETWEEN 1 AND 67108864),
+    sha256       text        NOT NULL CONSTRAINT api_upload_parts_sha256 CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_upload_parts_number ON api_upload_parts (upload_id, part_number);
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_files_assembling_upload_fk') THEN
+    ALTER TABLE api_files ADD CONSTRAINT api_files_assembling_upload_fk
+      FOREIGN KEY (assembling_upload_id) REFERENCES api_uploads(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+ALTER TABLE api_uploads ADD COLUMN IF NOT EXISTS part_mode text
+    CONSTRAINT api_uploads_part_mode CHECK (part_mode IS NULL OR part_mode IN ('numbered','sequential'));
+
+-- The chat pipeline serves both lanes. A column with a constant default is metadata-only on PG >= 11;
+-- the CHECK is NOT VALID (the no-timeout migration rule: no verification scan under a lock).
+ALTER TABLE video_analyses ADD COLUMN IF NOT EXISTS lane text NOT NULL DEFAULT 'chat';
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'video_analyses_lane') THEN
+    ALTER TABLE video_analyses ADD CONSTRAINT video_analyses_lane CHECK (lane IN ('chat','api')) NOT VALID;
+  END IF;
+END $$;
+"""
+
+#: The Files API migration as other modules name it (`apifiles/schema.py`
+#: reads it instead of keeping a second copy that could drift).
+FILES_MIGRATION_VERSION = 37
+FILES_MIGRATION_SQL = _MIGRATION_V37
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2400,6 +2674,8 @@ _MIGRATIONS: tuple = (
     (33, _MIGRATION_V33),
     (34, _MIGRATION_V34),
     (35, _MIGRATION_V35),
+    (36, _MIGRATION_V36),
+    (37, _MIGRATION_V37),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -2614,6 +2890,13 @@ def wait_for_database(timeout: Optional[float] = None) -> None:
                 )
 
 
+#: init_schema's retry on lock_not_available (V36, 2026-09-13): attempts and
+#: the backoff between them (1, 2, 4, 8, then 10 s). Module constants so a test
+#: can shorten the sleep; the attempt count is the design's.
+INIT_SCHEMA_LOCK_ATTEMPTS = 10
+INIT_SCHEMA_LOCK_BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 10.0)
+
+
 def init_schema() -> None:
     """Apply any unapplied migrations. Idempotent; safe to call concurrently.
 
@@ -2622,7 +2905,39 @@ def init_schema() -> None:
     `pg_advisory_xact_lock` serialises two instances starting together, and
     releases automatically when the transaction ends — including on failure,
     where PostgreSQL's transactional DDL also rolls the partial schema back.
+
+    LOCK_NOT_AVAILABLE IS RETRIED (2026-09-13). A migration that sets
+    `lock_timeout` (V36: 3 s) fails fast when another session holds a
+    conflicting lock — a parked pgAdmin tab, a long read. Failing start-up on
+    the first such collision would leave the orchestrator down until someone
+    restarts it, so the whole transaction is retried up to
+    INIT_SCHEMA_LOCK_ATTEMPTS times with 1→10 s backoff (about 1.5 min of
+    patience) and only then raises. Every attempt rolls back completely.
     """
+    import time as _time
+
+    attempts = max(1, int(INIT_SCHEMA_LOCK_ATTEMPTS))
+    for attempt in range(1, attempts + 1):
+        try:
+            _apply_migrations()
+            return
+        except psycopg.errors.LockNotAvailable as exc:
+            if attempt >= attempts:
+                raise
+            steps = INIT_SCHEMA_LOCK_BACKOFF_S
+            pause = float(steps[min(attempt - 1, len(steps) - 1)])
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "init_schema: a migration could not take its lock (attempt %d of %d: %s); "
+                "retrying in %.0fs — check pg_locks for a parked session",
+                attempt, attempts, str(exc).strip()[:160], pause,
+            )
+            _time.sleep(pause)
+
+
+def _apply_migrations() -> None:
+    """One transaction: the advisory lock, then every unapplied migration."""
     with connection() as con:
         with con.transaction():
             con.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
@@ -5850,6 +6165,9 @@ _VIDEO_COLUMNS = (
     "height", "has_audio", "has_video", "language", "probe", "counts", "summary",
     "understanding", "artifacts", "indexed_at", "chunk_version", "created_at",
     "updated_at", "started_at", "finished_at", "lease_owner", "lease_expires_at",
+    # V37: which lane owns the row ('chat' | 'api'), for the pipeline's per-lane
+    # semaphore and for the reaper; every row has it once V37 has applied.
+    "lane",
 )
 
 #: Columns update_video_analysis may touch. Identity, hash and created_at are
@@ -5882,7 +6200,7 @@ def _video_row(r: Any) -> dict:
 
 
 def upsert_video_analysis(
-    content_hash: str, size: int, media_type: str, filename: str
+    content_hash: str, size: int, media_type: str, filename: str, lane: str = "chat"
 ) -> dict:
     """The analysis row for these bytes, created at 'queued' if new.
 
@@ -5890,7 +6208,16 @@ def upsert_video_analysis(
     except that a FAILED one is put back in the queue — a re-upload is the
     natural "try again", and the stages that succeeded last time are cached
     on disk so the retry is cheap.
+
+    `lane` (V37, 2026-09-13) is written only when the row is CREATED: `api` for
+    a Files API analysis (`apifiles/media.py`), whose content hash is
+    project-keyed and so never names a chat row, and `chat` for everything
+    else. `orphan_video_analyses` reaps only `chat` rows — without the column
+    the chat reaper would delete an API file's analysis after 24 h, because no
+    conversation attachment ever points at one.
     """
+    if lane not in ("chat", "api"):
+        raise ValueError(f"unknown video analysis lane {lane!r}")
     ts = _now()
     with connection() as con:
         row = con.execute(
@@ -5908,11 +6235,11 @@ def upsert_video_analysis(
             created = True
             row = con.execute(
                 """INSERT INTO video_analyses
-                       (content_hash, bytes, media_type, filename, created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s)
+                       (content_hash, bytes, media_type, filename, lane, created_at, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (content_hash) DO UPDATE SET updated_at = EXCLUDED.updated_at
                    RETURNING *""",
-                (content_hash, int(size), _text(media_type or "") or "", _text(filename or "") or "", ts, ts),
+                (content_hash, int(size), _text(media_type or "") or "", _text(filename or "") or "", lane, ts, ts),
             ).fetchone()
     out = _video_row(row)
     out["created"] = created
@@ -6076,11 +6403,20 @@ def get_video_by_upload(conversation_id: str, upload_id: str) -> Optional[dict]:
 
 
 def orphan_video_analyses(older_than_hours: int) -> List[dict]:
-    """Analyses no conversation refers to, untouched for the grace period."""
+    """Analyses no conversation refers to, untouched for the grace period.
+
+    CHAT LANE ONLY (V37, 2026-09-13). A Files API analysis is never attached to
+    a conversation, so without the lane predicate every one would look orphaned
+    and be deleted with its stage files after the grace period while its file
+    still names it; the NOT EXISTS on `api_file_blobs` is the second fence for
+    a row written before its lane was set. API analyses are removed by
+    `apifiles.retention` when their blob is purged."""
     with connection() as con:
         rows = con.execute(
             """SELECT a.* FROM video_analyses a
                 WHERE NOT EXISTS (SELECT 1 FROM video_attachments l WHERE l.analysis_id = a.id)
+                  AND a.lane = 'chat'
+                  AND NOT EXISTS (SELECT 1 FROM api_file_blobs b WHERE b.video_analysis_id = a.id)
                   AND a.updated_at < %s
                 ORDER BY a.id LIMIT 50""",
             (_now() - timedelta(hours=max(1, int(older_than_hours))),),
@@ -6905,9 +7241,20 @@ _API_RESPONSE_UPDATABLE = frozenset({
     "cancel_requested", "metadata", "started_at", "completed_at", "expires_at",
     # V35 (2026-09-13): the applied output ceiling and why generation stopped.
     "max_output_tokens", "finish_reason",
+    # V36 (2026-09-13): the durable run — lease, counters, suspension, the
+    # gateway's attempt token and body hash. project_id / workspace_id /
+    # key_id stay out: nothing may move a run between tenants or credentials.
+    "resumable", "dialect", "item_id", "engine", "lease_owner", "lease_expires_at",
+    "enqueued_at", "attempt", "stalled_attempts", "engine_fault_attempts", "yields",
+    "generated_tokens", "recomputed_prompt_tokens", "suspend_reason", "suspended_at",
+    "orphaned_at", "ever_followed", "attempt_token", "body_sha256", "last_incident_id",
 })
 _API_RESPONSE_JSON = frozenset({"metadata"})
-_API_RESPONSE_TEXT = frozenset({"error_code", "error_message", "output_text", "finish_reason"})
+_API_RESPONSE_TEXT = frozenset({
+    "error_code", "error_message", "output_text", "finish_reason",
+    "dialect", "item_id", "engine", "lease_owner", "suspend_reason", "attempt_token",
+    "body_sha256", "last_incident_id",
+})
 _API_RESPONSE_TERMINAL = ("completed", "failed", "cancelled")
 
 #: The columns a LIST read of `api_keys` returns. Spelled out rather than
@@ -8839,7 +9186,9 @@ def prune_api_platform(
       * minute counters older than `minute_retention_days` — the daily ledger
         is the durable one, and the minute table exists to answer "right now";
       * responses past their own `expires_at`, which was computed from the
-        project's `retention_days` when the row was created;
+        project's `retention_days` when the row was created — settled ones,
+        and open ones no durable runner will resume; an open resumable run
+        waits until it settles (`_API_EXPIRED_PRUNABLE_SQL`, 2026-09-14);
       * generated text on responses that are still inside their retention
         window but whose PROJECT has since shortened it — the text goes, the
         metadata row stays, because the usage record must outlive the content
@@ -8867,6 +9216,13 @@ def prune_api_platform(
     moment = now or _now()
     size = max(1, int(batch_size))
     batches = max(1, int(max_batches))
+    # V36 FIRST (2026-09-13): the durable-run log, specs and blob references,
+    # BEFORE the response rows they hang off — a response row is deleted only
+    # once no event of it remains, so its cascade never walks a large log
+    # inside one statement.
+    counts: Dict[str, int] = {}
+    retention_s = float(getattr(settings, "public_api_event_retention_s", 3600.0) or 0.0)
+    counts.update(_prune_api_durable(moment, retention_s=retention_s, batch_size=size, max_statements=batches * 4))
     jobs: Tuple[Tuple[str, str, Tuple[Any, ...]], ...] = (
         (
             "api_idempotency",
@@ -8887,9 +9243,19 @@ def prune_api_platform(
         ),
         (
             "api_responses",
+            # NOT EXISTS events (V36): a row whose log is still being pruned
+            # waits for the next run instead of cascading the log in one
+            # statement under the 15 s statement_timeout.
+            # _API_EXPIRED_PRUNABLE_SQL (T1 review, 2026-09-14): an OPEN durable
+            # run is never deleted for its expiry — a suspended, queued or
+            # lease-lapsed run past `expires_at` lost its row, and its client's
+            # re-attach got 404.
             "DELETE FROM api_responses WHERE ctid IN ("
-            " SELECT ctid FROM api_responses "
-            "  WHERE expires_at IS NOT NULL AND expires_at < %s LIMIT %s)",
+            " SELECT r.ctid FROM api_responses r "
+            "  WHERE r.expires_at IS NOT NULL AND r.expires_at < %s "
+            f"    AND {_API_EXPIRED_PRUNABLE_SQL} "
+            "    AND NOT EXISTS (SELECT 1 FROM api_response_events e WHERE e.response_id = r.id) "
+            "  LIMIT %s)",
             (moment,),
         ),
         (
@@ -8910,7 +9276,6 @@ def prune_api_platform(
             (moment - timedelta(days=int(delivery_retention_days)),),
         ),
     )
-    counts: Dict[str, int] = {}
     for name, statement, params in jobs:
         total = 0
         for _ in range(batches):
@@ -8932,4 +9297,165 @@ def prune_api_platform(
         if revoked < min(size, 5000):
             break
     counts["api_keys_rotated_out"] = rotated
+    return counts
+
+
+#: Terminal api_responses statuses, as SQL.
+_API_TERMINAL_SQL = "('completed', 'failed', 'cancelled')"
+
+#: Which rows past `expires_at` retention may take (alias `r`): a SETTLED row,
+#: or a row no durable runner will ever resume (`resumable` false: the
+#: pre-V36 rule, kept for them — background.py fails a restart-orphaned one).
+#: NEVER an open resumable run, whatever its lease says (T1 review,
+#: 2026-09-14). `expires_at` is computed at creation from the project's
+#: retention_days (as low as 1), while an open run can legitimately outlive
+#: it: a background job queued behind main.long, a run suspended for a deploy
+#: (its lease released), a live owner whose 60 s lease lapsed in a DB blip.
+#: The old test "expired and no live lease" deleted all three — their log,
+#: their spec, then their row — and the client's re-attach got 404. An open
+#: run's content goes when the runner settles it (a suspended run nobody reads
+#: is cancelled after PUBLIC_API_SUSPENDED_UNREAD_TTL_S) and the next prune
+#: then takes it.
+_API_EXPIRED_PRUNABLE_SQL = f"(r.status IN {_API_TERMINAL_SQL} OR NOT r.resumable)"
+
+#: How many response ids one due-list read returns. Small: each is then
+#: deleted in bounded range statements, and the list is re-read.
+_PRUNE_DUE_IDS = 50
+
+
+def _delete_response_events_batched(response_id: str, size: int, budget: List[int]) -> int:
+    """Delete one response's events in statements of at most `size` rows,
+    by sequence-number range over the primary key (no scan of the table, no
+    `ctid IN` semi-join that PostgreSQL may plan as a sequential scan).
+    `budget` is a one-element statement allowance shared by the caller;
+    returns the rows deleted."""
+    total = 0
+    while budget[0] > 0:
+        budget[0] -= 1
+        with connection() as con:
+            deleted = con.execute(
+                "DELETE FROM api_response_events WHERE response_id = %s AND sequence_number < "
+                " (SELECT min(sequence_number) FROM api_response_events WHERE response_id = %s) + %s",
+                (response_id, response_id, int(size)),
+            ).rowcount
+        deleted = max(0, int(deleted))
+        total += deleted
+        if deleted == 0:
+            break
+    return total
+
+
+def _prune_api_durable(
+    moment: datetime, *, retention_s: float, batch_size: int = 5000, max_statements: int = 800
+) -> Dict[str, int]:
+    """The V36 half of `prune_api_platform` (2026-09-13).
+
+    Events go for: terminal runs past PUBLIC_API_EVENT_RETENTION_S; terminal
+    runs of a project that is no longer active (a disabled project's replay
+    log is unreadable anyway); and expired rows that are settled or not
+    resumable (`_API_EXPIRED_PRUNABLE_SQL`). An OPEN resumable run's log, spec
+    and blob references are never touched here, leased or not, expired or not
+    — deleting under a live writer would corrupt its resume point, and
+    deleting a suspended or queued run's would lose the run (T1 review,
+    2026-09-14); the durable runner settles it first, and the next prune takes
+    it.
+
+    Specs and blob references go for every terminal run and every expired
+    prunable row (the runner deletes them at the terminal event; this is the
+    backstop for a process that died first).
+    """
+    size = max(1, int(batch_size))
+    budget = [max(1, int(max_statements))]
+    cutoff = moment - timedelta(seconds=max(0.0, float(retention_s)))
+    due_sql = (
+        "SELECT r.id FROM api_responses r "
+        " WHERE ("
+        f"   (r.status IN {_API_TERMINAL_SQL} AND COALESCE(r.completed_at, r.created_at) < %s)"
+        f"   OR (r.status IN {_API_TERMINAL_SQL} AND EXISTS ("
+        "        SELECT 1 FROM api_projects p WHERE p.id = r.project_id AND p.status <> 'active'))"
+        f"   OR (r.expires_at IS NOT NULL AND r.expires_at < %s AND {_API_EXPIRED_PRUNABLE_SQL})"
+        " ) AND EXISTS (SELECT 1 FROM api_response_events e WHERE e.response_id = r.id)"
+        " LIMIT %s"
+    )
+    events = 0
+    while budget[0] > 0:
+        budget[0] -= 1
+        with connection() as con:
+            ids = [str(row["id"]) for row in con.execute(due_sql, (cutoff, moment, _PRUNE_DUE_IDS)).fetchall()]
+        if not ids:
+            break
+        progressed = 0
+        for response_id in ids:
+            if budget[0] <= 0:
+                break
+            progressed += _delete_response_events_batched(response_id, size, budget)
+        events += progressed
+        if progressed == 0:
+            break
+    counts = {"api_response_events": events}
+    backstop_where = (
+        f" WHERE r.status IN {_API_TERMINAL_SQL}"
+        f"    OR (r.expires_at IS NOT NULL AND r.expires_at < %s AND {_API_EXPIRED_PRUNABLE_SQL})"
+    )
+    for table in ("api_response_requests", "api_response_blobs"):
+        total = 0
+        while budget[0] > 0:
+            budget[0] -= 1
+            with connection() as con:
+                touched = con.execute(
+                    f"DELETE FROM {table} WHERE ctid IN ("
+                    f" SELECT c.ctid FROM {table} c JOIN api_responses r ON r.id = c.response_id"
+                    f" {backstop_where} LIMIT %s)",
+                    (moment, size),
+                ).rowcount
+            touched = max(0, int(touched))
+            total += touched
+            if touched < size:
+                break
+        counts[table] = total
+    return counts
+
+
+def purge_api_content_batched(project_ids: Sequence[str], *, batch_size: int = 5000) -> Dict[str, int]:
+    """Delete every durable-run log, spec and blob reference of these
+    projects in bounded statements, so the cascade that follows — a workspace
+    or project DELETE — never walks a million-row event log inside one
+    statement under the 15 s statement_timeout (no-timeout /v1, 2026-09-13).
+
+    CALL IT BEFORE deleting a project or a workspace. Checked 2026-09-13:
+    nothing in orchestrator/app deletes an api_projects or workspaces row today
+    (the cascades exist only in the DDL), so there is no caller yet; the first
+    function that deletes either must call this first.
+    The response rows themselves are left to the cascade: with their logs gone
+    each is a single-row delete.
+    """
+    ids = [str(p) for p in project_ids if p]
+    counts = {"api_response_events": 0, "api_response_requests": 0, "api_response_blobs": 0}
+    if not ids:
+        return counts
+    size = max(1, int(batch_size))
+    unlimited = [1 << 62]
+    while True:
+        with connection() as con:
+            due = [str(row["id"]) for row in con.execute(
+                "SELECT r.id FROM api_responses r WHERE r.project_id = ANY(%s) "
+                " AND EXISTS (SELECT 1 FROM api_response_events e WHERE e.response_id = r.id) LIMIT %s",
+                (ids, _PRUNE_DUE_IDS),
+            ).fetchall()]
+        if not due:
+            break
+        for response_id in due:
+            counts["api_response_events"] += _delete_response_events_batched(response_id, size, unlimited)
+    for table in ("api_response_requests", "api_response_blobs"):
+        while True:
+            with connection() as con:
+                touched = max(0, int(con.execute(
+                    f"DELETE FROM {table} WHERE ctid IN ("
+                    f" SELECT c.ctid FROM {table} c JOIN api_responses r ON r.id = c.response_id"
+                    "  WHERE r.project_id = ANY(%s) LIMIT %s)",
+                    (ids, size),
+                ).rowcount))
+            counts[table] += touched
+            if touched < size:
+                break
     return counts

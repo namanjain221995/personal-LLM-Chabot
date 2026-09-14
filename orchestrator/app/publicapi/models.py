@@ -126,7 +126,24 @@ def body_cap_for(method: str, path: str) -> int:
     application's body-size middleware asks (`app/main.py::body_cap_for`, via
     `_public_api_body_cap`, since the 2026-09-13 integration). A new `/v1`
     route whose body may exceed `max_body_bytes()` is added here, and the
-    mounted app follows with no edit to main.py."""
+    mounted app follows with no edit to main.py.
+
+    FILES (files-hookup, 2026-09-13): `POST /v1/files` and
+    `POST /v1/uploads/{id}/parts` get 65 MiB and `PUT /v1/uploads/{id}/parts/{n}`
+    64 MiB, from `publicapi/files/routes.body_cap_for` — exact paths only, so
+    `POST /v1/uploads` and `complete` stay under the JSON rule. Those routes
+    stream the body to disk under their own caps; this is only the
+    middleware's outer bound. A files module that will not import leaves every
+    file route at the 1 MiB default, which refuses parts rather than opening
+    a larger cap anywhere."""
+    try:
+        from .files.routes import body_cap_for as _files_body_cap_for
+
+        files_cap = _files_body_cap_for(method, path)
+    except Exception:  # noqa: BLE001 - see the docstring: fail small
+        files_cap = None
+    if files_cap is not None:
+        return int(files_cap)
     normalised = "/" + str(path or "").strip("/")
     if str(method or "").upper() == "POST":
         if normalised in _MEDIA_ROUTES:

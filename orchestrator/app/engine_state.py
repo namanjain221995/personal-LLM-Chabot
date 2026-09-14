@@ -141,6 +141,21 @@ class EngineSnapshot:
     #: The controller's engine sample: what vLLM's /metrics said about load.
     requests_running: Optional[int]
     requests_waiting: Optional[int]
+    #: The controller's recovery budget (`recovery.budget`) and how much of it
+    #: the rolling window has used (`recovery.attempts_in_window`); None when
+    #: the document does not carry them (an older controller build). Read by
+    #: `recovery_headroom` (no-timeout /v1, 2026-09-13: POISON QUARANTINE).
+    recovery_budget: Optional[int] = None
+    recovery_attempts_in_window: Optional[int] = None
+    #: Seconds the engine's token counters have not moved while requests ran
+    #: (`signals.engine.frozen_seconds`); None when absent.
+    frozen_seconds: Optional[float] = None
+    #: The controller's wall-clock stamp of its engine sample
+    #: (`signals.engine.observed_at`). It stops moving while /metrics is
+    #: unavailable even though `generated_at` keeps advancing, so a consumer
+    #: can tell a CURRENT sample from the last good one (assembler,
+    #: 2026-09-14: the interface publicapi/liveness.py's 'lost' rule asked for).
+    engine_observed_at: Optional[float] = None
 
     def age_s(self, now: Optional[float] = None) -> float:
         read_age = max(0.0, (time.monotonic() if now is None else now) - self.observed_at)
@@ -251,11 +266,19 @@ def engine_load(now: Optional[float] = None) -> Optional[Dict[str, float]]:
     assert snap is not None
     if snap.requests_running is None:
         return None
-    return {
+    load = {
         "requests_running": float(snap.requests_running),
         "requests_waiting": float(snap.requests_waiting or 0),
         "age_s": snap.age_s(now),
+        # The controller's own stamp: two samples with the same value are ONE
+        # observation, which the /v1 'lost' rule must not count twice.
+        "generated_at": float(snap.generated_at),
     }
+    if snap.engine_observed_at is not None:
+        # When the SAMPLE was taken (same wall clock as generated_at); absent
+        # from a controller build that does not publish it.
+        load["sample_observed_at"] = float(snap.engine_observed_at)
+    return load
 
 
 def describe(now: Optional[float] = None) -> dict:
@@ -287,6 +310,9 @@ def describe(now: Optional[float] = None) -> dict:
             incident_id=snap.incident_id,
             requests_running=snap.requests_running,
             requests_waiting=snap.requests_waiting,
+            recovery_budget=snap.recovery_budget,
+            recovery_attempts_in_window=snap.recovery_attempts_in_window,
+            proven_not_serving=proven_not_serving(now),
         )
     if _last_attempt_at is not None:
         out["last_poll_age_s"] = round(max(0.0, (time.monotonic() if now is None else now) - _last_attempt_at), 1)
@@ -328,7 +354,8 @@ async def wait_ready(timeout: float) -> bool:
     if event.is_set():
         return True
     try:
-        await asyncio.wait_for(event.wait(), max(0.0, float(timeout)))
+        async with asyncio.timeout(max(0.0, float(timeout))):
+            await event.wait()
     except asyncio.TimeoutError:
         return False
     return True
@@ -378,6 +405,250 @@ def _note_unknown() -> None:
     snapshot fires the READY edge (see `_was_serving`)."""
     global _was_serving
     _was_serving = None
+
+
+# ---------------------------------------------------------------------------
+# Evidence for a caller that must never cut a healthy silent prefill
+# (no-timeout /v1 design, revision 2, 2026-09-13: LIVENESS GUARD)
+# ---------------------------------------------------------------------------
+#
+# WHY A SECOND READING OF THE SAME VERDICT. `external_open` answers the chat
+# BREAKER's question — "should a new chat turn be queued rather than sent?" —
+# and a false positive there costs a person seconds. The public API asks a
+# different question of the same document: "may I CUT a generation that has
+# been silent for twenty minutes?" A false positive there throws away a 950K
+# prefill (~800 s at the measured ~1,190 tok/s) and pays it again. So the /v1
+# reading is stricter about what counts as proven:
+#
+# - unknown stays unknown: MONITORING_UNKNOWN, QUEUEING, a stale or
+#   unreachable controller, a STARTING that is only the controller's own cold
+#   start — exactly as for the breaker;
+# - AND a DOWN whose reason is the controller's cold-start budget running out
+#   ("cold start timeout") on a head that is alive, carries no incident and
+#   has already served, is unknown too. The controller publishes that DOWN
+#   900 s after IT restarted during a long prefill (controller.py, cold start
+#   branch): the head was never unhealthy. The breaker's use of
+#   `external_open` is deliberately NOT changed here (flagged to the
+#   controller owner instead).
+#
+# - AND a STARTING on a head younger than STARTING_HEAD_AGE_S is unknown too
+#   when the head is running, its engine process alive, there is no incident,
+#   and this process has seen THIS head serve (evidence after its start). The
+#   controller restarting within 15 minutes of a head (re)start — after one of
+#   the 172-188 s recoveries, say — says STARTING "readiness sequence not
+#   passed yet" until its own probe passes; during a silent public prefill the
+#   guard read that as proven down and threw a healthy prefill away after 30 s
+#   (T1 review, 2026-09-14). A head restart moves `started_at` past the
+#   evidence, so a real start stays proven.
+#
+# "Has already served" is this process's own evidence when it has any: a
+# fresh SERVING snapshot, or an engine chunk received by any llm stream, at a
+# wall-clock time after the head started. A head this process watched start
+# and never saw serve is a real cold-start failure and stays proven bad. With
+# no evidence at all (this process started after the head's last answer) the
+# document's own qualification decides, as the design states.
+
+#: The reason prefix the controller gives its cold-start-budget DOWN.
+COLD_START_TIMEOUT_REASON = "cold start timeout"
+
+#: Monotonic and wall-clock time of the last fresh SERVING snapshot.
+_serving_seen_at: Optional[float] = None
+_serving_seen_wall: Optional[float] = None
+#: Monotonic and wall-clock time of the last engine chunk any llm stream of
+#: this process received (`note_chunk`).
+_chunk_at: Optional[float] = None
+_chunk_wall: Optional[float] = None
+#: Since when (monotonic) the /v1 verdict has been continuously proven bad,
+#: and which state it was; None while it is not.
+_bad_since: Optional[float] = None
+_bad_state: Optional[str] = None
+
+
+def note_chunk() -> None:
+    """An engine chunk arrived on some llm stream of this process.
+
+    Called on EVERY chunk (llm.stream_chat_events), so it is two clock reads
+    and two assignments — no lock, no allocation. A chunk is the strongest
+    serving evidence there is: the engine produced a token for us just now.
+    """
+    global _chunk_at, _chunk_wall
+    _chunk_at = time.monotonic()
+    _chunk_wall = time.time()
+
+
+def serving_evidence_at() -> Optional[float]:
+    """Monotonic time of the latest serving evidence: the later of the last
+    fresh SERVING snapshot and the last engine chunk. None when this process
+    has seen neither."""
+    seen = [t for t in (_serving_seen_at, _chunk_at) if t is not None]
+    return max(seen) if seen else None
+
+
+def _serving_evidence_wall() -> Optional[float]:
+    seen = [t for t in (_serving_seen_wall, _chunk_wall) if t is not None]
+    return max(seen) if seen else None
+
+
+def _fresh_snapshot(now: Optional[float] = None) -> Optional[EngineSnapshot]:
+    return None if unknown(now) else _snapshot
+
+
+def head_started_at(now: Optional[float] = None) -> Optional[float]:
+    """The head container's start (controller wall clock) from a FRESH
+    snapshot, or None. A change between two non-None readings is a head
+    restart: the liveness guard interrupts on it."""
+    snap = _fresh_snapshot(now)
+    return None if snap is None else snap.head_started_at
+
+
+def incident_id(now: Optional[float] = None) -> Optional[str]:
+    """The open incident's id from a fresh snapshot, or None."""
+    snap = _fresh_snapshot(now)
+    return None if snap is None else snap.incident_id
+
+
+def recovery_headroom(now: Optional[float] = None) -> Optional[int]:
+    """`recovery.budget − recovery.attempts_in_window` from a fresh snapshot,
+    never below 0; None when the verdict is unknown or either number is
+    absent. A quarantined /v1 run is dispatched only while this is at least
+    PUBLIC_API_QUARANTINE_MIN_RECOVERIES, so a request that crashed the engine
+    once can never spend the recoveries chat needs (design review, 2026-09-13)."""
+    snap = _fresh_snapshot(now)
+    if snap is None or snap.recovery_budget is None or snap.recovery_attempts_in_window is None:
+        return None
+    return max(0, int(snap.recovery_budget) - int(snap.recovery_attempts_in_window))
+
+
+def frozen_seconds(now: Optional[float] = None) -> Optional[float]:
+    """How long the engine's token counters have been frozen with requests
+    running, per a fresh snapshot; None when unknown or absent."""
+    snap = _fresh_snapshot(now)
+    return None if snap is None else snap.frozen_seconds
+
+
+def _cold_start_timeout_on_served_head(snap: EngineSnapshot) -> bool:
+    """See the section comment: is this DOWN only the controller's cold-start
+    budget running out on a head that is (as far as anything shows) healthy?"""
+    if snap.state != "DOWN" or not snap.reason.lower().startswith(COLD_START_TIMEOUT_REASON):
+        return False
+    if _starting_is_real(snap):
+        # An incident, a dead head or engine process, or a head younger than
+        # STARTING_HEAD_AGE_S: the document itself says it is real.
+        return False
+    evidence = _serving_evidence_wall()
+    if evidence is not None and snap.head_started_at is not None and evidence < snap.head_started_at:
+        # This process watched this head start and never saw it serve.
+        return False
+    return True
+
+
+def _controller_starting_on_served_head(snap: EngineSnapshot) -> bool:
+    """See the section comment: is this STARTING (on a young head) only the
+    controller's own cold start, on a head this process has seen serve since
+    it started? Positive evidence only: a head or engine process the document
+    does not call alive, an incident, or no head start leaves it proven."""
+    if snap.state != "STARTING" or snap.incident_id:
+        return False
+    if snap.head_running is not True or snap.head_engine_alive is not True:
+        return False
+    if snap.head_started_at is None:
+        return False
+    evidence = _serving_evidence_wall()
+    return evidence is not None and evidence > snap.head_started_at
+
+
+def proven_not_serving(now: Optional[float] = None) -> Optional[str]:
+    """The state name when the controller has PROVEN the primary is not
+    serving, else None — `external_open` minus the cold-start-timeout DOWN on
+    an old, alive head, and minus the controller's own STARTING on a young
+    head this process has seen serve (section comment). Non-None only for a
+    fresh WEDGED, RECOVERING, a real STARTING, or any other DOWN (worker_rank_dead,
+    head_engine_dead, head_api_dead, manual, recovery budget exhausted)."""
+    state = external_open(now)
+    if state is None:
+        return None
+    snap = _snapshot
+    assert snap is not None  # external_open returned a state
+    if _cold_start_timeout_on_served_head(snap) or _controller_starting_on_served_head(snap):
+        return None
+    return state
+
+
+def not_serving_since(now: Optional[float] = None) -> Optional[float]:
+    """Monotonic time since which `proven_not_serving` has been non-None at
+    every poll, or None when it is not now. Tracked by the poller, so "30 s
+    continuously" means every read in those 30 s said so — a single unknown
+    read in between restarts the count (unknown is never down)."""
+    if proven_not_serving(now) is None:
+        return None
+    return _bad_since
+
+
+def _note_verdict() -> None:
+    """After every poll: move the serving-evidence clock and the proven-bad
+    streak. Unknown ends a streak — it must never extend one."""
+    global _serving_seen_at, _serving_seen_wall, _bad_since, _bad_state
+    now = time.monotonic()
+    if serving(now) is True:
+        _serving_seen_at = now
+        _serving_seen_wall = time.time()
+    bad = proven_not_serving(now)
+    if bad is None:
+        _bad_since = None
+        _bad_state = None
+    elif _bad_since is None:
+        _bad_since = now
+        _bad_state = bad
+    else:
+        _bad_state = bad
+
+
+async def wait_not_bad(
+    abandon: "Optional[Callable[[], bool] | asyncio.Event]" = None,
+    *,
+    poll_s: Optional[float] = None,
+    polls: int = 2,
+) -> bool:
+    """Sleep until `polls` consecutive checks, one poll interval apart, find
+    the engine NOT proven bad; True then. False as soon as `abandon` (a
+    callable returning True, or a set Event) says the caller left.
+
+    No deadline, on purpose: an interrupted /v1 attempt waits here for as long
+    as the engine is proven down, and the ENGINE-DOWN GRACE — counted by the
+    caller from `not_serving_since` — is what ends a wait that should end.
+    Unknown is not bad, so a crashlooping controller never parks a waiter.
+    """
+    interval = max(0.05, float(poll_s if poll_s is not None else max(0.5, float(settings.engine_state_poll_s))))
+    need = max(1, int(polls))
+    good = 0
+
+    def left() -> bool:
+        if abandon is None:
+            return False
+        if isinstance(abandon, asyncio.Event):
+            return abandon.is_set()
+        try:
+            return bool(abandon())
+        except Exception:  # noqa: BLE001 — a broken probe is not an abandon
+            return False
+
+    while True:
+        if left():
+            return False
+        if proven_not_serving() is None:
+            good += 1
+            if good >= need:
+                return True
+        else:
+            good = 0
+        if isinstance(abandon, asyncio.Event):
+            try:
+                async with asyncio.timeout(interval):
+                    await abandon.wait()
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +724,10 @@ def parse_state_document(
         head_started_at=_opt_float(head.get("started_at")),
         requests_running=_opt_int(engine.get("requests_running")),
         requests_waiting=_opt_int(engine.get("requests_waiting")),
+        recovery_budget=_opt_int(recovery.get("budget")),
+        recovery_attempts_in_window=_opt_int(recovery.get("attempts_in_window")),
+        frozen_seconds=_opt_float(engine.get("frozen_seconds")),
+        engine_observed_at=_opt_float(engine.get("observed_at")),
     )
 
 
@@ -496,6 +771,7 @@ def _record(snap: Optional[EngineSnapshot], error: str) -> None:
         _publish_event(_snapshot)
     else:
         _note_unknown()
+    _note_verdict()
 
 
 async def poll_once(client=None) -> Optional[EngineSnapshot]:
@@ -600,10 +876,17 @@ async def stop() -> None:
 def reset() -> None:
     """Tests only: forget every read, every event and every listener."""
     global _snapshot, _last_error, _last_attempt_at, _was_serving
+    global _serving_seen_at, _serving_seen_wall, _chunk_at, _chunk_wall, _bad_since, _bad_state
     _snapshot = None
     _last_error = ""
     _last_attempt_at = None
     _was_serving = None
+    _serving_seen_at = None
+    _serving_seen_wall = None
+    _chunk_at = None
+    _chunk_wall = None
+    _bad_since = None
+    _bad_state = None
     _events.clear()
     _ready_listeners.clear()
     _publish(None)

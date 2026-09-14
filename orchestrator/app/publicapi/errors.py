@@ -97,6 +97,11 @@ RETRYABLE_CODES = frozenset(
 #: here rather than by a client that never retries.
 _RETRY_AFTER_REQUIRED = frozenset({429, 503})
 
+#: The header both OpenAI SDKs obey before their own status table
+#: (openai-python `_should_retry`, openai-node `shouldRetry`): `false` stops a
+#: retry of a 409/429/5xx, `true` forces one. Lower case, as the SDKs read it.
+SHOULD_RETRY_HEADER = "x-should-retry"
+
 #: The floor the public OpenAPI schema types for `Retry-After` (integer,
 #: minimum 1). A `Retry-After: 0` invites an immediate retry storm from the
 #: caller we just throttled.
@@ -220,6 +225,18 @@ class ApiError(Exception):
     and get a different answer.
     """
 
+    #: `x-should-retry` (2026-09-13, no-timeout design sdk_and_docs): None
+    #: sends no header and leaves the SDKs to their status table; False tells
+    #: openai-python and openai-node NOT to retry a status they would
+    #: otherwise retry (a 409 or 5xx), which is how a failure that must not
+    #: run the model twice says so. Set through `no_retry`.
+    #:
+    #: A CLASS attribute, not one set in `__init__`: a subclass that builds
+    #: itself without calling it (apifiles.service._PendingCodeError, for the
+    #: codes the table does not hold yet) must still render `headers()` — the
+    #: first draft set it per instance and broke four Files API tests.
+    should_retry: Optional[bool] = None
+
     def __init__(
         self,
         code: str,
@@ -283,8 +300,14 @@ class ApiError(Exception):
 
     def headers(self) -> Dict[str, str]:
         """Headers this failure must carry. `Retry-After` is seconds, integer,
-        minimum 1 — a float here is unparseable to most HTTP clients."""
-        return {} if self.retry_after is None else {"Retry-After": str(self.retry_after)}
+        minimum 1 — a float here is unparseable to most HTTP clients.
+        `x-should-retry` only when a caller decided it (`no_retry`)."""
+        headers: Dict[str, str] = {}
+        if self.retry_after is not None:
+            headers["Retry-After"] = str(self.retry_after)
+        if self.should_retry is not None:
+            headers[SHOULD_RETRY_HEADER] = "true" if self.should_retry else "false"
+        return headers
 
     def stream_payload(self, sequence_number: int) -> Dict[str, Any]:
         """The `event: error` data of CONTRACT §10 / STANDARDS: type, code,
@@ -574,6 +597,69 @@ def from_unexpected(exc: BaseException, *, request_id: str = "") -> ApiError:
         "unhandled error on the public API (request_id=%s)", (request_id or "-")
     )
     return internal_error()
+
+
+def no_retry(error: ApiError) -> ApiError:
+    """Mark `error` so its response carries `x-should-retry: false`.
+
+    For the failures a retry would make WORSE rather than merely repeat
+    (no-timeout design, sdk_and_docs "x-should-retry: false on"): a 500 after
+    a generation started for a request with no Idempotency-Key (the retry
+    runs the model again from nothing), a 409 caused by a different body or
+    credential, and the second engine fault of one run. Returns the same
+    object, so it can wrap a `raise`.
+    """
+    error.should_retry = False
+    return error
+
+
+def committed_failure_error(exc: BaseException, *, request_id: str = "") -> Dict[str, Any]:
+    """The `error` object of a failed body written AFTER a committed 200.
+
+    The envelope's four wire fields without `request_id` (the header carried
+    it before the first byte): the same `code` and scrubbed `message` the HTTP
+    envelope would have used, so a client applies one table whether the
+    failure arrived as a status or in a committed body.
+    """
+    failure = from_unexpected(exc, request_id=request_id)
+    return {
+        "message": redact(failure.message),
+        "type": failure.type,
+        "code": failure.code,
+        "param": failure.param,
+    }
+
+
+def chat_completion_failure_body(
+    exc: BaseException,
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    usage: Optional[Mapping[str, Any]] = None,
+    max_output_tokens: Optional[int] = None,
+    request_id: str = "",
+) -> Dict[str, Any]:
+    """A `chat.completion` that failed after its 200 was committed.
+
+    `choices: []` and a top-level `error` (no-timeout design, edge_100s 2):
+    the shape the compatibility dialect's own streaming error chunk uses, so
+    a client that already unwraps `error` from a chunk reads this the same
+    way, and one that only reads `choices[0]` fails loudly on an empty list
+    instead of rendering an answer that never came. `usage` is what the
+    engine reported for the tokens it did produce (None: not measured, never
+    zero).
+    """
+    return {
+        "id": str(completion_id),
+        "object": "chat.completion",
+        "created": int(created),
+        "model": str(model),
+        "choices": [],
+        "usage": None if usage is None else dict(usage),
+        "max_output_tokens": max_output_tokens,
+        "error": committed_failure_error(exc, request_id=request_id),
+    }
 
 
 def envelope_from(exc: BaseException, *, request_id: str = "") -> Dict[str, Any]:

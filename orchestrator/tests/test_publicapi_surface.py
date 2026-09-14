@@ -36,6 +36,25 @@ ELEVEN = {
     "GET /v1/openapi.json",
 }
 
+#: The fourteen `/v1/files` and `/v1/uploads` operations (files-hookup,
+#: 2026-09-13): described exactly while `router.FILES_MOUNTED`.
+FILES = {
+    "POST /v1/files",
+    "GET /v1/files",
+    "GET /v1/files/{file_id}",
+    "GET /v1/files/{file_id}/content",
+    "DELETE /v1/files/{file_id}",
+    "GET /v1/files/{file_id}/events",
+    "GET /v1/files/{file_id}/derived",
+    "GET /v1/files/{file_id}/derived/{name}",
+    "POST /v1/uploads",
+    "GET /v1/uploads/{upload_id}",
+    "POST /v1/uploads/{upload_id}/parts",
+    "PUT /v1/uploads/{upload_id}/parts/{part_number}",
+    "POST /v1/uploads/{upload_id}/complete",
+    "POST /v1/uploads/{upload_id}/cancel",
+}
+
 #: Recognisable internal identities, installed into settings so a leak of any
 #: of them into the public document is detectable.
 _INTERNAL = {
@@ -69,7 +88,15 @@ def _operations(document):
             yield f"{method.upper()} {path}", operation
 
 
-def test_the_public_document_describes_exactly_the_eleven_operations(configured):
+def test_the_public_document_describes_exactly_the_eleven_operations_and_the_fourteen_file_routes(configured):
+    document = openapi_module.public_openapi()
+
+    assert public_router.FILES_MOUNTED
+    assert {name for name, _ in _operations(document)} == ELEVEN | FILES
+
+
+def test_without_the_files_mount_the_document_describes_only_the_eleven(configured, monkeypatch):
+    monkeypatch.setattr(public_router, "FILES_MOUNTED", False)
     document = openapi_module.public_openapi()
 
     assert {name for name, _ in _operations(document)} == ELEVEN

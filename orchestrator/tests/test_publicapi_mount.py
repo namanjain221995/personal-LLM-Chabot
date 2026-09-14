@@ -198,11 +198,10 @@ def test_the_body_limit_sits_inside_cors_so_a_413_is_readable_by_a_browser(
     the limit were outermost its 413 would carry no CORS headers and a browser
     would see an opaque network error instead of a status it can act on."""
     names = [getattr(m, "cls", None).__name__ for m in app.user_middleware]
-    assert names == [
-        "BaseHTTPMiddleware",  # _reject_cross_site_writes
-        "BrowserCorsExceptPublicApi",
-        "RequestBodySizeLimitMiddleware",
-    ]
+    assert names[1:] == ["BrowserCorsExceptPublicApi", "RequestBodySizeLimitMiddleware"]
+    # _reject_cross_site_writes: a BaseHTTPMiddleware until main.py makes it
+    # plain ASGI (see the abort test below, which says why it must).
+    assert names[0] in ("BaseHTTPMiddleware", "RejectCrossSiteWrites")
 
     allowed = settings.cors_allow_origins[0]
     monkeypatch.setenv("MAX_REQUEST_BODY_BYTES", "512")
@@ -563,7 +562,7 @@ def _main_uses_the_public_per_route_caps() -> bool:
 
     return all(
         app_main.body_cap_for("POST", path).signed_in == public_models.body_cap_for("POST", path)
-        for path in ("/v1/responses", "/v1/chat/completions", "/v1/audio/transcriptions")
+        for path in ("/v1/responses", "/v1/chat/completions", "/v1/audio/transcriptions", "/v1/files")
     )
 
 
@@ -982,3 +981,71 @@ def test_rotated_out_keys_are_revoked_by_the_scheduled_loop_against_the_real_dat
     assert held, "the rotated-out key was never revoked by the loop"
     assert running
     assert db.api_key_by_public_id(live["public_id"])["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# A /v1 response that fails mid-body must reach the caller as a failure
+# ---------------------------------------------------------------------------
+
+
+# Assembler, 2026-09-14: the strict xfail markers that waited for the main.py
+# integration are removed; both integrations are in this tree.
+@pytest.mark.parametrize("kind", ["committed-abort", "sse"])
+def test_a_v1_response_that_fails_mid_body_drops_the_connection_through_the_whole_app(kind):
+    """Adversarial review of T3-wire, 2026-09-14. Starlette's BaseHTTPMiddleware
+    re-streams the body through a memory stream, and when the app raises
+    mid-body it ends that stream CLEANLY and re-raises only after the outer
+    response is complete. Measured on uvicorn: without it a committed abort
+    and an SSE generator raising mid-body both give the client
+    `httpx.RemoteProtocolError`; with it both give a complete 200 (a
+    whitespace-only JSON body, a truncated stream) and no error — so an SDK
+    parses a success instead of retrying, the gateway cannot see an
+    incomplete read, and T4's `failure_mode="abort"` and T2's `suspend_all`
+    reader aborts are silently turned into answers. Through the REAL
+    `app.main:app` stack, on a real socket: an in-process client buffers the
+    body and would prove nothing."""
+    import asyncio
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    from app.publicapi import keepalive
+    from tests.test_publicapi_sync_commit import serve
+
+    async def committed_abort():
+        async def work():
+            await asyncio.sleep(0.3)
+            raise RuntimeError("the engine went away after the commit")
+
+        return keepalive.CommittedJSONResponse(
+            work, failure_mode=keepalive.FAILURE_ABORT, commit_s=0.05, heartbeat_s=0.05
+        )
+
+    async def sse():
+        async def frames():
+            yield "event: response.created\ndata: {}\n\n"
+            await asyncio.sleep(0.2)
+            raise RuntimeError("the reader was suspended")
+
+        return StreamingResponse(frames(), media_type="text/event-stream")
+
+    endpoint = committed_abort if kind == "committed-abort" else sse
+    path = f"/v1/__mount_abort_{kind.replace('-', '_')}"
+    app.add_api_route(path, endpoint, methods=["GET"])
+    added = app.router.routes[-1]
+    try:
+        with serve(app) as port:
+            received = b""
+            error = None
+            with httpx.Client(timeout=10) as client:
+                with client.stream("GET", f"http://127.0.0.1:{port}{path}") as response:
+                    assert response.status_code == 200
+                    try:
+                        for chunk in response.iter_raw():
+                            received += chunk
+                    except httpx.HTTPError as exc:
+                        error = exc
+    finally:
+        if added in app.router.routes:
+            app.router.routes.remove(added)
+    assert isinstance(error, httpx.RemoteProtocolError), (error, received)

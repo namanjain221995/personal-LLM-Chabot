@@ -37,11 +37,14 @@ HOW INPUT IS COUNTED, PER MODEL (`PublicModel.clamp_basis`):
   under-estimate would be an engine 400. Text at its UTF-8 byte length plus
   2,048 tokens per image (measured pages: 487-1,807).
 
-THE WALL CLOCK, PER REQUEST. A 1,000,000-token answer at the measured 71-101
-tok/s runs 2.8-3.9 hours — it must not be cut at the chat app's 70 minutes.
-`wall_clock_s = min(PUBLIC_API_GEN_WALL_CLOCK_S, max(floor, prefill_allowance
-+ planned / min_decode_tps))`: the default 8,192 keeps the chat app's 4,200 s,
-and 1,000,000 gets 900 + 20,000 = 20,900 s.
+NO WALL CLOCK (no-timeout design, 2026-09-13). The per-request wall clock
+this module used to size (`wall_clock_for`, up to PUBLIC_API_GEN_WALL_CLOCK_S
+= 6 h) is DELETED: liveness comes from engine evidence (`liveness.py`), and a
+generation that crosses a deploy is resumed (`durable.py`). The retired
+settings PUBLIC_API_GEN_WALL_CLOCK_S, PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S and
+PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S are ignored (T1's config logs one
+warning each). `GenerationPlan.wall_clock_s` stays as 0.0 — meaning "none" —
+only so a reader that still logs it (router metadata) keeps working.
 """
 from __future__ import annotations
 
@@ -53,6 +56,70 @@ from ..config import settings
 from . import errors, models, registry
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FileInputs:
+    """What files and audio parts add to one plan (files-hookup, 2026-09-13).
+
+    Built by `publicapi/file_inputs.py` from `apifiles.service.prepare`, so this
+    module never imports the Files package. Two states:
+
+    * `pending=True` — the request carries file parts that are not resolved
+      yet (the plan made before admission). The image rules that depend on how
+      many images the files hold (OCR's exactly-one, the per-model maximum) are
+      left to the plan made after resolution; everything else is decided as
+      for any request.
+    * resolved — `messages` are the engine messages with each file's blocks
+      spliced where its part was (`service.splice_messages`), `tokens` the
+      file context's estimated tokens, `images` the images the files add.
+
+    HOW FILE TEXT IS COUNTED (senior fix 2026-09-14; the first hookup counted
+    it at the ESTIMATE, which the review showed a digit-dense file games DOWN:
+    120,000 random digits estimated 40,001 tokens, planned `main.extended`
+    where the same text typed in planned `main.long`, and a numeric CSV in
+    `full` mode passed the 1M input ceiling).
+
+    * `measured_tokens` — the engine's EXACT `/tokenize` count of the file
+      text plus the image estimates (`FileRun.planning_inputs`). Used for the
+      hard input ceiling, the gate footprint and the output clamp. Exact, so it
+      can be gamed in neither direction, and a 100,000-token prose file is
+      100,000 tokens — not the ~300,000 of its byte bound.
+    * `bounded_tokens` — the file text at its UTF-8 byte length (never below
+      `tokens`). Used in place of the count when the engine could not count:
+      the same byte rule caller-typed text keeps, so a failure to count can
+      only make a request wait for a larger gate or be refused, never slip an
+      oversized prompt into a shared lane.
+    * `tokens` — the context builder's estimate. Only the soft input-TPM
+      reservation, which settles to the measured count at the end.
+
+    Caller-typed text keeps the byte bound for the ceiling and the gate,
+    exactly as before.
+    """
+
+    messages: Optional[List[Dict[str, Any]]] = None
+    tokens: int = 0
+    bounded_tokens: int = 0
+    images: int = 0
+    pending: bool = False
+    measured_tokens: Optional[int] = None
+
+    def ceiling_tokens(self) -> int:
+        """The file text for the hard ceiling and the gate: the engine's count,
+        else the byte bound (never below the estimate)."""
+        if self.measured_tokens is not None:
+            return max(0, int(self.measured_tokens))
+        return max(0, int(self.bounded_tokens), int(self.tokens))
+
+    def clamp_tokens(self) -> int:
+        """The file text for the output clamp: the count when there is one."""
+        if self.measured_tokens is not None:
+            return max(0, int(self.measured_tokens))
+        return max(0, int(self.tokens))
+
+
+#: The plan made before a request's files are resolved.
+FILES_PENDING = FileInputs(pending=True)
 
 
 @dataclass(frozen=True)
@@ -72,6 +139,7 @@ class GenerationPlan:
     estimated_input_tokens: int
     bounded_input_tokens: int
     footprint_tokens: int
+    #: RETIRED (2026-09-13): always 0.0, meaning no wall clock.
     wall_clock_s: float
     temperature: float
     clamped: bool
@@ -140,28 +208,7 @@ def _with_ocr_prompt(
     return shaped
 
 
-# ---------------------------------------------------------- wall clock --
-
-
-def wall_clock_for(model: registry.PublicModel, planned_max_output_tokens: int) -> float:
-    """The per-request generation wall clock (module docstring).
-
-    The floor for techsara-35b is the chat app's GEN_WALL_CLOCK_S (4,200 s on
-    this deployment), so a default-sized public request is cut exactly where
-    it always was; 600 s for the sidecars.
-    """
-    ceiling = registry.setting_float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)
-    if model.engine == registry.ENGINE_MAIN:
-        floor = float(getattr(settings, "gen_wall_clock_s", 1800.0) or 1800.0)
-        prefill = registry.setting_float("PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0)
-        rate = registry.setting_float("PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", 50.0)
-    else:
-        floor = registry.SIDECAR_WALL_CLOCK_FLOOR_S
-        prefill = registry.SIDECAR_PREFILL_ALLOWANCE_S
-        rate = registry.SIDECAR_MIN_DECODE_TOKENS_PER_S
-    rate = max(0.001, float(rate))
-    wanted = max(float(floor), float(prefill) + float(planned_max_output_tokens) / rate)
-    return float(min(float(ceiling), wanted)) if ceiling > 0 else float(wanted)
+# ------------------------------------------------------------ transport --
 
 
 #: The transport check below logs once per process, not once per request.
@@ -172,24 +219,24 @@ def transport_timeout_is_sufficient() -> bool:
     """THE LLM_REQUEST_TIMEOUT INVARIANT, restated for `/v1` (2026-09-13).
 
     Every `/v1` generation is a STREAMED engine call, so the httpx read
-    timeout bounds the longest SILENCE between two chunks, not the whole
-    generation — and the longest legitimate silence on the main engine is a
-    full-window prefill (878 s measured at 949,915 tokens, 2026-08-29), which
-    PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S (900 s) stands for. A read timeout
-    shorter than that kills a legitimate 1M-context request inside the HTTP
-    client, where it reads as an engine fault. Logged as an error once, the
-    first time a main-engine generation is planned; never a refusal, because
-    the operator's setting is the thing to fix.
+    timeout bounds the longest SILENCE between two chunks — and the longest
+    legitimate silence on the main engine is a full-window prefill (~800 s
+    measured at 950k tokens, 2026-09-12). Once llm.py accepts
+    `read_timeout_s=None` (T1) the public path has no read timeout at all and
+    this check is moot; until then a read timeout shorter than 900 s kills a
+    legitimate long-context request inside the HTTP client. Logged as an
+    error once; never a refusal, because the operator's setting is the thing
+    to fix.
     """
     global _TRANSPORT_CHECKED
     timeout = float(getattr(settings, "llm_request_timeout", 0) or 0)
-    allowance = registry.setting_float("PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0)
+    allowance = 900.0
     sufficient = timeout <= 0 or timeout >= allowance
     if not sufficient and not _TRANSPORT_CHECKED:
         log.error(
-            "LLM_REQUEST_TIMEOUT (%.0fs) is shorter than the public prefill allowance "
+            "LLM_REQUEST_TIMEOUT (%.0fs) is shorter than a full-window prefill "
             "(%.0fs): a long-context /v1 request will be cut by the HTTP read timeout "
-            "during its prefill",
+            "during its prefill until llm.py accepts read_timeout_s=None",
             timeout, allowance,
         )
     _TRANSPORT_CHECKED = True
@@ -268,23 +315,29 @@ def plan_generation(
     project_max_output_tokens: Optional[int] = None,
     project_max_input_tokens: Optional[int] = None,
     endpoint: str = registry.ENDPOINT_RESPONSES,
+    files: Optional[FileInputs] = None,
 ) -> GenerationPlan:
     """Decide one generation, or raise the 400 that says why it cannot run.
 
     Raises `ApiError`: 400 `invalid_request_error` (endpoint, image rules,
     `max_output_tokens`) or 400 `context_length_exceeded`. Never a 413 — the
     text rule was applied when the body was parsed.
+
+    `files` (2026-09-13): see `FileInputs` — pending before resolution, the
+    spliced messages and the file counts after.
     """
     check_endpoint(model, endpoint)
     if model.engine == registry.ENGINE_MAIN and not _TRANSPORT_CHECKED:
         transport_timeout_is_sufficient()
 
-    images = request_model.image_count()
+    pending = bool(files is not None and files.pending)
+    file_images = 0 if files is None or pending else max(0, int(files.images))
+    images = request_model.image_count() + file_images
     if images and not model.vision:
         raise errors.invalid_request(
             f"The model `{model.id}` does not accept image input.", param="input"
         )
-    if model.ocr and images != registry.OCR_IMAGES_PER_REQUEST:
+    if model.ocr and images != registry.OCR_IMAGES_PER_REQUEST and not pending:
         raise errors.invalid_request(
             f"The model `{model.id}` reads exactly one image per request.", param="input"
         )
@@ -297,6 +350,18 @@ def plan_generation(
     messages = request_model.chat_messages()
     if model.ocr:
         messages = _with_ocr_prompt(request_model, messages)
+    #: The caller's own turns, counted as before; file text is added below
+    #: (FileInputs, HOW FILE TEXT IS COUNTED): the engine's count or the byte
+    #: bound for the ceiling, the gate and the clamp; the estimate for the TPM.
+    caller_messages = messages
+    file_tokens = 0
+    file_ceiling = 0
+    file_clamp = 0
+    if files is not None and not pending and files.messages is not None:
+        messages = [dict(message) for message in files.messages]
+        file_tokens = max(0, int(files.tokens))
+        file_ceiling = files.ceiling_tokens()
+        file_clamp = files.clamp_tokens()
 
     # 1. requested, against the ceiling (explicit above it: 400).
     ceiling = max(1, int(model.max_output_tokens or registry.public_default_max_output_tokens()))
@@ -325,9 +390,11 @@ def plan_generation(
     from .. import context
 
     if model.clamp_basis == registry.CLAMP_UPPER_BOUND:
+        # The engine window IS the public window: the spliced messages, image
+        # parts included, at their bound (an OCR request's file is one image).
         bounded = upper_bound_with_image_bound(messages, registry.OCR_TOKENS_PER_IMAGE_BOUND)
     else:
-        bounded = int(context.upper_bound_messages(messages))
+        bounded = int(context.upper_bound_messages(caller_messages)) + file_ceiling
     limits = []
     if int(model.max_input_tokens or 0) > 0:
         limits.append(int(model.max_input_tokens))
@@ -339,11 +406,12 @@ def plan_generation(
         )
 
     # 3. clamp to what the window leaves.
+    caller_estimate = int(context.estimate_messages(caller_messages))
+    estimated = caller_estimate + file_tokens
     if model.clamp_basis == registry.CLAMP_UPPER_BOUND:
         counted = bounded
     else:
-        counted = int(context.estimate_messages(messages))
-    estimated = int(context.estimate_messages(messages))
+        counted = caller_estimate + file_clamp
     window = int(model.context_window or 0)
     reserve = int(model.context_reserve or 0)
     if window > 0:
@@ -393,7 +461,7 @@ def plan_generation(
         estimated_input_tokens=estimated,
         bounded_input_tokens=int(bounded),
         footprint_tokens=int(footprint),
-        wall_clock_s=wall_clock_for(model, planned),
+        wall_clock_s=0.0,
         temperature=temperature,
         clamped=bool(planned < requested),
         gate_engine=gate,
@@ -458,6 +526,8 @@ def reservation_output_tokens(plan: GenerationPlan, *, limits_enforced: bool) ->
 
 
 __all__ = [
+    "FILES_PENDING",
+    "FileInputs",
     "GenerationPlan",
     "applied_max_output_tokens",
     "check_endpoint",
@@ -467,5 +537,4 @@ __all__ = [
     "plan_generation",
     "reservation_output_tokens",
     "upper_bound_with_image_bound",
-    "wall_clock_for",
 ]

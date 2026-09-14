@@ -19,10 +19,13 @@ THREE RULES.
    the way around the breaker and the lanes.
 2. **The transport timeout is fixed per engine, never per request.** Every
    `/v1` generation is streamed, so the read timeout bounds the longest
-   SILENCE between chunks, not the generation; the per-request wall clock is
-   enforced here by elapsed time. And `llm._client` caches a client per
-   (loop, URL, key, read timeout): a caller-derived value in that key turns
-   the bounded cache into a new connection pool per request (F048).
+   SILENCE between chunks, not the generation. There is NO wall clock
+   (no-timeout design, 2026-09-13): the router/OCR read timeout is
+   PUBLIC_API_SIDECAR_SILENCE_S (1,800 s), the fallback for when the engine's
+   `/metrics` witnesses are unknown; `liveness.SidecarWitness` decides a
+   stalled, lost or restarted engine long before it. And `llm._client` caches
+   a client per (loop, URL, key, read timeout): a caller-derived value in that
+   key turns the bounded cache into a new connection pool per request (F048).
 3. **Lazy imports.** `publicapi` must stay importable by the OpenAPI lint job
    without the engine stack, so `llm`, `resilience` and `httpx` are imported
    inside the functions that use them.
@@ -41,16 +44,26 @@ from . import errors, registry
 
 log = logging.getLogger(__name__)
 
-#: Read timeouts per engine: the longest legitimate silence between two
-#: chunks. Router and OCR prefill a window of at most 24,576 / 8,192 tokens in
-#: seconds; 300 s is the stuck-engine guard, not a budget. Speech uses the
-#: chat app's ASR_TIMEOUT_S (240 s, whole-clip, non-streaming).
+#: Read timeouts per engine for the POOLING engines (embeddings, rerank; T4
+#: owns their re-send rules). The chat sidecars read `sidecar_read_timeout_s`.
 READ_TIMEOUT_S: Dict[str, float] = {
-    registry.ENGINE_ROUTER: 300.0,
-    registry.ENGINE_OCR: 300.0,
     registry.ENGINE_EMBED: 60.0,
     registry.ENGINE_RERANK: 60.0,
 }
+
+
+def sidecar_read_timeout_s() -> float:
+    """PUBLIC_API_SIDECAR_SILENCE_S (1,800 s): the router/OCR transport read
+    timeout — the silence fallback when the witnesses are unknown, never a
+    budget for the generation. Read per call (a monkeypatch or an operator's
+    restart takes effect), and a SETTING, never a request value (F048)."""
+    return max(1.0, registry.setting_float("PUBLIC_API_SIDECAR_SILENCE_S", 1800.0))
+
+
+def metrics_root(resolved: "EngineTarget") -> str:
+    """The engine's server root for `/metrics` (the base URL minus `/v1`)."""
+    base = resolved.base_url.rstrip("/")
+    return base[: -len("/v1")] if base.endswith("/v1") else base
 
 #: How long a served-window probe waits. It is a nicety that can only NARROW a
 #: ceiling; a slow engine must not add seconds to a request for it.
@@ -272,7 +285,8 @@ async def stream_chat(
     *,
     max_tokens: int,
     temperature: float,
-    wall_clock_s: float,
+    continue_final_message: bool = False,
+    on_dispatch: Optional[Any] = None,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Stream a chat completion from the router or the OCR engine, yielding
     `(kind, delta)` exactly like `llm.stream_chat_events`, so
@@ -287,11 +301,16 @@ async def stream_chat(
     engine's larger real window absorbs (router), so there is no `/tokenize`
     round-trip here and no trimming of a caller's prompt, ever.
 
-    The wall clock is checked as each chunk arrives. A generation past it is
-    closed and ends with finish reason `wall_clock` and NO in-band marker
-    token; `Generation` turns that into the `timeout` failure. A silent engine
-    is bounded by the fixed read timeout and, above it, by `Generation`'s own
-    backstop.
+    No wall clock (2026-09-13). A silent engine is judged by the attempt's
+    `liveness.SidecarGuard` (witness verdicts) and, when the witnesses are
+    unknown, by the 1,800 s read timeout.
+
+    `continue_final_message` resumes an interrupted answer: the last message
+    is the assistant's partial text and the engine extends it
+    (`add_generation_prompt: false`), so a durable router run is never
+    regenerated from scratch (operator check in the design: verify on the
+    router before relying on it; PUBLIC_API_RESUME_ENABLED is the switch).
+    `on_dispatch` fires as the request is sent (before the first chunk).
     """
     from .. import llm
     from ..resilience import resilient
@@ -305,7 +324,7 @@ async def stream_chat(
         raise errors.model_unavailable(retry_after=UNAVAILABLE_RETRY_AFTER)
 
     client = llm._client(
-        resolved.base_url, resolved.api_key, read_timeout=READ_TIMEOUT_S[resolved.key]
+        resolved.base_url, resolved.api_key, read_timeout=sidecar_read_timeout_s()
     )
     request: Dict[str, Any] = dict(
         model=resolved.model,
@@ -319,17 +338,35 @@ async def stream_chat(
         stream_options={"include_usage": True},
     )
     capabilities = _capabilities(resolved.key)
+    extra_body: Dict[str, Any] = {}
     if capabilities is not None:
-        extra_body = llm.reasoning_extra_body(capabilities, False)
-        if extra_body is not None:
-            request["extra_body"] = extra_body
+        extra_body = dict(llm.reasoning_extra_body(capabilities, False) or {})
+    if continue_final_message:
+        extra_body["continue_final_message"] = True
+        extra_body["add_generation_prompt"] = False
+    if extra_body:
+        request["extra_body"] = extra_body
 
     llm.reset_finish_reason()
-    started = time.monotonic()
+
+    async def open_stream() -> Any:
+        # `on_dispatch` fires as the request is SENT, not after `resilient`
+        # returns (2026-09-14 review, high): `resilient(stream=True)` primes
+        # the first chunk as part of the open, so the old placement meant a
+        # router call was "dispatched" only once it had produced a token —
+        # the witness verdicts never applied to a prefill, and a router
+        # crash mid-prefill looked like a refused connection. A call that
+        # never reached the engine is told apart by its error instead
+        # (`liveness.sidecar_error_kind`: connect vs status vs broken).
+        if on_dispatch is not None:
+            with contextlib.suppress(Exception):
+                on_dispatch()
+        return await client.chat.completions.create(**request)
+
     # ONE attempt (recovery_s=0): a public request is not queued behind an
     # engine restart; it gets the retry-safe 503 and its Retry-After.
     opened = await resilient(
-        lambda: client.chat.completions.create(**request),
+        open_stream,
         what=f"public_{resolved.key}_stream",
         base_url=resolved.base_url,
         recovery_s=0,
@@ -338,17 +375,6 @@ async def stream_chat(
     async with llm._consume(opened) as stream:
         async for chunk in stream:
             llm._capture_finish(chunk)
-            if time.monotonic() - started > float(wall_clock_s):
-                log.warning(
-                    "public %s generation passed its %.0fs wall clock; closing it",
-                    resolved.key, float(wall_clock_s),
-                )
-                with contextlib.suppress(Exception):
-                    closer = getattr(stream, "close", None)
-                    if closer is not None:
-                        await closer()
-                llm._finish_reason.set(llm.WALL_CLOCK_FINISH)
-                return
             llm._capture_usage(chunk)
             choices = getattr(chunk, "choices", None)
             if not choices:
@@ -369,6 +395,8 @@ __all__ = [
     "EngineTarget",
     "READ_TIMEOUT_S",
     "SIDECAR_CHAT_ENGINES",
+    "metrics_root",
+    "sidecar_read_timeout_s",
     "engine_error",
     "map_engine_exception",
     "served_window",

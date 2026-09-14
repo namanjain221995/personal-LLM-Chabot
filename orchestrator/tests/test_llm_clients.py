@@ -173,3 +173,28 @@ def test_embed_texts_payload_shape_and_input_order(monkeypatch):
         "input": ["alpha", "beta"],
     }
     assert vectors == [[0.1, 0.1], [0.2, 0.2]]
+
+
+# ---------------------------------------------------------------------------
+# The client cache and the no-timeout transport (2026-09-13)
+# ---------------------------------------------------------------------------
+
+def test_the_client_cache_keys_on_the_transport_kind_and_refuses_an_unknown_one():
+    import pytest
+
+    llm._CLIENTS.clear()
+
+    async def run():
+        default = llm._client("http://engine.test/v1")
+        assert llm._client("http://engine.test/v1") is default
+        unbounded = llm._client("http://engine.test/v1", unbounded_read=True)
+        assert unbounded is not default and unbounded.timeout.read is None
+        # unbounded_read always implies keepalive, whatever was asked for.
+        assert llm._client("http://engine.test/v1", unbounded_read=True, transport=llm.TRANSPORT_DEFAULT) is unbounded
+        with pytest.raises(ValueError):
+            llm._client("http://engine.test/v1", transport="carrier-pigeon")
+        await default.close()
+        await unbounded.close()
+
+    asyncio.run(run())
+    llm._CLIENTS.clear()

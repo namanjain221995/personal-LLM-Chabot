@@ -23,6 +23,7 @@ from app import db, llm
 from app.config import settings
 from app.publicapi import engines, errors, events, registry, streaming
 from tests.test_publicapi_routes import TOKENS, _auth, _pepper, api, platform  # noqa: F401
+from tests.publicapi_fake_engine import set_setting
 
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 40).decode()
 DATA_URL = f"data:image/png;base64,{PNG}"
@@ -149,7 +150,10 @@ def test_the_vision_model_is_served_by_the_router_under_its_public_id_only(api, 
     assert body["max_output_tokens"] == 64
     # The main model was never asked, and the router was asked for ITS model.
     assert main_engine == []
-    assert fake.clients == [(settings.router_base_url, engines.READ_TIMEOUT_S["router"])]
+    # The read timeout is the 1,800 s silence FALLBACK (no-timeout design,
+    # 2026-09-13), a setting and never a request value (F048).
+    assert fake.clients == [(settings.router_base_url, engines.sidecar_read_timeout_s())]
+    assert engines.sidecar_read_timeout_s() == 1800.0
     sent = fake.requests[0]
     assert sent["model"] == settings.router_model
     assert sent["max_tokens"] == 64 and sent["stream"] is True
@@ -320,7 +324,7 @@ def test_the_sidecar_path_refuses_to_become_a_way_around_the_main_engines_lanes(
     async def scenario():
         with pytest.raises(errors.ApiError) as refused:
             async for _ in engines.stream_chat(
-                target, [{"role": "user", "content": "x"}], max_tokens=1, temperature=0, wall_clock_s=5
+                target, [{"role": "user", "content": "x"}], max_tokens=1, temperature=0
             ):
                 pass
         return refused.value
@@ -329,7 +333,10 @@ def test_the_sidecar_path_refuses_to_become_a_way_around_the_main_engines_lanes(
     assert fake.requests == []
 
 
-def test_a_sidecar_generation_past_its_wall_clock_fails_as_timeout_with_its_partial_text(sidecar):
+def test_a_sidecar_generation_has_no_wall_clock_and_runs_to_its_end(sidecar):
+    """2026-09-13 (no-timeout design): the old 0.12 s wall clock cut this
+    answer and failed it as `timeout`. Now nothing but the engine ends it —
+    even a legacy spec that still carries `wall_clock_s` is not cut."""
     sidecar(FakeSidecar(pieces=["a", "b", "c", "d"], delay=0.05))
     spec = streaming.GenerationSpec(
         response_id="resp_wall",
@@ -344,19 +351,70 @@ def test_a_sidecar_generation_past_its_wall_clock_fails_as_timeout_with_its_part
 
     outcome = asyncio.run(streaming.run_to_completion(spec))
 
-    assert outcome.status == "failed"
-    assert outcome.error.code == "timeout"
-    assert outcome.text and outcome.text != "abcd"
-    # No in-band "[generation stopped …]" marker ever reaches /v1 output.
-    assert "stopped" not in outcome.text
+    assert outcome.status == "completed", outcome.error
+    assert outcome.text == "abcd"
+
+
+def test_a_sidecar_continuation_asks_the_engine_to_extend_the_assistant_text(sidecar):
+    """A durable router run resumes by continuation: the partial answer is the
+    last message and vLLM is told to continue it, not to start a new turn."""
+    fake = sidecar(FakeSidecar(pieces=[" 5 6"]))
+    spec = streaming.GenerationSpec(
+        response_id="resp_cont",
+        model="techsara-8b-vision",
+        messages=[{"role": "user", "content": "count"}],
+        max_tokens=16,
+        temperature=0.0,
+        created_at=1,
+        engine="router",
+    )
+    messages = [{"role": "user", "content": "count"}, {"role": "assistant", "content": "1 2 3 4"}]
+
+    async def scenario():
+        generation = streaming.Generation(
+            spec, messages=messages, max_tokens=8, continue_final_message=True
+        )
+        texts = [chunk.text async for chunk in generation.stream() if chunk.kind == "token"]
+        await generation.aclose()
+        return texts
+
+    assert asyncio.run(scenario()) == [" 5 6"]
+    sent = fake.requests[0]
+    assert sent["messages"][-1] == {"role": "assistant", "content": "1 2 3 4"}
+    assert sent["max_tokens"] == 8
+    assert sent["extra_body"]["continue_final_message"] is True
+    assert sent["extra_body"]["add_generation_prompt"] is False
 
 
 def test_the_capacity_gate_refuses_a_sidecar_stream_before_its_status_line(api, sidecar, monkeypatch, platform):
     from app.publicapi import capacity
+    from app.publicapi import router as public_router
 
     fake = sidecar(FakeSidecar())
-    monkeypatch.setattr(settings, "public_api_gate_wait_s", 0.05, raising=False)
-    monkeypatch.setattr(settings, "public_api_router_max_concurrent", 1, raising=False)
+    set_setting(monkeypatch, "PUBLIC_API_GATE_WAIT_S", "0.05")
+    set_setting(monkeypatch, "PUBLIC_API_ROUTER_MAX_CONCURRENT", "1")
+    if hasattr(public_router, "_patient_gate"):
+        # No-timeout design, once T3's router waits through the patient gate:
+        # a full sidecar gate is a wait IN THE BODY, never a 503 — the stream
+        # starts, waits while the gate is held, and completes once it frees.
+        import threading
+
+        held = api.portal.wrap_async_context_manager(capacity.hold("router", wait_s=1))
+        held.__enter__()
+        releaser = threading.Timer(0.6, lambda: held.__exit__(None, None, None))
+        releaser.start()
+        try:
+            response = api.post(
+                "/v1/responses",
+                json={"model": "techsara-8b-vision", "input": "hi", "stream": True},
+                headers=_auth(),
+            )
+        finally:
+            releaser.join(5)
+        assert response.status_code == 200
+        assert "response.completed" in response.text
+        assert len(fake.requests) == 1
+        return
 
     # The gate lives on the app's own event loop, so it is held from there.
     with api.portal.wrap_async_context_manager(capacity.hold("router", wait_s=1)):

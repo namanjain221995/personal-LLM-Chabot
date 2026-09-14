@@ -54,6 +54,8 @@ Idempotency-Key is still running is `409 idempotency_conflict` with
 """
 from __future__ import annotations
 
+import sys
+
 from typing import Any, Dict, List
 
 from ..apiplatform.scopes import SCOPE_DESCRIPTIONS, Scope
@@ -1516,7 +1518,27 @@ def public_openapi() -> Dict[str, Any]:
     `settings` at call time — the main model has been swapped under a running
     deployment more than once, and a document cached at import would keep
     publishing the old window until somebody restarted the process.
+
+    FILES (files-hookup, 2026-09-13): the fourteen `/v1/files` and
+    `/v1/uploads` operations and the file model-input parts are described
+    exactly when the router serves them (`router.FILES_MOUNTED`), by
+    `publicapi/files/openapi_doc.py`.
     """
+    document = _base_openapi()
+    try:
+        from . import router as _router
+
+        mounted = bool(getattr(_router, "FILES_MOUNTED", False))
+    except Exception:  # noqa: BLE001 - the document must build without the router
+        mounted = False
+    if not mounted:
+        return document
+    from .files import openapi_doc as _files_doc
+
+    return _files_doc.extend(document, sys.modules[__name__])
+
+
+def _base_openapi() -> Dict[str, Any]:
     return {
         "openapi": "3.1.0",
         "info": {

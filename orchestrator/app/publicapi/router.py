@@ -56,6 +56,31 @@ read inside those two and inside `quotas.limit_headers`, which is where both
 header paths below get their fields. `Retry-After` on 503 `model_recovering`
 is the engine's, and stays.
 
+NO RESPONSE IS SILENT FOR MORE THAN 15 SECONDS (no-timeout design,
+2026-09-13; CONTRACT §10 byte invariant). Once a generating request is
+authenticated, validated and admitted by the quota gate:
+
+* a STREAM sends its status line and a first frame at once —
+  `response.created` on /v1/responses, `: ping` on /v1/chat/completions — and
+  waits for engine capacity INSIDE the body, with a `: queued` comment every
+  `events.HEARTBEAT_SECONDS` (14 s). Only the concurrency slot (when limits
+  are enforced), the row write and the physical guards may still refuse
+  before the status line;
+* a SYNCHRONOUS call is a `keepalive.CommittedJSONResponse`: the real status
+  if it finishes within PUBLIC_API_SYNC_COMMIT_S (12 s), otherwise `200` and
+  a space every heartbeat, then the object — and a failure after that point
+  arrives as a failed object;
+* no public capacity wait this file starts ends on a clock: every public
+  gate the generation holds (`_plan_gates` — `main.normal` for a normal-size
+  techsara-35b answer once capacity.py has it) is waited for without a
+  deadline (`_patient_gate`), and the generation waits in the shared
+  admission lanes as a PATIENT request (`patient_admission`), outside chat's
+  600 s bound. The one refusal left on that path is a physical guard: more
+  than PUBLIC_API_GATE_MAX_WAITERS requests already waiting for one gate.
+
+A gateway-tagged request (`gateway_protocol`) additionally gets
+`X-TechSara-Run` and, on a stream, `: ts-seq=N` after each data frame.
+
 WHAT THIS FILE DOES NOT IMPLEMENT, AND CALLS INSTEAD. Identity is
 `apiplatform/resolver.py`; the four limits, the sliding window and the
 `RateLimit` header syntax are `apiplatform/quotas.py`; the detached job, its
@@ -84,6 +109,7 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
+    List,
     Mapping,
     Optional,
     Tuple,
@@ -93,7 +119,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
-from .. import context, db, usage as usage_ledger
+from .. import admission, context, db, usage as usage_ledger
 from ..apiplatform import idempotency, quotas, resolver
 from ..apiplatform.resolver import ApiCaller
 from ..apiplatform.scopes import InsufficientScopeError, Scope, requires
@@ -103,6 +129,9 @@ from . import (
     engines,
     errors,
     events,
+    file_inputs,
+    gateway_protocol,
+    keepalive,
     models,
     openapi as openapi_module,
     planning,
@@ -129,9 +158,18 @@ SCOPES: Dict[str, Any] = {
 #: CONTRACT §3. The preflight carries no credential and reveals nothing, so it
 #: is permissive by design; the ACTUAL request is authorized against the
 #: project's `allowed_origins`.
+#:
+#: FILES (2026-09-13, Files design §2.1 / §12): `PUT` (a raw upload part) and
+#: `DELETE` (a file) are methods a browser must be allowed to send, and the
+#: part checksum headers, `Range` and `If-None-Match` are request headers the
+#: file routes read. Still no credentials header: the permissiveness is safe for
+#: the same reason as before.
 PREFLIGHT_HEADERS: Dict[str, str] = {
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "authorization, content-type, idempotency-key",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": (
+        "authorization, content-type, idempotency-key, "
+        "content-digest, x-part-sha256, range, if-none-match"
+    ),
     "Access-Control-Max-Age": "600",
 }
 
@@ -139,7 +177,13 @@ PREFLIGHT_HEADERS: Dict[str, str] = {
 #: Without this a developer's browser app can see the status code and nothing
 #: else — not the request id it needs to quote in a support ticket, not the
 #: `Retry-After` its own retry logic depends on.
-_EXPOSE_HEADERS = "X-Request-Id, RateLimit, RateLimit-Policy, Retry-After"
+#: The file routes add what a browser download and a resumable upload read:
+#: the name and range of the bytes, the validator for a 304, and the retry
+#: verdict (`x-should-retry: false` on a 409 the SDKs must not repeat).
+_EXPOSE_HEADERS = (
+    "X-Request-Id, RateLimit, RateLimit-Policy, Retry-After, "
+    "Content-Disposition, Content-Range, Accept-Ranges, ETag, x-should-retry"
+)
 
 #: CONTRACT §12: "8,192 default". The live number is
 #: PUBLIC_API_DEFAULT_MAX_OUTPUT_TOKENS, read by the registry per request;
@@ -418,6 +462,14 @@ class PublicRoute(APIRoute):
         async def handler(request: Request) -> Response:
             request_id = _new_request_id()
             request.state.public_request_id = request_id
+            # The gateway's tag, decided ONCE from the socket peer (2026-09-13):
+            # every later reader asks `request.state`, never the headers, so
+            # no route can honour an `x-techsara-*` header from an untrusted
+            # peer by reading it itself. A tagged request's responses all
+            # carry `X-TechSara-Run` — `none` unless a route names its run.
+            tag = gateway_protocol.from_request(request)
+            request.state.public_gateway_tag = tag
+            request.state.public_internal_headers = gateway_protocol.run_headers(tag)
             try:
                 response = await original(request)
             except errors.ApiError as exc:
@@ -447,6 +499,11 @@ class PublicRoute(APIRoute):
 
 def _decorate(request: Request, response: Response, request_id: str) -> None:
     response.headers["X-Request-Id"] = request_id
+    # Internal protocol headers: present only for a trusted, tagged request
+    # (`gateway_protocol.run_headers`), and never listed in
+    # Access-Control-Expose-Headers — a browser has no business reading them.
+    for name, value in (getattr(request.state, "public_internal_headers", None) or {}).items():
+        response.headers[name] = value
     for name, value in (getattr(request.state, "public_rate_limit", None) or {}).items():
         response.headers[name] = value
     origin = request.headers.get("origin")
@@ -460,6 +517,23 @@ def _decorate(request: Request, response: Response, request_id: str) -> None:
 
 
 router = APIRouter(prefix="/v1", route_class=PublicRoute, tags=["public"])
+
+
+def gateway_tag(request: Request) -> gateway_protocol.GatewayTag:
+    """The gateway's tag for this request, as `PublicRoute` decided it —
+    `UNTAGGED` for a request that did not come through the handler."""
+    tag = getattr(request.state, "public_gateway_tag", None)
+    return tag if isinstance(tag, gateway_protocol.GatewayTag) else gateway_protocol.UNTAGGED
+
+
+def name_run(request: Request, *, response_id: Optional[str] = None, job_key: Optional[str] = None) -> None:
+    """Set this request's `X-TechSara-Run` (a no-op when it is not tagged).
+
+    Public for `publicapi/endpoints.py` (T4): an audio job names itself with
+    `job_key` so the gateway can re-attach with X-TechSara-Attach-Job."""
+    request.state.public_internal_headers = gateway_protocol.run_headers(
+        gateway_tag(request), response_id=response_id, job_key=job_key
+    )
 
 
 # -------------------------------------------------------------- helpers --
@@ -587,6 +661,7 @@ def _recorder(
     held: Optional[idempotency.Claim] = None,
     reservation: Any = None,
     plan: Optional[planning.GenerationPlan] = None,
+    extra_meta: Optional[Callable[[], Mapping[str, Any]]] = None,
 ) -> streaming.OnFinish:
     """The one write per request of CONTRACT §16, plus the durable row.
 
@@ -615,6 +690,15 @@ def _recorder(
         )
         input_tokens = None if counted is None else counted.input_tokens
         output_tokens = None if counted is None else counted.output_tokens
+        # Files (2026-09-13): the file ids, context mode and tokens, retrieval,
+        # citations and readiness wait of Files design §5.7, read at the end so
+        # they describe what was actually supplied. Never fails the record.
+        added: Dict[str, Any] = {}
+        if extra_meta is not None:
+            try:
+                added = dict(extra_meta())
+            except Exception:  # noqa: BLE001
+                log.warning("extra usage meta for %s was not read", response_id, exc_info=True)
         await usage_ledger.record_async(
             user_id=None,
             workspace_id=workspace_id or None,
@@ -657,6 +741,7 @@ def _recorder(
                         "wall_clock_s": plan.wall_clock_s,
                     }
                 ),
+                **added,
             },
         )
         # The quota ledgers, ONCE per request and never per token. The
@@ -792,6 +877,11 @@ class _Parsed:
     #: max_output_tokens). Raised only after the model has been resolved, so
     #: a model this key may not use is still the 404 first.
     plan_error: Optional[errors.ApiError] = None
+    #: The body with its file parts lifted out (`apifiles.service.
+    #: LiftedRequest`, 2026-09-13), or None when the body never parsed.
+    lifted: Any = None
+    #: Which generating route: the dialect of the lift and the plan's endpoint.
+    endpoint: str = registry.ENDPOINT_RESPONSES
 
 
 def _declared_for(caller: ApiCaller, model_id: str) -> Optional[registry.PublicModel]:
@@ -807,15 +897,24 @@ async def _parse_generating(
     parse: Callable[[Any], Tuple[models.ResponsesRequest, bool]],
     endpoint: str = registry.ENDPOINT_RESPONSES,
 ) -> _Parsed:
-    parsed = _Parsed()
+    parsed = _Parsed(endpoint=endpoint)
     try:
         parsed.payload = await _json_body(request, limit=models.max_media_body_bytes())
+        # Files (2026-09-13): `input_file`, `input_image.file_id`,
+        # `input_video`, Chat `file` / `input_audio` and `file_context` come
+        # out of the raw body FIRST, so the one validator below sees a body it
+        # already accepts; their shape errors are deferred like any other 400.
+        # The lift walks every message and part, so for a large body it runs
+        # in a worker thread like the validator (senior fix 2026-09-14: 446 ms
+        # on the loop for a 19.8 MiB body of 560,000 parts).
         if int(getattr(request.state, "public_body_bytes", 0) or 0) > OFF_LOOP_BODY_BYTES:
+            parsed.lifted = await asyncio.to_thread(file_inputs.lift, parsed.payload, endpoint)
             parsed.request_model, parsed.include_usage = await asyncio.to_thread(
-                parse, parsed.payload
+                parse, parsed.lifted.payload
             )
         else:
-            parsed.request_model, parsed.include_usage = parse(parsed.payload)
+            parsed.lifted = file_inputs.lift(parsed.payload, endpoint)
+            parsed.request_model, parsed.include_usage = parse(parsed.lifted.payload)
     except errors.ApiError as refusal:
         parsed.deferred = refusal
         return parsed
@@ -844,6 +943,7 @@ async def _parse_generating(
             project_max_input_tokens=getattr(limits, "max_input_tokens", None),
             endpoint=endpoint,
             large=int(getattr(request.state, "public_body_bytes", 0) or 0) > OFF_LOOP_BODY_BYTES,
+            files=file_inputs.pending_inputs(parsed.lifted),
         )
     except errors.ApiError as refusal:
         if refusal.code == "context_length_exceeded":
@@ -871,6 +971,26 @@ async def _plan(
     if large:
         return await asyncio.to_thread(call)
     return call()
+
+
+async def _replan(
+    parsed: _Parsed, caller: ApiCaller, files: planning.FileInputs
+) -> planning.GenerationPlan:
+    """The plan again once the request's files have resolved: the same model
+    and project ceilings as the first one, with the spliced messages and the
+    file counts (`planning.FileInputs`). Off the loop — the messages now carry
+    the file text."""
+    assert parsed.request_model is not None and parsed.plan is not None
+    limits = getattr(caller, "limits", None)
+    return await _plan(
+        parsed.request_model,
+        parsed.plan.model,
+        project_max_output_tokens=getattr(limits, "max_output_tokens", None),
+        project_max_input_tokens=getattr(limits, "max_input_tokens", None),
+        endpoint=parsed.endpoint,
+        large=True,
+        files=files,
+    )
 
 
 def _reserved_output(parsed: _Parsed) -> Optional[int]:
@@ -991,24 +1111,31 @@ async def _generate(
 
     1. the model (404), then the plan's own refusals (400: endpoint, images,
        output ceiling) — cheap, and before any write;
-    2. the `Idempotency-Key` claim, so a replay answers without a slot, a row
+    2. a gateway RE-ATTACH that nothing here can serve is a 404 (the gateway
+       then cuts its client rather than splice a second generation onto the
+       first — `_refuse_unattachable_reattach`);
+    3. the `Idempotency-Key` claim, so a replay answers without a slot, a row
        or the engine;
-    3. background → `background.start`, the ONE background implementation
+    4. background → `background.start`, the ONE background implementation
        (it takes the project's concurrency slot for the job's whole life and
        writes the row);
-    4. streaming → `_SlotStream`, which takes the slot — and the engine's
-       capacity gate — INSIDE the response call that also releases them;
-    5. synchronous → the slot and the gate around the row and the
-       generation, in this coroutine.
+    5. streaming → `_SlotStream`: the slot and the row BEFORE the status line
+       (a refusal there is still a real 429/503), the engine's capacity gate
+       INSIDE the body, after the opening frame;
+    6. synchronous → `keepalive.CommittedJSONResponse` around the slot, the
+       gate, the row and the generation — the real status when it is quick,
+       a committed 200 with whitespace heartbeats when it is not.
 
-    A capacity-gate wait for 4 and 5 happens BEFORE the status line, bounded
-    by PUBLIC_API_GATE_WAIT_S (30 s), so a refusal is a real 503 with a
-    Retry-After. A background job waits inside its own task instead.
+    No capacity wait in 5 or 6 ends on a clock (no-timeout design,
+    capacity_waits): every gate `_plan_gates` names is held without a deadline
+    and the engine call waits in the admission lanes as a patient request.
+    The caller waits, and sees bytes while it does.
     """
     request_model = parsed.request_model
     assert request_model is not None
     route = "v1_chat_completions" if chat else "v1_responses"
     request_id = _request_id(request)
+    tag = gateway_tag(request)
     try:
         await _resolve_model(caller, request_model.model)
         if parsed.plan_error is not None:
@@ -1016,6 +1143,18 @@ async def _generate(
         plan = parsed.plan
         if plan is None:  # pragma: no cover - a resolved model always has a plan
             raise errors.internal_error()
+        # Files (2026-09-13): `files.read` for any `file_id`, before an id is
+        # looked up and before a replay could answer from another key's claim.
+        file_run = file_inputs.FileRun.for_request(
+            parsed.lifted,
+            caller=caller,
+            plan=plan,
+            request_id=request_id,
+            request_model=request_model,
+        )
+        if file_run is not None:
+            await file_run.authorize(request, authorize_scope)
+        _refuse_unattachable_reattach(tag)
         held = await _claim_idempotency(request, caller, route, parsed.payload)
         if held is not None and not held.claimed:
             await _nothing_ran(caller, reservation, None)
@@ -1028,6 +1167,8 @@ async def _generate(
 
     try:
         response_id = _new_response_id()
+        if RUNS_ATTACHABLE:
+            name_run(request, response_id=response_id)
         created = int(time.time())
         spec = streaming.spec_from_plan(plan, response_id=response_id, created_at=created)
         on_finish = _recorder(
@@ -1039,11 +1180,14 @@ async def _generate(
             held=held,
             reservation=reservation,
             plan=plan,
+            extra_meta=(file_run.usage_meta if file_run is not None else None),
         )
+        if file_run is not None:
+            on_finish = file_run.wrap_finish(on_finish)
 
         if request_model.background:
-            row = await background.start(
-                spec,
+            start = functools.partial(
+                background.start,
                 caller=caller,
                 on_finish=on_finish,
                 request_id=request_id,
@@ -1051,21 +1195,79 @@ async def _generate(
                 instructions_present=bool(request_model.instructions),
                 fingerprint=(held.fingerprint if held is not None else ""),
             )
+            if file_run is not None:
+                # Files (senior fix 2026-09-14): the row and the 202 NOW; the
+                # file wait, the context and the second plan in a detached task
+                # while the row is `queued`, then this same `background.start`
+                # (file_inputs.start_background).
+                row = await file_inputs.start_background(
+                    file_run,
+                    spec=spec,
+                    caller=caller,
+                    on_finish=on_finish,
+                    replan=functools.partial(_replan, parsed, caller),
+                    start=start,
+                    request_id=request_id,
+                    metadata=dict(request_model.metadata or {}),
+                    instructions_present=bool(request_model.instructions),
+                    fingerprint=(held.fingerprint if held is not None else ""),
+                )
+            else:
+                row = await start(spec)
             # The 202 IS the outcome a retry should replay; the job's own end
             # re-finishes the claim through `on_finish`.
             await _finish_claim(held, str(row["id"]))
             return JSONResponse(status_code=202, content=_row_to_wire(row))
 
         if request_model.stream:
-            if chat:
-                frames = streaming.chat_completions_sse(
-                    spec,
+            gate_failure = _GateFailure()
+            recorded = gate_failure.recording(on_finish)
+            launch = _stream_launch(
+                chat=chat,
+                completion_id=_completion_id(response_id),
+                include_usage=parsed.include_usage,
+                on_finish=recorded,
+            )
+            files_frames = None
+            if file_run is not None:
+                # The 404 / failed-file 400 before the status line; the wait,
+                # the context, the second plan and the capacity gate inside
+                # the stream, with heartbeats (file_inputs.stream_with_files).
+                # The gate is THIS router's patient gate and the generation is
+                # started by THIS router's launch (senior fix 2026-09-14): no
+                # capacity wait of a file stream ends on a clock, and the day
+                # streams launch durably, file streams do too.
+                await file_run.precheck()
+                files_frames = file_inputs.stream_with_files(
+                    file_run,
+                    chat=chat,
+                    spec=spec,
+                    on_finish=recorded,
+                    replan=functools.partial(_replan, parsed, caller),
                     completion_id=_completion_id(response_id),
                     include_usage=parsed.include_usage,
-                    on_finish=on_finish,
+                    gate=_patient_gate,
+                    launch=launch,
+                )
+            if chat:
+                opener = OPEN_WITH_PING
+                refusal_frames = functools.partial(
+                    _chat_gate_refusal_frames,
+                    completion_id=_completion_id(response_id),
+                    model=spec.model,
+                    created=created,
+                    include_usage=parsed.include_usage,
                 )
             else:
-                frames = streaming.responses_sse(spec, on_finish=on_finish)
+                opener = OPEN_WITH_FIRST_FRAME
+                refusal_frames = functools.partial(_responses_gate_refusal_frames, spec)
+            if files_frames is not None:
+                # The files stream opens with its own first frame (a progress
+                # comment or `response.created`) and takes its gate itself,
+                # after the plan that knows the file text.
+                frames, opener = files_frames, OPEN_WITH_FIRST_FRAME
+            else:
+                frames = launch(spec)
             return _SlotStream(
                 frames,
                 caller=caller,
@@ -1079,27 +1281,224 @@ async def _generate(
                     max_output_tokens=spec.planned,
                 ),
                 on_refused=functools.partial(_nothing_ran, caller, reservation, held),
-                on_abandoned=functools.partial(_record_abandoned, spec, on_finish),
-                capacity_for=functools.partial(_capacity_gate, plan),
+                # Through `recorded`, so a chat stream whose capacity wait failed
+                # before its generator started is recorded as that failure.
+                on_abandoned=functools.partial(_record_abandoned, spec, recorded),
+                # Every public gate this generation holds (`_plan_gates`, which
+                # includes `main.normal` for a normal-size techsara-35b answer),
+                # waited for in the body. None only for work no gate covers.
+                # A files stream takes its gates itself, after the plan that
+                # knows the file text (file_inputs.stream_with_files).
+                capacity_for=(
+                    functools.partial(_patient_gate, plan)
+                    if _plan_gates(plan) and files_frames is None
+                    else None
+                ),
+                # Its place in those lines, taken before the status line: the
+                # waiter bound is still a real 503 there.
+                reserve_place=(
+                    functools.partial(_GATE_LINE.reserve, _plan_gates(plan))
+                    if files_frames is None
+                    else None
+                ),
+                patient=True,
+                opener=opener,
+                refusal_frames=refusal_frames,
+                gate_failure=gate_failure,
+                tag=tag,
             )
     except BaseException:
+        if file_run is not None:
+            file_run.cleanup()
         await _nothing_ran(caller, reservation, held)
         raise
 
-    # Two failure regions, two different truths (re-verifier, 2026-09-13).
-    # Before `run_to_completion` starts — the slot refused, or the row not
-    # written — NOTHING RAN: the key is released and the estimate given back.
-    # Once it has started, the engine may have generated: a cancellation (a
-    # shutdown, a client gone under a server that cancels) is recorded through
-    # `on_finish` with whatever usage the engine reported, so the tokens are
-    # charged, the reservation is settled to the measured count and the row
-    # leaves `in_progress`. The old single `except BaseException` handed the
-    # spent tokens back as "nothing ran" and never touched the row.
+    # One outcome, filled in place by the generation and read by the failed
+    # body: a failure after the commit still reports the partial output and
+    # the usage the engine produced.
     partial = streaming.new_outcome(spec)
+    work = functools.partial(
+        _run_synchronous,
+        request=request,
+        caller=caller,
+        request_model=request_model,
+        plan=plan,
+        spec=spec,
+        outcome=partial,
+        on_finish=on_finish,
+        reservation=reservation,
+        held=held,
+        chat=chat,
+    )
+    if file_run is not None:
+        # Files (2026-09-13): resolved and waited for INSIDE the committed
+        # response, with no deadline — it writes bytes while it waits, so a
+        # file still processing no longer becomes a 409 or a 524.
+        work = functools.partial(_run_synchronous_with_files, work, file_run=file_run, parsed=parsed)
+    return keepalive.CommittedJSONResponse(
+        work,
+        failure_mode=keepalive.FAILURE_BODY,
+        failed_body=functools.partial(
+            _committed_failure_body, spec=spec, chat=chat, request_id=request_id, outcome=partial
+        ),
+        request_id=request_id,
+    )
+
+
+#: SEAM (assembler, 2026-09-13). Whether a generation launched here can be
+#: re-attached by the gateway. False until the router launches through T2's
+#: `durable.launch` / `durable.attach`: this build keeps no event log, so a
+#: gateway that re-POSTed after an orchestrator restart would get a SECOND
+#: generation spliced onto the first client's stream. With False, tagged
+#: generations answer `X-TechSara-Run: none` — the gateway then never re-POSTs
+#: a generation it may already have delivered — and a re-attach is a 404.
+#: The commit that routes generations through `durable` sets it True (and
+#: replaces `_refuse_unattachable_reattach` with `durable.attach`).
+RUNS_ATTACHABLE = False
+
+
+def _refuse_unattachable_reattach(tag: gateway_protocol.GatewayTag) -> None:
+    """A gateway re-attach this build cannot serve → 404, before any work.
+
+    The design's rule (deploy_survival, INTERNAL ATTACH PROTOCOL 5): a run that
+    exists but cannot be replayed answers 404, and the gateway aborts its
+    client (gateway/lib/reattach.cjs treats 404 as final). Without the durable
+    layer nothing can be replayed, and a Resume-After or Attach-Job only ever
+    arrives AFTER the gateway relayed part of a run — launching fresh would
+    hand the client a second, different answer from byte N+1."""
+    if tag.reattach and not RUNS_ATTACHABLE:
+        raise errors.response_not_found()
+
+
+#: How a stream opens. The first frame must leave before any capacity wait.
+OPEN_WITH_FIRST_FRAME = "first_frame"  # the generator's own opener (response.created)
+OPEN_WITH_PING = "ping"  # a comment (chat chunks have no opening event)
+
+
+class _GateFailure:
+    """What happened to a stream's capacity wait, for the outcome record.
+
+    The streaming generator records its own outcome when it is closed, and a
+    generator closed before it generated anything records `completed` with no
+    text. That is wrong twice over for a wait that happens in the body:
+
+    * a wait that FAILED sent the client a failure frame, so the record says
+      `failed` with that error;
+    * a client that LEFT while still waiting never had anything generated, so
+      the record says `cancelled` (nothing ran, no usage) — the same truth a
+      synchronous request abandoned before its generation is recorded with.
+
+    So the row, the ledger and the idempotency claim agree with the wire.
+
+    It also carries `queued_s`: how long a stream that had ALREADY started its
+    generator (the Responses opener) waited for its gates. That generator's
+    clock started before the wait, so its `ttft_ms` and `duration_ms` would
+    count time in the queue as time to first token (adversarial review of
+    T3-wire, 2026-09-14, low): the analytics console's /v1/responses TTFT
+    read queue depth as engine speed. Subtracted here, so every dialect
+    records engine time; the chat stream's generator starts after its gates
+    and needs nothing.
+    """
+
+    def __init__(self) -> None:
+        self.error: Optional[errors.ApiError] = None
+        #: True once the gate is held (or when there is no gate to wait for).
+        self.admitted = False
+        #: Seconds the already-started generator spent waiting for its gates.
+        self.queued_s = 0.0
+
+    def recording(self, on_finish: streaming.OnFinish) -> streaming.OnFinish:
+        async def finish(outcome: streaming.StreamOutcome) -> None:
+            if self.error is not None:
+                outcome.status = "failed"
+                outcome.error = self.error
+                outcome.client_gone = False
+            elif not self.admitted and outcome.client_gone:
+                outcome.status = "cancelled"
+            queued_ms = int(self.queued_s * 1000)
+            if queued_ms > 0:
+                if outcome.ttft_ms is not None:
+                    outcome.ttft_ms = max(0, int(outcome.ttft_ms) - queued_ms)
+                if outcome.duration_ms is not None:
+                    outcome.duration_ms = max(0, int(outcome.duration_ms) - queued_ms)
+            await on_finish(outcome)
+
+        return finish
+
+
+def _responses_gate_refusal_frames(spec: streaming.GenerationSpec, failure: errors.ApiError) -> List[str]:
+    """`response.failed`, numbered after the `response.created` already sent."""
+    emitter = events.SequencedEvents.resume_from(1, events.RESPONSE_CREATED, item_id=spec.item_id)
+    wire = models.Response(
+        id=spec.response_id,
+        created_at=spec.created_at,
+        status="failed",
+        model=spec.model,
+        output=[],
+        usage=None,
+        max_output_tokens=spec.planned,
+        error=models.ResponseError(code=failure.code, message=failure.message),
+    ).to_wire()
+    return [emitter.failed(wire)]
+
+
+def _chat_gate_refusal_frames(
+    failure: errors.ApiError,
+    *,
+    completion_id: str,
+    model: str,
+    created: int,
+    include_usage: bool,
+) -> List[str]:
+    """The compatibility dialect's error chunk, then `data: [DONE]`."""
+    chunks = events.ChatCompletionChunks(
+        completion_id=completion_id, model=model, created=created, include_usage=include_usage
+    )
+    return [chunks.error_chunk(failure), chunks.done()]
+
+
+async def _run_synchronous(
+    *,
+    request: Request,
+    caller: ApiCaller,
+    request_model: models.ResponsesRequest,
+    plan: planning.GenerationPlan,
+    spec: streaming.GenerationSpec,
+    outcome: streaming.StreamOutcome,
+    on_finish: streaming.OnFinish,
+    reservation: Any,
+    held: Optional[idempotency.Claim],
+    chat: bool,
+    slot_held: bool = False,
+) -> Response:
+    """The work of a synchronous generation, run by `CommittedJSONResponse`.
+
+    `slot_held`: the caller already holds this request's concurrency slot
+    (`_run_synchronous_with_files` takes it before the file wait), so it is not
+    taken twice.
+
+    Two failure regions, two different truths (re-verifier, 2026-09-13).
+    Before the generation starts — the slot refused, the gate abandoned, or
+    the row not written — NOTHING RAN: the key is released and the estimate
+    given back. Once it has started, the engine may have generated: a
+    cancellation (the client left, which `CommittedJSONResponse` turns into a
+    cancel of this task, or a shutdown) is recorded through `on_finish` with
+    whatever usage the engine reported, so the tokens are charged, the
+    reservation is settled to the measured count and the row leaves
+    `in_progress`.
+
+    The outcome object is filled IN PLACE (`run_to_completion(outcome=…)`),
+    which is what lets `_committed_failure_body` put the partial output into a
+    failed body after the 200 was committed.
+    """
+    request_id = _request_id(request)
+    response_id = spec.response_id
+    partial = outcome
     generating = False
+    began = time.monotonic()
     try:
-        with quotas.concurrency_slot(caller, KIND_SYNC):
-            async with _capacity_gate(plan):
+        with (contextlib.nullcontext() if slot_held else quotas.concurrency_slot(caller, KIND_SYNC)):
+            async with _patient_gate(plan):
                 await _claim_row(
                     caller,
                     request_id,
@@ -1109,20 +1508,14 @@ async def _generate(
                     max_output_tokens=spec.planned,
                 )
                 generating = True
-                # Watching the client (adversarial review 2026-09-13): an
-                # abandoned synchronous request must give its gate, its
-                # admission slot and the engine back when its caller leaves,
-                # not when a generation nobody will read has finished.
-                outcome = await streaming.run_to_completion_watching(
-                    spec, receive=request.receive, outcome=partial
-                )
-    except streaming.ClientGone:
-        # Recorded like any cancellation that ran: charged for what the engine
-        # produced, the row leaves `in_progress`. Nobody reads the answer; the
-        # nginx-style 499 is for the access log.
-        await streaming.settle(on_finish, partial)
-        return Response(status_code=499)
+                # Not `run_to_completion_watching`: the committed response owns
+                # the one reader of ASGI `receive` and cancels this task when
+                # the client leaves. Two readers would race for the disconnect.
+                with patient_admission():
+                    finished = await streaming.run_to_completion(spec, outcome=partial)
     except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            _note_client_gone(request, time.monotonic() - began)
         if not generating:
             await _nothing_ran(caller, reservation, held)
             raise
@@ -1135,44 +1528,415 @@ async def _generate(
         # Shielded (`streaming._settle`): we are very likely running under the
         # cancellation that brought us here.
         await streaming.settle(on_finish, partial)
-        raise
-    await on_finish(outcome)
-    if outcome.error is not None:
+        if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+            raise
+        raise _generation_failure(partial.error, held) from None
+    await on_finish(finished)
+    if finished.error is not None:
         # A synchronous call that could not reach the engine is the documented
-        # 503 with a Retry-After (CONTRACT §9), not a 200 carrying a failure a
-        # client has to notice.
-        raise outcome.error
+        # 503 with a Retry-After (CONTRACT §9) when it fails inside the commit
+        # window; after it, `_committed_failure_body` renders the same error
+        # as a failed object.
+        raise _generation_failure(finished.error, held)
     if not chat:
-        return JSONResponse(outcome.response().to_wire())
-    counted = outcome.usage_model()
+        return JSONResponse(finished.response().to_wire())
+    counted = finished.usage_model()
     return JSONResponse(
         _chat_body(
             completion_id=_completion_id(response_id),
-            created=created,
+            created=spec.created_at,
             model=spec.model,
-            content=outcome.text,
-            finish_reason=outcome.chat_finish_reason(),
+            content=finished.text,
+            finish_reason=finished.chat_finish_reason(),
             usage=counted,
-            max_output_tokens=outcome.max_output_tokens,
+            max_output_tokens=finished.max_output_tokens,
         )
     )
 
 
-def _capacity_gate(plan: planning.GenerationPlan) -> Any:
-    """The capacity gate a synchronous or streaming generation holds, or a
-    no-op when its engine needs none (NORMAL-lane techsara-35b work is gated
-    by the shared admission lanes inside `llm.stream_chat_events`). A main
-    gate is given the plan: it admits the answer into admission's LONG_OUTPUT
-    lane before the status line (capacity.py, one accounting)."""
-    if not plan.gate_engine:
-        return contextlib.nullcontext()
-    return capacity.hold(
-        plan.gate_engine,
+async def _run_synchronous_with_files(
+    work: Callable[..., Awaitable[Response]],
+    *,
+    file_run: file_inputs.FileRun,
+    parsed: _Parsed,
+) -> Response:
+    """`_run_synchronous` for a request with file parts: take the concurrency
+    slot, prepare the files (no deadline: the committed response heartbeats),
+    plan again with their text and the engine's count of it, run on that plan,
+    then attach `file_citation` annotations to the answer.
+
+    The slot comes FIRST (senior fix 2026-09-14): a file wait is a request in
+    flight, so an operator who turns PUBLIC_API_ENFORCE_LIMITS on bounds the
+    waiting requests too, not only the generating ones."""
+    run = work.keywords
+    caller, spec, partial = run["caller"], run["spec"], run["outcome"]
+    slot = contextlib.ExitStack()
+    try:
+        slot.enter_context(quotas.concurrency_slot(caller, KIND_SYNC))
+        await file_run.prepare(file_inputs.DELIVERY_SYNC, no_deadline=True)
+        plan = await _replan(parsed, caller, await file_run.planning_inputs())
+    except BaseException:
+        slot.close()
+        file_run.cleanup()
+        await _nothing_ran(caller, run["reservation"], run["held"])
+        raise
+    final = streaming.spec_from_plan(plan, response_id=spec.response_id, created_at=spec.created_at)
+    try:
+        with slot:
+            response = await work(plan=plan, spec=final, slot_held=True)
+    finally:
+        # Idempotent; `wrap_finish` already cleaned when the generation ran.
+        file_run.cleanup()
+    try:
+        body = json.loads(bytes(response.body))
+    except (AttributeError, ValueError):  # pragma: no cover - always a JSONResponse
+        return response
+    if run["chat"]:
+        return JSONResponse(file_run.chat_body(body, partial.text))
+    return JSONResponse(file_run.response_wire(body, partial.text))
+
+
+def _stream_launch(
+    *,
+    chat: bool,
+    completion_id: str,
+    include_usage: bool,
+    on_finish: streaming.OnFinish,
+) -> Callable[[streaming.GenerationSpec], AsyncIterator[str]]:
+    """THE stream launch of this router, for a stream with files and without
+    (senior fix 2026-09-14). One function, so the commit that starts streams
+    through the durable runtime (`RUNS_ATTACHABLE`) changes both at once — a
+    file stream is never the one generation left without resume."""
+
+    def launch(spec: streaming.GenerationSpec) -> AsyncIterator[str]:
+        if chat:
+            return streaming.chat_completions_sse(
+                spec, completion_id=completion_id, include_usage=include_usage, on_finish=on_finish
+            )
+        return streaming.responses_sse(spec, on_finish=on_finish)
+
+    return launch
+
+
+def _generation_failure(
+    failure: Optional[errors.ApiError], held: Optional[idempotency.Claim]
+) -> errors.ApiError:
+    """The error a failed synchronous generation raises.
+
+    `x-should-retry: false` on a 500 for a request with no Idempotency-Key
+    (no-timeout design, sdk_and_docs): the engine may have generated, nothing
+    ties a retry to this run, and both SDKs would otherwise retry a 500 and
+    run the model again from nothing."""
+    error = failure if failure is not None else errors.internal_error()
+    if error.status == 500 and held is None:
+        errors.no_retry(error)
+    return error
+
+
+def _committed_failure_body(
+    exc: BaseException,
+    *,
+    spec: streaming.GenerationSpec,
+    chat: bool,
+    request_id: str,
+    outcome: Optional[streaming.StreamOutcome] = None,
+) -> Dict[str, Any]:
+    """The failed object a synchronous generation sends after its 200 was
+    committed (no-timeout design, edge_100s 2).
+
+    /v1/responses: the Response itself, `status: "failed"`, with its error
+    and its usage, and `output: []`. /v1/chat/completions: a `chat.completion`
+    with `choices: []` and `error`.
+
+    WHY NO PARTIAL TEXT IN `output` (adversarial review of T3-wire,
+    2026-09-14). Before the commit existed this failure was a 5xx, and the
+    SDKs raised. After it, a body carrying the partial message made the
+    canonical `client.responses.create(...).output_text` return a truncated
+    answer WITHOUT raising (measured with openai-python 3.13.0: status
+    `failed`, output_text `'The capital of Fra'`) — a caller that does not
+    check `status` would ship half an answer as a whole one. With `output: []`
+    `output_text` is empty, like the chat dialect's `choices: []`. The cost,
+    stated: the partial text of a failed synchronous call is not returned
+    anywhere (CONTRACT §16 stores no synchronous text), while `usage` still
+    reports what the engine generated — a failed answer is retried, not
+    salvaged.
+    """
+    failure = errors.from_unexpected(exc, request_id=request_id)
+    usage: Optional[Dict[str, Any]] = None
+    ceiling: Optional[int] = spec.planned
+    if outcome is not None:
+        usage = outcome.usage
+        ceiling = outcome.max_output_tokens or spec.planned
+    if not chat:
+        return models.Response(
+            id=spec.response_id,
+            created_at=spec.created_at,
+            status="failed",
+            model=spec.model,
+            output=[],
+            usage=models.Usage.from_llm(usage),
+            max_output_tokens=ceiling,
+            error=models.ResponseError(code=failure.code, message=failure.message),
+        ).to_wire()
+    counted = models.Usage.from_llm(usage)
+    return errors.chat_completion_failure_body(
+        failure,
+        completion_id=_completion_id(spec.response_id),
+        created=spec.created_at,
+        model=spec.model,
+        usage=(
+            None
+            if counted is None
+            else {
+                "prompt_tokens": counted.input_tokens,
+                "completion_tokens": counted.output_tokens,
+                "total_tokens": counted.total_tokens,
+            }
+        ),
+        max_output_tokens=ceiling,
+        request_id=request_id,
+    )
+
+
+def _plan_gates(plan: planning.GenerationPlan) -> List[str]:
+    """Every public capacity gate one router generation holds, in the order
+    they are taken.
+
+    WHY NOT JUST `plan.gate_engine` (adversarial review of T3-wire,
+    2026-09-14, high). A normal-size techsara-35b answer plans no gate engine,
+    so the router took no gate at all, and its only wait was inside
+    `llm.stream_chat_events`: the NORMAL admission lane, bounded by
+    ADMISSION_NORMAL_WAIT_S (600 s), which then failed the generation — a
+    clock ending a public wait. It also skipped T2's `main.normal` gate, the
+    6-of-10 NORMAL-slot cap that keeps a public flood from crowding chat out
+    (design capacity_waits). `capacity.gates_for` is T2's single answer to
+    "which gates, in which order" (the durable runner asks it too), so the
+    router asks it rather than re-deriving it.
+    """
+    # Assembler, 2026-09-14: the pre-T2 fallback (the plan's own gate only)
+    # is gone; T2's capacity.py is in the tree.
+    return list(capacity.gates_for(plan.engine, plan.gate_engine))
+
+
+#: PUBLIC_API_GATE_MAX_WAITERS when it is unset. See `gate_max_waiters`.
+DEFAULT_GATE_MAX_WAITERS = 10_000
+
+#: What a caller refused by the waiter bound is told to wait: the fd guard's
+#: number (T1 resources), inside both SDKs' honoured Retry-After caps.
+GATE_CROWDED_RETRY_AFTER_S = 30
+
+
+def gate_max_waiters() -> int:
+    """PUBLIC_API_GATE_MAX_WAITERS (10,000; 0 or less switches the bound off):
+    how many /v1 generations may already be waiting for ONE public gate before
+    the next one is refused, before its status line, with 503
+    `model_unavailable` and Retry-After.
+
+    A PHYSICAL GUARD, NOT A LIMIT (design capacity_waits PHYSICAL GUARDS;
+    adversarial review of T3-wire, 2026-09-14). No wait ends on a clock, and
+    usage limits are off by default, so nothing else bounds how many requests
+    sit in a line. Each waiter costs a socket, a task and a wake-up per
+    heartbeat on the event loop chat shares; the fd guard (70% of the soft
+    limit) trips only in the hundreds of thousands. Measured on this code
+    (T3-wire hand-over, 2026-09-14; waiters started together, so their 14 s
+    heartbeats coincide): 10,000 waiting generations on one gate gave a worst
+    event-loop lag of 24-33 ms on today's capacity.py and 86-89 ms on T2's,
+    2% CPU, +127-138 MiB RSS; 20,000 gave 217-233 ms and +255-280 MiB.
+    Hence 10,000."""
+    return registry.setting_int("PUBLIC_API_GATE_MAX_WAITERS", DEFAULT_GATE_MAX_WAITERS)
+
+
+class _Place:
+    """One request's place in the lines of its gates, until it is admitted
+    to all of them or gives up. `release` is idempotent."""
+
+    __slots__ = ("_line", "_gates", "_held")
+
+    def __init__(self, line: "_GateLine", gates: Tuple[str, ...]) -> None:
+        self._line = line
+        self._gates = gates
+        self._held = True
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
+        for gate in self._gates:
+            left = self._line.waiting.get(gate, 0) - 1
+            if left > 0:
+                self._line.waiting[gate] = left
+            else:
+                self._line.waiting.pop(gate, None)
+
+
+class _GateLine:
+    """How many router generations wait for each public gate (O(1) per
+    request: capacity's own counts walk every waiter).
+
+    `reserve` checks and counts in one step with no await in between, so a
+    burst arriving in the same tick cannot all pass the check before any of
+    them is counted."""
+
+    def __init__(self) -> None:
+        self.waiting: Dict[str, int] = {}
+
+    def reserve(self, gates: List[str]) -> _Place:
+        unique = tuple(dict.fromkeys(gates))
+        limit = gate_max_waiters()
+        if limit > 0:
+            for gate in unique:
+                if self.waiting.get(gate, 0) >= limit:
+                    log.warning(
+                        "refusing a /v1 generation: %d requests already wait for the %s gate "
+                        "(PUBLIC_API_GATE_MAX_WAITERS)",
+                        self.waiting.get(gate, 0), gate,
+                    )
+                    raise errors.model_at_capacity(retry_after=GATE_CROWDED_RETRY_AFTER_S)
+        for gate in unique:
+            self.waiting[gate] = self.waiting.get(gate, 0) + 1
+        return _Place(self, unique)
+
+    def reset_for_tests(self) -> None:
+        self.waiting.clear()
+
+
+_GATE_LINE = _GateLine()
+
+
+@contextlib.contextmanager
+def patient_admission() -> Any:
+    """Run the enclosed engine call as a PATIENT admission waiter.
+
+    WHY (adversarial review of T3-wire, 2026-09-14, high). Inside
+    `llm.stream_chat_events` a public generation waits for a slot in the
+    admission lanes it shares with chat, and a non-patient waiter gives up
+    after ADMISSION_NORMAL_WAIT_S (600 s) — a failed generation, ended by a
+    clock. T1's admission.py keeps a patient line (no time limit, outside
+    chat's waiting-depth bound, served after chat) chosen by a ContextVar.
+    Set here, around the call, it reaches the generation's producer task:
+    asyncio copies the context when `Generation.stream()` creates it. The
+    durable runner passes `admission_patient=True` instead; streaming.py's
+    functions the router calls take no such argument.
+    """
+    # Assembler, 2026-09-14: the pre-T1 no-op fallback is gone.
+    with admission.as_patient(True):
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _hold_patiently(gate: str, plan: planning.GenerationPlan) -> AsyncIterator[None]:
+    """One public gate, held without a deadline: T2's `capacity.hold` with
+    `wait_s=None`. Assembler, 2026-09-14: the pre-T2 re-queue shim (one week
+    per finite hold) is gone with the capacity.py that needed it."""
+    async with capacity.hold(
+        gate,
         weight_tokens=plan.gate_weight_tokens,
-        wait_s=capacity.sync_wait_s(),
+        wait_s=None,
         yield_to_chat=plan.yield_to_chat,
         work=plan,
+    ):
+        yield
+
+
+@contextlib.asynccontextmanager
+async def _patient_gate(
+    plan: planning.GenerationPlan, *, place: Optional[_Place] = None
+) -> AsyncIterator[None]:
+    """Every gate of `_plan_gates(plan)`, in order, waited on WITHOUT a
+    deadline.
+
+    No capacity wait on /v1 ends because of the clock (no-timeout design,
+    capacity_waits RULE): a caller waits for as long as the engine is busy,
+    and the byte invariant — `: queued` comments in a stream, whitespace in a
+    committed body — keeps every hop in between from mistaking the wait for a
+    dead connection. It ends on admission, on the client leaving (the task is
+    cancelled, and `capacity.hold` gives a cancelled waiter's place back), or
+    on a failure that is not "busy".
+
+    `place` is the request's place in the lines, reserved before its status
+    line (`_SlotStream`); without one, it is reserved here — for a
+    synchronous call that is inside the commit window, so the waiter bound's
+    refusal is still a real 503. Released once every gate is held.
+    """
+    gates = _plan_gates(plan)
+    if not gates:
+        yield
+        return
+    if place is None:
+        place = _GATE_LINE.reserve(gates)
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            for gate in gates:
+                await stack.enter_async_context(_hold_patiently(gate, plan))
+            place.release()
+            yield
+    finally:
+        place.release()
+
+
+#: Public for the callers outside this file that wait for a generation's
+#: gates the router's way (the Files hookup's streams, T4): the same gates,
+#: the same order, the same waiter bound.
+patient_gate = _patient_gate
+plan_gates = _plan_gates
+
+
+#: What the Stainless SDKs (openai-python, openai-node) send: which attempt
+#: of one call this is (0 first), and — only when a per-request timeout was
+#: passed — that timeout in seconds. Read as numbers; never logged verbatim.
+SDK_RETRY_COUNT_HEADER = "x-stainless-retry-count"
+SDK_TIMEOUT_HEADER = "x-stainless-timeout"
+
+
+def _header_number(request: Request, name: str) -> Optional[float]:
+    raw = request.headers.get(name)
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value >= 0 and value == value and value != float("inf") else None
+
+
+def _note_client_gone(request: Request, waited_s: float) -> None:
+    """Say so when a synchronous generation loses its client, and louder when
+    the client was an SDK retry.
+
+    WHY (adversarial review of T3-wire, 2026-09-14). The committed response's
+    whitespace keeps a READ timeout alive (openai-python), but openai-node 7.x
+    counts its `timeout` (600 s by default) across the whole response: a
+    synchronous answer longer than that fails however many heartbeats arrive,
+    and the SDK retries twice — each retry a new generation, because nothing
+    ties it to the first until implicit attach (T3's durable work) exists.
+    Measured, scaled (timeout 3 s, an 8 s answer): openai-node 7.15.0 failed
+    with APIConnectionTimeoutError after 10.3 s and started the engine 3
+    times; 6.49.0 and openai-python 3.13.0 completed with 1 start each. The
+    fix for the caller is to stream, use background, or raise `timeout`; this
+    line and `public_api_sync_client_gone_total{attempt}` make the waste
+    visible to the operator meanwhile. `X-Stainless-Timeout` is quoted only
+    when present: openai-node 7.15.0 sent none for a client-level timeout."""
+    retry = _header_number(request, SDK_RETRY_COUNT_HEADER)
+    declared = _header_number(request, SDK_TIMEOUT_HEADER)
+    attempt = "first" if not retry else "retry"
+    log.log(
+        logging.WARNING if retry else logging.INFO,
+        "a synchronous /v1 generation (%s) lost its client after %.0f s (SDK attempt %s%s); "
+        "a retry starts a new generation — answers longer than a client's total timeout "
+        "should stream or use background",
+        _request_id(request),
+        waited_s,
+        "?" if retry is None else int(retry),
+        "" if declared is None else f", declared timeout {declared:.0f} s",
     )
+    with contextlib.suppress(Exception):
+        from .. import metrics
+
+        metrics.inc(
+            "public_api_sync_client_gone_total",
+            "synchronous /v1 generations whose client disconnected before the answer",
+            attempt=attempt,
+        )
 
 
 def _chat_body(
@@ -1229,8 +1993,7 @@ async def get_usage(request: Request, caller: ApiCaller = Depends(resolve_caller
         )
     except ValueError as exc:
         raise errors.invalid_request(str(exc), param="start_date") from None
-    return JSONResponse(
-        {
+    body: Dict[str, Any] = {
             "object": "list",
             "start_date": start.isoformat(),
             "end_date": end.isoformat(),
@@ -1246,7 +2009,26 @@ async def get_usage(request: Request, caller: ApiCaller = Depends(resolve_caller
                 for row in rows
             ],
         }
-    )
+    # Files design §2.16 / §11 (files-hookup, 2026-09-13): storage is ACCOUNTED,
+    # not metered — files, stored bytes (distinct blobs with a live file),
+    # derived bytes and uploads in progress. Omitted, never zeroed, when the
+    # Files API is not mounted or the read fails: a 0 would be a claim.
+    storage = await _files_storage(project_id)
+    if storage is not None:
+        body["storage"] = storage
+    return JSONResponse(body)
+
+
+async def _files_storage(project_id: str) -> Optional[Dict[str, Any]]:
+    if not FILES_MOUNTED:
+        return None
+    try:
+        from ..apifiles import accounting as _files_accounting
+
+        return dict(await _files_accounting.project_storage(project_id))
+    except Exception:  # noqa: BLE001 - usage must answer without the files half
+        log.warning("files storage for /v1/usage was not read", exc_info=True)
+        return None
 
 
 @router.get("/openapi.json", operation_id="getOpenapi")
@@ -1328,21 +2110,31 @@ async def _shielded(awaitable: Awaitable[Any], what: str) -> None:
 
 
 class _SlotStream(StreamingResponse):
-    """An SSE response that takes its concurrency slot IN THE CODE THAT RELEASES IT.
+    """An SSE response that takes its concurrency slot IN THE CODE THAT RELEASES IT,
+    sends its first frame at once, and waits for capacity in the body.
 
-    THE LEAK THIS REPLACES (verifier finding, 2026-09-13). The slot used to be
+    THE LEAK THIS REPLACED (verifier finding, 2026-09-13). The slot used to be
     taken in the handler and released in the `finally` of the body generator.
     A client that sends the POST and resets the connection before the body's
     first step leaves that generator unstarted — and an unstarted generator's
-    `finally` never runs, so the slot was never given back. Repeated, that
-    drives a project's concurrency to zero until a restart.
+    `finally` never runs, so the slot was never given back. Now `__call__` —
+    the one method Starlette always awaits once the handler has returned this
+    object — holds the slot in a `with` around the whole response: taken
+    before the status line (a refusal is still the documented 429 with
+    `Retry-After`), released however the response ends.
 
-    Now `__call__` — the one method Starlette always awaits once the handler
-    has returned this object — holds the slot in a `with` around the whole
-    response. Taken before the status line is sent, so a refusal is still the
-    documented 429 with `Retry-After` rather than a 200 whose stream dies; and
-    released by the same `with`, however the response ends: finished, failed,
-    disconnected before the first byte, or cancelled.
+    THE BYTE INVARIANT (no-timeout design, 2026-09-13). Until then the
+    engine's capacity gate was taken here too, BEFORE the status line, for up
+    to PUBLIC_API_GATE_WAIT_S of silence — and then a 503. Now the status line
+    and a first frame leave immediately (`response.created`, or `: ping` for
+    the compatibility dialect, whose chunks have no opening event), and the
+    gate is waited for INSIDE the body with a `: queued` comment at least every
+    `events.HEARTBEAT_SECONDS`, with no deadline. The engine is not asked for
+    anything until the gate is held: the generation's own generator is only
+    advanced past its opener afterwards.
+
+    A tagged request from the gateway also gets `: ts-seq=N` after every data
+    frame (`gateway_protocol.tag_frames`), in the same write as the frame.
 
     The same method closes the body generator explicitly (a started one gets
     its `finally`, which closes the engine stream and records the outcome) and,
@@ -1361,6 +2153,13 @@ class _SlotStream(StreamingResponse):
         on_abandoned: Callable[[], Awaitable[None]],
         kind: str = KIND_STREAM,
         capacity_for: Optional[Callable[[], Any]] = None,
+        opener: str = OPEN_WITH_FIRST_FRAME,
+        refusal_frames: Optional[Callable[[errors.ApiError], List[str]]] = None,
+        gate_failure: Optional["_GateFailure"] = None,
+        tag: gateway_protocol.GatewayTag = gateway_protocol.UNTAGGED,
+        heartbeat_s: Optional[float] = None,
+        reserve_place: Optional[Callable[[], _Place]] = None,
+        patient: bool = False,
     ) -> None:
         super().__init__(frames, media_type="text/event-stream", headers=streaming.SSE_HEADERS)
         self._frames = frames
@@ -1370,24 +2169,91 @@ class _SlotStream(StreamingResponse):
         self._on_refused = on_refused
         self._on_abandoned = on_abandoned
         self._kind = kind
-        #: The engine's capacity gate (2026-09-13), taken in the same place as
-        #: the slot and for the same reason: before the status line, so a
-        #: refusal is a real 503; released by the same block, however the
-        #: response ends.
-        self._capacity_for = capacity_for or contextlib.nullcontext
+        #: The engine's capacity gate: an async context manager factory,
+        #: entered INSIDE the body after the opener (None: no public gate).
+        self._capacity_for = capacity_for
+        self._opener = opener
+        self._refusal_frames = refusal_frames
+        self._gate_failure = gate_failure
+        self._heartbeat_s = heartbeat_s
+        #: Takes this request's place in its gates' lines (the waiter bound)
+        #: before the status line; `capacity_for` then waits from that place.
+        self._reserve_place = reserve_place
+        self._place: Optional[_Place] = None
+        #: Whether the body runs under `patient_admission()`.
+        self._patient = patient
         self.started = False
-        self.body_iterator = self._tracked()
+        body: AsyncIterator[str] = self._tracked()
+        if tag.tagged:
+            body = gateway_protocol.tag_frames(body)
+        self.body_iterator = body
+
+    def _beat_s(self) -> float:
+        value = self._heartbeat_s if self._heartbeat_s is not None else events.HEARTBEAT_SECONDS
+        return max(0.001, min(15.0, float(value)))
 
     async def _tracked(self) -> AsyncIterator[str]:
         self.started = True
+        factory = self._capacity_for
+        if factory is not None and self._place is not None:
+            factory = functools.partial(factory, place=self._place)
+        holder = _GateHolder(factory) if factory is not None else None
+        #: Whether the generation's own generator has been advanced. A chat
+        #: stream opens with our comment and only starts it after the gate, so
+        #: a wait that fails, or a client that leaves while waiting, ends with
+        #: that generator UNSTARTED — and an unstarted generator's `finally`
+        #: (which records the outcome) never runs.
+        frames_started = False
         try:
-            async for frame in self._frames:
-                yield frame
+            if self._opener == OPEN_WITH_FIRST_FRAME:
+                frames_started = True
+                try:
+                    opening = await self._frames.__anext__()
+                except StopAsyncIteration:
+                    return
+                yield opening
+            else:
+                yield events.SequencedEvents().heartbeat()
+            if holder is not None:
+                queued_from = time.monotonic()
+                try:
+                    async with contextlib.aclosing(holder.wait(self._beat_s())) as ticks:
+                        async for _tick in ticks:
+                            yield events.queued_comment()
+                    if self._gate_failure is not None and frames_started:
+                        self._gate_failure.queued_s = time.monotonic() - queued_from
+                except errors.ApiError as failure:
+                    # A capacity wait that failed for a reason other than
+                    # "busy" (which never ends it). The status line is long
+                    # gone, so the failure is the stream's terminal frame.
+                    if self._gate_failure is not None:
+                        self._gate_failure.error = failure
+                    for frame in (self._refusal_frames(failure) if self._refusal_frames else ()):
+                        yield frame
+                    return
+            if self._gate_failure is not None:
+                self._gate_failure.admitted = True
+            frames_started = True
+            # The generation's producer task is created inside this block, so
+            # it uses the ticket the gate holder's task was given (one
+            # accounting of long public work, PR #65).
+            with admission.adopt_preadmission(holder.carried if holder is not None else None):
+                async for frame in self._frames:
+                    yield frame
         finally:
             # `async for` has no teardown of its own: closing THIS generator
             # does not close the one it iterates, and the engine stream inside
-            # that one would stay open until garbage collection.
-            await self._frames.aclose()
+            # that one would stay open until garbage collection. Closed BEFORE
+            # the gate is given back, so the next holder never overlaps a
+            # stream that is still open on the engine.
+            try:
+                if frames_started:
+                    await self._frames.aclose()
+                else:
+                    await _shielded(self._on_abandoned(), "record a stream that never generated")
+            finally:
+                if holder is not None:
+                    await holder.release()
 
     def _refusal(self, failure: errors.ApiError) -> JSONResponse:
         request_id = _request_id(self._request) or _new_request_id()
@@ -1399,30 +2265,101 @@ class _SlotStream(StreamingResponse):
         admitted = False
         try:
             with quotas.concurrency_slot(self._caller, self._kind):
-                async with self._capacity_for():
-                    admitted = True
-                    try:
-                        await self._prepare()
-                    except Exception as exc:  # noqa: BLE001 - still before the status line
-                        await _shielded(self._on_refused(), "release the idempotency key")
-                        failure = exc if isinstance(exc, errors.ApiError) else errors.from_unexpected(exc)
-                        await self._refusal(failure)(scope, receive, send)
-                        return
-                    try:
+                admitted = True
+                try:
+                    if self._reserve_place is not None:
+                        self._place = self._reserve_place()
+                    await self._prepare()
+                except Exception as exc:  # noqa: BLE001 - still before the status line
+                    self._release_place()
+                    await _shielded(self._on_refused(), "release the idempotency key")
+                    failure = exc if isinstance(exc, errors.ApiError) else errors.from_unexpected(exc)
+                    await self._refusal(failure)(scope, receive, send)
+                    return
+                try:
+                    with patient_admission() if self._patient else contextlib.nullcontext():
                         await super().__call__(scope, receive, send)
-                    finally:
-                        await _shielded(self._close(), "close the stream")
+                finally:
+                    await _shielded(self._close(), "close the stream")
+                    self._release_place()
         except errors.ApiError as refusal:
             if admitted:
                 raise
             await _shielded(self._on_refused(), "release the idempotency key")
             await self._refusal(refusal)(scope, receive, send)
 
+    def _release_place(self) -> None:
+        if self._place is not None:
+            self._place.release()
+
     async def _close(self) -> None:
         with contextlib.suppress(Exception):
             await self.body_iterator.aclose()
         if not self.started:
+            with contextlib.suppress(Exception):
+                await self._frames.aclose()
             await self._on_abandoned()
+
+
+class _GateHolder:
+    """Hold a capacity gate from a helper task while a stream keeps talking.
+
+    WHY A TASK. `async with gate:` inside the body generator would block the
+    generator for the whole wait, and a blocked generator cannot yield the
+    `: queued` comment that keeps every proxy on the path from reading the
+    wait as a dead connection. So the gate is entered by a task that signals
+    admission and then parks until `release()`; the body waits for that signal
+    one heartbeat at a time.
+
+    Released on every path: admitted and finished, cancelled while waiting
+    (the body was closed — `capacity.hold` gives a cancelled waiter's place
+    back), or failed.
+    """
+
+    def __init__(self, factory: Callable[[], Any]) -> None:
+        self._factory = factory
+        self.carried: Any = None
+        self._admitted = asyncio.Event()
+        self._done = asyncio.Event()
+        self._task: Optional[asyncio.Task] = None
+
+    async def _hold(self) -> None:
+        async with self._factory():
+            #: The pre-admission `capacity.hold` made in THIS task's context,
+            #: for the body to adopt (admission.preadmission_carry: without it
+            #: a long answer was admitted twice).
+            self.carried = admission.preadmission_carry()
+            self._admitted.set()
+            await self._done.wait()
+
+    async def wait(self, heartbeat_s: float) -> AsyncIterator[None]:
+        """Yield once per heartbeat until admitted; raise what the gate raised."""
+        self._task = asyncio.ensure_future(self._hold())
+        while not self._admitted.is_set():
+            signal = asyncio.ensure_future(self._admitted.wait())
+            try:
+                await asyncio.wait({self._task, signal}, timeout=heartbeat_s, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                signal.cancel()
+            if self._admitted.is_set():
+                return
+            if self._task.done():
+                failure = None if self._task.cancelled() else self._task.exception()
+                if isinstance(failure, errors.ApiError):
+                    raise failure
+                raise errors.model_unavailable(retry_after=streaming.UNAVAILABLE_RETRY_AFTER)
+            yield None
+
+    async def release(self) -> None:
+        self._done.set()
+        task = self._task
+        if task is None:
+            return
+        if not self._admitted.is_set() and not task.done():
+            task.cancel()
+        await asyncio.wait({task})
+        if not task.cancelled() and task.exception() is not None and self._admitted.is_set():
+            log.warning("releasing a public capacity gate failed", exc_info=task.exception())
 
 
 async def _record_abandoned(spec: streaming.GenerationSpec, on_finish: streaming.OnFinish) -> None:
@@ -1930,3 +2867,72 @@ def _register_endpoints() -> None:
 
 
 _register_endpoints()
+
+
+# -------------------------------------------------------- the files hook --
+
+#: Whether `publicapi/files/routes.py` added `/v1/files` and `/v1/uploads`,
+#: and why not when it did not (files-hookup, 2026-09-13).
+FILES_MOUNTED = False
+FILES_MOUNT_ERROR: Optional[str] = None
+#: The dependencies the routes were registered with — the developer console's
+#: Files routes reuse them (`apiplatform/console_files.py`), so both surfaces
+#: share one purge per blob and one processing view.
+FILES_DEPENDENCIES: Any = None
+
+
+def _register_files() -> None:
+    """Add the fourteen file and upload routes (Files design §2.1).
+
+    Guarded and last, like `_register_endpoints` and for the same reasons. The
+    dependencies are the platform's own — `router_dependencies()` wires this
+    file's `resolve_caller`, `authorize_scope` (with `files.read` /
+    `files.write`), `admit` and the usage ledger — plus the processing half:
+    the File object's `processing` view, derived data and the events stream
+    (routes 6–8 exist only when these are given), and the purge that stops
+    processing before bytes go. `assembler` wakes the jobs' cpu lane, which
+    runs assembly in the same slots as extraction; it is a kick, not a second
+    runner (a separate `AssembleRunner` would add slots beyond
+    PUBLIC_API_FILES_CPU_JOBS).
+
+    Mounting the routes does not start processing: the lifespan starts
+    `apifiles.jobs`, `retention` and `uploads_sweep` (`app/main.py`).
+    """
+    global FILES_MOUNTED, FILES_MOUNT_ERROR, FILES_DEPENDENCIES
+    try:
+        import dataclasses
+        import types
+
+        from ..apifiles import derived as _files_derived
+        from ..apifiles import events as _files_events
+        from ..apifiles import jobs as _files_jobs
+        from ..apifiles import retention as _files_retention
+        from .files import routes as _files_routes
+
+        if FILES_DEPENDENCIES is None:
+            # Once per process: registration is idempotent, and a second call
+            # must keep the dependencies (and in-flight purges) the routes
+            # were registered with.
+            FILES_DEPENDENCIES = dataclasses.replace(
+                _files_routes.router_dependencies(),
+                processing_view=_files_jobs.file_processing_view,
+                derived=_files_derived,
+                events=_files_events.stream_file_events,
+                purge_blob=_files_retention.purge_blob,
+                assembler=types.SimpleNamespace(kick=lambda: _files_jobs.enqueue("assemble")),
+            )
+        _files_routes.register(router, FILES_DEPENDENCIES)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        FILES_MOUNTED = False
+        FILES_MOUNT_ERROR = type(exc).__name__
+        log.warning(
+            "the /v1 files and uploads routes are not mounted (%s)",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return
+    FILES_MOUNTED = True
+    FILES_MOUNT_ERROR = None
+
+
+_register_files()

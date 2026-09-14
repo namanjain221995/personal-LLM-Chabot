@@ -29,17 +29,17 @@ from app.publicapi import capacity, endpoint_models, models, planning, registry
 APP = Path(__file__).resolve().parents[1] / "app"
 
 #: name -> (type, default). Dynamic defaults are resolved in `_expected`.
+#:
+#: The settings the no-timeout design retires (config.RETIRED_PUBLIC_API_SETTINGS:
+#: the wall-clock formula, the gate waits, the audio length cap) were declared
+#: here by PR #65 and are deliberately absent since the merge of 2026-09-14 —
+#: `test_retired_settings_are_not_declared` pins that.
 DECLARED: Dict[str, Tuple[type, Any]] = {
     "PUBLIC_API_MAX_OUTPUT_TOKENS": (int, 1_000_000),
-    "PUBLIC_API_GEN_WALL_CLOCK_S": (float, 21_600.0),
-    "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S": (float, 900.0),
-    "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S": (float, 50.0),
     "PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS": (int, 800_000),
     "PUBLIC_API_MAIN_LONG_MAX_CONCURRENT": (int, 1),
     "PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS": (int, "public_api_default_max_output_tokens"),
     "PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT": (int, 2),
-    "PUBLIC_API_GATE_WAIT_S": (float, 30.0),
-    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": (float, 3600.0),
     "PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S": (float, 10.0),
     "PUBLIC_API_ROUTER_CONTEXT_TOKENS": (int, 24_576),
     "PUBLIC_API_ROUTER_MAX_CONCURRENT": (int, 4),
@@ -55,7 +55,6 @@ DECLARED: Dict[str, Tuple[type, Any]] = {
     "PUBLIC_API_RERANK_KV_BUDGET_TOKENS": (int, 8192),
     "PUBLIC_API_RERANK_MAX_DOCUMENTS": (int, 100),
     "PUBLIC_API_ASR_MAX_CONCURRENT": (int, 1),
-    "PUBLIC_API_MAX_AUDIO_SECONDS": (int, 300),
     "PUBLIC_API_MAX_AUDIO_BYTES": (int, 26_214_400),
     "PUBLIC_API_MAX_AUDIO_BODY_BYTES": (int, 27_262_976),
     "PUBLIC_API_MAX_MEDIA_BODY_BYTES": (int, 20_971_520),
@@ -172,8 +171,6 @@ def test_every_reader_in_the_app_ships_the_default_config_py_declares(monkeypatc
 def test_the_readers_return_the_declared_attribute(monkeypatch):
     checks = [
         ("public_api_max_output_tokens", 123_456, registry.max_output_tokens_setting),
-        ("public_api_gate_wait_s", 7.5, capacity.sync_wait_s),
-        ("public_api_background_gate_wait_s", 77.0, capacity.background_wait_s),
         ("public_api_yield_to_chat_max_wait_s", 1.25, capacity.yield_to_chat_max_wait_s),
         ("public_api_main_extended_output_tokens", 16_384, planning.main_extended_output_tokens),
         ("public_api_main_solo_output_tokens", 900_000, planning.main_solo_output_tokens),
@@ -182,7 +179,6 @@ def test_the_readers_return_the_declared_attribute(monkeypatch):
         ("public_api_max_audio_body_bytes", 9 * 1024 * 1024, models.max_audio_body_bytes),
         ("public_api_embed_max_inputs", 17, endpoint_models.embed_max_inputs),
         ("public_api_rerank_max_documents", 9, endpoint_models.rerank_max_documents),
-        ("public_api_max_audio_seconds", 120, endpoint_models.max_audio_seconds),
         ("public_api_max_audio_bytes", 1024 * 1024, endpoint_models.max_audio_bytes),
         ("public_api_webhook_delivery_retention_days", 7, webhook_queue.delivery_retention_days),
         ("public_api_webhook_disabled_grace_seconds", 60.0, webhook_queue.disabled_grace_seconds),
@@ -218,3 +214,16 @@ def test_the_environment_is_parsed_by_config_pys_own_rule(monkeypatch, name):
     monkeypatch.setenv(name, "lots")
     with pytest.raises(ValueError):
         Settings()
+
+
+def test_retired_settings_are_not_declared(monkeypatch):
+    """The no-timeout design retires these; declaring one would make a value in
+    .env silently honoured instead of warned about (config.warn_retired_settings)."""
+    _clean_env(monkeypatch)
+    fresh = Settings()
+    for name in config_module.RETIRED_PUBLIC_API_SETTINGS:
+        if name == "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS":
+            # Declared before either release, and read by idempotency.py as an
+            # attribute; STILL_READ_RETIRED_SETTINGS names it.
+            continue
+        assert not hasattr(fresh, name.lower()), name
