@@ -548,6 +548,8 @@ class FileRun:
         self.caller_messages = [dict(message) for message in caller_messages]
         self.prepared: Any = None
         self.annotated: Any = None
+        #: The one worker-thread scan of a long answer (`note_output_off_loop`).
+        self._scan: Optional["asyncio.Future[Any]"] = None
         self._cleaned = False
 
     @classmethod
@@ -750,6 +752,21 @@ class FileRun:
             self.annotated = None
         return self.annotated
 
+    async def note_output_off_loop(self, text: Optional[str]) -> Any:
+        """`note_output` for a caller on the event loop: a long answer
+        (`streaming.ANNOTATE_OFF_LOOP_CHARS`) is scanned on a worker thread,
+        and ONE scan serves every caller — the stream's annotation events, the
+        usage row's counts (`wrap_finish`) and a synchronous body built after
+        it, which then reads the cached result. Without the shared scan a
+        client that left while the stream's thread was scanning got a second,
+        on-loop scan from `wrap_finish`."""
+        if self._scan is not None:
+            return await asyncio.shield(self._scan)
+        if self.annotated is not None or self.prepared is None or not streaming.off_loop(text):
+            return self.note_output(text)
+        self._scan = asyncio.ensure_future(asyncio.to_thread(self.note_output, text))
+        return await asyncio.shield(self._scan)
+
     def response_wire(self, wire: Dict[str, Any], text: Optional[str]) -> Dict[str, Any]:
         annotated = self.note_output(text)
         if annotated is None or not annotated.annotations:
@@ -803,7 +820,7 @@ class FileRun:
 
         async def finish(outcome: streaming.StreamOutcome) -> None:
             try:
-                self.note_output(outcome.text)
+                await self.note_output_off_loop(outcome.text)
                 await on_finish(outcome)
             finally:
                 self.cleanup()

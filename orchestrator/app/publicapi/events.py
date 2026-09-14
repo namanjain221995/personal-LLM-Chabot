@@ -429,7 +429,19 @@ class SequencedEvents:
         return self._frame(RESPONSE_CONTENT_PART_ADDED, content_part_added_payload(self.item_id))
 
     def annotation_added(self, annotation_index: int, annotation: Mapping[str, Any]) -> str:
-        """One `file_citation` annotation on the finished text."""
+        """One `file_citation` annotation on the finished text.
+
+        Only directly after `output_text.done` or another annotation. The rank
+        table alone lets a stage be SKIPPED (an annotation straight after a
+        delta or `content_part.added` ranks higher, so it would pass), and
+        this stage may not be: an annotation's `index` counts UTF-16 units into
+        the final text, which does not exist before `output_text.done`."""
+        previous = self._emitted[-1] if self._emitted else None
+        if previous not in (RESPONSE_OUTPUT_TEXT_DONE, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED):
+            raise StreamProtocolError(
+                f"{RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED!r} must follow "
+                f"{RESPONSE_OUTPUT_TEXT_DONE!r}, not {previous!r}"
+            )
         return self._frame(
             RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
             annotation_added_payload(self.item_id, annotation_index, annotation),
