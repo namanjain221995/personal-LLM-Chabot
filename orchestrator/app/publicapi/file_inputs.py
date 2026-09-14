@@ -67,10 +67,12 @@ launch here.
 
 ANNOTATIONS. Synchronous Responses carry `file_citation` annotations on the
 `output_text` part and Chat Completions on `choices[0].message.annotations`.
-Streams and background rows record the citation counts in usage meta but do
-not yet carry the annotation events: `response.output_text.annotation.added` is
-not in `publicapi/events.EVENT_NAMES` (the stream grammar's closed set, owned
-by the wire team), and `citations.splice_annotation_events` is ready for it.
+Streams (2026-09-14, Files API publication) carry the same objects: one
+`response.output_text.annotation.added` event each after `output_text.done`,
+all of them on `response.completed`, and on Chat the finish chunk's
+`delta.annotations` — the router hands `FileRun.stream_annotations` to its
+stream launch, and the emitter numbers the events like any other. Background
+rows record the citation counts in usage meta only.
 """
 from __future__ import annotations
 
@@ -750,6 +752,16 @@ class FileRun:
             self.annotated = None
         return self.annotated
 
+    def stream_annotations(self, text: str) -> List[Dict[str, Any]]:
+        """The `file_citation` objects a stream sends for its final text
+        (`streaming.Annotator`). The same computation, cached once, that the
+        usage row's citation counts and the synchronous body read, so the
+        three can never disagree."""
+        annotated = self.note_output(text)
+        if annotated is None:
+            return []
+        return [dict(annotation) for annotation in annotated.annotations]
+
     def response_wire(self, wire: Dict[str, Any], text: Optional[str]) -> Dict[str, Any]:
         annotated = self.note_output(text)
         if annotated is None or not annotated.annotations:
@@ -915,17 +927,26 @@ Gate = Callable[[planning.GenerationPlan], AsyncContextManager[None]]
 
 
 def default_launch(
-    *, chat: bool, on_finish: streaming.OnFinish, completion_id: str = "", include_usage: bool = False
+    *,
+    chat: bool,
+    on_finish: streaming.OnFinish,
+    completion_id: str = "",
+    include_usage: bool = False,
+    annotate: Optional[streaming.Annotator] = None,
 ) -> Launch:
     """The stream launch of a build whose router passes none: exactly what the
-    router itself calls for a stream without files."""
+    router itself calls, with the file run's citations."""
 
     def launch(final: streaming.GenerationSpec) -> AsyncIterator[str]:
         if chat:
             return streaming.chat_completions_sse(
-                final, completion_id=completion_id, include_usage=include_usage, on_finish=on_finish
+                final,
+                completion_id=completion_id,
+                include_usage=include_usage,
+                on_finish=on_finish,
+                annotate=annotate,
             )
-        return streaming.responses_sse(final, on_finish=on_finish)
+        return streaming.responses_sse(final, on_finish=on_finish, annotate=annotate)
 
     return launch
 
@@ -957,7 +978,11 @@ async def stream_with_files(
     heartbeat_s = HEARTBEAT_S if heartbeat_s is None else float(heartbeat_s)
     gate = gate or patient_gate
     launch = launch or default_launch(
-        chat=chat, on_finish=on_finish, completion_id=completion_id, include_usage=include_usage
+        chat=chat,
+        on_finish=on_finish,
+        completion_id=completion_id,
+        include_usage=include_usage,
+        annotate=run.stream_annotations,
     )
     notes: "asyncio.Queue[str]" = asyncio.Queue()
     held = contextlib.AsyncExitStack()
