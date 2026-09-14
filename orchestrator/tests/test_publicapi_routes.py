@@ -395,14 +395,19 @@ def test_a_body_that_is_not_json_never_echoes_the_decoder_s_view_of_it(api, engi
     assert "secret prompt" not in response.text
 
 
-def test_stream_and_background_together_are_refused(api, engine):
+def test_stream_and_background_without_a_running_durable_runtime_is_a_retryable_503(api, engine):
+    # Valid since 2026-09-14 (CONTRACT §14): the stream follows the job's
+    # durable event log. This bare app never starts the durable runtime, so
+    # there is no log to follow — an operational fault, not a bad request.
+    # With the runtime running it streams (test_publicapi_foreground_durable).
     engine(["ok"])
     response = api.post(
         "/v1/responses", json=_body(stream=True, background=True), headers=_auth()
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_request_error"
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "model_unavailable"
+    assert response.headers["retry-after"]
 
 
 def test_a_temperature_outside_the_documented_range_is_refused(api, engine):
@@ -704,7 +709,8 @@ def test_the_preflight_answers_204_and_never_allows_credentials(api):
 
     assert response.status_code == 204
     assert response.headers["Access-Control-Allow-Origin"] == "https://someone-elses-app.example"
-    assert response.headers["Access-Control-Allow-Methods"] == "GET, POST, OPTIONS"
+    # PUT (a raw upload part) and DELETE (a file) since the Files API, 2026-09-13.
+    assert response.headers["Access-Control-Allow-Methods"] == "GET, POST, PUT, DELETE, OPTIONS"
     assert "idempotency-key" in response.headers["Access-Control-Allow-Headers"]
     assert response.headers["Access-Control-Max-Age"] == "600"
     # The header that would let a browser attach a cookie. Its absence is what
@@ -1958,11 +1964,17 @@ def test_with_the_limits_off_a_spent_daily_quota_refuses_nothing_and_usage_is_st
 
 
 def test_with_the_limits_off_simultaneous_streams_beyond_max_concurrency_all_run(
-    platform, gated
+    platform, gated, monkeypatch
 ):
     """Eight streams opened at once against max_concurrency=1, all held open
     by an engine that will not answer yet: every one reaches the engine,
-    every one ends 200, and every slot comes back."""
+    every one ends 200, and every slot comes back.
+
+    The engine's own public capacity gate (`main.normal`, 6 by default since
+    2026-09-14, when the router started holding it) is a different thing
+    from the project limit this pins, so it is opened wide here."""
+    monkeypatch.setattr(settings, "public_api_main_normal_max_concurrent", 16, raising=False)
+    monkeypatch.setenv("PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", "16")
     project_id = platform["project"]["id"]
     projects.update_project(project_id, WORKSPACE, max_concurrency=1, rpm=1)
     caller = _caller()

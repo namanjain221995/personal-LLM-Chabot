@@ -7,6 +7,7 @@ the ledger and the envelope are the production code.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from app import rerank
 from app.config import settings
@@ -21,7 +22,9 @@ from tests.publicapi_sidecar_support import (  # noqa: F401 - fixtures by name
     daily,
     engines_configured,
     install_transport,
+    no_backoff,
     platform,
+    script_witness,
     usage_events,
 )
 
@@ -111,6 +114,9 @@ def test_the_model_card_template_is_applied_and_nothing_is_truncated(api):
     assert "<Instruct>: Find the passage that answers.\n" in sent["text_1"]
     assert sent["text_1"].endswith(f"<Query>: {query}\n")
     assert sent["text_2"] == [f"<Document>: {document}{rerank.SUFFIX}"]
+    # Longer than the window in bytes, so the engine counted the templated
+    # pair before any gate: the query half and the document half, as sent.
+    assert recorded.tokenized == [sent["text_1"] + sent["text_2"][0]]
 
 
 def test_equal_scores_are_returned_as_they_are_and_never_refused_as_degenerate(api):
@@ -208,6 +214,7 @@ def test_the_embedding_model_on_the_rerank_endpoint_is_a_400_naming_model(api):
 
 def test_a_body_over_the_cap_is_a_413_before_the_engine(api, monkeypatch):
     monkeypatch.setattr(settings, "public_api_max_body_bytes", 256, raising=False)
+    monkeypatch.setattr(settings, "public_api_max_pooling_body_bytes", 512, raising=False)
     recorded = install_transport(_scores({}))
 
     response = api.post(URL, json=_body(documents=["x" * 1000]), headers=auth())
@@ -233,9 +240,30 @@ def test_a_top_n_that_is_not_a_positive_integer_and_a_blank_document_are_refused
 # ---------------------------------------------------------- the engine --
 
 
-def test_an_unreachable_reranker_is_a_503_with_retry_after_and_counts_as_an_error(api, platform):
+def test_a_reranker_that_refuses_connections_is_waited_for_then_answers(api, platform, monkeypatch):
+    slept = no_backoff(monkeypatch)
+    refusals = {"left": 2}
+
+    def restarting(request, body):
+        if refusals["left"] > 0:
+            refusals["left"] -= 1
+            raise httpx.ConnectError("connection refused")
+        return _scores({})(request, body)
+
+    recorded = install_transport(restarting)
+
+    response = api.post(URL, json=_body(), headers=auth())
+
+    assert response.status_code == 200, response.text
+    assert recorded.calls == 3 and slept == [2.0, 4.0]
+    assert daily(platform["project"]["id"])["errors"] == 0
+
+
+def test_a_reranker_unreachable_for_the_whole_down_grace_is_a_retryable_503_naming_nothing_internal(api, platform, monkeypatch):
+    monkeypatch.setattr(settings, "public_api_engine_down_grace_s", 0.0, raising=False)
+
     def down(request, body):
-        raise httpx.ConnectError("connection refused")
+        raise httpx.ConnectError("connection refused to rerank-engine.internal:30005")
 
     install_transport(down)
 
@@ -245,19 +273,61 @@ def test_an_unreachable_reranker_is_a_503_with_retry_after_and_counts_as_an_erro
     assert response.json()["error"]["code"] == "model_unavailable"
     assert int(response.headers["Retry-After"]) >= 1
     assert_nothing_internal(response)
-    assert daily(platform["project"]["id"])["errors"] == 1
 
 
-def test_a_reranker_that_answers_500_is_a_503_not_a_500(api):
-    install_transport(lambda request, body: httpx.Response(500, text="Traceback: CUDA error at /app/x.py"))
+def test_a_reranker_that_answers_500_is_sent_once_more_then_a_503_not_a_500(api):
+    recorded = install_transport(lambda request, body: httpx.Response(500, text="Traceback: CUDA error at /app/x.py"))
 
     response = api.post(URL, json=_body(), headers=auth())
 
     assert response.status_code == 503
     assert "CUDA" not in response.text and "/app/" not in response.text
+    assert recorded.calls == 2
 
 
-def test_a_pair_over_the_window_is_named_by_document_index(api):
+def test_a_silent_score_call_on_a_progressing_reranker_is_sent_again_and_a_stalled_one_is_a_503(api, monkeypatch):
+    script_witness(monkeypatch, [("progressing", 0), ("progressing", 0)])
+    silent = {"left": 2}
+
+    def slow(request, body):
+        if silent["left"] > 0:
+            silent["left"] -= 1
+            raise httpx.ReadTimeout("silent")
+        return _scores({})(request, body)
+
+    recorded = install_transport(slow)
+    assert api.post(URL, json=_body(), headers=auth()).status_code == 200
+    assert recorded.calls == 3
+
+    script_witness(monkeypatch, [("stalled", 0)])
+
+    def stalled(request, body):
+        raise httpx.ReadTimeout("silent")
+
+    recorded = install_transport(stalled)
+    response = api.post(URL, json=_body(), headers=auth())
+    assert response.status_code == 503 and recorded.calls == 1
+
+
+def test_a_pair_over_the_window_is_a_400_naming_the_document_before_any_score_call(api):
+    """The templated pair is counted by the reranker's /tokenize before any
+    gate (CONTRACT §8.5): nothing is scored for a request that cannot be."""
+
+    def tokenize(prompt):
+        return 9000 if "enormous" in prompt else 50
+
+    recorded = install_transport(_scores({}), tokenize=tokenize)
+
+    response = api.post(URL, json=_body(documents=["a", "b", "enormous " + "e" * 4200]), headers=auth())
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert (error["code"], error["param"]) == ("context_length_exceeded", "documents.2")
+    assert "4096" in error["message"] and "9000" not in error["message"]
+    assert recorded.calls == 0 and len(recorded.tokenized) == 1
+
+
+def test_a_pair_the_engine_still_refuses_is_named_by_document_index(api):
     def engine(request, body):
         import json
 
@@ -274,6 +344,18 @@ def test_a_pair_over_the_window_is_named_by_document_index(api):
     error = response.json()["error"]
     assert (error["code"], error["param"]) == ("context_length_exceeded", "documents.2")
     assert [len(body["text_2"]) for body in recorded.json_bodies()] == [3, 1, 1, 1]
+
+
+def test_a_thousand_documents_are_one_request_ranked_across_every_score_call(api):
+    recorded = install_transport(_scores({"doc 999": 0.99, "doc 0": 0.01}))
+
+    response = api.post(URL, json=_body(documents=[f"doc {i}" for i in range(1000)], top_n=2), headers=auth())
+
+    assert response.status_code == 200, response.text
+    assert [r["index"] for r in response.json()["results"]] == [999, 1]
+    assert recorded.calls == 63
+    too_many = api.post(URL, json=_body(documents=[f"doc {i}" for i in range(1001)]), headers=auth())
+    assert too_many.status_code == 400 and "at most 1000" in too_many.json()["error"]["message"]
 
 
 def test_a_malformed_score_reply_is_a_503_not_a_misattributed_score(api):
@@ -306,3 +388,39 @@ def test_a_completed_rerank_is_one_usage_row_with_the_engine_count(api, platform
         "output_tokens": 0,
         "errors": 0,
     }
+
+
+# ------------------------------------------------------ library callers --
+
+
+def test_a_library_caller_that_names_no_wait_keeps_its_bounded_budget_and_is_refused_at_once_by_a_down_engine(engines_configured, monkeypatch):
+    """`sidecars.BOUNDED_DEFAULT`: the synchronous file preparation's reranker
+    (apifiles/retrieval.py) runs before its status line and falls back to
+    lexical order, so a caller that passes no `wait_s` keeps the retired
+    budget and is not held through an engine restart. The route passes None."""
+    import asyncio
+
+    from app.publicapi import sidecars
+
+    monkeypatch.setenv("PUBLIC_API_GATE_WAIT_S", "0.05")
+    monkeypatch.setattr(settings, "public_api_rerank_max_concurrent", 1, raising=False)
+    slept = no_backoff(monkeypatch)
+
+    def down(request, body):
+        raise httpx.ConnectError("connection refused")
+
+    install_transport(down)
+
+    async def scenario():
+        with pytest.raises(sidecars.SidecarError) as refused:
+            await sidecars.rerank_scores("q", ["a"], instruction=None)
+        async with capacity.hold("rerank"):
+            with pytest.raises(sidecars.SidecarError) as busy:
+                await sidecars.rerank_scores("q", ["a"], instruction=None)
+        return refused.value, busy.value
+
+    refused, busy = asyncio.run(scenario())
+
+    assert refused.error.code == "model_unavailable" and slept == []
+    assert busy.error.code == "model_unavailable" and "at capacity" in busy.error.message
+    assert busy.engine_calls == 0

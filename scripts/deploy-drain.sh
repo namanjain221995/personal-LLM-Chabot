@@ -4,6 +4,7 @@
 #   scripts/deploy-drain.sh check   [SERVICE...]
 #   scripts/deploy-drain.sh wait    SERVICE [--deadline S] [--quiet-for S] [--max N]
 #   scripts/deploy-drain.sh uploads [--deadline S] [--poll S]
+#   scripts/deploy-drain.sh api
 #
 # WHAT DRAINING CAN AND CANNOT BE HERE
 #
@@ -52,6 +53,19 @@
 #          are designed to survive a restart. Like `wait`, it is advisory and
 #          bounded (exit 2 on the deadline), and it reads the database through
 #          the postgres container with a SELECT and nothing else.
+#
+#   api    (2026-09-13, no-timeout /v1) a REPORT, never a wait. Durable /v1
+#          generations suspend on SIGTERM and the next process resumes them,
+#          so a deploy never waits for them — a 3-hour public job must not be
+#          able to hold a security fix. What a deploy does cost them is a
+#          re-prefill, and this line says how much: runs generating now,
+#          suspended runs, queued background runs, quarantined runs (one
+#          engine incident implicated them), and the tokens the running and
+#          suspended runs will prefill again (input + generated so far; input
+#          is counted only once the engine measured it, so it is a floor).
+#          One read-only SELECT through the postgres container; exit 0 always,
+#          including when the database cannot be read or the schema predates
+#          V36 (the line says which).
 #
 # No mode ever stops, kills or recreates anything, and none of them writes.
 set -euo pipefail
@@ -350,10 +364,33 @@ do_uploads() {
   done
 }
 
+# ------------------------------------------------------------------------ api
+# The durable /v1 run report (header, `api`). The V36 column is asked for
+# FIRST and separately, for the reason finalizing_count gives: a statement
+# naming a column that does not exist fails at parse time whatever it says.
+do_api() {
+  local present row
+  present="$(dr_psql_ro "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'api_responses' AND column_name = 'lease_owner')")" || present=""
+  case "$present" in
+    t) : ;;
+    f) dr_say "drain api: schema predates V36 - no durable /v1 runs to report"; return 0 ;;
+    *) dr_warn "drain api: cannot read api_responses (no postgres container, or psql failed); nothing reported"; return 0 ;;
+  esac
+  row="$(dr_psql_ro "SELECT count(*) FILTER (WHERE lease_owner IS NOT NULL AND lease_expires_at > now()) || '|' || count(*) FILTER (WHERE lease_owner IS NULL AND suspended_at IS NOT NULL) || '|' || count(*) FILTER (WHERE status = 'queued' AND background AND suspended_at IS NULL AND lease_owner IS NULL) || '|' || count(*) FILTER (WHERE engine_fault_attempts > 0) || '|' || COALESCE(sum(COALESCE(input_tokens, 0) + COALESCE(generated_tokens, 0)) FILTER (WHERE (lease_owner IS NOT NULL AND lease_expires_at > now()) OR (lease_owner IS NULL AND suspended_at IS NOT NULL)), 0) FROM api_responses WHERE resumable AND status IN ('queued', 'in_progress')")" || row=""
+  case "$row" in
+    *[!0-9\|]*|'') dr_warn "drain api: the durable run report could not be read; nothing reported"; return 0 ;;
+  esac
+  local running suspended queued quarantined tokens
+  IFS='|' read -r running suspended queued quarantined tokens <<<"$row"
+  dr_say "drain api: running=${running:-?} suspended=${suspended:-?} queued=${queued:-?} quarantined=${quarantined:-?} re_prefill_tokens=${tokens:-?} (never waited for: running runs suspend and resume)"
+  return 0
+}
+
 case "$MODE" in
   check)   do_check "$@" ;;
   wait)    do_wait "$@" ;;
   uploads) do_uploads "$@" ;;
+  api)     do_api "$@" ;;
   -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0" ;;
-  *) dr_die "usage: $0 {check|wait|uploads} ..." ;;
+  *) dr_die "usage: $0 {check|wait|uploads|api} ..." ;;
 esac

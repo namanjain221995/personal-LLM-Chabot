@@ -70,6 +70,61 @@ export const MODEL_IDS = [
  */
 export const LONG_OUTPUT_WALL_CLOCK_LIVE: boolean = true;
 
+/** What the post-deploy checks through the public URL found (NO_TIMEOUT_EDGE_PROBE). */
+export interface NoTimeoutEdgeProbe {
+  /** The day of the run, `YYYY-MM-DD`. */
+  ranOn: string;
+  /** A synchronous call with no client read timeout completed after more than 125 s. */
+  syncPastFirstByteWall: boolean;
+  /**
+   * A stream from an `openai` client with DEFAULT settings, in Python and in
+   * Node, finished without raising across a routine deploy — one that
+   * recreated the frontend and the orchestrator, as routine deploys do.
+   */
+  defaultStreamsSurvivedRoutineDeploy: boolean;
+  /**
+   * The gateway's own log showed the re-attach for that stream: proof that
+   * /v1 reached the gateway through the public URL, and not the frontend's
+   * fallback route, whose sockets a deploy closes.
+   */
+  gatewayReattachLogged: boolean;
+}
+
+/**
+ * THE NO-TIMEOUT EDGE PROBE — whether "deploys are invisible to a connected
+ * client" may be printed.
+ *
+ * 2026-09-14, review: the release pages used to say it as soon as the code
+ * was in (NO_TIMEOUT_LIVE). It is only true once public /v1 traffic reaches
+ * the gateway, a process routine deploys do not recreate — and that takes a
+ * path rule on the tunnel, an operator step after the deploy. Before it,
+ * public /v1 still lands on the frontend, and every frontend deploy closes its
+ * /v1 sockets two seconds after SIGTERM (server-preload.cjs). With about five
+ * deploys a day, printing the promise early would publish a guarantee the
+ * service breaks daily.
+ *
+ * Record the design's post-deploy public checks here, by hand, once they have
+ * passed. Until then this is null, DEPLOYS_HELD is false, and the release
+ * pages say instead that a deploy can close a connection and that resuming
+ * (or retrying with the same Idempotency-Key) picks the generation up — which
+ * is true either way. tests/docs-site.test.tsx holds every page to it.
+ */
+export const NO_TIMEOUT_EDGE_PROBE: NoTimeoutEdgeProbe | null = null;
+
+/** Did a recorded run through the public URL prove deploys are held? */
+export function deploysHeldOnTheEdge(probe: NoTimeoutEdgeProbe | null): boolean {
+  return (
+    probe !== null &&
+    /^\d{4}-\d{2}-\d{2}$/.test(probe.ranOn) &&
+    probe.syncPastFirstByteWall &&
+    probe.defaultStreamsSurvivedRoutineDeploy &&
+    probe.gatewayReattachLogged
+  );
+}
+
+/** The switch the release pages read for their deploy sentences. */
+export const DEPLOYS_HELD: boolean = deploysHeldOnTheEdge(NO_TIMEOUT_EDGE_PROBE);
+
 /** The caveat while the per-request wall clock is not yet enforced. */
 export const WALL_CLOCK_PENDING_NOTE =
   '**Not yet deliverable end to end.** The 1,000,000 ceiling is accepted and ' +

@@ -29,6 +29,7 @@ from app.apiplatform import quotas
 from app.config import settings
 from app.publicapi import capacity, errors, events, models, planning, registry, streaming
 from tests.test_publicapi_routes import TOKENS, _auth, _pepper, api, platform  # noqa: F401
+from tests.publicapi_fake_engine import set_setting
 
 _run = asyncio.run
 
@@ -110,27 +111,25 @@ def test_input_over_the_ceiling_counted_on_the_byte_bound_is_the_only_size_refus
     assert refused.value.code == "context_length_exceeded"
 
 
-@pytest.mark.parametrize(
-    "planned, expected",
-    [
-        (8192, 4200.0),  # the chat app's wall clock, unchanged for a default request
-        (100_000, 4200.0),  # 900 + 2,000 = 2,900 < the 4,200 floor
-        (1_000_000, 20_900.0),  # 900 s prefill + 1,000,000 / 50 tok/s
-    ],
-)
-def test_the_wall_clock_is_sized_from_the_planned_output(planned, expected):
-    assert planning.wall_clock_for(_flagship(), planned) == expected
+@pytest.mark.parametrize("max_output_tokens", [None, 100_000, 1_000_000])
+def test_a_plan_carries_no_wall_clock_at_any_output_size(max_output_tokens):
+    """No-timeout design (2026-09-13): the per-request wall clock is deleted.
+    `wall_clock_s` survives on the plan only as 0.0 — "none" — for readers
+    that still log it."""
+    plan = planning.plan_generation(_request(max_output_tokens=max_output_tokens), _flagship())
+    assert plan.wall_clock_s == 0.0
+    assert not hasattr(planning, "wall_clock_for")
 
 
-def test_the_wall_clock_never_exceeds_the_public_hard_ceiling(monkeypatch):
-    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 10_000.0, raising=False)
-    assert planning.wall_clock_for(_flagship(), 1_000_000) == 10_000.0
-
-
-def test_a_sidecar_wall_clock_has_its_own_floor_and_rate():
+def test_the_retired_wall_clock_settings_change_nothing(monkeypatch):
+    set_setting(monkeypatch, "PUBLIC_API_GEN_WALL_CLOCK_S", "10")
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", "1")
+    set_setting(monkeypatch, "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", "1")
     router = registry.resolve_public_model("techsara-8b-vision")
-    assert planning.wall_clock_for(router, 8192) == 600.0
-    assert planning.wall_clock_for(router, 24_576) == pytest.approx(60 + 24_576 / 20)
+    for model in (_flagship(), router):
+        if model is None:
+            continue
+        assert planning.plan_generation(_request(), model).wall_clock_s == 0.0
 
 
 def test_an_answer_planned_above_800k_takes_the_one_at_a_time_gate_and_a_normal_one_takes_none():
@@ -179,7 +178,6 @@ def _spec(**overrides) -> streaming.GenerationSpec:
         created_at=1789200000,
         item_id="msg_fixed",
         engine="main",
-        wall_clock_s=20_900.0,
         requested_max_output_tokens=1_000_000,
         planned_max_output_tokens=999_000,
         context_window=1_000_000,
@@ -230,9 +228,33 @@ def test_the_in_band_wall_clock_marker_never_reaches_the_answer_and_the_response
     assert outcome.max_output_tokens == _spec().planned
 
 
-def test_a_generation_cut_by_the_backstop_is_counted_too(monkeypatch):
+class _InterruptAfter:
+    """A liveness guard that proves the engine lost the request after `ticks`
+    quiet heartbeats — the only thing that ends a silent attempt now."""
+
+    def __init__(self, ticks: int) -> None:
+        self.ticks = ticks
+        self.seen = 0
+        self.dispatched_at = None
+        self.chunks = 0
+
+    def dispatched(self, now=None):
+        self.dispatched_at = 0.0
+
+    def chunk(self, now=None, *, token=True):
+        self.chunks += 1
+
+    def tick(self, now=None):
+        from app.publicapi import liveness
+
+        self.seen += 1
+        if self.seen >= self.ticks:
+            return liveness.Verdict(True, liveness.REASON_LOST, False, "test")
+        return liveness.OK
+
+
+def test_an_interrupted_generation_is_counted_too(monkeypatch):
     _usage(monkeypatch, None)
-    monkeypatch.setattr(streaming, "BACKSTOP_GRACE_S", 0.05)
 
     def engine(messages, **kwargs):
         async def run():
@@ -244,33 +266,98 @@ def test_a_generation_cut_by_the_backstop_is_counted_too(monkeypatch):
         return run()
 
     monkeypatch.setattr(llm, "stream_chat_events", engine)
-    outcome = _run(
-        asyncio.wait_for(
-            streaming.run_to_completion(_spec(wall_clock_s=0.1, estimated_input_tokens=41), heartbeat_s=0.02),
-            10,
-        )
-    )
-    assert outcome.error.code == "timeout"
-    assert outcome.usage["completion_tokens"] == 3  # the reasoning delta was generated too
-    assert outcome.usage["prompt_tokens"] == 41
-    assert outcome.usage["source"] == streaming.USAGE_COUNTED_AT_STOP
+    guard = _InterruptAfter(ticks=3)
+
+    async def scenario():
+        generation = streaming.Generation(_spec(estimated_input_tokens=41), heartbeat_s=0.02, guard=guard)
+        async for _ in generation.stream():
+            pass
+        await generation.aclose()
+        return generation
+
+    generation = _run(asyncio.wait_for(scenario(), 10))
+    assert generation.interrupt is not None and generation.interrupt.reason == "lost"
+    assert generation.error is None
+    assert generation.usage["completion_tokens"] == 3  # the reasoning delta was generated too
+    assert generation.usage["prompt_tokens"] == 41
+    assert generation.usage["source"] == streaming.USAGE_COUNTED_AT_STOP
+    assert guard.chunks == 3
 
 
-def test_the_per_request_wall_clock_reaches_an_engine_that_accepts_one(monkeypatch):
+def test_an_engine_that_accepts_the_no_timeout_kwargs_gets_no_wall_clock_and_no_read_timeout(monkeypatch):
     _usage(monkeypatch, None)
     seen: Dict[str, Any] = {}
 
-    def engine(messages, *, model_choice, effort, temperature, max_tokens, wall_clock_s=None, wall_clock_marker=True):
-        seen.update(wall_clock_s=wall_clock_s, wall_clock_marker=wall_clock_marker)
+    def engine(
+        messages, *, model_choice, effort, temperature, max_tokens, wall_clock_s=None,
+        wall_clock_marker=True, read_timeout_s=600.0, admission_patient=False, on_dispatch=None,
+        continue_final_message=False,
+    ):
+        seen.update(
+            wall_clock_s=wall_clock_s, wall_clock_marker=wall_clock_marker, read_timeout_s=read_timeout_s,
+            admission_patient=admission_patient, continue_final_message=continue_final_message,
+            messages=list(messages), max_tokens=max_tokens,
+        )
 
         async def run():
+            if on_dispatch is not None:
+                on_dispatch()
             yield ("token", "ok")
 
         return run()
 
     monkeypatch.setattr(llm, "stream_chat_events", engine)
     _run(streaming.run_to_completion(_spec()))
-    assert seen == {"wall_clock_s": 20_900.0, "wall_clock_marker": False}
+    assert seen["wall_clock_s"] == 0 and seen["wall_clock_marker"] is False
+    assert seen["read_timeout_s"] is None
+    assert seen["continue_final_message"] is False
+
+    # A continuation: the partial answer as the final assistant message, the
+    # remaining budget, and continue_final_message — never a fresh turn.
+    guard = _InterruptAfter(ticks=10**9)
+    prefix = [{"role": "user", "content": "write"}, {"role": "assistant", "content": "partial"}]
+
+    async def resume():
+        generation = streaming.Generation(
+            _spec(), guard=guard, messages=prefix, max_tokens=900, continue_final_message=True,
+            admission_patient=True,
+        )
+        texts = [c.text async for c in generation.stream() if c.kind == "token"]
+        await generation.aclose()
+        return texts
+
+    assert _run(resume()) == ["ok"]
+    assert seen["continue_final_message"] is True and seen["admission_patient"] is True
+    assert seen["messages"] == prefix and seen["max_tokens"] == 900
+    assert guard.dispatched_at is not None  # on_dispatch reached the guard
+
+
+def test_a_continuation_on_an_engine_path_without_continue_final_message_is_refused_not_regenerated(monkeypatch):
+    _usage(monkeypatch, None)
+    calls: List[Any] = []
+
+    def engine(messages, *, model_choice, effort, temperature, max_tokens):
+        calls.append(messages)
+
+        async def run():
+            yield ("token", "fresh answer")
+
+        return run()
+
+    monkeypatch.setattr(llm, "stream_chat_events", engine)
+
+    async def scenario():
+        generation = streaming.Generation(
+            _spec(), messages=[{"role": "assistant", "content": "x"}], continue_final_message=True
+        )
+        async for _ in generation.stream():
+            pass
+        await generation.aclose()
+        return generation
+
+    generation = _run(scenario())
+    assert type(generation.error).__name__ == "ContinuationUnsupported"
+    assert calls == []
 
 
 def test_an_engine_without_a_per_call_clock_is_not_handed_one_and_its_own_clock_is_named(monkeypatch):
@@ -294,9 +381,12 @@ def test_an_engine_without_a_per_call_clock_is_not_handed_one_and_its_own_clock_
     assert "4200 second" in outcome.error.message
 
 
-def test_a_hung_engine_is_cut_by_the_backstop_shortly_after_its_wall_clock(monkeypatch):
+def test_a_hung_engine_is_waited_on_until_its_liveness_guard_interrupts_then_closed(monkeypatch):
+    """No clock cuts a silent engine (a 30-minute prefill is legitimate); the
+    guard's proof does. Non-durable callers report the interrupt as the
+    retry-safe `model_unavailable`, with the partial text, and the engine
+    stream is closed."""
     _usage(monkeypatch, None)
-    monkeypatch.setattr(streaming, "BACKSTOP_GRACE_S", 0.05)
     closed: List[bool] = []
 
     def engine(messages, **kwargs):
@@ -310,15 +400,22 @@ def test_a_hung_engine_is_cut_by_the_backstop_shortly_after_its_wall_clock(monke
         return run()
 
     monkeypatch.setattr(llm, "stream_chat_events", engine)
+    guard = _InterruptAfter(ticks=5)
+    real = streaming.Generation
+
+    def guarded(spec, **kwargs):
+        kwargs.setdefault("guard", guard)
+        return real(spec, **kwargs)
+
+    monkeypatch.setattr(streaming, "Generation", guarded)
     started = time.monotonic()
-    # Bounded, so a regression that removes the backstop FAILS in seconds
-    # instead of hanging the suite on an engine nobody stops.
     outcome = _run(
         asyncio.wait_for(streaming.run_to_completion(_spec(wall_clock_s=0.1), heartbeat_s=0.02), 10)
     )
 
     assert time.monotonic() - started < 5
-    assert outcome.status == "failed" and outcome.error.code == "timeout"
+    assert guard.seen >= 5  # it waited through every quiet heartbeat first
+    assert outcome.status == "failed" and outcome.error.code == "model_unavailable"
     assert outcome.text == "started"
     assert closed == [True]
 
@@ -466,8 +563,9 @@ def test_the_usage_ledger_records_what_was_asked_for_what_was_applied_and_the_cl
     assert meta["max_output_tokens_requested"] == 1_000_000
     assert meta["max_output_tokens_applied"] == 1_000_000 - 100_000 - 512
     assert meta["clamped"] is True
-    # Sized from the PLANNED output (the window minus the estimated "hi").
-    assert 20_800.0 < meta["wall_clock_s"] <= 20_900.0
+    # RETIRED: the plan carries 0.0 — no wall clock (no-timeout design). The
+    # router (T3) may drop the field; until then it must never be a limit.
+    assert meta.get("wall_clock_s", 0.0) == 0.0
     assert rows[-1]["model"] == "techsara-35b"
 
 
@@ -510,7 +608,12 @@ def test_an_answer_planned_above_800k_holds_the_main_long_gate_while_it_runs(api
     short = api.post("/v1/responses", json={"model": "techsara-35b", "input": "hi"}, headers=_auth())
 
     assert long.status_code == short.status_code == 200
-    assert seen == [("main.long", 0)]
+    # The long request holds main.long, alone. The short one never touches
+    # main.long; T3's router takes `capacity.gates_for` (design
+    # capacity_waits), so it holds main.normal (assembler, 2026-09-14: the
+    # pre-T3 alternative is no longer accepted).
+    assert seen[0] == ("main.long", 0)
+    assert [gate for gate, _ in seen[1:]] == ["main.normal"]
 
 
 @pytest.mark.parametrize("mode", ["sync", "stream", "background"])
@@ -576,7 +679,7 @@ def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_neve
     api, platform, engine, monkeypatch
 ):
     calls = engine(["never"])
-    monkeypatch.setattr(settings, "public_api_background_gate_wait_s", 30.0, raising=False)
+    set_setting(monkeypatch, "PUBLIC_API_BACKGROUND_GATE_WAIT_S", "30")
 
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(
@@ -601,7 +704,7 @@ def test_a_background_job_waits_queued_for_the_long_gate_and_a_cancel_there_neve
 
 def test_a_background_job_that_never_gets_capacity_fails_retry_safe(api, platform, engine, monkeypatch):
     calls = engine(["never"])
-    monkeypatch.setattr(settings, "public_api_background_gate_wait_s", 0.2, raising=False)
+    set_setting(monkeypatch, "PUBLIC_API_BACKGROUND_GATE_WAIT_S", "0.2")
 
     with api.portal.wrap_async_context_manager(capacity.hold("main.long", wait_s=1)):
         created = api.post(

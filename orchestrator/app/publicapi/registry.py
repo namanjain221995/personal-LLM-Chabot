@@ -152,9 +152,6 @@ OCR_TOKENS_PER_IMAGE_BOUND = 2048
 #: 2026-09-11). Appended only when the caller sent no text at all.
 OCR_DEFAULT_PROMPT = "OCR"
 SIDECAR_CONTEXT_RESERVE = 64
-SIDECAR_PREFILL_ALLOWANCE_S = 60.0
-SIDECAR_MIN_DECODE_TOKENS_PER_S = 20.0
-SIDECAR_WALL_CLOCK_FLOOR_S = 600.0
 EMBEDDING_DIMENSIONS = 1024  # Qwen3-Embedding-0.6B config.json hidden_size
 TRANSCRIPTION_RESPONSE_FORMATS: Tuple[str, ...] = ("json", "text", "verbose_json")
 
@@ -829,7 +826,7 @@ def _build_embed(configured: bool) -> PublicModel:
         max_output_tokens=None,
         default_max_output_tokens=None,
         limits={
-            "max_inputs_per_request": max(1, setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 256)),
+            "max_inputs_per_request": max(1, setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 2048)),
             "embedding_dimensions": EMBEDDING_DIMENSIONS,
         },
         default_temperature=0.0,
@@ -870,7 +867,7 @@ def _build_rerank(configured: bool) -> PublicModel:
         default_max_output_tokens=None,
         limits={
             "max_documents_per_request": max(
-                1, setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100)
+                1, setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 1000)
             ),
         },
         default_temperature=0.0,
@@ -904,9 +901,11 @@ def _build_asr(configured: bool) -> PublicModel:
         max_input_tokens=None,
         max_output_tokens=None,
         default_max_output_tokens=None,
+        # No seconds limit (no-timeout design, 2026-09-14): audio of any
+        # duration is transcribed in windows. The byte cap is ONE request's
+        # file part; longer recordings arrive through the Files API.
         limits={
-            "max_audio_seconds": max(1, setting_int("PUBLIC_API_MAX_AUDIO_SECONDS", 300)),
-            "max_audio_bytes": max(1, setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)),
+            "max_audio_bytes": max(1, setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 93_323_264)),
             "response_formats": list(TRANSCRIPTION_RESPONSE_FORMATS),
         },
         default_temperature=0.0,

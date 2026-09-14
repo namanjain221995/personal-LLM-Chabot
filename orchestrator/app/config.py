@@ -55,6 +55,71 @@ def _float(name: str, default: float) -> float:
     return float(raw)
 
 
+#: Settings the no-timeout /v1 design (revision 2, 2026-09-13) retired: each
+#: was a total wall clock, a capacity-wait bound or a duration cap on /v1. They
+#: are IGNORED — the code that read them is deleted by the teams that own it —
+#: and a deployment that still sets one gets ONE warning per name per process,
+#: so an operator's stale override is visible instead of silently meaningless.
+#: PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS keeps its Settings attribute
+#: until its reader (apiplatform/idempotency.py) drops it, so an assembly in
+#: either order imports cleanly.
+RETIRED_PUBLIC_API_SETTINGS = {
+    "PUBLIC_API_GEN_WALL_CLOCK_S": "no wall clock on /v1: liveness comes from engine evidence",
+    "PUBLIC_API_GATE_WAIT_S": "capacity waits have no limit while the engine is not proven down",
+    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "background runs queue as rows with no wait limit",
+    "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S": "the per-request wall clock it sized is deleted",
+    "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S": "the per-request wall clock it sized is deleted",
+    "PUBLIC_API_MAX_AUDIO_SECONDS": "audio of any length is transcribed in windows",
+    "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS": "a claim bound to a response lives while the run is open",
+}
+
+#: The retired settings some code in THIS build still reads, and what reads
+#: them. WHY (assembler, 2026-09-14): the warning said "ignored" for all
+#: seven, but the no-timeout work of T3 (idempotency attach) and T4 (the
+#: embeddings, rerank and transcription routes) is not in this build, so five
+#: are still honoured there. An operator told a setting is ignored removes it
+#: and changes behaviour; the warning now names the remaining reader instead.
+#: Delete an entry in the change that removes its last reader.
+STILL_READ_RETIRED_SETTINGS = {
+    "PUBLIC_API_GEN_WALL_CLOCK_S": "apiplatform/idempotency.py (the Idempotency-Key in-flight lease)",
+    "PUBLIC_API_GATE_WAIT_S": "publicapi/capacity.py sync_wait_s, for the bounded file preparation of a "
+    "synchronous request (file_inputs.bounded_engines, and the retrieval reranker through sidecars' "
+    "BOUNDED_DEFAULT); the embeddings, rerank and transcription routes stopped reading it 2026-09-14",
+    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "publicapi/capacity.py for the legacy background path while the durable "
+    "runtime is not running, and apiplatform/idempotency.py (the in-flight claim lease); Files processing jobs "
+    "no longer read it",
+    "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS": "apiplatform/idempotency.py",
+}
+
+_retired_warned: set = set()
+
+
+def warn_retired_settings(environ=None) -> list:
+    """Log one WARNING per retired setting present in the environment, once
+    per process; returns the names warned about by THIS call. Never raises."""
+    import logging
+
+    env = os.environ if environ is None else environ
+    warned = []
+    for name, why in RETIRED_PUBLIC_API_SETTINGS.items():
+        raw = env.get(name)
+        if raw is None or str(raw).strip() == "" or name in _retired_warned:
+            continue
+        _retired_warned.add(name)
+        warned.append(name)
+        reader = STILL_READ_RETIRED_SETTINGS.get(name)
+        if reader:
+            logging.getLogger("app.config").warning(
+                "%s is set; it is retired by the no-timeout /v1 design (%s) but this build still reads it in %s",
+                name, why, reader,
+            )
+        else:
+            logging.getLogger("app.config").warning(
+                "%s is set but retired by the no-timeout /v1 design and is ignored (%s)", name, why
+            )
+    return warned
+
+
 #: Valid CHART_TRIGGER_MODE values. `automatic` is intentionally not one.
 CHART_TRIGGER_MODES = ("explicit", "hybrid")
 
@@ -1520,18 +1585,11 @@ class Settings:
         # The public ceiling for `max_output_tokens` (owner decision): not the
         # chat app's MODEL_MAX_OUTPUT, which `/v1` no longer reads.
         self.public_api_max_output_tokens: int = _int("PUBLIC_API_MAX_OUTPUT_TOKENS", 1_000_000)
-        # Wall clock per generation: min(this, max(floor, prefill allowance +
-        # planned output / minimum decode rate)). The floor for techsara-35b
-        # is GEN_WALL_CLOCK_S; 900 s is the measured full-window prefill
-        # (878 s at 949,915 tokens, 2026-08-29) and 50 tok/s sits under the
-        # measured 71-101. A 1,000,000-token request gets 20,900 s.
-        self.public_api_gen_wall_clock_s: float = _float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)
-        self.public_api_main_prefill_allowance_s: float = _float(
-            "PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0
-        )
-        self.public_api_main_min_decode_tokens_per_s: float = _float(
-            "PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", 50.0
-        )
+        # PUBLIC_API_GEN_WALL_CLOCK_S, PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S and
+        # PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S were declared here by PR #65
+        # for the per-request wall clock. The no-timeout design retires them
+        # (RETIRED_PUBLIC_API_SETTINGS): they are deliberately NOT attributes,
+        # so a value in .env is warned about, never silently honoured.
         # Capacity gates (publicapi/capacity.py): one per shared engine, for
         # every caller, first come first served; a refusal is 503
         # model_unavailable with Retry-After, never 429. The main gates are
@@ -1554,15 +1612,12 @@ class Settings:
         self.public_api_main_extended_max_concurrent: int = _int(
             "PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT", 2
         )
-        # How long a sync / streaming / embeddings / rerank / transcription
-        # request waits for its gate BEFORE the status line (under
-        # Cloudflare's 100 s origin timeout); a background job waits inside
-        # its task with the row `queued`; a gate that yields to chat waits for
-        # chat at most this long per attempt.
-        self.public_api_gate_wait_s: float = _float("PUBLIC_API_GATE_WAIT_S", 30.0)
-        self.public_api_background_gate_wait_s: float = _float(
-            "PUBLIC_API_BACKGROUND_GATE_WAIT_S", 3600.0
-        )
+        # PUBLIC_API_GATE_WAIT_S and PUBLIC_API_BACKGROUND_GATE_WAIT_S are
+        # retired too (no /v1 capacity wait ends on a clock) and not declared;
+        # the readers that remain in this build read the environment through
+        # `registry.setting_float` with the same 30 s / 3,600 s defaults, and
+        # STILL_READ_RETIRED_SETTINGS names them. A gate that yields to chat
+        # waits for chat at most this long per attempt:
         self.public_api_yield_to_chat_max_wait_s: float = _float(
             "PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S", 10.0
         )
@@ -1582,23 +1637,28 @@ class Settings:
         self.public_api_embed_context_tokens: int = _int("PUBLIC_API_EMBED_CONTEXT_TOKENS", 4096)
         self.public_api_embed_max_concurrent: int = _int("PUBLIC_API_EMBED_MAX_CONCURRENT", 2)
         self.public_api_embed_kv_budget_tokens: int = _int("PUBLIC_API_EMBED_KV_BUDGET_TOKENS", 8192)
-        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 256)
+        # Request SHAPE, not usage (no-timeout design, 2026-09-14): OpenAI's
+        # own 2,048 inputs and 1,000 documents; the JSON body of both routes
+        # is PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB, endpoint_models).
+        self.public_api_embed_max_inputs: int = _int("PUBLIC_API_EMBED_MAX_INPUTS", 2048)
         self.public_api_rerank_context_tokens: int = _int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096)
         self.public_api_rerank_max_concurrent: int = _int("PUBLIC_API_RERANK_MAX_CONCURRENT", 2)
         self.public_api_rerank_kv_budget_tokens: int = _int(
             "PUBLIC_API_RERANK_KV_BUDGET_TOKENS", 8192
         )
-        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100)
-        # techsara-whisper: one public clip fleet-wide, yielding to dictation;
-        # 300 s of audio decodes in ~43 s, inside the 100 s origin timeout.
+        self.public_api_rerank_max_documents: int = _int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 1000)
+        # techsara-whisper: one public window fleet-wide, yielding to dictation.
         self.public_api_asr_max_concurrent: int = _int("PUBLIC_API_ASR_MAX_CONCURRENT", 1)
-        self.public_api_max_audio_seconds: int = _int("PUBLIC_API_MAX_AUDIO_SECONDS", 300)
-        # Body caps (app/main.py asks publicapi.models.body_cap_for): 25 MiB of
-        # audio in a 26 MiB multipart body; 20 MiB on the two generating
-        # routes, which carry image parts (each at most 10 MiB decoded). The
-        # text inside any body is still held to PUBLIC_API_MAX_BODY_BYTES.
-        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)
-        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 27_262_976)
+        # PUBLIC_API_MAX_AUDIO_SECONDS (300) is retired and read by nothing:
+        # audio of any length is transcribed in windows (publicapi/audio_jobs.py).
+        # Body caps (app/main.py asks publicapi.models.body_cap_for): 89 MiB of
+        # audio streamed to disk in a 90 MiB multipart body (the same bytes the
+        # edge and the gateway allow; longer recordings go through the Files
+        # API); 20 MiB on the two generating routes, which carry image parts
+        # (each at most 10 MiB decoded). The text inside any body is still held
+        # to PUBLIC_API_MAX_BODY_BYTES.
+        self.public_api_max_audio_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BYTES", 93_323_264)
+        self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 94_371_840)
         self.public_api_max_media_body_bytes: int = _int("PUBLIC_API_MAX_MEDIA_BODY_BYTES", 20_971_520)
         self.public_api_max_image_bytes: int = _int("PUBLIC_API_MAX_IMAGE_BYTES", 10_485_760)
 
@@ -1618,6 +1678,155 @@ class Settings:
         self.public_api_webhook_max_pending_per_endpoint: int = _int(
             "PUBLIC_API_WEBHOOK_MAX_PENDING_PER_ENDPOINT", 1000
         )
+        # ---- No-timeout /v1 (design revision 2, 2026-09-13) ----------------
+        #
+        # THE RULE these settings serve: no wall clock anywhere on /v1.
+        # Liveness comes from engine evidence (app/engine_state.py), capacity
+        # waits never expire while the engine is not proven down, and the only
+        # refusals before headers are PHYSICAL (open files, free disk). Every
+        # number below is a detector threshold or a physical guard, never a
+        # usage limit or a total duration. Read by publicapi through
+        # `registry.setting_*` (settings first, then the environment), so the
+        # names are the environment variables lower-cased.
+        #
+        # LIVENESS GUARD (publicapi/liveness.py MainGuard), evaluated only once
+        # an attempt is dispatched:
+        #: Silence below this is never examined: a decoding stream never gets
+        #: past it. 120 s.
+        self.public_api_liveness_quiet_s: float = _float("PUBLIC_API_LIVENESS_QUIET_S", 120.0)
+        #: The controller must PROVE not-serving for this long (two 15 s polls)
+        #: before an attempt is interrupted. 30 s.
+        self.public_api_liveness_not_serving_s: float = _float("PUBLIC_API_LIVENESS_NOT_SERVING_S", 30.0)
+        #: The 'lost' rule (engine idle on 3 samples) applies only this long
+        #: after dispatch: it must exceed the API server's tokenisation of a
+        #: full-window prompt (unmeasured; operator action). 300 s.
+        self.public_api_liveness_lost_min_s: float = _float("PUBLIC_API_LIVENESS_LOST_MIN_S", 300.0)
+        #: With the controller blind, silence this long interrupts: 4.5x the
+        #: ~800 s full-window prefill measured 2026-09-12. 3600 s.
+        self.public_api_liveness_unknown_silence_s: float = _float(
+            "PUBLIC_API_LIVENESS_UNKNOWN_SILENCE_S", 3600.0
+        )
+        #: A NOT-dispatched run fails only after the engine is PROVEN down this
+        #: long continuously (unknown never counts). 1800 s.
+        self.public_api_engine_down_grace_s: float = _float("PUBLIC_API_ENGINE_DOWN_GRACE_S", 1800.0)
+        #: Stalled attempts on a proven-serving engine before failing. 3.
+        self.public_api_resume_max_stalled_attempts: int = _int("PUBLIC_API_RESUME_MAX_STALLED_ATTEMPTS", 3)
+        #: POISON QUARANTINE: a run implicated in one engine incident is
+        #: dispatched again only alone, after this much proven serving … 300 s.
+        self.public_api_quarantine_serving_s: float = _float("PUBLIC_API_QUARANTINE_SERVING_S", 300.0)
+        #: … and only while the controller's recovery budget has at least this
+        #: many recoveries left (engine_state.recovery_headroom), so public work
+        #: can cause at most one recovery and chat always keeps one. 2.
+        self.public_api_quarantine_min_recoveries: int = _int("PUBLIC_API_QUARANTINE_MIN_RECOVERIES", 2)
+        #
+        # DURABLE GENERATIONS (publicapi/durable.py):
+        #: Kill switch for resume-by-continuation. False: a suspended run fails
+        #: model_unavailable and its log stays readable (operator action if
+        #: the continuation check on the engine fails). True.
+        self.public_api_resume_enabled: bool = _bool("PUBLIC_API_RESUME_ENABLED", True)
+        #: Background runs resume one per this interval, oldest first. 30 s.
+        self.public_api_resume_stagger_s: float = _float("PUBLIC_API_RESUME_STAGGER_S", 30.0)
+        #: A suspended run nobody reads is cancelled (no engine work) after this. 900 s.
+        self.public_api_suspended_unread_ttl_s: float = _float("PUBLIC_API_SUSPENDED_UNREAD_TTL_S", 900.0)
+        #: Keyed runs and Responses streams keep generating this long after the
+        #: last reader leaves (client absence, not a duration limit). 600 s.
+        self.public_api_stream_orphan_grace_s: float = _float("PUBLIC_API_STREAM_ORPHAN_GRACE_S", 600.0)
+        #: The same for unkeyed sync and chat streams. 120 s.
+        self.public_api_unkeyed_orphan_grace_s: float = _float("PUBLIC_API_UNKEYED_ORPHAN_GRACE_S", 120.0)
+        #: An SDK retry (x-stainless-retry-count >= 1) attaches to an orphaned or
+        #: suspended run of the same key and body created within this. 3600 s.
+        self.public_api_implicit_attach_window_s: float = _float(
+            "PUBLIC_API_IMPLICIT_ATTACH_WINDOW_S", 3600.0
+        )
+        #: The shared follower poller's interval for runs owned elsewhere. 1 s.
+        self.public_api_follower_poll_s: float = _float("PUBLIC_API_FOLLOWER_POLL_S", 1.0)
+        #: Per-process cap on event bytes waiting for the database; above it the
+        #: largest run suspends with reason 'store'. 64 MiB.
+        self.public_api_pending_events_max_bytes: int = _int(
+            "PUBLIC_API_PENDING_EVENTS_MAX_BYTES", 67_108_864
+        )
+        #: Output events are kept this long after a run's terminal event, then
+        #: pruned in batches (db.prune_api_platform). 3600 s.
+        self.public_api_event_retention_s: float = _float("PUBLIC_API_EVENT_RETENTION_S", 3600.0)
+        #: A synchronous response commits its 200 after this and then writes a
+        #: space every heartbeat (the 15 s byte invariant). 12 s: WHY
+        #: (assembler, 2026-09-14) T3 measured the first byte at 15.07 s with a
+        #: 15 s window, and `keepalive.sync_commit_s` reads THIS attribute
+        #: before its own default, so 15 here silently undid T3's 12 s and put
+        #: the orchestrator's headers behind the gateway's own 15 s commit.
+        #: keepalive clamps it to [0, 15].
+        self.public_api_sync_commit_s: float = _float("PUBLIC_API_SYNC_COMMIT_S", 12.0)
+        #: Content-addressed image blobs of durable specs (0700 dir, 0600 files).
+        self.public_api_blob_dir: str = os.environ.get(
+            "PUBLIC_API_BLOB_DIR", "/data/publicapi/blobs"
+        ).strip() or "/data/publicapi/blobs"
+        #
+        # PHYSICAL GUARDS (app/resources.py; the only pre-header refusals):
+        #: New /v1 requests are refused 503 Retry-After 30 while open files
+        #: exceed this share of the soft RLIMIT_NOFILE; chat is never refused.
+        #: 0 turns the guard off. 0.70.
+        self.public_api_fd_guard_ratio: float = _float("PUBLIC_API_FD_GUARD_RATIO", 0.70)
+        #: PUBLIC_API_MIN_FREE_DISK_BYTES (20 GiB: a launch or an audio decode
+        #: is refused 503 Retry-After 60 below it) is NOT defined here: its
+        #: first reader, publicapi/disk_ledger.py, reads Settings before the
+        #: environment and its tests set the variable at run time. It and
+        #: app/resources.py read it the same way (attribute, else variable).
+        #
+        # CAPACITY (publicapi/capacity.py, app/admission.py):
+        #: Public techsara-35b generations inside the NORMAL lane at once:
+        #: ADMISSION_NORMAL_MAX (10) minus PUBLIC_API_CHAT_NORMAL_RESERVE (4),
+        #: so a public flood can never reach chat's waiting-depth refusal. 6.
+        self.public_api_main_normal_max_concurrent: int = _int("PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", 6)
+        self.public_api_chat_normal_reserve: int = _int("PUBLIC_API_CHAT_NORMAL_RESERVE", 4)
+        #: A chat LONG request's charge plus every patient (/v1) LONG footprint
+        #: must fit this (of the 1,663,201-token pool, leaving ~263k for live
+        #: NORMAL KV); 0 turns the check off. 1,400,000.
+        self.public_api_shared_kv_budget_tokens: int = _int(
+            "PUBLIC_API_SHARED_KV_BUDGET_TOKENS", 1_400_000
+        )
+        #: A patient LONG ticket gives the LONG seat back at first token and
+        #: keeps its KV charge (admission PATIENT LONG HOLDERS); false holds the
+        #: seat to the stream's end. True.
+        self.public_api_long_release_at_first_token: bool = _bool(
+            "PUBLIC_API_LONG_RELEASE_AT_FIRST_TOKEN", True
+        )
+        #: How many times ONE public run's DECODE may be suspended so a chat
+        #: document (a LONG request) can prefill with the engine idle. Past it
+        #: the chat document prefills beside that run's decode instead — the
+        #: design's own shape (admission, DECODE YIELDS ARE CAPPED). 1.
+        #: WHY A CAP (T1 review, 2026-09-14): with ADMISSION_LONG_IDLE_MAX=0 every
+        #: chat document yielded the decoder, each yield costs a re-prefill of
+        #: input plus generated text (~800 s at 950K tokens), and chat documents
+        #: arriving faster than that kept a 1M job from ever finishing. 0 never
+        #: suspends a decode (the design as written); a larger value trades
+        #: public re-prefills for fewer chat prefills beside a decode.
+        self.public_api_decode_yields_per_run: int = _int("PUBLIC_API_DECODE_YIELDS_PER_RUN", 1)
+        #: The /tokenize timeout for sizing a CONTINUATION (a resumed durable
+        #: run). TOKENIZE_TIMEOUT (5 s) is sized for chat turns; a 700K-token
+        #: continuation can take longer, and on the character estimate a run
+        #: was settled `length` with ~300K tokens of room left (T1 review,
+        #: 2026-09-14). This path has no wall clock; the bound only stops a
+        #: dead engine from holding the sizing forever. 120 s.
+        self.public_api_continuation_tokenize_timeout_s: float = _float(
+            "PUBLIC_API_CONTINUATION_TOKENIZE_TIMEOUT_S", 120.0
+        )
+        #
+        # SIDECARS AND AUDIO (publicapi/engines.py, sidecars.py, audio_jobs.py).
+        # The input caps PUBLIC_API_EMBED_MAX_INPUTS / PUBLIC_API_RERANK_MAX_DOCUMENTS
+        # are declared above (2,048 / 1,000). PUBLIC_API_DECODE_CONCURRENCY (2)
+        # and PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB) are NOT defined here:
+        # audio_jobs and endpoint_models read them from the environment at call
+        # time with their own defaults. So do sidecars.py's guards (review
+        # 2026-09-14): PUBLIC_API_TOKENIZE_CONCURRENCY (8, process-wide per
+        # engine), PUBLIC_API_LENGTH_CHECK_BUDGET_S (8 s, at most 15),
+        # PUBLIC_API_POOLING_MEMORY_BYTES (512 MiB) and
+        # PUBLIC_API_POISON_QUARANTINE_S (3,600 s).
+        #: Router/OCR stream silence used only when every witness is unknown. 1800 s.
+        self.public_api_sidecar_silence_s: float = _float("PUBLIC_API_SIDECAR_SILENCE_S", 1800.0)
+        #: Embeddings/rerank: how long one engine call may be silent before the
+        #: engine's /metrics witness decides what happens (sidecars.py). 600 s.
+        self.public_api_pooling_silence_s: float = _float("PUBLIC_API_POOLING_SILENCE_S", 600.0)
+        warn_retired_settings()
 
         # --- Conversation sharing (V20) ---
         # Off-by-default at the RISKY end only: sharing inside the workspace
@@ -1970,4 +2179,241 @@ class Settings:
         self.reranker_capabilities = reranker_capabilities
 
 
+# --- The Files API (files-hookup, 2026-09-13) --------------------------------
+#
+# Every PUBLIC_API_FILES_* / PUBLIC_API_UPLOAD_* / PUBLIC_API_INLINE_* name the
+# Files modules read, with its type, default and reason, in ONE table an
+# operator can read. The readers (`apifiles/limits.py`, `publicapi/registry.
+# setting_int`, `apifiles/images.py`, `extract_worker.sandbox_mode`) already ask
+# `getattr(settings, name.lower())` first; naming the attributes here is what
+# makes the table the reference rather than one of several.
+#
+# READ AT CALL TIME, NOT AT IMPORT, and that is deliberate. The Files modules
+# were written, reviewed and tested against "every ceiling is read at call
+# time" (limits.py's docstring): suites point PUBLIC_API_FILES_DIR at a tmp dir
+# with `monkeypatch.setenv`, and the extraction CHILD process sees only the
+# environment. A plain `self.x = _int(...)` would freeze the import-time value
+# and silently turn every one of those setenv calls into a no-op. So each name
+# is a descriptor: an explicit assignment (`monkeypatch.setattr`) wins while
+# the variable is unchanged, otherwise the environment is parsed with this
+# file's own rules (blank = default), and a
+# default of None means "the reader derives it" (the assembly renew interval is
+# a third of the lease; the tabular cap is the upload cap). `validate()` parses
+# every one at start-up so a garbage value fails the process, as `_int` does.
+
+_UNSET = object()
+#: Where `_CallTimeSetting` keeps assignments on the Settings instance.
+_PINS_KEY = "_files_setting_pins"
+
+
+class _CallTimeSetting:
+    """One environment-backed setting, parsed on every read (see above)."""
+
+    def __init__(self, env: str, kind: str, default: object, why: str) -> None:
+        self.env = env
+        self.kind = kind
+        self.default = default
+        self.why = why
+        self.attr = env.lower()
+
+    def from_environment(self) -> object:
+        raw = os.environ.get(self.env)
+        if raw is None or raw.strip() == "":
+            return self.default
+        if self.kind == "int":
+            return int(raw)
+        if self.kind == "float":
+            return float(raw)
+        return raw.strip()
+
+    def __get__(self, obj: object, objtype: object = None) -> object:
+        if obj is None:
+            return self
+        pins = obj.__dict__.get(_PINS_KEY) or {}
+        pinned = pins.get(self.attr, _UNSET)
+        if pinned is not _UNSET:
+            value, raw_when_pinned = pinned
+            if os.environ.get(self.env) == raw_when_pinned:
+                return value
+            # The environment changed since the assignment: it decides again.
+            pins.pop(self.attr, None)
+        return self.from_environment()
+
+    def __set__(self, obj: object, value: object) -> None:
+        # An assignment wins while the environment variable is what it was
+        # when the assignment was made. Why keyed to the environment:
+        # `monkeypatch.undo()` restores attributes BEFORE the environment, by
+        # assigning back the values it read — so a test that set the variable
+        # and then assigned would otherwise leave that value pinned for every
+        # later test (measured: a 1,024-byte part cap leaking into the upload
+        # suites). Pins live under their own key, never under the attribute's
+        # name, so nothing but this descriptor ever reads one.
+        pins = obj.__dict__.setdefault(_PINS_KEY, {})
+        try:
+            live = self.from_environment()
+        except ValueError:
+            live = _UNSET
+        if value == live:
+            pins.pop(self.attr, None)
+        else:
+            pins[self.attr] = (value, os.environ.get(self.env))
+
+    def __delete__(self, obj: object) -> None:
+        (obj.__dict__.get(_PINS_KEY) or {}).pop(self.attr, None)
+
+
+_GIB = 1024 * 1024 * 1024
+_MIB_ = 1024 * 1024
+
+#: (environment name, type, default, why). None as a default: the reader
+#: derives it. Kept in the order an operator meets them: storage and ingest,
+#: processing, model input.
+PUBLIC_API_FILES_SETTINGS = (
+    # -- storage and ingest (apifiles/limits.py, storage.py, queue.py) --
+    ("PUBLIC_API_FILES_DIR", "str", "/data/api-files",
+     "same ext4 volume as /data/video (hard links) and outside WORKSPACE_DIR, whose 24 h / 20 GB sweep would delete API files"),
+    ("PUBLIC_API_FILES_MIN_FREE_GIB", "float", 250.0,
+     "new bytes are refused (503 storage_unavailable) below this: one 100 GiB assembly needs 200 GiB transiently, and Postgres, LanceDB and the models share the disk"),
+    ("PUBLIC_API_FILES_PART_MAX_BYTES", "int", 67_108_864,
+     "64 MiB: openai-python's DEFAULT_PART_SIZE, 32.9 MB under Cloudflare's 100 MB request wall; api_upload_parts.bytes has the same CHECK, so raising it needs a migration"),
+    ("PUBLIC_API_FILES_SINGLE_MAX_BYTES", "int", 67_108_864,
+     "POST /v1/files single shot: the same wall, and the SDKs read a Path into memory"),
+    ("PUBLIC_API_FILES_MAX_BODY_BYTES", "int", 68_157_440,
+     "64 MiB plus 1 MiB of multipart framing: the transport cap of POST /v1/files and POST /v1/uploads/{id}/parts"),
+    ("PUBLIC_API_FILES_UPLOAD_MAX_BYTES", "int", 100 * _GIB,
+     "100 GiB per upload: 2x transient disk is ~7% of free space, assembly ~7 min"),
+    ("PUBLIC_API_FILES_MAX_PARTS", "int", 10_000,
+     "OpenAI parity; a 10,000-id complete body is ~310 KB, under the 1 MiB JSON rule"),
+    ("PUBLIC_API_FILES_JSON_MAX_BYTES", "int", 1_048_576,
+     "CONTRACT §12's JSON body rule for create/complete/cancel"),
+    ("PUBLIC_API_UPLOAD_IDLE_TTL_HOURS", "float", 24.0,
+     "sliding upload expiry: 100 GiB at 10 Mbit/s is ~24 h"),
+    ("PUBLIC_API_UPLOAD_MAX_TTL_HOURS", "float", 168.0,
+     "hard cap on a sliding expiry"),
+    ("PUBLIC_API_UPLOAD_RECORD_TTL_DAYS", "float", 30.0,
+     "how long a finished upload record stays readable"),
+    ("PUBLIC_API_UPLOAD_FINALIZING_STALE_S", "float", 600.0,
+     "a complete left finalizing by a dead process is returned to pending (the V29 crash reset)"),
+    ("PUBLIC_API_UPLOAD_COMPLETE_BUSY_WAIT_S", "float", 2.0,
+     "a second complete waits this long for the O(parts) winner before 409 x-should-retry"),
+    ("PUBLIC_API_FILES_ASSEMBLY_LEASE_S", "float", 90.0,
+     "assembly lease, the processing lease's length: a crashed copy is re-claimed when it lapses"),
+    ("PUBLIC_API_FILES_ASSEMBLY_RENEW_S", "float", None,
+     "renew the assembly lease on a timer (default: a third of the lease) so a long fsync cannot start a duplicate copy"),
+    ("PUBLIC_API_FILES_PURGE_WAIT_S", "float", 8.0,
+     "POST /v1/files waits this long for a purge of the same bytes, inside the 15 s first-byte invariant"),
+    ("PUBLIC_API_FILES_ASSEMBLY_MAX_ATTEMPTS", "int", 5,
+     "VIDEO_MAX_ATTEMPTS semantics; disk-full deferrals are refunded"),
+    ("PUBLIC_API_FILES_SWEEP_INTERVAL_S", "float", 600.0,
+     "upload sweep and retention cadence"),
+    ("PUBLIC_API_FILES_LEFTOVER_MAX_AGE_S", "float", 86_400.0,
+     "crash leftovers (tmp parts, _inline renders) older than this are removed"),
+    ("PUBLIC_API_FILES_ORPHAN_MIN_AGE_S", "float", 3_600.0,
+     "never sweep a directory whose row may be about to commit"),
+    ("PUBLIC_API_FILES_SWEEP_BATCH", "int", 200,
+     "rows per sweep pass, so one pass stays bounded"),
+    ("PUBLIC_API_FILES_LIST_MAX_LIMIT", "int", 10_000,
+     "GET /v1/files limit ceiling (OpenAI parity)"),
+    ("PUBLIC_API_FILES_TOMBSTONE_DAYS", "int", 30,
+     "byte-less tombstones kept for audit after DELETE"),
+    # -- processing (apifiles/jobs.py, extract_worker.py, media.py, chunks.py) --
+    ("PUBLIC_API_FILES_CPU_JOBS", "int", 2,
+     "extraction children (8 GiB address space each) on shared unified memory; assembly shares these slots"),
+    ("PUBLIC_API_FILES_MEDIA_JOBS", "int", 1,
+     "audio/video through the video pipeline costs whole-GPU time on both Sparks"),
+    ("PUBLIC_API_FILES_PROCESSING_LEASE_S", "float", 90.0,
+     "processing lease, renewed every 30 s"),
+    ("PUBLIC_API_FILES_PROCESSING_RETRY_DELAY_S", "float", 300.0,
+     "deferral backoff when an engine or the disk is unavailable"),
+    ("PUBLIC_API_FILES_PROCESSING_MAX_ATTEMPTS", "int", 5,
+     "deferrals and crash takeovers before processing_unavailable / internal_error"),
+    ("PUBLIC_API_FILES_EXTRACT_RLIMIT_AS_GIB", "float", 8.0,
+     "address space of one extraction child"),
+    ("PUBLIC_API_FILES_EXTRACT_SANDBOX", "str", "required",
+     "required: a child that cannot apply Landlock, seccomp and the capability drop refuses to parse; best_effort only for development kernels"),
+    ("PUBLIC_API_FILES_PDF_MAX_BYTES", "int", 1 * _GIB,
+     "PDFium working set"),
+    ("PUBLIC_API_FILES_PDF_MAX_PAGES", "int", 10_000,
+     "pages table size"),
+    ("PUBLIC_API_FILES_OCR_PAGE_BUDGET", "int", 1_000,
+     "OCR pages per PDF: worker GPU minutes"),
+    ("PUBLIC_API_FILES_OFFICE_MAX_BYTES", "int", 512 * _MIB_,
+     "DOCX/PPTX: a DOCX measured 34.8x its size as JSONL"),
+    ("PUBLIC_API_FILES_XLSX_MAX_BYTES", "int", 256 * _MIB_,
+     "openpyxl read_only measured 26,929 rows/s"),
+    ("PUBLIC_API_FILES_TABULAR_MAX_BYTES", "int", None,
+     "CSV/TSV/Parquet/JSONL (default: the upload cap)"),
+    ("PUBLIC_API_FILES_TEXT_MAX_BYTES", "int", 1 * _GIB,
+     "plain text and Markdown"),
+    ("PUBLIC_API_FILES_HTML_READABLE_MAX_BYTES", "int", 64 * _MIB_,
+     "trafilatura parses the whole DOM"),
+    ("PUBLIC_API_FILES_IMAGE_MAX_BYTES", "int", 64 * _MIB_,
+     "one original image"),
+    ("PUBLIC_API_FILES_IMAGE_MAX_PIXELS", "int", 89_478_485,
+     "Pillow's decompression-bomb default, enforced before any pixel is decoded"),
+    ("PUBLIC_API_FILES_MEDIA_MAX_SECONDS", "float", 14_400.0,
+     "4 h of audio or video"),
+    ("PUBLIC_API_FILES_INDEX_MAX_CHUNKS", "int", 50_000,
+     "a 195 MiB memmap, 4.1 ms search measured"),
+    ("PUBLIC_API_FILES_CHUNK_CHARS", "int", 1500,
+     "matches video/index screen chunks; ~500 estimated tokens, far under the embed window"),
+    ("PUBLIC_API_FILES_CHUNK_OVERLAP_CHARS", "int", 150,
+     "a sentence cut at a chunk edge stays readable in both"),
+    ("PUBLIC_API_FILES_API_LANE_OCR_CONCURRENCY", "int", 2,
+     "OCR calls one api-lane video job makes at once"),
+    ("PUBLIC_API_FILES_YIELD_TO_CHAT_VIDEO_MAX_WAIT_S", "float", 120.0,
+     "an api-lane GPU unit yields to a chat video unit at most this long, then runs"),
+    # -- model input (apifiles/service.py, context.py, inline.py) --
+    ("PUBLIC_API_FILES_SYNC_READY_WAIT_S", "float", 30.0,
+     "a sync request waits this long for a processing file, then 409 file_not_ready (Files design §5.2)"),
+    ("PUBLIC_API_FILES_SYNC_PREPARE_BUDGET_S", "float", 45.0,
+     "the whole pre-header budget of a sync prepare: 30 s readiness + 15 s engine steps, inside Cloudflare's 100 s with the 30 s gate"),
+    ("PUBLIC_API_FILES_READY_POLL_S", "float", 1.0,
+     "how often a readiness wait re-reads the rows"),
+    ("PUBLIC_API_FILES_INLINE_MAX_TOKENS", "int", 100_000,
+     "auto mode inlines whole files up to this, keeping requests out of the >131,072-token LONG lane"),
+    ("PUBLIC_API_FILES_RETRIEVAL_TOKENS", "int", 32_000,
+     "default retrieval packing budget"),
+    ("PUBLIC_API_FILES_RETRIEVAL_MAX_TOKENS", "int", 200_000,
+     "ceiling on file_context.max_tokens"),
+    ("PUBLIC_API_FILES_MAX_PER_REQUEST", "int", 20,
+     "file parts per request: bounds context-build fan-out"),
+    ("PUBLIC_API_FILES_VIDEOS_PER_REQUEST", "int", 3,
+     "audio/video parts per request, the chat app's video limit"),
+    ("PUBLIC_API_FILES_VIDEO_FRAMES", "int", 3,
+     "frames per video at detail auto (~525 tokens each)"),
+    ("PUBLIC_API_FILES_VIDEO_FRAMES_HIGH", "int", 8,
+     "frames per video at detail high"),
+    ("PUBLIC_API_FILES_PDF_VISION_PAGES", "int", 2,
+     "page renders per PDF at detail auto on a vision model"),
+    ("PUBLIC_API_FILES_PDF_VISION_PAGES_HIGH", "int", 6,
+     "page renders at detail high (chat's MAX_PDF_PAGES)"),
+    ("PUBLIC_API_INLINE_SYNC_MAX_OCR_PAGES", "int", 8,
+     "a sync request whose file_data needs more OCR than this is refused toward /v1/files, never a 524"),
+    ("PUBLIC_API_FILES_INLINE_OCR_MAX_PAGES", "int", 40,
+     "OCR pages for inline file_data on stream/background"),
+    ("PUBLIC_API_FILES_INLINE_AUDIO_MAX_SECONDS", "int", 300,
+     "input_audio ceiling per clip"),
+)
+
+
+def _install_files_settings() -> None:
+    for env, kind, default, why in PUBLIC_API_FILES_SETTINGS:
+        setattr(Settings, env.lower(), _CallTimeSetting(env, kind, default, why))
+
+
+def validate_files_settings(target: "Settings") -> None:
+    """Parse every Files setting once, so a non-number fails start-up rather
+    than the first upload that reads it."""
+    for env, _kind, _default, _why in PUBLIC_API_FILES_SETTINGS:
+        try:
+            getattr(target, env.lower())
+        except ValueError as exc:
+            raise ValueError(f"{env} is not a valid value: {exc}") from None
+
+
+_install_files_settings()
+
+
 settings = Settings()
+validate_files_settings(settings)

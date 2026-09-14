@@ -157,20 +157,31 @@ def test_the_stream_follows_the_documented_lifecycle_with_sequence_numbers(
 
     records = events.parse_frames(_frames())
 
+    # CONTRACT §10.2 (2026-09-14): the item and content-part events both
+    # SDKs' stream() helpers build their snapshot from.
     assert [r["event"] for r in records] == [
         "response.created",
         "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
         "response.completed",
     ]
     # Starts at 1, increases by exactly 1 — a client detects a dropped or
     # reordered frame with this, and cannot if we ever skip.
-    assert [r["data"]["sequence_number"] for r in records] == [1, 2, 3, 4, 5, 6, 7]
+    assert [r["data"]["sequence_number"] for r in records] == list(range(1, 12))
     assert [r["data"]["type"] for r in records] == [r["event"] for r in records]
-    assert records[-2]["data"]["text"] == "Because of Rayleigh scattering."
+    done = next(r for r in records if r["event"] == "response.output_text.done")
+    assert done["data"]["text"] == "Because of Rayleigh scattering."
+    assert records[-3]["data"]["part"] == {
+        "type": "output_text", "text": "Because of Rayleigh scattering.", "annotations": [],
+    }
+    assert records[-2]["data"]["item"]["content"][0]["text"] == "Because of Rayleigh scattering."
     # Usage on the terminal event only, so a client cannot be tempted to sum
     # deltas into a bill.
     assert records[0]["data"]["response"]["usage"] is None
@@ -299,6 +310,8 @@ def test_a_client_disconnect_closes_the_engine_generator(engine, measured):
         # that navigates away does to a StreamingResponse.
         assert "response.created" in await frames.__anext__()
         assert "response.in_progress" in await frames.__anext__()
+        assert "response.output_item.added" in await frames.__anext__()
+        assert "response.content_part.added" in await frames.__anext__()
         assert "response.output_text.delta" in await frames.__anext__()
         await frames.aclose()
         await asyncio.sleep(0.05)
@@ -662,3 +675,88 @@ def test_an_unreported_finish_reason_is_stop_and_never_invented(engine, measured
 
     assert outcome.finish_reason is None
     assert outcome.chat_finish_reason() == "stop"
+
+
+# ----------------------------------------- no wall clock, liveness instead --
+#
+# No-timeout design (2026-09-13): nothing but the engine, the caller, or the
+# liveness guard's PROOF ends an attempt.
+
+
+class _Interrupting:
+    """A liveness guard that interrupts on its Nth quiet tick."""
+
+    def __init__(self, after: int) -> None:
+        self.after = after
+        self.ticks = 0
+        self.dispatched_at = None
+
+    def dispatched(self, now=None):
+        self.dispatched_at = 1.0
+
+    def chunk(self, now=None, *, token=True):
+        pass
+
+    def tick(self, now=None):
+        from app.publicapi import liveness
+
+        self.ticks += 1
+        if self.ticks >= self.after:
+            return liveness.Verdict(True, liveness.REASON_ENGINE, True, "test")
+        return liveness.OK
+
+
+def test_a_silent_stream_keeps_its_heartbeat_for_as_long_as_the_guard_sees_no_proof(engine, measured, monkeypatch):
+    measured(None)
+    fake = engine(_FakeEngine(["late answer"], delay=0.6))
+    guard = _Interrupting(after=10**9)
+    real = streaming.Generation
+    monkeypatch.setattr(streaming, "Generation", lambda spec, **kw: real(spec, guard=guard, **kw))
+
+    wire = _frames(_spec(wall_clock_s=0.05), heartbeat_s=0.02)
+
+    records = events.parse_frames(wire)
+    assert records[-1]["event"] == "response.completed"
+    assert next(r for r in records if r["event"] == "response.output_text.done")["data"]["text"] == "late answer"
+    assert wire.count(": ping") >= 10 and guard.ticks >= 10
+    assert fake.closed
+
+
+def test_a_liveness_interrupt_ends_a_non_durable_stream_with_one_retry_safe_failure(engine, measured, monkeypatch):
+    measured(None)
+    fake = engine(_FakeEngine(["partial "], hang=False, delay=0.0))
+    fake.pieces.append(("token", "never"))
+    fake.delay = 0.0
+
+    async def silent_after_first():
+        try:
+            yield ("token", "partial ")
+            await asyncio.sleep(3600)
+            yield ("token", "never")
+        finally:
+            fake.closed = True
+
+    fake._run = silent_after_first
+    guard = _Interrupting(after=3)
+    real = streaming.Generation
+    monkeypatch.setattr(streaming, "Generation", lambda spec, **kw: real(spec, guard=guard, **kw))
+
+    wire = _run(asyncio.wait_for(_drain(streaming.responses_sse(_spec(), heartbeat_s=0.02)), 10))
+
+    records = events.parse_frames(wire)
+    terminals = [r for r in records if r["event"] in events.TERMINAL_EVENTS]
+    assert len(terminals) == 1 and terminals[0]["event"] == "response.failed"
+    failure = terminals[0]["data"]["response"]["error"]
+    assert failure["code"] == "model_unavailable"
+    assert fake.closed
+
+
+def test_a_default_generation_is_guarded_on_every_engine(engine, measured):
+    from app.publicapi import liveness
+
+    measured(None)
+    engine(_FakeEngine(["x"]))
+    main = streaming.Generation(_spec())
+    router = streaming.Generation(_spec(engine="router", model="techsara-8b-vision"))
+    assert isinstance(main.guard, liveness.MainGuard)
+    assert isinstance(router.guard, liveness.SidecarGuard)

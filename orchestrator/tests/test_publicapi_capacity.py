@@ -20,6 +20,7 @@ import pytest
 
 from app.config import settings
 from app.publicapi import capacity, errors
+from tests.publicapi_fake_engine import set_setting
 
 
 @pytest.fixture(autouse=True)
@@ -186,7 +187,7 @@ def test_an_abandoned_wait_raises_abandoned_rather_than_a_capacity_error():
 
 
 def test_the_wait_bound_is_read_at_call_time_from_the_setting(monkeypatch):
-    monkeypatch.setattr(settings, "public_api_gate_wait_s", 2.5, raising=False)
+    set_setting(monkeypatch, "PUBLIC_API_GATE_WAIT_S", "2.5")
     assert capacity.sync_wait_s() == 2.5
     monkeypatch.setattr(settings, "public_api_router_max_concurrent", 1, raising=False)
     assert capacity.snapshot()["router"]["max_concurrent"] == 1
@@ -199,7 +200,7 @@ def _install_video_probe(monkeypatch, busy):
 
 
 def test_public_ocr_work_waits_while_a_chat_generation_is_running_and_then_goes_anyway(monkeypatch):
-    monkeypatch.setattr(settings, "public_api_yield_to_chat_max_wait_s", 0.2, raising=False)
+    set_setting(monkeypatch, "PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S", "0.2")
     probes = []
 
     def busy():
@@ -296,3 +297,230 @@ def test_the_gate_publishes_its_depth_for_a_deploy_guard(monkeypatch):
     during = _run(scenario())
     assert during[("public_api_engine_in_flight", "main.long")] == 1
     assert seen[("public_api_engine_in_flight", "main.long")] == 0
+
+
+# ------------------------------------------ no clock ends a /v1 wait (T2) --
+#
+# No-timeout design (2026-09-13): `hold(wait_s=None)` — the default, and
+# what every durable /v1 caller passes — waits until admitted or abandoned.
+
+
+def test_the_new_main_normal_gate_caps_public_work_at_six_of_chats_ten_normal_slots():
+    async def scenario():
+        release = asyncio.Event()
+        admitted = []
+
+        async def public(n):
+            async with capacity.hold("main.normal"):
+                admitted.append(n)
+                await release.wait()
+
+        tasks = [asyncio.ensure_future(public(n)) for n in range(10)]
+        await asyncio.sleep(0.05)
+        snap = capacity.snapshot()["main.normal"]
+        release.set()
+        await asyncio.gather(*tasks)
+        return snap, admitted
+
+    snap, admitted = _run(scenario())
+    assert snap["max_concurrent"] == 6 and snap["in_flight"] == 6 and snap["waiting"] == 4
+    assert sorted(admitted) == list(range(10))
+
+
+def test_a_wait_with_no_limit_outlasts_the_old_sync_bound_and_is_still_first_come_first_served(monkeypatch):
+    set_setting(monkeypatch, "PUBLIC_API_GATE_WAIT_S", "0.01")  # the legacy bound, which must not apply
+    order = []
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def holder():
+            async with capacity.hold("asr"):
+                order.append("holder")
+                await release.wait()
+
+        async def waiter(name):
+            async with capacity.hold("asr"):
+                order.append(name)
+
+        first = asyncio.ensure_future(holder())
+        await asyncio.sleep(0.01)
+        waiters = [asyncio.ensure_future(waiter(f"w{n}")) for n in range(3)]
+        await asyncio.sleep(0.4)  # 40x the legacy bound: nobody was refused
+        assert all(not w.done() for w in waiters)
+        release.set()
+        await asyncio.gather(first, *waiters)
+
+    _run(scenario())
+    assert order == ["holder", "w0", "w1", "w2"]
+
+
+def test_on_wait_reports_the_position_on_entry_on_every_move_and_at_least_every_interval(monkeypatch):
+    monkeypatch.setattr(capacity, "ON_WAIT_EVERY_S", 0.05)
+    reports = []
+
+    async def scenario():
+        release_first = asyncio.Event()
+        release_second = asyncio.Event()
+
+        async def holder(event):
+            async with capacity.hold("asr"):
+                await event.wait()
+
+        first = asyncio.ensure_future(holder(release_first))
+        await asyncio.sleep(0.01)
+        second = asyncio.ensure_future(holder(release_second))
+        await asyncio.sleep(0.01)
+
+        async def reporter():
+            async with capacity.hold("asr", on_wait=lambda position, waited: reports.append((position, waited))):
+                pass
+
+        third = asyncio.ensure_future(reporter())
+        await asyncio.sleep(0.18)
+        release_first.set()
+        await asyncio.sleep(0.02)
+        release_second.set()
+        await asyncio.gather(first, second, third)
+
+    _run(scenario())
+    positions = [p for p, _ in reports]
+    assert positions[0] == 2  # on entry: one waiter ahead
+    assert positions.count(2) >= 3  # the periodic reports while nothing moved
+    assert 1 in positions  # the move to the head of the line was reported
+
+
+def test_a_run_that_yielded_goes_back_to_the_head_of_the_line():
+    order = []
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def holder():
+            async with capacity.hold("main.long"):
+                await release.wait()
+
+        async def waiter(name, front=False):
+            async with capacity.hold("main.long", front=front):
+                order.append(name)
+
+        first = asyncio.ensure_future(holder())
+        await asyncio.sleep(0.01)
+        late = asyncio.ensure_future(waiter("queued-first"))
+        await asyncio.sleep(0.01)
+        yielded = asyncio.ensure_future(waiter("yielded", front=True))
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(first, late, yielded)
+
+    _run(scenario())
+    assert order == ["yielded", "queued-first"]
+
+
+def test_an_unlimited_wait_ends_on_abandon():
+    async def scenario():
+        abandon = asyncio.Event()
+        async with capacity.hold("asr"):
+            waiting = asyncio.ensure_future(capacity.hold("asr", abandon=abandon).__aenter__())
+            await asyncio.sleep(0.05)
+            abandon.set()
+            with pytest.raises(capacity.Abandoned):
+                await waiting
+        return capacity.snapshot()["asr"]
+
+    snap = _run(scenario())
+    assert snap["in_flight"] == 0 and snap["waiting"] == 0
+
+
+def test_a_dictation_busy_fleet_makes_public_speech_wait_instead_of_refusing(monkeypatch):
+    busy = {"on": True}
+    monkeypatch.setattr(capacity, "dictation_is_busy", lambda: busy["on"])
+    monkeypatch.setattr(capacity, "chat_is_busy", lambda: False)
+    monkeypatch.setattr(capacity, "ON_WAIT_EVERY_S", 0.05)
+    notices = []
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def public():
+            async with capacity.hold("asr", yield_to_chat=True, on_wait=lambda p, w: notices.append((p, w))):
+                entered.set()
+
+        task = asyncio.ensure_future(public())
+        await asyncio.sleep(0.2)
+        was_waiting = not entered.is_set() and not task.done()
+        busy["on"] = False
+        await asyncio.wait_for(task, 2)
+        return was_waiting
+
+    assert _run(scenario()) is True
+    # The wait was reported while it happened (position 0: not in line yet),
+    # so a stream can say `queued` instead of going silent.
+    assert len(notices) >= 3 and all(position == 0 for position, _ in notices)
+
+
+def test_the_gates_a_generation_holds_are_taken_in_one_fixed_order():
+    assert capacity.gates_for("main", None) == ["main.normal"]
+    assert capacity.gates_for("main", "main.extended") == ["main.extended", "main.normal"]
+    assert capacity.gates_for("main", "main.long") == ["main.long"]
+    assert capacity.gates_for("router", "router") == ["router"]
+    assert capacity.gates_for("ocr", None) == []
+
+
+def test_has_room_is_false_while_anyone_waits_so_the_dispatcher_never_jumps_the_line():
+    async def scenario():
+        async with capacity.hold("asr"):
+            assert capacity.has_room("asr") is False
+            waiter = asyncio.ensure_future(capacity.hold("asr").__aenter__())
+            await asyncio.sleep(0.01)
+        # The holder left and the waiter was granted in the same release.
+        await waiter
+        busy = capacity.has_room("asr")
+        capacity._release("asr", capacity._gate("asr"), 0)
+        return busy, capacity.has_room("asr")
+
+    busy, free = _run(scenario())
+    assert busy is False and free is True
+
+
+def test_the_oldest_wait_is_published(monkeypatch):
+    gauges = {}
+    from app import metrics
+
+    monkeypatch.setattr(metrics, "set_gauge", lambda name, value, *_a, **labels: gauges.__setitem__((name, labels.get("engine")), value))
+
+    async def scenario():
+        async with capacity.hold("asr"):
+            waiter = asyncio.ensure_future(capacity.hold("asr").__aenter__())
+            await asyncio.sleep(0.05)
+            capacity._publish("asr", capacity._gate("asr"))
+            oldest = gauges[("public_api_engine_oldest_wait_seconds", "asr")]
+        await waiter
+        capacity._release("asr", capacity._gate("asr"), 0)
+        return oldest
+
+    assert _run(scenario()) >= 0.04
+
+
+def test_the_chat_long_probe_keeps_the_before_first_token_rule_beside_admissions_own_answer():
+    """Merge of 2026-09-14. T1's admission exposes `chat_long_admission_present()`
+    (a chat LONG request holds the seat or waits for it) and T1's capacity
+    delegated to it. PR #65's capacity answers a narrower question — only a
+    large prefill still AHEAD counts (rereview P1: a chat document already
+    decoding, with the lanes reopened, must not hold public long work for its
+    whole generation) — so the gate keeps reading the lanes itself."""
+    from app import admission
+
+    async def scenario():
+        admission.reset()
+        lanes = admission.lanes()
+        # A chat document past its first token: it still holds the LONG seat,
+        # the lanes are open again, nothing waits for idle.
+        lanes.long.active += 1
+        lanes.long.active_by_origin[admission.ORIGIN_CHAT] = lanes.long.active_by_origin.get(admission.ORIGIN_CHAT, 0) + 1
+        try:
+            return capacity.chat_long_admission_present(), admission.chat_long_admission_present()
+        finally:
+            admission.reset()
+
+    assert _run(scenario()) == (False, True)

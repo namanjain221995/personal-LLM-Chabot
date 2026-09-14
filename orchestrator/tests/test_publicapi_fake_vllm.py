@@ -28,7 +28,7 @@ from starlette.routing import Route
 
 from app import context, db, usage as usage_ledger
 from app.config import settings
-from app.publicapi import capacity, events, models, openapi, planning, registry, streaming
+from app.publicapi import capacity, events, models, openapi, planning, registry
 from tests.test_publicapi_routes import TOKENS, _auth, _pepper, api, platform  # noqa: F401
 
 CONTRACT = Path(__file__).resolve().parents[2] / "docs" / "developer-platform" / "CONTRACT.md"
@@ -200,24 +200,20 @@ def test_a_refusal_the_retry_cannot_fix_is_still_reported_once_and_not_looped(ap
     assert len({call["max_tokens"] for call in FAKE.chat}) == 2
 
 
-# ------------------------------------------- usage after a wall clock --
+# ------------------------------------------- no wall clock on /v1 --
 
 
-def test_a_wall_clock_stop_records_counted_usage_when_the_engine_sends_usage_only_at_the_end(
+def test_a_background_answer_runs_past_the_chat_apps_wall_clock_and_keeps_the_engines_usage(
     api, platform, monkeypatch
 ):
-    """CONTRACT §8.3 promised the partial output AND its usage; vLLM's usage
-    chunk is the stream's last, and the wall clock closes the stream before
-    it, so the row said `usage: null`. Scaled: the request's own wall clock is
-    1 s (PUBLIC_API_GEN_WALL_CLOCK_S, the ceiling of every /v1 clock), six
-    tokens 0.4 s apart — the guard fires on the third chunk.
-
-    Scaled through the PUBLIC ceiling since the llm.py integration
-    (2026-09-13): llm.stream_chat_events now enforces the per-request clock,
-    so shrinking only GEN_WALL_CLOCK_S (a floor under the 900 s prefill
-    allowance) no longer cuts a /v1 generation — which is the point."""
+    """Assembler, 2026-09-14. This test used to pin CONTRACT §8.3's wall-clock
+    stop: GEN_WALL_CLOCK_S = 1 s cut a background answer at its third token
+    and the row carried `failed`/`timeout` with counted usage. The no-timeout
+    release removes that clock from /v1 (T1's llm `wall_clock_s=None`, T2's
+    streaming and durable runner), so the same scaled scenario — six tokens
+    0.4 s apart, 2.4 s against a 1 s chat clock — now completes with every
+    token and the ENGINE's usage report."""
     monkeypatch.setattr(settings, "gen_wall_clock_s", 1.0)
-    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 1.0, raising=False)
     FAKE.tokens = 6
     FAKE.delay = 0.4
     rows: List[Dict[str, Any]] = []
@@ -233,31 +229,31 @@ def test_a_wall_clock_stop_records_counted_usage_when_the_engine_sends_usage_onl
     assert created.status_code == 202, created.text
     final = _await_terminal(api, created.json()["id"])
 
-    assert final["status"] == "failed" and final["error"]["code"] == "timeout"
+    assert final["status"] == "completed", final
     text = final["output"][0]["content"][0]["text"]
-    produced = len(text.split())
-    assert produced >= 1
-    assert final["usage"] == {
-        "input_tokens": FAKE.prompt_tokens,  # the exact /tokenize count _fit took
-        "output_tokens": produced,
-        "total_tokens": FAKE.prompt_tokens + produced,
-    }
+    assert len(text.split()) == 6, text
+    assert final["usage"]["input_tokens"] == FAKE.prompt_tokens
+    assert final["usage"]["output_tokens"] == 6
     ledger = [row for row in rows if row.get("generation_id") == created.json()["id"]][-1]
-    assert ledger["input_tokens"] == FAKE.prompt_tokens and ledger["output_tokens"] == produced
-    assert ledger["meta"]["usage_source"] == streaming.USAGE_COUNTED_AT_STOP
+    assert ledger["output_tokens"] == 6
+    assert ledger["meta"]["usage_source"] == "engine"
 
 
-def test_a_timed_out_background_response_is_never_readable_as_finished_without_its_partial_text(
+def test_a_background_response_is_never_readable_as_finished_without_its_text(
     api, platform, monkeypatch
 ):
-    """The race behind an intermittent IndexError in the test above on a loaded
-    runner (2026-09-14): the router's recorder committed `failed`, and the text
-    followed in a second update, so a poll in between read `output: []`.
+    """The race behind an intermittent IndexError on a loaded runner
+    (2026-09-14): the router's recorder committed the terminal status, and the
+    text followed in a second update, so a poll in between read `output: []`.
     Delaying ONLY a text-only write widened that window from microseconds to
     0.6 s and made it fail every time; with the text in the status update, the
-    delay has nothing to delay."""
+    delay has nothing to delay.
+
+    Written (PR #65) against a wall-clock stop, `failed`/`timeout`. The
+    no-timeout merge (2026-09-14) removed that clock from /v1 — the test above
+    now completes past it — so the same scaled answer ends `completed`, and the
+    invariant is pinned on that terminal status instead."""
     monkeypatch.setattr(settings, "gen_wall_clock_s", 1.0)
-    monkeypatch.setattr(settings, "public_api_gen_wall_clock_s", 1.0, raising=False)
     FAKE.tokens = 6
     FAKE.delay = 0.4
     returned: List[Dict[str, Any]] = []
@@ -280,8 +276,8 @@ def test_a_timed_out_background_response_is_never_readable_as_finished_without_i
     response_id = created.json()["id"]
     final = _await_terminal(api, response_id)
 
-    assert final["status"] == "failed" and final["error"]["code"] == "timeout"
-    assert final["output"] and final["output"][0]["content"][0]["text"]
+    assert final["status"] == "completed"
+    assert final["output"] and final["output"][0]["content"][0]["text"] == " ".join(f"t{i}" for i in range(6))
     finished_empty = [
         row
         for row in returned
@@ -369,6 +365,9 @@ def test_contract_section_9_says_the_applied_ceiling_may_exceed_the_planned_one_
     assert applied == 998_728 > 998_480
 
 
+# Assembler, 2026-09-14: the strict xfail that waited for llm.py's
+# `wall_clock_s` is removed — T1's llm accepts it in this tree, so the marker
+# was inert (the CONTRACT §8.3 caveat is T5's, already gone).
 def test_a_million_token_stream_is_not_cut_at_the_chat_apps_wall_clock(api, platform, monkeypatch):
     """Scaled: GEN_WALL_CLOCK_S = 1 s; the engine streams 8 tokens 0.4 s apart
     (3.2 s); a 1,000,000-token request's own clock is 20,900 s.

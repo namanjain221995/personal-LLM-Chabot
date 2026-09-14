@@ -368,8 +368,11 @@ groups:
         # background job waits behind it for up to
         # PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600 s) by design, so a queue of
         # them holds this gauge above 0 for hours with nothing wrong. A sync
-        # or stream request there gives up after PUBLIC_API_GATE_WAIT_S (30 s)
-        # with a 503, which PublicApiAtCapacityRefusals counts. Background jobs
+        # or stream generation there gives up after PUBLIC_API_GATE_WAIT_S (30 s)
+        # with a 503, which PublicApiAtCapacityRefusals counts. Embeddings,
+        # rerank and transcription requests (embed, rerank, asr) never give up:
+        # since 2026-09-14 they wait with no limit inside a committed response,
+        # so waiters there are callers holding a connection. Background jobs
         # on the other gates wait the same way; the gauge has no mode label
         # to tell them apart (README proposes `mode`), so on those gates this
         # warning can also be by design — read the background jobs panel.

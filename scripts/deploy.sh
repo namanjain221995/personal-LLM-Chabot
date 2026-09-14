@@ -5,6 +5,7 @@
 #
 #   scripts/deploy.sh [--ref origin/main] [--branch NAME] [--full] [--dry-run]
 #                     [--no-rollback]
+#   scripts/deploy.sh --print-v1-gateway-sha
 #
 #   --full          `techsara down` first, so EVERY container is recreated.
 #                   Costs 6-10 extra minutes because the main model reloads.
@@ -16,6 +17,17 @@
 #                   keeps the detached-HEAD behaviour exactly as it was.
 #   --dry-run       resolve and report; change nothing.
 #   --no-rollback   leave a failed deploy in place for inspection.
+#   --print-v1-gateway-sha
+#                   print the v1-gateway's code digest for this checkout and
+#                   exit (no lock, no git). Export it as V1_GATEWAY_CODE_SHA
+#                   before any hand-run `docker compose` with the launcher's
+#                   chain, or that command renders the gateway as `:unpinned`.
+#
+# The public /v1 relay (v1-gateway, added 2026-09-13) exists to keep developer
+# connections alive THROUGH the deploys this script runs, so this script
+# reports what each deploy does to it and to public work in flight. It does
+# not wait for either by default (deploys never wait); a hand-run deploy can
+# opt in to a bounded wait: see "the v1 gateway and public work in flight".
 #
 # Deliberate properties:
 #   * ONE deploy at a time (flock), because two `techsara up` runs would fight
@@ -69,7 +81,20 @@ REF="${DEPLOY_REF:-origin/main}"
 # Empty means "detached HEAD", which is what this script did before the setting
 # existed. Any non-empty value is a LOCAL branch name to land the checkout on.
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-}"
-FULL=0; DRY=0; ROLLBACK=1
+FULL=0; DRY=0; ROLLBACK=1; PRINT_V1_GATEWAY_SHA=0
+
+# The v1-gateway's code digest: sha256 over `sha256sum` of its image inputs
+# (Dockerfile, server.cjs, every regular file under lib/), sorted by path
+# bytes. launcher/techsara_cli/cli.py v1_gateway_code_sha is the same
+# computation (launcher/tests/test_v1_gateway_pin.py holds the two equal). A
+# README or test edit under gateway/ is not an input, so it recreates nothing.
+v1_gateway_code_sha() {  # v1_gateway_code_sha ROOT -> the digest, or nothing when ROOT has no gateway
+  local gw="$1/gateway" inputs=(Dockerfile server.cjs)
+  [ -f "$gw/Dockerfile" ] && [ ! -L "$gw/Dockerfile" ] && [ -f "$gw/server.cjs" ] && [ ! -L "$gw/server.cjs" ] || return 0
+  [ -d "$gw/lib" ] && inputs+=(lib)
+  ( cd "$gw" && find "${inputs[@]}" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 )
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --ref) REF="$2"; shift ;;
@@ -78,12 +103,18 @@ while [ $# -gt 0 ]; do
     --full) FULL=1 ;;
     --dry-run) DRY=1 ;;
     --no-rollback) ROLLBACK=0 ;;
+    --print-v1-gateway-sha) PRINT_V1_GATEWAY_SHA=1 ;;
     # Print the whole header block, so adding to it cannot desync a line range.
     -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+if [ "$PRINT_V1_GATEWAY_SHA" = 1 ]; then
+  printf '%s\n' "$(v1_gateway_code_sha "$ROOT")"
+  exit 0
+fi
 
 cd "$ROOT"
 
@@ -425,11 +456,339 @@ reconcile_engine_guards() {
   fi
 }
 
+# ------------------------------------ the v1 gateway and public work in flight
+# Added 2026-09-13 with the no-timeout developer API. Four facts drive it:
+#
+#   * The v1-gateway's image tag is its code digest, V1_GATEWAY_CODE_SHA. The
+#     launcher derives it for its own Compose calls; the helpers this script
+#     runs first (deploy-record.sh, deploy-preflight.sh, deploy-drain.sh)
+#     render the same chain, so apply() exports the value of the tree it just
+#     checked out. It is never written to an env file: those fold into the
+#     orchestrator's and frontend's definitions.
+#   * A routine deploy leaves the gateway running unless its definition
+#     changed (its code or one of its own settings); --full removes it with
+#     everything else. A recreate cuts every relay 2 s after SIGTERM, and the
+#     clients resume.
+#   * An orchestrator that suspends public runs on SIGTERM (the durable
+#     runtime, with PUBLIC_API_RESUME_ENABLED on) cuts only the runs that are
+#     not resumable (store:false, and a request whose input files were still
+#     being prepared, which ends with a retryable failure); the next process
+#     resumes the rest. One
+#     that cannot (the code before that runtime shipped, i.e. the deploy that
+#     ships it, or resume switched off) fails every run in flight.
+#   * The gateway is on a public path only when the operator puts it there:
+#     the tunnel's ^/v1 rule, or V1_GATEWAY_URL on the frontend (blank by
+#     default, compose.yaml). v1_gateway_guard says which path /v1 takes and
+#     warns when the frontend relays through the gateway while
+#     PUBLIC_API_GATEWAY_PEERS is blank.
+#   * DEPLOYS NEVER WAIT (no-timeout design, deploy_survival: "a deploy wait
+#     can block security fixes forever"). By default both guards only SAY
+#     what this deploy is about to cut. WHY NOT A BOUNDED WAIT BY DEFAULT
+#     (review 2026-09-14): the waits run after the new commit is checked out
+#     in the shared production checkout and under the deploy lock, and
+#     nothing stops new work arriving meanwhile -- the old orchestrator keeps
+#     admitting runs and the gateway keeps opening relays -- so under steady
+#     traffic a count never reaches 0 and every deploy (about 70 s today)
+#     would sit out the whole bound: up to 15 minutes, on the path that ships
+#     security fixes. The gateway wait could not outlast the hours-long
+#     streams it would be waiting for anyway.
+#     A HAND-RUN deploy at a quiet moment may opt in with
+#     DEPLOY_GATEWAY_DRAIN_DEADLINE / DEPLOY_PUBLIC_WORK_DEADLINE (seconds,
+#     default 0 = report only), e.g. the first deploy that ships the durable
+#     runtime, after the operator's in-flight check. Even then nothing waits
+#     during an automatic ROLLBACK (restoring service comes first), for an
+#     orchestrator that is not running (nothing is executing its runs), or
+#     for a run created before the running orchestrator started (code that
+#     cannot suspend cannot have resumed it either).
+#
+# Both guards run BEFORE the engine lock is taken, so a recovery is never held
+# up by an opted-in wait, and before the connection drains, which stay closest
+# to SIGTERM.
+V1_GATEWAY_CONTAINER="sf-local-ai-v1-gateway-1"
+# The gateway container's id when v1_gateway_guard looked, before `up`: the
+# health gate fails a deploy on gateway health only when this deploy created
+# or recreated the container (see v1_gateway_health).
+V1_GATEWAY_ID_BEFORE=""
+
+pin_v1_gateway() {  # pin_v1_gateway ROOT - export the tree's digest for every compose render that follows
+  local sha
+  sha="$(v1_gateway_code_sha "$1")"
+  if [ -n "$sha" ]; then
+    export V1_GATEWAY_CODE_SHA="$sha"
+  else
+    unset V1_GATEWAY_CODE_SHA
+  fi
+}
+
+v1_gateway_relays() {  # the relays the running gateway reports on /healthz, or nothing when it cannot say
+  docker exec "$V1_GATEWAY_CONTAINER" wget -q -O - http://127.0.0.1:8090/healthz 2>/dev/null \
+    | python3 -c 'import json, sys
+v = json.load(sys.stdin).get("relays")
+print(v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else "")' 2>/dev/null || true
+}
+
+v1_gateway_rendered_hash() {  # the definition hash `up -d` will compare, or nothing
+  # The gateway has no env_file, so `config --hash` is the whole comparison
+  # (for a service with one, Compose also folds that file's keys in).
+  local prefix
+  prefix="$(dr_compose_prefix 2>/dev/null)" || return 0
+  ( cd "$ROOT" && eval "$prefix" config --hash v1-gateway 2>/dev/null ) | awk '$1 == "v1-gateway" { print $2; exit }'
+}
+
+bounded_wait() {  # bounded_wait DEADLINE POLL PROBE - 0 once PROBE prints 0 or nothing, 1 when DEADLINE passes
+  local deadline="$1" poll="$2" probe="$3" start=$SECONDS elapsed left value
+  while :; do
+    elapsed=$((SECONDS - start))
+    [ "$elapsed" -lt "$deadline" ] || return 1
+    left=$((deadline - elapsed))
+    sleep "$(( poll < left ? poll : left ))"
+    value="$("$probe")"
+    if [ -z "$value" ] || [ "$value" = 0 ]; then return 0; fi
+  done
+}
+
+v1_gateway_path_report() {  # which way the frontend's /v1 route goes after this deploy, and the one misconfiguration to warn about
+  # Release review 2026-09-14 (high): with a fixed V1_GATEWAY_URL the deploy
+  # that shipped the gateway put all public /v1 traffic on it before the
+  # orchestrator trusted its address. The relay is opt-in now; say which path
+  # this deploy renders, because nothing else in the log does.
+  local url peers
+  url="$(dr_env_value V1_GATEWAY_URL)"
+  peers="$(dr_env_value PUBLIC_API_GATEWAY_PEERS)"
+  if [ -z "$url" ]; then
+    say "  v1-gateway: the frontend's /v1 route goes straight to the orchestrator (V1_GATEWAY_URL is blank)"
+    return 0
+  fi
+  say "  v1-gateway: the frontend's /v1 route relays through $url (V1_GATEWAY_URL)"
+  if [ -z "$peers" ]; then
+    say "  v1-gateway: WARNING PUBLIC_API_GATEWAY_PEERS is blank: the orchestrator ignores the gateway's re-attach headers,"
+    say "  v1-gateway: and unless PUBLIC_API_TRUSTED_PROXIES names the gateway it sees every caller at the gateway's address"
+    say "  v1-gateway: (ip_allowlist). Set both in .env (gateway/README.md, Settings the operator owns) or blank V1_GATEWAY_URL."
+  fi
+}
+
+v1_gateway_guard() {  # before `up`: say what this deploy does to the gateway; wait (bounded) before a recreate only when opted in
+  local want="${V1_GATEWAY_CODE_SHA:-}" running have rendered why relays image
+  local deadline="${DEPLOY_GATEWAY_DRAIN_DEADLINE:-0}" poll="${DEPLOY_GATEWAY_DRAIN_POLL:-5}"
+  V1_GATEWAY_ID_BEFORE="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+  running="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.State.Running}}' 2>/dev/null || true)"
+  if [ -z "$want" ]; then
+    if [ "$running" = true ]; then
+      say "  v1-gateway: WARNING this tree has no gateway/, but $V1_GATEWAY_CONTAINER is still running and is"
+      say "  v1-gateway: left alone. If the tunnel routes ^/v1 to it, delete that route now (gateway/README.md,"
+      say "  v1-gateway: rollback): its orchestrator path goes away with this tree's orchestrator."
+    fi
+    return 0
+  fi
+  v1_gateway_path_report
+  if [ "$running" != true ]; then
+    say "  v1-gateway: not running; this deploy creates it (code sha ${want:0:12}). It takes no public traffic until the tunnel routes ^/v1 to it or V1_GATEWAY_URL points the frontend's /v1 route at it"
+    return 0
+  fi
+  image="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
+  case "$image" in
+    *:unpinned)
+      say "  v1-gateway: WARNING it runs $image - a hand-run \`docker compose\` without V1_GATEWAY_CODE_SHA recreated it"
+      say "  v1-gateway: (export it first: scripts/deploy.sh --print-v1-gateway-sha); this deploy puts it back on the pinned image" ;;
+  esac
+  if [ "$FULL" = 1 ]; then
+    why="--full removes every container, this one included"
+  else
+    have="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' 2>/dev/null || true)"
+    rendered="$(v1_gateway_rendered_hash)"
+    if [ -n "$rendered" ] && [ "$rendered" = "$have" ]; then
+      say "  v1-gateway unchanged (code sha ${want:0:12}, definition ${have:0:12}): it keeps every /v1 connection through this deploy"
+      return 0
+    fi
+    if [ -n "$rendered" ]; then
+      why="its definition changed (${have:0:12} -> ${rendered:0:12}, code sha ${want:0:12})"
+    else
+      why="its rendered definition could not be read, so a change is assumed"
+    fi
+  fi
+  relays="$(v1_gateway_relays)"
+  case "$relays" in
+    '') say "  v1-gateway: will be recreated - $why; it cannot report its relays, so not waiting"; return 0 ;;
+    0)  say "  v1-gateway: will be recreated - $why; it is relaying nothing"; return 0 ;;
+  esac
+  if [ "${DEPLOY_ROLLING_BACK:-0}" = 1 ] || [ "$deadline" -le 0 ]; then
+    say "  v1-gateway: will be recreated - $why - cutting $relays relay(s) now ($([ "${DEPLOY_ROLLING_BACK:-0}" = 1 ] && printf 'rolling back' || printf 'deploys never wait; DEPLOY_GATEWAY_DRAIN_DEADLINE opts a hand-run deploy in'))"
+    say "  v1-gateway: they are cut 2 s after SIGTERM; their clients see an incomplete read and resume"
+    return 0
+  fi
+  say "  v1-gateway: will be recreated - $why; waiting up to ${deadline}s for its $relays relay(s) to finish"
+  if bounded_wait "$deadline" "$poll" v1_gateway_relays; then
+    say "  v1-gateway: its relays finished (or it stopped reporting them); going ahead"
+  else
+    say "  v1-gateway: WARNING still relaying $(v1_gateway_relays) connection(s) after ${deadline}s; deploying anyway."
+    say "  v1-gateway: those clients see an incomplete read and resume (SDK retries attach to the run)."
+  fi
+  return 0
+}
+
+public_api_psql_ro() {  # public_api_psql_ro SQL - one read-only value from the app database, or nothing
+  local pg user db
+  pg="$(dr_container_for postgres)"
+  docker inspect "$pg" >/dev/null 2>&1 || return 0
+  user="$(dr_env_value POSTGRES_USER)"; user="${user:-techsara}"
+  db="$(dr_env_value POSTGRES_DB)"; db="${db:-techsara}"
+  docker exec -e PGOPTIONS="-c default_transaction_read_only=on" "$pg" \
+    psql -U "$user" -d "$db" -tA -v ON_ERROR_STOP=1 -c "$1" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+public_api_in_flight() {  # public_api_in_flight [SINCE] - queued + in-progress public runs (created at or after SINCE), or nothing when unreadable
+  local since="${1:-}" present out filter=""
+  present="$(public_api_psql_ro "SELECT to_regclass('public.api_responses') IS NOT NULL")"
+  case "$present" in
+    t) : ;;
+    f) printf '0\n'; return 0 ;;
+    *) return 0 ;;
+  esac
+  if [ -n "$since" ]; then
+    # Docker's RFC 3339 StartedAt, checked before it goes near SQL.
+    [[ "$since" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 0
+    filter=" AND created_at >= '$since'::timestamptz"
+  fi
+  out="$(public_api_psql_ro "SELECT count(*) FROM api_responses WHERE status IN ('queued', 'in_progress')$filter")"
+  case "$out" in
+    ''|*[!0-9]*) return 0 ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+live_orchestrator_suspends_public_runs() {  # 0 when the RUNNING orchestrator ships the durable runtime AND has resume on
+  local orchestrator enabled
+  orchestrator="$(dr_container_for orchestrator)"
+  docker exec "$orchestrator" test -f /app/app/publicapi/durable.py >/dev/null 2>&1 || return 1
+  # The kill switch (config.py public_api_resume_enabled: unset or blank is
+  # on; otherwise on only for 1/true/yes/on). Off, a suspended run FAILS, so
+  # the file alone says nothing about what a restart cuts (review 2026-09-14).
+  enabled="$(docker exec "$orchestrator" printenv PUBLIC_API_RESUME_ENABLED 2>/dev/null || true)"
+  enabled="$(printf '%s' "$enabled" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  case "$enabled" in
+    ''|1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+public_api_not_resumable_in_flight() {  # queued + in-progress runs that are not resumable (foreground or store:false), or nothing when unreadable
+  local present out
+  present="$(public_api_psql_ro "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'api_responses' AND column_name = 'resumable')")"
+  [ "$present" = t ] || return 0
+  out="$(public_api_psql_ro "SELECT count(*) FROM api_responses WHERE status IN ('queued', 'in_progress') AND resumable IS NOT TRUE")"
+  case "$out" in
+    ''|*[!0-9]*) return 0 ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+PUBLIC_WORK_SINCE=""
+public_api_live_in_flight() {  # the probe the hold polls: runs the running orchestrator can still be executing
+  public_api_in_flight "$PUBLIC_WORK_SINCE"
+}
+
+public_work_guard() {  # before `up`: report public /v1 work in flight; wait (bounded) only when it cannot survive and a hand-run deploy opted in
+  local n cut deadline="${DEPLOY_PUBLIC_WORK_DEADLINE:-0}" poll="${DEPLOY_PUBLIC_WORK_POLL:-15}"
+  # The durable runtime's own read-only report (running, suspended, queued,
+  # quarantined, re-prefill tokens) when the applied tree ships it.
+  if grep -q 'deploy-drain.sh api' "$ROOT/scripts/deploy-drain.sh" 2>/dev/null; then
+    "$ROOT/scripts/deploy-drain.sh" api >>"$LOG" 2>&1 \
+      || say "  public api: the deploy-drain api report failed (see $LOG); continuing"
+  fi
+  n="$(public_api_in_flight)"
+  case "$n" in
+    '') say "  public api: cannot read the in-flight /v1 runs (database unreachable); not waiting"; return 0 ;;
+    0)  say "  public api: no queued or in-progress /v1 runs"; return 0 ;;
+  esac
+  local orchestrator started
+  orchestrator="$(dr_container_for orchestrator)"
+  if [ "$(docker inspect "$orchestrator" --format '{{.State.Running}}' 2>/dev/null || true)" != true ]; then
+    say "  public api: $n queued/in-progress /v1 run(s), but the orchestrator is not running, so nothing is executing them; not waiting"
+    return 0
+  fi
+  if live_orchestrator_suspends_public_runs; then
+    say "  public api: $n queued/in-progress /v1 run(s); the running orchestrator suspends the resumable ones on SIGTERM and the next one resumes them (each resume re-prefills); not waiting"
+    cut="$(public_api_not_resumable_in_flight)"
+    case "$cut" in
+      ''|0) : ;;
+      # WHY (assembler, 2026-09-14): "(store:false)" alone was wrong for this
+      # build: the router does not launch foreground generations durably yet,
+      # so every sync or streaming /v1 run is non-resumable and is cut.
+      *) say "  public api: $cut of them are not resumable (foreground sync/stream runs, or store:false) and will be cut: their clients get an incomplete read" ;;
+    esac
+    return 0
+  fi
+  started="$(docker inspect "$orchestrator" --format '{{.State.StartedAt}}' 2>/dev/null || true)"
+  PUBLIC_WORK_SINCE="$started"
+  n="$(public_api_live_in_flight)"
+  case "$n" in
+    '') say "  public api: cannot tell which /v1 runs the running orchestrator started; not waiting"; return 0 ;;
+    0)  say "  public api: no /v1 run started since the orchestrator did (older rows cannot be running); not waiting"; return 0 ;;
+  esac
+  say "  public api: $n queued/in-progress /v1 run(s) on an orchestrator that CANNOT suspend them - replacing it fails them"
+  if [ "${DEPLOY_ROLLING_BACK:-0}" = 1 ]; then
+    say "  public api: rolling back; not waiting"
+    return 0
+  fi
+  if [ "$deadline" -le 0 ]; then
+    say "  public api: not waiting (deploys never wait; DEPLOY_PUBLIC_WORK_DEADLINE opts a hand-run deploy in) - they end failed"
+    return 0
+  fi
+  say "  public api: waiting up to ${deadline}s for them to finish"
+  if bounded_wait "$deadline" "$poll" public_api_live_in_flight; then
+    say "  public api: in-flight /v1 runs finished (or became unreadable); continuing"
+  else
+    say "  public api: WARNING $(public_api_live_in_flight) run(s) still in flight after ${deadline}s; deploying anyway - they end failed"
+  fi
+  return 0
+}
+
+v1_gateway_health() {  # after `up`: the gateway this tree renders runs its digest; healthy is required only of one this deploy (re)created
+  local want="${V1_GATEWAY_CODE_SHA:-}" image health status id
+  [ -n "$want" ] || return 0
+  image="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"
+  if [ "$image" != "sf-local-ai-v1-gateway:$want" ]; then
+    say "  health: v1-gateway is running '${image:-nothing}', not sf-local-ai-v1-gateway:${want:0:12}"
+    return 1
+  fi
+  health="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' 2>/dev/null || true)"
+  if [ "$health" != healthy ]; then
+    id="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.Id}}' 2>/dev/null || true)"
+    if [ -n "$id" ] && [ "$id" = "$V1_GATEWAY_ID_BEFORE" ]; then
+      # WHY NOT A FAILURE (2026-09-14, review finding): this deploy did not
+      # touch the container, so failing it rolls back an unrelated change,
+      # and the rollback -- same gateway/, same untouched container -- fails
+      # the same way. A gateway this deploy created or recreated still gates.
+      say "  health: WARNING v1-gateway is '${health:-of unknown health}' and this deploy did not change it; not failing the deploy for it."
+      say "  health: inspect \`docker logs --tail 200 $V1_GATEWAY_CONTAINER\`; \`docker restart $V1_GATEWAY_CONTAINER\` cuts every /v1 connection it holds (clients resume)"
+      return 0
+    fi
+    say "  health: v1-gateway is '${health:-not running}', not healthy"
+    return 1
+  fi
+  # Advisory, not a gate: through the gateway to the orchestrator. Any answer
+  # the orchestrator itself gives (401 without a key) proves the relay path;
+  # 502/503/504 or none means the gateway cannot reach it -- which matters
+  # only once the tunnel routes ^/v1 there, and must not roll back a deploy.
+  status="$(docker exec "$V1_GATEWAY_CONTAINER" timeout 20 wget -S -q -O /dev/null http://127.0.0.1:8090/v1/models 2>&1 \
+    | awk '$1 ~ /^HTTP\// { print $2; exit }' || true)"
+  case "$status" in
+    ''|502|503|504)
+      say "  health: WARNING v1-gateway could not reach the orchestrator (status ${status:-none}); keep ^/v1 off the tunnel until it can (gateway/README.md)" ;;
+    *)
+      say "  health: v1-gateway ok (code sha ${want:0:12}; /v1/models relayed, the orchestrator answered $status)" ;;
+  esac
+  return 0
+}
+
 # --------------------------------------------------------------------- deploy
 MANIFEST=""     # set by apply(): the release manifest the digest gate checks against
 apply() {  # apply <sha> - move the checkout and bring the stack up
   local sha="$1" record svc
   land "$sha" || return 1
+  # Before the first render below (deploy-record.sh): every compose call in
+  # this deploy names the gateway image of the tree just checked out.
+  pin_v1_gateway "$ROOT"
 
   # (1) RECORD BEFORE REPLACING. Image ids, rendered configuration, applied
   #     migrations, PostgreSQL major. Every one of those stops being readable
@@ -466,6 +825,12 @@ manifest = json.load(open(sys.argv[1]))
 for service, meta in sorted(manifest["images"].items()):
     print("    %-14s %s" % (service, meta["id"]))
 PY
+
+  # Public /v1 work and the gateway: say what this deploy cuts. Waiting is
+  # off unless a hand-run deploy opts in (deploys never wait). Before the
+  # engine lock.
+  public_work_guard
+  v1_gateway_guard
 
   # ONE ACTOR RESTARTS THE ENGINE PAIR AT A TIME. --full restarts it on
   # purpose; a routine deploy restarts it too whenever the launcher finds the
@@ -557,6 +922,8 @@ print(",".join(bad) if bad else "-")' 2>/dev/null)"
   curl -fsS -m 20 -o /dev/null "http://127.0.0.1:${front}/" || { say "  health: frontend did not answer on ${front}"; return 1; }
   say "  health: frontend ok"
 
+  v1_gateway_health || return 1
+
   # A real completion, not just /v1/models: the API server answers that even
   # when the engine behind it is dead.
   local reply
@@ -615,6 +982,9 @@ if ! schema_gate "$PREVIOUS" "the rollback target"; then
 fi
 
 say "ROLLING BACK to $PREVIOUS"
+# The public-work and gateway guards report during a rollback but never wait:
+# the stack is failing its health gate, and restoring it comes first.
+DEPLOY_ROLLING_BACK=1
 if [ -n "$FF_BRANCH" ]; then
   # This run fast-forwarded $FF_BRANCH to a commit that then failed the health
   # gate. Undo exactly that move and nothing else, with a compare-and-swap:

@@ -51,6 +51,17 @@ the chat surface that is correct (one person, one tab, one answer), and on
 this surface it would be a denial of service one customer could inflict on
 themselves by running two requests with the same key.
 
+NO WALL CLOCK (no-timeout design, 2026-09-13). A generation is one ATTEMPT
+here: it ends when the engine finishes, when the caller or the durable runner
+closes it, or when its liveness guard (`liveness.MainGuard` /
+`liveness.SidecarGuard`, ticked at least every heartbeat) proves the engine
+wedged, down, or has lost the request. The per-request wall clock
+(`planning.wall_clock_for`, up to 6 h) and the 30 s backstop are deleted: a
+clock cannot tell a 30-minute silent prefill from a dead engine. An interrupt
+is recorded on `Generation.interrupt`; the durable runner (durable.py) resumes
+from it by continuation, and the non-durable paths (`store: false`) report it
+as the retry-safe `model_unavailable`.
+
 It also never asks for thinking. `PUBLIC_EFFORT` is `fast`, which on this
 deployment means the reasoning pass is off — see the constant for the billing
 reason, which is not the obvious one.
@@ -63,7 +74,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
 from .. import llm
 from ..config import settings
@@ -113,15 +124,15 @@ REASONING_KIND = "reasoning"
 RECOVERING_RETRY_AFTER = 20.0
 UNAVAILABLE_RETRY_AFTER = 30.0
 
-#: How far past its own wall clock a generation may run before the consumer
-#: stops waiting for the engine's guard and cancels the producer itself. The
-#: engine-side check only runs when a chunk ARRIVES, so a stalled engine would
-#: otherwise be bounded by the transport read timeout alone.
-BACKSTOP_GRACE_S = 30.0
-
 #: What `usage["source"]` says when the engine never sent its usage report and
-#: the counts were taken by this server (a wall-clock stop, 2026-09-13).
+#: the counts were taken by this server (an interrupted attempt, 2026-09-13).
 USAGE_COUNTED_AT_STOP = "counted_at_stop"
+
+
+class ContinuationUnsupported(RuntimeError):
+    """A resume needs `continue_final_message` and this engine path does not
+    accept it (SHIM(T1): llm.stream_chat_events before its kwargs land). The
+    durable runner fails the run retryably rather than regenerate the text."""
 
 
 # --------------------------------------------------------------- the spec --
@@ -151,8 +162,8 @@ class GenerationSpec:
     #: The registry's engine key. `main` goes through `llm.stream_chat_events`;
     #: `router` and `ocr` through `engines.stream_chat`.
     engine: str = registry.ENGINE_MAIN
-    #: This request's own wall clock (`planning.wall_clock_for`), or None for
-    #: the engine's default (the chat app's GEN_WALL_CLOCK_S).
+    #: RETIRED 2026-09-13 (no wall clock on /v1). Kept so a stored spec or a
+    #: caller that still passes it keeps constructing; never read.
     wall_clock_s: Optional[float] = None
     requested_max_output_tokens: Optional[int] = None
     planned_max_output_tokens: Optional[int] = None
@@ -193,7 +204,6 @@ def spec_from_plan(
         temperature=plan.temperature,
         created_at=created_at,
         engine=plan.engine,
-        wall_clock_s=plan.wall_clock_s,
         requested_max_output_tokens=plan.requested_max_output_tokens,
         planned_max_output_tokens=plan.planned_max_output_tokens,
         context_window=plan.model.context_window,
@@ -394,11 +404,41 @@ class Generation:
     the aclose rule exists to prevent.
     """
 
-    def __init__(self, spec: GenerationSpec, *, heartbeat_s: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        spec: GenerationSpec,
+        *,
+        heartbeat_s: Optional[float] = None,
+        guard: Any = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
+        continue_final_message: bool = False,
+        admission_patient: bool = False,
+        on_dispatch: Optional[Callable[[], None]] = None,
+        admission_run_id: Optional[str] = None,
+    ) -> None:
         self.spec = spec
         self.heartbeat_s = float(
             heartbeat_s if heartbeat_s is not None else events.HEARTBEAT_SECONDS
         )
+        #: The liveness guard ticked by `stream()`: `liveness.MainGuard` for
+        #: the main model, `liveness.SidecarGuard` otherwise. Built here when
+        #: the caller passes none, so no public attempt runs unguarded.
+        self.guard = guard if guard is not None else _default_guard(spec)
+        #: One ATTEMPT's shape: the durable runner passes the continuation
+        #: messages and the remaining output budget on a resume.
+        self.messages = list(messages) if messages is not None else spec.messages
+        self.attempt_max_tokens = None if max_tokens is None else int(max_tokens)
+        self.continue_final_message = bool(continue_final_message)
+        self.admission_patient = bool(admission_patient)
+        #: T1's `admission_run_id`: ties a patient LONG ticket to the run's
+        #: `admission.register_yield(run_id, …)`, so a chat LONG turn can ask
+        #: THIS run to yield. None: no yield can be matched.
+        self.admission_run_id = admission_run_id
+        self._on_dispatch = on_dispatch
+        #: Set when the guard interrupted this attempt (a `liveness.Verdict`).
+        #: Not an error: the durable runner resumes from it.
+        self.interrupt: Any = None
         self.usage: Optional[Dict[str, Any]] = None
         self.error: Optional[BaseException] = None
         self.first_token_at: Optional[float] = None
@@ -408,63 +448,81 @@ class Generation:
         #: `llm.get_applied_max_tokens()`, read in the producer, when llm.py
         #: exposes it (needs_integration); None otherwise.
         self.llm_applied_max_tokens: Optional[int] = None
-        #: The wall clock the ENGINE path enforces for this generation — the
-        #: spec's own when the path accepts one, llm's GEN_WALL_CLOCK_S when
-        #: it does not yet. Named in the `timeout` message.
-        self.effective_wall_clock_s: Optional[float] = self.spec.wall_clock_s
-        #: Every non-empty delta the engine streamed (answer and reasoning,
-        #: never our own wall-clock marker). One streamed chunk is one token
-        #: on this deployment (llm.py, verified: usage.completion_tokens ==
-        #: chunk count), so after a wall-clock stop — which closes the stream
-        #: BEFORE vLLM's final usage chunk — this is the output count.
+        #: Every non-empty delta the engine streamed (answer and reasoning).
+        #: One streamed chunk is one token on this deployment (llm.py,
+        #: verified: usage.completion_tokens == chunk count), so after an
+        #: interrupted attempt — closed BEFORE vLLM's final usage chunk —
+        #: this is the output count.
         self.streamed_deltas = 0
         #: Set when the one window retry ran: the `max_tokens` it was sent.
         self.retried_max_tokens: Optional[int] = None
-        self._backstop_fired = False
         self._queue: "asyncio.Queue[Optional[_Chunk]]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
+        self._last_tick = 0.0
 
     # -- the producer -----------------------------------------------------
 
+    def _dispatched(self) -> None:
+        """llm's on_dispatch: the request is past admission and written to the
+        engine. The guard only judges silence from here."""
+        with contextlib.suppress(Exception):
+            self.guard.dispatched()
+        if self._on_dispatch is not None:
+            with contextlib.suppress(Exception):
+                self._on_dispatch()
+
     def _open_engine_stream(self, max_tokens: Optional[int] = None) -> AsyncIterator[Any]:
-        """The engine's `(kind, delta)` generator for this spec."""
+        """The engine's `(kind, delta)` generator for this attempt."""
         spec = self.spec
+        wanted = max_tokens if max_tokens is not None else self.attempt_max_tokens
+        tokens = int(wanted if wanted is not None else spec.max_tokens)
         if spec.engine == registry.ENGINE_MAIN:
             kwargs: Dict[str, Any] = dict(
                 model_choice="smart",
                 effort=spec.effort,
                 temperature=spec.temperature,
-                max_tokens=int(max_tokens if max_tokens is not None else spec.max_tokens),
+                max_tokens=tokens,
             )
             accepted = _accepted_keywords(
-                llm.stream_chat_events, ("wall_clock_s", "wall_clock_marker")
+                llm.stream_chat_events,
+                ("wall_clock_s", "wall_clock_marker", "read_timeout_s", "continue_final_message",
+                 "admission_patient", "on_dispatch", "admission_run_id"),
             )
-            if spec.wall_clock_s is not None and "wall_clock_s" in accepted:
-                kwargs["wall_clock_s"] = float(spec.wall_clock_s)
-            else:
-                # SEAM (needs_integration, llm.py): until stream_chat_events
-                # takes a per-call wall clock, its own GEN_WALL_CLOCK_S cuts
-                # every generation — including a 1M-token one — at ~70 min.
-                self.effective_wall_clock_s = float(
-                    getattr(settings, "gen_wall_clock_s", 0) or 0
-                ) or spec.wall_clock_s
+            # T1 kwargs, passed only when llm accepts them so the two files
+            # land in either order. 0 means "no wall clock"; None means "no
+            # read timeout" (TCP keepalive finds a half-open peer instead).
+            if "wall_clock_s" in accepted:
+                kwargs["wall_clock_s"] = 0
             if "wall_clock_marker" in accepted:
                 kwargs["wall_clock_marker"] = False
-            return llm.stream_chat_events(spec.messages, **kwargs)
+            if "read_timeout_s" in accepted:
+                kwargs["read_timeout_s"] = None
+            if "admission_patient" in accepted:
+                kwargs["admission_patient"] = self.admission_patient
+            if "on_dispatch" in accepted:
+                kwargs["on_dispatch"] = self._dispatched
+            if self.admission_run_id and "admission_run_id" in accepted:
+                kwargs["admission_run_id"] = self.admission_run_id
+            if self.continue_final_message:
+                if "continue_final_message" not in accepted:
+                    raise ContinuationUnsupported()
+                kwargs["continue_final_message"] = True
+            return llm.stream_chat_events(self.messages, **kwargs)
         resolved = engines.target(spec.engine)
         if resolved is None:
             raise errors.model_unavailable(retry_after=UNAVAILABLE_RETRY_AFTER)
-        return engines.stream_chat(
-            resolved,
-            spec.messages,
-            max_tokens=spec.max_tokens,
+        sidecar_kwargs: Dict[str, Any] = dict(
+            max_tokens=tokens,
             temperature=spec.temperature,
-            wall_clock_s=float(
-                spec.wall_clock_s
-                if spec.wall_clock_s is not None
-                else registry.SIDECAR_WALL_CLOCK_FLOOR_S
-            ),
         )
+        accepted = _accepted_keywords(engines.stream_chat, ("continue_final_message", "on_dispatch"))
+        if "on_dispatch" in accepted:
+            sidecar_kwargs["on_dispatch"] = self._dispatched
+        if self.continue_final_message:
+            if "continue_final_message" not in accepted:
+                raise ContinuationUnsupported()
+            sidecar_kwargs["continue_final_message"] = True
+        return engines.stream_chat(resolved, self.messages, **sidecar_kwargs)
 
     def _window_retry_tokens(self) -> Optional[int]:
         """The `max_tokens` for the ONE retry after the main engine refused a
@@ -490,6 +548,9 @@ class Generation:
         bounded = spec.bounded_input_tokens
         if window <= 0 or bounded is None:
             return None
+        if self.continue_final_message:
+            # A continuation is sized by the durable runner; never re-clamped here.
+            return None
         requested = int(spec.requested_max_output_tokens or spec.max_tokens)
         room = window - int(bounded) - int(spec.context_reserve or 0)
         fallback = min(requested, room)
@@ -498,9 +559,9 @@ class Generation:
         return int(fallback)
 
     def _counted_usage(self) -> Optional[Dict[str, Any]]:
-        """Usage for a generation the wall clock (or the backstop) cut before
-        vLLM's final usage chunk arrived — which is every such generation,
-        because the usage chunk is the stream's last.
+        """Usage for an attempt closed before vLLM's final usage chunk arrived
+        (an interrupt, or an older llm's chat wall clock) — the usage chunk is
+        the stream's last, so every such attempt lacks it.
 
         Output: the deltas this server received and counted. Input: the exact
         `/tokenize` count `llm._fit` took for this very call when it took one
@@ -570,6 +631,8 @@ class Generation:
                                 continue
                             if delta:
                                 self.streamed_deltas += 1
+                                with contextlib.suppress(Exception):
+                                    self.guard.chunk()
                                 if isinstance(tracked, capacity.PublicMainGeneration):
                                     tracked.first_token()
                             if kind != TOKEN_KIND:
@@ -625,45 +688,47 @@ class Generation:
                 with contextlib.suppress(Exception):
                     value = applied()
                     self.llm_applied_max_tokens = int(value) if value else None
-            cut = self._backstop_fired or self.finish_reason == llm.WALL_CLOCK_FINISH
+            cut = self.interrupt is not None or self.finish_reason == llm.WALL_CLOCK_FINISH
             if cut and self.usage is None:
                 # Adversarial review 2026-09-13: vLLM sends usage in the LAST
-                # chunk only, and the wall clock closes the stream before it —
-                # so a multi-hour answer cut at its clock was ledgered as "not
-                # measured". CONTRACT §8.3 promises its usage; these are the
-                # counts this server can stand behind.
+                # chunk only, and a closed stream never gets it — so a
+                # multi-hour answer cut short was ledgered as "not measured".
+                # CONTRACT §8.3 promises its usage; these are the counts this
+                # server can stand behind.
                 self.usage = self._counted_usage()
-            if self.error is None and self.finish_reason == llm.WALL_CLOCK_FINISH:
-                # The engine path's guard stopped the stream. The partial text
-                # and the usage are kept; the response fails with the
-                # retry-safe `timeout` that names the limit.
-                self.error = errors.timeout(self.effective_wall_clock_s)
             self._queue.put_nowait(None)
 
     # -- the consumer -----------------------------------------------------
 
-    def _backstop_deadline(self, started: float) -> Optional[float]:
-        if self.spec.wall_clock_s is None:
-            return None
-        clock = max(float(self.spec.wall_clock_s), float(self.effective_wall_clock_s or 0))
-        return started + clock + BACKSTOP_GRACE_S
+    def _tick(self, now: float) -> bool:
+        """Tick the guard; True when it interrupted this attempt."""
+        self._last_tick = now
+        try:
+            verdict = self.guard.tick()
+        except Exception:  # noqa: BLE001 - a broken guard never ends a generation
+            log.debug("liveness guard tick failed", exc_info=True)
+            return False
+        if getattr(verdict, "interrupt", False):
+            self.interrupt = verdict
+            log.warning(
+                "public %s generation %s interrupted by liveness (%s)",
+                self.spec.engine, self.spec.response_id, getattr(verdict, "reason", "?"),
+            )
+            return True
+        return False
 
     async def stream(self) -> AsyncIterator[_Chunk]:
-        """Text chunks, with a heartbeat tick whenever the engine goes quiet."""
-        started = time.monotonic()
+        """Text chunks, with a heartbeat tick whenever the engine goes quiet.
+
+        The liveness guard is ticked on every quiet heartbeat and at least
+        every heartbeat interval while text flows. An interrupt closes the
+        producer (vLLM frees the KV) and ends the iteration; `interrupt`
+        says why. There is no clock here: a silent engine that the guard does
+        not prove bad is waited on for as long as it takes."""
         self._task = asyncio.ensure_future(self._run())
+        self._last_tick = time.monotonic()
         try:
             while True:
-                wait = self.heartbeat_s
-                deadline = self._backstop_deadline(started)
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # The engine path did not stop at its own clock (a
-                        # stalled engine sends no chunk to check it on).
-                        self._backstop_fired = True
-                        return
-                    wait = min(wait, remaining)
                 try:
                     # asyncio.timeout, not asyncio.wait_for (2026-09-14). On
                     # Python 3.11 wait_for swallows a cancellation that lands
@@ -675,29 +740,23 @@ class Generation:
                     # follows_the_owner_policy[proceed]; the CPU image runs
                     # 3.11 too. asyncio.timeout propagates the cancellation on
                     # both versions.
-                    async with asyncio.timeout(wait):
+                    async with asyncio.timeout(self.heartbeat_s):
                         item = await self._queue.get()
                 except TimeoutError:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        continue
+                    if self._tick(time.monotonic()):
+                        return
                     yield _HEARTBEAT
                     continue
                 if item is None:
                     return
                 if self.first_token_at is None:
                     self.first_token_at = time.monotonic()
+                now = time.monotonic()
+                if now - self._last_tick >= self.heartbeat_s and self._tick(now):
+                    return
                 yield item
         finally:
             await self._close()
-            if self._backstop_fired:
-                log.error(
-                    "public %s generation %s outlived its %.0fs wall clock by %.0fs; "
-                    "the producer was cancelled",
-                    self.spec.engine, self.spec.response_id,
-                    float(self.spec.wall_clock_s or 0), BACKSTOP_GRACE_S,
-                )
-                self.error = errors.timeout(self.spec.wall_clock_s)
-                self.finish_reason = llm.WALL_CLOCK_FINISH
 
     def applied_max_output_tokens(self) -> int:
         """What this generation was actually allowed (planning's rule), never
@@ -823,10 +882,34 @@ async def run_to_completion(
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
             outcome.ttft_ms = int((generation.first_token_at - started) * 1000)
-    if generation.error is not None:
+    failure = attempt_failure(generation)
+    if failure is not None:
         outcome.status = "failed"
-        outcome.error = engine_error(generation.error, spec.engine)
+        outcome.error = failure
     return outcome
+
+
+def _default_guard(spec: GenerationSpec) -> Any:
+    from . import liveness
+
+    if spec.engine == registry.ENGINE_MAIN:
+        return liveness.MainGuard()
+    return liveness.SidecarGuard(None)
+
+
+def attempt_failure(generation: Any) -> Optional[errors.ApiError]:
+    """What a NON-durable caller reports for an ended attempt: the engine
+    error, the retry-safe `model_unavailable` for a liveness interrupt, or the
+    legacy `timeout` when an older llm's own chat wall clock cut the stream
+    (SHIM(T1): impossible once `wall_clock_s=0` is accepted). None: success."""
+    if getattr(generation, "error", None) is not None:
+        engine = getattr(getattr(generation, "spec", None), "engine", registry.ENGINE_MAIN)
+        return engine_error(generation.error, engine)
+    if getattr(generation, "interrupt", None) is not None:
+        return errors.model_unavailable(retry_after=UNAVAILABLE_RETRY_AFTER)
+    if getattr(generation, "finish_reason", None) == llm.WALL_CLOCK_FINISH:
+        return errors.timeout(float(getattr(settings, "gen_wall_clock_s", 0) or 0) or None)
+    return None
 
 
 class ClientGone(Exception):
@@ -953,22 +1036,71 @@ async def _settle(on_finish: Optional[OnFinish], outcome: StreamOutcome) -> None
 settle = _settle
 
 
+#: What a stream calls with the finished text to get its `file_citation`
+#: annotations (Files design §5.6; `file_inputs.FileRun.note_output_off_loop`).
+#: A plain function or a coroutine function. Never expected to raise; an
+#: empty list means none.
+Annotator = Callable[[str], Union[Sequence[Mapping[str, Any]], Awaitable[Sequence[Mapping[str, Any]]]]]
+
+#: An answer at least this long is scanned for citation labels on a worker
+#: thread, not on the event loop every other stream shares. The scan is
+#: linear, but a million-token answer is megabytes of text: measured on
+#: Python 3.11 (2026-09-14), `citations.annotate` held its thread 52-93 ms for
+#: 1 MiB and 216-314 ms for 4 MiB, a stall of every other stream on the loop.
+ANNOTATE_OFF_LOOP_CHARS = 256_000
+
+
+def off_loop(text: Optional[str]) -> bool:
+    """Whether scanning `text` for citations belongs on a worker thread."""
+    return len(text or "") >= ANNOTATE_OFF_LOOP_CHARS
+
+
+async def annotations_for(annotate: Optional[Annotator], text: str) -> List[Dict[str, Any]]:
+    """`annotate(text)`, as a list of dicts; a failure is "no annotations"
+    (a citation that cannot be computed is plain text, never a failed
+    answer). A plain annotator runs on a worker thread for a long text; a
+    coroutine annotator decides that itself."""
+    if annotate is None or not text:
+        return []
+    try:
+        if inspect.iscoroutinefunction(annotate):
+            found = await annotate(text)
+        elif off_loop(text):
+            found = await asyncio.to_thread(annotate, text)
+        else:
+            found = annotate(text)
+            if inspect.isawaitable(found):
+                found = await found
+        return [dict(a) for a in (found or ())]
+    except Exception:  # noqa: BLE001
+        log.warning("file citations were not computed for a stream", exc_info=True)
+        return []
+
+
 async def responses_sse(
     spec: GenerationSpec,
     *,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
+    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
-    """The CONTRACT §10 lifecycle for one `POST /v1/responses` with `stream: true`.
+    """The CONTRACT §10.2 lifecycle for one `POST /v1/responses` with `stream: true`.
 
         response.created → [response.queued] → response.in_progress
+          → response.output_item.added → response.content_part.added
           → response.output_text.delta (×N) → response.output_text.done
+          → [response.output_text.annotation.added (×K)]
+          → response.content_part.done → response.output_item.done
           → response.completed
 
     with `response.failed` replacing the tail on any engine-side failure.
     `events.SequencedEvents` numbers the frames and refuses a second terminal;
     nothing here emits one from a `finally`, because a generator that is being
     closed cannot yield and a client that has gone is not owed a frame.
+
+    This is the NON-DURABLE stream (`store: false`, or a process whose durable
+    runtime is not running); `durable.RecordBuilder` produces the same grammar
+    from the write-ahead log. `annotate` adds the Files API's citations.
     """
     emitter = events.SequencedEvents(item_id=spec.item_id)
     generation = Generation(spec, heartbeat_s=heartbeat_s)
@@ -987,24 +1119,39 @@ async def responses_sse(
                 if chunk.kind != TOKEN_KIND:
                     yield emitter.heartbeat()
                     continue
+                if not emitter.item_open:
+                    yield emitter.output_item_added()
+                    yield emitter.content_part_added()
                 pieces.append(chunk.text)
                 yield emitter.output_text_delta(chunk.text)
-            if generation.error is not None:
-                raise generation.error
+            failure = attempt_failure(generation)
+            if failure is not None:
+                raise failure
             text = "".join(pieces)
             outcome.text = text
             outcome.usage = generation.usage
             outcome.finish_reason = generation.finish_reason
             outcome.max_output_tokens = generation.applied_max_output_tokens()
+            if not emitter.item_open:
+                yield emitter.output_item_added()
+                yield emitter.content_part_added()
             yield emitter.output_text_done(text)
+            annotations = await annotations_for(annotate, text)
+            for index, annotation in enumerate(annotations):
+                yield emitter.annotation_added(index, annotation)
+            yield emitter.content_part_done(text, annotations)
+            yield emitter.output_item_done(text, annotations)
             yield emitter.completed(
-                _wire(
-                    spec,
-                    "completed",
-                    text=text,
-                    usage=generation.usage,
-                    max_output_tokens=outcome.max_output_tokens,
-                    finish_reason=generation.finish_reason,
+                events.with_annotations(
+                    _wire(
+                        spec,
+                        "completed",
+                        text=text,
+                        usage=generation.usage,
+                        max_output_tokens=outcome.max_output_tokens,
+                        finish_reason=generation.finish_reason,
+                    ),
+                    annotations,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - every failure is a frame
@@ -1033,9 +1180,7 @@ async def responses_sse(
     finally:
         await generation.aclose()
         if not emitter.finished:
-            outcome.client_gone = True
-        if not pieces and outcome.status == "completed" and not outcome.text:
-            outcome.text = ""
+            _cut_short(outcome, generation, pieces)
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
             outcome.ttft_ms = int((generation.first_token_at - started) * 1000)
@@ -1044,6 +1189,28 @@ async def responses_sse(
         if outcome.finish_reason is None:
             outcome.finish_reason = generation.finish_reason
         await _settle(on_finish, outcome)
+
+
+def _cut_short(outcome: StreamOutcome, generation: "Generation", pieces: List[str]) -> None:
+    """The outcome of a non-durable stream closed before its terminal frame:
+    the client left, or the process is shutting down.
+
+    WHY (verifier, 2026-09-14, restart-gateway-TERM). The stream was cut after
+    193 tokens by an orchestrator restart, and its usage row said `ok` with
+    input and output NULL: the outcome still read `completed` (nothing had
+    set another status) and vLLM's usage chunk — the stream's last — never
+    arrived. A generation stopped before its end is `cancelled` (the caller,
+    or the restart, stopped it; the same word the synchronous path and an
+    abandoned stream use), and it is charged the tokens this server can stand
+    behind: the deltas it received and the input it counted
+    (`usage_source: counted_at_stop`)."""
+    outcome.client_gone = True
+    if outcome.status == "completed":
+        outcome.status = "cancelled"
+    outcome.text = outcome.text or "".join(pieces)
+    if outcome.usage is None and generation.usage is None and (generation.streamed_deltas or pieces):
+        with contextlib.suppress(Exception):
+            outcome.usage = generation._counted_usage()
 
 
 # ------------------------------------------ the Chat Completions stream --
@@ -1056,6 +1223,7 @@ async def chat_completions_sse(
     include_usage: bool = False,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
+    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
     """The compatibility dialect: anonymous chunks, then `data: [DONE]`.
 
@@ -1082,8 +1250,9 @@ async def chat_completions_sse(
                     continue
                 pieces.append(chunk.text)
                 yield chunks.delta(chunk.text)
-            if generation.error is not None:
-                raise generation.error
+            failure = attempt_failure(generation)
+            if failure is not None:
+                raise failure
             outcome.text = "".join(pieces)
             outcome.usage = generation.usage
             outcome.finish_reason = generation.finish_reason
@@ -1091,6 +1260,7 @@ async def chat_completions_sse(
             yield chunks.stop(
                 chat_finish_reason(generation.finish_reason),
                 max_output_tokens=outcome.max_output_tokens,
+                annotations=await annotations_for(annotate, outcome.text),
             )
             if include_usage:
                 yield chunks.usage_chunk(_completion_usage(generation.usage))
@@ -1108,7 +1278,7 @@ async def chat_completions_sse(
     finally:
         await generation.aclose()
         if not chunks.finished:
-            outcome.client_gone = True
+            _cut_short(outcome, generation, pieces)
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
             outcome.ttft_ms = int((generation.first_token_at - started) * 1000)

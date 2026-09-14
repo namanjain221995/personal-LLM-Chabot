@@ -61,6 +61,16 @@ behaviour and, on 2026-09-10, the shape of the upload-reliability bug where a
 finaliser "sometimes" did not run. `_tasks` holds each job until its own done
 callback removes it.
 
+DURABLE BACKGROUND RUNS (no-timeout design, 2026-09-13). When the durable
+runtime is running (`durable.is_active()`, started by main.py's lifespan),
+`start` hands the job to `durable.launch(background=True)`: the job becomes a
+ROW with its spec, not a coroutine. The dispatcher claims the oldest queued
+row when its gate has room, a deploy suspends it, and the next process resumes
+it by continuation — so "an orchestrator restart fails it" below is the
+legacy path only (the runtime not started: the OpenAPI lint job, older
+tests). `repair_if_orphaned` and `reconcile_interrupted` therefore never touch
+a `resumable` row: nobody is "gone" from a run that a lease sweep will pick up.
+
 CANCELLATION IS A FLAG, NOT A KILL. `POST /v1/responses/{id}/cancel` sets
 `api_responses.cancel_requested` and, in this process, an in-memory event too.
 The running job checks both between chunks and stops at the next one, so a
@@ -184,8 +194,22 @@ async def start(
     metadata: Optional[Mapping[str, Any]] = None,
     instructions_present: bool = False,
     fingerprint: str = "",
+    recorder_ref: Any = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    retain_hook: bool = False,
+    attempt_token: Optional[str] = None,
+    body_sha256: Optional[str] = None,
 ) -> dict:
     """Persist (if needed), start the detached job, and return the row.
+
+    `recorder_ref`, `extra` and `retain_hook` (2026-09-14) reach only the
+    durable launch (`durable.launch`): the serialisable recorder a process
+    that resumes the job records it with, what the spec carries besides the
+    generation (the file citation index), and whether the `on_finish` closure
+    is kept while queued even with a ref; `attempt_token` and `body_sha256`
+    are the gateway's attempt and the raw body's digest, so a gateway
+    re-POST or an SDK retry of the same request attaches to this job instead
+    of queueing a second one.
 
     Returns the `api_responses` row the route renders as its 202 body. Raises
     `errors.ApiError` (429 `concurrency_limit_exceeded`) when the project is
@@ -219,6 +243,13 @@ async def start(
     """
     project_id = caller.project_id
     workspace_id = caller.workspace_id
+    if _durable_active():
+        return await _start_durable(
+            spec, caller=caller, on_finish=on_finish, request_id=request_id, metadata=metadata,
+            instructions_present=instructions_present, fingerprint=fingerprint,
+            recorder_ref=recorder_ref, extra=extra, retain_hook=retain_hook,
+            attempt_token=attempt_token, body_sha256=body_sha256,
+        )
     existing = await db.run_in_thread(db.get_api_response, spec.response_id, project_id)
     slot = contextlib.ExitStack()
     try:
@@ -282,6 +313,83 @@ async def start(
     # or cancelled before it ever ran. `ExitStack.close()` is idempotent.
     task.add_done_callback(lambda _task: slot.close())
     return row
+
+
+def _durable_active() -> bool:
+    try:
+        from . import durable
+
+        return durable.is_active()
+    except Exception:  # noqa: BLE001 - the legacy path is always available
+        return False
+
+
+async def _start_durable(
+    spec: streaming.GenerationSpec,
+    *,
+    caller: ApiCaller,
+    on_finish: Optional[streaming.OnFinish],
+    request_id: str,
+    metadata: Optional[Mapping[str, Any]],
+    instructions_present: bool,
+    fingerprint: str,
+    recorder_ref: Any = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    retain_hook: bool = False,
+    attempt_token: Optional[str] = None,
+    body_sha256: Optional[str] = None,
+) -> dict:
+    """The durable background launch: row + spec, dispatched when its gate has
+    room. `on_finish` runs only if THIS process settles the job; a process
+    that resumes it after a deploy uses the runtime's recorder.
+
+    THE PROJECT SLOT IS TAKEN FIRST, exactly as on the legacy path (step 1 of
+    the module docstring). Until 2026-09-14 (review, high) this path returned
+    before `quotas.concurrency_slot`, so with limits enforced a project could
+    queue any number of background jobs past its ceiling, and the console's
+    in-flight counter never saw them. The lease is handed to the durable
+    runtime, which releases it however the job leaves this process (settled,
+    cancelled while queued, claimed elsewhere, suspended); it is released
+    here only when the launch itself raises."""
+    from . import durable
+
+    try:
+        lease = quotas.take_slot(caller, SLOT_KIND)
+    except errors.ApiError as refusal:
+        existing = await db.run_in_thread(db.get_api_response, spec.response_id, caller.project_id)
+        if existing is not None and str(existing.get("status")) not in TERMINAL_STATUSES:
+            with contextlib.suppress(Exception):
+                await db.run_in_thread(
+                    db.update_api_response, spec.response_id, caller.project_id,
+                    status="failed", error_code=refusal.code, error_message=refusal.message,
+                )
+        raise
+    try:
+        handle = await durable.launch(
+            spec,
+            caller=durable.caller_of(caller),
+            background=True,
+            streamed=False,
+            keyed=bool(fingerprint),
+            on_finish=on_finish,
+            request_id=request_id,
+            metadata=metadata,
+            instructions_present=instructions_present,
+            fingerprint=fingerprint,
+            slot=lease,
+            recorder_ref=recorder_ref,
+            extra=extra,
+            retain_hook=retain_hook,
+            attempt_token=attempt_token,
+            body_sha256=body_sha256,
+        )
+    except BaseException:
+        lease.release()
+        raise
+    # The handle's id, not the spec's: a gateway re-POST that raced its first
+    # attempt is attached to that attempt's job, and the 202 names it.
+    row = await db.run_in_thread(db.get_api_response, handle.id, caller.project_id)
+    return row or {}
 
 
 # ------------------------------------------------------------ the runner --
@@ -445,14 +553,18 @@ async def _run(
         _jobs.pop(job.response_id, None)
 
     _finalise(outcome, generation, pieces, started)
-    if outcome.status != "cancelled" and getattr(generation, "error", None) is not None:
+    failure = None if generation is None else streaming.attempt_failure(generation)
+    if outcome.status != "cancelled" and failure is not None:
         # The engine failed inside the producer task, which carries the
-        # exception rather than raising it into this loop. `engine_error` maps
-        # it to the retry-safe CONTRACT §9 code — `model_recovering` when the
-        # controller says a reload is in progress, `timeout` for a wall-clock
-        # kill — which a flat `internal_error` would have hidden.
+        # exception rather than raising it into this loop — or the attempt
+        # was interrupted by its liveness guard, or (legacy llm) cut by the
+        # chat app's own wall clock. `attempt_failure` maps each to its
+        # CONTRACT §9 code — `model_recovering` when the controller says a
+        # reload is in progress, `model_unavailable` for an interrupt,
+        # `timeout` for a legacy wall-clock kill — which a flat
+        # `internal_error` would have hidden.
         outcome.status = "failed"
-        outcome.error = streaming.engine_error(generation.error, spec.engine)
+        outcome.error = failure
     await _settle(job, outcome, on_finish)
 
 
@@ -625,6 +737,8 @@ async def request_cancel(response_id: str, project_id: str) -> Optional[dict]:
         return None
     if str(row.get("status") or "") in TERMINAL_STATUSES:
         return row
+    if row.get("resumable"):
+        return await _cancel_durable(row)
     job = _jobs.get(response_id)
     fields: Dict[str, Any] = {"cancel_requested": True}
     if job is None:
@@ -636,6 +750,46 @@ async def request_cancel(response_id: str, project_id: str) -> Optional[dict]:
         # The fast path: the running task sees this before its next chunk.
         job.cancel.set()
     return updated or row
+
+
+async def _cancel_durable(row: dict) -> dict:
+    """Cancel a durable run. The flag is always written (the owner's lease
+    tick reads it within 15 s, wherever the owner is). A run this process
+    holds stops at its next chunk and records its own text and usage; a run
+    NOBODY holds (suspended, lapsed lease) is settled cancelled here, with no
+    engine work, under `durable_store.finish`'s own lease check."""
+    from . import durable, durable_store
+
+    response_id, project_id = str(row["id"]), str(row["project_id"])
+    updated = await db.run_in_thread(
+        db.update_api_response, response_id, project_id, cancel_requested=True
+    )
+    if await durable.RUNTIME.cancel_after_claim(response_id):
+        return updated or row
+    current = await db.run_in_thread(durable_store.get_run, response_id)
+    if (
+        current is not None and current.get("lease_owner") == durable.RUNTIME.owner
+        and durable.RUNTIME.cancel_local(response_id)
+    ):
+        # Claimed by this process between the flag and the read above.
+        return updated or row
+    if current is not None and not (current.get("lease_owner") and current.get("lease_live")):
+        fields: Dict[str, Any] = {"status": "cancelled"}
+        if current.get("generated_tokens") is not None:
+            # What the engine already produced is still charged (measured
+            # usage; the input count lives in metadata.attempts when known).
+            fields["output_tokens"] = int(current["generated_tokens"])
+        settled = await db.run_in_thread(durable_store.finish, None, response_id, [], fields)
+        if settled is not None:
+            # A queued row cancelled before any process claimed it: the hook
+            # (and the prompt its closure holds) and the project slot this
+            # process kept for it go now (review 2026-09-14).
+            durable.RUNTIME.forget_local(response_id)
+            if settled.get("background"):
+                await _notify(settled, str(settled.get("workspace_id") or ""))
+            return settled
+    final = await db.run_in_thread(db.get_api_response, response_id, project_id)
+    return final or updated or row
 
 
 def as_datetime(value: Any) -> Optional[datetime]:
@@ -669,10 +823,20 @@ async def repair_if_orphaned(row: Optional[dict]) -> Optional[dict]:
     every such poller passes through, so the repair happens there, lazily,
     for exactly the row being asked about.
 
-    Only a row that is background, still open, not running in this process,
-    and created before this process started. Anything else is returned as is.
+    Only a row that is still open, not running in this process, NOT durable
+    (a `resumable` row is resumed by a lease sweep, never declared dead on
+    sight), and created before this process started. Anything else is
+    returned as is. The webhook fires for a background row this closes: its
+    job will never reach `_settle` to send it (design build_plan T2).
+
+    FOREGROUND ROWS TOO (2026-09-14, verifier finding). A non-durable
+    synchronous or streaming request (`store: false`) cut by a restart left
+    its row `queued` for ever, because this used to return early for every
+    row that was not background. Such a row is closed the same way (no
+    webhook: a foreground response has none); the durable runtime's sweep
+    closes the ones nobody reads (`durable_store.fail_interrupted_foreground`).
     """
-    if not row or not row.get("background"):
+    if not row or row.get("resumable"):
         return row
     if str(row.get("status") or "") not in OPEN_STATUSES:
         return row
@@ -689,6 +853,8 @@ async def repair_if_orphaned(row: Optional[dict]) -> Optional[dict]:
         error_code=INTERRUPTED_CODE,
         error_message=INTERRUPTED_MESSAGE,
     )
+    if updated is not None and updated.get("background"):
+        await _notify(updated, str(updated.get("workspace_id") or ""))
     return updated or row
 
 
@@ -711,9 +877,10 @@ async def reconcile_interrupted(project_id: str) -> int:
             db.list_api_responses, project_id, status=status, limit=200
         )
         for row in rows:
-            if not row.get("background"):
+            if not row.get("background") or row.get("resumable"):
                 # A synchronous response in this state died with the socket
-                # that was waiting on it; nobody is polling for it.
+                # that was waiting on it; nobody is polling for it. A durable
+                # row is the lease sweep's to resume, not this function's.
                 continue
             if str(row["id"]) in _jobs:
                 # Still running in THIS process. A restart is the only thing

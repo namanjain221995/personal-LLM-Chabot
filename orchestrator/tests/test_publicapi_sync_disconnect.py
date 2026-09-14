@@ -183,7 +183,13 @@ def served_api(platform):
     thread.join(10)
 
 
-def _raw_post_then_reset(port: int, path: str, body: Dict[str, Any], engine: _HangsAfterAToken) -> None:
+def _raw_post_then_reset(
+    port: int,
+    path: str,
+    body: Dict[str, Any],
+    engine: _HangsAfterAToken,
+    while_connected: Any = None,
+) -> None:
     payload = json.dumps(body).encode()
     request = (
         f"POST {path} HTTP/1.1\r\nHost: api.test\r\nContent-Type: application/json\r\n"
@@ -192,6 +198,12 @@ def _raw_post_then_reset(port: int, path: str, body: Dict[str, Any], engine: _Ha
     conn = socket.create_connection(("127.0.0.1", port), timeout=10)
     conn.sendall(request)
     assert engine.started.wait(15), "the generation never started"
+    if while_connected is not None:
+        # Checked BEFORE the reset (2026-09-14): after it, a server that
+        # notices the disconnect within milliseconds — the committed
+        # response watches for it — may already have released everything,
+        # and a check made then races the very behaviour under test.
+        while_connected()
     # RST, like a proxy giving up: SO_LINGER 0 then close.
     import struct
 
@@ -218,11 +230,13 @@ def test_an_abandoned_synchronous_long_request_gives_its_gate_and_slot_back_with
     monkeypatch.setattr(settings, "model_max_context", 1_000_000)
     capacity.reset_for_tests()
 
+    held = []
     _raw_post_then_reset(
         served_api,
         "/v1/responses",
         {"model": "techsara-35b", "input": "Write a book.", "max_output_tokens": 900_000},
         engine,
+        while_connected=lambda: held.append(capacity.snapshot()["main.long"]["in_flight"]),
     )
     # Read by the generation itself: asserting it from here raced the release,
     # which can land before this line (flaky before the gates integration too).

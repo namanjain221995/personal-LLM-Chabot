@@ -23,6 +23,7 @@ export type TabId =
   | 'overview'
   | 'projects'
   | 'keys'
+  | 'files'
   | 'models'
   | 'playground'
   | 'usage'
@@ -56,6 +57,7 @@ const ALL_TABS: TabId[] = [
   'overview',
   'projects',
   'keys',
+  'files',
   'models',
   'playground',
   'usage',
@@ -102,6 +104,9 @@ export function consoleNav(me: Me): ConsoleNavGroup[] {
       items: [
         { id: 'projects', label: 'Projects', href: tabHref('projects'), capability: 'api.projects.read' },
         { id: 'keys', label: 'API keys', href: tabHref('keys'), capability: 'api.projects.read' },
+        // Files design §14.1: reading needs api.projects.read; upload and delete
+        // are api.projects.manage, checked by the orchestrator on every call.
+        { id: 'files', label: 'Files', href: tabHref('files'), capability: 'api.projects.read' },
         { id: 'models', label: 'Models', href: tabHref('models'), capability: null },
         { id: 'playground', label: 'Playground', href: tabHref('playground'), capability: null },
       ],

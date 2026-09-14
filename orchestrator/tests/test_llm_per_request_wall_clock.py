@@ -7,10 +7,14 @@ Before this, every techsara-35b generation stopped at GEN_WALL_CLOCK_S
 What is pinned here:
 
 * a per-call clock replaces GEN_WALL_CLOCK_S for that call only, in both
-  directions, and a nonsense value never removes the guard;
-* a stubbed generation planned for five hours runs past 4,200 s and is cut at
-  ITS clock — driven through `publicapi.streaming` exactly as `/v1` drives it,
-  on an injected clock (`llm._generation_clock`), in milliseconds;
+  directions, and a nonsense value (NaN, infinity, not a number) never removes
+  the guard — only the deliberate None or ≤ 0 of the no-timeout /v1 path does;
+* SINCE THE NO-TIMEOUT MERGE (2026-09-14): a `/v1` generation has NO clock at
+  all. A stubbed generation of five hours — and one of more than eight —
+  completes, driven through `publicapi.streaming` exactly as `/v1` drives it,
+  on an injected clock (`llm._generation_clock`), in milliseconds. The
+  per-request clock this file was written for (planning.wall_clock_for) is
+  retired with PUBLIC_API_GEN_WALL_CLOCK_S;
 * `wall_clock_marker=False` keeps the "[generation stopped …]" sentence out of
   the answer while the finish reason still says WALL_CLOCK_FINISH;
 * THE TRANSPORT INVARIANT: the HTTP read timeout is never shorter than the
@@ -149,7 +153,9 @@ def _tokens(count: int, finish: str = "stop"):
 
 def test_the_signature_is_what_publicapi_feature_detects_and_the_liveness_answer_flips():
     parameters = inspect.signature(llm.stream_chat_events).parameters
-    assert parameters["wall_clock_s"].default is None
+    # Not passing it keeps GEN_WALL_CLOCK_S (a sentinel default since the
+    # no-timeout merge, because None now means "no clock").
+    assert llm._wall_clock_for(parameters["wall_clock_s"].default) == settings.gen_wall_clock_s
     assert parameters["wall_clock_marker"].default is True
     assert parameters["wall_clock_s"].kind is inspect.Parameter.KEYWORD_ONLY
     assert streaming._accepted_keywords(
@@ -173,8 +179,8 @@ def _five_hour_spec() -> streaming.GenerationSpec:
 
 def test_a_generation_planned_for_five_hours_is_not_cut_at_4200_s_and_completes(engine):
     spec = _five_hour_spec()
-    # 900 s prefill allowance + 855,000 tokens / 50 tok/s = 18,000 s: five hours.
-    assert spec.wall_clock_s == 18_000.0
+    # No per-request clock any more (no-timeout /v1): the spec carries none.
+    assert spec.wall_clock_s is None
     engine["budget"] = 855_000
     # 35 chunks of 500 s each: the answer ends at 17,500 s of engine time,
     # four times the chat application's 4,200 s clock.
@@ -188,17 +194,22 @@ def test_a_generation_planned_for_five_hours_is_not_cut_at_4200_s_and_completes(
     assert "wall-clock guard" not in outcome.text
     assert outcome.finish_reason == "stop"
     assert stream.delivered == 36  # every chunk, the finish chunk included
-    # Sent with its own transport timeout: the read timeout is the call's own
-    # clock, never the 4,200 s LLM_REQUEST_TIMEOUT that would give up first.
+    # No per-request transport override: the public path asks llm for
+    # `read_timeout_s=None`, the keep-alive client with no read timeout at all
+    # (the fixture's `_client` accepts that shape), never the 4,200 s
+    # LLM_REQUEST_TIMEOUT that would give up first.
     sent = completions.requests[0]
-    assert sent["timeout"].read == 18_000.0
-    assert sent["timeout"].connect == settings.llm_connect_timeout
+    assert "timeout" not in sent
     assert sent["max_tokens"] == 855_000
     # The ceiling reported is the one llm.py applied, not a re-derivation.
     assert outcome.max_output_tokens == 855_000
 
 
-def test_the_same_generation_is_still_cut_at_its_own_clock_and_fails_as_timeout_without_the_marker(engine):
+def test_a_public_generation_has_no_clock_at_all_and_eight_hours_complete(engine):
+    """Inverted by the no-timeout merge (2026-09-14). This test pinned the cut
+    at the request's own 18,000 s clock; `/v1` has no clock now, so the same
+    stream — 60 chunks of 500 s, 30,000 s of engine time — completes, with the
+    engine's own finish and no marker."""
     spec = _five_hour_spec()
     engine["budget"] = 855_000
     stream = TimedStream(_tokens(60), engine["clock"], step_s=500.0)
@@ -206,15 +217,11 @@ def test_the_same_generation_is_still_cut_at_its_own_clock_and_fails_as_timeout_
 
     outcome = _run(streaming.run_to_completion(spec, heartbeat_s=0.5))
 
-    # 36 x 500 = 18,000 s is not past the clock; the 37th chunk (18,500 s) is.
-    assert outcome.text == "".join(f"t{i} " for i in range(36))
+    assert outcome.error is None and outcome.status == "completed"
+    assert outcome.text == "".join(f"t{i} " for i in range(60))
     assert "generation stopped" not in outcome.text
-    assert outcome.status == "failed" and outcome.error.code == "timeout"
-    assert "18000 second" in outcome.error.message
-    assert outcome.finish_reason == llm.WALL_CLOCK_FINISH
-    assert stream.closed is True
-    assert outcome.usage["completion_tokens"] == 36
-    assert outcome.usage["source"] == streaming.USAGE_COUNTED_AT_STOP
+    assert outcome.finish_reason == "stop"
+    assert stream.delivered == 61
 
 
 # --------------------------------------------------- the llm.py contract --
@@ -271,7 +278,7 @@ def test_a_shorter_per_call_clock_also_wins_and_needs_no_transport_override(engi
     assert "timeout" not in completions.requests[0]
 
 
-@pytest.mark.parametrize("bad", [0, -5, math.nan, math.inf, "soon"])
+@pytest.mark.parametrize("bad", [math.nan, math.inf, "soon"])
 def test_a_nonsense_per_call_clock_never_removes_the_guard(engine, bad):
     engine["install"](TimedStream(_tokens(20), engine["clock"], step_s=500.0))
     events = _run(_collect(llm.stream_chat_events(
@@ -335,3 +342,18 @@ def test_the_forced_closure_retry_reports_its_own_ceiling(engine, monkeypatch):
     assert completions.requests[1]["max_tokens"] == 300
     assert applied == 300
     assert ("token", "t0 ") in events
+
+
+@pytest.mark.parametrize("none", [None, 0, -5])
+def test_none_or_a_clock_at_or_below_zero_is_the_deliberate_no_clock_of_the_public_path(engine, none):
+    """No-timeout /v1 (merged 2026-09-14): `streaming` passes `wall_clock_s=0`;
+    None and any value ≤ 0 mean no wall clock, so 20 chunks of 500 s — past
+    GEN_WALL_CLOCK_S — all arrive and no marker is appended."""
+    engine["install"](TimedStream(_tokens(20), engine["clock"], step_s=500.0))
+    events = _run(_collect(llm.stream_chat_events(
+        [{"role": "user", "content": "q"}], effort="fast", max_tokens=100, wall_clock_s=none,
+    )))
+    text = "".join(delta for _, delta in events)
+    assert text == "".join(f"t{i} " for i in range(20))
+    assert "wall-clock guard" not in text
+

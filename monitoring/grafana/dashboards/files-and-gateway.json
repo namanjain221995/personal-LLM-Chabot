@@ -1,0 +1,5053 @@
+{
+  "uid": "dgx-files-gateway",
+  "title": "Files API and v1-gateway",
+  "description": "The public Files / Uploads API and the v1-gateway: disk free versus the storage floor, stored bytes, the processing and assembly queues by lane, failures by stage and kind, the media lane, retention, gateway connections, re-attach, drain, spool and file descriptors. Panels on metrics that do not exist yet are marked [pending] or [proposed].",
+  "tags": [
+    "dgx-spark",
+    "developer-api",
+    "files",
+    "v1-gateway"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m"
+    ]
+  },
+  "templating": {
+    "list": []
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "How to read this dashboard",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**The public Files / Uploads API and the v1-gateway.** A title carries the status of the metric it reads: no marker = in Prometheus today; **[pending]** = the code that produces it is written but not published yet (`apifiles/accounting.gauges()` returns the four storage gauges; `app/metrics.py` does not export them), or the container is not deployed; **[proposed]** = nothing emits it yet. The metric contract, with the closed label sets and the exact place to emit each metric, is the header of `monitoring/prometheus/rules/files-and-gateway.yml`. On 2026-09-13 production Prometheus held no `api_files_*`, `public_api_upload_*` or `v1_gateway_*` series.\n\n**Where the bytes are.** On this head the Files store (`/data/api-files`), the gateway spool, Postgres, LanceDB and the models all sit on the root filesystem, so the live *Head root filesystem* panel is the Files store's device until the orchestrator publishes its own statvfs. The floor is `PUBLIC_API_FILES_MIN_FREE_GIB` (250 GiB): under it every write gets 503 `storage_unavailable` and processing defers. Dashed lines: 250 GiB and 1 TiB.\n\n**Lanes.** `cpu` = PUBLIC_API_FILES_CPU_JOBS (2) slots, shared with upload assembly; `media` = PUBLIC_API_FILES_MEDIA_JOBS (1), audio and video, paced behind live chat. Waiting with every slot busy is load; waiting with a free slot is a stuck runner. **Re-attaches are expected at every orchestrator deploy**; a client cut is not, on any of its paths: before a re-attach is tried (relay aborts), when it gives up (exhausted, abort, run_mismatch), or on a relay exception. **Multi-process note:** Files DB snapshots are read with max by instance, per-process series (upload parts in flight, storage refusals) with sum. **Snapshot gauges can freeze:** app/metrics.py keeps a gauge's last value when a read fails, so check *Files snapshot publishes* before trusting a flat queue, lane, deleting or trash line; every alert on those gauges is held silent while the snapshot is not refreshing (ApiFilesSnapshotFailing). No panel reads an orchestrator epoch timestamp: its /metrics prints six significant digits. Alerts are in the rules file above — **no Alertmanager is configured, so no alert reaches anyone yet**."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "At a glance",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Files store free [pending]",
+      "description": "PENDING — the code that produces this metric is written but not published on /metrics yet (apifiles/accounting.gauges() is not wired into app/metrics.py), or the container is not deployed; this panel is empty until it is. statvfs free bytes of PUBLIC_API_FILES_DIR, as storage.require_free() reads them. Red under the 250 GiB default floor, amber under 1 TiB (ApiFilesDiskLow).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "min(api_files_disk_free_bytes{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#EF4444",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 268435456000
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 1099511627776
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Headroom above the floor [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Free bytes minus PUBLIC_API_FILES_MIN_FREE_GIB. Under 0 every write is refused (ApiFilesBelowStorageFloor); under 100 GiB large uploads are refused at create (ApiFilesDiskNearStorageFloor). Needs api_files_disk_floor_bytes (proposed) beside the pending free gauge. The two alerts do not wait for it: without a fresh free and floor pair they compare the head's root filesystem (the live panel below) with the 250 GiB default.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "min(min by (job, instance) (api_files_disk_free_bytes{job=\"orchestrator\"}) - on (job, instance) max by (job, instance) (api_files_disk_floor_bytes{job=\"orchestrator\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#EF4444",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 107374182400
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 214748364800
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Due jobs waiting [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Blobs due for processing now: queued past their not_before, plus processing rows whose lease lapsed (a dead holder), both lanes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance, lane, state) (api_files_jobs{job=\"orchestrator\", state=~\"queued|orphaned\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Oldest due wait [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. The longest any due blob has waited, either lane. Amber past 5 minutes (the stuck line when a slot is free), red past 1 hour (the cpu backlog line).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(api_files_job_oldest_due_seconds{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 300
+              },
+              {
+                "color": "#EF4444",
+                "value": 3600
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Upload parts in flight [pending]",
+      "description": "PENDING — the code that produces this metric is written but not published on /metrics yet (apifiles/accounting.gauges() is not wired into app/metrics.py), or the container is not deployed; this panel is empty until it is. Part bodies streaming into the orchestrator right now (accounting.PARTS_IN_FLIGHT, held by the part routes), summed over every orchestrator process: each process publishes its own count, because a part lands on whichever process took the request. No server limit; the docs advise at most 8 concurrent parts per upload.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(public_api_upload_parts_in_flight{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Gateway relays in flight [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Requests the v1-gateway is relaying now (gw.registry.size). Each holds a client socket and an orchestrator socket, and a spilled body holds a file.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(v1_gateway_relays_in_flight{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Disk free versus the storage floor",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 14
+      },
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Files store free vs storage floor [pending]",
+      "description": "PENDING — the code that produces this metric is written but not published on /metrics yet (apifiles/accounting.gauges() is not wired into app/metrics.py), or the container is not deployed; this panel is empty until it is. Free bytes of the Files store (pending: accounting.gauges()) and the configured floor (proposed: api_files_disk_floor_bytes). Dashed lines mark the 250 GiB default floor and the 1 TiB warning. ApiFilesDiskLow, ApiFilesDiskNearStorageFloor, ApiFilesBelowStorageFloor and ApiFilesDiskFloorForecast24h read these series while the snapshot is fresh; otherwise the first three read the head root filesystem panel instead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "min(api_files_disk_free_bytes{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "free"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "min(api_files_disk_floor_bytes{job=\"orchestrator\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "floor (PUBLIC_API_FILES_MIN_FREE_GIB)"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#EF4444",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 268435456000
+              },
+              {
+                "color": "#94A3B8",
+                "value": 1099511627776
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "floor (PUBLIC_API_FILES_MIN_FREE_GIB)"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Head root filesystem free (the device under /data and the gateway spool)",
+      "description": "node-exporter's view of the head's root filesystem, which on this deployment holds the sf-local-ai_data volume (Files store, LanceDB), Postgres and the gateway's spool volume. The second series projects free space 24 hours ahead at the last 6 hours' trend. ApiFilesDiskLow, ApiFilesDiskNearStorageFloor and ApiFilesBelowStorageFloor fall back to this series (against the 250 GiB default floor) while the orchestrator publishes no fresh free and floor gauges. 2026-09-13: 2,545 GiB free of 3,755 GiB.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "node_filesystem_avail_bytes{job=\"node\", node=\"spark-1\", mountpoint=\"/\", fstype!=\"tmpfs\"}",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "free"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "predict_linear(node_filesystem_avail_bytes{job=\"node\", node=\"spark-1\", mountpoint=\"/\", fstype!=\"tmpfs\"}[6h], 86400)",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "24 h ahead at the 6 h trend"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#EF4444",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 268435456000
+              },
+              {
+                "color": "#94A3B8",
+                "value": 1099511627776
+              }
+            ]
+          },
+          "noValue": "no data",
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "24 h ahead at the 6 h trend"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Stored bytes: originals and derived [pending]",
+      "description": "PENDING — the code that produces this metric is written but not published on /metrics yet (apifiles/accounting.gauges() is not wired into app/metrics.py), or the container is not deployed; this panel is empty until it is. Bytes of every blob not being deleted (two files over one blob count once) and the derived data measured at finalize (pages, chunks, vectors, audio.wav, frames). A DOCX can expand up to 36x into derived text.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance) (api_files_bytes_total{job=\"orchestrator\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "originals"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance) (api_files_derived_bytes_total{job=\"orchestrator\"}))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "derived"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Uploads open and their declared bytes [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Multipart uploads still pending or finalizing (left axis) and the bytes they declared (right axis). Creating an upload needs free space minus twice its bytes to stay above the floor, so a large declared total is future disk pressure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (status) (max by (job, instance, status) (api_files_uploads{job=\"orchestrator\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{status}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance) (api_files_uploads_pending_bytes{job=\"orchestrator\"}))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "declared bytes"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "declared bytes"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Storage refusals / 15m by reason [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. 503 storage_unavailable answers, summed over orchestrator processes. disk: free space under the floor, or an upload's size would take it there (Retry-After 60, x-should-retry false; ApiFilesStorageRefusals). purge_busy: a re-upload waiting on the purge of the same bytes (Retry-After 2, x-should-retry true). io: a multipart part's temporary file could not be opened (an I/O or permission error, not a space check).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(api_files_storage_refusals_total{job=\"orchestrator\"}[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Processing queue: cpu and media lanes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "panels": []
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Blobs by lane and state [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. api_files_jobs (Files design §7.4). queued = due now; deferred = waiting out a 300 s retry backoff; processing = under a live lease; orphaned = processing under a lapsed lease, due for takeover; deleting = waiting for its purge.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane, state) (max by (job, instance, lane, state) (api_files_jobs{job=\"orchestrator\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} {{state}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Oldest due wait by lane [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Seconds the oldest due blob of each lane has waited: a queued blob since the later of its not_before and its last row write (a blob released at shutdown or moved to the other lane is not dated from an old deferral), an orphaned one since its lease lapsed. Dashed: 5 minutes (ApiFilesDueJobsWaitWithFreeSlot, only while a slot is free) and 1 hour (ApiFilesProcessingBacklog for cpu; media's line is 6 hours).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max by (lane) (api_files_job_oldest_due_seconds{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 300
+              },
+              {
+                "color": "#EF4444",
+                "value": 3600
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Most silent running job by lane [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Seconds since the most silent processing row with a live lease last changed. Videos waiting out the video pipeline's own retry delay after an engine outage (analysis row queued) are excluded by the gauge's definition. The longest legitimate silence is an extraction child or video stage at its 2 h wall; dashed at 2.5 h (ApiFilesJobSilent).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 33
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max by (lane) (api_files_job_silent_seconds{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#EF4444",
+                "value": 9000
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Lane running vs slots [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Jobs (and, in the cpu lane, assemblies) running in the runner process against the lane's slots (dashed). Slots come from configuration and running is 0 for a lane whose runner never started, so a lane that jobs.start() never reached still shows its free slots. Running below slots while due work waits is the stuck signature.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane) (api_files_lane_running{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} running"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane) (api_files_lane_slots{job=\"orchestrator\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} slots"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".* slots"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Job runs / 15m by lane and outcome [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Every run end: processed, failed, deferred (see the deferral reasons below), stopped (shutdown, DELETE, lost lease), moved (sniff sent it to the other lane).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 41
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane, outcome) (increase(api_files_job_runs_total{job=\"orchestrator\"}[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} {{outcome}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Processed job duration p50 / p95 by lane [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Claim to end for runs that finished processed, over the last hour. A 3 h video takes 25-90 minutes in the media lane.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 41
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (lane, le) (rate(api_files_job_seconds_bucket{job=\"orchestrator\", outcome=\"processed\"}[1h])))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (lane, le) (rate(api_files_job_seconds_bucket{job=\"orchestrator\", outcome=\"processed\"}[1h])))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} p95"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "row",
+      "title": "Failures and deferrals by stage and kind",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "panels": []
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Failures / 1h by kind and stage [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Files that ended failed, by kind (sniff.KINDS) and the stage it was in (sniff.STAGES_BY_KIND); stage none is the crash-loop cap, which fails a file before any stage starts. All error codes, including verdicts about the developer's bytes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (kind, stage) (increase(api_files_job_failures_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{kind}} @ {{stage}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Failures / 1h by error code [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. unsupported_file, file_corrupt and file_too_complex are verdicts about the file. internal_error and processing_unavailable are ours, and only those feed ApiFilesInternalFailures.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (error_code) (increase(api_files_job_failures_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{error_code}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Deferrals / 30m by lane, stage and reason [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Runs put back in the queue with finished stages kept. reason=engine: OCR (stage ocr) or embeddings (index). reason=probe_timeout: the media probe did not finish. reason=storage: the disk under the floor, or an extraction child that hit ENOSPC. reason=memory_pressure: an extraction child SIGKILLed from outside. reason=sandbox_unavailable: the child refused to parse without its sandbox. The fifth deferral of a file fails it processing_unavailable (ApiFilesDeferralsSustained above 5 for storage, engine and probe_timeout). A storage deferral is labelled with the stage whose free-space check refused, not the stage before it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane, stage, reason) (increase(api_files_job_deferrals_total{job=\"orchestrator\"}[30m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}} {{stage}} {{reason}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Extraction sandbox refusals and memory kills / 1h [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. The two deferral reasons that are host problems, not outages that end on their own. sandbox_unavailable: the extraction child could not apply the sandbox it requires and did not parse (ApiFilesExtractionSandboxUnavailable, critical on any). memory_pressure: the child was killed with SIGKILL from outside (ApiFilesExtractionMemoryKills at 2 in 30 minutes). Neither is a disk problem.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(api_files_job_deferrals_total{job=\"orchestrator\", reason=~\"sandbox_unavailable|memory_pressure\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Crash takeovers / 1h by lane [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. A claim that found the previous run's owner still recorded: that run died with its process (an OOM kill, a crash). The fifth takeover of one file fails it internal_error at stage none (ApiFilesCrashTakeovers).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 58
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (lane) (increase(api_files_job_crash_takeovers_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{lane}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Upload assembly (runs in the cpu lane's slots)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Assemblies waiting / running [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Completed uploads whose file is still being put together, by lease owner: waiting = claimable now; deferred = held back by a deferral (disk under the floor, a purge in flight) until its expiry; running = under a live assembly lease.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (state) (max by (job, instance, state) (api_files_assembly_uploads{job=\"orchestrator\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Oldest assembly wait [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Seconds since the oldest waiting upload completed. Dashed at 10 minutes (ApiFilesAssemblyWaitWithFreeSlot, only while a cpu slot is idle). The largest upload assembles in about 7 minutes once claimed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(api_files_assembly_oldest_wait_seconds{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "oldest wait"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 600
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Assembly outcomes / 1h [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. attached = the file has its blob; checksum_mismatch = the declared md5/sha256 disagreed with the parts (client side); failed = internal_error after the attempts (ApiFilesAssemblyFailed); deferred = disk under the floor or a part unreadable; abandoned = deleted meanwhile or lease lost. exception in the runner = an exception _run_assembly caught that no AssemblyResult reported (log: files assembly ... failed a unit).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (outcome) (increase(api_files_assembly_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(api_files_assembly_errors_total{job=\"orchestrator\"}[1h]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "exception in the runner"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Assembly duration p95 [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Copy-and-hash time of assemblies that ran, over the last hour.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 67
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (outcome, le) (rate(api_files_assembly_seconds_bucket{job=\"orchestrator\"}[1h])))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{outcome}} p95"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "type": "row",
+      "title": "Media lane (audio and video through the video pipeline)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 75
+      },
+      "panels": []
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Media lane running vs slots [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Audio and video jobs running against PUBLIC_API_FILES_MEDIA_JOBS (dashed). The media lane shares the GPUs with chat; its slot count is the GPU budget, not a usage limit.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 76
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(api_files_lane_running{job=\"orchestrator\", lane=\"media\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "running"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(api_files_lane_slots{job=\"orchestrator\", lane=\"media\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "slots"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "slots"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Media pacing: seconds waited behind chat per hour [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Time api-lane GPU units spent in api_pace() before running: chat_live = behind a live chat generation (up to 20 s per unit), chat_unit = behind a chat video job's GPU unit (up to 120 s). The unit then runs anyway, so this is slowed, never starved.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 76
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(api_files_media_pace_wait_seconds_sum{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Video analyses by state (chat and API lanes together)",
+      "description": "The video pipeline's own gauge (video_queue_depth, set by health._publish_work_gauges for state queued and running only; done and failed rows are not exported). Once API media runs through the pipeline these counts are chat and API together; the Files panels to the left are the API half. VideoQueueBacklog in alerts.yml watches it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 76
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (state) (video_queue_depth{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "no data",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 37,
+      "type": "row",
+      "title": "Retention, the upload sweep, the trash and the snapshot",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 84
+      },
+      "panels": []
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Retention removals / 1h [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. What each retention pass removed: blob_purged (a DELETE made true on disk), file_expired, tombstone (30-day records), orphan_dir, orphan_analysis, leftover (crash files older than 24 h).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 85
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (what) (increase(api_files_retention_removed_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{what}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Upload sweep removals / 1h [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. finalizing_reset (a complete that crashed), expired (parts removed), abandoned_assembly (file deleted mid-assembly), record_purged (30-day upload rows), leftover, orphan_upload_dir.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 85
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (what) (increase(api_files_upload_sweep_removed_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{what}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Passes / 1h: completed, failed, and retention steps that failed [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Completed and failed passes of each loop (a pass at start, then every 600 s by default, so about 6 ok per hour) and retention steps that raised inside a pass that still completed. No ok pass in 35 minutes is ApiFilesRetentionPassOverdue / ApiFilesUploadSweepOverdue; a step failing on three passes is ApiFilesRetentionStepFailing. Counters, not a last-pass timestamp: the orchestrator's /metrics prints six significant digits, which rounds an epoch timestamp to 10,000 s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 85
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (outcome) (increase(api_files_retention_passes_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "retention {{outcome}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (outcome) (increase(api_files_upload_sweep_passes_total{job=\"orchestrator\"}[1h]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "upload sweep {{outcome}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (step) (increase(api_files_retention_step_failures_total{job=\"orchestrator\"}[1h]))",
+          "refId": "C",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "retention step {{step}} failed"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Purge failures / 30m by reason and blobs waiting to be purged [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. error: a purge raised (retention pass, DELETE kick or the DELETE route); it is moved behind the others and retried each pass (ApiFilesPurgeFailing after 30 minutes with blobs still deleting). fence: storage refused to move the blob directory and nothing raised; it is refused again every pass (ApiFilesPurgeFenceRefused). While either continues, a deleted file's bytes are still on disk.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 93
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(api_files_purge_failures_total{job=\"orchestrator\"}[30m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "purge failures {{reason}} / 30m"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance, lane) (api_files_jobs{job=\"orchestrator\", state=\"deleting\"}))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "blobs deleting"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Oldest blob waiting for its purge [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Seconds since the oldest blob in deleting became deleting (a stable deleting_since, not updated_at, which every failed purge bumps). Keyed on age, so it also shows purges that fail without being counted. Dashed at 2 h (ApiFilesDeletingStuck).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 93
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(api_files_deleting_oldest_seconds{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "oldest deleting"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 7200
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 43,
+      "type": "timeseries",
+      "title": "Stored bytes change over 1h [pending]",
+      "description": "PENDING — the code that produces this metric is written but not published on /metrics yet (apifiles/accounting.gauges() is not wired into app/metrics.py), or the container is not deployed; this panel is empty until it is. Net change of originals and derived bytes over the last hour: uploads and processing push it up, purges pull it down. A long run of increases with no purges is where the disk is going.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 93
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance) (delta(api_files_bytes_total{job=\"orchestrator\"}[1h])))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "originals"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(max by (job, instance) (delta(api_files_derived_bytes_total{job=\"orchestrator\"}[1h])))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "derived"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": null,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 44,
+      "type": "timeseries",
+      "title": "Trash: entries and the oldest entry's age [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Entries under _trash in the Files store (left axis) and the age of the oldest by ctime (right axis). A purge renames a blob's directory there, deletes the row and removes the entry; the upload sweep removes what is left 60 s after the move, every pass. An entry older than an hour is a deleted file whose bytes are still on disk with no row left to show it (ApiFilesTrashNotEmptied, dashed at 1 h).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 101
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(api_files_trash_entries{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "entries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(api_files_trash_oldest_seconds{job=\"orchestrator\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "oldest entry age"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 3600
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "oldest entry age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 45,
+      "type": "timeseries",
+      "title": "Sweep removals that failed / 1h by area [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Entries the upload sweep could not remove (log: files sweep could not remove an entry), by where they were: trash (purged blobs), single and inline (crash leftovers), uploads (orphan upload directories and stray temporaries). The sweep's own removal counts include only successes, so these are otherwise invisible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 101
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (area) (increase(api_files_sweep_remove_failures_total{job=\"orchestrator\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{area}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 46,
+      "type": "timeseries",
+      "title": "Files snapshot publishes / 5m by result [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Attempts of the snapshot publisher (every 15 s in the runner process, so about 20 ok per 5 minutes). With no ok publish the disk, queue, lane, assembly, deleting and trash gauges above keep their last values and the alerts that read them are held silent; ApiFilesSnapshotFailing fires after 10 minutes. error is usually the database.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 101
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (result) (increase(api_files_snapshot_total{job=\"orchestrator\"}[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 47,
+      "type": "row",
+      "title": "v1-gateway: connections and re-attach",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 109
+      },
+      "panels": []
+    },
+    {
+      "id": 48,
+      "type": "stat",
+      "title": "Gateway scrape [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. up for the v1-gateway scrape job. Needs both a /metrics route in the gateway and a scrape job named v1-gateway (V1GatewayScrapeDown).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 0,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(up{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN"
+                },
+                "1": {
+                  "text": "UP"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#EF4444",
+                "value": null
+              },
+              {
+                "color": "#2DD4BF",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 49,
+      "type": "stat",
+      "title": "Draining [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. 1 between SIGTERM and exit (at most V1_GATEWAY_DRAIN_ABORT_S, 2 s, plus the destroy), so it is rarely caught by a scrape.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 4,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(v1_gateway_draining{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "no"
+                },
+                "1": {
+                  "text": "DRAINING"
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 50,
+      "type": "stat",
+      "title": "Gateway uptime [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Since the process started. The gateway is recreated only when gateway/ changes, so a short uptime without such a change is a crash (V1GatewayRestarted).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 8,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "time() - max(process_start_time_seconds{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 51,
+      "type": "stat",
+      "title": "Last drain duration [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. From SIGTERM to exit at the gateway's last stop, published by the next process from the file the drain writes in the spool volume (a scrape cannot see a process that is exiting).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 12,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(v1_gateway_last_drain_duration_seconds{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 52,
+      "type": "stat",
+      "title": "Relays cut by last drain [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Relays still running V1_GATEWAY_DRAIN_ABORT_S after the last SIGTERM, destroyed so their clients resume (V1GatewayDrainCutRelays).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 16,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(v1_gateway_last_drain_relays_aborted{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 53,
+      "type": "stat",
+      "title": "Clients cut by the gateway, 1h [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Every relay the gateway cut outside its own stop: before any re-attach was tried (relay aborts, except terminal and attach_off), when a re-attach ended exhausted (1,800 s of absence), abort (a non-retryable status such as 404, or a 200 of the other shape) or run_mismatch (the answer named another run), and relay exceptions that destroyed a response under way.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 4,
+        "x": 20,
+        "y": 110
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(v1_gateway_reattach_ended_total{job=\"v1-gateway\", outcome=~\"exhausted|abort|run_mismatch\"}[1h])) + sum(increase(v1_gateway_relay_aborts_total{job=\"v1-gateway\", reason!~\"terminal|attach_off\"}[1h])) + sum(increase(v1_gateway_relay_errors_total{job=\"v1-gateway\", client=\"cut\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#2DD4BF",
+                "value": null
+              },
+              {
+                "color": "#F59E0B",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 54,
+      "type": "timeseries",
+      "title": "Open connections vs relays in flight [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Sockets the gateway's server holds (including idle keep-alive, closed by cloudflared at 90 s) against requests actively relaying. Many connections with few relays is idle or slow sockets, not traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 115
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(v1_gateway_open_connections{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "open connections"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(v1_gateway_relays_in_flight{job=\"v1-gateway\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "relays in flight"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 55,
+      "type": "timeseries",
+      "title": "Re-attach started and ended by outcome / 15m [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Started re-attaches are expected at every orchestrator deploy. relay = rejoined the run; cancelled = the client left; exhausted / abort / run_mismatch = the client was cut (V1GatewayReattachGivingUp, V1GatewayReattachRunMismatch). Relays cut without a re-attach are in the next panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 115
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(v1_gateway_reattach_started_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "started"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (outcome) (increase(v1_gateway_reattach_ended_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "ended {{outcome}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "type": "timeseries",
+      "title": "Relays cut without a re-attach, and relay exceptions / 15m [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. relay_abort: the upstream broke and planReattach() refused, so the client was cut at once. partial_json, sequence_unconfirmed, not_replayable, body_not_replayable and opaque_body are losses (V1GatewayClientsCutWithoutReattach at 3); protocol_unknown means no answer since this gateway started carried X-TechSara-Run (V1GatewayAttachProtocolUnknown); terminal (the SSE terminal event was already relayed) and attach_off (V1_GATEWAY_ATTACH=off) are shown but not alerted. relay error: an exception in the relay, answered with a 500 or cut (V1GatewayRelayErrors).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 115
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(v1_gateway_relay_aborts_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "cut before re-attach: {{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (client) (increase(v1_gateway_relay_errors_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "relay error, client {{client}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "type": "timeseries",
+      "title": "Orchestrator absence during successful re-attach, p50 / p95 [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. How long clients were held on heartbeats before the gateway rejoined their run, over the last hour. A routine orchestrator recreate is tens of seconds; the budget is 1,800 s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 123
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(v1_gateway_reattach_absent_seconds_bucket{job=\"v1-gateway\", outcome=\"relay\"}[1h])))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(v1_gateway_reattach_absent_seconds_bucket{job=\"v1-gateway\", outcome=\"relay\"}[1h])))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "p95"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 58,
+      "type": "timeseries",
+      "title": "Pre-commit outcomes, self-commits and upstream failures / 15m [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Before any byte reached the client: recovered (a retry got through), exhausted (110 s, then 503; V1GatewayPrecommitFailures), outcome_unknown (503 with x-should-retry false), body_lost, stale_socket. self-commit = 15 s of orchestrator silence answered with a heartbeat. upstream failure = the orchestrator connection broke.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 123
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (outcome) (increase(v1_gateway_precommit_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "pre-commit {{outcome}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (shape) (increase(v1_gateway_self_commits_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "self-commit {{shape}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (committed) (increase(v1_gateway_upstream_failures_total{job=\"v1-gateway\"}[15m]))",
+          "refId": "C",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "upstream failure committed={{committed}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "type": "row",
+      "title": "v1-gateway: spool and file descriptors",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 131
+      },
+      "panels": []
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Spool reserved vs quota [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Bytes of spilled JSON bodies held across all relays against V1_GATEWAY_SPOOL_MAX_BYTES (dashed, 2 GiB default). At the quota new spilled bodies get 503 and the connection is closed (V1GatewaySpoolNearQuota at 80 %).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 132
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(v1_gateway_spool_reserved_bytes{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "reserved"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(v1_gateway_spool_max_bytes{job=\"v1-gateway\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "quota"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "quota"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Spool filesystem free vs its floor [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. statfs of the spool volume (the head's root filesystem here) against PUBLIC_API_MIN_FREE_DISK_BYTES (dashed, 20 GiB default). Under it spilling is refused with reason disk.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 132
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "min(v1_gateway_spool_free_bytes{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "free"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(v1_gateway_spool_min_free_bytes{job=\"v1-gateway\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "floor"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "floor"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 62,
+      "type": "timeseries",
+      "title": "Spool refusals and body-idle closes / 10m [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. quota / disk / storage refusals (V1GatewaySpoolRefusals) and sockets destroyed after V1_GATEWAY_BODY_IDLE_S (60 s) with no body byte.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 132
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (reason) (increase(v1_gateway_spool_refusals_total{job=\"v1-gateway\"}[10m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "refused {{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(v1_gateway_body_idle_total{job=\"v1-gateway\"}[10m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "body idle"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "type": "timeseries",
+      "title": "Gateway descriptor use vs refusal threshold [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Open descriptors over the soft RLIMIT_NOFILE, against V1_GATEWAY_FD_PRESSURE_RATIO (dashed, 0.7). At the threshold new /v1 requests get 503 Retry-After 30 before a header (V1GatewayFdPressureHigh warns at 0.5).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 140
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(process_open_fds{job=\"v1-gateway\"} / on (job, instance) process_max_fds{job=\"v1-gateway\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "open / max"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(v1_gateway_fd_pressure_threshold_ratio{job=\"v1-gateway\"})",
+          "refId": "B",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "refusal threshold"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "refusal threshold"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 64,
+      "type": "timeseries",
+      "title": "Gateway descriptor refusals / 5m [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. Requests refused for descriptor pressure (V1GatewayFdRefusals, critical). Chat does not pass through the gateway and is never refused here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 140
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(increase(v1_gateway_fd_refusals_total{job=\"v1-gateway\"}[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "refused"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 65,
+      "type": "timeseries",
+      "title": "Orchestrator descriptor use [proposed]",
+      "description": "PROPOSED — nothing emits this metric yet; monitoring/prometheus/rules/files-and-gateway.yml (metric contract in its header) says what to emit and where. This panel is empty until then. orchestrator_open_fds_ratio: open descriptors over the soft RLIMIT_NOFILE, the gauge the no-timeout design's resources.py fd_pressure() publishes (not written yet). The orchestrator holds a socket per /v1 request and a file per streaming upload part. Dashed at PUBLIC_API_FD_GUARD_RATIO (0.70): above it new /v1 requests get 503 before headers; chat is never refused.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 140
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(orchestrator_open_fds_ratio{job=\"orchestrator\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "open / soft limit"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#EF4444",
+                "value": 0.7
+              }
+            ]
+          },
+          "noValue": "proposed: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 66,
+      "type": "timeseries",
+      "title": "Gateway container memory (cAdvisor) [pending]",
+      "description": "PENDING — the v1-gateway container is not deployed, so the existing cadvisor job has no series for it yet; no code change is needed. Working set of the v1-gateway container from the existing cadvisor job. The series appears once the container is deployed, with no code change. The design measured edge RSS plateauing at 632 MiB with 8 x 64 MiB parts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 148
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (name) (container_memory_working_set_bytes{job=\"cadvisor\", name=~\"sf-local-ai-v1-gateway-.*\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 12,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet",
+          "decimals": 1
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 67,
+      "type": "timeseries",
+      "title": "Gateway container starts / 1h (cAdvisor) [pending]",
+      "description": "PENDING — the v1-gateway container is not deployed, so the existing cadvisor job has no series for it yet; no code change is needed. Changes of the container's start time: a restart. Every relay the gateway held is destroyed at a stop, so outside a gateway/ rollout this should stay at 0.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 148
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (name) (changes(container_start_time_seconds{job=\"cadvisor\", name=~\"sf-local-ai-v1-gateway-.*\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "range": true,
+          "legendFormat": "{{name}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": null,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 70,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "pending: not emitted yet",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

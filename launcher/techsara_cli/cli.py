@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -1280,6 +1282,344 @@ def _restart_controller_after_failure(compose: ComposeManager, project_root: Pat
     return True
 
 
+# --------------------------------------------------------------- v1-gateway
+#: The public /v1 relay (gateway/README.md, no-timeout design T6, 2026-09-13).
+#: Its whole value is that a routine deploy does not restart it, so its
+#: Compose definition must change only when the relay itself does: the image
+#: tag is a digest of the image's inputs, rendered through the process
+#: environment -- never through .env, secrets.env or generated.env, which
+#: Compose folds into the orchestrator's and the frontend's definitions and
+#: would recreate them whenever the gateway changed.
+V1_GATEWAY_SERVICE = "v1-gateway"
+V1_GATEWAY_DIR = Path("gateway")
+V1_GATEWAY_IMAGE_REPOSITORY = "sf-local-ai-v1-gateway"
+V1_GATEWAY_CODE_SHA_KEY = "V1_GATEWAY_CODE_SHA"
+V1_GATEWAY_CONTAINER = "sf-local-ai-v1-gateway-1"
+
+
+def v1_gateway_code_sha(project_root: Path) -> str:
+    """sha256 over the v1-gateway image's inputs, or "" when there is no gateway.
+
+    The inputs are exactly what gateway/Dockerfile COPYs plus the Dockerfile:
+    ``Dockerfile``, ``server.cjs`` and every regular file under ``lib/``. A
+    README, test or testkit edit is not one (.dockerignore keeps them out of
+    the build context), so it changes nothing -- which matters, because a
+    changed digest is a recreate and a recreate cuts every connection the
+    relay holds. Regular files only (symlinks are skipped), listed as
+    ``sha256sum`` prints them, ``<hex>  <path>\n``, sorted by path bytes,
+    and that listing hashed once: scripts/deploy.sh computes the same value
+    with ``find ... -type f | LC_ALL=C sort | xargs sha256sum | sha256sum``.
+    """
+    root = project_root / V1_GATEWAY_DIR
+    required = (root / "Dockerfile", root / "server.cjs")
+    if not all(path.is_file() and not path.is_symlink() for path in required):
+        return ""
+    files = list(required)
+    lib = root / "lib"
+    if lib.is_dir():
+        files.extend(path for path in lib.rglob("*") if path.is_file() and not path.is_symlink())
+    listing = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root).as_posix()}\n"
+        for path in sorted(files, key=lambda item: item.relative_to(root).as_posix().encode())
+    )
+    return hashlib.sha256(listing.encode("utf-8")).hexdigest()
+
+
+def _pin_v1_gateway(
+    project_root: Path,
+    layers: Mapping[str, Mapping[str, str]],
+    *,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Compute the gateway digest and hand it to every Compose call of this run.
+
+    ComposeManager builds each command's environment from ``os.environ`` and
+    then the three env-file layers, so the digest goes into the process
+    environment. A layer that names the key is refused rather than let win:
+    its value would pin the gateway to a stale image AND fold into the
+    orchestrator's definition (``layers`` maps a layer's name to its values).
+    """
+    target = os.environ if environ is None else environ
+    for name, values in layers.items():
+        if V1_GATEWAY_CODE_SHA_KEY in values:
+            raise TechSaraError(
+                f"{V1_GATEWAY_CODE_SHA_KEY} is set in {name}; remove it. The launcher derives it from "
+                "gateway/ on every `up`, and a value in an env file would also change the orchestrator's "
+                "and the frontend's definitions"
+            )
+    sha = v1_gateway_code_sha(project_root)
+    if sha:
+        target[V1_GATEWAY_CODE_SHA_KEY] = sha
+    else:
+        target.pop(V1_GATEWAY_CODE_SHA_KEY, None)
+    return sha
+
+
+def _docker_output(compose: ComposeManager, argv: list[str], *, timeout: float = 30.0) -> str | None:
+    """stdout of a plain docker command through the compose runner, or None on failure."""
+    result = compose.runner(argv, timeout=timeout)
+    if getattr(result, "returncode", 1) != 0:
+        return None
+    return str(getattr(result, "stdout", "") or "").strip()
+
+
+def _start_v1_gateway(compose: ComposeManager, code_sha: str) -> dict[str, Any]:
+    """Create the v1-gateway, or leave the running one exactly as it is.
+
+    Build only when the digest-tagged image is missing: a warm rebuild keeps
+    the image id (measured 2026-09-13), but one after the build cache was
+    pruned gives the same inputs a new id, and Compose recreates a container
+    whose image id moved. Then ``up -d --no-deps``,
+    NEVER --force-recreate: Compose recreates only when the rendered
+    definition or the image changed, i.e. only when gateway/ did. The
+    container id before and after says which happened, for the deploy log.
+
+    HEALTH DECIDES THE RUN ONLY FOR A GATEWAY THIS RUN MADE (2026-09-14,
+    review finding, reproduced with a real ComposeManager: an unchanged
+    container reporting ``unhealthy`` raised "did not become healthy", so the
+    deploy failed, rolled back, and the rollback -- whose tree has the same
+    gateway/, hence the same untouched container -- failed the same way; with
+    a migration applied, schema_gate then stops at "This box needs a human").
+    A created or recreated gateway must become healthy or the run fails,
+    while the previous image is still local to roll back to. A gateway this
+    run did NOT touch cannot be healed by failing an unrelated orchestrator
+    deploy: its health is reported as a loud WARNING with the command that
+    restarts it -- an operator decision, because a restart cuts every
+    connection it holds -- and the run goes on.
+    """
+    if not code_sha:
+        _step("v1-gateway: this checkout has no gateway/ program; not started")
+        return {"status": "absent"}
+    rendered = compose.run("config", "--services", timeout=60.0)
+    if V1_GATEWAY_SERVICE not in str(getattr(rendered, "stdout", "") or "").split():
+        _step("v1-gateway: gateway/ exists but no compose file defines the v1-gateway service; not started")
+        return {"status": "not_rendered", "code_sha": code_sha}
+    image = f"{V1_GATEWAY_IMAGE_REPOSITORY}:{code_sha}"
+    before = _docker_output(
+        compose, ["docker", "inspect", V1_GATEWAY_CONTAINER, "--format", "{{.Id}}\t{{.Config.Image}}\t{{.State.Running}}"]
+    )
+    before_id, before_image, before_running = ((before or "").split("\t") + ["", "", ""])[:3]
+    if before_image.endswith(":unpinned"):
+        _step(
+            f"  v1-gateway: WARNING the running container is on {before_image} (a hand-run `docker compose` "
+            "without V1_GATEWAY_CODE_SHA); this run puts it back on the pinned image, which recreates it"
+        )
+    built = False
+    if _docker_output(compose, ["docker", "image", "inspect", image, "--format", "{{.Id}}"]) is None:
+        _step(f"v1-gateway: building {image} (its inputs under gateway/ changed)...")
+        compose.run("build", V1_GATEWAY_SERVICE, timeout=900.0)
+        built = True
+    _step(f"Starting the v1-gateway (code sha {code_sha[:12]}; only a changed sha or setting recreates it)...")
+    compose.up_service(V1_GATEWAY_SERVICE)
+    after = _docker_output(compose, ["docker", "inspect", V1_GATEWAY_CONTAINER, "--format", "{{.Id}}"]) or ""
+    if not before_id:
+        action = "created"
+    elif after and after == before_id:
+        # The same container: left running, or (stopped before) started again.
+        action = "unchanged" if before_running.strip() == "true" else "started"
+    else:
+        action = "recreated"
+    if action in {"created", "recreated"}:
+        # This run's gateway: it must come up healthy, or the run fails.
+        row = compose.wait_service(V1_GATEWAY_SERVICE, timeout=120.0, reporter=_step)
+        health = "healthy"
+        if action == "created":
+            _step(
+                "  v1-gateway: created; it takes no public traffic until the tunnel routes ^/v1 to it "
+                "or V1_GATEWAY_URL points the frontend's /v1 route at it"
+            )
+        else:
+            _step(
+                f"  v1-gateway: RECREATED ({before_image or 'unknown image'} -> {image}); the connections it relayed "
+                "were cut and resume through their clients"
+            )
+    else:
+        row, health = _observe_kept_v1_gateway(compose, started=action == "started")
+        if action == "unchanged":
+            _step("  v1-gateway unchanged: left running with every /v1 connection it holds")
+        else:
+            _step("  v1-gateway: was stopped; started the same container (same definition, same image)")
+        if health != "healthy":
+            _step(
+                f"  v1-gateway: WARNING it is {health or 'of unknown health'} and this run did not change it, so the run "
+                f"goes on. Inspect `docker logs --tail 200 {V1_GATEWAY_CONTAINER}`; restarting it is an operator "
+                f"decision because it cuts every /v1 connection it holds (clients resume): "
+                f"`docker restart {V1_GATEWAY_CONTAINER}`"
+            )
+    status = str(row.get("Status") or "").strip() if isinstance(row, Mapping) else ""
+    if status:
+        _step(f"  v1-gateway: {status}")
+    return {
+        "status": "running", "action": action, "health": health,
+        "code_sha": code_sha, "image": image, "built": built,
+    }
+
+
+def _observe_kept_v1_gateway(compose: ComposeManager, *, started: bool) -> tuple[dict[str, Any], str]:
+    """(ps row, health) of a gateway this run did not create; never raises.
+
+    A kept running container is read once. One that was stopped and has just
+    been started gets the normal 120 s to become healthy, but running out of
+    it is reported, not raised (see _start_v1_gateway).
+    """
+    if started:
+        try:
+            return compose.wait_service(V1_GATEWAY_SERVICE, timeout=120.0, reporter=_step), "healthy"
+        except TechSaraError as exc:
+            _step(f"  v1-gateway: {exc}")
+    try:
+        rows = compose.ps(V1_GATEWAY_SERVICE)
+    except TechSaraError:
+        rows = []
+    row = rows[0] if rows and isinstance(rows[0], Mapping) else {}
+    state = str(row.get("State") or row.get("state") or "").strip().lower()
+    health = str(row.get("Health") or row.get("health") or "").strip().lower()
+    if state and state != "running":
+        health = state
+    elif not health:
+        # No healthcheck result yet (or none defined): not "healthy".
+        health = "unknown" if not state else "starting"
+    return dict(row), health
+
+
+# ------------------------------------------------------ the v1relay network
+#: The gateway -> orchestrator network (compose.yaml `v1relay`). Its subnet is
+#: pinned so the gateway has one address PUBLIC_API_GATEWAY_PEERS can name.
+V1RELAY_NETWORK = "v1relay"
+#: Routes shorter than this are catch-alls (a VPN's 0.0.0.0/1 + 128.0.0.0/1
+#: "def1" pair, say), not an address range in use; they would overlap every
+#: subnet and block every start.
+_V1RELAY_ROUTE_MIN_PREFIX = 8
+_ROUTE_TYPES_WITHOUT_A_RANGE = frozenset({"local", "broadcast", "multicast", "anycast", "nat"})
+_ROUTE_TYPES_BEFORE_THE_PREFIX = frozenset({"unicast", "unreachable", "blackhole", "prohibit", "throw"})
+
+
+def _ipv4_routes(text: str) -> list[ipaddress.IPv4Network]:
+    """Destination prefixes of `ip -4 route show table all` output."""
+    found: list[ipaddress.IPv4Network] = []
+    for line in text.splitlines():
+        tokens = line.split()
+        if not tokens or tokens[0] in _ROUTE_TYPES_WITHOUT_A_RANGE:
+            continue
+        destination = tokens[1] if tokens[0] in _ROUTE_TYPES_BEFORE_THE_PREFIX and len(tokens) > 1 else tokens[0]
+        if destination == "default":
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        if isinstance(network, ipaddress.IPv4Network) and network.prefixlen >= _V1RELAY_ROUTE_MIN_PREFIX:
+            found.append(network)
+    return found
+
+
+def _proc_net_routes(text: str) -> list[ipaddress.IPv4Network]:
+    """Destination prefixes of /proc/net/route (main table; little-endian hex)."""
+    found: list[ipaddress.IPv4Network] = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            destination = ipaddress.IPv4Address(int(fields[1], 16).to_bytes(4, "little"))
+            mask = ipaddress.IPv4Address(int(fields[7], 16).to_bytes(4, "little"))
+            network = ipaddress.IPv4Network(f"{destination}/{mask}", strict=False)
+        except (ValueError, OverflowError):
+            continue
+        if network.prefixlen >= _V1RELAY_ROUTE_MIN_PREFIX:
+            found.append(network)
+    return found
+
+
+def _check_v1relay_subnet(compose: ComposeManager, *, proc_net_route: Path = Path("/proc/net/route")) -> dict[str, Any]:
+    """Refuse to start a stack whose pinned v1relay subnet is already in use.
+
+    WHY (2026-09-14, review finding). Docker refuses to create a network that
+    overlaps an existing one ("networks have overlapping IPv4"), and routes a
+    user-specified subnet over a host route without complaint. v1relay's
+    subnet is fixed in compose.yaml, so a network another project created in
+    the meantime, or a new VPN or LAN route, would otherwise surface as a
+    failed orchestrator `up` in the middle of a deploy (and a rollback), or
+    after a `techsara down --full` as a stack that cannot come back. This runs
+    before the first `up` that could create the network and names what
+    overlaps. A network that already exists was allocated by Docker and is
+    left to Compose.
+    """
+    rendered = compose.run("config", "--format", "json", timeout=60.0)
+    try:
+        document = json.loads(str(getattr(rendered, "stdout", "") or "{}"))
+    except json.JSONDecodeError as exc:
+        raise TechSaraError("Docker Compose config --format json did not print JSON") from exc
+    network = ((document.get("networks") or {}) if isinstance(document, Mapping) else {}).get(V1RELAY_NETWORK)
+    if not isinstance(network, Mapping):
+        return {"status": "not_rendered"}
+    name = str(network.get("name") or f"sf-local-ai_{V1RELAY_NETWORK}")
+    wanted: list[ipaddress.IPv4Network] = []
+    for pool in ((network.get("ipam") or {}).get("config") or []):
+        if isinstance(pool, Mapping) and pool.get("subnet"):
+            candidate = ipaddress.ip_network(str(pool["subnet"]), strict=False)
+            if isinstance(candidate, ipaddress.IPv4Network):
+                wanted.append(candidate)
+    if not wanted:
+        return {"status": "unpinned", "network": name}
+    subnet_text = ", ".join(str(item) for item in wanted)
+
+    listing = _docker_output(compose, ["docker", "network", "ls", "--format", "{{.Name}}"])
+    names = [item for item in (listing or "").split() if item]
+    if name in names:
+        existing = _docker_output(
+            compose, ["docker", "network", "inspect", name, "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}"]
+        )
+        have = sorted((existing or "").split())
+        if have and have != sorted(str(item) for item in wanted):
+            _step(
+                f"  v1relay: WARNING {name} exists with subnet {' '.join(have)}, but compose.yaml pins {subnet_text}; "
+                "changing it needs the orchestrator and the v1-gateway stopped and the network removed first"
+            )
+        return {"status": "exists", "network": name, "subnet": subnet_text}
+
+    occupied: list[tuple[str, ipaddress.IPv4Network]] = []
+    if listing is None:
+        _step("  v1relay: WARNING could not list Docker networks; only host routes are checked for an overlap")
+    elif names:
+        inspected = _docker_output(
+            compose,
+            ["docker", "network", "inspect", *names, "--format", "{{.Name}}\t{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+        )
+        for line in (inspected or "").splitlines():
+            owner, _tab, subnets = line.partition("\t")
+            for item in subnets.split():
+                try:
+                    candidate = ipaddress.ip_network(item, strict=False)
+                except ValueError:
+                    continue
+                if isinstance(candidate, ipaddress.IPv4Network):
+                    occupied.append((f"Docker network {owner.strip()}", candidate))
+    routes_text = _docker_output(compose, ["ip", "-4", "route", "show", "table", "all"], timeout=15.0)
+    if routes_text is not None:
+        routes = _ipv4_routes(routes_text)
+    else:
+        try:
+            routes = _proc_net_routes(proc_net_route.read_text(encoding="utf-8"))
+        except OSError:
+            routes = []
+            _step("  v1relay: WARNING could not read the host's routes; only Docker networks are checked for an overlap")
+    occupied.extend(("host route", route) for route in routes)
+
+    clashes = sorted({f"{owner} {other}" for owner, other in occupied for item in wanted if item.overlaps(other)})
+    if clashes:
+        raise TechSaraError(
+            f"the v1relay network ({name}) pins {subnet_text} in compose.yaml, which overlaps "
+            + "; ".join(clashes)
+            + ". Docker cannot create it there. Pick an unused /28 outside Docker's default address pools "
+            "(172.17-31.0.0/16, 192.168.0.0/16) and this host's networks, change the v1relay subnet, ip_range, "
+            "gateway and the v1-gateway ipv4_address in compose.yaml together, and put the new gateway address "
+            "in PUBLIC_API_GATEWAY_PEERS and PUBLIC_API_TRUSTED_PROXIES (gateway/README.md)"
+        )
+    _step(f"  v1relay: {subnet_text} is free (checked {len(occupied)} Docker subnet(s) and host route(s))")
+    return {"status": "free", "network": name, "subnet": subnet_text}
+
+
 def _start_compose(
     compose: ComposeManager,
     profile: SelectedProfile,
@@ -1665,6 +2005,9 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
         models, runtimes = load_model_manifest(root)
         user_env = parse_env_file(root / ".env")
         secrets, secret_warnings = prepare_local_secrets(layout, profile, user_env)
+        # Before anything renders: every Compose call below sees the same
+        # v1-gateway digest, and a stale one in an env file stops the run here.
+        gateway_sha = _pin_v1_gateway(root, {".env": user_env, str(layout.secrets_env): secrets})
         if _has_engine_controller(profile):
             # The sentinel token, in its own 0600 layer that only the
             # engine-controller service reads (never secrets.env).
@@ -1753,12 +2096,23 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
         )
         _verbose(args, "reconciled project-owned optional services without deleting containers or volumes")
         endpoints = _local_endpoints(generated, user_env)
+        # Before the first `up` that could create the v1relay network (the
+        # orchestrator's, inside _start_compose): a pinned subnet someone else
+        # now uses fails here, by name, instead of mid-start.
+        relay_network = _check_v1relay_subnet(compose) if gateway_sha else {"status": "absent"}
         result = _start_compose(
             compose, profile, generated, salesforce_ready=salesforce_ready,
             search_enabled="search" in profiles, dry_run=args.dry_run,
             endpoints=endpoints, root=root,
             ocr_remote=bool(remote_ocr_url(user_env)),
         )
+        # LAST, after the frontend: nothing waits on it, and a routine deploy
+        # leaves it running (see _start_v1_gateway).
+        if not args.dry_run:
+            gateway = _start_v1_gateway(compose, gateway_sha)
+            if gateway.get("status") != "absent" and isinstance(result, dict):
+                gateway["network"] = relay_network
+                result["v1_gateway"] = gateway
         combined_capability_results = list(capability_results)
         docker_capability_results = result.get("capability_results", [])
         if isinstance(docker_capability_results, list):

@@ -53,6 +53,11 @@ const DEFAULT_SCOPES = [
   'embeddings.write',
   'rerank.write',
   'audio.write',
+  // 2026-09-13, with the Files API: both are defaults upstream (Files design
+  // §10.2, owner decision D1 — the design's proposal). A key minted before
+  // keeps its stored scopes and does not gain them.
+  'files.read',
+  'files.write',
 ];
 
 export function CreateKeyDialog({
@@ -193,6 +198,9 @@ export function CreateKeyDialog({
                   <span className="min-w-0">
                     <span className="block text-ink">{scope.label}</span>
                     <span className="block text-xs text-faint">{scope.hint}</span>
+                    {scope.note ? (
+                      <span className="block text-xs text-muted">{scope.note}</span>
+                    ) : null}
                   </span>
                 </label>
               ))}

@@ -27,6 +27,12 @@ RUN addgroup -S nodejs && adduser -S nextjs -G nodejs
 COPY --from=build /app/public ./public
 COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
+# The server preload (2026-09-13, no-timeout design): Node's 300 s request
+# timeout off, a 60 s body-idle guard in its place, keep-alive above
+# cloudflared's 90 s, and a SIGTERM drain that cuts /v1 relays at +2 s and chat
+# streams at +15 s so one long relay no longer holds a deploy for 5 minutes.
+# Not part of Next's standalone output, so it is copied on its own.
+COPY --from=build --chown=nextjs:nodejs /app/server-preload.cjs ./server-preload.cjs
 USER nextjs
 EXPOSE 3000
 # EXEC FORM, AND IT HAS TO STAY THAT WAY.
@@ -49,4 +55,10 @@ EXPOSE 3000
 #
 # The time to use that is compose.yaml's `stop_grace_period: 5m`; without it
 # Docker's 10 s default made the handler's politeness irrelevant.
-CMD ["node", "server.js"]
+#
+# `--require ./server-preload.cjs` (2026-09-13) keeps all three links: node is
+# still PID 2 with no shell, and the preload's own SIGTERM listener only
+# decides which connections to cut and when — Next's handler still does the
+# server.close() and the exit, now as soon as the uploads still in flight end
+# instead of when the longest relay does (tests/server-preload.test.ts).
+CMD ["node", "--require", "./server-preload.cjs", "server.js"]

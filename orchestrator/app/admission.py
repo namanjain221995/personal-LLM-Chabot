@@ -263,6 +263,77 @@ estimate is over twice it, and /tokenize decides the band between. Until
 token estimate, and a non-Latin prompt of ~190,000 real tokens passed it
 into the NORMAL lane (N013).
 
+PATIENT WAITERS (no-timeout /v1 design, revision 2, 2026-09-13). Public
+work waits with NO time limit: a wait on /v1 ends on admission, the client
+leaving, a yield to chat, or the engine proven down — never the clock. Such a
+waiter is PATIENT (`patient()`, entered by `llm.stream_chat_events(
+admission_patient=True)`). In every lane a patient waiter:
+
+- has no wait bound (and a `set_wait_bound_s` bound is ignored for it);
+- is not counted by ADMISSION_MAX_WAITING and is never refused `capacity` at
+  the door — measured with the real Lane in the design review: 400 patient
+  waiters refused chat instantly when they shared the counter. The per-class
+  queues above already keep chat first; this keeps the door open too;
+- is granted in the same synchronous FIFO order as before (one grant per
+  release, a per-waiter future), so 3,000 of them cost one scan per release,
+  not a thundering herd.
+
+A patient LONG request never refuses where a bounded one would (an engine not
+idle after the bound with our own long answers on it, or a chat turn waiting
+for NORMAL): it keeps waiting instead. And while it waits for idle holding the
+seat, a chat LONG request arriving makes it give the seat and its KV back and
+queue again behind chat.
+
+PATIENT LONG HOLDERS AND YIELD. A patient LONG ticket releases its LONG SEAT at
+first token when PUBLIC_API_LONG_RELEASE_AT_FIRST_TOKEN (default true) and
+keeps its KV charge until the stream ends; the in-process `kv_ledger()` maps
+its run (`set_run_id`) to that footprint. A chat LONG request that is blocked
+by a patient holder — its prefill seat, its KV (the chat request would fit
+without the patient charges, or it would overflow
+PUBLIC_API_SHARED_KV_BUDGET_TOKENS beside them), or its decode during the idle
+wait — calls the holder's yield callback (`register_yield`), once per holder,
+on the next loop iteration (never re-entrantly from a grant). The durable
+runner suspends the run (it pays a re-prefill later; the client sees
+heartbeats), the ticket releases, and chat is granted. THE DECODE CASE IS A
+DELIBERATE DEVIATION from the design's "a chat LONG prefill then runs beside
+one public decode": LONG BESIDE LONG ANSWERS above (adversarial review of the
+same date) refuses a LONG prefill beside our own long decoders because a
+decode-only sequence supplies the other half of the GDN fault shape, and no
+soak has shown otherwise. Yielding the decoder keeps that rule and still gives
+chat the lane at suspend latency.
+
+DECODE YIELDS ARE CAPPED (T1 review, 2026-09-14). With ADMISSION_LONG_IDLE_MAX
+at its production 0 the public decoder itself makes the engine "not idle", so
+EVERY chat document yielded it, and each yield costs the run a re-prefill of
+input plus generated text (~800 s at 950K) and a /v1 closure. Nothing counted
+them: chat documents arriving faster than a job's remaining decode kept a 1M
+job from ever finishing. So one run's decode is asked to yield at most
+PUBLIC_API_DECODE_YIELDS_PER_RUN (1) times over its life in this process
+(counted per run id, across its tickets). Past that, a chat document neither
+waits for that decoder nor refuses: it prefills BESIDE it (`_ahead`'s `beside`
+discount) — the design's own shape, a LONG prefill beside one public decode,
+now reached only on a second collision with the same run. A decoder that was
+just asked is not discounted (it is suspending); no other running work is.
+0 is the design as written (never suspend a decode). The prefill and KV
+yields above are not capped: a chat document that does not fit, or finds the
+seat taken by a prefill, still gets the lane at suspend latency.
+
+PATIENT IDLE WAITERS NEVER HOLD CHAT (T1 review, 2026-09-14). A LONG request
+waiting for idle holds new LONG_OUTPUT admissions (LONG BESIDE LONG ANSWERS),
+and a patient one never stops waiting: past its bound with a long answer still
+decoding it waits again, so it held every chat LONG_OUTPUT request — an Artifact
+Studio or Deep Research answer above 65,536 tokens — for as long as any long
+answer decoded (hours; a bounded /v1 request gave up after 600 s). Now:
+
+- a patient idle waiter holds /v1 LONG_OUTPUT admissions only (public FIFO:
+  those end when the running long answers do, and then it proceeds); a chat
+  LONG_OUTPUT request is admitted beside it, and the patient request, which
+  waits with no limit, simply waits longer for idle;
+- a patient idle waiter gives its seat AND its KV charge back and queues again
+  when a chat request is kept out by exactly those — a chat LONG request the
+  seat blocks, or a chat LONG_OUTPUT request only its charge keeps out of KV
+  (`_patient_idle_gives_way`), at most once per poll.
+
 Per event loop, like the breaker registry: a lane is asyncio state and
 the test suite runs a loop per test. So is the KV ledger — a multi-process
 orchestrator would multiply every cap and the budget by its worker count.
@@ -271,10 +342,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import math
 import time
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from contextvars import ContextVar, Token
 from typing import Awaitable, Callable, Deque, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
 
@@ -307,6 +380,13 @@ LONG_OUTPUT_LINE = "Waiting for room on the main model for a long answer ({n} ah
 #: How often a waiter re-reads the lane and the engine sample while it
 #: waits. In-memory; a grant wakes it earlier.
 _POLL_S = 1.0
+
+#: How often a PATIENT waiter that is not the head of its class queue wakes on
+#: its own (no-timeout /v1, 2026-09-13). Grants are synchronous and resolve its
+#: future directly, and the heads already poll for the time-based conditions;
+#: 3,000 patient waiters each polling at _POLL_S would be 3,000 loop wake-ups a
+#: second doing nothing. A tail wake-up is a safety net only.
+_PATIENT_TAIL_POLL_S = 30.0
 
 #: How many /v1 NORMAL waiters one grant looks at for one that fits KV. The
 #: pump runs on every release; a bounded scan keeps it O(1) whatever the depth
@@ -438,6 +518,62 @@ del _check
 
 _origin: ContextVar[str] = ContextVar("admission_origin", default=ORIGIN_CHAT)
 _wait_bound: ContextVar[Optional[float]] = ContextVar("admission_wait_bound_s", default=None)
+#: PATIENT WAITERS (module docstring): public work that waits with no limit.
+_patient: ContextVar[bool] = ContextVar("admission_patient", default=False)
+#: The durable run this context generates for, so a patient LONG ticket can be
+#: found by the chat request it must yield to.
+_run_id: ContextVar[Optional[str]] = ContextVar("admission_run_id", default=None)
+
+
+def patient() -> bool:
+    """Is this context's admission patient (no wait bound, outside the chat
+    waiting-depth bound)?"""
+    return bool(_patient.get())
+
+
+def set_patient(value: bool) -> Token:
+    return _patient.set(bool(value))
+
+
+@contextlib.contextmanager
+def as_patient(value: bool = True) -> Iterator[None]:
+    token = set_patient(value)
+    try:
+        yield
+    finally:
+        _patient.reset(token)
+
+
+def set_run_id(run_id: Optional[str]) -> Token:
+    """Name the durable run this context generates for (publicapi sets it
+    INSIDE its producer task, like `set_origin`)."""
+    return _run_id.set(None if run_id is None else str(run_id))
+
+
+def current_run_id() -> Optional[str]:
+    return _run_id.get()
+
+
+def long_release_at_first_token() -> bool:
+    """PUBLIC_API_LONG_RELEASE_AT_FIRST_TOKEN (default true)."""
+    return bool(getattr(settings, "public_api_long_release_at_first_token", True))
+
+
+def decode_yields_per_run() -> int:
+    """PUBLIC_API_DECODE_YIELDS_PER_RUN (1; 0 never suspends a decode)."""
+    return max(0, int(getattr(settings, "public_api_decode_yields_per_run", 1) or 0))
+
+
+#: How many runs' decode-yield counts one loop remembers. A run that falls out
+#: of this memory (10,000 later runs have been asked since) may be asked once
+#: more — harmless, and it keeps the map from growing with every run served.
+_DECODE_YIELD_MEMORY = 10_000
+
+
+def shared_kv_budget_tokens() -> int:
+    """PUBLIC_API_SHARED_KV_BUDGET_TOKENS (1,400,000; 0 turns the check off):
+    a chat LONG request's charge plus every patient footprint must fit it."""
+    return max(0, int(getattr(settings, "public_api_shared_kv_budget_tokens", 1_400_000) or 0))
 
 
 def _fold(value: object) -> str:
@@ -503,10 +639,10 @@ def _reject(lane: str, reason: str, waited_s: float) -> AdmissionRejected:
 
 
 class _Waiter:
-    __slots__ = ("fut", "origin", "charge", "enqueued_at", "lane", "key", "tokens")
+    __slots__ = ("fut", "origin", "charge", "enqueued_at", "lane", "key", "tokens", "patient")
 
     def __init__(self, fut: asyncio.Future, origin_: str, charge: int, lane: str, key: object = None,
-                 tokens: int = 0) -> None:
+                 tokens: int = 0, patient_: bool = False) -> None:
         self.fut = fut
         self.origin = origin_
         self.charge = int(charge)
@@ -514,6 +650,7 @@ class _Waiter:
         self.lane = lane
         self.key = key
         self.tokens = int(tokens)
+        self.patient = bool(patient_)
 
 
 def _other(cls: str) -> str:
@@ -550,6 +687,11 @@ class _ClassQueue:
     def total(self, lane: Optional[str] = None) -> int:
         return self.depth(ORIGIN_CHAT, lane) + self.depth(ORIGIN_V1, lane)
 
+    def bounded_depth(self, cls: str, lane: Optional[str] = None) -> int:
+        """Waiters ADMISSION_MAX_WAITING counts: every one but the patient
+        (module docstring, PATIENT WAITERS)."""
+        return sum(1 for w in self.q[cls] if not w.patient and (lane is None or w.lane == lane))
+
     def position(self, w: _Waiter, lane: Optional[str] = None) -> int:
         """How many waiters are ahead of `w`: same-class waiters in front of
         it, plus every chat waiter for a v1 waiter (chat goes first)."""
@@ -582,6 +724,7 @@ async def _await_grant(
     leave: Callable[[_Waiter], None],
     give_back: Callable[[], None],
     max_deferral_s: Optional[float] = None,
+    is_head: Optional[Callable[[], bool]] = None,
 ) -> float:
     """Wait for `w`'s future to be granted, up to `timeout` seconds of wait
     that was the caller's own (time behind a LONG closure is deferred, for at
@@ -617,6 +760,10 @@ async def _await_grant(
             remaining = timeout - (now - started)
             if remaining <= 0:
                 raise _reject(lane_name, "timeout", now - started)
+            if w.patient and is_head is not None and not is_head():
+                # A patient tail: its grant arrives through its future.
+                await asyncio.wait({w.fut}, timeout=_PATIENT_TAIL_POLL_S)
+                continue
             await asyncio.wait({w.fut}, timeout=min(_POLL_S, remaining))
             if not w.fut.done():
                 # Every tick: time-based conditions (a /v1 promotion, the /v1
@@ -810,22 +957,27 @@ class Lane:
         on_wait: Optional[Callable[[int], Awaitable[None]]],
         charge: int = 0,
         key: object = None,
+        patient_: bool = False,
     ) -> float:
         """Take one seat, waiting up to `timeout`. Returns the seconds
         waited; raises AdmissionRejected on capacity or timeout. `on_wait`
         is called once, with how many are ahead, the first time the caller
         actually has to wait. A /v1 NORMAL request passes its projected KV
-        `charge` and a ledger `key`: the grant commits it."""
+        `charge` and a ledger `key`: the grant commits it. A PATIENT waiter
+        (`patient_`) has no bound and is never refused at the door."""
         cls = _fold(origin)
-        w = _Waiter(asyncio.get_running_loop().create_future(), cls, charge, self.name, key)
+        w = _Waiter(asyncio.get_running_loop().create_future(), cls, charge, self.name, key, patient_=patient_)
+        if patient_:
+            timeout = math.inf
         self.queue.add(w)
         self._pump_all()
         if w.fut.done():
             self._publish()
             return 0.0
         # The depth bound is per class: a flood of one class never refuses
-        # the other at the door.
-        if self.queue.depth(cls) - 1 >= max(0, int(settings.admission_max_waiting)):
+        # the other at the door. Patient waiters are neither refused nor
+        # counted (module docstring, PATIENT WAITERS).
+        if not patient_ and self.queue.bounded_depth(cls) - 1 >= max(0, int(settings.admission_max_waiting)):
             self.queue.remove(w)
             self._publish()
             raise _reject(self.name, "capacity", 0.0)
@@ -839,9 +991,11 @@ class Lane:
                 self._owner.ledger.release(key)
             self.release_nowait(cls)
 
+        queue = self.queue.q[cls]
         return await _await_grant(
             w, lane_name=self.name, closed=lambda: self.closed, timeout=timeout, on_wait=on_wait,
             ahead=ahead, pump=self._tick, leave=self._leave, give_back=give_back,
+            is_head=lambda: bool(queue) and queue[0] is w,
         )
 
     def release_nowait(self, origin: str = ORIGIN_CHAT, *, pump: bool = True) -> None:
@@ -882,7 +1036,7 @@ class _KvArbiter:
         ls = self.ls
         if w.lane == LONG_OUTPUT:
             lo = ls.long_output
-            return (lo.closed or lo.active >= lo.capacity or ls.long_idle_waiting > 0
+            return (lo.closed or lo.active >= lo.capacity or _idle_waiters_holding(ls, w) > 0
                     or (w.origin == ORIGIN_V1 and ls.v1_long_output_held()))
         lg = ls.long
         if lg.active >= lg.capacity:
@@ -942,6 +1096,7 @@ class _KvArbiter:
             if (not self._gate_blocked(w)
                     and self._fits_long(led, w.charge, budget, self._borrows(w))
                     and led.fits_managed(w.charge, limit)
+                    and self._shared_fits(w)
                     and all(since_long + (0 if borrows and v1_answer else w.charge) + h.charge <= budget
                             and since_all + w.charge + h.charge <= limit
                             for h, since_long, since_all, borrows in protected)):
@@ -954,6 +1109,16 @@ class _KvArbiter:
                                        except_origin_lane=(ORIGIN_V1, LONG_OUTPUT) if borrows else None)
                 protected.append((w, since_long, led.since(w.enqueued_at), borrows))
         return None
+
+    def _shared_fits(self, w: _Waiter) -> bool:
+        """A chat LONG request's charge plus every patient footprint must fit
+        PUBLIC_API_SHARED_KV_BUDGET_TOKENS (module docstring, PATIENT LONG
+        HOLDERS). Patient and LONG_OUTPUT waiters are not held by it."""
+        if w.patient or w.lane != LONG:
+            return True
+        shared = shared_kv_budget_tokens()
+        held = self.ls.patient.total()
+        return shared <= 0 or held == 0 or held + w.charge <= shared
 
     def _pump(self) -> None:
         q = self.queue
@@ -972,6 +1137,51 @@ class _KvArbiter:
             granted = True
         if granted:
             self._publish()
+        self._yield_for_chat_long()
+
+    def _yield_for_chat_long(self) -> None:
+        """The first chat (non-patient) LONG waiter still waiting: when a
+        patient holder is what blocks it — the LONG seat, or KV it would have
+        without the patient charges — ask those holders to yield (module
+        docstring, PATIENT LONG HOLDERS). Largest footprint first, only as
+        many as it needs."""
+        ls = self.ls
+        if not ls.patient.entries:
+            return
+        head = next((w for w in self.queue.q[ORIGIN_CHAT] if w.lane == LONG and not w.patient), None)
+        if head is None:
+            return
+        holders = ls.patient.holders()
+        lg = ls.long
+        if lg.active >= lg.capacity:
+            seated = [h for h in holders if h.seated]
+            if seated:
+                ls.patient.request_yield(seated, "prefill")
+                return
+        led = ls.ledger
+        pool = kv_budget.cached()
+        budget = kv_budget.budget_tokens(pool)
+        limit = kv_budget.managed_limit_tokens(pool)
+        shared = shared_kv_budget_tokens()
+        if (led.fits(head.charge, budget) and led.fits_managed(head.charge, limit)
+                and self._shared_fits(head)):
+            return  # not blocked by KV: whatever holds it is not a patient holder's to give
+        chosen = []
+        committed, managed, held = led.committed, led.managed, ls.patient.total()
+        for h in sorted(holders, key=lambda e: e.charge, reverse=True):
+            fits_now = ((committed == 0 or committed + head.charge <= budget)
+                        and (managed == 0 or managed + head.charge <= limit)
+                        and (shared <= 0 or held == 0 or held + head.charge <= shared))
+            if fits_now:
+                break
+            chosen.append(h)
+            committed -= h.charge
+            managed -= h.charge
+            held -= h.charge
+        fits_after = ((committed <= 0 or committed + head.charge <= budget)
+                      and (managed <= 0 or managed + head.charge <= limit))
+        if chosen and fits_after:
+            ls.patient.request_yield(chosen, "kv")
 
     def _publish(self) -> None:
         self.ls.long._publish()
@@ -1000,17 +1210,22 @@ class _KvArbiter:
         on_wait: Optional[Callable[[int], Awaitable[None]]],
         tokens: int = 0,
         max_deferral_s: Optional[float] = None,
+        patient_: bool = False,
     ) -> float:
         cls = _fold(origin)
         if lane == LONG_OUTPUT and self.ls.long_output.capacity == 0:
+            # The kill switch is an operator's configuration, not a wait: a
+            # patient request is refused by it too.
             raise _reject(lane, "capacity", 0.0)
-        w = _Waiter(asyncio.get_running_loop().create_future(), cls, charge, lane, key, tokens)
+        w = _Waiter(asyncio.get_running_loop().create_future(), cls, charge, lane, key, tokens, patient_=patient_)
+        if patient_:
+            timeout = math.inf
         self.queue.add(w)
         self.ls.pump()
         if w.fut.done():
             self._publish()
             return 0.0
-        if self.queue.depth(cls, lane) - 1 >= max(0, int(settings.admission_max_waiting)):
+        if not patient_ and self.queue.bounded_depth(cls, lane) - 1 >= max(0, int(settings.admission_max_waiting)):
             self.queue.remove(w)
             self._publish()
             raise _reject(lane, "capacity", 0.0)
@@ -1022,11 +1237,133 @@ class _KvArbiter:
             ahead = self.ls.long.active + self.queue.position(w, LONG)
             closed = lambda: False  # noqa: E731
         self._publish()
+        queue = self.queue.q[cls]
         return await _await_grant(
             w, lane_name=lane, closed=closed, timeout=timeout, on_wait=on_wait, ahead=ahead,
             pump=self.ls.pump, leave=self._leave, give_back=lambda: self._give_back(w),
-            max_deferral_s=max_deferral_s,
+            max_deferral_s=max_deferral_s, is_head=lambda: bool(queue) and queue[0] is w,
         )
+
+
+class _PatientEntry:
+    __slots__ = ("run_id", "charge", "seated", "registered_at", "yield_asked")
+
+    def __init__(self, run_id: str, charge: int, seated: bool) -> None:
+        self.run_id = run_id
+        self.charge = max(0, int(charge))
+        #: True while the entry's ticket still holds the LONG seat (prefill).
+        self.seated = bool(seated)
+        self.registered_at = time.monotonic()
+        #: Set once a yield was requested: a holder is asked once, not per tick.
+        self.yield_asked = False
+
+
+class PatientKvLedger:
+    """The in-process map of patient LONG holders — run → footprint tokens
+    (input + planned output, the projected KV charge) — and the yield
+    callbacks the durable runner registers per run (module docstring, PATIENT
+    LONG HOLDERS). Synchronous throughout: it is read from grants.
+
+    `register`/`unregister`/`total` are the design's kv_ledger surface; a
+    patient LONG ticket maintains its own entry, and a caller may register a
+    run directly (a footprint it holds outside a ticket)."""
+
+    def __init__(self) -> None:
+        self.entries: Dict[str, _PatientEntry] = {}
+        self.callbacks: Dict[str, Callable[[], object]] = {}
+        #: Awaitables returned by async callbacks, held so the loop cannot drop them.
+        self._pending: "set[asyncio.Future]" = set()
+        #: Decode yields already asked of each run (DECODE YIELDS ARE CAPPED).
+        #: Keyed by run id and kept across the run's tickets — a yielded run
+        #: comes back with a new ticket under the same id — so it outlives
+        #: `unregister`; bounded, oldest forgotten first.
+        self.decode_yields: "OrderedDict[str, int]" = OrderedDict()
+
+    def register(self, run_id: str, tokens: int, *, seated: bool = False) -> None:
+        self.entries[str(run_id)] = _PatientEntry(str(run_id), tokens, seated)
+
+    def unregister(self, run_id: str) -> None:
+        self.entries.pop(str(run_id), None)
+
+    def total(self) -> int:
+        return sum(e.charge for e in self.entries.values())
+
+    def holders(self) -> List[_PatientEntry]:
+        return list(self.entries.values())
+
+    def unseat(self, run_id: str) -> None:
+        entry = self.entries.get(str(run_id))
+        if entry is not None:
+            entry.seated = False
+
+    def register_yield(self, run_id: str, callback: Callable[[], object]) -> None:
+        self.callbacks[str(run_id)] = callback
+
+    def decode_yields_left(self, run_id: str) -> int:
+        """How many more times this run's decode may be asked to yield
+        (PUBLIC_API_DECODE_YIELDS_PER_RUN less what was asked already)."""
+        return max(0, decode_yields_per_run() - int(self.decode_yields.get(str(run_id), 0)))
+
+    def _count_decode_yield(self, run_id: str) -> None:
+        key = str(run_id)
+        self.decode_yields[key] = int(self.decode_yields.get(key, 0)) + 1
+        self.decode_yields.move_to_end(key)
+        while len(self.decode_yields) > _DECODE_YIELD_MEMORY:
+            self.decode_yields.popitem(last=False)
+
+    def beside_decoders(self) -> List[_PatientEntry]:
+        """Patient holders a chat LONG request prefills BESIDE rather than
+        waiting for: past their first token, never asked to yield in this
+        ticket, and with no decode yield left (DECODE YIELDS ARE CAPPED)."""
+        return [h for h in self.entries.values()
+                if not h.seated and not h.yield_asked and self.decode_yields_left(h.run_id) <= 0]
+
+    def unregister_yield(self, run_id: str) -> None:
+        self.callbacks.pop(str(run_id), None)
+
+    def request_yield(self, entries: Sequence[_PatientEntry], reason: str) -> int:
+        """Ask each holder once to yield. The callback runs on the NEXT loop
+        iteration (`call_soon`): a callback that suspends synchronously would
+        otherwise release a ticket inside the very grant loop that asked.
+        Returns how many callbacks were scheduled."""
+        scheduled = 0
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return 0
+        for entry in entries:
+            if entry.yield_asked:
+                continue
+            if reason == "decode" and self.decode_yields_left(entry.run_id) <= 0:
+                # Spent: this run's decode is prefilled beside, not suspended again.
+                continue
+            callback = self.callbacks.get(entry.run_id)
+            entry.yield_asked = True
+            if callback is None:
+                log.warning("admission: patient run %s blocks a chat long request (%s) but registered no "
+                            "yield callback; chat waits for it", entry.run_id, reason)
+                continue
+            metrics.inc("llm_admission_patient_yields_total",
+                        "Patient (/v1) long holders asked to yield to a chat long request, by reason.",
+                        reason=reason)
+            log.info("admission: asking patient run %s (%d KV tokens) to yield to a chat long request (%s)",
+                     entry.run_id, entry.charge, reason)
+            if reason == "decode":
+                self._count_decode_yield(entry.run_id)
+            loop.call_soon(self._invoke, callback, entry.run_id)
+            scheduled += 1
+        return scheduled
+
+    def _invoke(self, callback: Callable[[], object], run_id: str) -> None:
+        try:
+            result = callback()
+        except Exception:  # noqa: BLE001 — a failing callback must not break the lanes
+            log.exception("admission: yield callback for run %s raised", run_id)
+            return
+        if inspect.isawaitable(result):
+            fut = asyncio.ensure_future(result)
+            self._pending.add(fut)
+            fut.add_done_callback(self._pending.discard)
 
 
 class Lanes:
@@ -1040,8 +1377,13 @@ class Lanes:
         #: LONG requests between their grant and the end of their idle wait:
         #: LONG_OUTPUT admissions are held meanwhile (LONG BESIDE LONG ANSWERS).
         self.long_idle_waiting = 0
+        #: How many of those are PATIENT: they hold only /v1 LONG_OUTPUT
+        #: admissions, never chat ones (PATIENT IDLE WAITERS NEVER HOLD CHAT).
+        self.long_idle_waiting_patient = 0
         #: [start, end or None] of /v1-origin LONG closures (THE /v1 CLOSURE BUDGET).
         self.v1_closures: Deque[List[Optional[float]]] = deque()
+        #: Patient LONG holders and their yield callbacks (PATIENT LONG HOLDERS).
+        self.patient = PatientKvLedger()
         #: When a chat LONG request was last refused while /v1 long answers
         #: were on the engine (module docstring, BACK TO BACK), or None.
         self.chat_long_refused_at: Optional[float] = None
@@ -1176,6 +1518,62 @@ def lanes() -> Lanes:
     return found
 
 
+class _KvLedgerAccess:
+    """`admission.kv_ledger` — callable (`kv_ledger()` returns this loop's
+    PatientKvLedger) AND usable as the ledger itself (`kv_ledger.register`,
+    `.unregister`, `.total`, `.fits`), so a caller written against either
+    shape of the design's surface works. Every method resolves the running
+    loop's lanes at call time."""
+
+    def __call__(self) -> PatientKvLedger:
+        return lanes().patient
+
+    def register(self, run_id: str, tokens: int) -> None:
+        lanes().patient.register(run_id, tokens)
+
+    def unregister(self, run_id: str) -> None:
+        lanes().patient.unregister(run_id)
+
+    def total(self) -> int:
+        return lanes().patient.total()
+
+    def fits(self, tokens: int) -> bool:
+        """Would a patient run with this footprint (input + planned output)
+        fit if it were admitted now — the KV budget, the managed limit and
+        PUBLIC_API_SHARED_KV_BUDGET_TOKENS beside what is committed? What a
+        yielded run waits for before it re-enters the LONG queue."""
+        ls = lanes()
+        pool = kv_budget.cached()
+        charge = kv_budget.charge_tokens(int(tokens), 0, block_size=pool.block_size,
+                                         window=getattr(settings, "model_max_context", None))
+        shared = shared_kv_budget_tokens()
+        held = ls.patient.total()
+        return (ls.ledger.fits(charge, kv_budget.budget_tokens(pool))
+                and ls.ledger.fits_managed(charge, kv_budget.managed_limit_tokens(pool))
+                and (shared <= 0 or held == 0 or held + int(tokens) <= shared))
+
+
+kv_ledger = _KvLedgerAccess()
+
+
+def chat_long_admission_present() -> bool:
+    """A chat (non-patient) LONG request holds the LONG seat or waits for it —
+    the other half of what a yielded patient run waits out."""
+    ls = lanes()
+    return ls.long.active_by_origin.get(ORIGIN_CHAT, 0) > 0 or _chat_long_waiting(ls)
+
+
+def register_yield(run_id: str, callback: Callable[[], object]) -> None:
+    """Register the durable runner's yield callback for `run_id`: called
+    (sync, or an awaitable that is scheduled) when a chat LONG request is
+    blocked by that run's patient LONG ticket."""
+    lanes().patient.register_yield(run_id, callback)
+
+
+def unregister_yield(run_id: str) -> None:
+    lanes().patient.unregister_yield(run_id)
+
+
 # ---------------------------------------------------------------------------
 # Choosing the lane
 # ---------------------------------------------------------------------------
@@ -1237,41 +1635,120 @@ def _beside_v1_answers_proceeds(ls: "Lanes", origin_: str) -> bool:
             and chat_long_beside_v1_answers() == BESIDE_PROCEED)
 
 
-def _ahead(ls: "Lanes", origin_: str = ORIGIN_CHAT) -> Optional[int]:
+def _ahead(ls: "Lanes", origin_: str = ORIGIN_CHAT, *, beside: int = 0) -> Optional[int]:
     """How much work is in front of a long request: the engine's own
     `requests_running` from the controller's sample — every sequence,
     LONG_OUTPUT decoders included (a decode is half of the GDN fault shape;
     module docstring, LONG BESIDE LONG ANSWERS) — or, with no sample, this
     process's NORMAL and LONG_OUTPUT occupancy less the pre-admitted calls
-    parked behind a closure (they are not on the engine). Under
+    parked behind a closure (they are not on the engine), plus the patient LONG
+    holders past their first token. Under
     ADMISSION_CHAT_LONG_BESIDE_V1_ANSWERS=proceed a chat request does not count
-    /v1 long answers that are decoding. None when idle by that measure."""
+    /v1 long answers that are decoding. `beside` sequences are not counted
+    either: the patient decoders a chat document prefills beside once their
+    decode yields are spent (DECODE YIELDS ARE CAPPED). None when idle by that
+    measure."""
     idle_max = max(0, int(settings.admission_long_idle_max))
     sample = engine_state.engine_load()
     if sample is not None:
         running = int(sample["requests_running"])
     else:
-        running = int(ls.normal.active) + int(ls.long_output.active) - int(ls.long_output_parked)
+        # Patient LONG holders past their first token gave the LONG seat back
+        # but still decode: they are running work too (PATIENT LONG HOLDERS).
+        decoding = sum(1 for h in ls.patient.holders() if not h.seated)
+        running = int(ls.normal.active) + int(ls.long_output.active) - int(ls.long_output_parked) + decoding
     if _beside_v1_answers_proceeds(ls, origin_):
         running -= int(ls.long_output.decoding)
-    running = max(0, running)
+    running = max(0, running - max(0, int(beside)))
     return running if running > idle_max else None
 
 
-async def _wait_for_idle(deadline: float, ls: "Lanes", origin_: str = ORIGIN_CHAT) -> bool:
+def _idle_waiters_holding(ls: "Lanes", w: "_Waiter") -> int:
+    """The LONG idle waiters that hold LONG_OUTPUT waiter `w` back (LONG BESIDE
+    LONG ANSWERS): all of them for a /v1 waiter, only the chat ones for a chat
+    waiter (PATIENT IDLE WAITERS NEVER HOLD CHAT)."""
+    if w.origin == ORIGIN_CHAT:
+        return max(0, ls.long_idle_waiting - ls.long_idle_waiting_patient)
+    return ls.long_idle_waiting
+
+
+def _patient_idle_gives_way(ls: "Lanes", ticket: "_Ticket") -> bool:
+    """Should a patient LONG request that holds the LONG seat and a KV charge
+    while it waits for idle give both back and queue again (PATIENT IDLE
+    WAITERS NEVER HOLD CHAT)? Exactly when a chat waiter is kept out by what
+    it holds: the arbiter grants nothing now, and WITHOUT this ticket's seat,
+    charge and patient footprint it would grant a chat waiter — a chat LONG
+    request the seat blocks, or a chat LONG_OUTPUT request only the charge
+    keeps out of KV.
+
+    A dry run of the arbiter's own choice (`_KvArbiter._choose`), not a
+    re-statement of it: "any chat waiter" re-granted the patient request at
+    once for a chat waiter held by something else (a protected head, the
+    reserve), and a grant that needs no await spun the loop. The state is
+    lifted and restored synchronously, with no await in between, so nothing
+    else can observe it.
+    """
+    if not any(not w.patient for w in ls.kv.queue.q[ORIGIN_CHAT]):
+        return False
+    arbiter = ls.kv
+    if arbiter._choose() is not None:
+        return False  # something is grantable already: the next pump grants it
+    led = ls.ledger
+    key = ticket.kv_key
+    entry = led._entries.pop(key, None) if key is not None else None
+    if entry is not None:
+        if entry.kind == kv_budget.NORMAL_V1:
+            led.normal_committed -= entry.charge
+        else:
+            led.committed -= entry.charge
+    seat = ls.get(ticket.lane)
+    seated = not ticket.seat_released and not ticket.released
+    if seated:
+        seat.active -= 1
+        seat.active_by_origin[ticket.origin] = seat.active_by_origin.get(ticket.origin, 0) - 1
+    footprint = ls.patient.entries.pop(str(ticket.run_id), None) if ticket.run_id is not None else None
+    try:
+        chosen = arbiter._choose()
+    finally:
+        if footprint is not None:
+            ls.patient.entries[str(ticket.run_id)] = footprint
+        if seated:
+            seat.active += 1
+            seat.active_by_origin[ticket.origin] = seat.active_by_origin.get(ticket.origin, 0) + 1
+        if entry is not None:
+            led._entries[key] = entry
+            if entry.kind == kv_budget.NORMAL_V1:
+                led.normal_committed += entry.charge
+            else:
+                led.committed += entry.charge
+    return chosen is not None and chosen.origin == ORIGIN_CHAT and not chosen.patient
+
+
+async def _wait_for_idle(
+    deadline: float,
+    ls: "Lanes",
+    origin_: str = ORIGIN_CHAT,
+    *,
+    interrupt: Optional[Callable[[], bool]] = None,
+    beside: Optional[Callable[[], int]] = None,
+) -> bool:
     """Wait until the engine is idle — the controller's engine sample says
     `requests_running` ≤ ADMISSION_LONG_IDLE_MAX, or, with no sample (an
     unknown controller), this process's own lanes are that empty — or
-    `deadline` passes. The NORMAL lane is NOT closed meanwhile (module
-    docstring); the log says once when the sample is unknown."""
+    `deadline` passes, or `interrupt()` says to stop waiting (False either
+    way). `beside()` is re-read each poll (see `_ahead`). The NORMAL lane is
+    NOT closed meanwhile (module docstring); the log says once when the sample
+    is unknown."""
     said_unknown = False
     while True:
         if engine_state.engine_load() is None and not said_unknown:
             said_unknown = True
             log.info("admission: controller engine sample unknown; the long request waits for this "
                      "process's own lane to be idle")
-        if _ahead(ls, origin_) is None:
+        if _ahead(ls, origin_, beside=beside() if beside is not None else 0) is None:
             return True
+        if interrupt is not None and interrupt():
+            return False
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -1283,12 +1760,20 @@ class _Ticket:
     synchronous and idempotent (module docstring, KV BUDGET)."""
 
     __slots__ = ("lane", "lanes", "origin", "long_holds_normal", "released", "waited_s", "_closure_timer",
-                 "kv_key", "decoding", "loop", "_closure_interval", "claimed")
+                 "kv_key", "decoding", "loop", "_closure_interval", "claimed", "patient", "run_id",
+                 "seat_released")
 
-    def __init__(self, lane: str, lanes_: Lanes, origin_: str = ORIGIN_CHAT) -> None:
+    def __init__(self, lane: str, lanes_: Lanes, origin_: str = ORIGIN_CHAT, *, patient_: bool = False,
+                 run_id: Optional[str] = None) -> None:
         self.lane = lane
         self.lanes = lanes_
         self.origin = _fold(origin_)
+        self.patient = bool(patient_)
+        #: The patient-ledger name of a patient LONG ticket (its run, or its
+        #: own id when the caller named none).
+        self.run_id = run_id
+        #: A patient LONG ticket that gave its seat back at first token.
+        self.seat_released = False
         self.long_holds_normal = False
         self.released = False
         self.waited_s = 0.0
@@ -1363,13 +1848,46 @@ class _Ticket:
 
     def first_token_nowait(self) -> None:
         """The first chunk: a LONG request's large prefill is done (the lanes
-        may take new work again); a LONG_OUTPUT request is decode-only now."""
+        may take new work again); a LONG_OUTPUT request is decode-only now; a
+        patient LONG ticket gives its seat back and keeps its KV
+        (`release_patient_at_first_token`)."""
         self._cancel_timer()
         if self.lane == LONG_OUTPUT and not self.decoding and not self.released:
             self.decoding = True
             self.lanes.long_output.decoding += 1
             self.lanes.publish_kv()
-        self._reopen_closure()
+        changed = self.long_holds_normal
+        self._reopen_closure(pump=False)
+        if self.patient and self.lane == LONG and long_release_at_first_token() and not self.seat_released:
+            self.release_patient_at_first_token(pump=False)
+            changed = True
+        if changed:
+            # Exactly when the chat path always pumped here: a reopened closure
+            # (or, for patient work, a freed seat). Nothing else changed.
+            self.lanes.pump()
+
+    def register_patient(self) -> None:
+        """A granted patient LONG ticket enters the patient ledger."""
+        if not self.patient or self.lane != LONG or self.released:
+            return
+        if self.run_id is None:
+            self.run_id = f"ticket-{id(self):x}"
+        entry = self.lanes.ledger._entries.get(self.kv_key) if self.kv_key is not None else None
+        charge = entry.charge if entry is not None else 0
+        self.lanes.patient.register(self.run_id, charge, seated=True)
+
+    def release_patient_at_first_token(self, *, pump: bool = True) -> None:
+        """Give the LONG seat back and keep the KV charge and the ledger entry
+        until the stream ends (module docstring, PATIENT LONG HOLDERS)."""
+        if self.released or self.seat_released or self.lane != LONG:
+            return
+        self.seat_released = True
+        ls = self.lanes
+        ls.long.release_nowait(self.origin, pump=False)
+        if self.run_id is not None:
+            ls.patient.unseat(self.run_id)
+        if pump:
+            ls.pump()
 
     async def first_token(self) -> None:
         self.first_token_nowait()
@@ -1387,7 +1905,10 @@ class _Ticket:
         if self.kv_key is not None:
             ls.ledger.release(self.kv_key)
             self.kv_key = None
-        ls.get(self.lane).release_nowait(self.origin, pump=False)
+        if self.patient and self.lane == LONG and self.run_id is not None:
+            ls.patient.unregister(self.run_id)
+        if not self.seat_released:
+            ls.get(self.lane).release_nowait(self.origin, pump=False)
         ls.pump()
         ls.publish_kv()
 
@@ -1431,10 +1952,12 @@ async def _admit(
     tokens: int = 0,
     max_tokens: Optional[int] = None,
     base_url: str = "",
+    patient_: bool = False,
+    run_id: Optional[str] = None,
 ) -> _Ticket:
     ls = lanes()
-    ticket = _Ticket(lane, ls, origin_)
     if lane == NORMAL:
+        ticket = _Ticket(lane, ls, origin_, patient_=patient_, run_id=run_id)
         charge, key = 0, None
         if _fold(origin_) == ORIGIN_V1:
             # The NORMAL path never reads the pool: the cached block size is
@@ -1444,12 +1967,14 @@ async def _admit(
                                              window=getattr(settings, "model_max_context", None))
             key = object()
         ticket.waited_s = await ls.normal.acquire(origin=origin_, timeout=float(settings.admission_normal_wait_s),
-                                                  on_wait=on_wait, charge=charge, key=key)
+                                                  on_wait=on_wait, charge=charge, key=key, patient_=patient_)
         ticket.kv_key = key
         return ticket
     if lane == LONG_OUTPUT:
+        ticket = _Ticket(lane, ls, origin_, patient_=patient_, run_id=run_id)
         charge = _charge(ls, tokens, max_tokens, base_url)
-        bound = _wait_bound.get()
+        # A patient request ignores a per-request bound: it has none.
+        bound = None if patient_ else _wait_bound.get()
         key = object()
         # Seat and KV in one wait; a refusal holds nothing (a same-tick grant
         # was given back inside the wait). A caller's own bound is a wall
@@ -1458,10 +1983,30 @@ async def _admit(
         ticket.waited_s = await ls.kv.acquire(
             lane=LONG_OUTPUT, origin=origin_, charge=charge, key=key, tokens=tokens,
             timeout=float(long_output_wait_s() if bound is None else bound), on_wait=on_wait,
-            max_deferral_s=None if bound is None else 0.0,
+            max_deferral_s=None if bound is None else 0.0, patient_=patient_,
         )
         ticket.kv_key = key
         return ticket
+    return await _admit_long(on_wait, ls, origin_=origin_, tokens=tokens, max_tokens=max_tokens,
+                             base_url=base_url, patient_=patient_, run_id=run_id)
+
+
+def _chat_long_waiting(ls: "Lanes") -> bool:
+    """A chat (non-patient) LONG request is waiting for the seat or KV."""
+    return any(w.lane == LONG and not w.patient for w in ls.kv.queue.q[ORIGIN_CHAT])
+
+
+async def _admit_long(
+    on_wait,
+    ls: "Lanes",
+    *,
+    origin_: str,
+    tokens: int,
+    max_tokens: Optional[int],
+    base_url: str,
+    patient_: bool,
+    run_id: Optional[str],
+) -> _Ticket:
     budget = float(settings.admission_long_wait_s)
     started = time.monotonic()
     told = False
@@ -1475,54 +2020,115 @@ async def _admit(
         told = True
         await on_wait(ahead)
 
-    # Seat and KV in one grant (module docstring, ONE ARBITER): a document
-    # waiting for the seat is already in the KV order.
-    charge = _charge(ls, tokens, max_tokens, base_url)
-    key = object()
-    try:
-        ticket.waited_s = await ls.kv.acquire(lane=LONG, origin=origin_, charge=charge, key=key, tokens=tokens,
-                                              timeout=budget, on_wait=tell)
-    except AdmissionRejected:
-        ls.note_chat_long_refused(origin_)
-        raise
-    ticket.kv_key = key
-    try:
-        deadline = started + budget
-        # Wait for the engine to be idle — the NORMAL lane keeps admitting
-        # meanwhile (module docstring); new LONG_OUTPUT admissions do not.
-        ls.long_idle_waiting += 1
+    #: When this request last gave its place back (PATIENT IDLE WAITERS NEVER
+    #: HOLD CHAT): no second give-back inside one poll, so a re-grant that
+    #: needs no await can never spin the loop.
+    gave_way_at: Optional[float] = None
+    chat_document = not patient_ and _fold(origin_) == ORIGIN_CHAT
+
+    while True:
+        ticket = _Ticket(LONG, ls, origin_, patient_=patient_, run_id=run_id)
+        # Seat and KV in one grant (module docstring, ONE ARBITER): a document
+        # waiting for the seat is already in the KV order.
+        charge = _charge(ls, tokens, max_tokens, base_url)
+        key = object()
         try:
-            ahead = _ahead(ls, origin_)
-            if ahead is not None:
-                await tell(ahead)
-            idle = await _wait_for_idle(deadline, ls, origin_)
-        finally:
-            ls.long_idle_waiting = max(0, ls.long_idle_waiting - 1)
-        if not idle:
-            waited = time.monotonic() - started
-            if ls.long_output.active > 0 and not _beside_v1_answers_proceeds(ls, origin_):
-                # Our own long answers decode for hours: proceeding would make
-                # the fault shape routine (LONG BESIDE LONG ANSWERS).
-                log.warning("admission: engine not idle after %.0fs with %d long answer(s) on it; "
-                            "long request refused", budget, ls.long_output.active)
-                ls.note_chat_long_refused(origin_)
-                raise _reject(LONG, "timeout", waited)
-            if _fold(origin_) == ORIGIN_V1 and ls.normal.queue.depth(ORIGIN_CHAT) > 0:
-                log.warning("admission: engine not idle after %.0fs and a chat turn waits for NORMAL; "
-                            "/v1 long request refused", budget)
-                raise _reject(LONG, "timeout", waited)
-            # The bound is "at most": the engine never went idle (the other
-            # tenant, most likely). The closed lane below is the protection
-            # the orchestrator can give; the request goes in and the log says.
-            log.warning("admission: engine not idle after %.0fs; long request proceeds", budget)
-        # ADMITTED: from here to the first token nothing new is admitted to
-        # NORMAL or LONG_OUTPUT, so no other prefill of ours mixes with it.
-        ticket.close_lanes()
-        ticket.waited_s = time.monotonic() - started
-        return ticket
-    except BaseException:
-        ticket.release_nowait()
-        raise
+            await ls.kv.acquire(lane=LONG, origin=origin_, charge=charge, key=key, tokens=tokens,
+                                timeout=budget, on_wait=tell, patient_=patient_)
+        except AdmissionRejected:
+            ls.note_chat_long_refused(origin_)
+            raise
+        ticket.kv_key = key
+        ticket.register_patient()
+        try:
+            round_started = time.monotonic()
+            deadline = (started if not patient_ else round_started) + budget
+            requeue = False
+
+            def gives_way(ticket_: _Ticket = ticket) -> bool:
+                if gave_way_at is not None and time.monotonic() - gave_way_at < _POLL_S:
+                    return False
+                return _patient_idle_gives_way(ls, ticket_)
+
+            def beside() -> int:
+                # A chat document prefills beside a public decode whose decode
+                # yields are spent (DECODE YIELDS ARE CAPPED); nothing else does.
+                return len(ls.patient.beside_decoders()) if chat_document else 0
+
+            # Wait for the engine to be idle — the NORMAL lane keeps admitting
+            # meanwhile (module docstring); new LONG_OUTPUT admissions do not
+            # (a patient waiter holds only /v1 ones).
+            ls.long_idle_waiting += 1
+            if patient_:
+                ls.long_idle_waiting_patient += 1
+            try:
+                ahead = _ahead(ls, origin_, beside=beside())
+                if ahead is not None:
+                    await tell(ahead)
+                    if chat_document:
+                        # Our own patient long answers are running work this
+                        # request must not prefill beside (LONG BESIDE LONG
+                        # ANSWERS): they yield to it (PATIENT LONG HOLDERS) —
+                        # each run at most PUBLIC_API_DECODE_YIELDS_PER_RUN
+                        # times (DECODE YIELDS ARE CAPPED).
+                        decoders = [h for h in ls.patient.holders() if not h.seated]
+                        if decoders:
+                            ls.patient.request_yield(decoders, "decode")
+                while True:
+                    idle = await _wait_for_idle(
+                        deadline, ls, origin_, interrupt=gives_way if patient_ else None, beside=beside,
+                    )
+                    if idle:
+                        break
+                    if patient_ and gives_way():
+                        # A chat request is kept out by the seat or the KV we
+                        # hold without having started: give both back and
+                        # queue again behind it.
+                        requeue = True
+                        break
+                    if time.monotonic() < deadline:
+                        continue
+                    waited = time.monotonic() - started
+                    if ls.long_output.active > 0 and not _beside_v1_answers_proceeds(ls, origin_):
+                        if patient_:
+                            deadline = time.monotonic() + budget
+                            continue
+                        # Our own long answers decode for hours: proceeding would make
+                        # the fault shape routine (LONG BESIDE LONG ANSWERS).
+                        log.warning("admission: engine not idle after %.0fs with %d long answer(s) on it; "
+                                    "long request refused", budget, ls.long_output.active)
+                        ls.note_chat_long_refused(origin_)
+                        raise _reject(LONG, "timeout", waited)
+                    if _fold(origin_) == ORIGIN_V1 and ls.normal.queue.depth(ORIGIN_CHAT) > 0:
+                        if patient_:
+                            deadline = time.monotonic() + budget
+                            continue
+                        log.warning("admission: engine not idle after %.0fs and a chat turn waits for NORMAL; "
+                                    "/v1 long request refused", budget)
+                        raise _reject(LONG, "timeout", waited)
+                    # The bound is "at most": the engine never went idle (the other
+                    # tenant, most likely). The closed lane below is the protection
+                    # the orchestrator can give; the request goes in and the log says.
+                    log.warning("admission: engine not idle after %.0fs; long request proceeds", budget)
+                    break
+            finally:
+                ls.long_idle_waiting = max(0, ls.long_idle_waiting - 1)
+                if patient_:
+                    ls.long_idle_waiting_patient = max(0, ls.long_idle_waiting_patient - 1)
+            if requeue:
+                metrics.inc("llm_admission_patient_requeues_total",
+                            "Patient long requests that gave their seat back to a chat long request before starting.")
+                gave_way_at = time.monotonic()
+                ticket.release_nowait()
+                continue
+            # ADMITTED: from here to the first token nothing new is admitted to
+            # NORMAL or LONG_OUTPUT, so no other prefill of ours mixes with it.
+            ticket.close_lanes()
+            ticket.waited_s = time.monotonic() - started
+            return ticket
+        except BaseException:
+            ticket.release_nowait()
+            raise
 
 
 class _LaneStream:
@@ -1610,8 +2216,15 @@ async def run(
     model: str,
     stream: bool = False,
     max_tokens: Optional[int] = None,
+    patient: Optional[bool] = None,
+    run_id: Optional[str] = None,
 ) -> T:
     """Run one main-model call through its lane.
+
+    `patient` (None: this context's `patient()`) makes every wait unbounded
+    and keeps the waiter out of the chat depth bound (PATIENT WAITERS).
+    `run_id` (None: this context's `set_run_id`) names the durable run a
+    patient LONG ticket yields for.
 
     `op` opens the call (the resilient wrapper's retry loop calls this per
     attempt, AFTER the breaker admitted it — a request queued for a
@@ -1631,6 +2244,7 @@ async def run(
         # LONG (never pre-admitted), are still admitted AS the long answer they
         # are — a LONG_OUTPUT seat, and a KV charge that includes the output.
         max_tokens = _planned_max_tokens.get()
+    patient_ = _patient.get() if patient is None else bool(patient)
     lane = lane_for(tokens, max_tokens, origin_)
     line = LONG_LINE if lane == LONG else LONG_OUTPUT_LINE if lane == LONG_OUTPUT else NORMAL_LINE
 
@@ -1645,12 +2259,13 @@ async def run(
         # that has closed the lanes since: that closure holds it too.
         ticket, lane = pre, pre.lane
         try:
-            ticket.waited_s += await _wait_out_closure(ticket.lanes)
+            ticket.waited_s += await _wait_out_closure(ticket.lanes, patient_=ticket.patient)
         except BaseException:
             ticket.release_nowait()
             raise
     else:
-        ticket = await _admit(lane, on_wait, origin_=origin_, tokens=tokens, max_tokens=max_tokens, base_url=base_url)
+        ticket = await _admit(lane, on_wait, origin_=origin_, tokens=tokens, max_tokens=max_tokens, base_url=base_url,
+                              patient_=patient_, run_id=run_id if run_id is not None else _run_id.get())
     # Everything between the grant and the stream's hand-off releases the
     # ticket if it raises: `hold.resume()` raises LeaseLost on purpose and
     # awaits the database, where a Stop can cancel it — a ticket lost there
@@ -1738,12 +2353,16 @@ def _take_preadmitted(lane: str) -> Optional["_Ticket"]:
     return pre
 
 
-async def _wait_out_closure(ls: "Lanes") -> float:
+async def _wait_out_closure(ls: "Lanes", *, patient_: bool = False) -> float:
     """A pre-admitted LONG_OUTPUT call waits, before it is sent, while a LONG
     request holds the lanes closed or is waiting for the engine to go idle —
     the two states that hold a LONG_OUTPUT grant (`_KvArbiter._gate_blocked`)
     — for at most LONG_CLOSURE_MAX_S in total, like any waiter's deferral;
-    past that it is refused `timeout`. Returns the seconds waited."""
+    past that it is refused `timeout`. Returns the seconds waited.
+
+    A PATIENT ticket (no-timeout /v1, merged with the front door 2026-09-14)
+    has no such bound: it waits the closure out however long it lasts, like
+    every other patient wait in this module (PATIENT WAITERS)."""
     started = time.monotonic()
     if not (ls.long_output.closed or ls.long_idle_waiting > 0):
         return 0.0
@@ -1751,6 +2370,9 @@ async def _wait_out_closure(ls: "Lanes") -> float:
     try:
         while ls.long_output.closed or ls.long_idle_waiting > 0:
             waited = time.monotonic() - started
+            if patient_:
+                await asyncio.sleep(_POLL_S)
+                continue
             if waited >= LONG_CLOSURE_MAX_S:
                 raise _reject(LONG_OUTPUT, "timeout", waited)
             await asyncio.sleep(min(_POLL_S, LONG_CLOSURE_MAX_S - waited))
@@ -1765,7 +2387,8 @@ async def preadmit(
     base_url: str,
     model: str,
     max_tokens: Optional[int],
-    wait_s: float,
+    wait_s: Optional[float],
+    patient: Optional[bool] = None,
 ) -> "Optional[_Ticket]":
     """Admit a long answer now, for a call that will be made later in this
     context (publicapi's gate, before the status line).
@@ -1775,15 +2398,24 @@ async def preadmit(
     admitted by `run` itself). Raises AdmissionRejected as `run` would, after
     at most `wait_s` of the caller's own wait. The caller releases the ticket
     (`release_nowait`, idempotent) when its request ends, whatever happened to
-    the call."""
+    the call.
+
+    `wait_s=None` is the no-timeout /v1 caller (capacity.hold with no
+    deadline): the admission is PATIENT, with no bound at all, whatever this
+    context's `patient()` says — a gate that waits without a clock must not
+    hand its caller to a lane that refuses on one. `patient` overrides."""
     tokens = await prompt_tokens(messages, base_url=base_url, model=model)
     origin_ = current_origin()
     if lane_for(tokens, max_tokens, origin_) != LONG_OUTPUT:
         return None
-    bound = _wait_bound.set(max(0.0, float(wait_s)))
+    if patient is None:
+        patient_ = True if wait_s is None else _patient.get()
+    else:
+        patient_ = bool(patient)
+    bound = _wait_bound.set(None if wait_s is None else max(0.0, float(wait_s)))
     try:
         return await _admit(LONG_OUTPUT, None, origin_=origin_, tokens=tokens, max_tokens=max_tokens,
-                            base_url=base_url)
+                            base_url=base_url, patient_=patient_)
     finally:
         _wait_bound.reset(bound)
 
@@ -1804,6 +2436,35 @@ def use_preadmitted(ticket: "Optional[_Ticket]", *, max_tokens: Optional[int] = 
             _planned_max_tokens.reset(planned)
         with contextlib.suppress(ValueError):
             _preadmitted.reset(token)
+
+
+def preadmission_carry() -> "Tuple[Optional[_Ticket], Optional[int]]":
+    """This context's pre-admitted ticket and planned output, unclaimed and
+    unchanged — for a caller that holds the public gate in ONE task and runs
+    the generation in ANOTHER.
+
+    WHY (merge of the no-timeout release with PR #65, 2026-09-14). The no-
+    timeout stream holds its gates from a helper task, so it can keep writing
+    `: queued` while it waits (publicapi/router.py `_GateHolder`, and the file
+    stream's gate task). `capacity.hold` sets `use_preadmitted` in THAT task's
+    context, which the generation's producer task never sees: the answer was
+    admitted into LONG_OUTPUT twice — one seat held by the waiting helper, one
+    taken by the generation — and two such streams would fill both seats and
+    then wait for a third that never frees. The helper reads this after the
+    gate is held; the generating context re-applies it with
+    `adopt_preadmission`."""
+    return _preadmitted.get(), _planned_max_tokens.get()
+
+
+@contextlib.contextmanager
+def adopt_preadmission(carried: "Optional[Tuple[Optional[_Ticket], Optional[int]]]") -> Iterator[None]:
+    """`use_preadmitted` for a value `preadmission_carry` read in another
+    context; nothing when there is nothing to carry."""
+    if carried is None or (carried[0] is None and carried[1] is None):
+        yield
+        return
+    with use_preadmitted(carried[0], max_tokens=carried[1]):
+        yield
 
 
 def describe() -> dict:

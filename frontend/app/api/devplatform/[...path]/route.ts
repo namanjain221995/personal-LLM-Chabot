@@ -37,6 +37,7 @@
 
 import {
   MAX_PROXY_BODY_BYTES,
+  PROXY_TIMEOUT_MS,
   declaredBodyOverLimit,
   orchestratorUrl,
   proxyToOrchestrator,
@@ -107,6 +108,16 @@ interface Operation {
   query?: Readonly<Record<string, QueryRule>>;
   /** Piped through unbuffered (the playground). */
   stream?: boolean;
+  /** A GET event stream piped through unbuffered (a file's processing events). */
+  events?: boolean;
+  /** A raw upload part: bounded at MAX_CONSOLE_PART_BYTES, its digest forwarded. */
+  part?: boolean;
+  /**
+   * Writes here must come from this page: see `crossSiteWriteRefusal`. Set on
+   * the Files writes, whose upload handlers read a JSON body whatever its
+   * content type and accept an empty one.
+   */
+  sameOriginWrites?: boolean;
 }
 
 /**
@@ -153,6 +164,43 @@ const OPERATIONS: readonly Operation[] = [
   { pattern: ['projects', ':id', 'webhooks'], methods: ['GET', 'POST'] },
   { pattern: ['projects', ':id', 'webhooks', ':id'], methods: ['PATCH', 'DELETE'] },
   { pattern: ['projects', ':id', 'webhooks', ':id', 'test'], methods: ['POST'] },
+  // The Files tab (Files design §14.1): metadata, the processing events and
+  // the Uploads flow. NO BYTE ROUTE — neither `files/:id/content` nor
+  // `files/:id/derived/:name` is here (owner decision D6: bytes never ride a
+  // session cookie on the app origin).
+  {
+    pattern: ['projects', ':id', 'files'],
+    methods: ['GET'],
+    // console_api.list_files: `after` a file id, `Query(50, ge=1, le=100)`,
+    // `status` one of processing.state, `kind` one of sniff.STAGES_BY_KIND's.
+    query: {
+      after: identifier,
+      limit: boundedInt(1, 100),
+      status: oneOf(['queued', 'processing', 'processed', 'failed']),
+      kind: oneOf([
+        'pdf',
+        'document',
+        'presentation',
+        'text',
+        'html',
+        'spreadsheet',
+        'tabular',
+        'image',
+        'audio',
+        'video',
+        'unsupported',
+      ]),
+    },
+  },
+  { pattern: ['projects', ':id', 'files', ':id'], methods: ['GET', 'DELETE'], sameOriginWrites: true },
+  { pattern: ['projects', ':id', 'files', ':id', 'events'], methods: ['GET'], events: true },
+  { pattern: ['projects', ':id', 'files', ':id', 'derived'], methods: ['GET'] },
+  { pattern: ['projects', ':id', 'storage'], methods: ['GET'] },
+  { pattern: ['projects', ':id', 'uploads'], methods: ['POST'], sameOriginWrites: true },
+  { pattern: ['projects', ':id', 'uploads', ':id'], methods: ['GET'] },
+  { pattern: ['projects', ':id', 'uploads', ':id', 'parts', ':id'], methods: ['PUT'], part: true, sameOriginWrites: true },
+  { pattern: ['projects', ':id', 'uploads', ':id', 'complete'], methods: ['POST'], sameOriginWrites: true },
+  { pattern: ['projects', ':id', 'uploads', ':id', 'cancel'], methods: ['POST'], sameOriginWrites: true },
   {
     pattern: ['usage'],
     methods: ['GET'],
@@ -230,6 +278,16 @@ export function consoleQuery(parts: string[], method: string, search: string): s
  */
 export const MAX_CONSOLE_BODY_BYTES = 1024 * 1024;
 
+/**
+ * The one exception to the 1 MiB rule: an upload part from the Files tab.
+ * It equals the tab's own part size (`CONSOLE_PART_BYTES` in
+ * components/devplatform/files-api.ts, pinned equal by the proxy suite), so
+ * one request holds at most one 8 MiB part in this process.
+ */
+export const MAX_CONSOLE_PART_BYTES = 8 * 1024 * 1024;
+
+const SHA256_HEX = /^[0-9a-f]{64}$/i;
+
 /** Not found, in the console's own words, with nothing about what does exist. */
 function unknownEndpoint(): Response {
   return Response.json({ message: 'Unknown console endpoint.' }, { status: 404 });
@@ -268,6 +326,8 @@ const STREAM_RESPONSE_HEADERS = [
   'ratelimit',
   'ratelimit-policy',
   'x-request-id',
+  // Files design §2.17: whether a Files refusal is worth sending again.
+  'x-should-retry',
 ] as const;
 
 function copyRelayedHeaders(upstream: Response, out: Headers): void {
@@ -344,6 +404,11 @@ async function proxyStream(req: Request, upstreamPath: string): Promise<Response
     );
   }
 
+  return relayEventStream(upstream);
+}
+
+/** Relay an upstream answer that should be a stream: piped when it is, as sent when not. */
+async function relayEventStream(upstream: Response): Promise<Response> {
   const isStream = (upstream.headers.get('content-type') ?? '').includes(
     'text/event-stream',
   );
@@ -368,11 +433,133 @@ async function proxyStream(req: Request, upstreamPath: string): Promise<Response
   return new Response(upstream.body, { status: 200, headers: headersOut });
 }
 
+/** The headers every Files relay sends upstream: the session and the deployment-stated forwarding pair. */
+function sessionHeaders(req: Request, extra: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...extra };
+  const cookie = req.headers.get('cookie');
+  if (cookie) headers.cookie = cookie;
+  const clientIp = trustedClientIp(req);
+  if (clientIp) headers['x-forwarded-for'] = clientIp;
+  const proto = trustedForwardedProto();
+  if (proto) headers['x-forwarded-proto'] = proto;
+  return headers;
+}
+
+/**
+ * A file's processing events, piped (design §2.8). No wall clock, for the
+ * playground's reason: the stream heartbeats every 15 s and ends at the file's
+ * terminal state, and a 90-minute video is a legitimate 90-minute stream. The
+ * caller's signal is forwarded, so a closed drawer stops it.
+ */
+async function proxyEvents(req: Request, upstreamPath: string): Promise<Response> {
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${orchestratorUrl()}${upstreamPath}`, {
+      method: 'GET',
+      headers: sessionHeaders(req, { accept: 'text/event-stream' }),
+      cache: 'no-store',
+      redirect: 'manual',
+      signal: req.signal,
+    });
+  } catch {
+    if (req.signal.aborted) return new Response(null, { status: 499 });
+    return Response.json({ message: 'The orchestrator is unreachable.' }, { status: 502 });
+  }
+  return relayEventStream(upstream);
+}
+
+/**
+ * One upload part, as raw bytes.
+ *
+ * Not `proxyToOrchestrator`: that forwards content-type and the cookie only,
+ * and the part's `X-Part-SHA256` is what lets the orchestrator refuse bytes
+ * corrupted on this hop (`checksum_mismatch`) instead of assembling them. The
+ * digest is forwarded only in its one valid shape. A part must declare its
+ * length (the route answers 411 without one) and is refused over
+ * MAX_CONSOLE_PART_BYTES before a byte is read.
+ */
+async function proxyPart(req: Request, upstreamPath: string): Promise<Response> {
+  if (req.headers.get('content-length') === null) {
+    return Response.json({ message: 'An upload part must declare its Content-Length.' }, { status: 411 });
+  }
+  if (declaredBodyOverLimit(req, MAX_CONSOLE_PART_BYTES)) {
+    return Response.json({ message: 'The request body is too large.' }, { status: 413 });
+  }
+  const raw = await readBoundedBody(req, MAX_CONSOLE_PART_BYTES);
+  if (raw === null) {
+    return Response.json({ message: 'The request body is too large.' }, { status: 413 });
+  }
+  const extra: Record<string, string> = { 'content-type': 'application/octet-stream' };
+  const digest = req.headers.get('x-part-sha256');
+  if (digest && SHA256_HEX.test(digest.trim())) extra['x-part-sha256'] = digest.trim().toLowerCase();
+
+  const timeout = AbortSignal.timeout(PROXY_TIMEOUT_MS);
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${orchestratorUrl()}${upstreamPath}`, {
+      method: 'PUT',
+      headers: sessionHeaders(req, extra),
+      body: raw.buffer as ArrayBuffer,
+      cache: 'no-store',
+      redirect: 'manual',
+      signal: AbortSignal.any([req.signal, timeout]),
+    });
+  } catch {
+    if (req.signal.aborted) return new Response(null, { status: 499 });
+    if (timeout.aborted) {
+      return Response.json({ message: 'The orchestrator took too long to answer.' }, { status: 504 });
+    }
+    return Response.json({ message: 'The orchestrator is unreachable.' }, { status: 502 });
+  }
+  const out = new Headers({
+    'content-type': upstream.headers.get('content-type') ?? 'application/json',
+    'cache-control': 'no-store',
+  });
+  copyRelayedHeaders(upstream, out);
+  return new Response(await upstream.arrayBuffer(), { status: upstream.status, headers: out });
+}
+
+/**
+ * The Files writes' cross-site guard.
+ *
+ * The orchestrator's `_reject_cross_site_writes` cannot see a browser's Origin
+ * behind this proxy (a server-to-server hop has none), and the session cookie
+ * is SameSite=Lax, which does not separate sibling subdomains of the app's
+ * site. So the check is made here, where the browser's own headers still are:
+ *
+ *  · `Sec-Fetch-Site` is set by the browser and cannot be written by a page.
+ *    Present and not `same-origin` — a sibling subdomain says `same-site` — is
+ *    refused.
+ *  · A POST must say `application/json`. A cross-site page cannot send that
+ *    content type without a CORS preflight this route never answers, so the
+ *    request never leaves such a browser; and the upload handlers parse JSON
+ *    whatever the header says, so without this a `text/plain` form post would
+ *    reach them. PUT and DELETE always preflight.
+ *
+ * A client with no `Sec-Fetch-Site` (an older browser, a script holding a
+ * stolen cookie) still passes the first check; the second still binds any
+ * browser.
+ */
+function crossSiteWriteRefusal(req: Request, op: { sameOriginWrites?: boolean }): Response | null {
+  if (!op.sameOriginWrites || req.method === 'GET' || req.method === 'HEAD') return null;
+  const site = req.headers.get('sec-fetch-site');
+  if (site !== null && site.trim().toLowerCase() !== 'same-origin') {
+    return Response.json({ message: 'Cross-site request refused.' }, { status: 403 });
+  }
+  const type = (req.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+  if (req.method === 'POST' && type !== 'application/json') {
+    return Response.json({ message: 'This request must send JSON.' }, { status: 415 });
+  }
+  return null;
+}
+
 async function handle(req: Request, ctx: Ctx): Promise<Response> {
   const { path } = await ctx.params;
   const parts = path ?? [];
   const op = matchOperation(parts, req.method);
   if (!op) return unknownEndpoint();
+  const refusal = crossSiteWriteRefusal(req, op);
+  if (refusal) return refusal;
 
   const query = consoleQuery(parts, req.method, new URL(req.url).search);
   if (query === null) return badQuery();
@@ -385,6 +572,8 @@ async function handle(req: Request, ctx: Ctx): Promise<Response> {
     .join('/')}${query}`;
 
   if (op.stream) return proxyStream(req, upstreamPath);
+  if (op.events) return proxyEvents(req, upstreamPath);
+  if (op.part) return proxyPart(req, upstreamPath);
   return proxyToOrchestrator(req, upstreamPath, {
     maxBodyBytes: Math.min(MAX_CONSOLE_BODY_BYTES, MAX_PROXY_BODY_BYTES),
   });

@@ -36,6 +36,25 @@ ELEVEN = {
     "GET /v1/openapi.json",
 }
 
+#: The fourteen `/v1/files` and `/v1/uploads` operations (files-hookup,
+#: 2026-09-13): described exactly while `router.FILES_MOUNTED`.
+FILES = {
+    "POST /v1/files",
+    "GET /v1/files",
+    "GET /v1/files/{file_id}",
+    "GET /v1/files/{file_id}/content",
+    "DELETE /v1/files/{file_id}",
+    "GET /v1/files/{file_id}/events",
+    "GET /v1/files/{file_id}/derived",
+    "GET /v1/files/{file_id}/derived/{name}",
+    "POST /v1/uploads",
+    "GET /v1/uploads/{upload_id}",
+    "POST /v1/uploads/{upload_id}/parts",
+    "PUT /v1/uploads/{upload_id}/parts/{part_number}",
+    "POST /v1/uploads/{upload_id}/complete",
+    "POST /v1/uploads/{upload_id}/cancel",
+}
+
 #: Recognisable internal identities, installed into settings so a leak of any
 #: of them into the public document is detectable.
 _INTERNAL = {
@@ -69,7 +88,15 @@ def _operations(document):
             yield f"{method.upper()} {path}", operation
 
 
-def test_the_public_document_describes_exactly_the_eleven_operations(configured):
+def test_the_public_document_describes_exactly_the_eleven_operations_and_the_fourteen_file_routes(configured):
+    document = openapi_module.public_openapi()
+
+    assert public_router.FILES_MOUNTED
+    assert {name for name, _ in _operations(document)} == ELEVEN | FILES
+
+
+def test_without_the_files_mount_the_document_describes_only_the_eleven(configured, monkeypatch):
+    monkeypatch.setattr(public_router, "FILES_MOUNTED", False)
     document = openapi_module.public_openapi()
 
     assert {name for name, _ in _operations(document)} == ELEVEN
@@ -139,7 +166,8 @@ def test_with_the_limits_off_the_new_operations_document_capacity_not_a_limit(co
     for path in ("/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions"):
         responses = document["paths"][path]["post"]["responses"]
         assert "429" not in responses, path
-        assert "at capacity" in responses["503"]["description"], path
+        # No clock (2026-09-14): a queue is never the 503, only a down engine.
+        assert "waiting in that queue is never answered with this" in responses["503"]["description"], path
         assert "not a per-caller limit" in responses["503"]["description"], path
         assert "Retry-After" in responses["503"]["headers"], path
         # No Idempotency-Key on these three: nothing to replay, so no 409.
@@ -157,11 +185,16 @@ def test_with_the_limits_on_the_new_operations_advertise_the_limit_headers(confi
         assert "RateLimit" in responses["200"]["headers"], path
 
 
-def test_the_transcription_operation_is_multipart_and_answers_json_or_text(configured):
+def test_the_transcription_operation_takes_multipart_or_a_file_id_and_answers_json_text_or_a_stream(configured):
     operation = openapi_module.public_openapi()["paths"]["/v1/audio/transcriptions"]["post"]
+    schemas = openapi_module.public_openapi()["components"]["schemas"]
 
-    assert list(operation["requestBody"]["content"]) == ["multipart/form-data"]
-    assert set(operation["responses"]["200"]["content"]) == {"application/json", "text/plain"}
+    assert list(operation["requestBody"]["content"]) == ["multipart/form-data", "application/json"]
+    assert set(operation["responses"]["200"]["content"]) == {"application/json", "text/plain", "text/event-stream"}
+    # Any duration (no-timeout design, 2026-09-14): no seconds are published.
+    assert "seconds" not in schemas["TranscriptionRequest"]["properties"]["file"]["description"]
+    assert schemas["TranscriptionFileRequest"]["required"] == ["model", "file_id"]
+    assert "max_audio_seconds" not in schemas["Model"]["properties"]["limits"]["properties"]
 
 
 def test_the_published_ceilings_are_the_ones_the_server_enforces(configured, monkeypatch):

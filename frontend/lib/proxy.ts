@@ -306,6 +306,9 @@ const RESPONSE_HEADER_ALLOWLIST = [
   'x-request-id',
   'content-disposition',
   'cache-control',
+  // Files design §2.17: whether a 409/503 is worth sending again. The console's
+  // uploader reads it; without it the uploader falls back to Retry-After.
+  'x-should-retry',
 ] as const;
 
 /** Allowlisted by prefix: the x-ratelimit-* family has no fixed member list. */

@@ -251,7 +251,8 @@ def test_every_console_route_refuses_a_signed_in_member_with_404(member):
         assert response.status_code == 404, f"{method} {path} answered {response.status_code}"
         assert "developer" not in response.text.lower()
         checked += 1
-    assert checked == 24, f"the router declares {checked} operations; update this pin"
+    # 24, plus the eleven Files tab operations (files-hookup, 2026-09-13).
+    assert checked == 35, f"the router declares {checked} operations; update this pin"
 
 
 def test_an_anonymous_caller_is_refused_before_any_capability_is_considered(
@@ -1103,15 +1104,21 @@ def test_a_streamed_playground_run_follows_the_public_event_grammar(admin, fake_
 
     frames = api_events.parse_frames(response.text)
     names = [frame["event"] for frame in frames]
+    # CONTRACT-3 §10.2 (2026-09-14): the item and content-part events the
+    # SDKs' stream helpers need are part of the public grammar.
     assert names == [
         "response.created",
         "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
         "response.completed",
     ]
-    assert [frame["data"]["sequence_number"] for frame in frames] == [1, 2, 3, 4, 5, 6]
+    assert [frame["data"]["sequence_number"] for frame in frames] == list(range(1, 11))
     assert len([n for n in names if n in api_events.TERMINAL_EVENTS]) == 1
     # The reasoning delta never reached the wire.
     assert "hmm" not in response.text
@@ -1210,7 +1217,7 @@ def test_a_streamed_run_heartbeats_while_the_engine_is_still_thinking(
     )
     assert ": ping" in response.text
     frames = api_events.parse_frames(response.text)
-    assert [frame["data"]["sequence_number"] for frame in frames] == [1, 2, 3, 4, 5]
+    assert [frame["data"]["sequence_number"] for frame in frames] == list(range(1, 10))
     assert frames[-1]["event"] == "response.completed"
     # Not measured is null, never zero.
     assert frames[-1]["data"]["response"]["usage"] is None
@@ -2697,9 +2704,9 @@ def test_the_playground_plans_a_long_output_through_the_public_planner_and_recor
     assert 999_000 <= body["max_output_tokens"] < 1_000_000
     assert meta["max_output_tokens_applied"] == body["max_output_tokens"]
     assert body["incomplete_details"] is None
-    assert (meta["max_output_tokens_requested"], meta["clamped"], meta["wall_clock_s"]) == (
-        1_000_000, True, 20_900.0,
-    )
+    assert (meta["max_output_tokens_requested"], meta["clamped"]) == (1_000_000, True)
+    # No wall clock is recorded any more: there is none (no-timeout design).
+    assert "wall_clock_s" not in meta
 
 
 def test_the_applied_ceiling_is_the_pumps_value_and_the_planned_one_only_when_the_pump_has_none():
@@ -2751,8 +2758,9 @@ def test_a_playground_run_on_a_gated_engine_holds_that_engines_capacity_gate_and
     admin, fake_model, monkeypatch, stream
 ):
     """The same gate `/v1` waits at: named by the plan, weighted by the
-    footprint, bounded by the synchronous wait, yielding to chat when the plan
-    says so — and released once the run ends, streamed or not."""
+    footprint, with NO wait limit (no-timeout design, 2026-09-13), yielding to
+    chat when the plan says so — and released once the run ends, streamed or
+    not."""
     planning = FakePlanning(gate_engine="router", gate_weight_tokens=6_100, yield_to_chat=True)
     capacity = FakeCapacity()
     monkeypatch.setattr(console_api, "_planning", lambda: planning)
@@ -2767,19 +2775,19 @@ def test_a_playground_run_on_a_gated_engine_holds_that_engines_capacity_gate_and
     assert response.status_code == 200, response.text
     if stream:
         assert "response.completed" in response.text
-    assert capacity.holds == [{"engine": "router", "weight_tokens": 6_100, "wait_s": 30.0,
+    assert capacity.holds == [{"engine": "router", "weight_tokens": 6_100, "wait_s": None,
                                "yield_to_chat": True}]
     assert capacity.released == 1
 
 
-@pytest.mark.parametrize("stream", [False, True], ids=["sync", "stream"])
 @pytest.mark.usefixtures("limits_enforced")
 def test_a_playground_run_refused_at_capacity_is_the_v1_503_with_retry_after_and_gives_everything_back(
-    admin, fake_model, monkeypatch, stream
+    admin, fake_model, monkeypatch
 ):
-    """Never a 429 and never a dead stream: a real 503 `model_unavailable`
-    with its Retry-After, before any status line, the estimate handed back
-    and the project slot released."""
+    """Never a 429: a refusal that arrives before the commit clock is a real
+    503 `model_unavailable` with its Retry-After, the estimate handed back
+    and the project slot released. (The real gate no longer refuses at all —
+    `wait_s=None` — so only a refusing gate module can produce this.)"""
     from app.publicapi import errors as api_errors
 
     planning = FakePlanning(gate_engine="router", planned_max_output_tokens=512)
@@ -2790,7 +2798,7 @@ def test_a_playground_run_refused_at_capacity_is_the_v1_503_with_retry_after_and
 
     response = admin.post(
         PLAYGROUND,
-        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "stream": stream},
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "stream": False},
     )
 
     assert response.status_code == 503
@@ -2799,14 +2807,82 @@ def test_a_playground_run_refused_at_capacity_is_the_v1_503_with_retry_after_and
     assert response.json()["error"]["code"] == "model_unavailable"
     assert fake.calls == []
     assert _playground_ledger(store.default_workspace()["id"]) == {"daily": 0, "minute": 0}
-    # `quotas.in_flight` counts per PROJECT, and the allowance row's id is
-    # derived from the workspace, so no key or principal is needed to ask.
     from types import SimpleNamespace
 
     allowance = SimpleNamespace(
         project_id=console_api.playground_project_id(store.default_workspace()["id"])
     )
     assert quotas.in_flight(allowance) == 0
+
+
+@pytest.mark.usefixtures("limits_enforced")
+def test_a_streamed_playground_run_waits_for_its_gate_in_the_body_and_a_refusal_is_an_error_event(
+    admin, fake_model, monkeypatch
+):
+    """No-timeout design: a stream's capacity wait happens AFTER the status
+    line, so a refusal arrives as the grammar's `error` event on a 200 — the
+    estimate still handed back, the slot still released, the engine never
+    asked."""
+    from app.publicapi import errors as api_errors
+
+    planning = FakePlanning(gate_engine="router", planned_max_output_tokens=512)
+    capacity = FakeCapacity(refuse=api_errors.model_at_capacity(5))
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    monkeypatch.setattr(console_api, "_capacity", lambda: capacity)
+    fake = fake_model()
+
+    response = admin.post(
+        PLAYGROUND,
+        json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "event: error" in response.text and "model_unavailable" in response.text
+    assert fake.calls == []
+    assert _playground_ledger(store.default_workspace()["id"]) == {"daily": 0, "minute": 0}
+    from types import SimpleNamespace
+
+    allowance = SimpleNamespace(
+        project_id=console_api.playground_project_id(store.default_workspace()["id"])
+    )
+    assert quotas.in_flight(allowance) == 0
+
+
+def test_a_sync_playground_run_that_waits_past_the_commit_clock_still_returns_its_object(
+    admin, fake_model, monkeypatch
+):
+    """The committed JSON body: 200 at the commit clock, whitespace while the
+    gate or the engine is slow, then the object — parseable as JSON."""
+    import asyncio as _asyncio
+    import contextlib
+
+    monkeypatch.setattr(console_api, "PLAYGROUND_COMMIT_S", 0.05)
+    monkeypatch.setattr(console_api, "PLAYGROUND_BEAT_S", 0.02)
+    planning = FakePlanning(gate_engine="router")
+
+    class SlowCapacity(FakeCapacity):
+        def hold(self, engine, *, weight_tokens=0, wait_s=None, yield_to_chat=False):
+            inner = super().hold(engine, weight_tokens=weight_tokens, wait_s=wait_s, yield_to_chat=yield_to_chat)
+
+            @contextlib.asynccontextmanager
+            async def slow():
+                await _asyncio.sleep(0.3)
+                async with inner:
+                    yield
+
+            return slow()
+
+    capacity = SlowCapacity()
+    monkeypatch.setattr(console_api, "_planning", lambda: planning)
+    monkeypatch.setattr(console_api, "_capacity", lambda: capacity)
+    fake_model()
+
+    response = admin.post(PLAYGROUND, json={"model": registry.PUBLIC_MODEL_IDS[0], "input": "hi"})
+
+    assert response.status_code == 200
+    assert response.content.startswith(b" ")
+    assert response.json()["status"] == "completed"
+    assert capacity.released == 1
 
 
 def test_a_plan_that_names_a_gate_with_no_capacity_module_fails_closed_with_a_503(
@@ -2951,9 +3027,9 @@ def test_the_playground_runs_techsara_8b_vision_on_its_own_engine_through_the_re
     seen: List[Dict[str, Any]] = []
     in_flight_while_running: List[int] = []
 
-    async def fake_router(resolved, messages, *, max_tokens, temperature, wall_clock_s):
+    async def fake_router(resolved, messages, *, max_tokens, temperature):
         seen.append({"engine": resolved.key, "messages": list(messages), "max_tokens": max_tokens,
-                     "temperature": temperature, "wall_clock_s": wall_clock_s})
+                     "temperature": temperature})
         in_flight_while_running.append(capacity.snapshot()["router"]["in_flight"])
         yield "token", "A red "
         yield "token", "square."

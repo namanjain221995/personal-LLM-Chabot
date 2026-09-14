@@ -77,6 +77,25 @@ _CODES: Dict[str, _CodeSpec] = {
     "model_unavailable": _CodeSpec(503, "service_unavailable_error"),
     "timeout": _CodeSpec(504, "timeout_error"),
     "internal_error": _CodeSpec(500, "server_error"),
+    # The Files API (CONTRACT §9, added 2026-09-14 when /v1/files and
+    # /v1/uploads were published in §7). They used to live only in
+    # `files/wire.FILE_CODES`, outside this table, which meant the OpenAPI
+    # document's `code` enum, the `/docs` error page and every SDK generated
+    # from the schema listed a vocabulary the server did not keep to: a client
+    # switching on `code` met seven values the schema said could not exist.
+    # One table again. `files/wire.FILE_CODES` keeps only the `x-should-retry`
+    # default of each, and a test pins the two to the same status and type.
+    "file_not_found": _CodeSpec(404, "invalid_request_error"),
+    "upload_not_found": _CodeSpec(404, "invalid_request_error"),
+    "file_not_ready": _CodeSpec(409, "invalid_request_error"),
+    "upload_state_conflict": _CodeSpec(409, "invalid_request_error"),
+    "checksum_mismatch": _CodeSpec(400, "invalid_request_error"),
+    "incomplete_body": _CodeSpec(408, "invalid_request_error"),
+    # `api_error`, not `service_unavailable_error`: the two 503s of that type
+    # are "the model cannot serve you yet, retry", while a full disk does not
+    # empty in an SDK's backoff and says `x-should-retry: false`. A client
+    # that retries on `service_unavailable_error` must not loop on this one.
+    "storage_unavailable": _CodeSpec(503, "api_error"),
 }
 
 #: The codes a client may retry unchanged. Published so the documentation and
@@ -89,6 +108,13 @@ RETRYABLE_CODES = frozenset(
         "model_recovering",
         "model_unavailable",
         "timeout",
+        # Files (2026-09-14). A file still processing is ready later, and a
+        # body cut in transit recorded nothing, so the same request succeeds
+        # when sent again. `storage_unavailable` is deliberately absent: it
+        # is retry-safe only when its `x-should-retry` says `true` (a purge
+        # of the same bytes in progress), never for a full disk.
+        "file_not_ready",
+        "incomplete_body",
     }
 )
 
@@ -96,6 +122,11 @@ RETRYABLE_CODES = frozenset(
 #: 429 and 503"). Constructing one without it is a programming error, caught
 #: here rather than by a client that never retries.
 _RETRY_AFTER_REQUIRED = frozenset({429, 503})
+
+#: The header both OpenAI SDKs obey before their own status table
+#: (openai-python `_should_retry`, openai-node `shouldRetry`): `false` stops a
+#: retry of a 409/429/5xx, `true` forces one. Lower case, as the SDKs read it.
+SHOULD_RETRY_HEADER = "x-should-retry"
 
 #: The floor the public OpenAPI schema types for `Retry-After` (integer,
 #: minimum 1). A `Retry-After: 0` invites an immediate retry storm from the
@@ -220,6 +251,18 @@ class ApiError(Exception):
     and get a different answer.
     """
 
+    #: `x-should-retry` (2026-09-13, no-timeout design sdk_and_docs): None
+    #: sends no header and leaves the SDKs to their status table; False tells
+    #: openai-python and openai-node NOT to retry a status they would
+    #: otherwise retry (a 409 or 5xx), which is how a failure that must not
+    #: run the model twice says so. Set through `no_retry`.
+    #:
+    #: A CLASS attribute, not one set in `__init__`: a subclass that builds
+    #: itself without calling it (apifiles.service._PendingCodeError, for the
+    #: codes the table does not hold yet) must still render `headers()` — the
+    #: first draft set it per instance and broke four Files API tests.
+    should_retry: Optional[bool] = None
+
     def __init__(
         self,
         code: str,
@@ -283,8 +326,14 @@ class ApiError(Exception):
 
     def headers(self) -> Dict[str, str]:
         """Headers this failure must carry. `Retry-After` is seconds, integer,
-        minimum 1 — a float here is unparseable to most HTTP clients."""
-        return {} if self.retry_after is None else {"Retry-After": str(self.retry_after)}
+        minimum 1 — a float here is unparseable to most HTTP clients.
+        `x-should-retry` only when a caller decided it (`no_retry`)."""
+        headers: Dict[str, str] = {}
+        if self.retry_after is not None:
+            headers["Retry-After"] = str(self.retry_after)
+        if self.should_retry is not None:
+            headers[SHOULD_RETRY_HEADER] = "true" if self.should_retry else "false"
+        return headers
 
     def stream_payload(self, sequence_number: int) -> Dict[str, Any]:
         """The `event: error` data of CONTRACT §10 / STANDARDS: type, code,
@@ -490,6 +539,42 @@ def model_unavailable(retry_after: float = 30) -> ApiError:
     )
 
 
+#: The one sentence of a request whose input files were still being prepared
+#: when the service restarted (`preparation_interrupted`). Matched by value
+#: nowhere: the durable runtime marks its own run, the file wait its own row.
+PREPARATION_INTERRUPTED_MESSAGE = (
+    "The service restarted while this request's files were being prepared. "
+    "Nothing was generated or charged; send the request again."
+)
+
+#: What that failure tells the caller to wait: the new process is usually up
+#: within the ~97 s restart window, and every hop in front retries a refused
+#: connect for 110 s, so a short hint is enough.
+PREPARATION_INTERRUPTED_RETRY_AFTER_S = 2
+
+
+def preparation_interrupted() -> ApiError:
+    """A request ended by a restart BEFORE it generated anything: its files
+    (a wait for processing, the context build) were still being prepared.
+
+    WHY A FAILURE AND NOT A RESUME (release review 2026-09-14). A durable run
+    resumes from its stored spec, and the spec of a request with files exists
+    only once the files are prepared: what the next process would need to
+    prepare them again (the request body, the caller's credential) is not
+    stored. So the restart ends it at once, retry-safe (`model_unavailable`,
+    `x-should-retry` left to the status: nothing ran, the Idempotency-Key is
+    released), instead of holding the old process's shutdown for its full
+    grace and then cutting the connection with nothing said. The files keep
+    processing across the restart, so the retry continues from there."""
+    error = ApiError(
+        "model_unavailable",
+        PREPARATION_INTERRUPTED_MESSAGE,
+        retry_after=PREPARATION_INTERRUPTED_RETRY_AFTER_S,
+    )
+    error.should_retry = True
+    return error
+
+
 #: How long a caller is told to wait when the platform's own database is out.
 #: Short: a pool that timed out under a burst is usually back within seconds,
 #: and a longer figure turns a blip into minutes of refused traffic.
@@ -574,6 +659,69 @@ def from_unexpected(exc: BaseException, *, request_id: str = "") -> ApiError:
         "unhandled error on the public API (request_id=%s)", (request_id or "-")
     )
     return internal_error()
+
+
+def no_retry(error: ApiError) -> ApiError:
+    """Mark `error` so its response carries `x-should-retry: false`.
+
+    For the failures a retry would make WORSE rather than merely repeat
+    (no-timeout design, sdk_and_docs "x-should-retry: false on"): a 500 after
+    a generation started for a request with no Idempotency-Key (the retry
+    runs the model again from nothing), a 409 caused by a different body or
+    credential, and the second engine fault of one run. Returns the same
+    object, so it can wrap a `raise`.
+    """
+    error.should_retry = False
+    return error
+
+
+def committed_failure_error(exc: BaseException, *, request_id: str = "") -> Dict[str, Any]:
+    """The `error` object of a failed body written AFTER a committed 200.
+
+    The envelope's four wire fields without `request_id` (the header carried
+    it before the first byte): the same `code` and scrubbed `message` the HTTP
+    envelope would have used, so a client applies one table whether the
+    failure arrived as a status or in a committed body.
+    """
+    failure = from_unexpected(exc, request_id=request_id)
+    return {
+        "message": redact(failure.message),
+        "type": failure.type,
+        "code": failure.code,
+        "param": failure.param,
+    }
+
+
+def chat_completion_failure_body(
+    exc: BaseException,
+    *,
+    completion_id: str,
+    created: int,
+    model: str,
+    usage: Optional[Mapping[str, Any]] = None,
+    max_output_tokens: Optional[int] = None,
+    request_id: str = "",
+) -> Dict[str, Any]:
+    """A `chat.completion` that failed after its 200 was committed.
+
+    `choices: []` and a top-level `error` (no-timeout design, edge_100s 2):
+    the shape the compatibility dialect's own streaming error chunk uses, so
+    a client that already unwraps `error` from a chunk reads this the same
+    way, and one that only reads `choices[0]` fails loudly on an empty list
+    instead of rendering an answer that never came. `usage` is what the
+    engine reported for the tokens it did produce (None: not measured, never
+    zero).
+    """
+    return {
+        "id": str(completion_id),
+        "object": "chat.completion",
+        "created": int(created),
+        "model": str(model),
+        "choices": [],
+        "usage": None if usage is None else dict(usage),
+        "max_output_tokens": max_output_tokens,
+        "error": committed_failure_error(exc, request_id=request_id),
+    }
 
 
 def envelope_from(exc: BaseException, *, request_id: str = "") -> Dict[str, Any]:

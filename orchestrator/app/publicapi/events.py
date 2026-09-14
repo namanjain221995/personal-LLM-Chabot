@@ -48,23 +48,43 @@ from .errors import ApiError
 RESPONSE_CREATED = "response.created"
 RESPONSE_QUEUED = "response.queued"
 RESPONSE_IN_PROGRESS = "response.in_progress"
+RESPONSE_OUTPUT_ITEM_ADDED = "response.output_item.added"
+RESPONSE_CONTENT_PART_ADDED = "response.content_part.added"
 RESPONSE_OUTPUT_TEXT_DELTA = "response.output_text.delta"
 RESPONSE_OUTPUT_TEXT_DONE = "response.output_text.done"
+RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED = "response.output_text.annotation.added"
+RESPONSE_CONTENT_PART_DONE = "response.content_part.done"
+RESPONSE_OUTPUT_ITEM_DONE = "response.output_item.done"
 RESPONSE_COMPLETED = "response.completed"
 RESPONSE_FAILED = "response.failed"
 ERROR = "error"
 
-#: Every event name `/v1/responses` may emit — CONTRACT §10 and no more. The
-#: fuller upstream lifecycle (`response.output_item.added`,
-#: `response.content_part.added` and their `.done` partners) is deliberately
-#: absent: the contract names this set, and a client that must ignore unknown
-#: events can be given the others later without a breaking change.
+#: Every event name `/v1/responses` may emit — CONTRACT §10.2 and no more.
+#:
+#: THE ITEM AND CONTENT-PART EVENTS (2026-09-14). The first grammar left out
+#: `response.output_item.added`, `response.content_part.added` and their
+#: `.done` partners. Both SDKs' `responses.stream()` helpers build their
+#: snapshot from them — openai-python indexes `snapshot.output[output_index]`
+#: on the first delta, so a stream without `output_item.added` raised
+#: IndexError inside the helper, and `client.responses.stream(response_id=…,
+#: starting_after=N)` (the documented resume helper, which replays from the
+#: start and filters client-side) could not work at all. CONTRACT §10.2 lists
+#: them; now the code does too.
+#:
+#: `response.output_text.annotation.added` (Files design §5.6): one event per
+#: `file_citation` annotation, after `output_text.done` and before the parts
+#: close, an event type both SDKs already parse.
 EVENT_NAMES: Tuple[str, ...] = (
     RESPONSE_CREATED,
     RESPONSE_QUEUED,
     RESPONSE_IN_PROGRESS,
+    RESPONSE_OUTPUT_ITEM_ADDED,
+    RESPONSE_CONTENT_PART_ADDED,
     RESPONSE_OUTPUT_TEXT_DELTA,
     RESPONSE_OUTPUT_TEXT_DONE,
+    RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
+    RESPONSE_CONTENT_PART_DONE,
+    RESPONSE_OUTPUT_ITEM_DONE,
     RESPONSE_COMPLETED,
     RESPONSE_FAILED,
     ERROR,
@@ -101,20 +121,116 @@ _LIFECYCLE_RANK: Dict[str, int] = {
     RESPONSE_CREATED: 0,
     RESPONSE_QUEUED: 1,
     RESPONSE_IN_PROGRESS: 2,
-    RESPONSE_OUTPUT_TEXT_DELTA: 3,
-    RESPONSE_OUTPUT_TEXT_DONE: 4,
-    RESPONSE_COMPLETED: 5,
+    RESPONSE_OUTPUT_ITEM_ADDED: 3,
+    RESPONSE_CONTENT_PART_ADDED: 4,
+    RESPONSE_OUTPUT_TEXT_DELTA: 5,
+    RESPONSE_OUTPUT_TEXT_DONE: 6,
+    RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED: 7,
+    RESPONSE_CONTENT_PART_DONE: 8,
+    RESPONSE_OUTPUT_ITEM_DONE: 9,
+    RESPONSE_COMPLETED: 10,
 }
 
-#: The one event that may legitimately repeat: the text arrives in many
-#: deltas. Every other rank is a stage, and a stage happens once.
-_REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA,)
+#: The events that may legitimately repeat: the text arrives in many deltas,
+#: and an answer may cite many places. Every other rank is a stage, and a
+#: stage happens once.
+_REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED)
+
+
+# ------------------------------------------------- the item and its part --
+#
+# Payload builders shared by `SequencedEvents` (a stream framed in memory)
+# and the durable run's record builder (`durable.RecordBuilder`, a stream
+# framed from the write-ahead log), so the two can never describe the one
+# assistant message differently. One message, one `output_text` part: the
+# only item kind `/v1/responses` returns (`models.OutputMessage`).
+
+
+def _part(text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    return {
+        "type": "output_text",
+        "text": str(text),
+        "annotations": [dict(a) for a in (annotations or ())],
+    }
+
+
+def output_item_added_payload(item_id: str) -> Dict[str, Any]:
+    return {
+        "output_index": 0,
+        "item": {"id": item_id, "type": "message", "role": "assistant", "status": "in_progress", "content": []},
+    }
+
+
+def content_part_added_payload(item_id: str) -> Dict[str, Any]:
+    return {"item_id": item_id, "output_index": 0, "content_index": 0, "part": _part("")}
+
+
+def annotation_added_payload(item_id: str, annotation_index: int, annotation: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "item_id": item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "annotation_index": int(annotation_index),
+        "annotation": dict(annotation),
+    }
+
+
+def content_part_done_payload(
+    item_id: str, text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None
+) -> Dict[str, Any]:
+    return {"item_id": item_id, "output_index": 0, "content_index": 0, "part": _part(text, annotations)}
+
+
+def output_item_done_payload(
+    item_id: str, text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None
+) -> Dict[str, Any]:
+    return {
+        "output_index": 0,
+        "item": {
+            "id": item_id, "type": "message", "role": "assistant", "status": "completed",
+            "content": [_part(text, annotations)],
+        },
+    }
+
+
+def with_annotations(response: Mapping[str, Any], annotations: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    """A Response object whose `output_text` part carries `annotations` (the
+    terminal snapshot repeats what the annotation events announced). A
+    response with no output is returned unchanged."""
+    listed = [dict(a) for a in annotations]
+    copy: Dict[str, Any] = dict(response)
+    if not listed:
+        return copy
+    output = []
+    placed = False
+    for item in copy.get("output") or []:
+        item = dict(item)
+        content = []
+        for part in item.get("content") or []:
+            part = dict(part)
+            if not placed and part.get("type") == "output_text":
+                part["annotations"] = [dict(a) for a in listed]
+                placed = True
+            content.append(part)
+        if "content" in item:
+            item["content"] = content
+        output.append(item)
+    if "output" in copy:
+        copy["output"] = output
+    return copy
 
 #: CONTRACT §10: "at least every 15 s". `app/sse.py` reads the interval from
 #: SSE_HEARTBEAT_SECONDS, which an operator may set HIGHER for the chat app;
 #: the public contract is a promise to third parties, so it is capped here
 #: rather than inherited.
-HEARTBEAT_SECONDS: float = min(float(_chat_sse.HEARTBEAT_SECONDS), 15.0)
+#:
+#: Capped at 14, not 15 (2026-09-13, T3-wire). The promise is about the gap a
+#: CLIENT measures, and a 15 s timer is a 15 s floor: the real-time proof of
+#: the no-timeout wave measured 15.08 s between bytes of a silent stream with
+#: the cap at 15. One second of margin keeps a late timer, a busy loop and a
+#: relay hop inside the promise; a heartbeat is five bytes.
+HEARTBEAT_CEILING_S = 14.0
+HEARTBEAT_SECONDS: float = min(float(_chat_sse.HEARTBEAT_SECONDS), HEARTBEAT_CEILING_S)
 
 #: The literal last line of a Chat Completions stream. Reserved for that
 #: surface: an OpenAI-derived client reading `/v1/responses` waits for
@@ -156,6 +272,39 @@ class SequencedEvents:
         self._terminal: Optional[str] = None
         self._emitted: list[str] = []
         self.item_id = item_id or new_item_id()
+
+    @classmethod
+    def resume_from(
+        cls,
+        sequence_number: int,
+        last_event: str,
+        *,
+        item_id: Optional[str] = None,
+    ) -> "SequencedEvents":
+        """An emitter that continues a stream somebody else started.
+
+        WHY (2026-09-13, no-timeout design). A stream's opening frames are not
+        always framed by the object that must frame its end: the router sends
+        `response.created` from the generation's own emitter, then waits for
+        capacity in the body, and a refusal there has to be the NEXT event —
+        numbered after `created`, never a second opener. The same holds for a
+        re-attach that replays up to N and continues live. The grammar checks
+        (forward-only ranks, one terminal) apply from `last_event` exactly as
+        if this object had emitted everything before it.
+        """
+        number = int(sequence_number)
+        if number < 1:
+            raise StreamProtocolError("a stream can only be resumed after at least one event")
+        if last_event not in EVENT_NAMES:
+            raise StreamProtocolError(f"unknown public API event: {last_event!r}")
+        if last_event in TERMINAL_EVENTS:
+            raise StreamProtocolError(
+                f"a stream that ended with {last_event!r} cannot be resumed (CONTRACT §10)"
+            )
+        emitter = cls(item_id=item_id)
+        emitter._sequence = number
+        emitter._emitted = [last_event]
+        return emitter
 
     # -- state ------------------------------------------------------------
 
@@ -271,6 +420,44 @@ class SequencedEvents:
             },
         )
 
+    def output_item_added(self) -> str:
+        """The assistant message begins (before its first delta)."""
+        return self._frame(RESPONSE_OUTPUT_ITEM_ADDED, output_item_added_payload(self.item_id))
+
+    def content_part_added(self) -> str:
+        """Its one `output_text` part begins, empty."""
+        return self._frame(RESPONSE_CONTENT_PART_ADDED, content_part_added_payload(self.item_id))
+
+    def annotation_added(self, annotation_index: int, annotation: Mapping[str, Any]) -> str:
+        """One `file_citation` annotation on the finished text.
+
+        Only directly after `output_text.done` or another annotation. The rank
+        table alone lets a stage be SKIPPED (an annotation straight after a
+        delta or `content_part.added` ranks higher, so it would pass), and
+        this stage may not be: an annotation's `index` counts UTF-16 units into
+        the final text, which does not exist before `output_text.done`."""
+        previous = self._emitted[-1] if self._emitted else None
+        if previous not in (RESPONSE_OUTPUT_TEXT_DONE, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED):
+            raise StreamProtocolError(
+                f"{RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED!r} must follow "
+                f"{RESPONSE_OUTPUT_TEXT_DONE!r}, not {previous!r}"
+            )
+        return self._frame(
+            RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
+            annotation_added_payload(self.item_id, annotation_index, annotation),
+        )
+
+    def content_part_done(self, text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
+        return self._frame(RESPONSE_CONTENT_PART_DONE, content_part_done_payload(self.item_id, text, annotations))
+
+    def output_item_done(self, text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
+        return self._frame(RESPONSE_OUTPUT_ITEM_DONE, output_item_done_payload(self.item_id, text, annotations))
+
+    @property
+    def item_open(self) -> bool:
+        """Whether `output_item.added` has been emitted on this stream."""
+        return RESPONSE_OUTPUT_ITEM_ADDED in self._emitted
+
     def output_text_done(
         self, text: str, *, output_index: int = 0, content_index: int = 0
     ) -> str:
@@ -327,6 +514,40 @@ class SequencedEvents:
         including before the first event, and is dropped by every conforming
         parser."""
         return _chat_sse.sse_comment(note)
+
+
+#: Field names this API never writes (2026-09-13, no-timeout design
+#: sdk_and_docs): an `id:` line followed by a comment breaks openai-python's
+#: SSE decoder (measured), and a `retry:` line would hand a browser client a
+#: reconnect policy that bypasses the documented resume loop. Sequence numbers
+#: travel in the JSON only.
+RESERVED_FIELDS: Tuple[str, ...] = ("id", "retry")
+
+#: The note a stream sends while it waits for capacity (no-timeout design,
+#: edge_100s 1): a comment, so it costs no sequence number and every parser
+#: drops it, but a person reading the raw stream sees why nothing is arriving.
+QUEUED_NOTE = "queued"
+
+
+def queued_comment() -> str:
+    """`: queued`, one complete comment frame."""
+    return _chat_sse.sse_comment(QUEUED_NOTE)
+
+
+def reserved_field_lines(stream: str) -> list[str]:
+    """Every line of `stream` that sets a reserved SSE field (`id`, `retry`).
+
+    Empty for everything this module frames — the event name and the JSON are
+    the only fields, and `json.dumps` escapes a newline inside a string — and
+    used by the tests that prove it stays that way on every route."""
+    found = []
+    for line in str(stream).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not line or line.startswith(":"):
+            continue
+        field = line.split(":", 1)[0]
+        if field in RESERVED_FIELDS:
+            found.append(line)
+    return found
 
 
 def parse_frames(stream: str) -> list[Dict[str, Any]]:
@@ -433,6 +654,7 @@ class ChatCompletionChunks:
         *,
         index: int = 0,
         max_output_tokens: Optional[int] = None,
+        annotations: Optional[Iterable[Mapping[str, Any]]] = None,
     ) -> str:
         """The chunk that names why generation ended: `stop`, or `length` when
         the answer hit `max_tokens`. A client that never sees one must treat
@@ -442,14 +664,21 @@ class ChatCompletionChunks:
         one chunk: the ceiling actually applied, which can be lower than the
         `max_tokens` the caller sent when their prompt left less of the
         context window. OpenAI-derived clients ignore keys they do not know.
+
+        `annotations` (Files design §5.6, 2026-09-14): the answer's
+        `file_citation` annotations on this final chunk's `delta`, the
+        streamed twin of `choices[0].message.annotations` (a TechSara
+        extension both SDKs parse leniently). Absent when there are none.
         """
         if self._stopped:
             raise StreamProtocolError("the finish_reason chunk was framed twice")
         self._stopped = True
         self._first = False
         extra = None if max_output_tokens is None else {"max_output_tokens": int(max_output_tokens)}
+        listed = [dict(a) for a in (annotations or ())]
+        delta: Dict[str, Any] = {"annotations": listed} if listed else {}
         return self._chunk(
-            [{"index": int(index), "delta": {}, "finish_reason": finish_reason}], extra=extra
+            [{"index": int(index), "delta": delta, "finish_reason": finish_reason}], extra=extra
         )
 
     def usage_chunk(self, usage: Optional[Mapping[str, Any]]) -> str:

@@ -72,7 +72,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import db, usage as usage_ledger
@@ -1826,6 +1826,211 @@ async def webhook_deliveries(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Files (files-hookup, 2026-09-13) — the console's Files tab
+# ---------------------------------------------------------------------------
+#
+# Metadata, processing events and the Uploads flow for ONE project, through the
+# same handlers `/v1/files` and `/v1/uploads` run (`console_files.py` explains
+# the credential difference). Read with `api.projects.read`; upload, resume,
+# complete, cancel and delete with `api.projects.manage`. NO BYTE ROUTE: never a
+# `/files/{id}/content` or `/files/{id}/derived/{name}` here (Files design D6).
+
+
+@router.get("/projects/{project_id}/files")
+async def list_project_files(
+    project_id: str,
+    request: Request,
+    after: Optional[str] = Query(None, max_length=64),
+    limit: int = Query(50, ge=1, le=100),
+    status: Optional[str] = Query(None, max_length=16),
+    kind: Optional[str] = Query(None, max_length=16),
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_READ)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    console_files.handlers()
+    return await console_files.run(
+        request,
+        lambda: _json_of(console_files.list_files(project, after=after, limit=limit, status=status, kind=kind)),
+    )
+
+
+async def _json_of(awaitable: Any) -> JSONResponse:
+    return JSONResponse(await awaitable)
+
+
+@router.get("/projects/{project_id}/files/{file_id}")
+async def project_file(
+    project_id: str,
+    file_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_READ)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    console_files.handlers()
+    return await console_files.run(request, lambda: _json_of(console_files.get_file(project, file_id)))
+
+
+@router.delete("/projects/{project_id}/files/{file_id}")
+async def delete_project_file(
+    project_id: str,
+    file_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    response = await console_files.run(request, lambda: handlers.delete_file(request, file_id, caller))
+    if response.status_code == 200:
+        # The bytes and derived data go now (design §2.7); the audit trail
+        # keeps who asked, as for every other console mutation.
+        await db.run_in_thread(
+            audit,
+            principal,
+            request,
+            "api_file_deleted",
+            resource_type="api_file",
+            resource_id=file_id,
+            meta={"project_id": project["id"]},
+        )
+    return response
+
+
+@router.get("/projects/{project_id}/files/{file_id}/events")
+async def project_file_events(
+    project_id: str,
+    file_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_READ)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    return await console_files.run(request, lambda: handlers.file_events(request, file_id, caller))
+
+
+@router.get("/projects/{project_id}/files/{file_id}/derived")
+async def project_file_derived(
+    project_id: str,
+    file_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_READ)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    return await console_files.run(request, lambda: handlers.list_derived(request, file_id, caller))
+
+
+@router.get("/projects/{project_id}/storage")
+async def project_file_storage(
+    project_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_READ)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    console_files.handlers()
+    return await console_files.run(request, lambda: _json_of(console_files.storage(project)))
+
+
+@router.post("/projects/{project_id}/uploads")
+async def create_project_upload(
+    project_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+
+    async def work():
+        console_files.require_json(request)
+        return await handlers.create_upload(request, caller)
+
+    return await console_files.run(request, work)
+
+
+@router.get("/projects/{project_id}/uploads/{upload_id}")
+async def project_upload(
+    project_id: str,
+    upload_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    return await console_files.run(request, lambda: handlers.retrieve_upload(request, upload_id, caller))
+
+
+@router.put("/projects/{project_id}/uploads/{upload_id}/parts/{part_number}")
+async def put_project_upload_part(
+    project_id: str,
+    upload_id: str,
+    part_number: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    return await console_files.run(request, lambda: handlers.put_part(request, upload_id, part_number, caller))
+
+
+@router.post("/projects/{project_id}/uploads/{upload_id}/complete")
+async def complete_project_upload(
+    project_id: str,
+    upload_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+
+    async def work():
+        console_files.require_json(request)
+        return await handlers.complete_upload(request, upload_id, caller)
+
+    return await console_files.run(request, work)
+
+
+@router.post("/projects/{project_id}/uploads/{upload_id}/cancel")
+async def cancel_project_upload(
+    project_id: str,
+    upload_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.API_PROJECTS_MANAGE)),
+):
+    from . import console_files
+
+    project = await _project_or_404(principal, project_id)
+    handlers = console_files.handlers()
+    caller = console_files.caller_for(project, principal.workspace_id)
+    return await console_files.run(request, lambda: handlers.cancel_upload(request, upload_id, caller))
+
+
 @router.get("/settings")
 async def platform_settings(
     principal: Principal = Depends(require_capability(Cap.API_CONSOLE_ACCESS)),
@@ -2588,20 +2793,28 @@ def _generation_spec(
 
 
 async def _enter_capacity_gate(plan: Any) -> Optional[contextlib.AsyncExitStack]:
-    """Wait for the shared engine's public capacity, BEFORE any status line.
+    """Wait for the shared engine's public capacity — with NO time limit.
 
-    Same order and wait as `/v1`'s synchronous and streaming paths: after the
-    quota reservation and the concurrency slot, before the response starts,
-    bounded by `capacity.sync_wait_s()` (PUBLIC_API_GATE_WAIT_S, 30 s) — so a
-    refusal is a real HTTP 503 with a Retry-After, and the silent wait stays
-    well under Cloudflare's 100 s origin timeout. None when the plan names no
-    gate (a techsara-35b request whose footprint fits the NORMAL admission
-    lanes, which stay the gate there, as today).
+    No-timeout design (2026-09-13): a playground run waits at its gate the way
+    `/v1` does, for as long as the engine is busy; the wait happens AFTER the
+    response has started (heartbeat comments on a stream, whitespace on a
+    committed JSON body), never before the status line, so nothing between
+    the browser and this process sees a silent connection. Every gate the plan
+    implies is held (`capacity.gates_for`, when the module has it), so the
+    playground cannot put more public work into chat's NORMAL lane than a key
+    can. None when there is nothing to hold.
     """
     engine = getattr(plan, "gate_engine", None)
-    if not engine:
-        return None
     capacity = _capacity()
+    model_engine = getattr(getattr(plan, "model", None), "engine", None)
+    gates: List[str] = []
+    gates_for = getattr(capacity, "gates_for", None) if capacity is not None else None
+    if callable(gates_for) and model_engine:
+        gates = list(gates_for(str(model_engine), engine))
+    elif engine:
+        gates = [str(engine)]
+    if not gates:
+        return None
     if capacity is None:
         # A plan that names a gate with no gate to hold it is a wiring fault.
         # Fail CLOSED: an ungated run on a shared engine is the starvation the
@@ -2611,28 +2824,115 @@ async def _enter_capacity_gate(plan: Any) -> Optional[contextlib.AsyncExitStack]
     gate = contextlib.AsyncExitStack()
     # A main gate admits the answer into admission's LONG_OUTPUT lane before
     # the status line, as /v1 does (capacity.py); the other gates count only.
-    extra: Dict[str, Any] = {"work": plan} if str(engine).startswith("main.") else {}
+    extra: Dict[str, Any] = {"work": plan}
     try:
-        await gate.enter_async_context(
-            capacity.hold(
-                str(engine),
-                # The planner's weight: the footprint on the router's token
-                # budget, 0 where the gate counts requests only (OCR, the main
-                # engine's long lane).
-                weight_tokens=int(
-                    getattr(plan, "gate_weight_tokens", getattr(plan, "footprint_tokens", 0)) or 0
-                ),
-                wait_s=float(capacity.sync_wait_s()),
-                # The OCR engine shares a GPU with a main-model rank, so its
-                # gate first waits (bounded) for chat to be idle.
-                yield_to_chat=bool(getattr(plan, "yield_to_chat", False)),
-                **extra,
+        for name in gates:
+            await gate.enter_async_context(
+                capacity.hold(
+                    str(name),
+                    # The planner's weight: the footprint on the router's token
+                    # budget, 0 where the gate counts requests only.
+                    weight_tokens=int(
+                        getattr(plan, "gate_weight_tokens", getattr(plan, "footprint_tokens", 0)) or 0
+                    ),
+                    wait_s=None,
+                    # The OCR engine shares a GPU with a main-model rank, so its
+                    # gate first waits (bounded) for chat to be idle.
+                    yield_to_chat=bool(getattr(plan, "yield_to_chat", False)),
+                    **(extra if str(name).startswith("main.") else {}),
+                )
             )
-        )
     except BaseException:
         await gate.aclose()
         raise
     return gate
+
+
+#: The commit clock and heartbeat of the playground's committed JSON. None
+#: (the default) reads `publicapi.keepalive.sync_commit_s()` (12 s) and
+#: `keepalive.heartbeat_s()` (14 s) at call time — the same clocks `/v1` uses.
+#: WHY (assembler, 2026-09-14): the SHIM(T3) constants were 15 s each, one
+#: late timer past the 15 s byte promise. The class below stays the
+#: console's own: after the commit it still sends a failed run's error
+#: envelope as the body (the console renders it), where `/v1`'s class drops
+#: the connection so an SDK retries. Tests pin small values here.
+PLAYGROUND_COMMIT_S: Optional[float] = None
+PLAYGROUND_BEAT_S: Optional[float] = None
+
+
+def _playground_clocks() -> "tuple[float, float]":
+    from app.publicapi import keepalive
+
+    commit = keepalive.sync_commit_s() if PLAYGROUND_COMMIT_S is None else float(PLAYGROUND_COMMIT_S)
+    beat = keepalive.heartbeat_s() if PLAYGROUND_BEAT_S is None else float(PLAYGROUND_BEAT_S)
+    return max(0.0, commit), max(0.001, beat)
+
+
+class _CommittedJSON(Response):
+    """A JSON response that may wait for as long as its work takes.
+
+    The console's twin of `keepalive.CommittedJSONResponse`, with the design's rule:
+    before PLAYGROUND_COMMIT_S the real status and body; after it, 200 with
+    `Cache-Control: no-store, no-transform`, one space at once, one every
+    PLAYGROUND_BEAT_S, then the object (JSON parsers skip leading whitespace).
+    A client that goes away cancels the work, whose own handlers record what
+    ran.
+    """
+
+    def __init__(self, work: Any, *, headers: Dict[str, str]) -> None:
+        super().__init__(content=None, status_code=200)
+        self.work = work
+        self.extra_headers = dict(headers)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(self.work())
+
+        async def disconnected() -> None:
+            while True:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    return
+
+        watcher = asyncio.ensure_future(disconnected())
+        committed = False
+        commit_s, beat_s = _playground_clocks()
+        deadline = loop.time() + commit_s
+        try:
+            while True:
+                timeout = (deadline - loop.time()) if not committed else beat_s
+                done, _ = await asyncio.wait(
+                    {task, watcher}, timeout=max(0.0, timeout), return_when=asyncio.FIRST_COMPLETED
+                )
+                if task in done:
+                    break
+                if watcher in done:
+                    task.cancel()
+                    await asyncio.wait({task})
+                    return
+                if not committed:
+                    committed = True
+                    raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in self.extra_headers.items()]
+                    raw.append((b"content-type", b"application/json"))
+                    raw.append((b"cache-control", b"no-store, no-transform"))
+                    await send({"type": "http.response.start", "status": 200, "headers": raw})
+                await send({"type": "http.response.body", "body": b" ", "more_body": True})
+            status, body, extra = task.result()
+            payload = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else b""
+            if not committed:
+                headers = {**self.extra_headers, **dict(extra or {})}
+                raw = [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()]
+                raw.append((b"content-type", b"application/json"))
+                raw.append((b"content-length", str(len(payload)).encode("ascii")))
+                await send({"type": "http.response.start", "status": int(status), "headers": raw})
+                await send({"type": "http.response.body", "body": payload, "more_body": False})
+            else:
+                await send({"type": "http.response.body", "body": payload, "more_body": False})
+        finally:
+            watcher.cancel()
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task})
 
 
 def _reserved_output_tokens(plan: Any) -> Optional[int]:
@@ -2701,10 +3001,9 @@ async def _record_playground(
     both. A FAILED run is recorded too — a generation that burned engine time
     and then died is exactly the kind a capacity review must not lose.
 
-    The ceiling fields (2026-09-13) are the same four `/v1` writes: what was
-    asked for, what the generation ran under, whether the window clamped it,
-    and the wall clock it was given — so a three-hour playground run reads in
-    the ledger as the long run it was.
+    The ceiling fields (2026-09-13) are the ones `/v1` writes: what was asked
+    for, what the generation ran under, and whether the window clamped it.
+    There is no wall clock to record any more (no-timeout design).
     """
     usage = api_models.Usage.from_llm(outcome.usage)
     try:
@@ -2722,7 +3021,6 @@ async def _record_playground(
         )
     except Exception:  # noqa: BLE001 — recording must never break a response
         log.warning("playground token spend was not written to the quota ledger", exc_info=True)
-    wall_clock = getattr(plan, "wall_clock_s", None)
     await usage_ledger.record_async(
         user_id=principal.user_id,
         workspace_id=principal.workspace_id,
@@ -2750,7 +3048,6 @@ async def _record_playground(
             "max_output_tokens_requested": int(plan.requested_max_output_tokens),
             "max_output_tokens_applied": _applied_max_output_tokens(plan, outcome),
             "clamped": bool(getattr(plan, "clamped", False)),
-            "wall_clock_s": None if wall_clock is None else float(wall_clock),
         },
     )
 
@@ -2895,18 +3192,6 @@ async def playground_execute(
         await settlement.nothing_ran()
         raise
     slot = _Slot(stack)
-    try:
-        slot.attach_gate(await _enter_capacity_gate(plan))
-    except api_errors.ApiError as exc:
-        # At capacity (or no gate to hold): nothing ran, the estimate comes
-        # back, and the answer is the `/v1` 503 with its Retry-After.
-        slot.release()
-        await settlement.nothing_ran()
-        return _api_error_response(exc, request_id, rate_headers)
-    except BaseException:
-        slot.release()
-        await settlement.nothing_ran()
-        raise
 
     if parsed.stream:
 
@@ -2925,6 +3210,26 @@ async def playground_execute(
 
         async def frames() -> AsyncIterator[str]:
             try:
+                # The capacity wait, IN THE BODY (no-timeout design): the
+                # status line is already out, and a comment every heartbeat
+                # keeps every proxy from reading the wait as a dead socket.
+                gate_task = asyncio.ensure_future(_enter_capacity_gate(plan))
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({gate_task}, timeout=streaming.events.HEARTBEAT_SECONDS)
+                        if gate_task in done:
+                            break
+                        yield ": queued\n\n"
+                finally:
+                    if not gate_task.done():
+                        gate_task.cancel()
+                        await asyncio.wait({gate_task})
+                try:
+                    slot.attach_gate(gate_task.result())
+                except api_errors.ApiError as exc:
+                    await settlement.nothing_ran()
+                    yield streaming.events.SequencedEvents().error(exc)
+                    return
                 async for frame in streaming.responses_sse(spec, on_finish=on_finish):
                     yield frame
             finally:
@@ -2938,55 +3243,69 @@ async def playground_execute(
             headers={**streaming.SSE_HEADERS, **rate_headers, "X-Request-Id": request_id},
         )
 
-    # 2026-09-13 (adversarial review; the `/v1` finding applies here too): a
-    # playground run whose browser has gone gives its gate, its slot and the
-    # engine back at once, not when a generation nobody reads has finished.
-    outcome = streaming.new_outcome(spec)
-    client_gone = False
-    try:
-        outcome = await streaming.run_to_completion_watching(
-            spec, receive=request.receive, outcome=outcome
+    async def work() -> Any:
+        """The synchronous run inside a committed JSON response: the gate (no
+        limit), the generation, the record. Returns (status, body, headers)."""
+        try:
+            slot.attach_gate(await _enter_capacity_gate(plan))
+        except api_errors.ApiError as exc:
+            # No gate to hold (a wiring fault) or a refusal: nothing ran, the
+            # estimate comes back, and the answer is the `/v1` 503.
+            slot.release()
+            await settlement.nothing_ran()
+            return exc.status, exc.envelope(request_id), {**exc.headers(), "X-Request-Id": request_id}
+        except BaseException:
+            slot.release()
+            await settlement.nothing_ran()
+            raise
+        outcome = streaming.new_outcome(spec)
+        try:
+            outcome = await streaming.run_to_completion(spec, outcome=outcome)
+        except asyncio.CancelledError:
+            # The browser went away (the committed response cancels us): the
+            # engine may have produced tokens, so record what ran, shielded.
+            outcome.status = "cancelled"
+            outcome.client_gone = True
+            await streaming.settle(
+                lambda done: _record_playground(
+                    principal=principal, caller=caller, reservation=reservation, project=project,
+                    model=model, plan=plan, request_id=request_id, outcome=done, streamed=False,
+                ),
+                outcome,
+            )
+            raise
+        except BaseException:
+            slot.release()
+            await settlement.may_have_run()
+            raise
+        finally:
+            await slot.release_all()
+        await _record_playground(
+            principal=principal,
+            caller=caller,
+            reservation=reservation,
+            project=project,
+            model=model,
+            plan=plan,
+            request_id=request_id,
+            outcome=outcome,
+            streamed=False,
         )
-    except streaming.ClientGone:
-        client_gone = True
-    except BaseException:
-        # Raised or cancelled before `_record_playground`: the engine may have
-        # run, so the estimate stays charged — but the reservation is settled
-        # rather than left dangling.
-        slot.release()
-        await settlement.may_have_run()
-        raise
-    finally:
-        await slot.release_all()
-    await _record_playground(
-        principal=principal,
-        caller=caller,
-        reservation=reservation,
-        project=project,
-        model=model,
-        plan=plan,
-        request_id=request_id,
-        outcome=outcome,
-        streamed=False,
-    )
-    if client_gone:
-        # Recorded above with what the engine produced; nobody is listening.
-        return JSONResponse(status_code=499, content=None)
-    if outcome.error is not None:
-        return _api_error_response(outcome.error, request_id, rate_headers)
-    body = outcome.response().to_wire()
-    # Relayed on the response (2026-09-13): the ceiling the generation ran
-    # under, and whether it stopped there. `setdefault`, so the pump's own
-    # values win the moment `Response` carries them.
-    body.setdefault("max_output_tokens", _applied_max_output_tokens(plan, outcome))
-    body.setdefault(
-        "incomplete_details",
-        {"reason": "max_output_tokens"} if outcome.finish_reason == "length" else None,
-    )
-    return JSONResponse(
-        content=body,
-        headers={**rate_headers, "X-Request-Id": request_id},
-    )
+        if outcome.error is not None:
+            exc = outcome.error
+            return exc.status, exc.envelope(request_id), {**exc.headers(), "X-Request-Id": request_id}
+        body = outcome.response().to_wire()
+        # Relayed on the response (2026-09-13): the ceiling the generation ran
+        # under, and whether it stopped there. `setdefault`, so the pump's own
+        # values win the moment `Response` carries them.
+        body.setdefault("max_output_tokens", _applied_max_output_tokens(plan, outcome))
+        body.setdefault(
+            "incomplete_details",
+            {"reason": "max_output_tokens"} if outcome.finish_reason == "length" else None,
+        )
+        return 200, body, {"X-Request-Id": request_id}
+
+    return _CommittedJSON(work, headers={**rate_headers, "X-Request-Id": request_id})
 
 
 def _estimate_input_tokens(messages: Sequence[Dict[str, Any]]) -> int:

@@ -6,7 +6,8 @@ physical fact: the router, the OCR engine, the embeddings model, the reranker
 and whisper are SHARED with the chat application, and a public caller must
 never be able to starve the product of them. So public work on each shared
 engine passes through ONE gate per engine — shared by every project and key,
-first come first served, with a bounded wait that ends in the existing
+first come first served. On /v1 that wait has no limit (NO CLOCK ENDS A /v1
+WAIT, below); only a caller passing a finite wait can get the
 `503 model_unavailable` "at capacity" with a `Retry-After`. Never a 429, and
 never a number attached to a caller.
 
@@ -56,6 +57,28 @@ architecture review of 2026-09-13 from the engines' own logs):
              ONE clip per replica, and saturating either Spark takes chat
              decode 71 → ~24 tok/s because the main model is TP=2.
 
+NO CLOCK ENDS A /v1 WAIT (no-timeout design, 2026-09-13). `hold(wait_s=None)`
+waits until admitted, abandoned, or the caller's own physical guards say
+otherwise; only a caller passing a FINITE `wait_s` can ever get
+`model_at_capacity`, and no /v1 route does: the generations wait inside
+their streams and committed responses, and since 2026-09-14 so do
+`/v1/embeddings`, `/v1/rerank` and `/v1/audio/transcriptions` (sidecars.py,
+audio_jobs.py). The one finite caller left is the bounded synchronous file
+preparation (`sync_wait_s`). A
+waiter can ask for `on_wait(position, waited_s)` — on entry, whenever its
+place in line changes, and at least every 15 s — which is how a stream says
+`response.queued` and a committed sync body writes its whitespace.
+
+  main.normal
+             6 at a time — every public techsara-35b generation that is not
+             `main.long` (design capacity_waits, critical finding): at most 6
+             public generations inside chat's 10-slot NORMAL lane, so a public
+             flood can never reach chat's max_waiting refusal (measured with
+             the real Lane: 400 patient waiters refused chat instantly). Held
+             from dispatch to the end of the attempt, released while suspended.
+             `main.extended` holders also hold `main.normal` (taken in that
+             order, always, so the two gates cannot deadlock).
+
 FIFO, AND SYNCHRONOUS RELEASE. Waiters are served strictly in arrival order
 (a heavy request is not starved by a stream of light ones), and giving a slot
 back takes no lock and no await — so a release in a `finally` running under
@@ -70,7 +93,7 @@ import contextlib
 import logging
 import sys
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Deque, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional
 
 from . import errors, registry
 
@@ -78,6 +101,7 @@ log = logging.getLogger(__name__)
 
 GATE_MAIN_LONG = "main.long"
 GATE_MAIN_EXTENDED = "main.extended"
+GATE_MAIN_NORMAL = "main.normal"
 #: The gates in front of the main engine: they hold an admission slot for a
 #: long time, so they yield to a chat LONG request rather than to a busy chat.
 MAIN_GATES = (GATE_MAIN_LONG, GATE_MAIN_EXTENDED)
@@ -87,8 +111,12 @@ GATE_EMBED = registry.ENGINE_EMBED
 GATE_RERANK = registry.ENGINE_RERANK
 GATE_ASR = registry.ENGINE_ASR
 GATES = (
-    GATE_MAIN_LONG, GATE_MAIN_EXTENDED, GATE_ROUTER, GATE_OCR, GATE_EMBED, GATE_RERANK, GATE_ASR,
+    GATE_MAIN_LONG, GATE_MAIN_EXTENDED, GATE_MAIN_NORMAL, GATE_ROUTER, GATE_OCR, GATE_EMBED,
+    GATE_RERANK, GATE_ASR,
 )
+
+#: The longest a waiter goes without an `on_wait` call.
+ON_WAIT_EVERY_S = 15.0
 
 #: How often a yield-to-chat wait asks again. One second is the video
 #: pipeline's pace (owner-accepted policy, video/pipeline.pace); tests shrink it.
@@ -119,6 +147,8 @@ def _config(engine: str) -> GateConfig:
         # no work): the pre-integration fallback. Otherwise admission's
         # LONG_OUTPUT seats are the cap (`snapshot` reports them).
         return GateConfig(max(1, s_int("PUBLIC_API_MAIN_EXTENDED_MAX_CONCURRENT", 2)), 0, 60.0)
+    if engine == GATE_MAIN_NORMAL:
+        return GateConfig(max(1, s_int("PUBLIC_API_MAIN_NORMAL_MAX_CONCURRENT", 6)), 0, 60.0)
     if engine == GATE_ROUTER:
         return GateConfig(
             max(1, s_int("PUBLIC_API_ROUTER_MAX_CONCURRENT", 4)),
@@ -145,10 +175,11 @@ def _config(engine: str) -> GateConfig:
 
 
 def sync_wait_s() -> float:
-    """PUBLIC_API_GATE_WAIT_S (30 s): how long a synchronous, streaming,
-    embeddings, rerank or transcription request may wait for its gate. It
-    waits BEFORE the status line, so the refusal is a real HTTP 503 — and the
-    silent pre-header wait stays well under Cloudflare's 100 s origin timeout."""
+    """PUBLIC_API_GATE_WAIT_S (30 s, retired): the gate budget of the one
+    caller that still waits BEFORE its status line with a clock — the bounded
+    synchronous file preparation (`file_inputs.bounded_engines`, and the
+    retrieval reranker through `sidecars.BOUNDED_DEFAULT`). No /v1 route reads
+    it any more; `config.STILL_READ_RETIRED_SETTINGS` names the readers."""
     return max(0.0, registry.setting_float("PUBLIC_API_GATE_WAIT_S", 30.0))
 
 
@@ -167,11 +198,12 @@ def yield_to_chat_max_wait_s() -> float:
 
 
 class _Waiter:
-    __slots__ = ("future", "charge")
+    __slots__ = ("future", "charge", "since")
 
-    def __init__(self, future: "asyncio.Future[None]", charge: int) -> None:
+    def __init__(self, future: "asyncio.Future[None]", charge: int, since: float = 0.0) -> None:
         self.future = future
         self.charge = charge
+        self.since = since
 
 
 class _Gate:
@@ -256,10 +288,18 @@ def _publish(engine: str, gate: _Gate) -> None:
             "public /v1 requests holding a shared engine's capacity gate",
             engine=engine,
         )
+        waiting = [waiter for waiter in gate.waiters if not waiter.future.done()]
         metrics.set_gauge(
             "public_api_engine_waiting",
             _waiting(gate),
             "public /v1 requests waiting for a shared engine's capacity gate",
+            engine=engine,
+        )
+        oldest = min((w.since for w in waiting), default=None)
+        metrics.set_gauge(
+            "public_api_engine_oldest_wait_seconds",
+            0.0 if oldest is None else max(0.0, gate.loop.time() - oldest),
+            "how long the oldest public /v1 waiter for a shared engine's gate has waited",
             engine=engine,
         )
     except Exception:  # noqa: BLE001
@@ -441,42 +481,94 @@ class PublicMainGeneration:
 
 async def _yield_to_chat(
     engine: str,
-    deadline: float,
+    deadline: Optional[float],
     loop: asyncio.AbstractEventLoop,
     abandon: Optional[asyncio.Event] = None,
+    on_wait: Optional["OnWait"] = None,
 ) -> None:
-    """Wait while a person is waiting for an answer — bounded.
+    """Wait while a person is waiting for an answer.
 
     Chat: up to PUBLIC_API_YIELD_TO_CHAT_MAX_WAIT_S (10 s), then the public
     work runs anyway, bounded by its gate; a chatty workspace must not starve
     an API caller for ever (the video pipeline's rule). Dictation (speech
-    only): for the whole gate wait, because a person holding a microphone
-    must always find a free replica — past the deadline it is the 503.
+    only) and a chat LONG request (main gates): for the whole gate wait —
+    with `deadline=None` (every durable /v1 caller) that wait has no limit and
+    ends only when the person is served or the waiter is abandoned; with a
+    finite deadline (the legacy synchronous path) it is the 503.
     """
+
+    def expired() -> bool:
+        return deadline is not None and loop.time() >= deadline
+
+    def step() -> float:
+        if deadline is None:
+            return YIELD_STEP_S
+        return min(YIELD_STEP_S, max(0.0, deadline - loop.time())) or 0
+
+    started = loop.time()
+    notice = {"at": None}
+
+    async def waiting() -> None:
+        """`on_wait(0, waited)` while a person is being served first:
+        position 0 means "not in the gate's line yet". On the first wait and
+        at least every ON_WAIT_EVERY_S, like the line itself."""
+        now = loop.time()
+        if on_wait is not None and (notice["at"] is None or now - notice["at"] >= ON_WAIT_EVERY_S):
+            notice["at"] = now
+            await _notify_wait(on_wait, 0, now - started)
+
     if engine in MAIN_GATES:
-        # A chat LONG request is waiting for the engine to go idle; a new
-        # multi-hour public generation would make it wait its whole bound.
-        # For the whole gate wait: past it, the 503 (or, in a background job,
-        # another turn of the queue).
         while chat_long_admission_present():
             if abandon is not None and abandon.is_set():
                 raise Abandoned()
-            if loop.time() >= deadline:
+            if expired():
                 raise errors.model_at_capacity(retry_after=_config(engine).retry_after)
-            await asyncio.sleep(min(YIELD_STEP_S, max(0.0, deadline - loop.time())) or 0)
+            await waiting()
+            await asyncio.sleep(step())
         return
-    chat_deadline = min(deadline, loop.time() + yield_to_chat_max_wait_s())
+    chat_deadline = loop.time() + yield_to_chat_max_wait_s()
+    if deadline is not None:
+        chat_deadline = min(deadline, chat_deadline)
     while loop.time() < chat_deadline and chat_is_busy():
         await asyncio.sleep(min(YIELD_STEP_S, max(0.0, chat_deadline - loop.time())) or 0)
     if engine != GATE_ASR:
         return
     while dictation_is_busy():
-        if loop.time() >= deadline:
+        if abandon is not None and abandon.is_set():
+            raise Abandoned()
+        if expired():
             raise errors.model_at_capacity(retry_after=_config(engine).retry_after)
-        await asyncio.sleep(min(YIELD_STEP_S, max(0.0, deadline - loop.time())) or 0)
+        await waiting()
+        await asyncio.sleep(step())
 
 
 # ------------------------------------------------------------ the gate --
+
+
+OnWait = Callable[[int, float], Any]
+
+
+def _position(gate: _Gate, waiter: _Waiter) -> int:
+    """1-based place in line among live waiters."""
+    place = 0
+    for other in gate.waiters:
+        if other.future.done():
+            continue
+        place += 1
+        if other is waiter:
+            return place
+    return 0
+
+
+async def _notify_wait(on_wait: Optional[OnWait], position: int, waited: float) -> None:
+    if on_wait is None:
+        return
+    try:
+        result = on_wait(position, waited)
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:  # noqa: BLE001 - a progress callback never fails a wait
+        log.debug("on_wait callback raised", exc_info=True)
 
 
 @contextlib.asynccontextmanager
@@ -484,16 +576,21 @@ async def hold(
     engine: str,
     *,
     weight_tokens: int = 0,
-    wait_s: float,
+    wait_s: Optional[float] = None,
     yield_to_chat: bool = False,
     abandon: Optional[asyncio.Event] = None,
+    on_wait: Optional[OnWait] = None,
+    front: bool = False,
     work: Any = None,
 ) -> AsyncIterator[None]:
     """Hold one unit of `engine`'s public capacity for the body of the block.
 
-    Raises `errors.ApiError` (503 `model_unavailable`, "at capacity", with
-    Retry-After) when not admitted within `wait_s`, and `Abandoned` when
-    `abandon` is set while waiting. Released in `finally`, however the block
+    `wait_s=None` (the default since 2026-09-13): no limit — the wait ends on
+    admission or abandonment only. A finite `wait_s` raises `errors.ApiError`
+    (503 `model_unavailable`, "at capacity", with Retry-After) when not
+    admitted in time. `Abandoned` when `abandon` is set while waiting.
+    `front=True` puts the waiter at the head of the line (a run that yielded
+    to chat goes back where it was). Released in `finally`, however the block
     ends — including cancellation, both while waiting and while held.
 
     `work`: for a main gate, the planned request (`GenerationPlan` or
@@ -504,14 +601,18 @@ async def hold(
     a front door — a main gate counts on its own, as before 2026-09-13.
     """
     if engine in MAIN_GATES:
-        async with _hold_main(engine, wait_s=wait_s, abandon=abandon, work=work):
+        async with _hold_main(engine, wait_s=wait_s, abandon=abandon, work=work, on_wait=on_wait, front=front):
             yield
         return
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, float(wait_s))
+    started = loop.time()
+    deadline = None if wait_s is None else started + max(0.0, float(wait_s))
     if yield_to_chat:
-        await _yield_to_chat(engine, deadline, loop, abandon)
-    async with _counted(engine, deadline=deadline, loop=loop, weight_tokens=weight_tokens, abandon=abandon):
+        await _yield_to_chat(engine, deadline, loop, abandon, on_wait)
+    async with _counted(
+        engine, deadline=deadline, loop=loop, weight_tokens=weight_tokens, abandon=abandon,
+        on_wait=on_wait, front=front, started=started,
+    ):
         yield
 
 
@@ -519,38 +620,64 @@ async def hold(
 async def _counted(
     engine: str,
     *,
-    deadline: float,
+    deadline: Optional[float],
     loop: asyncio.AbstractEventLoop,
     weight_tokens: int = 0,
     abandon: Optional[asyncio.Event] = None,
+    on_wait: Optional[OnWait] = None,
+    front: bool = False,
+    started: Optional[float] = None,
 ) -> AsyncIterator[None]:
-    """This module's own FIFO count for `engine`, waiting until `deadline`."""
+    """This module's own FIFO count for `engine`, waiting until `deadline`
+    (None: no limit — NO CLOCK ENDS A /v1 WAIT)."""
     config = _config(engine)
+    if started is None:
+        started = loop.time()
     gate = _gate(engine)
     weight = max(0, int(weight_tokens or 0))
     charge = min(weight, config.budget_tokens) if config.budget_tokens > 0 else 0
 
-    if not gate.waiters and _admissible(gate, config, charge):
+    if (not gate.waiters or front) and _admissible(gate, config, charge):
         gate.in_flight += 1
         gate.used_tokens += charge
         _publish(engine, gate)
     else:
-        waiter = _Waiter(loop.create_future(), charge)
-        gate.waiters.append(waiter)
+        waiter = _Waiter(loop.create_future(), charge, started)
+        if front:
+            gate.waiters.appendleft(waiter)
+        else:
+            gate.waiters.append(waiter)
         _publish(engine, gate)
         abandon_task: Optional[asyncio.Task] = None
+        position = _position(gate, waiter)
+        await _notify_wait(on_wait, position, 0.0)
+        last_notice = loop.time()
         try:
             waits = {waiter.future}
             if abandon is not None:
                 abandon_task = loop.create_task(abandon.wait())
                 waits.add(abandon_task)
             while not waiter.future.done():
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    break
-                await asyncio.wait(waits, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                now = loop.time()
+                timeout: Optional[float] = None
+                if deadline is not None:
+                    remaining = deadline - now
+                    if remaining <= 0:
+                        break
+                    timeout = remaining
+                if on_wait is not None:
+                    until_notice = max(0.01, ON_WAIT_EVERY_S - (now - last_notice))
+                    timeout = until_notice if timeout is None else min(timeout, until_notice)
+                await asyncio.wait(waits, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
                 if abandon is not None and abandon.is_set() and not waiter.future.done():
                     break
+                if on_wait is not None and not waiter.future.done():
+                    now = loop.time()
+                    moved = _position(gate, waiter)
+                    if moved != position or now - last_notice >= ON_WAIT_EVERY_S:
+                        position = moved
+                        last_notice = now
+                        await _notify_wait(on_wait, position, now - started)
         except BaseException:
             # Cancelled while waiting. A grant that landed in the same tick is
             # given straight back, so it can never be stranded.
@@ -624,18 +751,27 @@ async def _preadmit(
     admission: Any,
     request: tuple,
     *,
-    deadline: float,
+    deadline: Optional[float],
     loop: asyncio.AbstractEventLoop,
     abandon: Optional[asyncio.Event],
     retry_after: float,
+    on_wait: Optional["OnWait"] = None,
+    started: Optional[float] = None,
 ) -> Any:
     """admission.preadmit, bounded by what is left of this gate's wait as a
     hard wall clock (whatever the lane defers behind a closure) and abandoned
-    with the job. AdmissionRejected is the same retry-safe 503 the gate gives."""
+    with the job. AdmissionRejected is the same retry-safe 503 the gate gives.
+
+    `deadline=None` (every durable /v1 caller, NO CLOCK ENDS A /v1 WAIT): the
+    pre-admission is PATIENT and has no wall clock; it ends on the grant or on
+    `abandon`. `on_wait(0, waited)` is called at least every ON_WAIT_EVERY_S
+    meanwhile — position 0, as in `_yield_to_chat`: the wait is admission's,
+    not a place in this gate's line."""
     from ..config import settings
 
     messages, max_tokens = request
-    remaining = max(0.0, deadline - loop.time())
+    remaining = None if deadline is None else max(0.0, deadline - loop.time())
+    begun = loop.time() if started is None else started
     task = loop.create_task(
         admission.preadmit(
             messages,
@@ -651,9 +787,18 @@ async def _preadmit(
         abandon_task = loop.create_task(abandon.wait())
         waits.add(abandon_task)
     try:
-        # A small grace past the lane's own bound: the lane refuses first, with
-        # its reason; the wall clock only catches a wait the lane deferred.
-        await asyncio.wait(waits, timeout=remaining + 0.5, return_when=asyncio.FIRST_COMPLETED)
+        if remaining is not None:
+            # A small grace past the lane's own bound: the lane refuses first, with
+            # its reason; the wall clock only catches a wait the lane deferred.
+            await asyncio.wait(waits, timeout=remaining + 0.5, return_when=asyncio.FIRST_COMPLETED)
+        else:
+            while not task.done() and not (abandon is not None and abandon.is_set()):
+                await asyncio.wait(
+                    waits, timeout=ON_WAIT_EVERY_S if on_wait is not None else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if on_wait is not None and not task.done():
+                    await _notify_wait(on_wait, 0, loop.time() - begun)
     except BaseException:
         task.cancel()
         with contextlib.suppress(BaseException):
@@ -690,16 +835,20 @@ async def _preadmit(
 async def _hold_main(
     engine: str,
     *,
-    wait_s: float,
+    wait_s: Optional[float],
     abandon: Optional[asyncio.Event],
     work: Any,
+    on_wait: Optional["OnWait"] = None,
+    front: bool = False,
 ) -> AsyncIterator[None]:
     """A main gate: yield to a large prefill ahead, the one-at-a-time wait for
-    main.long, then the answer's admission (module docstring)."""
+    main.long, then the answer's admission (module docstring). `wait_s=None`
+    waits with no limit at every step (NO CLOCK ENDS A /v1 WAIT)."""
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, float(wait_s))
+    started = loop.time()
+    deadline = None if wait_s is None else started + max(0.0, float(wait_s))
     retry_after = _config(engine).retry_after
-    await _yield_to_chat(engine, deadline, loop, abandon)
+    await _yield_to_chat(engine, deadline, loop, abandon, on_wait)
     request = _work_request(work)
     front_door = _admission_front_door() if request is not None else None
     # Set in THIS context, before the pre-admission and before the generation's
@@ -711,7 +860,8 @@ async def _hold_main(
                 # main.long's one-at-a-time wait comes FIRST: a second 1M
                 # answer must not sit on a LONG_OUTPUT seat while it waits.
                 await stack.enter_async_context(
-                    _counted(engine, deadline=deadline, loop=loop, abandon=abandon)
+                    _counted(engine, deadline=deadline, loop=loop, abandon=abandon, on_wait=on_wait,
+                             front=front, started=started)
                 )
             if front_door is not None:
                 gate = _gate(engine)
@@ -720,7 +870,7 @@ async def _hold_main(
                 try:
                     ticket = await _preadmit(
                         front_door, request, deadline=deadline, loop=loop, abandon=abandon,
-                        retry_after=retry_after,
+                        retry_after=retry_after, on_wait=on_wait, started=started,
                     )
                 finally:
                     gate.admitting = max(0, gate.admitting - 1)
@@ -739,13 +889,43 @@ async def _hold_main(
                         # set above PUBLIC_API_MAIN_EXTENDED_OUTPUT_TOKENS — so no
                         # LONG_OUTPUT seat caps it: the gate's own count does.
                         await stack.enter_async_context(
-                            _counted(engine, deadline=deadline, loop=loop, abandon=abandon)
+                            _counted(engine, deadline=deadline, loop=loop, abandon=abandon, on_wait=on_wait,
+                                     front=front, started=started)
                         )
                     else:
                         stack.enter_context(_tallied(engine))
             yield
     finally:
         _reset_public_origin(origin)
+
+
+def gates_for(engine: str, gate_engine: Optional[str]) -> List[str]:
+    """Every gate one public generation holds, in acquisition order.
+
+    Main model: `main.long` alone when its footprint is long (it runs in the
+    LONG lane, not NORMAL); otherwise `main.extended` (when planned) THEN
+    `main.normal` — one fixed order, so no two runs can each hold the gate
+    the other waits for. Sidecars: their own gate, when planned."""
+    if engine == registry.ENGINE_MAIN:
+        if gate_engine == GATE_MAIN_LONG:
+            return [GATE_MAIN_LONG]
+        if gate_engine == GATE_MAIN_EXTENDED:
+            return [GATE_MAIN_EXTENDED, GATE_MAIN_NORMAL]
+        return [GATE_MAIN_NORMAL]
+    return [gate_engine] if gate_engine else []
+
+
+def has_room(engine: str, weight_tokens: int = 0) -> bool:
+    """Would `hold(engine)` admit at once? The background dispatcher asks
+    before it claims a row, so a queued job holds no coroutine."""
+    try:
+        config = _config(engine)
+        gate = _gate(engine)
+    except (ValueError, RuntimeError):
+        return True
+    charge = min(max(0, int(weight_tokens or 0)), config.budget_tokens) if config.budget_tokens > 0 else 0
+    live = [w for w in gate.waiters if not w.future.done()]
+    return not live and _admissible(gate, config, charge)
 
 
 def _forget(engine: str, gate: _Gate, waiter: _Waiter) -> None:
@@ -800,6 +980,7 @@ __all__ = [
     "GATE_EMBED",
     "GATE_MAIN_EXTENDED",
     "GATE_MAIN_LONG",
+    "GATE_MAIN_NORMAL",
     "MAIN_GATES",
     "PublicMainGeneration",
     "GATE_OCR",
@@ -809,6 +990,8 @@ __all__ = [
     "chat_is_busy",
     "chat_long_admission_present",
     "dictation_is_busy",
+    "gates_for",
+    "has_room",
     "hold",
     "snapshot",
     "sync_wait_s",

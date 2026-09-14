@@ -28,7 +28,7 @@ import binascii
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
 from typing_extensions import Annotated
 
 from ..config import settings
@@ -95,8 +95,9 @@ _DEFAULT_MAX_MEDIA_BODY_BYTES = 20 * 1024 * 1024
 #: resolution the processor downsamples anyway, and ten of them would be
 #: most of the body.
 _DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
-#: 25 MiB of audio plus multipart overhead (`POST /v1/audio/transcriptions`).
-_DEFAULT_MAX_AUDIO_BODY_BYTES = 27_262_976
+#: 89 MiB of audio plus multipart overhead (`POST /v1/audio/transcriptions`,
+#: CONTRACT §8.6); `endpoint_models` owns the number.
+_DEFAULT_MAX_AUDIO_BODY_BYTES = 94_371_840
 
 
 def max_media_body_bytes() -> int:
@@ -111,7 +112,7 @@ def max_image_bytes() -> int:
 
 
 def max_audio_body_bytes() -> int:
-    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (26 MiB): the wire cap on speech."""
+    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (90 MiB): the wire cap on speech."""
     return max(max_body_bytes(), _setting_int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", _DEFAULT_MAX_AUDIO_BODY_BYTES))
 
 
@@ -126,13 +127,35 @@ def body_cap_for(method: str, path: str) -> int:
     application's body-size middleware asks (`app/main.py::body_cap_for`, via
     `_public_api_body_cap`, since the 2026-09-13 integration). A new `/v1`
     route whose body may exceed `max_body_bytes()` is added here, and the
-    mounted app follows with no edit to main.py."""
+    mounted app follows with no edit to main.py.
+
+    FILES (files-hookup, 2026-09-13): `POST /v1/files` and
+    `POST /v1/uploads/{id}/parts` get 65 MiB and `PUT /v1/uploads/{id}/parts/{n}`
+    64 MiB, from `publicapi/files/routes.body_cap_for` — exact paths only, so
+    `POST /v1/uploads` and `complete` stay under the JSON rule. Those routes
+    stream the body to disk under their own caps; this is only the
+    middleware's outer bound. A files module that will not import leaves every
+    file route at the 1 MiB default, which refuses parts rather than opening
+    a larger cap anywhere."""
+    try:
+        from .files.routes import body_cap_for as _files_body_cap_for
+
+        files_cap = _files_body_cap_for(method, path)
+    except Exception:  # noqa: BLE001 - see the docstring: fail small
+        files_cap = None
+    if files_cap is not None:
+        return int(files_cap)
+    # The sidecar routes (2026-09-14): 8 MiB on embeddings and rerank, 90 MiB
+    # on transcriptions — read from the module whose handlers enforce them,
+    # so the middleware's outer cap and the route's own reader agree.
+    from .endpoint_models import body_cap_for as _sidecar_body_cap_for
+
+    sidecar_cap = _sidecar_body_cap_for(method, path)
+    if sidecar_cap is not None:
+        return int(sidecar_cap)
     normalised = "/" + str(path or "").strip("/")
-    if str(method or "").upper() == "POST":
-        if normalised in _MEDIA_ROUTES:
-            return max_media_body_bytes()
-        if normalised in _AUDIO_ROUTES:
-            return max_audio_body_bytes()
+    if str(method or "").upper() == "POST" and normalised in _MEDIA_ROUTES:
+        return max_media_body_bytes()
     return max_body_bytes()
 
 
@@ -312,6 +335,12 @@ class ResponsesRequest(_Strict):
     instructions: Optional[str] = None
     stream: bool = False
     background: bool = False
+    #: CONTRACT §8.1 (2026-09-14): `true` (the default) makes the generation
+    #: durable — its spec and events are stored while it runs, it survives a
+    #: restart and can be resumed by `GET /v1/responses/{id}?stream=true`;
+    #: `false` opts out (cancelled on disconnect and on a restart, never
+    #: resumable). Strict: a string "false" is a 400, never a truthy value.
+    store: StrictBool = True
     #: The ceiling is per model and is checked in `resolve_max_output_tokens`,
     #: which knows which model the key resolved to. Only the floor is here.
     max_output_tokens: Optional[int] = Field(default=None, ge=1)
@@ -371,15 +400,13 @@ class ResponsesRequest(_Strict):
                 )
         return value
 
-    @model_validator(mode="after")
-    def _stream_and_background_are_exclusive(self) -> "ResponsesRequest":
-        """CONTRACT §8: both true is refused. A background response is
-        delivered by `GET /v1/responses/{id}` and a webhook; there is no
-        stream to attach to, so honouring `stream` would be a lie and
-        ignoring it would be the silent-drop failure rule 1 forbids."""
-        if self.stream and self.background:
-            raise ValueError("stream and background cannot both be true")
-        return self
+    # STREAM AND BACKGROUND TOGETHER (2026-09-14). Refused until now because
+    # a background job had no stream to attach to. Every background job is a
+    # durable run with a write-ahead event log now, so the request's
+    # connection follows that log (CONTRACT §14): the job survives the client
+    # leaving, and a broken stream resumes by §10.3. What is still refused is
+    # `background` with `store: false` — a job nobody may read back and that
+    # a restart would silently drop (`parse_responses_request`).
 
     # ---------------------------------------------------------- helpers --
 
@@ -470,6 +497,10 @@ def parse_responses_request(payload: Any) -> ResponsesRequest:
             message,
             param=_param_from_loc(chosen.get("loc") or ()),
         ) from None
+    if request.background and not request.store:
+        # OpenAI's rule too: a background response is read back later, which
+        # is exactly what `store: false` forbids keeping.
+        raise errors.invalid_request("background requires store to be true.", param="store")
     # CONTRACT §12's text rule survives the larger media body (2026-09-13).
     limit = max_body_bytes()
     if request.text_bytes() > limit:

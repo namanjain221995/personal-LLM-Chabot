@@ -24,6 +24,7 @@ import {
   CONSOLE_UPSTREAM_BASE,
   DELETE,
   GET,
+  MAX_CONSOLE_PART_BYTES,
   PATCH,
   POST,
   PUT,
@@ -32,6 +33,7 @@ import {
   consoleRouteAllowed,
 } from '@/app/api/devplatform/[...path]/route';
 import { consolePaths } from '@/components/devplatform/paths';
+import { CONSOLE_PART_BYTES } from '@/components/devplatform/files-api';
 
 const ctx = (...path: string[]) => ({ params: Promise.resolve({ path }) });
 
@@ -93,6 +95,17 @@ describe('the console proxy forwards only the operations it declares', () => {
       [consolePaths.models(), 'GET'],
       [consolePaths.model('techsara-35b'), 'PUT'],
       [consolePaths.playground(), 'POST'],
+      [consolePaths.files(p), 'GET'],
+      [consolePaths.file(p, 'file-0123456789abcdef01234567'), 'GET'],
+      [consolePaths.file(p, 'file-0123456789abcdef01234567'), 'DELETE'],
+      [consolePaths.fileEvents(p, 'file-0123456789abcdef01234567'), 'GET'],
+      [consolePaths.fileDerived(p, 'file-0123456789abcdef01234567'), 'GET'],
+      [consolePaths.storage(p), 'GET'],
+      [consolePaths.uploads(p), 'POST'],
+      [consolePaths.upload(p, 'upload_0123456789abcdef01234567'), 'GET'],
+      [consolePaths.uploadPart(p, 'upload_0123456789abcdef01234567', 3), 'PUT'],
+      [consolePaths.completeUpload(p, 'upload_0123456789abcdef01234567'), 'POST'],
+      [consolePaths.cancelUpload(p, 'upload_0123456789abcdef01234567'), 'POST'],
     ];
     for (const [path, method] of calls) {
       expect(consoleRouteAllowed(path.split('/'), method), `${method} ${path}`).toBe(true);
@@ -657,5 +670,194 @@ describe('the playground stream', () => {
       ctx('playground', 'execute'),
     );
     expect(res.status).toBe(502);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The Files tab
+// ---------------------------------------------------------------------------
+
+describe('the Files operations', () => {
+  const p = 'proj_0123456789abcdef01234567';
+  const f = 'file-0123456789abcdef01234567';
+  const u = 'upload_0123456789abcdef01234567';
+
+  it('offers no route that serves bytes, for the original or a derived output', () => {
+    expect(consoleRouteAllowed(['projects', p, 'files', f, 'content'], 'GET')).toBe(false);
+    expect(consoleRouteAllowed(['projects', p, 'files', f, 'derived', 'text.txt'], 'GET')).toBe(false);
+    expect(consoleRouteAllowed(['projects', p, 'files'], 'POST')).toBe(false);
+  });
+
+  it('bounds the file list query as the router declares it', () => {
+    const list = ['projects', p, 'files'];
+    expect(consoleQuery(list, 'GET', `?limit=50&status=failed&kind=pdf&after=${f}`)).toBe(
+      `?limit=50&status=failed&kind=pdf&after=${f}`,
+    );
+    expect(consoleQuery(list, 'GET', '?limit=101')).toBeNull();
+    expect(consoleQuery(list, 'GET', '?status=deleted')).toBeNull();
+    expect(consoleQuery(list, 'GET', '?kind=playlist')).toBeNull();
+    expect(consoleQuery(list, 'GET', '?after=../x')).toBeNull();
+    expect(consoleQuery(list, 'GET', '?purpose=batch')).toBeNull();
+  });
+
+  it("sizes the part cap to the tab's own part size", () => {
+    expect(MAX_CONSOLE_PART_BYTES).toBe(CONSOLE_PART_BYTES);
+  });
+
+  it('relays a part as raw bytes with its digest and the session, and never an Authorization header', async () => {
+    const calls = capture(() => json({ id: 'part_1', object: 'upload.part', part_number: 3, bytes: 5 }));
+    const res = await PUT(
+      new Request(`http://localhost:3001/api/devplatform/projects/${p}/uploads/${u}/parts/3`, {
+        method: 'PUT',
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '5',
+          'x-part-sha256': 'AB'.repeat(32),
+          cookie: 'ts_session=abc',
+          authorization: 'Bearer tsk_live_deadbeef_secret',
+        },
+        body: new Uint8Array([1, 2, 3, 4, 5]),
+      }),
+      ctx('projects', p, 'uploads', u, 'parts', '3'),
+    );
+    expect(res.status).toBe(200);
+    expect(calls[0]!.url).toBe(`http://orchestrator:8080${CONSOLE_UPSTREAM_BASE}/projects/${p}/uploads/${u}/parts/3`);
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    expect(headers['x-part-sha256']).toBe('ab'.repeat(32));
+    expect(headers.cookie).toBe('ts_session=abc');
+    expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain('authorization');
+    expect(new Uint8Array(calls[0]!.init.body as ArrayBuffer)).toEqual(new Uint8Array([1, 2, 3, 4, 5]));
+  });
+
+  it('refuses a part declared over the cap without calling the orchestrator', async () => {
+    const calls = capture(() => json({}));
+    const over = await PUT(
+      new Request(`http://localhost:3001/api/devplatform/projects/${p}/uploads/${u}/parts/0`, {
+        method: 'PUT',
+        headers: { 'content-length': String(MAX_CONSOLE_PART_BYTES + 1) },
+        body: new Uint8Array(1),
+      }),
+      ctx('projects', p, 'uploads', u, 'parts', '0'),
+    );
+    expect(over.status).toBe(413);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("keeps a Files refusal's retry verdict on the way back", async () => {
+    capture(() =>
+      json({ error: { code: 'storage_unavailable', message: 'Try again later.' } }, 503, {
+        'retry-after': '60',
+        'x-should-retry': 'false',
+      }),
+    );
+    const res = await PUT(
+      new Request(`http://localhost:3001/api/devplatform/projects/${p}/uploads/${u}/parts/0`, {
+        method: 'PUT',
+        headers: { 'content-length': '1' },
+        body: new Uint8Array(1),
+      }),
+      ctx('projects', p, 'uploads', u, 'parts', '0'),
+    );
+    expect(res.status).toBe(503);
+    expect(res.headers.get('x-should-retry')).toBe('false');
+    expect(res.headers.get('retry-after')).toBe('60');
+  });
+
+  it("keeps a buffered Files refusal's retry verdict, as a busy complete sends it", async () => {
+    capture(() =>
+      json(
+        { error: { code: 'upload_state_conflict', message: 'This upload is being completed by another request. Retry to receive its result.' } },
+        409,
+        { 'retry-after': '2', 'x-should-retry': 'true' },
+      ),
+    );
+    const res = await POST(
+      new Request(`http://localhost:3001/api/devplatform/projects/${p}/uploads/${u}/complete`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin', cookie: 'ts_session=abc' },
+        body: '{}',
+      }),
+      ctx('projects', p, 'uploads', u, 'complete'),
+    );
+    expect(res.status).toBe(409);
+    expect(res.headers.get('x-should-retry')).toBe('true');
+    expect(res.headers.get('retry-after')).toBe('2');
+  });
+
+  it('refuses a Files write another site sent, or a POST that is not JSON, without calling the orchestrator', async () => {
+    const calls = capture(() => json({ id: u, object: 'upload', status: 'cancelled' }));
+    const at = (...segments: string[]) => `http://localhost:3001/api/devplatform/${segments.join('/')}`;
+
+    const sibling = await PUT(
+      new Request(at('projects', p, 'uploads', u, 'parts', '0'), {
+        method: 'PUT',
+        headers: { 'content-length': '1', 'sec-fetch-site': 'same-site', cookie: 'ts_session=abc' },
+        body: new Uint8Array(1),
+      }),
+      ctx('projects', p, 'uploads', u, 'parts', '0'),
+    );
+    expect(sibling.status).toBe(403);
+
+    const crossDelete = await DELETE(
+      new Request(at('projects', p, 'files', f), { method: 'DELETE', headers: { 'sec-fetch-site': 'cross-site' } }),
+      ctx('projects', p, 'files', f),
+    );
+    expect(crossDelete.status).toBe(403);
+
+    // A form post needs no preflight; the upload handlers would parse its body anyway.
+    const formPost = await POST(
+      new Request(at('projects', p, 'uploads', u, 'cancel'), {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain' },
+        body: '{}',
+      }),
+      ctx('projects', p, 'uploads', u, 'cancel'),
+    );
+    expect(formPost.status).toBe(415);
+    const empty = await POST(new Request(at('projects', p, 'uploads'), { method: 'POST' }), ctx('projects', p, 'uploads'));
+    expect(empty.status).toBe(415);
+    expect(calls).toHaveLength(0);
+
+    // The tab's own requests pass, and a read is never held to this.
+    const own = await POST(
+      new Request(at('projects', p, 'uploads', u, 'cancel'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8', 'sec-fetch-site': 'same-origin' },
+        body: '{}',
+      }),
+      ctx('projects', p, 'uploads', u, 'cancel'),
+    );
+    expect(own.status).toBe(200);
+    const read = await GET(
+      new Request(at('projects', p, 'files', f), { headers: { 'sec-fetch-site': 'cross-site' } }),
+      ctx('projects', p, 'files', f),
+    );
+    expect(read.status).toBe(200);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("hands a file's first processing frame to the browser while the stream is still open", async () => {
+    const calls = capture(
+      () =>
+        new Response(openStream('event: file.processing\ndata: {"sequence_number":1}\n\n'), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }),
+    );
+    const res = await GET(
+      new Request(`http://localhost:3001/api/devplatform/projects/${p}/files/${f}/events`, {
+        headers: { cookie: 'ts_session=abc', authorization: 'Bearer tsk_live_x' },
+      }),
+      ctx('projects', p, 'files', f, 'events'),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const headers = calls[0]!.init.headers as Record<string, string>;
+    expect(headers.accept).toBe('text/event-stream');
+    expect(Object.keys(headers).map((k) => k.toLowerCase())).not.toContain('authorization');
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    const chunk = await reader.read();
+    expect(new TextDecoder().decode(chunk.value)).toContain('file.processing');
+    await reader.cancel();
   });
 });

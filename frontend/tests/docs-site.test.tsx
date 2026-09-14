@@ -51,8 +51,13 @@ import { DocsNav } from '@/components/docs/DocsNav';
 import { docHeadingsOf } from '@/components/docs/docHeadings';
 import { DocsShell } from '@/components/docs/DocsShell';
 import {
-  DOC_PAGES,
-  DOC_SECTIONS,
+  DOC_PAGES as SITE_PAGES,
+  DOC_SECTIONS as SITE_SECTIONS,
+  DEPLOYS_HELD,
+  NO_TIMEOUT_EDGE_PROBE,
+  NO_TIMEOUT_LIVE,
+  deploysHeldOnTheEdge,
+  docSectionsFor,
   EMBED_MODEL_ID,
   EXAMPLE_KEYS,
   EXAMPLE_STATUS,
@@ -70,11 +75,43 @@ import {
   WALL_CLOCK_PENDING_NOTE,
   WHISPER_MODEL_ID,
   docHref,
-  findDocPage,
   neighboursOf,
 } from '@/content/docs';
+import { SIDECARS_NO_TIMEOUT_LIVE } from '@/content/docs/pages/sidecarsLive';
+import type { DocPage, DocSection } from '@/content/docs';
+import { FILES_API_PUBLISHED } from '@/content/docs/pages/files';
 
 afterEach(cleanup);
+
+/**
+ * WHICH SITE THE CONTENT TESTS READ (2026-09-13, no-timeout design).
+ *
+ * Most pages are built in two states from NO_TIMEOUT_LIVE
+ * (content/docs/pages/longOutput.ts): the API as it runs today, and the API
+ * once the no-timeout release is live. The content tests below read `LIVE`'s
+ * site. `DOCS_NO_TIMEOUT=1 npx vitest run tests/docs-site.test.tsx` runs every
+ * one of them against the release's pages before the switch is flipped; tests
+ * of a fact the release changes are `itNow` (today only) and have a partner in
+ * "the no-timeout release" block, which always reads the release's pages. The
+ * navigation tests always render the published registry (SITE_SECTIONS).
+ */
+const LIVE: boolean = process.env.DOCS_NO_TIMEOUT === '1' || NO_TIMEOUT_LIVE;
+const DOC_SECTIONS: DocSection[] =
+  LIVE === NO_TIMEOUT_LIVE ? SITE_SECTIONS : docSectionsFor({ noTimeout: LIVE });
+const DOC_PAGES: DocPage[] = DOC_SECTIONS.flatMap((section) => section.pages);
+function findDocPage(slug: string): DocPage | undefined {
+  return DOC_PAGES.find((page) => page.slug === slug);
+}
+/** A test of a fact the no-timeout release changes: today's pages only. */
+const itNow = LIVE ? it.skip : it;
+/** The site as it will read once the release is live, whatever LIVE is. */
+const RELEASE_SECTIONS: DocSection[] = docSectionsFor({ noTimeout: true });
+const RELEASE_PAGES: DocPage[] = RELEASE_SECTIONS.flatMap((section) => section.pages);
+function releasePage(slug: string): DocPage {
+  const page = RELEASE_PAGES.find((candidate) => candidate.slug === slug);
+  expect(page, `${slug} in the release site`).toBeDefined();
+  return page!;
+}
 
 const FRONTEND_DIR = join(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = join(FRONTEND_DIR, '..');
@@ -103,6 +140,23 @@ function proseUnitsOf(body: string): string[] {
 }
 
 const CONTRACT = repoFile('docs', 'developer-platform', 'CONTRACT.md');
+
+/**
+ * Does today's planner still size a public wall clock?
+ *
+ * 2026-09-14, review of the assembled patch set: the no-timeout release lands
+ * in parts. Its durable-generation part deletes the planner's wall clock
+ * before the router part that makes NO_TIMEOUT_LIVE flippable is in, and two
+ * `itNow` tests that read today's planner then failed on a string that no
+ * longer exists — with NO_TIMEOUT_LIVE false or true — and turned the frontend
+ * suite red for a reason nobody could act on. A test of a fact about today's
+ * code now checks it while that code is there. In the gap, today's pages still
+ * describe a clock the code no longer enforces: they understate the API, never
+ * overstate it, and the release pages replace them at the flip. The unsafe
+ * direction — dropping a caveat the code still needs — stays a failure.
+ */
+const PLANNING_PY = repoFile('orchestrator', 'app', 'publicapi', 'planning.py');
+const PLANNER_HAS_PUBLIC_WALL_CLOCK = /setting_float\("PUBLIC_API_GEN_WALL_CLOCK_S", /.test(PLANNING_PY);
 const REGISTRY_PY = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
 const KEYS_PY = repoFile('orchestrator', 'app', 'apiplatform', 'keys.py');
 
@@ -172,23 +226,29 @@ function contractRoutes(): Set<string> {
  * it is a concrete value, so both collapse to `{}` before comparison.
  */
 function normalisePath(path: string): string {
-  return path
-    .split('/')
-    .map((segment) => {
-      if (!segment) return segment;
-      if (/^\{.*\}$/.test(segment)) return '{}';
-      if (/^(resp|msg|proj|svc|key|whe|whd)_/.test(segment)) return '{}';
-      // Any of the six public ids fills `/v1/models/{model}` (2026-09-13).
-      if ((MODEL_IDS as readonly string[]).includes(segment)) return '{}';
-      return segment;
-    })
-    .join('/');
+  const segments = path.split('/');
+  const normalised = segments.map((segment, i) => {
+    if (!segment) return segment;
+    if (/^\{.*\}$/.test(segment)) return '{}';
+    if (/^(resp|msg|proj|svc|key|whe|whd)_/.test(segment)) return '{}';
+    // Any of the six public ids fills `/v1/models/{model}` (2026-09-13).
+    if ((MODEL_IDS as readonly string[]).includes(segment)) return '{}';
+    // The Files pages (2026-09-14): an example file, upload or part id, a
+    // shell variable (`$UPLOAD_ID`) and a derived output's name
+    // (`/derived/transcript.vtt`) each fill a parameter too, as in
+    // tests/docs-files.test.tsx.
+    if (/^(?:file-|upload_|part_)[0-9a-f]+$/.test(segment) || /^\$/.test(segment)) return '{}';
+    if (i > 0 && segments[i - 1] === 'derived') return '{}';
+    return segment;
+  });
+  while (normalised.length > 2 && normalised[normalised.length - 1] === '') normalised.pop();
+  return normalised.join('/');
 }
 
 /** Every `/v1/...` path mentioned anywhere in a page's prose or samples. */
 function routesMentionedIn(body: string): string[] {
   const found = new Set<string>();
-  for (const match of body.matchAll(/\/v1\/[A-Za-z0-9_\-{}./]+/g)) {
+  for (const match of body.matchAll(/\/v1\/[A-Za-z0-9_\-{}./$]+/g)) {
     const cleaned = match[0].replace(/[.]+$/, '');
     found.add(normalisePath(cleaned));
   }
@@ -208,6 +268,14 @@ function contractSection(start: string, end: string): string {
   expect(from, start).toBeGreaterThanOrEqual(0);
   expect(to, end).toBeGreaterThan(from);
   return CONTRACT.slice(from, to);
+}
+
+/** The Responses event names of CONTRACT §10.2's grammar block. */
+function contractGrammar(): Set<string> {
+  const section = contractSection('### 10.2 The Responses grammar', '### 10.3');
+  const block = /```\n([\s\S]*?)```/.exec(section);
+  expect(block, 'the grammar block in §10.2').not.toBeNull();
+  return new Set([...block![1].matchAll(/(response\.[a-z_.]+|\berror\b)/g)].map((m) => m[1]));
 }
 
 /** The scope table of CONTRACT §7: scope -> the sentence the server shows. */
@@ -359,7 +427,17 @@ describe('the documented API surface', () => {
   it('documents every route the contract publishes, somewhere', () => {
     const documented = new Set(DOC_PAGES.flatMap((page) => routesMentionedIn(page.body)));
     const missing = [...contractRoutes()].filter((route) => !documented.has(route));
-    expect(missing).toEqual([]);
+    // 2026-09-14: CONTRACT §7 lists the Files routes, and their pages are
+    // written, but FILES_API_PUBLISHED holds those pages back until a run
+    // through the public URL is recorded (pages/files.ts). So the routes the
+    // live site does not document must be exactly the Files routes, and the
+    // site as it publishes with them must document every contract route.
+    const filesRoute = (route: string) => route.startsWith('/v1/files') || route.startsWith('/v1/uploads');
+    expect(missing.filter((route) => !filesRoute(route))).toEqual([]);
+    if (FILES_API_PUBLISHED) expect(missing).toEqual([]);
+    const withFiles = docSectionsFor({ noTimeout: NO_TIMEOUT_LIVE, filesPublished: true }).flatMap((section) => section.pages);
+    const documentedWithFiles = new Set(withFiles.flatMap((page) => routesMentionedIn(page.body)));
+    expect([...contractRoutes()].filter((route) => !documentedWithFiles.has(route))).toEqual([]);
   });
 
   it('uses only the model ids the contract registry declares, and every one of them', () => {
@@ -600,7 +678,7 @@ describe('the error and scope vocabularies', () => {
     expect(defined.size).toBeGreaterThanOrEqual(4);
     const contract = contractScopes();
     expect([...contract.keys()].sort()).toEqual(
-      ['audio.write', 'embeddings.write', 'models.read', 'rerank.write', 'responses.read', 'responses.write', 'usage.read'],
+      ['audio.write', 'embeddings.write', 'files.read', 'files.write', 'models.read', 'rerank.write', 'responses.read', 'responses.write', 'usage.read'],
     );
     for (const scope of defined) expect(contract.has(scope), `${scope} is not in CONTRACT §7`).toBe(true);
 
@@ -687,12 +765,18 @@ describe('the error and scope vocabularies', () => {
     );
     expect(subscribable.size).toBe(3);
 
+    // DOCS_NO_TIMEOUT=1 reads the release's pages before events.py emits the
+    // release's grammar; then CONTRACT §10.2 is the list. Once NO_TIMEOUT_LIVE
+    // is true, the code must emit every name the pages use.
+    const allowed = new Set(emitted);
+    if (LIVE && !NO_TIMEOUT_LIVE) for (const name of contractGrammar()) allowed.add(name);
+
     const invented: string[] = [];
     for (const page of DOC_PAGES) {
       for (const pattern of sources) {
         for (const match of page.body.matchAll(pattern)) {
           const name = match[1];
-          if (!emitted.has(name) && !subscribable.has(name)) {
+          if (!allowed.has(name) && !subscribable.has(name)) {
             invented.push(`${page.slug}: ${name}`);
           }
         }
@@ -755,7 +839,9 @@ describe('the shipped router', () => {
     // here ONLY while the contract names it and the router has not caught
     // up; once the router lists it, this line adds nothing.
     const contractChat = contractSection('### 8.2 `POST /v1/chat/completions`', '### 8.3');
-    const pending = ['max_completion_tokens'].filter(
+    // `store` is the no-timeout release's (CONTRACT §8.2): allowed the same
+    // way while the pages are the release's and router.py has not caught up.
+    const pending = ['max_completion_tokens', ...(LIVE && !NO_TIMEOUT_LIVE ? ['store'] : [])].filter(
       (field) => contractChat.includes(`\`${field}\``) && !fields.includes(field),
     );
     expect([...documented].sort()).toEqual([...fields, ...pending].sort());
@@ -1080,9 +1166,11 @@ describe('the unlimited API (owner decision, 2026-09-13)', () => {
   it('records the removal in the changelog, dated 2026-09-13, as a decision, newest first', () => {
     const changelog = findDocPage('changelog')!.body;
     const headings = docHeadingsOf(changelog).map((heading) => heading.text);
-    // Newest first: the all-models entry of the same day came after it.
-    expect(headings[0]).toBe(ALL_MODELS_ENTRY);
-    expect(headings[1]).toBe('2026-09-13 — usage limits removed');
+    // Newest first: the all-models entry of the same day came after it, and
+    // the no-timeout entry after that once it is live.
+    const offset = LIVE ? 1 : 0;
+    expect(headings[offset]).toBe(ALL_MODELS_ENTRY);
+    expect(headings[offset + 1]).toBe('2026-09-13 — usage limits removed');
     const entry = sectionOf(changelog, '2026-09-13 — usage limits removed');
     expect(entry).toContain('by decision');
     expect(entry).toContain('`PUBLIC_API_ENFORCE_LIMITS`, off by default');
@@ -1154,8 +1242,14 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     return out;
   }
 
-  it('publishes the three new routes in CONTRACT §7 with exactly one scope each, eleven routes in all', () => {
-    expect(contractRoutes().size).toBe(11);
+  it('publishes the three new routes in CONTRACT §7 with exactly one scope each, twenty-five operations in all', () => {
+    // Eleven operations of 2026-09-13 and the fourteen Files operations of
+    // 2026-09-14 — the count public-api-surface.txt holds. Counted with the
+    // method: 25 operations share 23 paths.
+    const operations = [...CONTRACT.matchAll(/^\|\s*(GET|POST|PUT|PATCH|DELETE)\s*\|\s*`(\/v1\/[^`]+)`/gm)].map((m) => `${m[1]} ${m[2]}`);
+    expect(new Set(operations).size).toBe(25);
+    expect(operations).toHaveLength(25);
+    expect(contractRoutes().size).toBe(23);
     for (const [method, path, scope] of NEW_ROUTES) {
       expect(CONTRACT).toMatch(
         new RegExp(`^\\| ${method} \\| \`${escapeRe(path)}\` \\| \`${escapeRe(scope)}\` \\|`, 'm'),
@@ -1180,11 +1274,14 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     }
   });
 
-  it('lists all six models on the models page, with the ceilings CONTRACT §12.2 publishes', () => {
+  /**
+   * The per-request limits a models page must print. The release's page is held
+   * to CONTRACT §12.2, which states the no-timeout limits; today's page to the
+   * registry's own defaults, which are what the running API reports.
+   */
+  function expectCatalogueMatches(page: string, source: 'contract' | 'registry') {
     const ceilings = contractCeilings();
     expect([...ceilings.keys()]).toEqual([...MODEL_IDS]);
-
-    const page = findDocPage('models')!.body;
     const catalogue = jsonSamples(page).find(
       (sample) => (sample as { object?: string }).object === 'list',
     ) as {
@@ -1202,6 +1299,13 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     };
     expect(catalogue.data.map((model) => model.id)).toEqual([...MODEL_IDS]);
 
+    const registryPy = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
+    const registryDefault = (name: string): number => {
+      const match = new RegExp(`setting_int\\(\\s*"${name}",\\s*([\\d_]+)\\s*\\)`).exec(registryPy);
+      expect(match, `${name} in registry.py`).not.toBeNull();
+      return Number(match![1].replace(/_/g, ''));
+    };
+
     const routes = contractRoutes();
     for (const model of catalogue.data) {
       const row = ceilings.get(model.id)!;
@@ -1218,19 +1322,40 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
         expect(model.limits.max_images_per_request).toBe(count(/(\d+) images? per request/));
       }
       if (model.limits.max_inputs_per_request !== undefined) {
-        expect(model.limits.max_inputs_per_request).toBe(count(/(\d+) inputs/));
+        expect(model.limits.max_inputs_per_request).toBe(
+          source === 'contract' ? count(/([\d,]+) inputs/) : registryDefault('PUBLIC_API_EMBED_MAX_INPUTS'),
+        );
         expect(model.limits.embedding_dimensions).toBe(count(/([\d,]+) dimensions/));
       }
       if (model.limits.max_documents_per_request !== undefined) {
-        expect(model.limits.max_documents_per_request).toBe(count(/(\d+) documents/));
+        expect(model.limits.max_documents_per_request).toBe(
+          source === 'contract' ? count(/([\d,]+) documents/) : registryDefault('PUBLIC_API_RERANK_MAX_DOCUMENTS'),
+        );
       }
-      if (model.limits.max_audio_seconds !== undefined) {
-        expect(model.limits.max_audio_seconds).toBe(count(/(\d+) s\b/));
-        expect(model.limits.max_audio_bytes).toBe(count(/(\d+) MiB/) * 1024 * 1024);
+      if (model.kind === 'transcription') {
+        // Any duration (no-timeout design, shipped for the sidecars
+        // 2026-09-14): no seconds limit is published, and the registry has
+        // no such setting to report.
+        expect(model.limits.max_audio_seconds).toBeUndefined();
+        expect(registryPy).not.toContain('PUBLIC_API_MAX_AUDIO_SECONDS');
+        if (source === 'contract') {
+          expect(row.other).toContain('any duration');
+          expect(model.limits.max_audio_bytes).toBe(count(/(\d+) MiB/) * 1024 * 1024);
+        } else {
+          expect(model.limits.max_audio_bytes).toBe(registryDefault('PUBLIC_API_MAX_AUDIO_BYTES'));
+        }
       }
       // A heading of its own, so a link can point at the model.
       expect(page).toContain(`\n### ${model.id}\n`);
     }
+  }
+
+  itNow('lists all six models on the models page, with the ceilings the registry reports today', () => {
+    expectCatalogueMatches(findDocPage('models')!.body, 'registry');
+  });
+
+  it('lists all six models on the release models page, with the ceilings CONTRACT §12.2 publishes', () => {
+    expectCatalogueMatches(releasePage('models').body, 'contract');
   });
 
   it('names no internal checkpoint, engine, host or port on any page', () => {
@@ -1299,25 +1424,34 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     }
   });
 
-  it('computes every wall clock and duration on the long-output page from the contract formula', () => {
+  itNow('computes every wall clock and duration on the long-output page from the planner the API runs today', () => {
     const contract = contractSection('### 8.3 The output ceiling', '### 8.4');
-    expect(contract).toContain('`PUBLIC_API_GEN_WALL_CLOCK_S` defaults to 21,600 s');
-    expect(contract).toContain('`PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S` 900 s');
-    expect(contract).toContain('`PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S` 50');
-    expect(contract).toContain('`GEN_WALL_CLOCK_S` (4,200 s in `.env`)');
     expect(contract).toContain('reserve 512 (`CONTEXT_SAFETY_MARGIN`)');
-
     const page = findDocPage('long-output')!.body;
-    expect(page).toContain('min(21600, max(4200, 900 + planned_max_output_tokens / 50))');
 
-    const clock = sectionOf(page, 'The wall clock');
-    const rows = [...clock.matchAll(/^\| ([\d,]+)(?: \(the default\))? \| ([\d,]+) s — /gm)];
-    expect(rows).toHaveLength(4);
-    for (const [, tokens, seconds] of rows) {
-      const n = Number(tokens.replace(/,/g, ''));
-      expect(Number(seconds.replace(/,/g, '')), tokens).toBe(
-        Math.min(21600, Math.max(4200, Math.round(900 + n / 50))),
-      );
+    if (PLANNER_HAS_PUBLIC_WALL_CLOCK) {
+      // The formula is today's planning.py, while it still has one.
+      expect(PLANNING_PY).toContain('setting_float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)');
+      expect(PLANNING_PY).toContain('setting_float("PUBLIC_API_MAIN_PREFILL_ALLOWANCE_S", 900.0)');
+      expect(PLANNING_PY).toContain('setting_float("PUBLIC_API_MAIN_MIN_DECODE_TOKENS_PER_S", 50.0)');
+      expect(page).toContain('min(21600, max(4200, 900 + planned_max_output_tokens / 50))');
+
+      const clock = sectionOf(page, 'The wall clock');
+      const rows = [...clock.matchAll(/^\| ([\d,]+)(?: \(the default\))? \| ([\d,]+) s — /gm)];
+      expect(rows).toHaveLength(4);
+      for (const [, tokens, seconds] of rows) {
+        const n = Number(tokens.replace(/,/g, ''));
+        expect(Number(seconds.replace(/,/g, '')), tokens).toBe(
+          Math.min(21600, Math.max(4200, Math.round(900 + n / 50))),
+        );
+      }
+    } else {
+      // The durable release removed the planner's clock: the page that
+      // replaces this one at the flip must have none either.
+      expect(PLANNING_PY).not.toMatch(/def wall_clock_for\(/);
+      const release = releasePage('long-output').body;
+      expect(sectionOf(release, 'The wall clock')).toContain('**There is none.**');
+      expect(release).not.toContain('min(21600');
     }
 
     // The clamp example: 1,000,000 window − 300,000 prompt − 512 reserve.
@@ -1339,11 +1473,9 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     }
   });
 
-  it('says a synchronous request is unsuitable above about 5,000 output tokens, with the two timeouts behind it', () => {
-    const contract = contractSection('### 8.3 The output ceiling', '### 8.4');
-    expect(contract).toContain('response timeout is 100 s (HTTP 524)');
-    expect(contract).toContain('default 300 s header and body timeouts');
-
+  itNow('says a synchronous request is unsuitable above about 5,000 output tokens, with the two timeouts behind it', () => {
+    // Today's fact, and today's page only: the release's byte invariant
+    // (CONTRACT §10.1) removes both timeouts from the path.
     const page = sectionOf(findDocPage('long-output')!.body, 'Choose the mode before you choose the size');
     expect(page).toContain('**100 seconds**');
     expect(page).toContain('HTTP `524`');
@@ -1354,7 +1486,7 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     expect(findDocPage('responses')!.body).toContain('Above about 5,000 output tokens');
   });
 
-  it('ties the wall-clock caveat to llm.py itself, so it goes the day the per-request clock ships', () => {
+  itNow('ties the wall-clock caveat to llm.py itself, so it goes the day the per-request clock ships', () => {
     // The 1,000,000 ceiling is only deliverable once llm.stream_chat_events
     // accepts a per-call wall clock (CONTRACT §8.3, a separate integration).
     // Until then the pages say so; the day the parameter appears this fails
@@ -1363,7 +1495,16 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     const start = llmPy.indexOf('async def stream_chat_events(');
     expect(start).toBeGreaterThanOrEqual(0);
     const signature = llmPy.slice(start, llmPy.indexOf('->', start));
-    expect(LONG_OUTPUT_WALL_CLOCK_LIVE).toBe(/\bwall_clock_s\b/.test(signature));
+    const llmHonoursAClock = /\bwall_clock_s\b/.test(signature);
+    if (PLANNER_HAS_PUBLIC_WALL_CLOCK) {
+      // Today: the caveat is on exactly while llm.py cannot honour the planner's clock.
+      expect(LONG_OUTPUT_WALL_CLOCK_LIVE).toBe(llmHonoursAClock);
+    } else if (LONG_OUTPUT_WALL_CLOCK_LIVE) {
+      // The planner's clock is gone (durable release). A caveat left on until
+      // the release pages replace today's understates the API; one taken off
+      // while llm.py still cuts every generation at its own clock does not.
+      expect(llmHonoursAClock).toBe(true);
+    }
 
     for (const slug of ['long-output', 'changelog']) {
       const body = findDocPage(slug)!.body;
@@ -1372,14 +1513,31 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     expect(WALL_CLOCK_PENDING_NOTE).toContain('4,200 seconds');
   });
 
-  it('describes capacity refusals as a 503 per engine, shared by every caller, with the Retry-After the contract sets', () => {
-    const gates = contractSection('### 12.3 Capacity gates', '### 12.4');
-    const gateRows = new Map(
-      [...gates.matchAll(/^\| `([a-z.]+)` \| (\d+)[^|]* \| [^|]+ \| [^|]+ \| [^|]+ \| (\d+) s \|$/gm)].map(
-        (m) => [m[1], { concurrency: m[2], retryAfter: m[3] }],
-      ),
-    );
-    // Seven since 2026-09-13's adversarial review added `main.extended`.
+  itNow('describes capacity refusals as a 503 per engine, shared by every caller, with the Retry-After capacity.py sets today', () => {
+    // Today's gates refuse after a bounded wait; the release's never do
+    // (CONTRACT §12.3). The numbers come from capacity.py's own table.
+    const capacityPy = repoFile('orchestrator', 'app', 'publicapi', 'capacity.py');
+    const gateRows = new Map<string, { concurrency: string; retryAfter: string }>();
+    const blocks: [string, string][] = [
+      ['main.long', 'GATE_MAIN_LONG'],
+      ['main.extended', 'GATE_MAIN_EXTENDED'],
+      ['router', 'GATE_ROUTER'],
+      ['ocr', 'GATE_OCR'],
+      ['embed', 'GATE_EMBED'],
+      ['rerank', 'GATE_RERANK'],
+      ['asr', 'GATE_ASR'],
+    ];
+    for (const [gate, constant] of blocks) {
+      // Comment lines may sit between the test and its return (PR #65 explains
+      // main.extended's own count there, 2026-09-13).
+      const block = new RegExp(`if engine == ${constant}:\\s*(?:#[^\\n]*\\n\\s*)*return GateConfig\\(([\\s\\S]*?)\\)\\n`).exec(capacityPy);
+      expect(block, gate).not.toBeNull();
+      const concurrency = /_MAX_CONCURRENT", (\d+)\)/.exec(block![1])?.[1];
+      const retryAfter = /(\d+)\.0,?\s*$/.exec(block![1].trim())?.[1];
+      expect(concurrency, gate).toBeDefined();
+      expect(retryAfter, gate).toBeDefined();
+      gateRows.set(gate, { concurrency: concurrency!, retryAfter: retryAfter! });
+    }
     expect(gateRows.size).toBe(7);
     expect(gateRows.get('main.extended')?.retryAfter).toBe(gateRows.get('main.long')?.retryAfter);
 
@@ -1397,7 +1555,13 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     for (const [id, gate, concurrency] of byModel) {
       const row = new RegExp(`^\\| \`${escapeRe(id)}\` \\|[^\\n]*$`, 'm').exec(section)?.[0];
       expect(row, id).toBeDefined();
-      expect(row, id).toContain(`\`Retry-After\` ${gateRows.get(gate)!.retryAfter} s`);
+      if (SIDECARS_NO_TIMEOUT_LIVE && ['embed', 'rerank', 'asr'].includes(gate)) {
+        // Shipped without a clock on 2026-09-14: the queue is never a 503.
+        expect(row, id).toContain('Waits with no limit');
+        expect(row, id).not.toContain('Retry-After');
+      } else {
+        expect(row, id).toContain(`\`Retry-After\` ${gateRows.get(gate)!.retryAfter} s`);
+      }
       if (concurrency) expect(concurrency.exec(row!)?.[1], id).toBe(gateRows.get(gate)!.concurrency);
     }
     // The pre-decision sentence that called a full queue a 429 is gone.
@@ -1406,24 +1570,29 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     }
   });
 
-  it('refuses Idempotency-Key on exactly the three new endpoints, and leases a running claim for 13 hours', () => {
+  it('refuses Idempotency-Key on exactly the three new endpoints', () => {
     const contract = contractSection('## 13. Idempotency', '## 14.');
     expect(contract).toContain('`POST /v1/responses` and `POST /v1/chat/completions` **only**');
     for (const [, path] of NEW_ROUTES) expect(contract).toContain(`\`${path}\``);
     expect(contract).toContain('`param: Idempotency-Key`');
-    // 2 × PUBLIC_API_GEN_WALL_CLOCK_S (21,600) + PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600).
-    expect(contract).toContain(`${(2 * 21600 + 3600).toLocaleString('en-GB')} s`);
-    expect(2 * 21600 + 3600).toBe(13 * 3600);
 
-    const page = findDocPage('idempotency')!.body;
-    expect(page).toContain('**Not accepted on**');
-    expect(page).toContain('`400 invalid_request_error` with `param` `Idempotency-Key`');
-    for (const slug of ['embeddings', 'rerank', 'audio-transcriptions']) {
-      expect(page).toContain(`](/docs/${slug})`);
+    for (const page of [findDocPage('idempotency')!.body, releasePage('idempotency').body]) {
+      expect(page).toContain('**Not accepted on**');
+      expect(page).toContain('`400 invalid_request_error` with `param` `Idempotency-Key`');
+      for (const slug of ['embeddings', 'rerank', 'audio-transcriptions']) {
+        expect(page).toContain(`](/docs/${slug})`);
+      }
+      // The still-running refusal is a 409 since the limits were removed.
+      expect(page).not.toContain('This `429` is not a usage limit');
     }
-    expect(page).toContain('13 hours');
-    // The still-running refusal is a 409 since the limits were removed.
-    expect(page).not.toContain('This `429` is not a usage limit');
+  });
+
+  itNow('leases a running claim for 13 hours today, as idempotency.py derives it', () => {
+    const idempotencyPy = repoFile('orchestrator', 'app', 'apiplatform', 'idempotency.py');
+    expect(idempotencyPy).toContain('setting_float("PUBLIC_API_GEN_WALL_CLOCK_S", 21_600.0)');
+    // 2 × PUBLIC_API_GEN_WALL_CLOCK_S (21,600) + PUBLIC_API_BACKGROUND_GATE_WAIT_S (3,600).
+    expect(2 * 21600 + 3600).toBe(13 * 3600);
+    expect(findDocPage('idempotency')!.body).toContain('13 hours');
   });
 
   it('tells holders of older keys the three new scopes are not theirs, and lists the defaults scopes.py grants', () => {
@@ -1437,7 +1606,8 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     const defaults = [...contractScopes().keys()].filter((scope) =>
       new RegExp(`^\\| \`${escapeRe(scope)}\` \\| [^|]+ \\| yes \\|$`, 'm').test(CONTRACT),
     );
-    expect(defaults).toHaveLength(6);
+    // Six since the model endpoints; eight with the two file scopes (Files design D1).
+    expect(defaults).toHaveLength(8);
     const paragraph = authentication.slice(authentication.indexOf('A key created without a choice gets'));
     const sentence = paragraph.slice(0, paragraph.indexOf('\n\n'));
     for (const scope of defaults) expect(sentence).toContain(`\`${scope}\``);
@@ -1505,9 +1675,9 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     expect(findDocPage('usage')!.body).toContain('**audio seconds\nare not in it**');
   });
 
-  it('records the change in the changelog, dated 2026-09-13, as the newest entry', () => {
+  it('records the change in the changelog, dated 2026-09-13, as the newest entry before the no-timeout release', () => {
     const changelog = findDocPage('changelog')!.body;
-    expect(docHeadingsOf(changelog)[0].text).toBe(ALL_MODELS_ENTRY);
+    expect(docHeadingsOf(changelog)[LIVE ? 1 : 0].text).toBe(ALL_MODELS_ENTRY);
     const entry = sectionOf(changelog, ALL_MODELS_ENTRY);
     for (const id of MODEL_IDS) expect(entry).toContain(`\`${id}\``);
     for (const [method, path] of NEW_ROUTES) expect(entry).toContain(`\`${method} ${path}\``);
@@ -1519,23 +1689,447 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
   });
 });
 
+/**
+ * The no-timeout release (2026-09-13, no-timeout design revision 2).
+ *
+ * These tests read the release's pages (`docSectionsFor({ noTimeout: true })`)
+ * whatever NO_TIMEOUT_LIVE is, so the pages are held to CONTRACT.md — which
+ * states the release first — and to the edge code that already ships
+ * (frontend/app/v1/[[...path]]/route.ts, frontend/server-preload.cjs), long
+ * before the switch is flipped. The switch itself is tied to the orchestrator
+ * code by tests/docs-files.test.tsx.
+ */
+describe('the no-timeout release (2026-09-13)', () => {
+  const timeouts = () => releasePage('timeouts').body;
+  const oneLine = (text: string) => text.replace(/\s+/g, ' ');
+
+  it('publishes the timeouts page with the release and not before, right after long outputs', () => {
+    expect(SITE_PAGES.some((page) => page.slug === 'timeouts')).toBe(NO_TIMEOUT_LIVE);
+    const reference = RELEASE_SECTIONS.find((section) => section.title === 'API reference')!;
+    const slugs = reference.pages.map((page) => page.slug);
+    expect(slugs.indexOf('timeouts')).toBe(slugs.indexOf('long-output') + 1);
+    expect(docSectionsFor({ noTimeout: false }).flatMap((section) => section.pages).some((page) => page.slug === 'timeouts')).toBe(false);
+  });
+
+  it('names only routes the contract publishes, and resolves every link and anchor, on the release site', () => {
+    const routes = contractRoutes();
+    const offenders: string[] = [];
+    for (const page of RELEASE_PAGES) {
+      for (const route of routesMentionedIn(page.body)) {
+        if (!routes.has(route)) offenders.push(`${page.slug}: ${route}`);
+      }
+      for (const match of page.body.matchAll(/\]\((\/docs[^)\s]*|#[^)\s]+)\)/g)) {
+        const [path, fragment] = match[1].split('#');
+        const slug = path === '' ? page.slug : path === '/docs' ? OVERVIEW_SLUG : path.replace('/docs/', '');
+        const target = RELEASE_PAGES.find((candidate) => candidate.slug === slug);
+        if (!target) {
+          offenders.push(`${page.slug} -> ${match[1]} (no such page)`);
+        } else if (fragment && !docHeadingsOf(target.body).some((heading) => heading.id === fragment)) {
+          offenders.push(`${page.slug} -> ${match[1]} (no such heading)`);
+        }
+      }
+      const ids = docHeadingsOf(page.body).map((heading) => heading.id);
+      if (new Set(ids).size !== ids.length) offenders.push(`${page.slug} repeats a heading`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('uses only the event names of CONTRACT §10.2 and the webhook vocabulary, and says there are no id: lines', () => {
+    const grammar = contractGrammar();
+    for (const name of [
+      'response.created', 'response.queued', 'response.in_progress', 'response.output_item.added',
+      'response.content_part.added', 'response.output_text.delta', 'response.output_text.done',
+      'response.content_part.done', 'response.output_item.done', 'response.completed', 'response.failed',
+    ]) {
+      expect(grammar.has(name), name).toBe(true);
+    }
+    const webhookPy = repoFile('orchestrator', 'app', 'apiplatform', 'webhooks', 'sender.py');
+    const subscribable = new Set([...webhookPy.matchAll(/^RESPONSE_[A-Z]+ = "([a-z.]+)"$/gm)].map((m) => m[1]));
+    const invented: string[] = [];
+    for (const page of RELEASE_PAGES) {
+      for (const pattern of [/`(response\.[a-z_.]+)`/g, /event: (response\.[a-z_.]+)/g, /"type":\s?"(response\.[a-z_.]+)"/g]) {
+        for (const match of page.body.matchAll(pattern)) {
+          if (!grammar.has(match[1]) && !subscribable.has(match[1])) invented.push(`${page.slug}: ${match[1]}`);
+        }
+      }
+    }
+    expect(invented).toEqual([]);
+    expect(contractSection('### 10.2 The Responses grammar', '### 10.3')).toContain('There are **never**\n`id:` or `retry:` lines');
+    expect(oneLine(releasePage('streaming').body)).toContain('There are never `id:` or `retry:` lines');
+    // Every data frame on the release's streaming page parses and is numbered.
+    const frames = [...releasePage('streaming').body.matchAll(/^data: (\{.*\})$/gm)].map((m) => JSON.parse(m[1]));
+    expect(frames.length).toBeGreaterThan(8);
+    for (const frame of frames) expect(typeof frame.sequence_number, frame.type).toBe('number');
+  });
+
+  it('keeps every example key invalid and names no other vendor on the release site', () => {
+    const banned = /\b(anthropic|claude|gemini|mistral|cohere|azure openai|chatgpt)\b/i;
+    for (const page of RELEASE_PAGES) {
+      expect(page.body, page.slug).not.toMatch(banned);
+      for (const match of page.body.matchAll(/tsk_(?:live|test)_[A-Za-z0-9_-]+/g)) {
+        expect(splitKey(match[0]), `${page.slug}: ${match[0]}`).toBeNull();
+      }
+    }
+    // "openai" only as the package a reader installs or imports, on the pages
+    // this release writes it into.
+    for (const slug of ['timeouts', 'python', 'javascript', 'changelog']) {
+      for (const line of releasePage(slug).body.split('\n')) {
+        if (!/openai/i.test(line)) continue;
+        // "OpenAI-shaped" is the site's one permitted name for a request shape.
+        // 2026-09-14: and the SDK's own client type in a typed TypeScript signature.
+        expect(line, slug).toMatch(/from openai import|import OpenAI|from "openai"|`openai`|new OpenAI|OpenAI\(|OpenAI-shaped|: OpenAI[,)]|OpenAI\.Responses\./);
+      }
+    }
+  });
+
+  it('gives the exact Python client settings: Timeout(None, connect=10.0), five retries, a key per call, and never 0', () => {
+    const page = timeouts();
+    expect(page).toContain('timeout=Timeout(None, connect=10.0),');
+    expect(page).toContain('max_retries=5,');
+    expect(page).toContain('extra_headers={"Idempotency-Key": str(uuid.uuid4())},');
+    expect(page).toContain('**`None`, never `0`.**');
+    expect(oneLine(page)).toContain('`0` does not mean "no limit" to this client: it fails every call at once.');
+    expect(releasePage('python').body).toContain('timeout=Timeout(None, connect=10.0),');
+    // A key per call, never as a client default: three endpoints refuse it.
+    expect(page).not.toMatch(/default_headers=/);
+    expect(oneLine(page)).toContain('Do not set it as a client-wide default header');
+  });
+
+  it('gives the exact Node client settings: 2147483647, five retries, headers per call, never 0 or Infinity, and the 7.5 deadline', () => {
+    const page = timeouts();
+    expect(page).toContain('timeout: 2_147_483_647,');
+    expect(page).toContain('maxRetries: 5,');
+    expect(page).toContain('{ headers: { "Idempotency-Key": randomUUID() } },');
+    expect(oneLine(page)).toContain('`0`, `Infinity` and anything larger abort every call at once.');
+    expect(oneLine(page)).toContain('From version 7.5 the timeout covers the **whole** non-streamed call');
+    expect(page).toContain('new Agent({ headersTimeout: 0, bodyTimeout: 0 })');
+    expect(2_147_483_647).toBe(2 ** 31 - 1);
+    // The conformance suite's measured ceiling is the same number.
+    expect(repoFile('conformance', 'node', 'lib', 'client.mjs')).toContain('export const MAX_TIMER_MS = 2 ** 31 - 1;');
+    expect(releasePage('javascript').body).toContain('timeout: 2_147_483_647,');
+  });
+
+  it('states the 15-second rule and the 125-second first-byte wall exactly as CONTRACT §10.1 and §12.2 do', () => {
+    const contract10 = oneLine(contractSection('### 10.1 The byte invariant', '### 10.2'));
+    expect(contract10).toContain(
+      'a `/v1` response writes its status line and a first body byte within 15 s, and never goes more than 15 s between bytes after that.',
+    );
+    expect(oneLine(contractSection('### 12.2 Technical ceilings', '### 12.3'))).toContain('Cloudflare waits **125 s** for the first origin byte');
+    const page = oneLine(timeouts());
+    expect(page).toContain('its first byte is sent within 15 seconds, and another byte at least every 15 seconds after that');
+    expect(page).toContain('more than 125 seconds');
+    expect(page).toContain('**There are no server timeouts.**');
+  });
+
+  it('teaches the synchronous retry loop the design specifies: ten minutes, 1 to 60 s backoff, the same key, 502/503/524/530', () => {
+    const page = timeouts();
+    expect(page).toContain('RETRY_STATUSES = {502, 503, 524, 530}');
+    expect(page).toContain('key = str(uuid.uuid4())                  # the same key on every attempt');
+    expect(page).toContain('delay, give_up_at = 1.0, time.monotonic() + 600');
+    expect(page).toContain('delay = min(60.0, delay * 2)');
+    expect(page).toContain('except (APIConnectionError, APITimeoutError):');
+    expect(page).toContain('if response.status == "failed":');
+  });
+
+  it('tells a reader to strip a text transcript, and to check the body of an early 200', () => {
+    const page = oneLine(timeouts());
+    expect(page).toContain('call `.strip()` on it');
+    expect(timeouts()).toContain('print(transcript.strip())');
+    expect(page).toContain('Always check `status`, or `choices`, before you use the answer.');
+    expect(oneLine(releasePage('audio-transcriptions').body)).toContain('**Strip it.**');
+    expect(oneLine(contractSection('### 8.6', '## 9.'))).toContain('after a commit it carries leading spaces');
+  });
+
+  it('describes the resume request with the contract’s checks: stream required, creator-only, one hour, 400 on stream', () => {
+    const contract = oneLine(contractSection('### 10.3 Resuming', '### 10.4'));
+    expect(contract).toContain('project-scoped lookup (`404`); scope `responses.read`; the creator check');
+    expect(contract).toContain('`starting_after` without `stream=true` is `400`');
+    expect(contractSection('## 12. Limits', '## 13.')).toContain('| `PUBLIC_API_EVENT_RETENTION_S` | 3,600 |');
+    const page = oneLine(timeouts());
+    expect(page).toContain('client.responses.retrieve(response_id, stream=True, starting_after=last_seq)');
+    expect(page).toContain('client.responses.retrieve(responseId, { stream: true, starting_after: lastSeq })');
+    expect(page).toContain('**Only the key that created the response can replay it**');
+    // Measured on the local stack (2026-09-14): a stream cut mid-body raises the
+    // HTTP library's RemoteProtocolError, not an SDK error, so the loop must
+    // resume on any exception but a 4xx.
+    expect(page).toContain('if exc.status_code < 500:');
+    expect(page).toContain('except Exception:');
+    expect(page).not.toContain('except (APIConnectionError, APITimeoutError, InternalServerError):');
+    expect(page).toContain('ends without one of its three terminal events — `response.completed`, `response.failed` or `error`');
+    expect(page).toContain('`stream=true` is required; `starting_after` without it is a `400`.');
+    expect(page).toContain('for **one hour** after it ends');
+    expect(page).toContain('replays its chunks from the start');
+    for (const slug of ['streaming', 'responses', 'curl']) {
+      expect(releasePage(slug).body, slug).toContain('stream=true&starting_after=');
+    }
+  });
+
+  it('stops the documented resume loops on every terminal event, error included, and never swallows an exception from the reader’s own handler', () => {
+    // 2026-09-14, review: the Python loop only knew completed/failed, so a run
+    // that ended with `error` (CONTRACT §10.2's third terminal) was resumed 16
+    // times and surfaced as a TimeoutError after ten minutes; and its
+    // `except Exception` also caught the caller's handler, skipping that event
+    // for good. Executed against a stub in the fixer's evidence; pinned here by
+    // the shape that makes both impossible.
+    expect(contractSection('### 10.2 The Responses grammar', '### 10.3')).toContain('response.completed | response.failed | error');
+    const fenced = (body: string, language: string, from: string): string => {
+      const at = body.indexOf(from);
+      expect(at, from).toBeGreaterThanOrEqual(0);
+      const open = body.indexOf(`~~~${language}\n`, at);
+      expect(open, `${language} after ${from}`).toBeGreaterThanOrEqual(0);
+      return body.slice(open, body.indexOf('\n~~~', open + 4));
+    };
+    const functionBody = (code: string, header: string): string => {
+      const at = code.indexOf(header);
+      expect(at, header).toBeGreaterThanOrEqual(0);
+      const next = code.slice(at + header.length).search(/\n(?:def |async function|function )/);
+      return code.slice(at, next === -1 ? undefined : at + header.length + next);
+    };
+
+    // Python, on the timeouts page.
+    const python = fenced(timeouts(), 'python', '## Resuming a stream');
+    const pyEvents = functionBody(python, 'def events_after(');
+    const pyResume = functionBody(python, 'def resume(');
+    expect(pyEvents).toContain('except APIStatusError as exc:');
+    expect(pyEvents).toContain('except Exception:');
+    expect(pyEvents).not.toContain('handle(');
+    expect(pyResume).not.toMatch(/\btry:|\bexcept\b/);
+    expect(pyResume).toContain('if event.type == "error":');
+    expect(pyResume).toContain('if event.type in ("response.completed", "response.failed"):');
+    expect(pyResume.indexOf('handle(event)')).toBeGreaterThan(0);
+    expect(pyResume.indexOf('handle(event)')).toBeLessThan(pyResume.indexOf('last_seq = event.sequence_number'));
+    expect(pyResume.indexOf('last_seq = event.sequence_number')).toBeLessThan(pyResume.indexOf('if event.type == "error":'));
+
+    // TypeScript, on the timeouts page: the SDK throws the error event as an
+    // APIError without a status, so that is what the loop must not resume.
+    const ts = fenced(timeouts(), 'typescript', '## Resuming a stream');
+    const tsEvents = functionBody(ts, 'async function* eventsAfter(');
+    const tsResume = functionBody(ts, 'async function resume(');
+    expect(tsEvents).toContain('if (err instanceof APIConnectionError) return;');
+    expect(tsEvents).toContain('if (err instanceof APIError && (err.status ?? 0) < 500) throw err;');
+    expect(tsEvents).not.toContain('handle(');
+    expect(tsResume).not.toMatch(/\btry\b|\bcatch\b/);
+    expect(tsResume.indexOf('await handle(event);')).toBeGreaterThan(0);
+    expect(tsResume.indexOf('await handle(event);')).toBeLessThan(tsResume.indexOf('lastSeq = event.sequence_number;'));
+    expect(ts).toContain('import OpenAI, { APIConnectionError, APIError } from "openai";');
+    expect(oneLine(timeouts())).toContain('**`error` is a terminal event, like `response.failed`.**');
+    expect(oneLine(timeouts())).toContain('**Your handler runs outside the `except`.**');
+
+    // Python, on the long-output page: the same rules in its all-in-one loop.
+    const longOutput = releasePage('long-output').body;
+    const loop = fenced(longOutput, 'python', '## A long stream');
+    const generator = loop.slice(loop.indexOf('def events():'), loop.indexOf('delay, give_up_at = 1.0'));
+    const main = loop.slice(loop.indexOf('with open("manual.txt"'));
+    expect(generator).toContain('except APIStatusError as exc:');
+    expect(generator).toContain('except Exception:');
+    expect(loop).not.toContain('except (APIConnectionError, APITimeoutError, InternalServerError):');
+    expect(main).not.toMatch(/\btry:|\bexcept\b/);
+    expect(main).toContain('elif event.type == "error":');
+    expect(main.indexOf('out.write(event.delta)')).toBeLessThan(main.indexOf('last_seq = event.sequence_number'));
+    expect(oneLine(sectionOf(longOutput, 'Resuming a stream'))).toContain('`response.completed`, `response.failed` or `error`');
+  });
+
+  it('says deploys are invisible to a connected client only after a recorded run through the public URL proved it', () => {
+    // 2026-09-14, review: that promise needs /v1 to reach the gateway through
+    // the public URL — an operator step after the deploy. Until then public
+    // /v1 lands on the frontend, whose /v1 sockets a deploy closes 2 s after
+    // SIGTERM (server-preload.cjs), so the pages say what is true either way.
+    expect(DEPLOYS_HELD).toBe(deploysHeldOnTheEdge(NO_TIMEOUT_EDGE_PROBE));
+    if (DEPLOYS_HELD) {
+      // A recorded probe is believable only where the edge can relay to the gateway at all.
+      expect(repoFile('frontend', 'app', 'v1', '[[...path]]', 'route.ts')).toContain("process.env.V1_GATEWAY_URL");
+      expect(repoFile('compose.yaml')).toMatch(/V1_GATEWAY_URL/);
+    }
+    const promises = [
+      /invisible to a connected client/,
+      /connection is held while the service restarts/,
+      /connection\s+is held while the service restarts/,
+      /A connected client does not see one/,
+      /including our own deploys/,
+      /do not break a connected client/,
+      /Deploys no longer interrupt you/,
+      /A deploy on our side, or a chat turn/,
+      /held open waiting for it/,
+      /unreachable for 30 minutes/,
+      /most interruptions are\s+invisible/,
+    ];
+    const pagesOf = (sections: DocSection[]) => sections.flatMap((section) => section.pages);
+    const promised = (pages: DocPage[]) =>
+      pages.flatMap((page) => promises.filter((claim) => claim.test(page.body)).map((claim) => `${page.slug}: ${claim}`));
+    const unproven = pagesOf(docSectionsFor({ noTimeout: true, deploysHeld: false }));
+    const proven = pagesOf(docSectionsFor({ noTimeout: true, deploysHeld: true }));
+
+    expect(promised(unproven)).toEqual([]);
+    expect(promised(pagesOf(docSectionsFor({ noTimeout: false, deploysHeld: true })))).toEqual([]);
+    const gated = ['timeouts', 'streaming', 'long-output', 'status', 'changelog'];
+    for (const slug of gated) {
+      const without = unproven.find((page) => page.slug === slug)!.body;
+      const withProbe = proven.find((page) => page.slug === slug)!.body;
+      expect(oneLine(without), slug).toMatch(/[Aa] deploy on our side (?:can|can still) close/);
+      expect(promised([proven.find((page) => page.slug === slug)!]).length, slug).toBeGreaterThan(0);
+      expect(withProbe, slug).not.toMatch(/deploy on our side (?:can|can still) close/);
+    }
+    // Only those pages change with the probe, and the changelog's anchor never does.
+    for (const page of proven) {
+      const other = unproven.find((candidate) => candidate.slug === page.slug)!;
+      if (!gated.includes(page.slug)) expect(other.body, page.slug).toBe(page.body);
+    }
+    const heading = (pages: DocPage[]) => docHeadingsOf(pages.find((page) => page.slug === 'changelog')!.body)[0].text;
+    expect(heading(unproven)).toBe(heading(proven));
+    // The site reads the recorded probe.
+    for (const page of RELEASE_PAGES) {
+      const built = pagesOf(docSectionsFor({ noTimeout: true, deploysHeld: DEPLOYS_HELD })).find((candidate) => candidate.slug === page.slug)!;
+      expect(built.body, page.slug).toBe(page.body);
+    }
+  });
+
+  it('accepts an edge probe only when every public check passed on a real date', () => {
+    const passing = { ranOn: '2026-09-20', syncPastFirstByteWall: true, defaultStreamsSurvivedRoutineDeploy: true, gatewayReattachLogged: true };
+    expect(deploysHeldOnTheEdge(null)).toBe(false);
+    expect(deploysHeldOnTheEdge(passing)).toBe(true);
+    for (const key of ['syncPastFirstByteWall', 'defaultStreamsSurvivedRoutineDeploy', 'gatewayReattachLogged'] as const) {
+      expect(deploysHeldOnTheEdge({ ...passing, [key]: false }), key).toBe(false);
+    }
+    expect(deploysHeldOnTheEdge({ ...passing, ranOn: 'soon' })).toBe(false);
+  });
+
+  it('lists what still ends a request with the contract’s numbers: 30 minutes, three attempts, two crashes, 10 and 2 minutes', () => {
+    const settings = contractSection('## 12. Limits', '## 13.');
+    expect(settings).toContain('| `PUBLIC_API_ENGINE_DOWN_GRACE_S` | 1,800 |');
+    expect(settings).toContain('| `PUBLIC_API_RESUME_MAX_STALLED_ATTEMPTS` | 3 |');
+    expect(settings).toContain('| `PUBLIC_API_STREAM_ORPHAN_GRACE_S` | 600 |');
+    expect(settings).toContain('| `PUBLIC_API_UNKEYED_ORPHAN_GRACE_S` | 120 |');
+    expect(settings).toContain('| `PUBLIC_API_GATEWAY_REATTACH_MAX_S` | 1,800 |');
+    const whatEnds = (deploysHeld: boolean) =>
+      oneLine(sectionOf(docSectionsFor({ noTimeout: true, deploysHeld }).flatMap((s) => s.pages).find((p) => p.slug === 'timeouts')!.body, 'What still ends a request'));
+    for (const deploysHeld of [false, true]) {
+      const section = whatEnds(deploysHeld);
+      for (const phrase of [
+        '**proven down for 30 minutes**',
+        '**Three attempts in a row make no progress**',
+        '**The same request is caught up in two engine crashes.**',
+        '**The key is revoked**',
+        'within **10 minutes**',
+        '**2 minutes** for anything else',
+        '`"store": false`',
+      ]) {
+        expect(section, `${phrase} (deploys held: ${deploysHeld})`).toContain(phrase);
+      }
+    }
+    // The 30-minute hold is the gateway's re-attach budget: printed only once proven.
+    expect(whatEnds(true)).toContain('**Our service stays unreachable for 30 minutes**');
+    expect(whatEnds(false)).toContain('**Our service stays unreachable** for longer than your client keeps retrying');
+  });
+
+  it('has no wall clock, no 300-second cap, no 30-second gate wait and no restart failure anywhere on the release site', () => {
+    const retired = [
+      /wall clock \(seconds\) =/,
+      /up to six hours/i,
+      /\b300 seconds of audio\b|at most 300 seconds|Clips are at most 300 seconds/,
+      /must finish within about 100 seconds/,
+      /waits only about 30 seconds/,
+      /up to about 30 seconds for a place/,
+      /for up to an hour\*\*/,
+      /A service restart ends/,
+      /There is no resume/,
+      /A dropped stream cannot be resumed/,
+      /still running", with a short `Retry-After`/,
+      /released after 13 hours/,
+      /cannot both be true/,
+      /at capacity: its (?:public )?queue/,
+      /--max-time \d/,
+    ];
+    const offenders: string[] = [];
+    for (const page of RELEASE_PAGES) {
+      // The changelog keeps its history; only the release's own entry is read.
+      const text =
+        page.slug === 'changelog' ? sectionOf(page.body, docHeadingsOf(page.body)[0].text) : page.body;
+      for (const claim of retired) if (claim.test(text)) offenders.push(`${page.slug}: ${claim}`);
+    }
+    expect(offenders).toEqual([]);
+    expect(oneLine(timeouts())).toContain('Do not add `--max-time`');
+  });
+
+  it('prints the edge numbers the edge code enforces: 110 s of connect retry, 90 MiB of audio, 8 MiB for pooling, 2,048 and 1,000', () => {
+    const routeTs = repoFile('frontend', 'app', 'v1', '[[...path]]', 'route.ts');
+    expect(routeTs).toContain("envSeconds('V1_EDGE_CONNECT_RETRY_S', 110)");
+    expect(routeTs).toContain('export const DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES = 90 * 1024 * 1024;');
+    expect(routeTs).toContain('export const DEFAULT_PUBLIC_API_POOLING_BODY_BYTES = 8 * 1024 * 1024;');
+    const contract = oneLine(CONTRACT);
+    expect(contract).toContain('retries a refused connect every 2 s for ≤ 110 s');
+    expect(contract).toContain('| `PUBLIC_API_MAX_AUDIO_BODY_BYTES` | 94,371,840 |');
+    expect(contract).toContain('| `PUBLIC_API_MAX_POOLING_BODY_BYTES` | 8,388,608 |');
+    expect(contract).toContain('| `PUBLIC_API_EMBED_MAX_INPUTS` | 2,048 |');
+    expect(contract).toContain('| `PUBLIC_API_RERANK_MAX_DOCUMENTS` | 1,000 |');
+    expect(94_371_840).toBe(90 * 1024 * 1024);
+    expect(oneLine(timeouts())).toContain('One request carries up to **90 MiB**');
+    expect(releasePage('rate-limits').body).toContain('| Body bytes for embeddings and rerank | 8 MiB — up to 2,048 inputs or 1,000 documents |');
+    expect(releasePage('embeddings').body).toContain('One string, or 1 to 2,048 strings');
+    expect(releasePage('rerank').body).toContain('1 to 1,000 items');
+  });
+
+  it('holds the release’s chat fields to CONTRACT §8.2, which adds store', () => {
+    const contractChat = contractSection('### 8.2 `POST /v1/chat/completions`', '### 8.3');
+    expect(contractChat).toContain('`store`');
+    const page = releasePage('chat-completions').body;
+    const section = page.slice(page.indexOf('## The fields this endpoint accepts'), page.indexOf('That is the complete list.'));
+    const documented = [...section.matchAll(/^\|\s*`([a-z_]+)`\s*\|/gm)].map((m) => m[1]);
+    const contracted = [...contractChat.slice(0, contractChat.indexOf('(only')).matchAll(/`([a-z_]+)`/g)].map((m) => m[1]);
+    expect([...documented].sort()).toEqual([...new Set(contracted)].sort());
+  });
+
+  it('describes every capacity queue as a wait that never refuses, per CONTRACT §12.3', () => {
+    const gates = contractSection('### 12.3 Capacity gates', '### 12.4');
+    const rows = [...gates.matchAll(/^\| `([a-z.]+)` \| [^|]+ \| [^|]+ \| [^|]+ \| [^|]+ \| ([^|]+) \|$/gm)];
+    expect(rows.length).toBe(8);
+    for (const [, gate, wait] of rows) expect(wait.trim(), gate).toBe('no limit');
+    expect(gates).toContain('| `main.normal` | 6 |');
+    const section = oneLine(sectionOf(releasePage('rate-limits').body, 'Capacity queues, per engine'));
+    expect(section).toContain('**They wait and never refuse.**');
+    expect(section).toContain('Six everyday generations, of the ten the engine serves side by side');
+    expect(section).not.toMatch(/Retry-After/);
+  });
+
+  it('records the release as the newest changelog entry once it is live, with the client settings in it', () => {
+    const changelog = releasePage('changelog').body;
+    const headings = docHeadingsOf(changelog).map((heading) => heading.text);
+    expect(headings[0]).toBe('2026-09-13 — no timeouts, resumable streams, and generations that outlive our deploys');
+    expect(headings[1]).toBe(ALL_MODELS_ENTRY);
+    const entry = oneLine(sectionOf(changelog, headings[0]));
+    expect(entry).toContain('`timeout=Timeout(None, connect=10.0)` — never `0`');
+    expect(entry).toContain('`timeout: 2_147_483_647` — never `0` or `Infinity`');
+    expect(oneLine(docSectionsFor({ noTimeout: false }).flatMap((s) => s.pages).find((p) => p.slug === 'changelog')!.body)).not.toContain('no timeouts, resumable streams');
+  });
+
+  it('builds today’s pages byte for byte from the same builders the release uses', () => {
+    const today = docSectionsFor({ noTimeout: false }).flatMap((section) => section.pages);
+    const published = NO_TIMEOUT_LIVE ? RELEASE_PAGES : SITE_PAGES;
+    expect(published.map((page) => page.slug)).toEqual((NO_TIMEOUT_LIVE ? RELEASE_PAGES : today).map((page) => page.slug));
+    for (const page of published) {
+      const built = (NO_TIMEOUT_LIVE ? RELEASE_PAGES : today).find((candidate) => candidate.slug === page.slug)!;
+      expect(built.body, page.slug).toBe(page.body);
+      expect(built.summary, page.slug).toBe(page.summary);
+    }
+  });
+});
+
 describe('the navigation', () => {
   it('renders every section and every page in the registry', () => {
-    render(<DocsNav sections={DOC_SECTIONS} currentHref="/docs/errors" />);
+    render(<DocsNav sections={SITE_SECTIONS} currentHref="/docs/errors" />);
 
     const nav = screen.getByRole('navigation', { name: 'Documentation' });
-    for (const section of DOC_SECTIONS) {
+    for (const section of SITE_SECTIONS) {
       expect(within(nav).getByRole('heading', { name: section.title })).toBeTruthy();
     }
-    for (const page of DOC_PAGES) {
+    for (const page of SITE_PAGES) {
       const link = within(nav).getByRole('link', { name: page.title });
       expect(link.getAttribute('href')).toBe(docHref(page.slug));
     }
-    expect(within(nav).getAllByRole('link')).toHaveLength(DOC_PAGES.length);
+    expect(within(nav).getAllByRole('link')).toHaveLength(SITE_PAGES.length);
   });
 
   it('marks the page being read with aria-current, not colour alone', () => {
-    render(<DocsNav sections={DOC_SECTIONS} currentHref="/docs/errors" />);
+    render(<DocsNav sections={SITE_SECTIONS} currentHref="/docs/errors" />);
     const current = screen.getByRole('link', { name: 'Errors' });
     expect(current.getAttribute('aria-current')).toBe('page');
     expect(
@@ -1550,20 +2144,20 @@ describe('the navigation', () => {
 
   it('lists every page in exactly one section, under the title it claims', () => {
     const seen = new Set<string>();
-    for (const section of DOC_SECTIONS) {
+    for (const section of SITE_SECTIONS) {
       for (const page of section.pages) {
         expect(page.section).toBe(section.title);
         expect(seen.has(page.slug), `${page.slug} is listed twice`).toBe(false);
         seen.add(page.slug);
       }
     }
-    expect(seen.size).toBe(DOC_PAGES.length);
+    expect(seen.size).toBe(SITE_PAGES.length);
   });
 
   it('chains the pages in reading order', () => {
-    expect(neighboursOf(DOC_PAGES[0].slug).previous).toBeUndefined();
-    expect(neighboursOf(DOC_PAGES[0].slug).next?.slug).toBe(DOC_PAGES[1].slug);
-    const last = DOC_PAGES[DOC_PAGES.length - 1];
+    expect(neighboursOf(SITE_PAGES[0].slug).previous).toBeUndefined();
+    expect(neighboursOf(SITE_PAGES[0].slug).next?.slug).toBe(SITE_PAGES[1].slug);
+    const last = SITE_PAGES[SITE_PAGES.length - 1];
     expect(neighboursOf(last.slug).next).toBeUndefined();
   });
 });
@@ -2020,5 +2614,113 @@ describe('the design system', () => {
     for (const page of DOC_PAGES) {
       expect(page.body, `${page.slug} mentions another vendor`).not.toMatch(banned);
     }
+  });
+});
+
+/**
+ * THE CLOCK-FREE SIDECAR ROUTES, ON TODAY'S SITE (review 2026-09-14, medium).
+ *
+ * `/v1/embeddings`, `/v1/rerank` and `/v1/audio/transcriptions` lost their
+ * clocks before the rest of the no-timeout release. The live site said 256
+ * inputs, 300 seconds and a 504 for them, while the model catalogue already
+ * printed 2,048, 1,000 and "any duration". These tests read the pages as they
+ * render TODAY (`noTimeout: false`) and hold them to the caps the code
+ * enforces, so the two cannot drift apart again.
+ */
+describe('the clock-free sidecar routes on the site as it reads today (2026-09-14)', () => {
+  const endpointsPy = repoFile('orchestrator', 'app', 'publicapi', 'endpoints.py');
+  const endpointModelsPy = repoFile('orchestrator', 'app', 'publicapi', 'endpoint_models.py');
+  const registryPy = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
+  const sidecarsPy = repoFile('orchestrator', 'app', 'publicapi', 'sidecars.py');
+  const today = docSectionsFor({ noTimeout: false }).flatMap((section) => section.pages);
+  const todayPage = (slug: string): string => {
+    const page = today.find((candidate) => candidate.slug === slug);
+    expect(page, slug).toBeDefined();
+    return page!.body;
+  };
+  const flat = (text: string) => text.replace(/\s+/g, ' ');
+  const pyInt = (source: string, pattern: RegExp, name: string): number => {
+    const match = pattern.exec(source);
+    expect(match, name).not.toBeNull();
+    return Number(match![1].replace(/_/g, ''));
+  };
+  const thousands = (n: number) => n.toLocaleString('en-US');
+
+  it('is switched on exactly when endpoints.py sends embeddings and rerank with no gate limit inside a committed response', () => {
+    const code = endpointsPy.replace(/^\s*#.*$/gm, '');
+    const wired =
+      /await sidecars\.embed\([^)]*wait_s=None\)/.test(code) &&
+      /await sidecars\.rerank_scores\([\s\S]{0,200}?wait_s=None/.test(code) &&
+      /keepalive\.CommittedJSONResponse/.test(code) &&
+      !/PUBLIC_API_GATE_WAIT_S/.test(code);
+    expect(SIDECARS_NO_TIMEOUT_LIVE).toBe(wired);
+  });
+
+  it("prints today the input, document and body caps the code enforces", () => {
+    if (!SIDECARS_NO_TIMEOUT_LIVE) return;
+    const inputs = pyInt(endpointModelsPy, /setting_int\("PUBLIC_API_EMBED_MAX_INPUTS", (\d+)\)/, 'inputs');
+    const documents = pyInt(endpointModelsPy, /setting_int\("PUBLIC_API_RERANK_MAX_DOCUMENTS", (\d+)\)/, 'documents');
+    expect(registryPy).toContain(`setting_int("PUBLIC_API_EMBED_MAX_INPUTS", ${inputs})`);
+    expect(registryPy).toContain(`setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", ${documents})`);
+    const pooling = pyInt(endpointModelsPy, /DEFAULT_MAX_POOLING_BODY_BYTES = (\d+) \* 1024 \* 1024/, 'pooling MiB');
+    const audioFile = pyInt(endpointModelsPy, /DEFAULT_MAX_AUDIO_BYTES = ([\d_]+)/, 'audio file') / 1024 / 1024;
+    const audioBody = pyInt(endpointModelsPy, /DEFAULT_MAX_AUDIO_BODY_BYTES = ([\d_]+)/, 'audio body') / 1024 / 1024;
+    expect(Number.isInteger(audioFile) && Number.isInteger(audioBody)).toBe(true);
+
+    const embeddings = todayPage('embeddings');
+    expect(embeddings).toContain(`One string, or 1 to ${thousands(inputs)} strings`);
+    expect(embeddings).toContain(`The body is at most ${pooling} MiB.`);
+    expect(flat(embeddings)).toContain(`Up to ${thousands(inputs)} inputs per request.`);
+
+    const rerank = todayPage('rerank');
+    expect(rerank).toContain(`1 to ${thousands(documents)} items`);
+    expect(rerank).toContain(`The body is at most ${pooling} MiB.`);
+
+    const audio = todayPage('audio-transcriptions');
+    expect(audio).toContain(`at most **${audioFile} MiB**`);
+    expect(flat(audio)).toContain(`at most ${audioBody} MiB`);
+    expect(audio).toContain('| Audio length | None | — |');
+
+    const limits = todayPage('rate-limits');
+    expect(limits).toContain(`| Body bytes for embeddings and rerank | ${pooling} MiB — up to ${thousands(inputs)} inputs or ${thousands(documents)} documents |`);
+    expect(limits).toContain(`${audioBody} MiB on \`/v1/audio/transcriptions\`, of which the file at most ${audioFile} MiB. No limit on duration.`);
+    expect(todayPage('errors')).toContain(`${pooling} MiB for embeddings and rerank`);
+  });
+
+  it('no longer tells anyone today about the retired sidecar clocks and caps', () => {
+    if (!SIDECARS_NO_TIMEOUT_LIVE) return;
+    const retired: [string, RegExp][] = [
+      ['embeddings', /\b256\b|within 60 seconds|504 timeout|at capacity/],
+      ['rerank', /1 to 100 items|more than 100\b|within 60 seconds|504 timeout|at capacity/],
+      ['audio-transcriptions', /300 seconds|25 MiB|26 MiB|240 seconds|504 timeout|up to 30 seconds/],
+      ['errors', /26 MiB with audio|audio over 25 MiB|or an engine did not answer in time/],
+      ['rate-limits', /26 MiB on|300 seconds of audio/],
+      ['python', /Clips are at most 300 seconds/],
+    ];
+    const offenders = retired.filter(([slug, claim]) => claim.test(flat(todayPage(slug)))).map(([slug, claim]) => `${slug}: ${claim}`);
+    expect(offenders).toEqual([]);
+    // A link to a page that exists only after the release is printed only after it.
+    if (!NO_TIMEOUT_LIVE) {
+      for (const slug of ['embeddings', 'rerank', 'audio-transcriptions']) {
+        expect(todayPage(slug), slug).not.toContain('/docs/timeouts');
+      }
+    }
+  });
+
+  it('describes the crashing-input quarantine and the memory guard the way sidecars.py enforces them, today and after the release', () => {
+    const quarantine = pyInt(sidecarsPy, /DEFAULT_POISON_QUARANTINE_S = (\d+)\.0/, 'quarantine');
+    expect(quarantine).toBe(3600);
+    const memoryRetry = pyInt(sidecarsPy, /MEMORY_RETRY_AFTER_S = (\d+)/, 'memory retry');
+    expect(memoryRetry).toBeLessThanOrEqual(10);
+    const release = (slug: string) => RELEASE_PAGES.find((page) => page.slug === slug)!.body;
+    for (const [slug, noun] of [['embeddings', 'input'], ['rerank', 'document']] as const) {
+      for (const body of [todayPage(slug), release(slug)]) {
+        const errors = flat(sectionOf(body, 'Errors and capacity'));
+        expect(errors, slug).toContain(`one of your ${noun}s stopped the engine twice — then with \`x-should-retry: false\` and \`param\` naming the ${noun}`);
+        expect(errors, slug).toContain('for an hour');
+        expect(errors, slug).toContain('embedding and rerank work in memory');
+      }
+    }
+    expect(flat(release('errors'))).toContain('An embeddings or rerank input that stopped its engine twice');
   });
 });

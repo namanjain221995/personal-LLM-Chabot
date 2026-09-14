@@ -1,0 +1,15 @@
+# The OpenAI-SDK conformance suite for the TechSara developer API.
+# Pinned 2026-09-13. openai 3.13.0 is the SDK the Files API parity research
+# captured on the wire (it moved its transport to httpx2); bump it on purpose,
+# re-run, and record the result — a silently floating SDK makes a red run
+# impossible to attribute to the server or the client.
+openai==3.13.0
+# The SDK's own transport: openai 3.x requires httpx2 (>=2.7,<3) and sends
+# every request through it. Pinned beside the SDK for the same reason
+# (2026-09-13, review: the run header once named only httpx, which the SDK
+# does not use).
+httpx2==2.12.0
+# Raw calls where the SDK has no method (rerank) or would hide the wire
+# (SSE comments, headers before the body, cut request bodies).
+httpx==0.28.1
+pytest==9.1.1

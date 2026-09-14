@@ -211,6 +211,22 @@ class TheExpectationFileIsParsedStrictly(unittest.TestCase):
                 "POST /v1/audio/transcriptions",
                 "GET /v1/usage",
                 "GET /v1/openapi.json",
+                # The Files API block (2026-09-13, files-hookup): reviewed with
+                # the file and CONTRACT §7 in the same change.
+                "POST /v1/files",
+                "GET /v1/files",
+                "GET /v1/files/{file_id}",
+                "GET /v1/files/{file_id}/content",
+                "DELETE /v1/files/{file_id}",
+                "GET /v1/files/{file_id}/events",
+                "GET /v1/files/{file_id}/derived",
+                "GET /v1/files/{file_id}/derived/{name}",
+                "POST /v1/uploads",
+                "GET /v1/uploads/{upload_id}",
+                "POST /v1/uploads/{upload_id}/parts",
+                "PUT /v1/uploads/{upload_id}/parts/{part_number}",
+                "POST /v1/uploads/{upload_id}/complete",
+                "POST /v1/uploads/{upload_id}/cancel",
             },
         )
 

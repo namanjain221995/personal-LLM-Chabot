@@ -24,7 +24,6 @@ and a redeploy that moves a number moves it here too.
 """
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
@@ -71,8 +70,10 @@ TRANSCRIPTION_FORMATS: Tuple[str, ...] = ("json", "text", "verbose_json")
 
 
 def embed_max_inputs() -> int:
-    """PUBLIC_API_EMBED_MAX_INPUTS (256): one request's worth of inputs."""
-    return max(1, setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 256))
+    """PUBLIC_API_EMBED_MAX_INPUTS (2,048, OpenAI's own): one request's worth
+    of inputs. A shape of the request, not a usage limit (no-timeout design,
+    sidecars_and_audio): a bigger job is sharded by the caller."""
+    return max(1, setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 2048))
 
 
 def embed_context_tokens() -> int:
@@ -83,8 +84,8 @@ def embed_context_tokens() -> int:
 
 
 def rerank_max_documents() -> int:
-    """PUBLIC_API_RERANK_MAX_DOCUMENTS (100)."""
-    return max(1, setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100))
+    """PUBLIC_API_RERANK_MAX_DOCUMENTS (1,000): request shape, not usage."""
+    return max(1, setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 1000))
 
 
 def rerank_context_tokens() -> int:
@@ -92,29 +93,67 @@ def rerank_context_tokens() -> int:
     return max(1, setting_int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096))
 
 
-def max_audio_seconds() -> int:
-    """PUBLIC_API_MAX_AUDIO_SECONDS (300). Half the engine's own 600: at the
-    measured ~7 s of audio per wall-second a 300 s clip is ~43 s of decoding,
-    which with a 30 s capacity wait still finishes inside Cloudflare's 100 s
-    origin timeout for a synchronous request (2026-09-13 design)."""
-    return max(1, setting_int("PUBLIC_API_MAX_AUDIO_SECONDS", 300))
+#: CONTRACT §8.6: the file part of one transcription request (89 MiB) and the
+#: whole multipart body (90 MiB) — the same bytes the edge and the gateway
+#: allow, so a body one hop accepts is never refused by the next. Longer
+#: recordings go through the Files API (`file_id`). There is NO duration
+#: limit: audio of any length is transcribed in windows (audio_jobs.py).
+DEFAULT_MAX_AUDIO_BYTES = 93_323_264
+DEFAULT_MAX_AUDIO_BODY_BYTES = 94_371_840
+#: CONTRACT §8.4/§8.5: the JSON body of embeddings and rerank (8 MiB). 2,048
+#: inputs of real text do not fit the 1 MiB JSON rule of the other routes.
+DEFAULT_MAX_POOLING_BODY_BYTES = 8 * 1024 * 1024
 
 
 def max_audio_bytes() -> int:
-    """PUBLIC_API_MAX_AUDIO_BYTES (25 MiB): the file part itself."""
-    return max(1, setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400))
+    """PUBLIC_API_MAX_AUDIO_BYTES (89 MiB): the file part itself."""
+    return max(1, setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 93_323_264))
 
 
 def max_audio_body_bytes() -> int:
-    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (26 MiB): the whole multipart body —
+    """PUBLIC_API_MAX_AUDIO_BODY_BYTES (90 MiB): the whole multipart body —
     the file plus one MiB of form fields and boundaries."""
-    return max(1, setting_int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 27_262_976))
+    return max(1, setting_int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 94_371_840))
 
 
 def max_json_body_bytes() -> int:
     """The CONTRACT §12 JSON body cap, the same number `models.max_body_bytes`
-    reads — 1 MiB unless PUBLIC_API_MAX_BODY_BYTES says otherwise."""
+    reads — 1 MiB unless PUBLIC_API_MAX_BODY_BYTES says otherwise. A
+    transcription sent as JSON (`file_id`) is held to it."""
     return max(1, setting_int("PUBLIC_API_MAX_BODY_BYTES", 1024 * 1024))
+
+
+def max_pooling_body_bytes() -> int:
+    """PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB): the JSON body of
+    `/v1/embeddings` and `/v1/rerank`, never below the JSON rule."""
+    return max(max_json_body_bytes(), setting_int("PUBLIC_API_MAX_POOLING_BODY_BYTES", 8 * 1024 * 1024))
+
+
+def pooling_silence_s() -> float:
+    """PUBLIC_API_POOLING_SILENCE_S (600): how long one embeddings or rerank
+    engine call may be silent before the engine's own /metrics witness is
+    asked what happened. Not a budget: what follows is decided by the
+    witness verdict, never by this clock (sidecars.py)."""
+    return max(0.001, setting_float("PUBLIC_API_POOLING_SILENCE_S", 600.0))
+
+
+_POOLING_ROUTES = ("/v1/embeddings", "/v1/rerank")
+_AUDIO_ROUTES = ("/v1/audio/transcriptions",)
+
+
+def body_cap_for(method: str, path: str) -> Optional[int]:
+    """The transport body cap of the three sidecar routes, or None for any
+    other request line. `models.body_cap_for` (the table main.py's body-size
+    middleware asks) delegates here, so the outer cap and the route's own
+    reader cannot disagree. Exact paths only."""
+    if str(method or "").upper() != "POST":
+        return None
+    normalised = "/" + str(path or "").strip("/")
+    if normalised in _POOLING_ROUTES:
+        return max_pooling_body_bytes()
+    if normalised in _AUDIO_ROUTES:
+        return max_audio_body_bytes()
+    return None
 
 
 # ---------------------------------------------------------- validation --
@@ -364,13 +403,34 @@ def ranked(
 #: The form fields `/v1/audio/transcriptions` honours. `temperature`, `prompt`
 #: and everything else OpenAI's shape allows are refused by name: the engine
 #: exposes neither, and a prompt that is accepted and dropped is exactly the
-#: invisible no-op this platform does not ship.
+#: invisible no-op this platform does not ship. `file_id` names a Files API
+#: file instead of a `file` part (CONTRACT §8.6); `stream` answers with
+#: server-sent events.
 TRANSCRIPTION_FIELDS: Tuple[str, ...] = (
     "model",
     "language",
     "response_format",
     "timestamp_granularities[]",
+    "stream",
+    "file_id",
 )
+
+#: The same request sent as `application/json` (a Files API `file_id` needs no
+#: multipart body; CONTRACT §8.6). `timestamp_granularities` is the JSON
+#: spelling of the repeated form field.
+TRANSCRIPTION_JSON_FIELDS: Tuple[str, ...] = (
+    "model",
+    "language",
+    "response_format",
+    "timestamp_granularities",
+    "stream",
+    "file_id",
+)
+
+#: A `file_id` is a string of at most this many characters. Its SHAPE is not
+#: judged here: a malformed id gets the same 404 as another project's or a
+#: deleted one (Files design §7.2 rule 2), which the route decides.
+FILE_ID_MAX_CHARS = 128
 
 
 class TranscriptionRequest(_Forbid):
@@ -378,6 +438,8 @@ class TranscriptionRequest(_Forbid):
     language: Optional[str] = None
     response_format: Literal["json", "text", "verbose_json"] = "json"
     timestamp_granularities: List[Literal["segment"]] = Field(default_factory=list)
+    stream: bool = False
+    file_id: Optional[str] = None
 
     @field_validator("model")
     @classmethod
@@ -401,22 +463,39 @@ def _whisper_codes() -> frozenset:
         return frozenset()
 
 
-def parse_transcription_form(fields: Mapping[str, Sequence[str]]) -> TranscriptionRequest:
-    """The text fields of a transcription form → a validated request, or 400.
+def language_name(code: Optional[str]) -> Optional[str]:
+    """An ISO code (`en`) → the lower-case language name verbose_json carries
+    (`english`, CONTRACT §8.6), from `app/asr.py`'s table. A value that is not
+    a known code is returned lower-cased as it is (it may already be a name);
+    None stays None."""
+    if not code:
+        return None
+    cleaned = str(code).strip().lower()
+    try:
+        from .. import asr
 
-    The file part is checked by the route (it needs the byte caps and the
-    content-type allowlist); this is everything else.
-    """
-    for name in fields:
-        if name not in TRANSCRIPTION_FIELDS:
-            raise errors.invalid_request(f"Unsupported field: {name}.", param=name)
-    values: Dict[str, Any] = {}
-    for name in ("model", "language", "response_format"):
-        if name in fields:
-            values[name] = fields[name][0]
-    granularities = list(fields.get("timestamp_granularities[]") or [])
-    if "model" not in values:
+        for name, value in getattr(asr, "_LANGUAGE_CODES", {}).items():
+            if str(value).lower() == cleaned:
+                return str(name).lower()
+    except Exception:  # noqa: BLE001 - a missing table must not fail a transcript
+        pass
+    return cleaned or None
+
+
+def _parse_stream_flag(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in ("true", "false"):
+        return raw.strip().lower() == "true"
+    raise errors.invalid_request("stream must be true or false.", param="stream")
+
+
+def _finish_transcription(values: Dict[str, Any], granularities: Sequence[Any]) -> TranscriptionRequest:
+    """The checks both body shapes share, then the model."""
+    if "model" not in values or values.get("model") in (None, ""):
         raise errors.invalid_request("model is required.", param="model")
+    if not isinstance(values["model"], str):
+        raise errors.invalid_request("model must be a string.", param="model")
     response_format = values.get("response_format")
     if response_format is not None and response_format not in TRANSCRIPTION_FORMATS:
         raise errors.invalid_request(
@@ -434,6 +513,8 @@ def parse_transcription_form(fields: Mapping[str, Sequence[str]]) -> Transcripti
         )
     language = values.get("language")
     if language is not None:
+        if not isinstance(language, str):
+            raise errors.invalid_request("language must be a string.", param="language")
         cleaned = language.strip().lower()
         if cleaned in ("", "auto"):
             values["language"] = None
@@ -445,60 +526,66 @@ def parse_transcription_form(fields: Mapping[str, Sequence[str]]) -> Transcripti
                     param="language",
                 )
             values["language"] = cleaned
-    values["timestamp_granularities"] = granularities
+    if "stream" in values:
+        values["stream"] = _parse_stream_flag(values["stream"])
+    file_id = values.get("file_id")
+    if file_id is not None:
+        if not isinstance(file_id, str) or not file_id.strip() or len(file_id) > FILE_ID_MAX_CHARS:
+            raise errors.invalid_request("file_id must be the id of a file in this project.", param="file_id")
+        values["file_id"] = file_id.strip()
+    values["timestamp_granularities"] = list(granularities)
     try:
         return TranscriptionRequest.model_validate(values)
     except ValidationError as exc:
         raise _refuse_validation(exc) from None
 
 
-def transcription_body(
-    engine_reply: Mapping[str, Any], request: TranscriptionRequest
-) -> Union[str, Dict[str, Any]]:
-    """The engine's reply → the public shape for the requested format.
+def parse_transcription_form(fields: Mapping[str, Sequence[str]]) -> TranscriptionRequest:
+    """The text fields of a transcription form → a validated request, or 400.
 
-    Built from named fields only: `processing_ms`, `no_speech_prob` and the
-    engine's `language_code` stay server-side, and a key the engine adds next
-    month does not appear on the wire until somebody puts it here.
+    The file part is checked by the route (it needs the byte caps and the
+    content-type allowlist); this is everything else.
     """
-    text = str(engine_reply.get("text") or "").strip()
-    duration = _duration(engine_reply)
-    # Null, never zero, when the engine did not say how long the audio was —
-    # the rule every usage object on this API follows (CONTRACT §9).
-    usage = (
-        None if duration is None else {"type": "duration", "seconds": int(math.ceil(duration))}
-    )
-    if request.response_format == "text":
-        return text
-    if request.response_format == "json":
-        return {"text": text, "usage": usage}
-    segments = []
-    raw = engine_reply.get("segments")
-    for position, segment in enumerate(raw if isinstance(raw, list) else []):
-        if not isinstance(segment, Mapping):
-            continue
-        segments.append(
-            {
-                "id": position,
-                "start": float(segment.get("start") or 0.0),
-                "end": float(segment.get("end") or 0.0),
-                "text": str(segment.get("text") or ""),
-            }
+    for name in fields:
+        if name not in TRANSCRIPTION_FIELDS:
+            raise errors.invalid_request(f"Unsupported field: {name}.", param=name)
+    values: Dict[str, Any] = {}
+    for name in ("model", "language", "response_format", "stream", "file_id"):
+        if name in fields:
+            values[name] = fields[name][0]
+    granularities = list(fields.get("timestamp_granularities[]") or [])
+    return _finish_transcription(values, granularities)
+
+
+def parse_transcription_json(payload: Any) -> TranscriptionRequest:
+    """`application/json` `{model, file_id, language, response_format, stream}`
+    → a validated request naming a file, or 400 (CONTRACT §8.6)."""
+    body = _require_object(payload)
+    for name in body:
+        if name not in TRANSCRIPTION_JSON_FIELDS:
+            raise errors.invalid_request(f"Unsupported field: {name}.", param=str(name))
+    values: Dict[str, Any] = {name: body[name] for name in ("model", "language", "response_format", "stream", "file_id") if name in body}
+    granularities = body.get("timestamp_granularities") or []
+    if not isinstance(granularities, list):
+        raise errors.invalid_request(
+            "timestamp_granularities must be a list.", param="timestamp_granularities"
         )
-    language = engine_reply.get("language")
-    return {
-        "task": "transcribe",
-        "language": str(language).strip().lower() if language else None,
-        "duration": duration,
-        "text": text,
-        "segments": segments,
-        "usage": usage,
-    }
+    if values.get("response_format") is not None and not isinstance(values["response_format"], str):
+        raise errors.invalid_request("response_format must be a string.", param="response_format")
+    request = _finish_transcription(values, granularities)
+    if request.file_id is None:
+        raise errors.invalid_request(
+            "file_id is required when the body is JSON; send multipart/form-data to upload a file.",
+            param="file_id",
+        )
+    return request
 
 
-def _duration(engine_reply: Mapping[str, Any]) -> Optional[float]:
-    try:
-        value = float(engine_reply.get("duration"))
-    except (TypeError, ValueError):
-        return None
-    return value if math.isfinite(value) and value >= 0 else None
+def transcription_body(result: Any, request: TranscriptionRequest) -> Union[str, Dict[str, Any]]:
+    """A finished `audio_jobs.TranscriptResult` → the public shape for the
+    requested format. verbose_json names the language (`english`), as OpenAI
+    does and CONTRACT §8.6 promises; the job keeps the code."""
+    body = result.body(request.response_format)
+    if isinstance(body, dict) and request.response_format == "verbose_json":
+        body["language"] = language_name(body.get("language"))
+    return body
