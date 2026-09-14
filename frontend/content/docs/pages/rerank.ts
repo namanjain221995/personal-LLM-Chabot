@@ -6,10 +6,12 @@ import { API_BASE_URL, EXAMPLE_STATUS, RERANK_MODEL_ID } from '../samples';
 // what the score means, that nothing is truncated, that ties are returned as
 // ties — are stated here (CONTRACT §8.5).
 import { NO_TIMEOUT_LIVE } from './longOutput';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): 1,000 documents and an 8 MiB
 // body, lengths checked before any wait, and a busy engine waited for rather
-// than refused. Built in either state from NO_TIMEOUT_LIVE.
+// than refused. Shipped on 2026-09-14: built from SIDECARS_NO_TIMEOUT_LIVE
+// (pages/sidecarsLive.ts), or NO_TIMEOUT_LIVE.
 
 const INTRO = `
 ~~~http
@@ -180,26 +182,34 @@ const LATER_ERRORS_AND_CAPACITY = `
 | --- | --- | --- |
 | \`400 invalid_request_error\` | An unsupported field, no documents, more than 1,000, an instruction over 512 characters, or an \`Idempotency-Key\` header. | Fix the request. |
 | \`400 context_length_exceeded\` | A query-and-document pair is over 4,096 tokens; \`param\` names the document. | Split that document. |
-| \`503 model_unavailable\` | The engine is down, or restarted twice while your request ran (then with \`x-should-retry: false\`). | Wait for \`Retry-After\`, add jitter, retry — unless told not to. |
+| \`503 model_unavailable\` | The engine is down; or the server is holding as much embedding and rerank work in memory as it safely can (a short \`Retry-After\`, before any byte of the answer); or one of your documents stopped the engine twice — then with \`x-should-retry: false\` and \`param\` naming the document. | Wait for \`Retry-After\`, add jitter, retry — unless told not to. |
 
 The engine also serves the TechSara chat application, which keeps priority, and
 public requests share a small queue in front of it. **A busy engine is waited
 for, not refused**, with the connection kept alive; a thousand documents take a
-while, and there is no time limit.
+while, and there is no time limit. A document that stops the engine twice is
+refused — with \`x-should-retry: false\` — for an hour, with the same query.
 
 Reranking stores nothing, so an \`Idempotency-Key\` is refused rather than
 ignored; the same request scores the same, and a plain retry is safe.
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function rerankPage({ noTimeout }: { noTimeout: boolean }): DocPage {
-  const sections = noTimeout
+export function rerankPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
+  const live = noTimeout || sidecarsLive;
+  const sections = live
     ? [INTRO, S_RERANK_DOCUMENTS, LATER_THE_REQUEST, S_THE_RESPONSE, S_WHAT_THE_SCORE_MEANS, S_INSTRUCTIONS, LATER_ERRORS_AND_CAPACITY, S_USAGE]
     : [INTRO, S_RERANK_DOCUMENTS, S_THE_REQUEST, S_THE_RESPONSE, S_WHAT_THE_SCORE_MEANS, S_INSTRUCTIONS, S_ERRORS_AND_CAPACITY, S_USAGE];
   return {
     slug: 'rerank',
     title: 'Rerank',
-    summary: noTimeout
+    summary: live
       ? 'POST /v1/rerank scores up to 1,000 documents against a query with ' +
         'techsara-rerank and returns them best first.'
       : 'POST /v1/rerank scores up to 100 documents against a query with ' +

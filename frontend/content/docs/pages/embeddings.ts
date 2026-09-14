@@ -7,11 +7,13 @@ import { API_BASE_URL, EMBED_MODEL_ID, EXAMPLE_STATUS } from '../samples';
 // (no `dimensions`, no token-array input, no silent truncation) are listed
 // here rather than discovered (CONTRACT §8.4).
 import { NO_TIMEOUT_LIVE } from './longOutput';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): 2,048 inputs and an 8 MiB body
 // (request shape, not usage), lengths checked before any wait so an over-long
 // input is always a real 400, and a busy engine waited for rather than refused.
-// Built in either state from NO_TIMEOUT_LIVE.
+// That part shipped on 2026-09-14 (SIDECARS_NO_TIMEOUT_LIVE, pages/sidecarsLive.ts);
+// only the link to the timeouts page waits for NO_TIMEOUT_LIVE.
 
 const INTRO = `
 ~~~http
@@ -193,14 +195,17 @@ waits for anything, so this refusal is always an immediate \`400\`.
 
 The body is at most 8 MiB.
 `;
-const LATER_MANY_INPUTS = `
+const laterManyInputs = (timeoutsPage: boolean): string => `
 ## Many inputs
 
 Up to 2,048 inputs per request. The server splits a request into smaller engine
 calls and sends them in order, so a request of many long inputs takes
 proportionally longer — and that is fine: the API sends a byte at least every
-15 seconds while it works, and has no time limit of its own. Leave your
-client's read timeout off (see [timeouts](/docs/timeouts)). For a large corpus,
+15 seconds while it works, and has no time limit of its own. ${
+  timeoutsPage
+    ? "Leave your\nclient's read timeout off (see [timeouts](/docs/timeouts))."
+    : "Leave your\nclient's read timeout off, or set it above 15 seconds."
+} For a large corpus,
 batches of a few hundred make a failed batch cheap to repeat.
 
 ~~~python
@@ -230,13 +235,15 @@ const LATER_ERRORS_AND_CAPACITY = `
 | --- | --- | --- |
 | \`400 invalid_request_error\` | An unsupported field, an empty input, more than 2,048 inputs, or an \`Idempotency-Key\` header. | Fix the request. |
 | \`400 context_length_exceeded\` | One input is over 4,096 tokens; \`param\` names it. | Split that input. |
-| \`503 model_unavailable\` | The engine is down, or restarted twice while your request ran (then with \`x-should-retry: false\`). | Wait for \`Retry-After\`, add jitter, retry — unless told not to. |
+| \`503 model_unavailable\` | The engine is down; or the server is holding as much embedding and rerank work in memory as it safely can (a short \`Retry-After\`, before any byte of the answer); or one of your inputs stopped the engine twice — then with \`x-should-retry: false\` and \`param\` naming the input. | Wait for \`Retry-After\`, add jitter, retry — unless told not to. |
 
 The engine also serves the TechSara chat application, which keeps priority, and
 public requests share a small queue in front of it. **A busy engine is waited
 for, not refused**: your request waits its turn, with the connection kept
 alive. If the engine restarts under a request, the request is sent again for
-you.
+you. An input that stops the engine twice is refused — with
+\`x-should-retry: false\` — for an hour, in any request that sends it; remove or
+change that input.
 
 An \`Idempotency-Key\` header is refused here rather than ignored: an
 embeddings call stores nothing that a retry could be matched against, and an
@@ -245,14 +252,21 @@ same text twice returns the same vectors, so a plain retry is already safe.
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function embeddingsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
-  const sections = noTimeout
-    ? [INTRO, S_CREATE_EMBEDDINGS, LATER_THE_REQUEST, S_THE_RESPONSE, S_QUERIES_AND_DOCUMENTS, LATER_MANY_INPUTS, LATER_ERRORS_AND_CAPACITY, S_USAGE]
+export function embeddingsPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
+  const live = noTimeout || sidecarsLive;
+  const sections = live
+    ? [INTRO, S_CREATE_EMBEDDINGS, LATER_THE_REQUEST, S_THE_RESPONSE, S_QUERIES_AND_DOCUMENTS, laterManyInputs(noTimeout), LATER_ERRORS_AND_CAPACITY, S_USAGE]
     : [INTRO, S_CREATE_EMBEDDINGS, S_THE_REQUEST, S_THE_RESPONSE, S_QUERIES_AND_DOCUMENTS, S_MANY_INPUTS, S_ERRORS_AND_CAPACITY, S_USAGE];
   return {
     slug: 'embeddings',
     title: 'Embeddings',
-    summary: noTimeout
+    summary: live
       ? 'POST /v1/embeddings turns up to 2,048 texts into 1,024-dimension vectors ' +
         'with techsara-embed, for search, clustering and deduplication.'
       : 'POST /v1/embeddings turns text into 1,024-dimension vectors with ' +
