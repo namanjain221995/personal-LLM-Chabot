@@ -1,0 +1,1296 @@
+# Alerts for the public Files / Uploads API and the v1-gateway (2026-09-13).
+# Loaded by the same `rule_files: /etc/prometheus/rules/*.yml` glob as
+# alerts.yml and developer-api.yml; nothing in those files is changed, and no
+# alert or group name here repeats one of theirs.
+#
+# WHAT THIS WATCHES, AND FROM WHICH CODE. Every metric name below was taken
+# from, or placed next to, the modules that were built for this release:
+#   orchestrator/app/apifiles/accounting.py  gauges(): the four storage gauges
+#   orchestrator/app/apifiles/storage.py     free_bytes() / require_free(): the floor
+#   orchestrator/app/apifiles/limits.py      min_free_bytes(), cpu_jobs(), media_jobs()
+#   orchestrator/app/apifiles/queue.py       claim_due_blobs(), defer_blob(), AssemblyResult
+#   orchestrator/app/apifiles/jobs.py        JobRunner lanes, RunOutcome, _defer, _terminal
+#   orchestrator/app/apifiles/extract_worker.py RetryableWorkerError and its three causes
+#   orchestrator/app/apifiles/media.py       api_pace()
+#   orchestrator/app/apifiles/retention.py   run_pass, _purge_one, _loop, start(on_pass=)
+#   orchestrator/app/apifiles/uploads_sweep.py run_once, _loop, start(on_pass=)
+#   gateway/server.cjs, gateway/lib/{relay,reattach,guards,drain}.cjs
+#
+# STATUS OF EVERY METRIC (the developer-api convention, see
+# monitoring/developer-api/README.md "Metric status"):
+#   live      in production Prometheus on 2026-09-13
+#   pending   the code that produces it is written but not wired or deployed
+#   proposed  nothing emits it yet; the contract below says exactly what to emit
+#
+# On 2026-09-13 a read-only query of production Prometheus returned NO series
+# for {__name__=~"api_files.*|public_api_upload.*|v1_gateway.*"} and no
+# `process_*` series for the orchestrator job. So, today:
+#   live      node_filesystem_avail_bytes (job node), up (once a job exists)
+#   pending   api_files_disk_free_bytes, api_files_bytes_total,
+#             api_files_derived_bytes_total, public_api_upload_parts_in_flight
+#             (accounting.gauges() returns them; app/metrics.py does not
+#             publish them yet), and the cAdvisor series of the v1-gateway
+#             container (the container is not deployed)
+#   proposed  everything else below
+#
+# A RULE ON A PENDING OR PROPOSED METRIC IS INERT until the metric exists.
+# No rule here uses `or vector(...)` or `absent()`, the construction rule of
+# alerts.yml and developer-api.yml. Three constructions need a word:
+#   * ApiFilesDiskLow, ApiFilesDiskNearStorageFloor and
+#     ApiFilesBelowStorageFloor `or` two REAL series aggregated to the same
+#     {node} label set: the Files store's own statvfs (and, for the floor
+#     alerts, its configured floor) when the orchestrator publishes a FRESH
+#     snapshot, and otherwise the host's root filesystem compared with the
+#     literal default floor (250 GiB = 268435456000 bytes). A literal
+#     threshold is not `or vector()`: no series is invented, the host's real
+#     free space is compared with a number. Same labels on both sides means
+#     the alert keeps its identity, and its `for` timer, when the source
+#     switches at an orchestrator restart, and a disk that fills while the
+#     orchestrator is down or crashlooping still turns critical.
+#   * EVERY RULE THAT READS A DB-SNAPSHOT GAUGE is gated on the snapshot
+#     being fresh: `and on (job, instance) sum by (job, instance)
+#     (increase(api_files_snapshot_total{result="ok"}[5m])) > 0`. metrics.py
+#     keeps a gauge's last value forever when nothing sets it again, so
+#     without the gate a failed read freezes a high value (an alert that
+#     fires for hours about a job that ended) or a zero (an alert that can
+#     never fire during the database outage it should see).
+#     ApiFilesSnapshotFailing names the frozen case.
+#   * The two pass-overdue alerts and ApiFilesSnapshotFailing are gated on
+#     the orchestrator exporting ANY api_files_* series (the Files API is
+#     wired), and then fire when their ok counter did not increase,
+#     including when that counter is absent. That is what lets them see a
+#     loop that fails from process start. It also means those three
+#     counters (api_files_retention_passes_total,
+#     api_files_upload_sweep_passes_total, api_files_snapshot_total), with
+#     every label value registered at 0, MUST SHIP IN THE SAME CHANGE as the
+#     first api_files_* series: shipped alone, any api_files_* gauge makes
+#     all three warnings fire permanently.
+#
+# NOTHING HERE REACHES A PERSON YET. Prometheus has no Alertmanager on
+# 2026-09-13 (developer-api.yml header). These alerts show on /alerts and in
+# Grafana only, and there is no inhibition: severity says how urgent, not who
+# is told.
+#
+# ---------------------------------------------------------------------------
+# METRIC CONTRACT (orchestrator, job="orchestrator")
+# ---------------------------------------------------------------------------
+# Rules that hold for all of them (orchestrator/app/metrics.py):
+#  * Declare every label NAME and its closed VALUE set in _LABELS_BY_METRIC.
+#    Three label names used here already have GLOBAL vocabularies that would
+#    fold these values to "other":
+#      lane   global {normal, long}                    -> cpu, media fold
+#      state  global {queued, running, uploading, finalizing}
+#                                                      -> processing, deferred,
+#                                                         orphaned, deleting fold
+#      stage  global = video + artifact stages         -> sniff, text, chunk,
+#                                                         sheets, profile, decode,
+#                                                         variants, finalize fold
+#    The others (kind, outcome, reason, error_code, what, status, step) have
+#    no global set, so without a declaration they are unbounded. A per-metric
+#    entry wins over the global set (_clean reads per_metric first). `result`
+#    is deliberately not used: its global set is a union of other counters'.
+#  * Never label by project, workspace, key, file, upload or blob id.
+#  * Register every counter's label values at 0 at startup, or the first event
+#    after a restart is invisible to increase() (developer-api README).
+#  * metrics.inc() adds 1. The report counters below add N per pass; add an
+#    `inc_by`/`add` helper or loop, never a gauge that pretends to count.
+#  * PRECISION. metrics.render() writes counters, gauges and histogram _sum
+#    as f"{value:g}": SIX significant digits. Measured 2026-09-13 through the
+#    real module: time.time() = 1789320181.08 rendered as `1.78932e+09`
+#    (rounded to 10,000 s); 268435456000 as `2.68435e+11` (456 KB low);
+#    2732683264245 as `2.73268e+12` (about 3 MB low). Byte gauges at that
+#    resolution are fine for every threshold here. Epoch timestamps are not:
+#    NO RULE OR PANEL IN THIS FILE READS AN ORCHESTRATOR TIMESTAMP GAUGE, and
+#    none may be added until render() prints full precision (repr(float) or
+#    "%.17g", for counters and _sum too). Histogram buckets and _count are
+#    printed as integers and stay exact, so quantiles are exact; a mean from
+#    _sum loses resolution once the sum passes 1e6.
+#  * WHICH PROCESS. The multi-process orchestrator design (§4.6) merges every
+#    process's registry on /metrics and adds process="<slot>". The snapshot
+#    gauges below (disk, floor, bytes, uploads, jobs, oldest/silent/deleting
+#    ages, assembly, trash, lane running/slots) and the loop counters are
+#    published by the ONE process that runs JobRunner, retention and the
+#    sweep (the runner). The exceptions are the request-path series, which
+#    every process publishes for itself and rules SUM:
+#    public_api_upload_parts_in_flight (a part body lands on whichever web
+#    process took the request, so the runner's own count would read 0 during
+#    uploads) and api_files_storage_refusals_total. Rules read DB snapshots
+#    with min/max by (job, instance[, lane]) and per-process gauges and
+#    counters with sum by; every join here aggregates BOTH sides first, so a
+#    process label never turns a join many-to-many.
+#  * THE SNAPSHOT PUBLISHER. One loop in the runner process, every 15 s,
+#    started by main.py's lifespan INDEPENDENTLY of jobs.start() (a
+#    jobs.start() that raised or was skipped must still leave slots and a
+#    running count of 0 on /metrics, or the stuck-runner alerts cannot see
+#    it). Not from the /health path: /health lands on any process and runs
+#    only when a probe calls it. Each attempt reads every snapshot gauge
+#    below in one pass and ends in exactly one of
+#    api_files_snapshot_total{result="ok"} (every gauge was set) or
+#    {result="error"} (any read raised). accounting.gauges() SWALLOWS its
+#    own failures today (statvfs OSError, and any database error, leave the
+#    key out of the dict it returns): the publisher must count a missing
+#    api_files_disk_free_bytes or api_files_bytes_total key as result=error,
+#    or gauges() must re-raise. A failed attempt logs "files snapshot failed"
+#    at warning with its exception (ApiFilesSnapshotFailing greps for it).
+#
+# | metric | type | labels (closed) | status | emit |
+# | api_files_disk_free_bytes | gauge | - | pending | accounting.gauges(): storage.free_bytes() = statvfs f_bavail*f_frsize of PUBLIC_API_FILES_DIR |
+# | api_files_disk_floor_bytes | gauge | - | proposed | limits.min_free_bytes() (PUBLIC_API_FILES_MIN_FREE_GIB, default 250 GiB); add to accounting.gauges() beside free |
+# | api_files_bytes_total | gauge (name fixed by the design, despite _total) | - | pending | accounting.gauges(): sum(bytes) of non-deleting blobs |
+# | api_files_derived_bytes_total | gauge (same) | - | pending | accounting.gauges(): sum(derived_bytes) |
+# | public_api_upload_parts_in_flight | gauge | - | pending | accounting.PARTS_IN_FLIGHT, held by routes.py around each part body. PER PROCESS, not part of the snapshot: every process publishes its own counter and panels sum it (accounting.gauges() returns it today; the publisher must not be the only one to set it) |
+# | api_files_snapshot_total | counter | result: ok, error | proposed | the snapshot publisher (see THE SNAPSHOT PUBLISHER above), once per attempt; both values registered at 0 |
+# | api_files_uploads | gauge | status: pending, finalizing | proposed | count(api_uploads) by status, same snapshot |
+# | api_files_uploads_pending_bytes | gauge | - | proposed | sum(api_uploads.bytes) where status pending/finalizing (declared sizes) |
+# | api_files_storage_refusals_total | counter | reason: disk, purge_busy, io | proposed | every place a 503 storage_unavailable or storage_busy is built in publicapi/files: disk = storage.StorageUnavailable (Retry-After 60); purge_busy = wire.storage_busy (Retry-After 2); io = publicapi/files/multipart_disk.py, where open() of the part's temporary file raised OSError and wire.storage_unavailable() is sent without a space check |
+# | api_files_jobs | gauge (design §7.4 name) | lane: cpu, media; state: queued, deferred, processing, orphaned, deleting | proposed | one GROUP BY over api_file_blobs. queued = status queued AND (not_before IS NULL OR not_before <= now()); deferred = status queued AND not_before > now(); processing = status processing AND lease_expires_at >= now(); orphaned = status processing AND lease_expires_at < now() (exactly claim_due_blobs' takeover set); deleting = status deleting (lane of the row) |
+# | api_files_job_oldest_due_seconds | gauge | lane: cpu, media | proposed | max over due rows of: queued -> now() - GREATEST(COALESCE(not_before, updated_at), updated_at) (release_blob and claim never clear not_before, so a blob released on shutdown or moved to the other lane long after an old deferral is due since its updated_at, not since that deferral); orphaned -> now() - lease_expires_at; 0 when there are none |
+# | api_files_job_silent_seconds | gauge | lane: cpu, media | proposed | max over processing rows with a live lease of now() - updated_at (progress, stage and claim writes move updated_at; lease renewal does not), EXCLUDING rows whose video_analyses row (video_analysis_id) has status 'queued': that is the video pipeline waiting out its own retry delay after an engine outage (VIDEO_RETRY_DELAY_S x up to VIDEO_MAX_ATTEMPTS inside LLM_RECOVERY_WINDOW_S) while jobs._follow_pipeline holds the slot and writes nothing; 0 when none |
+# | api_files_lane_running | gauge | lane: cpu, media | proposed | len(JobRunner._jobs) + len(JobRunner._assemblies) per lane (add a public jobs.lane_snapshot()); 0 for a lane with no started runner (jobs._runners has no entry for it, because jobs.start() raised or never ran), NEVER absent |
+# | api_files_lane_slots | gauge | lane: cpu, media | proposed | limits.cpu_jobs() / limits.media_jobs() (PUBLIC_API_FILES_CPU_JOBS 2, _MEDIA_JOBS 1), the value a started runner's JobRunner.concurrency is built from, published for both lanes whether or not a runner exists |
+# | api_files_job_runs_total | counter | lane; kind: sniff.KINDS (12); outcome: processed, failed, deferred, stopped, moved | proposed | once per RunOutcome, where jobs.py appends it to self.outcomes |
+# | api_files_job_seconds | histogram | lane; outcome | proposed | claim to RunOutcome; buckets 1 5 15 60 300 900 1800 3600 7200 14400 21600 |
+# | api_files_job_failures_total | counter | kind; stage: every name in sniff.STAGES_BY_KIND (17) plus none; error_code: extractors.ERROR_CODES (5) | proposed | jobs._terminal(status failed) and jobs._defer when defer_blob returns failed; stage = ctx.current_stage, or "none" when no stage had started (the crash-loop cap in _run_job_inner raises ExtractError before any stage; never report it as sniff) |
+# | api_files_job_deferrals_total | counter | lane; stage: as above, with one exception below; reason: storage, memory_pressure, sandbox_unavailable, engine, probe_timeout | proposed | jobs._defer. The reason is a closed attribute set where the exception is RAISED, never parsed from a message: storage = storage.StorageUnavailable (free_check, require_free) and the extraction child's ENOSPC/EDQUOT retry payload; memory_pressure = extract_worker._verdict_from_signal on SIGKILL; sandbox_unavailable = the child's retry payload why="unsandboxed"; engine = ocr_pages.EngineUnavailable, the OCR gate's ApiError, the embedding engine's three Deferreds; probe_timeout = media.MediaTimeout. TODAY jobs.JobContext.worker wraps EVERY RetryableWorkerError as Deferred("... (disk full)"), so the three child causes are indistinguishable; RetryableWorkerError needs a reason attribute carried into Deferred. STAGE OF A STORAGE DEFERRAL: jobs._run_steps calls free_check for a DERIVED_WRITING step BEFORE it sets ctx.current_stage = step, so ctx.current_stage still names the previous stage (or None on a resumed run whose earlier stages come from markers); label it with the step being checked (set current_stage before free_check, or pass the step to _defer), and map None to "none" as for failures |
+# | api_files_job_crash_takeovers_total | counter | lane | proposed | jobs._run_job_inner, where it logs "previous run ended without releasing" |
+# | api_files_assembly_uploads | gauge | state: waiting, deferred, running | proposed | api_uploads with status completed and assembly_part_numbers set, split BY OWNER so no row is in two states: running = assembly_lease_owner set AND assembly_lease_expires_at > now(); deferred = owner NULL AND expiry > now() (queue._release_assembly_lease with defer_s > 0: disk under the floor, a purge in flight); waiting = expiry NULL or <= now() (claimable now) |
+# | api_files_assembly_oldest_wait_seconds | gauge | - | proposed | max over WAITING rows only of now() - GREATEST(completed_at, COALESCE(assembly_lease_expires_at, completed_at)) (a deferred row that became claimable waits from its deferral's end, so the value does not flicker between 0 and hours as a row moves between deferred and waiting); 0 when none |
+# | api_files_assembly_errors_total | counter | - | proposed | JobRunner._run_assembly's `except Exception` ("files assembly %s failed a unit"): an exception the AssemblyResult never reported |
+# | api_files_assembly_total | counter | outcome: attached, checksum_mismatch, failed, deferred, abandoned | proposed | JobRunner._run_assembly, from AssemblyResult.outcome |
+# | api_files_assembly_seconds | histogram | outcome | proposed | AssemblyResult.assembly_ms when > 0; buckets 1 5 15 60 300 900 1800 3600 |
+# | api_files_media_pace_wait_seconds | histogram | reason: chat_live, chat_unit | proposed | media.api_pace, one observation per non-zero wait; buckets 1 5 10 20 60 120 |
+# | api_files_retention_passes_total | counter | outcome: ok, failed | proposed | retention._loop: ok right after run_pass() returned (the on_pass callback may do it), failed in that loop's `except` (needs a line in retention.py; on_pass never sees a failed pass). Kicked passes count too |
+# | api_files_retention_step_failures_total | counter | step: deleting, expiry, tombstones, directories | proposed | one per step whose `try` in retention.run_pass caught an exception. run_pass only logs them today ("files retention step %s failed"): RetentionReport needs a step_failures list for on_pass to count. The analyses step's debug-level skip before the V36 migration is not a failure |
+# | api_files_retention_removed_total | counter | what: blob_purged, file_expired, tombstone, orphan_dir, orphan_analysis, leftover | proposed | retention.start(on_pass=...) from RetentionReport |
+# | api_files_purge_failures_total | counter | reason: error, fence | proposed | retention._purge_one, NOT from RetentionReport (purges started by kick() run with a throwaway report): error where it catches an exception; fence where purge_blob returns PurgeResult.skipped == "fence" (storage refused the move; nothing raised, the row stays deleting). Also error in publicapi/files/routes.py _purge's `except` (the DELETE-path purge) |
+# | api_files_deleting_oldest_seconds | gauge | - | proposed | now() - min(deleting_since) over api_file_blobs status 'deleting'; 0 when none. Needs a STABLE column: updated_at cannot be used because retention._requeue_deleting bumps it on every failed purge. Add deleting_since, set in the same UPDATE that sets status 'deleting' (schema.delete_api_file) and never touched afterwards |
+# | api_files_trash_entries | gauge | - | proposed | snapshot publisher: number of entries in storage.trash_root() (os.scandir; FileNotFoundError = 0) |
+# | api_files_trash_oldest_seconds | gauge | - | proposed | snapshot publisher: max of now() - os.lstat(entry).st_ctime over those entries, the clock uploads_sweep._sweep_trash uses (a rename moves ctime; so does every child an rmtree removes, so an entry being removed stays young); 0 when none. A trash entry is what is left when retention._retire deleted the row and storage.remove_trash raised ("files purge of %s left its bytes in the trash"): no row, so no deleting gauge can see it |
+# | api_files_sweep_remove_failures_total | counter | area: trash, single, inline, uploads | proposed | uploads_sweep._remove's `except Exception` ("files sweep could not remove an entry"); _remove needs the area passed in by its callers (_sweep_trash; the SINGLE_DIR and INLINE_DIR loops; the _uploads loop, orphan directories and stray temporaries alike). SweepReport counts only successes |
+# | orchestrator_open_fds_ratio | gauge | - | proposed | the no-timeout design's orchestrator/app/resources.py fd_pressure(): open descriptors over the soft RLIMIT_NOFILE, the ratio its PUBLIC_API_FD_GUARD_RATIO (0.70) refuses new /v1 requests at. resources.py does not exist in this worktree yet; the orchestrator exports no process_* series |
+# | api_files_upload_sweep_passes_total | counter | outcome: ok, failed | proposed | uploads_sweep._loop: ok after run_once returned, failed in its `except Exception` (run_once has no per-step try, so any database error fails the whole pass) |
+# | api_files_upload_sweep_removed_total | counter | what: finalizing_reset, expired, abandoned_assembly, record_purged, leftover, orphan_upload_dir | proposed | uploads_sweep.start(on_pass=...) from SweepReport |
+#
+# Series bound: the gauges are a few dozen; failures are kind x stage x code
+# but only real (kind, stage) pairs occur (about 60 of them), so a few hundred
+# at worst.
+#
+# ---------------------------------------------------------------------------
+# METRIC CONTRACT (v1-gateway, job="v1-gateway")
+# ---------------------------------------------------------------------------
+# The gateway has NO /metrics today: server.cjs answers /healthz and /v1/* and
+# 404s everything else, and it keeps only gw.stats.{reattachStarted,
+# reattachSucceeded, reattachFailed} and gw.registry in memory. Everything
+# below is proposed. Emit from a new node:-built-ins-only exposition writer
+# (Node 20, no npm dependency, like the rest of gateway/), served on its OWN
+# LISTENER, never on the relay port: V1_GATEWAY_METRICS_PORT (for example
+# 9464) bound on the application network only, answering exactly
+# `GET /metrics` (req.url compared as a string, no normalisation) and 404 to
+# everything else. The relay port (V1_GATEWAY_HOST 0.0.0.0:8090) is what
+# cloudflared forwards to; on a separate listener, keeping /metrics internal
+# never depends on how a tunnel ingress rule for the relay port is written.
+# The v1-gateway scrape job targets the metrics port. Labels are closed sets; never a
+# route with an id in it, never a key or a client address. Numbers are
+# written at full precision (String(n) of a JS number round-trips; never
+# toPrecision), because process_start_time_seconds and
+# v1_gateway_last_drain_timestamp_seconds are epoch seconds that rules read.
+# Every counter below is written from process start with each of its closed
+# label values at 0, for the same increase() reason as the orchestrator's, and
+# so a sum of the cut counters on the dashboard is never blank.
+#
+# EVERY WAY THE GATEWAY CUTS A CLIENT has a counter, because each happens
+# during an orchestrator deploy, the event the gateway exists for:
+#   before any re-attach is tried  v1_gateway_relay_aborts_total{reason}
+#   inside reattach()              v1_gateway_reattach_ended_total{outcome}
+#   an exception in the relay      v1_gateway_relay_errors_total{client}
+#   the gateway's own stop         v1_gateway_last_drain_relays_aborted
+#
+# | metric | type | labels | emit |
+# | process_open_fds | gauge | - | guards.openFdCount() at scrape |
+# | process_max_fds | gauge | - | guards.readNofile().soft (the ratio FdGuard uses) |
+# | process_resident_memory_bytes | gauge | - | process.memoryUsage().rss |
+# | process_start_time_seconds | gauge | - | Date.now()/1000 captured ONCE at start (recomputed per scrape from uptime it jitters, and V1GatewayRestarted's changes() would fire on every scrape) |
+# | v1_gateway_fd_pressure_threshold_ratio | gauge | - | settings.fdPressureRatio (V1_GATEWAY_FD_PRESSURE_RATIO, 0.7) |
+# | v1_gateway_fd_refusals_total | counter | - | beside log('fd_pressure_refusal') in server.cjs |
+# | v1_gateway_open_connections | gauge | - | server.getConnections() at scrape (includes idle keep-alive sockets) |
+# | v1_gateway_relays_in_flight | gauge | - | gw.registry.size at scrape |
+# | v1_gateway_draining | gauge | - | gw.draining ? 1 : 0 |
+# | v1_gateway_relay_aborts_total | counter | reason: terminal, attach_off, opaque_body, partial_json, not_replayable, sequence_unconfirmed, protocol_unknown, body_not_replayable | beside log('relay_abort', {reason}) in relay.cjs run(): R.planReattach() refused, abortClient() ran and reattach() never did. The set is planReattach's return reasons in reattach.cjs |
+# | v1_gateway_relay_errors_total | counter | client: answered, cut | beside both log('relay_error') sites in relay.cjs: run()'s catch (answered when it sent the 500 internal_error because no header was out yet; cut when it called abortClient()) and the upstream listener guard (cut) |
+# | v1_gateway_reattach_started_total | counter | - | where relay.cjs increments gw.stats.reattachStarted |
+# | v1_gateway_reattach_ended_total | counter | outcome: relay, abort, run_mismatch, exhausted, cancelled | relay.cjs reattach(): relay on success; run_mismatch when result.reason is run_mismatch; otherwise result.outcome. abort = classifyAttachResponse's verdict: a non-retryable status (404: the run is gone; any status but 200/502/503/504) or a 200 of the other shape (event stream vs JSON) |
+# | v1_gateway_reattach_absent_seconds | histogram | outcome (same set) | absent_ms at the end of reattach(); buckets 1 2 5 10 30 60 110 300 600 1800 |
+# | v1_gateway_precommit_total | counter | outcome: recovered, exhausted, outcome_unknown, body_lost, stale_socket | beside the precommit_* log lines in relay.cjs |
+# | v1_gateway_upstream_failures_total | counter | committed: true, false | beside log('upstream_failed') |
+# | v1_gateway_self_commits_total | counter | shape: sse, json | beside log('self_commit') |
+# | v1_gateway_spool_reserved_bytes | gauge | - | gw.spoolBudget.reserved |
+# | v1_gateway_spool_max_bytes | gauge | - | settings.spoolMaxBytes (V1_GATEWAY_SPOOL_MAX_BYTES, 2 GiB) |
+# | v1_gateway_spool_free_bytes | gauge | - | gw.spoolBudget.free() (statfs, sampled at most 1/s; omit when null) |
+# | v1_gateway_spool_min_free_bytes | gauge | - | settings.spoolMinFreeBytes (PUBLIC_API_MIN_FREE_DISK_BYTES, 20 GiB) |
+# | v1_gateway_spool_refusals_total | counter | reason: quota, disk, storage | beside log('spool_refused', {reason}) (quota, disk) and log('spool_failed') (storage) |
+# | v1_gateway_body_idle_total | counter | - | beside log('body_idle') |
+# | v1_gateway_last_drain_duration_seconds | gauge | - | see DRAIN below |
+# | v1_gateway_last_drain_relays_aborted | gauge | - | see DRAIN below |
+# | v1_gateway_last_drain_timestamp_seconds | gauge | - | see DRAIN below |
+#
+# DRAIN. installDrain() ends in process.exit, so a histogram observed during
+# the drain dies with the process before any scrape. Write
+# {started_at, duration_ms, reason, relays_at_start, aborted} to a small file
+# in the spool volume at drain_exit (its name must not start with `body-`, or
+# prepareSpool deletes it at start), and publish the three gauges from it at
+# the next start.
+
+groups:
+  # ------------------------------------------------------------------------
+  # Disk free versus the storage floor (Files design §7.4, storage.py).
+  #
+  # THE FLOOR. storage.require_free() refuses new bytes when
+  # free - needed < PUBLIC_API_FILES_MIN_FREE_GIB (250 GiB): POST /v1/files,
+  # POST /v1/uploads (needed = 2 x declared bytes), every part and complete
+  # get 503 storage_unavailable with Retry-After 60 and x-should-retry false,
+  # and processing DEFERS each derived-writing stage instead of writing under
+  # the line. Reads and deletes continue. The publicapi disk ledger raises the
+  # speech cache's own floor to the same value on the same device.
+  #
+  # THE DEVICE. On this head the Files store (/data/api-files in the
+  # orchestrator) is the sf-local-ai_data volume, which lives on the root
+  # filesystem /dev/nvme0n1p2 (3,755 GiB), next to Postgres, LanceDB, the
+  # models and the gateway's spool volume. Measured 2026-09-13 from
+  # node_filesystem_avail_bytes{node="spark-1",mountpoint="/"}: 2,545 GiB
+  # free; 14-day range 2,600-3,302 GiB; deriv over 7 d -23 GiB/day, over 3 d
+  # -36 GiB/day, over the last 6 h -275 GiB/day (a burst). alerts.yml's
+  # DiskFillingUp fires at 85 % used, which is ~563 GiB free here, before the
+  # 250 GiB floor; the rules below add the Files store's own view and the
+  # distance to the floor.
+  #
+  # ONE CRITICAL AT A TIME. Near-floor covers 0-100 GiB of headroom and
+  # below-floor covers under 0, so the two criticals never fire together
+  # (ApiFilesDiskLow, the warning, stays true under both). Both pick their
+  # source by the same test (a fresh orchestrator snapshot with both the free
+  # and the floor gauge), so they never disagree about which disk figure they
+  # read.
+  #
+  # NO ORCHESTRATOR, STILL A CRITICAL. The orchestrator is the one process
+  # that publishes the store's own figures, and a full disk is a plausible
+  # reason for it to be down or crashlooping. So all three alerts fall back to
+  # the head's root filesystem when the orchestrator's snapshot is missing or
+  # stale; the floor alerts compare it with the 250 GiB DEFAULT floor, which
+  # is the real floor unless PUBLIC_API_FILES_MIN_FREE_GIB was changed.
+  #
+  # FIRST LOOK, all read-only:
+  #   docker exec sf-local-ai-orchestrator-1 df -B1 /data/api-files
+  #   sudo du -xsh /var/lib/docker/volumes/*/_data 2>/dev/null | sort -h | tail
+  #   (the second walks every volume; it is slow on a full disk, run it once)
+  # ------------------------------------------------------------------------
+  - name: files-api-storage
+    rules:
+      - alert: ApiFilesDiskLow
+        # The design's `api_files_disk_low` (§7.4: free < 1 TiB), named in
+        # this file's CamelCase. Two real sources, never a made-up value:
+        # the orchestrator's statvfs of the Files store when it publishes
+        # it, and the head's root filesystem otherwise (the store's device
+        # on this deployment). Both sides are reduced to {node} (the
+        # orchestrator scrape job carries node="spark-1" in prometheus.yml),
+        # so `or` prefers the orchestrator's series when it exists and the
+        # alert is the SAME alert whichever side feeds it: an orchestrator
+        # restart does not start the 15-minute timer over. A stale snapshot
+        # (a frozen gauge) drops the orchestrator's side, so the host's live
+        # figure takes over. The source is named in the description by a
+        # template query instead of a label.
+        expr: >-
+          (
+            min by (node) (
+              min by (job, instance, node) (api_files_disk_free_bytes{job="orchestrator"})
+              and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+            )
+            or
+            min by (node) (node_filesystem_avail_bytes{job="node", node="spark-1", mountpoint="/", fstype!="tmpfs"})
+          ) < 1099511627776
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files store device has {{ $value | humanize1024 }}B free (under 1 TiB)"
+          description: >-
+            The disk that holds the Files API store has less than 1 TiB free
+            (source now: {{ if query "sum(increase(api_files_snapshot_total{job='orchestrator', result='ok'}[5m])) > 0 and on () count(api_files_disk_free_bytes{job='orchestrator'})" }}the orchestrator's
+            statvfs of PUBLIC_API_FILES_DIR{{ else }}the head's root filesystem,
+            because the orchestrator is not publishing a fresh api_files_disk_free_bytes{{ end }}).
+            New uploads are still accepted until free space minus twice an
+            upload's size falls under the 250 GiB floor; the largest upload
+            (100 GiB) needs 200 GiB above it. Find what grew before deciding
+            what to remove.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-storage
+          safe_command: "df -B1 /; docker exec sf-local-ai-orchestrator-1 df -B1 /data/api-files"
+
+      - alert: ApiFilesDiskNearStorageFloor
+        # 0 to 100 GiB above the floor: a 50 GiB upload is already refused at
+        # create (free - 2 x bytes < floor), and one more large processing
+        # run (a DOCX expands up to 36x plus a 195 MiB vector index,
+        # storage.projected_derived_bytes) can reach the line. Under the
+        # floor is ApiFilesBelowStorageFloor's, not this one's. The value is
+        # the headroom above the floor, from the orchestrator's fresh free and
+        # floor gauges, or the host root minus the 250 GiB default.
+        expr: >-
+          (
+            min by (node) (
+              min by (job, instance, node) (api_files_disk_free_bytes{job="orchestrator"})
+                - on (job, instance, node) max by (job, instance, node) (api_files_disk_floor_bytes{job="orchestrator"})
+              and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+            )
+            or
+            min by (node) (node_filesystem_avail_bytes{job="node", node="spark-1", mountpoint="/", fstype!="tmpfs"}) - 268435456000
+          ) < 107374182400 >= 0
+        for: 5m
+        labels: { severity: critical, service: files-api }
+        annotations:
+          summary: "Files store is {{ $value | humanize1024 }}B above its storage floor"
+          description: >-
+            Free space on the Files store is within 100 GiB of
+            PUBLIC_API_FILES_MIN_FREE_GIB (source now: {{ if query "sum(increase(api_files_snapshot_total{job='orchestrator', result='ok'}[5m])) > 0 and on () count(api_files_disk_free_bytes{job='orchestrator'}) and on () count(api_files_disk_floor_bytes{job='orchestrator'})" }}the
+            orchestrator's statvfs of PUBLIC_API_FILES_DIR against its
+            configured floor{{ else }}the head's root filesystem against the
+            250 GiB default floor, because the orchestrator is not publishing a
+            fresh free and floor pair: if it is down or restarting, a full disk
+            may be why{{ end }}). Large uploads are being
+            refused at create with 503 storage_unavailable, and the next
+            derived-writing stages will defer instead of writing. Postgres,
+            LanceDB and chat uploads share this device; the floor exists so
+            they are not the ones to fail.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-storage
+          safe_command: "df -B1 /; docker exec sf-local-ai-orchestrator-1 df -B1 /data/api-files"
+
+      - alert: ApiFilesBelowStorageFloor
+        # The value is the SHORTFALL under the floor (floor minus free), from
+        # the same two sources as ApiFilesDiskNearStorageFloor.
+        expr: >-
+          (
+            max by (node) (
+              max by (job, instance, node) (api_files_disk_floor_bytes{job="orchestrator"})
+                - on (job, instance, node) min by (job, instance, node) (api_files_disk_free_bytes{job="orchestrator"})
+              and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+            )
+            or
+            268435456000 - min by (node) (node_filesystem_avail_bytes{job="node", node="spark-1", mountpoint="/", fstype!="tmpfs"})
+          ) > 0
+        for: 2m
+        labels: { severity: critical, service: files-api }
+        annotations:
+          summary: "Files store is {{ $value | humanize1024 }}B below its storage floor: every write is refused"
+          description: >-
+            Free space is {{ $value | humanize1024 }}B under
+            PUBLIC_API_FILES_MIN_FREE_GIB (source now: {{ if query "sum(increase(api_files_snapshot_total{job='orchestrator', result='ok'}[5m])) > 0 and on () count(api_files_disk_free_bytes{job='orchestrator'}) and on () count(api_files_disk_floor_bytes{job='orchestrator'})" }}the
+            orchestrator's statvfs of PUBLIC_API_FILES_DIR against its
+            configured floor{{ else }}the head's root filesystem against the
+            250 GiB default floor, because the orchestrator is not publishing a
+            fresh free and floor pair: if it is down or restarting, a full disk
+            may be why{{ end }}). Every file create, upload
+            create, part and complete answers 503 storage_unavailable with
+            x-should-retry false, and every processing run defers at its next
+            derived-writing stage. A file's fifth deferral fails it
+            processing_unavailable, after four 300 s waits (about 20 minutes
+            plus its run time). Reads and deletes still work, and a DELETE's
+            purge is what frees bytes.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-storage
+          safe_command: "df -B1 /; docker exec sf-local-ai-orchestrator-1 df -B1 /data/api-files"
+
+      - alert: ApiFilesDiskFloorForecast24h
+        # predict_linear over 6 h: the 6 h burst measured on 2026-09-13
+        # (-275 GiB/day from 2,545 GiB) forecasts ~2,270 GiB a day out, so
+        # ordinary churn stays quiet; this is for a sustained fill that
+        # reaches the floor before a person would notice on the next day.
+        expr: >-
+          min by (job, instance) (predict_linear(api_files_disk_free_bytes{job="orchestrator"}[6h], 86400))
+            < on (job, instance) max by (job, instance) (api_files_disk_floor_bytes{job="orchestrator"})
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 30m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "At the last 6 hours' rate the Files store reaches its floor within 24 hours"
+          description: >-
+            The 6-hour trend of free space on the Files store projects
+            {{ $value | humanize1024 }}B free in 24 hours, under
+            PUBLIC_API_FILES_MIN_FREE_GIB. When it gets there every write is
+            refused. Look for a tenant uploading at scale, a derived-data
+            blow-up, or something else filling the same device.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-storage
+          safe_command: "df -B1 /; docker exec sf-local-ai-orchestrator-1 df -B1 /data/api-files"
+
+      - alert: ApiFilesStorageRefusals
+        # reason="disk" only: purge_busy is a DELETE and a re-upload of the
+        # same bytes racing (Retry-After 2, x-should-retry true), not space.
+        # A single refusal can be legitimate (a 100 GiB upload on 400 GiB
+        # free) and is still a developer who could not upload.
+        expr: >-
+          sum by (job, instance) (increase(api_files_storage_refusals_total{job="orchestrator", reason="disk"}[15m])) > 0
+        for: 1m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} Files API writes refused for disk space in 15 minutes"
+          description: >-
+            The Files API answered 503 storage_unavailable (Retry-After 60,
+            x-should-retry false). Either free space is under the floor, or an
+            upload's declared size would take it there. Compare with
+            api_files_disk_free_bytes and api_files_uploads_pending_bytes.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-storage
+          safe_command: "docker logs --since 20m sf-local-ai-orchestrator-1 2>&1 | grep 'files api refused new bytes' | tail -5"
+
+  # ------------------------------------------------------------------------
+  # Processing and assembly (jobs.py, queue.py, media.py, extract_worker.py).
+  #
+  # THE DATABASE ROW IS THE QUEUE. A blob is due when it is `queued` with
+  # not_before reached, or `processing` with a lapsed lease (a holder that
+  # died). Two lanes: cpu runs PUBLIC_API_FILES_CPU_JOBS (2) at once and also
+  # runs upload assembly in the same slots; media runs
+  # PUBLIC_API_FILES_MEDIA_JOBS (1), audio and video through the video
+  # pipeline, pacing behind live chat (api_pace: up to 20 s behind a live
+  # generation, then up to 120 s behind a chat video GPU unit). The claim loop
+  # polls every 5 s, a lease is 90 s renewed every 30 s, a deferral waits
+  # 300 s, and queue.defer_blob fails the file processing_unavailable on its
+  # fifth deferral (attempt + 1 >= 5).
+  #
+  # WHY "WITH A FREE SLOT". A due job waiting is normal under load: a tabular
+  # extraction may run 2 h (limits.kind_caps wall_s 7200) in both cpu slots,
+  # and a 3 h video takes 25-90 min in the one media slot. Due work waiting
+  # for minutes WHILE a slot of its lane is idle is never load: it is a claim
+  # loop that stopped, a database error on every claim, or a lane that was
+  # never started. That is the stuck signature the warnings key on; plain
+  # backlog is info.
+  #
+  # DEFERRAL REASONS ARE NOT ALL "WAIT AND RETRY". storage, engine and
+  # probe_timeout are outages that end on their own; memory_pressure (an
+  # extraction child SIGKILLed from outside) and sandbox_unavailable (the
+  # child refused to parse without the sandbox it requires) are host problems
+  # with their own alerts, and must never be reported as a full disk.
+  #
+  # FIRST LOOK, read-only:
+  #   docker exec -i sf-local-ai-postgres-1 sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  #     <<< "SELECT lane, status, count(*), min(updated_at) FROM api_file_blobs WHERE status IN ('queued','processing','deleting') GROUP BY 1, 2"
+  #   (psql reads the query on stdin, so neither shell touches its quotes)
+  #   docker logs --since 30m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files (cpu|media) lane|files blob|files assembly' | tail -20
+  # ------------------------------------------------------------------------
+  - name: files-api-processing
+    rules:
+      - alert: ApiFilesSnapshotFailing
+        # Every alert on a snapshot gauge (disk, floor, queue ages, lanes,
+        # assembly, deleting, trash) is gated on a fresh snapshot, so while
+        # this fires those alerts are SILENT and the disk alerts read the
+        # host's root filesystem instead. Same gate construction as the
+        # pass-overdue alerts: an up orchestrator that exports any api_files_*
+        # series and has no ok snapshot in 5 minutes, including a snapshot
+        # counter that was never created.
+        expr: >-
+          (
+            max by (job, instance) (up{job="orchestrator"}) == 1
+            and on (job, instance)
+            group by (job, instance) ({job="orchestrator", __name__=~"api_files_.+"})
+          )
+          unless on (job, instance)
+          sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 5m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "The Files API metrics snapshot has not refreshed for at least 10 minutes; the alerts that read it are held silent"
+          description: >-
+            The orchestrator is up and exports Files API metrics, but the
+            snapshot publisher has completed no read for at least 10 minutes
+            (no ok publish in a 5-minute window, held for 5 minutes). The queue, lane, assembly, deleting and trash gauges
+            still show their LAST values, which may be hours old, so the
+            alerts that read them are held silent: a stuck runner, a silent
+            job or a stuck purge would not be reported now. The usual cause is
+            the database: unreachable, or out of connections (every claim and
+            every purge fails at the same time, see the postgres alerts);
+            otherwise the publisher loop died or never started. Look for the
+            publisher's failure in the orchestrator log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 15m sf-local-ai-orchestrator-1 2>&1 | grep -iE 'files snapshot failed|OperationalError|too many clients' | tail -10"
+
+      - alert: ApiFilesDueJobsWaitWithFreeSlot
+        expr: >-
+          max by (job, instance, lane) (api_files_job_oldest_due_seconds{job="orchestrator"}) > 300
+          and on (job, instance, lane)
+          (
+            sum by (job, instance, lane) (api_files_lane_running{job="orchestrator"})
+              < on (job, instance, lane) sum by (job, instance, lane) (api_files_lane_slots{job="orchestrator"})
+          )
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 10m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files {{ $labels.lane }} lane: due work has waited {{ $value | humanizeDuration }} while a slot is free"
+          description: >-
+            A blob in the {{ $labels.lane }} lane is due (queued and past its
+            not_before, or processing under a lapsed lease) and has waited
+            more than 5 minutes while the lane runs fewer jobs than its slots.
+            The claim loop polls every 5 seconds, so this is not load: the
+            lane's runner stopped, its claims fail while the snapshot's own
+            reads succeed ("files ... lane: claim failed" in the log), or
+            jobs.start() never ran (the lane then shows 0 running of its
+            slots). Uploaded files stay `queued` on the wire until it moves.
+            A database that is down stops the snapshot too: this alert then
+            goes quiet and ApiFilesSnapshotFailing fires instead.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 30m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files (cpu|media) lane' | tail -10"
+
+      - alert: ApiFilesProcessingBacklog
+        # Capacity, not a fault: 1 h for the cpu lane (every text kind but
+        # tabular finishes inside its 30-60 min wall), 6 h for the one media
+        # slot (a queue of three to six long videos). Only while every slot
+        # of the lane is busy: with a slot free, the same wait is
+        # ApiFilesDueJobsWaitWithFreeSlot's, and this info would contradict it.
+        expr: >-
+          (
+            max by (job, instance, lane) (api_files_job_oldest_due_seconds{job="orchestrator", lane="cpu"}) > 3600
+            or
+            max by (job, instance, lane) (api_files_job_oldest_due_seconds{job="orchestrator", lane="media"}) > 21600
+          )
+          unless on (job, instance, lane)
+          (
+            sum by (job, instance, lane) (api_files_lane_running{job="orchestrator"})
+              < on (job, instance, lane) sum by (job, instance, lane) (api_files_lane_slots{job="orchestrator"})
+          )
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 15m
+        labels: { severity: info, service: files-api }
+        annotations:
+          summary: "Files {{ $labels.lane }} lane: the oldest due job has waited {{ $value | humanizeDuration }}"
+          description: >-
+            Developers are waiting hours for processing while every slot of
+            the lane is busy, so nothing is broken; the lane is undersized for
+            the traffic.
+            PUBLIC_API_FILES_CPU_JOBS / _MEDIA_JOBS raise the slots, at the
+            memory and GPU cost limits.py documents (each extraction child
+            may take 8 GiB of address space; a media job shares the GPUs with
+            chat).
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker exec -i sf-local-ai-postgres-1 sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"' <<< \"SELECT lane, kind, count(*) FROM api_file_blobs WHERE status = 'queued' GROUP BY 1, 2\""
+
+      - alert: ApiFilesJobSilent
+        # 9,000 s = 2.5 h. The longest single unit without a row write is an
+        # extraction child at its wall ceiling (tabular 7,200 s) or a video
+        # stage at VIDEO_STAGE_TIMEOUT_S (7,200 s); both are killed there.
+        # The video pipeline's own retry wait after an engine outage also
+        # writes nothing, and can pass 9,000 s; the gauge's contract EXCLUDES
+        # it (analysis row queued), so what is left is a job whose owner's
+        # event loop still renews the lease while its work does not move.
+        expr: >-
+          max by (job, instance, lane) (api_files_job_silent_seconds{job="orchestrator"}) > 9000
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 10m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files {{ $labels.lane }} lane: a running job has not written progress for {{ $value | humanizeDuration }}"
+          description: >-
+            A blob holds a live lease but its row has not changed for longer
+            than any processing ceiling allows, and it is not a video waiting
+            out the pipeline's retry delay after an engine outage (those are
+            excluded from this gauge; an outage shows in the engine's own
+            alerts and in reason=engine deferrals). It holds one of the lane's
+            slots. A DELETE of the file stops it at the next unit boundary;
+            otherwise it stays until the owner process restarts, when the
+            lease lapses and another claim resumes it at its first unfinished
+            stage.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker exec -i sf-local-ai-postgres-1 sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"' <<< \"SELECT id, lane, kind, stage, attempt, updated_at, lease_expires_at, video_analysis_id FROM api_file_blobs WHERE status = 'processing' ORDER BY updated_at LIMIT 5\""
+
+      - alert: ApiFilesInternalFailures
+        # Only failures that are ours. unsupported_file, file_corrupt and
+        # file_too_complex are verdicts about a developer's bytes and go to
+        # the dashboard, not here.
+        expr: >-
+          sum by (job, instance, kind, stage, error_code) (
+            increase(api_files_job_failures_total{job="orchestrator", error_code=~"internal_error|processing_unavailable"}[30m])
+          ) >= 3
+        for: 5m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} {{ $labels.kind }} files failed {{ $labels.error_code }} at stage {{ $labels.stage }} in 30 minutes"
+          description: >-
+            Processing failed for reasons that are not the file's fault.
+            internal_error at a named stage is a code or dependency fault
+            (the log says "files blob ... stage <stage> failed unexpectedly",
+            or "files extraction <kind>/<op> failed" for an extraction
+            child). stage=none is the crash-loop cap: the file's runs died
+            with their process five times before any stage started (see
+            ApiFilesCrashTakeovers). processing_unavailable has two paths:
+            the fifth deferral of a file whose disk, engine, probe, memory or
+            extraction sandbox stayed unavailable (see the deferral alerts),
+            and, for audio and video, at once when the video pipeline ended
+            the analysis without processing it or its analysis row is gone.
+            The developer sees status failed and has to upload again.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 40m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files blob .* (failed|deferred|without releasing)|files extraction' | tail -10"
+
+      - alert: ApiFilesMostRunsFailTheFile
+        # The verdict codes blame the developer's bytes, so
+        # ApiFilesInternalFailures ignores them. But a parser regression
+        # blames them too: extract_worker maps a child's SIGSEGV, SIGBUS,
+        # SIGABRT, SIGILL or SIGFPE to file_corrupt, so a PDFium or Pillow update that crashes
+        # on every input turns every upload into file_corrupt. More than half
+        # of a kind's finished runs in an hour, over at least 10 runs.
+        # unknown and unsupported are excluded: an upload of files the API
+        # does not read is supposed to end unsupported_file (a sniff that
+        # classifies everything as unsupported shows on the dashboard's
+        # failures-by-kind panel instead).
+        expr: >-
+          (
+            sum by (job, instance, kind) (
+              increase(api_files_job_failures_total{job="orchestrator", kind!~"unknown|unsupported", error_code=~"file_corrupt|unsupported_file|file_too_complex"}[1h])
+            )
+            / on (job, instance, kind)
+            sum by (job, instance, kind) (
+              increase(api_files_job_runs_total{job="orchestrator", kind!~"unknown|unsupported", outcome=~"processed|failed"}[1h])
+            )
+          ) > 0.5
+          and on (job, instance, kind)
+          sum by (job, instance, kind) (
+            increase(api_files_job_runs_total{job="orchestrator", kind!~"unknown|unsupported", outcome=~"processed|failed"}[1h])
+          ) >= 10
+        for: 30m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of {{ $labels.kind }} runs in the last hour failed with a verdict on the file"
+          description: >-
+            More than half of the {{ $labels.kind }} files that finished
+            processing in the last hour ended file_corrupt, unsupported_file
+            or file_too_complex. Those codes say the developer's file is at
+            fault, but at this share the likelier cause is ours: a parser or
+            image library update that crashes on every input (an extraction
+            child killed by SIGSEGV, SIGBUS, SIGABRT, SIGILL or SIGFPE is
+            reported as file_corrupt), or a sniff change that misreads the format. It can
+            also be one developer uploading a batch of broken files: look at
+            whether the log's "files extraction" lines name one signal or one
+            parser before blaming the files.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 70m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files extraction|ended on signal' | tail -10"
+
+      - alert: ApiFilesDeferralsSustained
+        # More than 5 in 30 minutes: one blob cannot defer more than five
+        # times before it fails, so this is several files hitting the same
+        # unavailable engine or a disk under the floor. memory_pressure and
+        # sandbox_unavailable are excluded: they have their own alerts below.
+        expr: >-
+          sum by (job, instance, lane, stage, reason) (
+            increase(api_files_job_deferrals_total{job="orchestrator", reason=~"storage|engine|probe_timeout"}[30m])
+          ) > 5
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files {{ $labels.lane }} lane: {{ $value | printf \"%.0f\" }} deferrals at {{ $labels.stage }} ({{ $labels.reason }}) in 30 minutes"
+          description: >-
+            Processing keeps putting files back in the queue at stage
+            {{ $labels.stage }}. reason=engine: the OCR (stage ocr) or
+            embedding (stage index) engine is refusing or failing; check that
+            engine's alerts first. reason=probe_timeout: the media probe did
+            not finish. reason=storage: free space is under the floor, or an
+            extraction child hit ENOSPC while writing; see files-api-storage.
+            Each file fails processing_unavailable on its fifth deferral.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 40m sf-local-ai-orchestrator-1 2>&1 | grep 'deferred at' | tail -10"
+
+      - alert: ApiFilesExtractionSandboxUnavailable
+        # The extraction child answered retry with why="unsandboxed"
+        # (extract_worker.py): under PUBLIC_API_FILES_EXTRACT_SANDBOX=required
+        # (the default) it refused to parse. Any occurrence: the guard worked,
+        # and the host or image stopped providing what it needs.
+        expr: >-
+          sum by (job, instance, lane) (
+            increase(api_files_job_deferrals_total{job="orchestrator", reason="sandbox_unavailable"}[15m])
+          ) > 0
+        for: 1m
+        labels: { severity: critical, service: files-api }
+        annotations:
+          summary: "Files extraction refused to run {{ $value | printf \"%.0f\" }} time(s) in 15 minutes: its sandbox could not be applied"
+          description: >-
+            An extraction child could not apply the sandbox it is required to
+            run in, so it did not parse the file (the log says "refused to run
+            unconfined"). This is not a disk problem and not load. Every file
+            that needs extraction defers and fails processing_unavailable on
+            its fifth deferral. Treat it as a security-relevant change to the
+            host or the orchestrator image: find what changed (image, kernel,
+            container settings) before anything else, and do not relax
+            PUBLIC_API_FILES_EXTRACT_SANDBOX to clear this alert without the
+            owner's decision.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 20m sf-local-ai-orchestrator-1 2>&1 | grep 'refused to run unconfined' | tail -5; docker inspect sf-local-ai-orchestrator-1 --format '{{`{{.Config.Image}} {{.State.StartedAt}}`}}'"
+
+      - alert: ApiFilesExtractionMemoryKills
+        # SIGKILL from outside the child (extract_worker._RETRY_SIGNALS):
+        # the kernel OOM killer or a cgroup limit. Two in 30 minutes: one can
+        # be a single oversized file, two is the host running short.
+        expr: >-
+          sum by (job, instance, lane) (
+            increase(api_files_job_deferrals_total{job="orchestrator", reason="memory_pressure"}[30m])
+          ) >= 2
+        for: 1m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} Files extraction children were killed for memory in 30 minutes"
+          description: >-
+            Extraction children were killed with SIGKILL from outside, which
+            the runner treats as host memory pressure rather than a verdict
+            on the file. It is not a disk problem. Each killed run defers and
+            the file fails processing_unavailable on its fifth deferral. The
+            kernel log names what was killed and what held the memory; also
+            check how many extractions ran at once (PUBLIC_API_FILES_CPU_JOBS)
+            against the other tenants of this host.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "journalctl -k --since '-40min' | grep -iE 'out of memory|killed process' | tail -5; docker logs --since 40m sf-local-ai-orchestrator-1 2>&1 | grep 'ended on signal 9' | tail -5"
+
+      - alert: ApiFilesCrashTakeovers
+        # A claim found `progress.running_owner` still set by another owner:
+        # the previous run died WITH ITS PROCESS (an OOM kill, a parser that
+        # took the orchestrator down). Every one is worth a look, because the
+        # same file will be retried until the fifth takeover fails it.
+        expr: >-
+          sum by (job, instance, lane) (increase(api_files_job_crash_takeovers_total{job="orchestrator"}[1h])) > 0
+        for: 1m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files {{ $labels.lane }} lane: {{ $value | printf \"%.0f\" }} run(s) resumed after their process died, in the last hour"
+          description: >-
+            A processing run ended without releasing its blob because the
+            process holding it died. Check whether the orchestrator restarted
+            and why (OOM kill, crash), and which file it was processing: the
+            same bytes will be retried, and fail internal_error (stage none)
+            after five takeovers.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 70m sf-local-ai-orchestrator-1 2>&1 | grep 'previous run ended without releasing' | tail -5; journalctl -k --since '-70min' | grep -i 'killed process' | tail -5"
+
+      - alert: ApiFilesAssemblyWaitWithFreeSlot
+        # Assembly shares the cpu lane's slots (queue.py / jobs.py): same
+        # stuck signature as ApiFilesDueJobsWaitWithFreeSlot, for completed
+        # uploads whose file is still being put together.
+        expr: >-
+          max by (job, instance) (api_files_assembly_oldest_wait_seconds{job="orchestrator"}) > 600
+          and on (job, instance)
+          (
+            sum by (job, instance) (api_files_lane_running{job="orchestrator", lane="cpu"})
+              < on (job, instance) sum by (job, instance) (api_files_lane_slots{job="orchestrator", lane="cpu"})
+          )
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 10m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "A completed upload has waited {{ $value | humanizeDuration }} for assembly while a cpu slot is free"
+          description: >-
+            POST /v1/uploads/{id}/complete succeeded, but the file is still
+            assembling and nothing is claiming it although the cpu lane has
+            an idle slot (a deferred assembly, held back 60 s for disk or a
+            purge, is not counted as waiting). The largest upload assembles in about 7 minutes at
+            260 MB/s once claimed. Check the assembly runner in the log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 30m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files assembly|files cpu lane' | tail -10"
+
+      - alert: ApiFilesAssemblyFailed
+        # outcome="failed" is internal_error after the assembly attempts.
+        # checksum_mismatch is the client's declared md5/sha256 disagreeing
+        # with its own parts: dashboard only.
+        expr: >-
+          sum by (job, instance) (increase(api_files_assembly_total{job="orchestrator", outcome="failed"}[1h])) > 0
+        for: 1m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} upload assembly(ies) failed internal_error in the last hour"
+          description: >-
+            A completed upload could not be assembled after its attempts, so
+            its file is failed and the developer must upload it again (up to
+            100 GiB). Look for disk, permission or part-file errors around
+            "files assembly" in the log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-processing
+          safe_command: "docker logs --since 70m sf-local-ai-orchestrator-1 2>&1 | grep 'files assembly' | tail -10"
+
+  # ------------------------------------------------------------------------
+  # Retention and the upload sweep (retention.py, uploads_sweep.py).
+  #
+  # Both loops run a bounded pass as soon as they start and then every
+  # PUBLIC_API_FILES_SWEEP_INTERVAL_S (600 s); retention also runs a pass on
+  # every DELETE kick.
+  #
+  # OVERDUE IS A COUNTER, NOT A TIMESTAMP. app/metrics.py renders a gauge
+  # with six significant digits, so a time.time() gauge is rounded to
+  # 10,000 s and a `time() - gauge` rule is wrong in both directions (see
+  # PRECISION in the header). The overdue alerts read the ok-pass counters
+  # instead: an orchestrator that is up and exports any api_files_* series,
+  # with no ok pass in 35 minutes (about three intervals). That covers a loop
+  # that died, a loop whose every pass raises from process start (the ok
+  # counter stays at 0 or was never created; uploads_sweep.run_once has no
+  # per-step try, so one database error fails every pass), and a loop that
+  # was never started.
+  #
+  # A PASS THAT RETURNED IS NOT PROOF ITS WORK HAPPENED. retention.run_pass
+  # catches each step's exception and goes on, so a pass can return having
+  # purged and expired nothing: ApiFilesRetentionStepFailing counts those.
+  #
+  # Retention's purge is what makes a DELETE true: the blob directory
+  # (original, derived pages, chunks, vectors) is renamed into _trash under the
+  # row lock, the row is deleted, and the trash entry is removed. A purge is
+  # watched from four sides, because it can fail in four ways: it raises
+  # (ApiFilesPurgeFailing), storage refuses the move without raising
+  # (ApiFilesPurgeFenceRefused), the row stays `deleting` for any other reason
+  # (ApiFilesDeletingStuck, on the age of the oldest deleting blob), or the row
+  # is already gone but the bytes stay in _trash because the rmtree failed, in
+  # retention._retire and then in every upload sweep (ApiFilesTrashNotEmptied,
+  # on the age of the oldest trash entry: no row is left for the others to
+  # see). The last two are ages, not counters, so they also catch failures no
+  # code path counts; both need a fresh snapshot.
+  # ------------------------------------------------------------------------
+  - name: files-api-retention
+    rules:
+      - alert: ApiFilesRetentionPassOverdue
+        expr: >-
+          (
+            max by (job, instance) (up{job="orchestrator"}) == 1
+            and on (job, instance)
+            group by (job, instance) ({job="orchestrator", __name__=~"api_files_.+"})
+          )
+          unless on (job, instance)
+          sum by (job, instance) (increase(api_files_retention_passes_total{job="orchestrator", outcome="ok"}[35m])) > 0
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files retention has completed no pass in the last 35 minutes"
+          description: >-
+            The orchestrator is up and exports Files API metrics, but no
+            retention pass has returned for more than three sweep intervals:
+            the loop died, every pass raises, or retention.start() never ran.
+            Expired files are not being deleted, crashed purges are not being
+            finished, and tombstones and orphan directories accumulate. Look
+            for "files retention pass failed" in the log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker logs --since 50m sf-local-ai-orchestrator-1 2>&1 | grep 'files retention' | tail -10"
+
+      - alert: ApiFilesUploadSweepOverdue
+        expr: >-
+          (
+            max by (job, instance) (up{job="orchestrator"}) == 1
+            and on (job, instance)
+            group by (job, instance) ({job="orchestrator", __name__=~"api_files_.+"})
+          )
+          unless on (job, instance)
+          sum by (job, instance) (increase(api_files_upload_sweep_passes_total{job="orchestrator", outcome="ok"}[35m])) > 0
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "The Files upload sweep has completed no pass in the last 35 minutes"
+          description: >-
+            The orchestrator is up and exports Files API metrics, but no
+            upload sweep pass has returned for more than three sweep
+            intervals: the loop died, every pass raises (one database error
+            fails the whole pass), or uploads_sweep.start() never ran. Uploads
+            stuck `finalizing` are not reset, expired uploads keep their parts
+            on disk, and crash leftovers and _trash entries are not removed.
+            Look for "files upload sweep pass failed" in the log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker logs --since 50m sf-local-ai-orchestrator-1 2>&1 | grep 'files upload sweep' | tail -10"
+
+      - alert: ApiFilesRetentionStepFailing
+        # Three failures of one step in 45 minutes: the step failed on most
+        # of the four or five passes in that window, while the pass itself
+        # kept returning (so the overdue alert stays quiet).
+        expr: >-
+          sum by (job, instance, step) (increase(api_files_retention_step_failures_total{job="orchestrator"}[45m])) >= 3
+        for: 5m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files retention step {{ $labels.step }} failed {{ $value | printf \"%.0f\" }} times in 45 minutes"
+          description: >-
+            Retention passes are completing, but their {{ $labels.step }}
+            step raises every time and is skipped. deleting: no purge runs
+            from the pass, so deleted files' bytes stay on disk. expiry:
+            expired files are still served. tombstones: 30-day records
+            accumulate. directories: orphan directories and crash leftovers
+            accumulate. Look for "files retention step {{ $labels.step }}
+            failed" with its traceback in the log.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker logs --since 50m sf-local-ai-orchestrator-1 2>&1 | grep -A3 'files retention step' | tail -20"
+
+      - alert: ApiFilesPurgeFailing
+        expr: >-
+          sum by (job, instance) (increase(api_files_purge_failures_total{job="orchestrator", reason="error"}[30m])) > 0
+          and on (job, instance)
+          sum by (job, instance) (max by (job, instance, lane) (api_files_jobs{job="orchestrator", state="deleting"})) > 0
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 30m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "Files purges have kept failing for 30 minutes; deleted files' bytes are still on disk"
+          description: >-
+            Blobs in `deleting` are not being removed: each failing purge is
+            moved behind the others and retried every pass, and has failed
+            again. The files are already gone from the API, but their bytes
+            (original, derived text, vectors) remain on disk until the purge
+            succeeds. Typical causes are EACCES or EBUSY on the blob
+            directory or its _trash entry.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker logs --since 40m sf-local-ai-orchestrator-1 2>&1 | grep -E 'files purge' | tail -10"
+
+      - alert: ApiFilesPurgeFenceRefused
+        # PurgeResult.skipped == "fence": storage refused to move the blob
+        # directory and nothing raised, so ApiFilesPurgeFailing cannot see
+        # it. Retrying never helps; a person has to look.
+        expr: >-
+          sum by (job, instance) (increase(api_files_purge_failures_total{job="orchestrator", reason="fence"}[1h])) > 0
+        for: 1m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} Files purge(s) refused by the storage fence in the last hour"
+          description: >-
+            A purge refused to move a blob directory because the path did not
+            resolve inside the Files tree (the log says "files purge: refused
+            to move the directory of <blob>"). The row stays `deleting`, every
+            pass refuses again, and nothing is removed. The Files tree is
+            written only by the orchestrator, so find out how the path came
+            to resolve elsewhere with read-only commands before any cleanup,
+            and never remove it by following the path.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker logs --since 70m sf-local-ai-orchestrator-1 2>&1 | grep 'refused to move the directory' | tail -5"
+
+      - alert: ApiFilesDeletingStuck
+        # On AGE, whatever the cause: a purge that raises, one refused by the
+        # fence, a DELETE-path purge that failed quietly, or a deleting row
+        # no pass reaches. 2 h is about twelve passes, each retrying it.
+        expr: >-
+          max by (job, instance) (api_files_deleting_oldest_seconds{job="orchestrator"}) > 7200
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "A deleted file's blob has waited {{ $value | humanizeDuration }} for its purge"
+          description: >-
+            The oldest blob in `deleting` became deleting more than 2 hours
+            ago. The file is gone from the API, but its bytes are still on
+            disk, and every retention pass since has failed to remove them,
+            or has not tried. Check ApiFilesPurgeFailing,
+            ApiFilesPurgeFenceRefused and ApiFilesRetentionPassOverdue for the
+            cause; if none fires, the purge is failing in a way nothing
+            counts, so read the retention log around that blob.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker exec -i sf-local-ai-postgres-1 sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"' <<< \"SELECT id, lane, kind, updated_at FROM api_file_blobs WHERE status = 'deleting' ORDER BY updated_at LIMIT 5\""
+
+      - alert: ApiFilesTrashNotEmptied
+        # uploads_sweep._sweep_trash removes a _trash entry once its ctime is
+        # more than TRASH_GRACE_S (60 s) old, on every sweep pass (600 s), and
+        # an rmtree in progress keeps the entry's ctime moving. So a healthy
+        # entry lives about 11 minutes at most; one an hour old has failed
+        # removal on about five passes, or the sweep is not running.
+        expr: >-
+          max by (job, instance) (api_files_trash_oldest_seconds{job="orchestrator"}) > 3600
+          and on (job, instance) sum by (job, instance) (increase(api_files_snapshot_total{job="orchestrator", result="ok"}[5m])) > 0
+        for: 15m
+        labels: { severity: warning, service: files-api }
+        annotations:
+          summary: "A purged file's bytes have sat in the Files trash for {{ $value | humanizeDuration }}"
+          description: >-
+            An entry under _trash in the Files store has not been removed for
+            more than an hour. It is the directory of a blob whose purge
+            already deleted the row, so the file is gone from the API and no
+            deleting-state alert can see it, but its original, derived text and
+            vectors are still on disk: a DELETE that is not yet true. Typical
+            causes are EACCES or EBUSY inside the entry ("files purge of ...
+            left its bytes in the trash", then "files sweep could not remove an
+            entry" on every pass), or the upload sweep not running (see
+            ApiFilesUploadSweepOverdue). Read the log's exception before
+            removing anything by hand.
+          runbook: monitoring/prometheus/rules/files-and-gateway.yml#files-api-retention
+          safe_command: "docker exec sf-local-ai-orchestrator-1 ls -la --time=ctime /data/api-files/_trash | head -20; docker logs --since 70m sf-local-ai-orchestrator-1 2>&1 | grep -E 'left its bytes in the trash|could not remove an entry' | tail -5"
+
+  # ------------------------------------------------------------------------
+  # The v1-gateway (gateway/README.md).
+  #
+  # It holds the developer's /v1 connection while the orchestrator and the
+  # frontend are recreated by deploys, re-attaching to a run after an
+  # upstream failure. It is recreated only when gateway/ changes. Once the
+  # tunnel's ^/v1(/|$) rule points at it, the gateway being down is a /v1
+  # outage that no other alert here names.
+  #
+  # Re-attaches are EXPECTED at every orchestrator deploy, so they are a
+  # dashboard series, not an alert. What is alerted is a client being CUT,
+  # on every path the relay can take:
+  #   * no re-attach tried at all: planReattach() refused (a JSON body
+  #     already partly relayed, SSE frames without a confirmed sequence, a
+  #     body that cannot be sent again, an orchestrator this process has not
+  #     yet seen speak the attach protocol) -> relay_aborts_total
+  #   * re-attach given up: 1,800 s of continuous absence (exhausted), or an
+  #     answer it cannot relay: a non-retryable status such as 404, or a 200
+  #     of the other shape (abort)
+  #   * an answer that named another run (a rolled-back build)
+  #   * an exception inside the relay (relay_errors_total)
+  #   * pre-commit failures that returned 503 after 110 s
+  # `terminal` (the SSE terminal event was already relayed) is not a loss and
+  # `attach_off` is the operator's V1_GATEWAY_ATTACH=off; both stay on the
+  # dashboard only.
+  #
+  # The physical guards: above V1_GATEWAY_FD_PRESSURE_RATIO (0.7) of the soft
+  # RLIMIT_NOFILE every new /v1 request gets 503 Retry-After 30 before a
+  # header; spilled JSON bodies are refused past V1_GATEWAY_SPOOL_MAX_BYTES
+  # (2 GiB total) or under PUBLIC_API_MIN_FREE_DISK_BYTES free (20 GiB).
+  #
+  # None of the gateway's metrics exist yet (contract in the header). A scrape
+  # job "v1-gateway" is also needed, targeting the gateway's separate metrics
+  # listener (V1_GATEWAY_METRICS_PORT, never the relay port); until then
+  # `up{job="v1-gateway"}` has no series and every rule in this group is
+  # inert.
+  #
+  # TWO ROUTES LEAD TO THE GATEWAY once the no-timeout compose change is
+  # deployed: cloudflared's ^/v1(/|$) path rule, and the Next frontend's /v1
+  # route, which relays to V1_GATEWAY_URL whenever that variable is set. Taking the gateway out of the path means removing
+  # BOTH, or /v1 keeps reaching the dead gateway through the frontend.
+  # ------------------------------------------------------------------------
+  - name: v1-gateway
+    rules:
+      - alert: V1GatewayScrapeDown
+        expr: up{job="v1-gateway"} == 0
+        for: 2m
+        labels: { severity: critical, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway {{ $labels.instance }} is not answering its scrape"
+          description: >-
+            Prometheus cannot reach the gateway's metrics listener. If the
+            gateway process is down, developers' /v1 calls are failing: the
+            tunnel's /v1 rule and the frontend's /v1 route (V1_GATEWAY_URL)
+            both lead to it. First check whether the container is running and
+            why it stopped (the safe command below is read-only). The operator
+            actions, in order: (1) start or recreate the v1-gateway
+            container; that is the fix (a dead process holds no relays to
+            drain). (2) Only if it cannot come back: remove the
+            tunnel's /v1 path rule AND unset V1_GATEWAY_URL on the frontend and
+            recreate the frontend. Removing the tunnel rule alone sends /v1 to
+            the Next route, which still relays to the dead gateway, so the
+            outage continues while it looks worked around. Without the gateway
+            /v1 works again through the frontend, without re-attach across
+            deploys. If the container is running and healthy, only the scrape
+            is broken: check the metrics port and the scrape job.
+          runbook: gateway/README.md
+          safe_command: "docker ps -a --filter name=v1-gateway; docker logs --tail 30 sf-local-ai-v1-gateway-1; docker inspect sf-local-ai-frontend-1 --format '{{`{{range .Config.Env}}{{println .}}{{end}}`}}' | grep '^V1_GATEWAY_URL='"
+
+      - alert: V1GatewayRestarted
+        # The gateway exists so deploys do NOT restart it. A start inside the
+        # window is either a gateway/ change being rolled out or a crash.
+        expr: changes(process_start_time_seconds{job="v1-gateway"}[15m]) > 0
+        labels: { severity: info, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway restarted in the last 15 minutes"
+          description: >-
+            Every relay it held was destroyed 2 s into the stop; clients saw an
+            incomplete read and, where their SDK retries or resumes, re-attached
+            through the new process. If gateway/ did not change, find out why
+            it restarted (OOM, crash) from the container's exit state.
+          runbook: gateway/README.md
+          safe_command: "docker inspect sf-local-ai-v1-gateway-1 --format '{{`{{.State.StartedAt}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}`}}'"
+
+      - alert: V1GatewayFdPressureHigh
+        # Warns at 0.5 so there is room before the 0.7 refusal line: each
+        # relay holds two sockets and, for a spilled body, a file.
+        expr: >-
+          process_open_fds{job="v1-gateway"} / on (job, instance) process_max_fds{job="v1-gateway"} > 0.5
+        for: 5m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway is using {{ $value | humanizePercentage }} of its file descriptors"
+          description: >-
+            Open descriptors are above half of the soft RLIMIT_NOFILE. At
+            V1_GATEWAY_FD_PRESSURE_RATIO (0.7) the gateway refuses every new
+            /v1 request with 503. Compare v1_gateway_relays_in_flight and
+            v1_gateway_open_connections: many long-lived relays is traffic,
+            many connections with few relays is idle or slow sockets.
+          runbook: gateway/README.md
+          safe_command: "curl -s --max-time 3 http://127.0.0.1:9090/api/v1/query --data-urlencode 'query=v1_gateway_relays_in_flight or v1_gateway_open_connections'"
+
+      - alert: V1GatewayFdRefusals
+        expr: >-
+          sum by (job, instance) (increase(v1_gateway_fd_refusals_total{job="v1-gateway"}[5m])) > 0
+        for: 1m
+        labels: { severity: critical, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway refused {{ $value | printf \"%.0f\" }} requests for file-descriptor pressure in 5 minutes"
+          description: >-
+            New /v1 requests are answered 503 Retry-After 30 before any
+            header, because the gateway's open descriptors reached the
+            refusal ratio. Requests already relaying continue. Chat is not
+            affected (it does not pass through the gateway).
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 10m sf-local-ai-v1-gateway-1 2>&1 | grep -c fd_pressure_refusal"
+
+      - alert: V1GatewaySpoolNearQuota
+        expr: >-
+          v1_gateway_spool_reserved_bytes{job="v1-gateway"} / on (job, instance) v1_gateway_spool_max_bytes{job="v1-gateway"} > 0.8
+        for: 5m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway spool is {{ $value | humanizePercentage }} of its quota"
+          description: >-
+            Buffered request bodies spilled to the spool volume hold more than
+            80 % of V1_GATEWAY_SPOOL_MAX_BYTES. At the quota further spilled
+            bodies are refused with 503 and the connection is closed. Many
+            bodies held for a long time with the orchestrator not being called
+            is the shape of connections that send slowly on purpose.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 10m sf-local-ai-v1-gateway-1 2>&1 | grep -E 'spool_refused|body_idle' | tail -10"
+
+      - alert: V1GatewaySpoolRefusals
+        expr: >-
+          sum by (job, instance, reason) (increase(v1_gateway_spool_refusals_total{job="v1-gateway"}[10m])) > 0
+        for: 1m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway refused {{ $value | printf \"%.0f\" }} request bodies ({{ $labels.reason }}) in 10 minutes"
+          description: >-
+            reason=quota: the spool's total budget is spent. reason=disk: the
+            spool's filesystem is under PUBLIC_API_MIN_FREE_DISK_BYTES, the
+            same device as the Files store on this head, so check
+            files-api-storage too. reason=storage: a spool file could not be
+            written. Each refused request got 503 with the connection closed.
+          runbook: gateway/README.md
+          safe_command: "df -B1 /; docker logs --since 15m sf-local-ai-v1-gateway-1 2>&1 | grep -E 'spool_refused|spool_failed' | tail -10"
+
+      - alert: V1GatewayReattachGivingUp
+        # Three in 15 minutes: one exhausted or aborted re-attach can be a
+        # client's own run ending oddly; three is the orchestrator staying
+        # away past the budget or answering 404 for runs it should hold.
+        expr: >-
+          sum by (job, instance, outcome) (
+            increase(v1_gateway_reattach_ended_total{job="v1-gateway", outcome=~"exhausted|abort"}[15m])
+          ) >= 3
+        for: 5m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway cut {{ $value | printf \"%.0f\" }} clients after re-attach ended {{ $labels.outcome }} in 15 minutes"
+          description: >-
+            outcome=exhausted: the orchestrator was absent for the whole
+            PUBLIC_API_GATEWAY_REATTACH_MAX_S (1,800 s). outcome=abort: it
+            answered the re-attach with something the gateway cannot relay:
+            a status other than 200/502/503/504 (a 404 means the run is gone:
+            events expired, or store false), or a 200 of the other shape (an
+            event stream for a JSON request or the reverse). Either way the
+            client connection was cut and its generation is lost to it unless
+            it resumes by id. Relays cut before any re-attach are
+            V1GatewayClientsCutWithoutReattach.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 20m sf-local-ai-v1-gateway-1 2>&1 | grep reattach_abort | tail -10"
+
+      - alert: V1GatewayReattachRunMismatch
+        expr: >-
+          sum by (job, instance) (increase(v1_gateway_reattach_ended_total{job="v1-gateway", outcome="run_mismatch"}[15m])) > 0
+        for: 1m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway refused to splice {{ $value | printf \"%.0f\" }} re-attach answer(s) that named another run"
+          description: >-
+            After an upstream failure the orchestrator answered a re-attach
+            with a different run than the client holds (or no run header), so
+            the gateway cut the client instead of handing it two generations
+            as one. The usual cause is an orchestrator build that does not
+            speak the attach protocol, such as a rollback to before it.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 20m sf-local-ai-v1-gateway-1 2>&1 | grep run_mismatch | tail -5; docker inspect sf-local-ai-orchestrator-1 --format '{{`{{.Config.Image}} {{.State.StartedAt}}`}}'"
+
+      - alert: V1GatewayClientsCutWithoutReattach
+        # relay_abort: planReattach() refused, so the client was cut without
+        # a re-attach being tried. Three in 15 minutes, summed over reasons
+        # (a deploy with mixed reasons is still one event). terminal and
+        # attach_off are excluded (see the group header); protocol_unknown
+        # has its own alert.
+        expr: >-
+          sum by (job, instance) (
+            increase(v1_gateway_relay_aborts_total{job="v1-gateway", reason!~"terminal|attach_off|protocol_unknown"}[15m])
+          ) >= 3
+        for: 5m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway cut {{ $value | printf \"%.0f\" }} clients without trying a re-attach in 15 minutes"
+          description: >-
+            The orchestrator connection broke under committed relays that the
+            gateway could not re-attach, so it cut their clients at once.
+            partial_json: part of a JSON body was already relayed.
+            sequence_unconfirmed: SSE frames went out without a confirmed
+            sequence number, so a resume could repeat them. not_replayable /
+            body_not_replayable: the request body cannot be sent again byte
+            for byte. opaque_body: a response shape the gateway never
+            re-attaches. A burst at an orchestrator deploy says which /v1
+            routes still lose clients at a deploy; the reason split is on the
+            dashboard and in the relay_abort log lines.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 20m sf-local-ai-v1-gateway-1 2>&1 | grep relay_abort | tail -10"
+
+      - alert: V1GatewayAttachProtocolUnknown
+        # reason=protocol_unknown: no orchestrator answer seen by this
+        # process has carried X-TechSara-Run, so the gateway will not re-POST
+        # a generation (it could launch it twice). After a gateway start this
+        # clears with the first answer; persisting, it is an orchestrator
+        # that does not speak attach (a rollback) or a header being dropped.
+        expr: >-
+          sum by (job, instance) (increase(v1_gateway_relay_aborts_total{job="v1-gateway", reason="protocol_unknown"}[15m])) > 0
+        for: 1m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway cut {{ $value | printf \"%.0f\" }} clients because the orchestrator has not shown it speaks attach"
+          description: >-
+            Relays broke and the gateway did not re-attach, because no answer
+            since this gateway process started has carried the
+            X-TechSara-Run header. Either the orchestrator build does not
+            speak the attach protocol (a rollback), something between the
+            gateway and the orchestrator strips the header, or the gateway
+            had just started and saw a deploy before any answer. With
+            V1_GATEWAY_ATTACH=auto these clients are cut at every deploy
+            until an answer carries the header.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 20m sf-local-ai-v1-gateway-1 2>&1 | grep -E 'relay_abort.*protocol_unknown' | tail -5; docker inspect sf-local-ai-orchestrator-1 --format '{{`{{.Config.Image}} {{.State.StartedAt}}`}}'"
+
+      - alert: V1GatewayRelayErrors
+        # relay_error is an exception inside the relay: a gateway bug, never
+        # an expected path. Any one.
+        expr: >-
+          sum by (job, instance, client) (increase(v1_gateway_relay_errors_total{job="v1-gateway"}[15m])) > 0
+        for: 1m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway hit {{ $value | printf \"%.0f\" }} relay exception(s) in 15 minutes (client {{ $labels.client }})"
+          description: >-
+            An exception escaped the relay code. client=answered: nothing had
+            been sent yet, and the client got 500 internal_error. client=cut:
+            the response was already under way, and the connection was
+            destroyed. The relay_error log line carries the error code.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 20m sf-local-ai-v1-gateway-1 2>&1 | grep relay_error | tail -10"
+
+      - alert: V1GatewayPrecommitFailures
+        # exhausted: 110 s of retries every 2 s, then 503 Retry-After 30.
+        # outcome_unknown: the orchestrator may hold the request, so the
+        # gateway answered 503 x-should-retry false instead of sending twice.
+        expr: >-
+          sum by (job, instance, outcome) (
+            increase(v1_gateway_precommit_total{job="v1-gateway", outcome=~"exhausted|outcome_unknown"}[10m])
+          ) > 0
+        for: 1m
+        labels: { severity: warning, service: v1-gateway }
+        annotations:
+          summary: "v1-gateway answered {{ $value | printf \"%.0f\" }} requests 503 before commit ({{ $labels.outcome }}) in 10 minutes"
+          description: >-
+            outcome=exhausted: the orchestrator could not be reached for the
+            whole 110 s pre-commit budget, which is longer than a routine
+            recreate; check the orchestrator's own alerts. outcome=
+            outcome_unknown: a non-idempotent request failed after it may have
+            reached the orchestrator, and the client was told not to retry.
+          runbook: gateway/README.md
+          safe_command: "docker logs --since 15m sf-local-ai-v1-gateway-1 2>&1 | grep -E 'precommit_(exhausted|outcome_unknown)' | tail -10"
+
+      - alert: V1GatewayDrainCutRelays
+        # The drain destroys every relay still running 2 s after SIGTERM, on
+        # purpose (a /v1 relay may run for hours). This is a record, for an
+        # hour after the start that followed it, of how many clients that was.
+        # The timestamp comes from the gateway's own writer, printed at full
+        # precision (contract), not through orchestrator/app/metrics.py.
+        expr: >-
+          v1_gateway_last_drain_relays_aborted{job="v1-gateway"} > 0
+          and on (job, instance)
+          (time() - v1_gateway_last_drain_timestamp_seconds{job="v1-gateway"}) < 3600
+        labels: { severity: info, service: v1-gateway }
+        annotations:
+          summary: "The last v1-gateway stop cut {{ $value | printf \"%.0f\" }} running relays"
+          description: >-
+            When the gateway last stopped, these relays were still running
+            after V1_GATEWAY_DRAIN_ABORT_S and were destroyed. Their clients
+            saw an incomplete read; SDK retries and the documented resume
+            loop re-attach to runs the orchestrator kept generating.
+          runbook: gateway/README.md
+          safe_command: "docker logs sf-local-ai-v1-gateway-1 2>&1 | grep -E 'drain_(start|aborted|exit)' | tail -5"

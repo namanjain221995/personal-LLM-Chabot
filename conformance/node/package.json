@@ -1,0 +1,21 @@
+{
+  "name": "techsara-conformance-node",
+  "private": true,
+  "version": "1.0.0",
+  "description": "openai-node conformance suite for the TechSara /v1 API",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "test": "node scripts/check-node.mjs && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./lib/table-reporter.mjs --test-reporter-destination=./results/table.md \"test/offline/*.test.mjs\" \"test/live/*.test.mjs\"",
+    "test:offline": "node scripts/check-node.mjs && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./lib/table-reporter.mjs --test-reporter-destination=./results/table-offline.md \"test/offline/*.test.mjs\"",
+    "test:live": "node scripts/check-node.mjs && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=./lib/table-reporter.mjs --test-reporter-destination=./results/table-live.md \"test/live/*.test.mjs\"",
+    "provision": "node scripts/provision-key.mjs",
+    "selftest": "node scripts/check-node.mjs && node selftest/run.mjs"
+  },
+  "dependencies": {
+    "openai": "7.15.0",
+    "undici": "7.29.1"
+  }
+}
