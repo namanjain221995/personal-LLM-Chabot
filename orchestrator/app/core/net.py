@@ -87,11 +87,15 @@ Pure-ish: stdlib + httpx + httpcore. No network at import time.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
+import functools
 import ipaddress
 import logging
 import os
 import socket
 import ssl
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
@@ -329,6 +333,77 @@ def _ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def shared_ssl_context() -> ssl.SSLContext:
+    """The process's one verifying client SSL context, for ``httpx.AsyncClient(verify=...)``.
+
+    WHY (event-loop profile, 2026-09-14): an ``httpx.AsyncClient()`` built
+    without ``verify=`` loads the CA bundle into a fresh context: 11.7 ms of
+    synchronous CPU on the production image (OpenSSL 3.0.13), 21-48 ms
+    measured ON THE EVENT LOOP under 8 concurrent Fast turns. Every call site
+    that builds a client per call (each uncached /health fan-out, every
+    SearXNG query on the chat path, Salesforce live calls, ASR requests, the
+    recovery probe, the engine-state poller) paid it. Passing this context
+    costs a dict lookup. Same env-keyed cache as the crawler's, so
+    SSL_CERT_FILE / SSL_CERT_DIR still win and a changed value gets its own
+    context.
+
+    CONTRACT FOR CALLERS (a shared context is shared state):
+
+    * never mutate it: no ``load_cert_chain``, ``load_verify_locations``,
+      ``set_alpn_protocols`` (h2), ``verify_mode``/``check_hostname`` changes.
+      A caller that needs client certificates, a private CA or ``verify=False``
+      builds its own context. ``tests/test_server_perf.py`` fails if a round of
+      client builds changes the context's options or verification settings.
+    * HTTP/1.1 clients only (no ``http2=True``): httpcore's per-connect ALPN
+      set for http1 is idempotent, an h2 client would change it for everyone.
+    * the context honours ``SSL_CERT_FILE``/``SSL_CERT_DIR`` (``trust_env=True``).
+      A client built with ``trust_env=False`` that must NOT honour them
+      (``kv_budget``: plain http to vLLM) keeps its own default; do not pass
+      this context there.
+
+    ``_SSL_CONTEXTS`` has no lock ON PURPOSE: two threads that miss at once
+    each build a context and the last write wins. Both are valid verifying
+    contexts, so the race costs one extra 12 ms build, never correctness.
+    """
+    return _ssl_context()
+
+
+#: Threads reserved for the SSRF guard's name resolution (``_validate_and_pin``).
+#: ``socket.getaddrinfo`` has no timeout: a nameserver that blackholes a query
+#: parks the calling thread for the libc retry schedule (10 s and more). On the
+#: loop's DEFAULT executor (``asyncio.to_thread``, min(32, cpu+4) threads) a
+#: burst of such lookups from web search or a crawl queued health checks,
+#: uploads and every other ``to_thread`` user behind them. A private bounded
+#: pool means the worst a slow resolver can exhaust is fetch resolution
+#: itself. Same shape as ``apiplatform/webhooks/ssrf.py``'s resolver pool.
+DNS_RESOLVER_THREADS = max(1, int(os.environ.get("NET_DNS_RESOLVER_THREADS", "8") or 8))
+
+_resolver_lock = threading.Lock()
+_resolver_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _resolver_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """The fetch resolver pool, created on first use (never at import: the
+    OpenAPI generator and the test collector import this module too)."""
+    global _resolver_pool
+    with _resolver_lock:
+        if _resolver_pool is None:
+            _resolver_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=DNS_RESOLVER_THREADS, thread_name_prefix="fetch-dns"
+            )
+        return _resolver_pool
+
+
+async def _off_loop_validate(url: str, backend: "_PinnedBackend") -> str:
+    """``_validate_and_pin`` on the resolver pool, with the caller's context
+    (what ``asyncio.to_thread`` did). Looked up at call time so a test's
+    monkeypatch of ``_validate_and_pin`` still applies."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, _validate_and_pin, url, backend)
+    return await loop.run_in_executor(_resolver_executor(), call)
+
+
 class _PinnedTransport(httpx.AsyncHTTPTransport):
     """httpx transport whose connection pool dials through ``_PinnedBackend``.
 
@@ -452,8 +527,9 @@ async def safe_fetch(
     # SSRF validation resolves DNS, and socket.getaddrinfo is BLOCKING with no
     # timeout. Called inline it froze the whole event loop for seconds on a cold
     # lookup — stalling SSE token delivery for every other user, not just this
-    # fetch. getaddrinfo is thread-safe, so the default executor is fine here.
-    current = await asyncio.to_thread(_validate_and_pin, url, backend)
+    # fetch. getaddrinfo is thread-safe; it runs on the dedicated resolver
+    # pool (see DNS_RESOLVER_THREADS), not the loop's shared default executor.
+    current = await _off_loop_validate(url, backend)
     # Split the budget: a dead host should shed on connect in 3s rather than
     # spend the caller's whole read allowance.
     timeout = httpx.Timeout(
@@ -543,5 +619,5 @@ async def safe_fetch(
                 raise FetchError("too many redirects")
             # Re-validate AND re-pin every hop (off-loop, same reason as above).
             # The redirect body was never read; leaving the stream block closed it.
-            current = await asyncio.to_thread(_validate_and_pin, next_url, backend)
+            current = await _off_loop_validate(next_url, backend)
     raise FetchError("too many redirects")  # unreachable; keeps the type-checker honest

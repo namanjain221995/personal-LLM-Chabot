@@ -5,6 +5,7 @@ from typing import List
 
 import httpx
 
+from ..core.net import shared_ssl_context
 from .base import SearchProvider, SearchResult, SearchUnavailableError
 
 _ENDPOINT = "https://api.tavily.com/search"
@@ -28,7 +29,7 @@ class TavilyProvider(SearchProvider):
             "search_depth": "basic",
         }
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0), verify=shared_ssl_context()) as client:
                 resp = await client.post(_ENDPOINT, json=payload)
                 resp.raise_for_status()
                 data = resp.json()

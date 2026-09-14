@@ -2145,6 +2145,23 @@ class Settings:
         # (2026-09-05). The engine-availability overlay is still computed
         # fresh on every call. 0 probes on every call. Added 2026-09-13.
         self.health_dependency_cache_s: float = _float("HEALTH_DEPENDENCY_CACHE_S", 4.0)
+        # --- Serving-process CPU (server performance track, 2026-09-15) ----
+        # CPU_POOL_WORKERS — worker PROCESSES for pure-CPU work
+        # (app/core/cpu_pool.py). 0 (default, tests, CI) runs the same
+        # functions in threads. Children start lazily on first use.
+        self.cpu_pool_workers: int = max(0, _int("CPU_POOL_WORKERS", 0))
+        # CPU_POOL_SLOTS — calls admitted at once; blank = CPU_POOL_WORKERS (min 1).
+        self.cpu_pool_slots: int = max(1, _int("CPU_POOL_SLOTS", self.cpu_pool_workers or 1))
+        # PY_SWITCH_INTERVAL_S — sys.setswitchinterval applied at lifespan
+        # start. Blank = the interpreter default (5 ms), unchanged. A shorter
+        # interval only REDISTRIBUTES the GIL (the loop thread gets it back
+        # sooner from a CPU thread) at some aggregate-throughput cost; it is a
+        # stopgap until CPU work leaves the process.
+        self.py_switch_interval_s: float = _float("PY_SWITCH_INTERVAL_S", 0.0)
+        # EVENT_LOOP_LAG_PROBE — the 50 ms loop-lag probe behind
+        # orchestrator_event_loop_lag_seconds. On by default (about 0.02 ms of
+        # loop time per second).
+        self.event_loop_lag_probe: bool = _bool("EVENT_LOOP_LAG_PROBE", True)
 
         # --- Typed model/runtime capabilities ------------------------------
         # These defaults reproduce the current DGX/vLLM deployment. Platform

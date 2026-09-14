@@ -319,6 +319,22 @@ services:
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-}
       CHAT_MAX_REQUEST_BODY_BYTES: ${CHAT_MAX_REQUEST_BODY_BYTES:-}
       ORCHESTRATOR_DEV_DOCS: ${ORCHESTRATOR_DEV_DOCS:-}
+      # Serving-process CPU (orchestrator/app/core/cpu_pool.py, 2026-09-15).
+      # BLANK here on purpose, like the /v1 knobs above: blank means the code
+      # default (0 worker processes = threads; the interpreter's own 5 ms GIL
+      # switch interval; the loop-lag probe on). An operator opts in from .env.
+      CPU_POOL_WORKERS: ${CPU_POOL_WORKERS:-}
+      CPU_POOL_SLOTS: ${CPU_POOL_SLOTS:-}
+      PY_SWITCH_INTERVAL_S: ${PY_SWITCH_INTERVAL_S:-}
+      EVENT_LOOP_LAG_PROBE: ${EVENT_LOOP_LAG_PROBE:-}
+      # libuv's worker pool, which uvloop uses for EVERY hostname lookup made
+      # by httpx/anyio connects (vllm-router, searxng, Salesforce, Tavily...).
+      # Default 4. Measured 2026-09-15 in this image with a blackholing
+      # resolver: 2 hung lookups stalled an unrelated /etc/hosts lookup for
+      # 19.8 s (4 hung: >30 s); with 16 threads the stall starts at 8. The
+      # stdlib asyncio path was unaffected (0.001 s). A number, not blank:
+      # libuv reads it once, before the pool starts, and ignores blank.
+      UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE:-16}
     volumes:
       - data:/data
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads

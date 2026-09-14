@@ -86,6 +86,11 @@ async def lifespan(_app: FastAPI):
     from .config import warn_retired_settings
 
     warn_retired_settings()
+    # SERVING-PROCESS PERFORMANCE (2026-09-15): the GIL switch interval from
+    # env, and the cold imports + the shared SSL context built in a thread
+    # BEFORE the first request, so no chat turn pays them on the loop.
+    previous_switch_interval = _apply_switch_interval()
+    await _warm_process()
     await db.run_in_thread(db.wait_for_database)
     await db.run_in_thread(db.init_schema)
     # Identity baseline: the workspace exists and every user (including the
@@ -220,9 +225,31 @@ async def lifespan(_app: FastAPI):
     # schema, like the webhook loop; their queues are PostgreSQL columns, so a
     # restart resumes rather than forgets.
     files_workers = await _start_files_workers()
+    # Worker processes for pure-CPU work (app/core/cpu_pool.py; 0 = threads)
+    # and the loop-lag probe behind orchestrator_event_loop_lag_seconds.
+    from .core import cpu_pool as _cpu_pool
+
+    _pool = _cpu_pool.start(settings.cpu_pool_workers, settings.cpu_pool_slots)
+    if _pool.workers:
+        # Fork the children from a thread before the first request, so the
+        # first run_cpu call does not start the forkserver on the loop.
+        try:
+            await asyncio.to_thread(_pool.prestart)
+        except Exception:  # noqa: BLE001 — first use retries; never a start-up gate
+            logging.getLogger(__name__).exception("cpu_pool prestart failed")
+    lag_probe_task = None
+    if settings.event_loop_lag_probe:
+        lag_probe_task = asyncio.get_running_loop().create_task(
+            _latency_metrics.event_loop_lag_probe(), name="event-loop-lag-probe"
+        )
     try:
         yield
     finally:
+        if lag_probe_task is not None:
+            lag_probe_task.cancel()
+            # asyncio.wait never re-raises the probe's CancelledError, so it
+            # cannot swallow a cancellation aimed at this shutdown itself.
+            await asyncio.wait({lag_probe_task}, timeout=1.0)
         # FIRST: durable /v1 runs suspend while the pool is still open (their
         # suspend writes leases and specs). The signal callback normally did
         # this at SIGTERM; repeating it is idempotent and covers a shutdown
@@ -265,7 +292,91 @@ async def lifespan(_app: FastAPI):
         from . import rerank as _rerank
 
         await _rerank.close_rerank_client()
+        # Queued CPU work is cancelled and children joined within 5 s: well
+        # inside uvicorn's 90 s graceful window.
+        try:
+            await _cpu_pool.stop()
+        except Exception:  # noqa: BLE001 — shutdown must continue
+            logging.getLogger(__name__).exception("cpu_pool stop failed at shutdown")
         await db.run_in_thread(db.close_pool)
+        _restore_switch_interval(previous_switch_interval)
+
+
+def _apply_switch_interval() -> Optional[float]:
+    """Apply PY_SWITCH_INTERVAL_S when set; returns the interval it replaced
+    (None = nothing changed). Read in the lifespan, never at import, so tests
+    and tools that import the app keep the interpreter default."""
+    wanted = float(getattr(settings, "py_switch_interval_s", 0.0) or 0.0)
+    if wanted <= 0:
+        return None
+    previous = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(wanted)
+    except (ValueError, TypeError):
+        logging.getLogger(__name__).warning("PY_SWITCH_INTERVAL_S=%r refused", wanted)
+        return None
+    logging.getLogger(__name__).info(
+        "GIL switch interval %.4f s (was %.4f s) from PY_SWITCH_INTERVAL_S",
+        sys.getswitchinterval(), previous,
+    )
+    return previous
+
+
+def _restore_switch_interval(previous: Optional[float]) -> None:
+    if previous is not None:
+        try:
+            sys.setswitchinterval(previous)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+#: Imported in a worker thread by the lifespan. Cold, openai + its resource
+#: modules and httpx cost about 220 ms of import on the production image; a
+#: chat turn that imported one lazily held the event loop (and the import
+#: lock) for that long.
+_WARM_IMPORTS = ("httpx", "openai", "openai.resources.chat", "openai.resources.embeddings")
+
+
+def _warm_imports_and_ssl() -> None:
+    import importlib
+
+    for name in _WARM_IMPORTS:
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 — a missing optional module is not fatal
+            logging.getLogger(__name__).debug("warm import of %s failed", name, exc_info=True)
+    from .core.net import shared_ssl_context
+
+    shared_ssl_context()
+
+
+async def _warm_process() -> None:
+    """Make the first request as cheap as the hundredth. NO network I/O: every
+    step is an import, a CA-bundle load or an object construction, so it is
+    safe with every engine unreachable (tests/test_server_perf.py asserts no
+    socket connects). Failures are logged and ignored: warm-up is an
+    optimisation, never a start-up gate."""
+    log = logging.getLogger(__name__)
+    try:
+        await asyncio.to_thread(_warm_imports_and_ssl)
+    except Exception:  # noqa: BLE001
+        log.debug("process warm-up failed", exc_info=True)
+    # The model clients themselves are llm.py's (a private, LRU-bounded cache
+    # keyed by loop/endpoint/timeout/transport); warming it from here with the
+    # wrong key would warm nothing and could evict a live entry. Called only
+    # when llm.py exposes the public hook.
+    warm_clients = getattr(llm, "warm_clients", None)
+    if callable(warm_clients):
+        try:
+            await _maybe_await(warm_clients())
+        except Exception:  # noqa: BLE001
+            log.debug("llm.warm_clients failed", exc_info=True)
+    try:
+        from .engines import search as _search
+
+        _search.warm_extractor()
+    except Exception:  # noqa: BLE001
+        log.debug("extractor warm-up failed", exc_info=True)
 
 
 async def _maybe_await(value):

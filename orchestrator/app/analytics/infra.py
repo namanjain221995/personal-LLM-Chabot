@@ -43,9 +43,10 @@ class Unavailable(Exception):
 
 async def _query(expr: str) -> List[Dict[str, Any]]:
     import httpx
+    from ..core.net import shared_ssl_context
 
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT_S, verify=shared_ssl_context()) as client:
             res = await client.get(
                 f"{PROM_URL}/api/v1/query", params={"query": expr}
             )
@@ -60,9 +61,10 @@ async def _query(expr: str) -> List[Dict[str, Any]]:
 
 async def _query_range(expr: str, start: float, end: float, step: int) -> List[Dict[str, Any]]:
     import httpx
+    from ..core.net import shared_ssl_context
 
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_S * 2) as client:
+        async with httpx.AsyncClient(timeout=TIMEOUT_S * 2, verify=shared_ssl_context()) as client:
             res = await client.get(
                 f"{PROM_URL}/api/v1/query_range",
                 params={"query": expr, "start": start, "end": end, "step": step},

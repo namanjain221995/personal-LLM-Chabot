@@ -92,6 +92,24 @@ _FETCH_CONCURRENCY = 16
 _EXTRACT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extract")
 
 
+def _import_extractor() -> None:
+    """Import trafilatura (and its lxml) on the extraction thread."""
+    try:
+        import trafilatura  # noqa: F401
+    except Exception:  # noqa: BLE001 — the fallback extractor still works
+        pass
+
+
+def warm_extractor():
+    """Start trafilatura's cold import on ``_EXTRACT_POOL`` without waiting.
+
+    Called by the lifespan (2026-09-15): the first search of a process used to
+    pay the import inside its first extraction. On the extraction thread, never
+    the loop, and serial with every extraction as the pool already guarantees.
+    """
+    return _EXTRACT_POOL.submit(_import_extractor)
+
+
 def source_budget(effort: str) -> int:
     """How many sources this level reads per search."""
     return _SOURCE_BUDGET.get(llm.normalize_effort(effort), _SOURCE_BUDGET["think"])

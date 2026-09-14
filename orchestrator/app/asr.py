@@ -203,8 +203,9 @@ class VLLMAudioProvider:
 
     async def _client(self):
         import httpx
+        from .core.net import shared_ssl_context
 
-        return httpx.AsyncClient(timeout=self.timeout_s)
+        return httpx.AsyncClient(timeout=self.timeout_s, verify=shared_ssl_context())
 
     async def _transcriptions(
         self,
@@ -229,10 +230,11 @@ class VLLMAudioProvider:
         still a working server — it just identifies no language.
         """
         import httpx
+        from .core.net import shared_ssl_context
 
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_s, verify=shared_ssl_context()) as client:
                 data = {"model": self.model}
                 if segments:
                     # OpenAI's name for "the shape with timestamped segments";
@@ -346,9 +348,10 @@ class VLLMAudioProvider:
 
     async def health(self) -> bool:
         import httpx
+        from .core.net import shared_ssl_context
 
         try:
-            async with httpx.AsyncClient(timeout=min(5.0, self.timeout_s)) as client:
+            async with httpx.AsyncClient(timeout=min(5.0, self.timeout_s), verify=shared_ssl_context()) as client:
                 response = await client.get(f"{self.base_url}/models")
             return response.status_code == 200
         except Exception:  # noqa: BLE001

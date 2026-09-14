@@ -5,6 +5,7 @@ from typing import List
 
 import httpx
 
+from ..core.net import shared_ssl_context
 from .base import SearchProvider, SearchResult, SearchUnavailableError
 
 _ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -27,7 +28,7 @@ class BraveProvider(SearchProvider):
         }
         params = {"q": query, "count": max_results}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0), verify=shared_ssl_context()) as client:
                 resp = await client.get(_ENDPOINT, params=params, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
