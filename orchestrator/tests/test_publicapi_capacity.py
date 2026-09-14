@@ -379,7 +379,11 @@ def test_on_wait_reports_the_position_on_entry_on_every_move_and_at_least_every_
         third = asyncio.ensure_future(reporter())
         await asyncio.sleep(0.18)
         release_first.set()
-        await asyncio.sleep(0.02)
+        # Wait for the move to be reported rather than a fixed 20 ms: on a
+        # slow CI runner the report can land after the next release.
+        async with asyncio.timeout(5):
+            while not any(p == 1 for p, _ in reports):
+                await asyncio.sleep(0.005)
         release_second.set()
         await asyncio.gather(first, second, third)
 

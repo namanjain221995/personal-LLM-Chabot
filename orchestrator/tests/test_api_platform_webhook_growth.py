@@ -333,6 +333,29 @@ def test_prune_deletes_only_settled_rows_past_retention_in_bounded_batches(proje
     }
 
 
+def test_prune_stays_bounded_when_the_planner_rescans_the_batch(project, endpoint, monkeypatch):
+    """Integration 2026-09-14: the full suite once saw one call delete all
+    7000 due rows with a 1000-row batch. `id IN (SELECT ... LIMIT n FOR UPDATE
+    SKIP LOCKED)` under a rescanning plan re-runs LockRows, which skips rows
+    the statement already deleted and returns the next n. Planner settings
+    that force that plan shape pin the bound on the materialized form."""
+    real = db._server_options
+    monkeypatch.setattr(
+        db, "_server_options",
+        lambda: real() + " -c enable_hashjoin=off -c enable_hashagg=off -c enable_mergejoin=off"
+                         " -c enable_material=off -c enable_sort=off",
+    )
+    db.close_pool()
+    try:
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=queue.delivery_retention_days() + 2)
+        _bulk(endpoint, 2500, created_at=old, status="delivered", prefix="rescan", attempt=1)
+        assert queue.prune_settled_deliveries(now=now, batch_size=1000, max_batches=1) == 1000
+        assert queue.prune_settled_deliveries(now=now, batch_size=1000, max_batches=3) == 1500
+    finally:
+        db.close_pool()
+
+
 def test_prune_and_settle_skip_locked_rows_instead_of_waiting_for_them(project, endpoint):
     """No long locks: a row another transaction holds (a sweep's claim, a
     console write to the endpoint) is passed over, and picked up next pass."""
