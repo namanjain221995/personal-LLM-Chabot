@@ -284,6 +284,7 @@ def test_the_body_cap_seam_for_the_application_middleware_names_each_routes_cap(
     monkeypatch.delenv("PUBLIC_API_MAX_AUDIO_BODY_BYTES", raising=False)
     assert models.body_cap_for("POST", "/v1/responses") == 20 * 1024 * 1024
     assert models.body_cap_for("POST", "/v1/chat/completions/") == 20 * 1024 * 1024
-    assert models.body_cap_for("POST", "/v1/audio/transcriptions") == 27_262_976
-    assert models.body_cap_for("POST", "/v1/embeddings") == models.max_body_bytes()
+    # 90 MiB of audio and 8 MiB of pooling JSON since 2026-09-14 (CONTRACT §8.4-§8.6).
+    assert models.body_cap_for("POST", "/v1/audio/transcriptions") == 94_371_840
+    assert models.body_cap_for("POST", "/v1/embeddings") == 8 * 1024 * 1024
     assert models.body_cap_for("GET", "/v1/responses") == models.max_body_bytes()
