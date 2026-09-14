@@ -544,7 +544,8 @@ def _requeue_recoverable_blob(con, project_id: str, sha256: str) -> Optional[dic
         con,
         "UPDATE api_file_blobs SET status = 'queued', error_code = NULL, attempt = 0, not_before = NULL, "
         "       lease_owner = NULL, lease_expires_at = NULL, processed_at = NULL, updated_at = now(), "
-        "       progress = jsonb_set(progress - 'error_ceiling' - 'derived' - 'running_owner' - 'outage_retries', "
+        "       progress = jsonb_set(progress - 'error_ceiling' - 'derived' - 'running_owner' - 'outage_retries' "
+        "                                     - 'outage_since', "
         "                            '{recoveries}', to_jsonb((CASE WHEN progress->>'recoveries' ~ '^[0-9]{1,9}$' "
         "                                                       THEN (progress->>'recoveries')::int ELSE 0 END) + 1)), "
         "       stages = COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(stages) e "

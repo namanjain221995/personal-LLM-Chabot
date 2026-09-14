@@ -38,6 +38,10 @@ WHAT ENDS A RUN.
   at the 300 s retry delay) for as long as the outage lasts: a file is never
   failed because an engine is down (2026-09-14; the rule and its two
   exceptions are `apifiles/outage.py`);
+* the engine REFUSES US (401/403/404 and other 4xx: a wrong model name, a
+  rotated key) or fails in a way that is not a proven transport failure →
+  a counted deferral, below: misconfiguration must end in a visible failure,
+  not a queue that never drains;
 * the engine is proven SERVING while this blob's call failed, or the ENGINE
   or the DISK is not there in a way that can be about the blob (an OCR batch
   with no success, disk under the watermark, ENOSPC in the child, a child
@@ -459,6 +463,11 @@ async def stage_index(ctx: JobContext) -> StageResult:
                 raise
             if isinstance(exc, RuntimeError):
                 raise Deferred("the embedding engine answered wrongly") from exc
+            if isinstance(exc, (ConnectionError, TimeoutError)):
+                # Bare builtins: the SDK wraps every engine transport failure
+                # in its own error, so this came from our side of the call.
+                # Counted, so it ends instead of retrying for ever.
+                raise Deferred(f"a connection outside the engine call failed ({type(exc).__name__})") from exc
             if isinstance(exc, OSError):
                 raise Deferred("the vector file could not be written") from exc
             raise
@@ -1013,6 +1022,7 @@ class JobRunner:
             # A stage finished: the engine outage that deferred this blob is
             # over, so the next one backs off from the start again.
             ctx.progress_state.pop("outage_retries", None)
+            ctx.progress_state.pop("outage_since", None)
             marker = {
                 "status": result.status,
                 "ms": ms,
@@ -1105,9 +1115,18 @@ class JobRunner:
             cap = self.retry_delay_s if self.retry_delay_s is not None else limits.processing_retry_delay_s()
             delay = outage.backoff_s(retries, cap)
             ctx.progress_state["outage_retries"] = retries + 1
-        log.info(
+            ctx.progress_state.setdefault("outage_since", datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        # An uncounted deferral never fails the blob, so a long run of them is
+        # the only sign of an engine that stays down: past OUTAGE_WARN_AFTER in
+        # a row each one is a WARNING naming when the streak began.
+        streak = 0 if counted else int(ctx.progress_state.get("outage_retries") or 0)
+        log.log(
+            logging.WARNING if streak >= outage.OUTAGE_WARN_AFTER else logging.INFO,
             "files blob %s deferred at %s (%s, retry in %s s): %s",
-            ctx.blob_id, ctx.current_stage, "counted" if counted else "outage, not counted",
+            ctx.blob_id, ctx.current_stage,
+            "counted" if counted else (
+                f"outage, not counted, {streak} in a row since {ctx.progress_state.get('outage_since')}"
+            ),
             "default" if delay is None else round(float(delay), 1), exc,
         )
         await db.run_in_thread(_update_held, ctx.blob_id, self.owner, progress=ctx.progress_state, stages=ctx.stages, facts=ctx.facts)

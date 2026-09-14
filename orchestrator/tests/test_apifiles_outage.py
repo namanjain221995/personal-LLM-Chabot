@@ -18,7 +18,7 @@ import os
 import re
 import socket
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
@@ -117,7 +117,10 @@ class EmbedEngine:
                     status = b"200 OK"
                 else:
                     body = json.dumps({"error": {"message": "engine failure", "type": "server_error"}}).encode()
-                    status = {"500": b"500 Internal Server Error", "503": b"503 Service Unavailable"}[mode]
+                    status = {
+                        "500": b"500 Internal Server Error", "503": b"503 Service Unavailable",
+                        "401": b"401 Unauthorized", "404": b"404 Not Found",
+                    }[mode]
                 writer.write(b"HTTP/1.1 " + status + b"\r\ncontent-type: application/json\r\ncontent-length: "
                              + str(len(body)).encode() + b"\r\n\r\n" + body)
                 await writer.drain()
@@ -172,6 +175,12 @@ def _cases():
             openai.APIConnectionError(request=req), httpx.RemoteProtocolError("Server disconnected without sending a response.")
         ),
         "400": openai.BadRequestError("too long", response=httpx.Response(400, request=req), body=None),
+        "401": openai.AuthenticationError("bad key", response=httpx.Response(401, request=req), body=None),
+        "403": openai.PermissionDeniedError("forbidden", response=httpx.Response(403, request=req), body=None),
+        "404": openai.NotFoundError(
+            "The model `techsara-embed` does not exist.", response=httpx.Response(404, request=req), body=None
+        ),
+        "unparseable-200": openai.APIResponseValidationError(response=httpx.Response(200, request=req), body="<html>"),
     }
 
 
@@ -184,6 +193,10 @@ def _cases():
     ("500", outage.KIND_STATUS),
     ("broke-mid-response", outage.KIND_BROKEN),
     ("400", outage.KIND_REFUSED),
+    ("401", outage.KIND_REJECTED),
+    ("403", outage.KIND_REJECTED),
+    ("404", outage.KIND_REJECTED),
+    ("unparseable-200", outage.KIND_UNEXPECTED),
 ])
 def test_the_openai_sdk_errors_of_an_engine_are_classified_by_what_the_engine_did(case, kind):
     assert outage.classify(_cases()[case]) == kind
@@ -192,6 +205,67 @@ def test_the_openai_sdk_errors_of_an_engine_are_classified_by_what_the_engine_di
 @pytest.mark.parametrize("exc", [KeyError("rows"), TypeError("NoneType"), ValueError("bad"), AttributeError("x")])
 def test_a_bug_in_our_own_code_is_never_classified_as_an_engine_failure(exc):
     assert outage.classify(exc) == outage.KIND_NOT_ENGINE
+
+
+def _raised_while_handling(inner: BaseException, outer: BaseException, *, from_none: bool = False) -> BaseException:
+    try:
+        try:
+            raise inner
+        except BaseException:
+            if from_none:
+                raise outer from None
+            raise outer
+    except BaseException as caught:  # noqa: BLE001 - the chained exception is the point
+        return caught
+
+
+def test_our_bug_raised_while_handling_an_engine_error_is_still_our_bug():
+    """Review finding (2026-09-14): `_chain` walked `__context__`, so a
+    `KeyError` raised inside `except httpx.ConnectError` classified as an
+    engine outage and was retried for ever without failing."""
+    httpx = llm._openai_httpx_module()
+    refused = httpx.ConnectError("[Errno 111] Connection refused")
+    assert outage.classify(_raised_while_handling(refused, KeyError("vectors"))) == outage.KIND_NOT_ENGINE
+    assert outage.classify(_raised_while_handling(refused, TypeError("NoneType"))) == outage.KIND_NOT_ENGINE
+
+
+def test_a_context_cut_with_from_none_is_not_walked():
+    import openai
+
+    httpx = llm._openai_httpx_module()
+    refused = httpx.ConnectError("[Errno 111] Connection refused")
+    outer = openai.APIError("wrapped", request=_request(), body=None)
+    assert outage.classify(_raised_while_handling(refused, outer)) == outage.KIND_CONNECT, "an implicit context is evidence"
+    assert outage.classify(_raised_while_handling(refused, outer, from_none=True)) == outage.KIND_UNEXPECTED
+
+
+@pytest.mark.parametrize("exc", [TimeoutError("ours"), ConnectionRefusedError(111, "refused"), ConnectionError("pool")])
+def test_a_bare_builtin_timeout_or_connection_error_is_not_classified_as_an_engine_outage(exc):
+    """The SDK wraps every transport failure in its own error: a bare builtin
+    came from our side of the call and must not be retried without a limit."""
+    assert outage.classify(exc) == outage.KIND_NOT_ENGINE
+
+
+def test_a_model_unavailable_wrapper_is_classified_by_the_engine_error_it_carries():
+    from app.resilience import ModelUnavailable
+
+    refused = _cases()["refused"]
+    assert outage.classify(ModelUnavailable("http://embed/v1", 30.0, 3, refused)) == outage.KIND_CONNECT
+    assert outage.classify(ModelUnavailable("http://embed/v1", 30.0, 3, _cases()["404"])) == outage.KIND_REJECTED
+
+
+def test_a_probe_the_engine_answered_with_a_4xx_proves_it_is_serving():
+    assert outage.probe_verdict(_cases()["404"]) == outage.PROBE_SERVING
+    assert outage.probe_verdict(_cases()["400"]) == outage.PROBE_SERVING
+    assert outage.probe_verdict(_cases()["refused"]) == outage.PROBE_DOWN
+    assert outage.probe_verdict(_cases()["read-timeout"]) == outage.PROBE_UNKNOWN
+
+
+def test_a_misconfigured_engine_or_an_unexplained_engine_error_spends_attempts():
+    for kind in (outage.KIND_REJECTED, outage.KIND_UNEXPECTED):
+        assert not outage.needs_probe(kind), kind
+        assert outage.counts_attempt(kind, probe=None, progressed=False), kind
+        assert not outage.counts_attempt(kind, probe=None, progressed=True), "a run that made progress is not a loop"
 
 
 def test_an_attempt_is_spent_only_on_evidence_about_the_blob_never_for_an_engine_that_is_down_or_unknown():
@@ -218,7 +292,7 @@ def test_the_outage_backoff_doubles_from_fifteen_seconds_and_stops_at_the_retry_
 # =============================================================== the runner ==
 
 
-def test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_processes_once_it_is_back(tmp_path, monkeypatch):
+def test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_processes_once_it_is_back(tmp_path, monkeypatch, caplog):
     """The verifier's files-embed-down scenario: nothing listens on the embed
     port. Before 2026-09-14 the file read `status: error, internal_error`
     after one run."""
@@ -235,6 +309,7 @@ def test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_p
 
     # The outage outlasts the old five-attempt budget several times over.
     delays = []
+    caplog.set_level("INFO", logger=jobs.log.name)
     for _ in range(8):
         J.set_blob(row["id"], "not_before = now() - interval '1 second'")
         outcomes = asyncio.run(_run_once_against(None, monkeypatch))
@@ -243,6 +318,11 @@ def test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_p
         delays.append(round(_not_before_in(current) / 15.0))
         assert current["status"] == "queued" and current["attempt"] == 0 and current["error_code"] is None
     assert delays == [2, 4, 8, 16, 20, 20, 20, 20], "backoff 30, 60, 120, 240, then the 300 s cap"
+    deferrals = [r for r in caplog.records if "deferred at" in r.getMessage() and row["id"] in r.getMessage()]
+    assert [r.levelname for r in deferrals] == ["INFO"] * 4 + ["WARNING"] * 4, "a long outage is visible"
+    assert "6 in a row since " in deferrals[4].getMessage()
+    since = J.blob(row["id"])["progress"]["outage_since"]
+    assert all(f"since {since}" in r.getMessage() for r in deferrals), "the streak keeps the time it began"
 
     async def back_up() -> List[jobs.RunOutcome]:
         engine = await EmbedEngine().start()
@@ -257,6 +337,7 @@ def test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_p
     final = J.blob(row["id"])
     assert final["status"] == "processed" and final["facts"]["chunks_indexed"] == final["facts"]["chunks"] > 5
     assert "outage_retries" not in final["progress"], "the next outage backs off from 15 s again"
+    assert "outage_since" not in final["progress"]
 
 
 @pytest.mark.parametrize("batch", ["503", "slow"])
@@ -299,6 +380,34 @@ def test_a_500_while_the_engine_answers_a_probe_spends_attempts_and_the_fifth_fa
     assert after["attempt"] == 1 and 250 < _not_before_in(after) <= 300, "a counted deferral keeps the 300 s schedule"
     rest = asyncio.run(scenario(4))
     assert [o.outcome for o in rest[-1]] == ["failed"]
+    final = J.blob(row["id"])
+    assert final["status"] == "failed" and final["error_code"] == "processing_unavailable"
+
+
+@pytest.mark.parametrize("answer", ["404", "401"])
+def test_an_engine_that_refuses_us_spends_attempts_and_the_fifth_fails_processing_unavailable(answer, tmp_path, monkeypatch):
+    """Review finding (2026-09-14): a wrong EMBED model name (404) or a bad key
+    (401) classified as `broken` with an `unknown` probe — 12 runs, 24 engine
+    calls, the file queued with attempt 0 and nobody told."""
+    tenant = J.new_project()
+    row = J.insert_blob(tenant, TEXT)
+
+    async def scenario(runs: int) -> Tuple[List[List[jobs.RunOutcome]], List[List[str]]]:
+        engine = await EmbedEngine(batch=answer, probe=answer).start()
+        results = []
+        try:
+            for _ in range(runs):
+                J.set_blob(row["id"], "not_before = now() - interval '1 second'")
+                results.append(await _run_once_against(engine, monkeypatch))
+        finally:
+            await engine.stop()
+        return results, list(engine.calls)
+
+    results, calls = asyncio.run(scenario(5))
+    assert [[(o.outcome, o.error_code) for o in run] for run in results] == [[("deferred", None)]] * 4 + [
+        [("failed", "processing_unavailable")]
+    ]
+    assert all(call != [jobs.PROBE_TEXT] for call in calls), "a refusal is not ambiguous: no probe is spent on it"
     final = J.blob(row["id"])
     assert final["status"] == "failed" and final["error_code"] == "processing_unavailable"
 
