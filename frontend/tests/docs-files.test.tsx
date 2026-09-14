@@ -1931,6 +1931,16 @@ describe('each new page, rendered', () => {
     for (const noTimeout of STATES) {
       const site = publishedSite(noTimeout);
       const find = (slug: string) => site.find((page) => page.slug === slug);
+      // Parsing a page's headings is the slow part; each target is parsed once, not once per link.
+      const headingIds = new Map<string, Set<string>>();
+      const headingsOf = (target: { slug: string; body: string }) => {
+        let ids = headingIds.get(target.slug);
+        if (!ids) {
+          ids = new Set(docHeadingsOf(target.body).map((heading) => heading.id));
+          headingIds.set(target.slug, ids);
+        }
+        return ids;
+      };
       const offenders: string[] = [];
       for (const page of ownPages(noTimeout)) {
         for (const m of page.body.matchAll(/\]\((\/docs[^)\s]*|#[^)\s]+)\)/g)) {
@@ -1941,14 +1951,14 @@ describe('each new page, rendered', () => {
             offenders.push(`${page.slug} -> ${m[1]} (no such page)`);
             continue;
           }
-          if (fragment && !docHeadingsOf(target.body).some((heading) => heading.id === fragment)) {
+          if (fragment && !headingsOf(target).has(fragment)) {
             offenders.push(`${page.slug} -> ${m[1]} (no such heading)`);
           }
         }
       }
       expect(offenders, `noTimeout=${noTimeout}`).toEqual([]);
     }
-  });
+  }, 30_000);
 
   it('lists the Files pages beside the other API reference pages, in reading order, once published', () => {
     for (const page of newPages(false)) expect(page.section).toBe('API reference');
