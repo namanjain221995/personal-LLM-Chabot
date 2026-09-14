@@ -18,9 +18,13 @@ three suites import its fixtures by name.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import httpx
 import pytest
@@ -85,12 +89,14 @@ def engines_configured(monkeypatch):
     monkeypatch.setattr(sidecars, "probe_seconds", _no_probe)
     asr.set_provider(None)
     capacity.reset_for_tests()
+    sidecars.reset_for_tests()
     # Every engine call goes through a stub; one that forgot to install one
     # must fail loudly, never wait on a DNS lookup of a test hostname.
     sidecars._transport = httpx.MockTransport(_no_engine_installed)
     yield
     asr.set_provider(None)
     capacity.reset_for_tests()
+    sidecars.reset_for_tests()
     sidecars._transport = None
 
 
@@ -145,6 +151,41 @@ def api(platform):
     app.include_router(public_router.router)
     with TestClient(app) as client:
         yield client
+
+
+@contextlib.contextmanager
+def serve(app: Any) -> Iterator[int]:
+    """`app` on a real uvicorn in a thread; yields the port. A committed
+    response that aborts drops a REAL connection here, which the TestClient
+    cannot show."""
+    import uvicorn
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    try:
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(10)
+
+
+@pytest.fixture()
+def api_port(platform):
+    """The `api` app on a real uvicorn: yields the port."""
+    endpoints.register(public_router.router)
+    app = FastAPI()
+    app.include_router(public_router.router)
+    public_router.install_error_handlers(app)
+    with serve(app) as port:
+        yield port
 
 
 def auth(which: str = "live") -> Dict[str, str]:
@@ -306,9 +347,11 @@ def assert_nothing_internal(response: httpx.Response) -> None:
 
 class ScriptedWitness:
     """A `liveness.SidecarWitness` stand-in whose verdicts are a script: one
-    entry per silent call it is asked about, as (verdict, restarts since the
-    call went out). The decision table in `sidecars._dispatch` is what the
-    tests exercise; the real witness's arithmetic has its own suite."""
+    entry per failed send it is asked about, as (verdict, restarts since the
+    send went out). `verdict` takes the next entry; `restarts_since` answers
+    for the entry `verdict` last took. The decision table in
+    `sidecars._dispatch` is what the tests exercise; the real witness's
+    arithmetic has its own suite."""
 
     def __init__(self, script):
         import time as _time
@@ -316,17 +359,15 @@ class ScriptedWitness:
         self.script = list(script)
         self.asked = []
         self.clock = _time.monotonic
+        self._restarts = 0
 
     def verdict(self, outstanding_since, now=None):
-        verdict, _restarts = self.script[0] if self.script else ("unknown", 0)
+        verdict, self._restarts = self.script.pop(0) if self.script else ("unknown", 0)
         self.asked.append(verdict)
         return verdict
 
     def restarts_since(self, moment):
-        if not self.script:
-            return 0
-        _verdict, restarts = self.script.pop(0)
-        return restarts
+        return self._restarts
 
 
 class ScriptedSampler:

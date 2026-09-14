@@ -264,11 +264,25 @@ def _sidecar(*, token_inputs: bool = True) -> tuple:
     return codes
 
 
-def _capacity_description(engine_words: str) -> str:
+def _capacity_description(engine_words: str, *, pooling: bool = False) -> str:
     """The 503 on an endpoint whose engine the chat application shares
     (no-timeout design, 2026-09-14): a queue is never a 503 — the request
-    waits, writing bytes — so this is only an engine that is really down."""
+    waits, writing bytes — so this is an engine that is really down, or, on
+    the pooling routes, the process memory guard before the status line."""
     grace = _setting_float("PUBLIC_API_ENGINE_DOWN_GRACE_S", 1800.0)
+    if pooling:
+        return (
+            f"model_unavailable — the {engine_words} has been unreachable for "
+            f"{grace:g} seconds without a break, or its own metrics show it stalled "
+            "or lost with this request outstanding, or the server's memory for "
+            "accepted embedding and rerank work is full (a short Retry-After, "
+            "before any byte of the answer). Public requests to it share ONE "
+            "queue for every project and key (the chat application keeps priority); "
+            "waiting in that queue is never answered with this, however long it "
+            "takes, and it is not a per-caller limit. Retry after Retry-After "
+            "seconds, unless `x-should-retry: false` says an input of this request "
+            "stopped the engine twice: that input is refused for an hour."
+        )
     return (
         f"model_unavailable — the {engine_words} has been unreachable for "
         f"{grace:g} seconds without a break, or its own metrics show it stalled "
@@ -699,7 +713,7 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                     **_error_responses(
                         *_always(),
                         *_sidecar(),
-                        descriptions={503: _capacity_description("embedding engine")},
+                        descriptions={503: _capacity_description("embedding engine", pooling=True)},
                     ),
                 },
             }
@@ -729,7 +743,7 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                     **_error_responses(
                         *_always(),
                         *_sidecar(),
-                        descriptions={503: _capacity_description("reranking engine")},
+                        descriptions={503: _capacity_description("reranking engine", pooling=True)},
                     ),
                 },
             }

@@ -461,10 +461,16 @@ def _knowledge_process_state_clear():
     TRUNCATE tables between runs would otherwise see leak across tests."""
     from app import llm as _llm, rerank as _rerank, web_memory as _web_memory
 
+    from app.publicapi import sidecars as _public_sidecars
+
     _web_memory.cache_clear()
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
+    # /v1 pooling: remembered token counts, quarantined inputs and the
+    # memory budget are process state too (2026-09-14).
+    _public_sidecars.reset_for_tests()
     yield
     _web_memory.cache_clear()
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
+    _public_sidecars.reset_for_tests()

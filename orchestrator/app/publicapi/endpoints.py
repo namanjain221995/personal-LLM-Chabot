@@ -194,6 +194,21 @@ async def _model_for(caller: ApiCaller, model_id: str, operation: str) -> Any:
 async def _read_json(request: Request, *, limit: Optional[int] = None) -> Any:
     """The JSON body under its cap (the route's, else the §12 JSON rule),
     counted while it arrives."""
+    parsed, _size = await _read_json_sized(request, limit=limit)
+    return parsed
+
+
+def _declared_body_bytes(request: Request, limit: int) -> int:
+    """What a body will hold before it is read: its Content-Length, or the
+    cap when it is chunked (or declares more, which the read refuses)."""
+    declared = (request.headers.get("content-length") or "").strip()
+    if declared.isdigit():
+        return min(int(declared), int(limit))
+    return int(limit)
+
+
+async def _read_json_sized(request: Request, *, limit: Optional[int] = None) -> "tuple[Any, int]":
+    """`_read_json`, and how many bytes the body was."""
     limit = endpoint_models.max_json_body_bytes() if limit is None else int(limit)
     declared = request.headers.get("content-length")
     if declared and declared.strip().isdigit() and int(declared) > limit:
@@ -208,12 +223,13 @@ async def _read_json(request: Request, *, limit: Optional[int] = None) -> Any:
             raise errors.request_too_large(limit)
         chunks.append(chunk)
     raw = b"".join(chunks)
+    del chunks
     if not raw.strip():
         raise errors.invalid_request("The request body must be a JSON object.")
     try:
         if len(raw) > _OFF_LOOP_JSON_BYTES:
-            return await asyncio.to_thread(json.loads, raw)
-        return json.loads(raw)
+            return await asyncio.to_thread(json.loads, raw), total
+        return json.loads(raw), total
     except ValueError:
         # The decoder's message names an offset into the caller's text.
         raise errors.invalid_request("The request body is not valid JSON.") from None
@@ -402,22 +418,73 @@ def _request_id(request: Request) -> str:
 # -------------------------------------------------------------- routes --
 
 
-def _committed(request: Request, work: Any, *, response_class: type = keepalive.CommittedJSONResponse) -> Response:
-    """The byte-invariant answer of a sidecar route (module docstring)."""
-    return response_class(work, failure_mode=keepalive.FAILURE_ABORT, request_id=_request_id(request))
+def _committed(
+    request: Request,
+    work: Any,
+    *,
+    response_class: type = keepalive.CommittedJSONResponse,
+    spent_s: float = 0.0,
+) -> Response:
+    """The byte-invariant answer of a sidecar route (module docstring).
+
+    `spent_s`: how long the route was silent BEFORE this response, counting
+    lengths (`sidecars.check_*_lengths`). It comes off the commit window, so
+    the first byte still leaves within PUBLIC_API_SYNC_COMMIT_S of the check
+    starting, however slow `/tokenize` was (review 2026-09-14)."""
+    commit_s = max(0.0, keepalive.sync_commit_s() - max(0.0, float(spent_s)))
+    return response_class(
+        work, failure_mode=keepalive.FAILURE_ABORT, request_id=_request_id(request), commit_s=commit_s
+    )
+
+
+def _render_embeddings(
+    vectors: Any, *, base64_wanted: bool, model_id: str, prompt_tokens: Optional[int]
+) -> bytes:
+    """The embeddings object, rendered one vector at a time: byte-identical to
+    `json.dumps` of the whole dict, without ever holding every vector as a
+    list of Python floats (a 2,048-input answer was ~65 MiB of them, review
+    2026-09-14). Run in a worker thread."""
+    dumps = functools.partial(json.dumps, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    parts = [b'{"object":"list","data":[']
+    for index, vector in enumerate(vectors):
+        if index:
+            parts.append(b",")
+        if base64_wanted:
+            embedding: Any = sidecars.encode_base64(vector)
+        else:
+            embedding = vector.tolist() if hasattr(vector, "tolist") else list(vector)
+        parts.append(dumps({"object": "embedding", "index": index, "embedding": embedding}).encode("utf-8"))
+    usage = None if prompt_tokens is None else {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}
+    parts.append(b'],"model":' + dumps(model_id).encode("utf-8") + b',"usage":' + dumps(usage).encode("utf-8") + b"}")
+    return b"".join(parts)
 
 
 async def create_embedding(request: Request, caller: ApiCaller = Depends(_caller)) -> Response:
     """OpenAI-shaped embeddings on `techsara-embed` (1,024 dimensions)."""
     operation = "create_embedding"
     await _authorize(request, caller, operation)
+    cap = endpoint_models.max_pooling_body_bytes()
+    # The physical memory guard, before a byte of the body is held
+    # (`sidecars.PoolingMemory`): a real 503 with Retry-After, not counted.
+    memory = sidecars.POOLING_MEMORY.reserve(sidecars.embed_memory_bytes(_declared_body_bytes(request, cap), 0))
+    try:
+        return await _embedding_response(request, caller, operation, memory, cap)
+    except BaseException:
+        memory.release()
+        raise
+
+
+async def _embedding_response(
+    request: Request, caller: ApiCaller, operation: str, memory: "sidecars.MemoryReservation", cap: int
+) -> Response:
     parsed: Optional[endpoint_models.EmbeddingsRequest] = None
     deferred: Optional[errors.ApiError] = None
     estimate = 0
+    body_bytes = 0
     try:
-        parsed = endpoint_models.parse_embeddings_request(
-            await _read_json(request, limit=endpoint_models.max_pooling_body_bytes())
-        )
+        payload, body_bytes = await _read_json_sized(request, limit=cap)
+        parsed = endpoint_models.parse_embeddings_request(payload)
+        del payload
         from .. import context
 
         estimate = sum(context.estimate_tokens(text) for text in parsed.inputs())
@@ -436,55 +503,52 @@ async def create_embedding(request: Request, caller: ApiCaller = Depends(_caller
         ledger.model_id = model.id
         inputs = parsed.inputs()
         single = isinstance(parsed.input, str)
+        base64_wanted = parsed.encoding_format == "base64"
+        # The exact charge now the inputs are known: their vectors until the
+        # response is sent. A refusal here is still before the status line.
+        memory.resize(sidecars.embed_memory_bytes(body_bytes, len(inputs), base64_wanted=base64_wanted))
         # Before any gate and before the commit clock: an over-length input
         # is a real 400 however long the queue is.
+        checked_at = time.monotonic()
         lengths = await sidecars.check_embed_lengths(inputs, single_string=single)
+        spent_s = time.monotonic() - checked_at
     except BaseException:
         await ledger.nothing_ran()
         raise
-    base64_wanted = parsed.encoding_format == "base64"
 
     async def work() -> Response:
         try:
-            # wait_s=None: no clock on the route (module docstring).
-            outcome = await sidecars.embed(inputs, single_string=single, lengths=lengths, wait_s=None)
-        except sidecars.SidecarError as failure:
-            await ledger.failed(failure, meta={"inputs": len(inputs)})
-            raise failure.error from None
-        except BaseException:
-            await ledger.nothing_ran()
-            raise
+            try:
+                # wait_s=None: no clock on the route (module docstring).
+                outcome = await sidecars.embed(inputs, single_string=single, lengths=lengths, wait_s=None)
+            except sidecars.SidecarError as failure:
+                await ledger.failed(failure, meta={"inputs": len(inputs)})
+                raise failure.error from None
+            except BaseException:
+                await ledger.nothing_ran()
+                raise
+            content = await asyncio.to_thread(
+                _render_embeddings,
+                outcome.vectors,
+                base64_wanted=base64_wanted,
+                model_id=model.id,
+                prompt_tokens=outcome.prompt_tokens,
+            )
+            del outcome.vectors[:]
+            await ledger.completed(
+                input_tokens=outcome.prompt_tokens,
+                # 0, not None: a pooling pass generates nothing, and that is measured.
+                output_tokens=0,
+                quota_input=outcome.prompt_tokens,
+                meta={"inputs": len(inputs), "engine_calls": outcome.engine_calls, **_resend_meta(outcome.resends)},
+            )
+            return Response(content=content, status_code=200, media_type="application/json")
+        finally:
+            memory.release()
 
-        def build() -> Dict[str, Any]:
-            return {
-                "object": "list",
-                "data": [
-                    {
-                        "object": "embedding",
-                        "index": index,
-                        "embedding": sidecars.encode_base64(vector) if base64_wanted else vector,
-                    }
-                    for index, vector in enumerate(outcome.vectors)
-                ],
-                "model": model.id,
-                "usage": (
-                    None
-                    if outcome.prompt_tokens is None
-                    else {"prompt_tokens": outcome.prompt_tokens, "total_tokens": outcome.prompt_tokens}
-                ),
-            }
-
-        body = await asyncio.to_thread(build) if base64_wanted else build()
-        await ledger.completed(
-            input_tokens=outcome.prompt_tokens,
-            # 0, not None: a pooling pass generates nothing, and that is measured.
-            output_tokens=0,
-            quota_input=outcome.prompt_tokens,
-            meta={"inputs": len(inputs), "engine_calls": outcome.engine_calls, **_resend_meta(outcome.resends)},
-        )
-        return await _json_response(body)
-
-    return _committed(request, work)
+    response = _committed(request, work, spent_s=spent_s)
+    memory.bind(response)
+    return response
 
 
 def _resend_meta(resends: Mapping[str, int]) -> Dict[str, Any]:
@@ -495,13 +559,26 @@ async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) 
     """Cohere/Jina-shaped reranking on `techsara-rerank`."""
     operation = "create_rerank"
     await _authorize(request, caller, operation)
+    cap = endpoint_models.max_pooling_body_bytes()
+    memory = sidecars.POOLING_MEMORY.reserve(sidecars.rerank_memory_bytes(_declared_body_bytes(request, cap), 0))
+    try:
+        return await _rerank_response(request, caller, operation, memory, cap)
+    except BaseException:
+        memory.release()
+        raise
+
+
+async def _rerank_response(
+    request: Request, caller: ApiCaller, operation: str, memory: "sidecars.MemoryReservation", cap: int
+) -> Response:
     parsed: Optional[endpoint_models.RerankRequest] = None
     deferred: Optional[errors.ApiError] = None
     estimate = 0
+    body_bytes = 0
     try:
-        parsed = endpoint_models.parse_rerank_request(
-            await _read_json(request, limit=endpoint_models.max_pooling_body_bytes())
-        )
+        payload, body_bytes = await _read_json_sized(request, limit=cap)
+        parsed = endpoint_models.parse_rerank_request(payload)
+        del payload
         from .. import context
 
         query_tokens = context.estimate_tokens(parsed.query)
@@ -518,15 +595,24 @@ async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) 
         model = await _model_for(caller, parsed.model, operation)
         ledger.model_id = model.id
         texts = parsed.texts()
+        memory.resize(sidecars.rerank_memory_bytes(body_bytes, len(texts)))
+        checked_at = time.monotonic()
         lengths = await sidecars.check_rerank_lengths(
             sidecars.rerank_query_text(parsed.query, parsed.instruction),
             [sidecars.rerank_document_text(text) for text in texts],
         )
+        spent_s = time.monotonic() - checked_at
     except BaseException:
         await ledger.nothing_ran()
         raise
 
     async def work() -> Response:
+        try:
+            return await scored()
+        finally:
+            memory.release()
+
+    async def scored() -> Response:
         try:
             outcome = await sidecars.rerank_scores(
                 parsed.query, texts, instruction=parsed.instruction, lengths=lengths, wait_s=None
@@ -565,7 +651,9 @@ async def create_rerank(request: Request, caller: ApiCaller = Depends(_caller)) 
         )
         return await _json_response(body)
 
-    return _committed(request, work)
+    response = _committed(request, work, spent_s=spent_s)
+    memory.bind(response)
+    return response
 
 
 # -------------------------------------------------------- transcription --

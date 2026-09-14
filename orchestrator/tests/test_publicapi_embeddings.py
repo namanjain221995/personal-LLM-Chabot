@@ -20,6 +20,7 @@ from app.publicapi import capacity, endpoint_models, events, sidecars
 from tests.publicapi_sidecar_support import (  # noqa: F401 - fixtures by name
     _pepper,
     api,
+    api_port,
     assert_nothing_internal,
     auth,
     daily,
@@ -318,7 +319,10 @@ def test_a_silent_call_on_a_progressing_engine_is_sent_again_until_it_answers(ap
     assert response.status_code == 200, response.text
     assert engine.calls == 6
     assert witness.witness.asked == ["progressing"] * 5
-    assert witness.acquired == witness.released == 6
+    # ONE witness for the whole call, re-sends included: released between
+    # re-sends, a lone request's restart history was thrown away (review
+    # 2026-09-14, high).
+    assert witness.acquired == witness.released == 1
     assert usage_events("v1_embeddings")[0]["meta"]["resends"] == {"progressing": 5}
 
 
@@ -360,7 +364,9 @@ def test_a_second_engine_restart_during_one_call_is_a_503_that_tells_the_sdk_not
     assert witness.witness.asked == ["restarted", "restarted"]
 
 
-def test_one_engine_restart_during_a_call_is_survived_by_sending_it_again(api, monkeypatch):
+def test_one_engine_restart_during_a_call_is_survived_by_sending_its_inputs_again_one_at_a_time(api, monkeypatch):
+    """A restart under a call of several inputs splits it: if one of them
+    crashes the engine, the next restart names that one input."""
     script_witness(monkeypatch, [("restarted", 1)])
     crashed = {"once": True}
 
@@ -375,7 +381,142 @@ def test_one_engine_restart_during_a_call_is_survived_by_sending_it_again(api, m
     response = api.post(URL, json=_body(), headers=auth())
 
     assert response.status_code == 200
-    assert engine.calls == 2
+    assert [body["input"] for body in engine.json_bodies()] == [
+        ["first passage", "second passage"],
+        ["first passage"],
+        ["second passage"],
+    ]
+    assert usage_events("v1_embeddings")[0]["meta"]["resends"] == {"restarted": 1}
+
+
+def test_a_connection_that_breaks_once_on_an_engine_that_answers_right_after_is_a_lost_resend_not_a_restart(api, monkeypatch):
+    """A stale keep-alive connection breaks too. Without the engine refusing
+    connections next (or its witness seeing a new process) it is not a
+    restart: nothing is split and nothing is quarantined."""
+    broke = {"once": True}
+
+    def breaks_once(request, body):
+        if broke["once"]:
+            broke["once"] = False
+            raise httpx.RemoteProtocolError("server disconnected without sending a response")
+        return vllm_embeddings(body)
+
+    engine = install_embed_engine(monkeypatch, breaks_once)
+
+    response = api.post(URL, json=_body(), headers=auth())
+
+    assert response.status_code == 200, response.text
+    assert [len(body["input"]) for body in engine.json_bodies()] == [2, 2]
+    assert usage_events("v1_embeddings")[0]["meta"]["resends"] == {"lost": 1}
+    assert not sidecars._QUARANTINE.active(time.monotonic())
+
+
+class _CrashingEngine:
+    """An embedding engine that dies on any batch holding POISON: the
+    connection breaks at once (no /metrics scrape can see it), the engine
+    refuses connections for the next `down_sends` sends, then it is back."""
+
+    def __init__(self, *, down_sends: int = 2, delay_s: float = 0.0):
+        self.down_sends = down_sends
+        self.delay_s = delay_s
+        self.down_left = 0
+        self.crashes = 0
+        self.embedded: list = []
+
+    async def __call__(self, request, body):
+        import asyncio
+
+        if self.down_left > 0:
+            self.down_left -= 1
+            raise httpx.ConnectError("connection refused")
+        inputs = json.loads(body)["input"]
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if any("POISON" in text for text in inputs):
+            self.crashes += 1
+            self.down_left = self.down_sends
+            raise httpx.RemoteProtocolError("server disconnected without sending a response")
+        self.embedded.extend(inputs)
+        return vllm_embeddings(body)
+
+
+def test_an_input_that_crashes_the_engine_twice_after_the_commit_is_refused_before_the_status_line_of_the_sdk_retry(
+    api_port, platform, monkeypatch
+):
+    """The review's scenario, end to end on a real socket with openai-python:
+    the witness never starts (WITNESS_START_S stays 15 s), the commit window
+    closes before the SECOND crash, so that refusal can only drop the
+    connection. The SDK retries; the retry is refused before its status line
+    with `x-should-retry: false`, which the SDK obeys. The engine went down
+    twice in all, and the input's neighbours were embedded and are not
+    quarantined."""
+    import openai
+
+    monkeypatch.setattr(settings, "public_api_sync_commit_s", 0.05, raising=False)
+    monkeypatch.setattr(events, "HEARTBEAT_SECONDS", 0.05)
+    slept = no_backoff(monkeypatch)
+    engine = _CrashingEngine(delay_s=0.2)
+    install_embed_engine(monkeypatch, engine)
+    requests_seen = []
+
+    def on_request(request):
+        requests_seen.append(request.url.path)
+
+    client = openai.OpenAI(
+        base_url=f"http://127.0.0.1:{api_port}/v1",
+        api_key=auth()["Authorization"].split(" ", 1)[1],
+        max_retries=2,
+        http_client=httpx.Client(event_hooks={"request": [on_request]}),
+    )
+
+    with pytest.raises(openai.APIStatusError) as raised:
+        client.embeddings.create(model="techsara-embed", input=["fine zero", "POISON one", "fine two"])
+
+    assert raised.value.status_code == 503
+    assert raised.value.response.headers["x-should-retry"] == "false"
+    assert raised.value.body["param"] == "input.1"
+    assert_nothing_internal(raised.value.response)
+    assert engine.crashes == 2
+    assert len(requests_seen) == 2  # the committed-then-dropped call and ONE retry
+    assert engine.embedded == ["fine zero"]
+    # One wait, for the engine to come back after the FIRST crash; the second
+    # is refused at once instead of being waited out.
+    assert slept == [2.0]
+    rows = usage_events("v1_embeddings")
+    assert [(row["status"], row["error_kind"]) for row in rows] == [("error", "model_unavailable")]
+
+    # The input on its own is refused before any engine call...
+    alone = httpx.post(
+        f"http://127.0.0.1:{api_port}/v1/embeddings",
+        json=_body(input="POISON one"),
+        headers=auth(),
+    )
+    assert alone.status_code == 503 and alone.headers["x-should-retry"] == "false"
+    assert alone.content[:1] == b"{"
+    assert engine.crashes == 2
+    # ...and its neighbours are not.
+    neighbour = httpx.post(f"http://127.0.0.1:{api_port}/v1/embeddings", json=_body(input=["fine two"]), headers=auth())
+    assert neighbour.status_code == 200, neighbour.text
+
+
+def test_the_quarantine_of_a_crashing_input_ends_with_its_setting(api, monkeypatch):
+    monkeypatch.setenv("PUBLIC_API_POISON_QUARANTINE_S", "30")
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(sidecars, "_clock", lambda: clock["now"])
+    no_backoff(monkeypatch)
+    engine = _CrashingEngine(down_sends=1)
+    install_embed_engine(monkeypatch, engine)
+
+    first = api.post(URL, json=_body(input="POISON"), headers=auth())
+    assert first.status_code == 503 and first.headers["x-should-retry"] == "false"
+    assert engine.crashes == 2
+
+    clock["now"] += 29
+    assert api.post(URL, json=_body(input="POISON"), headers=auth()).status_code == 503
+    assert engine.crashes == 2
+    clock["now"] += 2
+    assert api.post(URL, json=_body(input="POISON"), headers=auth()).headers.get("x-should-retry") == "false"
+    assert engine.crashes == 4  # sent again, crashed twice again, quarantined again
 
 
 def test_the_real_witness_sees_the_engine_process_restart_under_a_silent_call(api, monkeypatch):

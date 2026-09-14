@@ -1815,7 +1815,11 @@ class Settings:
         # are declared above (2,048 / 1,000). PUBLIC_API_DECODE_CONCURRENCY (2)
         # and PUBLIC_API_MAX_POOLING_BODY_BYTES (8 MiB) are NOT defined here:
         # audio_jobs and endpoint_models read them from the environment at call
-        # time with their own defaults.
+        # time with their own defaults. So do sidecars.py's guards (review
+        # 2026-09-14): PUBLIC_API_TOKENIZE_CONCURRENCY (8, process-wide per
+        # engine), PUBLIC_API_LENGTH_CHECK_BUDGET_S (8 s, at most 15),
+        # PUBLIC_API_POOLING_MEMORY_BYTES (512 MiB) and
+        # PUBLIC_API_POISON_QUARANTINE_S (3,600 s).
         #: Router/OCR stream silence used only when every witness is unknown. 1800 s.
         self.public_api_sidecar_silence_s: float = _float("PUBLIC_API_SIDECAR_SILENCE_S", 1800.0)
         #: Embeddings/rerank: how long one engine call may be silent before the
