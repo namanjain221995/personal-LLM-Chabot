@@ -79,8 +79,10 @@ remember and none to get wrong.
 | \`embeddings.write\` | Create embeddings. | \`POST /v1/embeddings\` |
 | \`rerank.write\` | Rerank documents against a query. | \`POST /v1/rerank\` |
 | \`audio.write\` | Transcribe audio. | \`POST /v1/audio/transcriptions\` |
+| \`files.read\` | Read, download and use this project's files. | Listing, reading and downloading files, and any file used as model input |
+| \`files.write\` | Upload and delete this project's files. | Uploading, resuming and deleting files |
 
-That is the whole vocabulary — seven scopes, and no eighth can be spelled. An
+That is the whole vocabulary — nine scopes, and no tenth can be spelled. An
 unrecognised scope string is an error when a key is created, not an entry
 that is quietly dropped and then grants nothing.
 
@@ -94,8 +96,10 @@ console, under the \`api.webhooks.manage\` capability, rather than by a
 machine credential — see [webhooks](/docs/webhooks).
 
 A key created without a choice gets \`models.read\`, \`responses.read\`,
-\`responses.write\`, \`embeddings.write\`, \`rerank.write\` and
-\`audio.write\` — enough to call every model, and nothing more. Reading usage
+\`responses.write\`, \`embeddings.write\`, \`rerank.write\`, \`audio.write\`,
+\`files.read\` and \`files.write\` — enough to call every model with your
+files, and nothing more. \`files.read\` includes downloading every file of the
+project; a key that only generates can be created without it. Reading usage
 is a separate job, usually for a separate credential.
 
 **Keys created before 2026-09-13 do not have the three newest scopes.** A key

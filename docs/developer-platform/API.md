@@ -29,13 +29,25 @@ read to confirm it. §1–§12 remain the code as it was read at 02:50 IST, with
 pointer to §13 wherever the wave changes them. Re-derive §13 from the tree after
 the wave merges and fold it into the sections above.
 
+**2026-09-13, night — the no-timeout wave (design revision 2).** No wall clock
+anywhere on `/v1`, a byte at least every 15 s, durable and resumable
+generations, capacity waits that never expire, audio of any length, and the
+v1-gateway. **§14 describes it**: the edge pieces (`frontend/app/v1/[[...path]]/route.ts`,
+`frontend/server-preload.cjs`, `gateway/`) from the code, and the orchestrator
+pieces from the binding design with the symbol to read for each. Where §1–§13
+say otherwise (the 30 s gate wait, the wall clock, the in-flight `409`, the
+restart failure of a background job, "no prompt is stored"), §14 supersedes them
+once the wave merges.
+
 ---
 
 ## 1. Where it lives and how a request reaches it
 
 | hop | what | file |
 |---|---|---|
-| public edge (today) | `https://ai.techsarasolutions.com/v1/…` → the Next.js route handler, which forwards `authorization`, `idempotency-key`, `content-type`, `origin` and a few more by name, never `cookie`, and pipes the body and the response stream through unbuffered | `frontend/app/v1/[[...path]]/route.ts` |
+| tunnel path rule (operator) | `^/v1(/|$)` → the v1-gateway, ahead of the catch-all to the frontend; until the rule exists `/v1` reaches the Next route below (§14.1) | Cloudflare dashboard |
+| v1-gateway | holds client connections across orchestrator restarts: connect retry before the first byte, heartbeats and re-attach after it (§14.2) | `gateway/server.cjs`, `gateway/lib/*.cjs` |
+| public edge (LAN, and the fallback) | the Next.js route handler: forwards `authorization`, `idempotency-key`, `content-type`, `origin`, `x-stainless-retry-count` and a few more by name, never `cookie` or `x-techsara-*`; relays to `V1_GATEWAY_URL` when set, else to the orchestrator with a 110 s connect retry; streams audio, file and part bodies; no timer on the gateway hop, a 300 s upstream silence limit on the direct path (§14.1) | `frontend/app/v1/[[...path]]/route.ts` |
 | orchestrator | `APIRouter(prefix="/v1", route_class=PublicRoute)` mounted by `app/main.py` inside a guarded import; `main.PUBLIC_API_MOUNTED` says whether it is there | `orchestrator/app/publicapi/router.py` |
 | engine | `llm.stream_chat_events(..., model_choice="smart")` and nothing lower, through the shared admission lanes and the breaker — for `techsara-35b`. The other five models go through `publicapi/engines.py` or `publicapi/sidecars.py` under per-engine capacity gates (§13.3) | `orchestrator/app/publicapi/streaming.py` |
 
@@ -801,3 +813,115 @@ restart-failed long job with a new key.
     (`engines/ocr.py` `_DEFAULT_PROMPT`, overridable by `OCR_PROMPT`), the prompt
     that loops; the public path appends `OCR` instead. The chat application's
     read path is unchanged by this wave.
+
+## 14. The no-timeout wave (2026-09-13, design revision 2)
+
+### 14.1 The Next `/v1` edge — read from the code
+
+`frontend/app/v1/[[...path]]/route.ts` exports `GET`, `POST`, `PUT`, `DELETE`
+and `OPTIONS`.
+
+* **Target.** `v1GatewayUrl()` reads `V1_GATEWAY_URL` (an absolute http(s) URL;
+  anything else is ignored). With it, the request goes to the gateway, body
+  streamed through `BodySource.attempt()`. When that fetch fails with a
+  connect-phase code (`isConnectPhaseError`: `ECONNREFUSED`, `ENOTFOUND`,
+  `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`,
+  `UND_ERR_CONNECT_TIMEOUT`) and the body is still replayable, the request falls
+  back to the orchestrator; any other failure after the request was sent is a
+  `503`, `Retry-After: 30`, and no `x-should-retry`: the gateway tagged the
+  request, so an identical SDK retry attaches to its run (CONTRACT §9 keeps
+  `x-should-retry: false` for the post-send `503` with no gateway in the path).
+* **Direct path.** `orchestratorUrl()`. A connect-phase failure is retried every
+  `V1_EDGE_CONNECT_RETRY_INTERVAL_S` (2 s) while the next attempt still fits in
+  `V1_EDGE_CONNECT_RETRY_S` (110 s), then `503 model_unavailable`,
+  `Retry-After: 30`. Any other failure is not re-sent.
+* **Dispatchers.** Agents of Node's own undici (found through the
+  `undici.globalDispatcher.1` symbol), used by every `/v1` fetch and by nothing
+  else, each with `pipelining: 0` — a fresh connection per request, so a uvicorn
+  keep-alive close can never cut a sent POST. The gateway hop's `v1Dispatcher()`
+  has `V1_DISPATCHER_OPTIONS = { headersTimeout: 0, bodyTimeout: 0, pipelining: 0 }`:
+  the gateway pings and watches the orchestrator itself. The direct path's
+  `v1DirectDispatcher(streamedBody)` keeps the design's silence defence,
+  `V1_EDGE_UPSTREAM_SILENCE_S` (300 s; `0` turns it off) as both `headersTimeout`
+  and `bodyTimeout`. A slow streamed upload is not counted against it (measured on
+  Node 20 and 22 and undici 7: chunks 1.5 s apart under a 1 s limit went through).
+  With the 15 s rule, 300 s of silence means a stuck orchestrator: a first byte that never comes is `503` (`x-should-retry:
+  false` on an unkeyed generation), a relayed answer that stops is cut.
+* **Bodies** (`publicApiBodyRuleFor`): `none` for GET, HEAD, OPTIONS; `stream`
+  for `POST /v1/audio/transcriptions` (90 MiB), `POST /v1/files` and
+  `POST /v1/uploads/{id}/parts` (65 MiB), `PUT /v1/uploads/{id}/parts/{n}`
+  (64 MiB, `411` without `Content-Length`); `buffer` for every other route
+  (20 MiB generation, 8 MiB embeddings and rerank, 1 MiB otherwise). Each cap reads
+  the orchestrator's variable. A declared over-cap body is `413` before any fetch;
+  an undeclared one is `413` when the count passes the cap. `BodySource` keeps up
+  to 1 MiB of streamed chunks to replay after a refused connect (undici pulls one
+  chunk before it knows), and drains the rest of the caller's body after an
+  upstream answer instead of cancelling it.
+* **Headers.** `REQUEST_HEADER_ALLOWLIST`, `RESPONSE_HEADER_ALLOWLIST` and
+  `RESPONSE_HEADER_PREFIXES` are plain `as const` arrays, parsed by
+  `gateway/test/parity.test.cjs`. The request list adds `x-stainless-retry-count`
+  (implicit attach), `content-digest`, `x-part-sha256`, `range`, `if-none-match`;
+  the response list adds `x-should-retry`, `content-disposition`,
+  `content-range`, `accept-ranges`, `etag`, `content-security-policy`. No
+  `x-techsara-*` name crosses in either direction. Byte downloads
+  (`GET /v1/files/{id}/content` and `…/derived/{name}`) keep `Content-Length`.
+  Through the gateway, the configured `TRUSTED_CLIENT_IP_HEADER` is re-stated
+  with the validated address.
+* **SSE.** `stripTsSeqComments()` removes `: ts-seq=N` frames from every event
+  stream, streaming and line-oriented.
+
+`frontend/server-preload.cjs` (loaded by `frontend/Dockerfile`'s `CMD`) sets
+`requestTimeout` 0, `headersTimeout` 100,000 ms and `keepAliveTimeout` 95,000 ms
+on the Next server, destroys a request whose body has been idle for
+`FRONTEND_BODY_IDLE_S` (60 s) while the handler has read everything that
+arrived, and on SIGTERM cuts `/v1` relays at `FRONTEND_DRAIN_V1_S` (2 s), chat
+and other event streams at `FRONTEND_DRAIN_SSE_S` (15 s), leaves uploads, and
+lets each connection go when its response ends.
+
+### 14.2 The v1-gateway — read from the code
+
+`gateway/server.cjs` and `gateway/lib/*.cjs` (Node 20, `node:` built-ins only):
+only `/v1` and `/v1/*` (else `404`), `/healthz`; the same header allowlists as
+the Next edge plus pending names; body caps; a fresh `X-TechSara-Attempt` per
+request; `: ts-seq` stripped and remembered; a 110 s connect retry before the
+first byte, then `503`, `Retry-After: 30`; after it, a self-commit at 15 s of
+silence (`: ping` or a space), re-attach with `X-TechSara-Resume-After` or
+`X-TechSara-Attach-Job` for ≤ 1,800 s, and a 300 s upstream silence watchdog;
+SIGTERM destroys relays at +2 s. `gateway/README.md` has the settings and log
+events.
+
+### 14.3 The orchestrator — as designed, to be re-read from the code
+
+| behaviour | read |
+|---|---|
+| `llm.stream_chat_events(wall_clock_s=0, wall_clock_marker=False, read_timeout_s=None, admission_patient=True, on_dispatch=…)`; TCP keepalive transport; `ContinuationRoomExhausted` | `app/llm.py` |
+| two-class lanes (chat first), patient waiters outside `max_waiting`, `kv_ledger`, `register_yield`, LONG ticket released at first token | `app/admission.py` |
+| `proven_not_serving`, `serving_evidence_at`, `note_chunk`, `wait_not_bad` | `app/engine_state.py` |
+| `durable.launch / attach / suspend_all`, lease, write-ahead events, claim `FOR UPDATE`, continuation, quarantine, orphan grace | `app/publicapi/durable.py`, `durable_store.py`, `blobs.py` |
+| `MainGuard` (G0–G3) and `SidecarWitness` verdicts | `app/publicapi/liveness.py` |
+| `keepalive.CommittedJSONResponse` (commit at 15 s, a space every 15 s, failed bodies) | `app/publicapi/keepalive.py` |
+| the resume route and its check order; attach order (gateway, key, implicit); `X-TechSara-*` from trusted peers only | `app/publicapi/router.py`, `gateway_protocol.py` |
+| the event grammar with item and content-part events; `: ts-seq` for tagged requests | `app/publicapi/events.py` |
+| `hold(wait_s=None, on_wait=…)`, `main.normal` 6 | `app/publicapi/capacity.py` |
+| embeddings and rerank `/tokenize` pre-check before any gate; 2,048 inputs, 1,000 documents | `app/publicapi/sidecars.py`, `endpoint_models.py` |
+| audio of any length: streamed ingest, 90 s windows, decode semaphore, window cache | `app/publicapi/audio_jobs.py`, `disk_ledger.py`, `multipart.py` |
+| `resolver.still_authorised(key_ids, model)` | `app/apiplatform/resolver.py` |
+| attach instead of the in-flight `409`; different credential `409`, `x-should-retry: false` | `app/apiplatform/idempotency.py` |
+| V36: `api_response_events`, `api_response_requests`, `api_response_blobs`, the new `api_responses` columns | `app/db.py` |
+| SIGTERM chained to `durable.request_suspend` | `app/shutdown_signals.py`, `app/main.py` |
+
+CONTRACT §8.3–§8.6, §10, §12.3, §12.4, §13, §14, §16, §18 and §19 state each rule
+and number.
+
+### 14.4 Disagreements to watch once it merges
+
+17. **`PUBLIC_API_MAX_POOLING_BODY_BYTES`** is the edge's name for the 8 MiB
+    embeddings and rerank cap; the orchestrator (`models.body_cap_for`) and the
+    gateway (`bodies.cjs`) must read the same variable.
+18. **The gateway's parity test** still expects route.ts without the absorbed
+    header names, without `invalid_request_error` in `EDGE_ERRORS`, with a
+    26 MiB audio default and without `PUT`/`DELETE`; it fails until
+    `gateway/lib/headers.cjs`, `bodies.cjs` and `test/parity.test.cjs` catch up.
+19. **The public documentation** shows the no-timeout pages only once
+    `NO_TIMEOUT_LIVE` (`frontend/content/docs/pages/longOutput.ts`) is true;
+    `tests/docs-files.test.tsx` ties it to `keepalive.py` and the resume route.

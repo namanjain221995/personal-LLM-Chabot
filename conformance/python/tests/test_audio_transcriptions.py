@@ -31,6 +31,9 @@ def test_text_response_format_is_a_plain_text_body(client, target, clip):
         model=target.models["whisper"], file=("tone.wav", clip, "audio/wav"), response_format="text"
     )
     assert isinstance(result, str)
+    # 2026-09-13 (CONTRACT-3 §8.6, §10.1): a transcription committed after
+    # 15 s carries leading keepalive spaces; the documented call is .strip().
+    assert result.strip() == result.strip().strip()
 
 
 def test_verbose_json_carries_segments_duration_and_task(client, target, clip):
@@ -63,3 +66,35 @@ def test_an_undecodable_file_is_a_400_with_no_decoder_output(client, target):
     error = asserts.sdk_error(caught.value, code="invalid_request_error")
     for leak in ("ffmpeg", "Invalid data found", "stderr"):
         assert leak not in error["message"], error["message"]
+
+
+# --------------------------------------------------------------------------
+# 2026-09-13, no-timeout design revision 2 (CONTRACT-3 §8.6): no duration
+# limit, windows of at most 90 s, `stream`, and a committed text body.
+
+
+@pytest.mark.long
+@pytest.mark.feature("no_timeouts")
+def test_audio_longer_than_the_old_300_second_limit_is_transcribed(make_client, target, note):
+    long_clip = media.tone_wav(seconds=320.0)
+    client = make_client(timeout=None)
+    result = client.audio.transcriptions.create(model=target.models["whisper"], file=("long.wav", long_clip, "audio/wav"))
+    usage = result.model_dump().get("usage") or {}
+    assert usage.get("type") == "duration" and usage.get("seconds") in (320, 321), f"usage {usage!r}"
+    note(f"{len(long_clip)} bytes of audio, {usage.get('seconds')} s transcribed")
+
+
+@pytest.mark.feature("no_timeouts")
+def test_a_streamed_transcription_is_event_stream_with_a_done_event_and_no_id_lines(raw, target, clip):
+    files = {"file": ("tone.wav", clip, "audio/wav")}
+    data = {"model": target.models["whisper"], "stream": "true"}
+    with raw.stream("POST", "audio/transcriptions", files=files, data=data) as response:
+        assert response.status_code == 200, response.read()[:200]
+        assert response.headers["content-type"].startswith("text/event-stream")
+        lines = list(response.iter_lines())
+    assert not [line for line in lines if line.startswith(("id:", "retry:", ": ts-seq"))]
+    payloads = [line[len("data: "):] for line in lines if line.startswith("data: ")]
+    import json
+
+    types = [json.loads(p).get("type") for p in payloads if p.strip() and p.strip() != "[DONE]"]
+    assert types and types[-1] == "transcript.text.done", types

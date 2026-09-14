@@ -1,15 +1,14 @@
 import type { DocPage } from '../types';
 import { API_BASE_URL, MODEL_ID, EXAMPLE_STATUS } from '../samples';
+import { NO_TIMEOUT_LIVE } from './longOutput';
 
-export const idempotency: DocPage = {
-  slug: 'idempotency',
-  title: 'Idempotency',
-  summary:
-    'Retry a generation safely: the same key and the same body gives you the ' +
-    'original response instead of a second bill.',
-  section: 'API reference',
-  examples: EXAMPLE_STATUS,
-  body: `
+// 2026-09-13, no-timeout design (revision 2): a request that repeats a running
+// request's key no longer gets a 409 to come back later — it attaches to the
+// generation and receives its answer. Attaching is limited to the key that
+// created it (or its service account), and an SDK retry of an identical body
+// attaches even without a key. Built in either state from NO_TIMEOUT_LIVE.
+
+const INTRO = `
 A network timeout does not tell you whether the request landed. Without an
 idempotency key, a retry is a second generation: a second bill, a second
 answer, and — if a person is watching — a duplicate.
@@ -37,7 +36,8 @@ there is a \`400 invalid_request_error\` with \`param\` \`Idempotency-Key\`.
 Those calls store nothing a retry could be matched against, so a key would be
 a promise the server cannot keep — and they return the same result for the
 same input, so a plain retry is already safe.
-
+`;
+const S_THE_RULES = `
 ## The rules
 
 | You send | You get |
@@ -87,7 +87,8 @@ answering \`409\` until then. When a stream dropped or a background response
 failed with "The service restarted while this response was running.", retry
 with a **new** key. For work that long, prefer [background](/docs/background):
 its \`202\` hands you the response id straight away.
-
+`;
+const S_CHOOSING_A_KEY = `
 ## Choosing a key
 
 * One key per **logical operation**, not per attempt. Every retry of the same
@@ -111,7 +112,8 @@ def summarise(ticket_id: str, text: str, client):
         json={"model": "${MODEL_ID}", "input": text},
     ).json()
 ~~~
-
+`;
+const S_WHAT_IT_DOES_NOT_DO = `
 ## What it does not do
 
 * It does not make a **bad** request succeed. A \`400\` is a \`400\` again.
@@ -122,12 +124,99 @@ def summarise(ticket_id: str, text: str, client):
 * It is not needed for \`GET\` or for
   [cancellation](/docs/responses#cancel-one), which is idempotent by
   construction.
-
+`;
+const S_PAIRING_IT_WITH_BACKGROUND_WORK = `
 ## Pairing it with background work
 
 A [background response](/docs/background) plus an idempotency key is the
 sturdy combination for anything expensive: the \`202\` is durable before the
 work starts, and a retry after a dropped connection returns the same response
 id rather than starting the job again.
-`.trim(),
-};
+`;
+
+// ------------------------------------------------ after the no-timeout release --
+
+const LATER_THE_RULES = `
+## The rules
+
+| You send | You get |
+| --- | --- |
+| A new key | The request runs normally. |
+| The same key and body **while the first request is still running** | Your request **attaches** to it. A synchronous call waits for the same answer; a stream replays from its first event and then follows live; a background request gets the \`202\` with the response as it stands. The model runs once. |
+| The same key and body, after the original finished | A replay of the original, in the original's shape, with its id, \`status\` and \`usage\`. The model is not invoked twice. |
+| The same key and body, after the original **failed** or was **refused before it ran** — a \`503\`, say | Nothing to replay: the key is released, and your retry runs. |
+| The same key, a **different** body | \`409 idempotency_conflict\` with \`x-should-retry: false\`: retrying will never succeed. |
+| The same key, sent with a **different API key** that is not of the same service account | \`409 idempotency_conflict\` with \`x-should-retry: false\`. A key is never a way to read another credential's answer. |
+| A key that is empty, longer than 255 characters, or not printable ASCII | \`400 invalid_request_error\` with \`param\` \`Idempotency-Key\` — never silently treated as "no key". |
+
+Keys are scoped to your project and the endpoint, and are retained for
+**24 hours**. After that the same key is simply a new one.
+
+**What a replay gives back.** A replay while the original's stream events are
+still kept — as it runs, and for one hour after it ends — carries the text: a
+Responses body, a \`chat.completion\`, or the stream replayed chunk for chunk.
+After that it is rebuilt from the stored record, and only a
+[background response](/docs/background) stores its output, so a later replay of
+a synchronous or streamed request tells you that it ran and what it cost, with
+an empty \`output\` or a \`null\` message \`content\`. A replay is still a
+request: it is recorded in the project's [usage](/docs/usage) like any other.
+
+The conflict case is the important one. A key is a promise that two requests
+are the same request; if the body differs, one of them is a mistake, and
+guessing which would be worse than refusing.
+
+**Long generations attach for as long as they run.** A retry an hour into a
+four-hour generation joins it and receives the rest; it does not start a second
+one, and there is no lease after which a running request's key is handed over.
+
+**Retries without a key.** The \`openai\` client libraries mark their own
+automatic retries. When one arrives from the same API key with a byte-identical
+body, for a request that lost its client or was paused by a restart less than
+an hour ago, it attaches too. Your own retry loop is not marked, and a body
+that differs by one byte is a new request — so send a key whenever a duplicate
+would cost you.
+`;
+const LATER_WHAT_IT_DOES_NOT_DO = `
+## What it does not do
+
+* It does not make a **bad** request succeed. A \`400\` is a \`400\` again.
+* It does not span projects, endpoints or credentials: the same string on
+  \`/v1/chat/completions\` is a different claim from the one on
+  \`/v1/responses\`, and another key cannot use it to attach.
+* It does not last forever. Past 24 hours, retry semantics are gone.
+* It is not needed for \`GET\` or for
+  [cancellation](/docs/responses#cancel-one), which is idempotent by
+  construction.
+`;
+const LATER_PAIRING_IT_WITH_BACKGROUND_WORK = `
+## Pairing it with background work
+
+A [background response](/docs/background) plus an idempotency key is the
+sturdy combination for anything expensive: the \`202\` is durable before the
+work starts, a retry after a dropped connection returns the same response id,
+and the job carries on through a restart of the service.
+`;
+
+/** The page before (`noTimeout: false`) or after the no-timeout release. */
+export function idempotencyPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+  const sections = noTimeout
+    ? [INTRO, LATER_THE_RULES, S_CHOOSING_A_KEY, LATER_WHAT_IT_DOES_NOT_DO, LATER_PAIRING_IT_WITH_BACKGROUND_WORK]
+    : [INTRO, S_THE_RULES, S_CHOOSING_A_KEY, S_WHAT_IT_DOES_NOT_DO, S_PAIRING_IT_WITH_BACKGROUND_WORK];
+  return {
+    slug: 'idempotency',
+    title: 'Idempotency',
+    summary: noTimeout
+      ? 'Retry a generation safely: the same key and the same body joins the ' +
+        'running request, or replays the finished one, instead of a second bill.'
+      : 'Retry a generation safely: the same key and the same body gives you the ' +
+      'original response instead of a second bill.',
+    section: 'API reference',
+    examples: EXAMPLE_STATUS,
+    body: sections
+      .map((section) => section.trim())
+      .filter((section) => section !== '')
+      .join('\n\n'),
+  };
+}
+
+export const idempotency: DocPage = idempotencyPage({ noTimeout: NO_TIMEOUT_LIVE });

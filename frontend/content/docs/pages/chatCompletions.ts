@@ -6,23 +6,22 @@ import {
   OCR_MODEL_ID,
   VISION_MODEL_ID,
 } from '../samples';
+import { NO_TIMEOUT_LIVE } from './longOutput';
 
-export const chatCompletions: DocPage = {
-  slug: 'chat-completions',
-  title: 'Chat Completions compatibility',
-  summary:
-    'A deliberately compatible endpoint so an existing client can point at ' +
-    'this platform with a base-URL change.',
-  section: 'API reference',
-  examples: EXAMPLE_STATUS,
-  body: `
+// 2026-09-13, no-timeout design (revision 2): `store` is accepted, a stream
+// shows its waits as `: queued` comments, a synchronous failure after the
+// early 200 is `choices: []` with an error, and a retry with the same key
+// replays the stream. Built in either state from NO_TIMEOUT_LIVE.
+
+const INTRO = `
 ~~~http
 POST /v1/chat/completions
 ~~~
 
 Requires the \`responses.write\` scope. Same engine, same limits, same error
 envelope, same idempotency rules as [\`/v1/responses\`](/docs/responses).
-
+`;
+const S_WHY_IT_EXISTS = `
 ## Why it exists
 
 \`/v1/chat/completions\` accepts the widely used chat-completions request
@@ -37,7 +36,8 @@ is written down here, in plain words, rather than left for you to discover.
 
 **Build new work against [the Responses API](/docs/responses).** It is the
 surface this platform develops; compatibility is for code you already have.
-
+`;
+const S_THE_FIELDS_THIS_ENDPOINT_ACCEPTS = `
 ## The fields this endpoint accepts
 
 | Field | Notes |
@@ -57,7 +57,8 @@ for an unknown key inside \`stream_options\`.
 There is no \`background\` here: background work is a
 [Responses](/docs/background) feature, and this endpoint has no shape to
 express it.
-
+`;
+const S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT = `
 ## What is different, and will be different
 
 * **Unsupported parameters are rejected, not ignored.** The rule holds
@@ -77,7 +78,8 @@ express it.
 * **No tools.** See [tool calling](/docs/tools).
 * **Errors are TechSara's envelope.** \`code\`, \`type\`, \`param\`,
   \`request_id\` — see [errors](/docs/errors).
-
+`;
+const S_A_REQUEST = `
 ## A request
 
 ~~~bash
@@ -94,7 +96,8 @@ curl ${API_BASE_URL}/chat/completions \\
     ]
   }'
 ~~~
-
+`;
+const S_THE_RESPONSE = `
 ## The response
 
 ~~~json
@@ -118,7 +121,8 @@ curl ${API_BASE_URL}/chat/completions \\
 \`usage\` keeps the older \`prompt_tokens\` / \`completion_tokens\` names
 here, because that is what a client of this shape reads. It is still
 \`null\` — never \`0\` — when the engine reported no counts.
-
+`;
+const S_STREAMING = `
 ## Streaming
 
 Set \`"stream": true\`. This endpoint uses the chat-completions streaming
@@ -162,16 +166,108 @@ A heartbeat comment (\`: ping\`) goes out at least every 15 seconds while the
 model is quiet — for the whole of a long answer, hours if need be — so an idle
 proxy does not close the connection. Every conforming SSE parser drops comments;
 if you wrote your own, drop them too.
-
+`;
+const S_IDEMPOTENCY = `
 ## Idempotency
 
 \`Idempotency-Key\` works here exactly as it does on \`/v1/responses\`. See
 [idempotency](/docs/idempotency).
-
+`;
+const S_MIGRATING = `
 ## Migrating
 
 [Migration and compatibility](/docs/migration) is the page-by-page version of
 this list, including what to change in an OpenAI-shaped client and what to
 expect the first time it refuses a parameter.
-`.trim(),
-};
+`;
+
+// ------------------------------------------------ after the no-timeout release --
+
+const LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS = `
+## The fields this endpoint accepts
+
+| Field | Notes |
+| --- | --- |
+| \`model\` | Required. \`${MODEL_ID}\`, \`${VISION_MODEL_ID}\` or \`${OCR_MODEL_ID}\`. |
+| \`messages\` | Required. \`{role, content}\` turns; \`role\` is \`system\`, \`user\` or \`assistant\` and \`content\` is a string — or, on a \`user\` turn, a list of \`text\` and \`image_url\` parts (see [images](/docs/images)). |
+| \`stream\` | Optional. See below. |
+| \`store\` | Optional, default \`true\`. \`false\` keeps nothing while the request runs: it is then cancelled when its client disconnects, and a restart of the service ends it. |
+| \`max_tokens\` | Optional. The older spelling of \`max_output_tokens\`, and mapped to it — up to the model's ceiling, clamped to what the prompt leaves in the window. |
+| \`max_completion_tokens\` | Optional. The newer spelling of the same thing. Send one or the other; both at once is a \`400\`. |
+| \`temperature\` | Optional, \`0.0\`–\`2.0\`. |
+| \`stream_options\` | Optional, and only \`{"include_usage": true}\`. |
+
+That is the complete list. **Any other field is a \`400\`** —
+\`"Unsupported field: top_p."\`, with the field in \`param\`. The same goes
+for an unknown key inside \`stream_options\`.
+
+There is no \`background\` here: background work is a
+[Responses](/docs/background) feature, and this endpoint has no shape to
+express it.
+`;
+const LATER_THE_RESPONSE = `
+## The response
+
+~~~json
+{
+  "id": "chatcmpl_…",
+  "object": "chat.completion",
+  "created": 1789200000,
+  "model": "${MODEL_ID}",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "…" },
+      "finish_reason": "stop"
+    }
+  ],
+  "max_output_tokens": 8192,
+  "usage": { "prompt_tokens": 37, "completion_tokens": 112, "total_tokens": 149 }
+}
+~~~
+
+\`usage\` keeps the older \`prompt_tokens\` / \`completion_tokens\` names
+here, because that is what a client of this shape reads. It is still
+\`null\` — never \`0\` — when the engine reported no counts.
+
+A request that runs longer than 15 seconds gets its \`200\` early, followed by
+spaces and then this object — and if it fails after that \`200\`, the object has
+\`"choices": []\` and an \`error\` carrying the code. Check \`choices\` before you
+read the answer. See [long synchronous calls](/docs/timeouts#long-synchronous-calls).
+`;
+const LATER_IDEMPOTENCY = `
+## Idempotency
+
+\`Idempotency-Key\` works here as it does on \`/v1/responses\`. A retry with the
+same key and body joins the request: a synchronous retry receives the same
+completion, and a streamed retry **replays the stream from its first chunk**,
+with the same completion id, and then continues live to \`[DONE]\`. That is how
+a broken Chat Completions stream is resumed — there is no response id to resume
+from. See [idempotency](/docs/idempotency) and
+[timeouts](/docs/timeouts#resuming-a-stream).
+
+While the request waits for its engine, the stream carries \`: queued\` comments
+instead of chunks; like \`: ping\`, every conforming SSE parser drops them.
+`;
+
+/** The page before (`noTimeout: false`) or after the no-timeout release. */
+export function chatCompletionsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+  const sections = noTimeout
+    ? [INTRO, S_WHY_IT_EXISTS, LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS, S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT, S_A_REQUEST, LATER_THE_RESPONSE, S_STREAMING, LATER_IDEMPOTENCY, S_MIGRATING]
+    : [INTRO, S_WHY_IT_EXISTS, S_THE_FIELDS_THIS_ENDPOINT_ACCEPTS, S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT, S_A_REQUEST, S_THE_RESPONSE, S_STREAMING, S_IDEMPOTENCY, S_MIGRATING];
+  return {
+    slug: 'chat-completions',
+    title: 'Chat Completions compatibility',
+    summary:
+      'A deliberately compatible endpoint so an existing client can point at ' +
+      'this platform with a base-URL change.',
+    section: 'API reference',
+    examples: EXAMPLE_STATUS,
+    body: sections
+      .map((section) => section.trim())
+      .filter((section) => section !== '')
+      .join('\n\n'),
+  };
+}
+
+export const chatCompletions: DocPage = chatCompletionsPage({ noTimeout: NO_TIMEOUT_LIVE });

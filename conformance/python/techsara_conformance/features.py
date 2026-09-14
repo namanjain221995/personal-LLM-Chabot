@@ -81,6 +81,22 @@ def _response_description_has(path: str, method: str, status: str, needle: str) 
     return detect
 
 
+def _query_param(path_pattern: str, method: str, param: str) -> Detector:
+    regex = re.compile(path_pattern)
+
+    def detect(doc: Mapping[str, Any], _text: str) -> Tuple[bool, str]:
+        for path, ops in (doc.get("paths") or {}).items():
+            if not regex.fullmatch(path):
+                continue
+            op = (ops or {}).get(method) or {}
+            names = {str(p.get("name")) for p in (op.get("parameters") or []) if isinstance(p, Mapping)}
+            if param in names:
+                return True, f"{method.upper()} {path} declares the query parameter `{param}`"
+        return False, f"no {method.upper()} {path_pattern} with a `{param}` parameter in /v1/openapi.json"
+
+    return detect
+
+
 def _no_429_anywhere(doc: Mapping[str, Any], _text: str) -> Tuple[bool, str]:
     offenders = [
         f"{method.upper()} {path}"
@@ -126,6 +142,24 @@ FEATURES: Dict[str, Feature] = {
             "chat.completions accepts max_completion_tokens as an alias of max_tokens",
             "CONTRACT-3 §8.2",
             _schema_has("ChatCompletionRequest", "max_completion_tokens"),
+        ),
+        # 2026-09-13, no-timeout design revision 2. The release adds `store`
+        # to both request schemas and the resume query parameters to
+        # GET /v1/responses/{id} in one change; `store` is the evidence for the
+        # behaviour a schema cannot declare (the 15 s commit, attach on retry,
+        # capacity waits that never refuse), so those tests share it.
+        Feature(
+            "no_timeouts",
+            "no server timeouts: a byte within 15 s and every 15 s, sync commit with whitespace, attach on retry, "
+            "capacity waits that never refuse, store on both dialects",
+            "CONTRACT-3 §8.1, §10.1, §12.3, §13",
+            _schema_has("ResponsesRequest", "store"),
+        ),
+        Feature(
+            "resumable_streams",
+            "GET /v1/responses/{id}?stream=true&starting_after=N replays and tails a response for its creating key",
+            "CONTRACT-3 §10.3",
+            _query_param(r"/v1/responses/\{[^}/]+\}", "get", "starting_after"),
         ),
         Feature(
             "idempotency_in_flight_409",

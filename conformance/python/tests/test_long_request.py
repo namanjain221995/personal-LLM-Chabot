@@ -15,9 +15,13 @@ from __future__ import annotations
 
 import time
 
+import httpx
+import openai
 import pytest
 
 from techsara_conformance import sse
+
+import json
 
 
 def counting_prompt(tokens: int) -> str:
@@ -91,3 +95,53 @@ def test_a_long_synchronous_request_with_timeout_none_completes_with_its_usage(m
         f"sync {response.usage.output_tokens} tokens in {elapsed:.1f} s; through a proxy with a 100 s origin timeout "
         "a synchronous request this long must be stream or background (§8.3)"
     )
+
+
+# --------------------------------------------------------------------------
+# 2026-09-13, no-timeout design revision 2: the byte invariant (CONTRACT-3
+# §10.1). A synchronous request no longer has to finish before a proxy's
+# first-byte timeout: after PUBLIC_API_SYNC_COMMIT_S (15 s) the API commits a
+# 200 and writes a space every 15 s until the JSON object is ready.
+
+COMMIT_S = 15.0
+
+
+@pytest.mark.long
+@pytest.mark.feature("no_timeouts")
+def test_a_synchronous_request_longer_than_the_commit_sends_its_first_byte_within_15_s_and_spaces_until_the_body(raw, target, note):
+    tokens = max(3000, target.long_output_tokens)
+    body = {"model": target.models["chat"], "input": counting_prompt(tokens), "max_output_tokens": tokens, "temperature": 0}
+    started = time.monotonic()
+    arrivals = []
+    chunks = []
+    with raw.stream("POST", "responses", json=body, timeout=httpx.Timeout(30.0, read=None)) as response:
+        headers_at = time.monotonic()
+        for chunk in response.iter_bytes():
+            arrivals.append(time.monotonic())
+            chunks.append(chunk)
+    ended = time.monotonic()
+    payload = b"".join(chunks)
+    elapsed = ended - started
+    if elapsed <= COMMIT_S:
+        pytest.skip(f"answered in {elapsed:.1f} s, inside the commit interval; raise TECHSARA_LONG_OUTPUT_TOKENS")
+    assert response.status_code == 200
+    assert arrivals and arrivals[0] - started <= COMMIT_S + SLACK_S, (
+        f"first body byte after {arrivals[0] - started:.1f} s; §10.1 owes one within {COMMIT_S:g} s"
+    )
+    gaps = [b - a for a, b in zip([headers_at, *arrivals], [*arrivals, ended])]
+    assert max(gaps) <= HEARTBEAT_S + SLACK_S, f"{max(gaps):.1f} s without a byte"
+    assert payload[:1] == b" ", "a committed body starts with the keepalive space"
+    parsed = json.loads(payload)
+    assert parsed["object"] == "response" and parsed["status"] in ("completed", "failed"), parsed.get("status")
+    note(f"{elapsed:.0f} s synchronous call; first byte after {arrivals[0] - started:.1f} s; {len(payload) - len(payload.lstrip())} leading spaces")
+
+
+@pytest.mark.long
+@pytest.mark.feature("no_timeouts")
+def test_openai_python_with_its_defaults_parses_a_committed_synchronous_body(make_client, target):
+    tokens = max(3000, target.long_output_tokens)
+    client = make_client(timeout=openai.Timeout(600.0, connect=5.0))
+    response = client.responses.create(
+        model=target.models["chat"], input=counting_prompt(tokens), max_output_tokens=tokens, temperature=0
+    )
+    assert response.status == "completed", f"{response.status}: {response.error!r}"

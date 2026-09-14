@@ -1,20 +1,22 @@
 import type { DocPage } from '../types';
 import {
+  DEPLOYS_HELD,
   EXAMPLE_STATUS,
   LONG_OUTPUT_WALL_CLOCK_LIVE,
   WALL_CLOCK_PENDING_NOTE,
 } from '../samples';
+import { NO_TIMEOUT_LIVE } from './longOutput';
 
-export const changelog: DocPage = {
-  slug: 'changelog',
-  title: 'Changelog',
-  summary: 'What changed on the developer platform, newest first.',
-  section: 'Reference',
-  examples: EXAMPLE_STATUS,
-  body: `
+// 2026-09-13, no-timeout design (revision 2): the entry for the release is
+// listed only once the release is live (NO_TIMEOUT_LIVE), newest first — a
+// changelog entry for a change the running API does not have would be the
+// stale claim this site's switches exist to prevent.
+
+const INTRO = `
 Dates are the date of the change in this repository. Anything that alters
 behaviour on \`/v1\` appears here.
-
+`;
+const S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00 = `
 ## 2026-09-13 — every model on the API, and answers up to 1,000,000 tokens
 
 * **Six models instead of one.** \`/v1\` now offers every model TechSara runs:
@@ -67,7 +69,8 @@ ${LONG_OUTPUT_WALL_CLOCK_LIVE ? `* **The per-request wall clock is live.** A \`t
 * **Examples are still marked as not executed.** The new pages and examples have
   not been run against a running deployment yet; the notice on every page says
   so.
-
+`;
+const S_2026_09_13_USAGE_LIMITS_REMOVED = `
 ## 2026-09-13 — usage limits removed
 
 * **The API no longer enforces any usage limit, by decision.** There is no
@@ -99,7 +102,8 @@ ${LONG_OUTPUT_WALL_CLOCK_LIVE ? `* **The per-request wall clock is live.** A \`t
   decision — the \`curl -i\` sample no longer shows \`RateLimit\` headers —
   so the run recorded below no longer covers what the pages say. The notice
   on every page changes back when the examples have been run again.
-
+`;
+const S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES = `
 ## 2026-09-13 — the first end-to-end run of the examples
 
 * Every runnable example on these pages was executed against a running
@@ -115,7 +119,8 @@ ${LONG_OUTPUT_WALL_CLOCK_LIVE ? `* **The per-request wall clock is live.** A \`t
 * Signed webhook delivery was checked against the signing code, not end to
   end: the SSRF guard correctly refuses a local receiver, and the run had no
   public HTTPS receiver.
-
+`;
+const S_2026_09_13_DOCUMENTATION = `
 ## 2026-09-13 — documentation
 
 * This documentation site published at \`/docs\`: quickstart,
@@ -149,7 +154,8 @@ ${LONG_OUTPUT_WALL_CLOCK_LIVE ? `* **The per-request wall clock is live.** A \`t
 * Documentation keys (\`tsk_live_0123456789abcdef_…\`) are deliberately
   invalid: the shape is perfect and the checksum is wrong, so pasting one
   gives a clean \`401\` rather than anything that looks like it might work.
-
+`;
+const S_EARLIER_THE_PLATFORM_BEING_BUILT = `
 ## Earlier — the platform being built
 
 The developer platform was built against a written contract: the API-key
@@ -158,7 +164,8 @@ service accounts, keys, responses, idempotency, usage counters and webhook
 endpoints, the public request and response models, the error envelope, the
 SSE grammar, the model registry, and then the \`/v1\` routes and the developer
 console on top of them.
-
+`;
+const S_HOW_TO_WATCH_FOR_CHANGES = `
 ## How to watch for changes
 
 * \`GET /v1/openapi.json\` is the machine-readable surface. Diff it between
@@ -166,5 +173,93 @@ console on top of them.
 * [Migration and compatibility](/docs/migration) states what may change
   inside \`/v1\` without notice — new optional fields, new events, new model
   ids — and how to write a client that does not mind.
-`.trim(),
-};
+`;
+
+// ------------------------------------------------ after the no-timeout release --
+
+// 2026-09-14, review: the heading and every bullet stay true whether or not a
+// run through the public URL has proved deploys are held (DEPLOYS_HELD,
+// samples.ts); only the sentences about a connected client depend on it. The
+// heading does not, so its anchor never moves when the probe is recorded.
+const laterPre0 = (deploysHeld: boolean): string => `
+## 2026-09-13 — no timeouts, resumable streams, and generations that outlive our deploys
+
+* **There are no server timeouts on \`/v1\`.** No request is ended because it has
+  run for a long time: the per-generation wall clock is gone, and so is the
+  30-second wait for capacity. After authentication a response sends its first
+  byte within 15 seconds and another at least every 15 seconds — a \`: ping\` on
+  a stream, a space before a synchronous JSON body — so no proxy between you and
+  the API closes it. See [timeouts](/docs/timeouts).
+* **A synchronous call that runs past 15 seconds gets its \`200\` early.** The
+  JSON follows after leading spaces, and a failure after that point is in the
+  body: \`"status": "failed"\` on \`/v1/responses\`, \`"choices": []\` with an
+  \`error\` on \`/v1/chat/completions\`. Check the body, not only the status.
+  A \`response_format=text\` transcript can start with those spaces: strip it.
+* **Busy is never an error.** A request that has to wait for an engine waits —
+  \`response.queued\` and heartbeats, \`: queued\` comments, or spaces — however
+  long it takes. \`503\` now means only an engine that is down or restarting, or a
+  physical safeguard of the service, with a \`Retry-After\` of 60 seconds or less.
+${deploysHeld
+  ? `* **Deploys no longer interrupt you.** Generations are written ahead as they run
+  and continue after a restart of the service from where they stopped, and a
+  connected client is held while the service restarts. Background jobs no longer
+  fail with "The service restarted while this response was running."`
+  : `* **Deploys no longer end your work.** Generations are written ahead as they run
+  and continue after a restart of the service from where they stopped. A deploy
+  on our side can still close a connected client's connection: resuming the
+  stream, or retrying with the same \`Idempotency-Key\`, picks the generation up.
+  Background jobs no longer fail with "The service restarted while this response
+  was running."`}
+* **Streams can be resumed.** \`GET /v1/responses/{id}?stream=true&starting_after=N\`
+  replays a response's events after sequence number \`N\` and follows it live —
+  for the key that created it, while it runs and for one hour after. On Chat
+  Completions, a retry with the same \`Idempotency-Key\` replays the stream.
+* **Retries join the request instead of repeating it.** The same
+  \`Idempotency-Key\` and body attaches to a running request rather than
+  answering \`409\`; a \`409\` now means a different body or a different
+  credential, with \`x-should-retry: false\`. The \`openai\` packages' own retries
+  of an identical request attach even without a key.
+* **New on the wire**: \`stream\` together with \`background\`; \`store\` on both
+  generation endpoints (\`false\` opts out of being written down, and so out of
+  resuming); the \`response.output_item.added\`, \`response.content_part.added\`,
+  \`response.content_part.done\` and \`response.output_item.done\` events; and
+  the \`x-should-retry\` header.
+* **Larger requests where the size is only shape**: embeddings take up to 2,048
+  inputs and rerank up to 1,000 documents, in a body of up to 8 MiB.
+  Transcription has no duration limit, takes up to 89 MiB of audio in one request,
+  and accepts \`stream\`.
+* **What still ends a request** — the engine proven down for 30 minutes, three
+  attempts without progress, the same request in two engine crashes, a revoked
+  key, ${deploysHeld ? 'our service unreachable for 30 minutes' : 'our service unreachable for longer than your client retries'}, or a client that disconnects and
+  does not return — is listed in [timeouts](/docs/timeouts#what-still-ends-a-request).
+* **Client settings.** Python: \`timeout=Timeout(None, connect=10.0)\` — never
+  \`0\`. Node: \`timeout: 2_147_483_647\` — never \`0\` or \`Infinity\`, and note
+  that from version 7.5 it covers a whole non-streamed call. Both: an
+  \`Idempotency-Key\` per generation call.
+`;
+
+/** The page before (`noTimeout: false`) or after the no-timeout release. */
+export function changelogPage({
+  noTimeout,
+  deploysHeld = DEPLOYS_HELD,
+}: {
+  noTimeout: boolean;
+  deploysHeld?: boolean;
+}): DocPage {
+  const sections = noTimeout
+    ? [INTRO, laterPre0(deploysHeld), S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00, S_2026_09_13_USAGE_LIMITS_REMOVED, S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES, S_2026_09_13_DOCUMENTATION, S_EARLIER_THE_PLATFORM_BEING_BUILT, S_HOW_TO_WATCH_FOR_CHANGES]
+    : [INTRO, S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00, S_2026_09_13_USAGE_LIMITS_REMOVED, S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES, S_2026_09_13_DOCUMENTATION, S_EARLIER_THE_PLATFORM_BEING_BUILT, S_HOW_TO_WATCH_FOR_CHANGES];
+  return {
+    slug: 'changelog',
+    title: 'Changelog',
+    summary: 'What changed on the developer platform, newest first.',
+    section: 'Reference',
+    examples: EXAMPLE_STATUS,
+    body: sections
+      .map((section) => section.trim())
+      .filter((section) => section !== '')
+      .join('\n\n'),
+  };
+}
+
+export const changelog: DocPage = changelogPage({ noTimeout: NO_TIMEOUT_LIVE });

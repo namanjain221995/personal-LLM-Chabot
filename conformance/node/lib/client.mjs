@@ -35,16 +35,26 @@ async function pace() {
 export const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
- * A client with no CLIENT-side timer: the SDK timer at its ceiling, AND undici's
- * own headers/body timeouts (300 s each by default in Node's built-in fetch)
- * turned off through a matching undici `fetch` + `Agent`. Setting only
+ * The client the documentation teaches (/docs/timeouts, 2026-09-13, no-timeout
+ * design revision 2): the SDK timer at its ceiling and five retries, nothing
+ * else. Against a no-timeout stack that is enough: the API writes a byte at least
+ * every 15 s (CONTRACT-3 §10.1), which resets undici's 300 s header and body
+ * timers in the caller's own process, and a retry of a running request attaches
+ * to it (§13).
+ */
+export function documentedClientOptions() {
+  return { timeout: MAX_TIMER_MS, maxRetries: 5 };
+}
+
+/**
+ * A client with no CLIENT-side timer at all: the SDK timer at its ceiling, AND
+ * undici's own headers/body timeouts (300 s each by default in Node's built-in
+ * fetch) turned off through a matching undici `fetch` + `Agent`. Setting only
  * `timeout` leaves the 300 s headers timeout in place.
  *
- * WHAT IT IS FOR (2026-09-13, review): long STREAMS, and synchronous calls to a
- * self-hosted origin reached directly. It does not make a long synchronous call
- * work through the public hostname — Cloudflare answers 524 after 100 s with no
- * byte (CONTRACT-3 §8.3); use `stream: true` or `background: true` with an
- * Idempotency-Key there.
+ * WHAT IT IS FOR: a caller behind a proxy of its own that goes silent, and a
+ * stack from before the no-timeout release, where a synchronous response sends
+ * no byte until it is done. The documentation recommends it only for the first.
  */
 export function noTimeoutOptions() {
   return {

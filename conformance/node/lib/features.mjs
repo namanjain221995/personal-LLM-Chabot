@@ -12,9 +12,30 @@
 //   CONFORMANCE_BUILT_FEATURES=embeddings,rerank npm test
 import { it } from 'node:test';
 import { env } from './env.mjs';
-import { FEATURES } from './feature-list.mjs';
+import { FEATURES as LISTED } from './feature-list.mjs';
 
-export { FEATURES };
+/**
+ * The no-timeout release (2026-09-13, design revision 2). Planned until a stack
+ * ships it; promote per run with CONFORMANCE_BUILT_FEATURES=no-timeouts,resumable-streams.
+ * Kept here rather than in feature-list.mjs because provisioning needs no new
+ * scope for them: both use responses.read / responses.write.
+ */
+const NO_TIMEOUT_FEATURES = {
+  'no-timeouts': {
+    status: 'planned',
+    scopes: ['responses.write'],
+    contract: 'CONTRACT-3 §10.1, §12.3, §13',
+    what: 'a byte within 15 s and every 15 s, a committed synchronous body with leading whitespace, attach on retry, capacity waits that never refuse',
+  },
+  'resumable-streams': {
+    status: 'planned',
+    scopes: ['responses.read', 'responses.write'],
+    contract: 'CONTRACT-3 §10.3',
+    what: 'GET /v1/responses/{id}?stream=true&starting_after=N replays and tails a response for its creating key',
+  },
+};
+
+export const FEATURES = { ...LISTED, ...NO_TIMEOUT_FEATURES };
 
 /**
  * Thrown by an `itPlanned` body to end as SKIP with a reason (a plain `it`

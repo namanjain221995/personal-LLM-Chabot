@@ -6,14 +6,16 @@ import {
   MODEL_ID,
   EXAMPLE_STATUS,
 } from '../samples';
+import { NO_TIMEOUT_LIVE } from './longOutput';
 
-export const quickstart: DocPage = {
-  slug: 'quickstart',
-  title: 'Quickstart',
-  summary: 'From an empty terminal to a generated answer, in four steps.',
-  section: 'Getting started',
-  examples: EXAMPLE_STATUS,
-  body: `
+// 2026-09-13, no-timeout design (revision 2): the first example no longer
+// teaches a client timeout that a long request would hit. Built in either
+// state from NO_TIMEOUT_LIVE.
+
+const INTRO = `
+
+`;
+const S_1_CREATE_A_PROJECT_AND_A_KEY = `
 ## 1. Create a project and a key
 
 Keys are created in the developer console at [\`${CONSOLE_PATH}\`](${CONSOLE_PATH}),
@@ -29,7 +31,8 @@ Choose a **test** key (\`tsk_test_…\`) while you are building and a **live**
 key (\`tsk_live_…\`) when you ship. The prefix is the difference, so a human
 reading a config file and a secret scanner reading a repository can both tell
 at a glance which one leaked.
-
+`;
+const S_2_PUT_THE_KEY_IN_THE_ENVIRONMENT = `
 ## 2. Put the key in the environment
 
 The secret is shown **once**, at creation. It is stored as a keyed digest and
@@ -46,7 +49,8 @@ literal text \`EXAMPL\`, so the platform rejects it offline with
 Never put a live key in a browser bundle, a mobile app, a public repository or
 a client-side environment variable. See
 [API-key security](/docs/key-security).
-
+`;
+const S_3_ASK_FOR_SOMETHING = `
 ## 3. Ask for something
 
 ~~~bash
@@ -84,7 +88,8 @@ The answer comes back in the response envelope:
 \`usage\` is \`null\` — never \`0\` — when the engine did not report counts.
 \`max_output_tokens\` is the output ceiling applied — 8,192 when you do not ask.
 Zero would be a lie, and an under-charge.
-
+`;
+const S_4_DO_IT_FROM_YOUR_LANGUAGE = `
 ## 4. Do it from your language
 
 ~~~python
@@ -130,7 +135,8 @@ console.log(body.output[0].content[0].text);
 Generation takes as long as generation takes. Set a client timeout in
 minutes, not seconds, or [stream](/docs/streaming) so you see the first token
 immediately.
-
+`;
+const S_WHERE_TO_GO_NEXT = `
 ## Where to go next
 
 * [The Responses API](/docs/responses) — every field, and every rule it is
@@ -140,5 +146,75 @@ immediately.
 * [The model reference](/docs/models) — the other five models: vision, OCR,
   embeddings, reranking and speech to text.
 * [Errors](/docs/errors) — the codes, and which of them are safe to retry.
-`.trim(),
-};
+`;
+
+// ------------------------------------------------ after the no-timeout release --
+
+const LATER_4_DO_IT_FROM_YOUR_LANGUAGE = `
+## 4. Do it from your language
+
+~~~python
+import os
+import httpx
+
+response = httpx.post(
+    "${API_BASE_URL}/responses",
+    headers={"Authorization": f"Bearer {os.environ['TECHSARA_API_KEY']}"},
+    json={
+        "model": "${MODEL_ID}",
+        "input": "Explain retrieval-augmented generation in two sentences.",
+    },
+    timeout=httpx.Timeout(10.0, read=None),
+)
+response.raise_for_status()
+answer = response.json()["output"][0]["content"][0]["text"]
+print(answer)
+~~~
+
+~~~typescript
+const response = await fetch("${API_BASE_URL}/responses", {
+  method: "POST",
+  headers: {
+    Authorization: \`Bearer \${process.env.TECHSARA_API_KEY}\`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    model: "${MODEL_ID}",
+    input: "Explain retrieval-augmented generation in two sentences.",
+  }),
+});
+
+if (!response.ok) {
+  const { error } = await response.json();
+  throw new Error(\`\${error.code}: \${error.message}\`);
+}
+
+const body = await response.json();
+console.log(body.output[0].content[0].text);
+~~~
+
+Generation takes as long as generation takes, and the API has no timeout of its
+own: leave your client's read timeout off, and [stream](/docs/streaming) so you
+see the first token immediately. [Timeouts](/docs/timeouts) has the settings for
+the \`openai\` packages.
+`;
+
+/** The page before (`noTimeout: false`) or after the no-timeout release. */
+export function quickstartPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+  const sections = noTimeout
+    ? [INTRO, S_1_CREATE_A_PROJECT_AND_A_KEY, S_2_PUT_THE_KEY_IN_THE_ENVIRONMENT, S_3_ASK_FOR_SOMETHING, LATER_4_DO_IT_FROM_YOUR_LANGUAGE, S_WHERE_TO_GO_NEXT]
+    : [INTRO, S_1_CREATE_A_PROJECT_AND_A_KEY, S_2_PUT_THE_KEY_IN_THE_ENVIRONMENT, S_3_ASK_FOR_SOMETHING, S_4_DO_IT_FROM_YOUR_LANGUAGE, S_WHERE_TO_GO_NEXT];
+  return {
+    slug: 'quickstart',
+    title: 'Quickstart',
+    summary: 'From an empty terminal to a generated answer, in four steps.',
+    section: 'Getting started',
+    examples: EXAMPLE_STATUS,
+    body: sections
+      .map((section) => section.trim())
+      .filter((section) => section !== '')
+      .join('\n\n'),
+  };
+}
+
+export const quickstart: DocPage = quickstartPage({ noTimeout: NO_TIMEOUT_LIVE });

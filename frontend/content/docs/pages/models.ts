@@ -15,15 +15,17 @@ import {
 // reference. Every ceiling below is the registry's default on the current
 // deployment (CONTRACT §12.2); the page says, twice, to read them from
 // GET /v1/models instead, because they follow the engines.
-export const models: DocPage = {
-  slug: 'models',
-  title: 'Model reference',
-  summary:
-    'Six public models — chat, vision, OCR, embeddings, reranking and speech ' +
-    'to text — what each accepts, and why you should read its limits from the API.',
-  section: 'API reference',
-  examples: EXAMPLE_STATUS,
-  body: `
+import { NO_TIMEOUT_LIVE } from './longOutput';
+
+// 2026-09-13, no-timeout design (revision 2): the embeddings, rerank and
+// speech limits in the catalogue change with it — 2,048 inputs, 1,000
+// documents, audio of any length up to 89 MiB a request — and a capacity queue
+// no longer refuses. Built in either state from NO_TIMEOUT_LIVE.
+
+const INTRO = `
+
+`;
+const S_THE_CATALOGUE = `
 ## The catalogue
 
 ~~~bash
@@ -173,7 +175,8 @@ curl ${API_BASE_URL}/models/${MODEL_ID} \\
 A model you are not permitted to use answers \`404 model_not_found\`, not
 \`403\`. The API does not confirm the existence of something you may not
 reach.
-
+`;
+const S_THE_SIX_MODELS_AT_A_GLANCE = `
 ## The six models at a glance
 
 | Model | Kind | For | Endpoints |
@@ -189,7 +192,8 @@ Sending a model to an endpoint its kind does not serve is a \`400\` with
 \`param\` \`model\` — for example "The model \`${EMBED_MODEL_ID}\` does not
 support /v1/responses." — rather than a \`404\`: you are allowed to use the
 model, just not there.
-
+`;
+const S_MODEL_ID = `
 ### ${MODEL_ID}
 
 | Ceiling | Value |
@@ -205,7 +209,8 @@ hours to do it. Because input and output share the window, a large
 response tells you the value it applied. Read
 [long outputs](/docs/long-output) before asking for more than a few thousand
 tokens. It answers directly, with no separate reasoning phase on this API.
-
+`;
+const S_VISION_MODEL_ID = `
 ### ${VISION_MODEL_ID}
 
 | Ceiling | Value |
@@ -220,7 +225,8 @@ set to about half of what that engine can hold, so that no public request —
 however large — can take the room those turns need. It is a capacity decision
 on this deployment, not a limit of the model, and like every ceiling it is
 reported by the models endpoint, which is where a change would show first.
-
+`;
+const S_OCR_MODEL_ID = `
 ### ${OCR_MODEL_ID}
 
 | Ceiling | Value |
@@ -240,7 +246,8 @@ If you write your own prompt, test it on your documents first.
 The output clamp reserves a conservative 2,048 tokens per image, so a request
 with a long prompt can see a lower applied \`max_output_tokens\` than you
 might expect; the response always tells you the value it applied.
-
+`;
+const S_EMBED_MODEL_ID = `
 ### ${EMBED_MODEL_ID}
 
 | Ceiling | Value |
@@ -252,7 +259,8 @@ might expect; the response always tells you the value it applied.
 Text is embedded exactly as you send it. For search, the model does best when
 a **query** carries a one-line task description and documents do not — see
 [embeddings](/docs/embeddings#queries-and-documents).
-
+`;
+const S_RERANK_MODEL_ID = `
 ### ${RERANK_MODEL_ID}
 
 | Ceiling | Value |
@@ -262,7 +270,8 @@ a **query** carries a one-line task description and documents do not — see
 
 \`relevance_score\` is the model's probability, from 0 to 1, that the
 document answers the query. See [rerank](/docs/rerank).
-
+`;
+const S_WHISPER_MODEL_ID = `
 ### ${WHISPER_MODEL_ID}
 
 | Ceiling | Value |
@@ -276,7 +285,8 @@ Let it detect the language. Forcing \`language\` forces the language of the
 translation rather than a transcript. Accuracy varies by language, and some —
 Gujarati among them — are noticeably weaker and slower. See
 [audio transcriptions](/docs/audio-transcriptions).
-
+`;
+const S_THE_CAPABILITY_FLAGS = `
 ## The capability flags
 
 | Flag | What it means for your code |
@@ -294,7 +304,8 @@ Gujarati among them — are noticeably weaker and slower. See
 \`endpoints\` lists the paths a model serves, and \`limits\` carries the
 per-request limits that are not token counts. Write your client to ignore a
 flag or a limit it does not recognise: new ones are additive.
-
+`;
+const S_WHICH_MODELS_EXIST_AND_WHO_DECIDES = `
 ## Which models exist, and who decides
 
 The catalogue is declared in code and narrowed by configuration — never the
@@ -311,7 +322,8 @@ List the models first rather than assuming.
 
 Practically: if it is not in \`GET /v1/models\`, it does not exist for you,
 and the answer to "can you enable X for my key" is a review, not a toggle.
-
+`;
+const S_CHOOSING_A_MODEL_IN_A_REQUEST = `
 ## Choosing a model in a request
 
 ~~~json
@@ -321,7 +333,8 @@ and the answer to "can you enable X for my key" is a review, not a toggle.
 The id must be one your key may use. Your project can carry a model
 allowlist; if it is empty, every available public model is open to it —
 including models added later. If that is not what you want, set an allowlist.
-
+`;
+const S_LIMITS_ATTACHED_TO_A_MODEL = `
 ## Limits attached to a model
 
 * \`max_input_tokens\` — the prompt ceiling. Over it is
@@ -340,5 +353,238 @@ per-project request, token or concurrency limits on top of them — see
 front of each shared engine, which can answer \`503 model_unavailable\` with
 \`Retry-After\` when that engine is full — see
 [rate limits](/docs/rate-limits#capacity-queues-per-engine).
-`.trim(),
-};
+`;
+
+// ------------------------------------------------ after the no-timeout release --
+
+const LATER_THE_CATALOGUE = `
+## The catalogue
+
+~~~bash
+export TECHSARA_API_KEY="tsk_live_…"   # your key, from the console
+
+curl ${API_BASE_URL}/models \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY"
+~~~
+
+~~~json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "${MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "chat",
+      "capabilities": {
+        "chat": true, "streaming": true, "vision": true, "tools": false,
+        "embeddings": false, "rerank": false, "audio_transcription": false,
+        "ocr": false, "background": true
+      },
+      "endpoints": ["/v1/responses", "/v1/chat/completions"],
+      "context_window": 1000000,
+      "max_input_tokens": 999232,
+      "max_output_tokens": 1000000,
+      "default_max_output_tokens": 8192,
+      "limits": { "max_images_per_request": 16 }
+    },
+    {
+      "id": "${VISION_MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "chat",
+      "capabilities": {
+        "chat": true, "streaming": true, "vision": true, "tools": false,
+        "embeddings": false, "rerank": false, "audio_transcription": false,
+        "ocr": false, "background": true
+      },
+      "endpoints": ["/v1/responses", "/v1/chat/completions"],
+      "context_window": 24576,
+      "max_input_tokens": 24320,
+      "max_output_tokens": 24576,
+      "default_max_output_tokens": 8192,
+      "limits": { "max_images_per_request": 8 }
+    },
+    {
+      "id": "${OCR_MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "chat",
+      "capabilities": {
+        "chat": true, "streaming": true, "vision": true, "tools": false,
+        "embeddings": false, "rerank": false, "audio_transcription": false,
+        "ocr": true, "background": true
+      },
+      "endpoints": ["/v1/responses", "/v1/chat/completions"],
+      "context_window": 8192,
+      "max_input_tokens": 7936,
+      "max_output_tokens": 8192,
+      "default_max_output_tokens": 8192,
+      "limits": { "max_images_per_request": 1 }
+    },
+    {
+      "id": "${EMBED_MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "embedding",
+      "capabilities": {
+        "chat": false, "streaming": false, "vision": false, "tools": false,
+        "embeddings": true, "rerank": false, "audio_transcription": false,
+        "ocr": false, "background": false
+      },
+      "endpoints": ["/v1/embeddings"],
+      "context_window": 4096,
+      "max_input_tokens": 4096,
+      "max_output_tokens": null,
+      "default_max_output_tokens": null,
+      "limits": { "max_inputs_per_request": 2048, "embedding_dimensions": 1024 }
+    },
+    {
+      "id": "${RERANK_MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "rerank",
+      "capabilities": {
+        "chat": false, "streaming": false, "vision": false, "tools": false,
+        "embeddings": false, "rerank": true, "audio_transcription": false,
+        "ocr": false, "background": false
+      },
+      "endpoints": ["/v1/rerank"],
+      "context_window": 4096,
+      "max_input_tokens": 4096,
+      "max_output_tokens": null,
+      "default_max_output_tokens": null,
+      "limits": { "max_documents_per_request": 1000 }
+    },
+    {
+      "id": "${WHISPER_MODEL_ID}",
+      "object": "model",
+      "owned_by": "techsara",
+      "status": "available",
+      "kind": "transcription",
+      "capabilities": {
+        "chat": false, "streaming": false, "vision": false, "tools": false,
+        "embeddings": false, "rerank": false, "audio_transcription": true,
+        "ocr": false, "background": false
+      },
+      "endpoints": ["/v1/audio/transcriptions"],
+      "context_window": null,
+      "max_input_tokens": null,
+      "max_output_tokens": null,
+      "default_max_output_tokens": null,
+      "limits": {
+        "max_audio_bytes": 93323264,
+        "response_formats": ["json", "text", "verbose_json"]
+      }
+    }
+  ]
+}
+~~~
+
+Each object is exactly what the model registry renders, field for field,
+inside the \`{"object": "list", "data": […]}\` envelope every listing on this
+API uses. A number that does not apply to a model — an output ceiling on a
+model that generates nothing — is \`null\`, never \`0\`.
+
+The numbers above are an **illustration, not a promise**. They are read at
+request time from what this deployment is actually running, and they move
+when an engine is upgraded or reconfigured. Read them from this endpoint —
+that is what it is for — rather than copying them into your client.
+
+A single model resolves the same way:
+
+~~~bash
+curl ${API_BASE_URL}/models/${MODEL_ID} \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY"
+~~~
+
+A model you are not permitted to use answers \`404 model_not_found\`, not
+\`403\`. The API does not confirm the existence of something you may not
+reach.
+`;
+const LATER_EMBED_MODEL_ID = `
+### ${EMBED_MODEL_ID}
+
+| Ceiling | Value |
+| --- | --- |
+| Dimensions | 1,024 |
+| Inputs | up to 2,048 per request, in a body of at most 8 MiB |
+| Input length | 4,096 tokens each — over it is a \`400\` naming the input, never a silent truncation |
+
+Text is embedded exactly as you send it. For search, the model does best when
+a **query** carries a one-line task description and documents do not — see
+[embeddings](/docs/embeddings#queries-and-documents).
+`;
+const LATER_RERANK_MODEL_ID = `
+### ${RERANK_MODEL_ID}
+
+| Ceiling | Value |
+| --- | --- |
+| Documents | up to 1,000 per request, in a body of at most 8 MiB |
+| Pair length | 4,096 tokens for the query and one document together, after the server's template |
+
+\`relevance_score\` is the model's probability, from 0 to 1, that the
+document answers the query. See [rerank](/docs/rerank).
+`;
+const LATER_WHISPER_MODEL_ID = `
+### ${WHISPER_MODEL_ID}
+
+| Ceiling | Value |
+| --- | --- |
+| Audio length | no limit |
+| File size | 89 MiB per request |
+| Formats | \`json\`, \`text\`, \`verbose_json\` |
+
+Let it detect the language. Forcing \`language\` forces the language of the
+*output*: \`en\` on speech in another language gives you an English
+translation rather than a transcript. Accuracy varies by language, and some —
+Gujarati among them — are noticeably weaker and slower. See
+[audio transcriptions](/docs/audio-transcriptions).
+`;
+const LATER_LIMITS_ATTACHED_TO_A_MODEL = `
+## Limits attached to a model
+
+* \`max_input_tokens\` — the prompt ceiling. Over it is
+  \`400 context_length_exceeded\`, refused before the model runs rather than
+  discovered halfway through generation.
+* \`max_output_tokens\` — the ceiling for \`max_output_tokens\` in a request.
+  Asking for more than the ceiling is a \`400\`. Asking for less, but more than
+  your prompt leaves in the window, is **clamped**, and the response says what
+  was applied. Asking for nothing gives you \`default_max_output_tokens\`.
+* \`limits\` — images, inputs, documents or audio per request.
+
+A project can set lower input and output ceilings of its own, which then
+apply to every key in it. These are the limits that apply: the API enforces no
+per-project request, token or concurrency limits on top of them — see
+[rate limits](/docs/rate-limits). What it does have is a capacity queue in
+front of each shared engine, where a request waits its turn for as long as it
+takes and is never refused — see
+[rate limits](/docs/rate-limits#capacity-queues-per-engine).
+`;
+
+/** The page before (`noTimeout: false`) or after the no-timeout release. */
+export function modelsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+  const sections = noTimeout
+    ? [INTRO, LATER_THE_CATALOGUE, S_THE_SIX_MODELS_AT_A_GLANCE, S_MODEL_ID, S_VISION_MODEL_ID, S_OCR_MODEL_ID, LATER_EMBED_MODEL_ID, LATER_RERANK_MODEL_ID, LATER_WHISPER_MODEL_ID, S_THE_CAPABILITY_FLAGS, S_WHICH_MODELS_EXIST_AND_WHO_DECIDES, S_CHOOSING_A_MODEL_IN_A_REQUEST, LATER_LIMITS_ATTACHED_TO_A_MODEL]
+    : [INTRO, S_THE_CATALOGUE, S_THE_SIX_MODELS_AT_A_GLANCE, S_MODEL_ID, S_VISION_MODEL_ID, S_OCR_MODEL_ID, S_EMBED_MODEL_ID, S_RERANK_MODEL_ID, S_WHISPER_MODEL_ID, S_THE_CAPABILITY_FLAGS, S_WHICH_MODELS_EXIST_AND_WHO_DECIDES, S_CHOOSING_A_MODEL_IN_A_REQUEST, S_LIMITS_ATTACHED_TO_A_MODEL];
+  return {
+    slug: 'models',
+    title: 'Model reference',
+    summary:
+      'Six public models — chat, vision, OCR, embeddings, reranking and speech ' +
+      'to text — what each accepts, and why you should read its limits from the API.',
+    section: 'API reference',
+    examples: EXAMPLE_STATUS,
+    body: sections
+      .map((section) => section.trim())
+      .filter((section) => section !== '')
+      .join('\n\n'),
+  };
+}
+
+export const models: DocPage = modelsPage({ noTimeout: NO_TIMEOUT_LIVE });
