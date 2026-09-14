@@ -913,7 +913,11 @@ def test_on_the_files_store_device_transcription_stops_at_the_files_watermark_so
     assert disk["free"] >= files_limits.min_free_bytes()
 
 
-def test_the_files_store_and_the_asr_cache_on_one_device_share_one_ledger_so_either_sees_the_others_promises(shared_disk_env):
+def test_the_files_store_and_the_asr_cache_on_one_device_share_one_ledger_so_either_sees_the_others_promises(shared_disk_env, monkeypatch):
+    # This reads the real device, and a CI runner has less free than either
+    # default watermark; the sharing is under test here, not the floors.
+    monkeypatch.setenv("PUBLIC_API_FILES_MIN_FREE_GIB", "0")
+    monkeypatch.setenv("PUBLIC_API_MIN_FREE_DISK_BYTES", "0")
     asr = disk_ledger.ledger_for(shared_disk_env["asr"])
     files = disk_ledger.ledger_for(shared_disk_env["files"])
     assert files is asr
