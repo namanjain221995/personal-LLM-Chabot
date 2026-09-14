@@ -7,6 +7,20 @@ import { NO_TIMEOUT_LIVE } from './longOutput';
 // `x-should-retry: false` marks the failures an SDK must not re-send. Built in
 // either state from NO_TIMEOUT_LIVE.
 
+/**
+ * The Files API's rows of the closed table (2026-09-14): `publicapi/errors.py`
+ * holds them since the Files routes joined CONTRACT §7, so this page lists
+ * them in both states. They name no route, which the Files pages (held back by
+ * FILES_API_PUBLISHED) describe.
+ */
+const FILES_CODE_ROWS = `| \`file_not_found\` | 404 | A file id that is absent, malformed, deleted, expired or another project's — all one answer — or a derived-output name that does not exist. |
+| \`upload_not_found\` | 404 | An upload id that is absent, malformed or another project's. |
+| \`file_not_ready\` | 409 | A file whose bytes are still being assembled, or derived output asked for before processing finished. Carries \`Retry-After\`. |
+| \`upload_state_conflict\` | 409 | A part, \`complete\` or \`cancel\` for an upload in the wrong state. Sent with \`x-should-retry: false\`, except for a \`complete\` that meets another one still being recorded. |
+| \`checksum_mismatch\` | 400 | A part's SHA-256 does not match the bytes that arrived. |
+| \`incomplete_body\` | 408 | The connection closed before a file or part body was complete. Nothing was recorded; send it again. |
+| \`storage_unavailable\` | 503 | The service cannot take new file bytes right now. Type \`api_error\`; \`x-should-retry\` says whether a retry can succeed. |`;
+
 const INTRO = `
 
 `;
@@ -58,6 +72,7 @@ const S_THE_CODES = `
 | \`model_unavailable\` | 503 | The engine is down, or at capacity: its queue, shared with the chat application, did not free a place in time. Retry-safe. |
 | \`timeout\` | 504 | Generation exceeded its wall clock, or an engine did not answer in time. |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
+${FILES_CODE_ROWS}
 
 A path under \`/v1\` that is not one of the published endpoints answers
 \`404\`, and a method an endpoint does not accept answers \`405\` — both in
@@ -68,7 +83,7 @@ bare framework error your parser has never seen.
 
 \`invalid_request_error\`, \`authentication_error\`, \`permission_error\`,
 \`rate_limit_error\`, \`service_unavailable_error\`, \`timeout_error\`,
-\`server_error\`.
+\`server_error\`, \`api_error\`.
 
 The API enforces **no usage limits** today — no request, token, daily or
 concurrency limit (see [rate limits](/docs/rate-limits)) — so no request is
@@ -209,6 +224,7 @@ const LATER_THE_CODES = `
 | \`model_unavailable\` | 503 | The engine is down, or a physical safeguard of the service tripped — too many open connections, or too little free disk. Never "busy": a busy engine is waited for. Retry-safe. |
 | \`timeout\` | 504 | Kept in the vocabulary; no request on \`/v1\` is ended by a clock. |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
+${FILES_CODE_ROWS}
 
 A path under \`/v1\` that is not one of the published endpoints answers
 \`404\`, and a method an endpoint does not accept answers \`405\` — both in
@@ -219,7 +235,7 @@ bare framework error your parser has never seen.
 
 \`invalid_request_error\`, \`authentication_error\`, \`permission_error\`,
 \`rate_limit_error\`, \`service_unavailable_error\`, \`timeout_error\`,
-\`server_error\`.
+\`server_error\`, \`api_error\`.
 
 The API enforces **no usage limits** today — no request, token, daily or
 concurrency limit (see [rate limits](/docs/rate-limits)) — so no request is

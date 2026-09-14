@@ -19,9 +19,13 @@
 # engine without publishing its port. Adding them here needs the owner's
 # approval at commit time, like every line in this file.
 #
+# 2026-09-14: CONTRACT §7 lists TWENTY-FIVE operations — those eleven and the
+# fourteen Files API routes below — and tests/test_publicapi_files_publication.py
+# holds the contract table, this file and the served document to one set.
+#
 # What is DELIBERATELY absent, per CONTRACT-3 §7: Salesforce, RAG and web
-# search, deep research, uploads, artifacts, memory, conversation history and
-# admin analytics. Each would need its own product, scope and threat review,
+# search, deep research, the chat application's own uploads, artifacts, memory,
+# conversation history and admin analytics. Each would need its own product, scope and threat review,
 # so each must arrive here as its own reviewed line, never as a side effect of
 # mounting a router.
 #
@@ -60,13 +64,13 @@ GET /v1/usage
 # comparison.
 GET /v1/openapi.json
 
-# ---- files and uploads (2026-09-13 owner request; Files design §2.1) ------
+# ---- files and uploads (2026-09-13 owner request; CONTRACT §7, §8.7) -------
 # Scopes files.read / files.write. Every id is project-scoped: another
 # project's file or upload is the same 404 as one that never existed. No
-# route here reads a cookie, and the console never serves file bytes (D6).
-# Mounted by publicapi/router.py `_register_files()`; threat review: Files
-# design §10. REVIEW GATE: this block needs the owner's approval like every
-# other line of this file.
+# route here reads a cookie, and the console never serves file bytes.
+# Mounted by publicapi/router.py `_register_files()`. Published in CONTRACT
+# §7 on 2026-09-14. REVIEW GATE: this block needs the owner's approval like
+# every other line of this file.
 POST /v1/files
 GET /v1/files
 GET /v1/files/{file_id}

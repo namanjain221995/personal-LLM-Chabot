@@ -326,6 +326,14 @@ CONTRACT_ERROR_STATUSES = {
     "model_unavailable": 503,
     "timeout": 504,
     "internal_error": 500,
+    # The Files rows (CONTRACT §9, 2026-09-14).
+    "file_not_found": 404,
+    "upload_not_found": 404,
+    "file_not_ready": 409,
+    "upload_state_conflict": 409,
+    "checksum_mismatch": 400,
+    "incomplete_body": 408,
+    "storage_unavailable": 503,
 }
 
 

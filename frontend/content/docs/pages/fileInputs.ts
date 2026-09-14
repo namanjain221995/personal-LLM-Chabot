@@ -381,7 +381,7 @@ Citations into a recording are timestamps: \`[standup.mp4 42:10]\`, or
 \`h:mm:ss\` past the first hour.
 
 **\`input_audio\`** on Chat Completions is for a short clip that is not worth
-uploading: base64 WAV or MP3 of at most 300 seconds, inside the 20 MiB request
+uploading: base64 WAV or MP3 of up to 300 seconds, inside the 20 MiB request
 body — about 15 MiB of audio. It is transcribed and the transcript is put in
 the prompt, marked as a transcript. Anything longer, upload as a file.
 ${syncAudio(noTimeout)}

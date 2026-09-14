@@ -17,6 +17,14 @@ moves first; the public documentation describes this behaviour only once
 `NO_TIMEOUT_LIVE` (`frontend/content/docs/pages/longOutput.ts`) is true, which a
 test ties to the code that serves it.
 
+**Revision 2026-09-14, the Files API published.** §7 lists the fourteen
+`/v1/files` and `/v1/uploads` routes, §8.7 states their contract, §9 adds the
+seven Files error codes to the closed table, §10.2 adds the streamed
+`file_citation` event, §12.2 the Files body caps, §13 and §17 the rest. The
+documentation pages publish once `FILES_API_PUBLISHED`
+(`frontend/content/docs/pages/files.ts`) is true, which a test ties to this
+section, the router, the public edge and a recorded run through the public URL.
+
 ---
 
 ## 1. Trust boundaries
@@ -180,6 +188,20 @@ Base: `/v1`. Every response carries `X-Request-Id`.
 | POST | `/v1/embeddings` | `embeddings.write` | `techsara-embed`; synchronous |
 | POST | `/v1/rerank` | `rerank.write` | `techsara-rerank`; synchronous |
 | POST | `/v1/audio/transcriptions` | `audio.write` | `techsara-whisper`; `multipart/form-data`; synchronous |
+| POST | `/v1/files` | `files.write` | one file ≤ 64 MiB, `multipart/form-data` (§8.7) |
+| GET | `/v1/files` | `files.read` | this project's files; `after`, `limit` ≤ 10,000, `order`, `purpose` |
+| GET | `/v1/files/{file_id}` | `files.read` | the File object with its processing state |
+| GET | `/v1/files/{file_id}/content` | `files.read` | the original bytes as an attachment; `Range`, `If-None-Match` |
+| DELETE | `/v1/files/{file_id}` | `files.write` | bytes, derived data and indexes removed at once |
+| GET | `/v1/files/{file_id}/events` | `files.read` | processing as server-sent events, one terminal |
+| GET | `/v1/files/{file_id}/derived` | `files.read` | the names processing produced |
+| GET | `/v1/files/{file_id}/derived/{name}` | `files.read` | one derived output, from a closed list per kind |
+| POST | `/v1/uploads` | `files.write` | declare a resumable upload ≤ 100 GiB, JSON |
+| GET | `/v1/uploads/{upload_id}` | `files.write` | the upload and every part received (resume) |
+| POST | `/v1/uploads/{upload_id}/parts` | `files.write` | one part ≤ 64 MiB, `multipart/form-data` (`data`, optional `part_number`, `sha256`) |
+| PUT | `/v1/uploads/{upload_id}/parts/{part_number}` | `files.write` | one part ≤ 64 MiB as a raw body; `Content-Length` required |
+| POST | `/v1/uploads/{upload_id}/complete` | `files.write` | `200` at once with the nested file; assembly is its first stage |
+| POST | `/v1/uploads/{upload_id}/cancel` | `files.write` | idempotent; the parts are discarded |
 | GET | `/v1/usage` | `usage.read` | project-scoped, bounded range |
 | GET | `/v1/openapi.json` | none | the public schema only |
 
@@ -189,8 +211,12 @@ the main chat model. The three rows `/v1/embeddings`, `/v1/rerank` and
 `/v1/chat/completions` now also serve `techsara-8b-vision` and `techsara-ocr`.
 Exposing a model means an authenticated, metered `/v1` route proxies to its
 engine; no engine port is published and no bind changes (§11).
-`.github/workflows/scripts/public-api-surface.txt` lists exactly these eleven
-operations.
+2026-09-14, owner decision to publish the Files API: the fourteen `/v1/files`
+and `/v1/uploads` rows are public. Every id is project-scoped: another
+project's file or upload is the same `404` as one that never existed. No file
+route reads a cookie, and none takes an `Idempotency-Key` (§8.7).
+`.github/workflows/scripts/public-api-surface.txt` lists exactly these
+twenty-five operations.
 
 ### Scopes
 
@@ -244,9 +270,10 @@ model on an endpoint its kind does not serve is
 existence is already known to that caller, so saying so discloses nothing.
 
 Not exposed, deliberately: Salesforce, RAG and web search, deep research,
-uploads, artifacts, memory, conversation history, admin analytics, tool
-calling, audio translation and speech synthesis. Each would need its own
-product, scope and threat review.
+the chat application's own uploads, artifacts, memory, conversation history,
+admin analytics, tool calling, audio translation and speech synthesis. Each
+would need its own product, scope and threat review. Files and uploads are
+exposed only through the rows above (§8.7), which had theirs.
 
 ## 8. Request contract
 
@@ -570,6 +597,71 @@ an `Idempotency-Key` header is `400`, `param: Idempotency-Key`; no
 `api_responses` row; lengths and shape checked before any gate; gates wait with
 no limit.
 
+### 8.7 Files and uploads (2026-09-14)
+
+Handlers in `publicapi/files/routes.py`, wire shapes in
+`publicapi/files/wire.py`, processing in `apifiles/`. The public reference is
+`/docs/files`, `/docs/uploads` and `/docs/file-inputs`; this section is the
+contract those pages are held to.
+
+**Every route**: `PublicRoute` (§9 envelope, `X-Request-Id`, CORS without
+credentials); Bearer only; the scope of §7 checked before any id is looked up;
+one admission (reads as `read`, writes as `sync`, events as `stream`); then
+validation. An `Idempotency-Key` header is `400`, `param: Idempotency-Key`:
+parts are idempotent by `part_number`, `complete` and `cancel` by state, and a
+repeated create gives a second id over one stored copy. Absent, malformed,
+deleted, expired and another project's ids are one `404 file_not_found` (or
+`upload_not_found`) whose body does not echo the id.
+
+**The File object**: `id` (`file-` + 24 hex), `object: "file"`, `bytes`,
+`created_at`, `filename`, `purpose`, `status`, `status_details`, `expires_at`,
+and the extensions `sha256`, `mime_type` and `processing` (`state`, `kind`,
+`stage`, `step`, `total_steps`, `percent`, `stages`, `queue_position`,
+`waited_for_capacity_s`, `started_at`, `finished_at`, `error`, `facts`,
+`derived`). `status` stays in the SDK literal set — `uploaded` while assembled,
+queued or processed, then `processed` or `error` — so both SDKs' wait helpers
+work. `status_details` is `null` or the one fixed sentence of its
+`processing.error.code` (`unsupported_file`, `file_corrupt`,
+`file_too_complex`, `processing_unavailable`, `internal_error`,
+`checksum_mismatch`), never an exception's text.
+
+| route | rule |
+|---|---|
+| `POST /v1/files` | `file` ≤ 67,108,864 bytes; `purpose` `user_data` (`assistants` and `vision` stored as given; batch, fine-tune and evals refused); optional `expires_after[anchor]=created_at` with `expires_after[seconds]` 3,600–2,592,000; any other field `400`. Body ≤ 68,157,440 bytes. The same bytes in the same project are stored and processed once, never shared across projects |
+| `GET /v1/files` | `limit` 1–10,000 (default 10,000); `order` `desc` (default) or `asc`; `after` a file id (a just-deleted one works, one the project never had is `400`, `param: after`); `purpose` |
+| `GET …/content` | `application/octet-stream`, `Content-Disposition: attachment`, `ETag` = sha256, `Accept-Ranges: bytes`, `X-Content-Type-Options: nosniff`, a sandboxing `Content-Security-Policy`, `Cache-Control: private, no-store`; one range `206`, a range past the end `416` with `Content-Range: bytes */<size>`, a matching `If-None-Match` `304`; bytes still assembling `409 file_not_ready`; a failed assembly `400`, `param: file_id` |
+| `DELETE /v1/files/{file_id}` | physical and immediate: the bytes (unless another file of the project holds them), derived data and index; running processing stops; a byte-less record is kept 30 days and never served; a second delete is `404` |
+| `GET …/events` | `text/event-stream`; `file.processing` (data = the File object) on a stage or percent change, at most once a second; exactly one terminal, `file.processed` or `file.failed` (also on delete); `sequence_number` from 1; `: ping` at least every 15 s; no server deadline |
+| `GET …/derived`, `…/derived/{name}` | names from a closed list per kind; another name `404 file_not_found`, `param: name`; the download headers above with the output's own type and no `ETag`; before `processed`, `409 file_not_ready` with `Retry-After` |
+| `POST /v1/uploads` | JSON ≤ 1 MiB: `bytes` 0–107,374,182,400, `filename`, `mime_type`, `purpose`, optional `expires_after` (it applies to the file); the Upload carries `part_max_bytes` and `max_parts` |
+| parts | 1 byte–64 MiB, numbers 0–9,999. `PUT` needs `Content-Length` (`411`) and checks `X-Part-SHA256` or `Content-Digest: sha-256=:…:`; `POST` is multipart `data` with optional `part_number` and `sha256`. A part is whole or absent (`408 incomplete_body`); a repeated number replaces the part and keeps its id; the first part fixes numbered or sequential, and mixing is `400`; a part after `complete` or `cancel` is `409 upload_state_conflict`, `x-should-retry: false` |
+| `GET /v1/uploads/{upload_id}` | `files.write`; every received part in number order, never paginated, with `part_mode` and `error` |
+| `…/complete` | optional `part_ids` (required for a sequential upload), `md5`, `sha256`; the parts must add up to `bytes` (else `400`, and the upload stays open); answers `200` at once with `status: completed` and the nested file at `processing.stage: assemble`; checksums are verified during assembly, and a mismatch fails the FILE with `checksum_mismatch`; repeatable; a concurrent second `complete` is `409` with `Retry-After: 2`, `x-should-retry: true` |
+| `…/cancel` | no body; idempotent; a completed upload is `409` |
+
+A pending upload expires 24 h after its last part and at most 7 days after its
+creation; finished, cancelled and expired upload records stay readable for 30
+days. A file with `expires_after` is deleted as by `DELETE` within about ten
+minutes of `expires_at`; otherwise files are kept until deleted, and storage is
+not a quota.
+
+**Files as model input** (`publicapi/file_inputs.py`, `apifiles/service.py`):
+`input_file` (`file_id`, or inline `file_data`; `file_url` is refused),
+`input_image` with `file_id` and `input_video` on `/v1/responses`; `file` and
+`input_audio` parts on `/v1/chat/completions`; `file_context: {mode: auto |
+full | retrieval, max_tokens}`. A `file_id` needs `files.read` in addition to
+`responses.write`, checked before any lookup (`403` before `404`); inline
+`file_data` needs no file scope. A request naming a file that is still
+processing waits for it; a file that failed or is unsupported is `400
+invalid_request_error`, `param` naming the part, with its code's fixed
+sentence. Citations that resolve to content the model was shown become
+`file_citation` annotations (`type`, `file_id`, `filename`, `index` in UTF-16
+code units, and `page` or `timestamp_s`): on the `output_text` part and on
+`choices[0].message.annotations`; streamed as §10.2's
+`response.output_text.annotation.added` and, on Chat, as the finish chunk's
+`delta.annotations`. The usage row records `file_ids`, the context mode and
+tokens, and the citation counts.
+
 ## 9. Response and error envelope
 
 Success (non-streaming):
@@ -626,7 +718,7 @@ Error, everywhere, including mid-stream:
 | `model_not_found` | 404 | unknown model, one this key may not use, or one not configured on this deployment |
 | `response_not_found` | 404 | not this project's response |
 | `idempotency_conflict` | 409 | same key with a different body, or from a different credential (not the creating key or its service account) — `x-should-retry: false` |
-| `request_too_large` | 413 | body over its route's cap, text over 1 MiB, an audio file part over 89 MiB |
+| `request_too_large` | 413 | body over its route's cap, text over 1 MiB, an audio file part over 89 MiB, a file or part over 64 MiB |
 | `context_length_exceeded` | 400 | prompt over the model's input ceiling; an embeddings input or a rerank pair over 4,096 tokens; no window left for one output token |
 | `rate_limit_error` | 429 | RPM/TPM exceeded, only when limits are enforced — `Retry-After` |
 | `quota_exceeded` | 429 | daily/monthly token quota, only when limits are enforced — `Retry-After` |
@@ -635,16 +727,30 @@ Error, everywhere, including mid-stream:
 | `model_unavailable` | 503 | engine proven down or failing (§18), or a physical guard before headers: fd pressure ≥ 70 % (`Retry-After: 30`) or free disk under `PUBLIC_API_MIN_FREE_DISK_BYTES` (`Retry-After: 60`) — never "at capacity" on `/v1` — `Retry-After` ≤ 60, retry-safe unless `x-should-retry: false` |
 | `timeout` | 504 | kept in the closed table; no `/v1` request is ended by a clock (§8.3) |
 | `internal_error` | 500 | anything else — never a traceback |
+| `file_not_found` | 404 | a file id that is absent, malformed, deleted, expired or another project's; an unknown derived `name` (§8.7) |
+| `upload_not_found` | 404 | an upload id that is absent, malformed or another project's |
+| `file_not_ready` | 409 | bytes still assembling; derived data before `processed` — `Retry-After`, retry-safe |
+| `upload_state_conflict` | 409 | a part, `complete` or `cancel` for an upload in the wrong state — `x-should-retry: false`, except a `complete` meeting another in progress (`Retry-After: 2`, `x-should-retry: true`) |
+| `checksum_mismatch` | 400 | a part's SHA-256 does not match its bytes |
+| `incomplete_body` | 408 | the connection closed before a file or part body was complete; nothing recorded — retry-safe |
+| `storage_unavailable` | 503 | free storage below the watermark (`Retry-After: 60`, `x-should-retry: false`), or the same bytes still being purged after a delete (`Retry-After: 2`, `x-should-retry: true`) — type `api_error` |
 
-The code table is closed. `errors.model_at_capacity(retry_after)` exists only for
+The code table is closed (`publicapi/errors.py::_CODES`; the Files rows joined it
+2026-09-14, and `files/wire.FILE_CODES` holds only their `x-should-retry`
+defaults). `invalid_request_error` is also sent as `411` (a raw part without
+`Content-Length`) and `416` (a range past the end of a file), the two statuses a
+code takes besides its table row. `errors.model_at_capacity(retry_after)` exists only for
 callers that pass a finite wait (`capacity.hold(wait_s=…)`), and no `/v1` route
 does.
 
 **`x-should-retry`** (both SDKs read it before their own retry table) is `false`
 on: a `409` for a different body or credential; a `500` after a generation
 without an `Idempotency-Key` started; the second engine-fault failure of a run
-(§14); a sidecar failure after two coinciding engine restarts; and the edge's
-post-send `503` for an unkeyed generation when no gateway is in the path.
+(§14); a sidecar failure after two coinciding engine restarts; the edge's
+post-send `503` for an unkeyed generation when no gateway is in the path;
+`upload_state_conflict`; and `storage_unavailable` for a full disk. It is
+`true` on `file_not_ready`, `incomplete_body`, a `complete` that meets another
+in progress, and `storage_unavailable` while the same bytes are being purged.
 
 **A failure after commit** (§10) cannot change the status: on `/v1/responses` it
 is a well-formed Response with `status: "failed"`, its `error` and its partial
@@ -699,9 +805,16 @@ contiguous and never reused, in the JSON only:
 response.created → response.queued → response.in_progress
   → response.output_item.added → response.content_part.added
   → response.output_text.delta (×N) → response.output_text.done
+  → response.output_text.annotation.added (×N)
   → response.content_part.done → response.output_item.done
   → response.completed | response.failed | error
 ```
+
+`response.output_text.annotation.added` (2026-09-14) is sent only by a request
+that names files, once per `file_citation` (§8.7), after the text is final:
+`{item_id, output_index, content_index, annotation_index, annotation}`. The
+terminal `response.completed` carries the same annotations on its `output_text`
+part, so a client that ignores the event loses nothing.
 
 `response.queued` is sent while the request waits for its engine (a gate, the
 admission lane, a recovering engine), on any engine, followed by `: ping`
@@ -856,6 +969,8 @@ atomically with a single statement, token counts written **once per request**.
 | `/v1/responses`, `/v1/chat/completions` | 20 MiB (`PUBLIC_API_MAX_MEDIA_BODY_BYTES`), of which text ≤ 1 MiB |
 | `/v1/embeddings`, `/v1/rerank` | 8 MiB (`PUBLIC_API_MAX_POOLING_BODY_BYTES`) |
 | `/v1/audio/transcriptions` | 90 MiB (`PUBLIC_API_MAX_AUDIO_BODY_BYTES`), file part ≤ 89 MiB |
+| `POST /v1/files`, `POST /v1/uploads/{upload_id}/parts` | 65 MiB (`PUBLIC_API_FILES_MAX_BODY_BYTES`), file or part ≤ 64 MiB |
+| `PUT /v1/uploads/{upload_id}/parts/{part_number}` | 64 MiB (`PUBLIC_API_FILES_PART_MAX_BYTES`) |
 | every other route | 1 MiB (`PUBLIC_API_MAX_BODY_BYTES`) |
 
 **The path to the API** (measured or published, 2026-09-13), which the byte
@@ -1121,7 +1236,8 @@ settings above. `LLM_MAX_RETRIES` stays 0. The database keeps `statement_timeout
 
 `Idempotency-Key` on `POST /v1/responses` and `POST /v1/chat/completions` **only**,
 scoped by `(project_id, endpoint, key)`, retained 24 h. On `/v1/embeddings`,
-`/v1/rerank` and `/v1/audio/transcriptions` the header is refused with
+`/v1/rerank`, `/v1/audio/transcriptions` and every file and upload route (§8.7)
+the header is refused with
 `400 invalid_request_error`, `param: Idempotency-Key`: those calls keep no
 durable row a key could name, and a silently ignored key would promise a safety
 the server does not provide.
@@ -1357,6 +1473,12 @@ design system (`AdminTable`, `Section`, `Stat`, `AnalyticsChart`, `RangePicker`,
 `AdminDialog`, `RowMenu`, `useToast`, `ConfirmDialog`) so it looks like the
 product rather than a bolted-on page, and the show-once secret flow copies
 `InviteDialog`.
+
+The console's **Files** tab (`/api?tab=files`, 2026-09-14) lists, uploads,
+follows and deletes a project's files through the session routes of
+`apiplatform/console_api.py` (reading needs `api.projects.read`, uploading and
+deleting `api.projects.manage`). It never serves file bytes: no content or
+derived download rides a cookie, so a download is a `/v1` call with a key.
 
 ## 18. What this contract does not promise
 

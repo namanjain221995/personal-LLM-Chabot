@@ -35,32 +35,33 @@ def _scope(scope: Scope) -> str:
 
 
 def _errors(base: Any, *codes: str) -> Dict[str, Any]:
-    """`openapi._error_responses` for the codes the closed table knows, plus
-    the Files codes (`wire.FILE_CODES`), grouped by status the same way."""
-    known = [code for code in codes if code not in wire.FILE_CODES]
-    out = base._error_responses(*base._always(), *known)
+    """`openapi._error_responses` for `codes`, with the Files headers added.
+
+    Every Files code is a row of the closed table since 2026-09-14, so the
+    statuses come from `errors.status_for` like every other operation's. What
+    the base helper does not know is `x-should-retry`: a Files 408, 409 or 503
+    says through it whether the same request can succeed later (both SDKs
+    obey it before their own status table), so those statuses document it,
+    with `Retry-After` optional where the base made it required only for
+    429/503."""
+    out = base._error_responses(*base._always(), *codes)
     for code in codes:
         if code not in wire.FILE_CODES:
             continue
-        status = str(wire.FILE_CODES[code][0])
-        if status in out:
-            entry = out[status]
-            if code not in entry["description"]:
-                entry["description"] = f"{entry['description']}; {code}"
-            continue
-        headers: Dict[str, Any] = {}
-        if wire.FILE_CODES[code][2] is not None or status in ("408", "409", "503"):
-            headers = {
-                "Retry-After": {"description": "Seconds to wait before retrying.", "required": False,
-                                "schema": {"type": "integer", "minimum": 1}},
-                "x-should-retry": {"description": "`true` or `false`: whether retrying can succeed.",
-                                   "required": False, "schema": {"type": "string", "enum": ["true", "false"]}},
+        entry = out[str(wire.FILE_CODES[code][0])]
+        if code not in entry["description"]:
+            entry["description"] = f"{entry['description']}; {code}"
+        if str(wire.FILE_CODES[code][0]) in ("408", "409", "503"):
+            headers = dict(entry.get("headers") or {})
+            headers.setdefault("Retry-After", {
+                "description": "Seconds to wait before retrying.", "required": False,
+                "schema": {"type": "integer", "minimum": 1},
+            })
+            headers["x-should-retry"] = {
+                "description": "`true` or `false`: whether sending the same request again can succeed.",
+                "required": False, "schema": {"type": "string", "enum": ["true", "false"]},
             }
-        out[status] = {
-            "description": code,
-            "headers": headers,
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}},
-        }
+            entry["headers"] = headers
     return dict(sorted(out.items()))
 
 
@@ -168,7 +169,7 @@ def paths(base: Any) -> Dict[str, Any]:
             "get": _operation(
                 base, tag="Files", operation_id="streamFileEvents", summary="Follow a file's processing", scope=read,
                 description=(
-                    "`text/event-stream`: numbered `file.progress` events, then exactly one of `file.processed` or "
+                    "`text/event-stream`: numbered `file.processing` events, then exactly one of `file.processed` or "
                     "`file.failed`; a `: ping` comment at least every 15 seconds. " + not_found
                 ),
                 parameters=[file_id],
@@ -241,6 +242,9 @@ def paths(base: Any) -> Dict[str, Any]:
                             {"name": "X-Part-SHA256", "in": "header", "required": False, "schema": {"type": "string"}}],
                 request_body={"required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "contentMediaType": "application/octet-stream"}}}},
                 responses={"200": _ok(base, "#/components/schemas/UploadPart"),
+                           # `wire.length_required`: the one invalid_request_error that is a 411.
+                           "411": {"description": "invalid_request_error: `Content-Length` is required.",
+                                   "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}},
                            **_errors(base, "invalid_request_error", "request_too_large", "upload_not_found",
                                      "upload_state_conflict", "checksum_mismatch", "incomplete_body", "storage_unavailable")},
             ),

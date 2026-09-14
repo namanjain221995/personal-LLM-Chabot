@@ -5,12 +5,14 @@ PARITY FIRST. `status` stays inside the SDK literal set (`uploaded`,
 everything TechSara adds (`sha256`, `mime_type`, `processing`) is an extra key
 both SDKs parse leniently (verified by the parity research, 2026-09-13).
 
-THE SEVEN NEW CODES. `publicapi/errors.py` is a CLOSED table and another team's
-file this wave, so `FilesApiError` carries the codes of design §2.17 and renders
-the identical CONTRACT §9 envelope through the same `redact()`. It subclasses
-`errors.ApiError`, so `router.PublicRoute` renders it with no change; when the
-integration adds the codes to `errors._CODES`, the factories here keep working
-and can be re-pointed at `errors.*` one by one.
+THE SEVEN FILES CODES are rows of the closed table in `publicapi/errors.py`
+(CONTRACT §9) since 2026-09-14, so the OpenAPI `code` enum and the docs list
+them. `FilesApiError` takes each code's status and wire type from that table
+alone; `FILE_CODES` below restates them only beside the `x-should-retry`
+default, which is the one thing the table does not hold, and
+`tests/test_publicapi_files_publication.py` fails if the two ever disagree.
+`status=` still overrides the table's status for the two `invalid_request_error`
+answers that are not a 400 (411 without Content-Length, 416 for a range).
 
 `x-should-retry` MATTERS. Both SDKs retry a 409 and a 503 by default. An upload
 in the wrong state will be in the wrong state on the retry too, and a full disk
@@ -65,10 +67,10 @@ class FilesApiError(errors.ApiError):
         should_retry: Optional[bool] = None,
         extra_headers: Optional[Mapping[str, str]] = None,
     ) -> None:
-        if code in FILE_CODES:
-            spec_status, spec_type, default_retry = FILE_CODES[code]
-        else:
-            spec_status, spec_type, default_retry = errors.status_for(code), errors.type_for(code), None
+        # The closed table is the authority for status and type (it raises
+        # for a code it does not hold); FILE_CODES adds the retry default.
+        spec_status, spec_type = errors.status_for(code), errors.type_for(code)
+        default_retry = FILE_CODES[code][2] if code in FILE_CODES else None
         Exception.__init__(self, message)
         self.code = code
         self.status = int(status if status is not None else spec_status)

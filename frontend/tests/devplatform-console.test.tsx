@@ -393,6 +393,22 @@ describe('the console navigation', () => {
     expect(document.querySelector('a[href="/api?tab=keys"]')).not.toBeNull();
   });
 
+  it('draws a Files link in the rail for anyone who may read projects, and opens the tab from its URL', async () => {
+    serve({ overview: overviewOf({}) });
+    render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(screen.getAllByText('Overview').length).toBeGreaterThan(0));
+    expect(document.querySelector('a[href="/api?tab=files"]')).not.toBeNull();
+    expect(tabFromQuery('files')).toBe('files');
+    expect(tabAllowed(ADMIN, 'files')).toBe(true);
+    cleanup();
+
+    state.search = new URLSearchParams('tab=files');
+    serve({ projects: { projects: [] } });
+    render(<ConsoleShell me={ADMIN} />);
+    await waitFor(() => expect(screen.getByText(/No projects to hold files/i)).toBeTruthy());
+    expect(screen.getByTestId('console-current-section').textContent).toContain('Files');
+  });
+
   it('renders a demoted admin Overview when their bookmarked tab is gone', async () => {
     state.search = new URLSearchParams('tab=limits');
     serve({ overview: overviewOf({}) });
@@ -414,6 +430,8 @@ describe('every section has an empty state and invents no numbers', () => {
     },
     { tab: 'projects', routes: { projects: { projects: [] } }, expect: /No projects yet/i },
     { tab: 'keys', routes: { projects: { projects: [] } }, expect: /No projects, so no keys/i },
+    // 2026-09-14, the Files API published: the tab is reached at its own URL.
+    { tab: 'files', routes: { projects: { projects: [] } }, expect: /No projects to hold files/i },
     { tab: 'models', routes: { models: { models: [] } }, expect: /No models are published/i },
     { tab: 'playground', routes: { models: { models: [] } }, expect: /No chat model is published/i },
     { tab: 'usage', routes: { projects: { projects: [] } }, expect: /No projects to measure/i },

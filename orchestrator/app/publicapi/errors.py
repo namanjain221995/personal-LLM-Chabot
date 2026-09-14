@@ -77,6 +77,25 @@ _CODES: Dict[str, _CodeSpec] = {
     "model_unavailable": _CodeSpec(503, "service_unavailable_error"),
     "timeout": _CodeSpec(504, "timeout_error"),
     "internal_error": _CodeSpec(500, "server_error"),
+    # The Files API (CONTRACT §9, added 2026-09-14 when /v1/files and
+    # /v1/uploads were published in §7). They used to live only in
+    # `files/wire.FILE_CODES`, outside this table, which meant the OpenAPI
+    # document's `code` enum, the `/docs` error page and every SDK generated
+    # from the schema listed a vocabulary the server did not keep to: a client
+    # switching on `code` met seven values the schema said could not exist.
+    # One table again. `files/wire.FILE_CODES` keeps only the `x-should-retry`
+    # default of each, and a test pins the two to the same status and type.
+    "file_not_found": _CodeSpec(404, "invalid_request_error"),
+    "upload_not_found": _CodeSpec(404, "invalid_request_error"),
+    "file_not_ready": _CodeSpec(409, "invalid_request_error"),
+    "upload_state_conflict": _CodeSpec(409, "invalid_request_error"),
+    "checksum_mismatch": _CodeSpec(400, "invalid_request_error"),
+    "incomplete_body": _CodeSpec(408, "invalid_request_error"),
+    # `api_error`, not `service_unavailable_error`: the two 503s of that type
+    # are "the model cannot serve you yet, retry", while a full disk does not
+    # empty in an SDK's backoff and says `x-should-retry: false`. A client
+    # that retries on `service_unavailable_error` must not loop on this one.
+    "storage_unavailable": _CodeSpec(503, "api_error"),
 }
 
 #: The codes a client may retry unchanged. Published so the documentation and
@@ -89,6 +108,13 @@ RETRYABLE_CODES = frozenset(
         "model_recovering",
         "model_unavailable",
         "timeout",
+        # Files (2026-09-14). A file still processing is ready later, and a
+        # body cut in transit recorded nothing, so the same request succeeds
+        # when sent again. `storage_unavailable` is deliberately absent: it
+        # is retry-safe only when its `x-should-retry` says `true` (a purge
+        # of the same bytes in progress), never for a full disk.
+        "file_not_ready",
+        "incomplete_body",
     }
 )
 
