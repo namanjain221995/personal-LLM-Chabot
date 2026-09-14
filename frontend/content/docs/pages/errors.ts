@@ -15,7 +15,7 @@ import { NO_TIMEOUT_LIVE } from './longOutput';
  */
 const FILES_CODE_ROWS = `| \`file_not_found\` | 404 | A file id that is absent, malformed, deleted, expired or another project's — all one answer — or a derived-output name that does not exist. |
 | \`upload_not_found\` | 404 | An upload id that is absent, malformed or another project's. |
-| \`file_not_ready\` | 409 | A file whose bytes are still being assembled, or derived output asked for before processing finished. Carries \`Retry-After\`. |
+| \`file_not_ready\` | 409 | A file whose bytes are still being assembled, or derived output asked for while processing is queued or running. Carries \`Retry-After\`. Derived output of a file in \`error\` is a \`400\` instead, and not worth retrying. |
 | \`upload_state_conflict\` | 409 | A part, \`complete\` or \`cancel\` for an upload in the wrong state. Sent with \`x-should-retry: false\`, except for a \`complete\` that meets another one still being recorded. |
 | \`checksum_mismatch\` | 400 | A part's SHA-256 does not match the bytes that arrived. |
 | \`incomplete_body\` | 408 | The connection closed before a file or part body was complete. Nothing was recorded; send it again. |

@@ -258,7 +258,7 @@ other code raises:
 | `internal_error` | 500 | `server_error` | no | anything else, including a deployment with no usable API-key pepper (§12) |
 | `file_not_found` | 404 | `invalid_request_error` | no | `files/wire.file_not_found`, `apifiles/service.file_not_found`: absent, malformed, deleted, expired or another project's file id; an unknown derived name (§15) |
 | `upload_not_found` | 404 | `invalid_request_error` | no | `files/wire.upload_not_found` |
-| `file_not_ready` | 409 | `invalid_request_error` | yes | `files/wire.file_not_ready`: bytes still assembling, derived data before `processed`; `service.file_not_ready` for a bounded synchronous prepare |
+| `file_not_ready` | 409 | `invalid_request_error` | yes | `files/wire.file_not_ready`: bytes still assembling, derived data while assembling, queued or processing (a file in `error` is a `400` on `file_id` from `routes._require_derived_ready`); `service.file_not_ready` for a bounded synchronous prepare |
 | `upload_state_conflict` | 409 | `invalid_request_error` | no (`x-should-retry: false`) | `files/wire.upload_state_conflict`; a `complete` meeting another in progress says `Retry-After: 2`, `x-should-retry: true` |
 | `checksum_mismatch` | 400 | `invalid_request_error` | no | `files/wire.checksum_mismatch`: a part's `sha256` / `X-Part-SHA256` / `Content-Digest` |
 | `incomplete_body` | 408 | `invalid_request_error` | yes | `files/wire.incomplete_body`: the client closed mid-body; nothing recorded |

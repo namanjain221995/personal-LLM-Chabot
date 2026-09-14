@@ -20,6 +20,7 @@ so the sides cannot drift apart again without a red build.
 """
 from __future__ import annotations
 
+import inspect
 import re
 from pathlib import Path
 from typing import Dict
@@ -170,3 +171,46 @@ def test_the_file_events_operation_names_the_events_the_stream_really_sends():
     for name in (file_events.FILE_PROCESSING, file_events.FILE_PROCESSED, file_events.FILE_FAILED):
         assert f"`{name}`" in description
     assert "file.progress" not in description
+
+
+# ------------------------------------------ what a failed file's derived data is --
+
+
+def _derived_row() -> str:
+    section = _section("### 8.7 Files and uploads", "## 9. Response and error envelope")
+    return re.search(r"^\| `GET …/derived`, `…/derived/\{name\}` \|.*$", section, re.M).group(0)
+
+
+def _contract_code_row(code: str) -> str:
+    section = _section("## 9. Response and error envelope", "## 10. Streaming")
+    return re.search(rf"^\| `{code}` \|.*$", section, re.M).group(0)
+
+
+def test_the_contract_keeps_409_for_a_file_still_processing_and_sends_a_failed_files_derived_data_to_a_400():
+    # A retryable 409 on a file whose processing FAILED told a client
+    # following the contract to retry for ever; the file never gets derived
+    # data until its bytes are uploaded again.
+    row = _derived_row()
+    assert "while the file is assembling, queued or processing, `409 file_not_ready` with `Retry-After: 5`" in row
+    assert "a file in `error`" in row
+    assert "`400 invalid_request_error`, `param: file_id`" in row
+    assert '"This file has no derived data: "' in row and "`status_details`" in row
+    assert "not retry-safe" in row
+    assert "before `processed`" not in row
+    code_row = _contract_code_row("file_not_ready")
+    assert "retry-safe" in code_row and "Never sent for a file in `error`" in code_row
+    assert "before `processed`" not in code_row
+
+
+def test_the_contracts_derived_answers_are_the_ones_the_derived_gate_sends():
+    gate = getattr(file_routes, "_require_derived_ready", None)
+    if gate is None:
+        pytest.skip("this tree predates the derived readiness gate the contract describes")
+    source = inspect.getsource(gate)
+    assert 'wire.invalid_request("This file has no derived data: " + str(ready.sentence), param="file_id")' in source
+    assert "raise wire.file_not_ready(5)" in source
+    # Both derived routes go through it: the list and the download.
+    assert inspect.getsource(file_routes).count("_require_derived_ready(row)") == 2
+    assert wire.FILE_CODES["file_not_ready"] == (409, "invalid_request_error", True)
+    assert wire.invalid_request("x", param="file_id").status == 400
+
