@@ -17,7 +17,10 @@
  *
  * TWO WAYS THERE (2026-09-13, no-timeout design revision 2).
  *
- *  · THROUGH THE v1-GATEWAY, when `V1_GATEWAY_URL` is set (compose sets it).
+ *  · THROUGH THE v1-GATEWAY, when `V1_GATEWAY_URL` is set. Compose leaves it
+ *    blank unless the operator sets it in .env together with the orchestrator's
+ *    PUBLIC_API_GATEWAY_PEERS (release review 2026-09-14: a fixed value put all
+ *    public /v1 traffic on the gateway before the orchestrator trusted it).
  *    The gateway (gateway/, a separate sha-pinned container) holds the client
  *    connection across orchestrator restarts: it retries a refused connect for
  *    up to 110 s before the first byte, and after the first byte it heartbeats

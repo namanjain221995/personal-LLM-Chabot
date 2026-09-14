@@ -535,11 +535,17 @@ class ComposeRendersThePinnedGatewayTests(unittest.TestCase):
         self.secrets = runtime / "secrets.env"
         self.secrets.write_text("POSTGRES_PASSWORD=fixture-password\n")
 
-    def _render(self) -> tuple[dict, dict[str, str]]:
+    def _render(self, user_env: str | None = None) -> tuple[dict, dict[str, str]]:
         sha = cli.v1_gateway_code_sha(self.project)
+        layers: list[str] = []
+        if user_env is not None:
+            # The operator's .env, first in the launcher's chain (compose.py).
+            dotenv = self.project / ".env"
+            dotenv.write_text(user_env)
+            layers = ["--env-file", str(dotenv)]
         base = [
             "docker", "compose", "--project-name", "sf-local-ai", "--project-directory", str(self.project),
-            "--env-file", str(self.secrets), "--env-file", str(self.generated),
+            *layers, "--env-file", str(self.secrets), "--env-file", str(self.generated),
             "-f", str(self.project / "compose.yaml"),
         ]
         environment = {
@@ -577,10 +583,28 @@ class ComposeRendersThePinnedGatewayTests(unittest.TestCase):
         self.assertEqual(gateway["stop_grace_period"], "30s")
         self.assertEqual([v["target"] for v in gateway["volumes"]], ["/spool"])
         self.assertEqual(document["volumes"]["v1gateway_spool"]["name"], "sf-local-ai_v1gateway_spool")
-        # The frontend's LAN path relays through it.
-        self.assertEqual(document["services"]["frontend"]["environment"]["V1_GATEWAY_URL"], "http://v1-gateway:8090")
+        # The frontend's /v1 route does NOT relay through it by default
+        # (release review 2026-09-14, high): see the opt-in test below.
+        self.assertEqual(document["services"]["frontend"]["environment"]["V1_GATEWAY_URL"], "")
         # The in-memory body budget reaches it (blank = the gateway's 256 MiB).
         self.assertIn("V1_GATEWAY_MEMORY_BUDGET_BYTES", gateway["environment"])
+
+    def test_the_frontend_relays_through_the_gateway_only_when_the_operator_sets_v1_gateway_url(self) -> None:
+        """Release review 2026-09-14 (high). Public /v1 reaches the frontend
+        through the tunnel, so a fixed V1_GATEWAY_URL put every public call on
+        the gateway hop at the deploy that created the gateway -- before
+        PUBLIC_API_GATEWAY_PEERS / PUBLIC_API_TRUSTED_PROXIES named it. The
+        relay is opt-in: blank unless .env sets it, and exactly what .env sets."""
+        default, _ = self._render()
+        self.assertEqual(default["services"]["frontend"]["environment"]["V1_GATEWAY_URL"], "")
+        opted, _ = self._render(
+            "V1_GATEWAY_URL=http://v1-gateway:8090\nPUBLIC_API_GATEWAY_PEERS=192.0.2.10\n"
+        )
+        self.assertEqual(opted["services"]["frontend"]["environment"]["V1_GATEWAY_URL"], "http://v1-gateway:8090")
+        self.assertEqual(opted["services"]["orchestrator"]["environment"]["PUBLIC_API_GATEWAY_PEERS"], "192.0.2.10")
+        # The gateway's own definition never carries it (no env_file), so
+        # turning the relay on does not recreate the gateway.
+        self.assertNotIn("V1_GATEWAY_URL", opted["services"]["v1-gateway"]["environment"])
 
     def test_the_frontend_edge_the_gateway_and_the_orchestrator_read_the_same_body_caps(self) -> None:
         """Review 2026-09-14: the frontend got only PUBLIC_API_MAX_BODY_BYTES."""
@@ -655,7 +679,7 @@ class DeployShGatewayGuardTests(unittest.TestCase):
     """scripts/deploy.sh's guards, run for real with a fake docker on PATH."""
 
     FUNCTIONS = (
-        "bounded_wait", "v1_gateway_relays", "v1_gateway_guard", "public_api_in_flight",
+        "bounded_wait", "v1_gateway_relays", "v1_gateway_path_report", "v1_gateway_guard", "public_api_in_flight",
         "live_orchestrator_suspends_public_runs", "public_api_not_resumable_in_flight", "public_api_live_in_flight",
         "public_work_guard", "v1_gateway_health", "pin_v1_gateway",
     )
@@ -773,6 +797,24 @@ class DeployShGatewayGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--full removes every container, this one included; it cannot report its relays, so not waiting", result.stdout)
         self.assertLess(elapsed, 5)
+
+    def test_the_guard_says_which_path_the_frontends_v1_route_takes_and_warns_when_the_gateway_is_untrusted(self) -> None:
+        """Release review 2026-09-14 (high): the deploy log claimed the gateway
+        took no public traffic while the frontend relayed every /v1 call to it."""
+        stub = "dr_env_value() { case \"$1\" in V1_GATEWAY_URL) printf '%s' \"${URL:-}\" ;; PUBLIC_API_GATEWAY_PEERS) printf '%s' \"${PEERS:-}\" ;; esac; }\n"
+        sha = "V1_GATEWAY_CODE_SHA=" + "f" * 64 + " v1_gateway_guard"
+        direct, _ = self._run(stub + sha)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertIn("the frontend's /v1 route goes straight to the orchestrator (V1_GATEWAY_URL is blank)", direct.stdout)
+        self.assertIn("no public traffic until the tunnel routes ^/v1 to it or V1_GATEWAY_URL points", direct.stdout)
+        self.assertNotIn("WARNING", direct.stdout)
+        untrusted, _ = self._run(stub + sha, env={"URL": "http://v1-gateway:8090"})
+        self.assertEqual(untrusted.returncode, 0, untrusted.stderr)
+        self.assertIn("relays through http://v1-gateway:8090 (V1_GATEWAY_URL)", untrusted.stdout)
+        self.assertIn("WARNING PUBLIC_API_GATEWAY_PEERS is blank", untrusted.stdout)
+        trusted, _ = self._run(stub + sha, env={"URL": "http://v1-gateway:8090", "PEERS": "192.0.2.10"})
+        self.assertIn("relays through http://v1-gateway:8090", trusted.stdout)
+        self.assertNotIn("WARNING", trusted.stdout)
 
     def test_a_first_deploy_creates_it_and_a_tree_without_it_warns_about_the_tunnel_route(self) -> None:
         result, _ = self._run("V1_GATEWAY_CODE_SHA=" + "f" * 64 + " v1_gateway_guard")

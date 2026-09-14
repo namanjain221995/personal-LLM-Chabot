@@ -11,7 +11,9 @@ developer → Cloudflare → cloudflared → v1-gateway :8090 → orchestrator :
 ```
 
 cloudflared sends `^/v1(/|$)` here once the operator adds that path rule.
-Until then, and for LAN callers, the Next `/v1` route keeps working.
+Until then, and for LAN callers, the Next `/v1` route keeps working: it goes
+straight to the orchestrator unless `V1_GATEWAY_URL` is set on the frontend
+(blank by default; see "Settings the operator owns").
 
 ## What it does
 
@@ -148,6 +150,7 @@ so it takes effect at the next deploy.
 |---|---|
 | `PUBLIC_API_GATEWAY_PEERS` | Must be exactly `10.231.231.2`, the gateway's pinned address on the internal `v1relay` network. Without it the orchestrator ignores the attach headers, the gateway never sees `X-TechSara-Run`, and re-attach stays off: requests still work, but they do not survive an orchestrator restart. Exact addresses only: an entry wider than /32 is ignored with a warning. |
 | `PUBLIC_API_TRUSTED_PROXIES` | Must also include `10.231.231.2`, so the orchestrator believes the `X-Forwarded-For` the gateway writes. This list alone no longer lets a peer attach. |
+| `V1_GATEWAY_URL` | Optional, blank by default. Set to `http://v1-gateway:8090` to relay the frontend's own `/v1` route (LAN callers, and tunnel traffic before the path rule exists) through the gateway. Set it only in the same change as the two rows above: until the orchestrator trusts the gateway's address, a relayed call is seen at that address (a project's `ip_allowlist` is checked against it) and re-attach stays off. `deploy.sh` reports which path `/v1` takes and warns when this is set while `PUBLIC_API_GATEWAY_PEERS` is blank. |
 | `TRUSTED_CLIENT_IP_HEADER` | Optional. Set to `cf-connecting-ip` only if a project's `ip_allowlist` must see the caller's address through the tunnel. |
 | `V1_GATEWAY_SPOOL_MAX_BYTES`, `PUBLIC_API_MIN_FREE_DISK_BYTES` | Spool quota and free-space floor. Blank uses the defaults above. |
 | `V1_GATEWAY_MEMORY_BUDGET_BYTES` | Body bytes held in memory across all relays. Blank uses 256 MiB. |

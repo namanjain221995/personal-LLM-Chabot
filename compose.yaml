@@ -386,9 +386,22 @@ services:
       PUBLIC_API_MAX_POOLING_BODY_BYTES: ${PUBLIC_API_MAX_POOLING_BODY_BYTES:-}
       PUBLIC_API_FILES_MAX_BODY_BYTES: ${PUBLIC_API_FILES_MAX_BODY_BYTES:-}
       PUBLIC_API_FILES_PART_MAX_BYTES: ${PUBLIC_API_FILES_PART_MAX_BYTES:-}
-      # The LAN path to /v1 relays through the same gateway as the tunnel, so
-      # a frontend recreate never cuts a developer call (app/v1 route.ts).
-      V1_GATEWAY_URL: http://v1-gateway:8090
+      # OPT-IN relay of the frontend's /v1 route through the v1-gateway
+      # (app/v1 route.ts). Blank by default: the route then goes straight to
+      # the orchestrator, as it did before the gateway existed.
+      #
+      # WHY NOT ON BY DEFAULT (release review 2026-09-14, high). Public /v1
+      # traffic arrives through the tunnel at THIS service today, so a fixed
+      # value here put every public call on the gateway hop at the deploy
+      # that shipped it -- before anyone had set PUBLIC_API_GATEWAY_PEERS or
+      # PUBLIC_API_TRUSTED_PROXIES. The orchestrator then saw every caller at
+      # the gateway's address (a project's ip_allowlist evaluated against the
+      # wrong address) and ignored the gateway's re-attach headers. Set it in
+      # .env to http://v1-gateway:8090 in the same change as those two
+      # settings (gateway/README.md, "Settings the operator owns");
+      # scripts/deploy.sh reports which path /v1 takes and warns when the
+      # relay is on without them.
+      V1_GATEWAY_URL: ${V1_GATEWAY_URL:-}
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     networks:

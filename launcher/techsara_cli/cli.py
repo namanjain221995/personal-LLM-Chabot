@@ -1424,7 +1424,10 @@ def _start_v1_gateway(compose: ComposeManager, code_sha: str) -> dict[str, Any]:
         row = compose.wait_service(V1_GATEWAY_SERVICE, timeout=120.0, reporter=_step)
         health = "healthy"
         if action == "created":
-            _step("  v1-gateway: created; it takes no public traffic until the tunnel routes ^/v1 to it")
+            _step(
+                "  v1-gateway: created; it takes no public traffic until the tunnel routes ^/v1 to it "
+                "or V1_GATEWAY_URL points the frontend's /v1 route at it"
+            )
         else:
             _step(
                 f"  v1-gateway: RECREATED ({before_image or 'unknown image'} -> {image}); the connections it relayed "

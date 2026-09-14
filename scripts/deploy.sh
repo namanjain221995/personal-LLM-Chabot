@@ -471,12 +471,16 @@ reconcile_engine_guards() {
 #     clients resume.
 #   * An orchestrator that suspends public runs on SIGTERM (the durable
 #     runtime, with PUBLIC_API_RESUME_ENABLED on) cuts only the runs that are
-#     not resumable (store:false, and — until the router launches through the
-#     durable runtime — every foreground sync or streaming generation; only
-#     background jobs are durable in the 2026-09-14 build); the next process
+#     not resumable (store:false, and a request whose input files were still
+#     being prepared, which ends with a retryable failure); the next process
 #     resumes the rest. One
 #     that cannot (the code before that runtime shipped, i.e. the deploy that
 #     ships it, or resume switched off) fails every run in flight.
+#   * The gateway is on a public path only when the operator puts it there:
+#     the tunnel's ^/v1 rule, or V1_GATEWAY_URL on the frontend (blank by
+#     default, compose.yaml). v1_gateway_guard says which path /v1 takes and
+#     warns when the frontend relays through the gateway while
+#     PUBLIC_API_GATEWAY_PEERS is blank.
 #   * DEPLOYS NEVER WAIT (no-timeout design, deploy_survival: "a deploy wait
 #     can block security fixes forever"). By default both guards only SAY
 #     what this deploy is about to cut. WHY NOT A BOUNDED WAIT BY DEFAULT
@@ -543,6 +547,26 @@ bounded_wait() {  # bounded_wait DEADLINE POLL PROBE - 0 once PROBE prints 0 or 
   done
 }
 
+v1_gateway_path_report() {  # which way the frontend's /v1 route goes after this deploy, and the one misconfiguration to warn about
+  # Release review 2026-09-14 (high): with a fixed V1_GATEWAY_URL the deploy
+  # that shipped the gateway put all public /v1 traffic on it before the
+  # orchestrator trusted its address. The relay is opt-in now; say which path
+  # this deploy renders, because nothing else in the log does.
+  local url peers
+  url="$(dr_env_value V1_GATEWAY_URL)"
+  peers="$(dr_env_value PUBLIC_API_GATEWAY_PEERS)"
+  if [ -z "$url" ]; then
+    say "  v1-gateway: the frontend's /v1 route goes straight to the orchestrator (V1_GATEWAY_URL is blank)"
+    return 0
+  fi
+  say "  v1-gateway: the frontend's /v1 route relays through $url (V1_GATEWAY_URL)"
+  if [ -z "$peers" ]; then
+    say "  v1-gateway: WARNING PUBLIC_API_GATEWAY_PEERS is blank: the orchestrator ignores the gateway's re-attach headers,"
+    say "  v1-gateway: and unless PUBLIC_API_TRUSTED_PROXIES names the gateway it sees every caller at the gateway's address"
+    say "  v1-gateway: (ip_allowlist). Set both in .env (gateway/README.md, Settings the operator owns) or blank V1_GATEWAY_URL."
+  fi
+}
+
 v1_gateway_guard() {  # before `up`: say what this deploy does to the gateway; wait (bounded) before a recreate only when opted in
   local want="${V1_GATEWAY_CODE_SHA:-}" running have rendered why relays image
   local deadline="${DEPLOY_GATEWAY_DRAIN_DEADLINE:-0}" poll="${DEPLOY_GATEWAY_DRAIN_POLL:-5}"
@@ -556,8 +580,9 @@ v1_gateway_guard() {  # before `up`: say what this deploy does to the gateway; w
     fi
     return 0
   fi
+  v1_gateway_path_report
   if [ "$running" != true ]; then
-    say "  v1-gateway: not running; this deploy creates it (code sha ${want:0:12}). It takes no public traffic until the tunnel routes ^/v1 to it"
+    say "  v1-gateway: not running; this deploy creates it (code sha ${want:0:12}). It takes no public traffic until the tunnel routes ^/v1 to it or V1_GATEWAY_URL points the frontend's /v1 route at it"
     return 0
   fi
   image="$(docker inspect "$V1_GATEWAY_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)"

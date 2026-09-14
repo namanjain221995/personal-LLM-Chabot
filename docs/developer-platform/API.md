@@ -836,7 +836,9 @@ restart-failed long job with a new key.
 and `OPTIONS`.
 
 * **Target.** `v1GatewayUrl()` reads `V1_GATEWAY_URL` (an absolute http(s) URL;
-  anything else is ignored). With it, the request goes to the gateway, body
+  anything else is ignored). Compose leaves it blank: the operator opts in from
+  `.env` in the same change that sets `PUBLIC_API_GATEWAY_PEERS` and adds the
+  gateway to `PUBLIC_API_TRUSTED_PROXIES` (gateway/README.md). With it, the request goes to the gateway, body
   streamed through `BodySource.attempt()`. When that fetch fails with a
   connect-phase code (`isConnectPhaseError`: `ECONNREFUSED`, `ENOTFOUND`,
   `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `EHOSTDOWN`,

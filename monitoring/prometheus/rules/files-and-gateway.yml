@@ -1031,9 +1031,10 @@ groups:
   # `up{job="v1-gateway"}` has no series and every rule in this group is
   # inert.
   #
-  # TWO ROUTES LEAD TO THE GATEWAY once the no-timeout compose change is
-  # deployed: cloudflared's ^/v1(/|$) path rule, and the Next frontend's /v1
-  # route, which relays to V1_GATEWAY_URL whenever that variable is set. Taking the gateway out of the path means removing
+  # TWO ROUTES CAN LEAD TO THE GATEWAY, each only once the operator opts in:
+  # cloudflared's ^/v1(/|$) path rule, and the Next frontend's /v1 route,
+  # which relays to V1_GATEWAY_URL when .env sets it (compose leaves it
+  # blank). Taking the gateway out of the path means removing
   # BOTH, or /v1 keeps reaching the dead gateway through the frontend.
   # ------------------------------------------------------------------------
   - name: v1-gateway
