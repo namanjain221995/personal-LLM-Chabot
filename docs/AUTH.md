@@ -75,7 +75,14 @@ Guard-rails baked into the API (not the UI):
 - Since 2026-09-13 the same rank rule applies to **reading**: an admin gets 404
   for a super admin's or a peer admin's sessions, conversations, uploads and
   reports, and the member detail withholds their usage counts. Reading your own
-  is always allowed.
+  is always allowed. Owner decision 2026-09-14: a **super admin** may inspect
+  every member, other super admins included (the audited reads still write
+  their events, and super admins can read the audit log). One rule,
+  `rbac.may_inspect`, drives both the routes and the member detail's
+  `may_inspect` flag; the console shows "Private" and a neutral notice instead
+  of calling a route it would be refused. Management keeps `outranks`, so a
+  super admin still cannot deactivate, remove, reset or revoke a peer super
+  admin.
 - The workspace can never lose its last active super admin — demotion,
   deactivation and removal all answer 409.
 - Nobody can deactivate or remove themselves.
@@ -95,7 +102,8 @@ knowing a filename.
 
 Administrative access is the one exception, and it is: read-only, behind
 `workspace_content.read`, limited to accounts the viewer outranks (or their
-own), and **audited** — every viewed conversation and
+own; a super admin may read any account, peer super admins included, since
+2026-09-14), and **audited** — every viewed conversation and
 downloaded file writes an `audit_events` row (admin, target, resource,
 timestamp, source address). There is no impersonation: nothing lets an admin
 act *as* a member or feed a member's content into their own model context.

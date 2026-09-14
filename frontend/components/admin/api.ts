@@ -92,6 +92,21 @@ export function assignableRoles(me: Me): Role[] {
   return [];
 }
 
+/**
+ * May this viewer read a member's sessions and content, as GET members/{id}
+ * stated it (server rule: rbac.may_inspect)? During a half-deploy (new page,
+ * old orchestrator) `may_inspect` is absent, and the old server's
+ * `stats === null` marked exactly the same refusal.
+ */
+export function mayInspectMember(detail: {
+  stats: unknown;
+  may_inspect?: boolean;
+}): boolean {
+  return typeof detail.may_inspect === 'boolean'
+    ? detail.may_inspect
+    : detail.stats !== null;
+}
+
 export class AdminApiError extends Error {
   constructor(
     readonly status: number,

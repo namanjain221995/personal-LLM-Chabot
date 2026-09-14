@@ -11,7 +11,11 @@ then the hole is back.
              admin capability, and the read was not audited
   N027       display names went into the usage CSV as live spreadsheet formulas
   F029/N007  the session list and the content viewer never applied the rank
-             rule, so an admin could read a super admin's sessions and chats
+             rule, so an admin could read a super admin's sessions and chats.
+             Policy change, owner decision 2026-09-14: a SUPER ADMIN may
+             inspect every member, peer super admins included (still audited);
+             an admin still reads nothing of an equal or higher role, and the
+             management routes keep the strict rank rule for everyone.
 """
 import csv
 import io
@@ -262,6 +266,31 @@ def test_an_admin_cannot_list_or_revoke_a_super_admins_sessions_but_can_for_a_me
     # Your own sessions are always yours to see.
     assert admin.get(f"/admin/api/members/{_uid('adm')}/sessions").status_code == 200
 
+    # A peer admin's sessions are refused the same way: equal rank is not lower.
+    login_client("peer", role="admin")
+    peer_listing = admin.get(f"/admin/api/members/{_uid('peer')}/sessions")
+    assert peer_listing.status_code == 404
+    assert "ip" not in peer_listing.text
+    assert admin.post(f"/admin/api/members/{_uid('peer')}/sessions/revoke").status_code == 403
+
+
+def test_a_super_admin_may_list_a_peer_super_admins_sessions_but_still_not_revoke_them(
+    login_client,
+):
+    """Owner decision, 2026-09-14: a super admin may INSPECT every member,
+    other super admins included. It is a deliberate policy change to F029/N007
+    for the top role only; revoking (management) keeps `outranks`, so equal
+    rank is still refused there."""
+    root = login_client("root", role="super_admin")
+    login_client("boss", role="super_admin")
+
+    listing = root.get(f"/admin/api/members/{_uid('boss')}/sessions")
+    assert listing.status_code == 200
+    assert len(listing.json()["sessions"]) == 1
+    assert root.post(f"/admin/api/members/{_uid('boss')}/sessions/revoke").status_code == 403
+    # ...and the peer's session survived the refused revoke.
+    assert len(root.get(f"/admin/api/members/{_uid('boss')}/sessions").json()["sessions"]) == 1
+
 
 @pytest.fixture()
 def content_of(tmp_path, monkeypatch):
@@ -324,7 +353,10 @@ def test_an_admin_cannot_read_a_super_admins_conversations_uploads_or_reports_bu
     # A peer admin is outside the rule too — equal rank is not a lower rank.
     peer = login_client("peer", role="admin")
     peer_content = content_of(peer, "peer")
-    assert admin.get(_content_routes(_uid("peer"), peer_content)[1]).status_code == 404
+    for path in _content_routes(_uid("peer"), peer_content):
+        resp = admin.get(path)
+        assert resp.status_code == 404, path
+        assert "private question" not in resp.text and b"%PDF" not in resp.content
 
     # No refused read pretends to have happened in the audit log.
     for action in ("admin_viewed_conversation", "admin_downloaded_upload", "admin_downloaded_report"):
@@ -351,3 +383,81 @@ def test_the_member_detail_withholds_a_super_admins_usage_counts_from_an_admin_b
     bob = admin.get(f"/admin/api/members/{_uid('bob')}").json()
     assert bob["stats"] is not None and bob["stats"]["conversations"] == 0
     assert admin.get(f"/admin/api/members/{_uid('adm')}").json()["stats"] is not None
+
+
+def test_a_super_admin_reads_a_peer_super_admins_content_and_every_read_is_audited(
+    login_client, content_of
+):
+    """Owner decision, 2026-09-14: a super admin may inspect every member of
+    the workspace, including other super admins. This deliberately changes the
+    F029/N007 rule for the top role only: the audited reads still write their
+    events, and super admins can read that log, so access between them stays
+    accountable. The admin-side refusals are pinned by the test above,
+    unchanged."""
+    root = login_client("root", role="super_admin")
+    boss = login_client("boss", role="super_admin")
+    boss_content = content_of(boss, "boss")
+
+    responses = [root.get(path) for path in _content_routes(_uid("boss"), boss_content)]
+    for path, resp in zip(_content_routes(_uid("boss"), boss_content), responses):
+        assert resp.status_code == 200, path
+    assert "boss's private question" in responses[1].text
+    assert responses[4].content == b"hello"
+    assert responses[5].content.startswith(b"%PDF")
+
+    for action in (
+        "admin_viewed_conversation",
+        "admin_downloaded_upload",
+        "admin_downloaded_report",
+    ):
+        rows = _audit_rows(action)
+        assert len(rows) == 1, action
+        assert rows[0]["actor_user_id"] == _uid("root"), action
+        assert rows[0]["target_user_id"] == _uid("boss"), action
+
+
+def test_the_member_detail_reports_may_inspect_and_withholds_stats_exactly_when_false(
+    login_client,
+):
+    root = login_client("root", role="super_admin")
+    login_client("boss", role="super_admin")
+    admin = login_client("adm", role="admin")
+    login_client("peer", role="admin")
+    member = login_client("bob")
+
+    cases = [
+        (root, "root", True),    # self
+        (root, "boss", True),    # super admin -> peer super admin (2026-09-14)
+        (root, "adm", True),     # super admin -> admin
+        (admin, "adm", True),    # self
+        (admin, "bob", True),    # admin -> member
+        (admin, "boss", False),  # admin -> super admin
+        (admin, "peer", False),  # admin -> peer admin
+    ]
+    for client, target, expected in cases:
+        resp = client.get(f"/admin/api/members/{_uid(target)}")
+        assert resp.status_code == 200, target
+        body = resp.json()
+        assert set(body) == {"member", "stats", "may_inspect"}
+        assert body["may_inspect"] is expected, target
+        assert (body["stats"] is None) is (not expected), target
+
+    # A member has no admin surface at all: the capability gate answers first.
+    assert member.get(f"/admin/api/members/{_uid('bob')}").status_code == 404
+    assert member.get(f"/admin/api/members/{_uid('boss')}").status_code == 404
+
+
+def test_a_member_reads_no_ones_sessions_or_content(login_client, content_of):
+    member = login_client("bob")
+    carl = login_client("carl")
+    seeded = {"bob": content_of(member, "bob"), "carl": content_of(carl, "carl")}
+
+    for user, content in seeded.items():
+        paths = _content_routes(_uid(user), content)
+        paths.append(f"/admin/api/members/{_uid(user)}/sessions")
+        for path in paths:
+            resp = member.get(path)
+            assert resp.status_code == 404, path
+            assert "private question" not in resp.text and b"%PDF" not in resp.content
+    for action in ("admin_viewed_conversation", "admin_downloaded_upload", "admin_downloaded_report"):
+        assert _audit_rows(action) == []

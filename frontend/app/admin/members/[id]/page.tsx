@@ -7,6 +7,15 @@
  * their sessions. Content tabs exist only with workspace_content.read,
  * sessions with sessions.manage — the server 404s regardless; the client
  * just never draws a dead tab.
+ *
+ * Rank: the member row is always readable, but sessions, content and usage
+ * counts follow rbac.may_inspect (yourself; a super admin reads everyone,
+ * other super admins included, owner decision 2026-09-14; anyone else only a
+ * lower role). The detail says `may_inspect`, and when it is false the page
+ * never calls the refused routes: tiles read "Private" and every tab shows
+ * the same calm notice instead of a red "No such member." with a Retry.
+ * The tab bodies mount only after the detail has loaded, so the rule is known
+ * before the first content request could go out.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -23,6 +32,7 @@ import {
   adminPost,
   can,
   deviceOf,
+  mayInspectMember,
 } from '@/components/admin/api';
 import { AdminTable, Pagination, type AdminColumn } from '@/components/admin/AdminTable';
 import { RoleChip, StatusChip } from '@/components/admin/chips';
@@ -30,6 +40,7 @@ import { IconArrowLeft } from '@/components/admin/icons';
 import {
   AvatarInitial,
   ErrorPanel,
+  PrivateContentNotice,
   SkeletonLine,
   StatTile,
 } from '@/components/admin/ui';
@@ -48,6 +59,7 @@ interface Member {
 
 interface MemberDetail {
   member: Member;
+  /** null when withheld from this viewer (never zeros). */
   stats: {
     conversations: number;
     messages: number;
@@ -55,7 +67,10 @@ interface MemberDetail {
     reports: number;
     memory_facts: number;
     research_runs: number;
-  };
+  } | null;
+  /** May this viewer read the member's sessions and content? Absent on an
+   *  orchestrator older than this page (half-deploy). */
+  may_inspect?: boolean;
 }
 
 const DOWNLOAD_LINK =
@@ -490,7 +505,10 @@ export default function AdminMemberDetailPage() {
 
   const loading = detail === null && error === null;
   const member = detail?.member;
-  const stats = detail?.stats;
+  const stats = detail?.stats ?? undefined;
+  // null until the detail says; the tab bodies wait for it.
+  const inspectable = detail === null ? null : mayInspectMember(detail);
+  const withheld = inspectable === false;
 
   const tabClass = (active: boolean) =>
     `-mb-px shrink-0 border-b-2 px-2.5 py-2 text-sm font-medium transition-colors duration-ts sm:px-3 ${
@@ -541,12 +559,12 @@ export default function AdminMemberDetailPage() {
           </div>
 
           <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-            <StatTile label="Conversations" value={stats?.conversations} loading={loading} />
-            <StatTile label="Messages" value={stats?.messages} loading={loading} />
-            <StatTile label="Uploads" value={stats?.uploads} loading={loading} />
-            <StatTile label="Reports" value={stats?.reports} loading={loading} />
-            <StatTile label="Memory facts" value={stats?.memory_facts} loading={loading} />
-            <StatTile label="Research runs" value={stats?.research_runs} loading={loading} />
+            <StatTile label="Conversations" value={stats?.conversations} loading={loading} withheld={withheld} />
+            <StatTile label="Messages" value={stats?.messages} loading={loading} withheld={withheld} />
+            <StatTile label="Uploads" value={stats?.uploads} loading={loading} withheld={withheld} />
+            <StatTile label="Reports" value={stats?.reports} loading={loading} withheld={withheld} />
+            <StatTile label="Memory facts" value={stats?.memory_facts} loading={loading} withheld={withheld} />
+            <StatTile label="Research runs" value={stats?.research_runs} loading={loading} withheld={withheld} />
           </div>
 
           {tabs.length > 0 && (
@@ -573,11 +591,25 @@ export default function AdminMemberDetailPage() {
               </div>
 
               <div className="mt-4">
-                {tab === 'conversations' && <ConversationsTab memberId={memberId} />}
-                {tab === 'uploads' && <UploadsTab memberId={memberId} />}
-                {tab === 'reports' && <ReportsTab memberId={memberId} />}
-                {tab === 'sessions' && (
-                  <SessionsTab memberId={memberId} memberName={member?.name ?? 'this member'} />
+                {inspectable === null ? (
+                  <div
+                    aria-hidden
+                    className="space-y-3 rounded-ts border border-border bg-surface px-4 py-4"
+                  >
+                    <SkeletonLine className="w-2/3" />
+                    <SkeletonLine className="w-1/2" />
+                  </div>
+                ) : inspectable === false ? (
+                  <PrivateContentNotice />
+                ) : (
+                  <>
+                    {tab === 'conversations' && <ConversationsTab memberId={memberId} />}
+                    {tab === 'uploads' && <UploadsTab memberId={memberId} />}
+                    {tab === 'reports' && <ReportsTab memberId={memberId} />}
+                    {tab === 'sessions' && (
+                      <SessionsTab memberId={memberId} memberName={member?.name ?? 'this member'} />
+                    )}
+                  </>
                 )}
               </div>
             </>
