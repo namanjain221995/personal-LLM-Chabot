@@ -657,8 +657,11 @@ invalid_request_error`, `param` naming the part, with its code's fixed
 sentence. Citations that resolve to content the model was shown become
 `file_citation` annotations (`type`, `file_id`, `filename`, `index` in UTF-16
 code units, and `page` or `timestamp_s`): on the `output_text` part and on
-`choices[0].message.annotations`. The usage row records `file_ids`, the context
-mode and tokens, and the citation counts.
+`choices[0].message.annotations` of the answer to the request itself. A
+response read back with `GET /v1/responses/{response_id}` — the way a
+background response is delivered — carries no annotations: its stored body is
+the text alone, and its row keeps only the citation counts. The usage row
+records `file_ids`, the context mode and tokens, and the citation counts.
 
 ## 9. Response and error envelope
 

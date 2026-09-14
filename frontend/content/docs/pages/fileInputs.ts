@@ -470,6 +470,11 @@ Where the annotations are:
   them all.
 * **Chat Completions:** \`choices[0].message.annotations\`, and in a stream on
   the last chunk's \`delta.annotations\`.
+* **A response read back later:** a response fetched with
+  \`GET /v1/responses/{id}\` — which is how a background request's answer is
+  delivered — has no annotations. The labels are still in its text, but they
+  have not been checked against what the model was given, so do not link
+  them as citations.
 
 The SDKs type annotations as a union, and a \`file_citation\` has no
 \`url_citation\` field: always branch on \`annotation.type\`.

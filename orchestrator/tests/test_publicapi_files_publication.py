@@ -28,11 +28,12 @@ from typing import Dict
 import pytest
 
 from app.apifiles import events as file_events, service
-from app.publicapi import errors, openapi as openapi_module, router as public_router
+from app.publicapi import errors, models, openapi as openapi_module, router as public_router
 from app.publicapi.files import routes as file_routes, wire
 
 REPO = Path(__file__).resolve().parents[2]
 CONTRACT = (REPO / "docs" / "developer-platform" / "CONTRACT.md").read_text(encoding="utf-8")
+FILE_INPUTS_PAGE = (REPO / "frontend" / "content" / "docs" / "pages" / "fileInputs.ts").read_text(encoding="utf-8")
 SURFACE = (REPO / ".github" / "workflows" / "scripts" / "public-api-surface.txt").read_text(encoding="utf-8")
 
 FILES_CODES = {
@@ -214,3 +215,25 @@ def test_the_contracts_derived_answers_are_the_ones_the_derived_gate_sends():
     assert wire.FILE_CODES["file_not_ready"] == (409, "invalid_request_error", True)
     assert wire.invalid_request("x", param="file_id").status == 400
 
+
+# --------------------------------------- annotations on a response read back --
+
+
+def test_a_response_read_back_is_documented_without_annotations_for_as_long_as_its_stored_body_has_none():
+    # The stored Response body is built from the row's text alone: an
+    # `output_text` part has no `annotations` field, and a background row
+    # records only the citation counts. The contract and the file-inputs page
+    # must say so, and must stop saying so the day the stored body carries
+    # them.
+    stores_annotations = "annotations" in models.OutputText.model_fields or "annotation" in inspect.getsource(
+        public_router._row_to_wire
+    )
+    contract = _section("**Files as model input**", "## 9. Response and error envelope")
+    page = FILE_INPUTS_PAGE[FILE_INPUTS_PAGE.index("Where the annotations are:"):]
+    page = page[: page.index("## Errors")].replace("\\`", "`")  # the template literal escapes its backticks
+    contract_says_none = "carries no annotations" in contract
+    page_says_none = "has no annotations" in page
+    assert contract_says_none is page_says_none is (not stores_annotations)
+    if not stores_annotations:
+        assert "`GET /v1/responses/{response_id}`" in contract and "background response" in contract
+        assert "`GET /v1/responses/{id}`" in page and "background" in page
