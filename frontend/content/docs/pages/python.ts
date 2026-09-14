@@ -10,6 +10,7 @@ import {
   WHISPER_MODEL_ID,
 } from '../samples';
 import { NO_TIMEOUT_LIVE } from './longOutput';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): the Python page gains the exact
 // `openai` package client settings (timeout None, never 0) and a resume loop,
@@ -480,10 +481,16 @@ field. [Migration](/docs/migration) has the details.
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function pythonPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+export function pythonPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
   const sections = noTimeout
     ? [INTRO, LATER_A_CLIENT, S_ONE_ANSWER, S_A_CONVERSATION, S_STREAMING, LATER_ERRORS_AND_RETRIES, S_IDEMPOTENT_AND_BACKGROUND, S_AN_IMAGE, S_SEARCH_EMBED_THEN_RERANK, LATER_SPEECH_TO_TEXT, LATER_A_VERY_LONG_ANSWER, LATER_USING_AN_OPENAI_SHAPED_CLIENT]
-    : [INTRO, S_A_CLIENT, S_ONE_ANSWER, S_A_CONVERSATION, S_STREAMING, S_ERRORS_AND_RETRIES, S_IDEMPOTENT_AND_BACKGROUND, S_AN_IMAGE, S_SEARCH_EMBED_THEN_RERANK, S_SPEECH_TO_TEXT, S_A_VERY_LONG_ANSWER, S_USING_AN_OPENAI_SHAPED_CLIENT];
+    : [INTRO, S_A_CLIENT, S_ONE_ANSWER, S_A_CONVERSATION, S_STREAMING, S_ERRORS_AND_RETRIES, S_IDEMPOTENT_AND_BACKGROUND, S_AN_IMAGE, S_SEARCH_EMBED_THEN_RERANK, sidecarsLive ? LATER_SPEECH_TO_TEXT : S_SPEECH_TO_TEXT, S_A_VERY_LONG_ANSWER, S_USING_AN_OPENAI_SHAPED_CLIENT];
   return {
     slug: 'python',
     title: 'Python',

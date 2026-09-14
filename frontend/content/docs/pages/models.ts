@@ -25,157 +25,6 @@ import { NO_TIMEOUT_LIVE } from './longOutput';
 const INTRO = `
 
 `;
-const S_THE_CATALOGUE = `
-## The catalogue
-
-~~~bash
-export TECHSARA_API_KEY="tsk_live_…"   # your key, from the console
-
-curl ${API_BASE_URL}/models \\
-  -H "Authorization: Bearer $TECHSARA_API_KEY"
-~~~
-
-~~~json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "${MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "chat",
-      "capabilities": {
-        "chat": true, "streaming": true, "vision": true, "tools": false,
-        "embeddings": false, "rerank": false, "audio_transcription": false,
-        "ocr": false, "background": true
-      },
-      "endpoints": ["/v1/responses", "/v1/chat/completions"],
-      "context_window": 1000000,
-      "max_input_tokens": 999232,
-      "max_output_tokens": 1000000,
-      "default_max_output_tokens": 8192,
-      "limits": { "max_images_per_request": 16 }
-    },
-    {
-      "id": "${VISION_MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "chat",
-      "capabilities": {
-        "chat": true, "streaming": true, "vision": true, "tools": false,
-        "embeddings": false, "rerank": false, "audio_transcription": false,
-        "ocr": false, "background": true
-      },
-      "endpoints": ["/v1/responses", "/v1/chat/completions"],
-      "context_window": 24576,
-      "max_input_tokens": 24320,
-      "max_output_tokens": 24576,
-      "default_max_output_tokens": 8192,
-      "limits": { "max_images_per_request": 8 }
-    },
-    {
-      "id": "${OCR_MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "chat",
-      "capabilities": {
-        "chat": true, "streaming": true, "vision": true, "tools": false,
-        "embeddings": false, "rerank": false, "audio_transcription": false,
-        "ocr": true, "background": true
-      },
-      "endpoints": ["/v1/responses", "/v1/chat/completions"],
-      "context_window": 8192,
-      "max_input_tokens": 7936,
-      "max_output_tokens": 8192,
-      "default_max_output_tokens": 8192,
-      "limits": { "max_images_per_request": 1 }
-    },
-    {
-      "id": "${EMBED_MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "embedding",
-      "capabilities": {
-        "chat": false, "streaming": false, "vision": false, "tools": false,
-        "embeddings": true, "rerank": false, "audio_transcription": false,
-        "ocr": false, "background": false
-      },
-      "endpoints": ["/v1/embeddings"],
-      "context_window": 4096,
-      "max_input_tokens": 4096,
-      "max_output_tokens": null,
-      "default_max_output_tokens": null,
-      "limits": { "max_inputs_per_request": 256, "embedding_dimensions": 1024 }
-    },
-    {
-      "id": "${RERANK_MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "rerank",
-      "capabilities": {
-        "chat": false, "streaming": false, "vision": false, "tools": false,
-        "embeddings": false, "rerank": true, "audio_transcription": false,
-        "ocr": false, "background": false
-      },
-      "endpoints": ["/v1/rerank"],
-      "context_window": 4096,
-      "max_input_tokens": 4096,
-      "max_output_tokens": null,
-      "default_max_output_tokens": null,
-      "limits": { "max_documents_per_request": 100 }
-    },
-    {
-      "id": "${WHISPER_MODEL_ID}",
-      "object": "model",
-      "owned_by": "techsara",
-      "status": "available",
-      "kind": "transcription",
-      "capabilities": {
-        "chat": false, "streaming": false, "vision": false, "tools": false,
-        "embeddings": false, "rerank": false, "audio_transcription": true,
-        "ocr": false, "background": false
-      },
-      "endpoints": ["/v1/audio/transcriptions"],
-      "context_window": null,
-      "max_input_tokens": null,
-      "max_output_tokens": null,
-      "default_max_output_tokens": null,
-      "limits": {
-        "max_audio_seconds": 300,
-        "max_audio_bytes": 26214400,
-        "response_formats": ["json", "text", "verbose_json"]
-      }
-    }
-  ]
-}
-~~~
-
-Each object is exactly what the model registry renders, field for field,
-inside the \`{"object": "list", "data": […]}\` envelope every listing on this
-API uses. A number that does not apply to a model — an output ceiling on a
-model that generates nothing — is \`null\`, never \`0\`.
-
-The numbers above are an **illustration, not a promise**. They are read at
-request time from what this deployment is actually running, and they move
-when an engine is upgraded or reconfigured. Read them from this endpoint —
-that is what it is for — rather than copying them into your client.
-
-A single model resolves the same way:
-
-~~~bash
-curl ${API_BASE_URL}/models/${MODEL_ID} \\
-  -H "Authorization: Bearer $TECHSARA_API_KEY"
-~~~
-
-A model you are not permitted to use answers \`404 model_not_found\`, not
-\`403\`. The API does not confirm the existence of something you may not
-reach.
-`;
 const S_THE_SIX_MODELS_AT_A_GLANCE = `
 ## The six models at a glance
 
@@ -247,45 +96,6 @@ The output clamp reserves a conservative 2,048 tokens per image, so a request
 with a long prompt can see a lower applied \`max_output_tokens\` than you
 might expect; the response always tells you the value it applied.
 `;
-const S_EMBED_MODEL_ID = `
-### ${EMBED_MODEL_ID}
-
-| Ceiling | Value |
-| --- | --- |
-| Dimensions | 1,024 |
-| Inputs | up to 256 per request |
-| Input length | 4,096 tokens each — over it is a \`400\` naming the input, never a silent truncation |
-
-Text is embedded exactly as you send it. For search, the model does best when
-a **query** carries a one-line task description and documents do not — see
-[embeddings](/docs/embeddings#queries-and-documents).
-`;
-const S_RERANK_MODEL_ID = `
-### ${RERANK_MODEL_ID}
-
-| Ceiling | Value |
-| --- | --- |
-| Documents | up to 100 per request |
-| Pair length | 4,096 tokens for the query and one document together, after the server's template |
-
-\`relevance_score\` is the model's probability, from 0 to 1, that the
-document answers the query. See [rerank](/docs/rerank).
-`;
-const S_WHISPER_MODEL_ID = `
-### ${WHISPER_MODEL_ID}
-
-| Ceiling | Value |
-| --- | --- |
-| Audio length | 300 seconds |
-| File size | 25 MiB |
-| Formats | \`json\`, \`text\`, \`verbose_json\` |
-
-Let it detect the language. Forcing \`language\` forces the language of the
-*output*: \`en\` on speech in another language gives you an English
-translation rather than a transcript. Accuracy varies by language, and some —
-Gujarati among them — are noticeably weaker and slower. See
-[audio transcriptions](/docs/audio-transcriptions).
-`;
 const S_THE_CAPABILITY_FLAGS = `
 ## The capability flags
 
@@ -333,26 +143,6 @@ const S_CHOOSING_A_MODEL_IN_A_REQUEST = `
 The id must be one your key may use. Your project can carry a model
 allowlist; if it is empty, every available public model is open to it —
 including models added later. If that is not what you want, set an allowlist.
-`;
-const S_LIMITS_ATTACHED_TO_A_MODEL = `
-## Limits attached to a model
-
-* \`max_input_tokens\` — the prompt ceiling. Over it is
-  \`400 context_length_exceeded\`, refused before the model runs rather than
-  discovered halfway through generation.
-* \`max_output_tokens\` — the ceiling for \`max_output_tokens\` in a request.
-  Asking for more than the ceiling is a \`400\`. Asking for less, but more than
-  your prompt leaves in the window, is **clamped**, and the response says what
-  was applied. Asking for nothing gives you \`default_max_output_tokens\`.
-* \`limits\` — images, inputs, documents or audio per request.
-
-A project can set lower input and output ceilings of its own, which then
-apply to every key in it. These are the limits that apply: the API enforces no
-per-project request, token or concurrency limits on top of them — see
-[rate limits](/docs/rate-limits). What it does have is a capacity queue in
-front of each shared engine, which can answer \`503 model_unavailable\` with
-\`Retry-After\` when that engine is full — see
-[rate limits](/docs/rate-limits#capacity-queues-per-engine).
 `;
 
 // ------------------------------------------------ after the no-timeout release --
@@ -571,7 +361,11 @@ takes and is never refused — see
 export function modelsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
   const sections = noTimeout
     ? [INTRO, LATER_THE_CATALOGUE, S_THE_SIX_MODELS_AT_A_GLANCE, S_MODEL_ID, S_VISION_MODEL_ID, S_OCR_MODEL_ID, LATER_EMBED_MODEL_ID, LATER_RERANK_MODEL_ID, LATER_WHISPER_MODEL_ID, S_THE_CAPABILITY_FLAGS, S_WHICH_MODELS_EXIST_AND_WHO_DECIDES, S_CHOOSING_A_MODEL_IN_A_REQUEST, LATER_LIMITS_ATTACHED_TO_A_MODEL]
-    : [INTRO, S_THE_CATALOGUE, S_THE_SIX_MODELS_AT_A_GLANCE, S_MODEL_ID, S_VISION_MODEL_ID, S_OCR_MODEL_ID, S_EMBED_MODEL_ID, S_RERANK_MODEL_ID, S_WHISPER_MODEL_ID, S_THE_CAPABILITY_FLAGS, S_WHICH_MODELS_EXIST_AND_WHO_DECIDES, S_CHOOSING_A_MODEL_IN_A_REQUEST, S_LIMITS_ATTACHED_TO_A_MODEL];
+    // The sidecar facts (2,048 inputs, 1,000 documents, audio of any length,
+    // capacity queues that wait) shipped before the rest of the no-timeout
+    // release (2026-09-14), and the catalogue sample must match what the
+    // registry reports today, so today's page already uses those sections.
+    : [INTRO, LATER_THE_CATALOGUE, S_THE_SIX_MODELS_AT_A_GLANCE, S_MODEL_ID, S_VISION_MODEL_ID, S_OCR_MODEL_ID, LATER_EMBED_MODEL_ID, LATER_RERANK_MODEL_ID, LATER_WHISPER_MODEL_ID, S_THE_CAPABILITY_FLAGS, S_WHICH_MODELS_EXIST_AND_WHO_DECIDES, S_CHOOSING_A_MODEL_IN_A_REQUEST, LATER_LIMITS_ATTACHED_TO_A_MODEL];
   return {
     slug: 'models',
     title: 'Model reference',

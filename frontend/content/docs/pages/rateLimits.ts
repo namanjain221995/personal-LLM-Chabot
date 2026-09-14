@@ -17,6 +17,7 @@ import { EXAMPLE_STATUS } from '../samples';
 // Retry-After, never 429 — and this page names it as a capacity fact, not a
 // limit (CONTRACT §12.3).
 import { NO_TIMEOUT_LIVE } from './longOutput';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): a capacity queue waits without a
 // clock and never refuses. The engines are still shared with the chat
@@ -36,7 +37,25 @@ that does not exist would be worse than none.
 That is a decision, not a gap waiting to be filled; the
 [changelog](/docs/changelog) records it on 2026-09-13.
 `;
-const S_WHAT_STILL_APPLIES = `
+/** Today's rows about embeddings, rerank and transcriptions, which shipped
+ * without a clock on 2026-09-14 (SIDECARS_NO_TIMEOUT_LIVE). */
+const sidecarBodyRowsToday = (sidecars: boolean): string =>
+  sidecars
+    ? `| Body bytes for embeddings and rerank | 8 MiB — up to 2,048 inputs or 1,000 documents | \`413 request_too_large\`. See [embeddings](/docs/embeddings). |
+| Body bytes with images | 20 MiB on \`/v1/responses\` and \`/v1/chat/completions\`, of which text at most 1 MiB | \`413 request_too_large\`. See [images](/docs/images). |
+| Body bytes with audio | 90 MiB on \`/v1/audio/transcriptions\`, of which the file at most 89 MiB. No limit on duration. | \`413 request_too_large\`. See [audio transcriptions](/docs/audio-transcriptions). |`
+    : `| Body bytes with images | 20 MiB on \`/v1/responses\` and \`/v1/chat/completions\`, of which text at most 1 MiB | \`413 request_too_large\`. See [images](/docs/images). |
+| Body bytes with audio | 26 MiB on \`/v1/audio/transcriptions\`: a 25 MiB file, 300 seconds of audio | \`413 request_too_large\`. See [audio transcriptions](/docs/audio-transcriptions). |`;
+const sidecarQueueRowsToday = (sidecars: boolean): string =>
+  sidecars
+    ? `| \`techsara-embed\` | 2, and a bounded share of the engine's memory | Waits with no limit, sending spaces, until the vectors are ready |
+| \`techsara-rerank\` | 2, and a bounded share of the engine's memory | Waits with no limit, sending spaces, until the scores are ready |
+| \`techsara-whisper\` | 1 across the whole deployment, stepping aside for chat and dictation | Waits with no limit: \`: queued\` comments on a stream, or spaces |`
+    : `| \`techsara-embed\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-rerank\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
+| \`techsara-whisper\` | 1 across the whole deployment, stepping aside for chat and dictation | \`503\`, \`Retry-After\` 5 s |`;
+
+const whatStillAppliesToday = (sidecars: boolean): string => `
 ## What still applies
 
 These are technical limits of the model and the server, not allowances, and
@@ -45,8 +64,7 @@ they apply to every request:
 | Limit | Value | What you see |
 | --- | --- | --- |
 | Body bytes | 1 MiB | \`413 request_too_large\`, checked before the body is parsed. |
-| Body bytes with images | 20 MiB on \`/v1/responses\` and \`/v1/chat/completions\`, of which text at most 1 MiB | \`413 request_too_large\`. See [images](/docs/images). |
-| Body bytes with audio | 26 MiB on \`/v1/audio/transcriptions\`: a 25 MiB file, 300 seconds of audio | \`413 request_too_large\`. See [audio transcriptions](/docs/audio-transcriptions). |
+${sidecarBodyRowsToday(sidecars)}
 | Input tokens | The model's input ceiling | \`400 context_length_exceeded\`, refused before admission. |
 | Output tokens | 8,192 by default; up to 1,000,000 on \`techsara-35b\` | Asking for more than the [model's ceiling](/docs/models) is a \`400\`; asking for more than your prompt leaves in the window is clamped, and the response says what was applied. See [long outputs](/docs/long-output). |
 | Per request | Images, inputs, documents: the model's \`limits\` | \`400\`, before anything runs. |
@@ -58,7 +76,7 @@ can serve them, not a thousand times faster. Sending more in parallel than it
 can generate makes each answer wait longer — [stream](/docs/streaming) so
 your users see output as soon as it exists.
 `;
-const S_CAPACITY_QUEUES_PER_ENGINE = `
+const capacityQueuesToday = (sidecars: boolean): string => `
 ## Capacity queues, per engine
 
 Every model on this API runs on an engine the TechSara chat application also
@@ -71,17 +89,15 @@ engine pass through a small queue of their own:
 | \`techsara-35b\` | Shared with chat in the engine's own queue; answers planned above 8,192 tokens two at a time and within the engine's memory, and answers planned above 800,000 tokens one at a time — all stepping aside while a large chat document is waiting, and for up to 30 minutes after one could not start beside them | \`503\`, \`Retry-After\` 60 s for a long generation |
 | \`techsara-8b-vision\` | 4, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
 | \`techsara-ocr\` | 2, stepping aside briefly while someone is chatting | \`503\`, \`Retry-After\` 5 s |
-| \`techsara-embed\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
-| \`techsara-rerank\` | 2, and a bounded share of the engine's memory | \`503\`, \`Retry-After\` 5 s |
-| \`techsara-whisper\` | 1 across the whole deployment, stepping aside for chat and dictation | \`503\`, \`Retry-After\` 5 s |
+${sidecarQueueRowsToday(sidecars)}
 
 What makes these capacity and not limits:
 
 * **They belong to the engine, not to you.** Every project and every key shares
   the same queue. There is no count of *your* requests anywhere in it, and no
   amount of spreading work across keys changes it.
-* **They wait before they refuse.** A synchronous or streaming request waits up
-  to about 30 seconds for a place, before any response is sent; a
+* **They wait before they refuse.** A synchronous or streaming ${sidecars ? 'generation' : 'request'} waits up
+  to about 30 seconds for a place, before any response is sent;${sidecars ? ' embeddings, rerank and transcriptions wait with no limit, keeping the connection alive;' : ''} a
   [background response](/docs/background#waiting-for-capacity) waits in
   \`queued\` for up to an hour.
 * **The refusal is a \`503\`, never a \`429\`**: \`model_unavailable\`, "at
@@ -224,7 +240,8 @@ A \`503\` now means one of three things, and none of them is "busy":
 * \`503 model_recovering\` — the engine is restarting;
 * \`503 model_unavailable\` — the engine is down;
 * \`model_unavailable\` from a physical safeguard — the service has too many
-  connections open, or too little free disk, to take a new request safely.
+  connections open, too little free disk, or as much embedding and rerank work
+  in memory as it safely holds, to take a new request safely.
 
 All of them carry \`Retry-After\` in whole seconds, between 1 and 60.
 
@@ -241,10 +258,16 @@ has a worked retry loop.
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function rateLimitsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+export function rateLimitsPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
   const sections = noTimeout
     ? [INTRO, LATER_WHAT_STILL_APPLIES, LATER_CAPACITY_QUEUES_PER_ENGINE, S_USAGE_IS_STILL_RECORDED, LATER_BACKING_OFF_ON_503, S_IF_AN_OPERATOR_ENABLES_LIMITS]
-    : [INTRO, S_WHAT_STILL_APPLIES, S_CAPACITY_QUEUES_PER_ENGINE, S_USAGE_IS_STILL_RECORDED, S_BACKING_OFF_ON_503, S_IF_AN_OPERATOR_ENABLES_LIMITS];
+    : [INTRO, whatStillAppliesToday(sidecarsLive), capacityQueuesToday(sidecarsLive), S_USAGE_IS_STILL_RECORDED, S_BACKING_OFF_ON_503, S_IF_AN_OPERATOR_ENABLES_LIMITS];
   return {
     slug: 'rate-limits',
     title: 'Rate limits',

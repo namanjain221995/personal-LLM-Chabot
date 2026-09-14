@@ -9,18 +9,22 @@ vLLM-shaped reply.
 
 WHAT IS STUBBED: the engines, and only at the HTTP transport. The embedding
 engine is an `httpx.MockTransport` behind a real `AsyncOpenAI` client (so the
-SDK's own parsing is exercised); the reranker and the speech replicas are the
-same kind of transport installed in `sidecars._transport`. No test reaches a
-network, and no test needs a GPU.
+SDK's own parsing is exercised); the reranker, the engines' `/tokenize` and
+the speech replicas are the same kind of transport installed in
+`sidecars._transport`. No test reaches a network, and no test needs a GPU.
 
 Not a test module (no `test_` prefix), so pytest does not collect it; the
 three suites import its fixtures by name.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import socket
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import httpx
 import pytest
@@ -85,10 +89,19 @@ def engines_configured(monkeypatch):
     monkeypatch.setattr(sidecars, "probe_seconds", _no_probe)
     asr.set_provider(None)
     capacity.reset_for_tests()
+    sidecars.reset_for_tests()
+    # Every engine call goes through a stub; one that forgot to install one
+    # must fail loudly, never wait on a DNS lookup of a test hostname.
+    sidecars._transport = httpx.MockTransport(_no_engine_installed)
     yield
     asr.set_provider(None)
     capacity.reset_for_tests()
+    sidecars.reset_for_tests()
     sidecars._transport = None
+
+
+def _no_engine_installed(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"no stub engine installed for {request.url.path}")
 
 
 async def _no_probe(audio, **_kwargs):
@@ -140,6 +153,41 @@ def api(platform):
         yield client
 
 
+@contextlib.contextmanager
+def serve(app: Any) -> Iterator[int]:
+    """`app` on a real uvicorn in a thread; yields the port. A committed
+    response that aborts drops a REAL connection here, which the TestClient
+    cannot show."""
+    import uvicorn
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", lifespan="off"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    try:
+        yield port
+    finally:
+        server.should_exit = True
+        thread.join(10)
+
+
+@pytest.fixture()
+def api_port(platform):
+    """The `api` app on a real uvicorn: yields the port."""
+    endpoints.register(public_router.router)
+    app = FastAPI()
+    app.include_router(public_router.router)
+    public_router.install_error_handlers(app)
+    with serve(app) as port:
+        yield port
+
+
 def auth(which: str = "live") -> Dict[str, str]:
     return {"Authorization": f"Bearer {TOKENS[which]}"}
 
@@ -165,16 +213,37 @@ class Recorded:
 Handler = Callable[[httpx.Request, bytes], Any]
 
 
-def install_transport(handler: Handler) -> Recorded:
+def word_count_tokens(text: str) -> int:
+    """The stub `/tokenize`: one token per whitespace-separated word, plus
+    one — so a test can write an input that is long in BYTES (and so must be
+    counted) but short in tokens, or long in both."""
+    return len(text.split()) + 1
+
+
+def _tokenize_response(counter: Callable[[str], Any], body: bytes) -> httpx.Response:
+    payload = json.loads(body)
+    count = counter(payload["prompt"])
+    if isinstance(count, httpx.Response):
+        return count
+    return httpx.Response(200, json={"count": count, "max_model_len": 4096, "tokens": []})
+
+
+def install_transport(handler: Handler, *, tokenize: Callable[[str], Any] = word_count_tokens) -> Recorded:
     """`sidecars._transport` = a MockTransport calling `handler(request, body)`.
 
     `handler` may return an `httpx.Response` or raise an httpx error. The body
-    is read here (an async stream for the speech upload), once.
+    is read here (an async stream for the speech upload), once. `POST
+    /tokenize` goes to `tokenize(prompt)` instead (a count, or a Response to
+    answer with) and is recorded in `recorded.tokenized`, not in `requests`.
     """
     recorded = Recorded()
+    recorded.tokenized = []  # type: ignore[attr-defined]
 
     async def respond(request: httpx.Request) -> httpx.Response:
         body = await request.aread()
+        if request.url.path.endswith("/tokenize"):
+            recorded.tokenized.append(json.loads(body)["prompt"])  # type: ignore[attr-defined]
+            return _tokenize_response(tokenize, body)
         recorded.requests.append(request)
         recorded.bodies.append(body)
         result = handler(request, body)
@@ -186,7 +255,9 @@ def install_transport(handler: Handler) -> Recorded:
     return recorded
 
 
-def install_embed_engine(monkeypatch, handler: Handler) -> Recorded:
+def install_embed_engine(
+    monkeypatch, handler: Handler, *, tokenize: Callable[[str], Any] = word_count_tokens
+) -> Recorded:
     """The embedding engine: a real AsyncOpenAI client over a MockTransport,
     handed out where `sidecars` asks `llm._client` for one."""
     from openai import AsyncOpenAI
@@ -215,6 +286,15 @@ def install_embed_engine(monkeypatch, handler: Handler) -> Recorded:
 
     monkeypatch.setattr(llm, "_client", client)
     recorded.read_timeouts = seen  # type: ignore[attr-defined]
+    recorded.tokenized = []  # type: ignore[attr-defined]
+
+    async def tokenize_only(request: httpx.Request) -> httpx.Response:
+        body = await request.aread()
+        assert request.url.path.endswith("/tokenize"), request.url.path
+        recorded.tokenized.append(json.loads(body)["prompt"])  # type: ignore[attr-defined]
+        return _tokenize_response(tokenize, body)
+
+    sidecars._transport = httpx.MockTransport(tokenize_only)
     return recorded
 
 
@@ -260,3 +340,69 @@ def assert_nothing_internal(response: httpx.Response) -> None:
     text = response.text + json.dumps(dict(response.headers))
     for internal in INTERNAL_STRINGS:
         assert internal not in text, internal
+
+
+# ------------------------------------------------------------ witnesses --
+
+
+class ScriptedWitness:
+    """A `liveness.SidecarWitness` stand-in whose verdicts are a script: one
+    entry per failed send it is asked about, as (verdict, restarts since the
+    send went out). `verdict` takes the next entry; `restarts_since` answers
+    for the entry `verdict` last took. The decision table in
+    `sidecars._dispatch` is what the tests exercise; the real witness's
+    arithmetic has its own suite."""
+
+    def __init__(self, script):
+        import time as _time
+
+        self.script = list(script)
+        self.asked = []
+        self.clock = _time.monotonic
+        self._restarts = 0
+
+    def verdict(self, outstanding_since, now=None):
+        verdict, self._restarts = self.script.pop(0) if self.script else ("unknown", 0)
+        self.asked.append(verdict)
+        return verdict
+
+    def restarts_since(self, moment):
+        return self._restarts
+
+
+class ScriptedSampler:
+    """`sidecars.witness_sampler()` for a test: hands out one witness and
+    counts acquire/release, so a test can prove none is leaked."""
+
+    def __init__(self, witness):
+        self.witness = witness
+        self.acquired = 0
+        self.released = 0
+        self.roots = []
+
+    def acquire(self, key, root):
+        self.acquired += 1
+        self.roots.append(root)
+        return self.witness
+
+    def release(self, key):
+        self.released += 1
+
+
+def script_witness(monkeypatch, script) -> ScriptedSampler:
+    """Install a scripted witness, acquired as soon as a call goes out."""
+    sampler = ScriptedSampler(ScriptedWitness(script))
+    monkeypatch.setattr(sidecars, "WITNESS_START_S", 0.0)
+    monkeypatch.setattr(sidecars, "witness_sampler", lambda: sampler)
+    return sampler
+
+
+def no_backoff(monkeypatch) -> List[float]:
+    """Record the sleeps between re-dispatches instead of taking them."""
+    slept: List[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(sidecars, "_sleep", sleep)
+    return slept

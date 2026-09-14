@@ -443,11 +443,28 @@ Body (≤ 8 MiB, `PUBLIC_API_MAX_POOLING_BODY_BYTES`; `extra="forbid"`):
 * `encoding_format`: `float` (default) or `base64` (little-endian float32).
 * `dimensions`, `user` and any other field → `400` naming it.
 * Each input ≤ 4,096 tokens; over it is `400 context_length_exceeded`,
-  `param: input.<i>`. **Checked before any gate and before the commit clock
-  starts**: an input whose UTF-8 bytes + 2 ≤ 4,096 cannot overflow, longer
-  inputs are counted with the engine's `/tokenize` (CPU only, no KV, no gate;
-  retried, never skipped), so the refusal is always a real `400`. Inputs are
+  `param: input.<i>`. **Checked before any gate**: an input whose UTF-8
+  bytes + 2 ≤ 4,096 cannot overflow; longer inputs are counted with the
+  engine's `/tokenize` (CPU only, no KV) through ONE process-wide gate per
+  engine (`PUBLIC_API_TOKENIZE_CONCURRENCY` 8, which chat never passes
+  through), for at most `PUBLIC_API_LENGTH_CHECK_BUDGET_S` (8 s, ≤ 15) before
+  the status line. The time spent comes off the commit window. What is not
+  counted by then is counted inside the committed response (retried, never
+  skipped); counts are remembered by text sha256, so an over-length input
+  found after the commit — which drops the connection — is a real `400` on
+  the SDK's retry. A `4xx` from `/tokenize` (no tokenizer route) sends the
+  input at the window weight and the engine's own `400` names it; that refusal
+  is remembered the same way, so a retry is refused before its status line. Inputs are
   embedded as given: no query instruction is added and nothing is clipped.
+* **Memory guard, before the body is read**: accepted-but-unfinished
+  embeddings and rerank work is charged against one process-wide budget,
+  `PUBLIC_API_POOLING_MEMORY_BYTES` (512 MiB) — twice the body (three times
+  for rerank) plus 1,024 × 56 bytes per float vector (× 20 for base64). A
+  request that does not fit is `503 model_unavailable`, `Retry-After: 5`,
+  before the status line: first on its declared `Content-Length` (not yet
+  counted against quota), then on its parsed input count (counted, settled as
+  nothing ran). A request alone is always admitted. Vectors are held as
+  doubles and rendered one at a time.
 
 `200`:
 
@@ -465,11 +482,20 @@ budget, sent in order under gate `embed`, which waits with no limit (§12.3);
 
 Engine calls: read timeout `PUBLIC_API_POOLING_SILENCE_S` 600 s, then the
 `liveness.SidecarWitness` verdict decides — `progressing` re-sends, `unknown`
-re-sends up to 3 times, `lost` once, `stalled` fails `503 model_unavailable`;
-two engine restarts coinciding with the call fail it with
-`x-should-retry: false`. Before commit those are real statuses; after commit the
-connection is aborted, and a gateway-tagged request is first recomputed by the
-gateway's re-POST (§19).
+re-sends up to 3 times, `lost` once, `stalled` fails `503 model_unavailable`.
+A connection that breaks with the call out is re-sent once. An engine restart
+is **implicated** in a call when its witness (held for the whole call, re-sends
+included) saw `process_start_time_seconds` change, or when the call's connection
+broke and the next send found the engine refusing connections. The first
+implicated restart under a call of several inputs re-sends them one at a time;
+the second fails the request `503 model_unavailable` with
+`x-should-retry: false` and `param: input.<i>`, and that input (by sha256) is
+refused the same way **before any gate or status line** for
+`PUBLIC_API_POISON_QUARANTINE_S` (3,600 s) — so an SDK retry of a request that
+already committed is refused with a header it obeys, and the engine goes down
+twice per input, not twice per retry. Before commit those are real statuses;
+after commit the connection is aborted, and a gateway-tagged request is first
+recomputed by the gateway's re-POST (§19).
 
 ### 8.5 `POST /v1/rerank`
 
@@ -509,7 +535,8 @@ gate `rerank`.
 ### 8.6 `POST /v1/audio/transcriptions`
 
 `multipart/form-data`, streamed to disk as it arrives (`publicapi/multipart.py`
-streaming reader feeding `audio_jobs.ingest`, never `UploadFile`): the file part
+streaming reader handing the file part to a `disk_ledger.DiskSink`, never
+`UploadFile`): the file part
 goes to `PUBLIC_API_ASR_CACHE_DIR` through a `DiskSink` — sha256 on the way,
 fsync and replace, 0700 directory and 0600 files, caps enforced while reading,
 reserved against free disk first. An `application/json` body
@@ -518,7 +545,7 @@ reserved against free disk first. An `application/json` body
 | field | rule |
 |---|---|
 | `file` | required unless `file_id`; the part's `Content-Type` in `audio_api.ALLOWED_TYPES`; ≤ 89 MiB (`PUBLIC_API_MAX_AUDIO_BYTES` 93,323,264); **any duration** |
-| `file_id` | instead of `file`: a project-scoped audio or video file of the Files API, read through `files.open_for_read(project_id, file_id)` |
+| `file_id` | instead of `file`: a project-scoped audio or video file of the Files API, used in place (never copied or deleted); needs `files.read` too; a malformed, deleted, expired or foreign id is the same `404 file_not_found` |
 | `model` | required, `techsara-whisper` |
 | `language` | optional ISO-639-1 code, or `auto` (the default) |
 | `response_format` | optional `json` (default), `text` or `verbose_json`; `srt` and `vtt` are `400` |
@@ -559,7 +586,9 @@ and every 15 s, `: queued` while waiting, `transcript.text.delta` and one
 `transcript.text.done`; an error object on failure; no `id:`, `retry:` or
 `event:` lines. Non-stream formats are `CommittedJSONResponse(failure_mode="abort")`;
 the gateway re-attaches with `X-TechSara-Attach-Job` before aborting a client
-(§19). A forced `language` forces the decoder: `en` on non-English speech
+(§19). A tagged request is named `X-TechSara-Run: job:<job key>-<response_format>`,
+because a `json` and a `text` request share one job and the empty re-attach body
+cannot say which it was; the re-attach is neither counted nor metered again. A forced `language` forces the decoder: `en` on non-English speech
 translates rather than transcribes (2026-09-10), so auto-detect is the
 recommendation.
 
@@ -632,7 +661,7 @@ Error, everywhere, including mid-stream:
 | `quota_exceeded` | 429 | daily/monthly token quota, only when limits are enforced — `Retry-After` |
 | `concurrency_limit_exceeded` | 429 | too many of the project's requests in flight, only when limits are enforced — `Retry-After` |
 | `model_recovering` | 503 | engine restarting — `Retry-After`, retry-safe |
-| `model_unavailable` | 503 | engine proven down or failing (§18), or a physical guard before headers: fd pressure ≥ 70 % (`Retry-After: 30`) or free disk under `PUBLIC_API_MIN_FREE_DISK_BYTES` (`Retry-After: 60`) — never "at capacity" on `/v1` — `Retry-After` ≤ 60, retry-safe unless `x-should-retry: false` |
+| `model_unavailable` | 503 | engine proven down or failing (§18), or a physical guard before headers: fd pressure ≥ 70 % (`Retry-After: 30`), free disk under `PUBLIC_API_MIN_FREE_DISK_BYTES` (`Retry-After: 60`) or, on embeddings and rerank, the pooling memory budget (`Retry-After: 5`, §8.4) — never "at capacity" on `/v1` — `Retry-After` ≤ 60, retry-safe unless `x-should-retry: false` |
 | `timeout` | 504 | kept in the closed table; no `/v1` request is ended by a clock (§8.3) |
 | `internal_error` | 500 | anything else — never a traceback |
 
@@ -643,7 +672,8 @@ does.
 **`x-should-retry`** (both SDKs read it before their own retry table) is `false`
 on: a `409` for a different body or credential; a `500` after a generation
 without an `Idempotency-Key` started; the second engine-fault failure of a run
-(§14); a sidecar failure after two coinciding engine restarts; and the edge's
+(§14); an embeddings or rerank input implicated in two engine restarts, and
+every request carrying it during its quarantine (§8.4); and the edge's
 post-send `503` for an unkeyed generation when no gateway is in the path.
 
 **A failure after commit** (§10) cannot change the status: on `/v1/responses` it
@@ -1085,7 +1115,11 @@ defaults. The webhook settings are additionally clamped at use
 | `PUBLIC_API_LIVENESS_LOST_MIN_S` | 300 | dispatched before the `lost` rule may fire |
 | `PUBLIC_API_LIVENESS_UNKNOWN_SILENCE_S` | 3,600 | silence under an unknown verdict before an interrupt |
 | `PUBLIC_API_SIDECAR_SILENCE_S` | 1,800 | router and OCR read timeout, used only when witnesses are unknown |
-| `PUBLIC_API_POOLING_SILENCE_S` | 600 | embeddings and rerank read timeout before the witness decides |
+| `PUBLIC_API_POOLING_SILENCE_S` | 600 | embeddings and rerank read timeout before the witness decides (the Files API's direct engine helpers keep 60 s) |
+| `PUBLIC_API_TOKENIZE_CONCURRENCY` | 8 | public `/tokenize` calls in flight per engine, process-wide |
+| `PUBLIC_API_LENGTH_CHECK_BUDGET_S` | 8, clamped to at most 15 | length counting before the status line; the rest is counted after the commit |
+| `PUBLIC_API_POOLING_MEMORY_BYTES` | 536,870,912 | accepted-but-unfinished embeddings and rerank work, process-wide |
+| `PUBLIC_API_POISON_QUARANTINE_S` | 3,600 | an input implicated in two engine restarts is refused before its gate |
 | `PUBLIC_API_DECODE_CONCURRENCY` | 2 | concurrent audio decodes |
 | `PUBLIC_API_EVENT_RETENTION_S` | 3,600 | stream events kept after the terminal event |
 | `PUBLIC_API_PENDING_EVENTS_MAX_BYTES` | 67,108,864 | unwritten events per process before the largest run suspends (`store`) |
@@ -1366,9 +1400,9 @@ settles it once.
 | route | generation id | tokens | meta adds |
 |---|---|---|---|
 | `v1_responses`, `v1_chat_completions` | `resp_<24 hex>` | from the engine's stream usage, or counted by the server when the stream closed early (§8.3); summed over attempts, input once; `None` = not measured, never 0 | `max_output_tokens_requested`, `max_output_tokens_applied`, `clamped`, `usage_source` (`engine` \| `counted_at_stop` \| `null` when not measured), `attempts`, `resume_count`, `recomputed_prompt_tokens`, `yields`, `suspended_ms` |
-| `v1_embeddings` | `emb_<24 hex>` | input = engine `prompt_tokens` summed (None if any call did not report); output 0 (pooling generates nothing — a measured truth) | `inputs`, `engine_calls` |
-| `v1_rerank` | `rrk_<24 hex>` | input = `/score` `prompt_tokens`; output 0 | `documents`, `top_n` |
-| `v1_audio_transcriptions` | `asr_<24 hex>` | both `None` in `usage_events`; 0 and 0 in the token ledgers so they stay token-true | `audio_seconds`, `processing_ms`, `response_format`, `language_forced` |
+| `v1_embeddings` | `emb_<24 hex>` | input = engine `prompt_tokens` summed (None if any call did not report); output 0 (pooling generates nothing — a measured truth) | `inputs`, `engine_calls`; `resends` by reason (`progressing`, `unknown`, `lost`, `restarted`, `engine_error`) when any call was re-sent |
+| `v1_rerank` | `rrk_<24 hex>` | input = `/score` `prompt_tokens`; output 0 | `documents`, `top_n`, `engine_calls`; `resends` as `v1_embeddings` |
+| `v1_audio_transcriptions` | `asr_<24 hex>` | both `None` in `usage_events`; 0 and 0 in the token ledgers so they stay token-true | `audio_seconds` (ceil of decoded samples / 16,000), `processing_ms`, `response_format`, `language_forced`, `windows`, `engine_calls`; `joined` when the request followed a job another request started or a finished result |
 
 * Reservation for chat models: estimated input + planned output when limits are
   enforced; when not enforced the output reservation is capped at

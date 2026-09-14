@@ -655,9 +655,18 @@ def decode_input_audio(value: Any, *, param: str) -> DecodedAudio:
 
 
 async def transcribe_decoded(audio: DecodedAudio, *, transcriber: Optional[Transcriber] = None) -> AudioTranscript:
+    from ..publicapi import errors as public_errors
+
     ceiling = audio_max_seconds()
     run = transcriber or engine_transcriber
-    text, measured = await run(audio.raw, audio.content_type)
+    try:
+        text, measured = await run(audio.raw, audio.content_type)
+    except public_errors.ApiError as refusal:
+        # The speech engine's refusals name its multipart field, `file`; in a
+        # generation the audio is this input part (review 2026-09-14).
+        if refusal.param == "file":
+            refusal.param = f"{audio.param}.data"
+        raise
     if measured is not None and measured > ceiling + 0.5:
         raise _error(
             f"input_audio may be at most {ceiling} seconds; upload longer audio with /v1/files.", f"{audio.param}.data"
@@ -674,9 +683,17 @@ async def transcribe_input_audio(
 
 async def engine_transcriber(raw: bytes, content_type: str) -> Tuple[str, Optional[float]]:
     """`publicapi.sidecars.transcribe` under the fleet-wide `asr` gate (yields
-    to chat and dictation). A refusal surfaces as its own §9 error."""
+    to chat and dictation). A refusal surfaces as its own §9 error.
+
+    An MP3 whose container says it is over the clip ceiling is not sent: its
+    probed length comes back as the measured duration and
+    `transcribe_decoded` refuses it, before a GPU decodes it (review
+    2026-09-14: the duration check went with the retired `_transcribe`)."""
     from ..publicapi import sidecars
 
+    probed = await sidecars.probe_seconds(bytearray(raw))
+    if probed is not None and probed > float(audio_max_seconds()) + 0.5:
+        return "", float(probed)
     try:
         outcome = await sidecars.transcribe(bytearray(raw), content_type=content_type, language=None, verbose=False)
     except sidecars.SidecarError as failure:

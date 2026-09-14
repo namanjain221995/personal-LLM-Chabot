@@ -87,7 +87,6 @@ import concurrent.futures
 import contextlib
 import functools
 import hashlib
-import inspect
 import json
 import logging
 import math
@@ -303,12 +302,6 @@ def min_bitrate_bps() -> int:
     when a duration cannot be read (Opus's 6 kbit/s floor), so bytes ÷ bitrate
     is an UPPER bound on duration for the disk reservation."""
     return max(1000, _setting_int("PUBLIC_API_ASR_MIN_BITRATE_BPS", 6000))
-
-
-def gate_shim_wait_s() -> float:
-    """PUBLIC_API_ASR_GATE_SHIM_WAIT_S (5): only while `capacity.hold` still
-    requires a finite wait — each refusal is re-queued, never surfaced."""
-    return max(0.01, _setting_float("PUBLIC_API_ASR_GATE_SHIM_WAIT_S", 5.0))
 
 
 # ------------------------------------------------------------ job spec --
@@ -980,7 +973,8 @@ class Decoder:
         except OSError:
             return None
         try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            async with asyncio.timeout(timeout_s):
+                out, _ = await proc.communicate()
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -1176,51 +1170,21 @@ class EngineFailure(Exception):
 GateFactory = Callable[[Callable[[Dict[str, Any]], Awaitable[None]]], "contextlib.AbstractAsyncContextManager[None]"]
 
 
-def _hold_supports_unbounded_wait() -> bool:
-    try:
-        return "on_wait" in inspect.signature(capacity.hold).parameters
-    except (TypeError, ValueError):  # pragma: no cover
-        return False
-
-
 @contextlib.asynccontextmanager
 async def capacity_gate(on_wait: Callable[[Dict[str, Any]], Awaitable[None]]) -> AsyncIterator[None]:
-    """The fleet-wide public `asr` gate, waited on WITHOUT a deadline.
+    """The fleet-wide public `asr` gate, waited on WITHOUT a deadline:
+    `capacity.hold(wait_s=None, on_wait=…)`, one FIFO wait that yields to chat
+    and waits while dictation needs a replica. A client that leaves cancels
+    it. (The pre-T2 re-queue loop around a finite hold, and its
+    PUBLIC_API_ASR_GATE_SHIM_WAIT_S, are gone with the finite hold.)"""
 
-    With T2's `capacity.hold(wait_s=None, on_wait=…)` the wait is one FIFO
-    wait. Until that lands, `hold` needs a finite wait and answers
-    `model_unavailable` when it ends; that refusal is a clock, and no capacity
-    wait on `/v1` may end on a clock (no-timeout design), so it is re-queued
-    here and reported as `queued` instead of surfacing.
-    """
-    if _hold_supports_unbounded_wait():
+    def position_changed(*args: Any, **_kwargs: Any) -> "asyncio.Future[None]":
+        # The gate passes (position, waited_s) and may or may not await the
+        # result. A scheduled task runs either way and is also awaitable.
+        position = args[0] if args and isinstance(args[0], int) else None
+        return asyncio.ensure_future(on_wait({"stage": "queued", "gate": "asr", "queue_position": position}))
 
-        def position_changed(*args: Any, **_kwargs: Any) -> "asyncio.Future[None]":
-            # T2's callback shape is not frozen: it may pass a position or
-            # nothing, and may or may not await the result. A scheduled task
-            # runs either way and is also awaitable.
-            position = args[0] if args and isinstance(args[0], int) else None
-            return asyncio.ensure_future(on_wait({"stage": "queued", "gate": "asr", "queue_position": position}))
-
-        async with capacity.hold(  # type: ignore[call-arg]
-            capacity.GATE_ASR, wait_s=None, yield_to_chat=True, on_wait=position_changed
-        ):
-            yield
-        return
-    stack = contextlib.AsyncExitStack()
-    waited = 0
-    while True:
-        try:
-            await stack.enter_async_context(
-                capacity.hold(capacity.GATE_ASR, wait_s=gate_shim_wait_s(), yield_to_chat=True)
-            )
-            break
-        except errors.ApiError as exc:
-            if exc.code != "model_unavailable":
-                raise
-            waited += 1
-            await on_wait({"stage": "queued", "gate": "asr", "requeued": waited})
-    async with stack:
+    async with capacity.hold(capacity.GATE_ASR, wait_s=None, yield_to_chat=True, on_wait=position_changed):
         yield
 
 
@@ -1266,7 +1230,17 @@ class WhisperDispatcher:
         transport: Optional[httpx.AsyncBaseTransport] = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        content_type: str = "audio/wav",
+        extension: str = "wav",
+        no_speech_check: Optional[bool] = False,
     ) -> None:
+        #: What one clip is sent as. Windows are WAV cut from voice activity,
+        #: so the engine's 30-s silence gate is off for them; a whole clip a
+        #: caller sent (`sidecars.transcribe`) keeps its own container and the
+        #: engine's default check (`no_speech_check=None`: the field is not sent).
+        self.content_type = content_type
+        self.extension = extension
+        self.no_speech_check = no_speech_check
         self._replicas = replicas
         self._gate = gate
         self._transport = transport
@@ -1293,7 +1267,10 @@ class WhisperDispatcher:
     async def _health(self, base_url: str) -> Optional[_Health]:
         client = await self._http()
         try:
-            response = await asyncio.wait_for(client.get(f"{_root_of(base_url)}/health"), timeout=5.0)
+            # `asyncio.timeout`, not `wait_for` (Python 3.11 cancellation): a
+            # health read is advisory, five seconds of it is "unknown".
+            async with asyncio.timeout(5.0):
+                response = await client.get(f"{_root_of(base_url)}/health")
         except (asyncio.TimeoutError, httpx.HTTPError):
             return None
         if response.status_code != 200:
@@ -1306,25 +1283,30 @@ class WhisperDispatcher:
             return None
         return _Health(bool(body.get("ready")), int(body.get("cuda_failures") or 0))
 
-    @staticmethod
-    def _multipart(clip: bytes, language: Optional[str], index: int) -> Tuple[bytes, str]:
+    def _multipart(self, clip: bytes, language: Optional[str], index: int) -> Tuple[bytes, str]:
         boundary = secrets.token_hex(16)
         fields = [
             ("model", str(getattr(settings, "asr_model", "") or "whisper")),
             ("response_format", "verbose_json"),
-            # The engine's 30-s silence gate is off: these clips are voice
-            # activity regions already (video/transcribe.py measured a quiet
-            # lead-in emptying a whole window with it on).
-            ("no_speech_check", "false"),
         ]
+        no_speech_check = getattr(self, "no_speech_check", False)
+        if no_speech_check is not None:
+            # Off for windows: these clips are voice activity regions already
+            # (video/transcribe.py measured a quiet lead-in emptying a whole
+            # window with it on).
+            fields.append(("no_speech_check", "true" if no_speech_check else "false"))
         if language:
             fields.append(("language", language))
         head = bytearray()
         for name, value in fields:
             head += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+        extension = re.sub(r"[^a-z0-9]", "", str(getattr(self, "extension", "wav")).lower())[:8] or "bin"
+        content_type = str(getattr(self, "content_type", "audio/wav"))
+        if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type):
+            content_type = "application/octet-stream"
         head += (
-            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"w{index:05d}.wav\"\r\n"
-            "Content-Type: audio/wav\r\n\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"w{index:05d}.{extension}\"\r\n"
+            f"Content-Type: {content_type}\r\n\r\n"
         ).encode()
         return bytes(head) + clip + f"\r\n--{boundary}--\r\n".encode(), boundary
 
@@ -1380,6 +1362,10 @@ class WhisperDispatcher:
             return ("ok", reply) if isinstance(reply, dict) else ("unavailable", None)
         if response.status_code >= 500:
             return "unavailable", None
+        if response.status_code == 413:
+            return "too_large", None
+        if response.status_code == 400:
+            return "undecodable", None
         return "rejected", None
 
     async def transcribe(
@@ -1410,6 +1396,22 @@ class WhisperDispatcher:
                     outcome, reply = await self._send_watched(base_url, clip, language, index)
                     if outcome == "ok" and reply is not None:
                         return reply
+                    if outcome == "too_large":
+                        raise EngineFailure(
+                            errors.ApiError(
+                                "request_too_large",
+                                "The audio clip is longer than the speech engine accepts in one piece.",
+                                param="file",
+                            ),
+                            reason="engine refused the clip's length",
+                        )
+                    if outcome == "undecodable":
+                        raise EngineFailure(
+                            errors.invalid_request(
+                                "The audio could not be decoded. Send a supported audio file.", param="file"
+                            ),
+                            reason="engine could not decode the clip",
+                        )
                     if outcome == "rejected":
                         raise EngineFailure(errors.internal_error(), reason="engine refused a window")
                     if outcome == "silent":
@@ -1626,6 +1628,13 @@ class AudioJob:
             log.info("audio job %s has no follower after the grace; cancelling", self.key[:12])
             self.task.cancel()
 
+    async def settled(self) -> None:
+        """Return once the job is done or failed, WITHOUT following it: a
+        waiter that only meters the outcome must not keep an abandoned job
+        alive past its orphan grace."""
+        while not self.terminal:
+            await self._changed_or_timeout(None)
+
     async def wait(self) -> TranscriptResult:
         async with self.follow() as follower:
             while True:
@@ -1737,6 +1746,17 @@ class AudioJobs:
     def preflight(self, expected_bytes: int) -> None:
         """Raise `DiskFull` now if `expected_bytes` would not fit (before headers)."""
         self.ledger.check(expected_bytes, purpose="asr-preflight")
+
+    async def preflight_decode(self, source: AudioSource) -> None:
+        """Raise `DiskFull` BEFORE the status line when the decoded PCM of
+        `source` could not be reserved now (design: "DiskLedger refusal → 503
+        Retry-After 60 before decode"). The same estimate `_run` reserves
+        against; a request that joins a running job or a stored result does
+        not decode, so the route asks only when it will start one. Advisory:
+        the reservation that counts is still taken just in time."""
+        seconds, _basis = await self._estimate_seconds(source)
+        need = int(math.ceil(seconds * PCM_BYTES_PER_SECOND * 1.02)) + (1 << 20)
+        self.ledger.check(need, purpose="asr-preflight")
 
     async def attach(self, key: str, project_id: str) -> Optional[AudioJob]:
         """A running or finished job of THIS project, or None (a 404 upstream).
@@ -2065,16 +2085,29 @@ def _sse_data(payload: Mapping[str, Any]) -> bytes:
     return b"data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
 
 
-async def sse_stream(job: AudioJob, *, heartbeat_s: float = HEARTBEAT_S) -> AsyncIterator[bytes]:
+async def sse_stream(job: AudioJob, *, heartbeat_s: float = HEARTBEAT_S, start_after: int = 0) -> AsyncIterator[bytes]:
     """`stream=true`: comments while waiting, text deltas, one terminal event.
 
     The first byte is sent at once (the byte invariant); `: ping` whenever
     nothing else was sent for `heartbeat_s`; `: queued` while the job waits
     for capacity; no `id:` or `retry:` lines. A failure is a `data:` object
     carrying `error`, the shape both SDKs raise from.
+
+    `start_after=N` (a v1-gateway re-attach, `X-TechSara-Resume-After`): the
+    first N data frames were already relayed, so they are skipped. Every data
+    frame is exactly one of the job's delta/done/failed events, so N is an
+    event index. A job answered from its stored result has only its `done`
+    event (its deltas are not kept): that one is sent — the done event
+    carries the whole text — rather than skipped into a silent stream.
     """
     yield b": ping\n\n"
     async with job.follow() as follower:
+        if start_after > 0:
+            available = len(job._events)
+            if job.terminal and start_after >= available:
+                follower.cursor = max(0, available - 1)
+            else:
+                follower.cursor = int(start_after)
         while True:
             event = await follower.next(heartbeat_s)
             if event is None:

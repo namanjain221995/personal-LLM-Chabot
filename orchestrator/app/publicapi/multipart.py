@@ -1,28 +1,28 @@
-"""A bounded, in-memory `multipart/form-data` reader for `/v1/audio/transcriptions`.
+"""A bounded, streaming `multipart/form-data` reader for `/v1/audio/transcriptions`.
 
 WHY NOT `request.form()` / `UploadFile` (2026-09-13). Starlette parses a
 multipart body into `UploadFile`s backed by a `SpooledTemporaryFile` whose
-rollover size is a class attribute fixed at 1 MB, so every clip longer than a
-minute or so is written to the container's disk before a handler sees a byte
-of it. `app/audio_api.py` documents the promise this platform makes about
-audio — it lives in this process's memory for the length of one call and
-nowhere else — and a public endpoint must not be the place that promise
-quietly stops being true. It also cannot be capped per route: the form parser
-reads the whole body, and a 2 GB upload is 2 GB on disk before anything says
-no.
+rollover size is a class attribute fixed at 1 MB, in the container's temporary
+directory, with no per-route cap: the form parser reads the whole body, and a
+2 GB upload is 2 GB on disk before anything says no.
 
 WHAT THIS DOES INSTEAD. The body is read chunk by chunk from
 `request.stream()` and pushed straight into `python_multipart`'s callback
-parser. Nothing keeps the raw chunks: a file part's bytes are appended to ONE
-`bytearray` as the parser hands out slices of the chunk in hand, so the audio
-exists in memory once (not once as a body and again as a part), and every cap
-is enforced WHILE reading:
+parser. Nothing keeps the raw chunks, and every cap is enforced WHILE reading:
 
 * the whole body (`max_body_bytes`) — 413 `request_too_large`;
 * each file part (`max_file_bytes`) — 413 `request_too_large`;
 * each text field (`max_field_bytes`), the number of parts, and each part's
   header block — 400, because a 5 KB `language` field is a malformed request,
   not a big one.
+
+WHERE A FILE PART GOES. With a `file_writer` (the transcription route, since
+the no-timeout design of 2026-09-13: audio of any length, up to 89 MiB in one
+request), the part's bytes are handed to it as they arrive — the route streams
+them into a private file under the disk ledger (`disk_ledger.DiskSink`), so at
+most one body chunk of audio is ever in this process's memory. Without one
+(the default), the part lands in ONE `bytearray` — memory once, not once as a
+body and again as a part — which the tests and small callers use.
 
 A malformed body (no boundary, a truncated part, a part with no name) is a
 400 with a fixed sentence: the parser's own message quotes offsets into the
@@ -33,7 +33,7 @@ Pure: no FastAPI, no database, no settings. The route passes the caps in.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Awaitable, Dict, List, Optional, Protocol, Tuple
 
 from . import errors
 
@@ -62,16 +62,29 @@ DEFAULT_MAX_FIELD_BYTES = 1024
 
 @dataclass
 class FilePart:
-    """One uploaded file, held in memory once."""
+    """One uploaded file: held in memory once (`data`), or handed to a
+    `FileWriter` as it arrived (`data` stays empty; `received` counts it)."""
 
     name: str
     filename: str
     content_type: str
     data: bytearray = field(default_factory=bytearray)
+    received: int = 0
+    streamed: bool = False
 
     @property
     def size(self) -> int:
-        return len(self.data)
+        return self.received if self.streamed else len(self.data)
+
+
+class FileWriter(Protocol):
+    """Where a streamed file part goes. `start` is awaited once, before the
+    part's first byte; `write` for every slice in order. Raising from either
+    stops the read and propagates (a disk refusal is the route's answer)."""
+
+    def start(self, part: FilePart) -> Awaitable[None]: ...
+
+    def write(self, data: bytes) -> Awaitable[None]: ...
 
 
 @dataclass
@@ -143,8 +156,14 @@ class _Collector:
         max_field_bytes: int,
         max_parts: int,
         file_fields: frozenset,
+        streaming: bool = False,
     ) -> None:
         self.form = FormData()
+        #: Streaming mode: the file part's bytes of the chunk in hand, and a
+        #: part whose `start` the reading loop has not yet awaited.
+        self._streaming = streaming
+        self.pending_start: Optional[FilePart] = None
+        self.pending_bytes = bytearray()
         self.failure: Optional[errors.ApiError] = None
         self.ended = False
         self._max_file = int(max_file_bytes)
@@ -222,7 +241,11 @@ class _Collector:
             content_type = (
                 self._headers.get("content-type", b"").decode("latin-1").split(";")[0].strip().lower()
             )
-            self._file = FilePart(name=name, filename=filename or "", content_type=content_type)
+            self._file = FilePart(
+                name=name, filename=filename or "", content_type=content_type, streamed=self._streaming
+            )
+            if self._streaming:
+                self.pending_start = self._file
             return
         if (name in self.form.fields and not name.endswith("[]")) or name in self.form.files:
             self._fail(_malformed("A form field appears more than once."))
@@ -237,10 +260,15 @@ class _Collector:
             if self._file.size + n > self._max_file:
                 self._fail(errors.request_too_large(self._max_file))
                 # Let go of what was collected: the refusal is decided, and a
-                # 25 MiB buffer held until the socket drains helps nobody.
+                # large buffer held until the socket drains helps nobody.
                 self._file.data = bytearray()
+                self.pending_bytes = bytearray()
                 return
-            self._file.data += data[start:end]
+            if self._streaming:
+                self._file.received += n
+                self.pending_bytes += data[start:end]
+            else:
+                self._file.data += data[start:end]
             return
         if self._field_name is not None:
             if len(self._field_value) + n > self._max_field:
@@ -297,6 +325,7 @@ async def read_form(
     max_parts: int = DEFAULT_MAX_PARTS,
     file_fields: frozenset = frozenset({"file"}),
     declared_length: Optional[str] = None,
+    file_writer: Optional[FileWriter] = None,
 ) -> FormData:
     """Read and parse a `multipart/form-data` body under every cap, or raise.
 
@@ -318,6 +347,7 @@ async def read_form(
         max_field_bytes=max_field_bytes,
         max_parts=max_parts,
         file_fields=file_fields,
+        streaming=file_writer is not None,
     )
     parser = MultipartParser(boundary, collector.callbacks())
     total = 0
@@ -335,15 +365,32 @@ async def read_form(
             raise _malformed() from None
         if collector.failure is not None:
             raise collector.failure
+        if file_writer is not None:
+            await _hand_over(collector, file_writer)
     try:
         parser.finalize()
     except Exception:  # noqa: BLE001
         raise _malformed() from None
     if collector.failure is not None:
         raise collector.failure
+    if file_writer is not None:
+        await _hand_over(collector, file_writer)
     if not collector.ended:
         # The closing boundary never arrived: a truncated upload, which must
         # not be transcribed as if it were the whole recording.
         raise _malformed("The multipart/form-data body ended before its closing boundary.")
     collector.form.body_bytes = total
     return collector.form
+
+
+async def _hand_over(collector: _Collector, writer: FileWriter) -> None:
+    """The streamed part's news from the chunk just parsed, in order: its
+    start (once), then its bytes. Synchronous parser callbacks cannot await,
+    so they queue; this drains the queue between chunks."""
+    if collector.pending_start is not None:
+        part, collector.pending_start = collector.pending_start, None
+        await writer.start(part)
+    if collector.pending_bytes:
+        data = bytes(collector.pending_bytes)
+        collector.pending_bytes = bytearray()
+        await writer.write(data)

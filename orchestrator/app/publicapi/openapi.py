@@ -264,16 +264,34 @@ def _sidecar(*, token_inputs: bool = True) -> tuple:
     return codes
 
 
-def _capacity_description(engine_words: str) -> str:
-    """The 503 on an endpoint whose engine the chat application shares. Says
-    "at capacity" in those words, and says it is not per caller."""
-    wait = _setting_float("PUBLIC_API_GATE_WAIT_S", 30.0)
+def _capacity_description(engine_words: str, *, pooling: bool = False) -> str:
+    """The 503 on an endpoint whose engine the chat application shares
+    (no-timeout design, 2026-09-14): a queue is never a 503 — the request
+    waits, writing bytes — so this is an engine that is really down, or, on
+    the pooling routes, the process memory guard before the status line."""
+    grace = _setting_float("PUBLIC_API_ENGINE_DOWN_GRACE_S", 1800.0)
+    if pooling:
+        return (
+            f"model_unavailable — the {engine_words} has been unreachable for "
+            f"{grace:g} seconds without a break, or its own metrics show it stalled "
+            "or lost with this request outstanding, or the server's memory for "
+            "accepted embedding and rerank work is full (a short Retry-After, "
+            "before any byte of the answer). Public requests to it share ONE "
+            "queue for every project and key (the chat application keeps priority); "
+            "waiting in that queue is never answered with this, however long it "
+            "takes, and it is not a per-caller limit. Retry after Retry-After "
+            "seconds, unless `x-should-retry: false` says an input of this request "
+            "stopped the engine twice: that input is refused for an hour."
+        )
     return (
-        f"model_unavailable — the {engine_words} is down, or at capacity: public "
-        "requests to it share ONE queue for every project and key (the chat "
-        f"application keeps priority), and a request that has waited {wait:g} "
-        "seconds is answered with this. It is not a per-caller limit. Retry "
-        "after Retry-After seconds."
+        f"model_unavailable — the {engine_words} has been unreachable for "
+        f"{grace:g} seconds without a break, or its own metrics show it stalled "
+        "or lost with this request outstanding. Public requests to it share ONE "
+        "queue for every project and key (the chat application keeps priority); "
+        "waiting in that queue is never answered with this, however long it "
+        "takes, and it is not a per-caller limit. Retry after Retry-After "
+        "seconds, unless `x-should-retry: false` "
+        "says the engine restarted twice while processing this input."
     )
 
 
@@ -379,12 +397,44 @@ def _sidecar_schemas() -> Dict[str, Any]:
     embed = _model_id("TECHSARA_EMBED", "techsara-embed")
     rerank = _model_id("TECHSARA_RERANK", "techsara-rerank")
     whisper = _model_id("TECHSARA_WHISPER", "techsara-whisper")
-    max_inputs = max(1, _setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 256))
+    max_inputs = max(1, _setting_int("PUBLIC_API_EMBED_MAX_INPUTS", 2048))
     embed_window = max(1, _setting_int("PUBLIC_API_EMBED_CONTEXT_TOKENS", 4096))
-    max_documents = max(1, _setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 100))
+    max_documents = max(1, _setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", 1000))
     rerank_window = max(1, _setting_int("PUBLIC_API_RERANK_CONTEXT_TOKENS", 4096))
-    audio_seconds = max(1, _setting_int("PUBLIC_API_MAX_AUDIO_SECONDS", 300))
-    audio_mib = max(1, _setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 26_214_400)) / (1024 * 1024)
+    audio_mib = max(1, _setting_int("PUBLIC_API_MAX_AUDIO_BYTES", 93_323_264)) / (1024 * 1024)
+    transcription_fields = {
+        "model": {"type": "string", "example": whisper},
+        "language": {
+            "type": "string",
+            "description": (
+                "An ISO-639-1 code, or `auto` (the default). Auto-detection "
+                "is recommended: forcing a language forces the decoder, and "
+                "speech in another language comes back translated or garbled."
+            ),
+            "example": "auto",
+        },
+        "response_format": {
+            "type": "string",
+            "enum": ["json", "text", "verbose_json"],
+            "default": "json",
+            "description": (
+                "`text` answered after the response committed (a long "
+                "recording) starts with keep-alive spaces: strip it."
+            ),
+        },
+        "stream": {
+            "type": "boolean",
+            "default": False,
+            "description": "`true` answers `text/event-stream`: transcript.text.delta events, then transcript.text.done.",
+        },
+        "file_id": {
+            "type": "string",
+            "description": (
+                "Instead of `file`: an audio or video file of this project uploaded "
+                "with the Files API (needs `files.read` too). Any duration."
+            ),
+        },
+    }
     return {
         "EmbeddingsRequest": {
             "type": "object",
@@ -543,34 +593,36 @@ def _sidecar_schemas() -> Dict[str, Any]:
         "TranscriptionRequest": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["file", "model"],
+            "description": "`file` or `file_id`, never both.",
+            "required": ["model"],
             "properties": {
                 "file": {
                     "type": "string",
                     "contentMediaType": "application/octet-stream",
                     "description": (
-                        f"The audio, at most {audio_mib:g} MiB and {audio_seconds} "
-                        "seconds. The part's Content-Type must be an audio type "
+                        f"The audio, at most {audio_mib:g} MiB, of any duration. "
+                        "The part's Content-Type must be an audio type "
                         "(audio/mpeg, audio/wav, audio/webm, audio/mp4, audio/ogg, "
-                        "audio/flac, …)."
+                        "audio/flac, …). Larger recordings: upload them with the "
+                        "Files API and send `file_id`."
                     ),
                 },
-                "model": {"type": "string", "example": whisper},
-                "language": {
-                    "type": "string",
-                    "description": (
-                        "An ISO-639-1 code, or `auto` (the default). Auto-detection "
-                        "is recommended: forcing a language forces the decoder, and "
-                        "speech in another language comes back translated or garbled."
-                    ),
-                    "example": "auto",
-                },
-                "response_format": {
-                    "type": "string",
-                    "enum": ["json", "text", "verbose_json"],
-                    "default": "json",
-                },
+                **transcription_fields,
                 "timestamp_granularities[]": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["segment"]},
+                    "description": "Only `segment`, and only with `verbose_json`.",
+                },
+            },
+        },
+        "TranscriptionFileRequest": {
+            "type": "object",
+            "additionalProperties": False,
+            "description": "A transcription of a Files API file, sent as JSON.",
+            "required": ["model", "file_id"],
+            "properties": {
+                **transcription_fields,
+                "timestamp_granularities": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["segment"]},
                     "description": "Only `segment`, and only with `verbose_json`.",
@@ -630,7 +682,6 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
         " `Idempotency-Key` is not accepted here (a 400 naming it): the request "
         "changes nothing a retry could repeat."
     )
-    wait = _setting_float("PUBLIC_API_GATE_WAIT_S", 30.0)
     return {
         "/v1/embeddings": {
             "post": {
@@ -642,8 +693,11 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                     "Model `techsara-embed`; any other model is a 400 naming "
                     "`model`. An input over the model's window is a 400 "
                     "`context_length_exceeded` whose `param` names it "
-                    f"(`input.3`). The request waits up to {wait:g} seconds for "
-                    "the shared engine before a 503." + no_idempotency
+                    "(`input.3`), checked before any wait. The request then waits "
+                    "for the shared engine with no time limit; a response not "
+                    "ready within a few seconds commits to 200 and writes a "
+                    "space every 14 seconds until the JSON follows (strip "
+                    "nothing: JSON allows leading whitespace)." + no_idempotency
                 ),
                 "security": [{"bearerAuth": []}],
                 "requestBody": {
@@ -659,7 +713,7 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                     **_error_responses(
                         *_always(),
                         *_sidecar(),
-                        descriptions={503: _capacity_description("embedding engine")},
+                        descriptions={503: _capacity_description("embedding engine", pooling=True)},
                     ),
                 },
             }
@@ -672,7 +726,8 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                 "description": (
                     f"Scope `rerank.write` — {scope_doc['rerank.write']} Model "
                     "`techsara-rerank`. Scores are returned as the model gives "
-                    "them, equal ones included." + no_idempotency
+                    "them, equal ones included. Waits and keep-alive bytes as "
+                    "for embeddings." + no_idempotency
                 ),
                 "security": [{"bearerAuth": []}],
                 "requestBody": {
@@ -688,7 +743,7 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                     **_error_responses(
                         *_always(),
                         *_sidecar(),
-                        descriptions={503: _capacity_description("reranking engine")},
+                        descriptions={503: _capacity_description("reranking engine", pooling=True)},
                     ),
                 },
             }
@@ -700,11 +755,14 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                 "summary": "Transcribe audio",
                 "description": (
                     f"Scope `audio.write` — {scope_doc['audio.write']} Model "
-                    "`techsara-whisper`, `multipart/form-data`. The audio is held "
-                    "in memory for the length of the request and never stored. "
-                    "Public transcriptions run one at a time across the fleet and "
-                    "give way to people dictating in the TechSara app; keep clips "
-                    "short enough to finish inside a synchronous request." + no_idempotency
+                    "`techsara-whisper`, `multipart/form-data` (or JSON naming a "
+                    "Files API `file_id`). Audio of any duration: it is stored "
+                    "for the length of the job and transcribed in windows of at "
+                    "most 90 seconds, which run one at a time across the fleet "
+                    "and give way to people dictating in the TechSara app. A "
+                    "response not ready within a few seconds commits to 200 and "
+                    "writes keep-alive spaces; `stream: true` sends text as it "
+                    "is ready." + no_idempotency
                 ),
                 "security": [{"bearerAuth": []}],
                 "requestBody": {
@@ -713,12 +771,18 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                         "multipart/form-data": {
                             "schema": {"$ref": "#/components/schemas/TranscriptionRequest"},
                             "encoding": {"file": {"contentType": "audio/*, video/webm, video/mp4"}},
-                        }
+                        },
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/TranscriptionFileRequest"}
+                        },
                     },
                 },
                 "responses": {
                     "200": {
-                        "description": "OK — `json` and `verbose_json` as JSON, `text` as plain text.",
+                        "description": (
+                            "OK — `json` and `verbose_json` as JSON, `text` as plain text, "
+                            "`stream: true` as server-sent events."
+                        ),
                         "headers": _request_id_header(),
                         "content": {
                             "application/json": {
@@ -730,6 +794,7 @@ def _sidecar_paths(scope_doc: Dict[str, str], json_ok: Any) -> Dict[str, Any]:
                                 }
                             },
                             "text/plain": {"schema": {"type": "string"}},
+                            "text/event-stream": {"schema": {"type": "string"}},
                         },
                     },
                     **_error_responses(
@@ -1078,8 +1143,8 @@ def _schemas() -> Dict[str, Any]:
                 "One model this key may use. Additive over the first release: "
                 "a client that reads only `id` and `capabilities` still works. "
                 "The ceilings are null — never 0 — where a model has none (an "
-                "embedding model generates nothing; speech is limited in "
-                "seconds, see `limits`)."
+                "embedding model generates nothing; speech has no token "
+                "ceiling and no duration limit, see `limits`)."
             ),
             "required": [
                 "id",
@@ -1146,7 +1211,6 @@ def _schemas() -> Dict[str, Any]:
                         "max_inputs_per_request": {"type": "integer", "minimum": 1},
                         "max_documents_per_request": {"type": "integer", "minimum": 1},
                         "embedding_dimensions": {"type": "integer", "minimum": 1},
-                        "max_audio_seconds": {"type": "integer", "minimum": 1},
                         "max_audio_bytes": {"type": "integer", "minimum": 1},
                         "response_formats": {"type": "array", "items": {"type": "string"}},
                     },

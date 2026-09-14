@@ -1,6 +1,7 @@
 import type { DocPage } from '../types';
 import { EXAMPLE_STATUS } from '../samples';
 import { NO_TIMEOUT_LIVE } from './longOutput';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): capacity is never a refusal, a
 // request is never ended by a clock, a 409 is only ever a real conflict, and
@@ -37,7 +38,22 @@ Every failure — HTTP or mid-stream — has the same shape:
 
 The same value is on every response as \`X-Request-Id\`, success included.
 `;
-const S_THE_CODES = `
+/** Today's rows about embeddings, rerank and transcriptions, which shipped
+ * without a clock on 2026-09-14 (SIDECARS_NO_TIMEOUT_LIVE). */
+const tooLargeToday = (sidecars: boolean): string =>
+  sidecars
+    ? 'Body over its endpoint\'s limit — 1 MiB, 8 MiB for embeddings and rerank, 20 MiB with images, 90 MiB with audio — or text over 1 MiB, or an audio file over 89 MiB.'
+    : 'Body over its endpoint\'s limit — 1 MiB, 20 MiB with images, 26 MiB with audio — or text over 1 MiB, audio over 25 MiB or 300 seconds.';
+const unavailableToday = (sidecars: boolean): string =>
+  sidecars
+    ? 'The engine is down, or at capacity: its queue, shared with the chat application, did not free a place in time. Embeddings, rerank and transcriptions wait for a place instead; for embeddings and rerank this is also the server holding as much work in memory as it safely can, or an input that stopped the engine twice (then with \`x-should-retry: false\`). Retry-safe unless told not to.'
+    : 'The engine is down, or at capacity: its queue, shared with the chat application, did not free a place in time. Retry-safe.';
+const timeoutToday = (sidecars: boolean): string =>
+  sidecars
+    ? 'Generation exceeded its wall clock. Embeddings, rerank and transcriptions are never ended by a clock.'
+    : 'Generation exceeded its wall clock, or an engine did not answer in time.';
+
+const theCodesToday = (sidecars: boolean): string => `
 ## The codes
 
 | Code | Status | When |
@@ -50,13 +66,13 @@ const S_THE_CODES = `
 | \`model_not_found\` | 404 | Unknown model, one this key may not use, or one this deployment does not run. |
 | \`response_not_found\` | 404 | Not this project's response. |
 | \`idempotency_conflict\` | 409 | Same \`Idempotency-Key\`, different body — or the same body while the first request with that key is still running, which carries \`Retry-After\`. |
-| \`request_too_large\` | 413 | Body over its endpoint's limit — 1 MiB, 20 MiB with images, 26 MiB with audio — or text over 1 MiB, audio over 25 MiB or 300 seconds. An image over 10 MiB is a \`400\`, like every other image rule. |
+| \`request_too_large\` | 413 | ${tooLargeToday(sidecars)} An image over 10 MiB is a \`400\`, like every other image rule. |
 | \`rate_limit_error\` | 429 | Only if an operator has [enabled limits](/docs/rate-limits#if-an-operator-enables-limits): requests or tokens per minute exceeded. |
 | \`quota_exceeded\` | 429 | Only if an operator has enabled limits: the daily token quota is exhausted. |
 | \`concurrency_limit_exceeded\` | 429 | Only if an operator has enabled limits: too many of the project's requests in flight. |
 | \`model_recovering\` | 503 | The engine is restarting. Retry-safe. |
-| \`model_unavailable\` | 503 | The engine is down, or at capacity: its queue, shared with the chat application, did not free a place in time. Retry-safe. |
-| \`timeout\` | 504 | Generation exceeded its wall clock, or an engine did not answer in time. |
+| \`model_unavailable\` | 503 | ${unavailableToday(sidecars)} |
+| \`timeout\` | 504 | ${timeoutToday(sidecars)} |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
 
 A path under \`/v1\` that is not one of the published endpoints answers
@@ -206,7 +222,7 @@ const LATER_THE_CODES = `
 | \`quota_exceeded\` | 429 | Only if an operator has enabled limits: the daily token quota is exhausted. |
 | \`concurrency_limit_exceeded\` | 429 | Only if an operator has enabled limits: too many of the project's requests in flight. |
 | \`model_recovering\` | 503 | The engine is restarting. Retry-safe. |
-| \`model_unavailable\` | 503 | The engine is down, or a physical safeguard of the service tripped — too many open connections, or too little free disk. Never "busy": a busy engine is waited for. Retry-safe. |
+| \`model_unavailable\` | 503 | The engine is down, or a physical safeguard of the service tripped — too many open connections, too little free disk, or as much embedding and rerank work in memory as the server safely holds. Never "busy": a busy engine is waited for. Retry-safe unless it carries \`x-should-retry: false\`. |
 | \`timeout\` | 504 | Kept in the vocabulary; no request on \`/v1\` is ended by a clock. |
 | \`internal_error\` | 500 | Anything else. Never a traceback. |
 
@@ -240,8 +256,9 @@ the work twice.
 * \`409 idempotency_conflict\` — a different body, or a different credential.
 * A \`500\` after a generation without an \`Idempotency-Key\` had started.
 * A generation that failed after being caught up in two engine crashes.
-* An embeddings, rerank or transcription call that failed because its engine
-  restarted twice while it ran.
+* An embeddings or rerank input that stopped its engine twice — and, for an
+  hour after, any request that sends that input again.
+* A transcription that failed because its engine restarted twice while it ran.
 * A \`503\` from the API's edge when the request may already have been received
   and carried no \`Idempotency-Key\`.
 
@@ -325,10 +342,16 @@ response is still running. [Resume it](/docs/timeouts#resuming-a-stream).
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function errorsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
+export function errorsPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
   const sections = noTimeout
     ? [INTRO, S_THE_ENVELOPE, LATER_THE_CODES, LATER_WHAT_TO_RETRY, S_401_403_AND_404_ARE_DIFFERENT_QUESTIONS, LATER_MID_STREAM, S_WHAT_AN_ERROR_WILL_NEVER_CONTAIN]
-    : [INTRO, S_THE_ENVELOPE, S_THE_CODES, S_WHAT_TO_RETRY, S_401_403_AND_404_ARE_DIFFERENT_QUESTIONS, S_MID_STREAM, S_WHAT_AN_ERROR_WILL_NEVER_CONTAIN];
+    : [INTRO, S_THE_ENVELOPE, theCodesToday(sidecarsLive), S_WHAT_TO_RETRY, S_401_403_AND_404_ARE_DIFFERENT_QUESTIONS, S_MID_STREAM, S_WHAT_AN_ERROR_WILL_NEVER_CONTAIN];
   return {
     slug: 'errors',
     title: 'Errors',

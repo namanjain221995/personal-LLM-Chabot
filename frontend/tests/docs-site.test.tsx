@@ -77,6 +77,7 @@ import {
   docHref,
   neighboursOf,
 } from '@/content/docs';
+import { SIDECARS_NO_TIMEOUT_LIVE } from '@/content/docs/pages/sidecarsLive';
 import type { DocPage, DocSection } from '@/content/docs';
 
 afterEach(cleanup);
@@ -1309,13 +1310,15 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
         );
       }
       if (model.kind === 'transcription') {
+        // Any duration (no-timeout design, shipped for the sidecars
+        // 2026-09-14): no seconds limit is published, and the registry has
+        // no such setting to report.
+        expect(model.limits.max_audio_seconds).toBeUndefined();
+        expect(registryPy).not.toContain('PUBLIC_API_MAX_AUDIO_SECONDS');
         if (source === 'contract') {
-          // Any duration (no-timeout design): no seconds limit is published.
           expect(row.other).toContain('any duration');
-          expect(model.limits.max_audio_seconds).toBeUndefined();
           expect(model.limits.max_audio_bytes).toBe(count(/(\d+) MiB/) * 1024 * 1024);
         } else {
-          expect(model.limits.max_audio_seconds).toBe(registryDefault('PUBLIC_API_MAX_AUDIO_SECONDS'));
           expect(model.limits.max_audio_bytes).toBe(registryDefault('PUBLIC_API_MAX_AUDIO_BYTES'));
         }
       }
@@ -1529,7 +1532,13 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
     for (const [id, gate, concurrency] of byModel) {
       const row = new RegExp(`^\\| \`${escapeRe(id)}\` \\|[^\\n]*$`, 'm').exec(section)?.[0];
       expect(row, id).toBeDefined();
-      expect(row, id).toContain(`\`Retry-After\` ${gateRows.get(gate)!.retryAfter} s`);
+      if (SIDECARS_NO_TIMEOUT_LIVE && ['embed', 'rerank', 'asr'].includes(gate)) {
+        // Shipped without a clock on 2026-09-14: the queue is never a 503.
+        expect(row, id).toContain('Waits with no limit');
+        expect(row, id).not.toContain('Retry-After');
+      } else {
+        expect(row, id).toContain(`\`Retry-After\` ${gateRows.get(gate)!.retryAfter} s`);
+      }
       if (concurrency) expect(concurrency.exec(row!)?.[1], id).toBe(gateRows.get(gate)!.concurrency);
     }
     // The pre-decision sentence that called a full queue a 429 is gone.
@@ -2582,5 +2591,113 @@ describe('the design system', () => {
     for (const page of DOC_PAGES) {
       expect(page.body, `${page.slug} mentions another vendor`).not.toMatch(banned);
     }
+  });
+});
+
+/**
+ * THE CLOCK-FREE SIDECAR ROUTES, ON TODAY'S SITE (review 2026-09-14, medium).
+ *
+ * `/v1/embeddings`, `/v1/rerank` and `/v1/audio/transcriptions` lost their
+ * clocks before the rest of the no-timeout release. The live site said 256
+ * inputs, 300 seconds and a 504 for them, while the model catalogue already
+ * printed 2,048, 1,000 and "any duration". These tests read the pages as they
+ * render TODAY (`noTimeout: false`) and hold them to the caps the code
+ * enforces, so the two cannot drift apart again.
+ */
+describe('the clock-free sidecar routes on the site as it reads today (2026-09-14)', () => {
+  const endpointsPy = repoFile('orchestrator', 'app', 'publicapi', 'endpoints.py');
+  const endpointModelsPy = repoFile('orchestrator', 'app', 'publicapi', 'endpoint_models.py');
+  const registryPy = repoFile('orchestrator', 'app', 'publicapi', 'registry.py');
+  const sidecarsPy = repoFile('orchestrator', 'app', 'publicapi', 'sidecars.py');
+  const today = docSectionsFor({ noTimeout: false }).flatMap((section) => section.pages);
+  const todayPage = (slug: string): string => {
+    const page = today.find((candidate) => candidate.slug === slug);
+    expect(page, slug).toBeDefined();
+    return page!.body;
+  };
+  const flat = (text: string) => text.replace(/\s+/g, ' ');
+  const pyInt = (source: string, pattern: RegExp, name: string): number => {
+    const match = pattern.exec(source);
+    expect(match, name).not.toBeNull();
+    return Number(match![1].replace(/_/g, ''));
+  };
+  const thousands = (n: number) => n.toLocaleString('en-US');
+
+  it('is switched on exactly when endpoints.py sends embeddings and rerank with no gate limit inside a committed response', () => {
+    const code = endpointsPy.replace(/^\s*#.*$/gm, '');
+    const wired =
+      /await sidecars\.embed\([^)]*wait_s=None\)/.test(code) &&
+      /await sidecars\.rerank_scores\([\s\S]{0,200}?wait_s=None/.test(code) &&
+      /keepalive\.CommittedJSONResponse/.test(code) &&
+      !/PUBLIC_API_GATE_WAIT_S/.test(code);
+    expect(SIDECARS_NO_TIMEOUT_LIVE).toBe(wired);
+  });
+
+  it("prints today the input, document and body caps the code enforces", () => {
+    if (!SIDECARS_NO_TIMEOUT_LIVE) return;
+    const inputs = pyInt(endpointModelsPy, /setting_int\("PUBLIC_API_EMBED_MAX_INPUTS", (\d+)\)/, 'inputs');
+    const documents = pyInt(endpointModelsPy, /setting_int\("PUBLIC_API_RERANK_MAX_DOCUMENTS", (\d+)\)/, 'documents');
+    expect(registryPy).toContain(`setting_int("PUBLIC_API_EMBED_MAX_INPUTS", ${inputs})`);
+    expect(registryPy).toContain(`setting_int("PUBLIC_API_RERANK_MAX_DOCUMENTS", ${documents})`);
+    const pooling = pyInt(endpointModelsPy, /DEFAULT_MAX_POOLING_BODY_BYTES = (\d+) \* 1024 \* 1024/, 'pooling MiB');
+    const audioFile = pyInt(endpointModelsPy, /DEFAULT_MAX_AUDIO_BYTES = ([\d_]+)/, 'audio file') / 1024 / 1024;
+    const audioBody = pyInt(endpointModelsPy, /DEFAULT_MAX_AUDIO_BODY_BYTES = ([\d_]+)/, 'audio body') / 1024 / 1024;
+    expect(Number.isInteger(audioFile) && Number.isInteger(audioBody)).toBe(true);
+
+    const embeddings = todayPage('embeddings');
+    expect(embeddings).toContain(`One string, or 1 to ${thousands(inputs)} strings`);
+    expect(embeddings).toContain(`The body is at most ${pooling} MiB.`);
+    expect(flat(embeddings)).toContain(`Up to ${thousands(inputs)} inputs per request.`);
+
+    const rerank = todayPage('rerank');
+    expect(rerank).toContain(`1 to ${thousands(documents)} items`);
+    expect(rerank).toContain(`The body is at most ${pooling} MiB.`);
+
+    const audio = todayPage('audio-transcriptions');
+    expect(audio).toContain(`at most **${audioFile} MiB**`);
+    expect(flat(audio)).toContain(`at most ${audioBody} MiB`);
+    expect(audio).toContain('| Audio length | None | — |');
+
+    const limits = todayPage('rate-limits');
+    expect(limits).toContain(`| Body bytes for embeddings and rerank | ${pooling} MiB — up to ${thousands(inputs)} inputs or ${thousands(documents)} documents |`);
+    expect(limits).toContain(`${audioBody} MiB on \`/v1/audio/transcriptions\`, of which the file at most ${audioFile} MiB. No limit on duration.`);
+    expect(todayPage('errors')).toContain(`${pooling} MiB for embeddings and rerank`);
+  });
+
+  it('no longer tells anyone today about the retired sidecar clocks and caps', () => {
+    if (!SIDECARS_NO_TIMEOUT_LIVE) return;
+    const retired: [string, RegExp][] = [
+      ['embeddings', /\b256\b|within 60 seconds|504 timeout|at capacity/],
+      ['rerank', /1 to 100 items|more than 100\b|within 60 seconds|504 timeout|at capacity/],
+      ['audio-transcriptions', /300 seconds|25 MiB|26 MiB|240 seconds|504 timeout|up to 30 seconds/],
+      ['errors', /26 MiB with audio|audio over 25 MiB|or an engine did not answer in time/],
+      ['rate-limits', /26 MiB on|300 seconds of audio/],
+      ['python', /Clips are at most 300 seconds/],
+    ];
+    const offenders = retired.filter(([slug, claim]) => claim.test(flat(todayPage(slug)))).map(([slug, claim]) => `${slug}: ${claim}`);
+    expect(offenders).toEqual([]);
+    // A link to a page that exists only after the release is printed only after it.
+    if (!NO_TIMEOUT_LIVE) {
+      for (const slug of ['embeddings', 'rerank', 'audio-transcriptions']) {
+        expect(todayPage(slug), slug).not.toContain('/docs/timeouts');
+      }
+    }
+  });
+
+  it('describes the crashing-input quarantine and the memory guard the way sidecars.py enforces them, today and after the release', () => {
+    const quarantine = pyInt(sidecarsPy, /DEFAULT_POISON_QUARANTINE_S = (\d+)\.0/, 'quarantine');
+    expect(quarantine).toBe(3600);
+    const memoryRetry = pyInt(sidecarsPy, /MEMORY_RETRY_AFTER_S = (\d+)/, 'memory retry');
+    expect(memoryRetry).toBeLessThanOrEqual(10);
+    const release = (slug: string) => RELEASE_PAGES.find((page) => page.slug === slug)!.body;
+    for (const [slug, noun] of [['embeddings', 'input'], ['rerank', 'document']] as const) {
+      for (const body of [todayPage(slug), release(slug)]) {
+        const errors = flat(sectionOf(body, 'Errors and capacity'));
+        expect(errors, slug).toContain(`one of your ${noun}s stopped the engine twice — then with \`x-should-retry: false\` and \`param\` naming the ${noun}`);
+        expect(errors, slug).toContain('for an hour');
+        expect(errors, slug).toContain('embedding and rerank work in memory');
+      }
+    }
+    expect(flat(release('errors'))).toContain('An embeddings or rerank input that stopped its engine twice');
   });
 });

@@ -9,11 +9,13 @@ import { API_BASE_URL, EXAMPLE_STATUS, WHISPER_MODEL_ID } from '../samples';
 // which a caller would otherwise learn from a customer.
 import { NO_TIMEOUT_LIVE } from './longOutput';
 import { FILES_API_PUBLISHED } from './files';
+import { SIDECARS_NO_TIMEOUT_LIVE } from './sidecarsLive';
 
 // 2026-09-13, no-timeout design (revision 2): audio of any length — the file
 // streams to disk, is cut into windows of at most 90 seconds at pauses, and is
 // transcribed window by window — a 90 MiB request, `stream`, and a `file_id`
-// once the Files API is published. Built in either state from NO_TIMEOUT_LIVE.
+// once the Files API is published. Shipped on 2026-09-14: built from
+// SIDECARS_NO_TIMEOUT_LIVE (pages/sidecarsLive.ts), or NO_TIMEOUT_LIVE.
 
 const INTRO = `
 ~~~http
@@ -338,14 +340,21 @@ for segment in body["segments"]:
 `;
 
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
-export function audioTranscriptionsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
-  const sections = noTimeout
+export function audioTranscriptionsPage({
+  noTimeout,
+  sidecarsLive = SIDECARS_NO_TIMEOUT_LIVE,
+}: {
+  noTimeout: boolean;
+  sidecarsLive?: boolean;
+}): DocPage {
+  const live = noTimeout || sidecarsLive;
+  const sections = live
     ? [INTRO, S_TRANSCRIBE_A_FILE, LATER_THE_FIELDS, LATER_RESPONSE_FORMATS, S_LANGUAGES, LATER_LIMITS, LATER_CAPACITY_ONE_CLIP_AT_A_TIME, LATER_ERRORS, LATER_FROM_PYTHON, S_USAGE]
     : [INTRO, S_TRANSCRIBE_A_FILE, S_THE_FIELDS, S_RESPONSE_FORMATS, S_LANGUAGES, S_LIMITS, S_CAPACITY_ONE_CLIP_AT_A_TIME, S_ERRORS, S_FROM_PYTHON, S_USAGE];
   return {
     slug: 'audio-transcriptions',
     title: 'Audio transcriptions',
-    summary: noTimeout
+    summary: live
       ? 'POST /v1/audio/transcriptions turns speech of any length into text ' +
         'with techsara-whisper, with optional segment timestamps and streaming.'
       : 'POST /v1/audio/transcriptions turns up to five minutes of speech into ' +

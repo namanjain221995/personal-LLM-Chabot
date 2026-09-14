@@ -166,7 +166,8 @@ def test_with_the_limits_off_the_new_operations_document_capacity_not_a_limit(co
     for path in ("/v1/embeddings", "/v1/rerank", "/v1/audio/transcriptions"):
         responses = document["paths"][path]["post"]["responses"]
         assert "429" not in responses, path
-        assert "at capacity" in responses["503"]["description"], path
+        # No clock (2026-09-14): a queue is never the 503, only a down engine.
+        assert "waiting in that queue is never answered with this" in responses["503"]["description"], path
         assert "not a per-caller limit" in responses["503"]["description"], path
         assert "Retry-After" in responses["503"]["headers"], path
         # No Idempotency-Key on these three: nothing to replay, so no 409.
@@ -184,11 +185,16 @@ def test_with_the_limits_on_the_new_operations_advertise_the_limit_headers(confi
         assert "RateLimit" in responses["200"]["headers"], path
 
 
-def test_the_transcription_operation_is_multipart_and_answers_json_or_text(configured):
+def test_the_transcription_operation_takes_multipart_or_a_file_id_and_answers_json_text_or_a_stream(configured):
     operation = openapi_module.public_openapi()["paths"]["/v1/audio/transcriptions"]["post"]
+    schemas = openapi_module.public_openapi()["components"]["schemas"]
 
-    assert list(operation["requestBody"]["content"]) == ["multipart/form-data"]
-    assert set(operation["responses"]["200"]["content"]) == {"application/json", "text/plain"}
+    assert list(operation["requestBody"]["content"]) == ["multipart/form-data", "application/json"]
+    assert set(operation["responses"]["200"]["content"]) == {"application/json", "text/plain", "text/event-stream"}
+    # Any duration (no-timeout design, 2026-09-14): no seconds are published.
+    assert "seconds" not in schemas["TranscriptionRequest"]["properties"]["file"]["description"]
+    assert schemas["TranscriptionFileRequest"]["required"] == ["model", "file_id"]
+    assert "max_audio_seconds" not in schemas["Model"]["properties"]["limits"]["properties"]
 
 
 def test_the_published_ceilings_are_the_ones_the_server_enforces(configured, monkeypatch):

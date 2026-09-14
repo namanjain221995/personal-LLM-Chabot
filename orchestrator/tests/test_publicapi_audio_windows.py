@@ -93,7 +93,6 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_FFMPEG_LOG", log_path)
     monkeypatch.setenv("FAKE_FFMPEG_RUNDIR", rundir)
     monkeypatch.setenv("PUBLIC_API_ASR_HEALTH_POLL_S", "0.05")
-    monkeypatch.setenv("PUBLIC_API_ASR_GATE_SHIM_WAIT_S", "0.05")
     monkeypatch.setattr(capacity, "YIELD_STEP_S", 0.02)
     # WHY (2026-09-13): the tmp root shares a device with the default
     # PUBLIC_API_FILES_DIR's nearest ancestor on this host, so the ledger would
@@ -538,10 +537,10 @@ def test_identical_audio_in_another_project_is_never_answered_from_this_projects
     assert windows_sent(world.fleet) == 2 * calls_a
 
 
-def test_the_gate_waits_without_a_deadline_once_capacity_hold_accepts_one(monkeypatch):
-    """The seam for T2's `capacity.hold(wait_s=None, on_wait=…)`: when the gate
-    grows that signature, windows wait on it with no deadline, and a position
-    update reaches the job whether or not the gate awaits the callback."""
+def test_the_speech_gate_waits_without_a_deadline_and_reports_queue_positions(monkeypatch):
+    """Windows wait on `capacity.hold(wait_s=None, on_wait=…)` with no
+    deadline, and a position update reaches the job whether or not the gate
+    awaits the callback."""
     seen: Dict[str, Any] = {}
 
     import contextlib
