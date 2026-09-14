@@ -3145,10 +3145,21 @@ async def _serve_attached(
     include_usage: bool,
     after: int = 0,
     held: Optional[idempotency.Claim] = None,
+    gateway: bool = False,
 ) -> Response:
     """Answer a request that ATTACHED to an existing run, in its own shape:
     a stream follows from `after`, a synchronous call waits and returns the
-    body, a background request gets the 202 of the job it attached to."""
+    body, a background request gets the 202 of the job it attached to.
+
+    `gateway`: the request is the v1-gateway's re-POST of the same client
+    call (`_attach_gateway_attempt`). A synchronous run that FAILED is then
+    answered as the committed failure body in a `200`, never as its status:
+    the gateway reads a 502/503/504 answer to a re-attach as "not now" and
+    re-POSTs for up to 30 minutes, so a retryable failure (a run a restart
+    left unresumable, `model_unavailable`) held the client that long for an
+    answer that was already final (release review 2026-09-14, found
+    end-to-end). The failed object is what the client would have received
+    had its connection not been cut."""
     row = await _run_row_for(handle.id)
     if row is None:  # pragma: no cover - attach read it a moment ago
         raise errors.response_not_found()
@@ -3168,7 +3179,16 @@ async def _serve_attached(
     request_id = _request_id(request)
 
     async def work() -> Response:
-        outcome = await _await_durable_outcome(handle, held=held, partial=partial)
+        try:
+            outcome = await _await_durable_outcome(handle, held=held, partial=partial)
+        except _RunSuspended:
+            raise
+        except errors.ApiError as failure:
+            if not gateway:
+                raise
+            return JSONResponse(
+                _committed_failure_body(failure, spec=spec, chat=chat, request_id=request_id, outcome=partial)
+            )
         return JSONResponse(_durable_body(outcome, chat=chat))
 
     return keepalive.CommittedJSONResponse(
@@ -3200,9 +3220,17 @@ async def _attach_gateway_attempt(
         handle = await durable.RUNTIME.attach_attempt(existing, durable.caller_of(caller), await _body_digest(request))
     except (durable.AttachForbidden, durable.NotStreamable):
         raise errors.response_not_found() from None
+    if (existing.get("metadata") or {}).get("preparation_interrupted"):
+        # A restart ended the run while its files were being prepared: it
+        # generated nothing, so there is nothing to re-attach to. 404 makes
+        # the gateway cut its client, whose SDK retries into a fresh run —
+        # what a direct client does after its dropped connection. Checked
+        # after the attach's own creator and body checks, so the answer
+        # tells another credential nothing.
+        raise errors.response_not_found()
     return await _serve_attached(
         request, handle, request_model=request_model, chat=chat, include_usage=parsed.include_usage,
-        after=int(tag.resume_after or 0),
+        after=int(tag.resume_after or 0), gateway=True,
     )
 
 

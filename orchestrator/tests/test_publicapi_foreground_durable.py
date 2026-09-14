@@ -586,6 +586,71 @@ def test_a_gateway_json_re_post_attaches_to_the_running_call_and_returns_the_sam
     assert len(engine.calls) == 1
 
 
+def test_a_gateway_re_post_of_a_call_whose_run_failed_gets_the_failed_body_not_a_status_it_would_retry(port, platform, monkeypatch):
+    """Found end-to-end (release review 2026-09-14): the gateway re-POSTs a cut
+    committed call and reads 502/503/504 as "not now", so a run that a restart
+    left unresumable answered 503 to every re-POST and held the client for the
+    gateway's whole 30-minute budget."""
+    engine = FakeMainEngine(answer_tokens=200, delay_s=0.01).install(monkeypatch)
+    set_setting(monkeypatch, "PUBLIC_API_GATEWAY_PEERS", "127.0.0.1")
+    tagged = _auth(extra={gateway_protocol.ATTEMPT_HEADER: "attempt-gateway-json-failed-01"})
+    result: Dict[str, Any] = {}
+
+    def first_call() -> None:
+        try:
+            result["first"] = httpx.post(_url(port, "/v1/responses"), json=_responses_body(), headers=tagged, timeout=30)
+        except httpx.HTTPError as exc:
+            result["first_error"] = exc
+
+    thread = threading.Thread(target=first_call)
+    thread.start()
+    # Past the commit window (PUBLIC_API_SYNC_COMMIT_S 0.3): the cut is mid-body.
+    _wait_for(lambda: engine.calls and engine.calls[0].tokens_sent >= 60)
+    set_setting(monkeypatch, "PUBLIC_API_RESUME_ENABLED", "false")
+    _post_restart(port)
+    thread.join(30)
+    assert "first_error" in result
+
+    again = httpx.post(_url(port, "/v1/responses"), json=_responses_body(), headers=tagged, timeout=30)
+
+    assert again.status_code == 200, again.text
+    body = again.json()
+    assert body["status"] == "failed" and body["error"]["code"] == "model_unavailable"
+    assert again.headers["x-techsara-run"] == body["id"]
+    assert len(engine.calls) == 1
+
+
+def test_a_gateway_re_post_of_a_call_ended_while_its_files_were_prepared_is_a_404_so_the_client_retries(port, platform, files_world, monkeypatch):
+    set_setting(monkeypatch, "PUBLIC_API_GATEWAY_PEERS", "127.0.0.1")
+    store, fid, project_id = files_world["store"], files_world["file_id"], files_world["project_id"]
+    store.update(project_id, fid, blob_status="processing", blob_stage="index", blob_progress={"percent": 10})
+    tagged = _auth(extra={gateway_protocol.ATTEMPT_HEADER: "attempt-gateway-json-prepared-01"})
+    result: Dict[str, Any] = {}
+
+    def first_call() -> None:
+        try:
+            result["first"] = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid), headers=tagged, timeout=30)
+        except httpx.HTTPError as exc:
+            result["first_error"] = exc
+
+    thread = threading.Thread(target=first_call)
+    thread.start()
+    run = _wait_for(lambda: (_preparing_runs() or [None])[0])
+    time.sleep(0.5)
+    _post_restart(port)
+    thread.join(30)
+    assert "first_error" in result
+    assert durable_store.get_run(run.id)["metadata"]["preparation_interrupted"] is True
+
+    again = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid), headers=tagged, timeout=30)
+    other_body = httpx.post(_url(port, "/v1/responses"), json=_file_body(fid, instructions="different"),
+                            headers=tagged, timeout=30)
+
+    assert again.status_code == 404, again.text
+    assert other_body.status_code == 404
+    assert files_world["engine"].messages == []
+
+
 # ------------------------------------------------------ Idempotency-Key --
 
 
@@ -843,6 +908,11 @@ def test_a_durable_file_stream_has_its_id_slot_and_place_while_its_file_processe
     assert _names(wire.records) == ["response.created"]
     response_id = _response_id(wire.records)
     assert _preparing_runs() and _preparing_runs()[0].id == response_id
+    # Its `response.created` is in the log, but no spec is stored while the
+    # files are prepared (the plan made before them must never be resumed).
+    _wait_for(lambda: durable_store.list_events(response_id, 0, 10))
+    time.sleep(0.2)
+    assert not durable_store.has_spec([response_id])
     # The run holds the project's slot and its place in the gates' lines.
     assert _in_flight(project_id) == 1
     assert sum(public_router._GATE_LINE.waiting.values()) >= 1
@@ -998,13 +1068,17 @@ def test_a_restart_ends_a_background_request_still_waiting_for_its_file_on_the_r
     assert files_world["engine"].messages == []
 
 
-def test_a_keyed_file_stream_cut_mid_answer_resumes_from_the_spec_its_files_produced(port, files_world, monkeypatch):
+@pytest.mark.parametrize("keyed", [True, False], ids=["keyed", "unkeyed"])
+def test_a_file_stream_cut_mid_answer_resumes_from_the_spec_its_files_produced(port, files_world, monkeypatch, keyed):
     """The spec a preparing run stores is the FINAL one, written when its files
     resolved: a restart during the answer resumes with the file text, never
-    from the plan made before the files were read."""
+    from the plan made before the files were read. Unkeyed too: its spec is
+    written lazily by the event writer or at the suspend, and the writer's
+    first flush (`response.created`) came while the files were still being
+    prepared (found end-to-end, 2026-09-14)."""
     engine = FakeMainEngine(answer_tokens=60, delay_s=0.01).install(monkeypatch)
     fid = files_world["file_id"]
-    keyed = _auth(extra={"Idempotency-Key": "file-stream-resumed"})
+    keyed = _auth(extra={"Idempotency-Key": "file-stream-resumed"} if keyed else None)
     restarted = threading.Event()
 
     def restart_once(deltas: int) -> None:

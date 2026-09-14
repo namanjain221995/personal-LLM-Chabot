@@ -1384,7 +1384,12 @@ continues from where processing is. A preparing run's plan-before-files is
 never written as its spec; a process that crashed (no SIGTERM) leaves one that
 the claimer settles `failed` retry-safe. Once the files are prepared the run is
 like any other: its spec is written (at once when keyed or gateway-tagged,
-otherwise at the suspend) and a restart resumes the answer.
+otherwise with its next events or at the suspend) and a restart resumes the
+answer with the file text. A gateway re-POST of a call whose run a restart ended
+this way is `404` (nothing to re-attach to: the gateway cuts its client and the
+SDK retries), and a gateway re-POST of a synchronous call whose run FAILED is
+answered with the failed body in a `200`, never with a retryable status the
+gateway would keep re-POSTing for its 30-minute budget.
 
 1. **Launch** writes the `api_responses` row (resumable, dialect, `key_id`,
    `attempt_token`, `body_sha256`, `enqueued_at`), the idempotency claim's

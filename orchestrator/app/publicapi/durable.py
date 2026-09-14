@@ -1839,7 +1839,15 @@ class Runtime:
             for run in candidates.values():
                 if run.terminal or not run.lease_held or not run._pending:
                     continue
-                if not run.spec_written:
+                # Never the spec of a run still preparing its files: that is
+                # the plan made before they resolved, and a resume from it
+                # would answer without them (found end-to-end, 2026-09-14:
+                # this lazy write stored it at the first flush of
+                # `response.created`, so an unkeyed file stream resumed after a
+                # restart lost its file context and its citations). Its
+                # records are still written; the final spec follows when
+                # preparation ends.
+                if not run.spec_written and not run.preparing:
                     try:
                         await self._write_spec(run)
                     except Exception:  # noqa: BLE001 - retried next tick
@@ -2703,6 +2711,10 @@ class Runtime:
             metadata["recomputed_prompt_tokens"] = run.recomputed_prompt_tokens
         if should_retry is not None:
             metadata["should_retry"] = bool(should_retry)
+        if run.preparation_interrupted:
+            # Read by a gateway re-attach (router._attach_gateway_attempt):
+            # there is nothing to re-attach to, and the client should retry.
+            metadata["preparation_interrupted"] = True
         row: Optional[Dict[str, Any]] = None
         delay = 0.2
         while True:
