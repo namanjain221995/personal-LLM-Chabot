@@ -419,3 +419,42 @@ def test_a_document_that_crashes_the_reranker_twice_is_named_and_refused_before_
     assert again.status_code == 503 and again.headers["x-should-retry"] == "false"
     assert recorded.calls == sent and state["crashes"] == 2
     assert api.post("/v1/rerank", json=_body(documents=["fine", "also fine"]), headers=auth()).status_code == 200
+
+
+# ------------------------------------------------------ inline input_audio --
+
+
+def test_an_inline_mp3_over_the_clip_ceiling_is_refused_before_whisper_decodes_it(engines_configured, monkeypatch):
+    from app.apifiles import inline
+    from app.publicapi import audio_jobs
+
+    async def long_probe(audio, **_kwargs):
+        return 900.0
+
+    class NeverSent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("the clip reached the speech engine")
+
+    monkeypatch.setattr(sidecars, "probe_seconds", long_probe)
+    monkeypatch.setattr(audio_jobs, "WhisperDispatcher", NeverSent)
+    decoded = inline.DecodedAudio(raw=b"ID3" + b"\x00" * 64, content_type="audio/mpeg", seconds=None, param="input.0.content.1")
+
+    with pytest.raises(errors.ApiError) as refused:
+        asyncio.run(inline.transcribe_decoded(decoded))
+
+    assert refused.value.param == "input.0.content.1.data"
+    assert "at most" in refused.value.message
+
+
+def test_a_speech_engine_refusal_in_a_generation_names_the_input_part_not_a_multipart_field(engines_configured):
+    from app.apifiles import inline
+
+    async def engine(raw, content_type):
+        raise errors.invalid_request("The audio could not be decoded. Send a supported audio file.", param="file")
+
+    decoded = inline.DecodedAudio(raw=b"RIFF", content_type="audio/wav", seconds=None, param="input.2.content.0")
+
+    with pytest.raises(errors.ApiError) as refused:
+        asyncio.run(inline.transcribe_decoded(decoded, transcriber=engine))
+
+    assert refused.value.param == "input.2.content.0.data"

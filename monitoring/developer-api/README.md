@@ -309,9 +309,11 @@ behind a LONG request is by design, up to the lane's bound. So is a background
 job waiting for its gate, for up to `PUBLIC_API_BACKGROUND_GATE_WAIT_S`
 (3,600 s); a queue of them behind one `main.long` generation can last hours.
 That is why `PublicApiGateWaitSustained` leaves `main.long` out. A sync or
-stream request that waits out its gate (`PUBLIC_API_GATE_WAIT_S`, 30 s) gets
+stream generation that waits out its gate (`PUBLIC_API_GATE_WAIT_S`, 30 s) gets
 `503 model_unavailable` with `Retry-After`, which `PublicApiAtCapacityRefusals`
-counts. On the other gates a background job waits the same way, and the gauge
+counts. Embeddings, rerank and transcription requests (gates `embed`, `rerank`,
+`asr`) never do: since 2026-09-14 they wait with no limit inside a committed
+response, and a waiter on those gates is a caller holding a connection. On the other gates a background job waits the same way, and the gauge
 cannot tell it from a sync caller (the proposed `mode` label would), so look at
 the background jobs panel before calling it a capacity shortage.
 

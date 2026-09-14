@@ -339,7 +339,6 @@ def _whisper(monkeypatch, replies: List[Dict[str, Any]]) -> List[str]:
     monkeypatch.setattr(sidecars, "_transport", httpx.MockTransport(handler))
     monkeypatch.setattr(settings, "asr_base_urls", ("http://whisper.test/v1",), raising=False)
     monkeypatch.setenv("PUBLIC_API_ASR_HEALTH_POLL_S", "0.05")
-    monkeypatch.setenv("PUBLIC_API_ASR_GATE_SHIM_WAIT_S", "0.2")
     monkeypatch.setenv("PUBLIC_API_GATE_WAIT_S", "0.2")
     return seen
 
