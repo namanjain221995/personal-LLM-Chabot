@@ -41,7 +41,12 @@ in total for its gate and then answered 503, and one engine call was cut at a
   `check_rerank_lengths`): an input whose UTF-8 bytes + 2 fit the window
   cannot overflow (a byte-level BPE spends at most one token per byte), and a
   longer one is counted by the engine's own `/tokenize` — API-server CPU, no
-  KV, no gate — so an over-length input is a real 400 before anything waits;
+  KV, no capacity gate, but one process-wide `/tokenize` gate per engine and
+  at most PUBLIC_API_LENGTH_CHECK_BUDGET_S before the status line (what is
+  left is counted inside the committed response, and every count is
+  remembered for the retry) — so an over-length input is a real 400;
+* accepted-but-unfinished work is held to PUBLIC_API_POOLING_MEMORY_BYTES
+  (`PoolingMemory`), refused before the status line;
 * one engine call may be silent for PUBLIC_API_POOLING_SILENCE_S (600 s); what
   happens then is decided by the engine's /metrics witness
   (`liveness.SidecarWitness`), never by the clock: `progressing` re-sends,
