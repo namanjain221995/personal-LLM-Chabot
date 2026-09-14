@@ -11,7 +11,9 @@ the runner's generic handler and the file failed `internal_error` for good
 stopped). And even a correct deferral spent one of five attempts per outage:
 a 25-minute embed outage failed every file indexed during it.
 
-THE RULE. A file is never failed because an engine is down.
+THE RULE. An engine that is down or unreachable never spends a file's attempts,
+with one bounded exception (an engine that dies under the blob's own batch,
+below, where the trade-off is stated).
 
 * The request never reached the model — the connection was refused, the
   engine (or its proxy) answered 502/503/504 or 429, or the public capacity

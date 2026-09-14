@@ -35,9 +35,9 @@ WHAT ENDS A RUN.
   too complex) → `failed` with that code, `file.failed` webhooks;
 * the EMBEDDING ENGINE is down, or its state is unknown → deferred WITHOUT
   spending an attempt, retried with exponential backoff (15 s doubling, capped
-  at the 300 s retry delay) for as long as the outage lasts: a file is never
-  failed because an engine is down (2026-09-14; the rule and its two
-  exceptions are `apifiles/outage.py`);
+  at the 300 s retry delay) for as long as the outage lasts (2026-09-14; the
+  rule, its exceptions and the one trade-off — an engine that dies under a
+  blob's first batch spends that blob an attempt — are `apifiles/outage.py`);
 * the engine REFUSES US (401/403/404 and other 4xx: a wrong model name, a
   rotated key) or fails in a way that is not a proven transport failure →
   a counted deferral, below: misconfiguration must end in a visible failure,
