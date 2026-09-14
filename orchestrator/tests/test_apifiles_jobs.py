@@ -58,6 +58,8 @@ def files_root(tmp_path, monkeypatch):
     root = tmp_path / "api-files"
     root.mkdir()
     monkeypatch.setenv("PUBLIC_API_FILES_DIR", str(root))
+    # Not the 250 GiB production watermark: a CI runner has far less free.
+    monkeypatch.setenv("PUBLIC_API_FILES_MIN_FREE_GIB", "0")
     events.reset_for_tests()
     yield str(root)
 
@@ -435,8 +437,9 @@ def test_a_blob_marked_deleting_stops_its_job_at_the_next_unit_and_nothing_more_
     async def scenario():
         r = runner(stages={"text": slow_text})
         tasks = await r._claim_and_spawn()
-        while len(ticks) < 3:
-            await asyncio.sleep(0.02)
+        async with asyncio.timeout(10):  # a job that never starts fails here, not at CI's job limit
+            while len(ticks) < 3:
+                await asyncio.sleep(0.02)
         schema.update_api_file_blob(row["id"], status="deleting")
         return await asyncio.wait_for(tasks[0], timeout=10)
 

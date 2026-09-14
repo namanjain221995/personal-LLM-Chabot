@@ -88,8 +88,11 @@ def test_create_refuses_bad_fields_naming_them(api, overrides, param):
     assert response.json()["error"]["param"] == param
 
 
-def test_an_upload_of_100_gib_is_accepted_and_the_message_above_it_says_the_ceiling(api):
+def test_an_upload_of_100_gib_is_accepted_and_the_message_above_it_says_the_ceiling(api, monkeypatch):
     client, caller, _usage, _app = api
+    # Creating it reserves parts plus the assembled copy (200 GiB); this test
+    # is about the size ceiling, so the disk is one that could hold it.
+    monkeypatch.setattr(storage, "free_bytes", lambda: 1024 ** 4)
     assert _upload(client, caller, 107_374_182_400)["bytes"] == 107_374_182_400
     response = client.post("/v1/uploads", headers=headers_for(caller), json={"bytes": 107_374_182_401, "filename": "a", "mime_type": "x", "purpose": "user_data"})
     assert "100 GiB" in response.json()["error"]["message"]

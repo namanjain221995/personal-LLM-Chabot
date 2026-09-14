@@ -41,6 +41,10 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "session_secret_file", str(tmp_path / "appdb" / ".session_secret"))
     monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
     monkeypatch.setenv("PUBLIC_API_FILES_DIR", str(tmp_path / "api-files"))
+    # The 250 GiB production watermark is a fact about the box, not the test:
+    # a CI runner has far less free, and every write would be refused.
+    # Tests of the watermark itself patch `storage.free_bytes` against it.
+    monkeypatch.setenv("PUBLIC_API_FILES_MIN_FREE_GIB", "0")
     if not _SCHEMA_READY["done"]:
         schema.ensure_schema()
         _SCHEMA_READY["done"] = True

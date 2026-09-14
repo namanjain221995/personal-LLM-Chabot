@@ -129,7 +129,8 @@ def test_limits_read_settings_first_then_the_environment_with_blank_meaning_defa
         limits.part_max_bytes()
 
 
-def test_the_design_defaults_hold():
+def test_the_design_defaults_hold(monkeypatch):
+    monkeypatch.delenv("PUBLIC_API_FILES_MIN_FREE_GIB", raising=False)  # the fixture's test floor is not the default
     assert limits.max_body_bytes() == 68_157_440
     assert limits.upload_max_bytes() == 107_374_182_400
     assert limits.max_parts() == 10_000
