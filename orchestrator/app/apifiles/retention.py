@@ -421,7 +421,8 @@ async def _loop(interval_s: float, on_pass: Optional[Callable[[RetentionReport],
             log.warning("files retention pass failed", exc_info=True)
         _kick.clear()
         try:
-            await asyncio.wait_for(_kick.wait(), timeout=interval_s)
+            async with asyncio.timeout(interval_s):
+                await _kick.wait()
         except asyncio.TimeoutError:
             pass
 

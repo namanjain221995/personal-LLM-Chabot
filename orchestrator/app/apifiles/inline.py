@@ -403,7 +403,10 @@ async def materialize_file_data(
         def build() -> List[chunk_store.Page]:
             text = raw.decode("utf-8", errors="replace")
             if kind == "html":
-                text = re.sub(r"<(script|style)\b[\s\S]*?</\1\s*>|<[^>]+>", " ", text, flags=re.IGNORECASE)
+                # `strip_tags`, the linear forward scanner written for this call
+                # (see its docstring), never a backtracking tag regex (senior
+                # fix 2026-09-14: the call had kept the old regex).
+                text = strip_tags(text)
             pages = csv_blocks(text) if kind == "tabular" else text_sections(text)
             _write_pages(derived, pages)
             return pages

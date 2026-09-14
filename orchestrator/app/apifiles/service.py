@@ -816,7 +816,8 @@ async def wait_until_ready(
         if abandon is not None and sleep is asyncio.sleep:
             # A cancelled background job stops waiting now, not a poll later.
             try:
-                await asyncio.wait_for(abandon.wait(), timeout=interval)
+                async with asyncio.timeout(interval):
+                    await abandon.wait()
             except asyncio.TimeoutError:
                 pass
         else:

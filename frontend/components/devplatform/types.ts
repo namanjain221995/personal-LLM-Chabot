@@ -346,7 +346,7 @@ export interface ConsoleOverview {
  * there first; anything this list offers that the server does not know is an
  * `UnknownScopeError` at creation time.
  */
-export const SCOPES: { id: string; label: string; hint: string }[] = [
+export const SCOPES: { id: string; label: string; hint: string; note?: string }[] = [
   { id: 'models.read', label: 'Read models', hint: 'List the models this key may use.' },
   { id: 'responses.read', label: 'Read responses', hint: 'Read responses created by this project.' },
   { id: 'responses.write', label: 'Create responses', hint: 'Create and cancel responses.' },
@@ -357,6 +357,17 @@ export const SCOPES: { id: string; label: string; hint: string }[] = [
   { id: 'embeddings.write', label: 'Create embeddings', hint: 'Create embeddings.' },
   { id: 'rerank.write', label: 'Rerank documents', hint: 'Rerank documents against a query.' },
   { id: 'audio.write', label: 'Transcribe audio', hint: 'Transcribe audio.' },
+  // 2026-09-13, with /v1/files and /v1/uploads (Files design §10.2, §14.1).
+  // `note` is the one line the design asks the dialog to add under the
+  // server's sentence: reading a file includes downloading its bytes, which
+  // is a larger reach than generating with it.
+  {
+    id: 'files.read',
+    label: 'Read files',
+    hint: 'Read, download and use this project’s files.',
+    note: 'A key with this scope can download every file in the project.',
+  },
+  { id: 'files.write', label: 'Upload files', hint: 'Upload and delete this project’s files.' },
 ];
 
 /** Webhook events a project may subscribe to (CONTRACT §14). */

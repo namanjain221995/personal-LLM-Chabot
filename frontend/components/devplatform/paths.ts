@@ -15,6 +15,8 @@
  * a check in another file to be well formed.
  */
 
+import { filesPaths } from './files-api';
+
 const seg = encodeURIComponent;
 
 export const consolePaths = {
@@ -35,4 +37,7 @@ export const consolePaths = {
   models: () => 'models',
   model: (modelId: string) => `models/${seg(modelId)}`,
   playground: () => 'playground/execute',
+  // The Files tab's paths live beside its uploader; spread here so this file
+  // still lists every console path and the proxy suite still sees them.
+  ...filesPaths,
 } as const;

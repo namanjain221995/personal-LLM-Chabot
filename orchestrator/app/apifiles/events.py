@@ -319,7 +319,8 @@ async def _wait(queue: Optional["asyncio.Queue[dict]"], timeout: float) -> bool:
         await asyncio.sleep(timeout)
         return False
     try:
-        await asyncio.wait_for(queue.get(), timeout=timeout)
+        async with asyncio.timeout(timeout):
+            await queue.get()
     except asyncio.TimeoutError:
         return False
     while not queue.empty():

@@ -347,6 +347,7 @@ describe('the console navigation', () => {
       'Overview',
       'Projects',
       'API keys',
+      'Files',
       'Models',
       'Playground',
       'Usage',
@@ -524,10 +525,10 @@ describe('the projects table', () => {
 
 describe('the scopes the console offers', () => {
   it('is exactly the closed vocabulary the server declares, and nothing more', () => {
-    // orchestrator/app/apiplatform/scopes.py: Scope has these seven members
-    // (the last three since 2026-09-13, with the embeddings, rerank and speech
-    // endpoints) and `validate` raises UnknownScopeError for anything else, so
-    // an eighth box on this form would be a key the platform refuses to mint.
+    // orchestrator/app/apiplatform/scopes.py: Scope has these nine members
+    // (embeddings, rerank and speech since 2026-09-13, and the two file scopes
+    // with /v1/files) and `validate` raises UnknownScopeError for anything else, so
+    // a tenth box on this form would be a key the platform refuses to mint.
     expect(SCOPES.map((s) => s.id)).toEqual([
       'models.read',
       'responses.read',
@@ -536,6 +537,8 @@ describe('the scopes the console offers', () => {
       'embeddings.write',
       'rerank.write',
       'audio.write',
+      'files.read',
+      'files.write',
     ]);
   });
 
@@ -548,6 +551,14 @@ describe('the scopes the console offers', () => {
     expect(hints['embeddings.write']).toBe('Create embeddings.');
     expect(hints['rerank.write']).toBe('Rerank documents against a query.');
     expect(hints['audio.write']).toBe('Transcribe audio.');
+    expect(hints['files.read']).toBe('Read, download and use this project’s files.');
+    expect(hints['files.write']).toBe('Upload and delete this project’s files.');
+  });
+
+  it('says under files.read that such a key can download every file of the project', () => {
+    const note = SCOPES.find((s) => s.id === 'files.read')?.note ?? '';
+    expect(note).toMatch(/download every file/);
+    expect(SCOPES.filter((s) => s.note).map((s) => s.id)).toEqual(['files.read']);
   });
 
   it('names no webhook scope, because the platform defines none', () => {
@@ -907,6 +918,8 @@ describe('the show-once key after the dialog closes', () => {
         'embeddings.write',
         'rerank.write',
         'audio.write',
+        'files.read',
+        'files.write',
       ],
     });
     expect(Object.keys(window.sessionStorage)).toHaveLength(0);

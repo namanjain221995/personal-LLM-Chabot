@@ -516,7 +516,8 @@ async def _follow_pipeline(ctx: JobContext, analysis_id: int) -> Dict[str, Any]:
                 ):
                     await pipeline.ensure_running(analysis_id)
             try:
-                event = await asyncio.wait_for(subscription.get(), timeout=MEDIA_POLL_S)
+                async with asyncio.timeout(MEDIA_POLL_S):
+                    event = await subscription.get()
             except asyncio.TimeoutError:
                 continue
             relayed = media.map_progress(ctx.kind, event)
@@ -1437,7 +1438,8 @@ async def wait_until_terminal(
                 wait = min(wait, remaining)
             loaded_at = loop.time()
             try:
-                await asyncio.wait_for(updates.get(), timeout=wait)
+                async with asyncio.timeout(wait):
+                    await updates.get()
             except asyncio.TimeoutError:
                 continue
             # A local event is a doorbell: ring it at most once per second

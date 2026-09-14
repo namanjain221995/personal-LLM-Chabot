@@ -1,17 +1,15 @@
-"""The Files API tables (V36 files portion) and the accessors every module uses.
+"""The Files API tables (migration V37 in db.py) and the accessors every module uses.
 
-WHY A MODULE OF ITS OWN THIS WAVE. `db.py` is shared by several engineers and is
-not edited by this build. The DDL below is written to move VERBATIM into
-`db.py`'s `_MIGRATIONS` chain as the files part of V36 (integration item); until
-then `ensure_schema()` applies it idempotently, and the tests call it. The
-accessors keep the names and contracts of design §9.2 so the other teams build
-against the same surface whichever file they end up in.
+WHERE THE DDL LIVES (files-hookup, 2026-09-13). The tables are migration V37 in
+`db.py`'s `_MIGRATIONS` chain, so `db.init_schema` creates them at start-up like
+every other table. `MIGRATION_SQL` below is that same string, and
+`ensure_schema()` still applies it idempotently for the suites that use a
+private database without the lifespan. The accessors keep the names and
+contracts of design §9.2.
 
-NUMBERING (re-check at merge, R12). The devapi worktree ends at V35; V36 is
-claimed by BOTH the Files design and the no-timeout design (which also sketches
-an `api_files` table). The Files design wins on files; the no-timeout tables
-are unrelated to these, so the two can share V36 or take V36/V37 — the
-integration team decides, and nothing here depends on the number.
+NUMBERING. V36 is the no-timeout durable-generation migration; the files tables
+are their own migration so neither can half-apply the other. See the comment at
+the top of `db._MIGRATION_V37`, including the shape guard.
 
 ISOLATION (design §7.2). Every accessor that a caller-supplied id can reach
 takes `project_id` and puts it in the WHERE clause, and "absent" and "another
@@ -50,7 +48,7 @@ from . import ids
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = db.FILES_MIGRATION_VERSION
 
 #: Distinct from `db._MIGRATION_LOCK_KEY`: this is only for `ensure_schema`
 #: racing itself (two test workers, two processes at start-up).
@@ -59,144 +57,11 @@ _ENSURE_LOCK_KEY = 0x41504946  # "APIF"
 PURPOSES = ("user_data", "assistants", "vision")
 FILE_ERROR_CODES = ("checksum_mismatch", "internal_error")
 
-MIGRATION_SQL = """
--- V36 (2026-09-13): the public Files API — content blobs per project, files, uploads and parts.
--- A BLOB is one project's copy of some bytes (unique per project+sha256; never global — a global key
--- would tell one tenant another uploaded the same bytes). A FILE is a named reference to a blob; many
--- files may share a blob; the bytes go when the last live file does. Every FK a cascade walks is indexed.
-SET LOCAL lock_timeout = '3s';
-CREATE TABLE IF NOT EXISTS api_file_blobs (
-    id                 text        PRIMARY KEY,
-    project_id         text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
-    workspace_id       text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    sha256             text        NOT NULL CONSTRAINT api_file_blobs_sha256 CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    bytes              bigint      NOT NULL CONSTRAINT api_file_blobs_bytes CHECK (bytes >= 0),
-    kind               text        NOT NULL DEFAULT 'unknown'
-                       CONSTRAINT api_file_blobs_kind CHECK (kind IN ('unknown','pdf','document','presentation',
-                       'spreadsheet','tabular','text','html','image','audio','video','unsupported')),
-    mime_type          text        NOT NULL DEFAULT 'application/octet-stream',
-    status             text        NOT NULL DEFAULT 'queued'
-                       CONSTRAINT api_file_blobs_status CHECK (status IN ('queued','processing','processed','failed','deleting')),
-    lane               text        NOT NULL DEFAULT 'cpu' CONSTRAINT api_file_blobs_lane CHECK (lane IN ('cpu','media')),
-    stage              text        NOT NULL DEFAULT 'sniff',
-    stages             jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_stages CHECK (jsonb_typeof(stages) = 'object'),
-    progress           jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_progress CHECK (jsonb_typeof(progress) = 'object'),
-    facts              jsonb       NOT NULL DEFAULT '{}'::jsonb CONSTRAINT api_file_blobs_facts CHECK (jsonb_typeof(facts) = 'object'),
-    error_code         text        CONSTRAINT api_file_blobs_error_code CHECK (error_code IS NULL OR error_code IN
-                       ('unsupported_file','file_corrupt','file_too_complex','processing_unavailable','internal_error')),
-    attempt            integer     NOT NULL DEFAULT 0 CONSTRAINT api_file_blobs_attempt CHECK (attempt >= 0),
-    not_before         timestamptz,
-    pipeline_version   smallint    NOT NULL DEFAULT 1,
-    lease_owner        text,
-    lease_expires_at   timestamptz,
-    video_analysis_id  bigint      REFERENCES video_analyses(id) ON DELETE SET NULL,
-    derived_bytes      bigint      NOT NULL DEFAULT 0 CONSTRAINT api_file_blobs_derived_bytes CHECK (derived_bytes >= 0),
-    created_at         timestamptz NOT NULL DEFAULT now(),
-    updated_at         timestamptz NOT NULL DEFAULT now(),
-    started_at         timestamptz,
-    processed_at       timestamptz
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_api_file_blobs_project_sha ON api_file_blobs (project_id, sha256);
-CREATE INDEX IF NOT EXISTS idx_api_file_blobs_workspace ON api_file_blobs (workspace_id);
-CREATE INDEX IF NOT EXISTS idx_api_file_blobs_due ON api_file_blobs (lane, status, not_before, updated_at)
-    WHERE status IN ('queued','processing','deleting');
-CREATE INDEX IF NOT EXISTS idx_api_file_blobs_video ON api_file_blobs (video_analysis_id) WHERE video_analysis_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS api_files (
-    id           text        PRIMARY KEY,
-    project_id   text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
-    workspace_id text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    key_id       text        REFERENCES api_keys(id) ON DELETE SET NULL,
-    blob_id      text        REFERENCES api_file_blobs(id) ON DELETE SET NULL,
-    assembling_upload_id text,
-    error_code   text        CONSTRAINT api_files_error_code CHECK (error_code IS NULL OR error_code IN ('checksum_mismatch','internal_error')),
-    filename     text        NOT NULL CONSTRAINT api_files_filename CHECK (char_length(filename) BETWEEN 1 AND 255),
-    purpose      text        NOT NULL CONSTRAINT api_files_purpose CHECK (purpose IN ('user_data','assistants','vision')),
-    bytes        bigint      NOT NULL CONSTRAINT api_files_bytes CHECK (bytes >= 0),
-    origin       text        NOT NULL DEFAULT 'file' CONSTRAINT api_files_origin CHECK (origin IN ('file','upload')),
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    expires_at   timestamptz,
-    deleted_at   timestamptz,
-    CONSTRAINT api_files_live_state CHECK (deleted_at IS NOT NULL OR blob_id IS NOT NULL OR assembling_upload_id IS NOT NULL OR error_code IS NOT NULL)
-);
-CREATE INDEX IF NOT EXISTS idx_api_files_assembling ON api_files (assembling_upload_id) WHERE assembling_upload_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_api_files_project_live ON api_files (project_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_api_files_workspace ON api_files (workspace_id);
-CREATE INDEX IF NOT EXISTS idx_api_files_key ON api_files (key_id);
-CREATE INDEX IF NOT EXISTS idx_api_files_blob ON api_files (blob_id);
-CREATE INDEX IF NOT EXISTS idx_api_files_expiry ON api_files (expires_at) WHERE deleted_at IS NULL AND expires_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_api_files_tombstones ON api_files (deleted_at) WHERE deleted_at IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS api_uploads (
-    id                         text        PRIMARY KEY,
-    project_id                 text        NOT NULL REFERENCES api_projects(id) ON DELETE CASCADE,
-    workspace_id               text        NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    key_id                     text        REFERENCES api_keys(id) ON DELETE SET NULL,
-    filename                   text        NOT NULL CONSTRAINT api_uploads_filename CHECK (char_length(filename) BETWEEN 1 AND 255),
-    purpose                    text        NOT NULL CONSTRAINT api_uploads_purpose CHECK (purpose IN ('user_data','assistants','vision')),
-    mime_type                  text        NOT NULL DEFAULT '',
-    bytes                      bigint      NOT NULL CONSTRAINT api_uploads_bytes CHECK (bytes BETWEEN 0 AND 1099511627776),
-    status                     text        NOT NULL DEFAULT 'pending'
-                               CONSTRAINT api_uploads_status CHECK (status IN ('pending','finalizing','completed','cancelled','expired','failed')),
-    bytes_received             bigint      NOT NULL DEFAULT 0 CONSTRAINT api_uploads_bytes_received CHECK (bytes_received >= 0),
-    file_expires_after_seconds integer     CONSTRAINT api_uploads_expires_after CHECK
-                               (file_expires_after_seconds IS NULL OR file_expires_after_seconds BETWEEN 3600 AND 2592000),
-    file_id                    text        REFERENCES api_files(id) ON DELETE SET NULL,
-    result                     jsonb,
-    error_status               integer,
-    error_code                 text,
-    error_message              text,
-    assembly_part_numbers      integer[],
-    expected_md5               text        CONSTRAINT api_uploads_expected_md5 CHECK (expected_md5 IS NULL OR expected_md5 ~ '^[0-9a-f]{32}$'),
-    expected_sha256            text        CONSTRAINT api_uploads_expected_sha256 CHECK (expected_sha256 IS NULL OR expected_sha256 ~ '^[0-9a-f]{64}$'),
-    assembly_bytes_done        bigint      NOT NULL DEFAULT 0 CONSTRAINT api_uploads_assembly_bytes CHECK (assembly_bytes_done >= 0),
-    assembly_attempts          integer     NOT NULL DEFAULT 0 CONSTRAINT api_uploads_assembly_attempts CHECK (assembly_attempts >= 0),
-    assembly_lease_owner       text,
-    assembly_lease_expires_at  timestamptz,
-    created_at                 timestamptz NOT NULL DEFAULT now(),
-    updated_at                 timestamptz NOT NULL DEFAULT now(),
-    last_part_at               timestamptz,
-    expires_at                 timestamptz NOT NULL,
-    completed_at               timestamptz
-);
-CREATE INDEX IF NOT EXISTS idx_api_uploads_project ON api_uploads (project_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_api_uploads_workspace ON api_uploads (workspace_id);
-CREATE INDEX IF NOT EXISTS idx_api_uploads_key ON api_uploads (key_id);
-CREATE INDEX IF NOT EXISTS idx_api_uploads_file ON api_uploads (file_id);
-CREATE INDEX IF NOT EXISTS idx_api_uploads_open ON api_uploads (status, expires_at) WHERE status IN ('pending','finalizing');
-CREATE INDEX IF NOT EXISTS idx_api_uploads_assembly ON api_uploads (assembly_lease_expires_at, completed_at)
-    WHERE status = 'completed' AND assembly_part_numbers IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_api_uploads_terminal ON api_uploads (updated_at)
-    WHERE status IN ('completed','cancelled','expired','failed');
-
-CREATE TABLE IF NOT EXISTS api_upload_parts (
-    id           text        PRIMARY KEY,
-    upload_id    text        NOT NULL REFERENCES api_uploads(id) ON DELETE CASCADE,
-    part_number  integer     NOT NULL CONSTRAINT api_upload_parts_number CHECK (part_number BETWEEN 0 AND 9999),
-    bytes        bigint      NOT NULL CONSTRAINT api_upload_parts_bytes CHECK (bytes BETWEEN 1 AND 67108864),
-    sha256       text        NOT NULL CONSTRAINT api_upload_parts_sha256 CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    created_at   timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_api_upload_parts_number ON api_upload_parts (upload_id, part_number);
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'api_files_assembling_upload_fk') THEN
-    ALTER TABLE api_files ADD CONSTRAINT api_files_assembling_upload_fk
-      FOREIGN KEY (assembling_upload_id) REFERENCES api_uploads(id) ON DELETE SET NULL;
-  END IF;
-END $$;
-ALTER TABLE api_uploads ADD COLUMN IF NOT EXISTS part_mode text
-    CONSTRAINT api_uploads_part_mode CHECK (part_mode IS NULL OR part_mode IN ('numbered','sequential'));
-
--- The chat pipeline serves both lanes. A column with a constant default is metadata-only on PG >= 11;
--- the CHECK is NOT VALID (the no-timeout migration rule: no verification scan under a lock).
-ALTER TABLE video_analyses ADD COLUMN IF NOT EXISTS lane text NOT NULL DEFAULT 'chat';
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'video_analyses_lane') THEN
-    ALTER TABLE video_analyses ADD CONSTRAINT video_analyses_lane CHECK (lane IN ('chat','api')) NOT VALID;
-  END IF;
-END $$;
-"""
+#: MOVED 2026-09-13 (files-hookup): the DDL lives in `db.py`'s migration chain
+#: as V37 and is applied by `db.init_schema` at start-up. This name stays so the
+#: tests' `ensure_schema()` (a private database, no lifespan) and anything that
+#: reads the text keep working — and it is the SAME string, not a copy.
+MIGRATION_SQL = db.FILES_MIGRATION_SQL
 
 #: The tables this module owns, children first — for a test fixture's TRUNCATE
 #: and for `conftest._APP_TABLES` (integration item).

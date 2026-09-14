@@ -1,6 +1,6 @@
 """The scope vocabulary for the public developer API — closed, flat, and data.
 
-CONTRACT-3 §7. SEVEN scopes exist and no eighth can be spelled: an unknown
+CONTRACT-3 §7. NINE scopes exist and no tenth can be spelled: an unknown
 string is a parse ERROR, never a silently-dropped entry. That rule is the
 whole point of this module. The alternative — tolerating an unrecognised
 scope — means a typo in a console form (`responses.wrte`) produces a key that
@@ -35,6 +35,12 @@ product. KEYS MINTED BEFORE THIS CHANGE KEEP THEIR STORED SCOPES and so do not
 gain the new ones — nothing here rewrites `api_keys.scopes`, because widening a
 credential nobody re-issued is exactly the silent grant this module refuses to
 make. A developer who wants embeddings on an old key creates a new key.
+
+FROM SEVEN TO NINE (2026-09-13, the Files API). `files.read` and `files.write`
+arrive with `/v1/files` and `/v1/uploads` (Files design §10.2), under the same
+rules: in `DEFAULT_SCOPES` (owner decision D1, the design's proposal), never
+added to a stored key, no implication table. A `file_id` used as model input
+needs `files.read` IN ADDITION to `responses.write`.
 
 SCOPES ARE DATA, NOT ROLES. There is no implication table here, and adding one
 would be a change of contract. `responses.write` does not grant
@@ -86,6 +92,14 @@ class Scope(str, Enum):
     #: `audio`, not `transcriptions`, because that is the path's own family
     #: (`/v1/audio/…`) and the name a client library already groups it under.
     AUDIO_WRITE = "audio.write"
+    #: Read, download and use this project's files — `GET /v1/files…`, and
+    #: any `file_id` used as model input (2026-09-13, Files design §10.2). Use
+    #: implies read: a model can be asked to repeat a file verbatim.
+    FILES_READ = "files.read"
+    #: Upload and delete this project's files — `POST /v1/files`,
+    #: `DELETE /v1/files/{id}` and every `/v1/uploads` route, including the
+    #: resume read `GET /v1/uploads/{id}` (resuming is part of writing).
+    FILES_WRITE = "files.write"
 
 
 #: Every scope. Computed from the enum so a new member can never be forgotten
@@ -103,6 +117,8 @@ SCOPE_DESCRIPTIONS: dict[Scope, str] = {
     Scope.EMBEDDINGS_WRITE: "Create embeddings.",
     Scope.RERANK_WRITE: "Rerank documents against a query.",
     Scope.AUDIO_WRITE: "Transcribe audio.",
+    Scope.FILES_READ: "Read, download and use this project's files.",
+    Scope.FILES_WRITE: "Upload and delete this project's files.",
 }
 
 #: What the console offers when the person creating a key does not choose.
@@ -120,6 +136,14 @@ SCOPE_DESCRIPTIONS: dict[Scope, str] = {
 #: project's behalf and nothing more, so leaving them out would not shrink a
 #: leak's blast radius (the key can already generate) — it would only make a
 #: default key 403 on three documented endpoints. `usage.read` stays opt-in.
+#:
+#: FILES (2026-09-13, Files design §10.2, OWNER DECISION D1 — the design's
+#: proposal, applied until the owner rules). Both file scopes are defaults: a
+#: default key that 403s on `/v1/files` reads as a broken product, and file
+#: input is a mainline use. The recorded counter-argument: `files.read` lets a
+#: leaked default key download every file of its project, a larger blast
+#: radius than generation. Flipping D1 is removing `Scope.FILES_READ` from this
+#: set and nothing else. Stored keys keep their stored scopes either way.
 DEFAULT_SCOPES: FrozenSet[Scope] = frozenset(
     {
         Scope.MODELS_READ,
@@ -128,6 +152,8 @@ DEFAULT_SCOPES: FrozenSet[Scope] = frozenset(
         Scope.EMBEDDINGS_WRITE,
         Scope.RERANK_WRITE,
         Scope.AUDIO_WRITE,
+        Scope.FILES_READ,
+        Scope.FILES_WRITE,
     }
 )
 

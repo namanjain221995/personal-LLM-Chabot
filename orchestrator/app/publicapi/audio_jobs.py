@@ -1596,7 +1596,8 @@ class AudioJob:
         future = asyncio.get_running_loop().create_future()
         self._changed.append(future)
         try:
-            await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+            async with asyncio.timeout(timeout):
+                await asyncio.shield(future)
             return True
         except asyncio.TimeoutError:
             return False

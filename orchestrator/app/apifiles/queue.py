@@ -705,6 +705,7 @@ class AssembleRunner:
             if self._stopping:
                 return
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=self._poll_s)
+                async with asyncio.timeout(self._poll_s):
+                    await self._wake.wait()
             except asyncio.TimeoutError:
                 pass

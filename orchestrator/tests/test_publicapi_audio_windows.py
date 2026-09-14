@@ -218,7 +218,9 @@ def test_a_two_hour_recording_transcribes_word_for_word_with_true_timestamps_in_
     assert_monotonic(result.segments)
 
     report = result.report
-    assert report["plan"]["detector"] == "energy"
+    # webrtcvad when installed (requirements-dev.txt installs it, as CI and the
+    # image do), the energy detector otherwise — as test_video_understanding.
+    assert report["plan"]["detector"] in ("webrtcvad", "energy")
     assert report["stitch"]["seams_aligned"] >= 10, report["stitch"]  # overlaps really happened
     assert report["longest_clip_s"] <= 90.0
     assert all(call["seconds"] <= 93.0 for call in world.fleet.calls)
@@ -243,7 +245,7 @@ def test_windows_are_at_most_ninety_seconds_and_overlap_only_inside_continuous_s
         fh.seek(44)
         pcm = np.frombuffer(fh.read(), dtype="<i2")
     windows, report = aj.plan(pcm, total_s=1200, window=90.0, overlap=3.0, gap=2.0)
-    assert report["detector"] == "energy"
+    assert report["detector"] in ("webrtcvad", "energy")
     assert windows and all(w.duration_s <= 90.0 + 1e-6 for w in windows)
     overlapping = [w for w in windows if w.overlaps_previous]
     assert overlapping, "the script has stretches longer than one window"
@@ -378,7 +380,11 @@ def test_streamed_deltas_are_never_retracted_and_join_exactly_into_the_final_tex
     assert len(deltas) > 5
     assert "".join(deltas) == result.text
     assert fw.normalized_words(result.text) == [fw.norm_word(w.text) for w in script.words]
-    assert {"queued", "decoding", "transcribing"} <= stages
+    # Progress is latest-state (`Job.publish` keeps only the newest queued or
+    # progress event), so a follower that attaches after the job has moved on
+    # legitimately never sees "queued": seen flaking 1 run in 3 on Python 3.11
+    # (2026-09-14). The stages a 1,200 s job must pass through are still seen.
+    assert {"decoding", "transcribing"} <= stages
     assert result.body("json") == {"text": result.text, "usage": {"type": "duration", "seconds": 1200}}
     assert result.body("text") == result.text
 
@@ -494,19 +500,24 @@ def test_while_dictation_needs_a_replica_windows_wait_instead_of_failing(world, 
         source = await aj.AudioSource.from_path(path)
         spec = aj.JobSpec.for_request(project_id="proj_a", sha256=source.sha256, language=None, response_format="json")
         job = await world.jobs.start(spec, source)
-        requeued = 0
+        failed = 0
         async with job.follow() as follower:
             while True:
                 event = await follower.next(5.0)
-                if event.type == "queued" and event.data.get("requeued"):
-                    requeued += 1
+                if event.type == "failed":
+                    failed += 1
                 if event.type in ("done", "failed"):
                     break
-        return job, requeued
+        return job, failed
 
-    job, requeued = run(scenario())
+    job, failed = run(scenario())
     assert job.state == "done", job.error
-    assert requeued >= 1
+    # Assembler, 2026-09-14: this counted `queued` events carrying `requeued`,
+    # which only the pre-T2 re-queue shim of `audio_jobs.capacity_gate` emits
+    # (each finite hold that ran out). With T2's `capacity.hold(wait_s=None)`
+    # the window waits ONCE in the gate's dictation loop, so there is nothing
+    # to re-queue; the wait itself is what the first-call assertion proves.
+    assert failed == 0
     first_call = min(call["started"] for call in world.fleet.calls)
     assert first_call >= busy["until"] - 0.05
     assert fw.compare_to_script(job.result.segments, script)["equal"]

@@ -59,3 +59,25 @@ GET /v1/usage
 # exactly what this file is for. Do not "fix" the red build by loosening the
 # comparison.
 GET /v1/openapi.json
+
+# ---- files and uploads (2026-09-13 owner request; Files design §2.1) ------
+# Scopes files.read / files.write. Every id is project-scoped: another
+# project's file or upload is the same 404 as one that never existed. No
+# route here reads a cookie, and the console never serves file bytes (D6).
+# Mounted by publicapi/router.py `_register_files()`; threat review: Files
+# design §10. REVIEW GATE: this block needs the owner's approval like every
+# other line of this file.
+POST /v1/files
+GET /v1/files
+GET /v1/files/{file_id}
+GET /v1/files/{file_id}/content
+DELETE /v1/files/{file_id}
+GET /v1/files/{file_id}/events
+GET /v1/files/{file_id}/derived
+GET /v1/files/{file_id}/derived/{name}
+POST /v1/uploads
+GET /v1/uploads/{upload_id}
+POST /v1/uploads/{upload_id}/parts
+PUT /v1/uploads/{upload_id}/parts/{part_number}
+POST /v1/uploads/{upload_id}/complete
+POST /v1/uploads/{upload_id}/cancel

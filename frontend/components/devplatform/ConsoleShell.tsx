@@ -35,6 +35,7 @@ import {
   IconFileText,
   IconMenu,
   IconPackage,
+  IconPaperclip,
   IconPlay,
   IconX,
 } from '@/components/icons';
@@ -55,6 +56,7 @@ import { consoleNav, tabAllowed, tabFromQuery, type TabId } from './nav';
 import { OverviewPanel } from './Overview';
 import { ProjectsPanel } from './Projects';
 import { KeysPanel } from './Keys';
+import { FilesPanel } from './Files';
 import { ModelsPanel } from './Models';
 import { PlaygroundPanel } from './Playground';
 import { UsagePanel } from './Usage';
@@ -68,6 +70,7 @@ const ICONS: Record<string, ReactNode> = {
   overview: <IconGrid size={15} />,
   projects: <IconPackage size={15} />,
   keys: <IconKey size={15} />,
+  files: <IconPaperclip size={15} />,
   models: <IconCpu size={15} />,
   playground: <IconPlay size={15} />,
   usage: <IconChart size={15} />,
@@ -84,6 +87,8 @@ function Panel({ tab, me }: { tab: TabId; me: Me }) {
       return <ProjectsPanel me={me} />;
     case 'keys':
       return <KeysPanel me={me} />;
+    case 'files':
+      return <FilesPanel me={me} />;
     case 'models':
       return <ModelsPanel me={me} />;
     case 'playground':
