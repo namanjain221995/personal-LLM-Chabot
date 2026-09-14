@@ -863,7 +863,19 @@ class Settings:
         # recall@10 = 0.995 with 50 probes, versus 150 ms flat). Built by the
         # background worker, never on a request. The table is compacted and
         # old versions pruned every WEB_INDEX_OPTIMIZE_EVERY worker cycles.
-        self.web_index_ann_min_rows: int = _int("WEB_INDEX_ANN_MIN_ROWS", 50_000)
+        #
+        # 10,000, not 50,000 (2026-09-14). At a fixed 50 probes over
+        # sqrt(rows) partitions a SMALLER table probes a LARGER share of
+        # itself, so recall below 50k is never worse than the recall already
+        # accepted above it: chunk recall@15 on synthetic 1024-d corpora was
+        # 1.0/1.0/1.0 (clustered), 0.95/0.92/0.88 (4x noisier) and
+        # 0.70/0.55/0.42 (structureless Gaussian) at 10k/20k/50k rows, and
+        # every top-15 page inside MAX_DISTANCE matched the flat scan. The
+        # 20k-row corpus this deployment holds was scanning flat: retrieve()
+        # 18.7-19.3 ms p50 / 24.8-25.2 ms p95 flat vs 9.0-9.2 / 11.2-11.5 ms on
+        # the index, identical results (build 1.3 s, off the request path).
+        # KNOWLEDGE_ANN_BYPASS stays the rollback.
+        self.web_index_ann_min_rows: int = _int("WEB_INDEX_ANN_MIN_ROWS", 10_000)
         self.web_index_nprobes: int = _int("WEB_INDEX_NPROBES", 50)
         self.web_index_optimize_every: int = _int("WEB_INDEX_OPTIMIZE_EVERY", 12)
         # Embedding calls sit on every assistant turn's critical path; this is
@@ -1726,6 +1738,16 @@ class Settings:
         self.public_api_resume_enabled: bool = _bool("PUBLIC_API_RESUME_ENABLED", True)
         #: Background runs resume one per this interval, oldest first. 30 s.
         self.public_api_resume_stagger_s: float = _float("PUBLIC_API_RESUME_STAGGER_S", 30.0)
+        #: Terminal records of a long answer (>= 1,024 chars) store it by
+        #: reference to the logged deltas instead of four more copies
+        #: (2026-09-14). Readers handle both forms. FALSE BY DEFAULT for the
+        #: first deploy of the reader (cross-track review 2026-09-14): every
+        #: push to main auto-deploys, and that deploy's automatic rollback puts
+        #: def6b94-era code back, which renders a by-reference record with an
+        #: EMPTY answer for the whole PUBLIC_API_EVENT_RETENTION_S. Expand, then
+        #: contract: flip the default to true one deploy after this reader is
+        #: the rollback target. False.
+        self.public_api_terminal_text_by_reference: bool = _bool("PUBLIC_API_TERMINAL_TEXT_BY_REFERENCE", False)
         #: A suspended run nobody reads is cancelled (no engine work) after this. 900 s.
         self.public_api_suspended_unread_ttl_s: float = _float("PUBLIC_API_SUSPENDED_UNREAD_TTL_S", 900.0)
         #: Keyed runs and Responses streams keep generating this long after the

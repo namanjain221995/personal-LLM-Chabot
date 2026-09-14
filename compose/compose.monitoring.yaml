@@ -277,6 +277,13 @@ services:
       DATA_SOURCE_USER: ${POSTGRES_USER}
       DATA_SOURCE_PASS: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       PG_EXPORTER_EXCLUDE_DATABASES: "template0,template1"
+      # Checkpoints, WAL, client transaction age and lock waits on PG18
+      # (2026-09-14): the file's header says why they are custom queries on the
+      # pinned image rather than an image bump. 0.16.0 logs one DEPRECATED
+      # warning for this variable at start-up; that is expected.
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml
+    volumes:
+      - ./monitoring/exporters/postgres/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
     command:
       # Per-table live-row estimates and index usage: this is what answers
       # "how many conversations / messages / web_pages do I actually have?"
@@ -286,7 +293,12 @@ services:
       # Per-database size, so growth is visible before the disk fills.
       - --collector.database
       - --collector.locks
-      - --collector.long_running_transactions
+      # MISLEADING, so off (2026-09-14). 0.16.0's query has no xact_start
+      # filter: it counts every non-idle process, PG18's three io workers and
+      # the exporter included, and its "oldest" value is clock_timestamp(), so
+      # for 14 days it read 9-11 "long-running transactions" whose age was the
+      # current epoch. pg_client_transactions_* (queries.yaml) replaces it.
+      - --no-collector.long_running_transactions
       # Off on purpose: this deployment has one small database and these add
       # cardinality without answering a question anyone here asks.
       - --no-collector.replication

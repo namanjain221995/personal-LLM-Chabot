@@ -127,6 +127,16 @@ SUSPEND_RECORD_WAIT_S = 2.0
 #: (2026-09-14 review P5: one global LIMIT 50 let fifty main rows hide a
 #: router row whose gate was free).
 DISPATCH_SCAN_PER_ENGINE = 200
+#: The dispatcher's longest wait when nothing wakes it and its last scan
+#: found no due row (2026-09-14, database-speed round). Everything THIS
+#: process does that can make a row due wakes it at once (a launch, a run
+#: leaving its gate group, the engine READY edge); the timer only finds rows
+#: made due elsewhere — another process's released or lapsed lease, which is
+#: staggered by PUBLIC_API_RESUME_STAGGER_S (30 s) anyway. The idle 1 s scan
+#: was 60 of the 107 transactions a minute an idle process issued.
+DISPATCH_IDLE_POLL_S = 15.0
+#: The wait while the last scan did find due rows (unchanged cadence).
+DISPATCH_BUSY_POLL_S = 1.0
 
 
 # ------------------------------------------------------------ settings --
@@ -140,6 +150,21 @@ def _bool_setting(name: str, default: bool) -> bool:
             return default
         return raw.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def terminal_text_by_reference() -> bool:
+    """PUBLIC_API_TERMINAL_TEXT_BY_REFERENCE (false). Whether `_settle` lets
+    `durable_store.finish` store a long answer in the terminal records by
+    reference (2026-09-14, database-speed round). READERS always understand
+    both forms; only the writer is switched. A process on code older than
+    this change renders such a record with empty text, so the FIRST deploy of
+    this code — whose automatic rollback would put that older code back while
+    the new records are still inside PUBLIC_API_EVENT_RETENTION_S — ships
+    with the writer off (cross-track review 2026-09-14: every push to main
+    auto-deploys, so an operator override cannot be relied on to land first).
+    Flip the default to true one deploy later, once a reader is the rollback
+    target."""
+    return _bool_setting("PUBLIC_API_TERMINAL_TEXT_BY_REFERENCE", False)
 
 
 def resume_enabled() -> bool:
@@ -959,20 +984,19 @@ async def sse_frames(
 
 def outcome_from_log(row: Mapping[str, Any]) -> streaming.StreamOutcome:
     """A settled run's outcome from its row and stored events (sync helper)."""
-    records = durable_store.list_events(str(row["id"]), 0, 1_000_000)
-    text = "".join(str(r[2].get("delta") or "") for r in records if r[1] == events.RESPONSE_OUTPUT_TEXT_DELTA)
+    # One aggregate statement (2026-09-14, database-speed round): this used to
+    # fetch every event row of the run into Python (509 ms for 100,000 events).
+    text, failed = durable_store.log_outcome(str(row["id"]))
     error = None
-    for record in reversed(records):
-        if record[1] == events.RESPONSE_FAILED:
-            failure = (record[2].get("response") or {}).get("error") or {}
-            try:
-                error = errors.ApiError(str(failure.get("code") or "model_unavailable"),
-                                        str(failure.get("message") or ""), retry_after=30)
-            except ValueError:
-                error = errors.model_unavailable()
-            if record[2].get("_should_retry") is not None:
-                setattr(error, "should_retry", bool(record[2]["_should_retry"]))
-            break
+    if failed is not None:
+        failure = (failed.get("response") or {}).get("error") or {}
+        try:
+            error = errors.ApiError(str(failure.get("code") or "model_unavailable"),
+                                    str(failure.get("message") or ""), retry_after=30)
+        except ValueError:
+            error = errors.model_unavailable()
+        if failed.get("_should_retry") is not None:
+            setattr(error, "should_retry", bool(failed["_should_retry"]))
     if error is None and row.get("status") == "failed":
         error = errors.model_unavailable()
     usage = None
@@ -1183,6 +1207,10 @@ class Runtime:
         self._dispatch_changed: Optional[asyncio.Event] = None
         self.serving = None
         self.dispatch_wake: Optional[asyncio.Event] = None
+        #: Whether the dispatcher's last scan found due rows, and its current
+        #: unwoken wait (see `_dispatch_wait_s`).
+        self._dispatch_saw_rows = False
+        self._dispatch_idle_wait = 0.0
         self.stats: Dict[str, int] = collections.defaultdict(int)
         #: Scrape router/OCR /metrics during their attempts (tests turn it off:
         #: the fake engines have no metrics endpoint to scrape).
@@ -1982,6 +2010,10 @@ class Runtime:
                 self._quarantined_dispatched = None
                 self._quarantine_prefill = False
             self._dispatch_state_changed()
+            if not run.terminal and run.background and not self.stopping and self.dispatch_wake is not None:
+                # A background runner that ended without settling left its row
+                # queued for a dispatcher: look now, not at the idle poll.
+                self.dispatch_wake.set()
             if not run.terminal and run.stop_reason in ("lease_lost", "restart", "shutdown"):
                 self._drop_run(run)
             if run.id not in self.runs:
@@ -2725,6 +2757,7 @@ class Runtime:
                     row = await db.run_in_thread(
                         durable_store.finish, self.owner if run.lease_held else None, run.id,
                         pending + final, fields, metadata=metadata,
+                        text=text if terminal_text_by_reference() else None,
                     )
                 except Exception:  # noqa: BLE001 - the database is out: retry
                     run.restore_inflight()
@@ -3102,6 +3135,7 @@ class Runtime:
         rows = await db.run_in_thread(
             durable_store.due_for_resume, limit=DISPATCH_SCAN_PER_ENGINE * 4, per_engine=DISPATCH_SCAN_PER_ENGINE,
         )
+        self._dispatch_saw_rows = bool(rows)
         claimed = 0
         placed: Set[Tuple[str, ...]] = set()
         for row in rows:
@@ -3158,14 +3192,30 @@ class Runtime:
             return None
         return await self.claim_and_resume(response_id)
 
+    def _dispatch_wait_s(self) -> float:
+        """How long the dispatcher sleeps unless woken: the busy cadence while
+        the last scan saw due rows, otherwise doubling from it up to
+        DISPATCH_IDLE_POLL_S (never longer than the sweep interval)."""
+        busy = min(DISPATCH_BUSY_POLL_S, sweep_s())
+        ceiling = max(busy, min(DISPATCH_IDLE_POLL_S, sweep_s()))
+        if self._dispatch_saw_rows or self._dispatch_idle_wait <= 0:
+            wait = busy
+        else:
+            wait = min(ceiling, self._dispatch_idle_wait * 2)
+        self._dispatch_idle_wait = wait
+        return wait
+
     async def _dispatch_loop(self) -> None:
         while True:
             try:
                 wake = self.dispatch_wake
                 if wake is not None:
                     with contextlib.suppress(asyncio.TimeoutError):
-                        async with asyncio.timeout(min(1.0, sweep_s())):
+                        async with asyncio.timeout(self._dispatch_wait_s()):
                             await wake.wait()
+                    if wake.is_set():
+                        # Woken for a reason: scan at the busy cadence again.
+                        self._dispatch_idle_wait = 0.0
                     wake.clear()
                 await self.dispatch_once()
             except asyncio.CancelledError:

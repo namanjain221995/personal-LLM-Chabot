@@ -1,0 +1,191 @@
+# promtool unit tests for monitoring/prometheus/rules/database-timing.yml.
+#
+#   IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+#     test rules /p/tests/database_timing.yml
+#
+# Label sets are the real ones (prometheus.yml job labels):
+#   orchestrator: instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"
+#   postgres:     instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres"
+#                 (+ server="postgres:5432" on custom-query series)
+
+rule_files:
+  - ../rules/database-timing.yml
+
+evaluation_interval: 15s
+
+group_eval_order:
+  - database-timing
+  - database-internals
+
+tests:
+  # ============================================== recording rules
+  - interval: 15s
+    name: "per-site statement p95 and the process statement rate are recorded"
+    input_series:
+      # 10 statements/s at site=history, all between 1 and 2 ms.
+      - series: 'techsara_db_statement_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",site="history",le="0.001"}'
+        values: '0x40'
+      - series: 'techsara_db_statement_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",site="history",le="0.002"}'
+        values: '0+150x40'
+      - series: 'techsara_db_statement_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",site="history",le="+Inf"}'
+        values: '0+150x40'
+      - series: 'techsara_db_statement_seconds_count{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",site="history"}'
+        values: '0+150x40'
+    promql_expr_test:
+      - expr: site:techsara_db_statement_seconds:p95_5m
+        eval_time: 8m
+        exp_samples:
+          - labels: 'site:techsara_db_statement_seconds:p95_5m{site="history"}'
+            value: 0.00195
+      - expr: round(instance:techsara_db_statements:rate5m, 0.001)
+        eval_time: 8m
+        exp_samples:
+          - labels: '{instance="host.docker.internal:8080"}'
+            value: 10
+
+  # ============================================== OrchestratorDbPoolWaiting
+  - interval: 15s
+    name: "pool wait p95 above 50 ms for 10 minutes fires"
+    input_series:
+      - series: 'techsara_db_pool_wait_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="0.05"}'
+        values: '0+1x80'
+      - series: 'techsara_db_pool_wait_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="0.1"}'
+        values: '0+10x80'
+      - series: 'techsara_db_pool_wait_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="+Inf"}'
+        values: '0+10x80'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: OrchestratorDbPoolWaiting
+        exp_alerts: []
+      - eval_time: 17m
+        alertname: OrchestratorDbPoolWaiting
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "Orchestrator waits 97.22ms (p95) for a database connection"
+              description: >-
+                Checkout wait includes the pool's liveness check (one round trip),
+                so a healthy value is well under a millisecond. Compare
+                techsara_db_pool_requests_waiting and the per-site transaction
+                p95 on the Data stores dashboard before raising APP_DB_POOL_MAX.
+
+  - interval: 15s
+    name: "a healthy sub-millisecond pool never fires"
+    input_series:
+      - series: 'techsara_db_pool_wait_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="0.0005"}'
+        values: '0+20x80'
+      - series: 'techsara_db_pool_wait_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="+Inf"}'
+        values: '0+20x80'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: OrchestratorDbPoolWaiting
+        exp_alerts: []
+
+  # ============================================== PostgresLockWaitSustained
+  - interval: 15s
+    name: "a lock wait of 2 minutes fires; a 1-minute one does not"
+    input_series:
+      - series: 'pg_lock_waits_backends{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '0 1 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 2 2 2 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 75s
+        alertname: PostgresLockWaitSustained
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: PostgresLockWaitSustained
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "2 PostgreSQL session(s) waiting on a lock for 2 minutes"
+              description: >-
+                `select pid, pg_blocking_pids(pid), wait_event, left(query, 80)
+                from pg_stat_activity where wait_event_type = 'Lock'` names the
+                waiter and its blocker.
+
+  # ============================================== PostgresLongTransaction
+  - interval: 15s
+    name: "a transaction older than 10 minutes for 5 minutes fires"
+    input_series:
+      - series: 'pg_client_transactions_oldest_seconds{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '0+15x80'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: PostgresLongTransaction
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: PostgresLongTransaction
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A PostgreSQL transaction has been open for 16m 0s"
+              description: >-
+                `select pid, datname, application_name, state, now() - xact_start
+                as age, left(query, 80) from pg_stat_activity where xact_start is
+                not null order by xact_start limit 5` names it.
+
+  # ============================================== PostgresCheckpointsMostlyRequested
+  - interval: 1m
+    name: "more requested than timed checkpoints for 30 minutes fires"
+    input_series:
+      # one requested checkpoint every 5 minutes, no timed ones
+      - series: 'pg_stat_checkpointer_num_requested_total{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '0+0.2x180'
+      - series: 'pg_stat_checkpointer_num_timed_total{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '5x180'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: PostgresCheckpointsMostlyRequested
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              instance: postgres-exporter:9187
+              job: postgres
+              node: spark-1
+              role: head
+              service: postgres
+              server: postgres:5432
+            exp_annotations:
+              summary: "12 requested PostgreSQL checkpoints in the last hour"
+              description: >-
+                Requested checkpoints outnumber timed ones, so WAL volume, not the
+                timer, drives checkpoint I/O. Look at rate(pg_stat_wal_bytes_total)
+                per database's write traffic before touching max_wal_size (a
+                restart-free reload setting, but an owner decision).
+
+  - interval: 1m
+    name: "timed checkpoints only never fire"
+    input_series:
+      - series: 'pg_stat_checkpointer_num_requested_total{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '1x180'
+      - series: 'pg_stat_checkpointer_num_timed_total{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres",server="postgres:5432"}'
+        values: '0+0.2x180'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: PostgresCheckpointsMostlyRequested
+        exp_alerts: []
+
+  # ============================================== PostgresExporterQueriesFailing
+  - interval: 15s
+    name: "custom queries failing for 15 minutes fires"
+    input_series:
+      - series: 'pg_exporter_last_scrape_error{instance="postgres-exporter:9187",job="postgres",node="spark-1",role="head",service="postgres"}'
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PostgresExporterQueriesFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PostgresExporterQueriesFailing
+        exp_alerts:
+          - exp_labels:
+              severity: info
+            exp_annotations:
+              summary: "postgres-exporter custom queries are failing"
+              description: >-
+                `docker logs --since 5m <postgres-exporter container> | grep -i
+                'error'` shows the query. The file requires PostgreSQL 18.

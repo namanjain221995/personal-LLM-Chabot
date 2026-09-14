@@ -974,7 +974,12 @@ async def _entity_candidates(
     if people:
         ambiguous = [p for p in people if len(p["matches"]) > 1]
         facts = (
-            "" if ambiguous else await db.run_in_thread(who_these_people_are, text)
+            # `resolved=people`: the lookup above already ran; rendering it
+            # must not repeat every LIKE (and a fuzzy scan) on a second
+            # warehouse connection.
+            ""
+            if ambiguous
+            else await db.run_in_thread(who_these_people_are, text, "sql", people)
         )
         options: List[dict] = []
         for person in ambiguous:

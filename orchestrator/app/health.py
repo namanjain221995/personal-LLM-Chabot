@@ -172,6 +172,22 @@ def _check_duckdb(path: str) -> dict:
     never raises. Blocking — callers run it in a thread."""
     import duckdb  # lazy
 
+    from .core import warehouse  # lazy
+
+    # The snapshot the readers actually use is checked through the same cached
+    # instance they use (core/warehouse.py) — a catalog open every few seconds
+    # was ~205 ms of CPU each time. A replaced or unreadable snapshot re-opens
+    # or falls through to the direct check below.
+    cached = warehouse.cursor(path)
+    if cached is not None:
+        try:
+            cached.execute("SELECT 1")
+            return {"status": "ok"}
+        except Exception as exc:  # noqa: BLE001 — never raises, by contract
+            return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        finally:
+            cached.close()
+
     # The config MUST match engines/sql.py exactly. DuckDB refuses a second
     # connection to one file whose configuration differs from the connection
     # already open ("Can't open a connection to same database file with a
@@ -216,6 +232,30 @@ def _check_embedding_index() -> dict:
         settings.lancedb_table,
         settings.embed_model,
     )
+
+
+#: (rows, distinct_pages) of the web index per directory, keyed on the table
+#: version it was counted at (2026-09-14). Uncached, the distinct-page count
+#: reads every page_id: measured 11.3 ms at 20k compacted rows, 29.7 ms at 20k
+#: fragmented, 44.6 / 204.8 ms at 200k — on every uncached /health probe,
+#: while the table changes only when the worker indexes a batch.
+_web_index_counts: dict = {}
+
+
+def _web_index_version_key(table, directory: str, web_table: str):
+    """What identifies the table state the counts were taken at, or None when
+    it cannot be read (then nothing is cached).
+
+    The version alone is not enough: a deleted-and-recreated directory
+    (web_index's "deleting the directory is always safe") restarts at the SAME
+    version numbers. The `_versions` directory's inode and mtime change on
+    that rebuild and on every commit, so the pair cannot collide in practice.
+    """
+    try:
+        st = os.stat(os.path.join(directory, f"{web_table}.lance", "_versions"))
+        return (int(table.version), st.st_ino, st.st_mtime_ns)
+    except Exception:  # noqa: BLE001 — no key, no cache
+        return None
 
 
 def _check_web_index() -> dict:
@@ -271,15 +311,26 @@ def _check_web_index() -> dict:
             out[key] = value
     if inspected.get("status") == "ok":
         try:
-            import lancedb  # lazy
             import pyarrow.compute as pc
 
-            table = lancedb.connect(directory).open_table(web_table)
-            rows = int(table.count_rows())
+            from .embedding_index import connect as lance_connect  # lazy
+
+            table = lance_connect(directory).open_table(web_table)
+            key = _web_index_version_key(table, directory, web_table)
+            cached = _web_index_counts.get(directory)
+            if key is not None and cached is not None and cached[0] == key:
+                rows, distinct = cached[1], cached[2]
+            else:
+                rows = int(table.count_rows())
+                distinct = 0
+                if rows:
+                    ids = table.search().select(["page_id"]).limit(rows).to_arrow()
+                    distinct = int(len(pc.unique(ids["page_id"])))
+                if key is not None:
+                    _web_index_counts[directory] = (key, rows, distinct)
             out["rows"] = rows
             if rows:
-                ids = table.search().select(["page_id"]).limit(rows).to_arrow()
-                out["distinct_pages"] = int(len(pc.unique(ids["page_id"])))
+                out["distinct_pages"] = distinct
             # Additive sidecar keys (chunker_version, query_instruction) that
             # the typed loader ignores; a chunker bump is visible here first.
             try:
@@ -805,6 +856,7 @@ def _same_fingerprint(a: tuple, b: tuple) -> bool:
 def reset_dependency_cache() -> None:
     """Forget every cached probe (tests, or after a configuration change)."""
     _DEPS_CACHE.clear()
+    _web_index_counts.clear()
 
 
 async def _dependency_probe() -> Tuple[List[Tuple[str, str]], Dict[str, str], list]:

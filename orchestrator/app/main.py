@@ -1993,22 +1993,36 @@ class _OrderedTraceWriter:
     upload-reliability contract depends on (the chat_requests row, the
     answer) goes through here. The worker drains the queue before the stream
     closes, so a trace is complete by the time its response is.
+
+    GROUP COMMIT (2026-09-14). With `on_idle`, the jobs only BUFFER their
+    rows, and `on_idle` writes the buffer in one transaction once the queue
+    is empty. While `hold()` says more is coming (the trace is not finished)
+    the writer waits up to `window_s` for the next job before writing, so a
+    turn's root, checkpoints and close land in one to three commits instead
+    of eight. `flush()` cuts the wait short; the order of rows is the order
+    of the jobs, as before.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, on_idle=None, hold=None, window_s: float = 0.0) -> None:
         from collections import deque
 
         self._jobs = deque()
         self._task: Optional[asyncio.Task] = None
+        self._on_idle = on_idle
+        self._hold = hold
+        self._window_s = float(window_s)
+        self._wake = asyncio.Event()
+        self._flush_requested = False
 
     def submit(self, job) -> None:
         self._jobs.append(job)
+        self._wake.set()
         if self._task is None or self._task.done():
             self._task = asyncio.ensure_future(self._drain())
             _background_tasks.add(self._task)
             self._task.add_done_callback(_background_tasks.discard)
 
-    async def _drain(self) -> None:
+    async def _run_jobs(self) -> None:
         while self._jobs:
             job = self._jobs.popleft()
             try:
@@ -2016,7 +2030,35 @@ class _OrderedTraceWriter:
             except Exception:  # noqa: BLE001 — a trace must never fail a turn
                 logging.getLogger(__name__).warning("queued trace write failed", exc_info=True)
 
+    async def _drain(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await self._run_jobs()
+            if self._on_idle is None:
+                return
+            if self._window_s > 0 and self._hold is not None:
+                deadline = loop.time() + self._window_s
+                while self._hold() and not self._flush_requested and loop.time() < deadline:
+                    self._wake.clear()
+                    if self._jobs:
+                        await self._run_jobs()
+                        continue
+                    try:
+                        async with asyncio.timeout(max(0.0, deadline - loop.time())):
+                            await self._wake.wait()
+                    except TimeoutError:
+                        break
+                    await self._run_jobs()
+            try:
+                await self._on_idle()
+            except Exception:  # noqa: BLE001 — a trace must never fail a turn
+                logging.getLogger(__name__).warning("queued trace write failed", exc_info=True)
+            if not self._jobs:
+                return
+
     async def flush(self) -> None:
+        self._flush_requested = True
+        self._wake.set()
         while self._task is not None and not self._task.done():
             await asyncio.shield(self._task)
 
@@ -2033,6 +2075,13 @@ _CLARIFICATION_CANCEL_BOUND_S = 2.0
 #: stream closes anyway (2026-09-13). They keep landing on their own task; a
 #: healthy INSERT is single-digit ms, and the answer is already on screen.
 _TRACE_FLUSH_BOUND_S = 2.0
+
+
+#: How long the trace writer holds a burst of rows for the next one before it
+#: commits them anyway (group commit, 2026-09-14). A crash can lose at most
+#: this much more of a trace's tail; the close of a trace and `flush()` never
+#: wait for it.
+_TRACE_COALESCE_S = 0.25
 
 
 class _TurnEnd:
@@ -2122,7 +2171,37 @@ class _QueuedTraceRecorder(TraceRecorder):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.writer = _OrderedTraceWriter()
+        self._pending: list = []
+        self.writer = _OrderedTraceWriter(
+            on_idle=self._write_pending,
+            hold=lambda: not self._finished,
+            window_s=_TRACE_COALESCE_S,
+        )
+
+    async def _persist(self, fn, *args, **kwargs) -> None:
+        # Buffered: the writer commits the burst in `_write_pending`.
+        self._pending.append((fn, args, kwargs))
+
+    async def _write_pending(self) -> None:
+        writes, self._pending = self._pending, []
+        if not writes:
+            return
+        try:
+            await db.run_in_thread(db.write_query_trace_batch, writes)
+            return
+        except Exception:  # noqa: BLE001 — retried one by one below
+            logging.getLogger(__name__).warning(
+                "query trace batch of %d writes failed trace_id=%s; retrying one by one",
+                len(writes), self.trace_id, exc_info=True,
+            )
+        for fn, args, kwargs in writes:
+            try:
+                await db.run_in_thread(fn, *args, **kwargs)
+            except Exception:  # noqa: BLE001 — best-effort, like every trace write
+                logging.getLogger(__name__).warning(
+                    "query trace write %s failed trace_id=%s", getattr(fn, "__name__", fn), self.trace_id,
+                    exc_info=True,
+                )
 
     async def start(self, **kwargs) -> None:  # type: ignore[override]
         self.writer.submit(lambda: TraceRecorder.start(self, **kwargs))
@@ -3723,6 +3802,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     gen.intent_id = intent_id
     gen.answer_branch = request.answer_branch
     gen.effort = str(request.effort or "")
+    # ONE commit for acceptance (2026-09-14): a NEW intent is written as
+    # `running` — its worker starts below without a further await on the
+    # database — and the parked rows it supersedes (see the `keep` comment
+    # further down) are cancelled in the same transaction. A known intent
+    # (row None) takes the attach / replay / retry paths exactly as before.
+    supersede_keep = (
+        None
+        if sweep_caller
+        else [intent_id] + [g.intent_id for g in _live_generations.values() if g.intent_id]
+    )
     row = await db.run_in_thread(
         db.create_chat_request,
         intent_id,
@@ -3731,8 +3820,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         gen.generation_id,
         snapshot,
         resumable=resumable,
+        status="running",
+        supersede_parked_except=supersede_keep,
     )
     resumed = False
+    if row is not None:
+        gen.request_status = "running"
     if row is None:
         known = await db.run_in_thread(db.get_chat_request, intent_id)
         if (
@@ -3853,12 +3946,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # process, with no live generation in this process, would otherwise
         # be resumed by the sweep and answered below this newer exchange.
         # A row this process still holds is cancelled through its task
-        # (above), which writes its own status.
-        keep = [intent_id] + [g.intent_id for g in _live_generations.values() if g.intent_id]
+        # (above), which writes its own status. The cancel itself ran in the
+        # acceptance transaction (`supersede_parked_except`), with `keep` =
+        # this intent + every generation this process held at that moment.
         with contextlib.suppress(Exception):
-            superseded = await db.run_in_thread(
-                db.cancel_parked_chat_requests, conv_key_outer, keep=keep
-            )
+            superseded = int(row.get("superseded") or 0)
             if superseded:
                 logging.getLogger(__name__).info(
                     "%d parked request(s) in conversation %s superseded by intent %s",
@@ -4175,7 +4267,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         reads = _ContextReads(_context_concurrent_reads_enabled())
         cancel_pending_task: Optional[asyncio.Task] = None
         try:
-            await _mark_chat_request(gen, "running")
+            if gen.request_status != "running":
+                # A new intent was accepted as `running` in its acceptance
+                # commit; a resumed attempt (`accepted` by the retry) says so here.
+                await _mark_chat_request(gen, "running")
             await query_trace.start(
                 conversation_id=conv_key_outer,
                 user_id=viewer,

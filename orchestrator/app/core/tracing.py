@@ -109,6 +109,11 @@ class TraceRecorder:
             **(versions or {}),
         }
 
+    async def _persist(self, fn, *args: Any, **kwargs: Any) -> None:
+        """Write one trace row. A subclass may buffer instead (main.py's
+        queued recorder writes a whole burst in one transaction)."""
+        await db.run_in_thread(fn, *args, **kwargs)
+
     def activate(self) -> contextvars.Token:
         return _current.set(self)
 
@@ -126,7 +131,7 @@ class TraceRecorder:
         requested_mode: str,
     ) -> None:
         try:
-            await db.run_in_thread(
+            await self._persist(
                 db.start_query_trace,
                 self.trace_id,
                 conversation_id,
@@ -178,7 +183,7 @@ class TraceRecorder:
             ),
         )
         try:
-            await db.run_in_thread(
+            await self._persist(
                 db.append_query_trace_event,
                 self.trace_id,
                 self._sequence,
@@ -209,7 +214,7 @@ class TraceRecorder:
         self.selected_route = route or self.selected_route
         self.resolved_mode = resolved_mode or self.resolved_mode
         try:
-            await db.run_in_thread(
+            await self._persist(
                 db.finish_query_trace,
                 self.trace_id,
                 status,

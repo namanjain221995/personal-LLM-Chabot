@@ -1318,7 +1318,12 @@ def analyse_page(
 
 _SELECT = """
 SELECT id, url, coalesce(title, '') AS title, coalesce(domain, '') AS domain,
-       coalesce(origin, '') AS origin, retrieval_count, text
+       coalesce(origin, '') AS origin,
+       -- V38: demand recorded since the migration lives in web_page_demand;
+       -- the page row keeps only the base it had then.
+       retrieval_count + coalesce((SELECT d.retrievals FROM web_page_demand d
+                                    WHERE d.page_id = web_pages.id), 0) AS retrieval_count,
+       text
   FROM web_pages
  WHERE quarantined_at IS NULL
    AND length(text) > %s

@@ -1,0 +1,171 @@
+# Custom queries for postgres-exporter 0.16.0 (compose/compose.monitoring.yaml,
+# PG_EXPORTER_EXTEND_QUERY_PATH). 2026-09-14, dbperf2 observability track.
+#
+# WHY A QUERIES FILE AND NOT AN IMAGE BUMP. 0.16.0's stat_bgwriter collector
+# selects checkpoints_timed from pg_stat_bgwriter, which PostgreSQL 17 moved to
+# pg_stat_checkpointer; on this 18.4 server it failed on every scrape and was
+# turned off on 2026-09-04, which left checkpoints and WAL invisible (the
+# 14-day study found exactly one pg_stat_checkpointer sample, from an
+# experiment on 08-30). Bumping the image would re-cut the pg_* names every
+# dashboard uses. These queries restore the missing signal on the pinned image.
+#
+# NAMES FOLLOW UPSTREAM. pg_stat_checkpointer_* use exactly the names
+# postgres-exporter 0.20.1's stat_checkpointer collector exports (checked
+# against that image on 2026-09-14), units included (write/sync time in
+# milliseconds). When the image is bumped, enable that collector and DELETE the
+# pg_stat_checkpointer block here in the same change; the series continue.
+#
+# REQUIRES POSTGRESQL 18 (pg_stat_checkpointer is 17+, pg_stat_io.write_bytes
+# is 18+). 0.16.0 does NOT honour `runonserver` for user queries: against a
+# postgres:16 server on 2026-09-14 both blocks failed every scrape
+# (`relation "pg_stat_checkpointer" does not exist`, `column "write_bytes" does
+# not exist`, pg_exporter_last_scrape_error 1) while pg_up stayed 1. If the
+# server is ever moved to an older major, remove this file from the exporter
+# in the same change. `master: true` runs each query once, on the configured
+# database, even if auto-discovery is ever turned on (the views are
+# cluster-wide).
+#
+# CARDINALITY: 8 + 4 + 20 + 3 + 2 = 37 series in total (pg_stat_io is folded
+# to four backend groups).
+
+pg_stat_checkpointer:
+  master: true
+  query: |
+    SELECT num_timed           AS num_timed_total,
+           num_requested       AS num_requested_total,
+           restartpoints_timed AS restartpoints_timed_total,
+           restartpoints_req   AS restartpoints_req_total,
+           restartpoints_done  AS restartpoints_done_total,
+           write_time          AS write_time_total,
+           sync_time           AS sync_time_total,
+           buffers_written     AS buffers_written_total
+      FROM pg_stat_checkpointer
+  metrics:
+    - num_timed_total:
+        usage: "COUNTER"
+        description: "Number of scheduled checkpoints due to timeout"
+    - num_requested_total:
+        usage: "COUNTER"
+        description: "Number of requested checkpoints that have been performed (max_wal_size reached, CHECKPOINT, shutdown)"
+    - restartpoints_timed_total:
+        usage: "COUNTER"
+        description: "Number of scheduled restartpoints due to timeout or after a failed attempt to perform it"
+    - restartpoints_req_total:
+        usage: "COUNTER"
+        description: "Number of requested restartpoints"
+    - restartpoints_done_total:
+        usage: "COUNTER"
+        description: "Number of restartpoints that have been performed"
+    - write_time_total:
+        usage: "COUNTER"
+        description: "Time spent writing checkpoint and restartpoint files to disk, in milliseconds"
+    - sync_time_total:
+        usage: "COUNTER"
+        description: "Time spent synchronizing checkpoint and restartpoint files to disk, in milliseconds"
+    - buffers_written_total:
+        usage: "COUNTER"
+        description: "Number of buffers written during checkpoints and restartpoints"
+
+# The four columns pg_stat_wal has kept from 14 through 18. PG18 moved the
+# write/sync counters to pg_stat_io (next block).
+pg_stat_wal:
+  master: true
+  query: |
+    SELECT wal_records        AS records_total,
+           wal_fpi            AS fpi_total,
+           wal_bytes::float8  AS bytes_total,
+           wal_buffers_full   AS buffers_full_total
+      FROM pg_stat_wal
+  metrics:
+    - records_total:
+        usage: "COUNTER"
+        description: "WAL records generated"
+    - fpi_total:
+        usage: "COUNTER"
+        description: "WAL full page images generated"
+    - bytes_total:
+        usage: "COUNTER"
+        description: "WAL generated, in bytes"
+    - buffers_full_total:
+        usage: "COUNTER"
+        description: "Times WAL was written because wal_buffers was full"
+
+# WAL writes and fsyncs by who did them. `client_backend` fsyncs are commit
+# flushes (synchronous_commit=on); `walwriter` is the background flush;
+# `checkpointer` is the checkpoint's own WAL. Times are 0 unless
+# track_wal_io_timing is on (it is off in production; see operator steps).
+pg_stat_io_wal:
+  master: true
+  query: |
+    SELECT CASE WHEN backend_type IN ('client backend', 'walwriter', 'checkpointer')
+                THEN replace(backend_type, ' ', '_') ELSE 'other' END AS backend,
+           COALESCE(sum(writes), 0)::float8        AS writes_total,
+           COALESCE(sum(write_bytes), 0)::float8   AS write_bytes_total,
+           COALESCE(sum(write_time), 0)::float8    AS write_time_total,
+           COALESCE(sum(fsyncs), 0)::float8        AS fsyncs_total,
+           COALESCE(sum(fsync_time), 0)::float8    AS fsync_time_total
+      FROM pg_stat_io
+     WHERE object = 'wal'
+     GROUP BY 1
+  metrics:
+    - backend:
+        usage: "LABEL"
+        description: "client_backend, walwriter, checkpointer or other"
+    - writes_total:
+        usage: "COUNTER"
+        description: "WAL write operations"
+    - write_bytes_total:
+        usage: "COUNTER"
+        description: "WAL bytes written"
+    - write_time_total:
+        usage: "COUNTER"
+        description: "Time spent in WAL writes, in milliseconds (needs track_wal_io_timing)"
+    - fsyncs_total:
+        usage: "COUNTER"
+        description: "WAL fsync calls"
+    - fsync_time_total:
+        usage: "COUNTER"
+        description: "Time spent in WAL fsyncs, in milliseconds (needs track_wal_io_timing)"
+
+# Replaces 0.16.0's pg_long_running_transactions, which has no xact_start
+# filter: it counted every non-idle process (PG18's io workers, the exporter
+# itself) and reported clock_timestamp() as the "oldest" value, so it sat at
+# 9-11 with an epoch timestamp for 14 days. Client backends only, excluding
+# this query's own session.
+pg_client_transactions:
+  master: true
+  query: |
+    SELECT COALESCE(max(EXTRACT(EPOCH FROM clock_timestamp() - xact_start)), 0)::float8 AS oldest_seconds,
+           COALESCE(max(EXTRACT(EPOCH FROM clock_timestamp() - state_change))
+                    FILTER (WHERE state LIKE 'idle in transaction%'), 0)::float8        AS idle_in_transaction_oldest_seconds,
+           count(*) FILTER (WHERE clock_timestamp() - xact_start > interval '60 seconds')::float8 AS over_60s
+      FROM pg_stat_activity
+     WHERE backend_type = 'client backend'
+       AND xact_start IS NOT NULL
+       AND pid <> pg_backend_pid()
+  metrics:
+    - oldest_seconds:
+        usage: "GAUGE"
+        description: "Age of the oldest open transaction of any client backend, in seconds (0 when none)"
+    - idle_in_transaction_oldest_seconds:
+        usage: "GAUGE"
+        description: "How long the oldest idle-in-transaction session has been idle, in seconds (0 when none)"
+    - over_60s:
+        usage: "GAUGE"
+        description: "Client transactions open for more than 60 seconds"
+
+# pg_locks_count counts every lock, granted or not, so it cannot show a wait.
+pg_lock_waits:
+  master: true
+  query: |
+    SELECT (SELECT count(*) FROM pg_locks WHERE NOT granted)::float8 AS locks,
+           (SELECT count(*) FROM pg_stat_activity
+             WHERE backend_type = 'client backend'
+               AND wait_event_type = 'Lock')::float8                AS backends
+  metrics:
+    - locks:
+        usage: "GAUGE"
+        description: "Lock requests not yet granted"
+    - backends:
+        usage: "GAUGE"
+        description: "Client backends currently waiting on a heavyweight lock"

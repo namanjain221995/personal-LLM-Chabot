@@ -39,7 +39,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "\nThis platform's data lives in **two very different places**, and both are on\nthis page.\n\n**PostgreSQL** holds application state \u2014 conversations, messages, cross-chat\nmemory, the web-search memory (`web_pages`, `web_searches`, `web_results`),\ncrawl records and Deep Research runs. It has a real exporter, so everything\nbelow is live server statistics.\n\n**Files on the `data` volume** hold everything else, and none of them speak a\nwire protocol: the Salesforce warehouse is a **DuckDB** file, the two vector\nindexes are **LanceDB** directories, and the sync worker lands **Parquet**.\nThose are measured by walking the volume read-only \u2014 size, file count, and how\nlong ago anything was written.\n\nThe number to watch is **warehouse snapshot age**. The sync worker publishes an\natomic read copy each cycle; if that age keeps climbing, every Salesforce\nanswer is quietly being served from a stale copy while every container still\nreports healthy.\n"
+        "content": "\nThis platform's data lives in **two very different places**, and both are on\nthis page.\n\n**PostgreSQL** holds application state — conversations, messages, cross-chat\nmemory, the web-search memory (`web_pages`, `web_searches`, `web_results`),\ncrawl records and Deep Research runs. It has a real exporter, so everything\nbelow is live server statistics.\n\n**Files on the `data` volume** hold everything else, and none of them speak a\nwire protocol: the Salesforce warehouse is a **DuckDB** file, the two vector\nindexes are **LanceDB** directories, and the sync worker lands **Parquet**.\nThose are measured by walking the volume read-only — size, file count, and how\nlong ago anything was written.\n\nThe number to watch is **warehouse snapshot age**. The sync worker publishes an\natomic read copy each cycle; if that age keeps climbing, every Salesforce\nanswer is quietly being served from a stale copy while every container still\nreports healthy.\n"
       }
     },
     {
@@ -387,8 +387,8 @@
     },
     {
       "type": "stat",
-      "title": "Long-running transactions",
-      "description": "An idle-in-transaction session blocks vacuum and holds locks.",
+      "title": "Oldest client transaction",
+      "description": "Age of the oldest open transaction of any client backend (0 when none). Replaces pg_long_running_transactions, whose 0.16.0 query counted background processes and reported the current time as its age.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -405,7 +405,7 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "max(pg_long_running_transactions_oldest_timestamp_seconds >= 0)",
+          "expr": "max(pg_client_transactions_oldest_seconds)",
           "refId": "A",
           "editorMode": "code",
           "instant": true,
@@ -1650,6 +1650,934 @@
               {
                 "color": "#2DD4BF",
                 "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Database timing (orchestrator side) and PostgreSQL internals",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 63
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Statement p95 by call site",
+      "description": "One execute() round trip on the app-state pool, p95 over 5 m, per call site (app/db_metrics.py). Dashed line: the 5 ms hot-path target.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 64
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "topk(12, site:techsara_db_statement_seconds:p95_5m)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{site}}",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "max": null,
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#FACC15",
+                "value": 0.005
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Transaction p95 by call site",
+      "description": "Pool checkout to commit/rollback, p95 over 5 m, per call site: every statement, the Python between them and the COMMIT.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 64
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "topk(12, site:techsara_db_transaction_seconds:p95_5m)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{site}}",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "max": null,
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Statements/sec by call site",
+      "description": "Round trips per second from this orchestrator. With no traffic this is the background polling rate (target: 1/s per process in total).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 72
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (site) (rate(techsara_db_statement_seconds_count[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{site}}",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(rate(techsara_db_statement_seconds_count[5m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "total",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": null,
+          "max": null,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#FACC15",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pool checkout and thread wait (p95)",
+      "description": "Checkout includes the pool's liveness check round trip. Thread wait is db.run_in_thread's queue for anyio's worker threads.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(techsara_db_pool_wait_seconds_bucket[5m])))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "pool checkout p95",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(techsara_db_thread_wait_seconds_bucket[5m])))",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "thread wait p95",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "max": null,
+          "decimals": 4,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pool connections",
+      "description": "psycopg_pool counters sampled at scrape: connections held, idle, threads waiting for one, and the max_size ceiling (APP_DB_POOL_MAX).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(techsara_db_pool_size)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "held",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(techsara_db_pool_available)",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "idle",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(techsara_db_pool_requests_waiting)",
+          "refId": "C",
+          "editorMode": "code",
+          "legendFormat": "waiting",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(techsara_db_pool_max)",
+          "refId": "D",
+          "editorMode": "code",
+          "legendFormat": "max",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": null,
+          "max": null,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoints per hour",
+      "description": "pg_stat_checkpointer (monitoring/exporters/postgres/queries.yaml). Requested checkpoints are forced by WAL volume (max_wal_size) or a CHECKPOINT command; timed ones by checkpoint_timeout.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "increase(pg_stat_checkpointer_num_timed_total[1h])",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "timed",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "increase(pg_stat_checkpointer_num_requested_total[1h])",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "requested",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": null,
+          "max": null,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL generated",
+      "description": "pg_stat_wal: bytes of WAL generated per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum(rate(pg_stat_wal_bytes_total[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "WAL",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "min": null,
+          "max": null,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WAL fsyncs by backend",
+      "description": "pg_stat_io (object = wal). client_backend fsyncs are commit flushes (synchronous_commit=on); walwriter is the background flush.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "sum by (backend) (rate(pg_stat_io_wal_fsyncs_total[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{backend}}",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": null,
+          "max": null,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Checkpoint write and sync time",
+      "description": "Milliseconds per second spent writing and fsyncing checkpoint buffers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 96
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "rate(pg_stat_checkpointer_write_time_total[5m])",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "write ms/s",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "rate(pg_stat_checkpointer_sync_time_total[5m])",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "sync ms/s",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": null,
+          "max": null,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Lock waits",
+      "description": "Sessions waiting on a heavyweight lock right now, and ungranted lock requests. pg_locks_count counts granted locks too, so it cannot show a wait.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 96
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(pg_lock_waits_backends)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "waiting sessions",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(pg_lock_waits_locks)",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "ungranted locks",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": null,
+          "max": null,
+          "decimals": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Transaction age",
+      "description": "Oldest open client transaction, and the longest current idle-in-transaction session.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 104
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(pg_client_transactions_oldest_seconds)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "oldest transaction",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "expr": "max(pg_client_transactions_idle_in_transaction_oldest_seconds)",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "idle in transaction",
+          "range": true
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": null,
+          "max": null,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "dashed"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#94A3B8",
+                "value": null
+              },
+              {
+                "color": "#FACC15",
+                "value": 60
+              },
+              {
+                "color": "#F43F5E",
+                "value": 600
               }
             ]
           }

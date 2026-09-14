@@ -1114,6 +1114,14 @@ def lexical_query(words: Sequence[str]) -> str:
     return " or ".join(clauses)
 
 
+#: How many matching pages one lexical pass may rank with ts_rank_cd (V38,
+#: 2026-09-14). The rest of the match set is cut by GIN-only signals first:
+#: see BOUNDED RANKING in `_lexical_candidates`. Sized from measurement
+#: (dbperf2 tracks/pg-web-memory: latency against top-24 fidelity and
+#: synthetic gold recall, at 1x and 10x the production corpus).
+_LEXICAL_RANK_BUDGET = 150
+
+
 def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     """PostgreSQL full-text candidates (V13 `search_tsv`).
 
@@ -1162,13 +1170,60 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
     # evidence at Think and Max too (lexical 0.33 -> 0.17, prepare
     # decision local -> stale_offline, adv_longpage.py). The cap's saving was
     # the window sort not carrying text, which this shape keeps.
-    sql = """WITH matched AS (
-               SELECT id, domain,
-                      ts_rank_cd(search_tsv, websearch_to_tsquery('english', %s), 32) AS rank
-                 FROM web_pages
-                WHERE search_tsv @@ websearch_to_tsquery('english', %s)
-                  AND text <> ''
-                  AND quarantined_at IS NULL
+    #
+    # BOUNDED RANKING (2026-09-14, V38 track pg-web-memory). The statement
+    # still ran ts_rank_cd over EVERY page the query matched, and the OR pass
+    # matches most of the corpus: on a production-shaped synthetic corpus
+    # (dbperf2 measure-queries) one 5-word question's OR pass took 352 ms and
+    # 29,462 buffers at today's size and 3.9 s at 10x. ts_rank_cd needs the
+    # page's whole `search_tsv`, stored uncompressed out of line (p50 9 KB,
+    # p99 148 KB), so every ranked page is a TOAST fetch plus a positional
+    # scan; and the planner fed the per-domain window from an index scan that
+    # applied `@@` as a FILTER, detoasting every row just to test membership.
+    #
+    # Now membership comes from the GIN index alone. Each term is its own
+    # bitmap scan (`cover`: page x how many question terms it carries, no
+    # detoast), and ts_rank_cd runs on at most _LEXICAL_RANK_BUDGET pages:
+    # those carrying the most distinct terms, ties to the larger stored
+    # tsvector (read from the TOAST pointer, not the value) — the two page
+    # properties ts_rank_cd's score grows with. When the match set fits the
+    # budget every matching page is ranked exactly as before, so a small
+    # corpus gets identical rows.
+    #
+    # The AND pass is the same statement over ONE term, the whole AND query:
+    # its GIN scan returns exactly the pages matching every term (a phrase
+    # variant is rechecked by the scan). The OR pass's terms are the
+    # disjuncts `any_of` is built from, so their union is exactly the OR
+    # query's match set; the rank still uses the full `any_of`.
+    #
+    # The terms go through unnest + LATERAL on purpose: a tsquery the planner
+    # cannot fold at plan time keeps it on the bitmap scan instead of a Seq
+    # Scan whose `@@` filter detoasts the whole table.
+    #
+    # The size and the two row filters are read from the heap tuple each
+    # bitmap scan already visits (`text <> ''` compares the stored length and
+    # never detoasts), so choosing the budget costs no second lookup per page.
+    # The ranking tsquery is parsed once (`q`): psycopg prepares a statement
+    # after five executions, and under a generic plan an inline
+    # websearch_to_tsquery(%s) would be re-parsed for every ranked row.
+    sql = """WITH q AS MATERIALIZED (
+               SELECT websearch_to_tsquery('english', %s) AS tsq
+             ), cover AS MATERIALIZED (
+               SELECT h.id, count(*) AS terms, max(h.size) AS size
+                 FROM unnest(%s::text[]) AS w(term)
+                 CROSS JOIN LATERAL (
+                   SELECT id, pg_column_size(search_tsv) AS size
+                     FROM web_pages
+                    WHERE search_tsv @@ websearch_to_tsquery('english', w.term)
+                      AND text <> ''
+                      AND quarantined_at IS NULL
+                 ) h
+                GROUP BY h.id
+             ), budget AS MATERIALIZED (
+               SELECT id FROM cover ORDER BY terms DESC, size DESC, id LIMIT %s
+             ), matched AS (
+               SELECT p.id, p.domain, ts_rank_cd(search_tsv, q.tsq, 32) AS rank
+                 FROM budget b JOIN web_pages p ON p.id = b.id CROSS JOIN q
              ), ranked AS (
                SELECT id, rank,
                       row_number() OVER (PARTITION BY domain ORDER BY rank DESC) AS dn
@@ -1183,13 +1238,19 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
                     p.authority, p.fetched_at, p.published_at, p.modified_at,
                     p.source_type, p.origin, picked.rank, picked.dn
                FROM picked JOIN web_pages p ON p.id = picked.id
+              WHERE NOT (p.id = ANY(%s::bigint[]))
               ORDER BY picked.ord"""
+    budget = max(int(limit), int(_LEXICAL_RANK_BUDGET))
+    disjuncts = list(dict.fromkeys(lexical_query([w]) for w in words))
     try:
         with db.connection() as con:
-            rows = list(con.execute(sql, (plain, plain, limit)).fetchall())
+            rows = list(con.execute(sql, (plain, [plain], budget, limit, [])).fetchall())
             if len(rows) < limit:
                 seen = {r["id"] for r in rows}
-                for r in con.execute(sql, (any_of, any_of, limit)).fetchall():
+                # The OR pass ranks and caps exactly as before, AND-pass pages
+                # included, but does not send their text a second time: the
+                # loop below would drop those rows anyway.
+                for r in con.execute(sql, (any_of, disjuncts, budget, limit, sorted(seen))).fetchall():
                     if r["id"] not in seen:
                         rows.append(r)
                         seen.add(r["id"])
@@ -1722,14 +1783,34 @@ def cache_clear() -> None:
 
 
 def _bump_retrieval(page_ids: Sequence[int]) -> None:
+    """Record retrieval demand in `web_page_demand` (V38).
+
+    It used to be `UPDATE web_pages SET retrieval_count = retrieval_count + 1`,
+    which can never be a HOT update (retrieval_count is a key of three btree
+    indexes), so every bump wrote a new page tuple and re-inserted its whole
+    lexeme set into the GIN index: measured 108 KB of WAL p50 per 5-page bump
+    at today's corpus (167 KB at 10x), with inline pending-list flushes of
+    0.3 s (6.9 s) inside the statement, and a longer pending list for every
+    lexical search to scan. The narrow side table's update is HOT.
+
+    Ids are deduplicated (ON CONFLICT cannot touch a row twice in one
+    statement) and sorted, so concurrent bumps lock rows in the same order.
+    The join to web_pages skips a page purged since it was retrieved instead
+    of failing the whole bump on the foreign key.
+    """
+    ids = sorted({int(i) for i in page_ids if i})
+    if not ids:
+        return
     try:
         with db.connection() as con:
             con.execute(
-                """UPDATE web_pages
-                      SET retrieval_count = retrieval_count + 1,
-                          last_retrieved_at = now()
-                    WHERE id = ANY(%s)""",
-                (list(page_ids),),
+                """INSERT INTO web_page_demand AS d (page_id, retrievals, retrieved_at)
+                   SELECT p.id, 1, now() FROM web_pages p
+                    WHERE p.id = ANY(%s) ORDER BY p.id
+                   ON CONFLICT (page_id) DO UPDATE
+                      SET retrievals = d.retrievals + 1,
+                          retrieved_at = EXCLUDED.retrieved_at""",
+                (ids,),
             )
     except Exception:  # noqa: BLE001
         log.debug("could not record retrieval demand", exc_info=True)

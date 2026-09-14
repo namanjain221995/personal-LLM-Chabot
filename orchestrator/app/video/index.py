@@ -56,6 +56,22 @@ _EMBED_BATCH = 64
 
 _write_lock = asyncio.Lock()
 
+#: Commits this process made since its last compaction. Starts at 1 so the
+#: first maintenance pass after a start compacts whatever an earlier process
+#: left behind (2026-09-14: `optimize()` existed and was never called, so every
+#: index_analysis / delete_analysis left a version and a fragment for ever).
+_writes_since_optimize = 1
+
+#: Old versions stay readable for this long after a compaction (an in-flight
+#: reader keeps the version it opened), so the versions a compaction replaces
+#: can only be pruned by a LATER pass. `_prune_due_at` (time.monotonic) is when
+#: that one extra pass is owed; None when nothing is waiting to be pruned.
+_PRUNE_GRACE_S = 3600.0
+_prune_due_at = None
+
+#: The columns a hit is built from. The 1024-float `vector` is never read.
+_HIT_COLUMNS = ["analysis_id", "modality", "start_s", "end_s", "text", "_distance"]
+
 
 class VideoIndexUnavailable(RuntimeError):
     pass
@@ -173,13 +189,11 @@ def _schema(dim: int):
 
 
 def _open(create_dim: Optional[int] = None):
-    import lancedb  # lazy
-
-    from ..embedding_index import open_compatible_table
+    from ..embedding_index import connect as lance_connect, open_compatible_table
 
     directory = video_dir()
     os.makedirs(directory, exist_ok=True)
-    conn = lancedb.connect(directory)
+    conn = lance_connect(directory)
     if TABLE not in conn.table_names():
         if create_dim is None:
             return conn, None
@@ -228,8 +242,10 @@ async def index_analysis(analysis_id: int, chunks: Sequence[dict]) -> int:
             table.delete(f"analysis_id = {int(analysis_id)}")
             table.add(rows)  # the second sanctioned LanceDB writer; see tests/test_exclusion_invariants
 
+    global _writes_since_optimize
     async with _write_lock:
         await asyncio.to_thread(_write)
+        _writes_since_optimize += 1
     return len(rows)
 
 
@@ -245,23 +261,91 @@ async def delete_analysis(analysis_id: int) -> None:
         except FileNotFoundError:
             pass
 
+    global _writes_since_optimize
     async with _write_lock:
         await asyncio.to_thread(_delete)
+        _writes_since_optimize += 1
+
+
+def _analysis_id_index_present(table) -> bool:
+    try:
+        return any(
+            [str(c) for c in (getattr(i, "columns", None) or [])] == ["analysis_id"]
+            for i in table.list_indices()
+        )
+    except Exception:  # noqa: BLE001 — unknown reads as absent; the build is idempotent
+        return False
 
 
 async def optimize() -> None:
-    def _opt() -> None:
-        from datetime import timedelta
+    """Compact now, unconditionally (kept for callers and tools)."""
+    await maintain(force=True)
 
-        from ..web_index import write_lock
 
-        with write_lock(video_dir(), wait_s=10.0):
+async def maintain(*, force: bool = False) -> dict:
+    """Index hygiene for the video table. Never on a request path: called from
+    `pipeline._maintenance_loop` every VIDEO_MAINTENANCE_INTERVAL_S.
+
+    - COMPACTION + VERSION PRUNE (1 h grace, so an in-flight reader keeps the
+      version it opened) when this process committed since the last pass, and
+      once more when the grace after such a compaction has passed — without
+      that second pass the versions it replaced would stay on disk until the
+      next upload. `optimize()` also folds new rows into the scalar index.
+    - BTREE ON analysis_id. Every query here prefilters
+      `analysis_id IN (...)`; without a scalar index LanceDB evaluates that
+      predicate row by row before the vector scan (an IN(3 ids) prefilter
+      measured 43.3 ms -> 5.0 ms at 200k rows, dbperf 2026-09-13).
+
+    Both are writers, so both take the cross-process lock and this module's
+    asyncio lock, like index_analysis and delete_analysis. A failure is a log
+    line; reads are correct without either.
+    """
+    import time
+    from datetime import timedelta
+
+    from ..web_index import IndexBusy, write_lock
+
+    global _writes_since_optimize, _prune_due_at
+    out = {"rows": 0, "optimized": False, "analysis_id_indexed": False}
+
+    def _run(compact: bool) -> None:
+        directory = video_dir()
+        if not os.path.isdir(os.path.join(directory, TABLE + ".lance")):
+            return  # nothing indexed yet; do not create the directory
+        with write_lock(directory, wait_s=10.0):
             _conn, table = _open()
-            if table is not None:
-                table.optimize(cleanup_older_than=timedelta(hours=1))
+            if table is None:
+                return
+            rows = int(table.count_rows())
+            out["rows"] = rows
+            if compact:
+                table.optimize(cleanup_older_than=timedelta(seconds=_PRUNE_GRACE_S))
+                out["optimized"] = True
+            if rows and not _analysis_id_index_present(table):
+                table.create_scalar_index("analysis_id", index_type="BTREE", replace=True)
+                out["analysis_id_indexed"] = True
 
     async with _write_lock:
-        await asyncio.to_thread(_opt)
+        pending = _writes_since_optimize
+        prune_due = _prune_due_at is not None and time.monotonic() >= _prune_due_at
+        try:
+            await asyncio.to_thread(_run, bool(force or pending or prune_due))
+        except IndexBusy:
+            log.debug("video index maintenance skipped: another process is writing")
+            return out
+        except FileNotFoundError:
+            return out
+        except Exception:  # noqa: BLE001
+            log.warning("video index maintenance failed", exc_info=True)
+            return out
+        if out["optimized"] or out["rows"] == 0:
+            # Writes cannot land meanwhile: they wait on _write_lock.
+            _writes_since_optimize = 0
+            if out["optimized"] and (force or pending):
+                _prune_due_at = time.monotonic() + _PRUNE_GRACE_S + 60.0
+            elif prune_due or out["rows"] == 0:
+                _prune_due_at = None
+    return out
 
 
 # ---------------------------------------------------------------- queries --
@@ -305,7 +389,7 @@ async def retrieve(
         query = query.where("analysis_id IN (" + ", ".join(str(i) for i in ids) + ")")
         if modality in ("speech", "screen", "visual"):
             query = query.where(f"modality = '{modality}'")
-        return query.to_list()
+        return query.select(_HIT_COLUMNS).to_list()
 
     try:
         hits = await asyncio.to_thread(_search)
@@ -348,7 +432,7 @@ async def best_distance(question: str, analysis_ids: Sequence[int]) -> Optional[
         _conn, table = _open()
         if table is None:
             return None
-        rows = table.search(vector).limit(1).where("analysis_id IN (" + ", ".join(str(i) for i in ids) + ")").to_list()
+        rows = table.search(vector).limit(1).where("analysis_id IN (" + ", ".join(str(i) for i in ids) + ")").select(["_distance"]).to_list()
         return float(rows[0]["_distance"]) if rows else None
 
     try:

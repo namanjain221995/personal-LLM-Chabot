@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from ..config import settings
@@ -80,6 +82,71 @@ def _reader_sql(path: str) -> str:
     return f"read_csv_auto('{quoted}', SAMPLE_SIZE=20000, IGNORE_ERRORS=true)"
 
 
+def _parse_once_enabled() -> bool:
+    raw = os.environ.get("PROFILE_PARSE_ONCE", "true")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _scratch_dir() -> Optional[str]:
+    """A private scratch directory for the columnar copy, or None (then the
+    source is read per statement, exactly as before). PROFILE_SCRATCH_DIR
+    places it; the default is the process temp directory."""
+    base = os.environ.get("PROFILE_SCRATCH_DIR", "").strip() or None
+    try:
+        return tempfile.mkdtemp(prefix="profile-", dir=base)
+    except OSError:
+        return None
+
+
+def _columnar_copy(con, path: str, source_columns: List[tuple], scratch: str) -> Optional[str]:
+    """Parse a CSV/JSON source ONCE into a scratch Parquet file; the reader
+    expression over it, or None to keep reading the source itself.
+
+    `profile_tabular` issues 2 statements per column plus one per
+    low-cardinality column, and every one of them used to re-run
+    `read_csv_auto` — sniffing and parsing the whole file again. Measured
+    2026-09-14 (dbperf2, DuckDB 1.5.5, including the DESCRIBE check below),
+    same statistics, types and samples:
+
+        10k rows x 20 cols CSV (2.4 MB)     1.90 s -> 0.14 s
+        100k rows x 30 cols CSV (36 MB)     6.89 s -> 0.49 s
+        100k rows x 30 cols JSONL (57 MB)   8.65 s -> 0.55 s
+        1M rows x 40 cols CSV (486 MB)     17.31 s -> 1.41-1.85 s
+
+    Parquet keeps the types the CSV sniffer chose and the row order, so the
+    profile — types, counts, samples, `full_rows` — is unchanged. That is
+    CHECKED, not assumed: the copy is used only when its column names and
+    types equal the source's DESCRIBE (Parquet has no HUGEINT, BIT or UNION;
+    such a file keeps the per-statement path).
+
+    ONE EXCEPTION, verified 2026-09-14: a DIRTY file under IGNORE_ERRORS. The
+    per-statement path let each statement skip only the rows that failed to
+    parse in the columns IT projected, so its numbers disagreed with each
+    other: a 60,002-line CSV with two bad `amount` values, a bad date and two
+    malformed lines reported rows=60,001, id distinct=60,000, amount
+    distinct=59,998. The copy drops every row that fails in ANY column, once,
+    so all statistics describe the same 59,998 rows, the rows a
+    `SELECT *` over the file returns. Clean files profile identically.
+    COPY streams, but its row-group
+    buffers raised peak RSS at 1M x 40 from 1.5 GB to 1.9 GB. Any failure here
+    (disk full, an odd file the COPY rejects) falls back to per-statement
+    parsing, which then reports whatever it always reported.
+    """
+    if path.lower().endswith(".parquet") or not _parse_once_enabled():
+        return None
+    target = os.path.join(scratch, "table.parquet")
+    quoted = target.replace("'", "''")
+    copy = f"read_parquet('{quoted}')"
+    try:
+        con.execute(f"COPY (SELECT * FROM {_reader_sql(path)}) TO '{quoted}' (FORMAT parquet)")
+        copied = con.execute(f"DESCRIBE SELECT * FROM {copy}").fetchall()
+    except Exception:  # noqa: BLE001 — the source path reports the real error
+        return None
+    if [tuple(r[:2]) for r in copied] != [tuple(r[:2]) for r in source_columns]:
+        return None
+    return copy
+
+
 def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     """Shape, per-column statistics, and a capped sample — no bulk load."""
     rel = name or os.path.basename(path)
@@ -89,10 +156,18 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
         "kind": "table",
     }
     con = _duck()
+    scratch: Optional[str] = None
     try:
         src = _reader_sql(path)
-        out["rows"] = int(con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0])
+        # The source's own DESCRIBE is the authority on names and types (the
+        # sniffer reads a sample, not the file); the columnar copy is used
+        # only when it reproduces it exactly.
         described = con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()
+        if _parse_once_enabled() and not path.lower().endswith(".parquet"):
+            scratch = _scratch_dir()
+            if scratch is not None:
+                src = _columnar_copy(con, path, described, scratch) or src
+        out["rows"] = int(con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0])
         columns = [{"name": r[0], "dtype": r[1]} for r in described]
         out["columns_total"] = len(columns)
         columns = columns[: settings.profile_max_columns]
@@ -130,7 +205,11 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
                 if 0 < col["distinct"] <= 50:
                     tops = con.execute(
                         f"SELECT {ident} AS v, COUNT(*) AS n FROM {src} "
-                        f"WHERE {ident} IS NOT NULL GROUP BY 1 ORDER BY n DESC "
+                        # Ties broken on the value's text: without it equal
+                        # counts came back in scan order, and one file gave
+                        # different profiles on repeated runs (3 of 10).
+                        f"WHERE {ident} IS NOT NULL GROUP BY 1 "
+                        f"ORDER BY n DESC, CAST(v AS VARCHAR) "
                         f"LIMIT {settings.profile_top_values}"
                     ).fetchall()
                     col["top_values"] = [
@@ -169,6 +248,8 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
         out["error"] = f"could not be read as a table: {type(exc).__name__}"
     finally:
         con.close()
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
     return out
 
 

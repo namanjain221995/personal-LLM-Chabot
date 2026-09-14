@@ -1077,6 +1077,11 @@ async def _maintenance_loop() -> None:
             reaped = await reap_orphans()
             if reaped:
                 log.info("video: reaped %d orphan analysis(es)", reaped)
+            # Compaction + the analysis_id scalar index, after the reap so the
+            # rows it deleted are compacted away in the same pass.
+            from . import index
+
+            await index.maintain()
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

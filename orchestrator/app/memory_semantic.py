@@ -110,7 +110,7 @@ def _embeddings_fingerprint(user_id: int, model_id: str, exclude_conversation_id
     for someone chatting (instrumented fast_path_bench followup: 0 hits, 17
     misses, fingerprint (1,1,...) .. (15,15,...)). Rows added or deleted
     anywhere the key reads move the count or the id sum. Blocking."""
-    with db.connection() as con:
+    with db.read_connection() as con:
         row = con.execute(
             "SELECT count(*) AS n, max(message_id) AS top, coalesce(sum(message_id), 0) AS total"
             "  FROM message_embeddings"

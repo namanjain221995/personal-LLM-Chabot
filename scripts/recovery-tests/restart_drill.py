@@ -38,11 +38,11 @@ BASE = os.environ.get("QA_BASE", "http://127.0.0.1:8081")
 
 
 def psql(sql: str) -> str:
-    user = subprocess.run(
-        ["bash", "-lc", "grep -E '^POSTGRES_USER=' /home/techsphere/Documents/project/personal-LLM-Chabot/.env | cut -d= -f2-"],
-        capture_output=True, text=True).stdout.strip()
+    # The e2e database has its own server since 2026-09-14 (scripts/e2e-stack.sh:
+    # techsara-e2e-postgres), not a database inside the production instance.
     out = subprocess.run(
-        ["docker", "exec", "sf-local-ai-postgres-1", "psql", "-U", user, "-d", "techsara_e2e_test", "-Atc", sql],
+        ["docker", "exec", "techsara-e2e-postgres", "psql", "-h", "127.0.0.1",
+         "-U", "techsara_e2e", "-d", "techsara_e2e_test", "-Atc", sql],
         capture_output=True, text=True)
     return out.stdout.strip()
 

@@ -20,7 +20,9 @@ would read an empty database).
 
 THE ONE REAL COST: the suite now needs a reachable PostgreSQL. It stays
 offline in every other sense — no vLLM, no GPU, no torch, no network. Point it
-somewhere with TEST_DATABASE_URL, or start a throwaway server:
+somewhere with TEST_DATABASE_URL, or start a throwaway server. It must be a
+DEDICATED test server: the suite refuses one that also holds a non-test
+database (the production instance holds `techsara`), see `_assert_test_server`.
 
     docker run -d --name pg-test -p 55432:5432 \\
         -e POSTGRES_PASSWORD=test -e POSTGRES_USER=test -e POSTGRES_DB=test \\
@@ -53,6 +55,7 @@ os.environ.setdefault("LLM_RECOVERY_WINDOW_S", "0")
 # window explicitly per test.
 os.environ.setdefault("LLM_QUEUE_MAX_WAIT_S", "0")
 
+import re  # noqa: E402
 from urllib.parse import unquote, urlsplit  # noqa: E402
 
 import pytest  # noqa: E402
@@ -173,47 +176,116 @@ def _assert_safe_test_dsn(dsn: str) -> str:
     return dsn
 
 
-def _suffixed(dsn: str) -> str:
-    """`…/techsara` -> `…/techsara_test`.
-
-    Never the production database itself: the fixture below TRUNCATEs every
-    table before each test, so pointing the suite at the real one would delete
-    the owner's entire history on the first `pytest`.
-    """
-    base, _, name = dsn.rpartition("/")
-    name = name.split("?", 1)[0]
-    if base and name and not name.endswith("_test"):
-        return f"{base}/{name}_test"
-    return dsn
-
-
 def _test_dsn() -> str:
     """Where the suite's database lives, in order of preference.
 
     1. TEST_DATABASE_URL — an explicit override always wins.
-    2. APP_DATABASE_URL with `_test` appended.
-    3. POSTGRES_USER/PASSWORD/DB from the environment, against the compose
-       service on its loopback-published port. `set -a; . ./.env` is then
-       enough to run the suite against the database that is already up — no
-       second server to remember.
-    4. A throwaway container on 55432 (see the module docstring).
+    2. A throwaway container on 55432 (see the module docstring).
+
+    Deliberately NOT derived from APP_DATABASE_URL or POSTGRES_USER/PASSWORD
+    any more (removed 2026-09-14). Both named the APPLICATION's server, so
+    `set -a; . ./.env` — or pytest inside the production container — turned
+    into `<production server>/techsara_test`. That is how about twenty `*_test`
+    databases came to live on the production instance, producing 98% of its
+    row writes, every AccessExclusiveLock and every WAL excursion to
+    max_wal_size in a 14-day window. The server guard in `_ensure_database`
+    refuses such a server even when TEST_DATABASE_URL points at it.
     """
     explicit = (os.environ.get("TEST_DATABASE_URL") or "").strip()
     if explicit:
         return _assert_safe_test_dsn(explicit)
-    app_dsn = (os.environ.get("APP_DATABASE_URL") or "").strip()
-    if app_dsn:
-        return _assert_safe_test_dsn(_suffixed(app_dsn))
-    user = (os.environ.get("POSTGRES_USER") or "").strip()
-    password = (os.environ.get("POSTGRES_PASSWORD") or "").strip()
-    if user and password:
-        host = (os.environ.get("POSTGRES_HOST") or "127.0.0.1").strip()
-        port = (os.environ.get("POSTGRES_PORT") or "5432").strip()
-        name = (os.environ.get("POSTGRES_DB") or user).strip()
-        return _assert_safe_test_dsn(
-            f"postgresql://{user}:{password}@{host}:{port}/{name}_test"
-        )
     return _assert_safe_test_dsn(_DEFAULT_TEST_DSN)
+
+
+#: Databases every PostgreSQL server has; they say nothing about its purpose.
+_SYSTEM_DATABASES = frozenset({"postgres", "template0", "template1"})
+
+#: Database names that can never be waved through by the escape hatch: the
+#: application database's default name. POSTGRES_DB, when set, is added.
+_APP_DATABASE_NAMES = frozenset({"techsara"})
+
+
+def _is_test_database_name(name: str) -> bool:
+    """A `test`/`tests` token anywhere in the name (`techsara_test_v34_fresh`,
+    `test_rehearsal_fresh_…`, `history-test`), but not `contest`/`testimony`.
+    Broader than `_assert_safe_test_dsn`, on purpose: it classifies what a
+    server ALREADY holds, including the companion databases fixtures create."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", name.strip().lower()) if t]
+    return "test" in tokens or "tests" in tokens
+
+
+def _foreign_databases(names) -> list:
+    """The databases on a server that are neither system nor test databases,
+    in the order given."""
+    return [
+        n for n in names
+        if n not in _SYSTEM_DATABASES and not _is_test_database_name(n)
+    ]
+
+
+def _server_databases(dsn: str) -> list:
+    """Every database on the server `dsn` names. Connects to the target
+    database when it exists, else to `postgres` (nothing is created)."""
+    import psycopg
+
+    base, _, tail = dsn.rpartition("/")
+    _name, sep, query = tail.partition("?")
+    sql = "SELECT datname FROM pg_database ORDER BY datname"
+    try:
+        with psycopg.connect(dsn, connect_timeout=5) as con:
+            return [r[0] for r in con.execute(sql).fetchall()]
+    except psycopg.OperationalError as exc:
+        if "does not exist" not in str(exc):
+            raise
+    with psycopg.connect(f"{base}/postgres{sep}{query}", connect_timeout=5) as con:
+        return [r[0] for r in con.execute(sql).fetchall()]
+
+
+def _assert_test_server(dsn: str) -> None:
+    """Refuse a server that holds anything but test databases.
+
+    The name guard above says the DATABASE is disposable; this says the SERVER
+    is. A test run's TRUNCATE-per-test, CREATE/DROP DATABASE and bulk inserts
+    force checkpoints, WAL growth and AccessExclusive locks on whatever
+    instance they land on, and on a production instance that is the users'
+    latency. Production holds `techsara`, so it is refused however the DSN
+    spells its address (port 5432, `postgres`, a host alias, docker exec).
+
+    Escape hatch for a developer box that deliberately shares one server:
+    TEST_DATABASE_ALLOW_SHARED_SERVER=<name>[,<name>…] lists the non-test
+    databases to tolerate. The application database's name is never accepted.
+    """
+    allowed = {
+        n.strip() for n in (os.environ.get("TEST_DATABASE_ALLOW_SHARED_SERVER") or "").split(",")
+        if n.strip()
+    }
+    app_names = set(_APP_DATABASE_NAMES)
+    if (os.environ.get("POSTGRES_DB") or "").strip():
+        app_names.add(os.environ["POSTGRES_DB"].strip())
+    never = sorted(allowed & app_names)
+    if never:
+        raise pytest.UsageError(
+            f"TEST_DATABASE_ALLOW_SHARED_SERVER lists {never}: the application "
+            "database can never be allowed to share a server with the test suite."
+        )
+    foreign = [n for n in _foreign_databases(_server_databases(dsn)) if n not in allowed]
+    if foreign:
+        shown = ", ".join(foreign[:10]) + (" …" if len(foreign) > 10 else "")
+        where = urlsplit(dsn)
+        raise pytest.UsageError(
+            f"Refusing to run the test suite on {where.hostname}:{where.port or 5432}: it is "
+            f"not a dedicated test server (it also holds: {shown}). Test runs on an "
+            "application server force checkpoints, WAL growth and exclusive locks "
+            "onto its users.\n"
+            "Start a throwaway server and point the suite at it:\n"
+            "    docker run -d --rm --memory=2g --name pg-test-$USER -p 127.0.0.1:55432:5432 "
+            "-e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres "
+            "-e POSTGRES_INITDB_ARGS='--locale=C --encoding=UTF8' postgres:18-alpine "
+            "-c fsync=off -c synchronous_commit=off -c full_page_writes=off\n"
+            "    export TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/techsara_test\n"
+            "A development server that holds other scratch databases can list them in "
+            "TEST_DATABASE_ALLOW_SHARED_SERVER (never the application database)."
+        )
 
 
 def _ensure_database(dsn: str) -> None:
@@ -222,6 +294,19 @@ def _ensure_database(dsn: str) -> None:
     and upload surface would silently stop being tested."""
     _assert_safe_test_dsn(dsn)
     import psycopg
+
+    try:
+        _assert_test_server(dsn)
+    except psycopg.OperationalError as exc:
+        raise pytest.UsageError(
+            f"the test suite needs a PostgreSQL server at {dsn!r} and could not "
+            f"reach it:\n    {exc}\n"
+            "Start one with:\n"
+            "    docker run -d --name pg-test -p 55432:5432 "
+            "-e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres "
+            "-e POSTGRES_DB=postgres postgres:18-alpine\n"
+            "or point the suite elsewhere with TEST_DATABASE_URL."
+        ) from exc
 
     try:
         with psycopg.connect(dsn, connect_timeout=5):

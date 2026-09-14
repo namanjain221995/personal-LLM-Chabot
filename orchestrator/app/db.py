@@ -58,6 +58,7 @@ import functools
 import json
 import random
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
@@ -67,6 +68,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from . import db_metrics
 from .config import settings
 
 # Driver-neutral aliases so callers never import psycopg. `history.py` and
@@ -2638,6 +2640,136 @@ FILES_MIGRATION_VERSION = 37
 FILES_MIGRATION_SQL = _MIGRATION_V37
 
 
+# V38 (2026-09-14): the web corpus's per-turn and per-scrape reads made O(1),
+# and the retrieval demand counter moved off the indexed page row.
+# Measured on a production-shaped synthetic corpus (dbperf2, production -c
+# settings) before this migration, at 1x / 10x today's corpus:
+#   * living_knowledge's vocabulary fingerprint, every Fast turn: a Seq Scan
+#     of web_pages, 2.1 / 22.9 ms, linear in the corpus;
+#   * web_corpus_counts, every /metrics scrape: a Seq Scan, 1.4 / 16.2 ms;
+#   * web_memory._page_meta: `url = ANY OR id = ANY` with no url index, a
+#     Seq Scan, 1.9 / 7.9 ms client;
+#   * web_memory._bump_retrieval: never a HOT update (retrieval_count is a key
+#     of three btree indexes), so every bump re-inserted the page's whole
+#     lexeme set into the GIN pending list: 108 / 167 KB WAL p50 per 5-page
+#     bump and inline pending-list flushes of 0.3 s / 6.9 s.
+_MIGRATION_V38 = """
+-- LOCKING. The same rule as V36: fail fast on a parked session and let
+-- init_schema retry with backoff. ACCESS EXCLUSIVE on web_pages, taken FIRST
+-- (review 2026-09-14): `ALTER COLUMN ... SET COMPRESSION` below needs it
+-- anyway (verified on 18: pg_locks shows AccessExclusiveLock), and taking a
+-- weaker lock first and upgrading to it later is a lock-upgrade deadlock
+-- with any transaction that has read web_pages and then writes it — a
+-- DeadlockDetected that init_schema does not treat as a lock wait.
+-- It holds off readers as well as writers for the length of this migration
+-- (0.05 s on a 20k-page corpus, 10x today's) and keeps the stored page
+-- count exact while it is taken and the triggers are created.
+SET LOCAL lock_timeout = '3s';
+LOCK TABLE web_pages IN ACCESS EXCLUSIVE MODE;
+
+-- _page_meta and web_page_ids_for_urls look pages up by url. HASH, not btree:
+-- a url can exceed btree's 2,704-byte tuple limit, and equality is the only
+-- operator asked of it.
+CREATE INDEX IF NOT EXISTS idx_web_pages_url_hash ON web_pages USING hash (url);
+
+-- New and changed page text is compressed with LZ4 instead of pglz: the
+-- lexical stage reads the full text of its final rows (megabytes per call),
+-- and LZ4 decompresses several times faster. Catalog-only: existing values
+-- keep pglz until they are rewritten. Skipped on a server built without LZ4.
+DO $$ BEGIN
+  ALTER TABLE web_pages ALTER COLUMN text SET COMPRESSION lz4;
+EXCEPTION WHEN feature_not_supported THEN
+  RAISE NOTICE 'lz4 unavailable; web_pages.text keeps the default compression';
+END $$;
+
+-- CORPUS GENERATION. One row, bumped by the database itself whenever a change
+-- that the per-process vocabulary (living_knowledge) or the corpus gauges can
+-- see is COMMITTED: a page inserted or deleted, or its content_hash, text
+-- length, title or indexed-ness changed. It replaces a whole-table fingerprint
+-- scan, and unlike db.web_corpus_generation (a per-process counter) it sees
+-- every process's writes.
+--
+-- WHY A DEFERRED CONSTRAINT TRIGGER. The bump runs at COMMIT, so (1) no reader
+-- can see the new generation before the change itself is visible, which
+-- would let a vocabulary be rebuilt from the old rows and then trusted; and
+-- (2) the counter row is always the LAST lock a writer takes, so two writers
+-- touching pages in different orders cannot deadlock through it. Writers do
+-- queue on it for the length of a commit; web_pages writes are one page per
+-- transaction at crawl rate. The generation moves once per transaction; the
+-- page count by one per inserted or deleted row.
+CREATE TABLE IF NOT EXISTS web_corpus_state (
+    id         smallint PRIMARY KEY CONSTRAINT web_corpus_state_singleton CHECK (id = 1),
+    generation bigint   NOT NULL DEFAULT 0,
+    pages      bigint   NOT NULL DEFAULT 0,
+    xact       xid8
+);
+INSERT INTO web_corpus_state (id, generation, pages)
+SELECT 1, 1, count(*) FROM web_pages
+ON CONFLICT (id) DO UPDATE SET generation = web_corpus_state.generation + 1, pages = EXCLUDED.pages;
+
+CREATE OR REPLACE FUNCTION web_corpus_bump() RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+  delta bigint := CASE TG_OP WHEN 'INSERT' THEN 1 WHEN 'DELETE' THEN -1 ELSE 0 END;
+  me text := pg_current_xact_id()::text;
+BEGIN
+  -- A transaction that already bumped needs nothing more for an update:
+  -- skip the row lookup (a bulk UPDATE fires this once per row).
+  IF delta = 0 AND current_setting('techsara.web_corpus_bumped', true) = me THEN
+    RETURN NULL;
+  END IF;
+  UPDATE web_corpus_state
+     SET generation = generation + CASE WHEN xact IS DISTINCT FROM pg_current_xact_id() THEN 1 ELSE 0 END,
+         pages = pages + delta,
+         xact = pg_current_xact_id()
+   WHERE id = 1;
+  PERFORM set_config('techsara.web_corpus_bumped', me, true);
+  RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION web_corpus_truncated() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+  UPDATE web_corpus_state
+     SET generation = generation + 1, pages = 0, xact = pg_current_xact_id()
+   WHERE id = 1;
+  RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS web_corpus_rows ON web_pages;
+CREATE CONSTRAINT TRIGGER web_corpus_rows
+    AFTER INSERT OR DELETE ON web_pages
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION web_corpus_bump();
+DROP TRIGGER IF EXISTS web_corpus_changes ON web_pages;
+CREATE CONSTRAINT TRIGGER web_corpus_changes
+    AFTER UPDATE OF content_hash, text, title, indexed_at ON web_pages
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (OLD.content_hash IS DISTINCT FROM NEW.content_hash
+          OR octet_length(OLD.text) IS DISTINCT FROM octet_length(NEW.text)
+          OR OLD.title IS DISTINCT FROM NEW.title
+          OR (OLD.indexed_at IS NULL) IS DISTINCT FROM (NEW.indexed_at IS NULL))
+    EXECUTE FUNCTION web_corpus_bump();
+DROP TRIGGER IF EXISTS web_corpus_truncate ON web_pages;
+CREATE TRIGGER web_corpus_truncate
+    AFTER TRUNCATE ON web_pages
+    FOR EACH STATEMENT EXECUTE FUNCTION web_corpus_truncated();
+
+-- RETRIEVAL DEMAND. The count the refresh scheduler orders by, kept off the
+-- page row: an update here touches one narrow row and its primary key (HOT,
+-- with the fillfactor's free space) instead of a new web_pages tuple with a
+-- full GIN re-insert. web_pages.retrieval_count stays as the base it had at
+-- this migration (and whatever a test or an operator writes to it); readers
+-- add the two. ON DELETE CASCADE: a purged page takes its demand with it.
+CREATE TABLE IF NOT EXISTS web_page_demand (
+    page_id      bigint      PRIMARY KEY REFERENCES web_pages(id) ON DELETE CASCADE,
+    retrievals   bigint      NOT NULL DEFAULT 0,
+    retrieved_at timestamptz
+) WITH (fillfactor = 80);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2676,6 +2808,7 @@ _MIGRATIONS: tuple = (
     (35, _MIGRATION_V35),
     (36, _MIGRATION_V36),
     (37, _MIGRATION_V37),
+    (38, _MIGRATION_V38),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -2717,12 +2850,144 @@ def _server_options() -> str:
       used to hold a request open indefinitely.
     - `idle_in_transaction_session_timeout` stops a leaked transaction from
       pinning a pooled connection (and holding back vacuum) forever.
+    - `idle_session_timeout=0` (2026-09-14): the server runs with a 10 min
+      idle-session timeout so a forgotten pgAdmin tab cannot park a backend
+      forever. A POOLED connection is idle by design, and when the server
+      ends one, the next checkout fails its check and psycopg_pool sleeps
+      its 1.0 s backoff before retrying (measured 929 ms on the first chat
+      read after a quiet spell). The pool bounds its own idle connections
+      (max_idle), so the server-wide guard stays for everyone else.
+    - `jit=off` (2026-09-14): this is an OLTP workload. No chat, /v1 or
+      analytics statement reaches jit_above_cost at 10x production data, and
+      the first that will (the analytics leaderboard, plan cost 53,561 at
+      10x) would pay 16-87 ms of compile for a 27 ms query, or 200-300 ms
+      once the inline/optimize thresholds are crossed. A session setting, so
+      it needs no server restart or reload and leaves other clients alone.
     """
     return (
         "-c timezone=UTC"
         f" -c statement_timeout={int(settings.app_db_statement_timeout_ms)}"
         " -c idle_in_transaction_session_timeout=60000"
+        " -c idle_session_timeout=0"
+        " -c jit=off"
     )
+
+
+#: A pooled connection idle for longer than this gets the full round-trip
+#: check (`ConnectionPool.check_connection`) even when its socket looks
+#: healthy — the belt to the socket probe's braces, for a peer that vanished
+#: without closing the TCP stream. Busy connections (a chat turn checks out
+#: 20-40 of them within a second) never pay it.
+_POOL_FULL_CHECK_IDLE_S = 30.0
+
+try:  # Linux and macOS; elsewhere every checkout gets the full check.
+    import select as _select
+
+    _POLL = getattr(_select, "poll", None)
+    _POLL_EVENTS = (
+        _select.POLLIN | _select.POLLPRI | _select.POLLERR | _select.POLLHUP | getattr(_select, "POLLRDHUP", 0)
+        if _POLL is not None
+        else 0
+    )
+except ImportError:  # pragma: no cover - select is part of CPython
+    _POLL = None
+    _POLL_EVENTS = 0
+
+
+def _socket_has_pending_input(con: psycopg.Connection) -> bool:
+    """True when the server has sent something to an IDLE connection, or the
+    socket is closed or in error — nothing that a live idle backend does.
+
+    An idle backend sends nothing on its own; what arrives unasked is the
+    FATAL of a terminated session (restart, pg_terminate_backend,
+    idle_session_timeout) followed by EOF, or a NOTIFY/parameter change this
+    app never subscribes to. A zero-timeout poll() on the socket sees all of
+    them without a round trip."""
+    if _POLL is None:
+        return True
+    try:
+        fd = con.fileno()
+    except Exception:  # noqa: BLE001 - a closed connection has no socket
+        return True
+    poller = _POLL()
+    poller.register(fd, _POLL_EVENTS)
+    return bool(poller.poll(0))
+
+
+def _check_pooled_connection(con: psycopg.Connection) -> None:
+    """The pool's liveness check, without a round trip in the common case.
+
+    `ConnectionPool.check_connection` sends an empty query on EVERY checkout:
+    a round trip per accessor (a Fast chat turn makes about 40), and on the
+    server one more commit each (half of production's idle commits were
+    those empty queries, measured 2026-09-14). The probe here asks the
+    socket instead, and falls back to that very check when the socket shows
+    anything or when the connection has been idle for a while.
+    Raises what the full check raises, so the pool discards and replaces
+    the connection exactly as before — and, first, drains the pool: see
+    `_drain_after_dead_connection`."""
+    try:
+        if con.closed or con.broken:
+            raise psycopg.OperationalError("the pooled connection is closed")
+        idle_since = getattr(con, "_techsara_idle_since", None)
+        if idle_since is None:
+            idle_since = getattr(con, "_created_at", None)
+        idle = (time.monotonic() - idle_since) if idle_since is not None else _POOL_FULL_CHECK_IDLE_S + 1
+        if idle > _POOL_FULL_CHECK_IDLE_S or _socket_has_pending_input(con):
+            ConnectionPool.check_connection(con)
+    except psycopg.Error:
+        _drain_after_dead_connection(con)
+        raise
+
+
+#: When this process last drained each pool (monotonic, psycopg_pool's clock).
+#: A dead connection CREATED BEFORE that drain was already out of the pool
+#: when it ran — the drain emptied the pool of its siblings, and psycopg_pool
+#: closes such a connection when it comes back — so it triggers no second
+#: drain. A restart finds every pooled connection dead at once; threads that
+#: meet them together drain once.
+_pool_drained_at: Dict[int, float] = {}
+_pool_drain_lock = threading.Lock()
+
+
+def _drain_after_dead_connection(con: psycopg.Connection) -> None:
+    """One dead pooled connection means the rest are probably dead too (a
+    `docker compose restart postgres`, an OOM-killed backend that makes the
+    postmaster end every session).
+
+    psycopg_pool sleeps an exponential backoff (1 s, 2 s, 4 s ...) after
+    EACH failed check within one getconn, so N dead idle connections cost
+    the next request 2^N - 1 seconds — measured 2026-09-14 (verifier): 4
+    dead connections 6.4-7.6 s, 6 dead a PoolTimeout after 10 s, on the
+    pristine tree and the patched one alike. Draining the idle connections
+    at the first failure leaves one backoff (about 1 s) and then fresh
+    connections. `drain()` exists from psycopg_pool 3.3; on older versions
+    this is a no-op and the behaviour is psycopg_pool's own."""
+    p = getattr(con, "_pool", None)
+    drain = getattr(p, "drain", None)
+    if drain is None:
+        return
+    created = getattr(con, "_created_at", None)
+    with _pool_drain_lock:
+        last = _pool_drained_at.get(id(p))
+        if last is not None and created is not None and created <= last:
+            return
+        _pool_drained_at[id(p)] = time.monotonic()
+    try:
+        drain()
+    except Exception:  # noqa: BLE001 - best effort; the pool's own retry still runs
+        import logging
+
+        logging.getLogger(__name__).warning("draining the pool after a dead connection failed", exc_info=True)
+
+
+def _reset_pooled_connection(con: psycopg.Connection) -> None:
+    """Runs as a connection goes back to the pool (IDLE, no round trip):
+    undo `read_connection`'s autocommit whatever happened inside the block,
+    and start the idle clock `_check_pooled_connection` reads."""
+    if con.autocommit:
+        con.autocommit = False
+    con._techsara_idle_since = time.monotonic()  # type: ignore[attr-defined]
 
 
 def dsn() -> str:
@@ -2764,8 +3029,10 @@ def pool() -> ConnectionPool:
             # A pooled connection outlives the server it was opened against.
             # Without a liveness check the first request after a `docker
             # compose restart postgres` fails; with it, the pool quietly
-            # replaces the dead connection.
-            check=ConnectionPool.check_connection,
+            # replaces the dead connection. `_check_pooled_connection` keeps
+            # that guarantee without a round trip on every checkout.
+            check=_check_pooled_connection,
+            reset=_reset_pooled_connection,
             kwargs={
                 "row_factory": dict_row,
                 "autocommit": False,
@@ -2781,6 +3048,8 @@ def pool() -> ConnectionPool:
 
 def _close_pool_locked() -> None:
     global _pool, _pool_dsn
+    _api_key_touched.clear()
+    _pool_drained_at.clear()
     if _pool is not None:
         try:
             _pool.close()
@@ -2804,7 +3073,31 @@ def connection() -> Iterator[psycopg.Connection]:
     `with closing(connect()) as con, con:` idiom, minus the 0.24 ms of schema
     replay that used to precede it.
     """
-    with pool().connection() as con:
+    with db_metrics.checkout(pool()) as con:
+        yield con
+
+
+@contextmanager
+def read_connection() -> Iterator[psycopg.Connection]:
+    """A pooled connection in AUTOCOMMIT, for an accessor that runs exactly
+    ONE statement (2026-09-14).
+
+    `connection()` wraps every use in BEGIN ... COMMIT: two extra round trips
+    around a single SELECT, which on the chat pre-pass is most of the cost of
+    a 0.2 ms primary-key read. One statement in autocommit is its own
+    transaction — the same snapshot, the same atomicity and, for a write, the
+    same durable commit — so nothing is lost for a single statement.
+
+    NOT for an accessor that runs two statements, needs them to see one
+    snapshot, or relies on a later Python error rolling a statement back:
+    those keep `connection()`. The pool's reset hook turns autocommit off
+    again whatever happens inside the block.
+
+    Timed exactly like `connection()` (db_metrics.checkout): the hot-path
+    reads moved here are the sites the database-timing dashboards and alerts
+    are about, so bypassing the seam would leave them without a sample."""
+    with db_metrics.checkout(pool()) as con:
+        con.autocommit = True
         yield con
 
 
@@ -2824,7 +3117,9 @@ async def run_in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     """
     import anyio  # local: keeps this module importable without a running loop
 
-    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+    return await anyio.to_thread.run_sync(
+        db_metrics.wrap_thread_call(functools.partial(fn, *args, **kwargs))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2920,8 +3215,12 @@ def init_schema() -> None:
     for attempt in range(1, attempts + 1):
         try:
             _apply_migrations()
+            _ensure_pg_stat_statements()
             return
-        except psycopg.errors.LockNotAvailable as exc:
+        except (psycopg.errors.LockNotAvailable, psycopg.errors.DeadlockDetected) as exc:
+            # A deadlock victim is a lock wait that lost, not a broken
+            # migration: the whole transaction rolled back, so retry it the
+            # same way (review 2026-09-14).
             if attempt >= attempts:
                 raise
             steps = INIT_SCHEMA_LOCK_BACKOFF_S
@@ -2934,6 +3233,52 @@ def init_schema() -> None:
                 attempt, attempts, str(exc).strip()[:160], pause,
             )
             _time.sleep(pause)
+
+
+def _ensure_pg_stat_statements() -> None:
+    """Create the pg_stat_statements extension once the server preloads it.
+
+    NOT A NUMBERED MIGRATION, deliberately (2026-09-14, database-speed
+    programme). The extension only works when the server was started with
+    `shared_preload_libraries=pg_stat_statements` (compose.yaml), and a
+    migration is recorded as applied whether or not that restart has
+    happened yet — so a migration that skipped or failed would never run
+    again. This step instead runs after every successful migration pass and
+    is a no-op in three cases: the extension already exists (the steady state:
+    one catalog read per start-up), the server does not preload the library
+    (CI, the test databases, a server not yet recreated — the next start-up
+    after the recreate creates it), or the image does not ship it.
+
+    It NEVER fails start-up: any database error (no CREATE privilege, a
+    concurrent CREATE from a second orchestrator, a lock wait) is logged and
+    swallowed, and the next start-up tries again. Without the extension the
+    only loss is per-statement attribution; nothing in the application reads
+    it.
+    """
+    import logging as _logging
+
+    log = _logging.getLogger(__name__)
+    try:
+        with connection() as con:
+            row = con.execute(
+                "SELECT"
+                " EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') AS installed,"
+                " EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_stat_statements') AS available,"
+                " 'pg_stat_statements' = ANY (string_to_array("
+                "     replace(current_setting('shared_preload_libraries'), ' ', ''), ',')) AS preloaded"
+            ).fetchone()
+            if not row or row["installed"] or not row["available"] or not row["preloaded"]:
+                return
+            with con.transaction():
+                con.execute("SET LOCAL lock_timeout = '3s'")
+                con.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        log.info("init_schema: created extension pg_stat_statements")
+    except Exception as exc:  # noqa: BLE001 — never fail start-up (not only psycopg.Error)
+        log.warning(
+            "init_schema: could not create extension pg_stat_statements (%s); "
+            "start-up continues, the next start-up retries",
+            str(exc).strip()[:160],
+        )
 
 
 def _apply_migrations() -> None:
@@ -3814,7 +4159,13 @@ def get_unindexed_web_pages(
     the two pages it just fetched instead of draining the global queue
     inside its deadline."""
     stale = "(indexed_at IS NULL OR chunk_version < %s)"
-    order = "ORDER BY (indexed_at IS NULL) DESC, retrieval_count DESC, fetched_at DESC"
+    # Demand is the page row's base plus web_page_demand (V38), looked up for
+    # the stale rows only.
+    order = (
+        "ORDER BY (indexed_at IS NULL) DESC, retrieval_count + coalesce(("
+        "SELECT d.retrievals FROM web_page_demand d WHERE d.page_id = web_pages.id), 0) DESC, "
+        "fetched_at DESC"
+    )
     with connection() as con:
         if page_ids:
             rows = con.execute(
@@ -3996,7 +4347,7 @@ def get_research_runs(conversation_id: str, limit: int = 10) -> List[dict]:
 
 def get_conversation_crawl_sites(conversation_id: str) -> List[dict]:
     """Sites crawled in this conversation — the follow-up Q&A scope."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT id, root_url, scope_prefix, status, pages_fetched, "
             "pages_from_store FROM web_crawls WHERE conversation_id = %s "
@@ -4433,7 +4784,7 @@ def list_messages(conversation_id: str) -> List[dict]:
     uuid and a rehydrated one positionally as `srv-<conversation>-<index>`, so
     anything attached to a message client-side (thumbs) was lost on reload.
     """
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT id, role, content, meta, feedback FROM messages "
             "WHERE conversation_id = %s ORDER BY id",
@@ -4551,7 +4902,7 @@ def conversation_owner(conversation_id: str) -> Optional[int]:
     Used to authorize the per-conversation stores (url_documents, repo_chunks,
     live generations) that are keyed by conversation id alone.
     """
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT user_id FROM conversations WHERE id = %s", (conversation_id,)
         ).fetchone()
@@ -4581,7 +4932,7 @@ class MessageCountWouldShrink(Exception):
 
 
 def get_summary(conversation_id: str) -> Optional[dict]:
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT summary, covers_through, token_estimate, updated_at "
             "FROM conversation_summaries WHERE conversation_id = %s",
@@ -4659,7 +5010,7 @@ def add_conversation_chunks(conversation_id: str, chunks: List[dict]) -> None:
 
 def get_conversation_chunks(conversation_id: str) -> List[dict]:
     """Every folded chunk for ONE conversation — the isolation boundary."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT ordinal, role, text, embedding FROM conversation_chunks "
             "WHERE conversation_id = %s ORDER BY ordinal",
@@ -4714,7 +5065,7 @@ def save_upload(
 
 def get_uploads(conversation_id: str) -> List[dict]:
     """Uploads for ONE conversation — the isolation boundary."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT id, filename, bytes, status, profile, notes, created_at "
             "FROM uploads WHERE conversation_id = %s ORDER BY created_at",
@@ -5059,7 +5410,7 @@ def save_url_document(conversation_id: str, url: str, title: str, text: str) -> 
 
 def get_url_documents(conversation_id: str) -> List[dict]:
     """All pages stored for a conversation, oldest first."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT url, title, text FROM url_documents "
             "WHERE conversation_id = %s ORDER BY id",
@@ -5095,7 +5446,7 @@ def save_document(
 
 def get_documents(conversation_id: str) -> List[dict]:
     """All documents stored for a conversation, oldest first."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT filename, text, total_pages FROM documents "
             "WHERE conversation_id = %s ORDER BY id",
@@ -5134,7 +5485,7 @@ def get_repo(conversation_id: str, repo_key: str) -> Optional[dict]:
 
 
 def get_repo_keys(conversation_id: str) -> List[str]:
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT repo_key FROM repos WHERE conversation_id = %s ORDER BY id",
             (conversation_id,),
@@ -5334,6 +5685,26 @@ SELECT c.id, c.title, c.updated_at, c.pinned, c.archived,
 
 _RECALL_SNIPPET_CHARS = 240
 
+#: At most this many keywords reach the recall statement (2026-09-14). Every
+#: keyword is one more substring pass over the candidate messages; the
+#: longest are kept, because a longer word is the more specific one (and the
+#: more selective for the trigram index).
+RECALL_MAX_KEYWORDS = 6
+
+
+def _recall_keywords(keywords: Sequence[str]) -> List[str]:
+    """De-duplicated, non-empty keywords, capped to the longest
+    `RECALL_MAX_KEYWORDS`, in the order they were given."""
+    seen: List[str] = []
+    for k in keywords or ():
+        k = str(k or "")
+        if k and k not in seen:
+            seen.append(k)
+    if len(seen) <= RECALL_MAX_KEYWORDS:
+        return seen
+    keep = set(sorted(range(len(seen)), key=lambda i: (-len(seen[i]), i))[:RECALL_MAX_KEYWORDS])
+    return [k for i, k in enumerate(seen) if i in keep]
+
 
 def recall_conversations(
     user_id: int,
@@ -5350,25 +5721,45 @@ def recall_conversations(
     each winner's snippet in the same pass, so this no longer issues N+1
     queries (it was 1 + `limit` round trips, each paying the old connect() tax).
     """
+    keywords = _recall_keywords(keywords)
     if not keywords:
         return []
     patterns = [like_contains_pattern(k) for k in keywords]
+    # ILIKE on a multibyte (UTF8) database IS `lower(text) LIKE lower(pattern)`
+    # — PostgreSQL lowercases both sides and runs LIKE — so the snippet pass
+    # lowercases each candidate message ONCE and matches every keyword
+    # against that, instead of lowercasing it again for every keyword in the
+    # WHERE and again in the score (16 passes for 8 keywords). The PATTERN is
+    # lowercased by PostgreSQL too (`lower(%s)`, folded to a constant at plan
+    # time), never by Python: under the production C collation lower() folds
+    # ASCII only, while str.lower() also folds 'É' — a Python-lowered pattern
+    # would miss messages that ILIKE matches (verified 2026-09-14).
     like_any = " OR ".join("m.content ILIKE %s ESCAPE '\\'" for _ in keywords)
-    snippet_any = " OR ".join("s.content ILIKE %s ESCAPE '\\'" for _ in keywords)
+    snippet_any = " OR ".join("l.lc LIKE lower(%s) ESCAPE '\\'" for _ in keywords)
     # The FIRST matching message in a conversation is almost always the user's
     # own question ("who is the CEO?"), which carries no information — handing
     # it back as recall told the model nothing. Prefer the message matching the
     # most keywords and, among ties, the most recent: that is where the answer
     # (or the fact the user supplied) actually lives.
     snippet_score = " + ".join(
-        "(CASE WHEN s.content ILIKE %s ESCAPE '\\' THEN 1 ELSE 0 END)"
+        "(CASE WHEN l.lc LIKE lower(%s) ESCAPE '\\' THEN 1 ELSE 0 END)"
         for _ in keywords
     )
+    # THE USER FIRST (2026-09-14). The trigram index has no user dimension, so
+    # `c.user_id = %s` used to be applied only after every user's matching
+    # messages had been fetched and rechecked with ILIKE (detoasting long
+    # answers nobody asked about). `m.conversation_id = ANY(ARRAY(the user's
+    # conversations))` gives the planner an index condition on
+    # idx_messages_conversation: a bitmap of this user's messages on its own,
+    # or ANDed with the trigram bitmap when the keywords are selective.
     sql = (
         "WITH ranked AS ("
         "  SELECT c.id, c.title, c.updated_at, COUNT(m.id) AS hits"
         "    FROM conversations c JOIN messages m ON m.conversation_id = c.id"
-        f"   WHERE c.user_id = %s AND c.id <> %s AND ({like_any})"
+        "   WHERE c.user_id = %s AND c.id <> %s"
+        "     AND m.conversation_id = ANY(ARRAY("
+        "           SELECT uc.id FROM conversations uc WHERE uc.user_id = %s AND uc.id <> %s))"
+        f"     AND ({like_any})"
         "   GROUP BY c.id, c.title, c.updated_at"
         "   ORDER BY hits DESC, c.updated_at DESC"
         "   LIMIT %s"
@@ -5377,15 +5768,17 @@ def recall_conversations(
         "  FROM ranked "
         "  LEFT JOIN LATERAL ("
         "    SELECT s.role, s.content FROM messages s"
+        "     CROSS JOIN LATERAL (SELECT lower(s.content) AS lc OFFSET 0) AS l"
         f"    WHERE s.conversation_id = ranked.id AND ({snippet_any})"
         f"     ORDER BY ({snippet_score}) DESC, s.id DESC LIMIT 1"
         "  ) AS snip ON true "
         " ORDER BY ranked.hits DESC, ranked.updated_at DESC"
     )
-    params: List[object] = [user_id, exclude_conversation_id or "", *patterns, limit]
+    excluded = exclude_conversation_id or ""
+    params: List[object] = [user_id, excluded, user_id, excluded, *patterns, limit]
     params += patterns  # snippet_any (LATERAL WHERE)
     params += patterns  # snippet_score (LATERAL ORDER BY)
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(sql, params).fetchall()
     out: List[dict] = []
     for r in rows:
@@ -5668,7 +6061,7 @@ def get_sf_conversation_state(conversation_id: str) -> Optional[dict]:
 
 def list_user_facts(user_id: int, limit: int = 500) -> List[dict]:
     """The user's durable facts, most recently updated first."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             "SELECT id, fact, source_conversation_id, created_at, updated_at"
             "  FROM user_facts WHERE user_id = %s"
@@ -5745,16 +6138,24 @@ def messages_missing_embeddings(
     Newest-first so fresh conversations become searchable immediately; the
     older backlog drains a batch per request.
     """
-    with connection() as con:
+    # 2026-09-14: `length(content)` counts characters, so it detoasts (and
+    # decompresses) every message of the user the scan reads — 12-14 ms at
+    # production size for a sub-millisecond anti-join. `octet_length` reads
+    # the stored size without detoasting, and one character is 1 to 4 bytes,
+    # so `length >= n` is exactly `octet_length >= n AND (octet_length >= 4n
+    # OR length >= n)`: `length` is left only for the short inline values in
+    # between. Same rows, same plan shapes; 13.4 -> 2.0 ms p95 (1x).
+    with read_connection() as con:
         rows = con.execute(
             "SELECT m.id, m.conversation_id, m.role, m.content"
             "  FROM messages m JOIN conversations c ON c.id = m.conversation_id"
             " WHERE c.user_id = %s AND m.role IN ('user', 'assistant')"
-            "   AND length(m.content) >= %s"
+            "   AND octet_length(m.content) >= %s"
+            "   AND (octet_length(m.content) >= 4 * %s OR length(m.content) >= %s)"
             "   AND NOT EXISTS (SELECT 1 FROM message_embeddings e"
             "                    WHERE e.message_id = m.id AND e.model_id = %s)"
             " ORDER BY m.id DESC LIMIT %s",
-            (user_id, min_chars, model_id, limit),
+            (user_id, min_chars, min_chars, min_chars, model_id, limit),
         ).fetchall()
     return [
         {
@@ -5811,8 +6212,11 @@ def fetch_message_embeddings(
     current conversation is excluded because within-chat context is already
     in the prompt.
     """
-    with connection() as con:
-        rows = con.execute(
+    with read_connection() as con:
+        # Binary results: 500 x 4 KB vectors travel as bytes instead of hex
+        # text twice their size that the driver then decodes (2026-09-14:
+        # 15.1 -> 9.5 ms for the same rows).
+        rows = con.cursor(binary=True).execute(
             "SELECT e.message_id, e.conversation_id, e.embedding,"
             "       m.role, m.content, c.title"
             "  FROM message_embeddings e"
@@ -5836,19 +6240,58 @@ def fetch_message_embeddings(
     ]
 
 
+def web_corpus_state() -> Optional[Tuple[int, int]]:
+    """(pages, generation) of the shared web corpus as COMMITTED, or None on a
+    database without V38's `web_corpus_state` row.
+
+    The database bumps the generation itself, at commit, whenever a page is
+    inserted or deleted or its content_hash, text length, title or
+    indexed-ness changes (see _MIGRATION_V38), so every process sees every
+    other process's writes. One primary-key read.
+    """
+    try:
+        with connection() as con:
+            row = con.execute(
+                "SELECT pages, generation FROM web_corpus_state WHERE id = 1"
+            ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        return None
+    return (int(row["pages"]), int(row["generation"])) if row else None
+
+
+#: Pages from the V38 state row; both backlogs from their partial indexes
+#: (idx_web_pages_pending, idx_web_pages_refresh), so a scrape reads index
+#: entries for the backlog only instead of every page's heap tuple.
+_WEB_CORPUS_COUNTS_SQL = """
+    SELECT s.pages,
+           (SELECT count(*) FROM web_pages WHERE indexed_at IS NULL) AS pending,
+           (SELECT count(*) FROM web_pages
+             WHERE next_refresh_at IS NOT NULL AND next_refresh_at <= now()) AS due
+      FROM web_corpus_state s WHERE s.id = 1"""
+
+
 def web_corpus_counts() -> dict:
     """Size, embedding backlog and refresh backlog of the public web corpus.
 
-    One query rather than three: this runs on every Prometheus scrape.
+    One query rather than three: this runs on every Prometheus scrape. Since
+    V38 it no longer scans web_pages (measured before: a Seq Scan, 1.4 ms at
+    today's corpus and 16.2 ms at 10x, four times a minute); a database
+    without the state row falls back to the scan.
     """
-    with connection() as con:
-        row = con.execute(
-            """SELECT count(*) AS pages,
-                      count(*) FILTER (WHERE indexed_at IS NULL) AS pending,
-                      count(*) FILTER (WHERE next_refresh_at IS NOT NULL
-                                         AND next_refresh_at <= now()) AS due
-                 FROM web_pages"""
-        ).fetchone()
+    try:
+        with connection() as con:
+            row = con.execute(_WEB_CORPUS_COUNTS_SQL).fetchone()
+    except psycopg.errors.UndefinedTable:
+        row = None
+    if row is None:
+        with connection() as con:
+            row = con.execute(
+                """SELECT count(*) AS pages,
+                          count(*) FILTER (WHERE indexed_at IS NULL) AS pending,
+                          count(*) FILTER (WHERE next_refresh_at IS NOT NULL
+                                             AND next_refresh_at <= now()) AS due
+                     FROM web_pages"""
+            ).fetchone()
     return {
         "pages": int(row["pages"]) if row else 0,
         "pending": int(row["pending"]) if row else 0,
@@ -6364,7 +6807,7 @@ def link_video_attachment(
 def get_conversation_videos(conversation_id: str) -> List[dict]:
     """Every analysis this conversation may see, newest attachment first,
     each carrying the name THIS conversation used for it."""
-    with connection() as con:
+    with read_connection() as con:
         rows = con.execute(
             """SELECT a.*, l.upload_id AS link_upload_id, l.filename AS link_filename,
                       l.created_at AS attached_at, l.id AS link_id
@@ -6641,31 +7084,73 @@ def create_chat_request(
     request: dict,
     *,
     resumable: bool = True,
+    status: str = "accepted",
+    supersede_parked_except: Optional[Sequence[str]] = None,
 ) -> Optional[dict]:
     """Record acceptance. Returns None when the intent already exists — the
-    caller then reads the existing row and attaches or replays."""
+    caller then reads the existing row and attaches or replays.
+
+    ONE durable commit for what /chat used to do in three (2026-09-14): the
+    row is written in `status` (`running` when the caller starts its worker
+    at once — `accepted` and `running` are the same open state to every
+    reader: startup marks both interrupted, the retry reason of both is
+    `lost_process`), and, when `supersede_parked_except` is given and the
+    row was created, `cancel_parked_chat_requests` runs in the same
+    transaction. Each synchronous commit waits for a WAL flush (4-5 ms on the
+    production disk); the SQL itself is sub-millisecond.
+
+    The superseding cancel runs under a SAVEPOINT: its failure is logged and
+    swallowed exactly as the caller's `contextlib.suppress` did, and never
+    costs the new row. The number of rows it cancelled is on the returned
+    dict as `superseded` (0 when not asked)."""
+    if status not in ("accepted", "running"):
+        raise ValueError(f"create_chat_request: a new row is 'accepted' or 'running', not {status!r}")
     ts = _now()
+    superseded = 0
     with connection() as con:
         row = con.execute(
             """INSERT INTO chat_requests
-                   (intent_id, user_id, conversation_id, generation_id, request, resumable,
+                   (intent_id, user_id, conversation_id, generation_id, status, request, resumable,
                     created_at, updated_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (intent_id) DO NOTHING
                RETURNING *""",
-            (intent_id, int(user_id), conversation_id, generation_id, _json_param(request), bool(resumable), ts, ts),
+            (intent_id, int(user_id), conversation_id, generation_id, status, _json_param(request),
+             bool(resumable), ts, ts),
         ).fetchone()
-    return _chat_request_row(row) if row is not None else None
+        if row is not None and supersede_parked_except is not None:
+            try:
+                with con.transaction():
+                    superseded = len(
+                        con.execute(
+                            _CANCEL_PARKED_SQL,
+                            ("replaced by a newer message", ts, ts, conversation_id,
+                             list(supersede_parked_except)),
+                        ).fetchall()
+                    )
+            except psycopg.Error:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "chat request %s: superseding parked requests failed", intent_id, exc_info=True
+                )
+                superseded = 0
+    if row is None:
+        return None
+    out = _chat_request_row(row)
+    if supersede_parked_except is not None:
+        out["superseded"] = superseded
+    return out
 
 
 def get_chat_request(intent_id: str) -> Optional[dict]:
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute("SELECT * FROM chat_requests WHERE intent_id = %s", (intent_id,)).fetchone()
     return _chat_request_row(row) if row is not None else None
 
 
 def latest_chat_request(conversation_id: str) -> Optional[dict]:
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT * FROM chat_requests WHERE conversation_id = %s ORDER BY created_at DESC LIMIT 1",
             (conversation_id,),
@@ -6728,7 +7213,7 @@ def resume_chat_request(
 def get_message_by_generation(conversation_id: str, generation_id: str) -> Optional[dict]:
     """The stored message for a generation, if any — how `answer_persisted`
     is answered without listing the whole thread."""
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT id, role, content, meta, created_at FROM messages "
             "WHERE conversation_id = %s AND generation_id = %s",
@@ -6829,7 +7314,7 @@ def list_resumable_chat_requests(statuses: Sequence[str], *, max_age_s: float, l
 def count_chat_requests(status: str) -> int:
     """How many rows are in `status` right now (the durable half of
     `llm_queued_generations`, app/continuity.py)."""
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT count(*) AS n FROM chat_requests WHERE status = %s", (status,)
         ).fetchone()
@@ -6842,7 +7327,7 @@ def generation_streamed(generation_id: str) -> bool:
     worker's finally — so by an orderly shutdown, not by a crash) records
     `ttft_ms` only when a token was streamed. CONTRACT §8.4: such an
     attempt is never re-run by itself."""
-    with connection() as con:
+    with read_connection() as con:
         row = con.execute(
             "SELECT ttft_ms FROM usage_events WHERE generation_id = %s", (str(generation_id),)
         ).fetchone()
@@ -6858,14 +7343,19 @@ def cancel_parked_chat_requests(conversation_id: str, *, keep: Sequence[str]) ->
     touched — the new send itself and any generation this process still
     holds (its own worker writes its terminal status). Returns how many."""
     ts = _now()
-    with connection() as con:
+    with read_connection() as con:  # one statement
         rows = con.execute(
-            "UPDATE chat_requests SET status = 'cancelled', error = %s, updated_at = %s, finished_at = %s "
-            "WHERE conversation_id = %s AND status = 'queued' AND NOT (intent_id = ANY(%s)) "
-            "RETURNING intent_id",
+            _CANCEL_PARKED_SQL,
             ("replaced by a newer message", ts, ts, conversation_id, list(keep)),
         ).fetchall()
     return len(rows)
+
+
+_CANCEL_PARKED_SQL = (
+    "UPDATE chat_requests SET status = 'cancelled', error = %s, updated_at = %s, finished_at = %s "
+    "WHERE conversation_id = %s AND status = 'queued' AND NOT (intent_id = ANY(%s)) "
+    "RETURNING intent_id"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -6883,10 +7373,13 @@ def start_query_trace(
     request_id: str = "",
     test_case_id: Optional[str] = None,
     versions: Optional[dict] = None,
+    *,
+    con: Optional[psycopg.Connection] = None,
 ) -> None:
-    """Create the durable root before any routing or retrieval work begins."""
+    """Create the durable root before any routing or retrieval work begins.
+    `con`: write inside the caller's transaction (`write_query_trace_batch`)."""
     now = _now()
-    with connection() as con:
+    with _on(con) as con:
         con.execute(
             """INSERT INTO query_traces
                    (trace_id, conversation_id, user_id, workspace_id,
@@ -6921,12 +7414,14 @@ def append_query_trace_event(
     error_type: str = "",
     error_message: str = "",
     component_version: str = "",
+    *,
+    con: Optional[psycopg.Connection] = None,
 ) -> None:
     """Append an ordered checkpoint; retries are idempotent by sequence."""
     completed_at = _now()
     elapsed = max(0, int(duration_ms or 0))
     started_at = completed_at - timedelta(milliseconds=elapsed)
-    with connection() as con:
+    with _on(con) as con:
         con.execute(
             """INSERT INTO query_trace_events
                    (trace_id, sequence_number, stage, status, created_at,
@@ -6963,9 +7458,10 @@ def finish_query_trace(
     error_type: str = "",
     error_message: str = "",
     meta: Optional[dict] = None,
+    con: Optional[psycopg.Connection] = None,
 ) -> None:
     """Close a trace once; a late duplicate finalizer cannot rewrite it."""
-    with connection() as con:
+    with _on(con) as con:
         con.execute(
             """UPDATE query_traces
                   SET final_status = %s, completed_at = %s,
@@ -6990,6 +7486,35 @@ def finish_query_trace(
                 trace_id,
             ),
         )
+
+
+def write_query_trace_batch(writes: Sequence[Tuple[Callable[..., None], tuple, dict]]) -> None:
+    """Several trace writes — `start_query_trace`, `append_query_trace_event`,
+    `finish_query_trace`, in the order given — in ONE transaction (2026-09-14).
+
+    A turn's trace is a root, about six checkpoints and a close; written one
+    transaction each, that was eight synchronous commits, each waiting for a
+    WAL flush (4-5 ms on the production disk) for a fraction of a
+    millisecond of SQL. The queued recorder in main.py hands over whatever
+    burst it has, and it commits once. All or nothing: a failure raises and
+    the caller decides (it retries the writes one by one)."""
+    allowed = (start_query_trace, append_query_trace_event, finish_query_trace)
+    for fn, _args, _kwargs in writes:
+        if fn not in allowed:
+            raise ValueError(f"write_query_trace_batch: {getattr(fn, '__name__', fn)!r} is not a trace writer")
+    if not writes:
+        return
+    with connection() as con:
+        # Both tables' ordinary write lock up front, child first: a batch that
+        # took query_traces (the root or the close) and only later
+        # query_trace_events held one while waiting for the other, and a
+        # TRUNCATE ... CASCADE or DDL taking them in the other order meant a
+        # deadlock (seen in the test suite's per-test TRUNCATE). ROW EXCLUSIVE
+        # is what every INSERT/UPDATE takes anyway; it conflicts only with
+        # SHARE and stronger.
+        con.execute("LOCK TABLE query_trace_events, query_traces IN ROW EXCLUSIVE MODE")
+        for fn, args, kwargs in writes:
+            fn(*args, con=con, **kwargs)
 
 
 def get_query_trace(trace_id: str, user_id: int) -> Optional[dict]:
@@ -7816,27 +8341,65 @@ def list_api_keys(
     return _api_rows(rows)
 
 
+#: `last_used_at` is written at most this often per key (2026-09-14), the
+#: resolution users.touch_last_active has always had. A NEW address is
+#: written at once whatever the clock says.
+API_KEY_TOUCH_INTERVAL_S = 60.0
+
+#: (dsn, key_id) -> (monotonic time of the last write, the address written).
+#: Per process; other processes throttle through the SQL predicate.
+_api_key_touched: Dict[Tuple[str, str], Tuple[float, Optional[str]]] = {}
+_api_key_touched_lock = threading.Lock()
+
+
 def touch_api_key(key_id: str, ip: Optional[str] = None) -> None:
     """Record that a key was used, and from where.
 
-    Written once per request, never per token. `last_used_ip` is the single
+    Called once per request, never per token. `last_used_ip` is the single
     reason the platform can answer "where is this leaked key being used
     from"; a None leaves the previous value rather than erasing it. The
     service account's own `last_used_at` moves with it so the console can
     show a dormant integration.
+
+    THROTTLED (2026-09-14): every /v1 request, GETs included, used to write
+    this row and wait for a synchronous commit — 5.0 ms of WAL flush for
+    0.56 ms of SQL, measured. `last_used_at` answers "is this integration
+    still alive", which a minute of resolution answers as well. So the row
+    is written when it is older than `API_KEY_TOUCH_INTERVAL_S` or when the
+    request comes from an address the row does not hold yet — never skipped
+    for a new address. This process remembers its own last write and skips
+    the round trip entirely inside the interval; the WHERE clause does the
+    same across processes (an UPDATE that matches nothing commits without a
+    WAL flush).
     """
+    ip = _text(ip) if ip is not None else None
+    cache_key = (_pool_dsn or "", str(key_id))
+    now = time.monotonic()
+    with _api_key_touched_lock:
+        last = _api_key_touched.get(cache_key)
+    if last is not None and now - last[0] < API_KEY_TOUCH_INTERVAL_S and (ip is None or ip == last[1]):
+        return
     with connection() as con:
         row = con.execute(
             "UPDATE api_keys SET last_used_at = now(), "
             "last_used_ip = COALESCE(%s, last_used_ip) WHERE id = %s "
-            "RETURNING service_account_id",
-            (_text(ip), key_id),
+            "AND (last_used_at IS NULL "
+            "     OR last_used_at < now() - make_interval(secs => %s) "
+            "     OR (%s::text IS NOT NULL AND last_used_ip IS DISTINCT FROM %s::text)) "
+            "RETURNING service_account_id, last_used_ip",
+            (ip, key_id, float(API_KEY_TOUCH_INTERVAL_S), ip, ip),
         ).fetchone()
         if row is not None and row["service_account_id"]:
             con.execute(
                 "UPDATE api_service_accounts SET last_used_at = now() WHERE id = %s",
                 (row["service_account_id"],),
             )
+    # Remembered either way: a row that did not match was touched inside the
+    # interval, from this address, by another request or process.
+    with _api_key_touched_lock:
+        if len(_api_key_touched) > 10_000:
+            _api_key_touched.clear()
+        _api_key_touched[cache_key] = (now, row["last_used_ip"] if row is not None else ip)
 
 
 def revoke_api_key(
@@ -9322,6 +9885,25 @@ _API_EXPIRED_PRUNABLE_SQL = f"(r.status IN {_API_TERMINAL_SQL} OR NOT r.resumabl
 #: deleted in bounded range statements, and the list is re-read.
 _PRUNE_DUE_IDS = 50
 
+#: `logs(response_id)`: every response that still has at least one stored
+#: event, one row each, by a LOOSE INDEX SCAN of api_response_events_pkey —
+#: each step is one `response_id > previous ORDER BY response_id LIMIT 1`
+#: probe, so the read follows the number of runs with a log, never the
+#: number of events (2026-09-14, database-speed round: the due lists that
+#: joined events to api_responses were planned as a sequential scan of the
+#: whole log — 748 ms idle at 5.8M events for `durable_store.purge_events`,
+#: 229 ms for the prune's due-ids). Rows are produced lazily, so a caller's
+#: LIMIT stops the walk early. Prefix it to a statement that reads `logs`.
+_RETAINED_LOG_IDS_CTE = (
+    "WITH RECURSIVE logs(response_id) AS ("
+    " (SELECT response_id FROM api_response_events ORDER BY response_id LIMIT 1)"
+    " UNION ALL"
+    " SELECT (SELECT e.response_id FROM api_response_events e"
+    "          WHERE e.response_id > logs.response_id ORDER BY e.response_id LIMIT 1)"
+    " FROM logs WHERE logs.response_id IS NOT NULL"
+    ")"
+)
+
 
 def _delete_response_events_batched(response_id: str, size: int, budget: List[int]) -> int:
     """Delete one response's events in statements of at most `size` rows,
@@ -9340,7 +9922,10 @@ def _delete_response_events_batched(response_id: str, size: int, budget: List[in
             ).rowcount
         deleted = max(0, int(deleted))
         total += deleted
-        if deleted == 0:
+        if deleted < int(size):
+            # A short range is the log's end (sequence numbers are contiguous):
+            # no confirming empty DELETE per run (2026-09-14). Were there a gap,
+            # every caller re-reads its due list, which still names this run.
             break
     return total
 
@@ -9367,14 +9952,18 @@ def _prune_api_durable(
     size = max(1, int(batch_size))
     budget = [max(1, int(max_statements))]
     cutoff = moment - timedelta(seconds=max(0.0, float(retention_s)))
+    # Driven from the runs that still have a log (_RETAINED_LOG_IDS_CTE), not
+    # from every api_responses row: the old form was a Seq Scan of
+    # api_responses with an event-PK probe per row (229 ms at 297k rows).
     due_sql = (
-        "SELECT r.id FROM api_responses r "
+        _RETAINED_LOG_IDS_CTE
+        + " SELECT r.id FROM logs JOIN api_responses r ON r.id = logs.response_id"
         " WHERE ("
         f"   (r.status IN {_API_TERMINAL_SQL} AND COALESCE(r.completed_at, r.created_at) < %s)"
         f"   OR (r.status IN {_API_TERMINAL_SQL} AND EXISTS ("
         "        SELECT 1 FROM api_projects p WHERE p.id = r.project_id AND p.status <> 'active'))"
         f"   OR (r.expires_at IS NOT NULL AND r.expires_at < %s AND {_API_EXPIRED_PRUNABLE_SQL})"
-        " ) AND EXISTS (SELECT 1 FROM api_response_events e WHERE e.response_id = r.id)"
+        " )"
         " LIMIT %s"
     )
     events = 0

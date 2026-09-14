@@ -70,6 +70,7 @@ progress `detail` written anywhere upstream cannot reach a caller.
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import os
@@ -114,8 +115,14 @@ STATUS_CHECK_S = 1.0
 RENEW_S = 30.0
 #: Retry cadence after a failed renewal (a database blip).
 RENEW_RETRY_S = 5.0
-#: The claim sweep when nothing wakes the runner.
-POLL_S = 5.0
+#: The claim sweep when nothing wakes the runner (2026-09-14, database-speed
+#: round: 5 s -> 30 s). Everything this process does that makes work due
+#: wakes the lane at once — `enqueue` after an ingest or a requeue, the
+#: assembler's kick after an upload completes, a job ending, a lane move —
+#: and a deferral written here arms its own timer (`_note_due`). The sweep
+#: only finds what another process left: a lapsed 90 s lease, or a deferral
+#: it wrote. At 5 s the two lanes issued 36 claim transactions a minute idle.
+POLL_S = 30.0
 #: How often a media job polls its analysis row (design §6.2.4).
 MEDIA_POLL_S = 5.0
 
@@ -774,6 +781,10 @@ class JobRunner:
         self._cancelled: set = set()
         self._last_renewal = time.monotonic()
         self.outcomes: List[RunOutcome] = []
+        #: monotonic deadlines of the deferrals this runner wrote that are not
+        #: due yet, earliest first (a min-heap: every one of them wakes the
+        #: lane, not only the earliest — verifier fix 2026-09-14).
+        self._due_at: List[float] = []
 
     # -- control ----------------------------------------------------------
 
@@ -821,6 +832,28 @@ class JobRunner:
 
     def running(self) -> List[str]:
         return list(self._jobs)
+
+    def _note_due(self, delay_s: float) -> None:
+        """Work this runner deferred is due in `delay_s`: wake then, not at the
+        next idle sweep. The database stamped its own `not_before` (or lease
+        expiry) with its own clock before this runs, so this deadline is never
+        the earlier one. Bounded: one entry per deferral, popped when due."""
+        heapq.heappush(self._due_at, time.monotonic() + max(0.0, float(delay_s)) + 0.05)
+        while len(self._due_at) > 10_000:  # never unbounded; the idle poll is the backstop
+            self._due_at.pop()
+
+    def _wait_s(self) -> float:
+        """The idle wait: the poll, or less when a local deferral falls due."""
+        now = time.monotonic()
+        fired = False
+        while self._due_at and self._due_at[0] <= now:
+            heapq.heappop(self._due_at)
+            fired = True
+        if fired:
+            return 0.0
+        if not self._due_at:
+            return self.poll_s
+        return min(self.poll_s, self._due_at[0] - now)
 
     # -- the loop ---------------------------------------------------------
 
@@ -883,9 +916,12 @@ class JobRunner:
             if spawned and len(self._jobs) + len(self._assemblies) < self.concurrency:
                 continue
             self._wake.clear()
+            wait_s = self._wait_s()
+            if wait_s <= 0:
+                continue
             waiters = [asyncio.ensure_future(self._wake.wait())]
             waiters += [t for t, _ in self._jobs.values()] + list(self._assemblies.values())
-            await asyncio.wait(waiters, timeout=self.poll_s, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait(waiters, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED)
             waiters[0].cancel()
 
     async def _renew_loop(self) -> None:
@@ -924,6 +960,10 @@ class JobRunner:
                 await _emit_file_events([result.file], None, "file.failed")
             if result.blob is not None:
                 enqueue(result.blob)
+            if result.outcome == "deferred":
+                # The upload is unclaimable for ASSEMBLY_DEFER_S: wake then, not
+                # up to POLL_S later (verifier fix 2026-09-14).
+                self._note_due(queue.ASSEMBLY_DEFER_S)
             return None
         except Exception:  # noqa: BLE001
             log.warning("files assembly %s failed a unit", upload_id, exc_info=True)
@@ -1140,6 +1180,8 @@ class JobRunner:
             outcome = RunOutcome(ctx.blob_id, "failed", "processing_unavailable")
         else:
             events.publish(ctx.blob_id, {"status": "queued"})
+            if row is not None:
+                self._note_due(delay if delay is not None else limits.processing_retry_delay_s())
             outcome = RunOutcome(ctx.blob_id, "deferred", None if counted else "outage")
         self.outcomes.append(outcome)
         return outcome
