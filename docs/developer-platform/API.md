@@ -719,11 +719,12 @@ Confirm in `publicapi/models.py`.
 ### 13.3 Capacity gates
 
 `publicapi/capacity.hold(engine, *, weight_tokens, wait_s, yield_to_chat)`: per
-engine, FIFO, bounded wait, refusal `errors.model_at_capacity(retry_after)` (503
-`model_unavailable`). Numbers and their arguments: CONTRACT §12.3. Sync, stream
-and sidecar requests wait ≤ `PUBLIC_API_GATE_WAIT_S` (30 s) **before** the status
-line; background jobs wait ≤ `PUBLIC_API_BACKGROUND_GATE_WAIT_S` (3,600 s) inside
-the job while `queued`. Chat-app paths never take a gate. Gauges
+engine, FIFO; `wait_s=None` waits with no limit, and only a finite `wait_s` can
+end in `errors.model_at_capacity(retry_after)` (503 `model_unavailable`).
+Numbers and their arguments: CONTRACT §12.3. `/v1/embeddings`, `/v1/rerank` and
+`/v1/audio/transcriptions` wait with no limit after their length and shape checks,
+inside a committed response (2026-09-14); the bounded synchronous file preparation
+still reads `PUBLIC_API_GATE_WAIT_S` (`config.STILL_READ_RETIRED_SETTINGS`). Chat-app paths never take a gate. Gauges
 `public_api_engine_in_flight` / `public_api_engine_waiting` by engine.
 `main.long` applies to flagship requests planning more than 800,000 output
 tokens (`PUBLIC_API_MAIN_SOLO_OUTPUT_TOKENS`), one at a time; `main.extended` to

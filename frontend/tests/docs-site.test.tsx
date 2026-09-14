@@ -1309,13 +1309,15 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
         );
       }
       if (model.kind === 'transcription') {
+        // Any duration (no-timeout design, shipped for the sidecars
+        // 2026-09-14): no seconds limit is published, and the registry has
+        // no such setting to report.
+        expect(model.limits.max_audio_seconds).toBeUndefined();
+        expect(registryPy).not.toContain('PUBLIC_API_MAX_AUDIO_SECONDS');
         if (source === 'contract') {
-          // Any duration (no-timeout design): no seconds limit is published.
           expect(row.other).toContain('any duration');
-          expect(model.limits.max_audio_seconds).toBeUndefined();
           expect(model.limits.max_audio_bytes).toBe(count(/(\d+) MiB/) * 1024 * 1024);
         } else {
-          expect(model.limits.max_audio_seconds).toBe(registryDefault('PUBLIC_API_MAX_AUDIO_SECONDS'));
           expect(model.limits.max_audio_bytes).toBe(registryDefault('PUBLIC_API_MAX_AUDIO_BYTES'));
         }
       }

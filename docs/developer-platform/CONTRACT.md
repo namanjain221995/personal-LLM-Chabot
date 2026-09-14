@@ -509,7 +509,8 @@ gate `rerank`.
 ### 8.6 `POST /v1/audio/transcriptions`
 
 `multipart/form-data`, streamed to disk as it arrives (`publicapi/multipart.py`
-streaming reader feeding `audio_jobs.ingest`, never `UploadFile`): the file part
+streaming reader handing the file part to a `disk_ledger.DiskSink`, never
+`UploadFile`): the file part
 goes to `PUBLIC_API_ASR_CACHE_DIR` through a `DiskSink` — sha256 on the way,
 fsync and replace, 0700 directory and 0600 files, caps enforced while reading,
 reserved against free disk first. An `application/json` body
@@ -518,7 +519,7 @@ reserved against free disk first. An `application/json` body
 | field | rule |
 |---|---|
 | `file` | required unless `file_id`; the part's `Content-Type` in `audio_api.ALLOWED_TYPES`; ≤ 89 MiB (`PUBLIC_API_MAX_AUDIO_BYTES` 93,323,264); **any duration** |
-| `file_id` | instead of `file`: a project-scoped audio or video file of the Files API, read through `files.open_for_read(project_id, file_id)` |
+| `file_id` | instead of `file`: a project-scoped audio or video file of the Files API, used in place (never copied or deleted); needs `files.read` too; a malformed, deleted, expired or foreign id is the same `404 file_not_found` |
 | `model` | required, `techsara-whisper` |
 | `language` | optional ISO-639-1 code, or `auto` (the default) |
 | `response_format` | optional `json` (default), `text` or `verbose_json`; `srt` and `vtt` are `400` |
@@ -559,7 +560,9 @@ and every 15 s, `: queued` while waiting, `transcript.text.delta` and one
 `transcript.text.done`; an error object on failure; no `id:`, `retry:` or
 `event:` lines. Non-stream formats are `CommittedJSONResponse(failure_mode="abort")`;
 the gateway re-attaches with `X-TechSara-Attach-Job` before aborting a client
-(§19). A forced `language` forces the decoder: `en` on non-English speech
+(§19). A tagged request is named `X-TechSara-Run: job:<job key>-<response_format>`,
+because a `json` and a `text` request share one job and the empty re-attach body
+cannot say which it was; the re-attach is neither counted nor metered again. A forced `language` forces the decoder: `en` on non-English speech
 translates rather than transcribes (2026-09-10), so auto-detect is the
 recommendation.
 
@@ -1310,7 +1313,7 @@ settles it once.
 | `v1_responses`, `v1_chat_completions` | `resp_<24 hex>` | from the engine's stream usage, or counted by the server when the stream closed early (§8.3); summed over attempts, input once; `None` = not measured, never 0 | `max_output_tokens_requested`, `max_output_tokens_applied`, `clamped`, `usage_source` (`engine` \| `counted_at_stop` \| `null` when not measured), `attempts`, `resume_count`, `recomputed_prompt_tokens`, `yields`, `suspended_ms` |
 | `v1_embeddings` | `emb_<24 hex>` | input = engine `prompt_tokens` summed (None if any call did not report); output 0 (pooling generates nothing — a measured truth) | `inputs`, `engine_calls` |
 | `v1_rerank` | `rrk_<24 hex>` | input = `/score` `prompt_tokens`; output 0 | `documents`, `top_n` |
-| `v1_audio_transcriptions` | `asr_<24 hex>` | both `None` in `usage_events`; 0 and 0 in the token ledgers so they stay token-true | `audio_seconds`, `processing_ms`, `response_format`, `language_forced` |
+| `v1_audio_transcriptions` | `asr_<24 hex>` | both `None` in `usage_events`; 0 and 0 in the token ledgers so they stay token-true | `audio_seconds` (ceil of decoded samples / 16,000), `processing_ms`, `response_format`, `language_forced`, `windows`, `engine_calls`; `joined` when the request followed a job another request started or a finished result |
 
 * Reservation for chat models: estimated input + planned output when limits are
   enforced; when not enforced the output reservation is capped at
