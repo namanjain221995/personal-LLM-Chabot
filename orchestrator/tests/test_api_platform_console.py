@@ -1104,15 +1104,21 @@ def test_a_streamed_playground_run_follows_the_public_event_grammar(admin, fake_
 
     frames = api_events.parse_frames(response.text)
     names = [frame["event"] for frame in frames]
+    # CONTRACT-3 §10.2 (2026-09-14): the item and content-part events the
+    # SDKs' stream helpers need are part of the public grammar.
     assert names == [
         "response.created",
         "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
         "response.completed",
     ]
-    assert [frame["data"]["sequence_number"] for frame in frames] == [1, 2, 3, 4, 5, 6]
+    assert [frame["data"]["sequence_number"] for frame in frames] == list(range(1, 11))
     assert len([n for n in names if n in api_events.TERMINAL_EVENTS]) == 1
     # The reasoning delta never reached the wire.
     assert "hmm" not in response.text
@@ -1211,7 +1217,7 @@ def test_a_streamed_run_heartbeats_while_the_engine_is_still_thinking(
     )
     assert ": ping" in response.text
     frames = api_events.parse_frames(response.text)
-    assert [frame["data"]["sequence_number"] for frame in frames] == [1, 2, 3, 4, 5]
+    assert [frame["data"]["sequence_number"] for frame in frames] == list(range(1, 10))
     assert frames[-1]["event"] == "response.completed"
     # Not measured is null, never zero.
     assert frames[-1]["data"]["response"]["usage"] is None

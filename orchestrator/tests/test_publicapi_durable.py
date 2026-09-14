@@ -83,7 +83,10 @@ def test_a_launched_stream_is_followed_from_the_log_with_contiguous_numbers_and_
     assert seqs == list(range(1, len(records) + 1))
     names = [r[1] for r in records]
     assert names[0] == "response.created" and names[1] == "response.in_progress"
-    assert names[-2:] == ["response.output_text.done", "response.completed"]
+    assert names[2:4] == ["response.output_item.added", "response.content_part.added"]
+    assert names[-4:] == [
+        "response.output_text.done", "response.content_part.done", "response.output_item.done", "response.completed",
+    ]
     text = "".join(r[2]["delta"] for r in records if r[1] == "response.output_text.delta")
     assert text == expected_text(30)
     assert records[-1][2]["response"]["usage"] == {"input_tokens": 17, "output_tokens": 30, "total_tokens": 47}
@@ -195,6 +198,49 @@ def test_no_pool_connection_is_held_while_the_engine_is_silent(monkeypatch, tmp_
 
 
 # ---------------------------------------------------------- followers --
+
+
+@pytest.mark.parametrize("reason", ["restart", "shutdown", "lease_lost"])
+def test_a_reader_of_a_run_dropped_for_a_suspend_is_aborted_not_switched_to_following_remotely(monkeypatch, tmp_path, reason):
+    """The runner drops a suspended run from `runs` when its attempt ends,
+    which can happen BEFORE `suspend_all` aborts the readers. A reader woken in
+    that gap must still end with FollowerAborted (an incomplete read the
+    gateway re-attaches from) — not follow the run remotely through a
+    stopping runtime, heartbeating until the process exits (2026-09-14)."""
+    FakeMainEngine(answer_tokens=100_000, delay_s=0.005).install(monkeypatch)
+    tenant = make_tenant()
+
+    async def scenario():
+        runtime = _runtime(tmp_path)
+        await runtime.start()
+        try:
+            handle = await runtime.launch(make_spec(), caller=tenant.caller(), streamed=True)
+            seen = []
+
+            async def read():
+                async for item in handle.follow(0, heartbeat=0.05):
+                    if item is not durable.HEARTBEAT:
+                        seen.append(item)
+
+            reader = asyncio.ensure_future(read())
+            while len(seen) < 5:
+                await asyncio.sleep(0.01)
+            # Only the stop — no abort_readers: the runner ends the attempt
+            # and drops the run, exactly the window before suspend_all's abort.
+            runtime.stop_run(handle.run, reason)
+            done, _ = await asyncio.wait({reader}, timeout=3)
+            outcome = None
+            if reader in done:
+                outcome = type(reader.exception()).__name__ if reader.exception() else "returned"
+            else:
+                reader.cancel()
+            return outcome, handle.id in runtime.runs
+        finally:
+            await runtime.stop()
+
+    outcome, still_local = asyncio.run(scenario())
+    assert still_local is False
+    assert outcome == "FollowerAborted"
 
 
 def test_the_ninth_follower_closes_the_oldest(monkeypatch, tmp_path):

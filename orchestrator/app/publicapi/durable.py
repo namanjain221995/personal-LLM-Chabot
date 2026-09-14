@@ -57,7 +57,13 @@ marked `SHIM(Tn)` for the assembler):
   swap the builder without touching the log format (event name + JSON data).
 * T3 router — calls `launch`/`attach`/`Handle`; `render_responses_frame` and
   `ChatRenderer` turn records into wire frames (`: ts-seq=N` for trusted
-  gateway-tagged requests).
+  gateway-tagged requests). WIRED 2026-09-14: every `store: true` generation
+  (sync, stream, background; both dialects) launches here, a gateway re-POST,
+  an Idempotency-Key retry and an SDK retry attach here, and
+  `GET /v1/responses/{id}?stream=true&starting_after=N` follows the log
+  (router.py, "durable foreground runs"). The grammar now includes the item
+  and content-part events and `response.output_text.annotation.added`
+  (`RecordBuilder`, FILE CITATIONS ON A DURABLE RUN).
 """
 from __future__ import annotations
 
@@ -65,6 +71,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 import os
@@ -112,6 +119,10 @@ _MIN_LOOP_S = 0.01
 #: started, and without this it generated for nobody and an SDK retry could
 #: never find it (`find_implicit` needs `orphaned_at`).
 LAUNCH_ATTACH_GRACE_S = 1.0
+#: How long `suspend_all` waits for the stopped runners to record their
+#: attempts before it releases the leases (a SIGTERM budget, not a clock on
+#: any request).
+SUSPEND_RECORD_WAIT_S = 2.0
 #: Queued background rows the dispatcher looks at per engine per pass
 #: (2026-09-14 review P5: one global LIMIT 50 let fifty main rows hide a
 #: router row whose gate was free).
@@ -306,7 +317,10 @@ class ChatRenderer:
             response = data.get("response") or {}
             incomplete = response.get("incomplete_details") or {}
             finish = "length" if incomplete.get("reason") == "max_output_tokens" else "stop"
-            out.append(self.chunks.stop(finish, max_output_tokens=response.get("max_output_tokens")))
+            out.append(self.chunks.stop(
+                finish, max_output_tokens=response.get("max_output_tokens"),
+                annotations=response_annotations(response),
+            ))
             if self.include_usage:
                 usage = response.get("usage")
                 out.append(self.chunks.usage_chunk(None if usage is None else {
@@ -329,6 +343,93 @@ class ChatRenderer:
         if text and tagged:
             text += f": ts-seq={int(seq)}\n\n"
         return text
+
+
+def response_annotations(response: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The annotations a terminal Response snapshot carries on its
+    `output_text` part (empty when none)."""
+    for item in response.get("output") or []:
+        for part in (item or {}).get("content") or []:
+            if (part or {}).get("type") == "output_text":
+                return [dict(a) for a in (part.get("annotations") or [])]
+    return []
+
+
+# --------------------------------------------------------- file citations --
+#
+# FILE CITATIONS ON A DURABLE RUN (2026-09-14, gap 4 of the no-timeout
+# release). A request with files resolves its `file_citation` annotations
+# against the pairs of content the model was actually shown
+# (`apifiles.citations.CitationIndex`, built with the context). A durable run
+# may be settled by a DIFFERENT process than the one that built that index
+# (a deploy in between), so the index travels with the spec as JSON under
+# `extra["file_citations"]` and the settling process rebuilds it. The
+# annotations are then emitted as `response.output_text.annotation.added`
+# records after `output_text.done` and repeated on the part, the item and the
+# terminal snapshot — the same grammar `streaming.responses_sse` frames for a
+# non-durable stream.
+#
+# THE INTERFACE WITH THE FILES TEAM: `CitationIndex.to_json()` /
+# `CitationIndex.from_json(data)` when the class has them; until then the two
+# functions below read and rebuild the index's registered entries through its
+# public `register`/`add_page`/`add_rows`/`add_span` methods, and the
+# round-trip is pinned by a test so a change to the class fails loudly.
+
+FILE_CITATIONS_KEY = "file_citations"
+
+
+def citation_index_to_json(index: Any) -> Optional[Dict[str, Any]]:
+    """A `CitationIndex` as JSON, or None when there is nothing to cite."""
+    if index is None:
+        return None
+    native = getattr(index, "to_json", None)
+    if callable(native):
+        return native()
+    entries = []
+    for label, entry in dict(getattr(index, "_by_label", {}) or {}).items():
+        entries.append({
+            "label": label, "file_id": entry.file_id, "filename": entry.filename, "unit": entry.unit,
+            "numbers": sorted({int(k) for k in entry.numbers}),
+            "row_blocks": [list(block) for block in entry.row_blocks],
+            "spans": [list(span) for span in entry.spans],
+        })
+    return {"entries": entries} if entries else None
+
+
+def citation_index_from_json(data: Mapping[str, Any]) -> Any:
+    from ..apifiles import citations
+
+    native = getattr(citations.CitationIndex, "from_json", None)
+    if callable(native):
+        return native(data)
+    index = citations.CitationIndex()
+    for entry in data.get("entries") or []:
+        label = str(entry["label"])
+        index.register(label, file_id=entry.get("file_id"), filename=str(entry.get("filename") or ""),
+                       unit=str(entry["unit"]))
+        for number in entry.get("numbers") or []:
+            index.add_page(label, int(number))
+        for first, last, page in entry.get("row_blocks") or []:
+            index.add_rows(label, int(first), int(last), int(page))
+        for start, end in entry.get("spans") or []:
+            index.add_span(label, float(start), float(end))
+    return index
+
+
+def file_annotations(extra: Mapping[str, Any], text: str) -> List[Dict[str, Any]]:
+    """The `file_citation` annotations of `text` for a run whose spec carries
+    a citation index. Never raises: a citation that cannot be resolved is
+    plain text, not a failed answer."""
+    data = (extra or {}).get(FILE_CITATIONS_KEY)
+    if not data or not text:
+        return []
+    try:
+        from ..apifiles import citations
+
+        return [dict(a) for a in citations.annotate(text, citation_index_from_json(data)).annotations]
+    except Exception:  # noqa: BLE001
+        log.warning("file citations of a durable run were not computed", exc_info=True)
+        return []
 
 
 class RecordBuilder:
@@ -360,6 +461,28 @@ class RecordBuilder:
     def in_progress(self) -> List[Any]:
         return self._record(events.RESPONSE_IN_PROGRESS, {"response": self.response("in_progress")})
 
+    def item_added(self) -> List[Any]:
+        return self._record(events.RESPONSE_OUTPUT_ITEM_ADDED, events.output_item_added_payload(self.run.spec.item_id))
+
+    def part_added(self) -> List[Any]:
+        return self._record(events.RESPONSE_CONTENT_PART_ADDED, events.content_part_added_payload(self.run.spec.item_id))
+
+    def annotation_added(self, index: int, annotation: Mapping[str, Any]) -> List[Any]:
+        return self._record(
+            events.RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
+            events.annotation_added_payload(self.run.spec.item_id, index, annotation),
+        )
+
+    def part_done(self, text: str, annotations: Sequence[Mapping[str, Any]]) -> List[Any]:
+        return self._record(
+            events.RESPONSE_CONTENT_PART_DONE, events.content_part_done_payload(self.run.spec.item_id, text, annotations)
+        )
+
+    def item_done(self, text: str, annotations: Sequence[Mapping[str, Any]]) -> List[Any]:
+        return self._record(
+            events.RESPONSE_OUTPUT_ITEM_DONE, events.output_item_done_payload(self.run.spec.item_id, text, annotations)
+        )
+
     def delta(self, text: str, tokens: int) -> List[Any]:
         return self._record(
             events.RESPONSE_OUTPUT_TEXT_DELTA,
@@ -373,8 +496,9 @@ class RecordBuilder:
             {"item_id": self.run.spec.item_id, "output_index": 0, "content_index": 0, "text": text},
         )
 
-    def completed(self, **kwargs: Any) -> List[Any]:
-        return self._record(events.RESPONSE_COMPLETED, {"response": self.response("completed", **kwargs)})
+    def completed(self, *, annotations: Sequence[Mapping[str, Any]] = (), **kwargs: Any) -> List[Any]:
+        response = events.with_annotations(self.response("completed", **kwargs), annotations)
+        return self._record(events.RESPONSE_COMPLETED, {"response": response})
 
     def failed(self, *, should_retry: Optional[bool] = None, **kwargs: Any) -> List[Any]:
         payload: Dict[str, Any] = {"response": self.response("failed", **kwargs)}
@@ -524,6 +648,14 @@ class Run:
         self.dispatch_key: Optional[Tuple[str, ...]] = None
         #: Times this run's quarantine was cleared by decoding (review P4).
         self.quarantine_cleared = 0
+        #: Whether `response.output_item.added` / `content_part.added` are in
+        #: the log (they precede the first delta, in the same pending batch).
+        self.item_open = False
+        #: Called once when the run holds its gates (`response.in_progress`)
+        #: or ends, whichever is first: the router's waiter count
+        #: (PUBLIC_API_GATE_MAX_WAITERS) gives its place back there.
+        self._admitted_callbacks: List[Callable[[], None]] = []
+        self.admitted = False
 
     # -- log ------------------------------------------------------------
 
@@ -535,10 +667,35 @@ class Run:
         self._pending.append(record)
         self.pending_bytes += _RECORD_OVERHEAD
 
+    def open_item(self) -> None:
+        """`output_item.added` + `content_part.added`, once, before any text."""
+        if self.item_open:
+            return
+        self.item_open = True
+        self.add_record(self.builder.item_added())
+        self.add_record(self.builder.part_added())
+
+    def on_admitted(self, callback: Callable[[], None]) -> None:
+        """Run `callback` when this run holds its gates or ends (at once if
+        either already happened)."""
+        if self.admitted or self.terminal:
+            with contextlib.suppress(Exception):
+                callback()
+            return
+        self._admitted_callbacks.append(callback)
+
+    def mark_admitted(self) -> None:
+        self.admitted = True
+        callbacks, self._admitted_callbacks = self._admitted_callbacks, []
+        for callback in callbacks:
+            with contextlib.suppress(Exception):
+                callback()
+
     def add_delta(self, text: str, tokens: int = 1) -> None:
         """Coalesce into the last pending delta (≤ one event per flush)."""
         if not text:
             return
+        self.open_item()
         self.pieces.append(text)
         self.generated_tokens += int(tokens)
         if self._pending and self._pending[-1][1] == events.RESPONSE_OUTPUT_TEXT_DELTA:
@@ -661,6 +818,8 @@ class Handle:
                     if run.aborted:
                         raise FollowerAborted()
                     if self.id not in runtime.runs:
+                        if runtime._suspended_under_reader(run):
+                            raise FollowerAborted()
                         break
                     await asyncio.wait({done, aborted}, timeout=max(0.0, next_beat - loop.time()),
                                        return_when=asyncio.FIRST_COMPLETED)
@@ -795,6 +954,12 @@ class RecorderRef:
         return {"name": self.name, "args": dict(self.args)}
 
 
+def handle_for(response_id: str) -> "Handle":
+    """A handle on a run by id, local or not (a stream following a background
+    job it just queued)."""
+    return Handle(RUNTIME, response_id, RUNTIME.runs.get(response_id))
+
+
 #: name → factory(args) → async recorder(row, outcome). T3 registers the
 #: router's ("router.v1") at import; "usage" is the runtime's own.
 _RECORDER_FACTORIES: Dict[str, Callable[[Mapping[str, Any]], "Recorder"]] = {}
@@ -828,8 +993,11 @@ async def default_recorder(row: Dict[str, Any], outcome: streaming.StreamOutcome
     unique generation id makes a second write a no-op. The row fields
     (tokens, status, error) were already written by `durable_store.finish`
     in the settling transaction. Quota counters are not touched: with the
-    owner's PUBLIC_API_ENFORCE_LIMITS=false there is no reservation to settle
-    (ASSEMBLER: T3 may replace this with the router's recorder factory)."""
+    owner's PUBLIC_API_ENFORCE_LIMITS=false there is no reservation to settle.
+    Since 2026-09-14 every run the router launches carries the `router.v1`
+    RecorderRef (router._router_recorder_factory), which settles the quota and
+    the Idempotency-Key too; this recorder remains for a run launched without
+    one (a tool, a test)."""
     from .. import usage as usage_ledger
 
     counted = streaming.models.Usage.from_llm(outcome.usage)
@@ -1089,9 +1257,19 @@ class Runtime:
         closes = [self._close_generation(run) for run in runs]
         if closes:
             await asyncio.gather(*closes, return_exceptions=True)
+        # Let each runner record the attempt the stop just ended BEFORE the
+        # leases go (2026-09-14, found by the foreground restart test, 1 run
+        # in 8): `_record_attempt` writes `metadata.attempts` under the lease,
+        # and a release that won the race turned it into a no-op — the resumed
+        # run then settled with `resume_count: 0` and without the first
+        # attempt's prompt count, under-reporting the re-prefill. Bounded: a
+        # runner stuck on an unreachable database must not hold a SIGTERM.
+        runners = [run.task for run in runs if run.task is not None and not run.task.done()]
+        if runners:
+            await asyncio.wait(runners, timeout=SUSPEND_RECORD_WAIT_S)
         released: Set[str] = set()
         try:
-            await self.flush()
+            await self.flush(runs)
             missing = [run for run in runs if not run.spec_written and run.lease_held]
             for run in missing:
                 await self._write_spec(run)
@@ -1150,6 +1328,7 @@ class Runtime:
         extra: Optional[Mapping[str, Any]] = None,
         slot: Any = None,
         recorder_ref: Optional[RecorderRef] = None,
+        retain_hook: bool = False,
     ) -> Handle:
         """Launch a durable run. Raises ApiError (disk guard) before any row.
 
@@ -1161,7 +1340,11 @@ class Runtime:
         this process — however that happens. The caller releases it only if
         this call raises. `recorder_ref` is the serialisable recorder, stored
         with the spec; with it, a background launch keeps no `on_finish`
-        closure while queued."""
+        closure while queued — unless `retain_hook` asks to keep it within
+        the retained-hook budget anyway (the router does for a request with
+        files: its closure also removes the request's inline file renders,
+        which a recorder rebuilt from JSON cannot), the ref then being the
+        recorder of a run settled elsewhere."""
         if not self.started:
             await self.start()
             if not self.started:
@@ -1218,7 +1401,7 @@ class Runtime:
             self._launched_here.add(run.id)
             if slot is not None:
                 self._slots[run.id] = slot
-            if on_finish is not None and recorder_ref is None:
+            if on_finish is not None and (recorder_ref is None or retain_hook):
                 self._retain_hook(run.id, on_finish, spec)
             if self.dispatch_wake is not None:
                 self.dispatch_wake.set()
@@ -1288,6 +1471,12 @@ class Runtime:
             "slots": len(self._slots), "launched_here": len(self._launched_here),
         }
 
+    async def attach_attempt(
+        self, existing: Mapping[str, Any], caller: Caller, body_sha256: Optional[str]
+    ) -> Handle:
+        """The router's gateway re-attach (`_attach_attempt`, public)."""
+        return await self._attach_attempt(existing, caller, body_sha256)
+
     async def _attach_attempt(
         self, existing: Mapping[str, Any], caller: Caller, body_sha256: Optional[str]
     ) -> Handle:
@@ -1348,6 +1537,16 @@ class Runtime:
         )
         if row is None:
             return None
+        local = self.runs.get(str(row["id"]))
+        if (local is None or local.terminal) and not row.get("background"):
+            # Not running here: resuming it needs its stored spec. A foreground
+            # run whose process CRASHED (no SIGTERM, so no suspend wrote the
+            # spec of an unkeyed run) cannot be resumed, and attaching would
+            # only settle it failed and hand the retry that failure — the
+            # retry launches fresh instead (2026-09-14).
+            stored = await db.run_in_thread(durable_store.has_spec, [str(row["id"])])
+            if str(row["id"]) not in stored:
+                return None
         return await self.attach_row(row, caller)
 
     async def attach_row(self, row: Mapping[str, Any], caller: Caller) -> Handle:
@@ -1367,8 +1566,13 @@ class Runtime:
             if not await db.run_in_thread(durable_store.events_retained, response_id):
                 raise NotStreamable()
             return Handle(self, response_id, None)
-        if not row.get("background") and not (row.get("lease_owner") and row.get("lease_live")):
-            # Suspended, lapsed: resume lazily, here.
+        if (
+            self.started and not self.stopping
+            and not row.get("background") and not (row.get("lease_owner") and row.get("lease_live"))
+        ):
+            # Suspended, lapsed: resume lazily, here — only in a runtime whose
+            # writer and lease loops run (a replay served before `start`, or
+            # during shutdown, follows the log without claiming the run).
             run = await self.claim_and_resume(response_id)
             if run is not None:
                 return Handle(self, response_id, run)
@@ -1435,6 +1639,10 @@ class Runtime:
         run.committed_seq = claim.last_sequence
         if claim.emitted_text:
             run.pieces = [claim.emitted_text]
+        # The item events precede the first delta in the same pending batch,
+        # so a log with a delta has them (an OCR re-read keeps them too: its
+        # discard starts at the first delta).
+        run.item_open = bool(claim.emitted_text) or claim.first_delta_sequence is not None
         run.generated_tokens = claim.generated_tokens
         run.attempt = int(row.get("attempt") or 1)
         run.stalled_attempts = int(row.get("stalled_attempts") or 0)
@@ -1510,12 +1718,20 @@ class Runtime:
 
     # -- the writer -----------------------------------------------------
 
-    async def flush(self) -> bool:
-        """One write-ahead flush of every local run's pending records."""
+    async def flush(self, also: Sequence[Run] = ()) -> bool:
+        """One write-ahead flush of every local run's pending records.
+
+        `also`: runs to flush even if they already left `runs` —
+        `suspend_all` passes the runs it is suspending, whose runners drop
+        them from `runs` as soon as their attempts end (2026-09-14: once the
+        suspend waited for the runners to record their attempts, their last
+        unflushed deltas were otherwise never written, and the resume
+        re-generated text that had been produced)."""
         async with self._lock():
             batches: Dict[str, List[Record]] = {}
             runs: Dict[str, Run] = {}
-            for run in list(self.runs.values()):
+            candidates = {id(run): run for run in list(self.runs.values()) + list(also)}
+            for run in candidates.values():
                 if run.terminal or not run.lease_held or not run._pending:
                     continue
                 if not run.spec_written:
@@ -1686,6 +1902,7 @@ class Runtime:
                 async with contextlib.AsyncExitStack() as stack:
                     if not await self._take_gates(run, stack):
                         continue
+                    run.mark_admitted()
                     if not in_progress_sent:
                         run.add_record(run.builder.in_progress())
                         in_progress_sent = True
@@ -2249,9 +2466,19 @@ class Runtime:
         max_output = applied if applied else run.spec.planned
         records: List[List[Any]] = []
         if status == "completed":
+            if not run.item_open:
+                run.item_open = True
+                records.append(run.builder.item_added())
+                records.append(run.builder.part_added())
+            annotations = file_annotations(run.extra, text)
             records.append(run.builder.text_done(text))
+            for index, annotation in enumerate(annotations):
+                records.append(run.builder.annotation_added(index, annotation))
+            records.append(run.builder.part_done(text, annotations))
+            records.append(run.builder.item_done(text, annotations))
             records.append(run.builder.completed(
                 text=text, usage=usage, max_output_tokens=max_output, finish_reason=finish_reason,
+                annotations=annotations,
             ))
         elif status == "failed":
             failure = error or errors.model_unavailable()
@@ -2336,6 +2563,7 @@ class Runtime:
         run.outcome = outcome
         run.wake()
         run.done.set()
+        run.mark_admitted()
         self._dispatch_state_changed()
         if row is None:
             # Somebody else settled (or owns) it: nothing to record here.
@@ -2352,6 +2580,7 @@ class Runtime:
         this process claimed since) and forget its local accounting."""
         if self.runs.get(run.id) is run:
             self.runs.pop(run.id, None)
+        run.mark_admitted()
         if run.id not in self.runs:
             self.forget_local(run.id)
 
@@ -2457,13 +2686,35 @@ class Runtime:
             self.stats["orphan_cancels"] += 1
             self.stop_run(run, "orphaned")
 
+    def _suspended_under_reader(self, run: Run) -> bool:
+        """A run that left `runs` WITHOUT settling because this process is
+        suspending it (SIGTERM) or lost its lease.
+
+        WHY (found 2026-09-14 by the foreground restart test, 1 run in 3). The
+        runner drops such a run from `runs` as soon as its attempt ends
+        (`_drive`'s finally) — which can be BEFORE `suspend_all` reaches
+        `abort_readers` (it awaits the flush and the lease release first). A
+        follower woken in between saw "not in runs, not aborted" and switched
+        to following remotely, through a runtime that was stopping: no claim,
+        no events, only heartbeats, so the client's connection stayed open
+        until the process exited (holding uvicorn's graceful shutdown) and the
+        gateway never learnt to re-attach. Such a reader must end with
+        `FollowerAborted`, exactly as if `abort_readers` had come first."""
+        if run.terminal:
+            return False
+        return self.stopping or run.aborted or run.stop_reason in ("restart", "shutdown", "lease_lost")
+
     async def follow(self, response_id: str, after: int = 0, *, heartbeat: Optional[float] = None) -> AsyncIterator[Any]:
         """Committed records after `after`, HEARTBEAT on silence; ends after
-        the terminal state. Raises FollowerAborted/FollowerEvicted."""
+        the terminal state. Raises FollowerAborted/FollowerEvicted. A
+        stopping runtime never starts following a run remotely: its reader is
+        aborted so the client re-attaches to the next process."""
         beat = heartbeat_s() if heartbeat is None else float(heartbeat)
         position = int(after)
         while True:
             run = self.runs.get(response_id)
+            if run is None and self.stopping:
+                raise FollowerAborted()
             if run is not None:
                 done = False
                 async for item in self._follow_local(run, position, beat):
@@ -2511,6 +2762,8 @@ class Runtime:
                 if run.terminal:
                     return
                 if run.id not in self.runs:
+                    if self._suspended_under_reader(run):
+                        raise FollowerAborted()
                     yield _SWITCH
                     return
                 try:
@@ -2757,6 +3010,15 @@ class Runtime:
             if settled is not None:
                 out["unread_cancelled"] += 1
                 self.forget_local(rid)
+        with contextlib.suppress(Exception):
+            from . import background
+
+            out["foreground_interrupted"] = len(await db.run_in_thread(
+                functools.partial(
+                    durable_store.fail_interrupted_foreground, created_before=background.PROCESS_STARTED_AT,
+                    error_code=background.INTERRUPTED_CODE, error_message=background.INTERRUPTED_MESSAGE,
+                )
+            ))
         out["events_purged"] = await db.run_in_thread(durable_store.purge_events, retention_s=event_retention_s())
         with contextlib.suppress(Exception):
             counts = await db.run_in_thread(durable_store.durable_counts)

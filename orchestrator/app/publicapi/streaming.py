@@ -74,7 +74,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .. import llm
 from ..config import settings
@@ -1036,22 +1036,49 @@ async def _settle(on_finish: Optional[OnFinish], outcome: StreamOutcome) -> None
 settle = _settle
 
 
+#: What a stream calls with the finished text to get its `file_citation`
+#: annotations (Files design §5.6; `file_inputs.FileRun.note_output`). Never
+#: expected to raise; an empty list means none.
+Annotator = Callable[[str], Sequence[Mapping[str, Any]]]
+
+
+def annotations_for(annotate: Optional[Annotator], text: str) -> List[Dict[str, Any]]:
+    """`annotate(text)`, as a list of dicts; a failure is "no annotations"
+    (a citation that cannot be computed is plain text, never a failed
+    answer)."""
+    if annotate is None:
+        return []
+    try:
+        return [dict(a) for a in (annotate(text) or ())]
+    except Exception:  # noqa: BLE001
+        log.warning("file citations were not computed for a stream", exc_info=True)
+        return []
+
+
 async def responses_sse(
     spec: GenerationSpec,
     *,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
+    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
-    """The CONTRACT §10 lifecycle for one `POST /v1/responses` with `stream: true`.
+    """The CONTRACT §10.2 lifecycle for one `POST /v1/responses` with `stream: true`.
 
         response.created → [response.queued] → response.in_progress
+          → response.output_item.added → response.content_part.added
           → response.output_text.delta (×N) → response.output_text.done
+          → [response.output_text.annotation.added (×K)]
+          → response.content_part.done → response.output_item.done
           → response.completed
 
     with `response.failed` replacing the tail on any engine-side failure.
     `events.SequencedEvents` numbers the frames and refuses a second terminal;
     nothing here emits one from a `finally`, because a generator that is being
     closed cannot yield and a client that has gone is not owed a frame.
+
+    This is the NON-DURABLE stream (`store: false`, or a process whose durable
+    runtime is not running); `durable.RecordBuilder` produces the same grammar
+    from the write-ahead log. `annotate` adds the Files API's citations.
     """
     emitter = events.SequencedEvents(item_id=spec.item_id)
     generation = Generation(spec, heartbeat_s=heartbeat_s)
@@ -1070,6 +1097,9 @@ async def responses_sse(
                 if chunk.kind != TOKEN_KIND:
                     yield emitter.heartbeat()
                     continue
+                if not emitter.item_open:
+                    yield emitter.output_item_added()
+                    yield emitter.content_part_added()
                 pieces.append(chunk.text)
                 yield emitter.output_text_delta(chunk.text)
             failure = attempt_failure(generation)
@@ -1080,15 +1110,26 @@ async def responses_sse(
             outcome.usage = generation.usage
             outcome.finish_reason = generation.finish_reason
             outcome.max_output_tokens = generation.applied_max_output_tokens()
+            if not emitter.item_open:
+                yield emitter.output_item_added()
+                yield emitter.content_part_added()
             yield emitter.output_text_done(text)
+            annotations = annotations_for(annotate, text)
+            for index, annotation in enumerate(annotations):
+                yield emitter.annotation_added(index, annotation)
+            yield emitter.content_part_done(text, annotations)
+            yield emitter.output_item_done(text, annotations)
             yield emitter.completed(
-                _wire(
-                    spec,
-                    "completed",
-                    text=text,
-                    usage=generation.usage,
-                    max_output_tokens=outcome.max_output_tokens,
-                    finish_reason=generation.finish_reason,
+                events.with_annotations(
+                    _wire(
+                        spec,
+                        "completed",
+                        text=text,
+                        usage=generation.usage,
+                        max_output_tokens=outcome.max_output_tokens,
+                        finish_reason=generation.finish_reason,
+                    ),
+                    annotations,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - every failure is a frame
@@ -1117,9 +1158,7 @@ async def responses_sse(
     finally:
         await generation.aclose()
         if not emitter.finished:
-            outcome.client_gone = True
-        if not pieces and outcome.status == "completed" and not outcome.text:
-            outcome.text = ""
+            _cut_short(outcome, generation, pieces)
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
             outcome.ttft_ms = int((generation.first_token_at - started) * 1000)
@@ -1128,6 +1167,28 @@ async def responses_sse(
         if outcome.finish_reason is None:
             outcome.finish_reason = generation.finish_reason
         await _settle(on_finish, outcome)
+
+
+def _cut_short(outcome: StreamOutcome, generation: "Generation", pieces: List[str]) -> None:
+    """The outcome of a non-durable stream closed before its terminal frame:
+    the client left, or the process is shutting down.
+
+    WHY (verifier, 2026-09-14, restart-gateway-TERM). The stream was cut after
+    193 tokens by an orchestrator restart, and its usage row said `ok` with
+    input and output NULL: the outcome still read `completed` (nothing had
+    set another status) and vLLM's usage chunk — the stream's last — never
+    arrived. A generation stopped before its end is `cancelled` (the caller,
+    or the restart, stopped it; the same word the synchronous path and an
+    abandoned stream use), and it is charged the tokens this server can stand
+    behind: the deltas it received and the input it counted
+    (`usage_source: counted_at_stop`)."""
+    outcome.client_gone = True
+    if outcome.status == "completed":
+        outcome.status = "cancelled"
+    outcome.text = outcome.text or "".join(pieces)
+    if outcome.usage is None and generation.usage is None and (generation.streamed_deltas or pieces):
+        with contextlib.suppress(Exception):
+            outcome.usage = generation._counted_usage()
 
 
 # ------------------------------------------ the Chat Completions stream --
@@ -1140,6 +1201,7 @@ async def chat_completions_sse(
     include_usage: bool = False,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
+    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
     """The compatibility dialect: anonymous chunks, then `data: [DONE]`.
 
@@ -1176,6 +1238,7 @@ async def chat_completions_sse(
             yield chunks.stop(
                 chat_finish_reason(generation.finish_reason),
                 max_output_tokens=outcome.max_output_tokens,
+                annotations=annotations_for(annotate, outcome.text),
             )
             if include_usage:
                 yield chunks.usage_chunk(_completion_usage(generation.usage))
@@ -1193,7 +1256,7 @@ async def chat_completions_sse(
     finally:
         await generation.aclose()
         if not chunks.finished:
-            outcome.client_gone = True
+            _cut_short(outcome, generation, pieces)
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
             outcome.ttft_ms = int((generation.first_token_at - started) * 1000)

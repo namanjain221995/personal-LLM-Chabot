@@ -194,8 +194,22 @@ async def start(
     metadata: Optional[Mapping[str, Any]] = None,
     instructions_present: bool = False,
     fingerprint: str = "",
+    recorder_ref: Any = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    retain_hook: bool = False,
+    attempt_token: Optional[str] = None,
+    body_sha256: Optional[str] = None,
 ) -> dict:
     """Persist (if needed), start the detached job, and return the row.
+
+    `recorder_ref`, `extra` and `retain_hook` (2026-09-14) reach only the
+    durable launch (`durable.launch`): the serialisable recorder a process
+    that resumes the job records it with, what the spec carries besides the
+    generation (the file citation index), and whether the `on_finish` closure
+    is kept while queued even with a ref; `attempt_token` and `body_sha256`
+    are the gateway's attempt and the raw body's digest, so a gateway
+    re-POST or an SDK retry of the same request attaches to this job instead
+    of queueing a second one.
 
     Returns the `api_responses` row the route renders as its 202 body. Raises
     `errors.ApiError` (429 `concurrency_limit_exceeded`) when the project is
@@ -233,6 +247,8 @@ async def start(
         return await _start_durable(
             spec, caller=caller, on_finish=on_finish, request_id=request_id, metadata=metadata,
             instructions_present=instructions_present, fingerprint=fingerprint,
+            recorder_ref=recorder_ref, extra=extra, retain_hook=retain_hook,
+            attempt_token=attempt_token, body_sha256=body_sha256,
         )
     existing = await db.run_in_thread(db.get_api_response, spec.response_id, project_id)
     slot = contextlib.ExitStack()
@@ -317,6 +333,11 @@ async def _start_durable(
     metadata: Optional[Mapping[str, Any]],
     instructions_present: bool,
     fingerprint: str,
+    recorder_ref: Any = None,
+    extra: Optional[Mapping[str, Any]] = None,
+    retain_hook: bool = False,
+    attempt_token: Optional[str] = None,
+    body_sha256: Optional[str] = None,
 ) -> dict:
     """The durable background launch: row + spec, dispatched when its gate has
     room. `on_finish` runs only if THIS process settles the job; a process
@@ -344,7 +365,7 @@ async def _start_durable(
                 )
         raise
     try:
-        await durable.launch(
+        handle = await durable.launch(
             spec,
             caller=durable.caller_of(caller),
             background=True,
@@ -356,11 +377,18 @@ async def _start_durable(
             instructions_present=instructions_present,
             fingerprint=fingerprint,
             slot=lease,
+            recorder_ref=recorder_ref,
+            extra=extra,
+            retain_hook=retain_hook,
+            attempt_token=attempt_token,
+            body_sha256=body_sha256,
         )
     except BaseException:
         lease.release()
         raise
-    row = await db.run_in_thread(db.get_api_response, spec.response_id, caller.project_id)
+    # The handle's id, not the spec's: a gateway re-POST that raced its first
+    # attempt is attached to that attempt's job, and the 202 names it.
+    row = await db.run_in_thread(db.get_api_response, handle.id, caller.project_id)
     return row or {}
 
 
@@ -795,13 +823,20 @@ async def repair_if_orphaned(row: Optional[dict]) -> Optional[dict]:
     every such poller passes through, so the repair happens there, lazily,
     for exactly the row being asked about.
 
-    Only a row that is background, still open, not running in this process,
-    NOT durable (a `resumable` row is resumed by a lease sweep, never declared
-    dead on sight), and created before this process started. Anything else is
-    returned as is. The webhook fires for a row this closes: its job will
-    never reach `_settle` to send it (design build_plan T2).
+    Only a row that is still open, not running in this process, NOT durable
+    (a `resumable` row is resumed by a lease sweep, never declared dead on
+    sight), and created before this process started. Anything else is
+    returned as is. The webhook fires for a background row this closes: its
+    job will never reach `_settle` to send it (design build_plan T2).
+
+    FOREGROUND ROWS TOO (2026-09-14, verifier finding). A non-durable
+    synchronous or streaming request (`store: false`) cut by a restart left
+    its row `queued` for ever, because this used to return early for every
+    row that was not background. Such a row is closed the same way (no
+    webhook: a foreground response has none); the durable runtime's sweep
+    closes the ones nobody reads (`durable_store.fail_interrupted_foreground`).
     """
-    if not row or not row.get("background") or row.get("resumable"):
+    if not row or row.get("resumable"):
         return row
     if str(row.get("status") or "") not in OPEN_STATUSES:
         return row
@@ -818,7 +853,7 @@ async def repair_if_orphaned(row: Optional[dict]) -> Optional[dict]:
         error_code=INTERRUPTED_CODE,
         error_message=INTERRUPTED_MESSAGE,
     )
-    if updated is not None:
+    if updated is not None and updated.get("background"):
         await _notify(updated, str(updated.get("workspace_id") or ""))
     return updated or row
 

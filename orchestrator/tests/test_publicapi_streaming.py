@@ -157,20 +157,31 @@ def test_the_stream_follows_the_documented_lifecycle_with_sequence_numbers(
 
     records = events.parse_frames(_frames())
 
+    # CONTRACT §10.2 (2026-09-14): the item and content-part events both
+    # SDKs' stream() helpers build their snapshot from.
     assert [r["event"] for r in records] == [
         "response.created",
         "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.delta",
         "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
         "response.completed",
     ]
     # Starts at 1, increases by exactly 1 — a client detects a dropped or
     # reordered frame with this, and cannot if we ever skip.
-    assert [r["data"]["sequence_number"] for r in records] == [1, 2, 3, 4, 5, 6, 7]
+    assert [r["data"]["sequence_number"] for r in records] == list(range(1, 12))
     assert [r["data"]["type"] for r in records] == [r["event"] for r in records]
-    assert records[-2]["data"]["text"] == "Because of Rayleigh scattering."
+    done = next(r for r in records if r["event"] == "response.output_text.done")
+    assert done["data"]["text"] == "Because of Rayleigh scattering."
+    assert records[-3]["data"]["part"] == {
+        "type": "output_text", "text": "Because of Rayleigh scattering.", "annotations": [],
+    }
+    assert records[-2]["data"]["item"]["content"][0]["text"] == "Because of Rayleigh scattering."
     # Usage on the terminal event only, so a client cannot be tempted to sum
     # deltas into a bill.
     assert records[0]["data"]["response"]["usage"] is None
@@ -299,6 +310,8 @@ def test_a_client_disconnect_closes_the_engine_generator(engine, measured):
         # that navigates away does to a StreamingResponse.
         assert "response.created" in await frames.__anext__()
         assert "response.in_progress" in await frames.__anext__()
+        assert "response.output_item.added" in await frames.__anext__()
+        assert "response.content_part.added" in await frames.__anext__()
         assert "response.output_text.delta" in await frames.__anext__()
         await frames.aclose()
         await asyncio.sleep(0.05)
@@ -704,7 +717,7 @@ def test_a_silent_stream_keeps_its_heartbeat_for_as_long_as_the_guard_sees_no_pr
 
     records = events.parse_frames(wire)
     assert records[-1]["event"] == "response.completed"
-    assert records[-2]["data"]["text"] == "late answer"
+    assert next(r for r in records if r["event"] == "response.output_text.done")["data"]["text"] == "late answer"
     assert wire.count(": ping") >= 10 and guard.ticks >= 10
     assert fake.closed
 
