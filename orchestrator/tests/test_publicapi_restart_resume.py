@@ -117,11 +117,19 @@ def test_a_run_suspended_in_a_is_claimed_by_b_within_two_seconds_and_its_text_co
     assert final["status"] == "completed" and final["stalled_attempts"] == 0 and final["attempt"] == 2
     # Settled by B, whose process never saw the request: its recorder writes
     # the ONE usage row, with input counted once and the re-prefill recorded.
-    with db.connection() as con:
-        usage_rows = con.execute(
-            "SELECT input_tokens, output_tokens, meta FROM usage_events WHERE generation_id = %s",
-            (final["id"],),
-        ).fetchall()
+    # The settling recorder writes after the terminal event is visible; on a
+    # slow CI runner that row can land a moment after stop() returns, so wait
+    # for it (bounded) instead of reading once.
+    deadline = time.monotonic() + 10
+    while True:
+        with db.connection() as con:
+            usage_rows = con.execute(
+                "SELECT input_tokens, output_tokens, meta FROM usage_events WHERE generation_id = %s",
+                (final["id"],),
+            ).fetchall()
+        if usage_rows or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
     assert len(usage_rows) == 1
     assert usage_rows[0]["output_tokens"] == 200 and usage_rows[0]["input_tokens"] == 17
     assert usage_rows[0]["meta"]["settled_by"] == "durable"
