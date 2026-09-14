@@ -393,7 +393,12 @@ jobs:
           TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/techsara_orchestrator_test
         # -rs lists every skip with its reason, so a suite that stops running
         # for real is visible in the log instead of hiding in a count.
-        run: python -m pytest tests -q -rs
+        run: |
+          uname -a
+          cat /proc/sys/kernel/core_pattern || true
+          cat /sys/kernel/security/lsm || true
+          python -c "import app.apifiles.extract_worker as w; print('landlock_abi', w.landlock_abi())"
+          timeout -s INT 900 python -m pytest -v -p no:cacheprovider -o faulthandler_timeout=60 tests/test_api_soak_tool.py tests/test_apifiles_*.py
       - name: The renderer suites ran (no skip hides them)
         working-directory: orchestrator
         run: |
