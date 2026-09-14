@@ -37,7 +37,7 @@ def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
 
 
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
-    with db.connection() as con:
+    with db.read_connection() as con:
         return con.execute("SELECT * FROM users WHERE id = %s", (user_id,)).fetchone()
 
 
@@ -76,7 +76,7 @@ def set_status(user_id: int, status: str) -> None:
 def touch_last_active(user_id: int) -> None:
     """Coarse activity stamp for the Members page. Writes at most once a
     minute per user — this rides the request path and must stay cheap."""
-    with db.connection() as con:
+    with db.read_connection() as con:
         con.execute(
             """UPDATE users SET last_active_at = now()
                WHERE id = %s
@@ -118,7 +118,7 @@ def membership(user_id: int) -> Optional[Dict[str, Any]]:
     Carries both feature layers (V17) so `Principal` can resolve tool access
     in the SAME round trip that already resolves the role — the /chat gate
     reads it on every request and must not cost a second query."""
-    with db.connection() as con:
+    with db.read_connection() as con:
         return con.execute(
             """SELECT m.workspace_id, m.user_id, m.role, m.created_at AS member_since,
                       m.features AS member_features,
@@ -457,7 +457,7 @@ def create_session(
 
 
 def get_session(session_id: str) -> Optional[Dict[str, Any]]:
-    with db.connection() as con:
+    with db.read_connection() as con:
         return con.execute(
             "SELECT * FROM auth_sessions WHERE id = %s", (session_id,)
         ).fetchone()

@@ -17,8 +17,9 @@ THE FOUR CORRECTNESS RULES (design H, "store correctness"):
    heartbeat's counters are never used as a resume point.
 3. **ON CONFLICT DO NOTHING is a lease loss, for that job only.** If two
    owners ever write the same sequence number (a split brain after a lapsed
-   lease), the loser's insert returns fewer rows than it sent, its SAVEPOINT
-   is rolled back, and it stops. Every other job in the same flush commits.
+   lease), the loser's insert returns fewer rows than it sent, the rows it
+   did insert are taken back inside the flush's transaction, and it stops.
+   Every other job in the same flush commits.
 4. **Terminal is atomic.** The terminal events, the status, the counters and
    the deletion of the spec and blob references are ONE transaction guarded by
    the lease (`finish`). A reader can never see `response.completed` on a row
@@ -151,10 +152,120 @@ def _row(row: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     return None if row is None else db._api_row(dict(row))  # type: ignore[attr-defined]
 
 
+#: A `\\u0000` escape json.dumps wrote for a NUL: an ODD run of backslashes
+#: before `u0000` (an even run is literal backslashes followed by the text
+#: "u0000", e.g. an answer that explains JSON escapes).
+_NUL_ESCAPE = re.compile(r"(\\+)u0000")
+
+
+def _drop_nul_escape(match: "re.Match[str]") -> str:
+    slashes = match.group(1)
+    return slashes[:-1] if len(slashes) % 2 else match.group(0)
+
+
 def _clean_json(value: Dict[str, Any]) -> str:
     """JSON for a jsonb column. PostgreSQL jsonb refuses \\u0000 — a model can
-    emit a NUL — so it is stripped here rather than failing the whole job."""
-    return json.dumps(value, ensure_ascii=False, default=str).replace("\\u0000", "")
+    emit a NUL — so it is stripped here rather than failing the whole job.
+
+    Only a real NUL escape is removed (verifier fix, 2026-09-14): the plain
+    `.replace("\\u0000", "")` also cut the text `\\u0000` out of an answer
+    that contained it, leaving an invalid escape (`::jsonb` refused the whole
+    record, so the run lost its lease on every attempt) or a silently
+    different character (`\\u0000n` became a newline)."""
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    return _NUL_ESCAPE.sub(_drop_nul_escape, text) if "u0000" in text else text
+
+
+#: A terminal record carries its own copy of the answer only while the answer
+#: is shorter than this many characters (2026-09-14, database-speed round).
+#: A longer answer is stored ONCE, as the deltas every client already
+#: streamed: `output_text.done`, `content_part.done`, `output_item.done` and
+#: `response.completed` (or `response.failed`) used to repeat it four more
+#: times in the one finish transaction — measured 527 ms, 5.8 MB of WAL and
+#: 5.6 MB of TOAST for a 1M-token answer, all under FOR UPDATE on the
+#: response row. Such a record stores "" in every slot that held the answer,
+#: plus the private `TEXT_KEY` marker; `list_events` and `poll_many` put the
+#: answer back from the deltas before anything renders the record.
+TERMINAL_TEXT_INLINE_MAX_CHARS = 1024
+#: {"paths": [[key or index, ...], ...], "strip": [bool, ...], "chars": n}.
+#: `strip` marks a slot that held `text.strip()` (the Response model strips
+#: surrounding whitespace). Private keys never reach a frame
+#: (`durable.public_data`).
+TEXT_KEY = "_text"
+
+
+def _externalise_text(data: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """A copy of a terminal record's data with every string slot equal to
+    `text` (or to `text.strip()`) emptied and listed under TEXT_KEY; `data`
+    itself is not changed. Equality decides, not position: whatever held
+    exactly the answer gets exactly the answer back."""
+    stripped = text.strip()
+    paths: List[List[Any]] = []
+    strips: List[bool] = []
+
+    def walk(node: Any, path: List[Any]) -> Any:
+        if isinstance(node, dict):
+            return {k: walk(v, path + [k]) for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(v, path + [i]) for i, v in enumerate(node)]
+        if isinstance(node, str) and len(node) >= TERMINAL_TEXT_INLINE_MAX_CHARS:
+            if node == text or node == stripped:
+                paths.append(path)
+                strips.append(node != text)
+                return ""
+        return node
+
+    copy = walk(data, [])
+    if paths:
+        copy[TEXT_KEY] = {"paths": paths, "strip": strips, "chars": len(text.replace("\x00", ""))}
+    return copy
+
+
+def _internalise_text(data: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Put the answer back into the slots `_externalise_text` emptied (in
+    place) and drop the marker."""
+    marker = data.pop(TEXT_KEY, None)
+    if not isinstance(marker, dict):
+        return data
+    paths = list(marker.get("paths") or [])
+    strips = list(marker.get("strip") or [False] * len(paths))
+    for path, strip in zip(paths, strips):
+        node: Any = data
+        try:
+            for key in path[:-1]:
+                node = node[key]
+            node[path[-1]] = text.strip() if strip else text
+        except (KeyError, IndexError, TypeError):
+            log.error("durable log: a terminal record's text slot %r is missing", path)
+    return data
+
+
+def _delta_text(con: Any, response_id: str, before_sequence: int) -> str:
+    """The answer as the log holds it: every delta before `before_sequence`,
+    in order — one range scan of the primary key."""
+    row = con.execute(
+        "SELECT COALESCE(string_agg(data->>'delta', '' ORDER BY sequence_number), '') AS text "
+        "FROM api_response_events WHERE response_id = %s AND sequence_number < %s AND event = %s",
+        (response_id, int(before_sequence), DELTA_EVENT),
+    ).fetchone()
+    return str(row["text"] or "")
+
+
+def _rehydrate(con: Any, response_id: str, records: List[Tuple[int, str, Dict[str, Any]]]) -> List[Tuple[int, str, Dict[str, Any]]]:
+    """Fill the answer back into the terminal records of one run's page."""
+    marked = [r for r in records if TEXT_KEY in r[2]]
+    if not marked:
+        return records
+    text = _delta_text(con, response_id, min(r[0] for r in marked))
+    for record in marked:
+        chars = (record[2].get(TEXT_KEY) or {}).get("chars")
+        if chars is not None and int(chars) != len(text):
+            log.error(
+                "durable log %s: the deltas hold %d characters, the terminal record was written for %s",
+                response_id, len(text), chars,
+            )
+        _internalise_text(record[2], text)
+    return records
 
 
 @dataclass
@@ -460,54 +571,132 @@ def mark_followed(response_id: str) -> None:
 
 
 def append(owner: str, batches: Mapping[str, Sequence[EventRecord]]) -> AppendResult:
-    """Commit each job's records in its own SAVEPOINT (design H).
+    """Commit every job's records of one flush (design H).
 
-    Per job: FOR SHARE on its row while the lease is this owner's, then an
-    INSERT ... ON CONFLICT DO NOTHING RETURNING. A missing row (deleted
-    project, cascaded), a lease that moved, a conflicting sequence number or
-    any database error for that job rolls back ITS savepoint and marks it
-    lost; the others commit in the same transaction."""
+    FAST PATH (2026-09-14, database-speed round): ONE statement for all the
+    jobs. It takes FOR SHARE on each job's row while the lease is this
+    owner's (rule 2 unchanged: a claim's FOR UPDATE still waits for this
+    transaction), in id order, and inserts the records of the held rows with
+    ON CONFLICT DO NOTHING RETURNING. A job whose row is not held (a missing
+    row, a lease that moved) inserted nothing and is lost; a held job that
+    got back fewer rows than it sent (a split brain, rule 3) has the rows it
+    did insert deleted again in this same transaction before COMMIT, and is
+    lost; every other job commits. The old shape cost 1 + 4N statements per
+    flush (SELECT 1, then SAVEPOINT / SELECT FOR SHARE / INSERT / RELEASE per
+    job): measured 2.1 ms p50 for 1 run and 7.0 ms for 10.
+
+    Any database ERROR in the fast path (one job's record the server
+    refuses) rolls the whole attempt back and replays the flush through the
+    per-job SAVEPOINT path, so one bad job still never fails the others."""
     result = AppendResult()
-    if not batches:
+    jobs = {rid: list(records) for rid, records in batches.items() if records}
+    if not jobs:
         return result
+    ids = sorted(jobs)
+    rids: List[str] = []
+    seqs: List[int] = []
+    names: List[str] = []
+    datas: List[str] = []
+    for rid in ids:
+        for record in jobs[rid]:
+            rids.append(rid)
+            seqs.append(int(record[0]))
+            names.append(str(record[1]))
+            datas.append(_clean_json(record[2]))
     with db.connection() as con:
-        con.execute("SELECT 1")
-        for response_id, records in batches.items():
-            if not records:
-                continue
-            con.execute("SAVEPOINT durable_job")
-            try:
-                held = con.execute(
-                    "SELECT id FROM api_responses WHERE id = %s AND lease_owner = %s "
-                    "AND status IN ('queued', 'in_progress') FOR SHARE",
-                    (response_id, owner),
-                ).fetchone()
-                if held is None:
-                    con.execute("ROLLBACK TO SAVEPOINT durable_job")
-                    result.lost.add(response_id)
-                    continue
-                seqs = [int(r[0]) for r in records]
-                names = [str(r[1]) for r in records]
-                datas = [_clean_json(r[2]) for r in records]
-                inserted = con.execute(
-                    """
+        try:
+            rows = con.execute(
+                """
+                WITH held AS MATERIALIZED (
+                    SELECT r.id FROM api_responses r
+                    WHERE r.id = ANY(%s::text[]) AND r.lease_owner = %s
+                      AND r.status IN ('queued', 'in_progress')
+                    ORDER BY r.id
+                    FOR SHARE OF r
+                ), ins AS (
                     INSERT INTO api_response_events (response_id, sequence_number, event, data)
-                    SELECT %s, s, e, d::jsonb FROM unnest(%s::int[], %s::text[], %s::text[]) AS t(s, e, d)
+                    SELECT t.rid, t.s, t.e, t.d::jsonb
+                    FROM unnest(%s::text[], %s::int[], %s::text[], %s::text[]) AS t(rid, s, e, d)
+                    WHERE t.rid IN (SELECT id FROM held)
                     ON CONFLICT (response_id, sequence_number) DO NOTHING
-                    RETURNING sequence_number
-                    """,
-                    (response_id, seqs, names, datas),
-                ).fetchall()
-                if len(inserted) != len(records):
-                    con.execute("ROLLBACK TO SAVEPOINT durable_job")
-                    result.lost.add(response_id)
-                    continue
-                con.execute("RELEASE SAVEPOINT durable_job")
-                result.committed[response_id] = sorted(int(r["sequence_number"]) for r in inserted)
-            except psycopg.Error:
-                log.warning("durable append failed for %s; isolating the job", response_id, exc_info=True)
+                    RETURNING response_id, sequence_number
+                )
+                SELECT id AS response_id, NULL::int AS sequence_number FROM held
+                UNION ALL
+                SELECT response_id, sequence_number FROM ins
+                """,
+                (ids, owner, rids, seqs, names, datas),
+            ).fetchall()
+        except psycopg.Error:
+            log.warning("durable append: one statement failed; isolating each job", exc_info=True)
+            con.rollback()
+            return _append_isolated(con, owner, jobs)
+        held: Set[str] = set()
+        inserted: Dict[str, List[int]] = {}
+        for row in rows:
+            rid = str(row["response_id"])
+            if row["sequence_number"] is None:
+                held.add(rid)
+            else:
+                inserted.setdefault(rid, []).append(int(row["sequence_number"]))
+        for rid in ids:
+            got = inserted.get(rid, [])
+            if rid in held and len(got) == len(jobs[rid]):
+                result.committed[rid] = sorted(got)
+                continue
+            if got:
+                # Rule 3: a conflicting sequence number. The rows this job
+                # did insert are this transaction's own; take them back so
+                # nothing of the loser's batch commits.
+                con.execute(
+                    "DELETE FROM api_response_events WHERE response_id = %s AND sequence_number = ANY(%s::int[])",
+                    (rid, got),
+                )
+            result.lost.add(rid)
+    return result
+
+
+def _append_isolated(con: Any, owner: str, jobs: Mapping[str, Sequence[EventRecord]]) -> AppendResult:
+    """The per-job SAVEPOINT shape (the pre-2026-09-14 `append`): each job's
+    FOR SHARE + INSERT in its own savepoint, so a database error for one job
+    rolls back only that job. Runs on `con` in a fresh transaction."""
+    result = AppendResult()
+    con.execute("SELECT 1")
+    for response_id in sorted(jobs):
+        records = jobs[response_id]
+        con.execute("SAVEPOINT durable_job")
+        try:
+            held = con.execute(
+                "SELECT id FROM api_responses WHERE id = %s AND lease_owner = %s "
+                "AND status IN ('queued', 'in_progress') FOR SHARE",
+                (response_id, owner),
+            ).fetchone()
+            if held is None:
                 con.execute("ROLLBACK TO SAVEPOINT durable_job")
                 result.lost.add(response_id)
+                continue
+            seqs = [int(r[0]) for r in records]
+            names = [str(r[1]) for r in records]
+            datas = [_clean_json(r[2]) for r in records]
+            inserted = con.execute(
+                """
+                INSERT INTO api_response_events (response_id, sequence_number, event, data)
+                SELECT %s, s, e, d::jsonb FROM unnest(%s::int[], %s::text[], %s::text[]) AS t(s, e, d)
+                ON CONFLICT (response_id, sequence_number) DO NOTHING
+                RETURNING sequence_number
+                """,
+                (response_id, seqs, names, datas),
+            ).fetchall()
+            if len(inserted) != len(records):
+                con.execute("ROLLBACK TO SAVEPOINT durable_job")
+                result.lost.add(response_id)
+                continue
+            con.execute("RELEASE SAVEPOINT durable_job")
+            result.committed[response_id] = sorted(int(r["sequence_number"]) for r in inserted)
+        except psycopg.Error:
+            log.warning("durable append failed for %s; isolating the job", response_id, exc_info=True)
+            con.execute("ROLLBACK TO SAVEPOINT durable_job")
+            result.lost.add(response_id)
     return result
 
 
@@ -527,7 +716,30 @@ def list_events(response_id: str, after: int = 0, limit: int = 1000) -> List[Eve
             "WHERE response_id = %s AND sequence_number > %s ORDER BY sequence_number LIMIT %s",
             (response_id, int(after), int(limit)),
         ).fetchall()
-    return [(int(r["sequence_number"]), str(r["event"]), dict(r["data"])) for r in rows]
+        records = [(int(r["sequence_number"]), str(r["event"]), dict(r["data"])) for r in rows]
+        return _rehydrate(con, response_id, records)
+
+
+def log_outcome(response_id: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """What a synchronous result rebuilt from the log needs, in ONE statement:
+    the answer (every delta, in order) and the data of the last
+    `response.failed` record (None when there is none). Replaces fetching
+    every event row into Python (2026-09-14: 509 ms measured for a
+    100,000-event log, `durable.outcome_from_log`)."""
+    with db.connection() as con:
+        row = con.execute(
+            """
+            SELECT
+              (SELECT COALESCE(string_agg(data->>'delta', '' ORDER BY sequence_number), '')
+                 FROM api_response_events WHERE response_id = %s AND event = %s) AS text,
+              (SELECT data FROM api_response_events
+                 WHERE response_id = %s AND event = 'response.failed'
+                 ORDER BY sequence_number DESC LIMIT 1) AS failed
+            """,
+            (response_id, DELTA_EVENT, response_id),
+        ).fetchone()
+    failed = row["failed"]
+    return str(row["text"] or ""), (None if failed is None else dict(failed))
 
 
 def poll_many(after_by_id: Mapping[str, int], *, limit_per: int = 500) -> Dict[str, PollResult]:
@@ -566,6 +778,13 @@ def poll_many(after_by_id: Mapping[str, int], *, limit_per: int = 500) -> Dict[s
             out[rid] = entry
         if r["sequence_number"] is not None:
             entry.events.append((int(r["sequence_number"]), str(r["event"]), dict(r["data"])))
+    marked = [rid for rid, entry in out.items() if any(TEXT_KEY in e[2] for e in entry.events)]
+    if marked:
+        # Only a poll that reaches a long answer's terminal records (once per
+        # run per follower) pays for this second, range-scan statement.
+        with db.connection() as con:
+            for rid in marked:
+                out[rid].events = _rehydrate(con, rid, out[rid].events)
     return out
 
 
@@ -596,6 +815,12 @@ _FINISH_COLUMNS = frozenset({
 })
 
 
+def _stored_data(record: EventRecord, text: Optional[str]) -> Dict[str, Any]:
+    if text is None or len(text) < TERMINAL_TEXT_INLINE_MAX_CHARS or record[1] == DELTA_EVENT:
+        return record[2]
+    return _externalise_text(record[2], text)
+
+
 def finish(
     owner: Optional[str],
     response_id: str,
@@ -603,12 +828,18 @@ def finish(
     fields: Mapping[str, Any],
     *,
     metadata: Optional[Mapping[str, Any]] = None,
+    text: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Settle ONCE: terminal records + status + counters + spec deletion, in
     one transaction under the lease. `owner=None` settles a run whose lease is
     NULL or lapsed (the suspended-unread TTL, a revoked key's suspended run).
     Returns the settled row, or None when somebody else owns or already
-    settled it."""
+    settled it.
+
+    `text`: the whole answer, which MUST equal the run's logged deltas in
+    order (the runner builds it from exactly those pieces). When it is at
+    least TERMINAL_TEXT_INLINE_MAX_CHARS long, the non-delta records store
+    it by reference (see `_externalise_text`); readers get it back."""
     status = str(fields.get("status") or "")
     if status not in TERMINAL_STATUSES:
         raise ValueError("finish needs a terminal status")
@@ -638,7 +869,7 @@ def finish(
                     response_id,
                     [int(r[0]) for r in records],
                     [str(r[1]) for r in records],
-                    [_clean_json(r[2]) for r in records],
+                    [_clean_json(_stored_data(r, text)) for r in records],
                 ),
             ).fetchall()
             if len(inserted) != len(records):
@@ -893,32 +1124,80 @@ def still_authorised_shim(key_ids: Sequence[str], model: Optional[str] = None) -
 # ------------------------------------------------------------- retention --
 
 
+#: Runs whose stored log `purge_events` may delete now (see there).
+_PURGE_DUE_SQL = (
+    db._RETAINED_LOG_IDS_CTE
+    + " SELECT r.id FROM logs JOIN api_responses r ON r.id = logs.response_id"
+    f" WHERE (r.status IN {db._API_TERMINAL_SQL}"
+    "         AND r.completed_at < now() - make_interval(secs => %s))"
+    f"    OR (r.expires_at IS NOT NULL AND r.expires_at < now() AND {db._API_EXPIRED_PRUNABLE_SQL})"
+    " LIMIT %s"
+)
+
+
+#: Due runs per list read: the DELETE below bounds rows, not runs, so a long
+#: list costs nothing extra and many short runs drain in few statements.
+_PURGE_DUE_IDS = 500
+
+#: Up to %s events of the listed runs, through the event primary key.
+_PURGE_DELETE_SQL = (
+    "DELETE FROM api_response_events e USING ("
+    " SELECT response_id, sequence_number FROM api_response_events"
+    " WHERE response_id = ANY(%s::text[]) LIMIT %s) d"
+    " WHERE e.response_id = d.response_id AND e.sequence_number = d.sequence_number"
+)
+
+
 def purge_events(*, retention_s: float, batch: int = 5000, max_batches: int = 200) -> int:
     """Delete stored events of runs terminal for longer than the retention
-    (PUBLIC_API_EVENT_RETENTION_S, 3,600 s) and of expired rows, in ctid
-    batches of `batch` — one short statement each, never one DELETE that
-    walks a million-event run under statement_timeout (design L). Also drops
-    specs and blob references a crash left on terminal rows. Returns the
-    number of events deleted. ASSEMBLER: T1's prune_api_platform calls this
-    (or inlines it) before deleting api_responses rows."""
+    (PUBLIC_API_EVENT_RETENTION_S, 3,600 s) and of expired prunable rows, in
+    statements of at most `batch` rows each — never one DELETE that walks a
+    million-event run under statement_timeout (design L); `max_batches`
+    bounds the DELETE statements of one call. Also drops specs and blob
+    references a crash left on terminal rows. Returns the events deleted.
+
+    INDEX-DRIVEN (2026-09-14, database-speed round). The due set used to be
+    a ctid batch whose join to api_responses carried an OR predicate, and
+    PostgreSQL planned it as a sequential scan of the WHOLE log with a
+    response probe per event: every 30 s sweep read every retained event
+    even with nothing due (measured 6.9 ms at 54k events, 748 ms at 5.8M,
+    196,863 cold buffers per call). Now the runs that still HAVE a log come
+    from a loose index scan of the event primary key
+    (`db._RETAINED_LOG_IDS_CTE`), each is checked on its response row, and a
+    due run is deleted by sequence-number range
+    (`db._delete_response_events_batched`). The cost follows the runs with a
+    retained log, not the events.
+
+    Expired rows follow `db._API_EXPIRED_PRUNABLE_SQL`, like the 30-min
+    prune: an OPEN resumable run's log is never purged for its expiry — its
+    runner settles it first (T1 review, 2026-09-14)."""
+    size = max(1, int(batch))
+    budget = [max(1, int(max_batches))]
     deleted = 0
-    for _ in range(max(1, max_batches)):
+    while budget[0] > 0:
         with db.connection() as con:
-            cur = con.execute(
-                """
-                DELETE FROM api_response_events WHERE ctid = ANY(ARRAY(
-                    SELECT e.ctid FROM api_response_events e
-                    JOIN api_responses r ON r.id = e.response_id
-                    WHERE (r.status IN ('completed', 'failed', 'cancelled')
-                           AND r.completed_at < now() - make_interval(secs => %s))
-                       OR (r.expires_at IS NOT NULL AND r.expires_at < now())
-                    LIMIT %s))
-                """,
-                (float(retention_s), int(batch)),
-            )
-            count = int(cur.rowcount or 0)
-        deleted += count
-        if count < batch:
+            ids = [
+                str(r["id"])
+                for r in con.execute(_PURGE_DUE_SQL, (float(retention_s), _PURGE_DUE_IDS)).fetchall()
+            ]
+        if not ids:
+            break
+        # ONE bounded statement for the whole due list, repeated while it
+        # fills (verifier fix, 2026-09-14): a statement per RUN capped the
+        # sweep at `max_batches` runs per call — measured 152 calls (76 min
+        # of 30 s sweeps) to drain 30,000 short runs that the ctid form
+        # purged in one call. The inner SELECT is an index scan of the event
+        # primary key over the listed ids that stops at `size` rows.
+        progressed = 0
+        while budget[0] > 0:
+            budget[0] -= 1
+            with db.connection() as con:
+                count = max(0, int(con.execute(_PURGE_DELETE_SQL, (ids, size)).rowcount or 0))
+            progressed += count
+            if count < size:
+                break
+        deleted += progressed
+        if progressed == 0:
             break
     with db.connection() as con:
         con.execute(
@@ -1016,6 +1295,7 @@ __all__ = [
     "get_spec",
     "has_spec",
     "list_events",
+    "log_outcome",
     "mark_durable",
     "mark_followed",
     "poll_many",

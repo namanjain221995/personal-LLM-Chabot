@@ -145,7 +145,8 @@ def test_a_misspelling_falls_back_to_fuzzy(fake_warehouse):
     con = fake_warehouse(
         _FakeCon(
             like_rows={},  # nothing matches the literal pattern
-            fuzzy_rows=[("Lead", "Samyukth challa", 0.96)],
+            # (index of the asked name, object, stored name, similarity)
+            fuzzy_rows=[(0, "Lead", "Samyukth challa", 0.96)],
         )
     )
     found = sqleng.resolve_people("tell me about samyukth chala")

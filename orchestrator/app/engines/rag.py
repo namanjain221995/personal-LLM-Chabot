@@ -22,7 +22,7 @@ from . import DIAGRAM_INSTRUCTION, NO_DATA_MESSAGE, recent_turns
 from .. import llm
 from ..config import settings
 from ..core.citations import build_citations
-from ..embedding_index import open_compatible_table, validate_query_dimension
+from ..embedding_index import connect as lance_connect, open_compatible_table, validate_query_dimension
 from ..model_capabilities import RerankerBackend
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -60,9 +60,7 @@ async def retrieve(query: str, top_k: Optional[int] = None) -> List[dict]:
     """
 
     def _open():
-        import lancedb  # lazy
-
-        db = lancedb.connect(settings.lancedb_dir)
+        db = lance_connect(settings.lancedb_dir)
         return open_compatible_table(
             db,
             settings.lancedb_dir,

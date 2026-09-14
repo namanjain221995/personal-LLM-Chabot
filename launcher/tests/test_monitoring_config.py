@@ -416,6 +416,51 @@ class DataStoreMonitoringTests(unittest.TestCase):
         self.assertIn("postgres-exporter:9187", prom)
         self.assertIn("data-stores-exporter:9836", prom)
 
+    # 2026-09-14 (dbperf2 observability): checkpoints and WAL had been invisible
+    # since stat_bgwriter was turned off, and pg_long_running_transactions read
+    # 9-11 with the current epoch as its "age" for 14 days.
+    def test_postgres_exporter_loads_the_pg18_custom_queries(self):
+        block = self.overlay[self.overlay.index("postgres-exporter:"):self.overlay.index("data-stores-exporter:")]
+        self.assertIn("PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml", block)
+        self.assertIn(
+            "./monitoring/exporters/postgres/queries.yaml:/etc/postgres-exporter/queries.yaml:ro", block
+        )
+        queries = (MONITORING / "exporters" / "postgres" / "queries.yaml").read_text()
+        for prefix in ("pg_stat_checkpointer:", "pg_stat_wal:", "pg_stat_io_wal:",
+                       "pg_client_transactions:", "pg_lock_waits:"):
+            self.assertIn("\n" + prefix, queries)
+
+    def test_the_misleading_long_running_transactions_collector_stays_off(self):
+        block = self.overlay[self.overlay.index("postgres-exporter:"):self.overlay.index("data-stores-exporter:")]
+        self.assertIn("- --no-collector.long_running_transactions", block)
+        self.assertNotIn("- --collector.long_running_transactions", block)
+        for path in (MONITORING / "grafana" / "dashboards").glob("*.json"):
+            self.assertNotIn("pg_long_running_transactions_oldest_timestamp_seconds",
+                             path.read_text().replace("Replaces pg_long_running_transactions", ""),
+                             f"{path.name} still plots the removed series")
+
+    def test_postgres_scrape_timeout_outlasts_the_database_size_walk(self):
+        import re
+
+        prom = (MONITORING / "prometheus" / "prometheus.yml").read_text()
+        job = prom[prom.index("- job_name: postgres"):prom.index("- job_name: data-stores")]
+        match = re.search(r"scrape_timeout: (\d+)s", job)
+        self.assertIsNotNone(match, "the postgres job must not inherit the global 4 s timeout")
+        self.assertGreaterEqual(int(match.group(1)), 10)
+        self.assertLess(int(match.group(1)), 15, "scrape_timeout must stay below the 15 s interval")
+
+    def test_database_timing_rules_are_loaded_and_tested(self):
+        rules = MONITORING / "prometheus" / "rules" / "database-timing.yml"
+        self.assertTrue(rules.exists())
+        text = rules.read_text()
+        import re
+
+        names = re.findall(r"- alert: (\w+)", text)
+        self.assertEqual(text.count("summary:"), len(names))
+        tests = (MONITORING / "prometheus" / "tests" / "database_timing.yml").read_text()
+        for name in names:
+            self.assertIn(f"alertname: {name}", tests, f"{name} has no promtool test")
+
 
 class GrafanaProvisioningTests(unittest.TestCase):
     def test_dashboards_are_valid_json_with_stable_uids(self):

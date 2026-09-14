@@ -794,6 +794,33 @@ def _schema_fingerprint(con):
     )
 
 
+def _companion_database_name(session_name: str) -> str:
+    """The schema-build database, private to ONE session database.
+
+    It used to be the fixed name `crawl_durability_test`, so two suites on one
+    server (each with its own session database) dropped each other's `public`
+    schema mid-build: 'relation "schema_migrations" does not exist' and
+    'assert 0 == 24' (2026-09-14 revalidation). PostgreSQL names stop at 63
+    bytes, so a long session name keeps its head and the `_crawl_test` tail.
+    """
+    session = session_name.split("?", 1)[0]
+    tail = "_crawl_test"
+    head = session.encode()[: 63 - len(tail)].decode("utf-8", "ignore")
+    return head + tail
+
+
+def test_the_schema_build_database_is_private_to_its_session():
+    first = _companion_database_name("test_suite_a")
+    second = _companion_database_name("techsara_test?sslmode=disable")
+    assert first != second
+    assert first == "test_suite_a_crawl_test"
+    assert second == "techsara_test_crawl_test"
+    long = _companion_database_name("test_" + "x" * 80)
+    assert len(long.encode()) <= 63 and long.endswith("_crawl_test")
+    wide = _companion_database_name("test_" + "\u00e9" * 40)  # 2 bytes a character
+    assert len(wide.encode()) <= 63 and wide.endswith("_crawl_test")
+
+
 @pytest.fixture
 def schema_build(app_database, monkeypatch):
     """Build the schema from scratch in a companion database and fingerprint it.
@@ -809,8 +836,8 @@ def schema_build(app_database, monkeypatch):
 
     from app.config import settings
 
-    base, _, _name = app_database.rpartition("/")
-    name = "crawl_durability_test"
+    base, _, session_name = app_database.rpartition("/")
+    name = _companion_database_name(session_name)
     dsn = f"{base}/{name}"
     with psycopg.connect(f"{base}/postgres", autocommit=True, connect_timeout=5) as admin:
         exists = admin.execute(

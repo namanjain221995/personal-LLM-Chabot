@@ -51,7 +51,9 @@ APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
 def test_the_files_tables_are_migration_v37_and_the_schema_module_applies_the_same_text():
     versions = [version for version, _ddl in db._MIGRATIONS]
-    assert versions[-1] == 37
+    # V37 stays the files migration; later migrations (V38: web corpus state)
+    # append after it.
+    assert 37 in versions and versions == sorted(versions)
     # V36 is the durable-generation migration (no-timeout T1); whether or not
     # it has landed, it must not be the files DDL.
     assert dict(db._MIGRATIONS).get(36) is not db.FILES_MIGRATION_SQL

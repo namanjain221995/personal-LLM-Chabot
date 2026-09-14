@@ -1,0 +1,112 @@
+# Database timing and PostgreSQL internals (dbperf2 observability, 2026-09-14).
+#
+# Two sources, both new that day:
+#   - the orchestrator's techsara_db_* histograms (orchestrator/app/db_metrics.py):
+#     pool checkout wait, transaction and statement time per call site;
+#   - postgres-exporter custom queries (monitoring/exporters/postgres/queries.yaml):
+#     pg_stat_checkpointer_*, pg_stat_wal_*, pg_stat_io_wal_*,
+#     pg_client_transactions_*, pg_lock_waits_*.
+#
+# Unit tests: monitoring/prometheus/tests/database_timing.yml (promtool).
+
+groups:
+  - name: database-timing
+    rules:
+      # p95 per call site over 5 minutes, for the dashboards and for reading
+      # the owner's targets straight off Prometheus (hot query <= 5 ms, durable
+      # flush <= 2 ms, lexical <= 50 ms). Recorded because the raw
+      # histogram_quantile over ~40 sites x 15 buckets is the expensive part of
+      # every panel that shows it.
+      - record: site:techsara_db_statement_seconds:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (site, le) (rate(techsara_db_statement_seconds_bucket[5m])))
+      - record: site:techsara_db_transaction_seconds:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (site, le) (rate(techsara_db_transaction_seconds_bucket[5m])))
+      # The "idle background polling <= 1 query/s per process" target.
+      - record: instance:techsara_db_statements:rate5m
+        expr: sum by (instance) (rate(techsara_db_statement_seconds_count[5m]))
+
+  - name: database-internals
+    rules:
+      # The pool, not the database, is the bottleneck: requests queue for a
+      # connection. p95 checkout above 50 ms for 10 minutes means APP_DB_POOL_MAX
+      # (16) is too small for the load or a caller holds connections too long.
+      # The per-site transaction panel names the holder.
+      - alert: OrchestratorDbPoolWaiting
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (instance, le) (rate(techsara_db_pool_wait_seconds_bucket[5m]))) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Orchestrator waits {{ $value | humanizeDuration }} (p95) for a database connection"
+          description: >-
+            Checkout wait includes the pool's liveness check (one round trip),
+            so a healthy value is well under a millisecond. Compare
+            techsara_db_pool_requests_waiting and the per-site transaction
+            p95 on the Data stores dashboard before raising APP_DB_POOL_MAX.
+
+      # Something waits on a heavyweight lock for two minutes. pg_locks_count
+      # cannot show this: it counts granted locks too.
+      - alert: PostgresLockWaitSustained
+        expr: max(pg_lock_waits_backends) > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} PostgreSQL session(s) waiting on a lock for 2 minutes"
+          description: >-
+            `select pid, pg_blocking_pids(pid), wait_event, left(query, 80)
+            from pg_stat_activity where wait_event_type = 'Lock'` names the
+            waiter and its blocker.
+
+      # The server kills idle-in-transaction sessions at 15 min and the
+      # orchestrator's own connections at 60 s, so a 10-minute transaction is an
+      # active one: a stuck query, a manual session or a dump. It holds back
+      # vacuum on every table while it lives. 14-day maximum in production was
+      # 2.69 s.
+      - alert: PostgresLongTransaction
+        expr: max(pg_client_transactions_oldest_seconds) > 600
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "A PostgreSQL transaction has been open for {{ $value | humanizeDuration }}"
+          description: >-
+            `select pid, datname, application_name, state, now() - xact_start
+            as age, left(query, 80) from pg_stat_activity where xact_start is
+            not null order by xact_start limit 5` names it.
+
+      # More checkpoints forced by WAL volume than by the timer: max_wal_size
+      # (1 GB) is reached within checkpoint_timeout (5 min). On 2026-09-07 this
+      # was test-database traffic on the production instance.
+      - alert: PostgresCheckpointsMostlyRequested
+        expr: >-
+          increase(pg_stat_checkpointer_num_requested_total[1h]) > 3
+          and
+          increase(pg_stat_checkpointer_num_requested_total[1h])
+            > increase(pg_stat_checkpointer_num_timed_total[1h])
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} requested PostgreSQL checkpoints in the last hour"
+          description: >-
+            Requested checkpoints outnumber timed ones, so WAL volume, not the
+            timer, drives checkpoint I/O. Look at rate(pg_stat_wal_bytes_total)
+            per database's write traffic before touching max_wal_size (a
+            restart-free reload setting, but an owner decision).
+
+      # The custom queries (queries.yaml) are failing: checkpoint, WAL, lock
+      # wait and transaction-age panels are empty while pg_up stays 1. Seen on
+      # 2026-09-14 against a PostgreSQL 16 server, where the PG18 views do not
+      # exist.
+      - alert: PostgresExporterQueriesFailing
+        expr: max(pg_exporter_last_scrape_error) == 1 or max(pg_exporter_user_queries_load_error) == 1
+        for: 15m
+        labels: { severity: info }
+        annotations:
+          summary: "postgres-exporter custom queries are failing"
+          description: >-
+            `docker logs --since 5m <postgres-exporter container> | grep -i
+            'error'` shows the query. The file requires PostgreSQL 18.

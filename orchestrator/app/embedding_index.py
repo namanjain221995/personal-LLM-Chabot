@@ -4,10 +4,78 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import threading
 
 
 METADATA_FILENAME = "_techsara_embedding_index.json"
 METADATA_SCHEMA_VERSION = 1
+
+
+def _env_int(name: str, default: int) -> int:
+    """config._int semantics (unset or blank -> default), read here until the
+    tunable moves into config.py."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+#: ONE LanceDB cache for the whole process (2026-09-13).
+#:
+#: Every read path connects per request (`lancedb.connect` + `open_table`) so
+#: it always sees the version another writer — the sync-worker, the crawl, the
+#: web worker — committed a moment ago. Each `connect()` without a `session`
+#: builds a NEW cache (6 GiB index + 1 GiB metadata ceilings), which the next
+#: request throws away. With an IVF index present the query then reloads the
+#: index from disk every time. Measured on a synthetic 1024-dim web_chunks
+#: table (dbperf 2026-09-13, lancedb 0.37.1, nprobes 50, refine 2, limit 90):
+#:
+#:     20k rows   per-request connect 42.5 ms p50 / 91.8 ms p95, RSS 2.06 GB
+#:                shared 512 MB session 10.4 ms / 12.1 ms,         RSS 0.37 GB
+#:     200k rows  per-request connect 42.0 ms / 116.9 ms,        RSS 5.11 GB
+#:                shared 512 MB session 17.9 ms / 21.6 ms,         RSS 0.82 GB
+#:
+#: (300 sequential queries per variant, separate processes.) Sharing the
+#: session changes WHAT IS CACHED, not what is read: `open_table` on a fresh
+#: connection still resolves the latest manifest, so rows another process
+#: added or deleted, a rebuilt index and a deleted-and-recreated directory are
+#: all visible on the next request (tests/test_lancedb_shared_session.py).
+#: The caps bound the process: 128 MB measured 34 ms at 200k rows (the index
+#: no longer fits), 2 GB bought nothing over 512 MB. 0 for the index cap
+#: restores a private session per connect.
+LANCEDB_INDEX_CACHE_MB = _env_int("LANCEDB_INDEX_CACHE_MB", 512)
+LANCEDB_METADATA_CACHE_MB = _env_int("LANCEDB_METADATA_CACHE_MB", 64)
+
+_session = None
+_session_lock = threading.Lock()
+
+
+def lance_session():
+    """The process-wide `lancedb.Session`, or None when sharing is disabled."""
+    global _session
+    if LANCEDB_INDEX_CACHE_MB <= 0:
+        return None
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                import lancedb  # lazy
+
+                _session = lancedb.Session(
+                    index_cache_size_bytes=LANCEDB_INDEX_CACHE_MB << 20,
+                    metadata_cache_size_bytes=max(1, LANCEDB_METADATA_CACHE_MB) << 20,
+                )
+    return _session
+
+
+def connect(uri: str):
+    """`lancedb.connect(uri)` on the shared session. Every orchestrator read
+    and write path connects through here (tests pin that)."""
+    import lancedb  # lazy
+
+    session = lance_session()
+    if session is None:
+        return lancedb.connect(uri)
+    return lancedb.connect(uri, session=session)
 
 
 def safe_reindex_guidance(lancedb_dir: str) -> str:
@@ -134,9 +202,7 @@ def inspect_embedding_index(
     if not os.path.isdir(lancedb_dir):
         return {"status": "empty", "detail": "embedding index has not been created"}
     try:
-        import lancedb  # lazy
-
-        db = lancedb.connect(lancedb_dir)
+        db = connect(lancedb_dir)
         _, metadata = open_compatible_table(db, lancedb_dir, table_name, model_id)
     except FileNotFoundError as exc:
         return {"status": "empty", "detail": str(exc)}

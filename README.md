@@ -947,9 +947,14 @@ snapshot may exist at the repo root (git-ignored).
 PYTHONPATH=launcher python3 -m pytest launcher/tests -q
 # or: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s launcher/tests -v
 
-# Orchestrator (needs a reachable test PostgreSQL; the guard refuses non-test database names)
+# Orchestrator (needs a DEDICATED test PostgreSQL; the guard refuses non-test database
+# names and any server that also holds a non-test database, e.g. the production instance)
+docker run -d --rm --memory=2g --name pg-test-$USER -p 127.0.0.1:55432:5432 \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_INITDB_ARGS="--locale=C --encoding=UTF8" postgres:18-alpine \
+  -c fsync=off -c synchronous_commit=off -c full_page_writes=off
 cd orchestrator && python3 -m pip install -r requirements-dev.txt && \
-  TEST_DATABASE_URL=postgresql://user:pass@127.0.0.1:5432/techsara_test python3 -m pytest tests -q
+  TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/techsara_test python3 -m pytest tests -q
 
 # Sync worker
 cd sync-worker && python3 -m pip install -r requirements-dev.txt && python3 -m pytest tests -q

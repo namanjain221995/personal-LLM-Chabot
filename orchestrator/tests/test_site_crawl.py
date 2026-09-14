@@ -217,6 +217,10 @@ class _FakeTable:
         self.where_clause = clause
         return self
 
+    def select(self, columns):
+        self.selected = list(columns)
+        return self
+
     def to_list(self):
         return self._hits
 

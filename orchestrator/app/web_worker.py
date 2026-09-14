@@ -120,17 +120,24 @@ def _ttl_for(row: Dict[str, Any]) -> int:
     return ttl
 
 
+#: Retrieval demand (V38, 2026-09-14): the base kept on the page row plus the
+#: counter `web_memory._bump_retrieval` now writes to `web_page_demand`, so a
+#: bump no longer rewrites the indexed page row. `d` is the LEFT JOIN below;
+#: none of web_page_demand's other column names collide with web_pages'.
+_DEMAND = "(retrieval_count + coalesce(d.retrievals, 0))"
+_DEMAND_JOIN = "web_pages LEFT JOIN web_page_demand d ON d.page_id = web_pages.id"
+
 _DUE_COLUMNS = (
     "id, url, url_key, title, content_hash, etag, last_modified, "
-    "retrieval_count, refresh_failures, fetched_at"
+    f"{_DEMAND} AS retrieval_count, refresh_failures, fetched_at"
 )
 
 #: The queue as it was before V21: deadline only.
 _DUE_SQL = (
-    f"SELECT {_DUE_COLUMNS} FROM web_pages "
+    f"SELECT {_DUE_COLUMNS} FROM {_DEMAND_JOIN} "
     "WHERE next_refresh_at IS NOT NULL AND next_refresh_at <= now() "
     "AND text <> '' "
-    "ORDER BY retrieval_count DESC, next_refresh_at LIMIT %s"
+    f"ORDER BY {_DEMAND} DESC, next_refresh_at LIMIT %s"
 )
 
 #: V21 (recovered 2026-09-06): the SAME bounded queue, widened by one term.
@@ -163,13 +170,13 @@ _DUE_SQL = (
 _EXTRACT_UPGRADE_MIN_SPACING_S = 6 * 3600
 
 _DUE_SQL_V21 = (
-    f"SELECT {_DUE_COLUMNS}, extract_version FROM web_pages "
+    f"SELECT {_DUE_COLUMNS}, extract_version FROM {_DEMAND_JOIN} "
     "WHERE text <> '' AND ("
     " (next_refresh_at IS NOT NULL AND next_refresh_at <= now())"
     " OR (extract_version < %s AND refresh_failures = 0"
     "     AND fetched_at < now() - make_interval(secs => %s))"
     ") "
-    "ORDER BY retrieval_count DESC, next_refresh_at NULLS LAST LIMIT %s"
+    f"ORDER BY {_DEMAND} DESC, next_refresh_at NULLS LAST LIMIT %s"
 )
 
 #: Cleared the first time PostgreSQL says the column is not there — i.e. on a

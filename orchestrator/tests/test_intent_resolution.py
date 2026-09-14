@@ -840,7 +840,7 @@ class TestPersonResolutionForThePlanner:
 
         monkeypatch.setattr(sqleng, "resolve_people", lambda _q: payload)
         monkeypatch.setattr(
-            sqleng, "who_these_people_are", lambda _q: "FACTS BLOCK" if payload else ""
+            sqleng, "who_these_people_are", lambda _q, *_a, **_k: "FACTS BLOCK" if payload else ""
         )
 
     def test_exact_matches_become_facts_not_questions(self, monkeypatch):

@@ -518,13 +518,77 @@ the internal `application` network. The password comes from
 reads — so no credential is duplicated into a monitoring file or committed.
 
 Collectors enabled: `stat_user_tables`, `statio_user_tables`, `stat_database`,
-`database`, `locks`, `long_running_transactions`. Replication collectors are
-off — this is a single instance and they would only add cardinality.
+`database`, `locks`. Replication collectors are off — this is a single instance
+and they would only add cardinality. `stat_bgwriter` is off because 0.16.0's
+query fails on PostgreSQL 17+, and `long_running_transactions` is off because
+its 0.16.0 query is misleading (no `xact_start` filter: it counted background
+processes and reported the current time as the "oldest" age).
+
+Custom queries (`monitoring/exporters/postgres/queries.yaml`, mounted through
+`PG_EXPORTER_EXTEND_QUERY_PATH`, 2026-09-14) put back what those collectors
+lost on PostgreSQL 18, in 37 series:
+
+| Series | Reads |
+|---|---|
+| `pg_stat_checkpointer_*_total` | timed vs requested checkpoints, write/sync ms, buffers (names identical to exporter 0.20's collector) |
+| `pg_stat_wal_{records,fpi,bytes,buffers_full}_total` | WAL generated |
+| `pg_stat_io_wal_{writes,write_bytes,fsyncs,write_time,fsync_time}_total{backend}` | WAL writes/fsyncs by client_backend, walwriter, checkpointer, other (times need `track_wal_io_timing`) |
+| `pg_client_transactions_{oldest_seconds,idle_in_transaction_oldest_seconds,over_60s}` | open client transactions only |
+| `pg_lock_waits_{backends,locks}` | sessions waiting on a lock, ungranted locks (`pg_locks_count` counts granted locks too) |
+
+The file needs PostgreSQL 18: 0.16.0 ignores `runonserver` for user queries,
+so on an older major every scrape reports `pg_exporter_last_scrape_error 1`
+(alert `PostgresExporterQueriesFailing`). The `postgres` job's
+`scrape_timeout` is 10 s, not the global 4 s: the `database` collector's
+`pg_database_size()` walk over ~20 databases overran 4 s eleven times on
+2026-09-13 while the NVMe was busy.
+
+**Rolling this out needs a container recreate, not only a restart.** The queries
+file arrives through a new bind mount, a new environment variable and a changed
+`command:`; `docker compose restart` (what `./scripts/monitoring.sh restart`
+runs) reuses the existing container definition and applies none of them. Use
+`./scripts/monitoring.sh up`, which recreates only the monitoring services whose
+definition changed (here postgres-exporter), followed by
+`./scripts/monitoring.sh restart` so Prometheus re-binds `prometheus.yml` (the
+10 s scrape timeout) and loads `rules/database-timing.yml`; its own compose
+definition did not change, so `up` leaves it running on the old file. Then
+check, read-only in Prometheus:
+`pg_exporter_user_queries_load_error` is 0, `pg_stat_checkpointer_num_timed_total`
+exists, and `pg_long_running_transactions` is gone.
 
 What that gives you: per-table live-row counts (conversations, messages,
-`web_pages`, `research_runs`…), database size, connections against the default
-`max_connections` of 100, cache hit ratio, commits vs rollbacks, dead tuples
-(vacuum pressure), deadlocks, and long-running transactions.
+`web_pages`, `research_runs`…), database size, connections against
+`max_connections` (60), cache hit ratio, commits vs rollbacks, dead tuples
+(vacuum pressure), deadlocks, checkpoints, WAL, lock waits and transaction age.
+
+### Database timing from the orchestrator
+
+`orchestrator/app/db_metrics.py` times every `db.connection()` transaction at
+the pool seam (one edit in `db.connection()`, one in `db.run_in_thread()`):
+
+| Series | Meaning |
+|---|---|
+| `techsara_db_pool_wait_seconds` | checkout wait, including the pool's liveness-check round trip |
+| `techsara_db_thread_wait_seconds` | `db.run_in_thread` queue for an anyio worker thread |
+| `techsara_db_transaction_seconds{site}` | checkout to commit/rollback |
+| `techsara_db_statement_seconds{site}` | one `execute`/`executemany` round trip; `_count` is statements per site |
+| `techsara_db_transaction_errors_total{site}` | transactions rolled back by an exception |
+| `techsara_db_pool_{size,available,max,requests_waiting}` | psycopg_pool counters at scrape time |
+
+`site` is a closed vocabulary of about 40 values (`history`, `recall`,
+`web_lexical`, `api_key`, `durable_flush`, `files_claim`, `metrics_scrape`, …)
+resolved from the function that opened the transaction; an unlisted function
+falls back to its module's area, then `other`. Buckets have edges at the
+owner's targets (2, 5, 20, 30, 50, 100 ms), so "share of statements under
+5 ms" is a bucket ratio. Recording rules and alerts are in
+`monitoring/prometheus/rules/database-timing.yml` (tests:
+`monitoring/prometheus/tests/database_timing.yml`); the panels are the last row
+of the Databases / Data Stores dashboard. Measured cost (paired live A/B on a
+PostgreSQL 18 container with the production settings, 2026-09-14): 10-20 µs
+median per one-statement transaction, and 44-78 µs median for a transaction of
+20 statements (about 2.5-4 µs per statement). Statement durations are recorded
+in chunks of 256, so a long per-row loop inside one transaction neither grows
+memory nor holds the metrics lock for long at commit.
 
 ### The file-based stores
 

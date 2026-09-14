@@ -15,7 +15,8 @@ Every function is called from request paths and must never raise.
 from __future__ import annotations
 
 import threading
-from typing import Dict, List, Tuple
+from bisect import bisect_left
+from typing import Callable, Dict, List, Tuple
 
 _lock = threading.Lock()
 
@@ -367,6 +368,35 @@ def observe(name: str, seconds: float, help_text: str = "", **labels: str) -> No
         pass
 
 
+def observe_many(observations) -> None:
+    """Record several PRE-CLEANED observations under one lock acquisition.
+
+    ``observations`` is an iterable of ``(name, key, seconds)`` where ``key`` is
+    exactly what ``_clean(labels, name)`` returns for the labels — the caller
+    (db_metrics, on every database transaction) cleans each label set once and
+    caches the key, so the per-call cost is the bucket update alone. The
+    registry contents are identical to calling ``observe`` for each.
+    """
+    try:
+        with _lock:
+            for name, key, seconds in observations:
+                buckets = _buckets_for(name)
+                series = _hists.get(name)
+                if series is None:
+                    series = _hists[name] = {}
+                entry = series.get(key)
+                if entry is None:
+                    counts, total, n = [0] * len(buckets), 0.0, 0
+                else:
+                    counts, total, n = entry
+                    counts = list(counts)
+                for i in range(bisect_left(buckets, seconds), len(buckets)):
+                    counts[i] += 1
+                series[key] = (counts, total + float(seconds), n + 1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ---------------------------------------------------------------------------
 # The living-knowledge call sites, named once so spelling cannot drift.
 # ---------------------------------------------------------------------------
@@ -538,8 +568,28 @@ def _fmt_labels(key: Tuple[Tuple[str, str], ...], extra: str = "") -> str:
     return "{" + ",".join(parts) + "}" if parts else ""
 
 
+#: Callables run at the start of every render(), to sample state that is only
+#: worth reading when someone scrapes (db_metrics' pool gauges). Each is
+#: guarded: a failing collector costs its own series, never the scrape.
+_collectors: List[Callable[[], None]] = []
+
+
+def register_collector(fn: Callable[[], None]) -> None:
+    """Run ``fn`` before each render(). Registering the same callable twice is a no-op."""
+    with _lock:
+        if fn not in _collectors:
+            _collectors.append(fn)
+
+
 def render() -> str:
     """The whole registry in Prometheus text exposition format."""
+    with _lock:
+        collectors = list(_collectors)
+    for collect in collectors:
+        try:
+            collect()
+        except Exception:  # noqa: BLE001 — serve what we have
+            pass
     lines: List[str] = []
     with _lock:
         counters = {n: dict(v) for n, v in _counters.items()}

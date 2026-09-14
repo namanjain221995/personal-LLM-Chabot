@@ -317,3 +317,119 @@ def test_string_columns_report_lengths_not_raw_min_max(csv_with_canaries):
     # Numeric columns keep real min/max — that is derived, not raw.
     amount = next(c for c in prof["columns"] if c["name"] == "amount")
     assert amount["min"] == 0 and amount["max"] == 9990
+
+
+# ---------------------------------------------------------------------------
+# Parse once (2026-09-13): every statistic from one columnar copy
+# ---------------------------------------------------------------------------
+
+
+class _CountingCon:
+    def __init__(self, con, seen):
+        self._con = con
+        self._seen = seen
+
+    def execute(self, sql, *args):
+        self._seen.append(sql)
+        return self._con.execute(sql, *args)
+
+    def close(self):
+        self._con.close()
+
+
+_REAL_DUCK = profiler._duck
+
+
+def _tie_order_free(profile):
+    """`top_values` ties come back in arbitrary order — the per-statement path
+    disagrees with ITSELF on 3 of 10 runs of the jsonl fixture below — so
+    equal counts are compared as a set."""
+    out = json.loads(json.dumps(profile, default=str))
+    for col in out.get("columns", []):
+        if "top_values" in col:
+            col["top_values"] = sorted(col["top_values"], key=lambda t: (-t["count"], json.dumps(t["value"])))
+    return out
+
+
+def _profile_counting(monkeypatch, path):
+    seen = []
+    monkeypatch.setattr(profiler, "_duck", lambda: _CountingCon(_REAL_DUCK(), seen))
+    return profiler.profile_tabular(str(path)), seen
+
+
+@pytest.mark.parametrize("kind", ["csv", "jsonl"])
+def test_the_profile_is_unchanged_and_the_source_is_parsed_once(tmp_path, monkeypatch, kind, csv_with_canaries):
+    if kind == "csv":
+        path = csv_with_canaries
+        reader = "read_csv_auto"
+    else:
+        path = tmp_path / "events.jsonl"
+        path.write_text("".join(
+            json.dumps({"id": i, "kind": ["a", "b", "c"][i % 3], "tags": {"x": i % 5, "y": [i, i + 1]},
+                        "note": None if i % 7 == 0 else f"note {i}"}) + "\n"
+            for i in range(400)
+        ))
+        reader = "read_json_auto"
+
+    once, seen_once = _profile_counting(monkeypatch, path)
+    monkeypatch.setenv("PROFILE_PARSE_ONCE", "false")
+    each, seen_each = _profile_counting(monkeypatch, path)
+
+    assert once == each, "ties are ordered deterministically, so the profiles are identical"
+    assert _tie_order_free(once) == _tie_order_free(each)
+    assert "error" not in once
+    # The source is bound once for its DESCRIBE and parsed once by the COPY.
+    assert sum(reader in s for s in seen_once) == 2
+    assert sum("COPY" in s and reader in s for s in seen_once) == 1
+    assert sum(reader in s for s in seen_each) > 10
+
+
+def test_the_scratch_copy_is_removed_even_when_the_file_is_unreadable(tmp_path, monkeypatch):
+    made = []
+    real_mkdtemp = profiler.tempfile.mkdtemp
+    monkeypatch.setattr(profiler.tempfile, "mkdtemp", lambda **kw: made.append(real_mkdtemp(**kw)) or made[-1])
+    good = tmp_path / "ok.csv"
+    good.write_text("a,b\n1,2\n3,4\n")
+    bad = tmp_path / "bad.csv"
+    bad.write_bytes(b"\x00\xff\x00" * 10)
+    assert profiler.profile_tabular(str(good))["rows"] == 2
+    profiler.profile_tabular(str(bad))
+    assert made and not any(os.path.exists(d) for d in made)
+
+
+def test_top_value_ties_are_ordered_by_value_text_on_every_run(tmp_path):
+    """Equal counts used to come back in scan order: the same file gave a
+    different profile on repeated runs."""
+    path = tmp_path / "ties.csv"
+    kinds = ["delta", "alpha", "charlie", "bravo", "echo"]
+    rows = ["k,n"] + [f"{kinds[i % 5]},{i}" for i in range(5000)]
+    path.write_text("\n".join(rows) + "\n")
+    for _ in range(3):
+        prof = profiler.profile_tabular(str(path))
+        col = next(c for c in prof["columns"] if c["name"] == "k")
+        assert [t["value"] for t in col["top_values"]] == sorted(kinds)[: settings.profile_top_values]
+
+
+def test_a_copy_that_changes_a_column_type_is_not_used(tmp_path, monkeypatch):
+    """Parquet has no HUGEINT (it comes back DOUBLE, losing digits): the
+    profile must keep reading the source rather than report the rounded value."""
+    path = tmp_path / "huge.csv"
+    path.write_text("a\n1\n")
+    huge = 170141183460469231731687303715884105727
+    monkeypatch.setattr(
+        profiler, "_reader_sql",
+        lambda _p: f"(SELECT {huge}::HUGEINT AS big, i AS a FROM range(3) t(i))",
+    )
+    prof, seen = _profile_counting(monkeypatch, path)
+    big = next(c for c in prof["columns"] if c["name"] == "big")
+    assert big["dtype"] == "HUGEINT"
+    assert big["max"] == huge
+    assert any(s.startswith("COPY") for s in seen), "the copy was attempted"
+    assert not any("read_parquet" in s and not s.startswith("DESCRIBE") for s in seen)
+
+
+def test_an_unusable_scratch_dir_falls_back_to_reading_the_source(tmp_path, monkeypatch, csv_with_canaries):
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "does-not-exist"))
+    prof, seen = _profile_counting(monkeypatch, csv_with_canaries)
+    assert prof["rows"] == 1000 and "error" not in prof
+    assert not any("COPY" in s for s in seen)

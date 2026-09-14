@@ -176,7 +176,7 @@ start (a change = orchestrator recreate).
 
 | variable | default | meaning |
 |---|---|---|
-| `WEB_INDEX_ANN_MIN_ROWS` | 50000 | web chunks above which the worker builds an IVF_FLAT index |
+| `WEB_INDEX_ANN_MIN_ROWS` | 10000 | web chunks above which the worker builds an IVF_FLAT index (lowered from 50000 on 2026-09-14: recall at fixed probes only rises as the table shrinks) |
 | `WEB_INDEX_NPROBES` | 50 | partitions probed per query when an index exists (recall@10 0.995 measured) |
 | `WEB_INDEX_OPTIMIZE_EVERY` | 12 | worker cycles between compactions of the web index |
 | `KNOWLEDGE_ANN_BYPASS` | false | force flat scans (reader-side rollback, no data change) |

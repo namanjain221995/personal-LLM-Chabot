@@ -9,12 +9,13 @@ validated by pydantic (invalid → table only; model output is NEVER executed)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import time
-from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import NO_DATA_MESSAGE, recent_turns
 from .. import llm
@@ -177,7 +178,11 @@ async def _ask_sql(
     user = f"Database schema:\n{schema_text}\n\nQuestion: {question}"
     # Closest to the question, because it is the most specific thing we know:
     # not a rule about people in general, but who THESE people are.
-    people = who_these_people_are(ground)
+    # A warehouse lookup (DuckDB, blocking): off the event loop, like every
+    # other caller of resolve_people. Inline it held the loop for the whole
+    # lookup — ~205 ms per SQL attempt before core/warehouse.py cached the
+    # snapshot, still a scan of the name columns on the fuzzy path after.
+    people = await asyncio.to_thread(who_these_people_are, ground)
     if people:
         user = f"{people}\n\n{user}"
     if hint:
@@ -238,6 +243,14 @@ _LOCK_WAIT_STEP = 0.25
 
 
 def _connect_warehouse(duckdb):
+    # The published snapshot is served from one cached instance (a cursor per
+    # call, core/warehouse.py): opening the 1,023-object catalog cost ~205 ms
+    # per connect. The live file is never held open — see that module.
+    from ..core import warehouse
+
+    cached = warehouse.cursor(settings.duckdb_path)
+    if cached is not None:
+        return cached
     deadline = time.monotonic() + _LOCK_WAIT_SECONDS
     while True:
         try:
@@ -434,40 +447,43 @@ def resolve_people(question: str) -> List[dict]:
         con = _connect_warehouse(duckdb)
     except Exception:  # noqa: BLE001
         return []
-    out: List[dict] = []
+    # One slot per name, so the answer keeps the question's order whether a
+    # name resolved exactly or through the fuzzy pass below.
+    slots: List[Optional[dict]] = [None] * len(names)
+    unmatched: List[int] = []
     try:
-        for name in names:
+        for index, name in enumerate(names):
             pattern = "%" + "%".join(p.lower() for p in name.split()) + "%"
-            hit = False
             for table, sql, meaning in _PERSON_SOURCES:
                 try:
                     rows = con.execute(sql, [pattern]).fetchall()
                 except Exception:  # noqa: BLE001 — a missing table is not fatal
                     continue
                 if rows:
-                    out.append(
-                        {
-                            "asked": name,
-                            "object": table,
-                            "meaning": meaning,
-                            "matches": sorted({str(r[0]) for r in rows})[:4],
-                        }
-                    )
-                    hit = True
+                    slots[index] = {
+                        "asked": name,
+                        "object": table,
+                        "meaning": meaning,
+                        "matches": sorted({str(r[0]) for r in rows})[:4],
+                    }
                     break
-            if not hit:
-                # SUBSTRING MATCHING IS EXACT ABOUT SPELLING, and people are
-                # not. "samyukth chala" (one l) finds nothing at all, while
-                # the org stores "Samyukth - challa"; so does any transposed
-                # or dropped letter. Fall back to edit distance, which costs a
-                # scan of the name columns (~25 ms over 63k rows here) and only
-                # runs when the cheap path already failed.
-                fuzzy = _fuzzy_person(con, name)
-                if fuzzy is not None:
-                    out.append(fuzzy)
+            else:
+                unmatched.append(index)
+        if unmatched:
+            # SUBSTRING MATCHING IS EXACT ABOUT SPELLING, and people are
+            # not. "samyukth chala" (one l) finds nothing at all, while
+            # the org stores "Samyukth - challa"; so does any transposed
+            # or dropped letter. Fall back to edit distance, which costs a
+            # scan of the name columns and only runs when the cheap path
+            # already failed — ONE statement for every unmatched name
+            # (2026-09-14: it was one per name, ~6 ms each over 63k rows, and
+            # a lowercase question can propose up to eight names).
+            fuzzy = _fuzzy_people(con, [names[i] for i in unmatched])
+            for index, found in zip(unmatched, fuzzy):
+                slots[index] = found
     finally:
         con.close()
-    return out
+    return [entry for entry in slots if entry is not None]
 
 
 #: Jaro-Winkler above this is the same human spelled differently; below it is
@@ -478,40 +494,73 @@ _FUZZY_NAME_MIN = 0.90
 
 
 def _fuzzy_person(con, name: str) -> Optional[dict]:
-    """Closest stored name across the person objects, or None.
+    """Closest stored name across the person objects, or None."""
+    return _fuzzy_people(con, [name])[0]
 
-    One UNION ALL so the whole thing is a single scan. Ordered by similarity,
-    and anything under the threshold is discarded rather than guessed at — a
-    confidently wrong name is worse than no grounding at all.
+
+def _fuzzy_people(con, names: Sequence[str]) -> List[Optional[dict]]:
+    """Closest stored names across the person objects, one entry per name
+    (None where nothing clears the threshold).
+
+    One UNION ALL scored against every name in a single statement, so the
+    whole thing is one scan however many names are asked. Ordered by
+    similarity, and anything under the threshold is discarded rather than
+    guessed at — a confidently wrong name is worse than no grounding at all.
+
+    DETERMINISTIC (2026-09-14). `ORDER BY s DESC` alone left equal scores in
+    whatever order the scan produced them: the same human stored on
+    Recruiter__c and on Account scores identically, and repeated calls in one
+    process answered "staff" once and "candidate" twice (dbperf2 revalidation).
+    Ties now break on `_PERSON_SOURCES` order — the precedence the exact path
+    already applies — and then on the stored name.
     """
+    if not names:
+        return []
     parts = []
-    for table, _sql, meaning in _PERSON_SOURCES:
+    for rank, (table, _sql, _meaning) in enumerate(_PERSON_SOURCES):
         parts.append(
-            f"SELECT '{table}' AS obj, CAST(Name AS VARCHAR) AS nm FROM \"{table}\" "
-            "WHERE Name IS NOT NULL"
+            f"SELECT '{table}' AS obj, {rank} AS src_rank, CAST(Name AS VARCHAR) AS nm "
+            f"FROM \"{table}\" WHERE Name IS NOT NULL"
         )
     union = " UNION ALL ".join(parts)
+    asked = ", ".join(f"({i}, ?)" for i in range(len(names)))
     try:
         rows = con.execute(
-            f"""SELECT obj, nm, jaro_winkler_similarity(lower(nm), ?) AS s
-                  FROM ({union})
-                 WHERE jaro_winkler_similarity(lower(nm), ?) >= ?
-                 ORDER BY s DESC LIMIT 4""",
-            [name.lower(), name.lower(), _FUZZY_NAME_MIN],
+            f"""SELECT i, obj, nm, s
+                  FROM (SELECT q.i, p.obj, p.src_rank, p.nm,
+                               jaro_winkler_similarity(p.lnm, q.name) AS s
+                          FROM (SELECT obj, src_rank, nm, lower(nm) AS lnm
+                                  FROM ({union})) p
+                         CROSS JOIN (VALUES {asked}) q(i, name))
+                 WHERE s >= ?
+               QUALIFY row_number() OVER (
+                           PARTITION BY i ORDER BY s DESC, src_rank, nm) <= 4
+                 ORDER BY i, s DESC, src_rank, nm""",
+            [n.lower() for n in names] + [_FUZZY_NAME_MIN],
         ).fetchall()
     except Exception:  # noqa: BLE001 — older DuckDB without the function
-        return None
-    if not rows:
-        return None
-    table = rows[0][0]
-    meaning = next((m for t, _s, m in _PERSON_SOURCES if t == table), table)
-    return {
-        "asked": name,
-        "object": table,
-        "meaning": meaning,
-        "matches": sorted({str(r[1]) for r in rows})[:4],
-        "fuzzy": True,
-    }
+        return [None] * len(names)
+    by_name: Dict[int, List[tuple]] = {}
+    for row in rows:
+        by_name.setdefault(int(row[0]), []).append(row)
+    out: List[Optional[dict]] = []
+    for index, name in enumerate(names):
+        hits = by_name.get(index)
+        if not hits:
+            out.append(None)
+            continue
+        table = hits[0][1]
+        meaning = next((m for t, _s, m in _PERSON_SOURCES if t == table), table)
+        out.append(
+            {
+                "asked": name,
+                "object": table,
+                "meaning": meaning,
+                "matches": sorted({str(r[2]) for r in hits})[:4],
+                "fuzzy": True,
+            }
+        )
+    return out
 
 
 def who_these_people_are(

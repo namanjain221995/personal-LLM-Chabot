@@ -421,6 +421,22 @@ _VOCAB_FINGERPRINT_SQL = """
       FROM web_pages"""
 
 
+def _corpus_fingerprint() -> tuple:
+    """What the vocabulary is keyed on: (pages, generation, 0) from V38's
+    `web_corpus_state` row, which the database bumps at commit on exactly the
+    changes `_VOCAB_FINGERPRINT_SQL` hashes (a page inserted or deleted, its
+    content_hash, text length, title or indexed-ness). One primary-key read
+    per turn instead of that statement's Seq Scan of web_pages (measured
+    2.1 ms at today's corpus, 22.9 ms at 10x). The scan remains the fallback
+    for a database without the row."""
+    state = db.web_corpus_state()
+    if state is not None:
+        return (state[0], state[1], 0)
+    with db.connection() as con:
+        row = con.execute(_VOCAB_FINGERPRINT_SQL).fetchone()
+    return (int(row["n"]), int(row["top"]), int(row["h"]))
+
+
 def _page_stems(*texts: str) -> set:
     """The set `web_memory._terms` would produce over `texts`, computed over
     distinct words (a stem per word, not per occurrence)."""
@@ -515,9 +531,7 @@ class _PageVocabulary:
         """The vocabulary as of the corpus right now, or None when it cannot
         be had without waiting (another thread is building it) or at all.
         Blocking; no pooled connection is held while pages are tokenised."""
-        with db.connection() as con:
-            row = con.execute(_VOCAB_FINGERPRINT_SQL).fetchone()
-        fingerprint = (int(row["n"]), int(row["top"]), int(row["h"]))
+        fingerprint = _corpus_fingerprint()
         state = self.state
         if state is None or state.fingerprint != fingerprint:
             if fingerprint[0] > _VOCAB_MAX_PAGES:

@@ -70,6 +70,57 @@ services:
       - synchronous_commit=on
       - -c
       - track_io_timing=on
+      # ---- Diagnostics (2026-09-14, database-speed programme) ----------------
+      # CHANGING ANY LINE OF THIS COMMAND RECREATES THE POSTGRES CONTAINER on the
+      # next `techsara up`, and every push to main auto-deploys one. Land edits
+      # here only inside an owner maintenance window. NONE of the settings below
+      # are on the live server before that recreate: production was checked
+      # untouched on 2026-09-14 (every one at its default; postgresql.auto.conf
+      # holds only idle_session_timeout and idle_in_transaction_session_timeout).
+      # They all take effect when this container is recreated —
+      # shared_preload_libraries needs the restart anyway. Note that a `-c` here
+      # OVERRIDES postgresql.auto.conf, so once these lines are live ALTER SYSTEM
+      # can no longer change them (verified on 18.4).
+      #
+      # Per-statement attribution. Production had none: the exporter's
+      # pg_locks_count and pg_long_running_transactions are not lock waits or
+      # transaction ages (measure-metrics 2026-09-13). `top` + no utility keeps
+      # the hash table to the application's statements; the extension itself
+      # is created by the orchestrator at start-up (db._ensure_pg_stat_statements:
+      # CREATE EXTENSION IF NOT EXISTS, tolerant of a missing library or
+      # privilege, never fails start-up) — no manual step. Measured on
+      # the 18.4 image with production settings and production-shaped data: no
+      # overhead distinguishable from run-to-run noise on the chat-turn
+      # sequence, the durable flush or the /metrics queries.
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=5000
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - pg_stat_statements.track_utility=off
+      # A lock wait longer than deadlock_timeout (1 s) is logged with the
+      # holder's pid and the statement, which no metric here can show.
+      - -c
+      - log_lock_waits=on
+      # Slow statements, WITHOUT their bind parameters: parameters carry chat
+      # text, recall keywords and e-mail addresses, and container logs are not
+      # a place for them (verified: 18.4 logs `DETAIL: Parameters: $3 =
+      # '%pipeline%'` unless log_parameter_max_length=0). 250 ms is above every
+      # hot-path statement's p95 at 1x and catches the lexical tail (p90 1.0 s).
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_temp_files=0
+      - -c
+      - log_autovacuum_min_duration=1s
+      # jit: the server default is unchanged here; the orchestrator's pool
+      # turns JIT off per session (db._server_options), because the analytics
+      # leaderboard crosses jit_above_cost at about 20x today's data and would
+      # then pay tens of milliseconds of compilation per call.
     volumes:
       - pgdata:/var/lib/postgresql
     ports:

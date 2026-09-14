@@ -186,6 +186,13 @@ scrape_configs:
   # --- Databases and data stores -----------------------------------------
   - job_name: postgres
     scrape_interval: 15s
+    # Not the global 4 s. The database collector runs pg_database_size() over
+    # every database on the instance (about 20 test databases share it today),
+    # and while nvme0n1 sat at 80-90% utilisation on 2026-09-13 that walk
+    # overran 4 s eleven times (max scrape 4.27 s): each overrun is a whole
+    # missing scrape, pg_up included. Quiet-disk cost with 24 databases and
+    # the custom queries: p95 83 ms (dbperf2 observability, 2026-09-14).
+    scrape_timeout: 10s
     static_configs:
       - targets: ["postgres-exporter:9187"]
         labels: { node: spark-1, role: head, service: postgres }

@@ -52,6 +52,16 @@ class SchemaCache:
     def _load(db_path: str) -> Dict[str, List[Tuple[str, str]]]:
         import duckdb  # lazy
 
+        from . import warehouse
+
+        cached = warehouse.cursor(db_path)
+        if cached is not None:
+            try:
+                rows = cached.execute(_COLUMNS_SQL).fetchall()
+            finally:
+                cached.close()
+            return _schema_from_rows(rows)
+
         # Same lockdown config as the sql engine's _execute: introspection
         # needs no external access, and DuckDB rejects concurrent
         # connections to one file whose configs differ.
@@ -80,19 +90,25 @@ class SchemaCache:
                     raise
                 time.sleep(LOCK_WAIT_STEP)
         try:
-            rows = con.execute(
-                "SELECT table_name, column_name, data_type "
-                "FROM information_schema.columns "
-                "WHERE table_schema = 'main' "
-                "ORDER BY table_name, ordinal_position"
-            ).fetchall()
+            rows = con.execute(_COLUMNS_SQL).fetchall()
         finally:
             con.close()
+        return _schema_from_rows(rows)
 
-        schema: Dict[str, List[Tuple[str, str]]] = {}
-        for table, column, dtype in rows:
-            schema.setdefault(table, []).append((column, dtype))
-        return schema
+
+_COLUMNS_SQL = (
+    "SELECT table_name, column_name, data_type "
+    "FROM information_schema.columns "
+    "WHERE table_schema = 'main' "
+    "ORDER BY table_name, ordinal_position"
+)
+
+
+def _schema_from_rows(rows) -> Dict[str, List[Tuple[str, str]]]:
+    schema: Dict[str, List[Tuple[str, str]]] = {}
+    for table, column, dtype in rows:
+        schema.setdefault(table, []).append((column, dtype))
+    return schema
 
 
 def format_schema(schema: Dict[str, List[Tuple[str, str]]]) -> str:

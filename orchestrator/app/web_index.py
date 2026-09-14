@@ -48,6 +48,7 @@ from . import db, llm, metrics
 from .config import settings
 from .embedding_index import (
     EmbeddingIndexMetadata,
+    connect as lance_connect,
     metadata_path,
     open_compatible_table,
     validate_query_dimension,
@@ -419,12 +420,10 @@ def write_lock(directory: str, *, wait_s: float = 0.0):
 
 def _open(create_dim: Optional[int] = None):
     """Connect + open (or create) the web_chunks table, sidecar-validated."""
-    import lancedb  # lazy
-
     directory = lancedb_web_dir()
     assert_not_salesforce(directory)
     os.makedirs(directory, exist_ok=True)
-    conn = lancedb.connect(directory)
+    conn = lance_connect(directory)
     if TABLE not in conn.table_names():
         if create_dim is None:
             return conn, None, None
@@ -701,6 +700,9 @@ def _servable_page_ids(page_ids: Sequence[int]) -> set:
     return {int(r["id"]) for r in rows}
 
 
+#: The columns a retrieval hit is built from (see `retrieve`).
+_HIT_COLUMNS = ["page_id", "url", "title", "text", "fetched_at", "_distance"]
+
 #: How many ANN scans one `retrieve` call may run. Round 1 is the scan this
 #: function always did; each later round repeats it with the pages already
 #: found excluded, and only when the previous rounds came back with fewer
@@ -708,6 +710,9 @@ def _servable_page_ids(page_ids: Sequence[int]) -> set:
 #: the live corpus round 1 (limit 36) returned 1 distinct page in 3.6 ms and
 #: round 2, excluding it, returned all 5 others in 5.1 ms.
 _RETRIEVE_MAX_ROUNDS = 3
+
+#: Round budget per requested page (see `retrieve`).
+_CANDIDATES_PER_PAGE = 12
 
 
 async def retrieve(
@@ -766,13 +771,35 @@ async def retrieve(
         #: One round's raw-chunk budget. It is still a global cut inside the
         #: database — what changed is that a round that spends it all on one
         #: page is now followed by another round that cannot see that page.
-        candidates = max(int(top_k) * 6, 24)
+        #:
+        #: 12 per wanted page, not 6 (2026-09-14). The live corpus averages
+        #: 9.0 chunks a page, so a budget of 6 per page came back short of
+        #: `top_k` pages almost every time and paid a second round (2.07
+        #: rounds per call at top_k=15) — a second scan AND a second
+        #: servable-page query. The scan costs the same at 180 rows as at 90
+        #: (IVF_FLAT 20k: 6.2 vs 6.1 ms p50; 200k: 12.8 vs 12.8 ms; flat 20k:
+        #: 16.2 vs 15.0 ms), and on per-page grouping the union of rounds is
+        #: the same best-chunk-per-page ranking, so the pages returned do not
+        #: change; oversized pages still fall through to the later rounds.
+        candidates = max(int(top_k) * _CANDIDATES_PER_PAGE, 24)
+
+        def _open_for_search():
+            """Once per call, not once per round (2026-09-13): every round of
+            one retrieval reads the same version, and the open plus the
+            sidecar check are paid once."""
+            conn, table, metadata = _open()
+            if table is not None:
+                validate_query_dimension(metadata, vector, lancedb_web_dir())
+            return table
+
+        opened: List = []
 
         def _search(exclude_page_ids: Sequence[int] = ()) -> List[dict]:
-            conn, table, metadata = _open()
+            if not opened:
+                opened.append(_open_for_search())
+            table = opened[0]
             if table is None:
                 return []
-            validate_query_dimension(metadata, vector, lancedb_web_dir())
             query = table.search(vector).limit(candidates)
             if settings.knowledge_ann_bypass:
                 # Reader-side rollback for an ANN index: no data change.
@@ -784,7 +811,13 @@ async def retrieve(
                 # ANN (ADR-0001 D8): 50 probes measured recall@10 = 0.995 at
                 # 9 ms on a 90k-row copy, versus 150 ms for the flat scan.
                 try:
-                    query = query.nprobes(max(1, int(settings.web_index_nprobes))).refine_factor(2)
+                    query = query.nprobes(max(1, int(settings.web_index_nprobes)))
+                    if not _index_exact:
+                        # Refining only changes distances a lossy index
+                        # (PQ/SQ) approximated. On IVF_FLAT it returned the
+                        # identical rows 60/60 and cost 1.4 ms a round
+                        # (8.1 -> 6.7 ms p50, 20k rows, dbperf 2026-09-14).
+                        query = query.refine_factor(2)
                 except Exception:  # noqa: BLE001 — older client: flat is fine
                     pass
             if site_prefix:
@@ -811,7 +844,10 @@ async def retrieve(
                     + ", ".join(str(int(i)) for i in exclude_page_ids)
                     + ")"
                 )
-            return query.to_list()
+            # Only what the loop below reads. The 1024-float `vector` rode
+            # along on every hit and was converted to a Python list for
+            # nothing (engines/rag.py dropped it the same way).
+            return query.select(_HIT_COLUMNS).to_list()
 
         per_page = max(1, int(max_chunks_per_page))
         wanted_pages = max(1, -(-int(top_k) // per_page))  # ceil
@@ -872,6 +908,17 @@ async def retrieve(
                 del kept[per_page:]
             if len(chunks_by_url) >= wanted_pages:
                 break
+            # NOTHING LEFT TO FIND (2026-09-14). A round is nearest-first, so
+            # every row it did not return is at least as far as the farthest
+            # row it did. When that row is already past MAX_DISTANCE, or the
+            # round came back short of its limit (the filter or the probed
+            # partitions ran out — a later round probes the same partitions),
+            # another round can only return rows the distance floor drops.
+            # It used to run anyway: a second scan plus a second servable-page
+            # query on most calls whose corpus simply held fewer than top_k
+            # near pages.
+            if len(near) < len(hits) or len(hits) < candidates:
+                break
             # A round that turned up no page this call had not already seen
             # cannot be improved on by repeating it (a chunk with no page_id
             # cannot be excluded, so it would come back for ever).
@@ -926,6 +973,11 @@ def optimize() -> None:
 # ---------------------------------------------------------------------------
 
 _has_index: Optional[bool] = None
+#: Every vector index is IVF_FLAT (full-precision vectors in the partitions),
+#: so the scan's distances are already exact and `refine_factor` only re-reads
+#: the vectors of the over-fetched rows to recompute the same numbers. None =
+#: not known (refine stays on). Refreshed together with `_has_index`.
+_index_exact: Optional[bool] = None
 _cycles = 0
 
 
@@ -936,12 +988,59 @@ def _index_names(table) -> List[str]:
         return []
 
 
+def _index_columns(table) -> List[tuple]:
+    """(name, columns) of every index on the table; [] when it cannot say."""
+    try:
+        return [
+            (str(getattr(i, "name", i)), [str(c) for c in (getattr(i, "columns", None) or [])])
+            for i in table.list_indices()
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _is_vector_index(name: str, columns: Sequence[str]) -> bool:
+    if columns:
+        return "vector" in columns
+    return "vector" in name.lower()
+
+
 def _index_present(table) -> bool:
-    """Cached per process; refreshed by maintain()."""
-    global _has_index
+    """Is there an ANN index on `vector`? Cached per process; refreshed by maintain().
+
+    Vector indices only. This matched any name containing "idx", so the
+    scalar index on page_id (lancedb's default name `page_id_idx`) would have read as an ANN
+    index — the query would ask for probes the table cannot use, and
+    `maintain()` would never build the real one."""
+    global _has_index, _index_exact
     if _has_index is None:
-        _has_index = any("vector" in n.lower() or "idx" in n.lower() for n in _index_names(table))
+        kinds = _vector_index_types(table)
+        _has_index = bool(kinds)
+        _index_exact = bool(kinds) and all(k == "ivfflat" for k in kinds)
     return bool(_has_index)
+
+
+def _vector_index_types(table) -> List[str]:
+    """Normalised index_type ("ivfflat", "ivfpq", ...) of every vector index."""
+    try:
+        indices = list(table.list_indices())
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for i in indices:
+        name = str(getattr(i, "name", i))
+        cols = [str(c) for c in (getattr(i, "columns", None) or [])]
+        if _is_vector_index(name, cols):
+            out.append(str(getattr(i, "index_type", "") or "").lower().replace("_", ""))
+    return out
+
+
+#: Name of the scalar index on page_id (see `maintain`).
+PAGE_ID_INDEX_NAME = "page_id_btree"
+
+
+def _page_id_index_present(table) -> bool:
+    return any(cols == ["page_id"] for _n, cols in _index_columns(table))
 
 
 def _optimize_table(table) -> None:
@@ -976,10 +1075,10 @@ async def maintain(*, force: bool = False) -> dict:
       count reaches zero. Both are observability, not work — the repair itself
       is `index_pending`, which needs no fetch.
     """
-    global _cycles, _has_index
+    global _cycles, _has_index, _index_exact
     out = {
         "healed": 0, "optimized": False, "indexed": False, "rows": 0,
-        "stale_chunk_pages": 0, "sidecar_advanced": False,
+        "stale_chunk_pages": 0, "sidecar_advanced": False, "page_id_indexed": False,
     }
     if not settings.web_memory_enabled:
         return out
@@ -1044,6 +1143,31 @@ async def maintain(*, force: bool = False) -> dict:
         except Exception:  # noqa: BLE001
             log.debug("web index optimize failed", exc_info=True)
 
+    # SCALAR INDEX ON page_id (2026-09-13). Every retrieval round after the
+    # first prefilters `page_id NOT IN (...)`, and every write deletes by
+    # `page_id IN (...)`. Without an index LanceDB evaluates the predicate row
+    # by row and the flat scan loses its fast path. Measured on a compacted
+    # 200k-row, 1024-dim copy: the round-2 prefilter 393.6 ms -> 65.2 ms, an
+    # `IN (3 ids)` prefilter 43.3 ms -> 5.0 ms, unfiltered unchanged
+    # (88.8 / 60.4 ms); the build took 0.04 s. `optimize()` keeps it current
+    # and rows added since are scanned, so it is never wrong, only less fast.
+    if not _page_id_index_present(table):
+        def _build_scalar() -> None:
+            with write_lock(lancedb_web_dir(), wait_s=10.0):
+                # Named without "idx"/"vector": the pre-2026-09-14 `_index_present`
+                # read ANY name containing "idx" as an ANN index, so a rolled-back
+                # orchestrator would take the default `page_id_idx` for one and
+                # never build the real vector index.
+                table.create_scalar_index("page_id", index_type="BTREE", replace=True, name=PAGE_ID_INDEX_NAME)
+
+        try:
+            await asyncio.to_thread(_build_scalar)
+            out["page_id_indexed"] = True
+        except IndexBusy:
+            log.debug("web index: page_id index skipped: another process is writing")
+        except Exception:  # noqa: BLE001 — the prefilter still works without it
+            log.warning("web index: page_id scalar index build failed", exc_info=True)
+
     if rows >= int(settings.web_index_ann_min_rows):
         _has_index = None
         if force or not _index_present(table):
@@ -1065,6 +1189,7 @@ async def maintain(*, force: bool = False) -> dict:
                 started = asyncio.get_running_loop().time()
                 await asyncio.to_thread(_build)
                 _has_index = True
+                _index_exact = True  # IVF_FLAT, built just above
                 out["indexed"] = True
                 log.info(
                     "web index: IVF_FLAT index built over %d rows (%d partitions) in %.1fs",
