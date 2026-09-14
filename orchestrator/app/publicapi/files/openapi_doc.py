@@ -183,21 +183,31 @@ def paths(base: Any) -> Dict[str, Any]:
         "/v1/files/{file_id}/derived": {
             "get": _operation(
                 base, tag="Files", operation_id="listFileDerived", summary="List a file's derived outputs", scope=read,
-                description="Transcripts, extracted text and profiles, by name, once the file is `processed` (else `409 file_not_ready`).",
+                description=(
+                    "Transcripts, extracted text and profiles, by name, once the file is `processed`. While it is "
+                    "still `uploaded`: `409 file_not_ready` with `Retry-After`. Once its status is `error`: `400 "
+                    "invalid_request_error` on `file_id`, with the file's own `status_details` — not retryable."
+                ),
                 parameters=[file_id],
-                responses={"200": _ok(base, "#/components/schemas/DerivedList"), **_errors(base, "file_not_found", "file_not_ready")},
+                responses={
+                    "200": _ok(base, "#/components/schemas/DerivedList"),
+                    **_errors(base, "invalid_request_error", "file_not_found", "file_not_ready"),
+                },
             ),
         },
         "/v1/files/{file_id}/derived/{name}": {
             "get": _operation(
                 base, tag="Files", operation_id="downloadFileDerived", summary="Download a derived output", scope=read,
-                description="A name from the derived list. `Range` is honoured.",
+                description=(
+                    "A name from the derived list. `Range` is honoured. The same readiness answers as the list: "
+                    "`409 file_not_ready` while processing, `400 invalid_request_error` for a file in `error`."
+                ),
                 parameters=[file_id, _path_param("name", "text.txt")],
                 responses={
                     "200": {"description": "The bytes.", "headers": base._request_id_header(),
                             "content": {"application/octet-stream": {"schema": {"type": "string", "contentMediaType": "application/octet-stream"}}}},
                     "206": {"description": "The requested range."},
-                    **_errors(base, "file_not_found", "file_not_ready"),
+                    **_errors(base, "invalid_request_error", "file_not_found", "file_not_ready"),
                 },
             ),
         },

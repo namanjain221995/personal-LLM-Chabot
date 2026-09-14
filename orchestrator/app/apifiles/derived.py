@@ -176,6 +176,54 @@ def list_names(blob_row: Mapping[str, Any]) -> List[dict]:
     return [n.to_json() for n in out]
 
 
+READY = "ready"
+PENDING = "pending"
+FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class Readiness:
+    """Whether a FILE's derived data can be served (routes 7 and 8).
+
+    `state`: `ready` (the blob is processed), `pending` (still assembling,
+    queued or processing — worth a retry), or `failed` (processing ended
+    without derived data — a retry would get the same answer until the bytes
+    are uploaded again). `sentence` is the File object's own `status_details`
+    for a failed file, never anything else."""
+
+    state: str
+    sentence: Optional[str] = None
+
+
+def readiness(file_row: Mapping[str, Any]) -> Readiness:
+    """Readiness from a joined file row (`schema._FILE_SELECT`: blob columns
+    prefixed `blob_`).
+
+    WHY (verifier, 2026-09-14). The derived routes answered every blob status
+    other than `processed` with `409 file_not_ready` and a Retry-After — on a
+    file whose processing had FAILED too, so a client following the contract
+    retried for ever. A failed file (a failed blob, an unsupported kind, or an
+    assembly that failed its checksum) is now `failed`, with the same fixed
+    sentence the File object shows, so the route can answer with a
+    non-retryable error. The sentence comes from `jobs.processing_view`: one
+    source for "why", never an exception text."""
+    blob_status = str(file_row.get("blob_status") or "")
+    failed_assembly = bool(file_row.get("error_code")) and not file_row.get("blob_id")
+    if file_row.get("blob_id") and blob_status == "processed" and str(file_row.get("blob_kind") or "") != "unsupported":
+        return Readiness(READY)
+    if failed_assembly or (file_row.get("blob_id") and blob_status == "failed") or (
+        file_row.get("blob_id") and blob_status == "processed" and str(file_row.get("blob_kind") or "") == "unsupported"
+    ):
+        from . import jobs
+
+        view = jobs.file_processing_view(file_row)
+        sentence = view.get("status_details") or jobs.sentence_for("internal_error")
+        if blob_status == "processed":  # a legacy unsupported row that was never marked failed
+            sentence = jobs.sentence_for("unsupported_file")
+        return Readiness(FAILED, str(sentence))
+    return Readiness(PENDING)
+
+
 def open_name(blob_row: Mapping[str, Any], name: str) -> Tuple[str, str, int]:
     """(path, content type, bytes) for a derived download; `NameNotFound`
     for anything not on the allowlist, not built, or before processing."""

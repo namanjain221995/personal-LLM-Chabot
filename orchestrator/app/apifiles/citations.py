@@ -26,12 +26,28 @@ consumers, whose string indices are UTF-16). Python's `str` indices are code
 points, so an answer containing an emoji or CJK outside the BMP would place a
 naive Python offset one unit early per astral character.
 
+DURABLE RUNS (2026-09-14, the interface for the durable-resume team). The
+index lives in memory, built while the request's context was assembled, so a
+generation resumed in ANOTHER process after a deploy cannot annotate its
+answer from it. A durable run stores `CitationIndex.to_state()` (JSON: the
+labels, file ids, filenames, units and the supplied page / row / time pairs —
+never file text) beside its spec when it is launched, and at its terminal
+event calls `annotate_from_state(full_output_text, state)`; the resulting
+`annotations` go out as `annotation_added_events(...,
+first_sequence_number=<output_text.done's> + 1)` before the terminal event,
+and on the terminal Response through `with_annotations` (chat: the final
+chunk's `delta.annotations` / `chat_message_annotations`). The text passed
+must be the whole `output_text` of every attempt joined, exactly as the
+client assembles it: `index` offsets count from its first character.
+`service.citation_state(model_input)` builds the stored document.
+
 MEDIA TOLERANCE. A timestamp resolves when it falls within ±5 s of a span the
 model was given (a transcript block, a screen span, or a frame time) —
 models round `8:05.4` to `8:05`, and speech blocks start at the first word.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -228,6 +244,97 @@ class CitationIndex:
             return {**base, "page": entry.numbers[number]}
         return None
 
+    # -- durable state (2026-09-14) -----------------------------------------
+
+    def to_state(self) -> Dict[str, Any]:
+        """A JSON-safe copy of what was supplied, for a durable run to store
+        beside its spec (`citation_state`, module section DURABLE RUNS)."""
+        files = []
+        for label, entry in self._by_label.items():
+            files.append({
+                "label": label,
+                "file_id": entry.file_id,
+                "filename": entry.filename,
+                "unit": entry.unit,
+                "numbers": sorted([int(n), int(p)] for n, p in entry.numbers.items()),
+                "row_blocks": [[int(a), int(b), int(p)] for a, b, p in entry.row_blocks],
+                "spans": [[float(a), float(b)] for a, b in entry.spans],
+            })
+        return {"v": STATE_VERSION, "files": files}
+
+    @classmethod
+    def from_state(cls, state: Any) -> "CitationIndex":
+        """The index `to_state` described. Raises `ValueError` on anything
+        else — a row that does not parse must not become annotations."""
+        if not isinstance(state, Mapping) or state.get("v") != STATE_VERSION or not isinstance(state.get("files"), list):
+            raise ValueError("not a citation state")
+        files = state["files"]
+        if len(files) > MAX_STATE_FILES:
+            raise ValueError("too many files in a citation state")
+        index = cls()
+        for item in files:
+            if not isinstance(item, Mapping):
+                raise ValueError("a citation state file must be an object")
+            label, filename, unit = item.get("label"), item.get("filename"), item.get("unit")
+            file_id = item.get("file_id")
+            if not isinstance(label, str) or not label or not isinstance(filename, str) or unit not in _UNITS:
+                raise ValueError("a citation state file needs a label, a filename and a unit")
+            if file_id is not None and not isinstance(file_id, str):
+                raise ValueError("a citation state file id must be a string")
+            index.register(label, file_id=file_id, filename=filename, unit=str(unit))
+            entry = index._by_label[label]
+            numbers, blocks, spans = item.get("numbers") or [], item.get("row_blocks") or [], item.get("spans") or []
+            if not all(isinstance(x, list) for x in (numbers, blocks, spans)) or \
+                    len(numbers) + len(blocks) + len(spans) > MAX_STATE_PAIRS:
+                raise ValueError("a citation state file has malformed pairs")
+            for pair in numbers:
+                n, page = _ints(pair, 2)
+                entry.numbers[n] = page
+            for block in blocks:
+                entry.row_blocks.append(_ints(block, 3))  # type: ignore[arg-type]
+            for span in spans:
+                start, end = _floats(span, 2)
+                entry.spans.append((min(start, end), max(start, end)))
+        return index
+
+
+#: `CitationIndex.to_state` format. A durable run that finds another version
+#: annotates nothing rather than guessing (`annotate_from_state`).
+STATE_VERSION = 1
+#: Bounds on a stored state read back: `service.max_file_parts_per_request`
+#: is 20 files, and a 10,000-page PDF supplies at most 10,000 pages.
+MAX_STATE_FILES = 64
+MAX_STATE_PAIRS = 200_000
+_UNITS = frozenset({UNIT_PAGE, UNIT_SECTION, UNIT_SLIDE, UNIT_ROWS, UNIT_TIME})
+
+
+def _ints(values: Any, n: int) -> Tuple[int, ...]:
+    if not isinstance(values, (list, tuple)) or len(values) != n:
+        raise ValueError("a citation state pair has the wrong shape")
+    out = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("a citation state number must be an integer")
+        out.append(int(value))
+    return tuple(out)
+
+
+def _floats(values: Any, n: int) -> Tuple[float, ...]:
+    if not isinstance(values, (list, tuple)) or len(values) != n:
+        raise ValueError("a citation state span has the wrong shape")
+    out = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("a citation state time must be a finite number")
+        try:
+            number = float(value)
+        except OverflowError:
+            raise ValueError("a citation state time must be a finite number") from None
+        if not math.isfinite(number):
+            raise ValueError("a citation state time must be a finite number")
+        out.append(number)
+    return tuple(out)
+
 
 def utf16_offsets(text: str) -> List[int]:
     """offsets[i] = UTF-16 code units before code point i (len(text)+1 long)."""
@@ -294,6 +401,23 @@ def annotate(text: str, index: CitationIndex) -> Annotated:
             annotation["timestamp_s"] = fields["timestamp_s"]
         annotations.append(annotation)
     return Annotated(annotations, resolved, unresolved)
+
+
+def annotate_from_state(text: str, state: Any) -> Annotated:
+    """`annotate` against a stored `CitationIndex.to_state()` (DURABLE RUNS).
+
+    Never raises: a state that is missing, of another version or malformed
+    annotates nothing and counts every marker as unresolved — an answer is
+    never failed, and never given a citation it cannot prove, because its
+    citation state was lost."""
+    try:
+        index = CitationIndex.from_state(state)
+    except Exception:  # noqa: BLE001 - the contract above: a bad state annotates nothing
+        # Not only ValueError/TypeError/KeyError: `float(10**400)` raises
+        # OverflowError, and this runs at a durable run's terminal event in
+        # another process, where a raise would fail a finished answer.
+        index = CitationIndex()
+    return annotate(text, index)
 
 
 # ------------------------------------------------------------------ wire --

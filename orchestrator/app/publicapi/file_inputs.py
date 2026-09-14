@@ -358,9 +358,11 @@ def patient_transcriber(*, dispatcher_factory: Optional[Callable[[str], Any]] = 
 
 
 def patient_ocr_gate() -> AsyncContextManager[None]:
-    """The OCR gate of an inline PDF's thin pages, patient, yielding to chat
-    (`ocr_pages.default_gate` waits PUBLIC_API_BACKGROUND_GATE_WAIT_S, then
-    the inline file is refused `model_unavailable`)."""
+    """The OCR gate of an inline PDF's thin pages, patient, yielding to chat.
+
+    `ocr_pages.default_gate` also has no clock since 2026-09-14, but it ends
+    only on a processing job's `abandon` event, which an inline file has no
+    use for; this gate is the request path's patient hold."""
     return patient_hold(capacity.GATE_OCR, yield_to_chat=True)
 
 

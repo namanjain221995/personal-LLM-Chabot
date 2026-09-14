@@ -85,8 +85,9 @@ STILL_READ_RETIRED_SETTINGS = {
     "PUBLIC_API_GATE_WAIT_S": "publicapi/capacity.py sync_wait_s, for the bounded file preparation of a "
     "synchronous request (file_inputs.bounded_engines, and the retrieval reranker through sidecars' "
     "BOUNDED_DEFAULT); the embeddings, rerank and transcription routes stopped reading it 2026-09-14",
-    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "apifiles/ocr_pages.py and apifiles/vectors.py (Files processing jobs) "
-    "and the legacy background path while the durable runtime is not running",
+    "PUBLIC_API_BACKGROUND_GATE_WAIT_S": "publicapi/capacity.py for the legacy background path while the durable "
+    "runtime is not running, and apiplatform/idempotency.py (the in-flight claim lease); Files processing jobs "
+    "no longer read it",
     "PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS": "apiplatform/idempotency.py",
 }
 
