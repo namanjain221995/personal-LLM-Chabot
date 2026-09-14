@@ -243,6 +243,11 @@ services:
       # stops every existing API key verifying at once, with no error beyond
       # a wall of 401 invalid_api_key.
       PUBLIC_API_TRUSTED_PROXIES: ${PUBLIC_API_TRUSTED_PROXIES:-}
+      # Who may send the v1-gateway's X-TechSara-* attach headers: the
+      # gateway's own address on v1relay, exact addresses only (T3-wire,
+      # 2026-09-14). Not PUBLIC_API_TRUSTED_PROXIES, which names every proxy
+      # allowed to set X-Forwarded-For and is documented as a network range.
+      PUBLIC_API_GATEWAY_PEERS: ${PUBLIC_API_GATEWAY_PEERS:-}
       PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
       PUBLIC_API_IDEMPOTENCY_TTL_HOURS: ${PUBLIC_API_IDEMPOTENCY_TTL_HOURS:-}
       PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS: ${PUBLIC_API_IDEMPOTENCY_IN_FLIGHT_LEASE_SECONDS:-}
@@ -274,8 +279,16 @@ services:
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${ORCHESTRATOR_PORT:-8080}:8080"
     networks:
-      - application
-      - inference
+      # Map form with EMPTY values, not `{}`: Compose hashes `{}` differently
+      # from the list form, and the v1relay entry below is meant to be the
+      # only change to this service's definition.
+      application:
+      inference:
+      # The v1-gateway's upstream path (network v1relay below). The alias
+      # exists on this network only, so the gateway's connection always
+      # arrives from its pinned address, never from its application address.
+      v1relay:
+        aliases: [orchestrator-v1relay]
     init: true
     restart: unless-stopped
     stop_grace_period: 2m
@@ -362,6 +375,20 @@ services:
       TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-}
       TRUSTED_FORWARDED_PROTO: ${TRUSTED_FORWARDED_PROTO:-}
       PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
+      # The per-path caps of the /v1 edge (route.ts reads the media and audio
+      # caps; the pooling cap for embeddings/rerank arrives with T5's route.ts
+      # and the Files routes' two with the Files wave), handed over
+      # like the one above so the frontend edge, the v1-gateway and the
+      # orchestrator refuse at the same byte when an operator raises one in
+      # .env: the frontend's env_file is generated.env only (review 2026-09-14).
+      PUBLIC_API_MAX_MEDIA_BODY_BYTES: ${PUBLIC_API_MAX_MEDIA_BODY_BYTES:-}
+      PUBLIC_API_MAX_AUDIO_BODY_BYTES: ${PUBLIC_API_MAX_AUDIO_BODY_BYTES:-}
+      PUBLIC_API_MAX_POOLING_BODY_BYTES: ${PUBLIC_API_MAX_POOLING_BODY_BYTES:-}
+      PUBLIC_API_FILES_MAX_BODY_BYTES: ${PUBLIC_API_FILES_MAX_BODY_BYTES:-}
+      PUBLIC_API_FILES_PART_MAX_BYTES: ${PUBLIC_API_FILES_PART_MAX_BYTES:-}
+      # The LAN path to /v1 relays through the same gateway as the tunnel, so
+      # a frontend recreate never cuts a developer call (app/v1 route.ts).
+      V1_GATEWAY_URL: http://v1-gateway:8090
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     networks:
@@ -417,10 +444,138 @@ services:
         condition: service_healthy
     logging: *default-logging
 
+  # The public developer API's relay (gateway/README.md), 2026-09-13.
+  #
+  # WHY A SEPARATE CONTAINER. Every routine deploy recreates the orchestrator
+  # and the frontend, and a client socket held by a process that restarts is a
+  # client call that fails. This process holds the developer's connection
+  # instead: before the first byte it retries the orchestrator for up to 110 s,
+  # and after it it heartbeats and re-attaches to the durable run. That only
+  # works if a routine deploy never recreates THIS container, so its
+  # definition is built to change only when the gateway itself changes:
+  #
+  #   * the image tag is the digest of the image's own inputs (Dockerfile,
+  #     server.cjs, lib/) -- V1_GATEWAY_CODE_SHA, which the launcher computes
+  #     and exports to Compose on every `up`, and scripts/deploy.sh exports for
+  #     its helpers. A README or test edit under gateway/ is not an input.
+  #   * NO env_file. Compose folds every key of an env_file into the service
+  #     definition, and generated.env gains or changes keys on ordinary
+  #     deploys; a single one would recreate this container. Everything it
+  #     reads is named below, from values an operator changes on purpose.
+  #     For the same reason V1_GATEWAY_CODE_SHA is never written to .env,
+  #     secrets.env or generated.env: those fold into the orchestrator and the
+  #     frontend, and would recreate THEM whenever the gateway changed.
+  #   * NO depends_on, so recreating the orchestrator never touches it.
+  #
+  # It takes no public traffic until the operator routes ^/v1 to it in the
+  # Cloudflare tunnel (gateway/README.md, "Operating it"). The launcher starts
+  # it with `up -d --no-deps v1-gateway`, never --force-recreate.
+  v1-gateway:
+    image: sf-local-ai-v1-gateway:${V1_GATEWAY_CODE_SHA:-unpinned}
+    build:
+      context: ./gateway
+    environment:
+      # The orchestrator's name on v1relay ONLY (see the network below), so the
+      # connection always leaves from this container's pinned address.
+      ORCHESTRATOR_URL: http://orchestrator-v1relay:8080
+      V1_GATEWAY_PORT: "8090"
+      V1_GATEWAY_SPOOL_DIR: /spool
+      # The same variables, with the same blank-means-default rule, as the
+      # frontend edge and the orchestrator, so all three refuse at the same byte
+      # and trust the same client-address header.
+      TRUSTED_CLIENT_IP_HEADER: ${TRUSTED_CLIENT_IP_HEADER:-}
+      TRUSTED_FORWARDED_PROTO: ${TRUSTED_FORWARDED_PROTO:-}
+      PUBLIC_API_MAX_BODY_BYTES: ${PUBLIC_API_MAX_BODY_BYTES:-}
+      PUBLIC_API_MAX_MEDIA_BODY_BYTES: ${PUBLIC_API_MAX_MEDIA_BODY_BYTES:-}
+      PUBLIC_API_MAX_AUDIO_BODY_BYTES: ${PUBLIC_API_MAX_AUDIO_BODY_BYTES:-}
+      PUBLIC_API_MAX_POOLING_BODY_BYTES: ${PUBLIC_API_MAX_POOLING_BODY_BYTES:-}
+      PUBLIC_API_FILES_MAX_BODY_BYTES: ${PUBLIC_API_FILES_MAX_BODY_BYTES:-}
+      PUBLIC_API_FILES_PART_MAX_BYTES: ${PUBLIC_API_FILES_PART_MAX_BYTES:-}
+      # Spooled request bodies: a total quota across relays, and the free-space
+      # floor the orchestrator's disk guard uses (blank = 2 GiB and 20 GiB).
+      V1_GATEWAY_SPOOL_MAX_BYTES: ${V1_GATEWAY_SPOOL_MAX_BYTES:-}
+      PUBLIC_API_MIN_FREE_DISK_BYTES: ${PUBLIC_API_MIN_FREE_DISK_BYTES:-}
+      # Request bodies held in memory, summed over every relay (blank =
+      # 256 MiB); past it new bodies spill to the spool above.
+      V1_GATEWAY_MEMORY_BUDGET_BYTES: ${V1_GATEWAY_MEMORY_BUDGET_BYTES:-}
+    # tini as PID 1 forwards SIGTERM straight to node (exec-form CMD), whose
+    # drain closes the listener and cuts relays still open 2 s later so their
+    # clients resume; 30 s is a ceiling, an idle gateway exits at once.
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # RESOURCE GUARDS. Deliberately no cgroup memory limit: none of this
+    # stack has one (launcher/tests/test_oom_score_adj.py records why), and an
+    # OOM kill here would cut every public connection at once. What is bounded:
+    #   * file descriptors, pinned rather than inherited from the daemon: two
+    #     per relay plus a spool file, and the gateway refuses new /v1 work
+    #     with 503 Retry-After 30 at 70% of this, while /healthz keeps answering;
+    #   * processes: node's own threads plus the healthcheck, far below this;
+    #   * disk: the spool quota and free-space floor above, on a named volume;
+    #   * request bodies in memory: V1_GATEWAY_MEMORY_BUDGET_BYTES in total.
+    #     Past it a new body spills to the spool, and past the spool quota it
+    #     is refused 503 Retry-After 30 (lib/guards.cjs MemoryBudget). WHY
+    #     (review 2026-09-14, measured): with the orchestrator refusing
+    #     connections, as during every deploy, 400 unauthenticated 1 MiB
+    #     bodies held +914 MiB of RSS, and only the fd guard -- tens of
+    #     thousands of relays -- stood between that and the 128 GB the model
+    #     shares. What remains per relay is its sockets and bookkeeping.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    pids_limit: 256
+    volumes:
+      - v1gateway_spool:/spool
+    networks:
+      # cloudflared and the frontend reach it as v1-gateway:8090 here.
+      application:
+      v1relay:
+        ipv4_address: 10.231.231.2
+    # No `ports:`. It is reached over the Docker network only.
+    healthcheck:
+      # Answers from the process itself (never the orchestrator), so an
+      # orchestrator restart does not mark the gateway unhealthy; 503 while
+      # draining. Exec form: no shell in the probe.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+
 networks:
   application:
   inference:
     internal: true
+  # v1-gateway -> orchestrator, 2026-09-13. Its own internal network with a
+  # fixed subnet, so the gateway has ONE stable address the orchestrator can
+  # name in PUBLIC_API_GATEWAY_PEERS (the attach headers are honoured only
+  # from a listed peer) instead of a range that other containers share.
+  # Members: v1-gateway at the pinned .2 and the orchestrator (alias
+  # orchestrator-v1relay). Dynamic addresses come from ip_range only, so
+  # nothing started before the gateway can take .2; the bridge keeps .1.
+  #
+  # WHERE (2026-09-14, review finding). Outside Docker's default address
+  # pools (172.17-31.0.0/16 and 192.168.0.0/16): Docker hands those out to
+  # every network any project creates, and refuses to create a network that
+  # overlaps one ("networks have overlapping IPv4"), so a subnet inside them
+  # works until the day another network takes the covering /16. Also clear of
+  # this host's own RoCE, LAN and VPN ranges. The launcher checks Docker's networks and the
+  # host's routes before the first `up` that creates it, and stops with what
+  # overlaps (cli.py _check_v1relay_subnet). Changing this block needs every
+  # member stopped and the network removed first; change the gateway's
+  # ipv4_address, PUBLIC_API_GATEWAY_PEERS and PUBLIC_API_TRUSTED_PROXIES with it.
+  v1relay:
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.231.231.0/28
+          ip_range: 10.231.231.8/29
+          gateway: 10.231.231.1
 
 volumes:
   data:
@@ -433,3 +588,5 @@ volumes:
     name: sf-local-ai_pgadmin
   hf-cache:
     name: sf-local-ai_hf-cache
+  v1gateway_spool:
+    name: sf-local-ai_v1gateway_spool

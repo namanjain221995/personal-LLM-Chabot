@@ -144,4 +144,42 @@ class SpoolBudget {
   }
 }
 
-module.exports = { parseNofile, readNofile, openFdCount, FdGuard, SpoolBudget };
+/**
+ * The memory budget for request bodies (2026-09-14, review finding,
+ * measured with scratchpad memflood.cjs on Node 20.20.2: the orchestrator
+ * refusing connections, as it does during every deploy, and 400 concurrent
+ * unauthenticated POST /v1/embeddings of a 1,000,024-byte body took the
+ * gateway from 47 MiB to 961 MiB of RSS with no response sent). Each buffered
+ * body up to V1_GATEWAY_MEMORY_BODY_BYTES stayed in memory for the life of
+ * its relay, only spooled bytes were budgeted, and authentication happens at
+ * the orchestrator -- so the only bound was the fd guard, tens of thousands
+ * of relays, on a host whose 128 GB the model shares.
+ *
+ * One process-wide total of body bytes held in memory
+ * (V1_GATEWAY_MEMORY_BUDGET_BYTES, default 256 MiB). A body that cannot get
+ * memory spills to the spool instead, which has its own quota and
+ * free-space floor (SpoolBudget); a body neither can hold is refused 503
+ * Retry-After 30. Counting is exact: bodies.cjs reserves each chunk's length
+ * before it keeps the chunk and releases it when the chunk goes to disk or
+ * the relay ends.
+ */
+class MemoryBudget {
+  constructor({ maxBytes } = {}) {
+    this.maxBytes = maxBytes;
+    this.used = 0;
+  }
+
+  /** true and the bytes are held, or false (nothing held). */
+  reserve(bytes) {
+    const n = Math.max(0, Math.ceil(bytes));
+    if (this.used + n > this.maxBytes) return false;
+    this.used += n;
+    return true;
+  }
+
+  release(bytes) {
+    this.used = Math.max(0, this.used - Math.max(0, Math.ceil(bytes)));
+  }
+}
+
+module.exports = { parseNofile, readNofile, openFdCount, FdGuard, SpoolBudget, MemoryBudget };

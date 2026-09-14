@@ -27,7 +27,7 @@ const { readSettings } = require('./lib/settings.cjs');
 const H = require('./lib/headers.cjs');
 const B = require('./lib/bodies.cjs');
 const { Relay } = require('./lib/relay.cjs');
-const { FdGuard, SpoolBudget, readNofile } = require('./lib/guards.cjs');
+const { FdGuard, SpoolBudget, MemoryBudget, readNofile } = require('./lib/guards.cjs');
 const { installDrain } = require('./lib/drain.cjs');
 
 /**
@@ -60,6 +60,7 @@ function createGateway({ env = process.env, log = jsonLog() } = {}) {
       maxBytes: settings.spoolMaxBytes,
       minFreeBytes: settings.spoolMinFreeBytes,
     }),
+    memoryBudget: new MemoryBudget({ maxBytes: settings.memoryBudgetBytes }),
     draining: false,
   };
 
@@ -146,6 +147,7 @@ function createGateway({ env = process.env, log = jsonLog() } = {}) {
             nofile_soft: nofile ? nofile.soft : null,
             nofile_hard: nofile ? nofile.hard : null,
             spool_removed: removed,
+            memory_budget_bytes: settings.memoryBudgetBytes,
             attach: settings.attach,
           });
           resolve(address.port);

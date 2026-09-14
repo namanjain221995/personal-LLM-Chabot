@@ -482,6 +482,95 @@ test.describe('the spool', () => {
     assert.ok(delta <= 2, `${delta} descriptors left open`);
   });
 
+  test('with the orchestrator refusing connections, bodies past the memory budget spill instead of growing the gateway, and every one is answered and cleaned up', { skip: !fs.existsSync('/proc/self/status') }, async (t) => {
+    // Review finding 2026-09-14 (scratchpad memflood.cjs, Node 20.20.2): the
+    // orchestrator refusing connections as in every deploy, 400 junk-key
+    // 1 MiB bodies took the gateway from 47 to 961 MiB of RSS, 0 responses.
+    // SCALED: 96 bodies, a 4 MiB budget, the 110 s pre-commit window 6 s.
+    const N = 96;
+    const budget = 4 * 1024 * 1024;
+    const spool = h.tmpdir('gw-membudget-flood-');
+    const g = await spawnGatewayUnder(t, '', 1, {
+      V1_GATEWAY_SPOOL_DIR: spool,
+      V1_GATEWAY_MEMORY_BUDGET_BYTES: String(budget),
+      PUBLIC_API_MIN_FREE_DISK_BYTES: '0',
+      PUBLIC_API_GATEWAY_PRECOMMIT_RETRY_S: '6',
+      V1_GATEWAY_PRECOMMIT_RETRY_INTERVAL_S: '0.5',
+    });
+    assert.equal(g.listening.memory_budget_bytes, budget);
+    await h.sleep(300);
+    const before = rssBytes(g.proc.pid);
+    const body = JSON.stringify({ model: 'm', input: 'a'.repeat(1_000_000) });
+    const statuses = [];
+    const pending = [];
+    for (let i = 0; i < N; i += 1) {
+      pending.push(new Promise((resolve) => {
+        const req = http.request({ host: '127.0.0.1', port: g.port, method: 'POST', path: '/v1/embeddings', agent: false, headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)), authorization: 'Bearer junk' } }, (res) => {
+          res.resume();
+          res.on('end', () => resolve(statuses.push(res.statusCode)));
+        });
+        req.on('error', () => resolve(statuses.push('error')));
+        req.end(body);
+      }));
+    }
+    let peak = 0;
+    let spilled = 0;
+    for (let i = 0; i < 16 && statuses.length === 0; i += 1) {
+      await h.sleep(250);
+      peak = Math.max(peak, rssBytes(g.proc.pid) - before);
+      spilled = Math.max(spilled, fs.readdirSync(spool).length);
+    }
+    t.diagnostic(`${N} waiting 1 MiB bodies: RSS +${(peak / 1048576).toFixed(1)} MiB, ${spilled} spilled`);
+    // Measured +39.3 to +49.7 MiB over six runs, some on a loaded host. Unbudgeted,
+    // the bodies alone are 96 MiB (the mutant measured +111.6 MiB, 0 spilled).
+    assert.ok(peak < budget + 72 * 1024 * 1024, `RSS grew ${(peak / 1048576).toFixed(1)} MiB`);
+    assert.ok(spilled >= N - Math.floor(budget / 1_000_000) - 1, `${spilled} of ${N} bodies spilled`);
+    await Promise.all(pending);
+    assert.deepEqual([...new Set(statuses)], [503], 'each waiting body got the pre-commit 503, none was dropped');
+    for (let i = 0; i < 40 && fs.readdirSync(spool).length > 0; i += 1) await h.sleep(50);
+    assert.deepEqual(fs.readdirSync(spool), [], 'every spilled body was removed');
+  });
+
+  test('a relayed body is byte-exact whether it stayed in memory or spilled because the budget was spent, and the budget comes back when relays end', async (t) => {
+    // SCALED: budget 256 MiB → 250 KiB; three 100 KiB bodies held open together.
+    let held = [];
+    const server = http.createServer((req, res) => {
+      const hash = require('node:crypto').createHash('sha256');
+      let bytes = 0;
+      req.on('data', (c) => {
+        bytes += c.length;
+        hash.update(c);
+      });
+      req.on('end', () => held.push(() => res.end(JSON.stringify({ bytes, sha256: hash.digest('hex') }))));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const gw = await h.startGateway({ orchestratorPort: server.address().port, env: { V1_GATEWAY_MEMORY_BUDGET_BYTES: String(250_000), PUBLIC_API_MIN_FREE_DISK_BYTES: '0' } });
+    t.after(async () => {
+      await gw.close();
+      server.closeAllConnections();
+      server.close();
+    });
+    const memory = gw.gateway.gw.memoryBudget;
+    const bodies = [0x41, 0x42, 0x43].map((b, i) => Buffer.concat([Buffer.from(`{"n":${i},"x":"`), Buffer.alloc(100_000, b), Buffer.from('"}')]));
+    const replies = [];
+    for (const body of bodies) {
+      replies.push(h.request(gw.port, { method: 'POST', path: '/v1/echo', headers: { 'content-type': 'application/json' }, body }));
+      for (let i = 0; i < 100 && held.length < replies.length; i += 1) await h.sleep(20);
+    }
+    assert.equal(held.length, 3);
+    assert.equal(memory.used, bodies[0].length + bodies[1].length, 'the first two bodies are in memory');
+    assert.equal(fs.readdirSync(gw.spool).length, 1, 'the third spilled');
+    for (const release of held) release();
+    held = [];
+    const answers = await Promise.all(replies);
+    const sha = (b) => require('node:crypto').createHash('sha256').update(b).digest('hex');
+    assert.deepEqual(answers.map((a) => JSON.parse(a.text)), bodies.map((b) => ({ bytes: b.length, sha256: sha(b) })));
+    for (let i = 0; i < 50 && gw.gateway.gw.registry.size > 0; i += 1) await h.sleep(20);
+    assert.equal(memory.used, 0);
+    for (let i = 0; i < 50 && fs.readdirSync(gw.spool).length > 0; i += 1) await h.sleep(20);
+    assert.deepEqual(fs.readdirSync(gw.spool), []);
+  });
+
   test('a restarted gateway removes the bodies a previous process left and tightens the directory', () => {
     const spool = h.tmpdir('gw-spool-stale-');
     fs.chmodSync(spool, 0o755);

@@ -17,6 +17,12 @@
  *    64 MiB body; streaming 8 x 64 MiB plateaued at 632 MiB.
  *  - NONE (GET, OPTIONS).
  *
+ * MEMORY IS BOUNDED TOO (2026-09-14, review finding: 400 waiting 1 MiB
+ * bodies held +914 MiB of RSS). The bytes kept in memory are reserved
+ * against one process-wide MemoryBudget (lib/guards.cjs); a body that
+ * cannot get memory spills to the spool at once, so the spool's quota and
+ * floor below are what refuse it.
+ *
  * THE SPOOL IS BOUNDED (2026-09-13, review finding, reproduced: six
  * credential-less connections trickling one byte per idle window held six
  * 19 MiB spool files, 114 MiB, with the orchestrator never called). Every
@@ -39,7 +45,9 @@ const MiB = 1024 * 1024;
 
 const DEFAULT_PUBLIC_API_BODY_BYTES = 1 * MiB;
 const DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES = 20 * MiB;
-const DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES = 26 * MiB;
+const DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES = 90 * MiB;
+// no-timeout design: 2,048 inputs / 1,000 documents are request shape (route.ts).
+const DEFAULT_PUBLIC_API_POOLING_BODY_BYTES = 8 * MiB;
 // Files design §8: 64 MiB part + 1 MiB multipart framing; raw PUT part 64 MiB.
 const DEFAULT_PUBLIC_API_FILES_MAX_BODY_BYTES = 68_157_440;
 const DEFAULT_PUBLIC_API_FILES_PART_MAX_BYTES = 67_108_864;
@@ -120,6 +128,13 @@ function bodyRuleFor(method, route, env = process.env) {
   if (route === 'responses' || route === 'chat/completions') {
     return {
       cap: envBytes(env, 'PUBLIC_API_MAX_MEDIA_BODY_BYTES', DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES),
+      mode: 'buffer',
+      requireLength: false,
+    };
+  }
+  if (route === 'embeddings' || route === 'rerank') {
+    return {
+      cap: envBytes(env, 'PUBLIC_API_MAX_POOLING_BODY_BYTES', DEFAULT_PUBLIC_API_POOLING_BODY_BYTES),
       mode: 'buffer',
       requireLength: false,
     };
@@ -425,13 +440,16 @@ class BodyIdleGuard {
 /* --------------------------------------------------- the buffered body -- */
 
 class BufferedBody {
-  constructor({ budget = null, scan = false } = {}) {
+  constructor({ budget = null, memory = null, scan = false } = {}) {
     this.size = 0;
     this.chunks = [];
     this.file = null;
     this.fd = null;
     this.budget = budget;
     this.reserved = 0;
+    // Bytes of `chunks` held against the MemoryBudget.
+    this.memory = memory;
+    this.memoryReserved = 0;
     this.scanner = scan ? new StreamFlagScanner() : null;
   }
 
@@ -439,10 +457,21 @@ class BufferedBody {
     return this.file !== null;
   }
 
-  /** A fresh readable over the same bytes, for every send. */
+  /**
+   * A fresh readable over the same bytes, for every send. The kept chunks
+   * themselves, never a Buffer.concat copy: every pre-commit retry (one per
+   * 2 s for up to 110 s) and re-attach makes a new stream, and a copy each
+   * time is body-sized garbage per attempt outside any budget.
+   */
   stream() {
     if (this.file) return fs.createReadStream(this.file);
-    return Readable.from(this.chunks.length ? [Buffer.concat(this.chunks, this.size)] : []);
+    return Readable.from(this.chunks.slice());
+  }
+
+  /** Give the memory budget back what `chunks` held (they went to disk, or away). */
+  releaseMemory() {
+    if (this.memory && this.memoryReserved > 0) this.memory.release(this.memoryReserved);
+    this.memoryReserved = 0;
   }
 
   /** StreamFlagScanner.summary() of the whole body; null when not scanned. */
@@ -457,6 +486,7 @@ class BufferedBody {
    */
   dispose() {
     this.chunks = [];
+    this.releaseMemory();
     if (this.budget && this.reserved > 0) {
       this.budget.release(this.reserved);
       this.reserved = 0;
@@ -486,12 +516,14 @@ class BufferedBody {
  *                            for a declared body, before a byte was read
  *
  * `budget` (a SpoolBudget) is charged for every byte that goes to disk;
+ * `memory` (a MemoryBudget) for every byte kept in memory -- when it says
+ * no, the body spills early and the spool budget decides;
  * `declared` is the Content-Length, reserved whole when it would spill;
  * `scan` feeds every chunk to a StreamFlagScanner (body.summary()).
  */
-function readBufferedBody(req, { cap, memoryBytes, spoolDir, idle, budget = null, declared = null, scan = false }) {
+function readBufferedBody(req, { cap, memoryBytes, spoolDir, idle, budget = null, memory = null, declared = null, scan = false }) {
   return new Promise((resolve) => {
-    const body = new BufferedBody({ budget, scan });
+    const body = new BufferedBody({ budget, memory, scan });
     let settled = false;
     let writing = Promise.resolve();
 
@@ -534,6 +566,7 @@ function readBufferedBody(req, { cap, memoryBytes, spoolDir, idle, budget = null
       body.file = file;
       for (const chunk of body.chunks) fs.writeSync(body.fd, chunk);
       body.chunks = [];
+      body.releaseMemory();
     };
 
     /** Reserve spool bytes up to `body.size`; false (and finished) when refused. */
@@ -559,7 +592,8 @@ function readBufferedBody(req, { cap, memoryBytes, spoolDir, idle, budget = null
         return;
       }
       if (body.scanner) body.scanner.push(chunk);
-      if (!body.file && body.size <= memoryBytes) {
+      if (!body.file && body.size <= memoryBytes && (!memory || memory.reserve(chunk.length))) {
+        body.memoryReserved += memory ? chunk.length : 0;
         body.chunks.push(chunk);
         return;
       }
@@ -687,6 +721,7 @@ module.exports = {
   DEFAULT_PUBLIC_API_BODY_BYTES,
   DEFAULT_PUBLIC_API_MEDIA_BODY_BYTES,
   DEFAULT_PUBLIC_API_AUDIO_BODY_BYTES,
+  DEFAULT_PUBLIC_API_POOLING_BODY_BYTES,
   DEFAULT_PUBLIC_API_FILES_MAX_BODY_BYTES,
   DEFAULT_PUBLIC_API_FILES_PART_MAX_BYTES,
   DETERMINISTIC_JSON_ROUTES,

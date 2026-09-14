@@ -33,11 +33,7 @@ const REQUEST_HEADER_ALLOWLIST = Object.freeze([
   'origin',
   'access-control-request-method',
   'access-control-request-headers',
-]);
-
-const PENDING_REQUEST_HEADERS = Object.freeze([
-  // no-timeout design, deploy_survival §10 IMPLICIT ATTACH: openai-python,
-  // openai-node 6.49.0 and 7.15.0 all send it (measured, nt-parity).
+  // no-timeout design, deploy_survival §10 IMPLICIT ATTACH (measured, nt-parity).
   'x-stainless-retry-count',
   // Files design §12.4.
   'content-digest',
@@ -45,6 +41,8 @@ const PENDING_REQUEST_HEADERS = Object.freeze([
   'range',
   'if-none-match',
 ]);
+
+const PENDING_REQUEST_HEADERS = Object.freeze([]);
 
 const RESPONSE_HEADER_ALLOWLIST = Object.freeze([
   'content-type',
@@ -60,9 +58,6 @@ const RESPONSE_HEADER_ALLOWLIST = Object.freeze([
   'access-control-allow-headers',
   'access-control-expose-headers',
   'access-control-max-age',
-]);
-
-const PENDING_RESPONSE_HEADERS = Object.freeze([
   // no-timeout design T5 (both SDKs read it before their own retry table).
   'x-should-retry',
   // Files design §12.5.
@@ -72,6 +67,8 @@ const PENDING_RESPONSE_HEADERS = Object.freeze([
   'etag',
   'content-security-policy',
 ]);
+
+const PENDING_RESPONSE_HEADERS = Object.freeze([]);
 
 const RESPONSE_HEADER_PREFIXES = Object.freeze(['x-ratelimit-']);
 

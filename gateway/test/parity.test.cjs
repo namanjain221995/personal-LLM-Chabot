@@ -99,7 +99,7 @@ test.describe('the lists match route.ts', { skip }, () => {
     );
     for (const [code, spec] of Object.entries(table)) assert.deepEqual(H.EDGE_ERRORS[code], spec, code);
     // The one addition is the Files design's 411 (§2.17).
-    assert.deepEqual(Object.keys(H.EDGE_ERRORS).filter((c) => !(c in table)), ['invalid_request_error']);
+    assert.deepEqual(Object.keys(H.EDGE_ERRORS).filter((c) => !(c in table)), []);
     for (const sentence of ['The service is temporarily unavailable. Please retry.', 'Something went wrong on our side.', 'byte limit.']) {
       assert.ok(src.includes(sentence), sentence);
     }
@@ -124,14 +124,16 @@ test.describe('the lists match route.ts', { skip }, () => {
     }
     const fallback = /return envBytes\('([A-Z_]+)', (DEFAULT_[A-Z_]+)\);\s*\}\s*\n\s*\/\*\*/.exec(src) || /function publicApiBodyBytes\(\)[^{]*\{\s*return envBytes\('([A-Z_]+)', (DEFAULT_[A-Z_]+)\)/.exec(src);
     assert.ok(fallback, 'default cap parsed');
-    assert.equal(B.bodyRuleFor('POST', 'embeddings', {}).cap, defaults[fallback[2]]);
-    assert.equal(B.bodyRuleFor('POST', 'embeddings', { [fallback[1]]: '777' }).cap, 777);
+    // 'responses/{id}/cancel': a JSON route with no cap of its own (embeddings
+    // and rerank have had 8 MiB since the no-timeout design).
+    assert.equal(B.bodyRuleFor('POST', 'responses/resp_1/cancel', {}).cap, defaults[fallback[2]]);
+    assert.equal(B.bodyRuleFor('POST', 'responses/resp_1/cancel', { [fallback[1]]: '777' }).cap, 777);
   });
 
   test('the gateway answers every method route.ts exports, plus HEAD (Next derives it from GET) and the Files design’s PUT and DELETE', () => {
     const exported = [...src.matchAll(/export async function ([A-Z]+)\(/g)].map((x) => x[1]);
     for (const m of exported) assert.ok(METHODS.has(m), m);
-    assert.deepEqual([...METHODS].filter((m) => !exported.includes(m)).sort(), ['DELETE', 'HEAD', 'PUT']);
+    assert.deepEqual([...METHODS].filter((m) => !exported.includes(m)).sort(), ['HEAD']);
   });
 
   test('route.ts still re-encodes each segment, as bodies.cjs does', () => {

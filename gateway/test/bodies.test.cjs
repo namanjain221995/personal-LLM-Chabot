@@ -11,7 +11,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const B = require('../lib/bodies.cjs');
-const { SpoolBudget } = require('../lib/guards.cjs');
+const { SpoolBudget, MemoryBudget } = require('../lib/guards.cjs');
 const h = require('../testkit/harness.cjs');
 
 /* ------------------------------------------------------ the stream flag -- */
@@ -203,6 +203,120 @@ test.describe('the spool budget', () => {
     assert.equal(readSettings({ PUBLIC_API_MIN_FREE_DISK_BYTES: '0' }).spoolMinFreeBytes, 0);
     assert.equal(readSettings({ PUBLIC_API_MIN_FREE_DISK_BYTES: 'nonsense' }).spoolMinFreeBytes, 21_474_836_480);
     assert.equal(readSettings({ V1_GATEWAY_SPOOL_MAX_BYTES: '4096' }).spoolMaxBytes, 4096);
+  });
+});
+
+/* ----------------------------------------------------- the memory budget -- */
+
+/** A request stand-in the tests drive chunk by chunk. */
+function fakeRequest() {
+  const { EventEmitter } = require('node:events');
+  const req = new EventEmitter();
+  req.complete = false;
+  req.pause = () => undefined;
+  req.resume = () => undefined;
+  req.send = (...chunks) => {
+    for (const chunk of chunks) req.emit('data', Buffer.from(chunk));
+  };
+  req.finish = () => {
+    req.complete = true;
+    req.emit('end');
+  };
+  return req;
+}
+
+function readAll(stream) {
+  return new Promise((resolve, reject) => {
+    const parts = [];
+    stream.on('data', (c) => parts.push(Buffer.from(c)));
+    stream.on('end', () => resolve(Buffer.concat(parts).toString('utf8')));
+    stream.on('error', reject);
+  });
+}
+
+test.describe('the memory budget', () => {
+  // Review finding 2026-09-14 (scratchpad memflood.cjs): 400 waiting 1 MiB
+  // bodies held +914 MiB of RSS, because only spooled bytes had a budget.
+  test('a reservation past the total is refused whole, and a release makes room again', () => {
+    const budget = new MemoryBudget({ maxBytes: 100 });
+    assert.equal(budget.reserve(60), true);
+    assert.equal(budget.reserve(41), false);
+    assert.equal(budget.used, 60, 'a refused reservation holds nothing');
+    assert.equal(budget.reserve(40), true);
+    budget.release(60);
+    assert.equal(budget.used, 40);
+    budget.release(1000);
+    assert.equal(budget.used, 0, 'never below zero');
+  });
+
+  test('bodies stay in memory while the budget lasts, the next one spills at once, and every byte is still sent', async () => {
+    const dir = h.tmpdir('gw-membudget-');
+    const memory = new MemoryBudget({ maxBytes: 1000 });
+    const spool = new SpoolBudget({ dir, maxBytes: 1 << 20, minFreeBytes: 0 });
+    const opts = { cap: 1 << 20, memoryBytes: 1 << 20, spoolDir: dir, idle: null, budget: spool, memory };
+
+    const reqA = fakeRequest();
+    const pA = B.readBufferedBody(reqA, opts);
+    reqA.send('a'.repeat(600));
+    reqA.finish();
+    const a = (await pA).body;
+    assert.equal(a.spilled, false);
+    assert.equal(memory.used, 600);
+
+    const reqB = fakeRequest();
+    const pB = B.readBufferedBody(reqB, opts);
+    reqB.send('b'.repeat(300));
+    assert.equal(memory.used, 900);
+    reqB.send('B'.repeat(300)); // 1,200 > 1,000: B goes to disk, with the 300 it had in memory
+    reqB.finish();
+    const b = (await pB).body;
+    assert.equal(b.spilled, true, 'the body that could not get memory spilled');
+    assert.equal(memory.used, 600, 'the spilled body gave its memory back');
+    assert.equal(spool.reserved, 600, 'and was charged to the spool instead');
+    assert.equal(fs.readFileSync(b.file, 'utf8'), 'b'.repeat(300) + 'B'.repeat(300));
+
+    // The same bytes on every send, from memory and from the file.
+    assert.equal(await readAll(a.stream()), 'a'.repeat(600));
+    assert.equal(await readAll(a.stream()), 'a'.repeat(600), 'a second send of an in-memory body');
+    assert.equal(await readAll(b.stream()), 'b'.repeat(300) + 'B'.repeat(300));
+
+    a.dispose();
+    b.dispose();
+    assert.equal(memory.used, 0, 'released when the relay ends');
+    assert.equal(spool.reserved, 0);
+  });
+
+  test('a body neither the memory budget nor the spool can hold is refused, holding nothing', async () => {
+    const dir = h.tmpdir('gw-membudget-full-');
+    const memory = new MemoryBudget({ maxBytes: 100 });
+    const spool = new SpoolBudget({ dir, maxBytes: 150, minFreeBytes: 0 });
+    const req = fakeRequest();
+    const p = B.readBufferedBody(req, { cap: 1 << 20, memoryBytes: 1 << 20, spoolDir: dir, idle: null, budget: spool, memory });
+    req.send('x'.repeat(80), 'y'.repeat(80));
+    assert.deepEqual(await p, { spoolRefused: 'quota' });
+    await h.sleep(20);
+    assert.equal(memory.used, 0, 'the refused body let go of its memory');
+    assert.equal(spool.reserved, 0);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+
+  test('a body that gives up mid-way gives its memory back', async () => {
+    const memory = new MemoryBudget({ maxBytes: 1000 });
+    const req = fakeRequest();
+    const p = B.readBufferedBody(req, { cap: 1 << 20, memoryBytes: 1 << 20, spoolDir: h.tmpdir('gw-membudget-gone-'), idle: null, memory });
+    req.send('z'.repeat(500));
+    assert.equal(memory.used, 500);
+    req.emit('close');
+    assert.deepEqual(await p, { gone: true });
+    await h.sleep(20);
+    assert.equal(memory.used, 0);
+  });
+
+  test('the budget defaults to 256 MiB and follows V1_GATEWAY_MEMORY_BUDGET_BYTES', () => {
+    const { readSettings } = require('../lib/settings.cjs');
+    assert.equal(readSettings({}).memoryBudgetBytes, 256 * 1024 * 1024);
+    assert.equal(readSettings({ V1_GATEWAY_MEMORY_BUDGET_BYTES: '8388608' }).memoryBudgetBytes, 8388608);
+    assert.equal(readSettings({ V1_GATEWAY_MEMORY_BUDGET_BYTES: '0' }).memoryBudgetBytes, 256 * 1024 * 1024, 'blank, zero or nonsense is the default');
   });
 });
 

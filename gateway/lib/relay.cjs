@@ -504,6 +504,7 @@ class Relay {
       spoolDir: this.s.spoolDir,
       idle: this.idle,
       budget: this.gw.spoolBudget || null,
+      memory: this.gw.memoryBudget || null,
       declared: declaredRaw === undefined ? null : Number(declaredRaw),
       scan: B.shapeNeedsBody(this.method, this.target.route),
     });

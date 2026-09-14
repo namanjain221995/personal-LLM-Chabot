@@ -107,6 +107,9 @@ function readSettings(env = process.env) {
     // --- physical safety ----------------------------------------------------
     fdPressureRatio: Math.min(1, positive(env, 'V1_GATEWAY_FD_PRESSURE_RATIO', 0.7)),
     memoryBodyBytes: Math.floor(positive(env, 'V1_GATEWAY_MEMORY_BODY_BYTES', MiB)),
+    // lib/guards.cjs MemoryBudget: body bytes held in memory across every
+    // relay; past it bodies spill to the spool (review 2026-09-14).
+    memoryBudgetBytes: Math.floor(positive(env, 'V1_GATEWAY_MEMORY_BUDGET_BYTES', 256 * MiB)),
     spoolDir: String(env.V1_GATEWAY_SPOOL_DIR ?? '').trim() || '/spool',
     // lib/guards.cjs SpoolBudget: a total across relays, and a free-space
     // floor shared with the orchestrator's publicapi/disk_ledger.py.
