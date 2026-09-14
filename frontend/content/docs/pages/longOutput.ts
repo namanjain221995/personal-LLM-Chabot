@@ -36,7 +36,7 @@ import {
  * in docs-site.test.tsx are rewritten in the same change. The Files pages
  * read it too, for the few sentences that change with it.
  */
-export const NO_TIMEOUT_LIVE: boolean = false;
+export const NO_TIMEOUT_LIVE: boolean = true;
 
 // ---------------------------------------------------------------- shared --
 // The introduction as it reads today, and the sections true in both worlds.
