@@ -291,8 +291,8 @@ Validation, all enforced server-side:
 | `max_output_tokens` | 1 … the model's ceiling (and the project's `max_output_tokens`); within the ceiling it is **clamped** to the remaining window (§8.3), never refused for size | 400 `invalid_request_error` above the ceiling |
 | `temperature` | 0.0 … 2.0; absent → the model's default (0.2; 0.0 on `techsara-ocr`) | 400 |
 | `metadata` | ≤ 16 keys, key ≤ 64 chars, value ≤ 512 chars, strings only | 400 |
-| `stream` + `background` | any combination (§14) | — |
-| `store` | boolean, default `true`; `false` opts the request out of the durable log (§10, §14): cancelled on disconnect and on a restart, never resumable | 400 when not a boolean |
+| `stream` + `background` | any combination (§14); both true streams the job's events | — |
+| `store` | boolean, default `true`; `false` opts the request out of the durable log (§10, §14): cancelled on disconnect and on a restart, never resumable | 400 when not a boolean; 400 `param: store` with `background: true` |
 
 **Why only `data:` URLs.** vLLM fetches a remote image URL server-side and no
 `--allowed-media-domains` is set, so an `http(s)` URL reaching an engine would
@@ -669,8 +669,10 @@ that number.
 
 * **SSE** (Responses and chat streams, the resume stream, transcription with
   `stream: true`): the status and a first frame go out at once —
-  `response.created` for Responses, `: ping` for chat and transcription. Every
-  capacity and admission wait happens in the body.
+  `response.created` for Responses, `: ping` for chat, transcription, the
+  resume stream and `stream` + `background` (whose `response.created` is
+  written when the dispatcher claims the job). Every capacity and admission
+  wait happens in the body.
 * **Non-stream JSON** (responses, chat completions, embeddings, rerank,
   transcription `json`/`text`/`verbose_json`) is
   `keepalive.CommittedJSONResponse`: the real status and body when ready within
@@ -699,6 +701,7 @@ contiguous and never reused, in the JSON only:
 response.created → response.queued → response.in_progress
   → response.output_item.added → response.content_part.added
   → response.output_text.delta (×N) → response.output_text.done
+  → response.output_text.annotation.added (×K)
   → response.content_part.done → response.output_item.done
   → response.completed | response.failed | error
 ```
@@ -706,7 +709,16 @@ response.created → response.queued → response.in_progress
 `response.queued` is sent while the request waits for its engine (a gate, the
 admission lane, a recovering engine), on any engine, followed by `: ping`
 comments. The item and content-part events exist because both SDKs' `stream()`
-helpers require them. A heartbeat comment (`: ping`) goes out at least every
+helpers require them: `output_item.added` and `content_part.added` precede the
+first delta (or `output_text.done` when there is no text); a failure after them
+goes straight to `response.failed`. `response.output_text.annotation.added` is
+sent once per `file_citation` annotation of an answer about the caller's files
+(`{item_id, output_index, content_index, annotation_index, annotation}`), after
+`output_text.done`; `content_part.done`, `output_item.done` and the terminal
+Response repeat the annotations on the `output_text` part. On Chat Completions
+they are the final chunk's `delta.annotations`. The same grammar is framed
+from the durable log (`durable.RecordBuilder`) and, for `store: false`, in
+memory (`streaming.responses_sse`). A heartbeat comment (`: ping`) goes out at least every
 15 s (`events.HEARTBEAT_SECONDS` = min(`SSE_HEARTBEAT_SECONDS`, 14)) **for the
 whole life of the stream, on every engine**. The terminal event carries `usage`; non-terminal events carry
 `usage: null`. Exactly one terminal event is ever emitted. There are **never**
@@ -729,9 +741,20 @@ closes after the terminal event — at once, whatever `N`, for a run already
 terminal. The checks, **in this order**: the project-scoped lookup (`404`); scope
 `responses.read`; the creator check — the same `key_id`, or a key of the same
 service account, else `404`; streamability — `400`, `param: stream`, when the
-run was `store: false` or its events are past retention; `starting_after`
-without `stream=true` is `400`. At most 8 followers per response; a ninth closes
-the oldest.
+run was `store: false` (or not durable) or its events are past retention;
+`starting_after` without `stream=true` is `400`, `param: starting_after`.
+`stream` takes `true`/`false` (else `400`, `param: stream`); `stream=false`
+without `starting_after` is the plain JSON read. At most 8 followers per
+response; a ninth closes the oldest. A reader of a run that is suspended (a
+restart) claims and resumes it in the process serving the read
+(`router._resume_stream`, `durable.Runtime.attach_row`).
+
+A stream that ends **without a terminal event** — the connection closed, or
+the service restarted and ended every reader with an incomplete read — did not
+finish: the client resumes it with this route. A synchronous call cut the
+same way (after its committed `200`) is dropped mid-body; before the commit it
+is `503 model_unavailable` with `Retry-After: 2`. Either way the SDK's retry
+attaches (§13) instead of generating again.
 
 Chat Completions has no resume route: a retry with the same `Idempotency-Key`
 and the same credential replays the chunks from the start, then continues live
@@ -1137,8 +1160,13 @@ the server does not provide.
   idempotency_conflict`, `x-should-retry: false` — replay and attach are
   creator-only (§10.3);
 * a claim bound to a response is live while the run is open; there is no
-  in-flight lease. A claim written before its row exists (the process died
-  between the two) may be taken over after 300 s;
+  in-flight lease. A durable generation binds its claim to its response id at
+  launch, so a retry attaches while the run is still generating; a run that
+  ends `failed` releases the key (a retry runs again), whichever process
+  settled it (the `router.v1` recorder, §14). A claim written before its row
+  exists (the process died between the two) may be taken over after 300 s;
+  a non-durable (`store: false`) run still answers `409` with `Retry-After`
+  while it runs;
 * the claim is `INSERT … ON CONFLICT DO NOTHING RETURNING id` — zero rows means
   someone else claimed it, which is the race-free primitive.
 
@@ -1149,8 +1177,12 @@ body bytes) as a run that is **orphaned or suspended** and was created within
 `PUBLIC_API_IMPLICIT_ATTACH_WINDOW_S` (3,600 s) attaches instead of launching.
 A retry count of 0 or a different body launches fresh.
 
-**Attach order** in `router.py`: the gateway's attempt id (§19), then
-`Idempotency-Key`, then implicit attach.
+**Attach order** in `router.py` (`_generate`): the gateway's attempt id (§19),
+then `Idempotency-Key`, then implicit attach — all before a slot, a row or the
+engine. An attach answers in the shape of the request that attached: a stream
+replays from the gateway's `X-TechSara-Resume-After` (or from the start) and
+tails, a synchronous call waits with whitespace keepalive and returns the body,
+a background request gets its job's `202`. The model is never invoked twice.
 
 ## 14. Background responses and webhooks
 
@@ -1158,12 +1190,24 @@ A retry count of 0 or a different body launches fresh.
 before any expensive work. Status is read with `GET /v1/responses/{id}`; the work
 survives client disconnect; cancellation is idempotent.
 
-**Stream and background together** (2026-09-13): allowed. The run is durable,
-the caller watches it, and a broken stream resumes by §10.3.
+**Stream and background together** (2026-09-13, built 2026-09-14): allowed. The
+job is queued as a durable row exactly as with `stream: false`; the request's
+connection follows its log (`: ping` at once, `response.created` when the
+dispatcher claims the job), leaving it cancels nothing, and a broken stream
+resumes by §10.3. `background: true` with `store: false` is `400`,
+`param: store`. A process whose durable runtime is not running answers a
+`stream` + `background` request `503 model_unavailable` with `Retry-After`.
 
-**Every main-model generation is durable** — sync, stream and background, keyed
-or not, on both dialects — unless the request says `store: false`
-(`publicapi/durable.py`, `durable_store.py`, V36):
+**Every generation is durable** — sync, stream and background, keyed or not, on
+both dialects and on every chat-kind model — unless the request says
+`store: false` (`publicapi/durable.py`, `durable_store.py`, V36; the router's
+section "durable foreground runs"). `store: false` keeps the non-durable path:
+no spec or events are stored, the run is cancelled on disconnect and on a
+restart (recorded `cancelled`, charged the tokens counted at the stop,
+`usage_source: counted_at_stop`), the gateway is told `X-TechSara-Run: none`,
+and its row is closed `failed` (`model_unavailable`, "The service restarted
+while this response was running.") by the next read or the durable sweep if a
+restart cut it before its recorder wrote.
 
 1. **Launch** writes the `api_responses` row (resumable, dialect, `key_id`,
    `attempt_token`, `body_sha256`, `enqueued_at`), the idempotency claim's
@@ -1174,11 +1218,13 @@ or not, on both dialects — unless the request says `store: false`
 2. **Queue.** Background runs are rows only: one dispatcher per process claims
    the oldest queued row with a compare-and-swap lease when its gate or lane has
    room. A queued background job holds no coroutine, memory, fd or lane waiter,
-   and waits with no limit. Connection-held runs wait as coroutines; request
-   bodies above 1 MiB are spilled to a 0600 spool file.
+   and waits with no limit. Connection-held runs wait as coroutines (their
+   bodies are held in memory while they wait; spilling large bodies to disk is
+   not built).
 3. **Run** under a lease (TTL 60 s, heartbeat 15 s). Each heartbeat renews all
    local leases in one statement and re-checks authorisation for all local runs
-   in one `resolver.still_authorised(key_ids)` query; a revoked key closes the
+   in one batched query (the resolver's predicate over the stored key, service
+   account and project rows, with the run's model); a revoked key closes the
    engine stream and settles `failed` with the resolver's single message.
 4. **Events** are written ahead: deltas coalesce in a buffer flushed every
    100 ms, each job in its own savepoint with `FOR SHARE` on its row and
@@ -1200,11 +1246,23 @@ or not, on both dialects — unless the request says `store: false`
    planned − generated`; the response text can only be extended. Router runs
    resume the same way; OCR runs that emitted nothing re-queue with their original
    `enqueued_at`.
-9. **Orphan grace** as §8.3; background runs have none.
+9. **Orphan grace**: a client that leaves DETACHES; the run keeps generating
+   with no reader for `PUBLIC_API_STREAM_ORPHAN_GRACE_S` (600 s) when it has an
+   `Idempotency-Key` or is a Responses stream, `PUBLIC_API_UNKEYED_ORPHAN_GRACE_S`
+   (120 s) otherwise (unkeyed sync and chat streams), so a re-attach or SDK retry
+   finds it; then it settles `cancelled`. A run no reader picked up within 1 s of
+   launch counts as orphaned from then. Background runs have none.
 10. **Terminal**: settled once (usage summed over attempts, input counted once;
     `meta.attempts[]`, `resume_count`, `recomputed_prompt_tokens`, `yields`,
     `suspended_ms`), the webhook fired once, the spec and blob references deleted.
-    Events are kept `PUBLIC_API_EVENT_RETENTION_S`.
+    Events are kept `PUBLIC_API_EVENT_RETENTION_S`. The request's own recorder
+    runs when the launching process settles the run; when another process does,
+    the serialisable `router.v1` recorder stored with the spec (`durable.RecorderRef`)
+    writes the same usage row, settles the quota reservation and finishes the
+    `Idempotency-Key` claim (released on `failed`). A foreground run's spec is
+    written at launch when it is keyed or gateway-tagged, otherwise at the
+    suspend; one whose spec was never written (a crash, not a SIGTERM) settles
+    `failed` retry-safe when claimed.
 
 **Quarantine.** An attempt ended by an engine incident it was dispatched into is
 *implicated*. After one, the run is dispatched only alone, after

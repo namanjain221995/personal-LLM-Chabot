@@ -95,12 +95,15 @@ describe('Responses: synchronous', { skip: liveSkipReason }, () => {
     assert.match(`${err.param} ${err.message}`, /top_p/);
   });
 
-  it('stream and background together are refused with 400', async () => {
+  // CONTRACT-3 §8.1 / §14 (2026-09-14): refused until a background job had an
+  // event log to follow; with the durable runtime the connection follows it.
+  itPlanned('resumable-streams', 'stream and background together stream the job to one terminal event', async () => {
     const { client } = makeClient();
-    const err = await rejection(
-      client.responses.create({ model: env.chatModel, input: SHORT, stream: true, background: true, max_output_tokens: 16 }),
-    );
-    assertEnvelope(err, { status: 400 });
+    const stream = await client.responses.create({ model: env.chatModel, input: SHORT, stream: true, background: true, max_output_tokens: 16 });
+    const events = [];
+    for await (const event of stream) events.push(event);
+    assert.equal(events[0]?.type, 'response.created');
+    assert.equal(events.filter((e) => TERMINAL.has(e.type)).length, 1);
   });
 
   it('max_output_tokens above the model ceiling advertised by /v1/models is 400, before any generation', async () => {
