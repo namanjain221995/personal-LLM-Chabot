@@ -369,7 +369,11 @@ Three ways, in order of how much they cost you:
    because there is no processing left to end. So read the file first, and
    wait for a webhook only while its \`status\` is \`uploaded\` and its
    \`processing.stage\` is past \`assemble\`; otherwise act on the \`status\`
-   you read.
+   you read. A file in \`error\` with \`processing_unavailable\` or
+   \`internal_error\` can still get a webhook: when the same bytes are
+   [uploaded again](#retrying-a-failed-file), processing starts over and every
+   file holding them is sent \`file.processed\` or \`file.failed\` when it
+   ends — even one that was already sent \`file.failed\`.
 
 You do not have to wait at all before *using* a file: a request that names a
 file still being processed waits for it — see
@@ -469,11 +473,14 @@ came from the text layer or from OCR. Only the names in this table exist;
 any other name is \`404 file_not_found\` with \`param: "name"\`.
 
 Derived data exists only for a file whose \`status\` is \`processed\`.
-Asking earlier is \`409 file_not_ready\` with \`Retry-After: 5\` — and so
-is asking for a file whose \`status\` is \`error\`, which will never have
-any. That answer says a retry may help, so both SDKs retry it on their own:
-**read the file's \`status\` first**, and do not ask for the derived data of
-a file in \`error\`.
+Asking while it is still \`uploaded\` — its parts being assembled, or its
+processing queued or running — is \`409 file_not_ready\` with
+\`Retry-After: 5\`, which both SDKs retry on their own. Asking for a file
+whose \`status\` is \`error\` is \`400 invalid_request_error\` with
+\`param: "file_id"\` and the message "This file has no derived data: "
+followed by the file's own \`status_details\`. It is not worth retrying:
+nothing changes until the bytes are
+[uploaded again](#retrying-a-failed-file).
 
 ## Download the original
 
@@ -592,9 +599,11 @@ all get the **same** \`404 file_not_found\`, byte for byte apart from the
 request id — the API does not confirm that someone else's file exists.
 
 Identical bytes uploaded twice **in the same project** are stored and processed
-once, which is why a re-upload can be \`processed\` immediately — and also why
-a re-upload of bytes whose processing failed is \`error\` immediately, with
-the same code (see [retrying a failed file](#retrying-a-failed-file)). That is
+once, which is why a re-upload can be \`processed\` immediately. A re-upload
+of bytes whose processing failed with \`unsupported_file\`, \`file_corrupt\`
+or \`file_too_complex\` is \`error\` immediately, with the same code; after
+\`processing_unavailable\` or \`internal_error\` it starts their processing
+again (see [retrying a failed file](#retrying-a-failed-file)). That is
 never true across projects: identical bytes in another project are stored and
 processed from scratch, so how fast an upload finishes says nothing about what
 other projects hold.
@@ -636,11 +645,11 @@ These codes are the ones the file routes add:
 | Code | Status | When | Retry? |
 | --- | --- | --- | --- |
 | \`file_not_found\` | 404 | The id is absent, malformed, deleted, expired or another project's; or a derived \`name\` that does not exist. | No |
-| \`file_not_ready\` | 409 | The bytes are still being assembled; or derived data was asked for before processing finished, or for a file in \`error\`, which never has any. | Yes, after \`Retry-After\` — but never for derived data of a file in \`error\`: check its \`status\` |
+| \`file_not_ready\` | 409 | The bytes are still being assembled; or derived data was asked for before processing finished. | Yes, after \`Retry-After\` |
 | \`incomplete_body\` | 408 | The connection closed before the body was complete. Nothing was recorded. | Yes |
 | \`request_too_large\` | 413 | The file is over 64 MiB. The message points to \`/v1/uploads\`. | No |
 | \`storage_unavailable\` | 503 | The service is short of storage (\`Retry-After: 60\`, \`x-should-retry: false\`), or the same bytes are still being removed after a delete (\`Retry-After: 2\`, \`x-should-retry: true\`). | Only when \`x-should-retry\` is \`true\` |
-| \`invalid_request_error\` | 400 | A missing or unknown field, a bad \`purpose\`, \`expires_after\`, \`limit\`, \`order\` or \`after\`, or an \`Idempotency-Key\`; or the content of a file whose assembly failed. | No |
+| \`invalid_request_error\` | 400 | A missing or unknown field, a bad \`purpose\`, \`expires_after\`, \`limit\`, \`order\` or \`after\`, or an \`Idempotency-Key\`; the content of a file whose assembly failed; or the derived data of a file in \`error\`. | No |
 | \`invalid_request_error\` | 416 | A \`Range\` past the end of the file. | No |
 
 \`x-should-retry\` is a response header both SDKs obey before their own
@@ -674,22 +683,25 @@ ceiling itself — see [files as model input](/docs/file-inputs#errors).
 
 ### Retrying a failed file
 
-The same bytes are processed once per project, and a failure is remembered
-with them. So "upload the file again" means **delete first**: while any file
-in the project still holds those bytes — any file with the same \`sha256\` —
-uploading them again, singly or through an upload, gives a new file id that is
-already \`status: "error"\` with the same code.
+\`unsupported_file\`, \`file_corrupt\` and \`file_too_complex\` are verdicts
+on the bytes, and they are final: uploading the same bytes again, singly or
+through an upload, gives a new file id that is already \`status: "error"\`
+with the same code.
 
-1. List the project's files and \`DELETE\` every one whose \`sha256\` is the
-   failed file's.
-2. Upload the bytes again. If the removal is still running you get
-   \`503 storage_unavailable\` with \`x-should-retry: true\`, which the SDKs
-   retry by themselves.
+\`processing_unavailable\` and \`internal_error\` can pass, so for them
+**upload the same bytes again** — there is nothing to delete first. Their
+processing starts over from the first step it had not finished, and the new
+file is \`uploaded\` while it runs. Every file in the project that holds
+those bytes — every file with the same \`sha256\`, the one that failed
+included — returns to \`uploaded\` with it and ends \`processed\` or
+\`error\` together. So \`error\` with one of these two codes is not final:
+read a file's \`status\` again before acting on an old failure.
 
-That is worth doing after \`processing_unavailable\` or \`internal_error\`,
-which can pass. \`unsupported_file\`, \`file_corrupt\` and
-\`file_too_complex\` are about the bytes and will fail again. A file that
-failed \`checksum_mismatch\` never had its bytes stored: upload them again
-directly.
+One \`internal_error\` does not start over: the one recorded because
+processing those bytes stopped unexpectedly several times in a row. Uploading
+them again leaves every file that holds them in \`error\`.
+
+A file that failed \`checksum_mismatch\` never had its bytes stored: upload
+them again directly.
 `.trim(),
 };

@@ -278,6 +278,21 @@ def test_the_derived_routes_of_a_file_whose_processing_failed_answer_400_with_it
         assert "retry-after" not in response.headers
 
 
+@pytest.mark.parametrize("path", ["/v1/files/{file_id}/derived", "/v1/files/{file_id}/derived/{name}"])
+def test_the_public_openapi_document_lists_the_400_a_failed_file_gets_from_the_derived_routes(path):
+    """Review finding (2026-09-14): the document still said "else 409
+    file_not_ready" and listed no 400, so a generated client had no type for
+    the refusal the routes now send."""
+    from app.publicapi.files import openapi_doc
+    from app.publicapi import openapi as openapi_module
+
+    operation = openapi_doc.paths(openapi_module)[path]["get"]
+    assert "invalid_request_error" in operation["responses"]["400"]["description"]
+    assert "file_not_ready" in operation["responses"]["409"]["description"]
+    assert "`400 invalid_request_error`" in operation["description"]
+    assert "else `409 file_not_ready`" not in operation["description"]
+
+
 def test_the_derived_routes_of_a_file_still_processing_keep_answering_409_file_not_ready_with_retry_after(api):
     client, caller = api
     first = _post(client, caller)  # queued, never run

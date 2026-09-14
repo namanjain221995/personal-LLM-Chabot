@@ -1540,34 +1540,53 @@ describe('what processing, retries and refusals really do', () => {
     expect(scanned).not.toContain('there is nothing to ask for. In `pages.json`, each page');
   });
 
-  it('tells a reader to delete before uploading failed bytes again, because a re-upload joins the failed copy', () => {
+  it('tells a reader that uploading the bytes again restarts a recoverable failure and not a verdict, as schema.py does', () => {
     const lock = functionBody(SCHEMA_PY, 'def _lock_or_create_blob(');
     expect(lock).toContain('ON CONFLICT (project_id, sha256) DO NOTHING');
     expect(lock).toContain('if row["status"] == "deleting":');
-    expect(lock, 'a join now resets a failed copy: rewrite "Retrying a failed file"').not.toMatch(/'queued'|'failed'|"failed"/);
-    expect(QUEUE_PY.split('if created:\n        _notify_enqueued(blob)').length - 1).toBe(2);
+    expect(lock).toContain('_requeue_recoverable_blob(con, project_id, sha256)');
+    expect(SCHEMA_PY).toContain('RECOVERABLE_BLOB_ERRORS = ("processing_unavailable", "internal_error")');
+    const requeue = functionBody(SCHEMA_PY, 'def _requeue_recoverable_blob(');
+    expect(requeue).toContain("SET status = 'queued', error_code = NULL, attempt = 0");
+    expect(requeue).toContain("WHERE project_id = %s AND sha256 = %s AND status = 'failed' AND error_code = ANY(%s)");
+    // The crash-loop guard: its internal_error is not re-queued.
+    expect(requeue).toContain("progress->>'crashes'");
+    // The runner is woken for a re-queued blob, from a single upload and from an assembly.
+    expect(QUEUE_PY.split('if created or blob.get("status") == "queued":\n').length - 1).toBe(2);
     expect(SERVICE_PY).toContain('"Upload the file again later."');
 
-    const retry = files.body.slice(files.body.indexOf('### Retrying a failed file\n'));
-    expect(retry.length).toBeLessThan(files.body.length);
-    expect(flat(retry)).toContain('"upload the file again" means **delete first**');
-    expect(flat(retry)).toContain('gives a new file id that is already `status: "error"` with the same code');
-    expect(flat(retry)).toContain('`DELETE` every one whose `sha256` is the failed file\'s');
-    expect(flat(sectionOf(files.body, 'Retention and isolation'))).toContain(
-      'a re-upload of bytes whose processing failed is `error` immediately',
-    );
+    const retry = flat(files.body.slice(files.body.indexOf('### Retrying a failed file\n')));
+    expect(retry.length).toBeLessThan(flat(files.body).length);
+    expect(retry).not.toMatch(/means \*\*delete first\*\*|`DELETE` every one/);
+    expect(retry).toContain('are verdicts on the bytes, and they are final');
+    expect(retry).toContain('gives a new file id that is already `status: "error"` with the same code');
+    expect(retry).toContain('**upload the same bytes again** — there is nothing to delete first');
+    expect(retry).toContain('the one that failed included — returns to `uploaded` with it');
+    expect(retry).toContain('So `error` with one of these two codes is not final');
+    expect(retry).toContain('processing those bytes stopped unexpectedly several times in a row');
+    const retention = flat(sectionOf(files.body, 'Retention and isolation'));
+    expect(retention).not.toContain('a re-upload of bytes whose processing failed is `error` immediately');
+    expect(retention).toContain('after `processing_unavailable` or `internal_error` it starts their processing again');
   });
 
-  it('warns that derived data of a failed file answers a retryable 409 for good, as routes.py and wire.py do', () => {
-    const refusal = 'if row.get("blob_status") != "processed":\n                raise wire.file_not_ready(5)';
-    expect(ROUTES_PY.split(refusal).length - 1).toBe(2);
+  it('says derived data of a failed file is a 400 with its own sentence, not a retryable 409, as routes.py and derived.py do', () => {
+    expect(ROUTES_PY.split('            _require_derived_ready(row)\n').length - 1).toBe(2);
+    expect(ROUTES_PY).not.toContain('if row.get("blob_status") != "processed":\n                raise wire.file_not_ready(5)');
+    const gate = functionBody(ROUTES_PY, 'def _require_derived_ready(');
+    expect(gate).toContain('raise wire.invalid_request("This file has no derived data: " + str(ready.sentence), param="file_id")');
+    expect(gate).toContain('raise wire.file_not_ready(5)');
+    expect(DERIVED_PY).toContain('return Readiness(FAILED, str(sentence))');
     expect(WIRE_PY).toContain('"file_not_ready": (409, "invalid_request_error", True)');
     const derived = flat(sectionOf(files.body, 'Derived data'));
-    expect(derived).toContain('and so is asking for a file whose `status` is `error`, which will never have any');
-    expect(derived).toContain("**read the file's `status` first**");
-    const row = /^\| `file_not_ready` \| 409 \|.*$/m.exec(files.body)![0];
-    expect(row).toContain('never for derived data of a file in `error`');
-
+    expect(derived).toContain('is `409 file_not_ready` with `Retry-After: 5`, which both SDKs retry on their own');
+    expect(derived).toContain(
+      'whose `status` is `error` is `400 invalid_request_error` with `param: "file_id"` and the message "This file has no derived data: " followed by the file\'s own `status_details`',
+    );
+    expect(derived).not.toContain('which will never have any');
+    const notReady = /^\| `file_not_ready` \| 409 \|.*$/m.exec(files.body)![0];
+    expect(notReady).not.toContain('`error`');
+    const invalid = /^\| `invalid_request_error` \| 400 \|.*$/m.exec(files.body)![0];
+    expect(invalid).toContain('or the derived data of a file in `error`');
   });
 
   it('quotes the two sentences a download of a failed assembly really sends, which differ from the file object', () => {
@@ -1698,8 +1717,8 @@ describe('what processing, retries and refusals really do', () => {
     expect(emitters).toEqual(['_after_terminal', '_run_assembly']);
     expect(JOBS_PY).toContain('files = await db.run_in_thread(schema.live_files_for_blob, str(row["id"]))');
     expect(JOBS_PY).toContain('if result.outcome in ("checksum_mismatch", "failed") and result.file and self.emit_webhooks:');
-    // A create or an assembly that joins an existing blob does not enqueue it, and nothing else emits.
-    expect(QUEUE_PY.split('if created:\n        _notify_enqueued(blob)').length - 1).toBe(2);
+    // A create, or a join that re-queued a failed blob, wakes the runner; a join to processed bytes does not, and nothing else emits.
+    expect(QUEUE_PY.split('if created or blob.get("status") == "queued":\n').length - 1).toBe(2);
     for (const source of [QUEUE_PY, ROUTES_PY, SCHEMA_PY]) expect(pythonCode(source)).not.toMatch(/emit_file_event/);
 
     const wait = flat(sectionOf(files.body, 'Wait for processing'));
@@ -1709,6 +1728,7 @@ describe('what processing, retries and refusals really do', () => {
     expect(wait).toContain(
       'wait for a webhook only while its `status` is `uploaded` and its `processing.stage` is past `assemble`; otherwise act on the `status` you read.',
     );
+    expect(wait).toContain('every file holding them is sent `file.processed` or `file.failed` when it ends — even one that was already sent `file.failed`');
   });
 
   it('names the SDK versions the raw part samples need, and starts over when a saved upload has lost its parts', () => {
