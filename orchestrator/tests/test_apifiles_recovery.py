@@ -127,6 +127,57 @@ def test_uploading_the_same_bytes_again_re_queues_a_file_whose_processing_failed
         assert _get(client, caller, file_id)["status"] == "processed"
 
 
+def _usage_rows(blob_id: str) -> List[Tuple[str, str, str]]:
+    with db.connection() as con:
+        rows = con.execute(
+            "SELECT generation_id, status, error_kind FROM usage_events WHERE generation_id LIKE %s ORDER BY id",
+            (f"{blob_id}.%",),
+        ).fetchall()
+    return [(r["generation_id"], r["status"], r["error_kind"]) for r in rows]
+
+
+def test_every_run_of_a_recovered_blob_keeps_its_own_usage_row_even_when_its_attempt_number_repeats(api):
+    """Review finding (2026-09-14): the re-queue reset `attempt` to 0, the
+    usage key was `<blob>.<attempt>`, and `usage_events.generation_id` is
+    unique with ON CONFLICT DO NOTHING — so the recovered run's row collided
+    with the failed run's `<blob>.0` and was dropped, embed tokens and all.
+    Here the blob fails twice at the SAME attempt number before it processes:
+    three runs, three rows."""
+    client, caller = api
+    first = _post(client, caller)
+    blob_id = _blob_of(first["id"])["id"]
+
+    failed = asyncio.run(J.runner(embed_documents=_key_error_embedder, record_usage=True).run_once())
+    assert [(o.outcome, o.error_code) for o in failed] == [("failed", "internal_error")]
+    assert _usage_rows(blob_id) == [(f"{blob_id}.0", "error", "internal_error")]
+
+    _post(client, caller)  # recovery 1
+    assert _blob_of(first["id"])["progress"]["recoveries"] == 1
+    failed_again = asyncio.run(J.runner(embed_documents=_key_error_embedder, record_usage=True).run_once())
+    assert [(o.outcome, o.error_code) for o in failed_again] == [("failed", "internal_error")]
+
+    _post(client, caller)  # recovery 2
+    done = asyncio.run(J.runner(record_usage=True).run_once())
+    assert [o.outcome for o in done] == ["processed"]
+    rows = _usage_rows(blob_id)
+    assert rows == [
+        (f"{blob_id}.0", "error", "internal_error"),
+        (f"{blob_id}.r1.0", "error", "internal_error"),
+        (f"{blob_id}.r2.0", "ok", ""),
+    ], rows
+    assert _blob_of(first["id"])["progress"]["recoveries"] == 2, "the count survives the runs and is never reset"
+
+
+def test_the_processing_usage_key_of_a_blob_never_recovered_keeps_its_old_shape():
+    from app.apifiles import accounting
+
+    assert accounting.processing_generation_id({"id": "blob_x", "attempt": 3, "progress": {}}) == "blob_x.3"
+    assert accounting.processing_generation_id({"id": "blob_x", "attempt": None}) == "blob_x.0"
+    assert accounting.processing_generation_id({"id": "blob_x", "attempt": 0, "progress": {"recoveries": 2}}) == "blob_x.r2.0"
+    assert accounting.processing_generation_id({"id": "blob_x", "attempt": 1, "progress": '{"recoveries": 1}'}) == "blob_x.r1.1"
+    assert accounting.processing_generation_id({"id": "blob_x", "attempt": 1, "progress": {"recoveries": "junk"}}) == "blob_x.1"
+
+
 def test_a_chunked_upload_of_the_same_bytes_re_queues_a_failed_blob_too(api, woken):
     client, caller = api
     first = _post(client, caller)

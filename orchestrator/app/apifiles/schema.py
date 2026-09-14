@@ -522,6 +522,14 @@ def _requeue_recoverable_blob(con, project_id: str, sha256: str) -> Optional[dic
     the runner resumes at the first stage without one, so a PDF whose index
     failed does not extract its text again.
 
+    What is counted: `progress.recoveries` goes up by one and is never reset.
+    The processing usage row is keyed `<blob>.<attempt>`
+    (`accounting.processing_generation_id`), `usage_events.generation_id` is
+    unique and the insert is ON CONFLICT DO NOTHING: with `attempt` back at 0
+    the recovered run's row collided with the failed run's `<blob>.0` and was
+    silently dropped, with its embed tokens, OCR pages and audio seconds
+    (review, 2026-09-14). The recovery count makes each run's key its own.
+
     NOT re-queued: a blob failed by the crash-loop guard (`progress.crashes`
     reached the attempt ceiling — its runs kept taking the process down, so a
     re-upload must not buy another five), and the verdicts listed above.
@@ -536,7 +544,9 @@ def _requeue_recoverable_blob(con, project_id: str, sha256: str) -> Optional[dic
         con,
         "UPDATE api_file_blobs SET status = 'queued', error_code = NULL, attempt = 0, not_before = NULL, "
         "       lease_owner = NULL, lease_expires_at = NULL, processed_at = NULL, updated_at = now(), "
-        "       progress = progress - 'error_ceiling' - 'derived' - 'running_owner' - 'outage_retries', "
+        "       progress = jsonb_set(progress - 'error_ceiling' - 'derived' - 'running_owner' - 'outage_retries', "
+        "                            '{recoveries}', to_jsonb((CASE WHEN progress->>'recoveries' ~ '^[0-9]{1,9}$' "
+        "                                                       THEN (progress->>'recoveries')::int ELSE 0 END) + 1)), "
         "       stages = COALESCE((SELECT jsonb_object_agg(e.key, e.value) FROM jsonb_each(stages) e "
         "                           WHERE e.value->>'status' IS DISTINCT FROM 'failed'), '{}'::jsonb) "
         " WHERE project_id = %s AND sha256 = %s AND status = 'failed' AND error_code = ANY(%s) "

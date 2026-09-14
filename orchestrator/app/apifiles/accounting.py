@@ -14,6 +14,7 @@ API processing without a parallel set of numbers.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -61,10 +62,33 @@ def finalize_blob_accounting(blob: dict) -> Optional[dict]:
 
 
 def processing_generation_id(blob: dict) -> str:
-    """`<blob id>.<attempt>`: `usage_events.generation_id` is unique, and a
-    blob whose processing is re-run (a deferral, a later pipeline version)
-    is a second run that must be a second row, not a silent no-op."""
-    return f"{blob['id']}.{int(blob.get('attempt') or 0)}"
+    """`<blob id>.<attempt>`, or `<blob id>.r<recoveries>.<attempt>` once the
+    blob has been re-queued by an upload of its bytes.
+
+    `usage_events.generation_id` is unique and `usage.record` inserts ON
+    CONFLICT DO NOTHING, so two runs that share a key keep only the first row.
+    A re-upload resets `attempt` to 0 (`schema._requeue_recoverable_blob`):
+    keyed by attempt alone, a recovered run reused the failed run's key and
+    its row — embed tokens, OCR pages, audio seconds — was dropped without a
+    log line (review, 2026-09-14). `progress.recoveries` only ever grows, so
+    each recovery gets keys of its own; a blob never recovered keeps the
+    `<blob id>.<attempt>` shape it always had."""
+    attempt = int(blob.get("attempt") or 0)
+    progress = blob.get("progress")
+    if isinstance(progress, str):
+        try:
+            progress = json.loads(progress)
+        except ValueError:
+            progress = None
+    recoveries = 0
+    if isinstance(progress, dict):
+        try:
+            recoveries = max(0, int(progress.get("recoveries") or 0))
+        except (TypeError, ValueError):
+            recoveries = 0
+    if recoveries:
+        return f"{blob['id']}.r{recoveries}.{attempt}"
+    return f"{blob['id']}.{attempt}"
 
 
 async def record_processing(
