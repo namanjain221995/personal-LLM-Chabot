@@ -476,19 +476,8 @@ response.created
 response.in_progress
 response.output_text.delta     ×N  {item_id, output_index, content_index, delta}
 response.output_text.done           {item_id, output_index, content_index, text}
-[response.output_text.annotation.added ×N]
-                                    {item_id, output_index, content_index, annotation_index, annotation}
 response.completed                  {response: <response object with usage>}
 ```
-
-The annotation events exist only for a request that names files (2026-09-14):
-the router passes `FileRun.stream_annotations` to `_stream_launch(annotate=)`,
-and `streaming.responses_sse` asks it for the final text's `file_citation`
-objects after `output_text.done` (on a worker thread past
-`ANNOTATE_OFF_LOOP_CHARS`), emits one event each and puts all of them on the
-`output_text` part of `response.completed`. A citation computation that raises
-leaves the stream `completed` with no annotations. `SequencedEvents` refuses an
-annotation that does not follow `output_text.done` or another annotation.
 
 On any failure after the stream has started, the tail is replaced by exactly one
 `response.failed` whose `response` carries `status: "failed"`, the partial
@@ -512,8 +501,7 @@ no sequence numbers:
 1. deltas — the first carries `delta: {role: "assistant", content}`, the rest
    `delta: {content}`, `finish_reason: null`, `usage: null`;
 2. one chunk with `delta: {}` and `finish_reason` of `"length"` when the engine
-   reported a length stop, otherwise `"stop"` — for a request that names files
-   with resolved citations, `delta: {annotations: [...]}`;
+   reported a length stop, otherwise `"stop"`;
 3. only when `stream_options.include_usage` was true: one chunk with
    `choices: []` and `usage: {prompt_tokens, completion_tokens, total_tokens}`
    (or `null` when not measured);

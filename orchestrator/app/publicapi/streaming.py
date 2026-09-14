@@ -74,7 +74,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional
 
 from .. import llm
 from ..config import settings
@@ -982,43 +982,6 @@ async def run_to_completion_watching(
 
 OnFinish = Callable[[StreamOutcome], Awaitable[None]]
 
-#: The citations of a finished answer (2026-09-14, Files API publication):
-#: text in, `file_citation` objects out — `file_inputs.FileRun.stream_annotations`
-#: for a request that names files, None for every other stream.
-Annotator = Callable[[str], Sequence[Mapping[str, Any]]]
-
-#: An answer this long is scanned for citation labels on a worker thread, not
-#: on the event loop every other stream shares. The scan is linear, but a
-#: million-token answer is megabytes of text: measured on Python 3.11
-#: (2026-09-14), `citations.annotate` held the thread 52-93 ms for 1 MiB and
-#: 216-314 ms for 4 MiB, which on the loop is a stall for every other stream.
-ANNOTATE_OFF_LOOP_CHARS = 256_000
-
-
-async def _annotations_for(annotate: Optional[Annotator], text: str, response_id: str) -> List[Dict[str, Any]]:
-    """The annotations of `text`, or none. NEVER raises: a citation that cannot
-    be computed leaves plain text, and must not turn a finished answer into a
-    failed one (the synchronous path's rule, `FileRun.note_output`)."""
-    if annotate is None or not text:
-        return []
-    try:
-        if len(text) >= ANNOTATE_OFF_LOOP_CHARS:
-            found = await asyncio.to_thread(annotate, text)
-        else:
-            found = annotate(text)
-        return [dict(annotation) for annotation in (found or ())]
-    except Exception:  # noqa: BLE001 - an answer is never failed by its citations
-        log.warning("stream citations were not computed for %s", response_id, exc_info=True)
-        return []
-
-
-def _with_annotations(wire: Dict[str, Any], annotations: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not annotations:
-        return wire
-    from ..apifiles import citations
-
-    return citations.with_annotations(wire, annotations)
-
 
 def _wire(
     spec: GenerationSpec,
@@ -1078,17 +1041,12 @@ async def responses_sse(
     *,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
-    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
     """The CONTRACT §10 lifecycle for one `POST /v1/responses` with `stream: true`.
 
         response.created → [response.queued] → response.in_progress
           → response.output_text.delta (×N) → response.output_text.done
-          → [response.output_text.annotation.added (×N)] → response.completed
-
-    `annotate` (a request with files) turns the final text into its
-    `file_citation` annotations: one event each, and all of them on the
-    `output_text` part of `response.completed`, as the synchronous body has.
+          → response.completed
 
     with `response.failed` replacing the tail on any engine-side failure.
     `events.SequencedEvents` numbers the frames and refuses a second terminal;
@@ -1123,20 +1081,14 @@ async def responses_sse(
             outcome.finish_reason = generation.finish_reason
             outcome.max_output_tokens = generation.applied_max_output_tokens()
             yield emitter.output_text_done(text)
-            annotations = await _annotations_for(annotate, text, spec.response_id)
-            for position, annotation in enumerate(annotations):
-                yield emitter.annotation_added(position, annotation)
             yield emitter.completed(
-                _with_annotations(
-                    _wire(
-                        spec,
-                        "completed",
-                        text=text,
-                        usage=generation.usage,
-                        max_output_tokens=outcome.max_output_tokens,
-                        finish_reason=generation.finish_reason,
-                    ),
-                    annotations,
+                _wire(
+                    spec,
+                    "completed",
+                    text=text,
+                    usage=generation.usage,
+                    max_output_tokens=outcome.max_output_tokens,
+                    finish_reason=generation.finish_reason,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - every failure is a frame
@@ -1188,12 +1140,8 @@ async def chat_completions_sse(
     include_usage: bool = False,
     on_finish: Optional[OnFinish] = None,
     heartbeat_s: Optional[float] = None,
-    annotate: Optional[Annotator] = None,
 ) -> AsyncIterator[str]:
     """The compatibility dialect: anonymous chunks, then `data: [DONE]`.
-
-    `annotate` (a request with files): the answer's `file_citation` objects
-    ride the `finish_reason` chunk as `delta.annotations`.
 
     Same pump, same closing rule, same metering. The wire shape differs
     because an existing client library reads it, and every difference from
@@ -1228,7 +1176,6 @@ async def chat_completions_sse(
             yield chunks.stop(
                 chat_finish_reason(generation.finish_reason),
                 max_output_tokens=outcome.max_output_tokens,
-                annotations=await _annotations_for(annotate, outcome.text, spec.response_id),
             )
             if include_usage:
                 yield chunks.usage_chunk(_completion_usage(generation.usage))

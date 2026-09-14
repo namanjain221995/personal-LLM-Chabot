@@ -2,7 +2,7 @@
 one schema.
 
 Before this, `/v1/files` and `/v1/uploads` were mounted and served but not
-published, and four places disagreed about what a client could meet:
+published, and three places disagreed about what a client could meet:
 
 * the seven Files error codes lived in `files/wire.FILE_CODES`, outside the
   closed table of `publicapi/errors.py`, so the OpenAPI `code` enum — and every
@@ -11,8 +11,9 @@ published, and four places disagreed about what a client could meet:
 * the OpenAPI document named a `file.progress` event the events route never
   sends, and no `411` on the raw part route that answers one.
 
-(The fourth seam — citations on a streamed answer — is
-tests/test_publicapi_file_citation_stream.py.)
+(Citations on a streamed answer are not a seam of this file: the
+`response.output_text.annotation.added` event belongs to the stream grammar
+of `publicapi/events.py` and is tested with it.)
 
 Each test below reads the primary source on both sides of one of those seams,
 so the sides cannot drift apart again without a red build.

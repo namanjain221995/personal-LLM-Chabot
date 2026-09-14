@@ -1227,7 +1227,6 @@ async def _generate(
                 completion_id=_completion_id(response_id),
                 include_usage=parsed.include_usage,
                 on_finish=recorded,
-                annotate=None if file_run is None else file_run.stream_annotations,
             )
             files_frames = None
             if file_run is not None:
@@ -1603,28 +1602,18 @@ def _stream_launch(
     completion_id: str,
     include_usage: bool,
     on_finish: streaming.OnFinish,
-    annotate: Optional[streaming.Annotator] = None,
 ) -> Callable[[streaming.GenerationSpec], AsyncIterator[str]]:
     """THE stream launch of this router, for a stream with files and without
     (senior fix 2026-09-14). One function, so the commit that starts streams
     through the durable runtime (`RUNS_ATTACHABLE`) changes both at once — a
-    file stream is never the one generation left without resume.
-
-    `annotate` (Files API publication, 2026-09-14): the file run's citations
-    of the final text, streamed as `response.output_text.annotation.added`
-    events (Chat: `delta.annotations` on the finish chunk). A durable launch
-    must carry it too, or a file stream loses its citations."""
+    file stream is never the one generation left without resume."""
 
     def launch(spec: streaming.GenerationSpec) -> AsyncIterator[str]:
         if chat:
             return streaming.chat_completions_sse(
-                spec,
-                completion_id=completion_id,
-                include_usage=include_usage,
-                on_finish=on_finish,
-                annotate=annotate,
+                spec, completion_id=completion_id, include_usage=include_usage, on_finish=on_finish
             )
-        return streaming.responses_sse(spec, on_finish=on_finish, annotate=annotate)
+        return streaming.responses_sse(spec, on_finish=on_finish)
 
     return launch
 

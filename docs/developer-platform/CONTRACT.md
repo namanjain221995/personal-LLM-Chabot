@@ -19,8 +19,8 @@ test ties to the code that serves it.
 
 **Revision 2026-09-14, the Files API published.** §7 lists the fourteen
 `/v1/files` and `/v1/uploads` routes, §8.7 states their contract, §9 adds the
-seven Files error codes to the closed table, §10.2 adds the streamed
-`file_citation` event, §12.2 the Files body caps, §13 and §17 the rest. The
+seven Files error codes to the closed table, §12.2 the Files body caps, §13
+and §17 the rest. The
 documentation pages publish once `FILES_API_PUBLISHED`
 (`frontend/content/docs/pages/files.ts`) is true, which a test ties to this
 section, the router, the public edge and a recorded run through the public URL.
@@ -657,10 +657,8 @@ invalid_request_error`, `param` naming the part, with its code's fixed
 sentence. Citations that resolve to content the model was shown become
 `file_citation` annotations (`type`, `file_id`, `filename`, `index` in UTF-16
 code units, and `page` or `timestamp_s`): on the `output_text` part and on
-`choices[0].message.annotations`; streamed as §10.2's
-`response.output_text.annotation.added` and, on Chat, as the finish chunk's
-`delta.annotations`. The usage row records `file_ids`, the context mode and
-tokens, and the citation counts.
+`choices[0].message.annotations`. The usage row records `file_ids`, the context
+mode and tokens, and the citation counts.
 
 ## 9. Response and error envelope
 
@@ -805,16 +803,9 @@ contiguous and never reused, in the JSON only:
 response.created → response.queued → response.in_progress
   → response.output_item.added → response.content_part.added
   → response.output_text.delta (×N) → response.output_text.done
-  → response.output_text.annotation.added (×N)
   → response.content_part.done → response.output_item.done
   → response.completed | response.failed | error
 ```
-
-`response.output_text.annotation.added` (2026-09-14) is sent only by a request
-that names files, once per `file_citation` (§8.7), after the text is final:
-`{item_id, output_index, content_index, annotation_index, annotation}`. The
-terminal `response.completed` carries the same annotations on its `output_text`
-part, so a client that ignores the event loses nothing.
 
 `response.queued` is sent while the request waits for its engine (a gate, the
 admission lane, a recovering engine), on any engine, followed by `: ping`

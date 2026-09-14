@@ -50,12 +50,6 @@ RESPONSE_QUEUED = "response.queued"
 RESPONSE_IN_PROGRESS = "response.in_progress"
 RESPONSE_OUTPUT_TEXT_DELTA = "response.output_text.delta"
 RESPONSE_OUTPUT_TEXT_DONE = "response.output_text.done"
-#: One `file_citation` annotation of the finished text (2026-09-14, Files API
-#: publication): a request that names files gets one per citation that
-#: resolved to content the model was given, after `output_text.done` and
-#: before the terminal, which then carries them all. The event name both SDKs
-#: already parse (openai-python `ResponseOutputTextAnnotationAddedEvent`).
-RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED = "response.output_text.annotation.added"
 RESPONSE_COMPLETED = "response.completed"
 RESPONSE_FAILED = "response.failed"
 ERROR = "error"
@@ -71,7 +65,6 @@ EVENT_NAMES: Tuple[str, ...] = (
     RESPONSE_IN_PROGRESS,
     RESPONSE_OUTPUT_TEXT_DELTA,
     RESPONSE_OUTPUT_TEXT_DONE,
-    RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
     RESPONSE_COMPLETED,
     RESPONSE_FAILED,
     ERROR,
@@ -110,15 +103,12 @@ _LIFECYCLE_RANK: Dict[str, int] = {
     RESPONSE_IN_PROGRESS: 2,
     RESPONSE_OUTPUT_TEXT_DELTA: 3,
     RESPONSE_OUTPUT_TEXT_DONE: 4,
-    # Only after the text is final: an annotation's `index` is an offset into
-    # that text, and a delta after it would move what it points at.
-    RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED: 5,
-    RESPONSE_COMPLETED: 6,
+    RESPONSE_COMPLETED: 5,
 }
 
 #: The one event that may legitimately repeat: the text arrives in many
 #: deltas. Every other rank is a stage, and a stage happens once.
-_REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED)
+_REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA,)
 
 #: CONTRACT §10: "at least every 15 s". `app/sse.py` reads the interval from
 #: SSE_HEARTBEAT_SECONDS, which an operator may set HIGHER for the chat app;
@@ -336,40 +326,6 @@ class SequencedEvents:
             },
         )
 
-    def annotation_added(
-        self,
-        annotation_index: int,
-        annotation: Mapping[str, Any],
-        *,
-        output_index: int = 0,
-        content_index: int = 0,
-    ) -> str:
-        """One annotation of the finished text (a `file_citation`), numbered
-        like every other event. The field names are the ones openai-python's
-        and openai-node's event types read: `item_id`, `output_index`,
-        `content_index`, `annotation_index`, `annotation`. Only legal after
-        `output_text.done` (the ranks above), because `index` counts into
-        the final text."""
-        previous = self._emitted[-1] if self._emitted else None
-        if previous not in (RESPONSE_OUTPUT_TEXT_DONE, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED):
-            # The rank rule alone lets a stage be skipped; this one may not
-            # be: without `output_text.done` there is no final text for
-            # `index` to count into.
-            raise StreamProtocolError(
-                f"{RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED!r} must follow "
-                f"{RESPONSE_OUTPUT_TEXT_DONE!r}, not {previous!r}"
-            )
-        return self._frame(
-            RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
-            {
-                "item_id": self.item_id,
-                "output_index": int(output_index),
-                "content_index": int(content_index),
-                "annotation_index": int(annotation_index),
-                "annotation": dict(annotation),
-            },
-        )
-
     # -- terminals --------------------------------------------------------
 
     def completed(self, response: Mapping[str, Any]) -> str:
@@ -551,7 +507,6 @@ class ChatCompletionChunks:
         *,
         index: int = 0,
         max_output_tokens: Optional[int] = None,
-        annotations: Optional[Iterable[Mapping[str, Any]]] = None,
     ) -> str:
         """The chunk that names why generation ended: `stop`, or `length` when
         the answer hit `max_tokens`. A client that never sees one must treat
@@ -561,23 +516,14 @@ class ChatCompletionChunks:
         one chunk: the ceiling actually applied, which can be lower than the
         `max_tokens` the caller sent when their prompt left less of the
         context window. OpenAI-derived clients ignore keys they do not know.
-
-        `annotations` (2026-09-14, Files API): the `file_citation` objects of
-        the finished answer, on this chunk's `delta.annotations` — the
-        stream's counterpart of `choices[0].message.annotations`, and the
-        first moment the whole text is known. Omitted when there are none.
         """
         if self._stopped:
             raise StreamProtocolError("the finish_reason chunk was framed twice")
         self._stopped = True
         self._first = False
         extra = None if max_output_tokens is None else {"max_output_tokens": int(max_output_tokens)}
-        delta: Dict[str, Any] = {}
-        cited = [dict(annotation) for annotation in (annotations or ())]
-        if cited:
-            delta["annotations"] = cited
         return self._chunk(
-            [{"index": int(index), "delta": delta, "finish_reason": finish_reason}], extra=extra
+            [{"index": int(index), "delta": {}, "finish_reason": finish_reason}], extra=extra
         )
 
     def usage_chunk(self, usage: Optional[Mapping[str, Any]]) -> str:
