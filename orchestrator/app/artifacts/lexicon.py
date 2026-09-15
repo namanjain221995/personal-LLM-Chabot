@@ -15,7 +15,9 @@ mapped to the word they mean ("genrate" -> "generate", "dox" -> "docx"), and
 Hindi, Gujarati, Hinglish and Gujlish words mapped to English tokens or to a
 few reserved tokens the SOV rules read:
 
-    _give_     a create / hand-over verb at the END of a clause (bana do, बनाओ, આપો)
+    _give_     a create / hand-over verb at the END of a clause (bana do, बनाओ,
+               આપો), and SHOW after a chart word ("pie chart me dikhao") —
+               SHOW anywhere else is a read of the thing, not a request for it
     _convert_  a conversion verb after a destination (badal do, बदल दो, ફેરવો)
     _in_       a postposition naming a destination (me, में, માં)
     _this_     a bare reference to what came before (isko, इसे, આને)
@@ -86,6 +88,13 @@ def _word(pattern: str, repl: str) -> Tuple[Pattern[str], str]:
     return re.compile(_w(pattern)), f" {repl} "
 
 
+#: SHOW, in all four languages. `_SHOW_LONG` is the "show and hand over"
+#: form; it is kept out of the read fallback so the plain `aapo`/`આપો`
+#: hand-over rule below still reads "batavi aapo" the way it always has.
+_SHOW = (r"दिखाओ|दिखा\s*(?:दो|दें|दीजिए|देना)|दिखाइए|दिखाएँ|दिखाएं|બતાવો|બતાવજો|"
+         r"dikhao|dikha\s*(?:do|de|dijiye|dena)|dikhado|dikhaiye|dekhao|batavo|batavjo")
+_SHOW_LONG = r"બતાવી\s+(?:આપો|દો)|batavi\s+(?:aapo|apo|do)"
+
 #: Applied in order. Indic phrases first (they are longest), then Latin
 #: script Hinglish/Gujlish, then English typos. Every replacement is padded
 #: with spaces; whitespace is collapsed at the end.
@@ -147,6 +156,17 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"बनाकर\s+(?:दो|दें|दीजिए|दे\s+दो)|बना\s*(?:दो|दें|दीजिए|देना)|बनाओ|बनाइए|बनाइये|बनाएं|बनाएँ|बनाये|बनाकर|"
           r"तैयार\s+(?:करें|करो|कीजिए|कर\s+दो|करके\s+दो)|दे\s+(?:दो|दीजिए|दें)|दीजिए|भेज\s*(?:दो|दीजिए)|भेजो|चाहिए|"
           r"બનાવી\s+(?:આપો|આપજો|દો)|બનાવો|બનાવજો|તૈયાર\s+કરો|તૈયાર\s+કરી\s+આપો|આપો|આપજો|જોઈએ|મોકલો|મોકલી\s+આપો", "_give_"),
+    # SHOW. Measured 2026-09-16 (measure2 harness): "show this as a pie
+    # chart" returned action=none in all 4 languages, because SHOW had no
+    # entry at all. It is a hand-over ONLY after a chart word — "pie chart me
+    # dikhao", "પાઇ ચાર્ટમાં બતાવો" — where there is something to hand over.
+    # On a source it is a read, like "बताओ"/"batao" below: "mujhe ye pdf
+    # dikhao" with a PDF attached must stay a question about that PDF, not an
+    # export of the previous answer. The chart words are already Latin here
+    # (चार्ट / ચાર્ટ / ગ્રાફ are mapped above), so one rule reads all four
+    # languages.
+    (re.compile(rf"{_B}(?P<lead>(?:chart|graph)s?(?:\s+\S+){{0,2}}?\s+)(?:{_SHOW}|{_SHOW_LONG}){_E}"), r" \g<lead> _give_ "),
+    _word(_SHOW, "_read_"),
     # Verifier 2026-09-15: "undo the last change" said as a removal of it.
     _word(r"पिछला\s+बदलाव\s+(?:हटा\s*(?:दो|दें|दीजिए)|हटाओ|वापस\s+(?:लो|ले\s+लो))|पिछले\s+बदलाव\s+(?:हटा\s*(?:दो|दें)|हटाओ)|છેલ્લો\s+ફેરફાર\s+(?:કાઢી\s+નાખો|પાછો\s+લો)", "undo"),
     _word(r"जोड़ो|जोड़ें|जोड़\s+दो|जोडो|जोड़िए|ઉમેરો|ઉમેરી\s+દો|ઉમેરી\s+આપો", "add"),
@@ -171,7 +191,8 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
           r"banavi\s+(?:aapo|apo|aapjo|do)|banavo|banavjo|mokli\s+aapo|kari\s+aapo|aapo|apo|aapjo|joie|joiye|joiae", "_give_"),
     # Verifier 2026-09-15: "isko excel sheet me daal do" puts the thing IN a format: a hand-over, not an add.
     (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet)\s+(?:me|mein|mai|mei|ma|maa)\s+(?:daal|dal|daalo|daldo|rakh)\s*(?:do|de|dijiye|dena)?{_E}"), r" \1 _in_ _give_ "),
-    _word(r"pichla\s+change\s+(?:hata\s*do|hatao|wapas\s+lo|remove\s+kar\s*do)|last\s+change\s+(?:hata\s*do|hatao|wapas\s+lo)", "undo"),
+    _word(r"pichla\s+change\s+(?:hata\s*do|hatao|wapas\s+lo|remove\s+kar\s*do)|last\s+change\s+(?:hata\s*do|hatao|wapas\s+lo)|"
+          r"chh?ell[oa]\s+ferfar\s+(?:kadhi\s+nakho|kadho|kadhi\s+do|pachho\s+lo|dur\s+karo)|chh?ell[oa]\s+badlav\s+kadhi\s+nakho", "undo"),
     _word(r"add\s+(?:kar\s*do|karo|kardo)|daal\s+do|dal\s+do|daalo|daldo|jod\s+do|jodo|umero|umeri\s+do", "add"),
     _word(r"hata\s+do|hatao|nikal\s+do|kadhi\s+nakho", "remove"),
     _word(r"badal\s+do|badlo|badli\s+do|badli\s+nakho|change\s+kar\s*do|change\s+karo", "change"),
@@ -184,7 +205,7 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     # aapjo", "ye reply ko word file me" — the existing thing.
     (re.compile(rf"{_B}(report|answer|content|data|text|reply|response|jawab|summary|output|audit)\s+(?:ne|ko|nu|ka|ki)(?=\s+(?:pdf|word|doc|docx|excel|csv|ppt|pptx|file|document|sheet)\b)"), r" the \1 "),
     # An English verb and a Hinglish/Gujlish light verb: "create karo", "banavi do ne".
-    (re.compile(rf"{_B}(?:create|generate|make|prepare|build|export|convert|save|download|send|share)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kar\s*ke\s+do|karke\s+do|kardo|kar\s*dijiye|karvanu)(?:\s+ne)?{_E}"), " _give_ "),
+    (re.compile(rf"{_B}(?:create|generate|make|prepare|build|export|convert|save|download|send|share|tayyar|taiyar|taiyyar|tayar)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kar\s*ke\s+do|karke\s+do|kardo|kar\s*dijiye|karvanu)(?:\s+ne)?{_E}"), " _give_ "),
     _word(r"navi|navu|nayi|naya|नई|नया|નવી|નવું", "new"),
     _word(r"kripya|kripaya|कृपया|કૃપા\s+કરીને", "please"),
     _word(r"upar\s+(?:wala|wale|wali|ka|ki|ke|diya|diye|lakhelo|no)|above\s+wala|uparno", "above"),
@@ -259,7 +280,9 @@ def normalize(text: str) -> str:
 
 #: Formats named in normalised text. `sheet` is not here: "cheat sheet".
 FORMAT_ALIASES = {
-    "docx": r"docx|word\s+(?:document|file|doc|docs|version|copy|format|report)|ms\s*word|microsoft\s+word|(?:in|as|to|into)\s+word",
+    "docx": r"docx|word\s+(?:document|file|doc|docs|version|copy|format|report)|ms\s*word|microsoft\s+word|(?:in|as|to|into)\s+word|"
+            # The normaliser's SOV shape — see formats._ALIAS for the measurement.
+            r"word\s+_in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word\s+(?:_convert_|_give_)",
     "xlsx": r"xlsx|xls|excel|spreadsheets?|workbook|(?<!cheat )(?<!fact )(?<!balance )(?<!time )sheet(?!\s*\d)",
     "pdf": r"pdf",
     "pptx": r"pptx|ppt|powerpoint|presentation|slide\s*deck|deck|slides",
@@ -564,8 +587,17 @@ def _clause_shape(clause: str, uploads: Sequence[str]) -> Optional[NegativeShape
 
 _DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 _GUJARATI = re.compile(r"[઀-૿]")
-_GUJLISH_RE = re.compile(r"\b(?:aapo|apo|banavo|banavi|che|chhe|nu|ma|aane|aano|joie|joiye|kem|shu|mate|karo|ketlu|saras|bahu|kevi)\b")
-_HINGLISH_RE = re.compile(r"\b(?:bana|banao|kar|karo|do|dedo|de|chahiye|hai|hain|mein|me|mujhe|isko|iska|ka|ki|ke|kya|kaise|yeh|ye|wala|bhi|nahi|aur|sab|mast|acha|accha)\b")
+#: Both lists were FUNCTION words only, so a whole request could score one
+#: marker or none and be answered in English: measured 2026-09-16 (measure2
+#: harness) on "is data me sabse zyada kisne becha" (hn=['me'], 7 words),
+#: "python me code likho jo document banaye", "aa file no saransh kaho"
+#: (gj=[], hn=[], score 0/0) and "chhello ferfar kadhi nakho". The content
+#: words people actually type are here too. Only words that cannot be English
+#: are added: bare `aa`, `no`, `na` and `ni` are deliberately left out.
+_GUJLISH_RE = re.compile(r"\b(?:aapo|apo|banavo|banavi|che|chhe|nu|ma|aane|aano|joie|joiye|kem|shu|mate|karo|ketlu|saras|bahu|kevi|"
+                         r"amara|amaru|amari|amaro|saransh|kaho|chhello|chello|ferfar|nakho|batavo)\b")
+_HINGLISH_RE = re.compile(r"\b(?:bana|banao|kar|karo|do|dedo|de|chahiye|hai|hain|mein|me|mujhe|isko|iska|ka|ki|ke|kya|kaise|yeh|ye|wala|bhi|nahi|aur|sab|mast|acha|accha|"
+                          r"hamare|hamara|hamari|sabse|zyada|kisne|becha|likho|dikhao|banaye)\b")
 
 
 def language_of(text: str) -> Language:
@@ -575,12 +607,22 @@ def language_of(text: str) -> Language:
     if _DEVANAGARI.search(t):
         return "hi"
     low = t.casefold()
-    gj = len(_GUJLISH_RE.findall(low))
-    hn = len(_HINGLISH_RE.findall(low))
-    if gj >= 2 or (gj >= 1 and gj >= hn):
+    gj_hits = _GUJLISH_RE.findall(low)
+    hn_hits = _HINGLISH_RE.findall(low)
+    gj, hn = len(gj_hits), len(hn_hits)
+    # A word BOTH lists claim ("karo", "kar") says the message is not
+    # English; it cannot say which of the two it is. Scoring it for Gujlish
+    # and handing every tie to Gujlish labelled 2/30 Hinglish cases Gujlish
+    # — "title bold karo" among them (measure2, 2026-09-16) — so only the
+    # DISCRIMINATING markers choose between the two, and a tie falls through
+    # to the larger Hinglish vocabulary below.
+    shared = sum(1 for w in gj_hits if _HINGLISH_RE.fullmatch(w))
+    if gj and (gj - shared) > (hn - shared):
         return "gujlish"
     if hn >= 2 or (hn == 1 and len(low.split()) <= 6):
         return "hinglish"
+    if gj:
+        return "gujlish"
     return "en"
 
 

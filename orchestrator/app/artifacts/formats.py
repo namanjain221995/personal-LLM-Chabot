@@ -53,7 +53,17 @@ _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
 #: sheet" and "sheet 2" are not.
 _ALIAS: Dict[str, str] = {
     "pdf": r"(?:pdfs?|\.pdf)",
-    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?)",
+    # The normaliser writes a destination BEFORE its postposition ("वर्ड में
+    # कन्वर्ट कर दो", "aane word ma convert karo" -> "word _in_ _convert_"),
+    # so no English-order alias could see it and all four "convert it to
+    # Word" cases lost their format and exported the previous ANSWER instead
+    # (measure2 harness, 2026-09-16; pdf/excel/ppt pass because they
+    # self-name). `_convert_` and `_give_` are emitted only by
+    # lexicon.normalize from Indic or romanised input, so requiring one of
+    # them keeps a bare English "the word me is a pronoun" — which the
+    # postposition rule also rewrites to "word _in_" — out of this.
+    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?|"
+            r"word _in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word (?:_convert_|_give_))",
     "pptx": r"(?:pptx|\.pptx|powerpoint|power ?point|powerpint|ppts?|slide ?decks?|slides)",
     "xlsx": r"(?:xlsx|\.xlsx|xlxs|xls|exel|excell?|spread ?sheets?|work ?books?|worksheets?|(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )sheets?(?!\s*\d))",
     "csv": r"(?:csvs?|\.csv|comma[- ]separated(?: values?)?|data ?sets?|data files?)",
