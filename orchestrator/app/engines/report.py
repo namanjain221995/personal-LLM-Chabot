@@ -8,7 +8,6 @@ LaTeX) in REPORTS_DIR → meta.report_files.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
@@ -17,7 +16,8 @@ import time
 from pathlib import Path
 from typing import Awaitable, Callable, List, Sequence
 
-from ..core.report_render import sanitise_for_render
+from ..core.report_render import (ReportRenderError, run_pandoc_to_file,
+                                  sanitise_for_render)
 from .. import llm
 from ..config import settings
 from ..core.chart_pipeline import build_chart
@@ -113,26 +113,13 @@ async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None
             md_path.write_text(cleaned, encoding="utf-8")
     except OSError:
         pass
-    cmd = [
-        "pandoc",
-        str(md_path),
-        "--standalone",
-        "--resource-path",
-        str(resource_dir),
-        "-o",
-        str(out_path),
-    ]
-    if out_path.suffix.lower() == ".pdf":
-        cmd.append("--pdf-engine=weasyprint")  # PDF without LaTeX
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"pandoc failed for {out_path.name}: "
-            f"{stderr.decode(errors='replace')[:500]}"
-        )
+    # The mechanics live in core/report_render.py so both copies render a PDF
+    # through the same asset fetcher; the sanitise above stays HERE because a
+    # guard a caller can forget is not a guard.
+    try:
+        await run_pandoc_to_file(md_path, out_path, resource_dir)
+    except ReportRenderError as exc:  # this module's callers expect RuntimeError
+        raise RuntimeError(str(exc)) from exc
 
 
 async def _sql_section(
