@@ -348,7 +348,7 @@ _CHART_ASK_RE = re.compile(
 )
 
 
-def _chart_image_formats(text: str) -> List[str]:
+def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> List[str]:
     """The image formats a chart request names — and PNG when it names none.
 
     A person who asks to "visualise this table on pie chart" has named the
@@ -359,8 +359,22 @@ def _chart_image_formats(text: str) -> List[str]:
     text names a deliverable (kind_for stays at its "default" rule) — "a
     report with a pie chart" is still a report, and an explicit format still
     decides.
+
+    `chart_request` is the INTENT GATE's verdict (intent.ArtifactIntent.
+    chart_request), and when the caller has one it replaces the two regexes
+    below. The gate reads lexicon-normalised text — typos, Hindi, Gujarati,
+    Hinglish and Gujlish folded to the rule vocabulary, negated clauses
+    blanked — and its chart vocabulary is the larger one: measured on this
+    branch, "give me a waterfall showing revenue by quarter" and "scatter of
+    Salary vs Experience" were chart_request=True at the gate and docx+pdf
+    here, because `waterfall` is not in _CHART_WORDS_RE and neither phrase
+    has a verb _CHART_ASK_RE knows. Everything after the verdict — a named
+    image format, an explicit format, another deliverable noun — still reads
+    the text, so "a report with a pie chart" stays a report.
     """
-    if not _CHART_WORDS_RE.search(text or ""):
+    words = bool(_CHART_WORDS_RE.search(text or ""))
+    asked = words if chart_request is None else bool(chart_request)
+    if not (words or asked):
         return []
     found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]
     images = list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
@@ -370,18 +384,22 @@ def _chart_image_formats(text: str) -> List[str]:
         return []
     if kind_for(text or "", [])[1] != "default":
         return []
-    if not _CHART_ASK_RE.search(text or ""):
+    if not asked or (chart_request is None and not _CHART_ASK_RE.search(text or "")):
         return []
     return ["png"]
 
 
-def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
+def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None,
+           chart_request: Optional[bool] = None) -> FormatDecision:
     """decide_base (below), plus the chart image formats a request names:
     alone ("pie chart as png") they are the only files; next to a document
     format or a document word they are companions. A CSV asked for with
     styling the styling parser can read ("with a blue header row") also gets
-    the Excel file, as the styling words below already do."""
-    return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only))
+    the Excel file, as the styling words below already do.
+
+    `chart_request` is the intent gate's verdict; None (the default) leaves
+    the chart decision to this module's own words."""
+    return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only, chart_request=chart_request))
 
 
 def _with_styled_csv(text: str, d: FormatDecision) -> FormatDecision:
@@ -401,8 +419,9 @@ def _with_styled_csv(text: str, d: FormatDecision) -> FormatDecision:
     return d
 
 
-def _decide_images(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
-    images = [f for f in _chart_image_formats(text) if not explicit_only or f not in explicit_only]
+def _decide_images(text: str, *, explicit_only: Optional[Sequence[str]] = None,
+                   chart_request: Optional[bool] = None) -> FormatDecision:
+    images = [f for f in _chart_image_formats(text, chart_request=chart_request) if not explicit_only or f not in explicit_only]
     if not images:
         return decide_base(text, explicit_only=explicit_only)
     rest = [f for f in (explicit_only or []) if f not in T.IMAGE_FORMATS]

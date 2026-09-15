@@ -5469,6 +5469,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 _as3_artifact_id = str(request.artifact_id or "")
                 if _as3_artifact_id and _as3_artifact_id not in {str(a.get("id") or "") for a in _published}:
                     _as3_artifact_id = ""  # not this viewer's published artifact: ignored
+                # The SHAPE of the most recent deliverable (V39), so "make it a
+                # bar chart instead" is read as a change to the chart that was
+                # just made. `_published` is newest first and already carries
+                # the version row, so this costs no query.
+                from .artifacts import deliverable as _as3_deliverable
+
+                _as3_shape = _as3_deliverable.of_version((_published[0].get("current") or {})).to_json() if _published else None
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
                     _as3_intent_llm.make_hook(
@@ -5486,6 +5493,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     upload_formats=_as3_upload_formats,
                     last_turn_is_artifact=_as3_last_is_card,
                     artifact_id=_as3_artifact_id or None,
+                    last_deliverable=_as3_shape,
                 )
                 # --- AS3 intent-capability END ---
             # --- AS3 intent-capability BEGIN ---

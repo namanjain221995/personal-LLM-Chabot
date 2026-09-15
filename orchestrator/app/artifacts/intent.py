@@ -87,6 +87,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from . import formats as F
 from . import lexicon as LX
+from . import types as T
 from . import visuals as VIS
 
 Action = str  # "create" | "edit" | "convert" | "export" | "none"
@@ -577,6 +578,31 @@ _NOUN_PHRASE_REQUEST_RE = re.compile(
 #: Edit verbs the pre-AS3 list did not have ("complete the document",
 #: "apply a formula", "fill in the owner column").
 _MORE_EDIT_VERBS_RE = re.compile(r"\b(?:complete|finish|fill\s+in|apply|set|highlight|sort|restyle|reformat|merge|split|translate)\b", re.I)
+#: "a bar chart", "line graph", "pie plot" — the type vocabulary lives in
+#: lexicon.CHART_TYPE_WORDS, which edits.py reads too.
+_CHART_TYPE_RE = re.compile(rf"\b(?:{LX.CHART_TYPE_WORDS})\s+(?:chart|graph|plot)\b", re.I)
+#: The words that point at the chart THAT WAS JUST MADE rather than asking
+#: for a new one: "instead", "the same", "make it a …", "the chart".
+_SAME_CHART_RE = re.compile(
+    r"\b(?:instead|rather|same|again)\b"
+    r"|\b(?:make|change|turn|redo|render|draw|show|convert|give|do|_give_)\s+(?:me\s+)?(?:it|this|that|_this_)\b"
+    r"|\bthe\s+(?:chart|graph|plot)\b",
+    re.I,
+)
+#: A NEW subject: the words that point at DATA instead of at the file, so
+#: "visualise this table on pie chart" stays a create even when a chart is
+#: already in the conversation.
+_NEW_CHART_SUBJECT_RE = re.compile(
+    r"\b(?:this|these|that|those|the|_this_)\s+(?:\w+\s+){0,2}?"
+    r"(?:table|tables|data|dataset|numbers|figures|rows|records|list|sheet|results|breakdown|split)\b",
+    re.I,
+)
+#: The whole message is the chart type: "as a bar chart", "line graph please".
+_ONLY_CHART_TYPE_RE = re.compile(
+    rf"^\W*(?:(?:ok|okay|now|and|also|plus|please)\s+)*(?:as|in|to|into)?\s*(?:an?\s+|the\s+)?"
+    rf"(?:{LX.CHART_TYPE_WORDS})\s+(?:chart|graph|plot)\s*(?:please|instead|now|again)?\s*[.!?]?\s*$",
+    re.I,
+)
 #: The person asked for the answer HERE: "in the chat", "no download",
 #: "just tell me", "in 3 lines", "yahin chat me".
 _CHAT_ONLY_RE = re.compile(
@@ -746,6 +772,31 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _shape_of(value: Any) -> Optional[Any]:
+    """`last_deliverable` as a deliverable.Deliverable, whatever the caller
+    handed over (the dataclass, the version row's jsonb, or None). Never
+    raises: a shape the gate cannot read is no shape, and the rules that
+    do not need one are unaffected."""
+    if value is None:
+        return None
+    if hasattr(value, "has_chart"):
+        return value
+    try:
+        from . import deliverable as _D
+
+        return _D.from_json(value)
+    except Exception:  # noqa: BLE001 — the shape is an optimisation, never a gate
+        return None
+
+
+def _chart_type_change(low: str) -> bool:
+    """The words change the TYPE of the chart that is already there, and
+    say nothing about new data."""
+    if _ONLY_CHART_TYPE_RE.match(low):
+        return True
+    return bool(_CHART_TYPE_RE.search(low)) and bool(_SAME_CHART_RE.search(low)) and not _NEW_CHART_SUBJECT_RE.search(low)
+
+
 def decide(
     text: str,
     *,
@@ -755,6 +806,7 @@ def decide(
     upload_formats: Sequence[str] = (),
     last_turn_is_artifact: bool = False,
     artifact_id: Optional[str] = None,
+    last_deliverable: Optional[Any] = None,
 ) -> ArtifactIntent:
     """Decide from the words alone; nothing here calls a model.
 
@@ -767,6 +819,10 @@ def decide(
     attached to this turn (a read verb on one of them is a question).
     `last_turn_is_artifact`: the most recent assistant turn is a file card.
     `artifact_id`: the artifact the UI's "Edit with a prompt" names.
+    `last_deliverable`: the SHAPE of the most recent published version
+    (artifacts/deliverable.Deliverable, or the jsonb the version row
+    carries), so "make it a bar chart instead" can be read as a change to
+    the chart that was just made instead of a second one.
     """
     # A request for a file is stated in the first sentences; what follows is
     # material. The rules run on a bounded prefix, because a regex with a
@@ -789,6 +845,7 @@ def decide(
     language = LX.language_of(raw)
     style = bool(LX.style_phrases(low))
     chart = LX.chart_signal(low)
+    prev_shape = _shape_of(last_deliverable)
 
     def made(action: Action, **kw) -> ArtifactIntent:
         kw.setdefault("formats", explicit)
@@ -858,6 +915,18 @@ def decide(
         if LX.undo_signal(low) and len(low.split()) <= 12 and not (explicit and _AS_FORMAT_RE.search(low)):
             # "undo that", "revert", "पहले जैसा कर दो" (AS3 (g)).
             return made("edit", reference="latest", rule="restore-version")
+        # 2a. The last deliverable HELD A CHART and these words change only
+        #     its type: "make it a bar chart instead", "now do the same as a
+        #     line chart". An EDIT, so the binding that version already
+        #     carries is re-rendered (edits.preplan → set_chart → 0 model
+        #     calls) instead of a second artifact whose numbers the model is
+        #     asked for again — production 2026-09-16, where "visualise this
+        #     table on pie chart" was followed by a new file every time.
+        #     A message that names its own DATA ("visualise this table …") is
+        #     a new chart, and a document format named outright is a convert.
+        if prev_shape is not None and prev_shape.has_chart and not explicit and _chart_type_change(low):
+            return made("edit", reference="latest", reference_hint=_hint(low, artifact_hints),
+                        rule="edit-chart-type", chart_request=True)
         # The ANSWER named as the source beats a conversion of the file:
         # "save the answer above as an excel file".
         if has_assistant_answer and _PREVIOUS_ANSWER_RE.search(low) and (explicit or _AS_FORMAT_RE.search(low) or _CREATE_RE.search(low)):
@@ -1017,6 +1086,12 @@ ClassifyHook = Callable[..., Awaitable[Any]]
 #: (intent_llm.IntentVerdict): converted here, so the decision of what a
 #: verdict MEANS stays with the rules' vocabulary.
 _HOOK_ACTIONS = ("create", "export", "convert", "edit", "none")
+#: The formats a verdict may name. png and svg are on it since 2026-09-16:
+#: intent_llm.FORMATS has offered them since the AS3 integration and the
+#: prompt names "PNG/SVG charts", but this filter listed only the five
+#: document formats, so the classifier could never produce a chart — the one
+#: escape hatch for a chart ask the rules cannot read was closed at the exit.
+_VERDICT_FORMATS = ("pdf", "docx", "pptx", "xlsx", "csv", "png", "svg")
 
 
 def _should_consult(intent: ArtifactIntent, text: str) -> bool:
@@ -1045,7 +1120,7 @@ def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: boo
     action = str(getattr(verdict, "action", "") or "none")
     if action not in _HOOK_ACTIONS or action == "none":
         return None
-    formats = [f for f in (getattr(verdict, "formats", None) or []) if f in ("pdf", "docx", "pptx", "xlsx", "csv")]
+    formats = [f for f in (getattr(verdict, "formats", None) or []) if f in _VERDICT_FORMATS]
     target = str(getattr(verdict, "target", "") or "none")
     if action == "edit" and not has_artifacts:
         # An edit of a file that does not exist: the model misread a remark
@@ -1071,7 +1146,10 @@ def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: boo
         raw_text=rules.raw_text,
         language=rules.language,
         style_request=bool(getattr(verdict, "style_request", False)),
-        chart_request=bool(getattr(verdict, "chart_request", False)),
+        # png and svg exist in this product only as chart images
+        # (types.CHART_IMAGE_FORMATS_FOR_KIND), so a verdict that names one
+        # IS a chart request whatever the model put in the boolean.
+        chart_request=bool(getattr(verdict, "chart_request", False)) or any(f in T.IMAGE_FORMATS for f in formats),
         llm_used=True,
     )
     if action == "export":
@@ -1141,4 +1219,5 @@ async def decide_with_hook(
 
 _DECIDE_KWARGS = frozenset({
     "has_artifacts", "artifact_hints", "has_assistant_answer", "upload_formats", "last_turn_is_artifact", "artifact_id",
+    "last_deliverable",
 })

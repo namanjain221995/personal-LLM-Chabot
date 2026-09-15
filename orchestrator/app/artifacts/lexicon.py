@@ -298,6 +298,16 @@ _CHART_RE = re.compile(_w(
     # AS3 integration (live 2026-09-15): a chart type named as a noun, "scatter of Salary vs Experience".
     r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)"
 ))
+#: A chart TYPE said in words — chart_spec.CHART_TYPES plus the words people
+#: type for them. One home, read by intent.py (which routes "make it a bar
+#: chart instead" to an edit) and by edits.py (which turns it into a
+#: set_chart op); chart_spec itself is not imported by either on the chat
+#: event loop, and both would otherwise drift apart.
+CHART_TYPE_WORDS = (
+    r"horizontal\s+bar|percent\s+stacked(?:\s+bar)?|stacked(?:\s+bar)?|bar|column|line|area|pie|donut|doughnut|"
+    r"scatter|bubble|histogram|combo|dual[\s-]axis|box(?:\s*plot)?|heat\s*map|waterfall|funnel|gantt|radar|spider"
+)
+
 _REQUEST_VERB_RE = re.compile(_w(
     r"make|create|generate|build|prepare|produce|export|convert|turn|put|save|download|give|send|share|provide|deliver|"
     r"format|wrap|compile|draft|write|design|plot|draw|need|want|get|add|change|update|insert|include|remove|delete|"
@@ -630,4 +640,5 @@ __all__ = [
     "request_marker",
     "StylePhrase", "normalize", "formats_in", "file_signal", "chart_signal", "style_phrases", "strip_style_clauses",
     "undo_signal", "negative_shape", "reads_source", "language_of", "FORMAT_ALIASES", "DEST_AFTER",
+    "CHART_TYPE_WORDS",
 ]

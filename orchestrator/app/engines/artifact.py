@@ -894,7 +894,7 @@ async def run_artifact_engine(
             # deck can take — a NEW workbook from the same conversation is
             # what was asked for.
             operation, parent, parent_row = "create", None, None
-            decision = F.decide(instruction, explicit_only=intent.formats or None)
+            decision = F.decide(instruction, explicit_only=intent.formats or None, chart_request=bool(intent.chart_request))
             kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, f"new {decision.kind}: {decision.reason}", list(decision.warnings)
             data_only_note = str(getattr(decision, "data_only_note", "") or "")
         else:
@@ -906,7 +906,13 @@ async def run_artifact_engine(
             reason = f"convert: {', '.join(ok)}"
             warnings = [f"{', '.join(bad)} cannot be produced for a {kind}"] if bad else []
     else:
-        decision = F.decide(instruction, explicit_only=intent.formats or None)
+        # The GATE decided whether this is a chart, on normalised text with
+        # the negated clauses blanked; formats.py is told that verdict
+        # instead of running its own smaller chart vocabulary over the
+        # instruction a second time. Production 2026-09-16: "visualise this
+        # table on pie chart" came back as a Word file AND a PDF because the
+        # two readings disagreed.
+        decision = F.decide(instruction, explicit_only=intent.formats or None, chart_request=bool(intent.chart_request))
         kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, decision.reason, list(decision.warnings)
         data_only_note = str(getattr(decision, "data_only_note", "") or "")
 

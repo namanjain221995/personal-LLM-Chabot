@@ -69,7 +69,9 @@ _JOB_UPDATABLE = frozenset({
     "selected_formats", "format_reason", "template_id", "input_hash",
 })
 
-_VERSION_JSON = frozenset({"formats", "files", "warnings", "validation", "assumptions"})
+_VERSION_JSON = frozenset({"formats", "files", "warnings", "validation", "assumptions", "deliverable"})
+#: The version-row jsonb columns that hold an OBJECT; the rest hold a list.
+_VERSION_JSON_OBJECTS = frozenset({"validation", "deliverable"})
 _VERSION_TIMES = ("created_at", "completed_at")
 
 
@@ -102,7 +104,7 @@ def _version_row(r: Any) -> dict:
         if key in out:
             out[key] = core._iso(out[key]) if out.get(key) else None
     for key in _VERSION_JSON:
-        out[key] = _jsonish(out.get(key), {} if key == "validation" else [])
+        out[key] = _jsonish(out.get(key), {} if key in _VERSION_JSON_OBJECTS else [])
     out["version"] = int(out["version"])
     out["preview_pages"] = int(out.get("preview_pages") or 0)
     if out.get("parent_version") is not None:
@@ -491,6 +493,7 @@ def publish_version(
     template_id: Optional[str] = None,
     template_version: str = "",
     renderer_version: str = "",
+    deliverable: Optional[dict] = None,
 ) -> str:
     """The version is published: files, validation and warnings recorded,
     the artifact's current_version bumped, the job completed — ONE
@@ -519,12 +522,14 @@ def publish_version(
                       SET status = %s, files = %s, validation = %s, warnings = %s,
                           assumptions = %s, preview_kind = %s, preview_pages = %s,
                           spec_version = %s, template_id = COALESCE(%s, template_id),
-                          template_version = %s, renderer_version = %s, completed_at = %s
+                          template_version = %s, renderer_version = %s, deliverable = %s,
+                          completed_at = %s
                     WHERE artifact_id = %s AND version = %s""",
                 (status, core._json_param(list(files)), core._json_param(dict(validation or {})),
                  core._json_param(list(warnings)), core._json_param(list(assumptions)),
                  preview_kind, int(preview_pages), int(spec_version), template_id,
-                 template_version, renderer_version, ts, artifact_id, int(version)),
+                 template_version, renderer_version, core._json_param(dict(deliverable or {})),
+                 ts, artifact_id, int(version)),
             )
             con.execute(
                 """UPDATE artifacts

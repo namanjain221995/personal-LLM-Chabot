@@ -92,20 +92,22 @@ def _key(project_row, workspace_id, *, public_id="pub0000000000001", **kwargs) -
 # --------------------------------------------------------------- migration --
 
 
-def test_the_migration_list_ends_at_v38_and_the_test_database_is_fully_migrated():
+def test_the_migration_list_ends_at_v39_and_the_test_database_is_fully_migrated():
     versions = [version for version, _ddl in db._MIGRATIONS]
 
     # V35 (2026-09-13): api_responses.max_output_tokens and finish_reason.
     # V36 (2026-09-13): durable /v1 generations (no-timeout design).
     # V37 (2026-09-13): the Files API tables (files-hookup).
     # V38 (2026-09-14): web corpus state, retrieval demand, url hash index.
-    assert versions == list(range(1, 39))
-    assert db.LATEST_SCHEMA_VERSION == 38
-    assert db.schema_version() == 38
+    # V39 (2026-09-16): artifact_versions.deliverable — the shape a follow-up
+    #                   inherits (artifacts/deliverable.Deliverable).
+    assert versions == list(range(1, 40))
+    assert db.LATEST_SCHEMA_VERSION == 39
+    assert db.schema_version() == 39
     # Applying an applied migration is a no-op, which is what makes the
     # startup path safe to run on every boot.
     db.init_schema()
-    assert db.schema_version() == 38
+    assert db.schema_version() == 39
 
 
 def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():
@@ -2476,7 +2478,7 @@ def test_init_schema_retries_lock_not_available_and_succeeds_once_the_lock_is_re
     finally:
         holder.join(10)
         db.init_schema()  # whatever happened above, leave the database migrated
-    assert db.schema_version() == 38
+    assert db.schema_version() == db.LATEST_SCHEMA_VERSION
     assert elapsed >= 3.0, "the first attempt really met the lock"
     assert any("could not take its lock" in r.getMessage() for r in caplog.records)
 
@@ -2494,7 +2496,7 @@ def test_init_schema_gives_up_after_its_attempts_rather_than_forever(monkeypatch
     finally:
         holder.join(15)
         db.init_schema()
-    assert db.schema_version() == 38
+    assert db.schema_version() == db.LATEST_SCHEMA_VERSION
 
 
 def test_the_event_log_refuses_a_duplicate_sequence_number_and_a_zero_one(tenants, project):
