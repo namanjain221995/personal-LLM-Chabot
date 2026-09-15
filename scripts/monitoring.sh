@@ -132,11 +132,10 @@ case "$action" in
     ensure_grafana_password
     log_info "starting Grafana + Prometheus on this node"
     write_ocr_scrape_target
-    write_alertmanager_config
     # Named services only: a bare `up -d` would reconcile every service in the
     # project, restarting the LLM stack for a monitoring change.
     head_monitoring_compose up -d --no-deps \
-      prometheus grafana alertmanager node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     if is_dual_mode; then
       bind="$(worker_mgmt_ip)"
@@ -151,10 +150,10 @@ case "$action" in
     ;;
   down)
     head_monitoring_compose stop \
-      prometheus grafana alertmanager node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter
     head_monitoring_compose rm -f \
-      prometheus grafana alertmanager node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     if is_dual_mode; then
       worker_monitoring_compose "$(worker_mgmt_ip)" down || true
@@ -163,14 +162,14 @@ case "$action" in
     ;;
   stop)
     head_monitoring_compose stop \
-      prometheus grafana alertmanager node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     # Best effort on the worker: a stop must never fail because Node 2 is away.
     if is_dual_mode; then worker_monitoring_compose "$(worker_mgmt_ip)" stop || true; fi
     ;;
   restart)
     head_monitoring_compose restart \
-      prometheus grafana alertmanager node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     ;;
   logs)

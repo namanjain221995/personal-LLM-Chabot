@@ -148,42 +148,6 @@ write_ocr_scrape_target() {
   check_pass "Prometheus OCR target: $host_port ($role)"
 }
 
-# write_alertmanager_config : render .runtime/alertmanager/alertmanager.yml.
-#
-# Alertmanager expands no environment variables of its own and the SMTP
-# password must stay out of the repository, so the file it reads is generated
-# here from .env plus .runtime/secrets.env, exactly like the OCR scrape target
-# above. With no ALERT_EMAIL_TO/ALERT_SMTP_HOST the renderer still writes a
-# valid config whose receiver only logs, so the notifier starts either way.
-write_alertmanager_config() {
-  local out_dir="$ROOT/.runtime/alertmanager" key
-  mkdir -p "$out_dir"
-  local -a settings=(
-    ALERT_EMAIL_TO ALERT_EMAIL_FROM ALERT_SMTP_HOST ALERT_SMTP_PORT
-    ALERT_SMTP_USER ALERT_SMTP_PASSWORD ALERT_SMTP_STARTTLS
-  )
-  local -a env_args=()
-  for key in "${settings[@]}"; do
-    local value=""
-    # The password lives in secrets.env; everything else in .env. Either file
-    # may be absent on a fresh checkout, and a missing setting is not an error.
-    value="$(env_get "$ROOT/.runtime/secrets.env" "$key" 2>/dev/null || true)"
-    [ -n "$value" ] || value="$(env_get "$ROOT/.env" "$key" 2>/dev/null || true)"
-    [ -n "$value" ] || value="${!key:-}"
-    [ -n "$value" ] || continue
-    env_args+=("$key=$value")
-  done
-  # env -i keeps the surrounding shell's unrelated variables out of the render.
-  env "${env_args[@]}" python3 "$ROOT/monitoring/alertmanager/render_config.py" \
-    "$out_dir/alertmanager.yml" >/dev/null \
-    || { check_fail "could not render the Alertmanager config"; return 1; }
-  if [ -n "$(env_get "$ROOT/.env" ALERT_EMAIL_TO 2>/dev/null || true)${ALERT_EMAIL_TO:-}" ]; then
-    check_pass "Alertmanager: mail configured"
-  else
-    check_warn "Alertmanager: no ALERT_EMAIL_TO set - alerts stay in the UI"
-  fi
-}
-
 # ------------------------------------------------------------------ ssh ----
 # ssh_worker CMD... : run a command on the worker host (BatchMode: keys only).
 ssh_worker() {

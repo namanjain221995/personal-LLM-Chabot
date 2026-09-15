@@ -1,10 +1,12 @@
-"""The three guards added after the 2026-09-15 twenty-minute degradation.
+"""The guards added after the 2026-09-15 twenty-minute degradation.
 
 1. `techsara up` refuses to reconfigure a stack another checkout created.
-2. The Alertmanager config renders with and without mail settings, and the
-   SMTP password never leaves .runtime.
+2. The store-size rule reads its gauge with delta(), not increase().
 3. scripts/service-reconcile.sh starts stopped services, and never the main
    model, another Compose project, or a container on the skip list.
+
+No notifier is wired on purpose (operator decision, 2026-09-15: no mail).
+Alerts stay in Grafana and in Prometheus's own alert list.
 """
 
 from __future__ import annotations
@@ -90,78 +92,12 @@ class ForeignCheckoutGuardTests(unittest.TestCase):
                 _guard_foreign_checkout(args, root=Path("/srv/here"))
 
 
-class AlertmanagerConfigTests(unittest.TestCase):
-    """monitoring/alertmanager/render_config.py"""
-
-    @staticmethod
-    def _render(env: dict) -> str:
-        import importlib.util
-
-        path = REPO_ROOT / "monitoring" / "alertmanager" / "render_config.py"
-        spec = importlib.util.spec_from_file_location("render_config", path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        return module.render(env)
-
-    def test_without_mail_settings_the_config_is_still_valid_and_silent(self) -> None:
-        text = self._render({})
-        data = _yaml(text)
-        self.assertEqual(data["route"]["receiver"], "null")
-        self.assertEqual([r["name"] for r in data["receivers"]], ["null"])
-        self.assertNotIn("smtp_smarthost", text)
-
-    def test_mail_settings_produce_an_email_receiver(self) -> None:
-        data = _yaml(self._render({
-            "ALERT_EMAIL_TO": "ops@example.com",
-            "ALERT_SMTP_HOST": "smtp.example.com",
-            "ALERT_SMTP_PORT": "587",
-            "ALERT_SMTP_USER": "bot@example.com",
-            "ALERT_SMTP_PASSWORD": "secret",
-        }))
-        self.assertEqual(data["route"]["receiver"], "email")
-        email = [r for r in data["receivers"] if r["name"] == "email"][0]
-        self.assertEqual(email["email_configs"][0]["to"], "ops@example.com")
-        self.assertTrue(email["email_configs"][0]["send_resolved"])
-        self.assertEqual(data["global"]["smtp_smarthost"], "smtp.example.com:587")
-        self.assertIs(data["global"]["smtp_require_tls"], True)
-
-    def test_several_recipients_become_one_comma_separated_string(self) -> None:
-        data = _yaml(self._render({
-            "ALERT_EMAIL_TO": "a@example.com, b@example.com",
-            "ALERT_SMTP_HOST": "smtp.example.com",
-        }))
-        email = [r for r in data["receivers"] if r["name"] == "email"][0]
-        self.assertEqual(email["email_configs"][0]["to"], "a@example.com, b@example.com")
-
-    def test_implicit_tls_port_does_not_ask_for_starttls(self) -> None:
-        data = _yaml(self._render({
-            "ALERT_EMAIL_TO": "ops@example.com",
-            "ALERT_SMTP_HOST": "smtp.example.com",
-            "ALERT_SMTP_PORT": "465",
-        }))
-        self.assertIs(data["global"]["smtp_require_tls"], False)
-
-    def test_a_quote_in_the_password_cannot_break_out_of_the_scalar(self) -> None:
-        data = _yaml(self._render({
-            "ALERT_EMAIL_TO": "ops@example.com",
-            "ALERT_SMTP_HOST": "smtp.example.com",
-            "ALERT_SMTP_PASSWORD": "it's a 'quoted' one",
-        }))
-        self.assertEqual(data["global"]["smtp_auth_password"], "it's a 'quoted' one")
-
-    def test_the_generated_path_is_inside_the_ignored_runtime_directory(self) -> None:
-        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-        self.assertIn(".runtime", gitignore)
-        compose = (REPO_ROOT / "compose" / "compose.monitoring.yaml").read_text(encoding="utf-8")
-        self.assertIn("./.runtime/alertmanager:/etc/alertmanager:ro", compose)
-
-
 class PrometheusAlertingTests(unittest.TestCase):
-    def test_prometheus_sends_its_alerts_to_alertmanager(self) -> None:
+    def test_no_notifier_is_wired(self) -> None:
+        """The operator asked for no mail (2026-09-15). Alerts are read in
+        Grafana; nothing sends them anywhere, and no config claims otherwise."""
         data = _yaml((REPO_ROOT / "monitoring" / "prometheus" / "prometheus.yml").read_text(encoding="utf-8"))
-        targets = data["alerting"]["alertmanagers"][0]["static_configs"][0]["targets"]
-        self.assertEqual(targets, ["alertmanager:9093"])
+        self.assertNotIn("alerting", data)
 
     def test_the_store_size_gauge_uses_delta_not_increase(self) -> None:
         rules = (REPO_ROOT / "monitoring" / "prometheus" / "rules" / "alerts.yml").read_text(encoding="utf-8")
