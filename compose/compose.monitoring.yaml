@@ -374,8 +374,50 @@ services:
     oom_score_adj: 600
     logging: *monitoring-logging
 
+  # ALERTMANAGER — the notification path. Without it every rule in
+  # monitoring/prometheus/rules fires into the Prometheus UI and nothing
+  # leaves the box: on 2026-09-15 searxng was down for ten minutes and the
+  # auxiliary engines were unreachable for twenty, and the only witness was a
+  # dashboard nobody was looking at.
+  #
+  # ITS CONFIG IS GENERATED, NEVER COMMITTED. The SMTP password belongs in
+  # .runtime/secrets.env, so scripts/monitoring.sh renders
+  # .runtime/alertmanager/alertmanager.yml (0600) from
+  # monitoring/alertmanager/render_config.py before it starts this service.
+  # With no mail settings the renderer writes a config that only logs, so a
+  # box without SMTP still starts and still shows alerts in the UI.
+  alertmanager:
+    image: prom/alertmanager@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    profiles: [monitoring]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # The URL a person clicks in the mail; the silence links are built from it.
+      - --web.external-url=${ALERTMANAGER_EXTERNAL_URL:-http://127.0.0.1:9093}
+    volumes:
+      - ./.runtime/alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      # Loopback only. Nothing off-box may silence this host's alerts.
+      - "${MONITORING_BIND_ADDRESS:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
+    networks:
+      - application
+    restart: unless-stopped
+    # OOM order: see prometheus above. The notifier ranks with Prometheus at
+    # 500: it holds the only evidence that leaves the box.
+    oom_score_adj: 500
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --proxy=off http://127.0.0.1:9093/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *monitoring-logging
+
 volumes:
   prometheus-data:
     name: sf-local-ai_prometheus
   grafana-data:
     name: sf-local-ai_grafana
+  alertmanager-data:
+    name: sf-local-ai_alertmanager

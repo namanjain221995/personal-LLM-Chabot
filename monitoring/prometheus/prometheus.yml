@@ -22,6 +22,18 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+# WHERE A FIRED RULE GOES. Without this block every rule above fires into this
+# process and stops there: on 2026-09-15 auxiliary engines were unreachable
+# for twenty minutes with each rule pending, firing and resolving unseen.
+# Alertmanager runs in the monitoring profile on the application network and
+# mails the receiver that monitoring/alertmanager/render_config.py wrote.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      # A notifier that is itself down must not stall evaluation.
+      timeout: 10s
+
 scrape_configs:
   # --- Prometheus itself -------------------------------------------------
   - job_name: prometheus

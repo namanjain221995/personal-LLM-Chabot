@@ -83,7 +83,10 @@ EXPECTED_SIDE_STACK = {
     "compose.monitoring.yaml": {
         "grafana": 600, "cadvisor": 600, "postgres-exporter": 600,
         "data-stores-exporter": 600, "blackbox-exporter": 600,
-        "prometheus": 500, "node-exporter": 500, "dgx-gpu-exporter": 500,
+        # alertmanager ranks with Prometheus: it carries the only evidence
+        # that leaves the box (2026-09-15).
+        "prometheus": 500, "alertmanager": 500, "node-exporter": 500,
+        "dgx-gpu-exporter": 500,
     },
     "compose.monitoring-worker.yaml": {"node-exporter": 500, "dgx-gpu-exporter": 500},
 }

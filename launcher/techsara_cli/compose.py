@@ -328,6 +328,65 @@ def docker_project_has_running_models(
     return getattr(result, "returncode", 1) == 0 and bool(str(getattr(result, "stdout", "")).strip())
 
 
+def running_project_checkouts(
+    *,
+    project: str = "sf-local-ai",
+    runner: Callable[..., object] = run_command,
+) -> list[str]:
+    """Working directories the RUNNING containers of `project` were created from.
+
+    Compose stamps every container it creates with
+    ``com.docker.compose.project.working_dir``. One box can hold several
+    checkouts of this repository, and each carries its own ``.env`` and
+    ``.runtime/generated.env``: the directory on that label is the one whose
+    settings the live stack actually has.
+    """
+    result = runner(
+        [
+            "docker", "ps", "--filter", f"label=com.docker.compose.project={project}",
+            "--format", "{{.Label \"com.docker.compose.project.working_dir\"}}",
+        ],
+        timeout=10.0,
+    )
+    if getattr(result, "returncode", 1) != 0:
+        return []
+    seen: list[str] = []
+    for line in str(getattr(result, "stdout", "")).splitlines():
+        value = line.strip()
+        if value and value not in seen:
+            seen.append(value)
+    return seen
+
+
+def foreign_checkout_owner(
+    root: "Path | str",
+    *,
+    project: str = "sf-local-ai",
+    runner: Callable[..., object] = run_command,
+) -> str | None:
+    """The other checkout that owns the running stack, or None.
+
+    WHY THIS IS A GUARD AND NOT A NOTE. On 2026-09-15 `techsara up` ran from a
+    second checkout of this repository whose ``.runtime/generated.env`` had
+    ``TECHSARA_PUBLISH_MODEL_PORTS=false`` and OCR disabled. Compose recreated
+    the auxiliary engines WITHOUT their loopback ports, so the engine
+    controller's ``ROUTER_HEALTH_URL`` (127.0.0.1:8002) stopped answering and
+    the cluster reported DEGRADED for twenty minutes; the same run stopped
+    searxng and started an OCR engine on the head GPU, which the driver then
+    refused for lack of memory. Both checkouts were internally consistent. The
+    damage came from mixing them.
+    """
+    here = str(Path(root).resolve())
+    for owner in running_project_checkouts(project=project, runner=runner):
+        try:
+            resolved = str(Path(owner).resolve())
+        except OSError:  # pragma: no cover - a path the daemon reported but we cannot stat
+            resolved = owner
+        if resolved != here:
+            return resolved
+    return None
+
+
 def reconcile_project_services(
     desired_services: Iterable[str],
     *,
