@@ -188,10 +188,20 @@ def test_a_slow_reader_hits_the_deadline_and_leaves_a_note(monkeypatch):
 
 
 def test_a_large_workbook_is_parsed_off_the_event_loop(tmp_path):
-    """The CPU work runs in a thread: a heartbeat on the loop keeps beating
-    (max gap < 250 ms: the thread shares the GIL, and 123 ms was seen
-    once under a parallel suite) while a 50,000-row workbook is read. Inline
-    on the loop the gap is the whole parse (seconds)."""
+    """The CPU work runs in a thread: the reader runs off the loop's thread,
+    and a heartbeat on the loop keeps beating (max gap < 250 ms: the thread
+    shares the GIL, and 123 ms was seen once under a parallel suite) while a
+    50,000-row workbook is read. Inline on the loop the gap is the whole parse
+    (seconds).
+
+    The heap the rest of the suite leaves behind is frozen for the
+    measurement: the reader's allocations trigger a full collection, which
+    pauses every thread for as long as it takes to walk the WHOLE process
+    heap — about 0.5 s on CI after 9,000 tests (2026-09-15), a cost of the
+    suite's leftovers rather than of where this reader runs."""
+    import gc
+    import threading
+
     from openpyxl import Workbook
 
     src = tmp_path / "big.xlsx"
@@ -216,13 +226,29 @@ def test_a_large_workbook_is_parsed_off_the_event_loop(tmp_path):
                 last = now
 
         task = asyncio.create_task(beat())
+        await asyncio.sleep(0)  # the heartbeat is running before the read starts
         g = await M.gather(history=[], pdf_uploads=[("big.xlsx", b64)], save_documents=False)
         stop.set()
         await task
-        return g, max(gaps)
+        return g, max(gaps), threading.get_ident()
 
-    g, worst = asyncio.run(run())
+    reader_threads = []
+    real_read_xlsx = M.read_xlsx
+
+    def recording_read_xlsx(*a, **k):
+        reader_threads.append(threading.get_ident())
+        return real_read_xlsx(*a, **k)
+
+    gc.collect()
+    gc.freeze()
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(M, "read_xlsx", recording_read_xlsx)
+            g, worst, loop_thread = asyncio.run(run())
+    finally:
+        gc.unfreeze()
     assert len(g.upload_tables[0].rows) == 50_000
+    assert reader_threads and loop_thread not in reader_threads
     assert worst < 0.25, worst
 
 

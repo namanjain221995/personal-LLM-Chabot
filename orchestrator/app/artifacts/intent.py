@@ -248,7 +248,27 @@ _NEGATED_FORMAT_RE = re.compile(rf"\b(?:not|never|no|rather than|instead of|don[
 #: of four or more cells with no space after the separators (a CSV export;
 #: a sentence puts a space after its commas). The prose the row count is
 #: read from ends at the first such line (#3).
-_TABLE_LINE_RE = re.compile(r"\t|\||(?:[^,;\n]*[,;](?![ \t])){3}")
+def _is_table_line(line: str) -> bool:
+    """A tab, a pipe, or three consecutive `,`/`;` separators none of which is
+    followed by a space or tab. The same language as the old
+    r"\\t|\\||(?:[^,;\\n]*[,;](?![ \\t])){3}", read in one pass: that regex
+    rescanned the rest of the line from every position, so one 4,000-character
+    line cost tens of milliseconds on the event loop (CI, 2026-09-15)."""
+    if "\t" in line or "|" in line:
+        return True
+    run = 0
+    last = len(line) - 1
+    for i, ch in enumerate(line):
+        if ch == "\n":
+            run = 0
+        elif ch == "," or ch == ";":
+            if i < last and line[i + 1] in " \t":
+                run = 0
+            else:
+                run += 1
+                if run >= 3:
+                    return True
+    return False
 
 # --- follow-ups --------------------------------------------------------------
 
@@ -385,7 +405,7 @@ def _prose_before_table(original: str) -> str:
         return " ".join(str(table.prose_before).split())
     out: List[str] = []
     for line in head.splitlines():
-        if _TABLE_LINE_RE.search(line):
+        if _is_table_line(line):
             break
         out.append(line)
     return " ".join(" ".join(out).split())
@@ -589,7 +609,16 @@ _ARTIFACT_SENTENCE_RE = re.compile(
 
 
 #: A clause the normaliser marked as a negated hand-over ("pdf mat banao").
-_NEG_TOKEN_CLAUSE_RE = re.compile(r"[^.;,!?\n]*_neg_[^.;,!?\n]*")
+_CLAUSE_RE = re.compile(r"[^.;,!?\n]+")
+
+
+def _blank_neg_token_clauses(text: str) -> str:
+    """Blank every clause that holds a `_neg_` token. Same result as
+    re.sub(r"[^.;,!?\\n]*_neg_[^.;,!?\\n]*", " ", text), which retried the
+    whole clause from every start position — quadratic on one long clause."""
+    if "_neg_" not in text:
+        return text
+    return _CLAUSE_RE.sub(lambda m: " " if "_neg_" in m.group(0) else m.group(0), text)
 
 
 def turn_text(turn: Any) -> str:
@@ -747,7 +776,7 @@ def decide(
     # creation clauses blanked (#9); `raw` — the instruction the composer
     # gets — keeps the person's words.
     low = LX.normalize(_without_negated_clauses(raw.lower()))
-    low = _without_negated_clauses(_NEG_TOKEN_CLAUSE_RE.sub(" ", low))
+    low = _without_negated_clauses(_blank_neg_token_clauses(low))
     uploads = [str(f).lower().lstrip(".") for f in (upload_formats or ()) if f]
     explicit = F.explicit_formats(low)
     rows = _row_count(_without_negated_clauses(_prose_before_table(original).lower()))

@@ -401,15 +401,18 @@ def test_v36_a_red_status_highlight_fills_only_the_status_column(tmp_path):
 
 def test_v37_landscape_reaches_the_docx_section_and_the_pdf_pages(tmp_path):
     import docx
-    import subprocess
+    import pypdfium2
     doc = nine_section_doc()
     out = E.apply(doc, E.preplan("make it landscape", doc), instruction="make it landscape")
     files = _render(out.spec, ["docx", "pdf"], tmp_path, "v37")
     sec = docx.Document(str(files["docx"])).sections[0]
     assert sec.page_width > sec.page_height
-    info = subprocess.run(["pdfinfo", str(files["pdf"])], capture_output=True, text=True).stdout
-    m = re.search(r"Page size:\s+([\d.]+) x ([\d.]+)", info)
-    assert m and float(m.group(1)) > float(m.group(2)), info
+    pdf = pypdfium2.PdfDocument(str(files["pdf"]))
+    try:
+        sizes = [pdf[i].get_size() for i in range(len(pdf))]
+    finally:
+        pdf.close()
+    assert sizes and all(w > h for w, h in sizes), sizes
     (tmp_path / "p").mkdir()
     parent_files = _render(doc, ["docx"], tmp_path / "p", "v37p")
     a = [p.text for p in docx.Document(str(files["docx"])).paragraphs]

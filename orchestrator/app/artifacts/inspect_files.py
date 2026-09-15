@@ -394,7 +394,7 @@ def inspect_docx(path: Path) -> List[Observation]:
         def where() -> Dict[str, Any]:
             return {"sections": [s for s in path if s], "section_index": h1_ordinal}
 
-        def emit(target: str, props: Dict[str, Any], locator: Dict[str, Any]) -> None:
+        def record(target: str, props: Dict[str, Any], locator: Dict[str, Any]) -> None:
             counts[target] = counts.get(target, 0) + 1
             if counts[target] > _MAX_PER_TARGET:
                 return
@@ -424,16 +424,16 @@ def inspect_docx(path: Path) -> List[Observation]:
                     path[level - 1] = text
                     for deeper in range(level, 3):
                         path[deeper] = ""
-                    emit(kind, agg, {"text": text[:120], "index": len(headings) - 1, "level": level})
+                    record(kind, agg, {"text": text[:120], "index": len(headings) - 1, "level": level})
                     if level == 1:
                         current = text
                 elif kind in ("title", "subtitle"):
-                    emit(kind, agg, {"text": text[:120]})
+                    record(kind, agg, {"text": text[:120]})
                     if kind == "title":
                         obs.append(Observation("title", "letter_spacing", float(agg.get("letter_spacing") or 0.0), fmt))
                         obs.append(Observation("title", "border", styles.para_border(sid), fmt))
                 elif kind == "paragraph":
-                    emit("paragraph", agg, {"chars": len(text), "list": _is_list_style(sname)})
+                    record("paragraph", agg, {"chars": len(text), "list": _is_list_style(sname)})
                 sections.setdefault(current, []).append(text)
             elif child.tag == _W + "tbl":
                 rows = child.findall(_W + "tr")
@@ -461,12 +461,12 @@ def inspect_docx(path: Path) -> List[Observation]:
                         loc = {"table": table_index, "row": r_i, "col": c_i}
                         if r_i == 0:
                             header_names.append(ctext)
-                            emit("table_header", agg, {**loc, "text": ctext[:60]})
+                            record("table_header", agg, {**loc, "text": ctext[:60]})
                         else:
                             if c_i < len(header_names) and header_names[c_i]:
-                                emit("column:" + norm_text(header_names[c_i]), agg, loc)
+                                record("column:" + norm_text(header_names[c_i]), agg, loc)
                             if row_texts and norm_text(row_texts[0]).startswith("total"):
-                                emit("table_total", agg, loc)
+                                record("table_total", agg, loc)
                     text_lines.append(" | ".join(row_texts))
                     sections.setdefault(current, []).append(" | ".join(row_texts))
                 obs.append(Observation("table", "columns", header_names, fmt, {"table": table_index}))
@@ -764,14 +764,14 @@ def inspect_xlsx(path: Path, spec=None) -> List[Observation]:
                 props["background"] = cf_fill or static or "#FFFFFF"
             return props
 
-        def emit(target: str, cell, extra: Optional[Dict[str, Any]] = None) -> None:
+        def record(target: str, cell, extra: Optional[Dict[str, Any]] = None) -> None:
             props = cell_style(cell)
             loc = {**loc_sheet, "cell": cell.coordinate, **(extra or {})}
             for key, value in props.items():
                 obs.append(Observation(target, key, value, fmt, dict(loc), verifiable=value is not None))
 
         for c_i, name in enumerate(headers):
-            emit("table_header", ws.cell(row=1, column=c_i + 1), {"text": name})
+            record("table_header", ws.cell(row=1, column=c_i + 1), {"text": name})
         data_rows = 0
         total_rows: List[int] = []
         emitted = 0
@@ -786,12 +786,12 @@ def inspect_xlsx(path: Path, spec=None) -> List[Observation]:
                 total_rows.append(r)
                 for c in range(width):
                     if values[c] not in (None, ""):
-                        emit("table_total", ws.cell(row=r, column=c + 1))
+                        record("table_total", ws.cell(row=r, column=c + 1))
                 continue
             data_rows += 1
             if emitted < _MAX_PER_TARGET:
                 for c in range(width):
-                    emit("column:" + norm_text(headers[c]) if c < len(headers) else "cell", ws.cell(row=r, column=c + 1), {"row": r})
+                    record("column:" + norm_text(headers[c]) if c < len(headers) else "cell", ws.cell(row=r, column=c + 1), {"row": r})
                     emitted += 1
         if not auxiliary:
             obs.append(Observation("sheet", "row_count", data_rows, fmt, dict(loc_sheet)))
@@ -1201,7 +1201,7 @@ def inspect_pdf(path: Path, spec=None) -> List[Observation]:
     path: List[str] = ["", "", ""]
     h1_ordinal = 0
 
-    def emit(target: str, run: PdfTextRun, locator: Dict[str, Any]) -> None:
+    def record(target: str, run: PdfTextRun, locator: Dict[str, Any]) -> None:
         counts[target] = counts.get(target, 0) + 1
         if counts[target] > _MAX_PER_TARGET:
             return
@@ -1240,11 +1240,11 @@ def inspect_pdf(path: Path, spec=None) -> List[Observation]:
             continue
         if not title_seen and texts["title"] and _matches(stripped, texts["title"]) and run.size_pt >= 14:
             title_seen = True
-            emit("title", run, {})
+            record("title", run, {})
             continue
         if not subtitle_seen and texts["subtitle"] and _matches(stripped, texts["subtitle"]) and not _matches(stripped, texts["title"]):
             subtitle_seen = True
-            emit("subtitle", run, {})
+            record("subtitle", run, {})
             continue
         hit = next(((lvl, t) for lvl, t in heading_left if _matches(stripped, t)), None)
         if hit is not None and run.size_pt >= 10:
@@ -1255,20 +1255,20 @@ def inspect_pdf(path: Path, spec=None) -> List[Observation]:
             path[level - 1] = hit[1]
             for deeper in range(level, 3):
                 path[deeper] = ""
-            emit(f"heading{min(hit[0], 3)}", run, {"level": hit[0]})
+            record(f"heading{min(hit[0], 3)}", run, {"level": hit[0]})
             # The heading as the page shows it (a spec heading that never
             # reached the page is never listed).
             pdf_headings.append(stripped if len(stripped) >= len(hit[1]) else hit[1])
             continue
         if slide_titles and norm_text(stripped) in slide_titles:
-            emit("slide_title", run, {})
+            record("slide_title", run, {})
             continue
         if norm_text(stripped) in texts["table_headers"] and run.background and run.background != "#FFFFFF":
-            emit("table_header", run, {})
+            record("table_header", run, {})
             continue
         if run.page < 2 and run.size_pt >= 22 and not texts["title"]:
             continue
-        emit("paragraph", run, {"chars": len(stripped), "list": _pdf_list_run(stripped, texts)})
+        record("paragraph", run, {"chars": len(stripped), "list": _pdf_list_run(stripped, texts)})
         body_sizes.append(run.size_pt)
     obs.append(Observation("page", "page_numbers", bool(sizes) and len(page_numbers_by_page) >= max(1, len(sizes) - 1), fmt,
                            {"pages_with_numbers": len(page_numbers_by_page), "pages": len(sizes)}))
