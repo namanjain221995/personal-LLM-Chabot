@@ -100,6 +100,9 @@ _GROUPED = r"(?:\d{1,3}(?:,\d{2})*,\d{3}|\d{1,3}(?:,\d{3})+)"
 _NUMBER_BODY_RE = re.compile(rf"^(?P<n>{_GROUPED}(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)\s*(?P<suf>[^\d\s.,]+\.?)?$")
 
 
+_APPROX_PREFIX_RE = re.compile(r"^(?:~|≈|∼|≅|about|approx\.?|approximately|circa|ca\.?|c\.)\s*", re.I)
+
+
 def to_number(value: Any) -> Optional[float]:
     """A cell or a typed figure → float; None when it is not a number.
     Handles ₹/$/€/£, Western and Indian digit grouping (1,20,000), Devanagari
@@ -117,6 +120,11 @@ def to_number(value: Any) -> Optional[float]:
     neg = False
     if s.startswith("(") and s.endswith(")"):
         neg, s = True, s[1:-1].strip()
+    # "~67", "≈ 67", "approx. 67": an estimate is still a number. A column
+    # with one estimated cell was typed text (6 of 7 numeric, under the 0.9
+    # bar), its sum was refused, and the pie fell back to counting rows
+    # (production 2026-09-16).
+    s = _APPROX_PREFIX_RE.sub("", s).strip()
     # `s[:1] in "+-"` is True for an EMPTY string ("" is in every string):
     # a lone "-" cell (a blank in many exports) raised IndexError here, and
     # describe_table/prompt_guide crashed on it. Verifier 2026-09-15.
@@ -500,6 +508,17 @@ def _is_total_label(value: Any) -> bool:
     return bool(text) and len(text) <= 40 and _TOTAL_LABEL_RE.match(text) is not None
 
 
+def _is_total_row(row: Sequence[Any]) -> bool:
+    """A summary row, wherever it carries its marker.
+
+    The x cell alone is not enough: production 2026-09-16 plotted a row whose
+    RANK cell read "Total" and whose state cell read "Distinct States", so a
+    count of 30 states joined five states on a pie of per-state counts. Any
+    short label cell of the row marks the whole row.
+    """
+    return any(_is_total_label(cell) for cell in row)
+
+
 def _build_frame(binding: CS.Binding, table: Any, roles: Dict[str, int], deadline: Optional[float], chart_type: str = "") -> _Frame:
     rows = list(_table_attr(table, "rows", []) or [])
     total = len(rows)
@@ -525,10 +544,10 @@ def _build_frame(binding: CS.Binding, table: Any, roles: Dict[str, int], deadlin
     filters_on_x = any(roles.get(f"f{i}") == x_idx for i in range(len(binding.filters)))
     if chart_type in _TOTAL_ROW_TYPES and x_idx is not None and kinds[x_idx].kind == "text" and not filters_on_x:
         before = len(keep)
-        dropped = [r for r in keep if _is_total_label(rows[r][x_idx] if x_idx < len(rows[r]) else None)]
+        dropped = [r for r in keep if _is_total_row(rows[r])]
         if dropped:
             labels = sorted({_label_of(rows[r][x_idx]) for r in dropped})[:3]
-            keep = [r for r in keep if not _is_total_label(rows[r][x_idx] if x_idx < len(rows[r]) else None)]
+            keep = [r for r in keep if not _is_total_row(rows[r])]
             notes.append(f"{before - len(keep)} total row{'s' if before - len(keep) != 1 else ''} ({', '.join(labels)}) left out so no figure is counted twice")
     cols: Dict[str, List[Any]] = {}
     for role, idx in roles.items():
@@ -734,6 +753,50 @@ def _numbers(values: List[Any]) -> List[Optional[float]]:
     return [to_number(v) for v in values]
 
 
+#: Columns that number or index the rows of a derived table rather than
+#: measure anything: plotting them says nothing about the subject.
+_NON_MEASURE_RE = re.compile(r"^(?:rank|ranking|sr\.?|s\.?\s*no\.?|no\.?|#|index|position|serial|row|year|month|day|date|id|code|pin|zip|phone|percent(?:age)?|%.*|.*%.*|share.*|.*\bpct\b.*)$", re.I)
+
+
+def _measure_column(table: Any, binding: CS.Binding, roles: Dict[str, int]) -> Optional[str]:
+    """The one numeric column a per-row table is really about, or None.
+
+    A table with one row per category ("State | Count | % of total") cannot be
+    summarised by COUNTING its rows: every category weighs 1 and the chart says
+    nothing. Production 2026-09-16 drew exactly that — six states, six equal
+    slices — because the measure column carried one estimated cell ("~67") and
+    the binding fell back to a row count. When the table offers exactly one
+    plottable measure, that is the chart's subject; when it offers none or
+    several, the count stands and the request is answered as written.
+    """
+    columns = [str(c) for c in (_table_attr(table, "columns", []) or [])]
+    taken = {roles.get("x"), roles.get("group_by")}
+    candidates: List[str] = []
+    for idx, name in enumerate(columns):
+        if idx in taken or _NON_MEASURE_RE.match(name.strip()):
+            continue
+        if infer_column(table, idx, full_scan=True).kind == "number":
+            candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _one_row_per_category(table: Any, roles: Dict[str, int]) -> bool:
+    """True when the x column holds a different label on every row."""
+    idx = roles.get("x")
+    rows = list(_table_attr(table, "rows", []) or [])
+    if idx is None or not rows:
+        return False
+    labels = [_label_of(r[idx]) for r in rows if idx < len(r) and not _is_total_row(r)]
+    return len(labels) > 1 and len(set(labels)) == len(labels)
+
+
+def frame_label(roles: Dict[str, int], table: Any) -> str:
+    """The x column's name, for a note about how the rows were read."""
+    columns = [str(c) for c in (_table_attr(table, "columns", []) or [])]
+    idx = roles.get("x")
+    return columns[idx] if idx is not None and idx < len(columns) else "category"
+
+
 def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) -> ComputedChart:
     """The chart's numbers from `table`. Raises ChartDataError with the
     sentence to show instead of the chart."""
@@ -742,6 +805,20 @@ def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) ->
     b = chart.data
     t = chart.type
     roles, notes = _resolve_columns(b, table, t)
+    if (
+        b.agg == "count" and not b.y and not b.y2
+        and t in CS.AGGREGATING_TYPES
+        and _one_row_per_category(table, roles)
+    ):
+        measure = _measure_column(table, b, roles)
+        if measure is not None:
+            b = b.model_copy(update={"y": [measure], "agg": "sum"})
+            chart = chart.model_copy(update={"data": b})
+            roles, extra_notes = _resolve_columns(b, table, t)
+            notes = notes + extra_notes + [
+                f"each row of this table is one {frame_label(roles, table)}, so counting rows would weigh them equally; "
+                f"{measure} was summed instead"
+            ]
     frame = _build_frame(b, table, roles, deadline, t)
     notes = notes + frame.notes
     title = str(_table_attr(table, "title", "") or _table_attr(table, "id", ""))

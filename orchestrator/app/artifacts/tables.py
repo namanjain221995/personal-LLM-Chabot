@@ -763,6 +763,13 @@ def _iso(y: int, mo: int, d: int, original: Any) -> Any:
 
 
 _NA = frozenset({"", "-", "—", "–", "n/a", "na", "n.a.", "none", "null", "nil", "tbd", "?"})
+#: "~67", "≈ 67", "approx. 67", "about 67", "circa 67" — a person's way of
+#: writing a number they estimated. The value is the number; only the claim to
+#: precision is softer. Production 2026-09-16: a state table whose one
+#: estimated cell read "~67" made its whole column parse as text (6 of 7 cells
+#: numeric, below the 0.9 bar), the sum was refused, and the chart silently
+#: fell back to counting rows — seven equal slices on a pie of real counts.
+_APPROX_RE = re.compile(r"^(?:~|≈|∼|≅|about|approx\.?|approximately|circa|ca\.?|c\.)\s*", re.I)
 _CURRENCY_RE = re.compile(r"^(?:rs\.?|inr|usd|eur|gbp|[₹$€£¥])\s*|\s*(?:rs\.?|inr|usd|eur|gbp|[₹$€£¥])$", re.I)
 _NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _INT_RE = re.compile(r"^[+-]?\d+$")
@@ -785,6 +792,7 @@ def parse_number(value: Any) -> Optional[Union[int, float]]:
     negative = False
     if s.startswith("(") and s.endswith(")"):
         s, negative = s[1:-1].strip(), True
+    s = _APPROX_RE.sub("", s).strip()
     s = _CURRENCY_RE.sub("", s).strip()
     if s.endswith("%"):
         s = s[:-1].strip()

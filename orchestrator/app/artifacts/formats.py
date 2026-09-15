@@ -329,11 +329,40 @@ _CHART_WORDS_RE = re.compile(r"\b(?:chart|charts|graph|graphs|plot|plots|histogr
 _IMAGE_FORMAT_RE = re.compile(r"\b(?:png|\.png|svg|\.svg)\b", re.I)
 
 
+#: The verbs a chart request is made with. "visualise this table on pie
+#: chart", "plot it", "draw a bar graph", "isko pie chart me dikhao".
+_CHART_ASK_RE = re.compile(
+    r"\b(?:visuali[sz]e|visuali[sz]ing|plot|plotted|graph|chart|draw|render|show|display|give|make|create|build|generate)\b"
+    r"|दिखा|बना|दिखाओ|बनाओ|બતાવ|બનાવ",
+    re.I,
+)
+
+
 def _chart_image_formats(text: str) -> List[str]:
+    """The image formats a chart request names — and PNG when it names none.
+
+    A person who asks to "visualise this table on pie chart" has named the
+    deliverable: a chart. Until 2026-09-16 this returned [] unless the text
+    also said "png" or "svg", so the request fell through to the document
+    default and production answered a one-line chart ask with a two-page Word
+    file and a PDF. The image default applies only when nothing else in the
+    text names a deliverable (kind_for stays at its "default" rule) — "a
+    report with a pie chart" is still a report, and an explicit format still
+    decides.
+    """
     if not _CHART_WORDS_RE.search(text or ""):
         return []
     found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]
-    return list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
+    images = list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
+    if images:
+        return images
+    if explicit_formats(text or ""):
+        return []
+    if kind_for(text or "", [])[1] != "default":
+        return []
+    if not _CHART_ASK_RE.search(text or ""):
+        return []
+    return ["png"]
 
 
 def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
