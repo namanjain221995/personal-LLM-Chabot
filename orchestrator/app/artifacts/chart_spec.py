@@ -1012,10 +1012,12 @@ def prompt_guide(kind: str, tables: Sequence[Any]) -> str:
         '"group_by": "Region", "y": ["Amount"], "agg": "sum"}}. Example: {"type": "pie", "title": "Tickets by status", "data": {"table_id": "upload2", "x": "Status", "agg": "count"}, '
         '"style": {"category_colors": {"Open": "red"}}}.'
     )
-    lines.append(
-        "Type when the person does not say: dates on x → line; parts of a whole with at most 7 categories → pie; comparing categories → bar "
-        "(horizontal_bar when labels are long); two numeric measures → scatter; one numeric distribution → histogram."
-    )
+    # The SAME rule table chart_choice.recommend applies after the model
+    # answers: a type the guidance and the chooser disagree on is a type the
+    # person is told was changed, so the two lists are kept in one place.
+    from . import chart_choice  # lazy: chart_choice imports this module
+
+    lines.append(chart_choice.rules_text())
     lines.append("Types: " + ", ".join(CHART_TYPES) + ".")
     if kind == "workbook":
         lines.append("On a sheet chart, an empty data.table_id means the sheet's own rows.")

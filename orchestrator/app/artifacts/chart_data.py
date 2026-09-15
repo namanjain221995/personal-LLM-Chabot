@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import chart_spec as CS
+from . import chart_choice, chart_spec as CS
 
 PANDAS_ROW_CAP = 200_000
 DUCKDB_ROW_CAP = 2_000_000
@@ -1416,7 +1416,10 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
     - a grouped type (stacked, heatmap) with no group_by, or a line/bar over
       dates whose request names a second text column, gets that column as
       group_by — only when exactly one such column is named in the request
-      or the title, with a note.
+      or the title, with a note;
+    - the TYPE is checked against the table's shape by chart_choice: a type
+      the person named in `instruction` wins whenever the shape carries it,
+      otherwise the chooser's type is used and the note names both and why.
 
     Live run 2026-09-15: 7 of 20 misses were a skipped group_by and 3 were
     stray y2/label/size fields. Nothing here invents a column or a number."""
@@ -1461,10 +1464,26 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
         if len(candidates) == 1 and (t in _GROUP_TYPES or x_is_date):
             upd["group_by"] = candidates[0]
             notes.append(f"the chart is split by {candidates[0]}, as the request names it")
-    if not upd:
+
+    # The type, LAST: the chooser reads the binding as repaired above (a
+    # group_by just filled in changes the shape), and the person's own words
+    # outrank both the model and the chooser.
+    type_upd: Dict[str, Any] = {}
+    if table is not None:
+        probe = chart if not upd else chart.model_copy(update={"data": CS.Binding.model_validate({**b.model_dump(), **upd})})
+        choice = chart_choice.choose(probe, table, instruction)
+        if choice is not None:
+            if choice.type != t:
+                type_upd["type"] = choice.type
+            if choice.trendline != probe.data.trendline and choice.type == "scatter":
+                upd["trendline"] = choice.trendline
+            if choice.note:
+                notes.append(choice.note)
+    if not upd and not type_upd:
         return chart, notes
     data = {**b.model_dump(), **upd}
-    return chart.model_copy(update={"data": CS.Binding.model_validate(data), "categories": [], "series": [], "extra": None, "provenance": None}), notes
+    return chart.model_copy(update={"data": CS.Binding.model_validate(data), **type_upd,
+                                    "categories": [], "series": [], "extra": None, "provenance": None}), notes
 
 
 def _sheet_table(sheet: Dict[str, Any]) -> Any:
