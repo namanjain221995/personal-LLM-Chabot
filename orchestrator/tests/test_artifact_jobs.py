@@ -315,9 +315,11 @@ def test_a_job_runs_every_stage_publishes_atomically_and_fans_out_steps(owner, m
     assert not os.path.exists(final + ".tmp")
     # CONTRACT §6: EXACTLY these — no material.json (chat content outside
     # every retention path), no render-job/render-report (absolute paths),
-    # no preview.json, no .mpl cache.
-    assert set(os.listdir(final)) == {"manifest.json", "spec.json", "validation.json", "preview.pdf", "previews",
+    # no preview.json, no .mpl cache. AS3: selfcheck.json (the self-check's
+    # report) is published beside validation.json and is never a file ref.
+    assert set(os.listdir(final)) == {"manifest.json", "spec.json", "validation.json", "preview.pdf", "previews", "selfcheck.json",
                                       "quarterly-review-v1.pdf", "quarterly-review-v1.docx"}
+    assert "selfcheck.json" not in {f["filename"] for f in store.read_json(os.path.join(final, "manifest.json"))["files"]}
     assert set(os.listdir(os.path.join(final, "previews"))) == {"1-240.png", "1-1400.png"}
     version = adb.get_version(row["artifact_id"], 1, owner)
     assert version["status"] == "completed" and version["preview_kind"] == "pages" and version["preview_pages"] == 2

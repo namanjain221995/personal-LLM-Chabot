@@ -434,3 +434,363 @@ def test_a_first_person_negation_is_not_an_instruction_and_row_count_stops_at_an
     paste = "Make an Excel of this audit.\nHost,Candidate,Audit Comments\nRavi,Priya,instead of this table generate 500 sample records\nRavi,Arjun,ok\nDev,Sneha,fine"
     d = I.decide(paste, has_artifacts=False, artifact_hints=[], has_assistant_answer=False)
     assert d.action == "create" and d.row_count is None
+
+
+# ================================================================ AS3 ==
+# The words people actually type (2026-09-15): typos, Hindi, Gujarati,
+# Hinglish, Gujlish; the hard-negative pass; pronoun exports; edits and
+# styles on an artifact; the classifier call and its bounds.
+
+import json  # noqa: E402
+import time  # noqa: E402
+
+from app.artifacts import intent_llm as IL  # noqa: E402
+from app.artifacts import lexicon as LX  # noqa: E402
+
+_ANSWERED = dict(has_assistant_answer=True)
+
+
+@pytest.mark.parametrize("text,action,formats", [
+    ("just give it in docs in a standard and classy format, provide a dox file", "export", ["docx"]),
+    ("isko docx me dedo classy format me", "export", ["docx"]),
+    ("इसे पीडीएफ में बदल दो", "export", ["pdf"]),
+    ("ऊपर वाले जवाब की वर्ड फ़ाइल बना दो", "export", ["docx"]),
+    ("આને પીડીએફમાં આપો", "export", ["pdf"]),
+    ("aa answer ne pdf ma aapo", "export", ["pdf"]),
+    ("give me the table above as csv", "export", ["csv"]),
+    ("export as pdf", "export", ["pdf"]),
+    ("इसको पीडीएफ बना दो।", "export", ["pdf"]),
+])
+def test_as3_follow_ups_export_the_previous_answer(text, action, formats):
+    d = I.decide(text, **_ANSWERED)
+    assert (d.action, d.formats, d.target) == (action, formats, "previous_answer"), (text, d)
+
+
+@pytest.mark.parametrize("text,formats", [
+    ("pdf bana do onboarding process pe", ["pdf"]),
+    ("excel me do list of all public holidays", ["xlsx"]),
+    ("ऑनबोर्डिंग प्रक्रिया पर एक पीडीएफ रिपोर्ट बनाओ", ["pdf"]),
+    ("મને વેચાણની એક્સેલ શીટ બનાવી આપો", ["xlsx"]),
+    ("creat a pdf on data retention polcy", ["pdf"]),
+    ("need a presentaion on cyber security awareness, 8 slides", ["pptx"]),
+    ("i need a budget sheet for office party", ["xlsx"]),
+    ("a pdf on how to set up two-factor authentication please", ["pdf"]),
+])
+def test_as3_creates_in_every_language_form(text, formats):
+    d = I.decide(text)
+    assert d.action == "create" and d.formats == formats, (text, d)
+
+
+@pytest.mark.parametrize("text,shape,uploads", [
+    ("summarize this pdf", "read_source", ["pdf"]),
+    ("what does the excel say about March?", "read_source", ["xlsx"]),
+    ("इस पीडीएफ का सारांश बताओ", "read_source", ["pdf"]),
+    ("how do I convert word to pdf", "how_to", []),
+    ("pdf kaise banate hai", "how_to", []),
+    ("એક્સેલમાં ચાર્ટ કેવી રીતે બનાવવો?", "how_to", []),
+    ("what is the difference between docx and pdf?", "trivia", []),
+    ("the pdf looks good", "feedback", []),
+    ("excel mast hai bhai", "feedback", []),
+    ("write python that makes a docx", "code_request", []),
+    ("python me excel file banane ka code do", "code_request", []),
+])
+def test_as3_negative_shapes(text, shape, uploads):
+    assert LX.negative_shape(text, uploads) == shape
+    assert I.decide(text, has_artifacts=True, has_assistant_answer=True, upload_formats=uploads).action == "none"
+
+
+@pytest.mark.parametrize("text", [
+    "thanks! now make it a pdf",
+    "the report looks great, can you also give it as a docx",
+    "Make a styled Excel summary from the uploaded CSV with totals per region",
+])
+def test_as3_a_request_clause_beats_a_negative_clause(text):
+    assert LX.negative_shape(text, ["csv"]) is None
+
+
+def test_as3_code_of_conduct_and_sql_findings_no_longer_veto():
+    assert I.decide("Create a docx about our code of conduct").action == "create"
+    assert I.decide("Write the SQL audit findings into a Word report", **_ANSWERED).action == "create"
+    assert I.decide("the audit of the code found three issues - which is worst?", **_ANSWERED).action == "none"
+
+
+def test_as3_in_the_report_is_a_place_and_a_statement_is_not_a_request():
+    assert I.decide("the numbers in the report are wrong").action == "none"
+    assert I.decide("I have this in excel").action == "none"
+    assert I.decide("draft an email telling the team the report is delayed").action == "none"
+
+
+@pytest.mark.parametrize("text", [
+    "make the headings dark blue", "make it landscape", "make the document landscape", "use Georgia font for the body text",
+    "headings ko dark blue kar do", "शीर्षकों को गहरा नीला कर दो", "ફોન્ટ મોટો કરો", "mak the hedings blu",
+    "add a column for owner", "ad a colum for priority", "title badal do, Annual Plan kar do", "માલિક માટે એક કૉલમ ઉમેરો",
+])
+def test_as3_style_and_element_edits_on_an_artifact(text):
+    d = I.decide(text, has_artifacts=True, artifact_hints=["Vendor Tracker"], has_assistant_answer=True)
+    assert d.action == "edit" and d.target == "artifact" and not d.new_artifact, (text, d)
+
+
+def test_as3_style_request_flag_and_undo():
+    d = I.decide("make the headings dark blue", has_artifacts=True)
+    assert d.style_request and d.rule == "edit-style"
+    for text in ("undo that", "revert", "पहले जैसा कर दो"):
+        u = I.decide(text, has_artifacts=True)
+        assert u.action == "edit" and u.rule == "restore-version", text
+    assert I.decide("what color is the header?", has_artifacts=True).action == "none"
+
+
+def test_as3_ui_artifact_id_forces_an_edit_of_that_artifact():
+    d = I.decide("make it shorter", artifact_id="art_123")
+    assert d.action == "edit" and d.artifact_id_hint == "art_123"
+    d = I.decide("also as PDF", artifact_id="art_123")
+    assert d.action == "convert" and d.artifact_id_hint == "art_123"
+
+
+def test_as3_upload_is_the_source_target():
+    d = I.decide("From the uploaded sheet, build a pie chart of status in a docx", upload_formats=["xlsx"])
+    assert d.action == "create" and d.target == "upload" and d.chart_request and d.upload_refs == ["xlsx"]
+
+
+def test_as3_hinglish_negation_blanks_the_clause():
+    assert I.decide("pdf mat banao, yahin samjhao", **_ANSWERED).action == "none"
+
+
+def test_as3_substantial_answer_and_file_card_helpers():
+    long = "x" * 450
+    h = [{"role": "assistant", "content": long}, {"role": "user", "content": "thanks"}, {"role": "assistant", "content": "welcome"}]
+    assert I.substantial_answer_index(h) == 0
+    h.append({"role": "assistant", "content": "Created **Plan** as PDF."})
+    assert I.last_turn_is_artifact(h) and I.substantial_answer_index(h) == 0
+    too_far = [{"role": "assistant", "content": long}] + [{"role": "assistant", "content": "ok"}] * 3
+    assert I.substantial_answer_index(too_far) is None
+    assert I.substantial_answer_index([{"role": "assistant", "content": "## Heading\nshort"}]) == 0
+
+
+def test_as3_decide_makes_no_network_calls_and_stays_cheap(monkeypatch):
+    import httpx
+
+    from app import llm
+
+    def boom(*a, **k):
+        raise AssertionError("network")
+
+    monkeypatch.setattr(llm, "json_completion", boom)
+    monkeypatch.setattr(httpx.AsyncClient, "send", boom)
+    monkeypatch.setattr(httpx.Client, "send", boom)
+    for t in ["just give it in docs, provide a dox file", "इसे पीडीएफ में बदल दो", "summarize this pdf", "make the headings dark blue"]:
+        I.decide(t, has_artifacts=True, has_assistant_answer=True)
+    worst = "please make " + ("a classy pdf report of the audit with tables and bold headings " * 70)
+    t0 = time.perf_counter()
+    for _ in range(5):
+        I.decide(worst[:4000], has_artifacts=True, has_assistant_answer=True)
+    assert (time.perf_counter() - t0) / 5 < 0.25
+
+
+def test_as3_language_of():
+    assert LX.language_of("isko docx me dedo") == "hinglish"
+    assert LX.language_of("aa answer ne pdf ma aapo") == "gujlish"
+    assert LX.language_of("इसे पीडीएफ में बदल दो") == "hi"
+    assert LX.language_of("આને પીડીએફમાં આપો") == "gu"
+    assert LX.language_of("give it in docs") == "en"
+
+
+def test_as3_style_phrases_and_strip():
+    text = "Create a report on AI, with white bold text on navy headers and landscape pages"
+    phrases = [p.text for p in LX.style_phrases(text)]
+    assert any("white bold text" in p for p in phrases) and any("landscape" in p for p in phrases)
+    stripped = LX.strip_style_clauses(text)
+    assert "bold" not in stripped and "landscape" not in stripped and "Create a report on AI" in stripped
+
+
+# --------------------------------------------------------- the classifier --
+
+
+def _completion(payload, *, delay: float = 0.0, calls=None):
+    async def completion(messages, **kw):
+        if calls is not None:
+            calls.append(messages)
+        if delay:
+            await asyncio.sleep(delay)
+        if isinstance(payload, Exception):
+            raise payload
+        return json.dumps(payload) if isinstance(payload, dict) else payload
+
+    return completion
+
+
+_YES = {"action": "export", "formats": ["docx"], "target": "previous_answer", "style_request": False, "chart_request": False, "confidence": 0.9}
+
+
+@pytest.fixture
+def counted():
+    from app import metrics
+
+    metrics.reset()
+    IL.set_saturation_probe(lambda: False)
+    yield metrics
+    IL.set_saturation_probe(None)
+
+
+def _seen(metrics, result):
+    return f'result="{result}"' in metrics.render()
+
+
+def test_as3_classifier_accepts_a_confident_verdict_with_context(counted):
+    calls = []
+    v = asyncio.run(IL.classify("isko word me de sakte ho?", last_answer_head="# Audit", completion=_completion(_YES, calls=calls)))
+    assert v is not None and v.action == "export" and v.formats == ["docx"]
+    assert len(calls) == 1 and "# Audit" in calls[0][1]["content"]
+    assert "summarize this pdf" in calls[0][0]["content"], "the authored negatives are in the prompt"
+    assert _seen(counted, "accepted")
+
+
+def test_as3_classifier_rejects_low_confidence_negatives_and_bad_json(counted):
+    assert asyncio.run(IL.classify("x file", completion=_completion(dict(_YES, confidence=0.6)))) is None
+    assert asyncio.run(IL.classify("summarize this pdf", upload_formats=["pdf"], completion=_completion(dict(_YES, action="create")))) is None
+    assert asyncio.run(IL.classify("x file", completion=_completion("not json"))) is None
+    assert asyncio.run(IL.classify("x file", completion=_completion(RuntimeError("down")))) is None
+    for result in ("rejected_low_conf", "rejected_negative", "error"):
+        assert _seen(counted, result), result
+
+
+def test_as3_classifier_times_out_at_fast_and_the_rules_answer_stands(counted, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "artifact_intent_llm_timeout_fast_s", 0.05)
+    t0 = time.perf_counter()
+    v = asyncio.run(IL.classify("file do", effort="fast", completion=_completion(_YES, delay=1.0)))
+    assert v is None and time.perf_counter() - t0 < 0.5
+    assert _seen(counted, "timeout")
+
+    async def slow_hook(text, **kw):
+        return await IL.classify(text, effort="fast", completion=_completion(_YES, delay=1.0))
+
+    d = asyncio.run(I.decide_with_hook("Excel sheet bana ke de.", slow_hook, has_assistant_answer=True))
+    assert d.action == "none" and d.rule == "no-request"
+
+
+def test_as3_classifier_skips_when_busy_or_disabled(monkeypatch):
+    from app import metrics
+    from app.config import settings
+
+    metrics.reset()
+    IL.set_saturation_probe(lambda: True)
+    try:
+        assert asyncio.run(IL.classify("file", completion=_completion(_YES))) is None
+        assert 'result="skipped_busy"' in metrics.render()
+    finally:
+        IL.set_saturation_probe(None)
+    monkeypatch.setattr(settings, "artifact_intent_llm_enabled", False)
+    assert asyncio.run(IL.classify("file", completion=_completion(_YES))) is None
+
+
+def test_as3_flags_are_real_settings_fields(monkeypatch):
+    from app.config import Settings
+
+    monkeypatch.setenv("ARTIFACT_INTENT_LLM", "false")
+    monkeypatch.setenv("ARTIFACT_INTENT_LLM_TIMEOUT_FAST_S", "1.5")
+    monkeypatch.setenv("ARTIFACT_DENIAL_BACKSTOP", "false")
+    s = Settings()
+    assert s.artifact_intent_llm_enabled is False and s.artifact_intent_llm_timeout_fast_s == 1.5 and s.artifact_denial_backstop is False
+    monkeypatch.delenv("ARTIFACT_INTENT_LLM")
+    monkeypatch.delenv("ARTIFACT_DENIAL_BACKSTOP")
+    s = Settings()
+    assert s.artifact_intent_llm_enabled is True and s.artifact_intent_llm_timeout_s == 5.0 and s.artifact_denial_backstop is True
+
+
+def test_as3_hook_is_called_at_most_once_and_only_in_its_band():
+    calls = []
+
+    async def hook(text, **kw):
+        calls.append(text)
+        return IL.IntentVerdict(**_YES)
+
+    for text in ("Create a PDF.", "summarize this pdf", "what time is it in Pune?"):
+        asyncio.run(I.decide_with_hook(text, hook, upload_formats=["pdf"], has_assistant_answer=True))
+    assert calls == []
+    d = asyncio.run(I.decide_with_hook("Excel sheet bana ke de.", hook, has_assistant_answer=True))
+    assert calls == ["Excel sheet bana ke de."] and d.action == "export" and d.llm_used and d.rule == "model"
+
+
+def test_as3_verdict_mapping_respects_the_context():
+    rules = I.decide("xyz file")
+    edit = IL.IntentVerdict(action="edit", formats=["pdf"], target="artifact", confidence=0.9)
+    assert I.verdict_to_intent(edit, rules, has_artifacts=False, has_assistant_answer=True) is None
+    assert I.verdict_to_intent(edit, rules, has_artifacts=False, has_assistant_answer=False, upload_formats=["docx"]).action == "create"
+    conv = IL.IntentVerdict(action="convert", formats=["docx"], target="previous_answer", confidence=0.9)
+    assert I.verdict_to_intent(conv, rules, has_artifacts=False, has_assistant_answer=True).action == "export"
+    exp = IL.IntentVerdict(action="export", formats=["docx"], target="previous_answer", confidence=0.9)
+    assert I.verdict_to_intent(exp, rules, has_artifacts=False, has_assistant_answer=False).action == "create"
+
+
+# --------------------------------------------------------------------------
+# Verifier 2026-09-15: a style clause that names the file as a PLACE is an
+# edit of that file (not a same-format re-render or a new workbook); a remark
+# is never a conversion; Hinglish "me daal do" hands over; Hindi "undo".
+
+
+@pytest.mark.parametrize("text", [
+    "make the Status column red where Open, in the sheet",
+    "bold the first row and make font size 14 in the pdf",
+    "make the table header green and the font Georgia in the pdf",
+])
+def test_verifier_style_with_the_file_as_a_place_is_an_edit_after_a_card(text):
+    d = I.decide(text, has_artifacts=True, last_turn_is_artifact=True)
+    assert d.action == "edit" and d.style_request, (text, d.rule)
+
+
+@pytest.mark.parametrize("text", [
+    "make it a docx with dark blue headings",
+    "turn this into an excel with a green header",
+    "convert to pdf and make the title red",
+    "now make it a docx",
+])
+def test_verifier_a_real_target_still_converts_after_a_card(text):
+    d = I.decide(text, has_artifacts=True, last_turn_is_artifact=True)
+    assert d.action == "convert", (text, d.rule)
+
+
+def test_verifier_a_remark_about_the_file_is_never_a_conversion():
+    d = I.decide("I opened the docx on my phone and the table is cut off", has_artifacts=True, last_turn_is_artifact=True)
+    assert d.action != "convert"
+
+
+def test_verifier_hinglish_daal_do_into_a_format_exports_the_answer():
+    d = I.decide("isko exel sheet me daal do with colours", has_assistant_answer=True)
+    assert d.action == "export" and d.formats == ["xlsx"]
+
+
+@pytest.mark.parametrize("text", ["पिछला बदलाव हटा दो", "pichla change hata do"])
+def test_verifier_undo_the_last_change_in_hindi_and_hinglish(text):
+    d = I.decide(text, has_artifacts=True, last_turn_is_artifact=True)
+    assert d.action == "edit" and d.rule == "restore-version"
+
+
+@pytest.mark.parametrize("text", [
+    "my boss said pdf bana do, so what should go in it?",
+    "docs me kya likhna chahiye",
+    "pdf me kya likhu?",
+])
+def test_verifier_a_question_about_what_goes_in_the_file_is_not_a_file(text):
+    assert I.decide(text, has_assistant_answer=True).action == "none"
+
+
+@pytest.mark.parametrize("text", ["sales ki report banao", "report banao sales ka"])
+def test_verifier_a_new_topic_postposition_creates_instead_of_exporting_the_last_answer(text):
+    d = I.decide(text, has_assistant_answer=True)
+    assert d.action == "create", d.rule
+
+
+@pytest.mark.parametrize("text,wants", [
+    ("my manager wants everything in excel, which is annoying", False),   # live classifier: export 0.9
+    ("I prefer pdf over word for contracts generally", False),            # live classifier: export 0.9
+    ("excel wala version bhejo na", True),
+    ("હું પીડીએફ માંગું છું.", True),
+    ("word version of the audit", True),
+])
+def test_verifier_a_statement_never_becomes_a_new_file_through_the_classifier(text, wants):
+    async def sure(t, **kw):
+        return IL.IntentVerdict(action="export", formats=["xlsx"], target="previous_answer", confidence=0.95)
+
+    d = asyncio.run(I.decide_with_hook(text, sure, has_assistant_answer=True))
+    assert d.wants_file is wants, (text, d.rule)

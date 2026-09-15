@@ -22,8 +22,17 @@ KINDS: Tuple[str, ...] = ("document", "presentation", "workbook")
 #: A file format we can actually write and reopen. A format is never
 #: promised that is not in this table. CSV joined on 2026-09-12 (CONTRACT-2
 #: §1): a workbook sheet as a portable data file — data only, no styling.
-FileFormat = Literal["pdf", "docx", "pptx", "xlsx", "csv"]
-FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx", "xlsx", "csv")
+#: PNG and SVG (AS3 charts, 2026-09-15) are STAGED, not yet live: see
+#: CHART_IMAGE_FORMATS_FOR_KIND below. They join FORMATS and FORMATS_FOR_KIND
+#: in the one integration commit that also lands the render/__init__ png/svg
+#: dispatch and api.py's SVG attachment + sandbox-CSP headers — before that a
+#: png/svg convert would be accepted by api.py and then refused by
+#: render_version, and an SVG could be asked for with disposition=inline.
+FileFormat = Literal["pdf", "docx", "pptx", "xlsx", "csv", "png", "svg"]
+#: AS3 integration (2026-09-15): png/svg are live — render/__init__ dispatches
+#: them to render/charts.render_standalone and api.py serves an SVG as an
+#: attachment under a sandboxing CSP.
+FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx", "xlsx", "csv", "png", "svg")
 
 MIME_TYPES: Dict[str, str] = {
     "pdf": "application/pdf",
@@ -36,6 +45,9 @@ MIME_TYPES: Dict[str, str] = {
     #: deliberately NOT in FORMATS, so no renderer is ever asked for one.
     "zip": "application/zip",
     "png": "image/png",
+    #: Served as an attachment with a sandboxing CSP (artifacts/api.py) —
+    #: never inline on the app origin.
+    "svg": "image/svg+xml",
     "json": "application/json",
 }
 
@@ -46,9 +58,18 @@ MIME_TYPES: Dict[str, str] = {
 #: file, and a tabular Word/PDF document (landscape, repeating header) from
 #: the same spec; a document or a deck can NOT be a csv/xlsx.
 FORMATS_FOR_KIND: Dict[str, Tuple[str, ...]] = {
-    "document": ("docx", "pdf"),
-    "presentation": ("pptx", "pdf"),
-    "workbook": ("xlsx", "csv", "docx", "pdf"),
+    "document": ("docx", "pdf", "png", "svg"),
+    "presentation": ("pptx", "pdf", "png"),
+    "workbook": ("xlsx", "csv", "docx", "pdf", "png"),
+}
+
+#: Chart image formats per kind, appended AFTER the native formats by the
+#: integration commit (see FileFormat above). Kept separate so nothing live
+#: can accept a format no renderer dispatches yet.
+CHART_IMAGE_FORMATS_FOR_KIND: Dict[str, Tuple[str, ...]] = {
+    "document": ("png", "svg"),
+    "presentation": ("png",),
+    "workbook": ("png",),
 }
 
 #: The role a file plays in a version (CONTRACT-2 §2): `primary` is the
@@ -62,6 +83,23 @@ FILE_ROLES: Tuple[str, ...] = ("primary", "companion", "data")
 #: are read as a grid.
 PAGE_FORMATS: Tuple[str, ...] = ("pdf", "docx", "pptx")
 GRID_FORMATS: Tuple[str, ...] = ("xlsx", "csv")
+#: Chart images: previewed as an image (preview_kind 'image'), never as pages.
+IMAGE_FORMATS: Tuple[str, ...] = ("png", "svg")
+
+
+def role_for_format(kind: str, fmt: str, formats: Tuple[str, ...] | List[str] = ()) -> str:
+    """The FileRef role of `fmt` in a version of `kind` whose formats are
+    `formats`: the native format is primary, csv is data, a chart image is
+    a companion unless the version holds only images (then primary), and
+    everything else is a companion."""
+    native = (FORMATS_FOR_KIND.get(kind) or ("",))[0]
+    if fmt == native:
+        return "primary"
+    if fmt == "csv":
+        return "data"
+    if fmt in IMAGE_FORMATS:
+        return "primary" if formats and all(f in IMAGE_FORMATS for f in formats) else "companion"
+    return "companion"
 
 # ---------------------------------------------------------------- stages --
 

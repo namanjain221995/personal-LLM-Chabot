@@ -1305,6 +1305,31 @@ _COLUMN_GENERATORS: Dict[str, Callable[[Dict[str, Any], int, Random, _Values, bo
 }
 
 
+def freeze_generated(sheet: Any) -> Any:
+    """A generator sheet as LITERAL rows (AS3 prompt-edits): the rows made
+    by the UNCHANGED `generate_rows` from the sheet's own recipe, with the
+    generator dropped — so an edit that adds a column or rows keeps every
+    generated value, and a later re-render or restore never re-rolls them.
+    Seeding is deliberately not changed: reseeding per column would alter
+    the rows of every existing generator sheet on restore. The recipe is
+    read exactly as the composer hands it to the generator (the alias
+    `in`, no unset field). A sheet without a generator is returned as is;
+    stored rows that differ from what the recipe makes (a sheet whose
+    count was set after generation) are kept, since they are what was
+    published."""
+    gen = getattr(sheet, "generator", None)
+    if gen is None:
+        return sheet
+    columns = [
+        {k: v for k, v in c.model_dump(by_alias=True).items() if v not in (None, [], "")}
+        for c in gen.columns
+    ]
+    rows, _report = generate_rows({"rows": gen.rows, "seed": gen.seed, "columns": columns})
+    stored = [list(r) for r in (getattr(sheet, "rows", None) or [])]
+    keep = stored if stored and stored != rows else rows
+    return sheet.model_copy(update={"generator": None, "rows": keep}, deep=True)
+
+
 # --------------------------------------------------------------- rewrite --
 
 

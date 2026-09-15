@@ -2638,6 +2638,12 @@ class ChatRequest(BaseModel):
     # Supplied only by the offline evaluation runner. The application receives
     # the stable case identifier, never the expected plan, query or answer.
     test_case_id: Optional[str] = None
+    # --- AS3 intent-capability BEGIN ---
+    # The artifact the UI's "Edit with a prompt" box names. Ownership is
+    # checked against this conversation's published artifacts before the
+    # intent gate uses it; an id that is not the viewer's is ignored.
+    artifact_id: Optional[str] = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    # --- AS3 intent-capability END ---
 
     @field_validator("test_case_id")
     @classmethod
@@ -5199,6 +5205,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # (2026-08-11): the second half of a resumed request was routed to
             # the agent engine and the resume was silently lost.
             sf_outcome = None
+            # --- AS3 intent-capability BEGIN ---
+            # A Salesforce planner refusal/clarification of a FILE request is
+            # held (not streamed) until the artifact gate has decided: a file
+            # request falls through to the artifact branch, anything else
+            # streams exactly what the planner said. (outcome, buffered events)
+            _as3_sf_held = None
+            _as3_sf_buffer = None
+            # --- AS3 intent-capability END ---
             # ONE clarification implementation, two planners. Intelligence Mode
             # on → the model plans and may ask; off → the deterministic
             # detectors in core/clarify.py ask, through the SAME persisted,
@@ -5277,10 +5291,26 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     )
                     sf_outcome = sf_intel.Outcome(handled=True, answer=answer)
                 else:
+                    # --- AS3 intent-capability BEGIN ---
+                    _as3_sf_emit = emit
+                    if not answer_to_pending:
+                        from .artifacts import lexicon as _as3_lexicon
+
+                        if _as3_lexicon.file_signal(text or ""):
+                            _as3_sf_buffer = []
+
+                            async def _as3_sf_emit(event: str, data: dict) -> None:
+                                # Tokens and meta wait for the gate; progress
+                                # (status, steps) is shown as it happens.
+                                if event in ("token", "meta"):
+                                    _as3_sf_buffer.append((event, data))
+                                else:
+                                    await emit(event, data)
+                    # --- AS3 intent-capability END ---
                     sf_outcome = await sf_intel.run(
                         text,
                         history,
-                        emit,
+                        _as3_sf_emit,
                         conversation_id=conv_key,
                         effort=request.effort,
                         model_choice=request.model,
@@ -5288,6 +5318,22 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         source_enabled=True,
                         use_planner=settings.salesforce_intelligence_enabled,
                     )
+                    # --- AS3 intent-capability BEGIN ---
+                    if _as3_sf_buffer is not None:
+                        _as3_meta = next((d for e, d in _as3_sf_buffer if e == "meta"), {}) or {}
+                        if (
+                            sf_outcome.handled
+                            and str(_as3_meta.get("route") or "") in ("chat", "clarify")
+                            and not _as3_meta.get("data")
+                        ):
+                            # DENY / UNSUPPORTED / ASK_CLARIFICATION: held.
+                            _as3_sf_held = (sf_outcome, list(_as3_sf_buffer), str(_as3_meta.get("route") or ""))
+                            sf_outcome = sf_intel.Outcome(handled=False)
+                        else:
+                            for _as3_event, _as3_data in _as3_sf_buffer:
+                                await emit(_as3_event, _as3_data)
+                        _as3_sf_buffer = None
+                    # --- AS3 intent-capability END ---
                     if sf_outcome.meta_extras:
                         salesforce_state.update(sf_outcome.meta_extras)
                     if not sf_outcome.handled and sf_outcome.resolved_text:
@@ -5395,13 +5441,72 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     if str((a.get("current") or {}).get("status") or "") in ("completed", "completed_with_warnings")
                 ]
                 _hints = [str(a.get("title") or "") for a in _published if a.get("title")]
+                # --- AS3 intent-capability BEGIN ---
+                # The gate reads the turn's CONTEXT: which files are attached,
+                # whether the last assistant turn was a file card, the most
+                # recent substantial answer (not "you're welcome"), and the
+                # artifact the UI's edit box named (only when it is one of
+                # this viewer's published artifacts). The classifier runs at
+                # every effort, only for the band the rules cannot read.
+                from .artifacts import intent_llm as _as3_intent_llm
+
+                _as3_upload_names = [str((r or {}).get("name") or "") for r in (request.pdf_uploads or []) if (r or {}).get("name")]
+                if request.pdf_data and request.pdf_filename:
+                    _as3_upload_names.append(str(request.pdf_filename))
+                _as3_upload_formats = list(dict.fromkeys(
+                    {"xls": "xlsx", "doc": "docx"}.get(n.rsplit(".", 1)[-1].lower(), n.rsplit(".", 1)[-1].lower())
+                    for n in _as3_upload_names if "." in n
+                ))
+                _as3_answer_idx = artifact_intent_rules.substantial_answer_index(history)
+                if _as3_answer_idx is None:
+                    _as3_answer_idx = next(
+                        (i for i in range(len(history) - 1, -1, -1)
+                         if str(history[i].get("role")) == "assistant" and not artifact_intent_rules.is_artifact_turn(history[i])
+                         and artifact_intent_rules.turn_text(history[i]).strip()),
+                        None,
+                    )
+                _as3_last_is_card = artifact_intent_rules.last_turn_is_artifact(history)
+                _as3_artifact_id = str(request.artifact_id or "")
+                if _as3_artifact_id and _as3_artifact_id not in {str(a.get("id") or "") for a in _published}:
+                    _as3_artifact_id = ""  # not this viewer's published artifact: ignored
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
-                    artifact_engine_mod.classify_hook if request.effort != "fast" else None,
+                    _as3_intent_llm.make_hook(
+                        last_answer_head=artifact_intent_rules.turn_text(history[_as3_answer_idx])[:500] if _as3_answer_idx is not None else "",
+                        last_turn_is_artifact=_as3_last_is_card,
+                        has_artifacts=bool(_published),
+                        artifact_titles=_hints,
+                        upload_names=_as3_upload_names,
+                        upload_formats=_as3_upload_formats,
+                        effort=str(request.effort or "fast"),
+                    ),
                     has_artifacts=bool(_published),
                     artifact_hints=_hints,
-                    has_assistant_answer=any(str(h.get("role")) == "assistant" for h in history),
+                    has_assistant_answer=_as3_answer_idx is not None,
+                    upload_formats=_as3_upload_formats,
+                    last_turn_is_artifact=_as3_last_is_card,
+                    artifact_id=_as3_artifact_id or None,
                 )
+                # --- AS3 intent-capability END ---
+            # --- AS3 intent-capability BEGIN ---
+            if _as3_sf_held is not None:
+                _as3_held_outcome, _as3_held_events, _as3_held_route = _as3_sf_held
+                if artifact_intent is not None and artifact_intent.wants_file:
+                    from . import metrics as _as3_metrics
+
+                    _as3_metrics.inc("artifact_sf_fallthrough_total", "Salesforce planner refusals of a file request sent to the artifact branch",
+                                     route=_as3_held_route)
+                    if _as3_held_route == "clarify":
+                        from .core.sf_intel import state as _as3_sf_state
+
+                        with contextlib.suppress(Exception):
+                            await _as3_sf_state.cancel_pending(conv_key)
+                else:
+                    for _as3_event, _as3_data in _as3_held_events:
+                        await emit(_as3_event, _as3_data)
+                    sf_outcome = _as3_held_outcome
+                _as3_sf_held = None
+            # --- AS3 intent-capability END ---
             # The route is known: memory may (or, for a file request, may
             # not) be written from this message — see fact_gate above.
             _release_facts(not (artifact_intent is not None and artifact_intent.wants_file))
@@ -5435,9 +5540,42 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     fact_task.cancel()
                 memory_state.pop("facts", None)
                 gen.waiting_on_job = True  # see _chat_is_busy in the lifespan
+                # --- AS3 intent-capability BEGIN ---
+                # Every artifact turn gathers its material by code: the most
+                # recent SUBSTANTIAL answer with its markdown, this turn's
+                # attachments (read, persisted to the document store, tables
+                # kept as rows), the answer's tables. An engine that takes
+                # `gathered=` uses it; until then (the prompt-edits track) the
+                # engine still sees the right answer and the attachments
+                # through its history.
+                from .artifacts import material_in as _as3_material
+
+                _as3_docs: list = []
+                if request.pdf_uploads or request.pdf_data:
+                    _as3_docs, _as3_images, _as3_doc_err = await _resolve_document_refs(request, conv_key)
+                    if _as3_doc_err:
+                        await emit("status", {"text": _as3_doc_err})
+                _as3_gathered = await _as3_material.gather(
+                    history=history, pdf_uploads=_as3_docs,
+                    pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
+                    intent=artifact_intent, text=text,
+                )
+                _as3_engine_kw: dict = {}
+                _as3_history = list(history)
+                import inspect as _as3_inspect
+
+                if "gathered" in _as3_inspect.signature(artifact_engine.run_artifact_engine).parameters:
+                    _as3_engine_kw["gathered"] = _as3_gathered
+                else:
+                    if artifact_intent.action == "export" and _as3_gathered.previous_answer_turn_index is not None:
+                        # The engine exports the LAST assistant turn: hand it
+                        # the history that ends at the substantial answer.
+                        _as3_history = _as3_history[: _as3_gathered.previous_answer_turn_index + 1]
+                    if _as3_gathered.uploads_text:
+                        _as3_history.append({"role": "user", "content": "Attached this turn:\n" + _as3_gathered.uploads_text[:48_000]})
                 answer = await artifact_engine.run_artifact_engine(
                     text,
-                    history,
+                    _as3_history,
                     emit,
                     intent=artifact_intent,
                     conversation_id=conv_key,
@@ -5447,7 +5585,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     mode=request.mode,
                     web_allowed=bool(search_allowed) and request.mode == "assistant",
                     intent_id=str(gen.intent_id or ""),
+                    # AS3 integration: the UI's owner-checked artifact id (the gate put it on the intent).
+                    artifact_id=getattr(artifact_intent, "artifact_id_hint", None) or None,
+                    **_as3_engine_kw,
                 )
+                # --- AS3 intent-capability END ---
             elif request.video_uploads or video_followup:
                 # 2026-09-09: a video attached now, or a question about one
                 # attached earlier. The engine waits for the detached analysis
@@ -5762,6 +5904,102 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             if knowledge_task is not None and not knowledge_task.done():
                 # Another engine answered; the speculative lookup is moot.
                 knowledge_task.cancel()
+            # --- AS3 intent-capability BEGIN ---
+            # DENIAL BACKSTOP. The engine's FINAL text (after core/answer_guard)
+            # denies making a file while the person named one: classify once
+            # with the turn's context and, only when the classifier is sure,
+            # make the file and append its card and one sentence. The streamed
+            # text is not rewritten — the browser already shows it. The gate
+            # is the fix; this counter watches what it missed.
+            _as3_route = str((gen.final_meta or {}).get("route") or "")
+            if (
+                settings.artifact_denial_backstop
+                and settings.artifacts_enabled
+                and request.text
+                and _as3_route in ("chat", "agent", "dataset", "vision")
+                and not (artifact_intent is not None and artifact_intent.wants_file)
+                and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
+                and isinstance(answer, str)
+            ):
+                from .artifacts import intent as _as3_rules
+                from .artifacts import intent_llm as _as3_llm
+                from .artifacts import lexicon as _as3_lex
+                from .engines import capability as _as3_capability
+
+                if _as3_capability.denial_in(answer) and _as3_lex.file_signal(text):
+                    from . import metrics as _as3_metrics
+
+                    _as3_hist = list(history)
+                    _as3_idx = _as3_rules.substantial_answer_index(_as3_hist)
+                    _as3_verdict = await _as3_llm.classify(
+                        text,
+                        last_answer_head=_as3_rules.turn_text(_as3_hist[_as3_idx])[:500] if _as3_idx is not None else "",
+                        last_turn_is_artifact=_as3_rules.last_turn_is_artifact(_as3_hist),
+                        upload_names=[str((r or {}).get("name") or "") for r in (request.pdf_uploads or [])],
+                        effort=str(request.effort or "fast"),
+                    )
+                    _as3_intent = None
+                    if _as3_verdict is not None and _as3_verdict.action in ("create", "export", "convert") and _as3_verdict.confidence >= 0.8:
+                        _as3_intent = _as3_rules.verdict_to_intent(
+                            _as3_verdict, _as3_rules.decide(text), has_artifacts=False,
+                            has_assistant_answer=_as3_idx is not None, last_turn_is_artifact=False,
+                        )
+                    _as3_rerouted = False
+                    if _as3_intent is not None and _as3_intent.wants_file:
+                        from .engines import artifact as _as3_artifact_engine
+
+                        _as3_prior_meta = dict(gen.final_meta or {})
+                        # The engine's sentence is HELD until it returns: "Here
+                        # is the file." is said only when a file card exists —
+                        # a refused or failed job streams its own sentence
+                        # alone (verifier 2026-09-15: a failure used to read
+                        # "Here is the file. The file could not be made").
+                        _as3_state = {"meta": None, "tokens": []}
+
+                        async def _as3_backstop_emit(event: str, data: dict) -> None:
+                            if event == "meta":
+                                _as3_state["meta"] = data
+                                return
+                            if event == "token":
+                                _as3_state["tokens"].append(str(data.get("text") or ""))
+                                return
+                            await emit(event, data)
+
+                        if _as3_intent.action == "export" and _as3_idx is not None:
+                            _as3_hist = _as3_hist[: _as3_idx + 1]
+                        gen.waiting_on_job = True
+                        try:
+                            # The chat answer is already streamed: a failure
+                            # here must not turn the whole turn into an error
+                            # and lose that answer (verifier 2026-09-15).
+                            _as3_line = await _as3_artifact_engine.run_artifact_engine(
+                                text, _as3_hist, _as3_backstop_emit, intent=_as3_intent, conversation_id=conv_key, user_id=viewer,
+                                generation_id=gen.generation_id, effort=request.effort, mode=request.mode, web_allowed=False,
+                                intent_id=str(gen.intent_id or "") + ":backstop",
+                            )
+                        except Exception as _as3_exc:  # noqa: BLE001 — the answer stands
+                            logging.getLogger(__name__).warning("artifact denial backstop failed: %s", type(_as3_exc).__name__)
+                            _as3_line = ""
+                        finally:
+                            gen.waiting_on_job = False
+                        _as3_art_meta = _as3_state["meta"] or {}
+                        _as3_said = "".join(_as3_state["tokens"]) or str(_as3_line or "")
+                        if _as3_art_meta.get("artifacts"):
+                            _as3_rerouted = True
+                            _as3_metrics.inc("artifact_denial_rerouted_total", "denials of file creation turned into a file", engine=_as3_route)
+                            _as3_tail = "\n\nHere is the file. " + _as3_said
+                            await emit("token", {"text": _as3_tail})
+                            answer = f"{answer}{_as3_tail}"
+                            _as3_merged = {**_as3_prior_meta, "artifacts": _as3_art_meta["artifacts"], "artifact_backstop": True}
+                            gen.final_meta = _as3_merged
+                            await gen.publish("meta", _as3_merged)
+                        elif _as3_said:
+                            _as3_tail = "\n\n" + _as3_said
+                            await emit("token", {"text": _as3_tail})
+                            answer = f"{answer}{_as3_tail}"
+                    if not _as3_rerouted:
+                        _as3_metrics.inc("artifact_denial_seen_total", "answers that denied making a file (not rerouted)", engine=_as3_route)
+            # --- AS3 intent-capability END ---
             gen.answer = answer
             memory.add_exchange(scoped_session, text, answer)
             # Durable BEFORE `done`: the row says 'completed' only once the

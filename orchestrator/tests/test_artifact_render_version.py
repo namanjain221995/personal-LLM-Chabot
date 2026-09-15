@@ -316,11 +316,21 @@ def test_missing_out_dir_and_unknown_category(tmp_path):
         RenderError("not_a_category", "x")
 
 
-def test_font_coverage_warning_for_non_latin_text(tmp_path):
+def test_font_coverage_warning_for_non_latin_text(tmp_path, monkeypatch):
+    """On a server with no font for the script (the container before the
+    proposed Lohit/Noto packages), the version carries one warning; where
+    fontconfig resolves a font for every script, none."""
+    from app.artifacts.render import theme
+
     spec = S.ArtifactSpec(kind="document", document=S.DocumentSpec(title="नमस्ते report", blocks=[S.Paragraph(text="Body in 中文 too")]))
+    monkeypatch.setattr(theme, "font_installed", lambda family: False)
     report = render_version(spec, ["pdf"], str(tmp_path), title_slug="intl", version=1)
-    assert any("Devanagari" in w and "CJK" in w for w in report.warnings)
+    assert sum(1 for w in report.warnings if "Devanagari" in w and "CJK" in w) == 1
     assert report.files[0].pages == 1
+    monkeypatch.setattr(theme, "font_installed", lambda family: True)
+    (tmp_path / "again").mkdir()
+    report = render_version(spec, ["pdf"], str(tmp_path / "again"), title_slug="intl", version=1)
+    assert not any("Devanagari" in w for w in report.warnings)
 
 
 # ---------------------------------------------------------------- worker --

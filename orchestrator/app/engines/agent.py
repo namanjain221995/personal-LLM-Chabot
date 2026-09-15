@@ -686,6 +686,13 @@ _SYNTH_SYSTEM = (
     "steps returned no rows, say what was looked for and found, not how the "
     "user could query it by hand."
 )
+# --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
+from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
+
+_AS3_CAPABILITY = _as3_capability_suffix()
+
+_SYNTH_SYSTEM = _SYNTH_SYSTEM + _AS3_CAPABILITY
+# --- AS3 intent-capability END ---
 
 
 def _synthesis_messages(message: str, results: Sequence[dict]) -> List[dict]:

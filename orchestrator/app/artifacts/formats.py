@@ -197,7 +197,14 @@ def _mentions(text: str) -> List[Tuple[int, str]]:
 
 def explicit_formats(text: str) -> List[str]:
     """Formats the person NAMED as deliverables. Order follows first
-    mention; a format said twice is one entry."""
+    mention; a format said twice is one entry.
+
+    AS3: the text is read through `lexicon.normalize` first, so "dox",
+    "in docs", "पीडीएफ", "એક્સેલમાં" and "exel" name their formats here too —
+    the engine's own call on the raw instruction agrees with the gate's."""
+    from . import lexicon
+
+    text = lexicon.normalize(text or "")
     out: List[str] = []
     for _, fmt in _mentions(text):
         if fmt not in out:
@@ -315,7 +322,75 @@ def _best_formats(text: str) -> Tuple[str, List[str], str]:
 _BEST_RE = re.compile(r"\bbest\s+(?:format|deliverable|output|file)\b", re.I)
 
 
+# --- AS3 integration BEGIN: standalone chart images ---
+#: "a bar chart ... as a png", "pie chart svg me": a chart image named next
+#: to chart words. A bare "png" ("draw a logo png") is not a chart file.
+_CHART_WORDS_RE = re.compile(r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot)\b|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ", re.I)
+_IMAGE_FORMAT_RE = re.compile(r"\b(?:png|\.png|svg|\.svg)\b", re.I)
+
+
+def _chart_image_formats(text: str) -> List[str]:
+    if not _CHART_WORDS_RE.search(text or ""):
+        return []
+    found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]
+    return list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
+
+
 def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
+    """decide_base (below), plus the chart image formats a request names:
+    alone ("pie chart as png") they are the only files; next to a document
+    format or a document word they are companions. A CSV asked for with
+    styling the styling parser can read ("with a blue header row") also gets
+    the Excel file, as the styling words below already do."""
+    return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only))
+
+
+def _with_styled_csv(text: str, d: FormatDecision) -> FormatDecision:
+    if d.kind != "workbook" or "csv" not in d.formats or any(f in d.formats for f in _STYLED_FORMATS):
+        return d
+    try:
+        from . import style as _style
+
+        patch, _unparsed = _style.parse_style_request(text or "", "workbook")
+        styled = not patch.is_empty()
+    except Exception:  # noqa: BLE001 — the word rules stand
+        styled = False
+    if styled:
+        d.formats = list(d.formats) + ["xlsx"]
+        d.reason += "; +xlsx for the styling"
+        d.data_only_note = "the CSV carries the data only; the formatting is in the Excel file"
+    return d
+
+
+def _decide_images(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
+    images = [f for f in _chart_image_formats(text) if not explicit_only or f not in explicit_only]
+    if not images:
+        return decide_base(text, explicit_only=explicit_only)
+    rest = [f for f in (explicit_only or []) if f not in T.IMAGE_FORMATS]
+    named = explicit_formats(text) if explicit_only is None else rest
+    if not named and kind_for(text, [])[1] != "default":
+        # "a word report with a line chart, plus the chart as png": the
+        # document is asked for too, in its default formats.
+        base = decide_base(text)
+        base.formats = list(base.formats) + [f for f in images if f in T.FORMATS_FOR_KIND[base.kind] and f not in base.formats]
+        base.reason += f"; +{', '.join(images)} (chart image)"
+        return base
+    if not named:
+        kind, _rule = kind_for(text, [])
+        allowed = [f for f in images if f in T.FORMATS_FOR_KIND[kind]]
+        if not allowed:
+            kind, allowed = "document", [f for f in images if f in T.FORMATS_FOR_KIND["document"]]
+        return FormatDecision(kind, allowed, template_for(kind, text), f"explicit: {', '.join(allowed)} (chart image)", explicit=True)
+    base = decide_base(text, explicit_only=named)
+    extra = [f for f in images if f in T.FORMATS_FOR_KIND[base.kind] and f not in base.formats]
+    base.formats = list(base.formats) + extra
+    if extra:
+        base.reason += f"; +{', '.join(extra)} (chart image)"
+    return base
+# --- AS3 integration END ---
+
+
+def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
     """The policy, applied to one request.
 
     `explicit_only` lets a caller that already knows the formats (an edit

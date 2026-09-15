@@ -32,7 +32,12 @@ describe('resolveArtifactPath — the routes the API defines', () => {
     [['jobs', JOB, 'retry'], `/artifacts/jobs/${JOB}/retry`, ['POST']],
     [[ID], `/artifacts/${ID}`, ['GET']],
     [[ID, 'convert'], `/artifacts/${ID}/convert`, ['POST']],
+    // AS3: restore a version (artifacts/api.py restore_artifact).
+    [[ID, 'restore'], `/artifacts/${ID}/restore`, ['POST']],
     [[ID, 'v', '2'], `/artifacts/${ID}/v/2`, ['GET']],
+    // AS3: standalone chart images are formats too.
+    [[ID, 'v', '2', 'file', 'png'], `/artifacts/${ID}/v/2/file/png`, ['GET', 'HEAD']],
+    [[ID, 'v', '2', 'file', 'svg'], `/artifacts/${ID}/v/2/file/svg`, ['GET', 'HEAD']],
     [[ID, 'v', '2', 'file', 'pdf'], `/artifacts/${ID}/v/2/file/pdf`, ['GET', 'HEAD']],
     [[ID, 'v', '2', 'file', 'pptx'], `/artifacts/${ID}/v/2/file/pptx`, ['GET', 'HEAD']],
     // CONTRACT-2 §1: csv is a format the studio writes.
@@ -68,6 +73,8 @@ describe('resolveArtifactPath — the routes the API defines', () => {
     ['short id', [ID.slice(0, 31)]],
     ['non-hex id', ['g'.repeat(32)]],
     ['unknown verb', [ID, 'delete']],
+    ['restore with a trailing segment', [ID, 'restore', '2']],
+    ['edit is not a route', [ID, 'edit']],
     ['unknown format', [ID, 'v', '1', 'file', 'exe']],
     ['zip as a file format', [ID, 'v', '1', 'file', 'zip']],
     ['format with traversal', [ID, 'v', '1', 'file', '../pdf']],
@@ -458,6 +465,25 @@ describe('handlers — passthrough', () => {
     const [, init] = fetchMock.mock.calls[0];
     expect(init?.method).toBe('POST');
     expect(init?.body).toBe('{"format":"pdf"}');
+  });
+
+  it('forwards a restore POST with its version body, and refuses GET on it', async () => {
+    const fetchMock = stubUpstream(
+      new Response('{"job_id":"x","version":4,"restored_from":1}', { status: 200, headers: { 'content-type': 'application/json' } }),
+    );
+    const request = new Request(`http://localhost:3001/api/artifacts/${ID}/restore`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: 'ts_session=s1' },
+      body: '{"version":1}',
+    });
+    const res = await POST(request, ctx([ID, 'restore']));
+    expect(res.status).toBe(200);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toMatch(new RegExp(`/artifacts/${ID}/restore$`));
+    expect(init?.method).toBe('POST');
+    expect(init?.body).toBe('{"version":1}');
+    expect((await GET(req(), ctx([ID, 'restore']))).status).toBe(404);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('refuses a POST body over the cap before reading it, declared or not', async () => {

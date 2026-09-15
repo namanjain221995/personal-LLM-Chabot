@@ -22,9 +22,17 @@
  * point at nothing a reader could find. Sheet tabs appear only when there
  * is more than one sheet — a CSV has exactly one, and a tab strip with a
  * single tab is a decoration.
+ *
+ * Styles (2026-09-15, AS3 styling engine): an xlsx window may also carry
+ * `header_styles`, `cell_styles` ({"r:c": {fill, color, bold, italic,
+ * underline}}) and `display` (values as their number format shows them,
+ * totals computed) — the server evaluates the workbook's conditional
+ * formats, since neither openpyxl nor a browser can. They are painted as
+ * inline styles, and only `#RRGGBB` colours are ever used; anything else is
+ * ignored. A CSV has none, and the grid looks as it always did.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import {
   ArtifactRequestError,
   fetchGrid,
@@ -65,6 +73,69 @@ function formatCell(value: unknown): string {
   return String(value);
 }
 
+/** What one cell looks like, as the server resolved it. */
+export interface CellStyle {
+  fill?: string;
+  color?: string;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+}
+
+/** The optional style fields both grid routes may add for an xlsx. */
+interface StyledFields {
+  header_styles?: unknown;
+  cell_styles?: unknown;
+  display?: unknown;
+}
+
+const HEX = /^#[0-9A-Fa-f]{6}$/;
+
+/**
+ * A server style made safe for a React `style` object: colours must be
+ * `#RRGGBB`, flags must be booleans; anything else is dropped.
+ */
+export function cleanCellStyle(raw: unknown): CellStyle | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: CellStyle = {};
+  if (typeof r.fill === 'string' && HEX.test(r.fill)) out.fill = r.fill;
+  if (typeof r.color === 'string' && HEX.test(r.color)) out.color = r.color;
+  if (r.bold === true) out.bold = true;
+  if (r.italic === true) out.italic = true;
+  if (r.underline === true) out.underline = true;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** The inline CSS for a cell style. */
+export function cellCss(style: CellStyle | undefined): CSSProperties | undefined {
+  if (!style) return undefined;
+  const css: CSSProperties = {};
+  if (style.fill) css.backgroundColor = style.fill;
+  if (style.color) css.color = style.color;
+  if (style.bold) css.fontWeight = 600;
+  if (style.italic) css.fontStyle = 'italic';
+  if (style.underline) css.textDecoration = 'underline';
+  return css;
+}
+
+function readStyles(data: StyledFields | null | undefined): Pick<NonNullable<GridView['sheet']>, 'headerStyles' | 'cellStyles' | 'display'> {
+  const headerStyles = Array.isArray(data?.header_styles) ? data!.header_styles.map((h) => cleanCellStyle(h)) : undefined;
+  let cellStyles: Record<string, CellStyle> | undefined;
+  if (data?.cell_styles && typeof data.cell_styles === 'object') {
+    cellStyles = {};
+    for (const [key, value] of Object.entries(data.cell_styles as Record<string, unknown>)) {
+      if (!/^\d+:\d+$/.test(key)) continue;
+      const clean = cleanCellStyle(value);
+      if (clean) cellStyles[key] = clean;
+    }
+  }
+  const display = Array.isArray(data?.display)
+    ? (data!.display as unknown[]).map((row) => (Array.isArray(row) ? row.map((v) => (v === null || v === undefined ? '' : String(v))) : []))
+    : undefined;
+  return { headerStyles, cellStyles, display };
+}
+
 /** The one shape the table draws, whichever route answered. */
 export interface GridView {
   /** Every sheet's name, with its size when the route said. */
@@ -77,6 +148,12 @@ export interface GridView {
     truncated: boolean;
     /** "B12" → "=SUM(B2:B11)" — shown as text, never evaluated. */
     formulas: Record<string, string>;
+    /** Per-column header style (xlsx only). */
+    headerStyles?: (CellStyle | undefined)[];
+    /** "row:col" (0-based within this window) → style (xlsx only). */
+    cellStyles?: Record<string, CellStyle>;
+    /** Values as their number format shows them (xlsx only). */
+    display?: string[][];
   } | null;
   /** The file's real size, when known — what the footer states. */
   totalRows?: number;
@@ -97,6 +174,7 @@ export function fromSheets(data: SheetsResponse): GridView {
         rows: data.sheet.rows ?? [],
         truncated: Boolean(data.sheet.truncated),
         formulas: data.sheet.formulas ?? {},
+        ...readStyles(data.sheet as unknown as StyledFields),
       }
     : null;
   const meta = sheet ? sheets.find((s) => s.name === sheet.name) : undefined;
@@ -112,7 +190,7 @@ export function fromGrid(data: GridResponse): GridView {
   const sheet =
     names.length === 0 && columns.length === 0 && rows.length === 0
       ? null
-      : { name, columns, rows, truncated: Boolean(data.truncated), formulas: {} };
+      : { name, columns, rows, truncated: Boolean(data.truncated), formulas: {}, ...readStyles(data as unknown as StyledFields) };
   return {
     sheets: names.map((n) => ({ name: n })),
     sheet,
@@ -213,7 +291,7 @@ export function SheetViewer({
       />
     );
   }
-  const { formulas, columns, rows } = sheet;
+  const { formulas, columns, rows, headerStyles, cellStyles, display } = sheet;
   const hasFormulas = Object.keys(formulas).length > 0;
   const size =
     typeof totalRows === 'number'
@@ -278,6 +356,7 @@ export function SheetViewer({
                   scope="col"
                   className="sticky top-0 z-10 max-w-[320px] truncate border-b border-r border-border bg-surface-2 px-2 py-1 text-left font-medium text-ink"
                   title={`${columnLetter(i)} · ${String(c)}`}
+                  style={cellCss(headerStyles?.[i])}
                 >
                   <span className="mr-1.5 font-mono text-[10px] font-normal text-faint">
                     {columnLetter(i)}
@@ -298,20 +377,29 @@ export function SheetViewer({
                 </th>
                 {columns.map((_, c) => {
                   const address = cellAddress(c, r);
-                  const formula = formulas[address];
                   const value = row?.[c];
-                  const shown = formula && (value === null || value === undefined || value === '')
-                    ? formula
-                    : formatCell(value);
-                  const numeric = typeof value === 'number';
+                  const formula =
+                    formulas[address] ??
+                    (display && typeof value === 'string' && value.startsWith('=') ? value : undefined);
+                  const shownDisplay = display?.[r]?.[c];
+                  const shown =
+                    shownDisplay !== undefined && shownDisplay !== ''
+                      ? shownDisplay
+                      : formula && (value === null || value === undefined || value === '')
+                        ? formula
+                        : formatCell(value);
+                  const numeric = typeof value === 'number' || (formula !== undefined && shownDisplay !== undefined);
+                  const style = cellStyles?.[`${r}:${c}`];
                   return (
                     <td
                       key={address}
                       className={`max-w-[320px] truncate border-b border-r border-border px-2 py-1 ${
                         numeric ? 'text-right tabular-nums' : 'text-left'
-                      } ${formula ? 'text-muted' : 'text-ink'}`}
+                      } ${formula && !style?.color ? 'text-muted' : 'text-ink'}`}
                       title={formula ? `${address}: ${formula}` : undefined}
                       data-formula={formula ? 'true' : undefined}
+                      data-styled={style ? 'true' : undefined}
+                      style={cellCss(style)}
                     >
                       {formula && (
                         <span

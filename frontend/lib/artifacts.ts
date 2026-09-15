@@ -64,9 +64,22 @@ export function isFileId(value: unknown): value is string {
   return typeof value === 'string' && FILE_ID_RE.test(value);
 }
 
-/** Every format the studio writes (types.FORMATS). `zip` is a route, not a format. */
-export const FORMATS: readonly string[] = ['pdf', 'docx', 'pptx', 'xlsx', 'csv'];
-const FORMAT_RE = /^(pdf|docx|pptx|xlsx|csv)$/;
+/**
+ * Every format the studio writes (types.FORMATS). `zip` is a route, not a
+ * format. AS3: `png` and `svg` are standalone chart images; an SVG is only
+ * ever shown through `<img src>` (never inlined, never
+ * dangerouslySetInnerHTML) and the server serves it as a sandboxed
+ * attachment.
+ */
+export const FORMATS: readonly string[] = ['pdf', 'docx', 'pptx', 'xlsx', 'csv', 'png', 'svg'];
+const FORMAT_RE = /^(pdf|docx|pptx|xlsx|csv|png|svg)$/;
+
+/** The image formats: shown with `<img src>`, never as markup. */
+export const IMAGE_FORMATS: readonly string[] = ['png', 'svg'];
+
+export function isImageFormat(format?: string | null): boolean {
+  return typeof format === 'string' && IMAGE_FORMATS.includes(format.toLowerCase());
+}
 
 /**
  * Every URL is built from a VALIDATED id and an integer version — never from
@@ -518,6 +531,8 @@ export const FORMAT_LABELS: Record<string, string> = {
   pptx: 'PowerPoint',
   xlsx: 'Excel',
   csv: 'CSV',
+  png: 'PNG image',
+  svg: 'SVG image',
   zip: 'ZIP',
 };
 
@@ -678,4 +693,195 @@ export function cardDomId(artifactId: string, version: number): string {
  */
 export function fileCardDomId(key: string): string {
   return `artifact-file-${key.replace(/[^A-Za-z0-9_-]+/g, '_')}`;
+}
+
+
+/* ---------------------------------------------------------- versions (AS3) */
+
+/** What GET /artifacts/{id} answers: the artifact row and every version's ref. */
+export interface ArtifactVersionsResponse {
+  artifact: {
+    id: string;
+    title: string;
+    kind: string;
+    current_version: number;
+    created_at?: string;
+    updated_at?: string;
+  };
+  versions: ArtifactRef[];
+}
+
+/** GET /api/artifacts/{id} — every version of one artifact, oldest first. */
+export function fetchArtifactVersions(
+  artifactId: string,
+  signal?: AbortSignal,
+): Promise<ArtifactVersionsResponse> {
+  const url = artifactUrls.artifact(artifactId);
+  if (!url) return Promise.reject(new ArtifactRequestError(404, 'not found'));
+  return getJson<ArtifactVersionsResponse>(url, signal);
+}
+
+/**
+ * The versions a switcher lists: finished or in flight, ascending, one per
+ * number (the server's list is already that; a malformed entry is dropped).
+ */
+export function versionList(versions: readonly ArtifactRef[] | null | undefined): ArtifactRef[] {
+  const seen = new Set<number>();
+  const out: ArtifactRef[] = [];
+  for (const v of versions ?? []) {
+    if (!v || typeof v.version !== 'number' || !Number.isFinite(v.version) || v.version < 1) continue;
+    const n = Math.trunc(v.version);
+    if (seen.has(n)) continue;
+    seen.add(n);
+    out.push(v);
+  }
+  return out.sort((a, b) => a.version - b.version);
+}
+
+/**
+ * The newest PUBLISHED version above `version`, or null when this version
+ * is the latest one people can open ("superseded by v3"). A failed or
+ * cancelled later attempt does not supersede anything.
+ */
+export function supersededBy(version: number, versions: readonly ArtifactRef[] | null | undefined): number | null {
+  let newest: number | null = null;
+  for (const v of versionList(versions)) {
+    if (v.version <= version) continue;
+    if (v.status !== 'completed' && v.status !== 'completed_with_warnings') continue;
+    newest = newest === null ? v.version : Math.max(newest, v.version);
+  }
+  return newest;
+}
+
+/** "v2 · Updated" / "v3 · Converted" / "v1 · Created" — the switcher's label for a version. */
+export function versionLabel(ref: Pick<ArtifactRef, 'version' | 'operation'>): string {
+  const how = ref.operation === 'edit' ? 'Updated' : ref.operation === 'convert' ? 'Converted' : 'Created';
+  return `v${Math.trunc(ref.version)} · ${how}`;
+}
+
+/**
+ * One cached versions lookup per artifact per page — a thread with many
+ * cards of the same artifact asks once. A lookup older than the TTL, or one
+ * that failed, is asked again.
+ */
+const VERSIONS_TTL_MS = 15_000;
+const versionsCache = new Map<string, { at: number; promise: Promise<ArtifactVersionsResponse> }>();
+
+export function cachedArtifactVersions(artifactId: string, now: number = Date.now()): Promise<ArtifactVersionsResponse> {
+  const hit = versionsCache.get(artifactId);
+  if (hit && now - hit.at < VERSIONS_TTL_MS) return hit.promise;
+  const promise = fetchArtifactVersions(artifactId);
+  versionsCache.set(artifactId, { at: now, promise });
+  promise.catch(() => versionsCache.delete(artifactId));
+  return promise;
+}
+
+/** Forget cached versions — after an edit lands, or in tests. */
+export function invalidateArtifactVersions(artifactId?: string): void {
+  if (artifactId) versionsCache.delete(artifactId);
+  else versionsCache.clear();
+}
+
+/* ------------------------------------------------- edit with a prompt (AS3) */
+
+/**
+ * The window event the "Edit with a prompt" box dispatches. An edit is a
+ * NORMAL chat turn (so the conversation, its history and its cards stay the
+ * record of what happened): the chat host listens for this event and sends
+ * `text` as the person's message with `artifact_id` on the /chat body. There
+ * is deliberately no separate /edit route.
+ */
+export const ARTIFACT_EDIT_EVENT = 'techsara:artifact-edit';
+
+export interface ArtifactEditRequest {
+  artifactId: string;
+  text: string;
+}
+
+/** The trimmed, bounded instruction, or '' when there is nothing to send. */
+export function editInstruction(text: unknown): string {
+  if (typeof text !== 'string') return '';
+  const trimmed = text.trim();
+  return trimmed.length > 4000 ? trimmed.slice(0, 4000) : trimmed;
+}
+
+/**
+ * Whether a chat host listens for edit requests. Until the chat host is
+ * wired (it registers itself, or passes `onEditPrompt` down), the "Edit with
+ * a prompt" box and the "Restore vN" button are NOT shown: a control whose
+ * event nobody handles would silently do nothing. A host registers during
+ * render (a `useState` initializer) so the first cards already see it.
+ */
+let artifactEditHosts = 0;
+
+export function registerArtifactEditHost(): () => void {
+  artifactEditHosts += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    artifactEditHosts = Math.max(0, artifactEditHosts - 1);
+  };
+}
+
+export function artifactEditHostReady(): boolean {
+  return artifactEditHosts > 0;
+}
+
+/** Dispatch an edit request; false when the id or the text is not sendable. */
+export function requestArtifactEdit(artifactId: string, text: string, target: EventTarget | null = typeof window !== 'undefined' ? window : null): boolean {
+  const instruction = editInstruction(text);
+  if (!isArtifactId(artifactId) || !instruction || !target) return false;
+  const detail: ArtifactEditRequest = { artifactId, text: instruction };
+  target.dispatchEvent(new CustomEvent<ArtifactEditRequest>(ARTIFACT_EDIT_EVENT, { detail }));
+  return true;
+}
+
+/** The /chat body for an edit turn: the ordinary body plus the artifact it targets. */
+export function withArtifactId<T extends Record<string, unknown>>(body: T, artifactId: string | null | undefined): T & { artifact_id?: string } {
+  if (!isArtifactId(artifactId)) return body;
+  return { ...body, artifact_id: artifactId };
+}
+
+/** The chat message that restores a version — sent through the same edit path. */
+export function restoreInstruction(version: number): string {
+  return `Restore version ${Math.trunc(version)}`;
+}
+
+
+/* ------------------------------------------- newest version on the page (AS3) */
+
+/**
+ * The newest PUBLISHED version of each artifact that any card on the page
+ * has shown. A card of v1 marks itself "superseded by v2" as soon as the v2
+ * card further down the thread renders — no request per card. The versions
+ * list itself is fetched only when a person opens the switcher.
+ */
+const newestSeen = new Map<string, number>();
+const newestListeners = new Set<() => void>();
+
+export function noteArtifactVersion(ref: Pick<ArtifactRef, 'artifact_id' | 'version' | 'status'>): void {
+  if (!isArtifactId(ref.artifact_id) || typeof ref.version !== 'number') return;
+  if (ref.status !== 'completed' && ref.status !== 'completed_with_warnings') return;
+  const v = Math.trunc(ref.version);
+  const prev = newestSeen.get(ref.artifact_id) ?? 0;
+  if (v <= prev) return;
+  newestSeen.set(ref.artifact_id, v);
+  for (const fn of [...newestListeners]) fn();
+}
+
+export function newestKnownVersion(artifactId: string): number {
+  return newestSeen.get(artifactId) ?? 0;
+}
+
+export function subscribeNewestVersions(fn: () => void): () => void {
+  newestListeners.add(fn);
+  return () => {
+    newestListeners.delete(fn);
+  };
+}
+
+/** Tests only. */
+export function resetNewestVersions(): void {
+  newestSeen.clear();
 }

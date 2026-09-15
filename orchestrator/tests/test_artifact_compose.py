@@ -920,3 +920,87 @@ def test_the_rows_are_filled_off_the_event_loop(monkeypatch):
     result, stall = asyncio.run(run())
     assert len(result.spec.body.sheets[0].rows) == 20
     assert stall < 0.25, f"the event loop stalled {stall:.2f}s while the rows were filled"
+
+
+# ------------------------------------------------------------ AS3 edits --
+
+
+def test_styling_words_are_never_requested_sections():
+    """AS3 P0: the production-shape sentence named styling, not chapters;
+    requested_sections turned "white bold text" and "landscape" into
+    sections the correction pass then added to the document."""
+    production = ("just give it in docs in a standard and classy format with white bold text, landscape, "
+                  "headings in dark blue and Georgia font, provide a dox file")
+    assert C.requested_sections(production) == []
+    assert C.requested_sections("make an excel workbook with a blue header, bold totals, 12pt Calibri and landscape pages") == []
+    assert C.requested_sections("Create a report including an executive summary, risks and a roadmap") == ["executive summary", "risks", "roadmap"]
+    assert C.requested_sections("Create a report with an executive summary and risks, in Georgia 11pt with navy headings") == ["executive summary", "risks"]
+
+
+def test_an_edit_never_asks_for_requested_sections(monkeypatch):
+    parent = S.parse_body("document", {"title": "Plan", "blocks": [{"type": "heading", "level": 1, "text": "Intro"}, {"type": "paragraph", "text": "x"}]})
+    calls = []
+
+    async def fake(messages, **kw):
+        calls.append(messages)
+        return json.dumps({"title": "Plan", "blocks": [{"type": "heading", "level": 1, "text": "Intro"}, {"type": "paragraph", "text": "y"}]})
+
+    monkeypatch.setattr(llm, "json_completion", fake)
+    req = C.ComposeRequest(kind="document", formats=["docx"], template_id="generic", effort="fast", operation="edit",
+                           material=C.Material(instruction="x"), parent_spec=parent,
+                           instruction="include a budget section and a timeline section in Georgia")
+    result = asyncio.run(C.compose(req))
+    assert len(calls) == 1, "no correction pass for requested sections on an edit"
+    assert result.spec.body.blocks[1].text == "y"
+
+
+def test_a_first_heading_that_repeats_the_title_is_dropped_and_numeric_columns_are_inferred():
+    raw = {"title": "Quarterly Review", "blocks": [
+        {"type": "heading", "level": 1, "text": "Quarterly  review"},
+        {"type": "table", "table": {"columns": ["Region", "Revenue", "Share"], "rows": [["North", "1,200", "40%"], ["South", 900, None]], "numeric_columns": [0]}},
+    ]}
+    req = C.ComposeRequest(kind="document", formats=["docx"], template_id="generic", effort="fast")
+    C._tidy_document(raw, req)
+    assert raw["blocks"][0]["type"] == "table"
+    assert raw["blocks"][0]["table"]["numeric_columns"] == [1, 2]
+
+
+def test_an_edit_keeps_the_parents_citations_through_source_reconciliation():
+    parent = S.parse_body("document", {"title": "P", "blocks": [{"type": "paragraph", "text": "a", "sources": ["w1"]}],
+                                       "sources": [{"id": "w1", "title": "Report", "url": "https://example.com/r"}]})
+    raw = {"title": "P", "blocks": [{"type": "paragraph", "text": "b", "sources": ["w1", "invented"]}], "sources": [{"id": "invented", "title": "x"}]}
+    notes = C._reconcile_sources(raw, C.Material(instruction=""), parent)
+    assert raw["blocks"][0]["sources"] == ["w1"] and [s["id"] for s in raw["sources"]] == ["w1"]
+    assert raw["sources"][0]["url"] == "https://example.com/r" and notes
+    raw2 = {"title": "P", "blocks": [{"type": "paragraph", "text": "b", "sources": ["w1"]}]}
+    C._reconcile_sources(raw2, C.Material(instruction=""))
+    assert raw2["blocks"][0]["sources"] == [], "without the parent (a create) the old rule stands"
+
+
+def test_material_from_history_keeps_the_lines_of_the_last_substantial_answer():
+    report = "# Audit\n\n## Findings\n- item one\n- item two\n\n| A | B |\n|---|---|\n| 1 | 2 |"
+    history = [{"role": "user", "content": "audit this"}, {"role": "assistant", "content": report},
+               {"role": "user", "content": "thanks"}, {"role": "assistant", "content": "You're welcome."}]
+    text = C.material_from_history(history)
+    assert "assistant: # Audit\n\n## Findings\n- item one\n- item two" in text
+    assert "user: thanks" in text and "| 1 | 2 |" in text
+
+
+def test_revise_section_rewrites_only_the_named_section(monkeypatch):
+    parent = S.parse_body("document", {"title": "D", "blocks": [
+        {"type": "heading", "level": 1, "text": "Summary"}, {"type": "paragraph", "text": "old summary"},
+        {"type": "heading", "level": 1, "text": "Risks"}, {"type": "paragraph", "text": "old risks"},
+        {"type": "heading", "level": 1, "text": "Plan"}, {"type": "paragraph", "text": "old plan"}]})
+    seen = []
+
+    async def fake(messages, **kw):
+        seen.append(kw.get("json_schema"))
+        return json.dumps({"blocks": [{"type": "heading", "level": 1, "text": "Risks"}, {"type": "paragraph", "text": "new risks"}]})
+
+    monkeypatch.setattr(llm, "json_completion", fake)
+    req = C.ComposeRequest(kind="document", formats=["docx"], template_id="generic", effort="fast", operation="edit", material=C.Material(instruction=""))
+    out = asyncio.run(C.revise_section(req, parent, "risks", ["say it plainly"]))
+    assert [b.text for b in out.body.blocks] == ["Summary", "old summary", "Risks", "new risks", "Plan", "old plan"]
+    assert len(seen) == 1 and set(seen[0]["properties"]) == {"blocks"}, "the schema is the section's block list only"
+    same = asyncio.run(C.revise_section(req, parent, "Budget", ["x"]))
+    assert same is parent

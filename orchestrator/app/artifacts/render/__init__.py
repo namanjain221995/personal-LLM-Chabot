@@ -30,6 +30,15 @@ exceptions become RenderError('renderer_failure', <one safe sentence>): a
 person sees "The PDF could not be built", never a path or a traceback; the
 worker logs the traceback on stderr for the job's diagnostic_ref.
 
+STYLE. The spec's style (artifacts/style.py, written by code from the
+person's request) is normalised against the spec once — a rule whose target
+does not exist is dropped with a note — and resolved once; the SAME
+ResolvedStyle is handed to every renderer, so the DOCX, the PDF, the PPTX
+and the XLSX agree. The report then carries exactly one sentence per
+(target, property, format) group a format cannot carry (the declared
+support matrix), each contrast warning, and a font substitution sentence
+when a requested font is not installed on this server.
+
 Effort does not change what is rendered — a file is a file at every effort
 (types.EffortBudget: "Effort decides depth ... never whether a file is
 made"). It is accepted so the report can record it and so a future
@@ -48,6 +57,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from .. import spec as S
+from .. import style as ST
 from .. import types as T
 
 log = logging.getLogger(__name__)
@@ -88,7 +98,7 @@ class RenderReport:
     #: `role:format:sheet_slug` → absolute path of the file written.
     paths: Dict[str, str] = field(default_factory=dict)
     preview_pdf: Optional[str] = None
-    preview_kind: str = "pages"        # "pages" | "grid" | "none"
+    preview_kind: str = "pages"        # "pages" | "grid" | "image" | "none"
     preview_pages: int = 0
     warnings: List[str] = field(default_factory=list)
     validation: Dict[str, object] = field(default_factory=dict)
@@ -232,6 +242,10 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
             wanted.append(f)
     if not wanted:
         raise RenderError("invalid_request", f"None of the requested formats can be made for a {spec.kind}.")
+    images = [f for f in wanted if f in IMAGE_FORMATS]
+    if images and len(images) == len(wanted):
+        return _render_images_only(spec, images, out, title_slug=title_slug, version=version, effort=effort, transform=transform)
+    wanted = [f for f in wanted if f not in IMAGE_FORMATS]
 
     report = RenderReport()
     report.transform = dict(transform or {})
@@ -240,6 +254,10 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     coverage = theme.font_coverage_warning(S.text_of(spec))
     if coverage:
         report.warnings.append(coverage)
+    _, style_notes = ST.normalize_spec_style(spec, add_totals=False)
+    report.warnings.extend(style_notes)
+    report.warnings.extend(ST.warnings_for(spec, wanted))
+    report.warnings.extend(font_substitution_warnings(spec, wanted))
 
     # 1. Charts (documents and presentations; workbook charts are native).
     with timed("charts"):
@@ -268,10 +286,12 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
         paths[key] = path
         entries[key] = {"role": role, "format": fmt, "title": title, "sheet": sheet}
 
+    resolved: Optional[ST.ResolvedStyle] = None
     if isinstance(body, S.DocumentSpec):
         plan = H.plan_document(body)
+        resolved = ST.resolve(spec, type_scale=plan.type)
         report.warnings.extend(plan.warnings)
-        html = H.document_html(body, plan)
+        html = H.document_html(body, plan, resolved)
         if "pdf" in wanted:
             with timed("pdf"):
                 pdf = _render_pdf(html, out, T.download_name(title_slug, version, "pdf"), "pdf")
@@ -284,17 +304,18 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
                 add("companion", "pdf", pdf)
         if "docx" in wanted:
             with timed("docx"):
-                add("primary", "docx", _render_docx(body, plan, out, T.download_name(title_slug, version, "docx"), report))
+                add("primary", "docx", _render_docx(body, plan, out, T.download_name(title_slug, version, "docx"), report, resolved))
         with timed("preview"):
             preview = _preview_from(paths, html, out)
         report.preview_kind = "pages"
     elif isinstance(body, S.PresentationSpec):
         plan = H.plan_deck(body)
+        resolved = ST.resolve(spec)
         report.warnings.extend(plan.warnings)
-        html = H.deck_html(body, plan)
+        html = H.deck_html(body, plan, resolved)
         if "pptx" in wanted:
             with timed("pptx"):
-                add("primary", "pptx", _render_pptx(body, plan, out, T.download_name(title_slug, version, "pptx")))
+                add("primary", "pptx", _render_pptx(body, plan, out, T.download_name(title_slug, version, "pptx"), resolved))
         if "pdf" in wanted:
             with timed("pdf"):
                 add("companion", "pdf", _render_pdf(html, out, T.download_name(title_slug, version, "pdf"), "pdf"))
@@ -303,6 +324,7 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
         report.preview_kind = "pages"
     elif isinstance(body, S.WorkbookSpec):
         spec_for_validation = body
+        resolved = ST.resolve(spec, type_scale=theme.DOCUMENT_TYPE)
         report.transform.update(_spec_transform(body))
         tabular = [f for f in ("docx", "pdf") if f in wanted]
         if tabular:
@@ -312,17 +334,17 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
             _refuse_oversized_tabular(body)
         if "xlsx" in wanted:
             with timed("xlsx"):
-                add("primary", "xlsx", _render_xlsx(body, out, T.download_name(title_slug, version, "xlsx"), report))
+                add("primary", "xlsx", _render_xlsx(body, out, T.download_name(title_slug, version, "xlsx"), report, resolved))
         if "csv" in wanted:
             with timed("csv"):
                 for sheet, path, title, slug in _render_csvs(body, out, title_slug, version, report):
                     add("data", "csv", path, title=title, sheet=sheet.name, sheet_slug=slug)
         if tabular:
             max_pages = TABULAR_MAX_PAGES
-            html = H.workbook_document_html(body, report.transform)
+            html = H.workbook_document_html(body, report.transform, resolved)
             if "docx" in tabular:
                 with timed("docx"):
-                    add("companion", "docx", _render_workbook_docx(body, out, T.download_name(title_slug, version, "docx"), report))
+                    add("companion", "docx", _render_workbook_docx(body, out, T.download_name(title_slug, version, "docx"), report, resolved))
             if "pdf" in tabular:
                 with timed("pdf"):
                     add("companion", "pdf", _render_pdf(html, out, T.download_name(title_slug, version, "pdf"), "pdf", max_pages=max_pages))
@@ -337,6 +359,13 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     else:  # pragma: no cover - the spec envelope admits only the three kinds
         raise RenderError("invalid_request", f"Unknown artifact kind {spec.kind!r}.")
 
+    # Standalone chart images requested next to a document, deck or
+    # workbook are companions (the charts track's render_standalone).
+    for fmt in images:
+        with timed(fmt):
+            for n, path in enumerate(_standalone_images(spec, fmt, out, resolved, stem=f"{title_slug}-v{version}-chart"), start=1):
+                add("companion", fmt, path, title=path.stem, sheet=f"chart-{n}", sheet_slug=f"chart-{n}")
+
     # 4. Validate by reopening. A validator's refusal is a ValidationFailed
     # (a ValueError) and becomes the validation_failure sentence here.
     try:
@@ -348,6 +377,9 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     except Exception as exc:
         log.exception("validation crashed")
         raise RenderError("validation_failure", "A rendered file could not be reopened for checking.") from exc
+    if resolved is not None:
+        report.warnings.extend(w for w in resolved.warnings if w not in report.warnings)
+    report.warnings[:] = list(dict.fromkeys(report.warnings))
     validation.update(report.validation)
     validation["warnings"] = list(report.warnings)
     report.validation = validation
@@ -367,6 +399,108 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
     if isinstance(body, S.PresentationSpec) and report.preview_pages != len(plan.slides):
         raise RenderError("validation_failure", "The slide preview does not have one page per slide.")
     return report
+
+
+#: Formats that are pictures of the spec's charts rather than the document.
+IMAGE_FORMATS = ("png", "svg")
+
+
+def _standalone_images(spec: S.ArtifactSpec, fmt: str, out: Path, resolved, *, stem: str = "chart") -> List[Path]:
+    """The chart images for `fmt`, drawn by render/charts.render_standalone
+    (the charts track) with the shared ResolvedStyle."""
+    from . import charts as C
+
+    standalone = getattr(C, "render_standalone", None)
+    if standalone is None:
+        raise RenderError("dependency_unavailable", "The standalone chart writer is not installed on this server.")
+    try:
+        # AS3 integration: never `chart-<n>.png` — that is the name of the
+        # document renderer's embedded chart images, which publish deletes
+        # as scratch; a standalone image is a file of its own.
+        return [Path(p) for p in standalone(spec, fmt, str(out), resolved, stem=stem)]
+    except RenderError:
+        raise
+    except Exception as exc:
+        log.exception("standalone %s failed", fmt)
+        raise _safe(fmt, "the chart writer reported an error") from exc
+
+
+def _render_images_only(spec: S.ArtifactSpec, formats: Sequence[str], out: Path, *, title_slug: str, version: int, effort: str,
+                        transform: Optional[Dict[str, object]]) -> RenderReport:
+    """A version that is only chart images: every image validated, the first
+    one downscaled to `preview.png`, preview_kind 'image' and no PDF."""
+    from . import preview as P
+    from . import validate as V
+
+    report = RenderReport()
+    report.transform = dict(transform or {})
+    report.validation["effort"] = effort if effort in T.EFFORT_BUDGETS else "fast"
+    _, notes = ST.normalize_spec_style(spec, add_totals=False)
+    report.warnings.extend(notes)
+    report.warnings.extend(ST.warnings_for(spec, formats))
+    resolved = ST.resolve(spec)
+    paths: Dict[str, Path] = {}
+    for fmt in formats:
+        with _timed(report, fmt):
+            for n, path in enumerate(_standalone_images(spec, fmt, out, resolved, stem=f"{title_slug}-v{version}-chart"), start=1):
+                paths[_key("primary", fmt, f"chart-{n}")] = path
+    if not paths:
+        raise RenderError("invalid_request", "The artifact has no charts to draw as images.")
+    try:
+        validation = V.validate_all({k: str(p) for k, p in paths.items()}, None)
+    except V.ValidationFailed as exc:
+        raise RenderError("validation_failure", f"A rendered file failed its check: {exc}.") from exc
+    first_png = next((p for p in paths.values() if p.suffix.lower() == ".png"), next(iter(paths.values())))
+    preview = out / "preview.png"
+    preview.write_bytes(P.rasterise_image(first_png, max(T.PREVIEW_WIDTHS)))
+    validation.update(report.validation)
+    validation["warnings"] = list(report.warnings)
+    report.validation = validation
+    for key, p in paths.items():
+        facts = validation["files"][key]
+        _role, fmt, _slug = key.split(":")
+        report.files.append(RenderedFile(format=fmt, filename=p.name, mime_type=T.MIME_TYPES.get(fmt, "application/octet-stream"),
+                                         size=int(facts["size"]), sha256=str(facts["sha256"]), role="primary", title=p.stem, sheet=_slug))
+    report.paths = {k: str(p) for k, p in paths.items()}
+    report.preview_pdf = None
+    report.preview_kind = "image"
+    report.preview_pages = 0
+    return report
+
+
+def requested_fonts(spec: S.ArtifactSpec) -> List[str]:
+    """The font families a person asked for (fonts and rules), in order."""
+    style = getattr(spec.body, "style", None)
+    if style is None:
+        return []
+    names = [style.fonts.body, style.fonts.heading] + [r.style.font_family for r in style.rules]
+    return [n for n in dict.fromkeys(names) if n]
+
+
+def font_substitution_warnings(spec: S.ArtifactSpec, formats: Sequence[str]) -> List[str]:
+    """One sentence per requested font this server cannot draw for the
+    files it renders HERE (the PDF preview is always rendered): which
+    family the PDF uses instead, and that the Office files keep the name."""
+    from . import theme
+
+    out: List[str] = []
+    office = [f for f in formats if f in ("docx", "pptx", "xlsx")]
+    for name in requested_fonts(spec):
+        face = ST.font_face(name)
+        if face is None:
+            continue
+        chosen = theme.resolve_font(face)
+        if chosen.kind == "exact":
+            continue
+        kept = f"; the {'/'.join(f.upper() for f in office)} file{'s' if len(office) != 1 else ''} name{'' if len(office) != 1 else 's'} {face.office_name}, which shows on a computer that has it" if office else ""
+        what = {
+            "metric": f"its metric-compatible twin {chosen.family}",
+            "substitute": f"its substitute {chosen.family}",
+            "fallback": f"{chosen.family}, its documented open fallback (no metric-compatible font for it is packaged)",
+            "generic": chosen.family,
+        }.get(chosen.kind, "a similar font")
+        out.append(f"{face.name} is not installed on this server, so the PDF uses {what}{kept}.")
+    return out
 
 
 def _refuse_oversized_tabular(body: S.WorkbookSpec) -> None:
@@ -454,12 +588,12 @@ def _render_pdf(html: str, out: Path, name: str, label: str, *, max_pages: int =
     return target
 
 
-def _render_docx(body: S.DocumentSpec, plan, out: Path, name: str, report: RenderReport) -> Path:
+def _render_docx(body: S.DocumentSpec, plan, out: Path, name: str, report: RenderReport, resolved=None) -> Path:
     from .docx import render_docx
 
     target = out / name
     try:
-        render_docx(body, target, out, plan=plan, warnings=report.warnings)
+        render_docx(body, target, out, plan=plan, warnings=report.warnings, resolved=resolved)
     except ImportError as exc:
         raise _import_failure("docx") from exc
     except Exception as exc:
@@ -468,12 +602,12 @@ def _render_docx(body: S.DocumentSpec, plan, out: Path, name: str, report: Rende
     return target
 
 
-def _render_pptx(body: S.PresentationSpec, plan, out: Path, name: str) -> Path:
+def _render_pptx(body: S.PresentationSpec, plan, out: Path, name: str, resolved=None) -> Path:
     from .pptx import render_pptx
 
     target = out / name
     try:
-        render_pptx(body, target, plan=plan)
+        render_pptx(body, target, plan=plan, resolved=resolved)
     except ImportError as exc:
         raise _import_failure("pptx") from exc
     except Exception as exc:
@@ -482,12 +616,12 @@ def _render_pptx(body: S.PresentationSpec, plan, out: Path, name: str) -> Path:
     return target
 
 
-def _render_workbook_docx(body: S.WorkbookSpec, out: Path, name: str, report: RenderReport) -> Path:
+def _render_workbook_docx(body: S.WorkbookSpec, out: Path, name: str, report: RenderReport, resolved=None) -> Path:
     from .docx import render_workbook_docx
 
     target = out / name
     try:
-        render_workbook_docx(body, target, warnings=report.warnings, transform=report.transform)
+        render_workbook_docx(body, target, warnings=report.warnings, transform=report.transform, resolved=resolved)
     except ImportError as exc:
         raise _import_failure("docx") from exc
     except Exception as exc:
@@ -535,12 +669,12 @@ def _render_csvs(body: S.WorkbookSpec, out: Path, title_slug: str, version: int,
         yield sheet, target, sheet.name, slug
 
 
-def _render_xlsx(body: S.WorkbookSpec, out: Path, name: str, report: RenderReport) -> Path:
+def _render_xlsx(body: S.WorkbookSpec, out: Path, name: str, report: RenderReport, resolved=None) -> Path:
     from .xlsx import render_xlsx
 
     target = out / name
     try:
-        render_xlsx(body, target, warnings=report.warnings)
+        render_xlsx(body, target, warnings=report.warnings, resolved=resolved)
     except ImportError as exc:
         raise _import_failure("xlsx") from exc
     except Exception as exc:
@@ -549,4 +683,4 @@ def _render_xlsx(body: S.WorkbookSpec, out: Path, name: str, report: RenderRepor
     return target
 
 
-__all__ = ["RenderError", "RenderReport", "RenderedFile", "render_version", "capabilities", "TABULAR_MAX_PAGES", "TABULAR_MAX_ROWS", "TABULAR_MAX_CELLS", "TABULAR_MAX_CHARS"]
+__all__ = ["RenderError", "RenderReport", "RenderedFile", "render_version", "capabilities", "TABULAR_MAX_PAGES", "TABULAR_MAX_ROWS", "TABULAR_MAX_CELLS", "TABULAR_MAX_CHARS", "requested_fonts", "font_substitution_warnings"]

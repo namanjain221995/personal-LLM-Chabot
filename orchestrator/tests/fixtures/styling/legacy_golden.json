@@ -1,0 +1,327 @@
+{
+ "document": {
+  "docx": [
+   "Generic sample <draft> & \"quoted\"",
+   "A subtitle with <b>markup</b>",
+   "Finance team · 2026-09-11 · For Leadership team",
+   "Contents",
+   "Right-click and choose Update Field to build the table of contents.",
+   "",
+   "",
+   "Section 1: Operations",
+   "This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. [1]",
+   "Detail 1.1",
+   "Point 1.1: a concrete observation with a number (7%)",
+   "Point 1.2: a concrete observation with a number (14%)",
+   "Point 1.3: a concrete observation with a number (21%)",
+   "Point 1.4: a concrete observation with a number (28%)",
+   "Section 2: Financials",
+   "This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next.",
+   "Detail 2.1",
+   "Point 2.1: a concrete observation with a number (7%)",
+   "Point 2.2: a concrete observation with a number (14%)",
+   "Point 2.3: a concrete observation with a number (21%)",
+   "Point 2.4: a concrete observation with a number (28%)",
+   "Section 3: Risks",
+   "This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. [1]",
+   "Detail 3.1",
+   "Point 3.1: a concrete observation with a number (7%)",
+   "Point 3.2: a concrete observation with a number (14%)",
+   "Point 3.3: a concrete observation with a number (21%)",
+   "Point 3.4: a concrete observation with a number (28%)",
+   "Regional figures [2]",
+   "Section 4: Outlook",
+   "This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next. This section explains what happened, why it matters, and what the team will do next.",
+   "Detail 4.1",
+   "Point 4.1: a concrete observation with a number (7%)",
+   "Point 4.2: a concrete observation with a number (14%)",
+   "Point 4.3: a concrete observation with a number (21%)",
+   "Point 4.4: a concrete observation with a number (28%)",
+   "",
+   "Quarterly revenue, both years [1]",
+   "",
+   "Sources",
+   "[1] Finance ledger export — https://example.com/ledger — retrieved 2026-09-10",
+   "[2] CRM pipeline report — https://example.com/crm — Q2 snapshot",
+   "Assumptions",
+   "FX held at the 2025 average",
+   "No change to headcount plan",
+   "$4.2M\nARR\n+18% YoY | 112%\nNRR | 3.1%\nCHURN\ndown from 4.0%",
+   "Region | Revenue | Cost | Margin %",
+   "North | 120,000 | 80,000.50 | 33.30",
+   "South | 90,000 | 61,000 | 32.20",
+   "West | 70,000 | 44,000 | 37.10",
+   "East | 45,000 | 30,000 | 33.30",
+   "We build what people need."
+  ]
+ },
+ "deck": {
+  "pptx": [
+   "FY26 Quarterly Review",
+   "Q2 results & outlook",
+   "Finance · 2026-09-11",
+   "The quarter in numbers",
+   "$1.4M",
+   "REVENUE",
+   "+12% QoQ",
+   "14",
+   "NEW LOGOS",
+   "112%",
+   "NRR",
+   "3.1%",
+   "CHURN",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "2 / 13",
+   "Sales",
+   "Pipeline and wins",
+   "What happened",
+   "•  Bullet 1 about the quarter <with markup>\n•  Bullet 2 about the quarter <with markup>\n•  Bullet 3 about the quarter <with markup>\n•  Bullet 4 about the quarter <with markup>\n•  Bullet 5 about the quarter <with markup>\n•  Bullet 6 about the quarter <with markup>\n•  Bullet 7 about the quarter <with markup>",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "4 / 13",
+   "Pipeline trend",
+   "•  Creation up 2x\n•  Win rate steady",
+   "Quarterly revenue, both years",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "5 / 13",
+   "Revenue mix",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "6 / 13",
+   "Regional performance",
+   "Region | Revenue | Cost | Margin %",
+   "North | 120,000 | 80,000.50 | 33.30",
+   "South | 90,000 | 61,000 | 32.20",
+   "West | 70,000 | 44,000 | 37.10",
+   "East | 45,000 | 30,000 | 33.30",
+   "Regional figures",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "7 / 13",
+   "Wins and misses",
+   "Wins",
+   "•  Enterprise\n•  Partnerships",
+   "Misses",
+   "•  SMB churn\n•  Support backlog",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "8 / 13",
+   "Build vs buy",
+   "Build",
+   "•  Full control\n•  Six months",
+   "Buy",
+   "•  Faster\n•  Licence cost",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "9 / 13",
+   "Roadmap",
+   "Q3",
+   "Launch v2",
+   "Q4",
+   "EU expansion",
+   "Q1 27",
+   "Marketplace",
+   "Q2 27",
+   "Platform APIs",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "10 / 13",
+   "Deals by region",
+   "Quarterly revenue, both years",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "11 / 13",
+   "Thank you",
+   "Questions?",
+   "finance@example.com",
+   "Sources",
+   "1.  Finance ledger export  —  https://example.com/ledger\n2.  CRM pipeline report  —  https://example.com/crm",
+   "FY26 Quarterly Review   CONFIDENTIAL",
+   "13 / 13"
+  ]
+ },
+ "workbook": {
+  "xlsx": {
+   "Pipeline": [
+    [
+     "Deal",
+     "Close date",
+     "Amount",
+     "Seats",
+     "Discount",
+     "Note"
+    ],
+    [
+     "Deal 1",
+     "2026-02-02T00:00:00",
+     1000.5,
+     3,
+     0.01,
+     "=HYPERLINK(\"http://evil.example/x\")"
+    ],
+    [
+     "Deal 2",
+     "2026-03-03T00:00:00",
+     2000.5,
+     6,
+     0.02,
+     "+cmd|' /C calc'!A0"
+    ],
+    [
+     "Deal 3",
+     "2026-04-04T00:00:00",
+     3000.5,
+     9,
+     0.03,
+     "-2+3"
+    ],
+    [
+     "Deal 4",
+     "2026-05-05T00:00:00",
+     4000.5,
+     12,
+     0.04,
+     "@SUM(A1:A9)"
+    ],
+    [
+     "Deal 5",
+     "2026-06-06T00:00:00",
+     5000.5,
+     15,
+     0.05,
+     "Tab lead"
+    ],
+    [
+     "Deal 6",
+     "2026-07-07T00:00:00",
+     6000.5,
+     18,
+     0.06,
+     "CR lead"
+    ],
+    [
+     "Deal 7",
+     "2026-08-08T00:00:00",
+     7000.5,
+     21,
+     0.07,
+     "plain text"
+    ],
+    [
+     "Deal 8",
+     "2026-09-09T00:00:00",
+     8000.5,
+     24,
+     0.08,
+     "plain text"
+    ],
+    [
+     "Deal 9",
+     "2026-01-10T00:00:00",
+     9000.5,
+     27,
+     0.09,
+     "plain text"
+    ],
+    [
+     "Deal 10",
+     "2026-02-11T00:00:00",
+     10000.5,
+     30,
+     0.1,
+     "plain text"
+    ],
+    [
+     "Deal 11",
+     "2026-03-12T00:00:00",
+     11000.5,
+     33,
+     0.11,
+     "plain text"
+    ],
+    [
+     "Deal 12",
+     "2026-04-13T00:00:00",
+     12000.5,
+     36,
+     0.12,
+     "plain text"
+    ],
+    [
+     "Total",
+     null,
+     "=SUM(C2:C13)",
+     "=SUM(D2:D13)",
+     "=AVERAGE(E2:E13)",
+     null
+    ]
+   ],
+   "Regions": [
+    [
+     "Region",
+     "Q1",
+     "Q2"
+    ],
+    [
+     "North",
+     120,
+     140
+    ],
+    [
+     "South",
+     90,
+     110
+    ],
+    [
+     "West",
+     70,
+     95
+    ],
+    [
+     "Total",
+     "=SUM(B2:B4)",
+     "=SUM(C2:C4)"
+    ]
+   ],
+   "Notes   draft": [
+    [
+     "Topic",
+     "Text"
+    ],
+    [
+     "Scope",
+     "Pipeline as of Friday"
+    ],
+    [
+     "Owner",
+     "Finance"
+    ]
+   ],
+   "Notes": [
+    [
+     "Sources",
+     null,
+     null
+    ],
+    [
+     "[1]",
+     "Finance ledger export",
+     "https://example.com/ledger"
+    ],
+    [
+     "[2]",
+     "CRM pipeline report",
+     "https://example.com/crm"
+    ],
+    [
+     null,
+     null,
+     null
+    ],
+    [
+     "Assumptions",
+     null,
+     null
+    ],
+    [
+     null,
+     "FX flat",
+     null
+    ]
+   ]
+  }
+ }
+}

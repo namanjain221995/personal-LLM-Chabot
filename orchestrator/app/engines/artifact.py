@@ -45,10 +45,15 @@ formats' word-gap regex (#8).
 
 WHAT THE ENGINE NEVER DOES: invent an id, a filename, a URL or a completion
 state; paste the document into the chat; emit more than one meta.
+
+AN EDIT IS PLANNED BEFORE IT IS ACCEPTED (AS3 prompt-edits, see the
+"AS3 edits" section below and artifacts/edits.py): typed ops applied by
+code, a no-op answered without a job, a restore copied byte for byte.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
 import datetime as _dt
 import logging
 import re
@@ -425,13 +430,121 @@ def _tables_from_parent(material: C.Material, parent: Any) -> None:
         have.add(source)
 
 
+# --- AS3 integration BEGIN: requested styling on a NEW file ---
+#: A style phrase the parser could not read goes to ONE small JSON call
+#: (style.extract_patch_llm: thinking off, 300 tokens) under this deadline.
+_STYLE_LLM_TIMEOUT_S = {"fast": 5.0, "think": 8.0, "max": 8.0}
+
+
 async def compose_for_pipeline(ctx: "pipeline.ComposeContext"):
+    """Installed on the pipeline at startup: the composer (below), then —
+    for a create — the styling the request asked for merged into the spec's
+    `style` BY CODE (style.apply_request), so "a Word report with purple
+    headings" or "an excel tracker with a yellow header row" is honoured in
+    the file and not only in the checklist. An edit carries its styling as a
+    planned `set_style` op, and a convert keeps the parent's style."""
+    spec = await _compose_for_pipeline_inner(ctx)
+    if ctx.operation != "create" or _style is None or not hasattr(_style, "apply_request"):
+        return spec
+    try:
+        spec = await _apply_requested_style(ctx, spec)
+    except Exception as exc:  # noqa: BLE001 — the file still renders in the house style
+        log.info("artifact: requested style not applied: %s", type(exc).__name__)
+        ctx.warn("the requested formatting could not be applied; the file uses the house style")
+    return spec
+
+
+async def _apply_requested_style(ctx: "pipeline.ComposeContext", spec: Any) -> Any:
+    instruction = ctx.instruction or ""
+    spec, _formats, notes, unparsed = await asyncio.to_thread(_style.apply_request, spec, instruction, formats=list(ctx.formats))
+    if unparsed and hasattr(_style, "extract_patch_llm"):
+        body = getattr(spec, "body", spec)
+        # Names only (sheets and their columns, headings) — never cell values.
+        parts: List[str] = []
+        for sh in list(getattr(body, "sheets", None) or [])[:8]:
+            parts.append(f"sheet {sh.name}: columns " + ", ".join(c.name for c in sh.columns[:40]))
+        heads = [b.text for b in list(getattr(body, "blocks", None) or []) if getattr(b, "type", "") == "heading"][:20]
+        if heads:
+            parts.append("headings: " + "; ".join(heads))
+        outline = "\n".join(parts)[:800]
+        patch, more = await _style.extract_patch_llm(
+            unparsed, str(ctx.kind), outline, effort=ctx.effort, timeout_s=_STYLE_LLM_TIMEOUT_S.get(ctx.effort, 5.0),
+        )
+        notes = list(notes) + list(more)
+        if not patch.is_empty():
+            body.style = _style.merge(getattr(body, "style", None), patch)
+            _, norm_notes = await asyncio.to_thread(_style.normalize_spec_style, spec)
+            notes.extend(norm_notes)
+    for n in dict.fromkeys(str(n) for n in notes if n):
+        if n == getattr(_style, "CSV_STYLE_SENTENCE", None):
+            continue  # formats.decide already said where a CSV's styling went
+        ctx.warn(n)
+    if ctx.kind == "workbook":
+        _house_sheet_style(spec, instruction, styled=bool(getattr(getattr(spec, "body", spec), "style", None)) and bool(_style.patch_fields(_style.parse_style_request(instruction, "workbook")[0])))
+    return spec
+
+
+_ASKS_HIGHLIGHT_RE = re.compile(r"highlight|colou?r|fill|shade|rang|रंग|કલર", re.I)
+_ASKS_HEADER_LOOK_RE = re.compile(r"header|plain|minimal|simple|no colou?rs?|without colou?rs?|light|black and white|monochrome", re.I)
+
+
+def _house_sheet_style(spec: Any, instruction: str, *, styled: bool) -> None:
+    """The model's legacy SheetStyle, when the person did not ask for it
+    (live 2026-09-15): a whole-column `highlight` it invented to approximate
+    "Status red where Blocked" or "Vendor column bold" is dropped once code
+    has applied the real request, and a light or absent header fill nobody
+    asked for is the professional dark header."""
+    for sh in list(getattr(getattr(spec, "body", spec), "sheets", None) or []):
+        st = getattr(sh, "style", None)
+        if st is None:
+            continue
+        upd: Dict[str, Any] = {}
+        if st.highlight and (styled or not _ASKS_HIGHLIGHT_RE.search(instruction or "")):
+            upd["highlight"] = []
+        if st.header_fill != "dark" and not _ASKS_HEADER_LOOK_RE.search(instruction or ""):
+            upd["header_fill"] = "dark"
+        if upd:
+            sh.style = st.model_copy(update=upd)
+# --- AS3 integration END ---
+
+
+async def _compose_for_pipeline_inner(ctx: "pipeline.ComposeContext"):
     """Installed on the pipeline at startup: the composer the runner calls
     from the compose stage — in THIS process, under the job's lease, from
     the material persisted at acceptance (so a requeued job sees the same
     evidence). Announces the composer-owned stages on the way."""
     material = _material_from_dict(ctx.material)
     material.instruction = ctx.instruction
+    reason = str((getattr(ctx, "job", None) or {}).get("format_reason") or "")
+    if ctx.operation == "edit" and reason.startswith(EDIT_REASON):
+        payload = await _load_payload(ctx, "edit")
+        if payload is None:
+            # The payload never reached material.json (a restart between
+            # acceptance and the attach, or a drain that won the race).
+            # Rebuilt from what the job row carries — never a whole-document
+            # rewrite, which would retype a restore or an untouched section.
+            payload = await _rebuild_edit_payload(ctx, reason)
+        if payload is not None:
+            return await _compose_edit(ctx, payload, material)
+        ctx.warn("the planned change was not found, so the edit was made by rewriting the document")
+    if ctx.operation == "create" and reason.startswith(IMPORT_REASON):
+        payload = await _load_payload(ctx, "import")
+        if payload is not None and isinstance(payload.get("spec"), dict):
+            from ..artifacts import spec as S
+
+            await ctx.progress_stage("intent", "done", f"{_KIND_WORDS.get(ctx.kind, ctx.kind)} · {', '.join(_FORMAT_WORDS.get(f, f) for f in ctx.formats)}")
+            await ctx.progress_stage("gather", "done", "the answer, converted as written")
+            await ctx.progress_stage("outline", "skipped", "a conversion keeps the structure")
+            for n in payload.get("notes") or []:
+                ctx.warn(str(n))
+            raw = dict(payload["spec"])
+            if "kind" not in raw:
+                # AS3 integration: md_import/docx_to_document return the
+                # DocumentSpec BODY; S.load reads the envelope. Every export
+                # of an answer failed "The content could not be written"
+                # with the real composer (live run 2026-09-15).
+                raw = {"kind": "document", "document": raw}
+            return await _post_process(S.load(raw), material.tables, ctx.warn, ctx.instruction)
     if ctx.operation == "edit" and ctx.parent_spec is not None:
         _tables_from_parent(material, ctx.parent_spec)
     await ctx.progress_stage("intent", "done", f"{_KIND_WORDS.get(ctx.kind, ctx.kind)} · {', '.join(_FORMAT_WORDS.get(f, f) for f in ctx.formats)} · {ctx.template_id.replace('_', ' ')}")
@@ -475,16 +588,76 @@ async def compose_for_pipeline(ctx: "pipeline.ComposeContext"):
         result = await C.compose(req, progress=progress)
     except C.ComposeError as exc:
         raise pipeline.StageFailure(exc.category, str(exc)) from exc
+    # B1: the figures warning is held until the typed aggregates have been
+    # replaced by computed ones (derived.enforce, in _post_process) — a
+    # warning about 63,668 that is no longer in the file would be false.
+    figures_warning = next((w for w in result.warnings if str(w).startswith(C.FIGURES_WARNING)), None)
+    typed_notes = [w for w in result.warnings if _TYPED_ROWS_NOTE_RE.match(str(w))]
     for w in result.warnings:
-        ctx.warn(w)
+        if w is not figures_warning and w not in typed_notes:
+            ctx.warn(w)
     if result.corrections > 1:
         ctx.warn(f"{result.corrections} correction passes were made")
     kept = int((result.transform or {}).get("kept_original") or 0)
     if kept:
         ctx.warn(f"{kept} rewritten cell{'s' if kept != 1 else ''} kept the original wording (a timestamp, a quoted phrase or a figure would have changed)")
-    if result.transform and hasattr(ctx, "record_transform"):
-        ctx.record_transform(result.transform)
-    return result.spec
+    spec = result.spec
+    derived_report: Dict[str, Any] = {}
+    if (material.tables and (_chart_data is not None or _style is not None)) or _has_charts(result.spec):
+        # AS3 integration: a chart is resolved even with no table in the
+        # material — a binding to nothing becomes a note, never a chart
+        # with numbers the model wrote.
+        spec = await _post_process(result.spec, material.tables, ctx.warn, ctx.instruction, derived_report=derived_report,
+                                   parent=ctx.parent_spec if ctx.operation == "edit" else None)
+    transform = dict(result.transform or {})
+    gone = set(derived_report.get("computed") or []) | set(derived_report.get("dropped") or [])
+    for w in typed_notes:
+        m = _TYPED_ROWS_NOTE_RE.match(str(w))
+        if m and m.group(1) not in gone:
+            ctx.warn(w)
+    if figures_warning is not None:
+        if derived_report.get("changed"):
+            figures = await asyncio.to_thread(_figures_still_typed, result.spec, spec, C.material_text(req))
+            if figures:
+                ctx.warn(C.FIGURES_WARNING + ", ".join(figures[:8]) + (" …" if len(figures) > 8 else ""))
+        else:
+            ctx.warn(figures_warning)
+    if derived_report.get("changed") and transform.get("typed_sheets"):
+        body = getattr(spec, "body", None)
+        typed = [sh for sh in list(getattr(body, "sheets", None) or []) if sh.name not in gone and not sh.rows_are_code_computed and sh.rows]
+        if typed:
+            transform["typed_rows"] = sum(len(sh.rows) for sh in typed)
+            transform["typed_sheets"] = [sh.name for sh in typed]
+        else:
+            transform.pop("typed_rows", None)
+            transform.pop("typed_sheets", None)
+    if transform and hasattr(ctx, "record_transform"):
+        ctx.record_transform(transform)
+    return spec
+
+
+#: compose's note on a sheet the model typed beside a copied one; stale once
+#: derived.enforce computed that sheet's figures or left it out.
+_TYPED_ROWS_NOTE_RE = re.compile(r"^sheet '(.+)': [\d,]+ rows? (?:were|was) typed by the model")
+
+
+def _figures_still_typed(before: Any, after: Any, material_text: str) -> List[str]:
+    """The unsupported figures of the composed draft that are still in the
+    file once typed aggregates were computed or left out (B1). A figure
+    code computed is not re-flagged: only the draft's own list is kept."""
+    from ..artifacts import spec as S
+
+    had = set(S.unsupported_figures(before, material_text))
+    return [f for f in S.unsupported_figures(after, material_text) if f in had]
+
+
+def _has_charts(spec: Any) -> bool:
+    try:
+        from ..artifacts import chart_spec as _CS
+
+        return any(True for _ in _CS.iter_chart_slots(spec))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------------------------------------------------------- the turn --
@@ -506,7 +679,7 @@ def _count_word(n: int, noun: str) -> str:
 
 
 def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, transform: Optional[Dict[str, Any]] = None,
-              dataset: bool = False, data_only_note: str = "", instruction: str = "") -> str:
+              dataset: bool = False, data_only_note: str = "", instruction: str = "", converted_to: Sequence[str] = ()) -> str:
     """The one line the person reads (CONTRACT-2 §7). "Updated" ONLY when
     the operation is an edit; "Converted" for a conversion; otherwise a
     create — of a pasted table ("Done — I preserved 34 audit rows and
@@ -520,7 +693,12 @@ def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, tr
     if operation == "edit":
         line = f"Updated **{what}** as {fmts}."
     elif operation == "convert":
-        line = f"Converted **{what}** to {fmts}."
+        if converted_to:
+            new = [f for f in ref.files if f.format in converted_to]
+            kept = [f for f in ref.files if f.format not in converted_to]
+            line = f"Converted **{what}** to {_format_list(new) if new else fmts}." + (f" The {_format_list(kept)} {'is' if len({f.format for f in kept}) == 1 else 'are'} kept." if kept else "")
+        else:
+            line = f"Converted **{what}** to {fmts}."
     elif t.get("rows"):
         noun = "audit rows" if re.search(r"\baudit", instruction or what, re.I) else "rows"
         line = f"Done — I preserved {int(t['rows']):,} {noun} and created {_count_word(len(ref.files), 'file')}."
@@ -642,6 +820,8 @@ async def run_artifact_engine(
     mode: str = "assistant",
     web_allowed: bool = False,
     intent_id: str = "",
+    gathered: Any = None,
+    artifact_id: Optional[str] = None,
 ) -> str:
     """The whole turn. Returns the sentence that was streamed.
 
@@ -662,11 +842,25 @@ async def run_artifact_engine(
     operation = intent.action if intent.action in ("edit", "convert") and not intent.new_artifact else "create"
     parent: Optional[Tuple[str, int]] = None
     parent_row: Optional[dict] = None
+    if artifact_id and operation == "create" and not intent.new_artifact and any(str(c.get("id")) == str(artifact_id) for c in candidates):
+        # The UI's "Edit with a prompt" names the artifact (owner-checked:
+        # it is one of the caller's candidates).
+        operation = "edit"
     if operation in ("edit", "convert"):
-        parent_row = _pick_artifact(candidates, intent)
+        parent_row, question = pick_artifact(candidates, intent, artifact_id=artifact_id, history=history, instruction=instruction)
+        if question:
+            await emit("token", {"text": question})
+            await emit("meta", {"route": "artifact", "effort": effort})
+            return question
         if parent_row is None:
             # Nothing to edit: the words were about a file, but there is none — make one.
             operation = "create"
+        elif operation == "edit":
+            return await _run_edit(
+                text=text, history=history, emit=emit, intent=intent, parent_row=parent_row, candidates=candidates,
+                conversation_id=conversation_id, user_id=int(user_id), generation_id=generation_id, effort=effort, mode=mode,
+                intent_id=intent_id, instruction=instruction, raw_text=raw_text, gathered=gathered,
+            )
         else:
             version = int(intent.version or parent_row.get("current_version") or 1)
             parent = (str(parent_row["id"]), version)
@@ -675,6 +869,7 @@ async def run_artifact_engine(
     #    asked for with styling words (formats.decide): the sentence says
     #    where the styling went.
     data_only_note = ""
+    converted_to: List[str] = []
     if parent_row is not None and operation == "edit":
         kind = str(parent_row.get("kind") or "document")
         current = parent_row.get("current") or {}
@@ -703,7 +898,11 @@ async def run_artifact_engine(
             kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, f"new {decision.kind}: {decision.reason}", list(decision.warnings)
             data_only_note = str(getattr(decision, "data_only_note", "") or "")
         else:
-            formats, template_id = ok, str((parent_row.get("current") or {}).get("template_id") or "generic")
+            # AS3: a convert KEEPS the formats the artifact has and adds the new one.
+            lineage = lineage_formats(await db.run_in_thread(adb.list_versions, str(parent_row["id"]), int(user_id)), kind)
+            formats = list(dict.fromkeys([*lineage, *ok])) if not intent.version else ok
+            converted_to = list(ok)
+            template_id = str((parent_row.get("current") or {}).get("template_id") or "generic")
             reason = f"convert: {', '.join(ok)}"
             warnings = [f"{', '.join(bad)} cannot be produced for a {kind}"] if bad else []
     else:
@@ -715,9 +914,35 @@ async def run_artifact_engine(
     material = C.Material(instruction=instruction, history_text=C.material_from_history(history))
     material.notes.append(f"Today is {_dt.date.today().strftime('%d %B %Y')}.")
     material.notes.append("Mode: Salesforce workspace" if mode == "salesforce" else "Mode: assistant")
+    import_payload: Optional[dict] = None
     if intent.action == "export":
         material.previous_answer = _previous_answer(history)
         material.notes.append("Turn the previous answer into the file faithfully; do not add claims it did not make.")
+        answer_md = str(getattr(gathered, "previous_answer_md", "") or "") if gathered is not None else ""
+        if answer_md:
+            # AS3 integration: the gathered SUBSTANTIAL answer, never a
+            # "You're welcome!" that came after it (the chat route used to
+            # slice the history for this; with `gathered` it no longer does).
+            material.previous_answer = answer_md
+        if answer_md and kind == "document" and _md_import is not None and hasattr(_md_import, "markdown_to_document"):
+            # AS3 (a): the export is the answer as written, imported by code —
+            # never a model retype of a long answer.
+            try:
+                doc, notes = await asyncio.to_thread(_md_import.markdown_to_document, answer_md, title_hint="")
+                import_payload = {"spec": doc.model_dump(mode="json", by_alias=True, exclude_none=True), "notes": list(notes or [])}
+                reason = f"{IMPORT_REASON}: previous answer · {reason}"
+            except Exception as exc:  # noqa: BLE001 — the composer path still works
+                log.info("artifact: markdown import failed: %s", type(exc).__name__)
+    if gathered is not None and import_payload is None and kind == "document" and getattr(intent, "target", "") == "upload" and _md_import is not None:
+        docs = [d for d in (getattr(gathered, "upload_docs", None) or []) if isinstance(d, dict) and d.get("kind") in ("docx", "md", "txt")]
+        if len(docs) == 1 and hasattr(docs[0].get("spec_or_text"), "model_dump"):
+            import_payload = {"spec": docs[0]["spec_or_text"].model_dump(mode="json", by_alias=True, exclude_none=True), "notes": []}
+            reason = f"{IMPORT_REASON}: upload · {reason}"
+    if gathered is not None:
+        for attr in ("upload_tables", "answer_tables", "prompt_tables"):
+            material.tables.extend(list(getattr(gathered, attr, []) or []))
+        if getattr(gathered, "uploads_text", ""):
+            material.uploads_text = str(gathered.uploads_text)
     transform: Dict[str, Any] = {}
     if operation == "create":
         # The pasted table(s), parsed from the ORIGINAL text — never from
@@ -732,7 +957,7 @@ async def run_artifact_engine(
             return line
         material.tables.extend(pasted)
         material.notes.extend(table_notes)
-        if kind == "workbook" and not pasted:
+        if kind == "workbook" and not pasted and gathered is None:
             try:
                 material.tables.extend(await db.run_in_thread(_upload_tables, conversation_id))
             except Exception as exc:  # noqa: BLE001 — an upload is an enhancement to the material
@@ -752,6 +977,8 @@ async def run_artifact_engine(
         material.sources.extend(await _web_sources(instruction, history, effort=effort, user_id=int(user_id), conversation_id=conversation_id, emit=emit))
     if not material.sources and not material.tables:
         material.notes.append("No external sources were gathered; write from the conversation and say where something is an assumption.")
+    if import_payload is not None and operation != "create":
+        import_payload = None
 
     # 4. Accept — persisted before any model call, keyed on the send's
     #    durable identity plus what it targets, so the same send answers
@@ -772,6 +999,8 @@ async def run_artifact_engine(
         await emit("token", {"text": line})
         await emit("meta", {"route": "artifact", "effort": effort})
         return line
+    if import_payload is not None and job.get("created"):
+        await db.run_in_thread(_attach_payload, int(user_id), str(job["artifact_id"]), int(job["version"]), "import", import_payload)
 
     await emit("step", {"id": _STEP_IDS["intent"], "title": _TITLES["intent"], "status": "running", "detail": ""})
     await emit("status", {"text": "Preparing the file…"})
@@ -803,7 +1032,8 @@ async def run_artifact_engine(
         # generated them. A workbook the model typed from the conversation
         # is "Created **X** in …", however its template is named.
         dataset = kind == "workbook" and operation == "create" and bool(intent.row_count or report.get("generated"))
-        line = _sentence(ref, operation, all_warnings, transform=report, dataset=dataset, data_only_note=data_only_note, instruction=instruction)
+        line = _sentence(ref, operation, all_warnings, transform=report, dataset=dataset, data_only_note=data_only_note, instruction=instruction,
+                         converted_to=converted_to)
     elif status == "cancelled":
         line = "The file was cancelled before it was finished."
     else:
@@ -836,7 +1066,7 @@ async def _published_transform(user_id: int, artifact_id: str, version: int) -> 
     if copied:
         out["rows"] = sum(len(sh.rows) for sh in copied)
         out["blanks"] = sum(1 for sh in copied for r in sh.rows for c in r if c is None or (isinstance(c, str) and not c.strip()))
-        typed = [sh for sh in sheets if not getattr(sh, "rows_are_code_made", False) and sh.rows]
+        typed = [sh for sh in sheets if not getattr(sh, "rows_are_code_computed", getattr(sh, "rows_are_code_made", False)) and sh.rows]
         if typed:
             out["typed_rows"] = sum(len(sh.rows) for sh in typed)
             out["typed_sheets"] = [sh.name for sh in typed]
@@ -850,6 +1080,617 @@ async def _published_transform(user_id: int, artifact_id: str, version: int) -> 
     return out
 
 
+# ------------------------------------------------------------ AS3 edits --
+#
+# PROMPT-DRIVEN EDITS (AS3 prompt-edits). An edit is planned and applied
+# HERE, before acceptance: artifacts.edits turns the request into typed ops
+# (0 model calls for style / orientation / title / undo / restore / rename
+# column / add a blank column / delete rows by a named condition; otherwise
+# ONE strict-JSON call over an outline), applies the deterministic ones to
+# the parent spec, and says what it could not do. Nothing changed → one
+# sentence, NO job and NO version (the version row is inserted at
+# acceptance, so this is the only place a no-op can be caught). Otherwise
+# the child spec rides into the job inside material.json under "edit"; the
+# composer returns it, writing only the pending sections (≤ 3 scoped calls).
+# A restore copies version N's spec.json and re-renders it (0 calls); undo
+# is a restore of the current version's parent.
+
+#: format_reason prefix of a job whose spec travels in material.json.
+EDIT_REASON = "edit plan"
+IMPORT_REASON = "import"
+#: How long the composer waits for the engine to attach the payload after
+#: acceptance (the maintenance drain may pick a queued row first).
+_PAYLOAD_WAIT_S = 5.0
+
+try:  # intent-capability track
+    from ..artifacts import material_in as _material_in  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _material_in = None  # type: ignore[assignment]
+try:
+    from ..artifacts import md_import as _md_import  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _md_import = None  # type: ignore[assignment]
+try:  # charts track
+    from ..artifacts import chart_data as _chart_data  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _chart_data = None  # type: ignore[assignment]
+try:  # styling-engine track
+    from ..artifacts import style as _style  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _style = None  # type: ignore[assignment]
+
+_ELEMENT_KIND = (
+    (re.compile(r"\b(columns?|rows?|cells?|sheets?|tabs?|totals?)\b", re.I), "workbook"),
+    (re.compile(r"\b(slides?|deck)\b", re.I), "presentation"),
+    (re.compile(r"\b(sections?|headings?|paragraphs?|pages?|chapters?|appendix|landscape|portrait)\b", re.I), "document"),
+)
+
+
+def _last_artifact_turn(history: Sequence[dict]) -> Optional[str]:
+    """The artifact id of the most recent assistant turn that carried an
+    artifact card, when the history rows carry their meta."""
+    for turn in reversed(list(history)):
+        if str(turn.get("role")) != "assistant":
+            continue
+        meta = turn.get("meta") if isinstance(turn.get("meta"), dict) else {}
+        refs = meta.get("artifacts") if isinstance(meta, dict) else None
+        if isinstance(refs, list):
+            for ref in refs:
+                if isinstance(ref, dict) and T.is_artifact_id(str(ref.get("artifact_id") or "")):
+                    return str(ref["artifact_id"])
+    return None
+
+
+def pick_artifact(candidates: Sequence[dict], intent: ArtifactIntent, *, artifact_id: Optional[str] = None,
+                  history: Sequence[dict] = (), instruction: str = "") -> Tuple[Optional[dict], str]:
+    """Which existing artifact a follow-up means (AS3 order): the UI's
+    artifact_id (owner-checked: it must be one of the caller's candidates)
+    > a title the words name > the artifact of the last artifact turn >
+    element-word/kind affinity ("add a column" → a workbook) > the newest.
+    Two equally named candidates → (None, question) and no job."""
+    if not candidates:
+        return None, ""
+    hint_id = artifact_id or getattr(intent, "artifact_id_hint", None)
+    if hint_id:
+        for c in candidates:
+            if str(c.get("id")) == str(hint_id):
+                return c, ""
+    last_id = _last_artifact_turn(history)
+    hint = (intent.reference_hint or "").lower().strip()
+    if hint and intent.reference != "latest":
+        by_title = [c for c in candidates if hint in str(c.get("title") or "").lower()]
+        if len(by_title) == 1:
+            return by_title[0], ""
+        if len(by_title) > 1:
+            exact = [c for c in by_title if str(c.get("title") or "").lower().strip() == hint]
+            if len(exact) == 1:
+                return exact[0], ""
+            if last_id and any(str(c.get("id")) == last_id for c in by_title):
+                return next(c for c in by_title if str(c.get("id")) == last_id), ""
+            names = " or ".join(f"**{c.get('title')}**" for c in by_title[:2])
+            return None, f"Which one should I change — {names}?"
+        legacy = _pick_artifact(candidates, intent)
+        if legacy is not None and legacy is not candidates[0]:
+            return legacy, ""
+    if last_id:
+        for c in candidates:
+            if str(c.get("id")) == last_id:
+                return c, ""
+    words_kind = next((k for rx, k in _ELEMENT_KIND if rx.search(instruction or "")), None)
+    if words_kind and candidates[0].get("kind") != words_kind:
+        by_kind = [c for c in candidates if c.get("kind") == words_kind]
+        if by_kind:
+            return by_kind[0], ""
+    return candidates[0], ""
+
+
+def lineage_formats(versions: Sequence[dict], kind: str, *, upto: Optional[int] = None) -> List[str]:
+    """The union of formats across an artifact's published versions, in
+    first-seen order — what an edit inherits (a convert ADDS its format)."""
+    allowed = T.FORMATS_FOR_KIND.get(kind, ())
+    out: List[str] = []
+    for v in sorted(versions, key=lambda r: int(r.get("version") or 0)):
+        if upto is not None and int(v.get("version") or 0) > upto:
+            continue
+        if str(v.get("status") or "") not in ("completed", "completed_with_warnings"):
+            continue
+        fmts = [f.get("format") for f in (v.get("files") or []) if isinstance(f, dict) and f.get("format")] or list(v.get("formats") or [])
+        for f in fmts:
+            if f in allowed and f not in out:
+                out.append(f)
+    return out
+
+
+def _attach_payload(user_id: int, artifact_id: str, version: int, key: str, payload: dict) -> None:
+    """Blocking. Put the edit/import payload into the job's material.json
+    (scratch: removed at publication)."""
+    import os as _os
+
+    from ..artifacts import store
+
+    path = _os.path.join(store.ensure_workdir(int(user_id), artifact_id, int(version)), store.MATERIAL_NAME)
+    data = store.read_json(path)
+    data = dict(data) if isinstance(data, dict) else {}
+    data[key] = payload
+    store.write_json(path, data)
+
+
+async def _load_payload(ctx: "pipeline.ComposeContext", key: str) -> Optional[dict]:
+    import os as _os
+
+    from ..artifacts import store
+
+    path = _os.path.join(ctx.work_dir, store.MATERIAL_NAME)
+    deadline = time.monotonic() + _PAYLOAD_WAIT_S
+    while True:
+        data = await asyncio.to_thread(store.read_json, path)
+        if isinstance(data, dict) and isinstance(data.get(key), dict):
+            return data[key]
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.1)
+
+
+async def _rebuild_edit_payload(ctx: "pipeline.ComposeContext", reason: str) -> Optional[dict]:
+    """The edit payload re-derived inside the job: a restore from the
+    version its format_reason names; any other planned edit re-planned
+    and re-applied over the job's parent spec (deterministic ops cost
+    nothing; a model plan is the same one call the engine made)."""
+    from ..artifacts import edits as E
+
+    m = re.search(r"restore v(\d+)", reason or "")
+    if m:
+        return {"restore_version": int(m.group(1)), "pending": []}
+    parent = ctx.parent_spec
+    if parent is None:
+        return None
+    try:
+        plan = await E.plan(ctx.instruction, parent, effort=ctx.effort)
+        outcome = await asyncio.to_thread(E.apply, parent, plan, instruction=ctx.instruction)
+    except Exception as exc:  # noqa: BLE001
+        log.info("artifact edit: re-plan failed: %s", type(exc).__name__)
+        return None
+    if plan.summary == "undo" or outcome.restore_version:
+        return None
+    for n in outcome.not_applied[:2]:
+        ctx.warn(f"not applied: {n.get('reason', '')}")
+    return outcome.to_payload()
+
+
+async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str], None], instruction: str = "", *,
+                        parent: Any = None, derived_report: Optional[Dict[str, Any]] = None, model_wrote: bool = True) -> Any:
+    """AS3 (d): after any compose/apply, the CPU-bound post-processing in a
+    thread — chart values from the bound tables, then (B1) every aggregate a
+    sheet shows computed from those tables by code, then the style
+    normalised — whichever of those modules this build has. `parent` is the
+    version an edit started from: a sheet it kept unchanged is not re-checked.
+    `model_wrote` is False for an edit whose ops were all deterministic: the
+    figures in it are the person's own (an added row), not a model's."""
+    if _chart_data is not None and hasattr(_chart_data, "repair_binding") and _has_charts(spec):
+        # AS3 integration: the charts track's deterministic binding repair
+        # (a skipped group_by named in the request, stray fields of another
+        # chart type) BEFORE compute — built but never called before (live
+        # 2026-09-15: "heatmap of ticket count by Status and Priority" drew
+        # a note "A heatmap needs a column for its rows").
+        try:
+            spec = await asyncio.to_thread(_repair_bindings, spec, list(tables_), instruction, warn)
+        except Exception as exc:  # noqa: BLE001 — resolve still runs on the model's binding
+            log.info("artifact: chart binding repair skipped: %s", type(exc).__name__)
+    if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
+        try:
+            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, list(tables_))  # type: ignore[attr-defined]
+            for n in notes or []:
+                warn(str(n))
+        except Exception as exc:  # noqa: BLE001 — never fails the job
+            log.info("artifact: chart resolve skipped: %s", type(exc).__name__)
+    if tables_ and model_wrote:
+        from ..artifacts import derived as _derived
+
+        # Not guarded like the steps above: a failure here must fail the
+        # job, never publish a table of figures the model typed.
+        spec, notes, report = await asyncio.to_thread(_derived.enforce, spec, list(tables_), parent=parent)
+        for n in notes:
+            warn(str(n))
+        if derived_report is not None:
+            derived_report.update(report)
+            derived_report["changed"] = bool(notes)
+    if _style is not None and hasattr(_style, "normalize_spec_style"):
+        try:
+            spec, notes = await asyncio.to_thread(functools.partial(_style.normalize_spec_style, add_totals=parent is None), spec)  # type: ignore[attr-defined]
+            for n in notes or []:
+                warn(str(n))
+        except Exception as exc:  # noqa: BLE001
+            log.info("artifact: style normalise skipped: %s", type(exc).__name__)
+    return spec
+
+
+def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Callable[[str], None]) -> Any:
+    from ..artifacts import chart_spec as CS
+
+    body = getattr(spec, "body", None)
+    if body is None:
+        return spec
+    for b in list(getattr(body, "blocks", None) or []):
+        if getattr(b, "type", "") == "chart" and b.chart.data is not None and not b.chart.series:
+            b.chart, notes = _chart_data.repair_binding(b.chart, tables_, instruction)
+            for n in notes:
+                warn(str(n))
+    for sl in list(getattr(body, "slides", None) or []):
+        if getattr(sl, "chart", None) is not None and sl.chart.data is not None and not sl.chart.series:
+            sl.chart, notes = _chart_data.repair_binding(sl.chart, tables_, instruction)
+            for n in notes:
+                warn(str(n))
+    for sh in list(getattr(body, "sheets", None) or []):
+        if not getattr(sh, "charts", None):
+            continue
+        own = _chart_data._sheet_table(sh.model_dump(mode="python"))
+        fixed = []
+        for c in sh.charts:
+            if isinstance(c, CS.Chart) and c.data is not None and not c.series:
+                c, notes = _chart_data.repair_binding(c, [*tables_, own] if not c.data.table_id else tables_, instruction)
+                for n in notes:
+                    warn(str(n))
+            fixed.append(c)
+        sh.charts = fixed
+    return spec
+
+
+async def _compose_edit(ctx: "pipeline.ComposeContext", payload: dict, material: C.Material):
+    """The job side of a planned edit: the child spec from the payload, the
+    pending sections written (scoped), the preservation re-checked."""
+    from ..artifacts import edits as E
+    from ..artifacts import spec as S
+    from ..artifacts import store
+
+    await ctx.progress_stage("intent", "done", f"edit · {', '.join(_FORMAT_WORDS.get(f, f) for f in ctx.formats)}")
+    await ctx.progress_stage("gather", "done", "the current version")
+    restore = payload.get("restore_version")
+    if restore:
+        await ctx.progress_stage("outline", "skipped", f"restoring v{int(restore)}")
+        spec = await asyncio.to_thread(store.read_spec, store.version_dir(int(ctx.user_id), str(ctx.artifact_id), int(restore)))
+        if spec is None:
+            raise pipeline.StageFailure("invalid_request", f"Version {int(restore)} has no stored content to restore.")
+        return spec
+    await ctx.progress_stage("outline", "skipped", "an edit keeps the structure")
+    try:
+        spec = S.load(payload.get("spec") or {})
+    except Exception as exc:  # noqa: BLE001
+        raise pipeline.StageFailure("invalid_request", "The planned change could not be read back.") from exc
+    pending = [p for p in payload.get("pending") or [] if isinstance(p, dict)]
+    req = C.ComposeRequest(
+        kind=ctx.kind, formats=ctx.formats, template_id=ctx.template_id, effort=ctx.effort, operation="edit",
+        material=material, parent_spec=spec, instruction=ctx.instruction, date=_dt.date.today().strftime("%d %B %Y"),
+    )
+    if any(p.get("kind") == "regenerate" for p in pending):
+        await ctx.progress(30.0, "rewriting")
+        try:
+            result = await C.compose(req, progress=ctx.progress)
+        except C.ComposeError as exc:
+            raise pipeline.StageFailure(exc.category, str(exc)) from exc
+        for w in result.warnings:
+            ctx.warn(w)
+        spec = result.spec
+        _refuse_unchanged_edit(ctx, payload, spec, [])
+    else:
+        writes = [p for p in pending if p.get("kind") in ("section", "slide")]
+        if writes:
+            async def writer(item: dict, current: Any, whole: Any) -> Any:
+                await ctx.progress(30.0 + 50.0 * writes.index(item) / max(1, len(writes)), f"writing {item.get('heading') or 'the section'}")
+                return await C.write_section(req, whole, item, current)
+
+            before = spec
+            spec, applied, not_applied = await E.resolve_pending(spec, writes, section_writer=writer)
+            for n in not_applied:
+                ctx.warn(f"not applied: {n['reason']}")
+            if not any(p.get("mode") == "insert" for p in writes):
+                broken = E.restore_pending_guard(before, spec, writes)
+                if broken:
+                    ctx.warn("a rewritten section touched other parts of the file; the earlier content was kept")
+                    spec = before
+            if not applied and not payload.get("applied_ops_deterministic"):
+                ctx.warn("nothing in the file changed")
+            unwritten = [str(n.get("reason") or "") for n in not_applied if n.get("reason")]
+            if not any(p.get("mode") == "insert" for p in writes) and spec is before and applied:
+                unwritten.append("the rewritten section changed other parts of the file, so it was not kept")
+        else:
+            unwritten = []
+        _refuse_unchanged_edit(ctx, payload, spec, unwritten)
+    if material.tables or (_chart_data is not None):
+        spec = await _post_process(spec, material.tables, ctx.warn, ctx.instruction, parent=ctx.parent_spec,
+                                   model_wrote=any(p.get("kind") in ("regenerate", "section", "slide") for p in pending))
+    return spec
+
+
+#: The row error of an edit job that was stopped because nothing in the
+#: file would change. `_run_edit` reads it back to answer "I didn't change
+#: X" instead of "I couldn't finish the change".
+UNCHANGED_EDIT_MARK = "nothing in the file changed"
+
+
+def _refuse_unchanged_edit(ctx: "pipeline.ComposeContext", payload: dict, spec: Any, reasons: Sequence[str]) -> None:
+    """AS3 fix B4: a planned edit whose child is still the parent — every
+    pending section write failed or came back unchanged, a rewrite that was
+    reverted, a regenerate that returned the same content — must NOT publish
+    a version. The version row already exists (acceptance inserts it), so the
+    job fails here, before render and publication, and the version is never
+    current. A format added for the formatting (a CSV lineage gaining XLSX)
+    is a change even when the spec is equal."""
+    from ..artifacts import edits as E
+
+    parent = ctx.parent_spec
+    if parent is None or payload.get("formats_added"):
+        return
+    try:
+        same = E.canonical_json(spec) == E.canonical_json(parent)
+    except Exception:  # noqa: BLE001 — a comparison that cannot run never blocks a change
+        return
+    if not same:
+        return
+    why = "; ".join(r for r in dict.fromkeys(str(x).strip() for x in reasons) if r)[:400]
+    raise pipeline.StageFailure("model_failure", f"{UNCHANGED_EDIT_MARK}: {why}" if why else UNCHANGED_EDIT_MARK)
+
+
+def _edit_sentence(title: str, version: int, changes: Sequence[str], not_applied: Sequence[dict], *, unmet: Sequence[str] = (),
+                   data_only_note: str = "", restored: Optional[int] = None, warnings: Sequence[str] = ()) -> str:
+    """"Updated **X** v3: headings dark blue (#1F3864); Owner column added."
+    plus what was not applied (≤ 2) and the selfcheck's unmet items (≤ 3).
+    Never "Updated" when nothing changed."""
+    if restored is not None:
+        line = f"Restored **{title}** to v{restored} — saved as v{version}."
+    elif changes:
+        said = "; ".join(changes[:6]) + (f"; and {len(changes) - 6} more" if len(changes) > 6 else "")
+        line = f"Updated **{title}** v{version}: {said}."
+    else:
+        line = f"Saved **{title}** v{version}, but nothing in it changed."
+    if not_applied:
+        bits = [f"{_op_words(n.get('op', ''))} ({n.get('reason', '')})" for n in not_applied[:2]]
+        line += " Not applied: " + "; ".join(bits) + "."
+    if unmet:
+        line += " Not confirmed in the file: " + "; ".join(str(u) for u in list(unmet)[:3]) + "."
+    if data_only_note:
+        note = data_only_note.strip().rstrip(".")
+        line += f" {note[0].upper()}{note[1:]}."
+    said_w = [w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")][:2]
+    if said_w:
+        line += " " + " ".join(f"_{w.rstrip('.')}._" for w in said_w)
+    return line
+
+
+def _op_words(op: str) -> str:
+    return {
+        "set_style": "the styling", "set_title": "the title", "set_subtitle": "the subtitle", "set_orientation": "the orientation",
+        "set_page": "the page setup", "set_chart": "the chart change", "replace_section": "the section rewrite",
+        "insert_section": "the new section", "delete_blocks": "the section delete", "rename_heading": "the heading rename",
+        "add_column": "the new column", "rename_column": "the column rename", "delete_column": "the column delete",
+        "reorder_columns": "the column order", "add_rows": "the new rows", "delete_rows": "the row delete",
+        "update_cells": "the cell update", "set_slide_title": "the slide title", "replace_slide": "the slide rewrite",
+        "insert_slide": "the new slide", "delete_slide": "the slide delete", "replace_section_section": "the section rewrite",
+        "insert_section_section": "the new section", "replace_slide_slide": "the slide rewrite", "insert_slide_slide": "the new slide",
+    }.get(op, op.replace("_", " "))
+
+
+def _no_change_sentence(title: str, not_applied: Sequence[dict]) -> str:
+    if not not_applied:
+        return f"**{title}** already looks that way, so I didn't make a new version."
+    bits = [f"{_op_words(n.get('op', ''))}: {n.get('reason', '')}" for n in not_applied[:2]]
+    return f"I didn't change **{title}** — " + "; ".join(bits) + "."
+
+
+async def _run_edit(
+    *, text: str, history: Sequence[dict], emit: Emit, intent: ArtifactIntent, parent_row: dict, candidates: Sequence[dict],
+    conversation_id: str, user_id: int, generation_id: str, effort: str, mode: str, intent_id: str, instruction: str,
+    raw_text: str, gathered: Any = None,
+) -> str:
+    from ..artifacts import edits as E
+    from ..artifacts import store
+
+    started = time.perf_counter()
+    kind = str(parent_row.get("kind") or "document")
+    artifact_id = str(parent_row["id"])
+    current = parent_row.get("current") or {}
+    current_version = int(parent_row.get("current_version") or current.get("version") or 1)
+    title = str(parent_row.get("title") or "")
+    versions = await db.run_in_thread(adb.list_versions, artifact_id, int(user_id))
+    published = {int(v["version"]): v for v in versions if str(v.get("status") or "") in ("completed", "completed_with_warnings")}
+
+    async def say(line: str) -> str:
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "artifact", "effort": effort})
+        return line
+
+    # 1. The plan.
+    restore_n: Optional[int] = None
+    # A restore is a byte copy ONLY when the restore words are the whole
+    # request ("go back to version 1"). "use the version 1 numbers in the
+    # Scope section" or "go back to v1 but keep the new title" names a
+    # version AND asks for a change: that is an edit planned against
+    # version N (the pre-AS3 meaning of a version-named edit), never a
+    # restore that silently drops the rest of the request.
+    base_version = current_version
+    covered = E.restore_request(instruction)
+    if covered is not None:
+        restore_n = covered
+    elif getattr(intent, "rule", "") == "restore-version" and intent.version:
+        named = int(intent.version)
+        if named not in published:
+            return await say(f"**{title}** has no version {named} to start from.")
+        base_version = named
+    elif E.undo_signal(instruction):
+        parent_version = current.get("parent_version")
+        if not parent_version:
+            return await say(f"**{title}** has no earlier version to go back to.")
+        restore_n = int(parent_version)
+    parent_spec = None
+    plan = None
+    if restore_n is not None:
+        if restore_n not in published:
+            other = [c for c in candidates if str(c.get("id")) != artifact_id]
+            for c in other:
+                vs = await db.run_in_thread(adb.list_versions, str(c["id"]), int(user_id))
+                if any(int(v["version"]) == restore_n and v.get("status") in ("completed", "completed_with_warnings") for v in vs):
+                    return await _run_edit(text=text, history=history, emit=emit, intent=intent, parent_row=c, candidates=[], conversation_id=conversation_id,
+                                           user_id=user_id, generation_id=generation_id, effort=effort, mode=mode, intent_id=intent_id,
+                                           instruction=instruction, raw_text=raw_text, gathered=gathered)
+            return await say(f"**{title}** has no version {restore_n} to go back to.")
+        if restore_n == current_version:
+            return await say(f"**{title}** is already at v{restore_n}; nothing changed.")
+        outcome = E.EditOutcome(spec=None, restore_version=restore_n, applied=[f"restored v{restore_n}"], applied_ops=["restore_version"])  # type: ignore[arg-type]
+        planner = "deterministic"
+        formats = lineage_formats(versions, kind, upto=current_version) or [f for f in (published[restore_n].get("formats") or []) if f]
+    else:
+        try:
+            parent_spec = await db.run_in_thread(store.read_spec, store.version_dir(int(user_id), artifact_id, base_version))
+        except Exception as exc:  # noqa: BLE001
+            log.info("artifact edit: parent spec unreadable: %s", type(exc).__name__)
+            parent_spec = None
+        if parent_spec is None:
+            return await say(f"I couldn't read the current version of **{title}** to change it.")
+        await emit("status", {"text": "Planning the change…"})
+        language = "en"
+        if _lexicon_mod is not None and hasattr(_lexicon_mod, "language_of"):
+            try:
+                language = str(_lexicon_mod.language_of(instruction))
+            except Exception:  # noqa: BLE001
+                language = "en"
+        plan = await E.plan(instruction, parent_spec, lineage=sorted(published), language=language, effort=effort)
+        pasted, _transform, _notes = await asyncio.to_thread(_pasted_tables, raw_text, [])
+        edit_tables = list(pasted)
+        if gathered is not None:
+            edit_tables.extend(list(getattr(gathered, "prompt_tables", []) or []))
+        if plan.summary == "undo":  # an undo the intent did not see as one
+            parent_version = current.get("parent_version")
+            if not parent_version:
+                return await say(f"**{title}** has no earlier version to go back to.")
+            restore_n = int(parent_version)
+            outcome = E.EditOutcome(spec=parent_spec, restore_version=restore_n, applied=[f"restored v{restore_n}"], applied_ops=["restore_version"])
+        else:
+            outcome = await asyncio.to_thread(E.apply, parent_spec, plan, tables=edit_tables, instruction=instruction)
+            restore_n = outcome.restore_version
+            if restore_n is not None:
+                if restore_n not in published or restore_n == current_version:
+                    return await say(f"**{title}** has no other version {restore_n} to go back to." if restore_n not in published else f"**{title}** is already at v{restore_n}; nothing changed.")
+        planner = plan.planner
+        formats = lineage_formats(versions, kind) or [f.get("format") for f in (current.get("files") or []) if f.get("format")] or list(T.FORMATS_FOR_KIND[kind][:1])
+
+    metrics_labels = {"planner": planner}
+    if outcome.question:
+        _edit_metric("asked", **metrics_labels)
+        return await say(outcome.question)
+
+    data_only_note = ""
+    style_asked = plan is not None and any(getattr(o, "op", "") == "set_style" for o in plan.ops)
+    added_xlsx = False
+    if kind == "workbook" and style_asked and "csv" in formats and "xlsx" not in formats:
+        formats = formats + ["xlsx"]
+        added_xlsx = True
+        data_only_note = "The CSV carries the data only; the formatting is in the Excel file."
+
+    if not outcome.changed and not added_xlsx:
+        _edit_metric("noop", **metrics_labels)
+        return await say(_no_change_sentence(title, outcome.not_applied))
+
+    # 2. Accept — the child spec rides in the payload.
+    material = C.Material(instruction=instruction, history_text=C.material_from_history(history))
+    material.notes.append(f"Today is {_dt.date.today().strftime('%d %B %Y')}.")
+    material.notes.append("Mode: Salesforce workspace" if mode == "salesforce" else "Mode: assistant")
+    if gathered is not None:
+        for attr in ("prompt_tables", "upload_tables", "answer_tables"):
+            material.tables.extend(list(getattr(gathered, attr, []) or []))
+    changes = list(outcome.applied)
+    if added_xlsx:
+        changes.append("an Excel copy added for the formatting")
+    key_seed = (intent_id or generation_id or "") + f":{artifact_id}:v{base_version}"
+    reason = f"{EDIT_REASON}: {planner}" + (f" · restore v{restore_n}" if restore_n else "")
+    try:
+        job = await db.run_in_thread(
+            pipeline.accept,
+            user_id=int(user_id), conversation_id=conversation_id, generation_id=generation_id,
+            operation="edit", instruction=instruction, kind=kind, formats=formats, format_reason=reason,
+            effort=effort, mode=mode, template_id=str(current.get("template_id") or "generic"), parent=(artifact_id, current_version if restore_n is not None else base_version),
+            requested_formats=intent.formats or None, material=_material_dict(material), title=title,
+            idempotency_key=pipeline.idempotency_key(int(user_id), conversation_id, key_seed, "edit", instruction) if key_seed.strip(":") else "",
+        )
+    except pipeline.ArtifactRefused as exc:
+        return await say(str(exc) or pipeline.safe_error(getattr(exc, "category", "invalid_request")))
+    if job.get("created"):
+        if restore_n is not None:
+            payload = {"restore_version": int(restore_n), "applied": changes, "not_applied": [], "pending": []}
+        else:
+            payload = outcome.to_payload()
+            payload["applied"] = changes
+            payload["applied_ops_deterministic"] = [o for o in outcome.applied_ops if o not in E.PENDING_OPS]
+            payload["formats_added"] = bool(added_xlsx)
+        payload["planner"] = planner
+        payload["parent_version"] = current_version if restore_n is not None else base_version
+        await db.run_in_thread(_attach_payload, int(user_id), str(job["artifact_id"]), int(job["version"]), "edit", payload)
+    _edit_metric("accepted", **metrics_labels)
+    log.info("artifact edit planned in %.2fs (%s, %d op(s), %d pending)", time.perf_counter() - started, planner,
+             len(outcome.applied_ops), len(outcome.pending_sections))
+
+    await emit("step", {"id": _STEP_IDS["intent"], "title": _TITLES["intent"], "status": "running", "detail": ""})
+    await emit("status", {"text": "Applying the change…"})
+    await pipeline.ensure_running(str(job["id"]))
+    row = await _forward_progress(str(job["id"]), emit) or job
+
+    version_row = None
+    try:
+        version_row = await db.run_in_thread(adb.get_version, str(row["artifact_id"]), int(row["version"]), int(user_id))
+    except Exception:  # noqa: BLE001
+        version_row = None
+    ref = pipeline.ref_for(row, version_row)
+    status = str(row.get("status") or "")
+    if status in ("completed", "completed_with_warnings"):
+        warnings = list(ref.warnings)
+        failed_pending = [w for w in warnings if str(w).startswith("not applied:")]
+        said = [c for c in changes if not any(_quoted(c) and _quoted(c) in w for w in failed_pending)]
+        not_applied = list(outcome.not_applied) + [{"op": "", "reason": w[len("not applied: "):]} for w in failed_pending]
+        if any(p.get("kind") == "regenerate" for p in outcome.pending_sections) and parent_spec is not None:
+            try:
+                child = await db.run_in_thread(store.read_spec, store.version_dir(int(user_id), str(row["artifact_id"]), int(row["version"])))
+                changed = E.changed_sections(parent_spec, child) if child is not None else []
+            except Exception:  # noqa: BLE001
+                changed = []
+            said = [c for c in said if c != "the document was rewritten as asked"]
+            said.append(("rewrote " + ", ".join(changed[:5]) + (" and more" if len(changed) > 5 else "")) if changed else "rewrote the file, but no section's text changed")
+        unmet = ((row.get("progress") or {}).get("selfcheck") or {}).get("unmet") or []
+        line = _edit_sentence(ref.title or title, int(ref.version), said, not_applied, unmet=unmet, data_only_note=data_only_note,
+                              restored=restore_n, warnings=[w for w in warnings if w not in failed_pending and w != "nothing in the file changed"])
+    elif status == "cancelled":
+        line = "The change was cancelled before it was finished."
+    elif str(row.get("error") or "").startswith(UNCHANGED_EDIT_MARK):
+        # The job stopped before publication because the file would not have
+        # changed (a pending section write failed): no version was published.
+        why = str(row.get("error") or "")[len(UNCHANGED_EDIT_MARK):].lstrip(": ").strip()
+        line = f"I didn't change **{title}** — {why or 'the change could not be made'}, so no new version was saved."
+        _edit_metric("unchanged", **metrics_labels)
+    else:
+        line = str(row.get("error") or "") or pipeline.safe_error(str(row.get("failure_category") or "renderer_failure"))
+        line = f"I couldn't finish the change: {line}"
+    await emit("token", {"text": line})
+    await emit("meta", {"route": "artifact", "effort": effort, "artifacts": [ref.to_json()]})
+    return line
+
+
+def _quoted(text: str) -> str:
+    m = re.search(r"“([^”]+)”", text or "")
+    return m.group(1) if m else ""
+
+
+def _edit_metric(result: str, **labels: str) -> None:
+    try:
+        from .. import metrics
+
+        metrics.inc("artifact_edits_total", "artifact edit turns by outcome", result=result, **labels)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+try:
+    from ..artifacts import lexicon as _lexicon_mod  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _lexicon_mod = None  # type: ignore[assignment]
+
+
 async def visual_reviewer(ctx: "pipeline.ComposeContext", spec, pages: List[bytes]):
     """Installed on the pipeline for Max effort: the vision-capable model
     looks at a few rendered pages; layout defects it reports become ONE
@@ -858,6 +1699,11 @@ async def visual_reviewer(ctx: "pipeline.ComposeContext", spec, pages: List[byte
     verdict = await C.visual_review(pages, kind=spec.kind, title=spec.title)
     issues = [i for i in (verdict or {}).get("issues", []) if isinstance(i, dict)]
     if not issues:
+        return None
+    if ctx.operation == "edit" and str((getattr(ctx, "job", None) or {}).get("format_reason") or "").startswith(EDIT_REASON):
+        # AS3 correction 6: a planned edit keeps every untouched part as it
+        # was; a whole-document revise would rewrite them. Said, not done.
+        ctx.warn("the page check found layout issues; an edit keeps the rest of the file as it was, so they were not changed")
         return None
     material = _material_from_dict(ctx.material)
     material.instruction = ctx.instruction
@@ -877,4 +1723,4 @@ async def classify_hook(text: str) -> Optional[ArtifactIntent]:
     return ArtifactIntent("create", rule="model", instruction=_decision_text(text))
 
 
-__all__ = ["run_artifact_engine", "compose_for_pipeline", "visual_reviewer", "classify_hook"]
+__all__ = ["run_artifact_engine", "compose_for_pipeline", "visual_reviewer", "classify_hook", "pick_artifact", "lineage_formats"]

@@ -5,6 +5,11 @@
  * prepends), and the @page rules are generated there too, because
  * WeasyPrint does not resolve var() inside page-margin boxes.
  *
+ * TechSara Classic (docs/artifact-studio/as3/styling-engine.md): the values
+ * behind the properties come from artifacts/style.py's ResolvedStyle, and
+ * html.py appends the element rules a requested style adds AFTER this sheet
+ * (class- and data-attribute selectors built from integers, never text).
+ *
  * First-party. No external fonts, no images, no imports: the renderer's URL
  * fetcher refuses everything but a bare chart filename anyway. */
 
@@ -14,17 +19,19 @@ html { font-family: var(--font-sans); color: var(--ink); }
 body { margin: 0; font-size: var(--body-pt); line-height: var(--line-height); }
 
 /* ------------------------------------------------------ running boxes -- */
-.running-header { position: running(header); font-size: var(--small-pt); color: var(--ink-muted);
-  border-bottom: 0.6pt solid var(--border); padding-bottom: 3pt; }
-.running-header .title { font-weight: bold; color: var(--ink); }
+.running-header { position: running(header); font-size: 9pt; color: var(--ink-faint);
+  border-bottom: 0.5pt solid var(--border); padding-bottom: 3pt; }
+.running-header .title { font-weight: bold; }
 .running-header .mark { float: right; color: var(--danger); font-weight: bold; letter-spacing: 0.08em; font-size: var(--caption-pt); }
-.running-footer { position: running(footer); font-size: var(--caption-pt); color: var(--ink-faint); }
+.running-header .date { float: right; }
+.running-footer { position: running(footer); font-size: 9pt; color: var(--ink-faint); }
 
 /* ---------------------------------------------------------- headings -- */
-h1, h2, h3 { font-family: var(--font-sans); color: var(--navy); line-height: 1.2; page-break-after: avoid; margin: 0; }
-h1 { font-size: var(--h1-pt); margin-top: 18pt; margin-bottom: 8pt; padding-bottom: 4pt; border-bottom: 1.2pt solid var(--accent); }
-h2 { font-size: var(--h2-pt); margin-top: 14pt; margin-bottom: 6pt; }
-h3 { font-size: var(--h3-pt); margin-top: 10pt; margin-bottom: 4pt; color: var(--boardroom); }
+h1, h2, h3 { font-family: var(--font-heading, var(--font-sans)); color: var(--navy); line-height: 1.2; page-break-after: avoid;
+  break-after: avoid; margin: 0; letter-spacing: normal; }
+h1 { font-size: var(--h1-pt); margin-top: 18pt; margin-bottom: 6pt; padding-bottom: 3pt; border-bottom: 0.75pt solid var(--border); }
+h2 { font-size: var(--h2-pt); margin-top: 14pt; margin-bottom: 4pt; color: var(--accent-text, var(--boardroom)); }
+h3 { font-size: var(--h3-pt); margin-top: 10pt; margin-bottom: 3pt; color: var(--ink); }
 main > h1:first-child, main > h2:first-child { margin-top: 0; }
 
 /* numbered headings (sop, technical_report, proposal): the number is text
@@ -33,8 +40,8 @@ main > h1:first-child, main > h2:first-child { margin-top: 0; }
 main h1 .hnum, main h2 .hnum, main h3 .hnum { color: var(--accent); margin-right: 0.55em; }
 
 /* -------------------------------------------------------------- text -- */
-p { margin: 0 0 7pt 0; orphans: 3; widows: 3; }
-p.lede { font-size: calc(var(--body-pt) + 1.5pt); color: var(--boardroom); line-height: 1.5; margin-bottom: 10pt; }
+p { margin: 0 0 6pt 0; orphans: 3; widows: 3; }
+p.lede { font-size: calc(var(--body-pt) + 1.5pt); color: var(--accent-text, var(--boardroom)); line-height: 1.45; margin-bottom: 10pt; }
 ul, ol { margin: 0 0 8pt 0; padding-left: 18pt; }
 li { margin-bottom: 3pt; }
 ol.steps { counter-reset: step; list-style: none; padding-left: 0; }
@@ -50,10 +57,10 @@ sup.cite { font-size: 70%; color: var(--accent); margin-left: 1pt; }
 
 /* ------------------------------------------------------------- cover -- */
 section.cover { page: cover; height: 100%; display: block; position: relative; }
-section.cover .band { background: var(--navy); color: #fff; padding: 28mm 18mm 20mm 18mm; }
+section.cover .band { background: var(--cover-band, var(--navy)); color: #fff; padding: 28mm 18mm 20mm 18mm; border-bottom: 4pt solid var(--accent); }
 section.cover .band .kicker { font-size: var(--small-pt); letter-spacing: 0.14em; text-transform: uppercase; opacity: 0.8; }
-section.cover .band h1.doc-title { color: #fff; border: none; font-size: var(--title-pt); margin: 10pt 0 6pt 0; line-height: 1.15; }
-section.cover .band .subtitle { font-size: var(--subtitle-pt); opacity: 0.9; }
+section.cover .band h1.doc-title { color: #fff; border: none; font-size: 32pt; margin: 10pt 0 6pt 0; line-height: 1.15; }
+section.cover .band .subtitle { font-size: 16pt; color: #DCE6F2; }
 section.cover table.meta { margin-top: 20mm; font-size: var(--body-pt); color: var(--ink-muted); border-collapse: collapse; }
 section.cover table.meta td { padding: 2pt 8pt 2pt 0; vertical-align: top; }
 section.cover table.meta td.label { width: 34mm; color: var(--ink-faint); font-size: var(--small-pt); text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap; }
@@ -62,9 +69,9 @@ section.cover + * { page-break-before: always; }
 
 /* title block when there is no cover page */
 header.titleblock { margin-bottom: 12pt; padding-bottom: 8pt; border-bottom: 2pt solid var(--navy); }
-header.titleblock h1.doc-title { border: none; font-size: var(--title-pt); margin: 0 0 4pt 0; padding: 0; }
-header.titleblock .subtitle { font-size: var(--subtitle-pt); color: var(--ink-muted); }
-header.titleblock .byline { font-size: var(--small-pt); color: var(--ink-faint); margin-top: 4pt; }
+header.titleblock h1.doc-title { border: none; font-size: var(--title-pt); margin: 0 0 4pt 0; padding: 0; letter-spacing: normal; }
+header.titleblock .subtitle { font-size: var(--subtitle-pt); color: var(--ink-muted); letter-spacing: normal; }
+header.titleblock .byline { font-size: var(--caption-pt); color: var(--ink-faint); margin-top: 4pt; font-style: italic; }
 
 /* ------------------------------------------------------ control strip -- */
 table.control { width: 100%; border-collapse: collapse; margin: 0 0 12pt 0; font-size: var(--small-pt); }
@@ -92,7 +99,7 @@ nav.toc a::after { content: leader(".") target-counter(attr(href), page); color:
 
 /* -------------------------------------------------------------- kpis -- */
 .kpis { display: flex; gap: 8pt; margin: 6pt 0 12pt 0; page-break-inside: avoid; }
-.kpi { flex: 1 1 0; background: var(--surface); border-top: 2.5pt solid var(--accent); padding: 8pt 10pt; }
+.kpi { flex: 1 1 0; background: var(--surface); border-top: 3pt solid var(--kpi-bar, var(--accent)); padding: 8pt 10pt; }
 .kpi .kpi-value { font-size: var(--kpi-pt); font-weight: bold; color: var(--navy); line-height: 1.1; overflow-wrap: normal; word-break: keep-all; hyphens: none; }
 /* A long value shrinks by length (html._kpi_size_class) rather than wrapping inside a token. */
 .kpi .kpi-value.kpi-sm { font-size: calc(var(--kpi-pt) * 0.72); }
@@ -102,10 +109,12 @@ nav.toc a::after { content: leader(".") target-counter(attr(href), page); color:
 
 /* ------------------------------------------------------------ tables -- */
 table.data { width: 100%; border-collapse: collapse; margin: 6pt 0 10pt 0; font-size: var(--small-pt); }
-p.table-caption { font-size: var(--caption-pt); color: var(--ink-muted); margin: -6pt 0 10pt 0; page-break-before: avoid; }
+p.table-caption { font-size: var(--caption-pt); color: var(--ink-faint); font-style: italic; margin: -6pt 0 10pt 0; page-break-before: avoid; }
 table.data thead { display: table-header-group; }
-table.data th { background: var(--navy); color: #fff; text-align: left; padding: 4pt 6pt; font-weight: bold; }
-table.data td { padding: 3.5pt 6pt; border-bottom: 0.5pt solid var(--border); vertical-align: top; }
+table.data th { background: var(--header-fill, var(--navy)); color: var(--header-text, #fff); text-align: left; padding: 4pt 6pt; font-weight: bold;
+  border-bottom: 1pt solid var(--navy); }
+table.data td { padding: 4pt 6pt; border-bottom: 0.5pt solid var(--border); vertical-align: top; }
+table.data tr.total td { background: var(--total-fill); color: var(--total-text); font-weight: bold; border-top: 1pt solid var(--total-text); }
 table.data tbody tr:nth-child(even) td { background: var(--surface); }
 table.data th.num, table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 table.data tr { page-break-inside: avoid; }
@@ -130,17 +139,21 @@ table.data.tabular th, table.data.tabular td { overflow-wrap: anywhere; word-bre
   padding: 3pt 4pt; vertical-align: top; }
 table.data.tabular th { font-weight: bold; }
 table.data.tabular[data-header-bold="no"] th { font-weight: normal; }
-table.data.tabular.borders th, table.data.tabular.borders td { border: 0.6pt solid #000; }
+table.data.tabular.borders th, table.data.tabular.borders td { border: 0.5pt solid var(--border); }
+table.data.tabular.borders th { border-bottom: 1pt solid var(--navy); }
 table.data.tabular.no-borders td { border-bottom: 0.5pt solid var(--border); }
 table.data.tabular tbody tr:nth-child(even) td { background: transparent; }
 table.data.tabular tbody tr:nth-child(even) td:not(.hl) { background: var(--surface); }
+table.data.tabular.unbanded tbody tr:nth-child(even) td:not(.hl) { background: transparent; }
+table.data.tabular tbody tr.total td { background: var(--total-fill); color: var(--total-text); font-weight: bold; border-top: 1pt solid var(--total-text); }
 table.data.tabular thead { display: table-header-group; }
 table.data.tabular tr { page-break-inside: avoid; }
 
 /* ------------------------------------------------------------ charts -- */
 figure.chart { margin: 8pt 0 12pt 0; page-break-inside: avoid; text-align: center; }
 figure.chart img { width: 100%; max-width: 6.3in; height: auto; }
-figure.chart figcaption { font-size: var(--caption-pt); color: var(--ink-muted); text-align: left; margin-top: 3pt; }
+figure.chart figcaption { font-size: var(--caption-pt); color: var(--ink-faint); font-style: italic; text-align: left; margin-top: 3pt; }
+body.landscape figure.chart img { max-width: 9.7in; }
 
 /* ------------------------------------------------------- tail sections -- */
 section.sources, section.assumptions { margin-top: 14pt; page-break-before: auto; }
@@ -162,6 +175,7 @@ body.deck { font-size: var(--slide-body-pt); }
 .slide.last { page-break-after: auto; }
 .slide .title { position: absolute; left: var(--slide-margin); right: var(--slide-margin); top: var(--slide-title-top);
   height: var(--slide-title-h); font-size: var(--slide-title-pt); font-weight: bold; color: var(--navy); line-height: 1.15;
+  font-family: var(--font-heading, var(--font-sans));
   border-bottom: 2pt solid var(--accent); padding-bottom: 6pt; }
 .slide .body { position: absolute; left: var(--slide-margin); right: var(--slide-margin); top: var(--slide-body-top);
   height: var(--slide-body-h); }

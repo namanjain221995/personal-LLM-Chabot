@@ -91,6 +91,12 @@ export interface ChatRequestBody {
    * version instead of a stacked copy. Forwarded only when well-formed.
    */
   answer_branch?: AnswerBranch;
+  /**
+   * AS3: the artifact an "Edit with a prompt" turn targets (32 lowercase
+   * hex). Forwarded only when it has that shape; the orchestrator re-checks
+   * that it is one of the caller's own published artifacts.
+   */
+  artifact_id?: string;
 }
 
 /** The tree position a send asks the server to store its answer under. */
@@ -126,7 +132,12 @@ export interface OrchestratorChatRequest {
   intent_id?: string;
   /** The answer's tree position — see ChatRequestBody.answer_branch. */
   answer_branch?: AnswerBranch;
+  /** The artifact an edit turn targets — see ChatRequestBody.artifact_id. */
+  artifact_id?: string;
 }
+
+/** An artifact id as the orchestrator issues them: 32 lowercase hex. */
+const ARTIFACT_ID_RE = /^[a-f0-9]{32}$/;
 
 /**
  * `answer_branch` as it may be forwarded: exactly `{self, parent?}`, both
@@ -294,5 +305,10 @@ export function toOrchestratorChatRequest(
     // Only when the browser announced one (a regenerate, an edit, a send in a
     // branched conversation), so an ordinary send stays byte-identical.
     ...(answerBranch ? { answer_branch: answerBranch } : {}),
+    // AS3: only a well-formed id, so an ordinary send stays byte-identical
+    // and a malformed one never reaches the orchestrator's 422.
+    ...(typeof body.artifact_id === 'string' && ARTIFACT_ID_RE.test(body.artifact_id)
+      ? { artifact_id: body.artifact_id }
+      : {}),
   };
 }

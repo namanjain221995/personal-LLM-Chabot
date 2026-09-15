@@ -18,6 +18,16 @@ in the spec is markup and nothing is rendered as markup. Chart images are
 referenced by BARE filename (`chart-3.png`); pdf.py's fetcher refuses
 anything else, so a spec cannot name a URL even if a field slipped through.
 
+STYLE FROM ONE RESOLVER. Colours, fonts, sizes and page geometry come from
+style.resolve(spec) — TechSara Classic unless spec.style says otherwise —
+the same ResolvedStyle docx.py and pptx.py read. What reaches the CSS is
+only what the style model validated: `#RRGGBB` colours, allowlisted font
+stacks (constant strings) and numbers. A rule that names one element (a
+heading by its text, a column, a row) becomes a class or a data attribute
+computed HERE (`ts-e3`, `table.ts-t2 td[data-col="4"]`), and the selector
+is built from those code-made names only — a heading's text never appears
+in a selector, and no `url(`, `@import` or external font is ever written.
+
 TEMPLATES DIFFER IN STRUCTURE, NOT JUST TITLE. An executive report opens with
 a cover and its KPI row hoisted to the top; a brief has no cover, tight
 margins and a KPI band; an SOP prints a document-control strip and numbered
@@ -29,11 +39,13 @@ rendering of each switch is here.
 from __future__ import annotations
 
 import html as _html
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .. import spec as S
+from .. import style as ST
 from . import theme
 
 e = _html.escape
@@ -58,6 +70,126 @@ def _kpi_size_class(value: str) -> str:
 def print_css() -> str:
     """The first-party stylesheet, read from assets/print.css."""
     return (_ASSETS_DIR / "print.css").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------ style → css --
+
+_CSS_HEX = re.compile(r"^#[0-9A-F]{6}$")
+
+
+def _css_colour(value: Optional[str]) -> Optional[str]:
+    """A validated colour, or None. The style model already guarantees the
+    shape; this second check is what makes an injection through a colour
+    impossible even if a caller built a TextStyle without validation."""
+    if not isinstance(value, str):
+        return None
+    v = value.upper()
+    return v if _CSS_HEX.match(v) else None
+
+
+def css_decls(ts: ST.TextStyle, R: ST.ResolvedStyle, *, keys: Optional[Sequence[str]] = None) -> str:
+    """CSS declarations for a TextStyle: only allowlisted font stacks,
+    validated hex colours, clamped numbers and enumerated keywords."""
+    want = set(keys) if keys is not None else set(ST.TextStyle.model_fields)
+    out: List[str] = []
+    if "font_family" in want and ts.font_family:
+        face = ST.font_face(ts.font_family)
+        if face is not None:
+            out.append(f"font-family:{theme.pdf_font_stack(face)}")
+    if "size_pt" in want and isinstance(ts.size_pt, (int, float)) and 6 <= float(ts.size_pt) <= 72:
+        out.append(f"font-size:{float(ts.size_pt):g}pt")
+    if "bold" in want and ts.bold is not None:
+        out.append("font-weight:bold" if ts.bold else "font-weight:normal")
+    if "italic" in want and ts.italic is not None:
+        out.append("font-style:italic" if ts.italic else "font-style:normal")
+    if "underline" in want and ts.underline is not None:
+        out.append("text-decoration:underline" if ts.underline else "text-decoration:none")
+    if "color" in want and _css_colour(ts.color):
+        out.append(f"color:{_css_colour(ts.color)}")
+    if "background" in want and _css_colour(ts.background):
+        out.append(f"background:{_css_colour(ts.background)}")
+    if "align" in want and ts.align in ("left", "center", "right", "justify"):
+        out.append(f"text-align:{ts.align}")
+    return ";".join(out)
+
+
+def _diff_keys(specific: ST.TextStyle, generic: ST.TextStyle) -> List[str]:
+    return [k for k in ST.TextStyle.model_fields if getattr(specific, k) != getattr(generic, k)]
+
+
+def _generic_css(R: ST.ResolvedStyle, *, deck: bool = False, table_pt: Optional[float] = None) -> str:
+    """The element styles every document shares, from the resolver's
+    generic element styles (the ones the DOCX named styles carry)."""
+    rules: List[str] = []
+
+    def g(selector: str, kind: str, keys: Optional[Sequence[str]] = None, **loc: Any) -> None:
+        ts = R.element(kind, generic_only=True, **loc)
+        if table_pt is not None and kind in ("table_header", "table_body", "table_total") and ts.size_pt == R.base(kind).size_pt:
+            # The tabular Word/PDF twin sets its cells at TABULAR_CELL_PT
+            # unless a person asked for a size.
+            ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "size_pt": table_pt})
+        decls = css_decls(ts, R, keys=keys)
+        if decls:
+            rules.append(f"{selector}{{{decls}}}")
+
+    if deck:
+        base = ("font_family", "color")
+        bullets = R.element("slide_body", generic_only=True)
+        for rule in R.matching_rules("bullet"):
+            if not rule.target.has_locator:
+                bullets = rule.style.over(bullets)
+        keys = list(dict.fromkeys(list(base) + _diff_keys(bullets, R.base("slide_body"))))
+        decls = css_decls(bullets, R, keys=keys)
+        if decls:
+            rules.append(f".slide ul.bullets > li{{{decls}}}")
+        for kind, selector in (("slide_title", ".slide .title"), ("slide_body", ".slide .body"),
+                               ("kpi_value", ".slide .kpi-box .v"), ("kpi_label", ".slide .kpi-box .l"), ("caption", ".slide figcaption, .slide p.table-caption"),
+                               ("header_footer", ".slide .footer")):
+            ts, b = R.element(kind, generic_only=True), R.base(kind)
+            g(selector, kind, keys=list(dict.fromkeys(list(base) + _diff_keys(ts, b))))
+        ts, b = R.element("table_header", generic_only=True), R.base("table_header")
+        g(".slide table.data th", "table_header", keys=list(dict.fromkeys(["background", "color", "font_family"] + _diff_keys(ts, b))))
+        ts, b = R.element("table_body", generic_only=True), R.base("table_body")
+        g(".slide table.data td", "table_body", keys=list(dict.fromkeys(["font_family", "color"] + _diff_keys(ts, b))))
+        ts, b = R.element("title", generic_only=True), R.base("title")
+        g(".slide.band .deck-title", "title", keys=[k for k in _diff_keys(ts, b) if k != "background"] + ["font_family"])
+        ts, b = R.element("subtitle", generic_only=True), R.base("subtitle")
+        g(".slide.band .deck-subtitle", "subtitle", keys=[k for k in _diff_keys(ts, b) if k != "background"] + ["font_family"])
+        return "".join(rules)
+    g("header.titleblock h1.doc-title", "title")
+    g("section.cover .band h1.doc-title", "title", keys=["font_family", "bold", "italic", "underline", "align"])
+    g("header.titleblock .subtitle", "subtitle")
+    for level in (1, 2, 3):
+        g(f"main h{level}", "heading", level=level)
+        g(f"section.sources h{level}, section.assumptions h{level}", "heading", keys=["font_family", "color"], level=level)
+    g("main > p", "paragraph")
+    g("main > ul > li, main > ol > li", "bullet")
+    g("p.table-caption, figure.chart figcaption, header.titleblock .byline, p.sheet-count, p.sheet-note, body.tpl-tabular p.sheet-note, body.tpl-tabular p.sheet-count", "caption")
+    g("table.data th", "table_header")
+    g("table.data td", "table_body", keys=["font_family", "size_pt", "bold", "italic", "underline", "color", "align"])
+    g("table.data tbody tr td, table.data tbody tr:nth-child(even) td", "table_body", keys=["background"])
+    if not R.banded:
+        rules.append("table.data tbody tr:nth-child(even) td:not(.hl){background:none}")
+    g("table.data tbody tr.total td, table.data.tabular.tabular tbody tr.total.total td:not(.hl)", "table_total")
+    g(".kpi .kpi-value", "kpi_value", keys=["font_family", "size_pt", "bold", "italic", "underline", "color", "align"])
+    g(".kpi .kpi-label", "kpi_label", keys=["font_family", "size_pt", "bold", "italic", "underline", "color", "align"])
+    g(".callout p", "callout", keys=["font_family", "size_pt", "bold", "italic", "underline", "color", "align"])
+    g(".running-header, .running-footer", "header_footer", keys=["font_family", "size_pt", "bold", "italic", "underline", "color"])
+    return "".join(rules)
+
+
+def document_orientation(spec: S.DocumentSpec, R: Optional[ST.ResolvedStyle] = None) -> str:
+    """The page orientation of a document, decided once for the PDF and the
+    DOCX: the style's when a person asked, else the spec's, else landscape
+    when a table has more than seven columns (style guide §3)."""
+    R = R or ST.resolve(spec)
+    if R.page.orientation_explicit:
+        return R.page.orientation
+    if spec.orientation == "landscape":
+        return "landscape"
+    if any(isinstance(b, S.TableBlock) and len(b.table.columns) > 7 for b in spec.blocks):
+        return "landscape"
+    return "portrait"
 
 
 # --------------------------------------------------------------- numbers --
@@ -462,22 +594,67 @@ def _cite(ids: Sequence[str], index: Dict[str, int]) -> str:
     return f'<sup class="cite">[{", ".join(str(n) for n in nums)}]</sup>'
 
 
-def _table_html(table: S.Table, index: Dict[str, int]) -> str:
+def _table_rules_css(R: Optional[ST.ResolvedStyle], ordinal: int, columns: Sequence[str], n_rows: int, *, sheet: Optional[str] = None,
+                     row_offset: int = 0) -> str:
+    """Per-table CSS for rules that name this table, one of its columns or
+    rows. Selectors are built from integers only (`ts-t2`, data-col,
+    data-row); `row_offset` maps a sheet's spreadsheet row numbers (the
+    header is row 1) onto data rows."""
+    if R is None or not R.rules:
+        return ""
+    out: List[str] = []
+    gen_head, gen_body = R.element("table_header", generic_only=True), R.element("table_body", generic_only=True)
+    # The class repeated three times: these rules must outrank print.css's
+    # zebra and tabular rules (up to five class-level selectors) without
+    # !important; a highlighted column's inline pair still wins.
+    tsel = f"table.data.ts-t{int(ordinal)}.ts-t{int(ordinal)}.ts-t{int(ordinal)}"
+    head = R.element("table_header", table=ordinal, sheet=sheet)
+    keys = _diff_keys(head, gen_head)
+    if keys:
+        out.append(f"{tsel} thead th{{{css_decls(head, R, keys=keys)}}}")
+    body = R.element("table_body", table=ordinal, sheet=sheet)
+    keys = _diff_keys(body, gen_body)
+    if keys:
+        out.append(f"{tsel} tbody tr td:not(.hl){{{css_decls(body, R, keys=keys)}}}")
+    for j, name in enumerate(columns):
+        ts = R.element("table_body", table=ordinal, sheet=sheet, column=name, column_index=j)
+        keys = _diff_keys(ts, body)
+        if keys:
+            out.append(f'{tsel} tbody tr td[data-col="{int(j)}"]:not(.hl){{{css_decls(ts, R, keys=keys)}}}')
+    for rule in R.rules:
+        t = rule.target
+        if t.kind == "row" and t.index is not None and (t.sheet is None or sheet is None or ST._fold(t.sheet) == ST._fold(sheet)):
+            data_row = int(t.index) - row_offset
+            if 1 <= data_row <= n_rows:
+                ts = ST.TextStyle.model_validate(rule.style.model_dump())
+                decls = css_decls(ts, R)
+                if rule.style.background and rule.style.color is None:
+                    decls += f";color:{ST.readable_on(rule.style.background)}" if ST.contrast_ratio(gen_body.color or ST.INK, rule.style.background) < 4.5 else ""
+                out.append(f'{tsel} tbody tr[data-row="{int(data_row)}"] td:not(.hl){{{decls}}}')
+    total = R.element("table_total", sheet=sheet)
+    keys = _diff_keys(total, R.element("table_total", generic_only=True))
+    if keys:
+        out.append(f"{tsel} tbody tr.total.total td:not(.hl){{{css_decls(total, R, keys=keys)}}}")
+    return "".join(out)
+
+
+def _table_html(table: S.Table, index: Dict[str, int], ordinal: int = 0) -> str:
     numeric = set(table.numeric_columns)
     head = "".join(
-        f'<th class="{"num" if i in numeric else "txt"}">{e(c)}</th>' for i, c in enumerate(table.columns)
+        f'<th class="{"num" if i in numeric else "txt"}" data-col="{i}">{e(c)}</th>' for i, c in enumerate(table.columns)
     )
     body_rows = []
-    for row in table.rows:
+    for r, row in enumerate(table.rows, start=1):
         cells = "".join(
-            f'<td class="{"num" if i in numeric else "txt"}">{e(cell_text(v, i in numeric))}</td>'
+            f'<td class="{"num" if i in numeric else "txt"}" data-col="{i}">{e(cell_text(v, i in numeric))}</td>'
             for i, v in enumerate(row)
         )
-        body_rows.append(f"<tr>{cells}</tr>")
+        body_rows.append(f'<tr data-row="{r}">{cells}</tr>')
     caption = ""
     if table.caption or table.sources:
         caption = f'<p class="table-caption">{e(table.caption)}{_cite(table.sources, index)}</p>'
-    return f'<table class="data"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>{caption}'
+    cls = f"data ts-t{ordinal}" if ordinal else "data"
+    return f'<table class="{cls}"><thead><tr>{head}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>{caption}'
 
 
 def _chart_html(chart: S.Chart, ordinal: int, index: Dict[str, int]) -> str:
@@ -496,8 +673,18 @@ def _kpis_html(row: S.KPIRow) -> str:
     return f'<div class="kpis">{items}</div>'
 
 
-def _callout_html(c: S.Callout) -> str:
-    accent, bg = theme.CALLOUT_COLOURS.get(c.kind, theme.CALLOUT_COLOURS["note"])
+_CALLOUT_STATUS = {"note": "info", "tip": "success", "warning": "warning", "quote": "neutral"}
+
+
+def _callout_html(c: S.Callout, R: Optional[ST.ResolvedStyle] = None) -> str:
+    """A callout: the status fill of its kind, a 3 pt left bar in the status
+    text colour (style guide §3). The two colours are constants of the
+    style module, validated hex."""
+    bg, accent = ST.STATUS_PAIRS[_CALLOUT_STATUS.get(c.kind, "info")]
+    if R is not None:
+        ts = R.element("callout")
+        if _css_colour(ts.background):
+            bg = _css_colour(ts.background)
     title = f'<div class="callout-title">{e(c.title or c.kind.capitalize())}</div>' if c.kind != "quote" or c.title else ""
     return (
         f'<div class="callout {e(c.kind)}" style="--callout-accent:{accent};--callout-bg:{bg}">'
@@ -528,39 +715,60 @@ def _assumptions_html(assumptions: Sequence[str]) -> str:
     return f'<section class="assumptions"><h2>Assumptions</h2><ul>{items}</ul></section>'
 
 
-def _root_vars(t: theme.TypeScale, extra: str = "") -> str:
+def _root_vars(t: theme.TypeScale, extra: str = "", R: Optional[ST.ResolvedStyle] = None) -> str:
+    """The custom properties print.css reads, from the ResolvedStyle. The
+    historical names (--navy, --surface, --border ...) are kept and point
+    at the Classic tokens, so the stylesheet's structure is unchanged."""
+    R = R or ST.resolve(None, type_scale=t)
+    k = R.tokens
+    serif = ST.font_face("Cambria")
+    mono = ST.font_face("Courier New")
+    sizes = R.sizes
     return (
         ":root{" + extra +
-        f"--font-sans:{theme.CSS_SANS};--font-serif:{theme.CSS_SERIF};--font-mono:{theme.CSS_MONO};"
-        f"--ink:{theme.INK};--ink-muted:{theme.INK_MUTED};--ink-faint:{theme.INK_FAINT};--surface:{theme.SURFACE};"
-        f"--border:{theme.BORDER};--accent:{theme.ACCENT};--navy:{theme.NAVY};--boardroom:{theme.BOARDROOM};"
-        f"--slate:{theme.SLATE};--teal:{theme.TEAL};--danger:{theme.DANGER};"
-        f"--body-pt:{t.body}pt;--small-pt:{t.small}pt;--caption-pt:{t.caption}pt;--h1-pt:{t.h1}pt;--h2-pt:{t.h2}pt;"
-        f"--h3-pt:{t.h3}pt;--title-pt:{t.title}pt;--subtitle-pt:{t.subtitle}pt;--kpi-pt:{t.kpi_value}pt;"
+        f"--font-sans:{theme.pdf_font_stack(R.body_face)};--font-heading:{theme.pdf_font_stack(R.heading_face)};"
+        f"--font-serif:{theme.pdf_font_stack(serif) if serif else theme.CSS_SERIF};--font-mono:{theme.pdf_font_stack(mono) if mono else theme.CSS_MONO};"
+        f"--ink:{k.ink};--ink-muted:{k.muted};--ink-faint:{k.caption};--surface:{k.band};--band:{k.band};"
+        f"--border:{k.hairline};--grid:{k.grid};--accent:{k.accent};--accent-text:{k.accent_text};--navy:{k.primary};--primary:{k.primary};"
+        f"--boardroom:{k.accent_text};--slate:{k.muted};--teal:{k.accent};--danger:{ST.STATUS_PAIRS['danger'][1]};"
+        f"--header-fill:{k.header_fill};--header-text:{k.header_text};--total-fill:{k.total_fill};--total-text:{k.total_text};"
+        f"--cover-band:{k.cover_band};--kpi-bar:{k.kpi_bar};"
+        f"--body-pt:{sizes.body:g}pt;--small-pt:{sizes.table:g}pt;--caption-pt:{sizes.caption:g}pt;--h1-pt:{sizes.h1:g}pt;--h2-pt:{sizes.h2:g}pt;"
+        f"--h3-pt:{sizes.h3:g}pt;--title-pt:{sizes.title:g}pt;--subtitle-pt:{sizes.subtitle:g}pt;--kpi-pt:{sizes.kpi_value:g}pt;"
         f"--line-height:{t.line_height};"
         "}"
     )
 
 
-def _page_rules(plan: DocumentPlan) -> str:
+def _page_box_text(R: ST.ResolvedStyle) -> str:
+    hf = R.element("header_footer")
+    return f"font-family:{theme.pdf_font_stack(R.face(hf.font_family))};font-size:{float(hf.size_pt or 9):g}pt;color:{_css_colour(hf.color) or R.tokens.caption}"
+
+
+def _page_rules(plan: DocumentPlan, R: Optional[ST.ResolvedStyle] = None, orientation: Optional[str] = None) -> str:
+    R = R or ST.resolve(plan.spec, type_scale=plan.type)
+    orientation = orientation or document_orientation(plan.spec, R)
     g = plan.grid
-    size = f"A4 {plan.spec.orientation}"
+    top, bottom, left, right = R.page.margins_mm or (g.top_mm, g.bottom_mm, g.left_mm, g.right_mm)
+    w, h = ST.PAGE_SIZES_MM.get(R.page.size, (210, 297))
+    if orientation == "landscape":
+        w, h = max(w, h), min(w, h)
+    else:
+        w, h = min(w, h), max(w, h)
+    size = f"{w:g}mm {h:g}mm"
     boxes = []
     if g.header:
         boxes.append("@top-center{content:element(header);width:100%;vertical-align:bottom;padding-bottom:4pt}")
     if g.footer:
-        boxes.append(
-            '@bottom-center{content:"Page " counter(page) " of " counter(pages);'
-            f"font-family:{theme.CSS_SANS};font-size:8.5pt;color:{theme.INK_FAINT}}}"
-        )
+        if R.page.page_numbers:
+            boxes.append('@bottom-right{content:"Page " counter(page) " of " counter(pages);' + _page_box_text(R) + ";vertical-align:top}")
         boxes.append("@bottom-left{content:element(footer);vertical-align:top}")
-    page = f"@page{{size:{size};margin:{g.top_mm}mm {g.right_mm}mm {g.bottom_mm}mm {g.left_mm}mm;{''.join(boxes)}}}"
-    cover = "@page cover{@top-center{content:none}@bottom-center{content:none}@bottom-left{content:none}}"
-    # The cover fills its page exactly: A4 is 210 x 297 mm.
-    page_h = 297 if plan.spec.orientation == "portrait" else 210
+    page = f"@page{{size:{size};margin:{top:g}mm {right:g}mm {bottom:g}mm {left:g}mm;{''.join(boxes)}}}"
+    cover = "@page cover{@top-center{content:none}@bottom-right{content:none}@bottom-left{content:none}}"
+    # The cover fills its page exactly.
     cover_box = (
-        f"section.cover{{height:{page_h - g.top_mm - g.bottom_mm}mm}}"
-        f"section.cover .band{{margin:-{g.top_mm}mm -{g.right_mm}mm 0 -{g.left_mm}mm}}"
+        f"section.cover{{height:{h - top - bottom:g}mm}}"
+        f"section.cover .band{{margin:-{top:g}mm -{right:g}mm 0 -{left:g}mm}}"
     )
     return page + cover + cover_box
 
@@ -568,18 +776,21 @@ def _page_rules(plan: DocumentPlan) -> str:
 # --------------------------------------------------------- document html --
 
 
-def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None) -> str:
+def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None, resolved: Optional[ST.ResolvedStyle] = None) -> str:
     """A complete HTML page for one document."""
     plan = plan or plan_document(spec)
+    R = resolved or ST.resolve(spec, type_scale=plan.type)
+    orientation = document_orientation(spec, R)
     index = plan.citation_index
+    extra_css: List[str] = []
     body_classes = [f"tpl-{plan.template_id}", "doc"]
     if plan.numbered:
         body_classes.append("numbered")
 
     parts: List[str] = []
-    mark = '<span class="mark">CONFIDENTIAL</span>' if spec.confidential else ""
-    parts.append(f'<div class="running-header"><span class="title">{e(spec.title)}</span>{mark}</div>')
-    footer_bits = [b for b in (spec.author, spec.date) if b]
+    mark = '<span class="mark">CONFIDENTIAL</span>' if spec.confidential else (f'<span class="date">{e(spec.date)}</span>' if spec.date else "")
+    parts.append(f'<div class="running-header"><span class="title">{e(R.page.header_text or spec.title)}</span>{mark}</div>')
+    footer_bits = [R.page.footer_text] if R.page.footer_text else [b for b in (spec.author,) if b]
     parts.append(f'<div class="running-footer">{e(" · ".join(footer_bits))}</div>')
 
     if plan.cover:
@@ -634,15 +845,49 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None) -> 
 
     heading_by_index = {h.index: h for h in plan.headings}
     main: List[str] = []
+    element_classes = 0
+    heading_ordinal = 0
+    level_ordinals = [0, 0, 0]
+    sections = ["", "", ""]
+    first_paragraph_done = False
+    table_ordinal = 0
+
+    def element_class(specific: ST.TextStyle, generic: ST.TextStyle, selector_tag: str) -> str:
+        nonlocal element_classes
+        keys = _diff_keys(specific, generic)
+        if not keys:
+            return ""
+        element_classes += 1
+        name = f"ts-e{element_classes}"
+        extra_css.append(f"main {selector_tag}.{name}{{{css_decls(specific, R, keys=keys)}}}")
+        return name
+
     for i, b in enumerate(plan.blocks):
         if isinstance(b, S.Heading):
             h = heading_by_index[i]
+            heading_ordinal += 1
+            level_ordinals[b.level - 1] += 1
+            sections[b.level - 1] = b.text
+            for deeper in range(b.level, 3):
+                sections[deeper] = ""
+            cls = ""
+            if R.has_specific_rules("heading"):
+                cls = element_class(R.element("heading", level=b.level, text=b.text, index=heading_ordinal, level_index=level_ordinals[b.level - 1]),
+                                    R.element("heading", generic_only=True, level=b.level), f"h{b.level}")
             # The number comes from the plan, not from CSS counters, so the
             # PDF shows exactly what the DOCX and the contents page show.
             num = f'<span class="hnum">{e(h.number)}</span>' if h.number else ""
-            main.append(f'<h{b.level} id="{h.anchor}">{num}{e(b.text)}</h{b.level}>')
+            cls_attr = f' class="{cls}"' if cls else ""
+            main.append(f'<h{b.level} id="{h.anchor}"{cls_attr}>{num}{e(b.text)}</h{b.level}>')
         elif isinstance(b, S.Paragraph):
-            cls = ' class="lede"' if i == plan.lede_index else ""
+            classes = ["lede"] if i == plan.lede_index else []
+            if R.has_specific_rules("paragraph"):
+                name = element_class(R.element("paragraph", first=not first_paragraph_done, sections=[x for x in sections if x]),
+                                     R.element("paragraph", generic_only=True), "p")
+                if name:
+                    classes.append(name)
+            first_paragraph_done = True
+            cls = f' class="{" ".join(classes)}"' if classes else ""
             main.append(f"<p{cls}>{e(b.text)}{_cite(b.sources, index)}</p>")
         elif isinstance(b, S.Numbered):
             cls = ' class="steps"' if plan.template_id == "sop" else ""
@@ -651,12 +896,14 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None) -> 
             cls = ' class="actions"' if plan.template_id == "meeting_summary" else ""
             main.append(f"<ul{cls}>" + "".join(f"<li>{e(t)}</li>" for t in b.items) + f"</ul>{_cite(b.sources, index)}")
         elif isinstance(b, S.TableBlock):
-            main.append(_table_html(b.table, index))
+            table_ordinal += 1
+            main.append(_table_html(b.table, index, table_ordinal))
+            extra_css.append(_table_rules_css(R, table_ordinal, b.table.columns, len(b.table.rows)))
         elif isinstance(b, S.ChartBlock):
             ordinal = sum(1 for x in plan.blocks[: i + 1] if isinstance(x, S.ChartBlock))
             main.append(_chart_html(b.chart, ordinal, index))
         elif isinstance(b, S.Callout):
-            main.append(_callout_html(b))
+            main.append(_callout_html(b, R))
         elif isinstance(b, S.KPIRow):
             main.append(_kpis_html(b))
         elif isinstance(b, S.PageBreak):
@@ -666,9 +913,11 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None) -> 
     parts.append(_sources_html(spec.sources, "References" if plan.template_id == "research_report" else "Sources"))
     parts.append(_assumptions_html(spec.assumptions))
 
+    if orientation == "landscape":
+        body_classes.append("landscape")
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f"<title>{e(spec.title)}</title><style>{_root_vars(plan.type)}{print_css()}{_page_rules(plan)}</style></head>"
+        f"<title>{e(spec.title)}</title><style>{_root_vars(plan.type, R=R)}{print_css()}{_generic_css(R)}{''.join(extra_css)}{_page_rules(plan, R, orientation)}</style></head>"
         f'<body class="{" ".join(body_classes)}">{"".join(parts)}</body></html>'
     )
 
@@ -676,14 +925,25 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None) -> 
 # ------------------------------------------------------------- deck html --
 
 
-def _deck_vars(plan: DeckPlan) -> str:
+def deck_band(plan: "DeckPlan", R: ST.ResolvedStyle) -> str:
+    """The title/section band: the template's colour, or the style's
+    primary when a person chose a palette."""
+    return R.tokens.primary if R.custom_palette else plan.band
+
+
+def _deck_vars(plan: DeckPlan, R: Optional[ST.ResolvedStyle] = None) -> str:
     t = plan.type
+    R = R or ST.resolve(plan.spec)
+    k = R.tokens
+    serif = ST.font_face("Cambria")
     return (
         ":root{"
-        f"--font-sans:{theme.CSS_SANS};--font-serif:{theme.CSS_SERIF};--ink:{theme.INK};--ink-muted:{theme.INK_MUTED};"
-        f"--ink-faint:{theme.INK_FAINT};--surface:{theme.SURFACE};--border:{theme.BORDER};--accent:{theme.ACCENT};"
-        f"--navy:{theme.NAVY};--boardroom:{theme.BOARDROOM};--slate:{theme.SLATE};--teal:{theme.TEAL};--danger:{theme.DANGER};"
-        f"--band:{plan.band};"
+        f"--font-sans:{theme.pdf_font_stack(R.body_face)};--font-heading:{theme.pdf_font_stack(R.heading_face)};--font-serif:{theme.pdf_font_stack(serif) if serif else theme.CSS_SERIF};"
+        f"--ink:{k.ink};--ink-muted:{k.muted};"
+        f"--ink-faint:{k.caption};--surface:{k.band};--border:{k.hairline};--accent:{k.accent};"
+        f"--navy:{k.primary};--boardroom:{k.accent_text};--slate:{k.muted};--teal:{k.accent};--danger:{ST.STATUS_PAIRS['danger'][1]};"
+        f"--header-fill:{k.header_fill};--header-text:{k.header_text};"
+        f"--band:{deck_band(plan, R)};"
         f"--slide-w:{theme.SLIDE_W_IN}in;--slide-h:{theme.SLIDE_H_IN}in;--slide-margin:{theme.SLIDE_MARGIN_IN}in;"
         f"--slide-title-top:{theme.SLIDE_TITLE_TOP_IN}in;--slide-title-h:{theme.SLIDE_TITLE_H_IN}in;"
         f"--slide-body-top:{theme.SLIDE_BODY_TOP_IN}in;--slide-body-h:{theme.SLIDE_BODY_H_IN}in;"
@@ -693,15 +953,21 @@ def _deck_vars(plan: DeckPlan) -> str:
         f"--slide-section-pt:{t.section}pt;--body-pt:{t.body}pt;--small-pt:{t.small}pt;--caption-pt:{t.small}pt;"
         f"--line-height:1.3;--h2-pt:{t.title}pt;"
         "}"
-        f"@page{{size:{theme.SLIDE_W_IN}in {theme.SLIDE_H_IN}in;margin:0}}"
+        f"@page{{size:{theme.SLIDE_W_IN}in {slide_height_in(R)}in;margin:0}}"
     )
+
+
+def slide_height_in(R: Optional[ST.ResolvedStyle]) -> float:
+    """16:9 is the house size (13.333 x 7.5 in); 4:3 keeps the width and
+    the body geometry and is 10 x 7.5 in in the .pptx."""
+    return theme.SLIDE_H_IN
 
 
 def _bullets_html(items: Sequence[str]) -> str:
     return '<ul class="bullets">' + "".join(f"<li>{e(t)}</li>" for t in items) + "</ul>"
 
 
-def _slide_body_html(s: PlannedSlide, plan: DeckPlan) -> str:
+def _slide_body_html(s: PlannedSlide, plan: DeckPlan, R: Optional[ST.ResolvedStyle] = None) -> str:
     index = plan.citation_index
     if s.layout == "two_column":
         left_title = f'<div class="col-title">{e(s.left_title)}</div>' if s.left_title else ""
@@ -725,7 +991,7 @@ def _slide_body_html(s: PlannedSlide, plan: DeckPlan) -> str:
             return f'<div class="chart-with-text">{_bullets_html(s.bullets)}{fig}</div>'
         return fig
     if s.layout == "table" and s.table is not None:
-        return _table_html(s.table, index)
+        return _table_html(s.table, index, s.number)
     if s.layout == "kpis":
         boxes = "".join(
             f'<div class="kpi-box"><div class="v{_kpi_size_class(k.value)}">{e(k.value)}</div><div class="l">{e(k.label)}</div>'
@@ -751,8 +1017,9 @@ def _slide_body_html(s: PlannedSlide, plan: DeckPlan) -> str:
     return _bullets_html(s.bullets) if s.bullets else ""
 
 
-def _slide_html(s: PlannedSlide, plan: DeckPlan, total: int) -> str:
+def _slide_html(s: PlannedSlide, plan: DeckPlan, total: int, R: Optional[ST.ResolvedStyle] = None) -> str:
     spec = plan.spec
+    R = R or ST.resolve(spec)
     last = " last" if s.number == total else ""
     if s.layout in ("title", "section", "closing"):
         title = s.title or (spec.title if s.layout == "title" else ("Thank you" if s.layout == "closing" else ""))
@@ -768,23 +1035,37 @@ def _slide_html(s: PlannedSlide, plan: DeckPlan, total: int) -> str:
             + meta + "</section>"
         )
     mark = '<span class="mark">CONFIDENTIAL</span>' if spec.confidential else ""
-    footer = f'<div class="footer">{e(spec.title)}{mark}<span class="n">{s.number} / {total}</span></div>'
+    number = f'<span class="n">{s.number} / {total}</span>' if R.page.page_numbers else ""
+    footer = f'<div class="footer">{e(R.page.footer_text or spec.title)}{mark}{number}</div>'
     cite = "" if s.is_sources_slide else _cite(s.sources, plan.citation_index)
     return (
-        f'<section class="slide layout-{e(s.layout)}{last}">'
+        f'<section class="slide layout-{e(s.layout)}{last}" data-slide="{s.number}">'
         f'<div class="title">{e(s.title)}{cite}</div>'
-        f'<div class="body">{_slide_body_html(s, plan)}</div>{footer}</section>'
+        f'<div class="body">{_slide_body_html(s, plan, R)}</div>{footer}</section>'
     )
 
 
-def deck_html(spec: S.PresentationSpec, plan: Optional[DeckPlan] = None) -> str:
+def deck_html(spec: S.PresentationSpec, plan: Optional[DeckPlan] = None, resolved: Optional[ST.ResolvedStyle] = None) -> str:
     """A complete HTML page whose pages are the 16:9 slides of the deck."""
     plan = plan or plan_deck(spec)
+    R = resolved or ST.resolve(spec)
     total = len(plan.slides)
-    slides = "".join(_slide_html(s, plan, total) for s in plan.slides)
+    slides = "".join(_slide_html(s, plan, total, R) for s in plan.slides)
+    extra: List[str] = [_generic_css(R, deck=True)]
+    if _css_colour(R.page.background):
+        # After print.css, whose `.slide` paints white: a content slide's
+        # requested background; band slides keep their band colour.
+        extra.append(f".slide:not(.band){{background:{_css_colour(R.page.background)}}}")
+    for s in plan.slides:
+        if s.layout == "table" and s.table is not None:
+            extra.append(_table_rules_css(R, s.number, s.table.columns, len(s.table.rows)))
+        ts = R.element("slide_title", index=s.number)
+        keys = _diff_keys(ts, R.element("slide_title", generic_only=True))
+        if keys:
+            extra.append(f'.slide[data-slide="{int(s.number)}"] .title{{{css_decls(ts, R, keys=keys)}}}')
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f"<title>{e(spec.title)}</title><style>{_deck_vars(plan)}{print_css()}</style></head>"
+        f"<title>{e(spec.title)}</title><style>{_deck_vars(plan, R)}{print_css()}{''.join(extra)}</style></head>"
         f'<body class="deck tpl-{e(plan.template_id)}">{slides}</body></html>'
     )
 
@@ -821,13 +1102,14 @@ def workbook_summary_html(spec: S.WorkbookSpec, max_rows: int = 25, max_cols: in
         main.append(f'<h2>{e(sheet.name)}</h2>{note}<table class="data"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>')
     parts.append(f"<main>{''.join(main)}</main>")
     t = theme.DOCUMENT_TYPE
+    R = ST.resolve(spec, type_scale=t)
     page = (
         f"@page{{size:A4 landscape;margin:16mm;@top-center{{content:element(header);width:100%}}"
-        f'@bottom-center{{content:"Page " counter(page) " of " counter(pages);font-size:8.5pt;color:{theme.INK_FAINT}}}}}'
+        f'@bottom-right{{content:"Page " counter(page) " of " counter(pages);{_page_box_text(R)}}}}}'
     )
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f"<title>{e(spec.title)}</title><style>{_root_vars(t)}{print_css()}{page}</style></head>"
+        f"<title>{e(spec.title)}</title><style>{_root_vars(t, R=R)}{print_css()}{_generic_css(R)}{page}</style></head>"
         f'<body class="doc tpl-workbook">{"".join(parts)}</body></html>'
     )
 
@@ -854,6 +1136,7 @@ _MAX_COL_SHARE = 0.45
 #: How many rows are sampled for a column's width.
 _WIDTH_SAMPLE_ROWS = 300
 
+#: Kept exactly as before (the legacy SheetStyle highlight pairs).
 TABULAR_HIGHLIGHT = {
     "red": ("#9C0006", "#FFFFFF", "#FFC7CE", "#9C0006"),
     "amber": ("#9C5700", "#FFFFFF", "#FFEB9C", "#9C5700"),
@@ -861,10 +1144,61 @@ TABULAR_HIGHLIGHT = {
     "blue": ("#1F4E78", "#FFFFFF", "#DDEBF7", "#1F4E78"),
 }
 TABULAR_HEADER_FILLS = {
-    "dark": (theme.NAVY, theme.WHITE),
-    "light": (theme.SURFACE_2, theme.INK),
-    "none": ("", theme.INK),
+    "dark": (theme.CLASSIC_PRIMARY, theme.WHITE),
+    "light": ("#EEF0F3", theme.CLASSIC_INK),
+    "none": ("", theme.CLASSIC_INK),
 }
+
+
+def percent_scales(sheet: S.Sheet) -> Dict[int, float]:
+    """Per percent column: 1.0 when the values are fractions (all within
+    [-1, 1]), 0.01 when they are whole percentages — the XLSX writer's rule."""
+    out: Dict[int, float] = {}
+    for j, col in enumerate(sheet.columns):
+        if col.type != "percent":
+            continue
+        nums = [theme._as_float(r[j]) for r in sheet.rows if j < len(r)]
+        nums = [n for n in nums if n is not None]
+        out[j] = 1.0 if (not nums or all(-1.0 <= n <= 1.0 for n in nums)) else 0.01
+    return out
+
+
+def tabular_cell_text(sheet: S.Sheet, j: int, value: Any, scales: Optional[Dict[int, float]] = None) -> str:
+    """What a tabular Word/PDF cell shows: text as written; numbers, money,
+    percentages and dates through theme.format_cell, as the Excel number
+    formats display them."""
+    if value is None:
+        return ""
+    col = sheet.columns[j]
+    if col.type == "text":
+        return str(value)
+    return theme.format_cell(value, col, percent_scale=(scales or {}).get(j, 1.0))
+
+
+def sheet_totals(sheet: S.Sheet) -> Dict[int, str]:
+    """The totals row of a sheet as TEXT, computed here from the rows (the
+    Excel file carries SUBTOTAL formulas; a Word/PDF table carries the
+    numbers they evaluate to): column index → display text, with the
+    first total's label in column 0 when it is free. Empty without totals."""
+    if not sheet.totals or not sheet.rows:
+        return {}
+    scales = percent_scales(sheet)
+    out: Dict[int, str] = {}
+    for total in sheet.totals:
+        j = int(total.column)
+        values = [theme._as_float(r[j]) for r in sheet.rows if j < len(r)]
+        nums = [v for v in values if v is not None]
+        if total.fn == "count":
+            out[j] = f"{sum(1 for r in sheet.rows if j < len(r) and r[j] not in (None, '')):,}"
+            continue
+        if not nums:
+            out[j] = ""
+            continue
+        value = {"sum": sum(nums), "average": sum(nums) / len(nums), "min": min(nums), "max": max(nums)}[total.fn]
+        out[j] = tabular_cell_text(sheet, j, value, scales)
+    if 0 not in out:
+        out[0] = sheet.totals[0].label
+    return out
 
 
 def column_shares(sheet: S.Sheet) -> List[float]:
@@ -940,58 +1274,80 @@ def methodology_note(spec: S.WorkbookSpec, transform: Optional[dict] = None) -> 
     return " ".join(bits)
 
 
-def _tabular_table_html(sheet: S.Sheet) -> str:
+def _tabular_table_html(sheet: S.Sheet, R: Optional[ST.ResolvedStyle] = None, ordinal: int = 1) -> Tuple[str, str]:
+    """(table html, its per-table css). Header fill, text and weight come
+    from the ResolvedStyle (a legacy SheetStyle header_fill still applies
+    when no rule sets the header background); highlighted columns keep
+    their exact pairs; cells are formatted like the Excel file; the totals
+    row is computed."""
+    R = R or ST.resolve(None)
     numeric = {i for i, c in enumerate(sheet.columns) if c.type != "text"}
     highlight = highlight_columns(sheet)
     style = sheet.style if sheet.style is not None else S.SheetStyle()
     shares = column_shares(sheet)
+    scales = percent_scales(sheet)
     cols = "".join(f'<col style="width:{sh * 100:.2f}%">' for sh in shares)
-    fill, ink = TABULAR_HEADER_FILLS.get(style.header_fill, TABULAR_HEADER_FILLS["dark"])
+    head_ts = R.element("table_header", sheet=sheet.name)
+    if sheet.style is not None and style.header_fill != "dark" and not any(r.style.background for r in R.matching_rules("table_header", sheet=sheet.name)):
+        fill, ink = TABULAR_HEADER_FILLS[style.header_fill]
+    else:
+        fill, ink = (head_ts.background or ""), (head_ts.color or R.tokens.header_text)
     head_cells = []
     for i, c in enumerate(sheet.columns):
         cls = "num" if i in numeric else "txt"
         colour = highlight.get(i)
         if colour:
             h_fill, h_ink, _, _ = TABULAR_HIGHLIGHT[colour]
-            head_cells.append(f'<th class="{cls} hl hl-{e(colour)}" style="background:{h_fill};color:{h_ink}">{e(c.name)}</th>')
+            head_cells.append(f'<th class="{cls} hl hl-{e(colour)}" data-col="{i}" style="background:{h_fill};color:{h_ink}">{e(c.name)}</th>')
         else:
-            bg = f"background:{fill};" if fill else "background:none;"
-            head_cells.append(f'<th class="{cls}" style="{bg}color:{ink}">{e(c.name)}</th>')
+            bg = f"background:{_css_colour(fill)};" if _css_colour(fill) else "background:none;"
+            head_cells.append(f'<th class="{cls}" data-col="{i}" style="{bg}color:{_css_colour(ink) or ST.INK}">{e(c.name)}</th>')
     body_rows = []
-    for row in sheet.rows:
+    for r_index, row in enumerate(sheet.rows, start=1):
         cells = []
         for i, v in enumerate(row):
             cls = "num" if i in numeric else "txt"
             colour = highlight.get(i)
-            text = e(cell_text(v, i in numeric))
+            text = e(tabular_cell_text(sheet, i, v, scales))
             if colour:
                 _, _, c_fill, c_ink = TABULAR_HIGHLIGHT[colour]
-                cells.append(f'<td class="{cls} hl" style="background:{c_fill};color:{c_ink}">{text}</td>')
+                cells.append(f'<td class="{cls} hl" data-col="{i}" style="background:{c_fill};color:{c_ink}">{text}</td>')
             else:
-                cells.append(f'<td class="{cls}">{text}</td>')
-        body_rows.append(f"<tr>{''.join(cells)}</tr>")
-    classes = "data tabular" + (" borders" if style.borders == "thin" else " no-borders") + (" wrap" if style.wrap else "")
-    bold = "" if style.header_bold else ' data-header-bold="no"'
+                cells.append(f'<td class="{cls}" data-col="{i}">{text}</td>')
+        body_rows.append(f'<tr data-row="{r_index}">{"".join(cells)}</tr>')
+    totals = sheet_totals(sheet)
+    if totals:
+        cells = "".join(f'<td class="{"num" if i in numeric else "txt"}" data-col="{i}">{e(totals.get(i, ""))}</td>' for i in range(len(sheet.columns)))
+        body_rows.append(f'<tr class="total">{cells}</tr>')
+    classes = f"data tabular ts-t{ordinal}" + (" borders" if style.borders == "thin" else " no-borders") + (" wrap" if style.wrap else "") + ("" if R.banded else " unbanded")
+    bold = "" if (style.header_bold if sheet.style is not None else True) and head_ts.bold is not False else ' data-header-bold="no"'
+    css = _table_rules_css(R, ordinal, [c.name for c in sheet.columns], len(sheet.rows), sheet=sheet.name, row_offset=1)
     return (
         f'<table class="{classes}"{bold}><colgroup>{cols}</colgroup>'
         f'<thead><tr>{"".join(head_cells)}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
-    )
+    ), css
 
 
-def workbook_document_html(spec: S.WorkbookSpec, transform: Optional[dict] = None) -> str:
+def workbook_document_html(spec: S.WorkbookSpec, transform: Optional[dict] = None, resolved: Optional[ST.ResolvedStyle] = None) -> str:
     """The tabular document as one HTML page: title, methodology note, then
     one section per sheet — a heading and the FULL table — each on its
     own named page (`landscape` / `portrait`) so orientation follows the
     sheet. The header row repeats on every page (print.css `thead
     {display: table-header-group}`), rows never split across pages, and
     there is no trailing page break, so no blank last page."""
-    first = sheet_orientation(spec.sheets[0]) if spec.sheets else "portrait"
+    t = theme.DOCUMENT_TYPE
+    R = resolved or ST.resolve(spec, type_scale=t)
+
+    def orient(sheet: S.Sheet) -> str:
+        return R.page.orientation if R.page.orientation_explicit else sheet_orientation(sheet)
+
+    first = orient(spec.sheets[0]) if spec.sheets else "portrait"
     # The title block shares the first sheet's named page: a change of page
     # name is a page break in WeasyPrint, and a title alone on page 1 with
     # the table starting on page 2 is the blank-looking first page.
     parts = [
-        '<div class="running-header"><span class="title">' + e(spec.title) + "</span></div>",
-        '<div class="running-footer"></div>',
+        '<div class="running-header"><span class="title">' + e(R.page.header_text or spec.title) + "</span></div>",
+        f'<div class="running-footer">{e(R.page.footer_text)}</div>',
         f'<div class="front {first}"><header class="titleblock"><h1 class="doc-title">{e(spec.title)}</h1>'
         + (f'<div class="subtitle">{e(spec.purpose)}</div>' if spec.purpose else "")
         + f'<div class="byline">{len(spec.sheets)} sheet{"s" if len(spec.sheets) != 1 else ""} · '
@@ -999,31 +1355,37 @@ def workbook_document_html(spec: S.WorkbookSpec, transform: Optional[dict] = Non
         + f'<p class="methodology">{e(methodology_note(spec, transform))}</p></div>',
     ]
     sections: List[str] = []
+    table_css: List[str] = []
     for k, sheet in enumerate(spec.sheets):
-        orientation = sheet_orientation(sheet)
+        orientation = orient(sheet)
         cls = f"sheet {orientation}" + (" first" if k == 0 else "")
         note = f"<p class=\"sheet-note\">{e(sheet.notes)}</p>" if sheet.notes else ""
+        table, css = _tabular_table_html(sheet, R, k + 1)
+        table_css.append(css)
         sections.append(
-            f'<section class="{cls}"><h2>{e(sheet.name)}</h2>{note}{_tabular_table_html(sheet)}'
+            f'<section class="{cls}"><h2>{e(sheet.name)}</h2>{note}{table}'
             f'<p class="sheet-count">{len(sheet.rows):,} row{"s" if len(sheet.rows) != 1 else ""} · {len(sheet.columns)} columns</p></section>'
         )
     parts.append(f"<main>{''.join(sections)}</main>")
     parts.append(_sources_html(spec.sources))
     parts.append(_assumptions_html(spec.assumptions))
-    t = theme.DOCUMENT_TYPE
-    footer = (
-        '@bottom-center{content:"Page " counter(page) " of " counter(pages);'
-        f"font-family:{theme.CSS_SANS};font-size:8.5pt;color:{theme.INK_FAINT}}}"
-    )
+    footer = ('@bottom-right{content:"Page " counter(page) " of " counter(pages);' + _page_box_text(R) + ";vertical-align:top}") if R.page.page_numbers else ""
+    footer += "@bottom-left{content:element(footer);vertical-align:top}"
     header = "@top-center{content:element(header);width:100%;vertical-align:bottom;padding-bottom:4pt}"
+    w, h = ST.PAGE_SIZES_MM.get(R.page.size, (210, 297))
+    lw, lh = max(w, h), min(w, h)
+    pw, ph = min(w, h), max(w, h)
+    margins = R.page.margins_mm
+    margin = f"{margins[0]:g}mm {margins[3]:g}mm {margins[1]:g}mm {margins[2]:g}mm" if margins else "16mm 14mm 16mm 14mm"
+    first_size = f"{lw:g}mm {lh:g}mm" if first == "landscape" else f"{pw:g}mm {ph:g}mm"
     pages = (
-        f"@page{{size:A4 {first};margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
-        f"@page landscape{{size:A4 landscape;margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
-        f"@page portrait{{size:A4 portrait;margin:16mm 14mm 16mm 14mm;{header}{footer}}}"
+        f"@page{{size:{first_size};margin:{margin};{header}{footer}}}"
+        f"@page landscape{{size:{lw:g}mm {lh:g}mm;margin:{margin};{header}{footer}}}"
+        f"@page portrait{{size:{pw:g}mm {ph:g}mm;margin:{margin};{header}{footer}}}"
     )
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f"<title>{e(spec.title)}</title><style>{_root_vars(t, f'--tabular-pt:{TABULAR_CELL_PT}pt;')}{print_css()}{pages}</style></head>"
+        f"<title>{e(spec.title)}</title><style>{_root_vars(t, f'--tabular-pt:{TABULAR_CELL_PT}pt;', R=R)}{print_css()}{_generic_css(R, table_pt=TABULAR_CELL_PT)}{''.join(table_css)}{pages}</style></head>"
         f'<body class="doc tpl-tabular">{"".join(parts)}</body></html>'
     )
 
@@ -1034,5 +1396,6 @@ __all__ = [
     "fit_table", "BULLET_BOXES", "TABLE_MAX_ROWS", "TABLE_MAX_COLS",
     "citation_numbers", "document_html", "deck_html", "workbook_summary_html",
     "workbook_document_html", "column_shares", "sheet_orientation", "highlight_columns", "methodology_note",
-    "TABULAR_CELL_PT", "TABULAR_HIGHLIGHT", "TABULAR_HEADER_FILLS",
+    "TABULAR_CELL_PT", "TABULAR_HIGHLIGHT", "TABULAR_HEADER_FILLS", "css_decls", "document_orientation", "deck_band",
+    "percent_scales", "tabular_cell_text", "sheet_totals", "slide_height_in",
 ]

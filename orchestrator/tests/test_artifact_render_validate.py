@@ -222,3 +222,69 @@ def test_grid_shows_a_date_cell_as_a_date():
     assert preview._json_value(_dt.datetime(2026, 8, 3)) == "2026-08-03"
     assert preview._json_value(_dt.datetime(2026, 8, 3, 9, 30)) == "2026-08-03T09:30:00"
     assert preview._json_value(_dt.date(2026, 8, 3)) == "2026-08-03"
+
+
+# --------------------------------------------------------- charts (AS3) --
+
+from pathlib import Path  # noqa: E402
+
+CORPUS = Path(__file__).resolve().parent / "fixtures" / "charts" / "svg_corpus"
+
+
+def test_malicious_svg_corpus_is_refused_every_time():
+    bad = sorted(p for p in CORPUS.glob("*.svg") if not p.name.startswith("ok_"))
+    assert len(bad) >= 8
+    for p in bad:
+        problems = validate.validate_svg_bytes(p.read_bytes())
+        assert problems, p.name
+        with pytest.raises(validate.ValidationFailed, match="not safe"):
+            validate.validate_file(p, "svg")
+    expected = {
+        "01_script.svg": "<script>", "02_foreign_object.svg": "<foreignobject>", "03_onload.svg": "event handler",
+        "04_external_xlink_href.svg": "non-fragment href", "05_xxe.svg": "DOCTYPE", "06_style_import.svg": "@import",
+        "07_javascript_link.svg": "non-fragment href", "08_set_href.svg": "animates href", "09_billion_laughs.svg": "DOCTYPE",
+        "10_css_url_attr.svg": "external url()",
+        # Verifier 2026-09-15: a CSS escape spells url( without the letters.
+        "11_css_escape_url.svg": "escape backslash", "12_style_attr_escape.svg": "escape backslash",
+    }
+    for name, fragment in expected.items():
+        assert any(fragment in msg for msg in validate.validate_svg_bytes((CORPUS / name).read_bytes())), name
+
+
+def test_fragment_references_are_allowed():
+    assert validate.validate_svg_bytes((CORPUS / "ok_fragment_refs.svg").read_bytes()) == []
+    assert validate.validate_svg_bytes(b"") and validate.validate_svg_bytes(b"<svg") and validate.validate_svg_bytes(b"<html/>")
+
+
+def test_png_signature_and_size_bounds(tmp_path):
+    from PIL import Image
+
+    small = tmp_path / "s.png"
+    Image.new("RGB", (399, 300), "white").save(small)
+    with pytest.raises(validate.ValidationFailed, match="at least 400x300"):
+        validate.validate_file(small, "png")
+    ok = tmp_path / "ok.png"
+    Image.new("RGB", (1600, 900), "white").save(ok)
+    assert validate.validate_file(ok, "png")["width"] == 1600
+    fake = tmp_path / "f.png"
+    fake.write_bytes(b"GIF89a" + b"\x00" * 40)
+    with pytest.raises(validate.ValidationFailed, match="PNG header"):
+        validate.validate_file(fake, "png")
+    # A header that claims 100000 x 100000 is refused from IHDR alone.
+    import struct
+    import zlib
+
+    ihdr = struct.pack(">IIBBBBB", 100000, 100000, 8, 2, 0, 0, 0)
+    bomb = tmp_path / "b.png"
+    bomb.write_bytes(b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR" + ihdr + struct.pack(">I", zlib.crc32(b"IHDR" + ihdr)))
+    with pytest.raises(validate.ValidationFailed, match="ceiling"):
+        validate.validate_file(bomb, "png")
+
+
+def test_office_validators_count_native_charts(tmp_path):
+    facts = validate.validate_file(_xlsx(tmp_path), "xlsx")
+    assert facts["charts"] == validate.count_native_charts(tmp_path / "w.xlsx")
+    deck_facts = validate.validate_file(_pptx(tmp_path), "pptx")
+    assert deck_facts["charts"] >= 1
+    with pytest.raises(validate.ValidationFailed, match="native charts"):
+        validate.validate_file(tmp_path / "d.pptx", "pptx", expected_charts=deck_facts["charts"] + 1)

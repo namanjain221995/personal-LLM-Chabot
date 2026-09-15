@@ -155,10 +155,10 @@ def test_trailing_and_doubled_page_breaks_are_removed():
 def test_numeric_columns_right_align_and_format_only_numeric_cells():
     t = S.Table(columns=["Year", "Revenue"], rows=[[2024, 1234567.891], ["2025", 5]], numeric_columns=[1])
     out = H._table_html(t, {})
-    assert '<td class="txt">2024</td>' in out          # a year in a text column stays 2024
-    assert '<td class="num">1,234,567.89</td>' in out
-    assert '<td class="num">5</td>' in out
-    assert '<th class="num">Revenue</th>' in out
+    assert '<td class="txt" data-col="0">2024</td>' in out          # a year in a text column stays 2024
+    assert '<td class="num" data-col="1">1,234,567.89</td>' in out
+    assert '<td class="num" data-col="1">5</td>' in out
+    assert '<th class="num" data-col="1">Revenue</th>' in out
 
 
 def test_citation_markers_number_sources_in_manifest_order():
@@ -270,7 +270,7 @@ def test_slide_tables_are_cut_in_the_plan():
     ]
     # The preview HTML draws the planned table: ten rows, not forty.
     out = H.deck_html(spec, plan)
-    assert "Row 10" in out and "Row 11" not in out and out.count("<tr>") == 11
+    assert "Row 10" in out and "Row 11" not in out and out.count("<tr") == 11
 
 
 def test_sources_slide_is_appended_when_citations_exist():
@@ -322,11 +322,18 @@ def test_workbook_summary_html_shows_first_rows_only():
     assert "&lt;draft&gt;" not in out and "evil.example" in out and "<script" not in out
 
 
-def test_theme_reports_scripts_the_fonts_cannot_draw():
+def test_theme_reports_scripts_the_fonts_cannot_draw(monkeypatch):
     assert theme.unsupported_scripts("Plain ASCII, café, €5, 10 ≥ 3 → ok") == []
     assert theme.unsupported_scripts("नमस्ते and 你好 and ગુજરાતી") == ["Devanagari", "CJK", "Gujarati"]
-    assert "Devanagari" in theme.font_coverage_warning("नमस्ते")
+    monkeypatch.setattr(theme, "font_installed", lambda family: False)
+    warning = theme.font_coverage_warning("नमस्ते")
+    assert "Devanagari" in warning
+    # The corrected sentence: chart IMAGES are drawn on the server too, so
+    # the old "the DOCX keeps the text intact" claim is not made for them.
+    assert "chart" in warning and "keep the text intact" not in warning
     assert theme.font_coverage_warning("hello") == ""
+    monkeypatch.setattr(theme, "font_installed", lambda family: family == "Lohit Gujarati")
+    assert theme.uncovered_scripts("नमस्ते ગુજરાતી") == ["Devanagari"]
 
 
 def test_format_number():

@@ -1,171 +1,1107 @@
-"""Chart (categories + series) → PNG with matplotlib Agg, in the theme palette.
+"""Charts → PNG and SVG with matplotlib (Agg), from COMPUTED values only.
 
-The PDF and DOCX renderers embed raster charts; PPTX and XLSX draw native
-ones from the same `Chart` data. This module follows core/charts_png.py's
-conventions (Agg forced, lazy pyplot import, the five-colour palette in fixed
-order, tight layout, the figure always closed) but takes an artifact `Chart`
-rather than a ChartSpec over SQL rows, because the data here is already
-columns of numbers the spec validated.
+WHAT IT DRAWS. Every chart_spec type (20) from a resolved Chart v2 — the
+numbers chart_data computed from a bound table — or a legacy spec.Chart
+(literal numbers in an old spec.json, converted with chart_spec.from_legacy).
+PNG is embedded in DOCX (200 dpi at the content width) and is a standalone
+download; SVG goes to the PDF/HTML path and is a standalone download.
 
-DETERMINISM. Two renders of the same Chart produce byte-identical PNGs:
-matplotlib's PNG writer embeds no timestamp, the Agg backend is
-deterministic, and the metadata block is pinned to nothing but the
-"Software" key it always writes. `test_artifact_render_charts.py` renders
-twice and compares bytes, so a caching layer keyed on the spec hash is safe.
+DEFAULTS AND OVERRIDES. The look comes from ResolvedStyle.chart_defaults when
+the styling track provides one (duck-typed: palette, font_family,
+title_size_pt, axis_size_pt, grid_color, axis_text_color, label_color_for),
+else from ChartStyleDefaults below (the style guide's values). A chart's own
+ChartStyle (colours, fonts, sizes, legend, labels, axis ranges) wins.
 
-160 dpi at 8 x 4.5 in gives 1280 x 720 px — sharp on an A4 page at the
-6.3 in column width the print CSS uses, and the same bitmap serves the DOCX.
+READABILITY RULES (style guide §6). Bars start at zero unless y_min is set.
+Data labels sit OUTSIDE bars in ink; inside only when the label colour
+reaches 4.5:1 on that bar and the bar is tall enough. Pie/donut slice labels
+are white or ink, whichever reaches 4.5:1 on the slice. Line charts with 3+
+series get distinct markers and dash styles (grayscale print); more than 5
+series get direct end labels instead of a legend. Thousands separators, and
+Indian grouping for currency_INR.
+
+DETERMINISM AND SAFETY. PNG metadata is pinned; SVG uses svg.fonttype='path'
+(text becomes outlines: no font dependency and no text node a viewer could
+interpret), a fixed svg.hashsalt, no metadata block and no DOCTYPE, so two
+renders are byte-identical and the output passes validate.validate_svg_bytes.
+Mathtext is off: finance text full of dollars is text, not TeX.
+
+pyplot is imported lazily (tests/test_imports.py): importing this module
+costs nothing.
 """
 from __future__ import annotations
 
+import io
+import math
+import re
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..spec import Chart
-from . import theme
+from .. import chart_spec as CS
 
-#: pie slices past this are folded into "Other" — matches charts_png.py and
-#: MAX_SLICES in frontend/lib/chartOption.ts.
-_MAX_PIE_SLICES = 8
+INK = "#1F2937"
+WHITE = "#FFFFFF"
+MUTED = "#5F6B7A"
+GRID = "#E5E9F0"
+NAVY = "#1F3864"
+DPI_EMBED = 200
+PORTRAIT_WIDTH_IN = 6.3
+LANDSCAPE_WIDTH_IN = 9.7
+LABEL_MAX_CATEGORIES = 12
+
+#: Tried in order for every glyph (matplotlib >= 3.6 falls back per glyph).
+FONT_FALLBACKS: Tuple[str, ...] = (
+    "Carlito", "Calibri", "Liberation Sans", "DejaVu Sans",
+)
+
+#: Script → (sample character range, candidate font families).
+SCRIPT_FONTS: Dict[str, Tuple[Tuple[int, int], Tuple[str, ...]]] = {
+    "Devanagari": ((0x0900, 0x097F), ("Noto Sans Devanagari", "Lohit Devanagari", "Samyak Devanagari", "Kalimati", "Nirmala UI", "Mangal")),
+    "Gujarati": ((0x0A80, 0x0AFF), ("Noto Sans Gujarati", "Lohit Gujarati", "Samyak Gujarati", "Rekha", "Nirmala UI", "Shruti")),
+}
+
+_MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
+_DASHES = ("-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1, 1, 1)), (0, (1, 1)), (0, (8, 2, 2, 2)))
 
 
-def _fmt_value(value: float) -> str:
-    """Bar labels: integers without decimals, otherwise one decimal place,
-    thousands separated."""
-    if abs(value - round(value)) < 1e-9:
-        return f"{int(round(value)):,}"
-    return f"{value:,.1f}"
+# ------------------------------------------------------------------ colour --
 
 
-def render_chart_png(chart: Chart, out_path: str | Path) -> Path:
-    """Draw `chart` to `out_path` (PNG) and return the path."""
-    if not isinstance(chart, Chart):
-        raise TypeError("render_chart_png requires a validated artifact Chart")
+def _rgb(hex_colour: str) -> Tuple[float, float, float]:
+    h = hex_colour.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))  # type: ignore[return-value]
 
+
+def _luminance(hex_colour: str) -> float:
+    def ch(c: float) -> float:
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (ch(c) for c in _rgb(hex_colour))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(a: str, b: str) -> float:
+    """WCAG 2 contrast ratio of two '#RRGGBB' colours."""
+    la, lb = _luminance(a), _luminance(b)
+    hi, lo = max(la, lb), min(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _to_hex(colour: Any) -> str:
+    if isinstance(colour, str) and colour.startswith("#") and len(colour) == 7:
+        return colour.upper()
+    r, g, b = colour[:3]
+    return "#{:02X}{:02X}{:02X}".format(int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+
+@dataclass(frozen=True)
+class ChartStyleDefaults:
+    """The style guide's chart tokens; style.ResolvedStyle.chart_defaults
+    supersedes it when the styling track is merged."""
+
+    palette: Tuple[str, ...] = CS.DEFAULT_PALETTE
+    font_family: str = "Carlito"
+    title_size_pt: float = 12.0
+    axis_size_pt: float = 10.0
+    grid_color: str = GRID
+    axis_text_color: str = MUTED
+    ink: str = INK
+    background: str = WHITE
+
+    def label_color_for(self, fill_hex: str) -> str:
+        """White or ink, whichever contrasts more with `fill_hex`."""
+        return WHITE if contrast_ratio(WHITE, fill_hex) >= contrast_ratio(self.ink, fill_hex) else self.ink
+
+
+def defaults_from(resolved: Any) -> ChartStyleDefaults:
+    cd = getattr(resolved, "chart_defaults", None) if resolved is not None else None
+    if cd is None:
+        return ChartStyleDefaults()
+    if isinstance(cd, ChartStyleDefaults):
+        return cd
+    base = ChartStyleDefaults()
+    kw = {}
+    for name in ("palette", "font_family", "title_size_pt", "axis_size_pt", "grid_color", "axis_text_color", "ink", "background"):
+        value = getattr(cd, name, None)
+        if value:
+            kw[name] = tuple(value) if name == "palette" else value
+    return ChartStyleDefaults(**{**base.__dict__, **kw})
+
+
+# ------------------------------------------------------------------ numbers --
+
+
+def indian_group(n: int) -> str:
+    s = str(abs(int(n)))
+    if len(s) <= 3:
+        out = s
+    else:
+        head, tail = s[:-3], s[-3:]
+        parts = []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        out = ",".join(parts) + "," + tail
+    return ("-" if n < 0 else "") + out
+
+
+def format_value(value: float, number_format: Optional[str], *, fraction_percent: bool = False) -> str:
+    """One number as a label. `fraction_percent`: the series holds 0..1."""
+    v = float(value)
+    fmt = number_format or ""
+    integral = abs(v - round(v)) < 1e-9
+    if fmt == "integer":
+        return f"{int(round(v)):,}"
+    if fmt == "decimal1":
+        return f"{v:,.1f}"
+    if fmt == "decimal2":
+        return f"{v:,.2f}"
+    if fmt == "percent":
+        p = v * 100 if fraction_percent else v
+        return f"{p:.0f}%" if abs(p - round(p)) < 1e-9 else f"{p:.1f}%"
+    if fmt == "currency_INR":
+        if integral:
+            return "₹" + indian_group(int(round(v)))
+        whole = int(abs(v))
+        return ("-" if v < 0 else "") + "₹" + indian_group(whole) + f"{abs(v) - whole:.2f}"[1:]
+    if fmt in ("currency_USD", "currency_EUR", "currency_GBP"):
+        sym = {"currency_USD": "$", "currency_EUR": "€", "currency_GBP": "£"}[fmt]
+        body = f"{abs(v):,.0f}" if integral else f"{abs(v):,.2f}"
+        return ("-" if v < 0 else "") + sym + body
+    if fmt == "compact":
+        a = abs(v)
+        for div, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+            if a >= div:
+                x = v / div
+                return (f"{x:.0f}" if abs(x - round(x)) < 0.05 else f"{x:.1f}") + suf
+        return f"{v:,.0f}" if integral else f"{v:,.1f}"
+    return f"{int(round(v)):,}" if integral else f"{v:,.1f}"
+
+
+# -------------------------------------------------------------------- fonts --
+
+
+@lru_cache(maxsize=1)
+def _installed_families() -> Dict[str, List[str]]:
+    from matplotlib import font_manager
+
+    out: Dict[str, List[str]] = {}
+    for f in font_manager.fontManager.ttflist:
+        out.setdefault(f.name, []).append(f.fname)
+    return out
+
+
+@lru_cache(maxsize=64)
+def _font_covers(path: str, codepoint: int) -> bool:
+    try:
+        from matplotlib.ft2font import FT2Font
+
+        return codepoint in FT2Font(path).get_charmap()
+    except Exception:
+        return False
+
+
+def scripts_in(text: str) -> List[str]:
+    found = []
+    for script, ((lo, hi), _) in SCRIPT_FONTS.items():
+        if any(lo <= ord(ch) <= hi for ch in text):
+            found.append(script)
+    return found
+
+
+def font_for_script(script: str) -> Optional[str]:
+    (lo, _hi), candidates = SCRIPT_FONTS[script]
+    families = _installed_families()
+    for name in candidates:
+        for path in families.get(name, []):
+            if _font_covers(path, lo + 0x15):
+                return name
+    return None
+
+
+def _chart_text(chart: CS.Chart) -> str:
+    parts = [chart.title, chart.subtitle, chart.x_label, chart.y_label, chart.y2_label, chart.caption, *chart.categories]
+    parts.extend(s.name for s in chart.series)
+    return " ".join(p for p in parts if p)
+
+
+def chart_warnings(chart: Any) -> List[str]:
+    """One sentence per script the chart's text uses that no installed font
+    can draw (the labels would show empty boxes)."""
+    c = _as_chart(chart)
+    out = []
+    for script in scripts_in(_chart_text(c)):
+        if font_for_script(script) is None:
+            out.append(f"The chart labels use {script} script, and no {script} font is installed on this server, so those labels may show empty boxes.")
+    return out
+
+
+def _mapped(family: str) -> List[str]:
+    """A requested family and the families that stand in for it on this
+    server, in order (style.FontFace.pdf_candidates: the family, its metric
+    twin, its documented open fallback, the generic Liberation/DejaVu), so a
+    chart asked for in Georgia draws in the family the PDF uses rather than
+    dropping to the default sans."""
+    try:
+        from .. import style as ST
+
+        face = ST.font_face(family)
+    except Exception:  # noqa: BLE001 - the painter never fails on a font
+        face = None
+    return list(face.pdf_candidates) if face is not None else [family]
+
+
+def _families(style: Optional[CS.ChartStyle], d: ChartStyleDefaults, text: str) -> List[str]:
+    fams: List[str] = []
+    if style and style.font_family:
+        fams.extend(_mapped(style.font_family))
+    fams.extend(_mapped(d.font_family))
+    for script in scripts_in(text):
+        f = font_for_script(script)
+        if f:
+            fams.append(f)
+    fams.extend(FONT_FALLBACKS)
+    seen: List[str] = []
+    installed = _installed_families()
+    for f in fams:
+        if f not in seen and f in installed:
+            seen.append(f)
+    return seen or ["DejaVu Sans"]
+
+
+# ------------------------------------------------------------------- entry --
+
+
+def _as_chart(chart: Any) -> CS.Chart:
+    if isinstance(chart, CS.Chart):
+        return chart
+    try:
+        from ..spec import Chart as LegacyChart
+    except Exception:  # pragma: no cover
+        LegacyChart = None  # type: ignore[assignment]
+    if LegacyChart is not None and isinstance(chart, LegacyChart):
+        return CS.from_legacy(chart)
+    raise TypeError("the chart renderer requires a validated Chart")
+
+
+def _drawable(c: CS.Chart) -> None:
+    if not c.series and not (c.extra and (c.extra.box or c.extra.spans)):
+        raise ValueError("the chart has no computed values; resolve it against its table first")
+
+
+@dataclass
+class _Ctx:
+    chart: CS.Chart
+    style: CS.ChartStyle
+    d: ChartStyleDefaults
+    ink: str
+    muted: str
+    bg: str
+    fmt: Optional[str]
+    fraction_percent: bool
+    warnings: List[str] = field(default_factory=list)
+
+    def series_colour(self, i: int, name: str = "") -> str:
+        s = self.chart.series[i] if i < len(self.chart.series) else None
+        if s is not None and s.color:
+            return s.color
+        if name and name in self.style.series_colors:
+            return self.style.series_colors[name]
+        if i == 0 and self.style.color and (len(self.chart.series) == 1 or self.chart.type == "combo"):
+            return self.style.color
+        palette = self.style.palette or list(self.d.palette)
+        return palette[i % len(palette)]
+
+    def category_colour(self, j: int, label: str) -> str:
+        if label in self.style.category_colors:
+            return self.style.category_colors[label]
+        palette = self.style.palette or list(self.d.palette)
+        if self.chart.type in CS.PART_OF_WHOLE_TYPES:
+            return palette[j % len(palette)]
+        return self.style.color or palette[0]
+
+    def label(self, v: float) -> str:
+        return format_value(v, self.fmt, fraction_percent=self.fraction_percent)
+
+
+def render_png(chart: Any, resolved: Any = None, width_px: Optional[int] = None, height_px: Optional[int] = None, *,
+               orientation: str = "portrait", section_heading: str = "", include_caption: bool = False) -> bytes:
+    """The chart as PNG bytes. Size: the ChartStyle's width/height/dpi, else
+    the content width for `orientation` at 200 dpi, else width_px/height_px."""
+    return _render(chart, resolved, "png", width_px, height_px, orientation, section_heading, include_caption)
+
+
+def render_svg(chart: Any, resolved: Any = None, *, orientation: str = "portrait", section_heading: str = "",
+               include_caption: bool = False) -> bytes:
+    """The chart as SVG bytes: text as paths, no metadata, no DOCTYPE,
+    deterministic ids."""
+    return _render(chart, resolved, "svg", None, None, orientation, section_heading, include_caption)
+
+
+def render_chart_png(chart: Any, out_path: str | Path) -> Path:
+    """Back-compat entry the document/deck renderers call: 8 x 4.5 in at 160
+    dpi (1280 x 720 before tight layout), written to `out_path`."""
+    c = _as_chart(chart)
+    data = _render(c, None, "png", 1280, 720, "portrait", "", False, dpi_override=160, fixed_size=True)
+    out = Path(out_path)
+    out.write_bytes(data)
+    return out
+
+
+def inspect_figure(chart: Any, fn: Any, resolved: Any = None, **kw: Any) -> bytes:
+    """Render to PNG, calling fn(figure) after drawing and before saving —
+    for tests that read artists (label colours, markers, dash styles)."""
+    return _render(chart, resolved, "png", kw.get("width_px"), kw.get("height_px"), kw.get("orientation", "portrait"),
+                   kw.get("section_heading", ""), kw.get("include_caption", False), inspect=fn)
+
+
+def render_standalone(spec: Any, fmt: str, out_dir: str | Path, resolved: Any = None, *, stem: str = "chart") -> List[Path]:
+    """Every chart of `spec` as a standalone `<stem>-<n>.<fmt>` (png or svg)
+    in `out_dir`, captions included. Charts without computed values are
+    skipped (resolve the spec first)."""
+    if fmt not in ("png", "svg"):
+        raise ValueError(f"standalone charts are png or svg, not {fmt}")
+    out = Path(out_dir)
+    stem = re.sub(r"[^a-z0-9-]+", "-", (stem or "chart").lower()).strip("-") or "chart"
+    paths: List[Path] = []
+    n = 0
+    for _path, raw in CS.iter_chart_slots(spec):
+        c = raw if isinstance(raw, CS.Chart) else (CS.Chart.model_validate(raw) if isinstance(raw, dict) else _as_chart(raw))
+        if not c.series:
+            continue
+        n += 1
+        target = out / f"{stem}-{n}.{fmt}"
+        if fmt == "png":
+            target.write_bytes(render_png(c, resolved, 1600, 900, include_caption=True))
+        else:
+            target.write_bytes(render_svg(c, resolved, orientation="landscape", include_caption=True))
+        paths.append(target)
+    return paths
+
+
+def _size(c: CS.Chart, width_px: Optional[int], height_px: Optional[int], orientation: str, dpi_override: Optional[int]) -> Tuple[float, float, int]:
+    st = c.style
+    dpi = dpi_override or (st.dpi if st and st.dpi else DPI_EMBED)
+    if st and st.width_in:
+        w = st.width_in
+    elif width_px:
+        w = width_px / dpi
+    else:
+        w = LANDSCAPE_WIDTH_IN if orientation == "landscape" else PORTRAIT_WIDTH_IN
+    if st and st.height_in:
+        h = st.height_in
+    elif height_px:
+        h = height_px / dpi
+    else:
+        h = max(3.0, min(w * 0.5625, 7.5))
+    if c.type in ("pie", "donut", "radar") and not (st and st.height_in) and not height_px:
+        h = max(h, min(w * 0.62, 7.5))
+    if c.type == "gantt" and not (st and st.height_in):
+        h = max(h, min(10.0, 1.2 + 0.38 * max(1, len(c.categories))))
+    return w, h, dpi
+
+
+def _render(chart: Any, resolved: Any, fmt: str, width_px: Optional[int], height_px: Optional[int], orientation: str,
+            section_heading: str, include_caption: bool, *, dpi_override: Optional[int] = None, fixed_size: bool = False,
+            inspect: Any = None) -> bytes:
+    c = _as_chart(chart)
+    _drawable(c)
     import matplotlib
 
-    matplotlib.use("Agg", force=True)  # headless
-    # Every string here is a person's or the model's text, never TeX. With
-    # mathtext on, a finance title such as "Revenue $M vs $K" loses the
-    # literal text between the dollars and "a $\frac$ b" raises a
-    # ParseSyntaxException that would fail the whole render (review
-    # 2026-09-11). The rcParam exists since matplotlib 3.6; the pin is >=3.8.
+    matplotlib.use("Agg", force=True)
+    # Every string is a person's or the model's text, never TeX (review
+    # 2026-09-11: "Revenue $M vs $K" lost words and "$\\frac$" raised).
     matplotlib.rcParams["text.parse_math"] = False
     import matplotlib.pyplot as plt
 
-    categories = list(chart.categories)
-    fig, ax = plt.subplots(figsize=theme.CHART_FIGSIZE)
-    fig.patch.set_facecolor(theme.WHITE)
-    ax.set_facecolor(theme.WHITE)
-    ax.set_prop_cycle(color=list(theme.PALETTE))
-    try:
-        if chart.type == "pie":
-            _draw_pie(ax, categories, chart.series[0].values)
-        elif chart.type == "horizontal_bar":
-            _draw_horizontal_bar(ax, categories, chart)
-        elif chart.type == "line":
-            _draw_line(ax, categories, chart)
+    d = defaults_from(resolved)
+    style = c.style or CS.ChartStyle()
+    bg = style.background or d.background
+    ink = d.ink if contrast_ratio(d.ink, bg) >= 4.5 else WHITE
+    muted = d.axis_text_color if contrast_ratio(d.axis_text_color, bg) >= 4.5 else ink
+    all_values = [v for s in c.series for v in s.values]
+    fraction = bool(all_values) and max(abs(v) for v in all_values) <= 1.0 and style.number_format == "percent"
+    ctx = _Ctx(chart=c, style=style, d=d, ink=ink, muted=muted, bg=bg, fmt=style.number_format, fraction_percent=fraction)
+    w, h, dpi = _size(c, width_px, height_px, orientation, dpi_override)
+    rc = {
+        "text.parse_math": False,
+        "font.family": _families(style, d, _chart_text(c)),
+        "svg.fonttype": "path",
+        "svg.hashsalt": "techsara-artifact-chart",
+        "axes.unicode_minus": False,
+        "path.simplify": True,
+    }
+    with matplotlib.rc_context(rc):
+        if c.type == "radar":
+            fig = plt.figure(figsize=(w, h))
+            ax = fig.add_subplot(111, projection="polar")
         else:
-            _draw_bar(ax, categories, chart)
+            fig, ax = plt.subplots(figsize=(w, h))
+        try:
+            fig.patch.set_facecolor(bg)
+            ax.set_facecolor(bg)
+            drawer = _DRAWERS.get(c.type, _draw_bars)
+            legend_handled = drawer(ax, ctx)
+            _decorate(fig, ax, ctx, section_heading, include_caption, legend_handled)
+            _place_bottom_legends(fig)
+            if include_caption and c.caption:
+                _caption_below(fig, ctx)
+            if inspect is not None:
+                fig.canvas.draw()
+                inspect(fig)
+            buf = io.BytesIO()
+            if fmt == "png":
+                if fixed_size:
+                    fig.tight_layout()
+                    fig.savefig(buf, dpi=dpi, format="png", metadata={"Software": None}, facecolor=bg)
+                else:
+                    fig.savefig(buf, dpi=dpi, format="png", metadata={"Software": None}, facecolor=bg, bbox_inches="tight", pad_inches=0.12)
+                return buf.getvalue()
+            fig.savefig(buf, format="svg", metadata={"Date": None, "Creator": None, "Format": None, "Type": None},
+                        facecolor=bg, bbox_inches="tight", pad_inches=0.12)
+            return clean_svg(buf.getvalue())
+        finally:
+            plt.close(fig)
 
-        _style_axes(ax, chart)
-        if chart.title:
-            ax.set_title(chart.title, fontsize=12, color=theme.INK, loc="left", pad=12)
-        if chart.type != "pie":
-            if chart.y_label and chart.type != "horizontal_bar":
-                ax.set_ylabel(chart.y_label, color=theme.INK_MUTED, fontsize=9)
-            elif chart.y_label:
-                ax.set_xlabel(chart.y_label, color=theme.INK_MUTED, fontsize=9)
-        if len(chart.series) > 1 and chart.type != "pie":
-            ax.legend(frameon=False, fontsize=9, labelcolor=theme.INK_MUTED)
-        fig.tight_layout()
-        out_path = Path(out_path)
-        fig.savefig(out_path, dpi=theme.CHART_DPI, format="png", metadata={"Software": None})
-    finally:
-        plt.close(fig)
-    return Path(out_path)
+
+_DOCTYPE_RE = re.compile(rb"<!DOCTYPE[^>]*>\s*", re.IGNORECASE)
+_METADATA_RE = re.compile(rb"<metadata>.*?</metadata>\s*", re.DOTALL)
+_COMMENT_RE = re.compile(rb"<!--.*?-->\s*", re.DOTALL)
 
 
-def _style_axes(ax, chart: Chart) -> None:
-    """The app's light chart chrome: no top/right spines, faint grid, muted
-    tick labels (chartTheme.ts CHROME.light)."""
-    if chart.type == "pie":
-        ax.axis("equal")
+def clean_svg(data: bytes) -> bytes:
+    """matplotlib's SVG without the DOCTYPE (refused by the validator, and a
+    classic entity vector), the metadata block and comments."""
+    data = _DOCTYPE_RE.sub(b"", data)
+    data = _METADATA_RE.sub(b"", data)
+    data = _COMMENT_RE.sub(b"", data)
+    return data
+
+
+# ----------------------------------------------------------------- chrome --
+
+
+def _text_kw(ts: Optional[CS.ChartTextStyle], size: float, colour: str, bold: bool = False) -> Dict[str, Any]:
+    kw: Dict[str, Any] = {"fontsize": size, "color": colour, "fontweight": "bold" if bold else "normal"}
+    if ts is not None:
+        if ts.size_pt:
+            kw["fontsize"] = ts.size_pt
+        if ts.color:
+            kw["color"] = ts.color
+        if ts.bold is not None:
+            kw["fontweight"] = "bold" if ts.bold else "normal"
+        if ts.italic:
+            kw["fontstyle"] = "italic"
+        if ts.font_family:
+            installed = _installed_families()
+            mapped = [f for f in dict.fromkeys(_mapped(ts.font_family)) if f in installed]
+            kw["fontfamily"] = [*(mapped or [ts.font_family]), *FONT_FALLBACKS]
+    return kw
+
+
+def _decorate(fig, ax, ctx: _Ctx, section_heading: str, include_caption: bool, legend_handled: bool) -> None:
+    c, st, d = ctx.chart, ctx.style, ctx.d
+    title = c.title
+    if title and section_heading and " ".join(title.split()).casefold() == " ".join(section_heading.split()).casefold():
+        title = ""
+    if title:
+        kw = _text_kw(st.title, d.title_size_pt, ctx.ink, bold=True)
+        ax.set_title(title, loc="left", pad=22 if c.subtitle else 12, **kw)
+    if c.subtitle:
+        kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
+        ax.text(0.0, 1.02, c.subtitle, transform=ax.transAxes, ha="left", va="bottom", **kw)
+    if c.type not in ("pie", "donut", "radar", "heatmap", "funnel"):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(d.grid_color if ctx.bg == WHITE else ctx.muted)
+        axis_kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
+        ax.tick_params(colors=axis_kw["color"], labelsize=axis_kw["fontsize"])
+        horizontal = c.type in ("horizontal_bar", "stacked_horizontal_bar", "gantt", "box") and c.type != "box"
+        if st.gridlines:
+            ax.grid(True, axis="x" if horizontal else "y", color=d.grid_color, linewidth=0.8)
+            ax.set_axisbelow(True)
+        else:
+            ax.grid(False)
+        xl = c.x_label
+        yl = c.y_label
+        if c.type in ("horizontal_bar", "stacked_horizontal_bar"):
+            xl, yl = yl, xl
+        if xl and c.type not in ("gantt",):
+            ax.set_xlabel(xl, **axis_kw)
+        if yl:
+            ax.set_ylabel(yl, **axis_kw)
+    if not legend_handled:
+        _legend(ax, ctx)
+
+
+def _place_bottom_legends(fig) -> None:
+    """A bottom legend sits under the tick labels as actually drawn (long
+    rotated category names push it down), never on top of them."""
+    renderer = fig.canvas.get_renderer()
+    for ax in fig.axes:
+        leg = ax.get_legend()
+        if leg is None or getattr(leg, "_ts_position", "") != "bottom":
+            continue
+        leg.set_visible(False)
+        box = ax.get_tightbbox(renderer)
+        leg.set_visible(True)
+        if box is None:
+            continue
+        y = ax.transAxes.inverted().transform((0, box.y0))[1]
+        leg.set_bbox_to_anchor((0.5, y - 0.02), transform=ax.transAxes)
+
+
+def _caption_below(fig, ctx: _Ctx) -> None:
+    """The caption under everything already drawn (rotated tick labels, a
+    bottom legend), so the tight bounding box grows instead of overlapping."""
+    renderer = fig.canvas.get_renderer()
+    boxes = [a.get_tightbbox(renderer) for a in fig.axes]
+    boxes = [b for b in boxes if b is not None]
+    inv = fig.transFigure.inverted()
+    ymin = min(inv.transform((0, b.y0))[1] for b in boxes) if boxes else 0.0
+    xmin = min(inv.transform((b.x0, 0))[0] for b in boxes) if boxes else 0.0
+    fig.text(max(0.0, xmin), ymin - 0.02, ctx.chart.caption, ha="left", va="top", fontsize=max(7.0, ctx.d.axis_size_pt - 1),
+             color=ctx.muted, fontstyle="italic")
+
+
+def _legend(ax, ctx: _Ctx, handles=None, labels=None) -> None:
+    st = ctx.style
+    if st.legend_position == "none":
         return
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(theme.BORDER)
-    ax.tick_params(colors=theme.INK_MUTED, labelsize=9)
-    axis = "x" if chart.type == "horizontal_bar" else "y"
-    ax.grid(True, axis=axis, color=theme.BORDER, linewidth=0.8)
-    ax.set_axisbelow(True)
+    if handles is None:
+        handles, labels = ax.get_legend_handles_labels()
+    if len(handles) < 2:
+        return
+    kw = _text_kw(st.legend, ctx.d.axis_size_pt - 1, ctx.muted)
+    pos = st.legend_position
+    common = dict(frameon=False, fontsize=kw["fontsize"], labelcolor=kw["color"])
+    if pos == "bottom":
+        leg = ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=min(len(handles), 4), **common)
+        leg._ts_position = "bottom"
+    elif pos == "top":
+        ax.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=min(len(handles), 4), **common)
+    elif pos == "left":
+        ax.legend(handles, labels, loc="center right", bbox_to_anchor=(-0.12, 0.5), **common)
+    else:
+        ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), **common)
 
 
-def _draw_bar(ax, categories: Sequence[str], chart: Chart) -> None:
-    n_series = len(chart.series)
+def _value_axis(ax, ctx: _Ctx, axis: str = "y") -> None:
+    from matplotlib.ticker import FuncFormatter
+
+    st = ctx.style
+    fmt = FuncFormatter(lambda v, _pos: ctx.label(v))
+    if axis == "y":
+        ax.yaxis.set_major_formatter(fmt)
+        if st.log_y:
+            ax.set_yscale("log")
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(st.y_min if st.y_min is not None else lo, st.y_max if st.y_max is not None else hi)
+    else:
+        ax.xaxis.set_major_formatter(fmt)
+        lo, hi = ax.get_xlim()
+        ax.set_xlim(st.y_min if st.y_min is not None else lo, st.y_max if st.y_max is not None else hi)
+
+
+TICK_LABEL_MAX = 28
+
+
+def _tick_text(label: str) -> str:
+    """A category label on an axis, clipped: one 80-character label drawn
+    at 45 degrees squeezed the plot to a sliver (verifier sample 2026-09-15).
+    The full label stays in the data (XLSX Chart data, captions)."""
+    label = str(label)
+    return label if len(label) <= TICK_LABEL_MAX else label[: TICK_LABEL_MAX - 1].rstrip() + "…"
+
+
+def _category_ticks(ax, categories: Sequence[str], ctx: _Ctx, axis: str = "x") -> None:
+    categories = [_tick_text(c) for c in categories]
     idx = list(range(len(categories)))
-    width = 0.8 / n_series
-    label_values = len(categories) <= theme.CHART_LABEL_MAX_CATEGORIES
-    for k, series in enumerate(chart.series):
-        positions = [i + k * width for i in idx]
-        bars = ax.bar(positions, list(series.values), width=width, label=series.name, color=theme.series_colour(k))
-        if label_values:
-            ax.bar_label(bars, labels=[_fmt_value(v) for v in series.values], padding=2, fontsize=8, color=theme.INK_MUTED)
-    ticks = [i + 0.4 - width / 2 for i in idx]
-    ax.set_xticks(ticks)
-    rotation = 45 if any(len(c) > 8 for c in categories) else 0
-    ax.set_xticklabels(categories, rotation=rotation, ha="right" if rotation else "center")
-    ax.margins(y=0.12)
+    if axis == "x":
+        ax.set_xticks(idx)
+        many = len(categories) > 24
+        rotation = 45 if any(len(c) > 8 for c in categories) or many else 0
+        labels = [c if not many or i % max(1, len(categories) // 24) == 0 else "" for i, c in enumerate(categories)]
+        ax.set_xticklabels(labels, rotation=rotation, ha="right" if rotation else "center")
+    else:
+        ax.set_yticks(idx)
+        ax.set_yticklabels(list(categories))
 
 
-def _draw_horizontal_bar(ax, categories: Sequence[str], chart: Chart) -> None:
-    n_series = len(chart.series)
-    idx = list(range(len(categories)))
-    height = 0.8 / n_series
-    label_values = len(categories) <= theme.CHART_LABEL_MAX_CATEGORIES
-    for k, series in enumerate(chart.series):
-        positions = [i + k * height for i in idx]
-        bars = ax.barh(positions, list(series.values), height=height, label=series.name, color=theme.series_colour(k))
-        if label_values:
-            ax.bar_label(bars, labels=[_fmt_value(v) for v in series.values], padding=3, fontsize=8, color=theme.INK_MUTED)
-    ticks = [i + 0.4 - height / 2 for i in idx]
-    ax.set_yticks(ticks)
-    ax.set_yticklabels(categories)
-    ax.invert_yaxis()  # first category at the top, as the browser draws it
-    ax.margins(x=0.12)
+def _labels_on(ctx: _Ctx, n_categories: int) -> bool:
+    if ctx.style.data_labels == "on":
+        return True
+    if ctx.style.data_labels == "off":
+        return False
+    return n_categories <= LABEL_MAX_CATEGORIES
 
 
-def _draw_line(ax, categories: Sequence[str], chart: Chart) -> None:
-    idx = list(range(len(categories)))
-    for k, series in enumerate(chart.series):
-        ax.plot(idx, list(series.values), marker="o", markersize=4, linewidth=2, label=series.name, color=theme.series_colour(k))
-    ax.set_xticks(idx)
-    rotation = 45 if any(len(c) > 8 for c in categories) else 0
-    ax.set_xticklabels(categories, rotation=rotation, ha="right" if rotation else "center")
+def _slice_label_style(ctx: Any, fill: str) -> str:
+    """Text colour for a label drawn on a slice. Every slice above the size
+    floor keeps its label (2026-09-15: mid-tone fills such as #4285F4 and
+    #EA4335 reach 4.5:1 with neither white nor the theme ink, and their labels
+    were dropped). Pure black or pure white always reaches at least 4.58:1 on
+    any opaque fill, so the fallback is whichever of the two contrasts more."""
+    for colour in (ctx.d.label_color_for(fill), ctx.ink):
+        if contrast_ratio(colour, fill) >= 4.5:
+            return colour
+    return max(("#000000", "#FFFFFF"), key=lambda c: contrast_ratio(c, fill))
 
 
-def _draw_pie(ax, categories: Sequence[str], values: Sequence[float]) -> None:
-    pairs = [(c, max(float(v), 0.0)) for c, v in zip(categories, values)]
-    pairs.sort(key=lambda p: p[1], reverse=True)
-    if len(pairs) > _MAX_PIE_SLICES:
-        head = pairs[: _MAX_PIE_SLICES - 1]
-        tail = sum(v for _, v in pairs[_MAX_PIE_SLICES - 1:])
-        pairs = head + [("Other", tail)]
+def _label_kw(ctx: _Ctx, colour: str) -> Dict[str, Any]:
+    kw = _text_kw(ctx.style.data_label, max(7.0, ctx.d.axis_size_pt - 2), colour)
+    return kw
+
+
+# ---------------------------------------------------------------- drawers --
+
+
+def _draw_bars(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    t = c.type
+    horizontal = t in ("horizontal_bar", "stacked_horizontal_bar")
+    stacked = t in ("stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar")
+    percent = t == "percent_stacked_bar"
+    cats = list(c.categories)
+    n = len(c.series)
+    idx = list(range(len(cats)))
+    values = [list(s.values) for s in c.series]
+    if percent:
+        totals = [sum(max(0.0, values[k][j]) for k in range(n)) or 1.0 for j in idx]
+        values = [[max(0.0, values[k][j]) / totals[j] * 100.0 for j in idx] for k in range(n)]
+    labels_on = _labels_on(ctx, len(cats))
+    base = [0.0] * len(cats)
+    width = 0.8 if stacked else 0.8 / max(1, n)
+    single_cat_colours = n == 1 and bool(ctx.style.category_colors)
+    for k, s in enumerate(c.series):
+        colour = ctx.series_colour(k, s.name)
+        colours = [ctx.category_colour(j, cats[j]) if single_cat_colours else colour for j in idx]
+        pos = idx if stacked else [i + (k - (n - 1) / 2) * width for i in idx]
+        vals = values[k]
+        if horizontal:
+            bars = ax.barh(pos, vals, height=width, left=base if stacked else None, label=s.name, color=colours)
+        else:
+            bars = ax.bar(pos, vals, width=width, bottom=base if stacked else None, label=s.name, color=colours)
+        if labels_on:
+            _bar_labels(ax, ctx, bars, vals, colours, stacked, horizontal, percent)
+        if stacked:
+            base = [b + v for b, v in zip(base, vals)]
+    if horizontal:
+        _category_ticks(ax, cats, ctx, axis="y")
+        ax.invert_yaxis()
+        ax.margins(x=0.12)
+        _value_axis(ax, ctx, "x")
+        if ctx.style.y_min is None:
+            lo, hi = ax.get_xlim()
+            ax.set_xlim(min(0.0, lo), hi)
+    else:
+        _category_ticks(ax, cats, ctx)
+        ax.margins(y=0.12)
+        _value_axis(ax, ctx, "y")
+        if ctx.style.y_min is None and not ctx.style.log_y:
+            lo, hi = ax.get_ylim()
+            ax.set_ylim(min(0.0, lo), hi)
+    if percent:
+        from matplotlib.ticker import FuncFormatter
+
+        (ax.xaxis if horizontal else ax.yaxis).set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.0f}%"))
+    return False
+
+
+def _bar_labels(ax, ctx: _Ctx, bars, vals, colours, stacked: bool, horizontal: bool, percent: bool) -> None:
+    """Grouped bars: every label outside the bar, in ink. Stacked segments:
+    inside, only where white/ink reaches 4.5:1 on the segment and the
+    segment is tall enough to hold the text; otherwise no label."""
+    texts = [("" if v == 0 else (f"{v:.0f}%" if percent else ctx.label(v))) for v in vals]
+    if not stacked:
+        ax.bar_label(bars, labels=texts, padding=3 if horizontal else 2, **_label_kw(ctx, ctx.ink))
+        return
+    extent = max((abs(v) for v in vals), default=0.0) or 1.0
+    for bar, v, col, text in zip(bars, vals, colours, texts):
+        if not text:
+            continue
+        inside_colour = ctx.d.label_color_for(col)
+        size = bar.get_width() if horizontal else bar.get_height()
+        if contrast_ratio(inside_colour, col) >= 4.5 and abs(size) >= 0.08 * extent:
+            cx = bar.get_x() + bar.get_width() / 2
+            cy = bar.get_y() + bar.get_height() / 2
+            ax.text(cx, cy, text, ha="center", va="center", **_label_kw(ctx, inside_colour))
+
+
+def _line_styles(n: int, k: int) -> Dict[str, Any]:
+    if n >= 3:
+        return {"marker": _MARKERS[k % len(_MARKERS)], "linestyle": _DASHES[k % len(_DASHES)]}
+    return {"marker": "o", "linestyle": "-"}
+
+
+def _draw_line(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    cats = list(c.categories)
+    idx = list(range(len(cats)))
+    n = len(c.series)
+    direct = n > 5
+    for k, s in enumerate(c.series):
+        colour = ctx.series_colour(k, s.name)
+        ax.plot(idx, list(s.values), linewidth=2, markersize=4.5, label=s.name, color=colour, **_line_styles(n, k))
+        if direct and s.values:
+            ax.annotate(s.name, xy=(idx[-1], s.values[-1]), xytext=(6, 0), textcoords="offset points", va="center",
+                        **_label_kw(ctx, ctx.ink))
+    if n == 1 and _labels_on(ctx, len(cats)) and ctx.style.data_labels != "auto":
+        for i, v in zip(idx, c.series[0].values):
+            ax.annotate(ctx.label(v), xy=(i, v), xytext=(0, 6), textcoords="offset points", ha="center", **_label_kw(ctx, ctx.ink))
+    _category_ticks(ax, cats, ctx)
+    _value_axis(ax, ctx)
+    if direct:
+        ax.margins(x=0.12)
+    return direct
+
+
+def _draw_area(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    cats = list(c.categories)
+    idx = list(range(len(cats)))
+    if c.type == "stacked_area":
+        ax.stackplot(idx, *[list(s.values) for s in c.series], labels=[s.name for s in c.series],
+                     colors=[ctx.series_colour(k, s.name) for k, s in enumerate(c.series)], alpha=0.9)
+    else:
+        for k, s in enumerate(c.series):
+            colour = ctx.series_colour(k, s.name)
+            ax.fill_between(idx, list(s.values), alpha=0.25 if len(c.series) > 1 else 0.35, color=colour)
+            ax.plot(idx, list(s.values), color=colour, linewidth=2, label=s.name, **({"linestyle": _DASHES[k % len(_DASHES)]} if len(c.series) >= 3 else {}))
+    _category_ticks(ax, cats, ctx)
+    _value_axis(ax, ctx)
+    if ctx.style.y_min is None and not ctx.style.log_y:
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(min(0.0, lo), hi)
+    return False
+
+
+def _draw_pie(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    pairs = [(cat, max(float(v), 0.0)) for cat, v in zip(c.categories, c.series[0].values)]
+    total = sum(v for _, v in pairs)
+    if total <= 0:
+        ax.text(0.5, 0.5, "No positive values to chart", ha="center", va="center", color=ctx.muted, transform=ax.transAxes)
+        ax.set_axis_off()
+        return True
     labels = [p[0] for p in pairs]
     sizes = [p[1] for p in pairs]
-    if sum(sizes) <= 0:
-        # Every value zero or negative: a pie has nothing to show. Draw the
-        # honest message rather than an empty circle with a title.
-        ax.text(0.5, 0.5, "No positive values to chart", ha="center", va="center", color=theme.INK_MUTED, transform=ax.transAxes)
-        ax.set_axis_off()
-        return
-    colours = [theme.series_colour(i) for i in range(len(pairs))]
-    ax.pie(
-        sizes, labels=labels, colors=colours, autopct="%1.1f%%", startangle=90, counterclock=False,
-        textprops={"color": theme.INK_MUTED, "fontsize": 9},
-        wedgeprops={"linewidth": 1.0, "edgecolor": theme.WHITE},
-    )
+    colours = [ctx.category_colour(j, lab) for j, lab in enumerate(labels)]
+    donut = c.type == "donut"
+    wedgeprops = {"linewidth": 1.2, "edgecolor": ctx.bg}
+    if donut:
+        wedgeprops["width"] = 0.42
+    wedges, texts = ax.pie(sizes, labels=labels, colors=colours, startangle=90, counterclock=False, wedgeprops=wedgeprops,
+                           textprops=_text_kw(ctx.style.axis, ctx.d.axis_size_pt, ctx.muted), labeldistance=1.08)
+    r_text = 0.79 if donut else 0.64
+    for wedge, v, col in zip(wedges, sizes, colours):
+        share = v / total
+        if share < 0.035:
+            continue
+        ang = math.radians((wedge.theta1 + wedge.theta2) / 2)
+        colour = _slice_label_style(ctx, col)
+        text = f"{share * 100:.0f}%" if ctx.style.number_format in (None, "percent") else ctx.label(v)
+        ax.text(r_text * math.cos(ang), r_text * math.sin(ang), text, ha="center", va="center", **_label_kw(ctx, colour))
+    if donut:
+        ax.text(0, 0, ctx.label(total), ha="center", va="center", **_text_kw(ctx.style.title, ctx.d.title_size_pt + 2, ctx.ink, bold=True))
+    ax.axis("equal")
+    return True
 
 
-__all__ = ["render_chart_png"]
+def _draw_scatter(ax, ctx: _Ctx) -> bool:
+    import numpy as np
+
+    c = ctx.chart
+    bubble = c.type == "bubble"
+    all_sizes = [z for s in c.series for z in (s.sizes or [])]
+    zmin, zmax = (min(all_sizes), max(all_sizes)) if all_sizes else (0.0, 1.0)
+    for k, s in enumerate(c.series):
+        colour = ctx.series_colour(k, s.name)
+        xs = list(s.x or [])
+        if bubble and s.sizes:
+            span = (zmax - zmin) or 1.0
+            area = [40 + 900 * (z - zmin) / span for z in s.sizes]
+            ax.scatter(xs, list(s.values), s=area, color=colour, alpha=0.55, edgecolors=ctx.bg, linewidths=0.8, label=s.name,
+                       marker=_MARKERS[k % len(_MARKERS)] if len(c.series) >= 3 else "o")
+        else:
+            ax.scatter(xs, list(s.values), s=22, color=colour, alpha=0.85, label=s.name, marker=_MARKERS[k % len(_MARKERS)] if len(c.series) >= 3 else "o")
+    for tr in (c.extra.trendlines if c.extra else []):
+        k = next((i for i, s in enumerate(c.series) if s.name == tr.series), 0)
+        xs = c.series[k].x or []
+        if not xs:
+            continue
+        gx = np.linspace(min(xs), max(xs), 50)
+        ax.plot(gx, tr.slope * gx + tr.intercept, linestyle="--", linewidth=1.6, color=ctx.ink if len(c.series) == 1 else ctx.series_colour(k, tr.series),
+                label=f"Trend ({tr.series}): R² = {tr.r2:.2f}")
+    _value_axis(ax, ctx, "y")
+    st = ctx.style
+    if st.x_min is not None or st.x_max is not None:
+        lo, hi = ax.get_xlim()
+        ax.set_xlim(st.x_min if st.x_min is not None else lo, st.x_max if st.x_max is not None else hi)
+    from matplotlib.ticker import FuncFormatter
+
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: format_value(v, None)))
+    handles, labels = ax.get_legend_handles_labels()
+    if len(handles) >= 2 or (c.extra and c.extra.trendlines):
+        if len(handles) >= 2:
+            _legend(ax, ctx, handles, labels)
+    return True
+
+
+def _draw_histogram(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    edges = list(c.extra.bin_edges) if c.extra and c.extra.bin_edges else []
+    n = len(c.series)
+    if len(edges) == len(c.categories) + 1:
+        widths = [edges[i + 1] - edges[i] for i in range(len(c.categories))]
+        for k, s in enumerate(c.series):
+            colour = ctx.series_colour(k, s.name)
+            if n == 1:
+                ax.bar(edges[:-1], list(s.values), width=widths, align="edge", color=colour, edgecolor=ctx.bg, linewidth=0.8, label=s.name)
+            else:
+                ax.step(edges, [s.values[0], *s.values], where="pre", color=colour, linewidth=2, label=s.name, linestyle=_DASHES[k % len(_DASHES)])
+        from matplotlib.ticker import FuncFormatter
+
+        tick_fmt = ctx.fmt or ("compact" if max(abs(e) for e in edges) >= 100_000 else None)
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _p: format_value(v, tick_fmt)))
+    else:
+        return _draw_bars(ax, ctx)
+    ax.set_ylim(0, None)
+    return False
+
+
+def _draw_combo(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    cats = list(c.categories)
+    idx = list(range(len(cats)))
+    bars = [(k, s) for k, s in enumerate(c.series) if (s.kind or "bar") == "bar" and s.axis == "primary"]
+    lines = [(k, s) for k, s in enumerate(c.series) if (k, s) not in bars]
+    nb = max(1, len(bars))
+    width = 0.8 / nb
+    for j, (k, s) in enumerate(bars):
+        pos = [i + (j - (nb - 1) / 2) * width for i in idx]
+        ax.bar(pos, list(s.values), width=width, color=ctx.series_colour(k, s.name), label=s.name)
+    ax2 = None
+    for j, (k, s) in enumerate(lines):
+        target = ax
+        if s.axis == "secondary":
+            if ax2 is None:
+                ax2 = ax.twinx()
+                ax2.spines["top"].set_visible(False)
+                ax2.tick_params(colors=ctx.muted, labelsize=ctx.d.axis_size_pt)
+                if c.y2_label:
+                    ax2.set_ylabel(c.y2_label, **_text_kw(ctx.style.axis, ctx.d.axis_size_pt, ctx.muted))
+            target = ax2
+        target.plot(idx, list(s.values), color=ctx.series_colour(k, s.name), linewidth=2.2, label=s.name, **_line_styles(len(lines) + 2 if len(lines) >= 1 else 1, j + 1))
+    _category_ticks(ax, cats, ctx)
+    _value_axis(ax, ctx)
+    if ctx.style.y_min is None:
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(min(0.0, lo), hi)
+    if ax2 is not None:
+        from matplotlib.ticker import FuncFormatter
+
+        ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: ctx.label(v)))
+        lo, hi = ax2.get_ylim()
+        ax2.set_ylim(min(0.0, lo), hi)
+    handles, labels = ax.get_legend_handles_labels()
+    if ax2 is not None:
+        h2, l2 = ax2.get_legend_handles_labels()
+        handles, labels = handles + h2, labels + l2
+    _legend(ax, ctx, handles, labels)
+    return True
+
+
+def _draw_box(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    boxes = c.extra.box if c.extra else []
+    stats = [{"label": b.name, "whislo": b.whisker_low, "q1": b.q1, "med": b.median, "q3": b.q3, "whishi": b.whisker_high,
+              "fliers": list(b.outliers), "mean": b.mean} for b in boxes]
+    colour = ctx.style.color or ctx.d.palette[0]
+    art = ax.bxp(stats, showfliers=True, patch_artist=True, widths=0.55,
+                 medianprops={"color": ctx.ink, "linewidth": 2}, whiskerprops={"color": ctx.muted},
+                 capprops={"color": ctx.muted}, flierprops={"marker": "o", "markersize": 3.5, "markerfacecolor": ctx.muted, "markeredgecolor": ctx.muted})
+    for j, patch in enumerate(art["boxes"]):
+        fill = ctx.style.category_colors.get(boxes[j].name, colour)
+        patch.set_facecolor(fill)
+        patch.set_alpha(0.55)
+        patch.set_edgecolor(fill)
+    _value_axis(ax, ctx)
+    if len(boxes) > 6 or any(len(b.name) > 10 for b in boxes):
+        for lab in ax.get_xticklabels():
+            lab.set_rotation(30)
+            lab.set_ha("right")
+    return True
+
+
+def _draw_heatmap(ax, ctx: _Ctx) -> bool:
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+
+    c = ctx.chart
+    grid = np.array([list(s.values) for s in c.series], dtype="float64")
+    top = ctx.style.color or NAVY
+    cmap = LinearSegmentedColormap.from_list("ts_heat", ["#F3F6FA", top])
+    # pcolormesh, not imshow: imshow embeds a base64 raster <image> in the
+    # SVG, which the validator (rightly) refuses as a non-fragment href.
+    im = ax.pcolormesh([j - 0.5 for j in range(grid.shape[1] + 1)], [i - 0.5 for i in range(grid.shape[0] + 1)], grid, cmap=cmap, edgecolors=ctx.bg, linewidth=0.5)
+    ax.set_xlim(-0.5, grid.shape[1] - 0.5)
+    ax.set_ylim(grid.shape[0] - 0.5, -0.5)
+    ax.set_xticks(range(len(c.categories)))
+    ax.set_xticklabels(list(c.categories), rotation=45 if any(len(x) > 8 for x in c.categories) else 0,
+                       ha="right" if any(len(x) > 8 for x in c.categories) else "center")
+    ax.set_yticks(range(len(c.series)))
+    ax.set_yticklabels([s.name for s in c.series])
+    ax.tick_params(colors=ctx.muted, labelsize=ctx.d.axis_size_pt, length=0)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    if grid.size <= 225:
+        vmin, vmax = float(grid.min()), float(grid.max())
+        for i in range(grid.shape[0]):
+            for j in range(grid.shape[1]):
+                rgba = cmap((grid[i, j] - vmin) / ((vmax - vmin) or 1.0))
+                cell = _to_hex(rgba)
+                colour = ctx.d.label_color_for(cell)
+                if contrast_ratio(colour, cell) >= 4.5:
+                    ax.text(j, i, ctx.label(grid[i, j]), ha="center", va="center", **_label_kw(ctx, colour))
+    cb = ax.figure.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    cb.outline.set_visible(False)
+    if cb.solids is not None:
+        cb.solids.set_rasterized(False)  # a raster would be an <image> href in the SVG
+    cb.ax.tick_params(colors=ctx.muted, labelsize=ctx.d.axis_size_pt - 1)
+    if c.x_label:
+        ax.set_xlabel(c.x_label, color=ctx.muted, fontsize=ctx.d.axis_size_pt)
+    return True
+
+
+def _draw_waterfall(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    deltas = list(c.series[0].values)
+    cats = list(c.categories) + ["Total"]
+    up = ctx.style.series_colors.get("Increase") or ctx.style.color or ctx.d.palette[0]
+    down = ctx.style.series_colors.get("Decrease") or ctx.d.palette[1]
+    total_colour = ctx.style.series_colors.get("Total") or NAVY
+    running = 0.0
+    bottoms, heights, colours = [], [], []
+    for v in deltas:
+        bottoms.append(running if v >= 0 else running + v)
+        heights.append(abs(v))
+        colours.append(up if v >= 0 else down)
+        running += v
+    bottoms.append(min(0.0, running))
+    heights.append(abs(running))
+    colours.append(total_colour)
+    idx = list(range(len(cats)))
+    ax.bar(idx, heights, bottom=bottoms, color=colours, width=0.62)
+    cum = 0.0
+    for i in range(len(deltas) - 1):
+        cum += deltas[i]
+        ax.plot([i + 0.31, i + 1 - 0.31], [cum, cum], color=ctx.muted, linewidth=0.8)
+    if _labels_on(ctx, len(cats)):
+        for i, (b, hgt) in enumerate(zip(bottoms, heights)):
+            v = deltas[i] if i < len(deltas) else running
+            text = ("+" if i < len(deltas) and v > 0 else "") + ctx.label(v)
+            ax.annotate(text, xy=(i, b + hgt), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", **_label_kw(ctx, ctx.ink))
+    _category_ticks(ax, cats, ctx)
+    _value_axis(ax, ctx)
+    ax.margins(y=0.12)
+    from matplotlib.patches import Patch
+
+    handles = [Patch(color=up, label="Increase"), Patch(color=down, label="Decrease"), Patch(color=total_colour, label="Total")]
+    _legend(ax, ctx, handles, [h.get_label() for h in handles])
+    return True
+
+
+def _draw_funnel(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    vals = [max(0.0, v) for v in c.series[0].values]
+    top = max(vals) or 1.0
+    cats = list(c.categories)
+    for j, (cat, v) in enumerate(zip(cats, vals)):
+        colour = ctx.style.category_colors.get(cat) or ctx.style.color or ctx.d.palette[0]
+        left = (top - v) / 2
+        ax.barh(j, v, left=left, height=0.72, color=colour)
+        share = f" ({v / vals[0] * 100:.0f}%)" if vals[0] and j > 0 else ""
+        text = ctx.label(v) + share
+        inside = ctx.d.label_color_for(colour)
+        if v >= 0.3 * top and contrast_ratio(inside, colour) >= 4.5:
+            ax.text(top / 2, j, text, ha="center", va="center", **_label_kw(ctx, inside))
+        else:
+            ax.text(left + v + 0.01 * top, j, text, ha="left", va="center", **_label_kw(ctx, ctx.ink))
+    ax.set_yticks(range(len(cats)))
+    ax.set_yticklabels(cats)
+    ax.invert_yaxis()
+    ax.set_xticks([])
+    ax.set_xlim(0, top * 1.18)
+    ax.tick_params(colors=ctx.muted, labelsize=ctx.d.axis_size_pt, length=0)
+    for side in ax.spines.values():
+        side.set_visible(False)
+    return True
+
+
+def _draw_gantt(ax, ctx: _Ctx) -> bool:
+    import datetime as dt
+
+    import matplotlib.dates as mdates
+
+    c = ctx.chart
+    spans = c.extra.spans if c.extra else []
+    for j, sp in enumerate(spans):
+        start = dt.date.fromisoformat(sp.start)
+        end = dt.date.fromisoformat(sp.end)
+        colour = ctx.style.category_colors.get(sp.label) or ctx.series_colour(0)
+        ax.barh(j, max(0.8, (end - start).days), left=mdates.date2num(start), height=0.55, color=colour)
+        if _labels_on(ctx, 13 if len(spans) > 30 else len(spans)):
+            ax.annotate(f"{sp.days:.0f}d", xy=(mdates.date2num(end), j), xytext=(4, 0), textcoords="offset points", va="center", **_label_kw(ctx, ctx.ink))
+    ax.set_yticks(range(len(spans)))
+    ax.set_yticklabels([s.label for s in spans])
+    ax.invert_yaxis()
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
+    ax.margins(x=0.06)
+    return True
+
+
+def _draw_radar(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    cats = list(c.categories)
+    n = len(cats)
+    angles = [2 * math.pi * i / n for i in range(n)] + [0.0]
+    for k, s in enumerate(c.series):
+        vals = list(s.values) + [s.values[0]]
+        colour = ctx.series_colour(k, s.name)
+        ax.plot(angles, vals, color=colour, linewidth=2, label=s.name, **_line_styles(len(c.series), k))
+        ax.fill(angles, vals, color=colour, alpha=0.06)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(cats, color=ctx.muted, fontsize=ctx.d.axis_size_pt)
+    ax.tick_params(axis="y", colors=ctx.muted, labelsize=ctx.d.axis_size_pt - 3)
+    ax.set_rlabel_position(90)
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+    ax.yaxis.set_major_locator(MaxNLocator(4))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: format_value(v, ctx.fmt or "compact")))
+    ax.grid(color=ctx.d.grid_color)
+    ax.spines["polar"].set_color(ctx.d.grid_color)
+    handles, labels = ax.get_legend_handles_labels()
+    _legend(ax, ctx, handles, labels)
+    return True
+
+
+_DRAWERS = {
+    "bar": _draw_bars, "horizontal_bar": _draw_bars, "stacked_bar": _draw_bars, "stacked_horizontal_bar": _draw_bars,
+    "percent_stacked_bar": _draw_bars, "line": _draw_line, "area": _draw_area, "stacked_area": _draw_area,
+    "pie": _draw_pie, "donut": _draw_pie, "scatter": _draw_scatter, "bubble": _draw_scatter, "histogram": _draw_histogram,
+    "combo": _draw_combo, "box": _draw_box, "heatmap": _draw_heatmap, "waterfall": _draw_waterfall, "funnel": _draw_funnel,
+    "gantt": _draw_gantt, "radar": _draw_radar,
+}
+
+
+__all__ = [
+    "ChartStyleDefaults", "defaults_from", "contrast_ratio", "format_value", "indian_group", "chart_warnings",
+    "font_for_script", "scripts_in", "render_png", "render_svg", "render_chart_png", "render_standalone", "clean_svg",
+]

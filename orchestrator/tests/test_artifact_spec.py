@@ -30,11 +30,12 @@ def test_every_kind_maps_to_real_formats_only():
     # CONTRACT-2 §1 (2026-09-12): csv is a format; a workbook is delivered
     # as xlsx, csv, and a tabular Word/PDF; zip is a route, not a format.
     assert "csv" in T.FORMATS and T.MIME_TYPES["csv"] == "text/csv; charset=utf-8"
-    assert T.FORMATS_FOR_KIND["workbook"] == ("xlsx", "csv", "docx", "pdf")
-    assert T.FORMATS_FOR_KIND["document"] == ("docx", "pdf") and T.FORMATS_FOR_KIND["presentation"] == ("pptx", "pdf")
+    # AS3 integration (2026-09-15): chart images are live formats, after the natives.
+    assert T.FORMATS_FOR_KIND["workbook"] == ("xlsx", "csv", "docx", "pdf", "png")
+    assert T.FORMATS_FOR_KIND["document"] == ("docx", "pdf", "png", "svg") and T.FORMATS_FOR_KIND["presentation"] == ("pptx", "pdf", "png")
     assert T.MIME_TYPES["zip"] == "application/zip" and "zip" not in T.FORMATS
     assert T.MAX_ZIP_BYTES == 200 * 1024 * 1024
-    assert set(T.PAGE_FORMATS) | set(T.GRID_FORMATS) == set(T.FORMATS)
+    assert set(T.PAGE_FORMATS) | set(T.GRID_FORMATS) | set(T.IMAGE_FORMATS) == set(T.FORMATS)
 
 
 def test_effort_decides_depth_never_availability():

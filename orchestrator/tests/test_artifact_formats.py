@@ -107,7 +107,8 @@ def test_a_workbook_carries_word_and_pdf_but_a_document_carries_no_grid():
     for a workbook; a document or a deck still cannot be a csv/xlsx."""
     d = F.decide("Share XLSX, Word, PDF, and CSV of this audit.")
     assert d.kind == "workbook" and d.formats == ["xlsx", "docx", "pdf", "csv"] and d.warnings == []
-    assert T.FORMATS_FOR_KIND["workbook"] == ("xlsx", "csv", "docx", "pdf")
+    # AS3 integration: a workbook's charts can also be standalone PNGs.
+    assert T.FORMATS_FOR_KIND["workbook"] == ("xlsx", "csv", "docx", "pdf", "png")
     d = F.decide("Create a PDF report on AI in business, plus an Excel of the raw numbers")
     assert d.kind == "document" and d.formats == ["pdf"]
     assert d.warnings == ["xlsx cannot be produced for a document; it was not made"]

@@ -492,6 +492,38 @@ class Settings:
         # Max effort visual QA: pages sent to the vision model, downscaled.
         self.artifact_qa_pages: int = _int("ARTIFACT_QA_PAGES", 4)
         self.artifact_qa_width: int = _int("ARTIFACT_QA_WIDTH", 896)
+        # --- AS3 intent-capability BEGIN ---
+        # The intent gate's one context-aware classifier call (artifacts/
+        # intent_llm.py), consulted only when the rules found no request, the
+        # message names a file and no negative shape fired. Off = rules only.
+        # Real fields, not getattr defaults: Settings reads the environment
+        # here, once, so a default elsewhere could never be switched off.
+        self.artifact_intent_llm_enabled: bool = _bool("ARTIFACT_INTENT_LLM", True)
+        self.artifact_intent_llm_timeout_fast_s: float = _float("ARTIFACT_INTENT_LLM_TIMEOUT_FAST_S", 2.5)
+        self.artifact_intent_llm_timeout_s: float = _float("ARTIFACT_INTENT_LLM_TIMEOUT_S", 5.0)
+        # After an assistant/agent/dataset/vision answer that DENIES it can
+        # make a file while the person named one: classify once and, when the
+        # classifier is sure (>= 0.8), start the artifact job and append the
+        # card. Counted either way (artifact_denial_{rerouted,seen}_total).
+        self.artifact_denial_backstop: bool = _bool("ARTIFACT_DENIAL_BACKSTOP", True)
+        # --- AS3 intent-capability END ---
+        # --- AS3 agentic-selfcheck ---
+        # After render/validate/preview (and Max's visual pass) every file is
+        # re-read and held to a checklist of what the person asked for
+        # (artifacts/selfcheck.py). Off = files publish as rendered, with no
+        # checklist and no repair. REAL fields, not getattr defaults: Settings
+        # reads the environment here, once, so only a field can be switched
+        # off by env.
+        self.artifact_selfcheck: bool = _bool("ARTIFACT_SELFCHECK", True)
+        # One code repair (plus, at Think/Max, one content call) when a
+        # must-item fails; the repair publishes only if it strictly helps.
+        self.artifact_selfcheck_repair: bool = _bool("ARTIFACT_SELFCHECK_REPAIR", True)
+        # Wall-clock per job INCLUDING a re-render, by effort. The job lease
+        # is 90 s with a heartbeat every 30 s, so these stay at or under it.
+        self.artifact_selfcheck_budget_fast_s: float = _float("ARTIFACT_SELFCHECK_BUDGET_FAST_S", 20.0)
+        self.artifact_selfcheck_budget_think_s: float = _float("ARTIFACT_SELFCHECK_BUDGET_THINK_S", 60.0)
+        self.artifact_selfcheck_budget_max_s: float = _float("ARTIFACT_SELFCHECK_BUDGET_MAX_S", 90.0)
+        # --- end AS3 agentic-selfcheck ---
 
         # --- Reranker ------------------------------------------------------
         # Backward compatibility: RERANK_ENABLED=false still disables the

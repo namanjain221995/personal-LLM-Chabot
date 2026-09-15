@@ -462,6 +462,11 @@ def test_the_non_lane_prompt_is_unchanged():
     expected_system = ASSISTANT = (
         chat_engine.ASSISTANT_SYSTEM + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION + identity_line()
     )
+    # --- AS3 intent-capability BEGIN --- the non-lane prompt now ends with the file capability line
+    from app.engines.capability import CAPABILITY_SUFFIX
+
+    ASSISTANT = ASSISTANT + CAPABILITY_SUFFIX
+    # --- AS3 intent-capability END ---
     messages = chat_engine._messages("hello", history, "assistant", "GROUNDING")
     assert messages[0] == {"role": "system", "content": ASSISTANT + "\n\nGROUNDING"}
     assert messages[1:] == [*history, {"role": "user", "content": "hello"}]

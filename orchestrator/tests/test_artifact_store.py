@@ -304,3 +304,25 @@ def test_write_bytes_is_atomic_and_write_json_never_leaves_a_partial(reports):
     assert store.read_json(os.path.join(work, "x.json")) == {"a": 1}
     assert not [n for n in os.listdir(work) if n.startswith(".stage-")]
     assert not [n for n in os.listdir(os.path.dirname(dest)) if n.startswith(".png-")]
+
+
+# --- AS3 agentic-selfcheck ---
+
+
+def test_publish_keeps_the_selfcheck_report_and_no_route_serves_it(reports):
+    """selfcheck.json is published beside validation.json (the card and a
+    later edit read it), but it is bookkeeping: not a manifest file, not a
+    download name, not in the zip (which is built from the manifest)."""
+    work = store.ensure_workdir(USER, ART, 1)
+    with open(os.path.join(work, "quarterly-review-v1.pdf"), "wb") as fh:
+        fh.write(b"%PDF-1.7 fake")
+    store.write_json(os.path.join(work, store.SELFCHECK_NAME), {"outcome": "clean", "items": []})
+    files = [{"format": "pdf", "filename": "quarterly-review-v1.pdf", "size": 13, "sha256": store.sha256_file(os.path.join(work, "quarterly-review-v1.pdf"))}]
+    final = store.publish(work, store.build_manifest(artifact_id=ART, version=1, files=files))
+    assert os.path.isfile(os.path.join(final, store.SELFCHECK_NAME))
+    assert store.SELFCHECK_NAME not in store.read_manifest(USER, ART, 1)["sha256s"]
+    assert store.SELFCHECK_NAME in store.NOT_DOWNLOADABLE_NAMES
+    with pytest.raises(store.PathRefused):
+        store.resolve_version_file(USER, ART, 1, "json", store.SELFCHECK_NAME)
+    with pytest.raises(store.PathRefused):
+        store.resolve_file_by_id(USER, ART, 1, "0123456789abcdef", [{"file_id": "0123456789abcdef", "format": "json", "filename": store.SELFCHECK_NAME}])

@@ -62,23 +62,28 @@ import {
 } from 'react';
 import {
   ArtifactRequestError,
+  cachedArtifactVersions,
   fetchArtifact,
   fileDownloadUrl,
   fileKey,
   fileMatchesKey,
   formatLabel,
   isFileId,
+  isImageFormat,
   isPreviewable,
   isTerminal,
   pollJob,
   previewKindFor,
   statusLine,
+  versionList,
 } from '@/lib/artifacts';
 import { focusableWithin, focusTrapNext } from '@/lib/focusTrap';
 import { fileKind } from '@/lib/format';
 import type { ArtifactFile, ArtifactJob, ArtifactRef } from '@/lib/types';
 import { IconChevronLeft, IconChevronRight, IconDownload, IconForFormat, IconX } from '../icons';
 import { groupArtifacts } from './ArtifactCards';
+import { IconImage } from './ArtifactCard';
+import { VersionSwitcher } from './VersionSwitcher';
 import { PagesViewer } from './PagesViewer';
 import { SheetViewer } from './SheetViewer';
 import { stateForStatus, ViewerState, type ViewerStateKind } from './ViewerState';
@@ -199,6 +204,20 @@ export function ArtifactPanel({
   originRef.current = originId;
   const titleId = 'artifact-panel-title';
 
+  // AS3: every version of the artifact on show, for the version switcher —
+  // loaded once per artifact (cached), not per step.
+  const [versions, setVersions] = useState<ArtifactRef[]>([]);
+  useEffect(() => {
+    let alive = true;
+    setVersions([]);
+    cachedArtifactVersions(cursor.artifactId)
+      .then((res) => alive && setVersions(versionList(res.versions)))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [cursor.artifactId]);
+
   // The host re-targets an open panel (another card clicked): follow it.
   useEffect(() => {
     setCursor({ artifactId, version, fileKey: initialFileKey });
@@ -315,9 +334,15 @@ export function ArtifactPanel({
     : null;
   const currentKey = artifact && current ? fileKey(artifact, current) : cursor.fileKey;
 
+  // Prev/next walk the message's versions AND every published version of
+  // the artifact on show (AS3: panel navigation crosses versions).
+  const allRefs = useMemo(() => {
+    const extra = versions.filter((v) => !refs.some((r) => r.artifact_id === v.artifact_id && r.version === v.version));
+    return extra.length ? [...refs, ...extra] : refs;
+  }, [refs, versions]);
   const entries = useMemo(
-    () => navigationEntries(refs, artifact && terminal && !failed ? artifact : null),
-    [refs, artifact, terminal, failed],
+    () => navigationEntries(allRefs, artifact && terminal && !failed ? artifact : null),
+    [allRefs, artifact, terminal, failed],
   );
   const index = entries.findIndex(
     (e) =>
@@ -386,7 +411,17 @@ export function ArtifactPanel({
         : typeof current.pages === 'number'
           ? current.pages
           : 0;
-    if (kind === 'pages' && previewable && pages > 0) {
+    if (isImageFormat(current.format) && downloadHref) {
+      // An image is shown ONLY through <img src> — never inlined as markup.
+      // The server answers an SVG as a sandboxed attachment, which an <img>
+      // still renders (no script runs in an image context).
+      body = (
+        <div className="flex h-full items-center justify-center overflow-auto p-4" data-testid="artifact-panel-image">
+          {/* eslint-disable-next-line @next/next/no-img-element -- a generated chart image, never next/image-optimised */}
+          <img src={fileDownloadUrl(artifact, current, current.format === 'svg' ? 'attachment' : 'inline')} alt={fileTitle} className="max-h-full max-w-full" />
+        </div>
+      );
+    } else if (kind === 'pages' && previewable && pages > 0) {
       body = (
         <PagesViewer
           // Keyed by VERSION: the page set is the version's, shared by its
@@ -469,7 +504,7 @@ export function ArtifactPanel({
             format ? fileKind(`x.${format}`).className : 'file-icon-other'
           }`}
         >
-          <IconForFormat format={format} size={16} />
+          {isImageFormat(format) ? <IconImage size={16} /> : <IconForFormat format={format} size={16} />}
         </span>
         <div className="min-w-0 flex-1">
           <h2 id={titleId} className="truncate text-sm font-semibold text-ink" title={current?.filename ?? fileTitle}>
@@ -481,6 +516,16 @@ export function ArtifactPanel({
             {entries.length > 1 && index >= 0 ? ` · ${index + 1} of ${entries.length}` : ''}
           </p>
         </div>
+        {artifact && versions.length > 1 && (
+          <VersionSwitcher
+            artifactId={artifact.artifact_id}
+            version={artifact.version}
+            versions={versions}
+            onSelect={(v) => {
+              setCursor({ artifactId: artifact.artifact_id, version: v, fileKey: null });
+            }}
+          />
+        )}
         {downloadHref && current && (
           <a
             href={downloadHref}

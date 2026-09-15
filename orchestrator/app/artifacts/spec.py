@@ -33,10 +33,20 @@ import re
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
+from . import style as ST
 from . import types as T
 
 SPEC_VERSION = 1
+
+#: Fields code writes and the model never sees: they are persisted in
+#: spec.json and validated like everything else, but `SkipJsonSchema` keeps
+#: them out of `schema_for(kind)` — the guided-decoding schema is exactly
+#: as large as before styling existed (asserted in test_artifact_style.py),
+#: and `parse_body` drops them from model output.
+_CODE_ONLY_BODY_FIELDS = ("style",)
+_CODE_ONLY_COLUMN_FIELDS = ("format", "align")
 
 # --------------------------------------------------------------- helpers --
 
@@ -118,57 +128,15 @@ class Citation(_Strict):
         return v
 
 
-class Series(_Strict):
-    name: str = Field(min_length=1, max_length=80)
-    #: Finite only: NaN and infinity are valid JSON to Python and pydantic,
-    #: and crash the chart and PPTX writers.
-    values: List[float] = Field(min_length=1, max_length=T.MAX_CHART_POINTS)
-
-    @field_validator("values")
-    @classmethod
-    def _finite(cls, v: List[float]) -> List[float]:
-        import math
-
-        if any(not math.isfinite(x) for x in v):
-            raise ValueError("chart values must be finite numbers")
-        return v
-
-
-class Chart(_Strict):
-    """A chart the renderers draw from DATA in the spec — categories and
-    numeric series — never from an image or a description. `bar`, `line`,
-    `pie` and `horizontal_bar` are what every renderer supports natively
-    (matplotlib for PDF/DOCX, native charts in PPTX/XLSX)."""
-
-    type: Literal["bar", "horizontal_bar", "line", "pie"] = "bar"
-    title: str = Field(default="", max_length=120)
-    categories: List[str] = Field(min_length=1, max_length=T.MAX_CHART_POINTS)
-
-    @field_validator("categories")
-    @classmethod
-    def _category_text(cls, v: List[str]) -> List[str]:
-        # A label, not a paragraph: matplotlib lays out every character of
-        # every tick label, and 200 labels of 10,000 characters cost ~100 s.
-        return [_clip(c, 80) or f"#{i + 1}" for i, c in enumerate(v)]
-    series: List[Series] = Field(min_length=1, max_length=8)
-    y_label: str = Field(default="", max_length=60)
-    caption: str = Field(default="", max_length=300)
-    sources: List[str] = Field(default_factory=list, max_length=8)
-
-    @model_validator(mode="after")
-    def _lengths_agree(self) -> "Chart":
-        n = len(self.categories)
-        for s in self.series:
-            if len(s.values) != n:
-                raise ValueError(f"series {s.name!r} has {len(s.values)} values for {n} categories")
-        if self.type == "pie" and len(self.series) != 1:
-            raise ValueError("a pie chart has exactly one series")
-        if all(v == 0 for s in self.series for v in s.values):
-            # Every value zero is a chart the model emptied rather than
-            # filled (the Think deck of 2026-09-11 drew two zero bars after
-            # its review); it is refused so the repair drops or fills it.
-            raise ValueError("the chart has no data: every value is 0 — fill it from the material or leave the chart out")
-        return self
+# --- AS3 integration BEGIN: Chart v2 ---
+# The chart a spec carries is the charts track's Chart v2 (chart_spec.py): a
+# SUPERSET of the old model (every old field keeps its name and meaning, so
+# every stored spec.json still loads) that adds `data` — the binding to a real
+# table — and the requested `style`. `categories`/`series` are OUTPUT fields
+# that chart_data.resolve_spec computes by code; schema_for() strips them from
+# what the model is offered, so guided decoding never writes a plotted number.
+from .chart_spec import Chart, Series  # noqa: E402,F401
+# --- AS3 integration END ---
 
 
 class Table(_Strict):
@@ -286,6 +254,8 @@ class DocumentSpec(_Strict):
     blocks: List[DocumentBlock] = Field(min_length=1, max_length=400)
     sources: List[Citation] = Field(default_factory=list, max_length=60)
     assumptions: List[str] = Field(default_factory=list, max_length=20)
+    #: How the document looks (style.StyleSpec): written by code, never by the model.
+    style: SkipJsonSchema[Optional[ST.StyleSpec]] = None
 
     @model_validator(mode="after")
     def _shape(self) -> "DocumentSpec":
@@ -362,6 +332,8 @@ class PresentationSpec(_Strict):
     slides: List[Slide] = Field(min_length=1, max_length=T.MAX_SLIDES)
     sources: List[Citation] = Field(default_factory=list, max_length=60)
     assumptions: List[str] = Field(default_factory=list, max_length=20)
+    #: How the deck looks (style.StyleSpec): written by code, never by the model.
+    style: SkipJsonSchema[Optional[ST.StyleSpec]] = None
 
     @model_validator(mode="after")
     def _shape(self) -> "PresentationSpec":
@@ -391,10 +363,25 @@ class PresentationSpec(_Strict):
 ColumnType = Literal["text", "integer", "number", "currency", "percent", "date"]
 
 
+class ColumnFormat(_Strict):
+    """How a column's cells DISPLAY, beyond its type: the currency, the
+    decimals, the date style. Written by code from a request ("amounts in
+    rupees", "dates as yyyy-mm-dd"); render/theme.format_cell and the XLSX
+    number formats read it."""
+
+    kind: Optional[Literal["integer", "decimal", "percent", "currency", "date", "datetime", "text"]] = None
+    currency: Optional[Literal["INR", "USD", "EUR", "GBP"]] = None
+    decimals: Optional[int] = Field(default=None, ge=0, le=6)
+    date_style: Optional[Literal["dmy", "iso"]] = None
+
+
 class Column(_Strict):
     name: str = Field(min_length=1, max_length=80)
     type: ColumnType = "text"
     width: Optional[int] = Field(default=None, ge=6, le=80)
+    #: Code-written display format and alignment (never in the model's schema).
+    format: SkipJsonSchema[Optional[ColumnFormat]] = None
+    align: SkipJsonSchema[Optional[Literal["left", "center", "right"]]] = None
 
 
 class Total(_Strict):
@@ -659,6 +646,12 @@ class Sheet(_Strict):
         description="Text columns to rewrite cell by cell after the rows are filled (an audit comment made concise); every other cell is kept exactly.",
     )
     style: Optional[SheetStyle] = Field(default=None, description="Borders, header, highlighted columns, wrapping and page orientation for the Excel/Word/PDF files.")
+    #: The id of the material table this sheet's rows were COMPUTED from by
+    #: code (artifacts.derived: an aggregate the model had typed, replaced
+    #: by the figures code computed from the source rows). Code-written,
+    #: never in the model's schema; the composer strips it from a model
+    #: answer so a model cannot certify its own figures (B1, 2026-09-15).
+    computed_from: SkipJsonSchema[Optional[str]] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -757,6 +750,12 @@ class Sheet(_Strict):
         made by code, never typed by the model."""
         return bool(self.rows_from) or self.generator is not None
 
+    @property
+    def rows_are_code_computed(self) -> bool:
+        """Every figure on the sheet came from code: copied, generated, or
+        computed from a material table (`computed_from`)."""
+        return self.rows_are_code_made or bool(self.computed_from)
+
     @model_validator(mode="after")
     def _shape(self) -> "Sheet":
         width = len(self.columns)
@@ -840,6 +839,8 @@ class WorkbookSpec(_Strict):
     sheets: List[Sheet] = Field(min_length=1, max_length=T.MAX_SHEETS)
     sources: List[Citation] = Field(default_factory=list, max_length=60)
     assumptions: List[str] = Field(default_factory=list, max_length=20)
+    #: How the workbook looks (style.StyleSpec): written by code, never by the model.
+    style: SkipJsonSchema[Optional[ST.StyleSpec]] = None
 
     @model_validator(mode="after")
     def _unique_sheet_names(self) -> "WorkbookSpec":
@@ -906,13 +907,37 @@ def _check_source_refs(blocks: Any, sources: List[Citation]) -> None:
 _BODY_FOR_KIND = {"document": DocumentSpec, "presentation": PresentationSpec, "workbook": WorkbookSpec}
 
 
-def schema_for(kind: str) -> dict:
+def schema_for(kind: str, tables: Any = ()) -> dict:
     """The JSON schema the model is constrained to for one kind: the typed
     body alone, not the envelope, because the kind is already decided and a
     smaller schema is held better by guided decoding."""
     if kind not in _BODY_FOR_KIND:
         raise ValueError(f"unknown artifact kind {kind!r}")
-    return _BODY_FOR_KIND[kind].model_json_schema()
+    # With the material's tables, a document's or a deck's chart binding
+    # names only real table ids and columns (enums). A workbook's sheet
+    # charts bind to the sheet's own columns, which the model is writing in
+    # the same reply, so no enum can hold them.
+    return guided_chart_defs(_BODY_FOR_KIND[kind].model_json_schema(), tables=tables if kind != "workbook" else ())
+
+
+def guided_chart_defs(schema: dict, tables: Any = ()) -> dict:
+    """AS3 integration: the chart inside a body schema is the charts track's
+    GUIDED chart (chart_spec.guided_schema): no output fields (categories,
+    series, extra, provenance — code computes them), `type/title/data`
+    required, and `style` limited to what a person asks for. The live pilot
+    showed the full ChartStyle invites the model to fill sizes and fonts
+    nobody asked for."""
+    from .chart_spec import guided_schema, strip_output_fields
+
+    defs = schema.get("$defs")
+    if isinstance(defs, dict) and "Chart" in defs:
+        chart = guided_schema(tables=list(tables or ()))
+        chart_defs = chart.pop("$defs", {})
+        defs["Chart"] = chart
+        for name in ("Series", "ChartExtra", "Provenance", "BoxStats", "Span", "Trend", "ChartTextStyle"):
+            defs.pop(name, None)
+        defs.update(chart_defs)
+    return strip_output_fields(schema)
 
 
 def parse_body(kind: str, data: dict) -> ArtifactSpec:
@@ -921,8 +946,29 @@ def parse_body(kind: str, data: dict) -> ArtifactSpec:
     caller feeds back to the model for one repair pass."""
     if kind not in _BODY_FOR_KIND:
         raise ValueError(f"unknown artifact kind {kind!r}")
-    body = _BODY_FOR_KIND[kind].model_validate(data)
+    body = _BODY_FOR_KIND[kind].model_validate(_without_code_only(kind, data))
     return ArtifactSpec(kind=kind, **{kind: body})
+
+
+def _without_code_only(kind: str, data: Any) -> Any:
+    """Model output with the code-written fields removed: `style` on the
+    body and `format`/`align` on workbook columns. The model's schema never
+    offered them, so anything there was invented; code carries a parent's
+    style across a revision itself."""
+    if not isinstance(data, dict):
+        return data
+    out = {k: v for k, v in data.items() if k not in _CODE_ONLY_BODY_FIELDS}
+    if kind == "workbook" and isinstance(out.get("sheets"), list):
+        sheets = []
+        for sh in out["sheets"]:
+            if isinstance(sh, dict) and isinstance(sh.get("columns"), list):
+                sh = {**sh, "columns": [
+                    {k: v for k, v in c.items() if k not in _CODE_ONLY_COLUMN_FIELDS} if isinstance(c, dict) else c
+                    for c in sh["columns"]
+                ]}
+            sheets.append(sh)
+        out["sheets"] = sheets
+    return out
 
 
 def load(data: dict) -> ArtifactSpec:
@@ -1131,10 +1177,11 @@ def _model_made(body: Any) -> Any:
     code (and the totals and charts drawn over them) are code's, and a
     500-row generated dataset would otherwise be 500 rows of "figures the
     material never gave"."""
-    dump = body.model_dump()
+    # The style is code's (a condition value of 80 is not a figure).
+    dump = body.model_dump(exclude={"style"})
     if isinstance(body, WorkbookSpec):
         for sheet, raw in zip(body.sheets, dump.get("sheets") or []):
-            if sheet.rows_are_code_made and isinstance(raw, dict):
+            if sheet.rows_are_code_computed and isinstance(raw, dict):
                 raw["rows"] = []
                 raw["charts"] = []
                 raw["generator"] = None
@@ -1177,6 +1224,6 @@ __all__ = [
     "Heading", "Paragraph", "Bullets", "Numbered", "TableBlock", "ChartBlock", "Callout",
     "KPI", "KPIRow", "PageBreak", "Slide", "Sheet", "Column", "Total", "Table", "Chart",
     "Series", "Citation", "Generator", "GenColumn", "OnlyWhen", "Derived", "TextPool", "Rewrite",
-    "Highlight", "SheetStyle", "schema_for", "parse_body", "load", "validation_summary",
+    "Highlight", "SheetStyle", "ColumnFormat", "schema_for", "parse_body", "load", "validation_summary",
     "text_of", "placeholders_in", "is_formula_like", "unsupported_figures", "templates_for", "part_count", "hollow",
 ]

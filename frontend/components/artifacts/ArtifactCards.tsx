@@ -61,11 +61,13 @@ function LiveGroup({
   siblings,
   activeKey,
   onOpen,
+  onEditPrompt,
 }: {
   artifact: ArtifactRef;
   siblings: ArtifactRef[];
   activeKey: string | null;
   onOpen: OpenArtifact;
+  onEditPrompt?: (artifactId: string, text: string) => void;
 }) {
   const live = useLiveArtifact(artifact);
   return (
@@ -74,7 +76,12 @@ function LiveGroup({
       job={live.job}
       error={live.error}
       activeKey={activeKey}
-      onOpen={(ref, originId, key) => onOpen(ref, originId, key, siblings)}
+      // A version picked in the switcher is not one of this message's refs:
+      // it joins the siblings so the panel can step from it (AS3).
+      onOpen={(ref, originId, key) =>
+        onOpen(ref, originId, key, siblings.some((s) => s.artifact_id === ref.artifact_id && s.version === ref.version) ? siblings : [...siblings, ref])
+      }
+      onEditPrompt={onEditPrompt}
     />
   );
 }
@@ -83,9 +90,12 @@ export function ArtifactCards({
   artifacts,
   onOpen,
   activeKey = null,
+  onEditPrompt,
 }: {
   artifacts: ArtifactRef[];
   onOpen: OpenArtifact;
+  /** The host's send for "Edit with a prompt" (a chat turn with artifact_id). */
+  onEditPrompt?: (artifactId: string, text: string) => void;
   /** The key (lib/artifacts.ts fileKey) of the FILE the panel is showing. */
   activeKey?: string | null;
 }) {
@@ -106,6 +116,7 @@ export function ArtifactCards({
               siblings={artifacts}
               activeKey={activeKey}
               onOpen={onOpen}
+              onEditPrompt={onEditPrompt}
             />
           ))}
         </div>
