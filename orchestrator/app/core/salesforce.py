@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..config import settings
+from .net import shared_ssl_context
 
 #: Hard ceiling on rows returned to a prompt, whatever the model asked for.
 MAX_ROWS = 200
@@ -210,7 +211,7 @@ async def _authenticate() -> Tuple[str, str]:
         raise SalesforceUnavailable(
             "live Salesforce lookups need SF_CLIENT_SECRET (client-credentials grant)"
         )
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, verify=shared_ssl_context()) as client:
         resp = await client.post(
             f"{settings.sf_login_url.rstrip('/')}/services/oauth2/token",
             data={
@@ -235,7 +236,7 @@ async def run_soql(soql: str) -> Tuple[str, List[Dict[str, Any]]]:
     """Run a guarded SOQL query live. → (query actually run, rows)."""
     safe = guard_soql(soql)
     token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
         resp = await client.get(
             f"{instance}/services/data/{settings.sf_api_version}/query",
             params={"q": safe},
@@ -244,7 +245,7 @@ async def run_soql(soql: str) -> Tuple[str, List[Dict[str, Any]]]:
     if resp.status_code == 401:
         _token.value = None  # expired underneath us — one retry
         token, instance = await _authenticate()
-        async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+        async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
             resp = await client.get(
                 f"{instance}/services/data/{settings.sf_api_version}/query",
                 params={"q": safe},
@@ -366,7 +367,7 @@ async def search_records(
     sosl = f"FIND {{{escape_sosl(term)}}} IN ALL FIELDS RETURNING {', '.join(returning)}"
 
     token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
         resp = await client.get(
             f"{instance}/services/data/{settings.sf_api_version}/search",
             params={"q": sosl},
@@ -405,7 +406,7 @@ def escape_sosl(term: str) -> str:
 async def _query(soql: str) -> Dict[str, Any]:
     """GET /query with one re-authentication retry. Returns the raw envelope."""
     token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
         resp = await client.get(
             f"{instance}/services/data/{settings.sf_api_version}/query",
             params={"q": soql},
@@ -434,7 +435,7 @@ async def _query(soql: str) -> Dict[str, Any]:
 async def _get(path: str, params: Optional[dict] = None) -> Any:
     """Authenticated GET against the REST API."""
     token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
         resp = await client.get(
             f"{instance}{path}",
             params=params or {},

@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import httpx
 
 from .config import settings
+from .core.net import shared_ssl_context
 from .model_capabilities import ModelCapabilities, RerankerBackend
 
 
@@ -919,7 +920,7 @@ async def _dependency_probe_uncached() -> Tuple[List[Tuple[str, str]], Dict[str,
         seen[url] = name
         vllm_targets.append((name, url))
 
-    async with httpx.AsyncClient(timeout=settings.health_probe_timeout) as client:
+    async with httpx.AsyncClient(timeout=settings.health_probe_timeout, verify=shared_ssl_context()) as client:
         results = await asyncio.gather(
             *(_probe_vllm(client, url) for _, url in vllm_targets),
             asyncio.to_thread(_check_duckdb, settings.duckdb_path),

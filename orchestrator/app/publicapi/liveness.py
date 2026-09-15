@@ -892,8 +892,9 @@ MetricsFetch = Callable[[str], Awaitable[Optional[str]]]
 async def _http_metrics(root: str) -> Optional[str]:
     try:
         import httpx
+        from ..core.net import shared_ssl_context
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0), verify=shared_ssl_context()) as client:
             response = await client.get(f"{root.rstrip('/')}/metrics")
             if response.status_code != 200:
                 return None

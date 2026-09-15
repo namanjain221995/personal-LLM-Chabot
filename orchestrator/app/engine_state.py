@@ -784,6 +784,7 @@ async def poll_once(client=None) -> Optional[EngineSnapshot]:
     """
     global _last_attempt_at
     import httpx
+    from .core.net import shared_ssl_context
 
     url = settings.engine_controller_url
     _last_attempt_at = time.monotonic()
@@ -792,7 +793,7 @@ async def poll_once(client=None) -> Optional[EngineSnapshot]:
         return None
     own_client = client is None
     if own_client:
-        client = httpx.AsyncClient(timeout=float(settings.health_probe_timeout))
+        client = httpx.AsyncClient(timeout=float(settings.health_probe_timeout), verify=shared_ssl_context())
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
@@ -816,11 +817,12 @@ async def _loop() -> None:
     loop: a fresh connection per poll against a host-network service is
     pointless churn, and the timeout is the short health-probe one."""
     import httpx
+    from .core.net import shared_ssl_context
 
     interval = max(0.5, float(settings.engine_state_poll_s))
     unknown_since: Optional[float] = None
     last_nag = 0.0
-    async with httpx.AsyncClient(timeout=float(settings.health_probe_timeout)) as client:
+    async with httpx.AsyncClient(timeout=float(settings.health_probe_timeout), verify=shared_ssl_context()) as client:
         while True:
             await poll_once(client)
             # The gauge must go to -1 when the controller has been silent

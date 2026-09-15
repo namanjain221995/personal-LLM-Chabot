@@ -155,8 +155,9 @@ async def served_window(engine: str) -> Optional[int]:
     _probed_at[engine] = now
     try:
         import httpx
+        from ..core.net import shared_ssl_context
 
-        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_S) as client:
+        async with httpx.AsyncClient(timeout=PROBE_TIMEOUT_S, verify=shared_ssl_context()) as client:
             response = await client.get(f"{resolved.base_url}/models")
             response.raise_for_status()
             payload = response.json()

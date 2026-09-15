@@ -470,11 +470,12 @@ async def engine_answers(base_url: str, *, timeout: Optional[float] = None) -> b
     that follows, so a cheap "the server is back up" is the right gate.
     """
     import httpx
+    from .core.net import shared_ssl_context
 
     root = service_root(base_url)
     probe_timeout = float(timeout if timeout is not None else settings.health_probe_timeout)
     try:
-        async with httpx.AsyncClient(timeout=probe_timeout) as client:
+        async with httpx.AsyncClient(timeout=probe_timeout, verify=shared_ssl_context()) as client:
             health = await client.get(f"{root}/health")
             if health.status_code != 200:
                 return False

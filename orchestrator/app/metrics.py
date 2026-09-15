@@ -68,6 +68,10 @@ _BUCKETS_BY_METRIC = {
     # retrieve p50 0.72 s / p90 2.09 s), so its whole-prepare time is read on
     # the same edges as the TTFT it is being subtracted from.
     "knowledge_prepare_seconds": _TTFT_BUCKETS,
+    # Event-loop lag (server performance track, 2026-09-15): 1 ms to 2.5 s.
+    "orchestrator_event_loop_lag_seconds": (
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    ),
 }
 
 
@@ -655,6 +659,90 @@ def render() -> str:
             lines.append(f"{name}_count{_fmt_labels(key)} {n}")
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Event-loop health (server performance track, 2026-09-15)
+# ---------------------------------------------------------------------------
+
+LOOP_LAG = "orchestrator_event_loop_lag_seconds"
+LOOP_LAG_INTERVAL_S = 0.05
+_LOOP_LAG_HELP = (
+    "How late a 50 ms asyncio.sleep on the serving loop woke up, minus the 50 ms "
+    "asked for. Conflates on-loop CPU, GIL wait and major page faults; read it "
+    "next to orchestrator_process_major_faults to tell swap stalls from GIL stalls."
+)
+
+
+def _read_major_faults(path: str = "/proc/self/stat") -> float:
+    """Field 12 (majflt) of /proc/self/stat; -1 where there is no procfs."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read().decode("ascii", "replace")
+        # comm (field 2) may contain spaces and parentheses: split after the LAST ')'.
+        fields = raw.rsplit(")", 1)[1].split()
+        return float(fields[9])  # fields[0] is field 3 (state); majflt is field 12
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def _sample_thread_limiter() -> None:
+    """anyio's default worker-thread limiter, through its PUBLIC statistics().
+    Must run inside the loop (the limiter is a per-loop RunVar)."""
+    try:
+        import anyio.to_thread
+
+        stats = anyio.to_thread.current_default_thread_limiter().statistics()
+        set_gauge("orchestrator_thread_limiter_borrowed", stats.borrowed_tokens,
+                  "anyio default worker-thread limiter: tokens in use (db.run_in_thread, sync routes).")
+        set_gauge("orchestrator_thread_limiter_total", stats.total_tokens,
+                  "anyio default worker-thread limiter: total tokens.")
+        set_gauge("orchestrator_thread_limiter_waiting", stats.tasks_waiting,
+                  "anyio default worker-thread limiter: tasks waiting for a token.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def event_loop_lag_probe(
+    interval: float = LOOP_LAG_INTERVAL_S,
+    *,
+    sample_every: int = 20,
+    clock: Callable[[], float] = None,  # type: ignore[assignment]
+) -> None:
+    """Observe the serving loop's lag until cancelled.
+
+    One monotonic sleep of ``interval`` per iteration: lag = actual - asked.
+    The first sample after start is discarded (it measures the start-up
+    burst, not steady state). Every ``sample_every`` iterations (1 s at the
+    default 50 ms) it also reads the process's major-fault count and the
+    anyio thread limiter. No labels, so no cardinality; about 0.02 ms of loop
+    time per second.
+    """
+    import asyncio
+    import time as _time
+
+    now = clock or _time.monotonic
+    _declare(LOOP_LAG, "histogram", _LOOP_LAG_HELP)
+    first = True
+    n = 0
+    while True:
+        started = now()
+        await asyncio.sleep(interval)
+        lag = max(0.0, now() - started - interval)
+        if first:
+            first = False
+        else:
+            observe(LOOP_LAG, lag, _LOOP_LAG_HELP)
+        n += 1
+        if n % max(1, sample_every) == 0:
+            faults = _read_major_faults()
+            if faults >= 0:
+                set_gauge(
+                    "orchestrator_process_major_faults", faults,
+                    "Major page faults of this process since start (/proc/self/stat majflt); "
+                    "a rise with loop lag is a swap-in stall, not GIL contention.",
+                )
+            _sample_thread_limiter()
 
 
 def reset() -> None:

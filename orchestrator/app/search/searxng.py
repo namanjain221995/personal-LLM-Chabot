@@ -10,6 +10,7 @@ from typing import List
 
 import httpx
 
+from ..core.net import shared_ssl_context
 from .base import SearchProvider, SearchResult, SearchUnavailableError
 
 
@@ -43,7 +44,7 @@ class SearxngProvider(SearchProvider):
         if categories:
             params["categories"] = categories
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), verify=shared_ssl_context()) as client:
                 resp = await client.get(f"{self.base_url}/search", params=params)
                 resp.raise_for_status()
                 data = resp.json()
