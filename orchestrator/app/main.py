@@ -5590,6 +5590,21 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     **_as3_engine_kw,
                 )
                 # --- AS3 intent-capability END ---
+            elif artifact_intent is not None and artifact_intent.unsupported_visual:
+                # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
+                # map", twice: there is no geographic type in
+                # chart_spec.CHART_TYPES, so no job can end in the picture
+                # that was asked for. The gate answered "none" and named the
+                # visual; the sentence is written by code — what cannot be
+                # drawn, why, and the nearest chart over the same table — so
+                # the model can neither deny being able to make files nor
+                # produce the Word file and PDF this turn produced in
+                # production. No job is opened and nothing is gathered.
+                from .artifacts import visuals as _t3_visuals
+
+                answer = _t3_visuals.refusal_for(artifact_intent.unsupported_visual, history=history)
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "chat", "effort": request.effort})
             elif request.video_uploads or video_followup:
                 # 2026-09-09: a video attached now, or a question about one
                 # attached earlier. The engine waits for the detached analysis

@@ -133,6 +133,29 @@ def test_a_question_about_pdfs_is_still_a_text_answer():
         assert "This is a text answer" in "".join(d["text"] for k, d in events if k == "token")
 
 
+def test_a_map_request_is_answered_in_chat_by_code_and_opens_no_job():
+    """2026-09-16: "plot this on a map", twice, came back as a Word file and a
+    PDF. There is no geographic type in chart_spec.CHART_TYPES, so the turn is
+    one sentence written by artifacts/visuals.py — and the model's own text
+    answer is not used either, because it was the model that invented the
+    document."""
+    from app.artifacts import db as adb
+
+    with TestClient(app) as client:
+        pipeline.set_composer(app_main._stub_composer_for_tests)
+        resp = _post(client, "plot this on a map", conv="art-chat-map", intent="int-art-map")
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        final = [d for k, d in events if k == "meta"][-1]
+        assert final["route"] != "artifact" and "artifacts" not in final
+        tokens = "".join(d["text"] for k, d in events if k == "token")
+        assert tokens.startswith("I can\'t draw a map")
+        assert "no geographic chart type" in tokens and "bar chart" in tokens
+        assert "This is a text answer" not in tokens
+
+    assert adb.list_artifacts(int(db.get_user_by_username(_owner_name())["id"]), "art-chat-map") == []
+
+
 def test_documents_off_for_the_deployment_means_text(monkeypatch):
     monkeypatch.setattr(settings, "artifacts_enabled", False)
     with TestClient(app) as client:

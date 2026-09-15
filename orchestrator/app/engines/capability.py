@@ -27,13 +27,29 @@ from __future__ import annotations
 import re
 from typing import Pattern
 
+#: THE CARVE-OUT (2026-09-16). "Do not say you cannot…" with no exception is
+#: what turned "plot this on a map" into a Word file and a PDF: the model had
+#: been told never to admit a limit, so it produced the nearest thing it was
+#: allowed to produce. The limit it may — must — admit is named here, and the
+#: list comes from artifacts/visuals.py, which derives it from
+#: chart_spec.CHART_TYPES, so the prompt cannot promise or deny the wrong set
+#: once a new chart type lands.
+def _limits_clause() -> str:
+    try:
+        from ..artifacts import visuals as _visuals
+
+        return " " + _visuals.limits_sentence()
+    except Exception:  # noqa: BLE001 — the file rules stand without it
+        return ""
+
+
 CAPABILITY_LINE = (
     "This platform can create downloadable Word (DOCX), PDF, Excel (XLSX), CSV and PowerPoint files and charts from this "
     "conversation or an uploaded file. Do not say you cannot create or attach files, and do not give python-docx, openpyxl, "
     "matplotlib or copy-paste instructions as a substitute. Mention files only when the person asks for one; then tell them "
     "to ask directly, for example \"make this a Word document\". Never claim a file is being prepared unless the system has "
     "shown a file card."
-)
+) + _limits_clause()
 
 #: The prompt suffix, with its separator — one string concatenation per prompt.
 CAPABILITY_SUFFIX = "\n\n" + CAPABILITY_LINE
@@ -109,14 +125,48 @@ _SUBSTITUTE_PROSE_RE: Pattern[str] = re.compile(
 )
 
 
+#: At most this many denial matches are read before the answer is taken as a
+#: denial. The detector runs on every answer of four routes; the carve-out
+#: below must not turn a pathological answer into a scan of hundreds of
+#: sentences.
+_MAX_DENIAL_HITS = 20
+_SENTENCE_END = ".!?\n।"
+
+
+def _sentence_around(text: str, start: int, end: int) -> str:
+    left = max((text.rfind(c, 0, start) for c in _SENTENCE_END), default=-1)
+    right = min((p for p in (text.find(c, end) for c in _SENTENCE_END) if p != -1), default=len(text))
+    return text[left + 1: right]
+
+
+def _honest_visual_refusal(text: str, start: int, end: int) -> bool:
+    """Is this "I cannot…" about a visual this platform genuinely has no
+    chart type for? "I can't put these on a map, so I can't give you a PDF of
+    one either" is the truth, not the denial the backstop hunts for, and
+    answering it with a document is the 2026-09-16 incident (artifacts/
+    visuals.py owns the list)."""
+    try:
+        from ..artifacts import visuals as _visuals
+
+        return _visuals.named_unsupported(_sentence_around(text, start, end)) is not None
+    except Exception:  # noqa: BLE001 — without the list every denial counts, as before
+        return False
+
+
 def denial_in(text: str) -> bool:
     """Does this answer deny that the assistant can create/attach a FILE — or
     hand over library code / copy-paste steps in place of the file?"""
     t = (text or "")[:20000]
     if not t:
         return False
-    if _EN_RE.search(t) or _EN_TEXT_ONLY_RE.search(t) or _HI_RE.search(t) or _GU_RE.search(t) or _HINGLISH_RE.search(t):
-        return True
+    hits = 0
+    for rx in (_EN_RE, _EN_TEXT_ONLY_RE, _HI_RE, _GU_RE, _HINGLISH_RE):
+        for m in rx.finditer(t):
+            hits += 1
+            if not _honest_visual_refusal(t, m.start(), m.end()):
+                return True
+            if hits >= _MAX_DENIAL_HITS:
+                return True
     if not _SUBSTITUTE_RE.search(t):
         return False
     # Library code for the file, introduced by prose that names the file

@@ -87,6 +87,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Sequence
 
 from . import formats as F
 from . import lexicon as LX
+from . import visuals as VIS
 
 Action = str  # "create" | "edit" | "convert" | "export" | "none"
 
@@ -354,6 +355,11 @@ class ArtifactIntent:
     #: The artifact the UI's "Edit with a prompt" named (ownership is checked
     #: by the caller before it gets here).
     artifact_id_hint: Optional[str] = None
+    #: The `visuals.Visual.token` of a visual the person asked for that this
+    #: platform has no chart type for ("map", "sankey", …). Set only with
+    #: action "none": the turn is answered in chat, by `visuals.refusal_for`,
+    #: and opens no job (2026-09-16 — a map request became a Word file).
+    unsupported_visual: str = ""
 
     @property
     def wants_file(self) -> bool:
@@ -828,6 +834,21 @@ def decide(
     if _ABOUT_FORMAT_RE.search(low) and not _POLITE_RE.match(low):
         return made("none", rule="about-format", instruction="")
 
+    # 1b. A VISUAL THIS PLATFORM CANNOT DRAW (2026-09-16). "plot this on a
+    #     map", asked twice, opened a document job and came back as a Word
+    #     file and a PDF with prose in them. There is no geographic chart
+    #     type in chart_spec.CHART_TYPES, so no job can end in the picture
+    #     that was asked for: the turn is answered in chat with a sentence
+    #     `visuals.refusal_for` writes. It runs before the follow-up and
+    #     creation rules — the conversation usually already holds the file
+    #     the earlier chart request made — and only when the words name no
+    #     OTHER deliverable: "put the map in a PDF report" still makes the
+    #     report, whose chart is refused where charts are refused.
+    _visual = VIS.asked_for(low)
+    if _visual is not None and not explicit and F.kind_for(low, [])[1] == "default":
+        return made("none", rule=f"unsupported-visual:{_visual.token}", instruction="",
+                    unsupported_visual=_visual.token)
+
     # 2. Follow-ups on an existing artifact.
     if has_artifacts:
         version = _VERSION_RE.search(low)
@@ -1006,7 +1027,10 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
         return False
     if intent.ambiguous:
         return True
-    if intent.rule.startswith("negative:") or intent.rule in ("code", "about-format", "empty", "text-object", "chat-only"):
+    if intent.rule.startswith(("negative:", "unsupported-visual:")) or intent.rule in ("code", "about-format", "empty", "text-object", "chat-only"):
+        # A visual with no chart type cannot become a file whatever the
+        # classifier believes; asking it would only buy back the document
+        # the 2026-09-16 incident produced.
         return False
     return LX.file_signal(text[:_DECIDE_CHARS])
 

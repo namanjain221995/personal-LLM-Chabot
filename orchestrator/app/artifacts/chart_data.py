@@ -868,6 +868,15 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
     for role in all_y:
         if frame.kinds[role].kind not in ("number", "empty") and agg != "count":
             raise ChartDataError(f"The column {frame.names[role]!r} is not numeric, so it cannot be plotted as a {CS.AGG_LABELS[agg].lower()}.")
+        if agg != "count" and frame.kinds[role].kind == "empty" and all(_is_blank(v) for v in frame.cols[role]):
+            # "empty" is on the whitelist above because infer_column reads the
+            # first 2,000 rows only: a number column that starts blank must
+            # still be plottable. A column blank in every row the chart would
+            # USE is a different thing — production 2026-09-16 asked for a map
+            # of PersonMailingLatitude / PersonMailingLongitude, which are null
+            # in 100% of that file, and a sum over nothing drew a row of zeros
+            # that looked like real data.
+            raise ChartDataError(f"The column {frame.names[role]!r} is empty in every row, so there is nothing to plot.")
     if t == "heatmap" and not b.group_by:
         raise ChartDataError("A heatmap needs a column for its rows (group_by).")
     if "x" not in frame.cols:
