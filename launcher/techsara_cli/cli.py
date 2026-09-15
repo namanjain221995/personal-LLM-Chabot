@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import environment as environment_module
 from .cluster import CLUSTER_COMPOSE_OVERLAY, discover_cluster_peer, resolve_cluster_mode
-from .compose import ComposeManager, docker_project_has_running_models
+from .compose import ComposeManager, docker_project_has_running_models, foreign_checkout_owner
 from .environment import (
     DGX_COMPOSE_OVERLAY,
     ENGINE_CONTROLLER_CODE_SHA_KEY,
@@ -1985,10 +1985,34 @@ def _start_compose(
     }
 
 
+def _guard_foreign_checkout(args: argparse.Namespace, *, root: Path) -> None:
+    """Refuse to reconfigure a stack another checkout of this repository owns.
+
+    `--force-checkout` (or TECHSARA_ALLOW_FOREIGN_CHECKOUT=1) takes the stack
+    over deliberately: every service is then recreated from THIS checkout's
+    env, which is the right thing when the other directory is the stale one.
+    """
+    if getattr(args, "force_checkout", False) or _truthy(os.environ.get("TECHSARA_ALLOW_FOREIGN_CHECKOUT")):
+        return
+    owner = foreign_checkout_owner(root)
+    if owner is None:
+        return
+    raise TechSaraError(
+        "the running stack was created from a different checkout of this "
+        f"repository:\n    running stack: {owner}\n    this command:  {root}\n"
+        "Running `up` here recreates those services from THIS directory's .env "
+        "and .runtime/generated.env, which is how the auxiliary engines lost "
+        "their loopback ports on 2026-09-15.\n"
+        f"Run it from {owner}, or pass --force-checkout to take the stack over "
+        "from here on purpose."
+    )
+
+
 def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
     print("TechSara AI platform bootstrap")
     if args.dry_run:
         return _cmd_up_dry(args, root=root)
+    _guard_foreign_checkout(args, root=root)
     layout = RuntimeLayout.for_project(root)
     layout.create()
     with FileLock(layout.locks_dir / "launcher.lock", timeout=3.0, stale_after=6 * 3600):
@@ -2925,6 +2949,10 @@ def _parser() -> argparse.ArgumentParser:
         item.add_argument("--profile")
         item.add_argument("--model")
         item.add_argument("--skip-ocr", action="store_true")
+        item.add_argument(
+            "--force-checkout", action="store_true",
+            help="take over a stack that another checkout of this repository started",
+        )
         item.add_argument("--offline", action="store_true")
         item.add_argument("--verbose", action="store_true")
     down = sub.add_parser("down")

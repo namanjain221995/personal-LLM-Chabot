@@ -592,6 +592,11 @@ class UpCommandTests(unittest.TestCase):
         self.running_models = self.stack.enter_context(
             patch.object(cli, "docker_project_has_running_models", return_value=False)
         )
+        # No other checkout of this repository owns the stack in these tests;
+        # the guard itself is covered in test_uptime_guards.py.
+        self.foreign_checkout = self.stack.enter_context(
+            patch.object(cli, "foreign_checkout_owner", return_value=None)
+        )
         self.select = self.stack.enter_context(patch.object(cli, "select_profile", return_value=self.profile))
         self.manifest = self.stack.enter_context(
             patch.object(

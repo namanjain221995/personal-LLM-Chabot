@@ -1224,7 +1224,11 @@ describe('usage limits when the server does not enforce them', () => {
     await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(JSON.parse(String(put.init.body))).toEqual({ max_output_tokens: 2048 });
-  });
+    // This case renders the console twice and drives userEvent through a full
+    // save; on a loaded CI runner it crossed vitest's 5 s default and failed
+    // as a timeout while every assertion still held (2026-09-15). The work is
+    // the same, the wall clock is not this test's subject.
+  }, 30_000);
 
   it('keeps every enforced field and its stored number when the server says the limits are on', async () => {
     state.search = new URLSearchParams('tab=limits');
