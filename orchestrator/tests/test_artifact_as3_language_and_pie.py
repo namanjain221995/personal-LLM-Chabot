@@ -34,9 +34,5 @@ def _ctx():
 def test_mid_tone_slices_keep_a_readable_label():
     ctx = _ctx()
     for fill in ("#4285F4", "#EA4335", "#34A853", "#FBBC05", "#1F3864", "#FFFFFF"):
-        colour, bbox = charts._slice_label_style(ctx, fill)
-        if bbox is None:
-            assert charts.contrast_ratio(colour, fill) >= 4.5
-        else:
-            assert bbox["facecolor"] == "#FFFFFF"
-            assert charts.contrast_ratio(colour, "#FFFFFF") >= 4.5
+        colour = charts._slice_label_style(ctx, fill)
+        assert charts.contrast_ratio(colour, fill) >= 4.5, (fill, colour)

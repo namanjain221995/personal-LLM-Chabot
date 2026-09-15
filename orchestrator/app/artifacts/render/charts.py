@@ -641,15 +641,16 @@ def _labels_on(ctx: _Ctx, n_categories: int) -> bool:
     return n_categories <= LABEL_MAX_CATEGORIES
 
 
-def _slice_label_style(ctx: Any, fill: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """(text colour, bbox) for a label drawn on a slice. Every slice above the
-    size floor keeps its label (2026-09-15: mid-tone fills such as #4285F4 and
-    #EA4335 reach 4.5:1 with neither white nor ink, and their labels were
-    dropped). Below 4.5:1 the label sits on a small light plate in ink."""
-    colour = ctx.d.label_color_for(fill)
-    if contrast_ratio(colour, fill) >= 4.5:
-        return colour, None
-    return ctx.ink, {"boxstyle": "round,pad=0.18", "facecolor": "#FFFFFF", "edgecolor": "none", "alpha": 0.9}
+def _slice_label_style(ctx: Any, fill: str) -> str:
+    """Text colour for a label drawn on a slice. Every slice above the size
+    floor keeps its label (2026-09-15: mid-tone fills such as #4285F4 and
+    #EA4335 reach 4.5:1 with neither white nor the theme ink, and their labels
+    were dropped). Pure black or pure white always reaches at least 4.58:1 on
+    any opaque fill, so the fallback is whichever of the two contrasts more."""
+    for colour in (ctx.d.label_color_for(fill), ctx.ink):
+        if contrast_ratio(colour, fill) >= 4.5:
+            return colour
+    return max(("#000000", "#FFFFFF"), key=lambda c: contrast_ratio(c, fill))
 
 
 def _label_kw(ctx: _Ctx, colour: str) -> Dict[str, Any]:
@@ -803,12 +804,9 @@ def _draw_pie(ax, ctx: _Ctx) -> bool:
         if share < 0.035:
             continue
         ang = math.radians((wedge.theta1 + wedge.theta2) / 2)
-        colour, bbox = _slice_label_style(ctx, col)
+        colour = _slice_label_style(ctx, col)
         text = f"{share * 100:.0f}%" if ctx.style.number_format in (None, "percent") else ctx.label(v)
-        kw = _label_kw(ctx, colour)
-        if bbox is not None:
-            kw["bbox"] = bbox
-        ax.text(r_text * math.cos(ang), r_text * math.sin(ang), text, ha="center", va="center", **kw)
+        ax.text(r_text * math.cos(ang), r_text * math.sin(ang), text, ha="center", va="center", **_label_kw(ctx, colour))
     if donut:
         ax.text(0, 0, ctx.label(total), ha="center", va="center", **_text_kw(ctx.style.title, ctx.d.title_size_pt + 2, ctx.ink, bold=True))
     ax.axis("equal")
