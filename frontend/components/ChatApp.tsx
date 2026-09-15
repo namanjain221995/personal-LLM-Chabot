@@ -56,7 +56,15 @@ import {
   uploadRefFor,
 } from '@/lib/attachments';
 import { uploadDocumentFile } from '@/lib/uploadDocument';
-import type { SendOptions } from './Composer';
+import type { SendOptions as ComposerSendOptions } from './Composer';
+import {
+  ARTIFACT_EDIT_EVENT,
+  editInstruction,
+  invalidateArtifactVersions,
+  isArtifactId,
+  registerArtifactEditHost,
+  type ArtifactEditRequest,
+} from '@/lib/artifacts';
 import {
   answerBranchFor,
   branchForAppend,
@@ -124,6 +132,12 @@ import { ContextMeter } from './ContextMeter';
 import { SummaryPanel } from './SummaryPanel';
 import { ArtifactPanel } from './artifacts/ArtifactPanel';
 import { type OpenArtifact } from './artifacts/ArtifactCards';
+
+/**
+ * A send's options: the composer's, plus (AS3) the artifact an "Edit with a
+ * prompt" turn targets — sent as `artifact_id` on the /chat body.
+ */
+type SendOptions = ComposerSendOptions & { artifactId?: string | null };
 
 /**
  * The file panel's width (CONTRACT-2 §9): a share of the workspace row,
@@ -2241,6 +2255,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
             assistantBranch: answerBranch,
             announceBranch,
             prefs: prefsRef.current,
+            ...(isArtifactId(options?.artifactId) ? { artifactId: options.artifactId } : {}),
             // NEW-14: the file itself does not travel — it is already on the
             // server, keyed by this conversation. Saying so is what lets the
             // proxy give a wordless dataset send a question to ask, instead of
@@ -2307,6 +2322,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         pdf: isPdf ? docAttachments[0]?.base64 ?? null : null,
         pdfName: isPdf ? docAttachments[0]?.name ?? null : null,
         clarification: clarification ?? null,
+        // AS3: an "Edit with a prompt" / "Restore vN" turn names its artifact.
+        ...(isArtifactId(options?.artifactId) ? { artifactId: options.artifactId } : {}),
       });
       disarmDeepResearch();
     },
@@ -2389,6 +2406,50 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     },
     [send],
   );
+
+  /**
+   * AS3 "Edit with a prompt" and "Restore vN" on an artifact card or in the
+   * panel. An edit is a NORMAL chat turn — the person's words and the new
+   * card land in the conversation — whose /chat body carries `artifact_id`
+   * (VersionSwitcher.tsx says why there is no /edit route). While an answer
+   * is still streaming the send would be dropped by `send`'s double-submit
+   * guard, so the person is told instead of the click vanishing.
+   */
+  const sendArtifactEdit = useCallback(
+    (artifactId: string, text: string) => {
+      const instruction = editInstruction(text);
+      if (!isArtifactId(artifactId) || !instruction) return;
+      const open = activeIdRef.current;
+      if (open && (isStreaming(open) || pendingSendRef.current.has(open))) {
+        toast('Wait for the current answer to finish, then send the change.', 'error');
+        return;
+      }
+      // The version list this card and the panel cached is about to grow.
+      invalidateArtifactVersions(artifactId);
+      send(instruction, [], null, { artifactId });
+    },
+    [send, toast],
+  );
+  const sendArtifactEditRef = useRef(sendArtifactEdit);
+  sendArtifactEditRef.current = sendArtifactEdit;
+  /** Stable for the memoised rows; always calls the current send. */
+  const onEditArtifact = useCallback((artifactId: string, text: string) => {
+    sendArtifactEditRef.current(artifactId, text);
+  }, []);
+  // The panel's "Restore vN" and any edit box without a host prop dispatch
+  // ARTIFACT_EDIT_EVENT; registering tells those controls a host listens.
+  useEffect(() => {
+    const release = registerArtifactEditHost();
+    const onEvent = (e: Event) => {
+      const detail = (e as CustomEvent<ArtifactEditRequest>).detail;
+      if (detail && typeof detail.text === 'string') onEditArtifact(detail.artifactId, detail.text);
+    };
+    window.addEventListener(ARTIFACT_EDIT_EVENT, onEvent);
+    return () => {
+      window.removeEventListener(ARTIFACT_EDIT_EVENT, onEvent);
+      release();
+    };
+  }, [onEditArtifact]);
 
   /** Re-run the turn that produced the assistant message at `messageId`. */
   const runRegenerate = useCallback(
@@ -3520,6 +3581,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                     onFeedback={on.onFeedback}
                     onOpenArtifact={openArtifact}
                     activeArtifactKey={artifactPanel?.fileKey ?? null}
+                    onEditArtifact={onEditArtifact}
                   />
                   );
                 })}

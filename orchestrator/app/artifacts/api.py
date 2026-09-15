@@ -25,6 +25,19 @@ and never held whole in memory; the bound is on what a person downloads
 
 PAGE IMAGES are rasterised on first request and cached under the version's
 `previews/` directory, so reopening a viewer never re-renders a document.
+
+AN SVG IS NEVER SERVED INLINE (AS3). An SVG is a document that can carry
+script; served inline from this origin it would run with the person's
+ts_session cookie in reach. Every SVG response is `attachment`, with
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline';
+sandbox` and nosniff, whatever `disposition` the request asked for. A PNG
+keeps inline.
+
+RESTORE IS A ROUTE, EDIT IS NOT (AS3). `POST /artifacts/{id}/restore
+{version}` makes a new version whose spec is version N's, byte for byte, and
+appends a short assistant note to the conversation so the thread shows the
+new card. A prompt edit is a normal /chat turn with `artifact_id`, so its
+history stays consistent; there is no /edit route.
 """
 from __future__ import annotations
 
@@ -107,12 +120,27 @@ def _content_disposition(kind: str, filename: str) -> str:
     return f'{kind}; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename)}'
 
 
+SVG_MIME = "image/svg+xml"
+#: What an SVG response carries (AS3): no script, no fetch, a sandboxed
+#: origin even when a browser is told to render it.
+SVG_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+
+
+def _is_svg(media_type: str, filename: str) -> bool:
+    return str(media_type or "").split(";")[0].strip().lower() == SVG_MIME or str(filename or "").lower().endswith(".svg")
+
+
 def _file_response(path: str, *, media_type: str, filename: str, disposition: str, etag: str = "") -> FileResponse:
+    svg = _is_svg(media_type, filename)
+    if svg:
+        media_type, disposition = SVG_MIME, "attachment"
     headers = {
         "Content-Disposition": _content_disposition(disposition, filename),
         "Cache-Control": "private, no-store",
         "X-Content-Type-Options": "nosniff",
     }
+    if svg:
+        headers["Content-Security-Policy"] = SVG_CSP
     if etag:
         headers["ETag"] = f'"{etag}"'
     return FileResponse(path, media_type=media_type, headers=headers)
@@ -319,7 +347,7 @@ async def get_file_by_id(
     fmt = str(entry.get("format") or "")
     _count_download(fmt, disposition)
     return _file_response(
-        path, media_type=T.MIME_TYPES.get(fmt, "application/octet-stream"),
+        path, media_type=T.MIME_TYPES.get(fmt, SVG_MIME if fmt == "svg" else "application/octet-stream"),
         filename=str(entry.get("filename") or f"file.{fmt}"), disposition=disposition, etag=str(entry.get("sha256") or ""),
     )
 
@@ -631,6 +659,10 @@ async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = 
     if current and _first_of_format(current, fmt) is not None:
         raise HTTPException(status_code=409, detail=f"The current version already has a {fmt.upper()} file.")
     conversation_id = str(artifact.get("conversation_id") or "")
+    # AS3: a convert keeps the formats the artifact already has and adds
+    # the new one, so v2 is the whole set, not a lone Word file.
+    versions = await db.run_in_thread(adb.list_versions, artifact_id, int(user["id"]))
+    formats = list(dict.fromkeys([*_lineage_formats(versions, kind), fmt]))
     # The key names the artifact AND the version: two artifacts converted
     # to the same format are two jobs, and a convert that failed earlier
     # is retried rather than handed back as the answer.
@@ -639,7 +671,7 @@ async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = 
         job = await db.run_in_thread(
             pipeline.accept,
             user_id=int(user["id"]), conversation_id=conversation_id, generation_id="",
-            operation="convert", instruction=f"convert to {fmt}", kind=kind, formats=[fmt], format_reason=f"convert: {fmt}",
+            operation="convert", instruction=f"convert to {fmt}", kind=kind, formats=formats, format_reason=f"convert: {fmt}",
             effort="fast", mode="assistant", template_id="generic", parent=(artifact_id, version),
             idempotency_key=key, title=str(artifact.get("title") or ""),
         )
@@ -655,3 +687,81 @@ async def convert_artifact(artifact_id: str, body: ConvertBody, user: UserRow = 
     await pipeline.ensure_running(str(job["id"]))
     return {"job_id": job["id"], "artifact_id": job["artifact_id"], "version": int(job["version"])}
 
+
+
+def _lineage_formats(versions: Sequence[dict], kind: str) -> List[str]:
+    from ..engines.artifact import lineage_formats
+
+    return lineage_formats(versions, kind)
+
+
+# ---------------------------------------------------------------- restore --
+
+
+class RestoreBody(BaseModel):
+    """The one field a restore takes: the version to bring back."""
+
+    model_config = ConfigDict(extra="forbid")
+    version: int
+
+
+@router.post("/{artifact_id}/restore")
+async def restore_artifact(artifact_id: str, body: RestoreBody, user: UserRow = Depends(require_user), _gate: None = Depends(require_artifacts)) -> dict:
+    """A new version whose content is version N's spec.json, byte for byte
+    (0 model calls), rendered in the formats the artifact has. Owner-scoped;
+    409 when N is already current or never finished. The idempotency key
+    names the artifact, N and the version it replaces, so a double click is
+    one job and a later restore of the same N (after other edits) is a new
+    one. A short assistant note with the new card is appended to the
+    artifact's conversation."""
+    from ..engines import artifact as engine
+
+    target = _version(int(body.version))
+    user_id = int(user["id"])
+    artifact = await db.run_in_thread(adb.get_artifact, _id(artifact_id), user_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="not found")
+    kind = str(artifact.get("kind") or "document")
+    current = int(artifact.get("current_version") or 0)
+    if current < 1:
+        raise HTTPException(status_code=409, detail="This artifact has no finished version yet.")
+    row = await db.run_in_thread(adb.get_version, artifact_id, target, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    if str(row.get("status") or "") not in ("completed", "completed_with_warnings"):
+        raise HTTPException(status_code=409, detail=f"Version {target} never finished, so it cannot be restored.")
+    if target == current:
+        raise HTTPException(status_code=409, detail=f"Version {target} is already the current version.")
+    versions = await db.run_in_thread(adb.list_versions, artifact_id, user_id)
+    formats = _lineage_formats(versions, kind) or [f.get("format") for f in _version_files(row) if f.get("format")]
+    conversation_id = str(artifact.get("conversation_id") or "")
+    title = str(artifact.get("title") or "")
+    key = pipeline.idempotency_key(user_id, conversation_id, f"{artifact_id}:{target}:restore:from:v{current}", "edit", f"restore v{target}")
+    try:
+        job = await db.run_in_thread(
+            pipeline.accept,
+            user_id=user_id, conversation_id=conversation_id, generation_id="",
+            operation="edit", instruction=f"restore version {target}", kind=kind, formats=formats,
+            format_reason=f"{engine.EDIT_REASON}: api · restore v{target}", effort="fast", mode="assistant",
+            template_id=str(row.get("template_id") or "generic"), parent=(artifact_id, current), idempotency_key=key, title=title,
+        )
+    except pipeline.ArtifactRefused as exc:
+        raise _refused(exc)
+    if job.get("created"):
+        await db.run_in_thread(engine._attach_payload, user_id, str(job["artifact_id"]), int(job["version"]), "edit",
+                               {"restore_version": target, "applied": [f"restored v{target}"], "not_applied": [], "pending": [], "planner": "api"})
+        if conversation_id:
+            ref = pipeline.ref_for(job, None)
+            note = f"Restored **{title}** to v{target} — saved as v{int(job['version'])}."
+            try:
+                await db.run_in_thread(db.add_message, user_id, conversation_id, "assistant", note,
+                                       {"route": "artifact", "artifacts": [ref.to_json()], "generation_id": f"restore-{job['id']}"})
+            except Exception as exc:  # noqa: BLE001 — the version is made either way
+                log.info("artifact restore: conversation note not written: %s", type(exc).__name__)
+    elif job.get("status") == "failed":
+        try:
+            job = await pipeline.retry(str(job["id"]), user_id) or job
+        except pipeline.ArtifactRefused as exc:
+            raise _refused(exc)
+    await pipeline.ensure_running(str(job["id"]))
+    return {"job_id": job["id"], "artifact_id": job["artifact_id"], "version": int(job["version"]), "restored_from": target}

@@ -48,12 +48,13 @@ def test_formulas_are_written_by_code_from_the_row_count(tmp_path):
 
     path, _ = render(workbook(rows=40), tmp_path)
     ws = load_workbook(str(path))["Pipeline"]
-    assert ws["C42"].value == "=SUM(C2:C41)" and ws["C42"].data_type == "f"
-    assert ws["D42"].value == "=SUM(D2:D41)"
-    assert ws["E42"].value == "=AVERAGE(E2:E41)"
+    # SUBTOTAL (109 sum, 101 average) so a filtered sheet totals the rows it shows.
+    assert ws["C42"].value == "=SUBTOTAL(109,C2:C41)" and ws["C42"].data_type == "f"
+    assert ws["D42"].value == "=SUBTOTAL(109,D2:D41)"
+    assert ws["E42"].value == "=SUBTOTAL(101,E2:E41)"
     assert ws["A42"].value == "Total"          # the label of the first total
     regions = load_workbook(str(path))["Regions"]
-    assert regions["B5"].value == "=SUM(B2:B4)" and regions["C5"].value == "=SUM(C2:C4)"
+    assert regions["B5"].value == "=SUBTOTAL(109,B2:B4)" and regions["C5"].value == "=SUBTOTAL(109,C2:C4)"
 
 
 def test_formula_injection_is_neutralised_to_text(tmp_path):
@@ -101,7 +102,7 @@ def test_number_formats_dates_and_percent_scale(tmp_path):
 
     path, warnings = render(workbook(), tmp_path)
     ws = load_workbook(str(path))["Pipeline"]
-    assert ws["B2"].value == dt.datetime(2026, 2, 2) and ws["B2"].number_format == "yyyy-mm-dd"
+    assert ws["B2"].value == dt.datetime(2026, 2, 2) and ws["B2"].number_format == "dd-mmm-yyyy"
     assert ws["C2"].value == 1000.5 and ws["C2"].number_format == "#,##0.00"
     assert ws["D2"].value == 3 and ws["D2"].number_format == "#,##0"
     assert ws["E2"].value == 0.01 and ws["E2"].number_format == "0.0%"
@@ -134,7 +135,7 @@ def test_freeze_autofilter_widths_and_header_style(tmp_path):
     assert ws.freeze_panes == "A2"
     assert ws.auto_filter.ref == "A1:F11"
     assert ws.column_dimensions["C"].width == 14 and ws.column_dimensions["F"].width == 30
-    assert ws["A1"].font.bold and ws["A1"].fill.fgColor.rgb.endswith("0A1D37")
+    assert ws["A1"].font.bold and ws["A1"].fill.fgColor.rgb.endswith("1F3864")
     notes = wb["Notes   draft"]
     assert notes.freeze_panes is None and notes.auto_filter.ref is None
 
@@ -217,7 +218,7 @@ def test_dashboard_kpi_formula_quotes_an_apostrophe_in_the_sheet_name(tmp_path):
     assert wb.sheetnames == ["Dashboard", "Q1's data"]
     assert wb["Dashboard"]["B6"].value == "='Q1''s data'!B4"
     # The same doubling openpyxl uses for its own chart references.
-    assert wb["Dashboard"]._charts == [] and wb["Q1's data"]["B4"].value == "=SUM(B2:B3)"
+    assert wb["Dashboard"]._charts == [] and wb["Q1's data"]["B4"].value == "=SUBTOTAL(109,B2:B3)"
     _assert_kpi_evaluates(path, "Dashboard", "B6", 5.0)
 
 
@@ -269,7 +270,7 @@ def test_sheet_grid_returns_formulas_as_text_and_honours_bounds(tmp_path):
     assert len(pipe["sheet"]["rows"]) == 5 and pipe["sheet"]["truncated"] is True
     assert pipe["sheet"]["rows"][0][1] == "2026-02-02"   # a date cell reads back as midnight; the grid shows the date
     full = preview.sheet_grid(path, "Pipeline", max_rows=200, max_cols=50)
-    assert full["sheet"]["formulas"]["C32"] == "=SUM(C2:C31)"
+    assert full["sheet"]["formulas"]["C32"] == "=SUBTOTAL(109,C2:C31)"
     assert full["sheet"]["truncated"] is False
     # The hostile note is data, as text.
     assert full["sheet"]["rows"][0][5] == '=HYPERLINK("http://evil.example/x")'
@@ -308,25 +309,35 @@ def _styled(rows=6, **style):
     ]))
 
 
-def test_default_style_is_thin_black_borders_bold_navy_header_and_top_aligned_cells(tmp_path):
-    """A sheet with no style gets SheetStyle's defaults (CONTRACT-2 §4)."""
+def test_default_style_is_thin_grid_borders_bold_navy_header_and_top_aligned_cells(tmp_path):
+    """A sheet with no style gets TechSara Classic (style guide §4): thin
+    #E5E9F0 grid lines, never black; a #1F3864 header, white bold, with a
+    medium rule under it."""
     from openpyxl import load_workbook
 
     from app.artifacts.render.xlsx import BORDER_COLOUR
 
     path, _ = render(_styled(), tmp_path)
     ws = load_workbook(str(path))["Audit"]
-    for ref in ("A1", "I1", "A2", "I2", "E7"):
+    assert BORDER_COLOUR == "E5E9F0"
+    for ref in ("A2", "I2", "E7"):
         b = ws[ref].border
         assert (b.left.style, b.right.style, b.top.style, b.bottom.style) == ("thin",) * 4, ref
         assert b.left.color.rgb.endswith(BORDER_COLOUR) and b.top.color.rgb.endswith(BORDER_COLOUR), ref
-    assert ws["A1"].font.bold and ws["A1"].fill.fgColor.rgb.endswith("0A1D37") and ws["A1"].font.color.rgb.endswith("FFFFFF")
-    assert ws["I2"].alignment.vertical == "top" and ws["I2"].alignment.wrap_text in (None, False)
+    for ref in ("A1", "I1"):
+        b = ws[ref].border
+        assert (b.left.style, b.right.style, b.top.style, b.bottom.style) == ("thin", "thin", "thin", "medium"), ref
+        assert b.bottom.color.rgb.endswith("1F3864"), ref
+    assert ws["A1"].font.bold and ws["A1"].fill.fgColor.rgb.endswith("1F3864") and ws["A1"].font.color.rgb.endswith("FFFFFF")
+    assert ws.row_dimensions[1].height == 24
+    # Text over 50 characters wraps (style guide §4); short text does not.
+    assert ws["I2"].alignment.vertical == "top" and ws["I2"].alignment.wrap_text is True
+    assert ws["B2"].alignment.wrap_text in (None, False)
     # Blanks are blank cells, never 0 or "".
     assert ws["A3"].value is None and ws["C3"].value is None and ws["F4"].value is None
     # An id with leading zeros is text in a text column; a date column holds dates.
     assert ws["D2"].value == "007" and ws["D2"].data_type == "s"
-    assert ws["C2"].value == dt.datetime(2026, 8, 3) and ws["C2"].number_format == "yyyy-mm-dd"
+    assert ws["C2"].value == dt.datetime(2026, 8, 3) and ws["C2"].number_format == "dd-mmm-yyyy"
 
 
 def test_leading_zero_ids_are_never_coerced_even_in_a_numeric_column(tmp_path):
@@ -371,14 +382,14 @@ def test_header_fill_light_none_and_no_borders(tmp_path):
 
     path, _ = render(_styled(header_fill="light", borders="none", header_bold=False), tmp_path, "light.xlsx")
     ws = load_workbook(str(path))["Audit"]
-    assert ws["A1"].fill.fgColor.rgb.endswith("ECECEC") and ws["A1"].font.color.rgb.endswith("0D0D0D")
+    assert ws["A1"].fill.fgColor.rgb.endswith("EEF0F3") and ws["A1"].font.color.rgb.endswith("1F2937")
     assert not ws["A1"].font.bold
     assert ws["A2"].border.left is None or ws["A2"].border.left.style is None
     assert ws["A2"].border.top is None or ws["A2"].border.top.style is None
-    assert ws["A1"].border.bottom.style == "thin", "no-borders keeps a rule under the header"
+    assert ws["A1"].border.bottom.style == "medium", "no-borders keeps a rule under the header"
     path, _ = render(_styled(header_fill="none"), tmp_path, "none.xlsx")
     ws = load_workbook(str(path))["Audit"]
-    assert ws["A1"].fill.fill_type is None and ws["A1"].font.bold and ws["A1"].font.color.rgb.endswith("0D0D0D")
+    assert ws["A1"].fill.fill_type is None and ws["A1"].font.bold and ws["A1"].font.color.rgb.endswith("1F2937")
 
 
 def test_is_landscape_follows_the_style_and_the_six_column_rule():

@@ -14,13 +14,28 @@ are the LIGHT theme's semantic tokens (`html.light` in globals.css: text
 accent #1d4ed8 "deepened for AA on paper"); navy/boardroom/slate/paper/teal
 are the brand constants. Nothing here is borrowed from another product.
 
-FONTS. The orchestrator images install fonts-dejavu-core and fonts-liberation
-only (Dockerfile.cuda / Dockerfile.cpu). Liberation Sans and Liberation Serif
-are metric-compatible with Arial and Times New Roman, so a DOCX or PPTX that
-names Arial opens identically on a Windows desktop and renders with the same
-line breaks in the container's PDF preview. Indic, CJK, Arabic and emoji
-glyphs are NOT covered in the image; `unsupported_scripts()` finds them so
-the render can carry a warning instead of failing or shipping tofu silently.
+FONTS. The orchestrator images (Dockerfile.cuda / Dockerfile.cpu) install
+open-licence fonts only: fonts-liberation + fonts-liberation2 (metric twins of
+Arial/Helvetica, Times New Roman and Courier New), fonts-crosextra-carlito and
+-caladea (metric twins of Calibri and Cambria, the TechSara Classic families),
+fonts-dejavu-core, and fonts-noto-core + fonts-lohit-deva/gujr for Devanagari
+and Gujarati. Office files name the family a person asked for
+(artifacts/style.FONT_ALLOWLIST). What the server draws with — the PDF and
+chart images — is `resolve_font(face)`: the family itself when fontconfig
+resolves it, else its metric twin, else the face's documented open fallback
+(Georgia -> Caladea: Gelasio, Georgia's metric twin, is packaged for neither
+base image), else Liberation/DejaVu. `pdf_font_stack()` puts that family
+first in the PDF stylesheet; the render warnings and the self-check name it.
+`font_installed()` asks fc-match once per family. `uncovered_scripts()` finds
+text no installed font draws, so the render carries one warning instead of
+shipping boxes silently.
+
+STYLE TOKENS. The TechSara Classic palette, presets and contrast policy live
+in artifacts/style.py (the resolver every renderer reads); the CLASSIC_*
+names below re-export its default values. The older constants (NAVY, SURFACE,
+PALETTE ...) stay for the chart painter and legacy callers: PALETTE must
+match core/charts_png.py until the charts track moves to
+ResolvedStyle.chart_defaults.
 
 TYPE SCALE. Body text is 11 pt in documents and 10.5 pt in the tight brief —
 never smaller; a 9 pt report is the single most common complaint about
@@ -28,9 +43,13 @@ generated documents. Slides never go below 14 pt for body text.
 """
 from __future__ import annotations
 
+import functools
+import math
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------- colours --
 
@@ -57,12 +76,14 @@ WARN = "#b26a00"         # --ts-warn (light)
 OK = "#1a7f37"           # --ts-ok (light)
 WHITE = "#ffffff"
 
-#: Callout tints: (border/accent colour, background) per callout kind.
+#: Callout tints: (left-bar/title colour, background) per callout kind —
+#: the style guide's status pairs (info, success, warning, neutral), each
+#: text colour >= 5.7:1 on its fill.
 CALLOUT_COLOURS: Dict[str, Tuple[str, str]] = {
-    "note": (ACCENT, ACCENT_SOFT),
-    "tip": (OK, "#e6f4ea"),
-    "warning": (WARN, "#fbf1e0"),
-    "quote": (SLATE, PAPER),
+    "note": ("#1F4E79", "#E3EDF8"),
+    "tip": ("#1E6B34", "#E3F2E6"),
+    "warning": ("#7A4F00", "#FFF1C7"),
+    "quote": ("#374151", "#EEF0F3"),
 }
 
 # ----------------------------------------------------------------- fonts --
@@ -98,7 +119,9 @@ class TypeScale:
     line_height: float = 1.42
 
 
-DOCUMENT_TYPE = TypeScale(body=11, small=9.5, caption=9, h1=20, h2=15, h3=12.5, title=30, subtitle=14, kpi_value=22)
+#: TechSara Classic (style guide §2): title 28, H1 18, H2 14, H3 12, body 11
+#: at 1.25 line height, tables 10, captions 9.
+DOCUMENT_TYPE = TypeScale(body=11, small=10, caption=9, h1=18, h2=14, h3=12, title=28, subtitle=14, kpi_value=22, line_height=1.25)
 #: The one-page brief: tighter, but body never below 10.5 pt.
 BRIEF_TYPE = TypeScale(body=10.5, small=9, caption=8.5, h1=16, h2=13, h3=11.5, title=22, subtitle=12, kpi_value=20, line_height=1.35)
 
@@ -220,9 +243,10 @@ _NON_LATIN_RE = re.compile(
 
 
 def unsupported_scripts(text: str) -> List[str]:
-    """Script names present in `text` that the image's fonts do not cover,
-    in first-seen order. Empty for Latin, Greek-extended, punctuation,
-    currency and arrows — everything DejaVu/Liberation draw."""
+    """Script names present in `text` that Liberation/DejaVu (the fonts the
+    image has always carried) do not cover, in first-seen order. Empty for
+    Latin, Greek-extended, punctuation, currency and arrows. Whether THIS
+    server can draw them is `uncovered_scripts`, which asks fontconfig."""
     seen: List[str] = []
     for ch in _NON_LATIN_RE.findall(text or ""):
         code = ord(ch)
@@ -233,16 +257,257 @@ def unsupported_scripts(text: str) -> List[str]:
     return seen
 
 
+#: Families that draw a script, in preference order; the first installed
+#: one is what WeasyPrint and matplotlib fall back to.
+SCRIPT_FONTS: Dict[str, Tuple[str, ...]] = {
+    "Devanagari": ("Noto Sans Devanagari", "Lohit Devanagari", "Nirmala UI", "Mangal"),
+    "Gujarati": ("Noto Sans Gujarati", "Lohit Gujarati", "Shruti"),
+    "Bengali": ("Noto Sans Bengali", "Lohit Bengali"),
+    "Gurmukhi": ("Noto Sans Gurmukhi", "Lohit Gurmukhi"),
+    "Odia": ("Noto Sans Oriya", "Lohit Odia"),
+    "Tamil": ("Noto Sans Tamil", "Lohit Tamil"),
+    "Telugu": ("Noto Sans Telugu", "Lohit Telugu"),
+    "Kannada": ("Noto Sans Kannada", "Lohit Kannada"),
+    "Malayalam": ("Noto Sans Malayalam", "Lohit Malayalam"),
+    "CJK": ("Noto Sans CJK SC", "Noto Sans CJK JP", "WenQuanYi Zen Hei"),
+    "Arabic": ("Noto Sans Arabic", "DejaVu Sans"),
+    "Hebrew": ("Noto Sans Hebrew", "DejaVu Sans"),
+    "Thai": ("Noto Sans Thai",),
+    "Sinhala": ("Noto Sans Sinhala",),
+    "Emoji": ("Noto Color Emoji",),
+}
+
+
+@functools.lru_cache(maxsize=256)
+def font_installed(family: str) -> bool:
+    """Does fontconfig resolve `family` to ITSELF (not a fallback)? Asked
+    once per family per process with `fc-match`; False when fontconfig is
+    absent. The family name comes from the allowlist or SCRIPT_FONTS, never
+    from a request, and is passed as an argv element, never a shell string."""
+    if not family or len(family) > 60 or not re.fullmatch(r"[A-Za-z0-9 ._-]+", family):
+        return False
+    exe = shutil.which("fc-match")
+    if exe is None:
+        return False
+    try:
+        out = subprocess.run([exe, "-f", "%{family}", family], capture_output=True, text=True, timeout=3, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    names = [n.strip().casefold() for n in (out or "").split(",")]
+    return family.casefold() in names
+
+
+def installed_family(candidates: Sequence[str]) -> str:
+    """The first installed family of `candidates`, or ''."""
+    for name in candidates:
+        if font_installed(name):
+            return name
+    return ""
+
+
+@dataclass(frozen=True)
+class FontChoice:
+    """The family this server draws a requested font with, and why.
+
+    kind: "exact" (the family itself is installed), "metric" (its metric-
+    compatible twin: Carlito for Calibri, Liberation Sans for Arial ...),
+    "substitute" (the face's declared substitute that is not a metric twin),
+    "fallback" (the documented open fallback the images carry when no twin
+    is packaged, e.g. Caladea for Georgia), "generic" (Liberation/DejaVu of
+    the same generic class) or "none" (fontconfig absent or nothing found)."""
+
+    requested: str
+    family: str
+    kind: str
+
+    @property
+    def substituted(self) -> bool:
+        return self.kind != "exact"
+
+    def sentence(self) -> str:
+        """'Georgia was drawn with Caladea, its documented fallback' — or ''
+        when the family itself was used."""
+        if self.kind == "exact" or not self.family:
+            return ""
+        why = {"metric": "its metric-compatible equivalent", "substitute": "its substitute",
+               "fallback": "its documented open fallback",
+               "generic": "the generic fallback"}.get(self.kind, "a fallback")
+        return f"{self.requested} was drawn with {self.family}, {why}"
+
+
+def resolve_font(face: Any) -> FontChoice:
+    """Which installed family renders `face` (a style.FontFace) on this
+    server: its `pdf_candidates` in order, asked of fontconfig. The one
+    mapping the PDF stylesheet, the chart painter, the render warnings and
+    the self-check all read."""
+    name = str(getattr(face, "name", "") or "")
+    for family in tuple(getattr(face, "pdf_candidates", ()) or ()):
+        if not font_installed(family):
+            continue
+        if family in tuple(getattr(face, "installed_file_candidates", ()) or ()):
+            kind = "exact"
+        elif family == getattr(face, "metric_substitute", None):
+            kind = "metric" if getattr(face, "metric_compatible", False) else "substitute"
+        elif family == getattr(face, "fallback", None):
+            kind = "fallback"
+        else:
+            kind = "generic"
+        return FontChoice(name, family, kind)
+    return FontChoice(name, "", "none")
+
+
+def pdf_font_stack(face: Any) -> str:
+    """The face's constant CSS stack with the family `resolve_font` picked
+    first, so WeasyPrint draws exactly the mapped family instead of letting
+    a fontconfig alias of the missing name ("Georgia" -> DejaVu Serif) jump
+    the queue. Every name comes from the allowlist, never from a request."""
+    stack = str(getattr(face, "css_stack", "") or CSS_SANS)
+    chosen = resolve_font(face)
+    if not chosen.family or chosen.kind == "exact" or not re.fullmatch(r"[A-Za-z0-9 ._-]+", chosen.family):
+        return stack
+    return f'"{chosen.family}", {stack}'
+
+
+def uncovered_scripts(text: str) -> List[str]:
+    """The scripts in `text` that no installed font on this server draws."""
+    return [s for s in unsupported_scripts(text) if not installed_family(SCRIPT_FONTS.get(s, ()))]
+
+
 def font_coverage_warning(text: str) -> str:
-    """The one-sentence warning for a spec that uses scripts the container
-    cannot draw, or '' when it uses none."""
-    missing = unsupported_scripts(text)
+    """The one-sentence warning for a spec that uses scripts this server
+    has no font for, or '' when every script is covered. Chart images and
+    the PDF are drawn HERE, so they are the files that show boxes; the
+    Office files carry the characters and display them on a computer with
+    a font for the script."""
+    missing = uncovered_scripts(text)
     if not missing:
         return ""
     return (
-        f"The text uses {', '.join(missing)} characters; the PDF preview may show them as boxes "
-        "because the server's fonts cover Latin scripts only. The DOCX/PPTX/XLSX files keep the text intact."
+        f"The text uses {', '.join(missing)} characters and this server has no font for them, so the PDF and any chart "
+        "images may show them as boxes; the Word, PowerPoint and Excel files keep the characters, which display on a "
+        "computer that has a font for the script."
     )
+
+
+# ------------------------------------------------------- TechSara Classic --
+#
+# The style guide's tokens (docs/artifact-studio/as3/styling-engine.md) live
+# in artifacts/style.py, where the resolver applies presets, user tokens and
+# the contrast policy; these names re-export the Classic values for code
+# that wants a constant.
+
+CLASSIC_PRIMARY = "#1F3864"
+CLASSIC_ACCENT = "#2E5597"
+CLASSIC_INK = "#1F2937"
+CLASSIC_MUTED = "#5F6B7A"
+CLASSIC_CAPTION = "#6B7280"
+CLASSIC_HAIRLINE = "#D0D7E2"
+CLASSIC_GRID = "#E5E9F0"
+CLASSIC_BAND = "#F3F6FA"
+CLASSIC_TOTAL_FILL = "#DCE6F2"
+#: Office names and the container's metric twins (Carlito ≈ Calibri,
+#: Caladea ≈ Cambria; Dockerfile.* install fonts-crosextra-carlito/caladea).
+CLASSIC_BODY_FONT = "Calibri"
+CLASSIC_HEADING_FONT = "Calibri"
+CSS_CLASSIC = '"Calibri", "Carlito", "Liberation Sans", Arial, "DejaVu Sans", "Noto Sans Devanagari", "Lohit Devanagari", "Noto Sans Gujarati", "Lohit Gujarati", sans-serif'
+
+_CURRENCY_SYMBOLS = {"INR": "₹", "USD": "$", "EUR": "€", "GBP": "£"}
+
+
+def indian_grouping(integer_digits: str) -> str:
+    """'12000000' → '1,20,00,000' (lakh/crore grouping)."""
+    if len(integer_digits) <= 3:
+        return integer_digits
+    head, tail = integer_digits[:-3], integer_digits[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return ",".join(parts + [tail])
+
+
+def _number_text(value: float, decimals: int, *, indian: bool = False) -> str:
+    text = f"{abs(value):,.{decimals}f}"
+    if indian:
+        whole, _, frac = f"{abs(value):.{decimals}f}".partition(".")
+        text = indian_grouping(whole) + (f".{frac}" if frac else "")
+    return ("-" if value < 0 and float(text.replace(",", "") or 0) != 0 else "") + text
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        for sym in _CURRENCY_SYMBOLS.values():
+            s = s.replace(sym, "")
+        s = s.rstrip("%").strip()
+        if re.match(r"^\s*[-+]?0\d", s):
+            return None
+        try:
+            f = float(s)
+        except ValueError:
+            return None
+        return f if math.isfinite(f) else None
+    return None
+
+
+def format_cell(value: Any, column_format: Any = None, *, percent_scale: float = 1.0) -> str:
+    """What a cell SHOWS in a Word/PDF table and the sheet preview, from the
+    same rules the XLSX number formats follow: integers `12,345`; decimals
+    two places (`#,##0` when integral); percent `12.5%` (a fraction ×100,
+    or a whole percentage when `percent_scale` is 0.01); currency with its
+    symbol (INR in lakh/crore grouping); dates `03-Aug-2026` (ISO when
+    asked). `column_format` is a spec Column (its `type` and `format`), a
+    column type string, or None (text). Text never changes."""
+    import datetime as _dt
+
+    if value is None:
+        return ""
+    ctype = column_format if isinstance(column_format, str) else getattr(column_format, "type", None) or "text"
+    fmt = getattr(column_format, "format", None)
+    kind = getattr(fmt, "kind", None) or {"integer": "integer", "number": "decimal", "currency": "currency", "percent": "percent", "date": "date"}.get(ctype, "text")
+    decimals = getattr(fmt, "decimals", None)
+    if kind == "text":
+        return str(value)
+    if kind in ("date", "datetime"):
+        moment = None
+        if isinstance(value, _dt.datetime):
+            moment = value
+        elif isinstance(value, _dt.date):
+            moment = _dt.datetime.combine(value, _dt.time())
+        elif isinstance(value, str):
+            m = re.match(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}))?", value.strip())
+            if m:
+                try:
+                    moment = _dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4) or 0), int(m.group(5) or 0))
+                except ValueError:
+                    moment = None
+        if moment is None:
+            return str(value)
+        if getattr(fmt, "date_style", None) == "iso":
+            return moment.strftime("%Y-%m-%d %H:%M" if kind == "datetime" else "%Y-%m-%d")
+        return moment.strftime("%d-%b-%Y %H:%M" if kind == "datetime" else "%d-%b-%Y")
+    number = _as_float(value)
+    if number is None:
+        return str(value)
+    if kind == "integer":
+        return _number_text(round(number), 0)
+    if kind == "percent":
+        pct = number * (100.0 if percent_scale == 1.0 else 1.0)
+        return f"{_number_text(pct, 1 if decimals is None else decimals)}%"
+    if kind == "currency":
+        code = getattr(fmt, "currency", None)
+        places = 2 if decimals is None else decimals
+        text = _number_text(number, places, indian=code == "INR")
+        symbol = _CURRENCY_SYMBOLS.get(code or "", "")
+        return (f"-{symbol}{text[1:]}" if text.startswith("-") else f"{symbol}{text}")
+    places = decimals if decimals is not None else (0 if abs(number - round(number)) < 1e-9 else 2)
+    return _number_text(number, places)
 
 
 def series_colour(index: int) -> str:
@@ -263,5 +528,9 @@ __all__ = [
     "SLIDE_BODY_TOP_IN", "SLIDE_BODY_H_IN", "SLIDE_FOOTER_TOP_IN", "SLIDE_FOOTER_H_IN", "SlideType",
     "SLIDE_TYPE", "CEO_SLIDE_TYPE", "SLIDE_MIN_BODY_PT", "PRESENTATION_TEMPLATES", "DOCUMENT_TEMPLATES",
     "CHART_DPI", "CHART_FIGSIZE", "CHART_LABEL_MAX_CATEGORIES", "unsupported_scripts",
-    "font_coverage_warning", "series_colour", "hex_to_rgb",
+    "font_coverage_warning", "series_colour", "hex_to_rgb", "SCRIPT_FONTS", "font_installed", "installed_family",
+    "FontChoice", "resolve_font", "pdf_font_stack",
+    "uncovered_scripts", "format_cell", "indian_grouping", "CLASSIC_PRIMARY", "CLASSIC_ACCENT", "CLASSIC_INK",
+    "CLASSIC_MUTED", "CLASSIC_CAPTION", "CLASSIC_HAIRLINE", "CLASSIC_GRID", "CLASSIC_BAND", "CLASSIC_TOTAL_FILL",
+    "CLASSIC_BODY_FONT", "CLASSIC_HEADING_FONT", "CSS_CLASSIC",
 ]

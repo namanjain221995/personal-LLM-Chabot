@@ -24,6 +24,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # WITHOUT LaTeX: pandoc is invoked with --pdf-engine=weasyprint. The pip
 # weasyprint package (see requirements.txt) needs these Pango/Cairo/GDK-PixBuf
 # C libraries plus fonts.
+# Fonts: the same open-licence set as Dockerfile.cuda / Dockerfile.cpu (see the
+# table there): Liberation 2, Carlito/Caladea, DejaVu, Noto core + Lohit for
+# Devanagari/Gujarati. tests/test_artifact_fonts.py asserts fc-match resolves them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pandoc \
         ffmpeg \
@@ -37,6 +40,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         shared-mime-info \
         fonts-dejavu-core \
         fonts-liberation \
+        fonts-liberation2 \
+        fonts-crosextra-carlito \
+        fonts-crosextra-caladea \
+        fonts-noto-core \
+        fonts-lohit-deva \
+        fonts-lohit-gujr \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

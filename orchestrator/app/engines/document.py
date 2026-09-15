@@ -84,6 +84,13 @@ _SYSTEM = (
     "fields (invoices, contracts, forms), return the structured values you "
     "find. Do not invent details that are not present."
 )
+# --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
+from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
+
+_AS3_CAPABILITY = _as3_capability_suffix()
+
+_SYSTEM = _SYSTEM + _AS3_CAPABILITY
+# --- AS3 intent-capability END ---
 
 #: Words that mean the QUESTION is about what the page looks like, where the
 #: text layer alone cannot answer and the renders earn their tokens.

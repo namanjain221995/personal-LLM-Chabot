@@ -14,6 +14,14 @@ plan (html.plan_deck) trims bullets over the template's cap and the slide's
 line budget, cuts tables to the rows a slide holds, and records one warning
 per slide. This writer trusts the plan and draws what it says.
 
+STYLE. Fonts, colours and sizes come from style.resolve(spec), the same
+ResolvedStyle the PDF preview reads (html.deck_html): the title band is the
+template's colour unless a palette was chosen, slide titles and body text
+take the resolved families and colours, a rule on one slide's title (by
+slide number) or on a table column/row applies to that element only, table
+headers take the resolved fill, charts take the chart title/axis/legend/
+label styles, and a requested slide background fills every content slide.
+
 python-pptx is imported lazily (tests/test_imports.py). Its native charts
 embed an .xlsx workbook written with XlsxWriter — that is why XlsxWriter is
 a transitive requirement; the workbook holds only the chart's numbers.
@@ -21,11 +29,39 @@ a transitive requirement; the workbook holds only the chart's numbers.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 from .. import spec as S
+from .. import style as ST
 from . import theme
-from .html import BULLET_GAP_EM, DeckPlan, PlannedSlide, cell_text, plan_deck
+from .html import BULLET_GAP_EM, DeckPlan, PlannedSlide, cell_text, deck_band, plan_deck
+
+#: The deck's ResolvedStyle while render_pptx runs (one render per process
+#: call; set and cleared by render_pptx, read by the drawing helpers).
+_R: Optional[ST.ResolvedStyle] = None
+
+
+def _style() -> ST.ResolvedStyle:
+    return _R if _R is not None else ST.resolve(None)
+
+
+def _run_style(run, ts: ST.TextStyle, *, size: Optional[float] = None) -> None:
+    from pptx.util import Pt
+
+    R = _style()
+    run.font.name = R.face(ts.font_family).office_name
+    run.font.size = Pt(max(size if size is not None else (ts.size_pt or 14), 1))
+    run.font.bold = bool(ts.bold)
+    run.font.italic = bool(ts.italic)
+    run.font.underline = bool(ts.underline)
+    if ts.color:
+        run.font.color.rgb = _rgb(ts.color)
+
+
+def _size_or(ts: ST.TextStyle, kind: str, template_size: float) -> float:
+    """The template's size unless a rule changed the element's size."""
+    base = _style().base(kind)
+    return float(ts.size_pt) if ts.size_pt is not None and ts.size_pt != base.size_pt else float(template_size)
 
 # python-pptx's blank layout index in the default template.
 _BLANK_LAYOUT = 6
@@ -60,6 +96,21 @@ def _text_box(slide, x, y, w, h, text: str, *, size: float, bold: bool = False, 
     return box
 
 
+def _styled_box(slide, x, y, w, h, text: str, ts: ST.TextStyle, *, size: float, align=None, anchor=None, wrap: bool = True):
+    """A text box whose one run carries every property of `ts`."""
+    from pptx.enum.text import PP_ALIGN
+
+    box = _text_box(slide, x, y, w, h, text, size=size, align=align, anchor=anchor, wrap=wrap)
+    p = box.text_frame.paragraphs[0]
+    _run_style(p.runs[0], ts, size=size)
+    if ts.align:
+        p.alignment = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.JUSTIFY}[ts.align]
+    if ts.background:
+        box.fill.solid()
+        box.fill.fore_color.rgb = _rgb(ts.background)
+    return box
+
+
 def _rect(slide, x, y, w, h, fill: str, *, line: Optional[str] = None):
     from pptx.enum.shapes import MSO_SHAPE
     from pptx.util import Inches
@@ -77,13 +128,17 @@ def _rect(slide, x, y, w, h, fill: str, *, line: Optional[str] = None):
     return shape
 
 
-def _bullets(slide, x, y, w, h, items: Sequence[str], size: float, *, numbered: bool = False, colour: str = theme.INK):
+def _bullets(slide, x, y, w, h, items: Sequence[str], size: float, *, numbered: bool = False, colour: Optional[str] = None):
     from pptx.util import Inches, Pt
 
+    R = _style()
+    bullet_ts = R.element("slide_body")
+    for rule in R.matching_rules("bullet"):
+        bullet_ts = rule.style.over(bullet_ts)
+    size = max(_size_or(bullet_ts, "slide_body", size), theme.SLIDE_MIN_BODY_PT)
     box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
     tf = box.text_frame
     tf.word_wrap = True
-    size = max(size, theme.SLIDE_MIN_BODY_PT)
     for i, item in enumerate(items):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.space_after = Pt(size * BULLET_GAP_EM)  # the gap the plan's line budget assumes
@@ -92,13 +147,11 @@ def _bullets(slide, x, y, w, h, items: Sequence[str], size: float, *, numbered: 
         run.text = marker
         run.font.size = Pt(size)
         run.font.bold = True
-        run.font.name = theme.OFFICE_SANS
-        run.font.color.rgb = _rgb(theme.TEAL if numbered else theme.ACCENT)
+        run.font.name = R.face(bullet_ts.font_family).office_name
+        run.font.color.rgb = _rgb(R.tokens.accent_text if numbered else R.tokens.accent)
         run = p.add_run()
         run.text = item
-        run.font.size = Pt(size)
-        run.font.name = theme.OFFICE_SANS
-        run.font.color.rgb = _rgb(colour)
+        _run_style(run, bullet_ts if colour is None else bullet_ts.model_copy(update={"color": colour}), size=size)
     return box
 
 
@@ -107,51 +160,70 @@ def _slide_title(slide, s: PlannedSlide, plan: DeckPlan) -> None:
 
     t = plan.type
     m = theme.SLIDE_MARGIN_IN
-    _text_box(slide, m, theme.SLIDE_TITLE_TOP_IN, theme.SLIDE_W_IN - 2 * m, theme.SLIDE_TITLE_H_IN, s.title,
-              size=t.title, bold=True, colour=theme.NAVY, anchor=MSO_ANCHOR.BOTTOM)
-    _rect(slide, m, theme.SLIDE_TITLE_TOP_IN + theme.SLIDE_TITLE_H_IN + 0.02, theme.SLIDE_W_IN - 2 * m, 0.03, theme.ACCENT)
+    R = _style()
+    ts = R.element("slide_title", index=s.number)
+    _styled_box(slide, m, theme.SLIDE_TITLE_TOP_IN, theme.SLIDE_W_IN - 2 * m, theme.SLIDE_TITLE_H_IN, s.title, ts,
+                size=_size_or(ts, "slide_title", t.title), anchor=MSO_ANCHOR.BOTTOM)
+    _rect(slide, m, theme.SLIDE_TITLE_TOP_IN + theme.SLIDE_TITLE_H_IN + 0.02, theme.SLIDE_W_IN - 2 * m, 0.03, R.tokens.accent)
 
 
 def _footer(slide, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
-    from pptx.enum.text import PP_ALIGN
 
     t = plan.type
     m = theme.SLIDE_MARGIN_IN
     y = theme.SLIDE_FOOTER_TOP_IN
     w = theme.SLIDE_W_IN - 2 * m
-    _rect(slide, m, y, w, 0.01, theme.BORDER)
-    label = plan.spec.title + ("   CONFIDENTIAL" if plan.spec.confidential else "")
-    _text_box(slide, m, y + 0.03, w * 0.75, theme.SLIDE_FOOTER_H_IN, label, size=t.small, colour=theme.INK_FAINT)
-    _text_box(slide, m + w * 0.75, y + 0.03, w * 0.25, theme.SLIDE_FOOTER_H_IN, f"{s.number} / {total}",
-              size=t.small, colour=theme.INK_FAINT, align=PP_ALIGN.RIGHT)
+    R = _style()
+    ts = R.element("header_footer")
+    size = _size_or(ts, "header_footer", t.small)
+    _rect(slide, m, y, w, 0.01, R.tokens.hairline)
+    label = (R.page.footer_text or plan.spec.title) + ("   CONFIDENTIAL" if plan.spec.confidential else "")
+    _styled_box(slide, m, y + 0.03, w * 0.75, theme.SLIDE_FOOTER_H_IN, label, ts, size=size)
+    if R.page.page_numbers:
+        _styled_box(slide, m + w * 0.75, y + 0.03, w * 0.25, theme.SLIDE_FOOTER_H_IN, f"{s.number} / {total}", ts.model_copy(update={"align": "right"}), size=size)
 
 
 def _band_slide(prs, s: PlannedSlide, plan: DeckPlan) -> None:
     """title / section / closing: a full-bleed band in the template colour."""
     spec = plan.spec
     t = plan.type
+    R = _style()
+    band = deck_band(plan, R)
+    on_band = ST.readable_on(band)
     slide = prs.slides.add_slide(prs.slide_layouts[_BLANK_LAYOUT])
     bg = slide.background.fill
     bg.solid()
-    bg.fore_color.rgb = _rgb(plan.band)
+    bg.fore_color.rgb = _rgb(band)
     title = s.title or (spec.title if s.layout == "title" else ("Thank you" if s.layout == "closing" else ""))
     subtitle = s.subtitle or (spec.subtitle if s.layout == "title" else "")
-    _rect(slide, 0.9, 2.0, 1.2, 0.08, theme.TEAL)
+    _rect(slide, 0.9, 2.0, 1.2, 0.08, R.tokens.accent)
+
+    def on(kind: str, template_size: float) -> Tuple[ST.TextStyle, float]:
+        ts = R.element(kind)
+        user_colour = any(r.style.color for r in R.matching_rules(kind))
+        ts = ts.model_copy(update={"color": ts.color if user_colour else on_band, "background": None})
+        return ts, _size_or(ts, kind, template_size)
+
     if s.layout == "section":
-        _text_box(slide, 0.9, 2.9, theme.SLIDE_W_IN - 1.8, 1.4, title, size=t.section, bold=True, colour=theme.WHITE)
+        ts, size = on("title", t.section)
+        _styled_box(slide, 0.9, 2.9, theme.SLIDE_W_IN - 1.8, 1.4, title, ts, size=size)
         if subtitle:
-            _text_box(slide, 0.9, 4.4, theme.SLIDE_W_IN - 1.8, 1.0, subtitle, size=t.body + 4, colour=theme.WHITE)
+            ts, size = on("subtitle", t.body + 4)
+            _styled_box(slide, 0.9, 4.4, theme.SLIDE_W_IN - 1.8, 1.0, subtitle, ts, size=size)
     else:
-        _text_box(slide, 0.9, 2.3, theme.SLIDE_W_IN - 1.8, 1.5, title, size=t.cover_title, bold=True, colour=theme.WHITE)
+        ts, size = on("title", t.cover_title)
+        _styled_box(slide, 0.9, 2.3, theme.SLIDE_W_IN - 1.8, 1.5, title, ts, size=size)
         if subtitle:
-            _text_box(slide, 0.9, 3.9, theme.SLIDE_W_IN - 1.8, 1.0, subtitle, size=t.body + 4, colour=theme.WHITE)
+            ts, size = on("subtitle", t.body + 4)
+            _styled_box(slide, 0.9, 3.9, theme.SLIDE_W_IN - 1.8, 1.0, subtitle, ts, size=size)
         meta_bits: List[str] = []
         if s.layout == "title":
             meta_bits = [b for b in (spec.author, spec.date, spec.audience and f"Prepared for {spec.audience}") if b]
         elif s.bullets:
             meta_bits = list(s.bullets)
         if meta_bits:
-            _text_box(slide, 0.9, 6.4, theme.SLIDE_W_IN - 1.8, 0.6, " · ".join(meta_bits), size=t.body, colour=theme.WHITE)
+            _text_box(slide, 0.9, 6.4, theme.SLIDE_W_IN - 1.8, 0.6, " · ".join(meta_bits), size=t.body, colour=on_band,
+                      font=R.body_face.office_name)
     _notes(slide, s)
 
 
@@ -185,6 +257,13 @@ def _label(text: str) -> str:
 
 
 def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
+    # --- AS3 integration: Chart v2 types and requested chart styling go to
+    # the charts track's writer (a picture where PowerPoint has no such chart).
+    if (str(chart.type) not in ("bar", "horizontal_bar", "line", "pie") or getattr(chart, "style", None) is not None) and chart.series:
+        from . import chart_native as CN
+
+        CN.add_pptx_chart(slide, chart, (x, y, w, h), _style())
+        return
     from pptx.chart.data import CategoryChartData
     from pptx.enum.chart import XL_LEGEND_POSITION
     from pptx.util import Inches, Pt
@@ -200,20 +279,30 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
         data.add_series(_label(series.name), [float(v) for v in series.values])
     frame = slide.shapes.add_chart(_chart_type(chart), Inches(x), Inches(y), Inches(w), Inches(h), data)
     c = frame.chart
-    c.font.size = Pt(max(body_pt - 4, theme.SLIDE_MIN_BODY_PT - 2))
-    c.font.name = theme.OFFICE_SANS
-    c.font.color.rgb = _rgb(theme.INK_MUTED)
+    R = _style()
+    axis_ts = R.element("chart_axis")
+    c.font.size = Pt(_size_or(axis_ts, "chart_axis", max(body_pt - 4, theme.SLIDE_MIN_BODY_PT - 2)))
+    c.font.name = R.face(axis_ts.font_family).office_name
+    c.font.bold = bool(axis_ts.bold)
+    c.font.italic = bool(axis_ts.italic)
+    c.font.color.rgb = _rgb(axis_ts.color or R.tokens.muted)
     c.has_title = bool(chart.title)
     if chart.title:
+        title_ts = R.element("chart_title")
         c.chart_title.text_frame.text = chart.title
         para = c.chart_title.text_frame.paragraphs[0]
-        para.runs[0].font.size = Pt(body_pt)
-        para.runs[0].font.bold = True
-        para.runs[0].font.color.rgb = _rgb(theme.INK)
+        _run_style(para.runs[0], title_ts, size=_size_or(title_ts, "chart_title", body_pt))
     c.has_legend = len(chart.series) > 1 or chart.type == "pie"
     if c.has_legend:
         c.legend.position = XL_LEGEND_POSITION.BOTTOM
         c.legend.include_in_layout = False
+        legend_ts = R.element("chart_legend")
+        c.legend.font.name = R.face(legend_ts.font_family).office_name
+        c.legend.font.size = Pt(_size_or(legend_ts, "chart_legend", max(body_pt - 4, theme.SLIDE_MIN_BODY_PT - 2)))
+        c.legend.font.bold = bool(legend_ts.bold)
+        c.legend.font.italic = bool(legend_ts.italic)
+        if legend_ts.color:
+            c.legend.font.color.rgb = _rgb(legend_ts.color)
     plot = c.plots[0]
     if chart.type == "pie":
         plot.has_data_labels = True
@@ -228,8 +317,12 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
     else:
         if len(chart.categories) <= theme.CHART_LABEL_MAX_CATEGORIES and chart.type != "line":
             plot.has_data_labels = True
-            plot.data_labels.font.size = Pt(max(body_pt - 6, 10))
-            plot.data_labels.font.color.rgb = _rgb(theme.INK_MUTED)
+            labels_ts = R.element("chart_labels")
+            plot.data_labels.font.size = Pt(_size_or(labels_ts, "chart_labels", max(body_pt - 6, 10)))
+            plot.data_labels.font.name = R.face(labels_ts.font_family).office_name
+            plot.data_labels.font.bold = bool(labels_ts.bold)
+            plot.data_labels.font.italic = bool(labels_ts.italic)
+            plot.data_labels.font.color.rgb = _rgb(labels_ts.color or R.tokens.ink)
         for i, series in enumerate(plot.series):
             fill = series.format.line if chart.type == "line" else series.format.fill
             if chart.type == "line":
@@ -242,18 +335,20 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
         if chart.type != "pie":
             va = c.value_axis
             va.has_major_gridlines = True
-            va.major_gridlines.format.line.color.rgb = _rgb(theme.BORDER)
+            va.major_gridlines.format.line.color.rgb = _rgb(R.tokens.grid)
             va.format.line.fill.background()
             if chart.y_label:
                 va.has_title = True
                 va.axis_title.text_frame.text = chart.y_label
                 va.axis_title.text_frame.paragraphs[0].runs[0].font.size = Pt(max(body_pt - 6, 10))
-            c.category_axis.format.line.color.rgb = _rgb(theme.BORDER)
+            c.category_axis.format.line.color.rgb = _rgb(R.tokens.hairline)
 
 
-def _native_table(slide, x, y, w, h, table: S.Table, body_pt: float) -> None:
+def _native_table(slide, x, y, w, h, table: S.Table, body_pt: float, ordinal: int = 0) -> None:
     from pptx.enum.text import PP_ALIGN
     from pptx.util import Inches, Pt
+
+    R = _style()
 
     numeric = set(table.numeric_columns)
     rows = len(table.rows) + 1
@@ -265,30 +360,33 @@ def _native_table(slide, x, y, w, h, table: S.Table, body_pt: float) -> None:
     tbl = shape.table
     size = Pt(max(body_pt - 2, theme.SLIDE_MIN_BODY_PT))
 
-    def put(cell, text: str, *, bold: bool = False, colour: str = theme.INK, right: bool = False):
+    aligns = {"left": PP_ALIGN.LEFT, "center": PP_ALIGN.CENTER, "right": PP_ALIGN.RIGHT, "justify": PP_ALIGN.JUSTIFY}
+
+    def put(cell, text: str, ts: ST.TextStyle, kind: str, *, right: bool = False):
         cell.text = ""
         p = cell.text_frame.paragraphs[0]
         run = p.add_run()
         run.text = text
-        run.font.size = size
-        run.font.bold = bold
-        run.font.name = theme.OFFICE_SANS
-        run.font.color.rgb = _rgb(colour)
-        if right:
+        _run_style(run, ts, size=_size_or(ts, kind, size.pt))
+        if ts.align:
+            p.alignment = aligns[ts.align]
+        elif right:
             p.alignment = PP_ALIGN.RIGHT
         cell.margin_left = cell.margin_right = Inches(0.08)
 
     for j, name in enumerate(table.columns):
         cell = tbl.cell(0, j)
+        ts = R.element("table_header", table=ordinal, column=name, column_index=j)
         cell.fill.solid()
-        cell.fill.fore_color.rgb = _rgb(theme.NAVY)
-        put(cell, name, bold=True, colour=theme.WHITE, right=j in numeric)
+        cell.fill.fore_color.rgb = _rgb(ts.background or R.tokens.header_fill)
+        put(cell, name, ts, "table_header", right=j in numeric)
     for i, row in enumerate(table.rows, start=1):
         for j, value in enumerate(row):
             cell = tbl.cell(i, j)
+            ts = R.element("table_body", table=ordinal, column=table.columns[j], column_index=j, row=i)
             cell.fill.solid()
-            cell.fill.fore_color.rgb = _rgb(theme.SURFACE if i % 2 == 0 else theme.WHITE)
-            put(cell, cell_text(value, j in numeric), right=j in numeric)
+            cell.fill.fore_color.rgb = _rgb(ts.background or (R.tokens.band if (R.banded and i % 2 == 0) else theme.WHITE))
+            put(cell, cell_text(value, j in numeric), ts, "table_body", right=j in numeric)
 
 
 def _kpi_boxes(slide, s: PlannedSlide, plan: DeckPlan) -> None:
@@ -301,13 +399,15 @@ def _kpi_boxes(slide, s: PlannedSlide, plan: DeckPlan) -> None:
     w = (theme.SLIDE_W_IN - 2 * m - gap * (n - 1)) / n
     y = theme.SLIDE_BODY_TOP_IN + 0.7
     h = 2.4
+    R = _style()
+    value_ts, label_ts = R.element("kpi_value"), R.element("kpi_label")
     for i, k in enumerate(s.kpis):
         x = m + i * (w + gap)
-        _rect(slide, x, y, w, h, theme.SURFACE)
-        _rect(slide, x, y, w, 0.07, theme.ACCENT)
-        _text_box(slide, x, y + 0.35, w, 1.0, k.value, size=t.kpi_value, bold=True, colour=theme.NAVY,
-                  align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
-        _text_box(slide, x, y + 1.45, w, 0.45, k.label.upper(), size=t.kpi_label, colour=theme.INK_MUTED, align=PP_ALIGN.CENTER)
+        _rect(slide, x, y, w, h, value_ts.background or R.tokens.band)
+        _rect(slide, x, y, w, 0.07, R.tokens.kpi_bar)
+        _styled_box(slide, x, y + 0.35, w, 1.0, k.value, value_ts.model_copy(update={"background": None}), size=_size_or(value_ts, "kpi_value", t.kpi_value),
+                    align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+        _styled_box(slide, x, y + 1.45, w, 0.45, k.label.upper(), label_ts.model_copy(update={"background": None}), size=_size_or(label_ts, "kpi_label", t.kpi_label), align=PP_ALIGN.CENTER)
         if k.note:
             _text_box(slide, x, y + 1.9, w, 0.4, k.note, size=max(t.kpi_label - 2, theme.SLIDE_MIN_BODY_PT), colour=theme.INK_FAINT, align=PP_ALIGN.CENTER)
 
@@ -368,6 +468,7 @@ def _sources_slide(prs, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
 
     t = plan.type
     slide = prs.slides.add_slide(prs.slide_layouts[_BLANK_LAYOUT])
+    _background(slide)
     _slide_title(slide, s, plan)
     m = theme.SLIDE_MARGIN_IN
     box = slide.shapes.add_textbox(Inches(m), Inches(theme.SLIDE_BODY_TOP_IN), Inches(theme.SLIDE_W_IN - 2 * m), Inches(theme.SLIDE_BODY_H_IN))
@@ -391,10 +492,19 @@ def _sources_slide(prs, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
     _footer(slide, s, plan, total)
 
 
+def _background(slide) -> None:
+    R = _style()
+    if R.page.background:
+        fill = slide.background.fill
+        fill.solid()
+        fill.fore_color.rgb = _rgb(R.page.background)
+
+
 def _content_slide(prs, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
     t = plan.type
     m = theme.SLIDE_MARGIN_IN
     slide = prs.slides.add_slide(prs.slide_layouts[_BLANK_LAYOUT])
+    _background(slide)
     _slide_title(slide, s, plan)
     x, y, w, h = m, theme.SLIDE_BODY_TOP_IN, theme.SLIDE_W_IN - 2 * m, theme.SLIDE_BODY_H_IN
     numbered = plan.template_id == "training"
@@ -405,11 +515,13 @@ def _content_slide(prs, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
         else:
             _native_chart(slide, x + 0.5, y, w - 1.0, h - 0.2, s.chart, t.body)
         if s.chart.caption:
-            _text_box(slide, x, y + h - 0.35, w, 0.35, s.chart.caption, size=theme.SLIDE_MIN_BODY_PT, colour=theme.INK_MUTED)
+            cap = _style().element("caption")
+            _styled_box(slide, x, y + h - 0.35, w, 0.35, s.chart.caption, cap, size=_size_or(cap, "caption", theme.SLIDE_MIN_BODY_PT))
     elif s.layout == "table" and s.table is not None:
-        _native_table(slide, x, y, w, h - 0.4, s.table, t.body)
+        _native_table(slide, x, y, w, h - 0.4, s.table, t.body, s.number)
         if s.table.caption:
-            _text_box(slide, x, y + h - 0.35, w, 0.35, s.table.caption, size=theme.SLIDE_MIN_BODY_PT, colour=theme.INK_MUTED)
+            cap = _style().element("caption")
+            _styled_box(slide, x, y + h - 0.35, w, 0.35, s.table.caption, cap, size=_size_or(cap, "caption", theme.SLIDE_MIN_BODY_PT))
     elif s.layout == "kpis":
         _kpi_boxes(slide, s, plan)
     elif s.layout == "timeline":
@@ -425,14 +537,25 @@ def _content_slide(prs, s: PlannedSlide, plan: DeckPlan, total: int) -> None:
     _notes(slide, s)
 
 
-def render_pptx(spec: S.PresentationSpec, out_path: str | Path, *, plan: Optional[DeckPlan] = None) -> Path:
+def render_pptx(spec: S.PresentationSpec, out_path: str | Path, *, plan: Optional[DeckPlan] = None,
+                resolved: Optional[ST.ResolvedStyle] = None) -> Path:
     """Write the deck to `out_path` and return it. Every layout decision —
     bullets trimmed, table rows cut — is the plan's, with its warnings; this
     writer makes none of its own, so the .pptx cannot differ from the preview."""
+
+    global _R
+    plan = plan or plan_deck(spec)
+    _R = resolved or ST.resolve(spec)
+    try:
+        return _render(spec, out_path, plan)
+    finally:
+        _R = None
+
+
+def _render(spec: S.PresentationSpec, out_path: str | Path, plan: DeckPlan) -> Path:
     from pptx import Presentation
     from pptx.util import Inches
 
-    plan = plan or plan_deck(spec)
     prs = Presentation()
     prs.slide_width = Inches(theme.SLIDE_W_IN)
     prs.slide_height = Inches(theme.SLIDE_H_IN)

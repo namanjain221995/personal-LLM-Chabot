@@ -66,6 +66,13 @@ _SYSTEM = (
     "anything not visible — then a short summary. In every other case do "
     "not output JSON."
 )
+# --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
+from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
+
+_AS3_CAPABILITY = _as3_capability_suffix()
+
+_SYSTEM = _SYSTEM + _AS3_CAPABILITY
+# --- AS3 intent-capability END ---
 
 # Words that mean "give me the data", not "answer my question". Deterministic
 # so the JSON-or-prose decision does not rest on the model's mood: the hint

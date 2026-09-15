@@ -62,9 +62,10 @@ def test_named_styles_exist_with_theme_sizes(tmp_path):
     d = Document(str(path))
     for name in ("Title", "Subtitle", "Heading 1", "Heading 2", "Heading 3", "Body", "Caption", "Callout", "Bullet", "Number"):
         st = d.styles[name]
-        assert st.font.name == "Arial", name
+        assert st.font.name == "Calibri", name
     assert d.styles["Body"].font.size.pt == 11
-    assert d.styles["Heading 1"].font.size.pt == 20
+    assert d.styles["Heading 1"].font.size.pt == 18
+    assert d.styles["Title"].font.size.pt == 28 and d.styles["Heading 2"].font.size.pt == 14 and d.styles["Heading 3"].font.size.pt == 12
 
 
 def test_footer_has_page_and_numpages_fields_and_header_has_title(tmp_path):
@@ -115,7 +116,7 @@ def test_tables_have_shaded_header_repeated_and_numbers_right_aligned(tmp_path):
     d = Document(str(path))
     t = d.tables[0]
     head = t.rows[0].cells[0]._tc.find(qn("w:tcPr")).find(qn("w:shd"))
-    assert head.get(qn("w:fill")) == "0A1D37"
+    assert head.get(qn("w:fill")) == "1F3864"
     assert t.rows[0]._tr.find(qn("w:trPr")).find(qn("w:tblHeader")) is not None
     assert t.rows[1].cells[1].paragraphs[0].alignment == WD_ALIGN_PARAGRAPH.RIGHT
     assert t.rows[1].cells[1].text == "1,234,567"
@@ -268,7 +269,7 @@ def test_workbook_docx_is_a_tabular_document_landscape_with_a_repeating_header(t
     assert audit.rows[1]._tr.find(qn("w:trPr")).find(qn("w:cantSplit")) is not None, "a row never splits across pages"
     assert audit.style.name == "Table Grid"
     head = audit.rows[0].cells
-    assert head[0]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "0A1D37"
+    assert head[0]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "1F3864"
     assert head[8]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "9C0006"
     assert audit.rows[1].cells[8]._tc.find(qn("w:tcPr")).find(qn("w:shd")).get(qn("w:fill")) == "FFC7CE"
     assert audit.rows[1].cells[8].paragraphs[0].style.name == "Table Cell" and d.styles["Table Cell"].font.size.pt == 9.5

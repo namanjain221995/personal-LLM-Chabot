@@ -9,6 +9,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Fonts, all open-licence. The renderers map a requested proprietary name to
+# one of these (app/artifacts/style.py FONT_ALLOWLIST, render/theme.resolve_font):
+#   fonts-liberation(2)          metric twins of Arial/Helvetica, Times New
+#                                Roman, Courier New (liberation2 is transitional
+#                                on noble/trixie; kept for older bases)
+#   fonts-crosextra-carlito      metric twin of Calibri
+#   fonts-crosextra-caladea      metric twin of Cambria; Georgia's documented
+#                                fallback (Gelasio, Georgia's twin, is packaged
+#                                for neither Ubuntu noble nor Debian trixie)
+#   fonts-dejavu-core            Verdana/Tahoma-class sans, generic last resort
+#   fonts-noto-core, fonts-lohit-deva, fonts-lohit-gujr
+#                                Devanagari and Gujarati for PDFs and chart labels
+# Names verified with apt-get install --simulate on this base (2026-09-15).
+# tests/test_artifact_fonts.py asserts fc-match resolves them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -25,6 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         shared-mime-info \
         fonts-dejavu-core \
         fonts-liberation \
+        fonts-liberation2 \
+        fonts-crosextra-carlito \
+        fonts-crosextra-caladea \
+        fonts-noto-core \
+        fonts-lohit-deva \
+        fonts-lohit-gujr \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

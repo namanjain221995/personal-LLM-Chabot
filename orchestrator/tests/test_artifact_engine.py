@@ -37,6 +37,15 @@ def isolated(tmp_path, monkeypatch):
     pipeline.reset_for_tests()
     pipeline.install_busy_probe(None)
     metrics.reset()
+
+    async def no_model_planner(messages, schema, timeout_s):
+        # AS3: the edit planner's model call is never made offline; a
+        # planner with no answer falls back to the whole-document edit.
+        return None
+
+    from app.artifacts import edits as _edits
+
+    monkeypatch.setattr(_edits, "planner_call", no_model_planner)
     yield
     pipeline.reset_for_tests()
     pipeline.set_composer(None)
@@ -189,7 +198,7 @@ def test_a_conversion_renders_the_stored_content_without_the_model(owner, monkey
     answer, second = _turn(owner, "Also as Word.", gen="g2")
     ref2 = _meta(second)["artifacts"][0]
     assert ref2["artifact_id"] == ref1["artifact_id"] and ref2["version"] == 2 and ref2["operation"] == "convert"
-    assert [f["format"] for f in ref2["files"]] == ["docx"]
+    assert [f["format"] for f in ref2["files"]] == ["pdf", "docx"], "AS3: a convert keeps the formats and adds the new one"
     assert seen[1]["operation"] == "convert" and seen[1]["parent"].title == "Pricing Update"
     assert answer.startswith("Converted **Pricing Update** to Word")
 

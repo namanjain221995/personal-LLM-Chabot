@@ -1,0 +1,713 @@
+{
+ "_about": "LIVE verdicts of app.artifacts.intent_llm.classify (Qwen3.6-35B-A3B, thinking off, guided JSON, 2026-09-15) for every item of the 205 set, the negatives and HELDOUT3 that the rules send to the classifier. raw = the model verdict; accepted = what classify returned after the 0.75 threshold and the negative veto (null = rejected or said none). engine_seconds = the completion round trip.",
+ "items": {
+  "n05": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.674
+  },
+  "n12": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.63
+  },
+  "n13": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 1.0
+   },
+   "accepted": null,
+   "engine_seconds": 0.625
+  },
+  "n22": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.659
+  },
+  "n23": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.624
+  },
+  "n33": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "artifact",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.704
+  },
+  "n37": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.635
+  },
+  "n40": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.63
+  },
+  "nf06": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": null,
+   "engine_seconds": 0.654
+  },
+  "nc15": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.633
+  },
+  "no04": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.635
+  },
+  "no05": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.625
+  },
+  "no06": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 1.0
+   },
+   "accepted": null,
+   "engine_seconds": 0.602
+  },
+  "no15": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.625
+  },
+  "no23": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.641
+  },
+  "h3p19": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.769
+  },
+  "h3p21": {
+   "raw": {
+    "action": "create",
+    "formats": [
+     "xlsx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "create",
+    "formats": [
+     "xlsx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.734
+  },
+  "h3p22": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.748
+  },
+  "h3p23": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "pdf"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "pdf"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.735
+  },
+  "h3p26": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "pptx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "pptx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.74
+  },
+  "h3p32": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.768
+  },
+  "h3p45": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "engine_seconds": 0.718
+  },
+  "h3p51": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.768
+  },
+  "h3p53": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "docx"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.756
+  },
+  "h3p54": {
+   "raw": {
+    "action": "export",
+    "formats": [
+     "pdf"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "export",
+    "formats": [
+     "pdf"
+    ],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.739
+  },
+  "h3n00": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 1.0
+   },
+   "accepted": null,
+   "engine_seconds": 0.715
+  },
+  "h3n01": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.623
+  },
+  "h3n03": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.613
+  },
+  "h3n06": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.636
+  },
+  "h3n11": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.612
+  },
+  "h3n13": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 1.0
+   },
+   "accepted": null,
+   "engine_seconds": 0.64
+  },
+  "h3n17": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.622
+  },
+  "h3n19": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.638
+  },
+  "h3n20": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.632
+  },
+  "h3n22": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.637
+  },
+  "h3n23": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.627
+  },
+  "h3n25": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.645
+  },
+  "h3n29": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.638
+  },
+  "h3n30": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.629
+  },
+  "h3n31": {
+   "raw": {
+    "action": "edit",
+    "formats": [
+     "pdf"
+    ],
+    "target": "artifact",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": {
+    "action": "edit",
+    "formats": [
+     "pdf"
+    ],
+    "target": "artifact",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "engine_seconds": 0.698
+  },
+  "h3n32": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.647
+  },
+  "h3n35": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.645
+  },
+  "h3n37": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.674
+  },
+  "h3n38": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.619
+  },
+  "h3n39": {
+   "raw": {
+    "action": "edit",
+    "formats": [
+     "docx"
+    ],
+    "target": "artifact",
+    "style_request": true,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "accepted": {
+    "action": "edit",
+    "formats": [
+     "docx"
+    ],
+    "target": "artifact",
+    "style_request": true,
+    "chart_request": false,
+    "confidence": 0.95
+   },
+   "engine_seconds": 0.7
+  },
+  "h3n41": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 1.0
+   },
+   "accepted": null,
+   "engine_seconds": 0.615
+  },
+  "h3n43": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "none",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.62
+  },
+  "h3n44": {
+   "raw": {
+    "action": "none",
+    "formats": [],
+    "target": "previous_answer",
+    "style_request": false,
+    "chart_request": false,
+    "confidence": 0.9
+   },
+   "accepted": null,
+   "engine_seconds": 0.631
+  }
+ }
+}

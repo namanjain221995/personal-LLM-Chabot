@@ -79,6 +79,17 @@ log = logging.getLogger(__name__)
 
 Progress = Callable[[Optional[float], str], Awaitable[None]]
 
+# Cross-track modules (AS3), imported behind shims: a missing one narrows
+# what the composer does, it never fails a job.
+try:
+    from . import lexicon as _lexicon  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _lexicon = None  # type: ignore[assignment]
+try:
+    from . import chart_spec as _chart_spec  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    _chart_spec = None  # type: ignore[assignment]
+
 
 class ComposeError(RuntimeError):
     """The model could not produce a valid spec within the budget."""
@@ -240,6 +251,9 @@ _TEMPLATE_GUIDE = {
     "data": "Data workbook: the rows as given, typed columns, filters on.",
 }
 
+#: The prefix of the version warning that names figures the material never gave.
+FIGURES_WARNING = "figures not in the material (derived or assumed): "
+
 _TONE = {"fast": "Be concise and concrete.", "think": "Be thorough but never padded.", "max": "Be thorough, precise, and polished."}
 
 
@@ -358,6 +372,13 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[d
         except Exception:  # noqa: BLE001 — the caps are advice; the renderer still fits
             caps = ""
     guide = f"\n\n{_workbook_guide(req)}" if req.kind == "workbook" else ""
+    if _chart_spec is not None and hasattr(_chart_spec, "prompt_guide"):
+        # AS3 (b): the charts track's binding guide ONLY — styling is never
+        # added to the compose schema or guide.
+        try:
+            guide += "\n\n" + str(_chart_spec.prompt_guide(req.kind, m.tables))  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
     system = (
         f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
         f"{_TONE.get(req.effort, '')} Limits: at most {budget.max_sections} top-level sections, "
@@ -365,8 +386,29 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget) -> List[d
         f"Set template_id to \"{req.template_id}\"."
         + (f" Author: {req.author}." if req.author else "") + (f" Date: {req.date}." if req.date else "")
     )
+    system += _language_line(req.instruction or m.instruction)
     user = "\n\n".join(parts + [f"Request: {req.instruction or m.instruction}"])
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+_SCRIPT_LANGUAGE = {"hi": "Hindi (Devanagari script)", "gu": "Gujarati (Gujarati script)"}
+
+
+def _language_line(instruction: str) -> str:
+    """A request written wholly in Hindi or Gujarati gets a document in that
+    language (2026-09-15: a Hindi PDF request came back in English twice).
+    Hinglish/Gujlish in Latin script and English keep today's behaviour."""
+    try:
+        from . import lexicon as _lex
+
+        language = str(_lex.language_of(instruction or ""))
+    except Exception:  # noqa: BLE001 — language is advice; composing still works
+        return ""
+    name = _SCRIPT_LANGUAGE.get(language)
+    if not name:
+        return ""
+    return (f" Write every title, heading, paragraph, table header and label of the file in {name},"
+            " unless the request asks for another language.")
 
 
 # ------------------------------------------------------------- the calls --
@@ -464,7 +506,8 @@ async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_
         )
     if extra:
         messages.append({"role": "user", "content": extra})
-    return await _json(messages, S.schema_for(req.kind), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort), effort=req.effort)
+    tables = list((req.material.tables if req.material is not None else []) or [])
+    return await _json(messages, S.schema_for(req.kind, tables=tables), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort), effort=req.effort)
 
 
 def body_json_for_prompt(spec: S.ArtifactSpec) -> str:
@@ -547,7 +590,72 @@ _NOT_SECTION_WORDS = frozenset({
     "header", "headers", "footer", "footers", "number", "numbers", "data", "record", "records", "image", "images",
     "picture", "pictures", "sheet", "sheets", "tab", "tabs", "version", "versions", "copy", "copies", "link", "links",
     "date", "dates", "name", "names", "title", "titles", "bullet", "bullets", "formatting", "style", "styles",
+    # AS3 P0: styling words are never sections — "with white bold text,
+    # landscape, headings in dark blue" asked for no chapter called that.
+    "text", "heading", "headings", "subheading", "subheadings", "body", "paragraph", "paragraphs", "caption", "captions",
+    "bold", "italic", "italics", "underline", "underlined", "emphasis", "highlight", "highlighted", "shade", "shaded",
+    # ("background" is NOT here: "Background" is one of the most common
+    # report sections, and "with background, findings and …" names it.)
+    "fill", "border", "borders", "landscape", "portrait", "orientation", "margin", "margins",
+    "size", "sized", "pt", "point", "points", "font", "typeface", "serif", "sans", "classy", "standard", "professional",
+    "elegant", "formal", "modern", "minimal", "clean", "simple", "look", "layout", "theme", "black", "white", "red",
+    "green", "blue", "navy", "yellow", "orange", "amber", "purple", "violet", "pink", "grey", "gray", "brown", "teal",
+    "gold", "maroon", "dark", "light", "calibri", "arial", "georgia", "times", "roman", "cambria", "verdana",
+    "garamond", "helvetica", "segoe", "roboto", "tahoma", "doc", "docs", "dox", "document", "documents",
 })
+
+#: A clause that only styles ("headings in dark blue", "Georgia 12pt",
+#: "landscape") — removed before sections are read, whichever of the
+#: lexicon (when merged) or this local fallback does it.
+_STYLE_CLAUSE_RE = re.compile(
+    r"[^,;.\n]*\b(?:bold|italic|underlined?|landscape|portrait|font|fonts|\d{1,2}\s*(?:pt|pts|points?)|"
+    r"(?:with|in)\s+colou?rs?|colou?r(?:s|ed|ful)?(?=\s*(?:$|[,;.]|\s(?:for|of|on|to|scheme)\b))|"
+    r"background\s+(?:colou?r|fill|shade)|(?:colou?red|shaded|filled)\s+background|highlight(?:ed)?|classy|standard\s+format|professional\s+format|georgia|calibri|arial|cambria|"
+    r"times\s+new\s+roman|dark\s+blue|navy|(?:black|white|red|green|blue|yellow|orange|purple|grey|gray)\s+(?:text|headings?|header|title))\b[^,;.\n]*",
+    re.IGNORECASE,
+)
+
+#: The style word alone (the middle of _STYLE_CLAUSE_RE), and the next
+#: clause separator after it.
+_STYLE_WORD_RE = re.compile(_STYLE_CLAUSE_RE.pattern[len("[^,;.\\n]*"):-len("[^,;.\\n]*")], re.IGNORECASE)
+_CLAUSE_END_RE = re.compile(r"[,;.\n]")
+
+
+def strip_style_clauses(text: str) -> str:
+    # AS3 integration: the local clause regex only. lexicon.strip_style_clauses
+    # (intent track) removes a bare "background", so "a report with
+    # background, findings and recommendations" lost its first section; the
+    # regex here was verified against exactly that case (prompt-edits v41).
+    #
+    # The pattern's leading `[^,;.\n]*` retried from every position of a
+    # separator-free stretch with no style word: 1.6 s of event loop on a
+    # 4,000-character instruction (verifier 2026-09-15). Same result, linear:
+    # find the style WORD, then widen it to the separators around it — which
+    # is exactly the span the leading and trailing `[^,;.\n]*` covered.
+    text = text or ""
+    out: List[str] = []
+    pos = 0
+    while True:
+        m = _STYLE_WORD_RE.search(text, pos)
+        if m is None:
+            break
+        left = max(pos, max(text.rfind(ch, pos, m.start()) for ch in ",;.\n") + 1)
+        sep = _CLAUSE_END_RE.search(text, m.start())
+        clause_end = sep.start() if sep else len(text)
+        # The greedy leading run backs off from the clause's end, so the
+        # LAST style word that starts in the clause is the one matched.
+        best = m
+        for p in range(m.start() + 1, clause_end):
+            mm = _STYLE_WORD_RE.match(text, p)
+            if mm is not None:
+                best = mm
+        tail = _CLAUSE_END_RE.search(text, best.end())
+        end = tail.start() if tail else len(text)
+        out.append(text[pos:left])
+        out.append(" ")
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def _stem(word: str) -> str:
@@ -578,7 +686,7 @@ def requested_sections(instruction: str) -> List[str]:
     logo, PDF, chart …); "with" needs a list of two or more, because "with
     a total row" describes the table, not a chapter. Empty when the
     request names none."""
-    text = " ".join((instruction or "").split())
+    text = " ".join(strip_style_clauses(instruction or "").split())
     if not text:
         return []
     found: List[str] = []
@@ -589,7 +697,7 @@ def requested_sections(instruction: str) -> List[str]:
         keep: List[str] = []
         for ph in phrases:
             words = ph.split()
-            if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph):
+            if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph) or re.search(r"\d\s*pt\b", ph, re.I):
                 continue
             content = _content_words(ph)
             if not content or content <= {_stem(w) for w in _NOT_SECTION_WORDS}:
@@ -709,7 +817,8 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # The sections the request named, matched to the headings: ONE
     # correction at every effort (the budget does not gate it — it is the
     # request itself), then a warning if the model still cannot.
-    requested = requested_sections(req.instruction or (req.material.instruction if req.material else "")) if req.kind == "document" else []
+    # Skipped for edits (AS3): an edit's words name changes, not chapters.
+    requested = requested_sections(req.instruction or (req.material.instruction if req.material else "")) if req.kind == "document" and req.operation != "edit" else []
     missing = _missing_sections(spec, requested)
     if missing:
         await correct(
@@ -743,7 +852,7 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             figures = S.unsupported_figures(spec, material_text(req))
 
     if figures:
-        result_warnings.append("figures not in the material (derived or assumed): " + ", ".join(figures[:8]) + (" …" if len(figures) > 8 else ""))
+        result_warnings.append(FIGURES_WARNING + ", ".join(figures[:8]) + (" …" if len(figures) > 8 else ""))
     result_warnings.extend(_enforce_caps(spec, budget, requested))
 
     # The rewrite columns, last — on the draft that will be rendered, once,
@@ -774,7 +883,7 @@ def _transform_report(req: ComposeRequest, spec: S.ArtifactSpec, rewrite_report:
         generated = [sh for sh in body.sheets if sh.generator is not None]
         if generated:
             out["generated"] = sum(len(sh.rows) for sh in generated)
-        typed = [sh for sh in body.sheets if not sh.rows_are_code_made and sh.rows]
+        typed = [sh for sh in body.sheets if not sh.rows_are_code_computed and sh.rows]
         if copied and typed:
             # The sentence must not call these preserved (#1).
             out["typed_rows"] = sum(len(sh.rows) for sh in typed)
@@ -838,7 +947,33 @@ def _pin_template(raw: dict, req: ComposeRequest) -> None:
         raw["template_id"] = req.template_id
 
 
-def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
+def _tidy_document(raw: dict, req: ComposeRequest) -> None:
+    """AS3 (e), code not model: a document's first heading that repeats
+    its title is dropped (the renderer already prints the title block), and
+    every table's `numeric_columns` is inferred from its cells — a column
+    is numeric when all its non-blank cells parse as numbers. Mutates."""
+    if req.kind != "document" or not isinstance(raw, dict) or not isinstance(raw.get("blocks"), list):
+        return
+    blocks = raw["blocks"]
+    title = " ".join(str(raw.get("title") or "").split()).casefold()
+    first = blocks[0] if blocks and isinstance(blocks[0], dict) else None
+    if (first is not None and first.get("type") == "heading" and title and len(blocks) > 1
+            and " ".join(str(first.get("text") or "").split()).casefold() == title and int(first.get("level") or 1) == 1):
+        blocks.pop(0)
+    for b in blocks:
+        t = b.get("table") if isinstance(b, dict) and b.get("type") == "table" else None
+        if not isinstance(t, dict) or not isinstance(t.get("columns"), list) or not isinstance(t.get("rows"), list):
+            continue
+        width = len(t["columns"])
+        numeric = []
+        for j in range(width):
+            cells = [r[j] for r in t["rows"] if isinstance(r, list) and j < len(r) and r[j] not in (None, "")]
+            if cells and all(not isinstance(c, bool) and (isinstance(c, (int, float)) or tables.parse_number(c) is not None) for c in cells):
+                numeric.append(j)
+        t["numeric_columns"] = numeric
+
+
+def _reconcile_sources(raw: dict, material: Optional[Material], parent: Optional[S.ArtifactSpec] = None) -> List[str]:
     """The sources manifest is CODE-BUILT from the material, never taken
     from the model. The model may cite an id it was given; every entry it
     invents — a title, a URL, a date — is dropped and the citations to it
@@ -846,6 +981,12 @@ def _reconcile_sources(raw: dict, material: Optional[Material]) -> List[str]:
     exactly the injected 'source' a hostile upload would plant (review,
     2026-09-11). Returns the warnings to show. Mutates `raw` in place."""
     known = {s.id: s for s in (material.sources if material else [])}
+    if parent is not None:
+        # AS3: an edit keeps the parent's citations — they were code-built
+        # from the material of an earlier turn, which this turn no longer
+        # carries; a revised block may cite them again.
+        for c in parent.sources:
+            known.setdefault(c.id, Source(id=c.id, title=c.title, text="", url=c.url or "", retrieved_at=c.retrieved_at or "", kind="conversation"))
     warnings: List[str] = []
     cited: set = set()
 
@@ -1061,6 +1202,9 @@ def _fill_code_made_rows(raw: dict, req: ComposeRequest, notes: List[str]) -> Li
     for index, sh in enumerate(raw["sheets"]):
         if not isinstance(sh, dict):
             continue
+        # Code's marker (derived.enforce), never the model's to claim: a
+        # sheet an edit kept unchanged gets it back from the parent there.
+        sh.pop("computed_from", None)
         name = str(sh.get("name") or f"sheet {index + 1}")
         source = sh.get("rows_from")
         gen = sh.get("generator")
@@ -1160,7 +1304,8 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     model's own list never reaches validation, let alone a page; then the
     code-made rows are filled (CONTRACT-2 §4), so the Sheet that validates
     is the one that renders."""
-    notes = _reconcile_sources(raw, req.material)
+    notes = _reconcile_sources(raw, req.material, req.parent_spec if req.operation == "edit" else None)
+    _tidy_document(raw, req)
     _pin_template(raw, req)
     # In a thread: a 10,000-row generator or copy is CPU the event loop
     # must not spend (#11); the fill mutates `raw` and `notes` in place.
@@ -1179,7 +1324,8 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         req, budget, outline_json=outline_json,
         extra=f"{lead}\n{summary}\nReturn the corrected, complete document.",
     )
-    notes = _reconcile_sources(fixed, req.material)
+    notes = _reconcile_sources(fixed, req.material, req.parent_spec if req.operation == "edit" else None)
+    _tidy_document(fixed, req)
     _pin_template(fixed, req)
     problems = await asyncio.to_thread(_fill_code_made_rows, fixed, req, notes)
     if problems:
@@ -1457,7 +1603,133 @@ async def revise(req: ComposeRequest, spec: S.ArtifactSpec, issues: Sequence[dic
     # The revised draft's rows were filled afresh from the material; its
     # rewrite columns are rewritten again so the rendered file has them.
     await _rewrite_columns(edit_req, fixed)
+    if isinstance(fixed.body, S.WorkbookSpec) and req.material is not None and req.material.tables:
+        # B1: a revision (the selfcheck's repair, Max's page check) is a
+        # model answer like the first draft: its typed aggregates are
+        # computed from the data by code, or left out.
+        from . import derived
+
+        if any(sh.charts for sh in fixed.body.sheets):
+            try:
+                from . import chart_data as _cd
+
+                fixed, _ = await asyncio.to_thread(_cd.resolve_spec, fixed, list(req.material.tables))
+            except ImportError:
+                pass
+        fixed, _notes, _report = await asyncio.to_thread(derived.enforce, fixed, list(req.material.tables), parent=spec)
     return fixed
+
+
+# ------------------------------------------------- scoped section writes --
+
+_SECTION_SYSTEM = (
+    "You rewrite ONE part of an existing file. You are given an outline of the whole file, the CURRENT content of "
+    "the part as JSON, the material, and the request. Return JSON only: the part's new content in the given schema. "
+    "Keep everything in the part that the request does not ask to change. Use only facts from the current part, "
+    "the material and the request; never invent figures, names or sources. Cite only the source ids listed."
+)
+
+
+def _schema_with_defs(model: Any, prop: str) -> dict:
+    full = model.model_json_schema()
+    # AS3 integration: chart numbers are computed by code, never offered.
+    full = S.guided_chart_defs(full)
+    out = {"type": "object", "additionalProperties": False, "properties": {prop: full["properties"][prop]}, "required": [prop]}
+    if "$defs" in full:
+        out["$defs"] = full["$defs"]
+    return out
+
+
+async def write_section(req: ComposeRequest, spec: S.ArtifactSpec, item: Dict[str, Any], current: Any) -> Any:
+    """The section writer the edit ops use (AS3 prompt-edits): ONE scoped
+    JSON call whose schema is the block list of that section only (or one
+    slide). Returns the new blocks (list) or slide (dict); None when the
+    model gave nothing usable. It never sees the other sections' text and
+    never returns them."""
+    from . import edits as E
+
+    budget = T.EFFORT_BUDGETS.get(req.effort, T.EFFORT_BUDGETS["fast"])
+    if item.get("kind") == "slide":
+        slide_schema = S.Slide.model_json_schema()
+        slide_schema = S.guided_chart_defs(slide_schema)  # AS3 integration
+        defs = slide_schema.pop("$defs", None)
+        schema: dict = {"type": "object", "additionalProperties": False, "properties": {"slide": slide_schema}, "required": ["slide"]}
+        if defs:
+            schema["$defs"] = defs
+        key = "slide"
+    else:
+        schema = _schema_with_defs(S.DocumentSpec, "blocks")
+        key = "blocks"
+    m = req.material or Material(instruction=req.instruction)
+    parts = [f"OUTLINE OF THE FILE\n{E.outline(spec)}"]
+    ids = [c.id for c in spec.sources] + [s.id for s in m.sources]
+    if ids:
+        parts.append("Source ids you may cite: " + ", ".join(dict.fromkeys(ids)))
+    if m.history_text:
+        parts.append("Conversation (recent):\n" + m.history_text[-12_000:])
+    if m.tables:
+        parts.append("Data (use these numbers as they are):\n" + _table_block(m.tables)[:12_000])
+    if m.sources:
+        parts.append("Sources:\n" + _source_block(m.sources[: budget.max_sources or len(m.sources)], 20_000))
+    what = f"the {'slide' if key == 'slide' else 'section'} “{item.get('heading', '')}”"
+    if item.get("mode") == "insert":
+        # AS3 integration (live 2026-09-15): given only the heading as a
+        # placeholder, the model returned the heading alone and the new
+        # section "came back unchanged".
+        parts.append(f"WRITE {what} (it is new). Return its heading block FIRST, then the section's content — at least one "
+                     f"paragraph, list or table that does what the request asks. The heading alone is not a section. "
+                     f"Heading block: {json.dumps(current, ensure_ascii=False)}")
+    else:
+        parts.append(f"CURRENT CONTENT OF {what} (JSON):\n{json.dumps(current, ensure_ascii=False)[:40_000]}")
+    parts.append(f"REQUEST: {item.get('instruction') or req.instruction}")
+    messages = [{"role": "system", "content": _SECTION_SYSTEM}, {"role": "user", "content": "\n\n".join(parts)}]
+    obj = await _json(messages, schema, "artifact_section", thinking=False, max_tokens=4000 if req.effort == "fast" else 6000, effort=req.effort)
+    value = obj.get(key)
+    if key == "blocks":
+        if not isinstance(value, list) or not value:
+            return None
+        known = {c.id for c in spec.sources} | {s.id for s in m.sources}
+        for b in value:
+            if isinstance(b, dict) and isinstance(b.get("sources"), list):
+                b["sources"] = [x for x in b["sources"] if x in known]
+        return value
+    return value if isinstance(value, dict) else None
+
+
+async def revise_section(req: ComposeRequest, spec: S.ArtifactSpec, target: Any, issues: Sequence[str]) -> S.ArtifactSpec:
+    """A selfcheck repair on an EDIT job (AS3): the named section only,
+    through the same scoped writer; every other part stays canonical-JSON
+    identical (checked with edits.restore_pending_guard). `target` is an
+    edits.SectionRef or its text. The spec comes back unchanged when the
+    section cannot be found or the write fails."""
+    from . import edits as E
+
+    text = getattr(target, "text", None) or str(target or "")
+    issue_text = "; ".join(str(i) for i in issues)[:2000] or "fix the problems found"
+    if spec.kind == "presentation":
+        titles = [s.title for s in spec.body.slides]
+        idx, _reason = E.resolve_section(text, titles, noun="slide")
+        if idx is None:
+            return spec
+        item = {"kind": "slide", "mode": "replace", "index": idx, "heading": titles[idx], "instruction": issue_text}
+    elif spec.kind == "document":
+        data = spec.body.model_dump(mode="json", exclude_none=True)
+        secs = E._sections(data["blocks"])
+        heads = [i for i, sec in enumerate(secs) if sec["key"] != "pre"]
+        idx, _reason = E.resolve_section(text, [secs[i]["heading"] for i in heads])
+        if idx is None:
+            return spec
+        item = {"kind": "section", "mode": "replace", "index": heads[idx], "heading": secs[heads[idx]]["heading"], "instruction": issue_text}
+    else:
+        return spec
+
+    async def writer(it: Dict[str, Any], current: Any, whole: S.ArtifactSpec) -> Any:
+        return await write_section(req, whole, it, current)
+
+    revised, _applied, _not_applied = await E.resolve_pending(spec, [item], section_writer=writer)
+    if E.restore_pending_guard(spec, revised, [item]):
+        return spec
+    return revised
 
 
 # --------------------------------------------------------- the classifier --
@@ -1491,16 +1763,44 @@ async def classify_intent(text: str) -> Optional[dict]:
     return obj
 
 
+def _last_substantial_answer(turns: Sequence[dict]) -> Optional[int]:
+    """The most recent SUBSTANTIAL assistant turn among the last three
+    assistant turns: at least 400 characters, or with a heading, a list or
+    a table."""
+    seen = 0
+    for index in range(len(turns) - 1, -1, -1):
+        turn = turns[index]
+        if str(turn.get("role")) != "assistant":
+            continue
+        seen += 1
+        content = turn.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+        text = str(content or "")
+        if len(text) >= 400 or re.search(r"(?m)^\s*(?:#{1,6}\s|[-*]\s|\d+[.)]\s|\|.*\|)", text):
+            return index
+        if seen >= 3:
+            break
+    return None
+
+
 def material_from_history(history: Sequence[dict], *, max_chars: int = 24_000) -> str:
     """The conversation as the model should see it: role-tagged, newest last,
     clipped from the OLD end so the recent turns survive."""
     lines: List[str] = []
-    for turn in history:
+    turns = list(history)
+    keep_index = _last_substantial_answer(turns)
+    for index, turn in enumerate(turns):
         role = str(turn.get("role") or "user")
         content = turn.get("content")
         if isinstance(content, list):
             content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
-        text = re.sub(r"\s+", " ", str(content or "")).strip()
+        if index == keep_index:
+            # AS3 (d): the answer a file is made from keeps its lines —
+            # headings, lists and table rows are structure, not spaces.
+            text = "\n".join(" ".join(line.split()) for line in str(content or "").strip().splitlines())
+        else:
+            text = re.sub(r"\s+", " ", str(content or "")).strip()
         if text:
             lines.append(f"{role}: {text}")
     joined = "\n".join(lines)
@@ -1509,6 +1809,7 @@ def material_from_history(history: Sequence[dict], *, max_chars: int = 24_000) -
 
 __all__ = [
     "ComposeError", "Source", "DataTable", "Material", "ComposeRequest", "ComposeResult",
-    "compose", "outline", "content_review", "visual_review", "revise", "classify_intent",
+    "compose", "outline", "content_review", "visual_review", "revise", "classify_intent", "write_section", "revise_section",
+    "strip_style_clauses",
     "material_from_history", "requested_sections", "body_json_for_prompt", "REWRITE_BATCH_ROWS", "REWRITE_MAX_BATCHES",
 ]

@@ -90,7 +90,20 @@ SCRATCH_NAMES = (RENDER_REPORT_NAME, MATERIAL_NAME, PREVIEW_META_NAME, JOB_NAME,
 #: version + an optional sheet part, types.download_name), so they cannot
 #: be listed here: `publish()` protects every name the manifest's `files`
 #: carries — the per-sheet CSVs of a workbook included — the same way.
-PUBLISHED_NAMES = frozenset({T.MANIFEST_NAME, T.SPEC_NAME, T.VALIDATION_NAME, T.PREVIEW_PDF_NAME, T.PREVIEWS_DIR})
+#: --- AS3 agentic-selfcheck ---
+#: The self-check's report (artifacts/selfcheck.py): the checklist, what the
+#: files showed, what was repaired and what is unmet. PUBLISHED beside
+#: validation.json so the card and a later edit can read it, but never a
+#: rendered file: it is not in the manifest's `files`, so it is neither a
+#: FileRef nor part of the zip bundle, and `_safe_published_name` refuses it
+#: as a download name like the other bookkeeping files.
+SELFCHECK_NAME = "selfcheck.json"
+PUBLISHED_NAMES = frozenset({T.MANIFEST_NAME, T.SPEC_NAME, T.VALIDATION_NAME, T.PREVIEW_PDF_NAME, T.PREVIEWS_DIR, SELFCHECK_NAME})
+#: Names a version directory holds that no download route and no zip bundle
+#: may ever serve (the zip is built from the manifest's files; this set is
+#: the explicit exclusion the API and the tests hold it to).
+NOT_DOWNLOADABLE_NAMES = frozenset({T.MANIFEST_NAME, T.SPEC_NAME, T.VALIDATION_NAME, SELFCHECK_NAME})
+#: --- end AS3 agentic-selfcheck ---
 
 
 class StorageError(Exception):

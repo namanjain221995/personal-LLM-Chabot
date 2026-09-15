@@ -26,6 +26,17 @@ the table is not a row — and compared with the spec. A mismatch is the
 sentence "the CSV has 499 data rows; 500 were required". `validate_all`
 takes the spec for that, and keys its files by the render report's
 `role:format:sheet_slug` (a bare format is still accepted).
+
+CHARTS (AS3). A PNG must carry the PNG signature and be between 400x300 and
+8000x8000 pixels. An SVG is parsed only after a guard refuses any DOCTYPE or
+ENTITY (no entity expansion, no external DTD), and is refused when it holds
+script, foreignObject (or other embedding elements), an on* attribute, an
+href/xlink:href to anything but a '#fragment', a url() to anything but a
+fragment, `javascript:`, or a <style> with @import. The Office validators
+count native chart parts; with `expected_charts` a count that differs (the
+spec's charts minus declared image fallbacks) is a failure, and
+`chart_data_mismatches` compares the "Chart data" sheet with the computed
+values (rel_tol 1e-9).
 """
 from __future__ import annotations
 
@@ -117,7 +128,20 @@ def validate_docx(path: str | Path) -> Dict[str, object]:
     return {"ok": True, "paragraphs": paragraphs, "tables": len(document.tables), "size": p.stat().st_size}
 
 
-def validate_pptx(path: str | Path) -> Dict[str, object]:
+def count_native_charts(path: str | Path) -> int:
+    """Chart parts in an Office package (xl/charts/chartN.xml, ppt/charts/chartN.xml)."""
+    with zipfile.ZipFile(path) as zf:
+        return sum(1 for n in zf.namelist() if re.fullmatch(r"(xl|ppt|word)/charts/chart\d+\.xml", n))
+
+
+def _check_chart_count(p: Path, expected: Optional[int], facts: Dict[str, object]) -> None:
+    count = count_native_charts(p)
+    facts["charts"] = count
+    if expected is not None and count != expected:
+        raise ValidationFailed(f"the file has {count} native charts; {expected} were expected")
+
+
+def validate_pptx(path: str | Path, *, expected_charts: Optional[int] = None) -> Dict[str, object]:
     from pptx import Presentation  # lazy
 
     p = Path(path)
@@ -131,7 +155,9 @@ def validate_pptx(path: str | Path) -> Dict[str, object]:
         raise ValidationFailed("the PPTX has no slides")
     if slides > T.MAX_SLIDES + 1:  # + the sources slide
         raise ValidationFailed(f"the PPTX has {slides} slides; the ceiling is {T.MAX_SLIDES}")
-    return {"ok": True, "slides": slides, "size": p.stat().st_size}
+    facts: Dict[str, object] = {"ok": True, "slides": slides, "size": p.stat().st_size}
+    _check_chart_count(p, expected_charts, facts)
+    return facts
 
 
 def _data_rows_of(ws, n_cols: int) -> int:
@@ -151,7 +177,7 @@ def _data_rows_of(ws, n_cols: int) -> int:
     return max(0, last_data - 1)
 
 
-def validate_xlsx(path: str | Path, *, spec: Any = None) -> Dict[str, object]:
+def validate_xlsx(path: str | Path, *, spec: Any = None, expected_charts: Optional[int] = None) -> Dict[str, object]:
     """Reopen the workbook; with the spec, count each spec sheet's data
     rows and refuse a count that differs from the sheet's rows."""
     from openpyxl import load_workbook  # lazy
@@ -188,6 +214,7 @@ def validate_xlsx(path: str | Path, *, spec: Any = None) -> Dict[str, object]:
             facts["columns"] = max(len(sh.columns) for sh in sheets)
     finally:
         wb.close()
+    _check_chart_count(p, expected_charts, facts)
     return facts
 
 
@@ -198,7 +225,168 @@ def validate_csv(path: str | Path, *, expected_rows: Optional[int] = None, expec
     return dict(_validate_csv(path, expected_rows=expected_rows, expected_columns=expected_columns))
 
 
-_VALIDATORS = {"pdf": validate_pdf, "docx": validate_docx, "pptx": validate_pptx, "xlsx": validate_xlsx, "csv": validate_csv}
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_MIN = (400, 300)
+PNG_MAX = (8000, 8000)
+
+
+def validate_png(path: str | Path) -> Dict[str, object]:
+    """Signature, IHDR first, and a sane pixel size, read from IHDR — no
+    decoder runs, so a decompression bomb is refused before it inflates."""
+    p = Path(path)
+    with open(p, "rb") as fh:
+        head = fh.read(33)
+    if len(head) < 33 or head[:8] != PNG_SIGNATURE or head[12:16] != b"IHDR":
+        raise ValidationFailed("the PNG does not start with a PNG header")
+    width = int.from_bytes(head[16:20], "big")
+    height = int.from_bytes(head[20:24], "big")
+    if width < PNG_MIN[0] or height < PNG_MIN[1]:
+        raise ValidationFailed(f"the PNG is {width}x{height} pixels; at least {PNG_MIN[0]}x{PNG_MIN[1]} is required")
+    if width > PNG_MAX[0] or height > PNG_MAX[1]:
+        raise ValidationFailed(f"the PNG is {width}x{height} pixels; the ceiling is {PNG_MAX[0]}x{PNG_MAX[1]}")
+    return {"ok": True, "width": width, "height": height, "size": p.stat().st_size}
+
+
+_SVG_FORBIDDEN_DECL = re.compile(rb"<!\s*(DOCTYPE|ENTITY|ELEMENT|ATTLIST|NOTATION)", re.IGNORECASE)
+_SVG_PI = re.compile(rb"<\?(?!xml[\s?])", re.IGNORECASE)
+_SVG_BAD_ELEMENTS = {"script", "foreignobject", "iframe", "object", "embed", "handler", "listener", "audio", "video", "canvas"}
+_URL_FN = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE | re.DOTALL)
+
+
+def _url_problems(text: str, where: str) -> List[str]:
+    out: List[str] = []
+    if "\\" in (text or ""):
+        # A CSS escape spells url( / @import / javascript: without those
+        # letters ("u\\72l(http://…)"). Nothing we generate needs one.
+        out.append(f"{where} contains a CSS/escape backslash")
+    for m in _URL_FN.finditer(text or ""):
+        if not m.group(2).strip().startswith("#"):
+            out.append(f"{where} references an external url()")
+    if re.search(r"javascript\s*:", text or "", re.IGNORECASE):
+        out.append(f"{where} contains a javascript: link")
+    if re.search(r"@import", text or "", re.IGNORECASE):
+        out.append(f"{where} contains @import")
+    if re.search(r"expression\s*\(", text or "", re.IGNORECASE):
+        out.append(f"{where} contains a CSS expression")
+    return out
+
+
+def validate_svg_bytes(data: bytes) -> List[str]:
+    """Every reason `data` is not an SVG we would serve; [] when it is safe.
+    DOCTYPE/ENTITY are refused BEFORE parsing, so the parser never expands
+    an entity or reads a DTD."""
+    import xml.etree.ElementTree as ET
+
+    if not data:
+        return ["the SVG is empty"]
+    if _SVG_FORBIDDEN_DECL.search(data):
+        return ["the SVG carries a DOCTYPE or ENTITY declaration"]
+    if _SVG_PI.search(data):
+        return ["the SVG carries a processing instruction"]
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        return [f"the SVG is not well-formed XML ({str(exc)[:80]})"]
+    problems: List[str] = []
+
+    def local(name: str) -> str:
+        return name.rsplit("}", 1)[-1] if "}" in name else name.split(":")[-1]
+
+    if local(root.tag).lower() != "svg":
+        problems.append("the root element is not <svg>")
+    for el in root.iter():
+        tag = local(el.tag).lower() if isinstance(el.tag, str) else ""
+        if tag in _SVG_BAD_ELEMENTS:
+            problems.append(f"the SVG contains a <{tag}> element")
+        if tag in ("set", "animate", "animatetransform", "animatemotion"):
+            target = (el.get("attributeName") or "").lower()
+            if target.startswith("on") or target.endswith("href"):
+                problems.append(f"the SVG animates {target}")
+        for key, value in el.attrib.items():
+            name = local(key).lower()
+            if name.startswith("on"):
+                problems.append(f"the SVG has an event handler attribute {name}")
+            elif name == "href":
+                if not (value or "").strip().startswith("#"):
+                    problems.append("the SVG links to a non-fragment href")
+            else:
+                problems.extend(_url_problems(value, f"attribute {name}"))
+        if tag == "style":
+            problems.extend(_url_problems(el.text or "", "a <style> element"))
+    seen: List[str] = []
+    for p in problems:
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def validate_svg(path: str | Path) -> Dict[str, object]:
+    p = Path(path)
+    data = p.read_bytes()
+    problems = validate_svg_bytes(data)
+    if problems:
+        raise ValidationFailed(f"the SVG is not safe to serve: {problems[0]}")
+    return {"ok": True, "size": len(data)}
+
+
+def chart_data_mismatches(path: str | Path, charts: List[Any], *, rel_tol: float = 1e-9) -> List[str]:
+    """Read the XLSX "Chart data" sheet block by block (title row, header
+    row, one row per category) and compare each block with the computed
+    chart in the same order. XY charts compare their (x, y) columns."""
+    import math
+
+    from openpyxl import load_workbook
+
+    wb = load_workbook(str(path), read_only=True, data_only=False)
+    try:
+        if "Chart data" not in wb.sheetnames:
+            return ["the workbook has no Chart data sheet"] if charts else []
+        rows = [list(r) for r in wb["Chart data"].iter_rows(values_only=True)]
+    finally:
+        wb.close()
+    out: List[str] = []
+    i = 0
+    for n, chart in enumerate(charts, start=1):
+        while i < len(rows) and all(v is None for v in rows[i]):
+            i += 1
+        if i + 1 >= len(rows):
+            out.append(f"chart {n}: no data block")
+            break
+        body_start = i + 2
+        xy = getattr(chart, "type", "") in ("scatter", "bubble")
+        length = max((len(s.values) for s in chart.series), default=0) if xy else len(chart.categories)
+        block = rows[body_start: body_start + length]
+        if len(block) != length:
+            out.append(f"chart {n}: {len(block)} rows in the Chart data sheet, {length} computed")
+        col = 0
+        for k, s in enumerate(chart.series):
+            if xy:
+                width = 3 if s.sizes is not None else 2
+                for j, (r, ex, ey) in enumerate(zip(block, s.x or [], s.values)):
+                    xv = r[col] if col < len(r) else None
+                    yv = r[col + 1] if col + 1 < len(r) else None
+                    if not isinstance(xv, (int, float)) or not isinstance(yv, (int, float)) or not math.isclose(float(xv), ex, rel_tol=rel_tol, abs_tol=1e-9) or not math.isclose(float(yv), ey, rel_tol=rel_tol, abs_tol=1e-9):
+                        out.append(f"chart {n} series {s.name!r} point {j + 1} differs")
+                        break
+                col += width
+            else:
+                for j, (r, ev) in enumerate(zip(block, s.values)):
+                    got = r[1 + k] if 1 + k < len(r) else None
+                    if not isinstance(got, (int, float)) or not math.isclose(float(got), ev, rel_tol=rel_tol, abs_tol=1e-9):
+                        out.append(f"chart {n} series {s.name!r} row {j + 1}: {got!r} in the file, {ev!r} computed")
+                        break
+        if not xy:
+            for j, (r, cat) in enumerate(zip(block, chart.categories)):
+                if str(r[0]) != str(cat):
+                    out.append(f"chart {n} category {j + 1}: {r[0]!r} in the file, {cat!r} computed")
+                    break
+        i = body_start + length
+    return out
+
+
+_VALIDATORS = {"pdf": validate_pdf, "docx": validate_docx, "pptx": validate_pptx, "xlsx": validate_xlsx, "csv": validate_csv,
+               "png": validate_png, "svg": validate_svg}
+
 
 
 def validate_file(path: str | Path, fmt: str, **facts_kw: Any) -> Dict[str, object]:
@@ -280,5 +468,6 @@ def validate_all(files: Dict[str, str], preview_pdf: Optional[str] = None, *, sp
 
 __all__ = [
     "ValidationFailed", "sha256_of", "validate_file", "validate_all", "validate_pdf", "validate_docx", "validate_pptx",
-    "validate_xlsx", "validate_csv", "split_key",
+    "validate_xlsx", "validate_csv", "split_key", "validate_png", "validate_svg", "validate_svg_bytes", "count_native_charts",
+    "chart_data_mismatches",
 ]

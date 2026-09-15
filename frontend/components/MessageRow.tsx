@@ -378,6 +378,7 @@ function MessageRowImpl({
   conversationId = null,
   onOpenArtifact,
   activeArtifactKey = null,
+  onEditArtifact,
 }: {
   message: ChatMessage;
   isLast: boolean;
@@ -484,6 +485,13 @@ function MessageRowImpl({
    * file too.
    */
   activeArtifactKey?: string | null;
+  /**
+   * AS3: the host's send for "Edit with a prompt" and "Restore vN" — a
+   * normal chat turn carrying `artifact_id`. Omitted where there is no chat
+   * host (previews, tests): the cards then hide both controls instead of
+   * showing a button that does nothing. Must be STABLE (the row is memoised).
+   */
+  onEditArtifact?: (artifactId: string, text: string) => void;
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
@@ -1320,6 +1328,7 @@ function MessageRowImpl({
               artifacts={message.meta.artifacts}
               onOpen={onOpenArtifact ?? noopOpen}
               activeKey={activeArtifactKey}
+              onEditPrompt={onEditArtifact}
             />
           )}
 

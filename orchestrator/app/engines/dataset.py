@@ -58,6 +58,13 @@ _SYSTEM = (
     "a group-by, a correlation), say so plainly and describe what the profile "
     "does show. Never invent numbers that are not in the profile."
 )
+# --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
+from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
+
+_AS3_CAPABILITY = _as3_capability_suffix()
+
+_SYSTEM = _SYSTEM + _AS3_CAPABILITY
+# --- AS3 intent-capability END ---
 
 
 def format_profile(uploads: Sequence[dict]) -> str:

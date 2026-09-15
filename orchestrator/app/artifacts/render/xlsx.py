@@ -24,14 +24,29 @@ totals row) and every chart, so the workbook opens on the summary. Data
 sheets follow. openpyxl is imported lazily; the file is reopened by
 validate.py.
 
-STYLE (CONTRACT-2 §4, `spec.SheetStyle`). A sheet without a style gets the
-defaults — thin black borders on every cell, a bold header on a navy fill —
-and a sheet with one gets what it says: header fill dark/light/none with a
-font that reads on it, a highlighted column in the red/amber/green/blue
-pairs Excel's own conditional formats use (dark text on a light fill for
-the cells, white on the dark tone for the header), wrapped text, top
-alignment. A CSV carries none of this; the Word/PDF companions carry the
-same pairs (docx.py, html.py) so the four files agree.
+STYLE (style guide §4, artifacts/style.py). Every workbook looks
+professional by default — TechSara Classic: a #1F3864 header with white
+bold 11 pt text, 24 pt tall, a medium rule under it; thin #E5E9F0 grid
+lines (never black); banded rows; the header frozen; widths from content;
+number, currency, percent and date formats per column; per-VALUE status
+colours in status-like columns and a 3-colour scale on score columns; a
+styled SUBTOTAL totals row; landscape past six columns, one page wide, the
+header repeated, "Page X of Y". `spec.style` (a StyleSpec, written by code
+from the person's request) overrides any of it, and the legacy
+`spec.SheetStyle` still works: header fill dark/light/none, borders,
+wrapping and the highlighted-column pairs exactly as before.
+
+CONDITIONAL-FORMAT PRIORITY. Excel paints a CF fill ABOVE a cell fill, so
+banding as a CF would hide a fill a person asked for. `sheet_cf_plan` adds
+rules highest priority first: user fills (highlighted columns, a column,
+a row, a cell range — stopIfTrue) → user conditions and colour scales →
+automatic status/score/due-date colours → banding. Formulas are built by
+code: column letters from code, user values only through
+style.xlsx_formula_literal (quotes doubled, capped). A cell range is
+clipped to the used range before anything is styled, and a range over
+10,000 cells is carried by its single CF rule instead of per-cell styles.
+A CSV carries none of this; the Word/PDF companions read the same
+ResolvedStyle (docx.py, html.py) so the files agree.
 
 LONG SHEETS AND CHARTS. A chart over a 500-row sheet is not 500 bars: past
 types.MAX_CHART_POINTS rows the chart is drawn over an aggregate — the
@@ -46,9 +61,10 @@ from __future__ import annotations
 import datetime as _dt
 import re
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from .. import spec as S
+from .. import style as ST
 from .. import types as T
 from . import theme
 
@@ -76,13 +92,14 @@ HIGHLIGHT_COLOURS = {
     "green": ("006100", "FFFFFF", "C6EFCE", "006100"),
     "blue": ("1F4E78", "FFFFFF", "DDEBF7", "1F4E78"),
 }
-#: Header fills by SheetStyle.header_fill: (fill or None, font colour).
+#: Header fills by SheetStyle.header_fill on the Classic palette: (fill or None, font colour).
 HEADER_FILLS = {
-    "dark": (theme.NAVY.lstrip("#").upper(), theme.WHITE.lstrip("#").upper()),
-    "light": (theme.SURFACE_2.lstrip("#").upper(), theme.INK.lstrip("#").upper()),
-    "none": (None, theme.INK.lstrip("#").upper()),
+    "dark": (theme.CLASSIC_PRIMARY.lstrip("#").upper(), theme.WHITE.lstrip("#").upper()),
+    "light": ("EEF0F3", theme.CLASSIC_INK.lstrip("#").upper()),
+    "none": (None, theme.CLASSIC_INK.lstrip("#").upper()),
 }
-BORDER_COLOUR = "000000"
+#: The grid line colour (style guide §4: thin #E5E9F0, never black).
+BORDER_COLOUR = theme.CLASSIC_GRID.lstrip("#").upper()
 #: How many categories an aggregated chart keeps before "Other".
 CHART_TOP_CATEGORIES = 20
 
@@ -246,84 +263,464 @@ def _percent_scale(sheet: S.Sheet, col_index: int, warnings: List[str]) -> float
     return 0.01
 
 
-def _write_sheet(ws, sheet: S.Sheet, warnings: List[str]) -> dict:
-    """Header, rows, totals, widths, freeze, filter, charts. Returns the
-    layout ({first_row, last_row, totals_row, column_letters}) the dashboard
-    sheet points its KPI formulas at."""
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+def _hex6(colour: Optional[str]) -> Optional[str]:
+    return colour.lstrip("#").upper() if colour else None
+
+
+def number_format_for(col: S.Column, values: Sequence[Any] = ()) -> str:
+    """The Excel number format of a column (style guide §4): integer
+    `#,##0`; number `#,##0.00`, or `#,##0` when every value is integral, with
+    a red negative section when a value is negative; currency by symbol
+    (INR in lakh/crore grouping); percent `0.0%`; date `dd-mmm-yyyy`
+    (`yyyy-mm-dd` when the column asks for ISO)."""
+    fmt = col.format
+    kind = (fmt.kind if fmt is not None and fmt.kind else None) or {"integer": "integer", "number": "decimal", "currency": "currency", "percent": "percent", "date": "date"}.get(col.type, "text")
+    decimals = fmt.decimals if fmt is not None else None
+    if kind == "text":
+        return "@"
+    if kind == "integer":
+        return "#,##0"
+    if kind == "percent":
+        return "0.0%" if decimals is None else ("0%" if decimals == 0 else "0." + "0" * decimals + "%")
+    if kind in ("date", "datetime"):
+        iso = fmt is not None and fmt.date_style == "iso"
+        base = "yyyy-mm-dd" if iso else "dd-mmm-yyyy"
+        return base + (" hh:mm" if kind == "datetime" else "")
+    places = 2 if decimals is None else decimals
+    tail = ("." + "0" * places) if places else ""
+    if kind == "currency":
+        code = fmt.currency if fmt is not None else None
+        if code == "INR":
+            return f'[>=10000000]"₹"##\\,##\\,##\\,##0{tail};[>=100000]"₹"##\\,##\\,##0{tail};"₹"##,##0{tail}'
+        symbol = {"USD": '"$"', "EUR": '"€"', "GBP": '"£"'}.get(code or "", "")
+        return f"{symbol}#,##0{tail}"
+    numbers = [n for n in (_as_number(v) for v in values) if n is not None]
+    if decimals is None and numbers and all(abs(n - round(n)) < 1e-9 for n in numbers):
+        tail = ""
+    base = f"#,##0{tail}"
+    if col.type == "number" and any(n < 0 for n in numbers):
+        return f"{base};[Red]-{base}"
+    return base
+
+
+#: Legacy SheetStyle.header_fill "light" on the Classic palette.
+LEGACY_LIGHT_HEADER = ("#EEF0F3", "#1F2937")
+#: SUBTOTAL function numbers: they ignore rows a filter hides.
+_SUBTOTAL = {"sum": 109, "average": 101, "count": 103, "min": 105, "max": 104}
+_ID_COLUMN_RE = re.compile(r"^\s*(id|#|no\.?|key|code|ref|s\.?\s?no\.?|sr\.?\s?no\.?)\b", re.IGNORECASE)
+
+
+class _StyleCache:
+    """openpyxl style objects shared across cells: one Font/Fill/Alignment
+    per distinct value, not one per cell (a 10,000-row sheet)."""
+
+    def __init__(self, resolved: ST.ResolvedStyle):
+        self.R = resolved
+        self._fonts: dict = {}
+        self._fills: dict = {}
+
+    def font(self, ts: ST.TextStyle, *, size: Optional[float] = None):
+        from openpyxl.styles import Font
+
+        face = self.R.face(ts.font_family)
+        key = (face.office_name, size or ts.size_pt, bool(ts.bold), bool(ts.italic), bool(ts.underline), ts.color)
+        f = self._fonts.get(key)
+        if f is None:
+            f = Font(name=face.office_name, size=key[1], bold=key[2], italic=key[3], underline="single" if key[4] else None, color=_hex6(ts.color))
+            self._fonts[key] = f
+        return f
+
+    def fill(self, colour: Optional[str]):
+        from openpyxl.styles import PatternFill
+
+        if not colour:
+            return None
+        f = self._fills.get(colour)
+        if f is None:
+            f = PatternFill("solid", fgColor=_hex6(colour))
+            self._fills[colour] = f
+        return f
+
+
+def on_fill(rule_style: ST.TextStyle, base: ST.TextStyle) -> ST.TextStyle:
+    """`rule_style` over `base`; when the rule set a fill but no text
+    colour, the SYSTEM's text colour flips to white or ink so it reads."""
+    ts = rule_style.over(base)
+    if rule_style.background and rule_style.color is None and ST.contrast_ratio(ts.color or ST.INK, rule_style.background) < 4.5:
+        ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "color": ST.readable_on(rule_style.background)})
+    return ts
+
+
+def _cf_font(ts: ST.TextStyle, base: ST.TextStyle):
+    """The differential font of a CF rule: only what differs from the
+    cell's base (colour, bold, italic, underline) — Excel ignores a dxf
+    font's name and size."""
+    from openpyxl.styles import Font
+
+    kw = {}
+    if ts.color and ts.color != base.color:
+        kw["color"] = _hex6(ts.color)
+    if ts.bold and not base.bold:
+        kw["bold"] = True
+    if ts.italic and not base.italic:
+        kw["italic"] = True
+    if ts.underline and not base.underline:
+        kw["underline"] = "single"
+    return Font(**kw) if kw else None
+
+
+def _cf_fill(colour: Optional[str]):
+    from openpyxl.styles import PatternFill
+
+    if not colour:
+        return None
+    return PatternFill(fill_type="solid", start_color=_hex6(colour), end_color=_hex6(colour), bgColor=_hex6(colour))
+
+
+def cond_formula(rule: ST.CondRule, letter: str, first_row: int) -> str:
+    """The CF formula of a user condition, anchored at the first data row.
+    Column letters come from code; user values only as escaped literals."""
+    ref = f"${letter}{first_row}"
+    lit = ST.xlsx_formula_literal
+    if rule.op == "blank":
+        return f"LEN(TRIM({ref}))=0"
+    if rule.op == "date_past":
+        return f"AND(ISNUMBER({ref}),{ref}<TODAY())"
+    if rule.op == "contains":
+        return f"ISNUMBER(SEARCH({ST.xlsx_search_literal(rule.value)},{ref}))"
+    if rule.op == "in":
+        parts = [(f"TRIM({ref})={lit(v)}" if isinstance(v, str) else f"{ref}={lit(v)}") for v in rule.values[:20]]
+        return "OR(" + ",".join(parts) + ")"
+    if rule.op == "between":
+        return f"AND(ISNUMBER({ref}),{ref}>={lit(rule.value)},{ref}<={lit(rule.value2)})"
+    if rule.op in ("gt", "gte", "lt", "lte"):
+        sym = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[rule.op]
+        return f"AND(ISNUMBER({ref}),{ref}{sym}{lit(rule.value)})"
+    sym = "=" if rule.op == "eq" else "<>"
+    if isinstance(rule.value, str):
+        return f"TRIM({ref}){sym}{lit(rule.value)}"
+    return f"{ref}{sym}{lit(rule.value)}"
+
+
+def status_formula(letter: str, first_row: int, values: Sequence[str]) -> str:
+    ref = f"${letter}{first_row}"
+    return "OR(" + ",".join(f"TRIM({ref})={ST.xlsx_formula_literal(v)}" for v in values) + ")"
+
+
+def status_like(col: S.Column) -> bool:
+    return col.type == "text" and bool(ST.STATUS_COLUMN_RE.search(col.name))
+
+
+def score_like(col: S.Column) -> bool:
+    return col.type in ("integer", "number", "percent") and bool(ST.SCORE_COLUMN_RE.search(col.name))
+
+
+def due_like(col: S.Column) -> bool:
+    return col.type == "date" and bool(ST.DUE_COLUMN_RE.search(col.name))
+
+
+def sheet_cf_plan(sheet: S.Sheet, R: ST.ResolvedStyle, *, first_row: int = 2, last_row: Optional[int] = None) -> List[dict]:
+    """Every conditional format a sheet gets, HIGHEST priority first (the
+    order openpyxl numbers them): user fills on named cells (legacy
+    highlight, a row, a cell range) → user conditions and colour scales →
+    user fills on a whole column or the table body → automatic
+    status/score/due-date colours → banding. A requested fill is therefore
+    never hidden by banding or by an automatic colour, and a requested
+    condition ("Status red for Blocked") is not hidden by a broader
+    requested column fill. Only a rule that paints a FILL carries
+    stopIfTrue: a font-only rule ("Owner column bold") merges with the
+    lower rules the way Excel merges non-conflicting formats, so the
+    column keeps its banding and status colours.
+    Each entry: {kind, level, range, formula | scale, fill, font, stop,
+    column}. The preview evaluates the same plan in Python."""
+    from openpyxl.utils import get_column_letter
 
     n_cols = len(sheet.columns)
     n_rows = len(sheet.rows)
-    style = sheet_style(sheet)
-    highlight = highlight_for(sheet)
-    fill_hex, header_colour = HEADER_FILLS.get(style.header_fill, HEADER_FILLS["dark"])
-    header_font = Font(bold=style.header_bold, color=header_colour, name=theme.OFFICE_SANS)
-    header_fill = PatternFill("solid", fgColor=fill_hex) if fill_hex else None
-    body_font = Font(name=theme.OFFICE_SANS)
-    thin = Side(style="thin", color=BORDER_COLOUR)
-    grid = Border(left=thin, right=thin, top=thin, bottom=thin) if style.borders == "thin" else Border()
-    header_border = grid if style.borders == "thin" else Border(bottom=Side(style="thin", color=theme.BORDER.lstrip("#").upper()))
+    last_row = last_row if last_row is not None else n_rows + 1
+    if n_rows == 0:
+        return []
+    last_letter = get_column_letter(n_cols)
+    plan: List[dict] = []
+    body_base = R.base("table_body")
+    by_name = {ST._fold(c.name): j for j, c in enumerate(sheet.columns)}
 
+    def add(kind: str, level: str, rng: str, *, formula: Optional[str] = None, fill: Optional[str] = None, ts: Optional[ST.TextStyle] = None,
+            stop: bool = False, scale: Optional[Tuple[str, Optional[str], str]] = None, column: Optional[int] = None) -> None:
+        plan.append({"kind": kind, "level": level, "range": rng, "formula": formula, "fill": fill, "style": ts, "stop": stop, "scale": scale, "column": column})
+
+    # 1. user fills on named cells (whole-column and table-body fills are
+    # collected in `broad` and placed after the user conditions)
+    broad: List[dict] = []
+    for j, colour in highlight_for(sheet).items():
+        letter = get_column_letter(j + 1)
+        _, _, c_fill, c_font = HIGHLIGHT_COLOURS[colour]
+        add("highlight", "user_fill", f"{letter}{first_row}:{letter}{last_row}", formula="TRUE", fill="#" + c_fill,
+            ts=ST.TextStyle.model_construct(**{**body_base.model_dump(), "color": "#" + c_font}), stop=True, column=j)
+    for r in R.rules:
+        t = r.target
+        if t.sheet is not None and ST._fold(t.sheet) != ST._fold(sheet.name):
+            continue
+        s = r.style
+        if s.background is None and s.color is None and not (s.bold or s.italic or s.underline):
+            continue
+        if t.kind == "column":
+            j = by_name.get(ST._fold(t.name)) if t.name else ((t.index - 1) if t.index and t.index <= n_cols else None)
+            if j is None:
+                continue
+            letter = get_column_letter(j + 1)
+            broad.append(dict(kind="column", level="user_fill", rng=f"{letter}{first_row}:{letter}{last_row}", formula="TRUE", fill=s.background,
+                              ts=on_fill(s, body_base), stop=bool(s.background), column=j))
+        elif t.kind == "row" and t.index is not None:
+            if first_row <= t.index <= last_row:
+                add("row", "user_fill", f"A{t.index}:{last_letter}{t.index}", formula="TRUE", fill=s.background, ts=on_fill(s, body_base), stop=bool(s.background))
+        elif t.kind == "cell_range" and t.a1:
+            clipped = ST.clip_a1(t.a1, n_cols, last_row)
+            if clipped is None:
+                continue
+            c1, r1, c2, r2 = clipped
+            r1 = max(r1, first_row)
+            if r1 > r2:
+                continue
+            add("cell_range", "user_fill", f"{get_column_letter(c1)}{r1}:{get_column_letter(c2)}{r2}", formula="TRUE", fill=s.background, ts=on_fill(s, body_base), stop=bool(s.background))
+        elif t.kind in ("table_body", "table") and s.background:
+            broad.append(dict(kind="table_body", level="user_fill", rng=f"A{first_row}:{last_letter}{n_rows + 1}", formula="TRUE", fill=s.background,
+                              ts=on_fill(s, body_base), stop=True, column=None))
+    # 2. user conditions and scales
+    for c in R.conditional:
+        if c.sheet is not None and ST._fold(c.sheet) != ST._fold(sheet.name):
+            continue
+        j = by_name.get(ST._fold(c.column))
+        if j is None:
+            continue
+        letter = get_column_letter(j + 1)
+        rng = f"A{first_row}:{last_letter}{n_rows + 1}" if c.whole_row else f"{letter}{first_row}:{letter}{n_rows + 1}"
+        ts = c.style.over(body_base)
+        if c.style.background and c.style.color is None:
+            ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "color": ST.readable_on(c.style.background) if ST.contrast_ratio(body_base.color or ST.INK, c.style.background) < 4.5 else None})
+        add("condition", "user_cond", rng, formula=cond_formula(c, letter, first_row), fill=c.style.background, ts=ts, column=j)
+    for sc in R.scales:
+        if sc.sheet is not None and ST._fold(sc.sheet) != ST._fold(sheet.name):
+            continue
+        j = by_name.get(ST._fold(sc.column))
+        if j is None:
+            continue
+        letter = get_column_letter(j + 1)
+        add("scale", "user_cond", f"{letter}{first_row}:{letter}{n_rows + 1}", scale=(sc.min_color, sc.mid_color, sc.max_color), column=j)
+    for b in broad:
+        add(b["kind"], b["level"], b["rng"], formula=b["formula"], fill=b["fill"], ts=b["ts"], stop=b["stop"], column=b["column"])
+    # 3. automatic colours
+    status_cols = [j for j, col in enumerate(sheet.columns) if status_like(col)]
+    if R.auto_status_colors:
+        for j in status_cols:
+            letter = get_column_letter(j + 1)
+            for cls in ("success", "warning", "danger", "info"):
+                fill, text = ST.STATUS_PAIRS[cls]
+                add("status", "auto", f"{letter}{first_row}:{letter}{n_rows + 1}", formula=status_formula(letter, first_row, ST.STATUS_VALUES[cls]),
+                    fill=fill, ts=ST.TextStyle.model_construct(**{**body_base.model_dump(), "color": text}), column=j)
+        for j, col in enumerate(sheet.columns):
+            if due_like(col):
+                letter = get_column_letter(j + 1)
+                formula = f"AND(ISNUMBER(${letter}{first_row}),${letter}{first_row}<TODAY()"
+                if status_cols:
+                    sl = get_column_letter(status_cols[0] + 1)
+                    formula += ",NOT(" + status_formula(sl, first_row, ST.STATUS_VALUES["success"]) + ")"
+                formula += ")"
+                add("due", "auto", f"{letter}{first_row}:{letter}{n_rows + 1}", formula=formula, fill=None,
+                    ts=ST.TextStyle.model_construct(**{**body_base.model_dump(), "color": ST.STATUS_PAIRS["danger"][1]}), column=j)
+    if R.auto_score_scale:
+        for j, col in enumerate(sheet.columns):
+            if score_like(col) and not any(p["kind"] == "scale" and p["column"] == j for p in plan):
+                letter = get_column_letter(j + 1)
+                add("scale", "auto", f"{letter}{first_row}:{letter}{n_rows + 1}", scale=ST.SCORE_SCALE, column=j)
+    # 4. banding, lowest
+    if R.banded:
+        add("band", "band", f"A{first_row}:{last_letter}{n_rows + 1}", formula="MOD(ROW(),2)=0", fill=R.tokens.band, ts=None)
+    return plan
+
+
+def _apply_cf(ws, plan: List[dict]) -> None:
+    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
+
+    body_base = None
+    for p in plan:
+        if p["scale"] is not None:
+            lo, mid, hi = p["scale"]
+            if mid:
+                rule = ColorScaleRule(start_type="min", start_color=_hex6(lo), mid_type="percentile", mid_value=50, mid_color=_hex6(mid), end_type="max", end_color=_hex6(hi))
+            else:
+                rule = ColorScaleRule(start_type="min", start_color=_hex6(lo), end_type="max", end_color=_hex6(hi))
+            ws.conditional_formatting.add(p["range"], rule)
+            continue
+        ts = p["style"]
+        font = None
+        if ts is not None:
+            font = _cf_font(ts, body_base or ST.TextStyle(color=ST.INK))
+        rule = FormulaRule(formula=[p["formula"]], fill=_cf_fill(p["fill"]), font=font, stopIfTrue=True if p["stop"] else None)
+        ws.conditional_formatting.add(p["range"], rule)
+
+
+def _write_sheet(ws, sheet: S.Sheet, warnings: List[str], R: Optional[ST.ResolvedStyle] = None) -> dict:
+    """Header, rows, totals, widths, freeze, filter, conditional formats,
+    page setup, charts. Returns the layout ({first_row, last_row,
+    totals_row, column_letters}) the dashboard sheet points its KPI
+    formulas at."""
+    from openpyxl.styles import Alignment, Border, Side
+
+    R = R or ST.resolve(None)
+    cache = _StyleCache(R)
+    n_cols = len(sheet.columns)
+    n_rows = len(sheet.rows)
+    legacy = sheet.style
+    sst = sheet_style(sheet)
+    highlight = highlight_for(sheet)
+    t = R.tokens
+    grid_side = Side(style="thin", color=_hex6(t.grid))
+    grid = Border(left=grid_side, right=grid_side, top=grid_side, bottom=grid_side) if sst.borders == "thin" else Border()
+    header_rule = Side(style="medium", color=_hex6(t.header_fill if t.header_fill.upper() != "#F3F4F6" else t.primary))
+    body_size = R.sizes.body
+    base_body = R.base("table_body")
+
+    header_styles = []
     for j, col in enumerate(sheet.columns):
+        ts = R.element("table_header", sheet=sheet.name, column=col.name, column_index=j)
+        user_header = R.matching_rules("table_header", sheet=sheet.name)
+        if legacy is not None and not any(r.style.background for r in user_header):
+            if sst.header_fill == "light":
+                ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "background": LEGACY_LIGHT_HEADER[0], "color": LEGACY_LIGHT_HEADER[1]})
+            elif sst.header_fill == "none":
+                ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "background": None, "color": t.ink})
+        if legacy is not None and not sst.header_bold and not any(r.style.bold is not None for r in user_header):
+            ts = ST.TextStyle.model_construct(**{**ts.model_dump(), "bold": False})
+        header_styles.append(ts)
         cell = ws.cell(row=1, column=j + 1)
         _write_text(cell, col.name)
         colour = highlight.get(j)
+        if colour and any(r.style.background for r in user_header):
+            # AS3 integration (live 2026-09-15): a header colour the person
+            # asked for beats the model's legacy column highlight — "a yellow
+            # header row" came out with one navy header cell.
+            colour = None
+        size = ts.size_pt if ts.size_pt != R.base("table_header").size_pt else body_size
         if colour:
+            from openpyxl.styles import Font, PatternFill
+
             h_fill, h_font, _, _ = HIGHLIGHT_COLOURS[colour]
-            cell.font = Font(bold=style.header_bold, color=h_font, name=theme.OFFICE_SANS)
+            cell.font = Font(bold=bool(ts.bold), color=h_font, name=R.face(ts.font_family).office_name, size=size)
             cell.fill = PatternFill("solid", fgColor=h_fill)
         else:
-            cell.font = header_font
-            if header_fill is not None:
-                cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="right" if col.type != "text" else "left", vertical="center", wrap_text=style.wrap)
-        cell.border = header_border
+            cell.font = cache.font(ts, size=size)
+            fill = cache.fill(ts.background)
+            if fill is not None:
+                cell.fill = fill
+        cell.alignment = Alignment(horizontal=ts.align or col.align or ("right" if col.type != "text" else "left"), vertical="center", wrap_text=True)
+        if sst.borders == "thin":
+            cell.border = Border(left=grid_side, right=grid_side, top=grid_side, bottom=header_rule)
+        else:
+            cell.border = Border(bottom=header_rule)
+    ws.row_dimensions[1].height = 24
 
     scales = {j: (_percent_scale(sheet, j, warnings) if col.type == "percent" else 1.0) for j, col in enumerate(sheet.columns)}
-    cell_fills = {}
-    cell_fonts = {}
-    for j, colour in highlight.items():
-        _, _, c_fill, c_font = HIGHLIGHT_COLOURS[colour]
-        cell_fills[j] = PatternFill("solid", fgColor=c_fill)
-        cell_fonts[j] = Font(color=c_font, name=theme.OFFICE_SANS)
+    formats = {j: number_format_for(col, [r[j] for r in sheet.rows[:2000]]) for j, col in enumerate(sheet.columns)}
+    # AS3 integration (live 2026-09-15): a column a requested condition
+    # fills ("negative growth in red") must not ALSO carry the [Red] number
+    # format — LibreOffice drew -13.33 red on the red fill, invisible.
+    filled = {ST._fold(c.column) for c in R.conditional if c.style.background and (c.sheet is None or ST._fold(c.sheet) == ST._fold(sheet.name))}
+    for j, col in enumerate(sheet.columns):
+        if ST._fold(col.name) in filled and ";[Red]-" in formats[j]:
+            formats[j] = formats[j].split(";[Red]-")[0] + ";-" + formats[j].split(";[Red]-")[1]
+    long_text = {j for j, col in enumerate(sheet.columns) if col.type == "text" and any(isinstance(r[j], str) and len(r[j]) > 50 for r in sheet.rows[:500])}
+    col_styles = [R.element("table_body", sheet=sheet.name, column=col.name, column_index=j) for j, col in enumerate(sheet.columns)]
+    # Rows and ranges a rule names: only those cells get a per-cell style.
+    row_rules = {r.target.index: r for r in R.rules if r.target.kind == "row" and r.target.index is not None and (r.target.sheet is None or ST._fold(r.target.sheet) == ST._fold(sheet.name))}
+    range_rules = []
+    for r in R.rules:
+        if r.target.kind != "cell_range" or not r.target.a1 or (r.target.sheet is not None and ST._fold(r.target.sheet) != ST._fold(sheet.name)):
+            continue
+        clipped = ST.clip_a1(r.target.a1, n_cols, n_rows + 1)
+        if clipped is None:
+            continue
+        c1, r1, c2, r2 = clipped
+        if (c2 - c1 + 1) * (r2 - r1 + 1) > 10_000:
+            continue  # a single CF rule carries it (sheet_cf_plan)
+        range_rules.append((clipped, r.style))
+    legacy_fills = {j: HIGHLIGHT_COLOURS[c] for j, c in highlight.items()}
+    wrap_all = sst.wrap
+    alignments: dict = {}
     for i, row in enumerate(sheet.rows):
+        excel_row = i + 2
+        row_rule = row_rules.get(excel_row)
         for j, value in enumerate(row):
-            cell = ws.cell(row=i + 2, column=j + 1)
+            cell = ws.cell(row=excel_row, column=j + 1)
             _write_value(cell, value, sheet.columns[j].type, percent_scale=scales[j])
-            cell.font = cell_fonts.get(j, body_font)
-            if j in cell_fills:
-                cell.fill = cell_fills[j]
-            # Top-aligned so a wrapped comment reads from the row's top edge,
-            # next to the id it belongs to.
-            cell.alignment = Alignment(horizontal="right" if sheet.columns[j].type != "text" else None, vertical="top", wrap_text=style.wrap)
+            if cell.data_type == "n" or isinstance(cell.value, (_dt.date, _dt.datetime)):
+                cell.number_format = formats[j] if formats[j] != "@" else cell.number_format
+            ts = col_styles[j]
+            if row_rule is not None:
+                ts = on_fill(row_rule.style, ts)
+            for (c1, r1, c2, r2), rs in range_rules:
+                if r1 <= excel_row <= r2 and c1 <= j + 1 <= c2:
+                    ts = on_fill(rs, ts)
+            size = ts.size_pt if ts.size_pt != base_body.size_pt else body_size
+            if j in legacy_fills:
+                from openpyxl.styles import Font, PatternFill
+
+                _, _, c_fill, c_font = legacy_fills[j]
+                cell.font = Font(color=c_font, name=R.face(ts.font_family).office_name, size=size)
+                cell.fill = PatternFill("solid", fgColor=c_fill)
+            else:
+                cell.font = cache.font(ts, size=size)
+                fill = cache.fill(ts.background)
+                if fill is not None:
+                    cell.fill = fill
+            wrap = wrap_all or j in long_text
+            key = (ts.align or sheet.columns[j].align or ("right" if sheet.columns[j].type != "text" else None), wrap)
+            al = alignments.get(key)
+            if al is None:
+                # Top-aligned so a wrapped comment reads from the row's top
+                # edge, next to the id it belongs to.
+                al = alignments[key] = Alignment(horizontal=key[0], vertical="top", wrap_text=True if key[1] else None)
+            cell.alignment = al
             cell.border = grid
 
     first_row, last_row = 2, n_rows + 1
     totals_row = None
     if sheet.totals and n_rows > 0:
         totals_row = last_row + 1
+        tts = R.element("table_total", sheet=sheet.name)
+        top_side = Side(style="thin", color=_hex6(tts.color or t.primary))
+        total_font = cache.font(tts, size=tts.size_pt if tts.size_pt != R.base("table_total").size_pt else body_size)
+        total_fill = cache.fill(tts.background)
+        for j in range(n_cols):
+            c = ws.cell(row=totals_row, column=j + 1)
+            c.font = total_font
+            if total_fill is not None:
+                c.fill = total_fill
+            c.border = Border(top=top_side, left=grid_side if sst.borders == "thin" else None, right=grid_side if sst.borders == "thin" else None,
+                              bottom=grid_side if sst.borders == "thin" else None)
         label_written = False
         for total in sheet.totals:
             letter = _column_letter(total.column)
             cell = ws.cell(row=totals_row, column=total.column + 1)
             # The formula is written by THIS code from the row count; the spec
-            # only named the column and the function.
-            cell.value = f"={_FN_NAMES[total.fn]}({letter}{first_row}:{letter}{last_row})"
-            col_type = sheet.columns[total.column].type
-            cell.number_format = _NUMBER_FORMATS["integer"] if total.fn == "count" else _NUMBER_FORMATS.get(col_type, "#,##0.00")
-            cell.font = Font(bold=True, name=theme.OFFICE_SANS)
-            cell.alignment = Alignment(horizontal="right")
-            cell.border = Border(top=thin)
+            # only named the column and the function. SUBTOTAL ignores rows
+            # the autofilter hides, so the total follows the visible rows.
+            cell.value = f"=SUBTOTAL({_SUBTOTAL[total.fn]},{letter}{first_row}:{letter}{last_row})"
+            col = sheet.columns[total.column]
+            cell.number_format = "#,##0" if total.fn == "count" else (formats[total.column] if formats[total.column] != "@" else "#,##0.00")
+            cell.alignment = Alignment(horizontal=tts.align or "right")
             if not label_written and total.column > 0:
                 label = ws.cell(row=totals_row, column=1)
                 if label.value is None:
                     _write_text(label, total.label)
-                    label.font = Font(bold=True, name=theme.OFFICE_SANS)
+                    label.font = total_font
+                    if tts.align:
+                        label.alignment = Alignment(horizontal=tts.align)
                     label_written = True
 
-    # Widths: the spec's width, or the longest of header/sampled values —
-    # capped lower when text wraps, so a long comment column is a readable
-    # paragraph rather than a 60-character strip.
+    # Widths: the spec's width, else from content (style guide §4: min 8,
+    # max 50; dates 12; currency at least 14), capped at 45 when the sheet
+    # wraps so a long comment column is a readable paragraph.
     for j, col in enumerate(sheet.columns):
         if col.width:
             width = col.width
@@ -333,18 +730,51 @@ def _write_sheet(ws, sheet: S.Sheet, warnings: List[str]) -> dict:
                 v = row[j]
                 if v is not None:
                     longest = max(longest, len(str(v)))
-            width = min(max(longest + 2, 8), 45 if style.wrap else 60)
+            width = min(max(longest + 2, 8), 45 if (sst.wrap or j in long_text) else 50)
+            if col.type == "date":
+                width = max(12, min(width, 14))
+            elif col.type == "currency":
+                width = max(14, width)
         ws.column_dimensions[_column_letter(j)].width = width
-    ws.row_dimensions[1].height = 20
 
-    if sheet.freeze_header:
-        ws.freeze_panes = "A2"
+    if sheet.freeze_header and R.freeze_header:
+        ws.freeze_panes = "B2" if (n_cols > 8 and _ID_COLUMN_RE.match(sheet.columns[0].name)) else "A2"
     if sheet.autofilter and n_rows > 0:
         ws.auto_filter.ref = f"A1:{_column_letter(n_cols - 1)}{last_row}"
 
+    _apply_cf(ws, sheet_cf_plan(sheet, R, first_row=first_row, last_row=last_row))
+    _page_setup(ws, sheet, R)
+
     layout = {"first_row": first_row, "last_row": last_row, "totals_row": totals_row, "n_cols": n_cols}
-    _draw_charts(ws, sheet, layout, n_cols)
+    _draw_charts(ws, sheet, layout, n_cols, R)
     return layout
+
+
+_PAPER = {"A4": 9, "Letter": 1, "Legal": 5, "A3": 8, "A5": 11}
+
+
+def _page_setup(ws, sheet: S.Sheet, R: ST.ResolvedStyle) -> None:
+    """Print setup (style guide §4): landscape past six columns (or as
+    asked), one page wide, the header row repeated, 0.5 in margins, a
+    'Page X of Y' footer; user header/footer text with '&' doubled."""
+    from openpyxl.worksheet.page import PageMargins
+
+    landscape = R.page.orientation == "landscape" if R.page.orientation_explicit else is_landscape(sheet)
+    ws.page_setup.orientation = "landscape" if landscape else "portrait"
+    ws.page_setup.paperSize = _PAPER.get(R.page.size, 9)
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_title_rows = "1:1"
+    margin = {"narrow": 0.25, "wide": 1.0}.get(R.page.margins, 0.5)
+    ws.page_margins = PageMargins(left=margin, right=margin, top=0.5 + 0.25, bottom=0.5 + 0.25, header=0.3, footer=0.3)
+    if R.page.page_numbers:
+        ws.oddFooter.right.text = "Page &P of &N"
+    if R.page.footer_text:
+        ws.oddFooter.left.text = ST.xlsx_header_footer_text(R.page.footer_text)
+    if R.page.header_text:
+        ws.oddHeader.left.text = ST.xlsx_header_footer_text(R.page.header_text)
+    ws.sheet_properties.tabColor = _hex6(R.tokens.primary)
 
 
 def _chart_columns(sheet: S.Sheet, chart: S.Chart) -> Tuple[Optional[int], List[int]]:
@@ -401,7 +831,20 @@ def aggregate_chart(sheet: S.Sheet, chart: S.Chart, cat_col: int, series_cols: L
     return categories, values
 
 
-def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int) -> None:
+# --- AS3 integration BEGIN: Chart v2 in the workbook ---
+_LEGACY_XLSX_TYPES = ("bar", "horizontal_bar", "line", "pie")
+
+
+def is_v2_native(chart: Any) -> bool:
+    """A chart the charts track draws (render/chart_native.add_xlsx_chart):
+    every type beyond the four legacy ones, and any chart with requested
+    styling (colours, fonts, labels, axis bounds) the legacy writer ignores.
+    Legacy charts keep the writer that references the sheet's own cells."""
+    return str(getattr(chart, "type", "")) not in _LEGACY_XLSX_TYPES or getattr(chart, "style", None) is not None
+# --- AS3 integration END ---
+
+
+def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int, R: Optional[ST.ResolvedStyle] = None) -> None:
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
     anchor_row = 2
@@ -411,6 +854,14 @@ def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int) -> None:
     aux_col = n_cols + 12
     layout["chart_blocks"] = {}
     for k, chart in enumerate(sheet.charts):
+        if is_v2_native(chart) and chart.series:
+            # AS3 integration: the charts track's native writer (values on
+            # the "Chart data" sheet; an image where Excel has no such chart).
+            from . import chart_native as CN
+
+            CN.add_xlsx_chart(ws, chart, f"{_column_letter(anchor_col - 1)}{anchor_row}", R)
+            anchor_row += 18
+            continue
         cat_col, series_cols = _chart_columns(sheet, chart)
         n_points = len(chart.categories)
         over_columns = cat_col is not None and series_cols and n_points <= len(sheet.rows)
@@ -475,7 +926,7 @@ def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int) -> None:
 def _bold():
     from openpyxl.styles import Font
 
-    return Font(bold=True, name=theme.OFFICE_SANS)
+    return Font(bold=True, name=theme.CLASSIC_BODY_FONT)
 
 
 def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]]) -> None:
@@ -486,17 +937,18 @@ def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]
 
     ws = wb.create_sheet(title="Dashboard", index=0)
     ws.sheet_view.showGridLines = False
+    ws.sheet_properties.tabColor = theme.CLASSIC_ACCENT.lstrip("#").upper()
     # The title and purpose are the model's text like any cell: through
     # _write_text, or a title of `=HYPERLINK(...)` is a live formula (found
     # in review 2026-09-11 — these two were the only bare assignments).
     _write_text(ws["B2"], spec.title)
-    ws["B2"].font = Font(bold=True, size=18, color=theme.NAVY.lstrip("#").upper(), name=theme.OFFICE_SANS)
+    ws["B2"].font = Font(bold=True, size=18, color=theme.CLASSIC_PRIMARY.lstrip("#").upper(), name=theme.CLASSIC_HEADING_FONT)
     if spec.purpose:
         _write_text(ws["B3"], spec.purpose)
-        ws["B3"].font = Font(color=theme.INK_MUTED.lstrip("#").upper(), name=theme.OFFICE_SANS)
+        ws["B3"].font = Font(color=theme.CLASSIC_MUTED.lstrip("#").upper(), name=theme.CLASSIC_BODY_FONT)
     row = 5
     col = 2
-    fill = PatternFill("solid", fgColor=theme.SURFACE.lstrip("#").upper())
+    fill = PatternFill("solid", fgColor=theme.CLASSIC_BAND.lstrip("#").upper())
     for sheet, title, layout in layouts:
         if not layout["totals_row"]:
             continue
@@ -504,18 +956,17 @@ def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]
             letter = _column_letter(total.column)
             label = ws.cell(row=row, column=col)
             _write_text(label, f"{sheet.columns[total.column].name} ({total.fn})")
-            label.font = Font(size=9, color=theme.INK_MUTED.lstrip("#").upper(), name=theme.OFFICE_SANS)
+            label.font = Font(size=9, color=theme.CLASSIC_MUTED.lstrip("#").upper(), name=theme.CLASSIC_BODY_FONT)
             label.fill = fill
             value = ws.cell(row=row + 1, column=col)
             # quote_sheetname doubles an apostrophe inside the name ("Q1's
             # data" → 'Q1''s data'), which is legal in a sheet name and which
             # a hand-built f"'{title}'" turned into Err:509 in LibreOffice.
             value.value = f"={quote_sheetname(title)}!{letter}{layout['totals_row']}"
-            value.font = Font(bold=True, size=16, color=theme.NAVY.lstrip("#").upper(), name=theme.OFFICE_SANS)
+            value.font = Font(bold=True, size=16, color=theme.CLASSIC_PRIMARY.lstrip("#").upper(), name=theme.CLASSIC_HEADING_FONT)
             value.fill = fill
             value.alignment = Alignment(horizontal="left")
-            col_type = sheet.columns[total.column].type
-            value.number_format = _NUMBER_FORMATS["integer"] if total.fn == "count" else _NUMBER_FORMATS.get(col_type, "#,##0.00")
+            value.number_format = "#,##0" if total.fn == "count" else number_format_for(sheet.columns[total.column], [r[total.column] for r in sheet.rows[:2000]])
             ws.column_dimensions[_column_letter(col - 1)].width = 22
             col += 2
             if col > 12:
@@ -538,6 +989,8 @@ def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row:
     row = start_row
     blocks = layout.get("chart_blocks") or {}
     for k, chart in enumerate(sheet.charts):
+        if is_v2_native(chart):
+            continue  # AS3 integration: drawn on its data sheet by chart_native
         cat_col, series_cols = _chart_columns(sheet, chart)
         n_points = len(chart.categories)
         block = blocks.get(k)
@@ -572,11 +1025,15 @@ def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row:
         row += 18
 
 
-def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optional[List[str]] = None) -> Path:
-    """Write the workbook to `out_path` and return it."""
+def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optional[List[str]] = None,
+                resolved: Optional[ST.ResolvedStyle] = None) -> Path:
+    """Write the workbook to `out_path` and return it. `resolved` is the
+    ResolvedStyle render/__init__ shares across formats; without it the
+    workbook's own style is resolved here."""
     from openpyxl import Workbook
 
     warnings = warnings if warnings is not None else []
+    R = resolved or ST.resolve(spec)
     wb = Workbook()
     wb.remove(wb.active)
     layouts: List[Tuple[S.Sheet, str, dict]] = []
@@ -585,12 +1042,22 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
             warnings.append(f"Sheet {sheet.name!r}: {len(sheet.rows):,} rows were cut to the {T.MAX_ROWS_PER_SHEET:,}-row ceiling.")
             sheet = sheet.model_copy(update={"rows": sheet.rows[: T.MAX_ROWS_PER_SHEET]})
         ws = wb.create_sheet(title=title)
-        layouts.append((sheet, title, _write_sheet(ws, sheet, warnings)))
+        layouts.append((sheet, title, _write_sheet(ws, sheet, warnings, R)))
     if spec.template_id == "dashboard":
         _dashboard(wb, spec, layouts)
-    if spec.sources or spec.assumptions:
-        ws = wb.create_sheet(title="Notes")
+    sheet_notes = [(sh.name, sh.notes) for sh in spec.sheets[: T.MAX_SHEETS] if sh.notes]
+    if spec.sources or spec.assumptions or sheet_notes:
+        ws = wb.create_sheet(title="Notes" if "notes" not in {t.lower() for t in wb.sheetnames} else "Notes-2")
+        ws.sheet_properties.tabColor = theme.CLASSIC_MUTED.lstrip("#").upper()
         r = 1
+        if sheet_notes:
+            ws.cell(row=r, column=1, value="Sheet notes").font = _bold()
+            r += 1
+            for name, text in sheet_notes:
+                _write_text(ws.cell(row=r, column=1), name)
+                _write_text(ws.cell(row=r, column=2), text)
+                r += 1
+            r += 1
         if spec.sources:
             ws.cell(row=r, column=1, value="Sources").font = _bold()
             r += 1
@@ -614,6 +1081,9 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
     props.creator = "TechSara Local AI"
     props.description = spec.purpose or "Generated by TechSara Local AI Artifact Studio"
     out = Path(out_path)
+    from . import chart_native as _CN  # AS3 integration: "Chart data" stays the last sheet
+
+    _CN.keep_chart_data_last(wb)
     wb.save(str(out))
     return out
 
@@ -621,4 +1091,5 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
 __all__ = [
     "render_xlsx", "is_formula_like", "safe_sheet_name", "sheet_titles", "sheet_style", "is_landscape",
     "highlight_for", "aggregate_chart", "HIGHLIGHT_COLOURS", "HEADER_FILLS", "BORDER_COLOUR", "CHART_TOP_CATEGORIES",
+    "number_format_for", "sheet_cf_plan", "cond_formula", "status_formula", "status_like", "score_like", "due_like",
 ]

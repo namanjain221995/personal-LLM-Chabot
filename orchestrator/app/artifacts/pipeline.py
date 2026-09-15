@@ -1199,13 +1199,137 @@ async def _visual_qa(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], pr
         _publish(runner.job_id, {"stage": "validate", "status": "done", "percent": 100, "detail": "layout checked", "elapsed_s": 0})
         return None
     metrics.inc("artifact_corrections_total", "artifact correction passes", stage="visual")
-    # The files on disk are a GOOD version. The revision is rendered next to
-    # them, and only replaces them once it has rendered, validated and
-    # previewed; if it cannot, the good version is published with a note —
-    # a correction must never turn a finished document into a failed job
-    # (review, 2026-09-11).
-    kept = os.path.join(ctx.work_dir, ".before-visual-qa")
+    # --- AS3 agentic-selfcheck: carry code-owned fields + shared revision helper ---
+    # The reviewer rewrote the spec knowing nothing about spec.style or the
+    # charts' data bindings; code puts them back, or a visual correction
+    # would silently undo a requested style before the self-check runs.
+    revised = carry_code_owned(spec, revised)
+    try:
+        applied = await _try_revision(runner, ctx, stages, revised, "visual QA")
+    except RevisionRestoreFailed as exc:
+        return str(exc)
+    if applied:
+        ctx.warnings.append("the layout was corrected after a visual check")
+    else:
+        ctx.warnings.append("a visual correction was attempted but could not be applied; the reviewed version is what was published")
+    return None
+    # --- end AS3 agentic-selfcheck ---
+
+
+# --- AS3 agentic-selfcheck: the set-aside / restore helper ---
+
+
+REVISION_KEPT_DIR = ".before-revision"
+
+
+def recover_interrupted_revision(work_dir: str) -> bool:
+    """A process that died inside _try_revision left the good files in
+    `.before-revision/` and a half-built candidate (with the candidate's
+    spec.json) beside them. Put the good files back before any stage runs,
+    so the cached stages describe them again and the regression guard's
+    "the pre-repair files publish on any doubt" holds across a restart; and
+    so the set-aside directory is never published inside the version.
+    Returns True when something was restored."""
+    import shutil
+
+    kept = os.path.join(work_dir, REVISION_KEPT_DIR)
+    if not os.path.isdir(kept):
+        return False
+    names = os.listdir(kept)
+    if not names:
+        os.rmdir(kept)
+        return False
+    for name in os.listdir(work_dir):
+        path = os.path.join(work_dir, name)
+        if os.path.isfile(path) and name != store.MATERIAL_NAME:
+            os.unlink(path)
+    stale_previews = os.path.join(work_dir, T.PREVIEWS_DIR)
+    if os.path.isdir(stale_previews) and T.PREVIEWS_DIR in names:
+        shutil.rmtree(stale_previews, ignore_errors=True)
+    for name in names:
+        os.replace(os.path.join(kept, name), os.path.join(work_dir, name))
+    os.rmdir(kept)
+    return True
+
+
+class RevisionRestoreFailed(Exception):
+    """The good files could not be put back after a rejected revision. The
+    working directory may hold a mix, so the job must not publish it."""
+
+
+def carry_code_owned(original: ArtifactSpec, revised: ArtifactSpec) -> ArtifactSpec:
+    """`revised` with the fields a MODEL revision may not change put back
+    from `original`: the body's `style` (styling track; written by code from
+    the deterministic parser) and every chart's `data` binding (charts
+    track; numbers come from code over bound tables). Charts are matched by
+    position among the spec's charts. A field the spec model does not have
+    yet is simply absent on both sides, so this is a no-op before those
+    tracks merge. Never raises: on any doubt `revised` is returned as is."""
+    try:
+        if original.kind != revised.kind:
+            return revised
+        before = original.model_dump(mode="json", by_alias=True)
+        after = revised.model_dump(mode="json", by_alias=True)
+        changed = False
+        ob, rb = before.get(original.kind) or {}, after.get(revised.kind) or {}
+        if ob.get("style") is not None and rb.get("style") != ob.get("style"):
+            rb["style"] = ob["style"]
+            changed = True
+        o_charts, r_charts = _chart_dicts(ob), _chart_dicts(rb)
+        for oc, rc in zip(o_charts, r_charts):
+            if oc.get("data") is not None and rc.get("data") != oc.get("data"):
+                rc["data"] = oc["data"]
+                changed = True
+        if not changed:
+            return revised
+        from .spec import load as _load_spec
+
+        return _load_spec(after)
+    except Exception:  # noqa: BLE001 — carrying is best effort; the revision stands
+        log.debug("carry_code_owned: kept the revision as returned", exc_info=True)
+        return revised
+
+
+def _chart_dicts(body: dict) -> List[dict]:
+    out: List[dict] = []
+    for block in body.get("blocks") or []:
+        if isinstance(block, dict) and block.get("type") == "chart" and isinstance(block.get("chart"), dict):
+            out.append(block["chart"])
+    for slide in body.get("slides") or []:
+        if isinstance(slide, dict) and isinstance(slide.get("chart"), dict):
+            out.append(slide["chart"])
+    for sheet in body.get("sheets") or []:
+        for chart in (sheet or {}).get("charts") or []:
+            if isinstance(chart, dict):
+                out.append(chart)
+    return out
+
+
+async def _try_revision(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], revised_spec: ArtifactSpec, label: str,
+                        *, accept: Optional[Callable[[], Awaitable[bool]]] = None) -> bool:
+    """Render `revised_spec` BESIDE the good files and keep it only if it
+    renders, validates, previews — and, when `accept` is given, only if
+    `accept()` (which may read the new files in the working directory)
+    returns True. Otherwise the good files, the spec, the report, the stage
+    stamps, the warnings and the runner's failure state are restored exactly
+    as they were, and False is returned.
+
+    Shared by Max's visual QA and the self-check repair (the files on disk
+    are a GOOD version; a correction must never turn a finished document
+    into a failed job — review 2026-09-11). Raises RevisionRestoreFailed
+    only when putting the good files back itself failed."""
+    import shutil
+
+    kept = os.path.join(ctx.work_dir, REVISION_KEPT_DIR)
     saved: List[str] = []
+    if os.path.isdir(kept):
+        # A crashed attempt's set-aside files are the GOOD version:
+        # _run_stages puts them back before any stage runs, so one still
+        # here is empty or a leftover — never deleted with files in it.
+        if os.listdir(kept):
+            log.warning("artifact job %s: set-aside files from an earlier attempt are still present; not revising", runner.job_id[:8])
+            return False
+        os.rmdir(kept)
     try:
         os.makedirs(kept, exist_ok=True)
         for name in os.listdir(ctx.work_dir):
@@ -1217,48 +1341,85 @@ async def _visual_qa(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], pr
         if os.path.isdir(previews):
             os.replace(previews, os.path.join(kept, T.PREVIEWS_DIR))
     except OSError as exc:
-        log.warning("artifact job %s: could not set the visual QA aside: %s", runner.job_id[:8], type(exc).__name__)
+        log.warning("artifact job %s: could not set the files aside for the %s: %s", runner.job_id[:8], label, type(exc).__name__)
         with contextlib.suppress(OSError):
             for name in saved:
                 os.replace(os.path.join(kept, name), os.path.join(ctx.work_dir, name))
-        return None
-    await asyncio.to_thread(store.write_spec, ctx.work_dir, revised)
-    original_spec, original_report = ctx.spec, ctx.report
-    ctx.spec, ctx.report = revised, None
-    before = {name: dict(state) for name, state in stages.items()}
-    for name in ("render", "validate", "preview"):
-        stages.pop(name, None)
-    failure = await runner.chain(("render", "validate", "preview"))
-    if failure is None and not runner.deferred:
-        ctx.warnings.append("the layout was corrected after a visual check")
-        with contextlib.suppress(OSError):
-            import shutil
-
+            prev_kept = os.path.join(kept, T.PREVIEWS_DIR)
+            if os.path.isdir(prev_kept):
+                os.replace(prev_kept, os.path.join(ctx.work_dir, T.PREVIEWS_DIR))
             shutil.rmtree(kept, ignore_errors=True)
-        return None
-    # The revision could not be built: put the good version back, exactly
-    # as it was, and say what happened. Nothing about the job fails.
-    log.warning("artifact job %s: the visual correction could not be rendered (%s); keeping the reviewed version", runner.job_id[:8], failure or "deferred")
-    with contextlib.suppress(OSError):
+        return False
+    original_spec, original_report = ctx.spec, ctx.report
+    before = {name: dict(state) for name, state in stages.items()}
+    warnings_before = list(ctx.warnings)
+    ok = False
+    try:
+        await asyncio.to_thread(store.write_spec, ctx.work_dir, revised_spec)
+        ctx.spec, ctx.report = revised_spec, None
+        for name in ("render", "validate", "preview"):
+            stages.pop(name, None)
+        failure = await runner.chain(("render", "validate", "preview"))
+        ok = failure is None and not runner.deferred
+        if not ok:
+            log.warning("artifact job %s: the %s could not be rendered (%s); keeping the previous files", runner.job_id[:8], label, failure or "deferred")
+        elif accept is not None:
+            ok = bool(await accept())
+            if not ok:
+                log.info("artifact job %s: the %s rendered but was not accepted; keeping the previous files", runner.job_id[:8], label)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — the good files go back
+        log.exception("artifact job %s: the %s failed", runner.job_id[:8], label)
+        ok = False
+    if ok:
+        shutil.rmtree(kept, ignore_errors=True)
+        return True
+    try:
         for name in os.listdir(ctx.work_dir):
             path = os.path.join(ctx.work_dir, name)
             if os.path.isfile(path) and name != store.MATERIAL_NAME:
                 os.unlink(path)
         stale_previews = os.path.join(ctx.work_dir, T.PREVIEWS_DIR)
         if os.path.isdir(stale_previews):
-            import shutil
-
             shutil.rmtree(stale_previews, ignore_errors=True)
         for name in os.listdir(kept):
             os.replace(os.path.join(kept, name), os.path.join(ctx.work_dir, name))
         os.rmdir(kept)
+    except OSError as exc:
+        raise RevisionRestoreFailed(f"the files could not be restored after the {label}") from exc
     ctx.spec, ctx.report = original_spec, original_report
     stages.clear()
     stages.update(before)
+    ctx.warnings[:] = warnings_before
     runner.deferred = None
     runner.failure = None
-    ctx.warnings.append("a visual correction was attempted but could not be applied; the reviewed version is what was published")
-    return None
+    return False
+
+
+async def _selfcheck(runner: "_Runner", ctx: "_Ctx", stages: Dict[str, dict], progress: Dict[str, Any]) -> Optional[str]:
+    """The self-check hook: after visual QA, before publication. Skipped
+    when ARTIFACT_SELFCHECK is off, for a restore (a byte copy of a version
+    that was checked when it was made) and while a stage deferred."""
+    if not settings.artifact_selfcheck or runner.deferred:
+        return None
+    job = ctx.job
+    job_progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    edit = job_progress.get("edit") if isinstance(job_progress.get("edit"), dict) else {}
+    if str(job.get("operation") or "") in ("restore", "restore_version") or edit.get("restore_version") is not None:
+        return None
+    from . import selfcheck
+
+    try:
+        return await selfcheck.run_hook(runner, ctx, stages, progress)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — never fails a job (run_hook catches its own; this is the import)
+        log.exception("artifact job %s: the self-check hook failed", runner.job_id[:8])
+        return None
+
+
+# --- end AS3 agentic-selfcheck ---
 
 
 async def _run_stages(job_id: str, row: dict) -> None:
@@ -1299,6 +1460,19 @@ async def _run_stages(job_id: str, row: dict) -> None:
         await _finish(job_id, "failed", "storage_failure", safe_error("storage_failure"), total_s=time.perf_counter() - started)
         return
     _workdirs[job_id] = work_dir
+    # --- AS3 agentic-selfcheck: a revision interrupted by a restart ---
+    try:
+        if await asyncio.to_thread(recover_interrupted_revision, work_dir):
+            log.warning("artifact job %s: restored the files set aside by an interrupted revision", job_id[:8])
+            # The candidate's render/validate/preview stamps may have been
+            # written; the restored files must be re-validated and previewed.
+            for name in ("validate", "preview"):
+                stages.pop(name, None)
+    except OSError:
+        log.exception("artifact job %s: could not restore an interrupted revision", job_id[:8])
+        await _finish(job_id, "failed", "storage_failure", safe_error("storage_failure"), total_s=time.perf_counter() - started)
+        return
+    # --- end AS3 agentic-selfcheck ---
     ctx = _Ctx(job=row, work_dir=work_dir)
     ctx.warnings = list(progress.get("warnings") or [])
     if row.get("operation") in ("edit", "convert"):
@@ -1308,6 +1482,10 @@ async def _run_stages(job_id: str, row: dict) -> None:
     failure = await runner.chain(RUNNER_STAGES)
     if failure is None and not runner.deferred:
         failure = await _visual_qa(runner, ctx, stages, progress)
+    # --- AS3 agentic-selfcheck: check the final candidate before publishing ---
+    if failure is None and not runner.deferred:
+        failure = await _selfcheck(runner, ctx, stages, progress)
+    # --- end AS3 agentic-selfcheck ---
     if runner.deferred:
         deferrals = int(progress.get("deferrals") or 0) + 1
         if deferrals < _MAX_DEFERRALS:
@@ -1627,7 +1805,9 @@ def _validate_files(work_dir: str, report: dict, selected: Sequence[str], title:
             problems.append(f"the renderer named a file it may not write ({fmt or 'unknown format'})")
             continue
         role = _file_role(kind, fmt, entry.get("role"))
-        sheet = str(entry.get("sheet") or "").strip() if role == "data" else ""
+        # AS3 integration: a chart image is one file PER CHART — its part
+        # ("chart-2") names it, keys it and mints its id, like a sheet's CSV.
+        sheet = str(entry.get("sheet") or "").strip() if role == "data" or fmt in T.IMAGE_FORMATS else ""
         expected = [T.download_name(title, version, fmt)]
         if sheet:
             expected.append(T.download_name(title, version, fmt, part=sheet))

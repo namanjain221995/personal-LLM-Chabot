@@ -97,6 +97,11 @@ def _messages(
         if mode == "assistant"
         else SALESFORCE_CHAT_SYSTEM
     ) + identity_line()
+    # --- AS3 intent-capability BEGIN --- (the file capability line; not in the lane prompt)
+    from .capability import capability_suffix as _as3_capability_suffix
+
+    system = system + _as3_capability_suffix()
+    # --- AS3 intent-capability END ---
     # Evidence goes AFTER the persona and the identity line, so the last thing
     # the model reads before the conversation is what today's date is and what
     # the sources actually say. Empty for a timeless question, which keeps an

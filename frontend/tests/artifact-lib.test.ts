@@ -378,3 +378,73 @@ describe('pollJob', () => {
     expect(await outcome).toBe('gave up');
   });
 });
+
+
+/* ------------------------------------------------------------ AS3 edits */
+
+describe('AS3: image formats, versions and edit requests', () => {
+  it('knows png and svg as formats, labels them, and builds their URLs', async () => {
+    const lib = await import('@/lib/artifacts');
+    expect(lib.FORMATS).toEqual(['pdf', 'docx', 'pptx', 'xlsx', 'csv', 'png', 'svg']);
+    expect(lib.isImageFormat('SVG')).toBe(true);
+    expect(lib.isImageFormat('pdf')).toBe(false);
+    expect(formatLabel('png')).toBe('PNG image');
+    expect(artifactUrls.file(ID, 1, 'svg')).toBe(`/api/artifacts/${ID}/v/1/file/svg?disposition=attachment`);
+    expect(artifactUrls.file(ID, 1, 'exe')).toBe('');
+    expect(previewKindFor({ format: 'svg' })).toBe('none');
+  });
+
+  it('lists versions ascending and names the newest published one that supersedes', async () => {
+    const lib = await import('@/lib/artifacts');
+    const vs = [ref({ version: 3, status: 'failed' }), ref({ version: 1 }), ref({ version: 2, operation: 'edit' }), ref({ version: 2 })];
+    expect(lib.versionList(vs).map((v) => v.version)).toEqual([1, 2, 3]);
+    expect(lib.supersededBy(1, vs)).toBe(2);
+    expect(lib.supersededBy(2, vs)).toBeNull();
+    expect(lib.versionLabel({ version: 2, operation: 'edit' })).toBe('v2 · Updated');
+  });
+
+  it('records the newest version on the page and tells subscribers once per change', async () => {
+    const lib = await import('@/lib/artifacts');
+    lib.resetNewestVersions();
+    const fn = vi.fn();
+    const off = lib.subscribeNewestVersions(fn);
+    lib.noteArtifactVersion({ artifact_id: ID, version: 1, status: 'completed' });
+    lib.noteArtifactVersion({ artifact_id: ID, version: 3, status: 'running' });
+    lib.noteArtifactVersion({ artifact_id: ID, version: 2, status: 'completed_with_warnings' });
+    lib.noteArtifactVersion({ artifact_id: ID, version: 2, status: 'completed' });
+    lib.noteArtifactVersion({ artifact_id: 'not-an-id', version: 9, status: 'completed' });
+    off();
+    expect(lib.newestKnownVersion(ID)).toBe(2);
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('an edit request carries a valid id and a bounded, trimmed instruction', async () => {
+    const lib = await import('@/lib/artifacts');
+    const target = new EventTarget();
+    const heard: unknown[] = [];
+    target.addEventListener(lib.ARTIFACT_EDIT_EVENT, (e) => heard.push((e as CustomEvent).detail));
+    expect(lib.requestArtifactEdit(ID, '  make it landscape ', target)).toBe(true);
+    expect(lib.requestArtifactEdit(ID, '   ', target)).toBe(false);
+    expect(lib.requestArtifactEdit('../x', 'hi', target)).toBe(false);
+    expect(lib.editInstruction('x'.repeat(5000))).toHaveLength(4000);
+    expect(heard).toEqual([{ artifactId: ID, text: 'make it landscape' }]);
+    expect(lib.withArtifactId({ message: 'm' }, 'nope')).toEqual({ message: 'm' });
+    expect(lib.restoreInstruction(2.9)).toBe('Restore version 2');
+  });
+
+  it('caches one versions lookup per artifact and forgets a failed one', async () => {
+    const lib = await import('@/lib/artifacts');
+    lib.invalidateArtifactVersions();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ artifact: { id: ID }, versions: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await lib.cachedArtifactVersions(ID, 1000);
+    await lib.cachedArtifactVersions(ID, 2000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await lib.cachedArtifactVersions(ID, 1000 + 20_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"detail":"no"}', { status: 404 })));
+    lib.invalidateArtifactVersions(ID);
+    await expect(lib.cachedArtifactVersions(ID, 50_000)).rejects.toBeInstanceOf(ArtifactRequestError);
+    vi.unstubAllGlobals();
+  });
+});

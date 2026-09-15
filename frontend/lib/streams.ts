@@ -18,6 +18,7 @@
  * which conversation is on screen.
  */
 
+import { isArtifactId } from './artifacts';
 import { handleSessionEnd } from './auth';
 import { branchForAppend, branchOf, metaWithBranch } from './branching';
 import type { ClarificationResponse } from './clarification';
@@ -1124,6 +1125,12 @@ export interface StartStreamOptions {
    * honest as the send moves accepted → processing → completed / failed.
    */
   intentMessageId?: string;
+  /**
+   * AS3: the artifact this turn edits ("Edit with a prompt" / "Restore vN"
+   * on a card). Sent as `artifact_id`; the orchestrator uses it only when it
+   * is one of the caller's own published artifacts.
+   */
+  artifactId?: string | null;
 }
 
 /** Conversations whose in-flight send already carries a clarification answer. */
@@ -1231,6 +1238,9 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         ...(opts.clarification ? { clarification: opts.clarification } : {}),
         // V29: one logical send, however many times it is retried.
         ...(opts.intentId ? { intent_id: opts.intentId } : {}),
+        // AS3: the artifact an "Edit with a prompt" turn changes. Only when
+        // the host named one, so every other send keeps its key set.
+        ...(opts.artifactId && isArtifactId(opts.artifactId) ? { artifact_id: opts.artifactId } : {}),
         // 2026-09-13: where the answer belongs, for the server to store it
         // there. Only when announced — see StartStreamOptions.announceBranch.
         ...(answerBranch ? { answer_branch: answerBranch } : {}),

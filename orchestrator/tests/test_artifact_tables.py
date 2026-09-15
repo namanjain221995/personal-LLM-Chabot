@@ -764,3 +764,30 @@ def test_apply_rewrites_keeps_the_negations_and_matches_quotes_as_whole_words():
     assert out[0][1] == "Didn't pass the basics." and out[3][1].startswith("The host did not wait")
     assert X.negations_in("cannot, won't, without, none, nobody, neither/nor") == 7
     assert X.negations_in("nothing here is a knot or a note") == 1
+
+
+# ------------------------------------------------------ freeze (AS3 edits) --
+
+
+def test_freeze_generated_equals_the_unchanged_generator_and_drops_the_recipe():
+    """AS3 prompt-edits: a generator sheet's first edit freezes it to the
+    rows the UNCHANGED generator makes — never a reseed, so restoring an
+    old version reproduces its rows."""
+    from app.artifacts import spec as S
+
+    recipe = {"rows": 40, "seed": 11, "columns": [
+        {"name": "ID", "kind": "id", "pattern": "C-{n:04d}"},
+        {"name": "Name", "kind": "name"},
+        {"name": "Stage", "kind": "choice", "values": ["New", "Won", "Lost"], "weights": [3, 1, 1]},
+        {"name": "Amount", "kind": "float", "min": 10, "max": 900, "decimals": 2},
+    ]}
+    rows, _ = X.generate_rows(recipe)
+    columns = [{"name": "ID"}, {"name": "Name"}, {"name": "Stage"}, {"name": "Amount", "type": "number"}]
+    sheet = S.Sheet.model_validate({"name": "Deals", "columns": columns, "rows": rows, "generator": recipe})
+    frozen = X.freeze_generated(sheet)
+    assert frozen.generator is None and frozen.rows == rows and sheet.generator is not None, "the original is not mutated"
+    assert X.generate_rows(recipe)[0] == rows, "the generator itself is unchanged and deterministic"
+    empty = S.Sheet.model_validate({"name": "Deals", "columns": columns, "rows": [], "generator": recipe})
+    assert X.freeze_generated(empty).rows == rows, "a sheet whose rows were never filled is materialised"
+    plain = S.Sheet.model_validate({"name": "P", "columns": [{"name": "A"}], "rows": [["x"]]})
+    assert X.freeze_generated(plain) is plain

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import os
 import zipfile
 
@@ -471,11 +472,11 @@ def test_convert_a_workbook_to_csv(alice):
 
     assert asyncio.run(wait())["status"] == "completed"
     files = _files_of(client, aid, 2)
-    assert list(files) == ["csv"] and files["csv"]["role"] == "data" and files["csv"]["mime_type"] == "text/csv; charset=utf-8"
+    assert list(files) == ["xlsx", "csv"] and files["csv"]["role"] == "data" and files["csv"]["mime_type"] == "text/csv; charset=utf-8", "AS3: a convert keeps the xlsx"
     # A document cannot become a csv: the refusal names what it can be.
     doc = _make(uid, conv="conv-api-4")
     refused = client.post(f"/artifacts/{doc['artifact_id']}/convert", json={"format": "csv"})
-    assert refused.status_code == 400 and "docx or pdf" in refused.json()["detail"]
+    assert refused.status_code == 400 and "docx, pdf" in refused.json()["detail"]
 
 
 def test_job_status_cancel_retry_and_convert(alice, monkeypatch):
@@ -682,3 +683,89 @@ def test_a_caller_without_a_session_sees_nothing():
     # not the shape of the 401 the real cookie gate raises (tests/test_auth*).
     anon = TestClient(app)
     assert anon.get(f"/artifacts/{'c' * 32}").status_code in (401, 404)
+
+
+# ------------------------------------------------------------ AS3 edits --
+
+
+def test_svg_is_always_an_attachment_with_a_sandbox_csp_and_png_stays_inline(tmp_path):
+    """AS3 critic correction 5: an SVG served inline from this origin is a
+    stored-XSS vector; every SVG response is attachment + CSP sandbox."""
+    from app.artifacts import api as A
+
+    svg = tmp_path / "chart-v1.svg"
+    svg.write_text('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', encoding="utf-8")
+    for disposition in ("inline", "attachment"):
+        resp = A._file_response(str(svg), media_type="image/svg+xml", filename="chart-v1.svg", disposition=disposition)
+        assert resp.headers["content-disposition"].startswith("attachment;")
+        assert resp.headers["content-security-policy"] == "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        assert resp.headers["x-content-type-options"] == "nosniff"
+    # By extension alone (a row that recorded the wrong type) it is still an SVG.
+    resp = A._file_response(str(svg), media_type="application/octet-stream", filename="chart-v1.svg", disposition="inline")
+    assert resp.headers["content-disposition"].startswith("attachment;") and resp.media_type == "image/svg+xml"
+    png = tmp_path / "chart-v1.png"
+    png.write_bytes(b"\x89PNG\r\n")
+    resp = A._file_response(str(png), media_type="image/png", filename="chart-v1.png", disposition="inline")
+    assert resp.headers["content-disposition"].startswith("inline;") and "content-security-policy" not in resp.headers
+
+
+@pytest.mark.skipif("svg" not in T.MIME_TYPES, reason="svg files are served once the charts track adds the format")
+def test_an_svg_file_of_a_version_is_served_as_a_sandboxed_attachment(alice):
+    client, uid = alice
+    row = _make(uid, formats=("pdf",), conv="conv-svg")
+    aid = row["artifact_id"]
+    version = adb.get_version(aid, 1, uid)
+    body = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+    name = "quarterly-review-v1.svg"
+    with open(os.path.join(store.version_dir(uid, aid, 1), name), "wb") as fh:
+        fh.write(body)
+    files = list(version["files"]) + [{"format": "svg", "filename": name, "size": len(body), "sha256": hashlib.sha256(body).hexdigest(), "file_id": "a" * 16, "role": "companion"}]
+    with db.connection() as con:
+        con.execute("UPDATE artifact_versions SET files = %s WHERE artifact_id = %s AND version = 1", (json.dumps(files), aid))
+    resp = client.get(f"/artifacts/{aid}/v/1/f/{'a' * 16}", params={"disposition": "inline"})
+    assert resp.status_code == 200 and resp.headers["content-disposition"].startswith("attachment;")
+    assert "sandbox" in resp.headers["content-security-policy"]
+
+
+def test_restore_route_makes_a_byte_identical_version_and_convert_keeps_formats(alice, monkeypatch):
+    from app.engines import artifact as engine
+
+    client, uid = alice
+    row = _make(uid, formats=("pdf",), conv="conv-restore")
+    aid = row["artifact_id"]
+    resp = client.post(f"/artifacts/{aid}/convert", json={"format": "docx"})
+    assert resp.status_code == 200
+
+    def wait(job_id):
+        async def go():
+            pipeline.reset_for_tests()
+            await pipeline.ensure_running(job_id)
+            return await pipeline.wait_for(job_id)
+        return asyncio.run(go())
+
+    assert wait(resp.json()["job_id"])["status"] == "completed"
+    assert set(_files_of(client, aid, 2)) == {"pdf", "docx"}, "a convert keeps the PDF and adds Word"
+    pipeline.set_composer(engine.compose_for_pipeline)
+    assert client.post(f"/artifacts/{aid}/restore", json={"version": 2}).status_code == 409, "already current"
+    assert client.post(f"/artifacts/{aid}/restore", json={"version": 9}).status_code == 404
+    assert client.post(f"/artifacts/{aid}/restore", json={"version": "x"}).status_code == 422
+    assert client.post(f"/artifacts/{aid}/restore", json={"version": 1, "extra": 1}).status_code == 422
+    resp = client.post(f"/artifacts/{aid}/restore", json={"version": 1})
+    again = client.post(f"/artifacts/{aid}/restore", json={"version": 1})
+    assert resp.status_code == 200 and again.json()["job_id"] == resp.json()["job_id"], "a double click is one job"
+    assert wait(resp.json()["job_id"])["status"] == "completed"
+    with open(os.path.join(store.version_dir(uid, aid, 1), T.SPEC_NAME), "rb") as fh:
+        v1 = fh.read()
+    with open(os.path.join(store.version_dir(uid, aid, 3), T.SPEC_NAME), "rb") as fh:
+        v3 = fh.read()
+    assert resp.json()["version"] == 3 and v3 == v1
+    assert set(_files_of(client, aid, 3)) == {"pdf", "docx"}
+    detail = client.get(f"/artifacts/{aid}").json()
+    assert detail["artifact"]["current_version"] == 3 and [v.get("parent_version") for v in detail["versions"]] == [None, 1, 2]
+
+
+def test_restore_is_owner_scoped(alice, login_client):
+    client, uid = alice
+    row = _make(uid, formats=("pdf",), conv="conv-own")
+    bob = login_client("api-bob-restore")
+    assert bob.post(f"/artifacts/{row['artifact_id']}/restore", json={"version": 1}).status_code == 404

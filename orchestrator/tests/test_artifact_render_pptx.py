@@ -112,7 +112,7 @@ def test_native_table_header_shading_and_numeric_alignment(tmp_path):
     prs = Presentation(str(path))
     table = next(sh.table for sh in prs.slides[0].shapes if sh.has_table)
     assert len(table.rows) == 5 and len(table.columns) == 4
-    assert str(table.cell(0, 0).fill.fore_color.rgb) == "0A1D37"
+    assert str(table.cell(0, 0).fill.fore_color.rgb) == "1F3864"
     assert table.cell(1, 1).text == "120,000"
     assert table.cell(1, 1).text_frame.paragraphs[0].alignment == PP_ALIGN.RIGHT
     assert table.cell(1, 0).text_frame.paragraphs[0].alignment != PP_ALIGN.RIGHT

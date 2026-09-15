@@ -38,9 +38,12 @@ from urllib.parse import unquote, urlsplit
 
 from .. import types as T
 
-#: MIME types the fetcher will hand back. A chart is a PNG; nothing else is
-#: ever referenced.
-_ALLOWED_SUFFIXES = {".png": "image/png"}
+#: MIME types the fetcher will hand back: a chart as a PNG, or as an SVG
+#: (the charts track draws text as paths; render/validate.py refuses
+#: scripts, foreignObject and external references before one is written).
+#: An SVG is still served ONLY from the assets directory, and anything it
+#: references comes back through this same fetcher, so it can fetch nothing.
+_ALLOWED_SUFFIXES = {".png": "image/png", ".svg": "image/svg+xml"}
 
 
 class RefusedFetch(ValueError):

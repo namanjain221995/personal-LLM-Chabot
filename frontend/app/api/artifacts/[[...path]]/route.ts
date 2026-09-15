@@ -14,7 +14,7 @@
  * accepts any number of segments — none at all is the listing — so the route
  * matches them against the SMALL closed grammar the API defines: ids are 32
  * lowercase hex, file ids 16 (CONTRACT-2 §2), versions and pages are
- * integers, formats are the five the studio writes. It answers 404 for
+ * integers, formats are the seven the studio writes. It answers 404 for
  * anything else BEFORE an upstream request
  * exists. Traversal, encoded separators, a `..`, an unknown verb: none of
  * them becomes an outbound request, exactly as the /api/reports proxy refuses
@@ -77,7 +77,8 @@ const ID = /^[a-f0-9]{32}$/;
 const FILE_ID = /^[a-f0-9]{16}$/;
 const INT = /^(0|[1-9][0-9]{0,8})$/;
 const POSITIVE_INT = /^[1-9][0-9]{0,8}$/;
-const FORMATS = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'csv']);
+/** types.FORMATS — AS3 adds the standalone chart images `png` and `svg`. */
+const FORMATS = new Set(['pdf', 'docx', 'pptx', 'xlsx', 'csv', 'png', 'svg']);
 const PAGE_PNG = /^([1-9][0-9]{0,4})\.png$/;
 /** A segment that still holds a separator, a dot-segment or encoding. */
 const BAD_SEGMENT = /[\\/%]|\.\./;
@@ -168,6 +169,12 @@ export function resolveArtifactPath(segments: readonly string[]): ResolvedArtifa
   if (second === 'convert') {
     if (third !== undefined) return null;
     return { upstreamPath: `/artifacts/${artifactId}/convert`, query: null, methods: ['POST'] };
+  }
+  // /artifacts/{id}/restore — AS3: `{"version": N}` makes a new version
+  // whose content is version N's (artifacts/api.py restore_artifact).
+  if (second === 'restore') {
+    if (third !== undefined) return null;
+    return { upstreamPath: `/artifacts/${artifactId}/restore`, query: null, methods: ['POST'] };
   }
   // /artifacts/{id}/v/{n}...
   if (second !== 'v' || !INT.test(third ?? '')) return null;
@@ -262,7 +269,7 @@ async function proxy(req: Request, ctx: Ctx): Promise<Response> {
     if (value) headers[name] = value;
   }
 
-  // A POST here carries at most `{"format":"pptx"}`; cancel and retry carry
+  // A POST here carries at most `{"format":"pptx"}` or `{"version":3}`; cancel and retry carry
   // nothing. The body is bounded BEFORE it is read, so a large or absent
   // Content-Length never becomes a buffer in this process (review, 2026-09-11).
   let body: string | undefined;
