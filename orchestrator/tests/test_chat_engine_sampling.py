@@ -77,7 +77,7 @@ def test_fast_prose_is_one_legacy_call(recorder):
     out = _run_chat("hey, what's a good name for a grey kitten?", mode="assistant", effort="fast")
     assert out["answer"] == "ok"
     long = out["long"]
-    assert (long["segment_max_tokens"], long["total_max_tokens"], long["temperature"]) == (8000, 8000, 0.6)
+    assert (long["segment_max_tokens"], long["total_max_tokens"], long["temperature"]) == (8000, 1_000_000, 0.6)
     plan = long["answer_plan"]
     assert plan.sampling == {"temperature": 0.6} and plan.shape == "prose"
     [call] = recorder.calls
@@ -88,18 +88,18 @@ def test_fast_prose_is_one_legacy_call(recorder):
 def test_low_is_fast(recorder):
     out = _run_chat("hi there", mode="assistant", effort="low")
     assert out["long"]["answer_plan"].shape == "prose"
-    assert out["long"]["total_max_tokens"] == 8000
+    assert out["long"]["total_max_tokens"] == 1_000_000
 
 
-def test_fast_prose_that_runs_out_of_room_is_not_continued(recorder, monkeypatch):
-    # A Fast prose call that really spent its 8,000 tokens and hit `length`:
-    # the logical budget is spent, so nothing continues it (before the plan,
-    # Fast's total was the 1M ceiling and this asked again).
+def test_fast_prose_that_runs_out_of_room_continues_to_the_ceiling(recorder, monkeypatch):
+    # Owner decision 2026-09-15: a Fast prose call that spends its 8,000 tokens
+    # and hits `length` is continued, up to the 1M system ceiling, until the
+    # model says it is done (a 50-problem coding answer had been cut at 8,000).
     recorder.script = [("a" * 50, "length"), ("b" * 50, "stop")]
     monkeypatch.setattr(llm, "get_usage", lambda: {"completion_tokens": 8000 * len(recorder.calls)})
     out = _run_chat("tell me everything about tea", mode="assistant", effort="fast")
-    assert len(recorder.calls) == 1
-    assert out["long"]["total_max_tokens"] == 8000
+    assert len(recorder.calls) == 2
+    assert out["long"]["total_max_tokens"] == 1_000_000
 
 
 @pytest.mark.parametrize(
@@ -110,14 +110,14 @@ def test_fast_longform_and_structured_may_continue(recorder, message, shape):
     out = _run_chat(message, mode="assistant", effort="fast")
     long = out["long"]
     assert long["answer_plan"].shape == shape
-    assert (long["segment_max_tokens"], long["total_max_tokens"]) == (8000, 64000)
+    assert (long["segment_max_tokens"], long["total_max_tokens"]) == (8000, 1_000_000)
 
 
 def test_fast_salesforce_is_structured(recorder):
     out = _run_chat("show my open opportunities", mode="salesforce", effort="fast")
     long = out["long"]
     assert long["answer_plan"].shape == "structured"
-    assert (long["segment_max_tokens"], long["total_max_tokens"], long["temperature"]) == (8000, 64000, 0.6)
+    assert (long["segment_max_tokens"], long["total_max_tokens"], long["temperature"]) == (8000, 1_000_000, 0.6)
 
 
 @pytest.mark.parametrize("effort, mode, max_tokens", [
@@ -172,7 +172,7 @@ def test_a_lower_operator_fast_budget_still_wins(recorder, monkeypatch):
     out = _run_chat("write a python script that renames files", mode="assistant", effort="fast")
     assert out["long"]["total_max_tokens"] == 20000
     out = _run_chat("hello there", mode="assistant", effort="fast")
-    assert out["long"]["total_max_tokens"] == 8000
+    assert out["long"]["total_max_tokens"] == 20000  # prose too: the operator's lower budget is the total
 
 
 def test_the_legacy_temperature_line_is_kept_verbatim():
