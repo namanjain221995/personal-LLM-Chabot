@@ -96,8 +96,13 @@ class PrometheusAlertingTests(unittest.TestCase):
     def test_no_notifier_is_wired(self) -> None:
         """The operator asked for no mail (2026-09-15). Alerts are read in
         Grafana; nothing sends them anywhere, and no config claims otherwise."""
-        data = _yaml((REPO_ROOT / "monitoring" / "prometheus" / "prometheus.yml").read_text(encoding="utf-8"))
-        self.assertNotIn("alerting", data)
+        # Read as text on purpose: the launcher test job runs on a bare
+        # interpreter with no PyYAML (CI, 2026-09-15). A top-level key is a
+        # line that starts in column one.
+        text = (REPO_ROOT / "monitoring" / "prometheus" / "prometheus.yml").read_text(encoding="utf-8")
+        top_level = [line.split(":")[0] for line in text.splitlines() if line[:1].isalpha()]
+        self.assertNotIn("alerting", top_level)
+        self.assertIn("scrape_configs", top_level)
 
     def test_the_store_size_gauge_uses_delta_not_increase(self) -> None:
         rules = (REPO_ROOT / "monitoring" / "prometheus" / "rules" / "alerts.yml").read_text(encoding="utf-8")
@@ -181,12 +186,6 @@ def shell_quote(value: str) -> str:
     import shlex
 
     return shlex.quote(value)
-
-
-def _yaml(text: str):
-    import yaml
-
-    return yaml.safe_load(text)
 
 
 if __name__ == "__main__":  # pragma: no cover
