@@ -42,9 +42,12 @@ only for a backend that accepts vLLM extensions; anywhere else they are
 dropped, because an unknown body field is a 400 on a strict server.
 
 FAST LENGTH CAPS (`fast_caps`). One call of 8,000 tokens for every shape; the
-logical total is 8,000 for prose (one call — a Fast chat reply that needs more
-than 8,000 tokens is almost always deliberating, not answering) and 64,000 for
-long-form and structured asks, which may continue across segments.
+logical total is the system output ceiling (MAX_LOGICAL_OUTPUT_TOKENS, 1,000,000)
+for every shape, continued across segments until the model says it is done.
+Owner decision 2026-09-15: a Fast answer must not stop at 8,000 or 64,000
+tokens (a 50-problem coding answer was cut at 8,000). Runaway repetition is
+stopped by the answer loop guard (core/answer_guard.py), not by a length cap.
+ANSWER_FAST_PROSE_TOTAL_TOKENS=8000 still puts the one-call prose cap back.
 """
 from __future__ import annotations
 
@@ -104,8 +107,20 @@ _ALLOWED_KEYS = TOP_LEVEL_KEYS | EXTRA_BODY_KEYS
 
 #: Fast caps (tokens). Segment = one call; total = the logical answer.
 FAST_SEGMENT_MAX_TOKENS = 8000
-FAST_PROSE_TOTAL_TOKENS_DEFAULT = 8000
-FAST_EXTENDED_TOTAL_TOKENS = 64000
+
+
+def _system_output_ceiling() -> int:
+    """MAX_LOGICAL_OUTPUT_TOKENS as config.py reads it (default 1,000,000)."""
+    raw = (os.environ.get("MAX_LOGICAL_OUTPUT_TOKENS") or "").strip()
+    try:
+        value = int(raw) if raw else 1_000_000
+    except ValueError:
+        value = 1_000_000
+    return value if value > 0 else 1_000_000
+
+
+FAST_PROSE_TOTAL_TOKENS_DEFAULT = _system_output_ceiling()
+FAST_EXTENDED_TOTAL_TOKENS = FAST_PROSE_TOTAL_TOKENS_DEFAULT
 #: The smallest prose total above one segment that is accepted. A total a
 #: little larger than one call is the pathological value config.py documents
 #: (8,192 over an 8,000 call: a notice, no extra answer), so anything between
@@ -140,10 +155,9 @@ def _env_presence(name: str) -> float:
 
 
 def _env_prose_total(name: str) -> int:
-    """The Fast prose total: 8,000 (one call) unless set to a value of at least
-    two segments. The knob exists so the one-call prose cap — a reversal of
-    config.py's "every effort runs to the ceiling" — can be undone with an env
-    change and no code change."""
+    """The Fast prose total: the system output ceiling unless set to 8,000 (one
+    call) or to a value of at least two segments. The knob lets an operator put
+    the one-call prose cap back with an env change and no code change."""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return FAST_PROSE_TOTAL_TOKENS_DEFAULT
@@ -151,11 +165,11 @@ def _env_prose_total(name: str) -> int:
         value = int(raw)
     except ValueError:
         value = -1
-    if value == FAST_PROSE_TOTAL_TOKENS_DEFAULT or value >= _PROSE_TOTAL_MIN_ABOVE_SEGMENT:
+    if value == FAST_SEGMENT_MAX_TOKENS or value >= _PROSE_TOTAL_MIN_ABOVE_SEGMENT:
         return value
     log.warning(
         "%s=%r ignored: use %d (one call) or at least %d",
-        name, raw, FAST_PROSE_TOTAL_TOKENS_DEFAULT, _PROSE_TOTAL_MIN_ABOVE_SEGMENT,
+        name, raw, FAST_SEGMENT_MAX_TOKENS, _PROSE_TOTAL_MIN_ABOVE_SEGMENT,
     )
     return FAST_PROSE_TOTAL_TOKENS_DEFAULT
 

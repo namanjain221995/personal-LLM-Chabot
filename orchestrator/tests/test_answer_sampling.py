@@ -188,9 +188,10 @@ def test_shape_truth_table(message, mode, shape):
 
 
 def test_fast_caps():
-    assert S.fast_caps("prose") == (8000, 8000)
-    assert S.fast_caps("longform") == (8000, 64000)
-    assert S.fast_caps("structured") == (8000, 64000)
+    # Owner decision 2026-09-15: every Fast shape runs to the 1M system ceiling.
+    assert S.fast_caps("prose") == (8000, 1_000_000)
+    assert S.fast_caps("longform") == (8000, 1_000_000)
+    assert S.fast_caps("structured") == (8000, 1_000_000)
 
 
 def test_shape_and_script_scan_are_bounded_on_huge_inputs():
@@ -216,10 +217,10 @@ def test_fast_decision_only_for_fast_assistant_and_salesforce():
     prose = S.fast_sampling_for("hi", [], mode="assistant", effort="fast", model_choice="smart")
     assert prose.sampling == {"temperature": 0.6}
     assert prose.enable_thinking is None
-    assert (prose.shape, prose.segment_max_tokens, prose.total_max_tokens) == ("prose", 8000, 8000)
+    assert (prose.shape, prose.segment_max_tokens, prose.total_max_tokens) == ("prose", 8000, 1_000_000)
 
     sf = S.fast_sampling_for("list my open opportunities", [], mode="salesforce", effort="fast", model_choice="smart")
-    assert (sf.shape, sf.segment_max_tokens, sf.total_max_tokens) == ("structured", 8000, 64000)
+    assert (sf.shape, sf.segment_max_tokens, sf.total_max_tokens) == ("structured", 8000, 1_000_000)
 
     router = S.fast_sampling_for("hi", [], mode="assistant", effort="fast", model_choice="fast")
     assert router.sampling == {} and router.profile == "legacy"
@@ -266,16 +267,16 @@ def test_long_form_asks_the_first_lexicon_missed(message, shape):
 
 
 def test_a_non_latin_conversation_is_not_held_to_the_one_call_prose_total():
-    """~3.8 tokens a Gujarati word (measured): 8,000 tokens is a third of the
-    English length, so dense scripts keep the extended total."""
+    """Dense scripts and English alike run to the 1M system ceiling (owner
+    decision 2026-09-15); nothing holds a Fast answer to one call."""
     for text in ("ચા વિશે કહો", "चाय के बारे में बताइए"):
         plan = S.fast_sampling_for(text, [], mode="assistant", effort="fast", model_choice="smart")
-        assert (plan.shape, plan.total_max_tokens) == ("prose", 64000)
+        assert (plan.shape, plan.total_max_tokens) == ("prose", 1_000_000)
     history = [{"role": "user", "content": "ચા વિશે કહો"}]
     plan = S.fast_sampling_for("aur batao", history, mode="assistant", effort="fast", model_choice="smart")
-    assert plan.total_max_tokens == 64000
+    assert plan.total_max_tokens == 1_000_000
     plan = S.fast_sampling_for("tell me about tea", [], mode="assistant", effort="fast", model_choice="smart")
-    assert plan.total_max_tokens == 8000
+    assert plan.total_max_tokens == 1_000_000
 
 
 def test_presence_penalty_is_withheld_when_the_answer_is_in_another_language():
@@ -286,8 +287,8 @@ def test_presence_penalty_is_withheld_when_the_answer_is_in_another_language():
 
 @pytest.mark.parametrize(
     "raw, expected",
-    [("", 8000), ("8000", 8000), ("16000", 16000), ("64000", 64000), ("8192", 8000), ("12000", 8000),
-     ("0", 8000), ("-5", 8000), ("abc", 8000)],
+    [("", 1_000_000), ("8000", 8000), ("16000", 16000), ("64000", 64000), ("8192", 1_000_000),
+     ("12000", 1_000_000), ("0", 1_000_000), ("-5", 1_000_000), ("abc", 1_000_000)],
 )
 def test_prose_total_env_refuses_the_just_above_one_segment_values(monkeypatch, raw, expected):
     monkeypatch.setenv("ANSWER_FAST_PROSE_TOTAL_TOKENS", raw)
@@ -295,18 +296,28 @@ def test_prose_total_env_refuses_the_just_above_one_segment_values(monkeypatch, 
 
 
 def test_prose_total_env_is_applied_at_import(monkeypatch):
-    monkeypatch.setenv("ANSWER_FAST_PROSE_TOTAL_TOKENS", "1000000")
+    monkeypatch.setenv("ANSWER_FAST_PROSE_TOTAL_TOKENS", "8000")
     module = importlib.reload(S)
     try:
-        assert module.fast_caps("prose") == (8000, 1000000)
-        assert module.fast_caps("longform") == (8000, 1000000)
+        assert module.fast_caps("prose") == (8000, 8000)  # the operator can put the one-call cap back
     finally:
         monkeypatch.delenv("ANSWER_FAST_PROSE_TOTAL_TOKENS")
         importlib.reload(S)
-    assert S.fast_caps("prose") == (8000, 8000)
+    assert S.fast_caps("prose") == (8000, 1_000_000)
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_sampling_values_are_refused(bad):
     with pytest.raises(ValueError):
         S.validate_sampling({"temperature": bad})
+
+
+def test_the_fast_total_follows_the_system_output_ceiling(monkeypatch):
+    monkeypatch.setenv("MAX_LOGICAL_OUTPUT_TOKENS", "250000")
+    module = importlib.reload(S)
+    try:
+        assert module.fast_caps("prose") == (8000, 250000)
+        assert module.fast_caps("longform") == (8000, 250000)
+    finally:
+        monkeypatch.delenv("MAX_LOGICAL_OUTPUT_TOKENS")
+        importlib.reload(S)
