@@ -928,7 +928,11 @@ groups:
 
       - alert: DataVolumeGrowingFast
         # LanceDB and Parquet both grow without bound; Parquet is never pruned.
-        expr: increase(techsara_store_total_bytes[24h]) > 50e9
+        # delta(), not increase(): techsara_store_total_bytes is a GAUGE (the
+        # size right now), and increase() reads every dip as a counter reset
+        # and extrapolates over it. Measured 2026-09-15: a 135 GB store on a
+        # 31%-full disk reported "2.354 TiB in 24h" and the alert stood fired.
+        expr: delta(techsara_store_total_bytes[24h]) > 50e9
         for: 1h
         labels: { severity: warning }
         annotations:
