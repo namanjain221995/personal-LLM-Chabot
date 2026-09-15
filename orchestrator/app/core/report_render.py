@@ -11,6 +11,7 @@ Pure-ish: stdlib only, no app imports. The caller supplies the directory.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import tempfile
 import time
@@ -108,10 +109,119 @@ class ReportRenderError(RuntimeError):
     """Raised when pandoc could not produce the requested file."""
 
 
+#: The markdown reader used for the PDF path, with every raw-HTML passthrough
+#: turned OFF. `sanitise_for_render` strips the fetching tags it knows about;
+#: this makes a tag it does NOT know harmless too, because pandoc renders it as
+#: visible text instead of an element. A denylist that has to keep up with
+#: every tag is not a boundary; these two together are.
+_PDF_MARKDOWN_READER = (
+    "markdown-raw_html-raw_attribute-native_divs-native_spans-link_attributes"
+)
+
+
+async def _pandoc(args: list, *, failure: str) -> bytes:
+    """Run pandoc with `args`, returning stdout. Raises ReportRenderError."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pandoc", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:  # pandoc missing entirely
+        raise ReportRenderError("pandoc is not installed") from exc
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise ReportRenderError(
+            f"{failure}: {stderr.decode(errors='replace')[:500]}"
+        )
+    return stdout
+
+
+def _write_pdf(html: str, out_path: Path, resource_dir: Path) -> None:
+    """HTML → PDF in-process, able to load NOTHING but this report's charts.
+
+    THE BOUNDARY IS THE FETCHER, NOT THE TEXT. `--pdf-engine=weasyprint` used
+    to hand the HTML to a WeasyPrint that would resolve every reference in it
+    with its own stack, so a `file:///…` that survived the sanitiser was read
+    off this container's disk and embedded in the PDF a user downloads —
+    `/proc/self/environ` included. Rendering here instead lets us pass the
+    SAME url_fetcher the artifacts renderer uses, which serves only
+    `<resource_dir>/<bare name>.png|svg` and raises for every other shape.
+
+    It does not inspect the text or guess intent, so genuine data that merely
+    contains `<`, `>` or a file path is rendered exactly as written; it simply
+    cannot become a fetch.
+    """
+    from weasyprint import HTML  # lazy: native libs, banned as an eager import
+
+    from ..artifacts.render.pdf import make_url_fetcher  # lazy: same reason
+
+    HTML(
+        string=html,
+        base_url=str(resource_dir) + os.sep,
+        url_fetcher=make_url_fetcher(resource_dir),
+    ).write_pdf(str(out_path))
+
+
+async def run_pandoc_to_file(
+    md_path: Path, out_path: Path, resource_dir: Path
+) -> None:
+    """Render `md_path` to `out_path`, choosing the path by suffix.
+
+    A .pdf goes markdown → HTML (pandoc) → PDF (WeasyPrint in this process,
+    behind the asset fetcher). Everything else — .docx — stays on the pandoc
+    CLI exactly as before. Callers sanitise BEFORE calling; this function is
+    the mechanics only.
+    """
+    if out_path.suffix.lower() != ".pdf":
+        await _pandoc(
+            [
+                str(md_path),
+                "--standalone",
+                "--resource-path",
+                str(resource_dir),
+                "-o",
+                str(out_path),
+            ],
+            failure=f"pandoc failed for {out_path.name}",
+        )
+        return
+
+    html = (
+        await _pandoc(
+            [
+                str(md_path),
+                "-f",
+                _PDF_MARKDOWN_READER,
+                "-t",
+                "html",
+                "--standalone",
+                "--resource-path",
+                str(resource_dir),
+            ],
+            failure=f"pandoc failed for {out_path.name}",
+        )
+    ).decode("utf-8", errors="replace")
+    # OFF THE EVENT LOOP: the old path awaited a subprocess, so laying out a
+    # report never blocked other requests. WeasyPrint is in-process CPU work,
+    # and a thread keeps that property.
+    try:
+        await asyncio.to_thread(_write_pdf, html, out_path, resource_dir)
+    except ImportError as exc:  # weasyprint missing entirely
+        raise ReportRenderError("weasyprint is not installed") from exc
+    except ReportRenderError:
+        raise
+    except Exception as exc:  # a layout failure is a failed render, not a 500
+        raise ReportRenderError(
+            f"the PDF renderer failed for {out_path.name}: {exc}"
+        ) from exc
+
+
 async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None:
     # Sanitise HERE rather than at the call sites: this function is the one
     # thing every PDF passes through, and a guard a caller can forget is not a
-    # guard.
+    # guard. The renderer's asset fetcher (see _write_pdf) is the second,
+    # independent gate.
     try:
         original = md_path.read_text(encoding="utf-8")
         cleaned = sanitise_for_render(original)
@@ -119,29 +229,7 @@ async def _run_pandoc(md_path: Path, out_path: Path, resource_dir: Path) -> None
             md_path.write_text(cleaned, encoding="utf-8")
     except OSError:
         pass  # unreadable markdown fails in pandoc below, with its own message
-    cmd = [
-        "pandoc",
-        str(md_path),
-        "--standalone",
-        "--resource-path",
-        str(resource_dir),
-        "-o",
-        str(out_path),
-    ]
-    if out_path.suffix.lower() == ".pdf":
-        cmd.append("--pdf-engine=weasyprint")  # PDF without LaTeX
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-    except FileNotFoundError as exc:  # pandoc missing entirely
-        raise ReportRenderError("pandoc is not installed") from exc
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise ReportRenderError(
-            f"pandoc failed for {out_path.name}: "
-            f"{stderr.decode(errors='replace')[:500]}"
-        )
+    await run_pandoc_to_file(md_path, out_path, resource_dir)
 
 
 def timestamped_base(title: str, fallback: str = "report") -> str:
@@ -181,5 +269,7 @@ async def render_markdown_pdf(
 __all__ = [
     "ReportRenderError",
     "render_markdown_pdf",
+    "run_pandoc_to_file",
+    "sanitise_for_render",
     "timestamped_base",
 ]

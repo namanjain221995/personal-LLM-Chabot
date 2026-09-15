@@ -98,11 +98,21 @@ def _md_escape(value: Any) -> str:
 
     Column names and cell values are user file content: a pipe would break the
     table and a backslash-run could escape out of the cell.
+
+    ANGLE BRACKETS ARE ESCAPED, NOT STRIPPED. A cell holding `<Config>`, `a<b`
+    or `x < 1000` is ordinary data and must reach the reader unchanged, so it
+    is escaped to an entity and rendered back as the very same characters —
+    what it must never do is become an ELEMENT the PDF renderer acts on.
+
+    TRUNCATE FIRST, THEN ESCAPE. The other way round, the 60-character cut
+    lands inside an `&gt;` and the cell ends in a broken `&g`: measured on
+    `<Config><timeout>30</timeout></Config>`, which is 38 characters of data
+    and 74 of entities.
     """
     text = "" if value is None else str(value)
+    text = re.sub(r"\s+", " ", text).strip()[:60]
     text = text.replace("\\", "\\\\").replace("|", "\\|")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:60]
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _tabular_files(uploads: Sequence[dict]) -> List[Dict[str, Any]]:
