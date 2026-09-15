@@ -909,12 +909,19 @@ def describe(item: ChecklistItem) -> str:
             return f"{label} at {e:g}pt" if isinstance(e, (int, float)) else f"{label} size {e}"
         return f"{label} {p}"
     if item.category == "format":
-        return {"docx": "a Word file", "pdf": "a PDF", "xlsx": "an Excel file", "csv": "a CSV", "pptx": "a PowerPoint file"}.get(str(e), f"a {e} file")
+        if p == "formats_only":
+            return "only the files that were asked for"
+        return {"docx": "a Word file", "pdf": "a PDF", "xlsx": "an Excel file", "csv": "a CSV", "pptx": "a PowerPoint file",
+                "png": "a PNG image", "svg": "an SVG image"}.get(str(e), f"a {e} file")
     if item.category == "layout":
         return {"orientation": f"{e} pages", "page_size": f"{e} paper", "margins": f"{e} margins", "page_numbers": "page numbers"}.get(p, p)
     if item.category == "chart":
         return {"type": f"a {str(e).replace('_', ' ')} chart", "series_color": f"chart colour {e}", "legend_position": f"legend at the {e}",
-                "data_labels": "data labels", "title": f"chart title '{e}'", "trendline": "a trend line", "values_match": "chart values from the data"}.get(p, p)
+                "data_labels": "data labels", "title": f"chart title '{e}'", "trendline": "a trend line", "values_match": "chart values from the data",
+                # The independent audit (artifacts/chart_audit.py).
+                "binding_plausible": "a chart whose slices follow the table's numbers",
+                "no_summary_category": "no totals row drawn as a slice or a bar",
+                "values_recomputed": "chart values that match the table regrouped by hand"}.get(p, p)
     if item.category == "content":
         return f"a section on {target.split(':', 1)[-1]}"
     if item.category == "data":

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from app import metrics
-from app.artifacts import pipeline, requirements as RQ, selfcheck as SC, store
+from app.artifacts import inspect_files as I, pipeline, requirements as RQ, selfcheck as SC, store
 from app.artifacts import spec as S
 from app.artifacts.render import render_version
 from app.config import Settings, settings
@@ -588,3 +588,157 @@ def test_an_edit_that_rewrites_an_unnamed_section_publishes_with_a_warning(owner
     assert preserve["result"] == "fail", preserve
     assert fresh["status"] == "completed_with_warnings"
     assert any("the rest of the document unchanged" in line for line in report["unmet"]), report["unmet"]
+
+
+# ------------------------------- the 2026-09-16 chart / format incident --
+
+#: "visualise this table on pie chart" — the table the assistant itself had
+#: written one turn earlier. Six states, an estimated "~67" cell, and a
+#: summary row whose RANK cell says "Total" and whose state cell says
+#: "Distinct States".
+_INCIDENT_TABLE = {
+    "id": "answer1", "title": "Table from the assistant's earlier answer",
+    "columns": ["Rank", "State", "Count (Approx)", "% of Total Records"],
+    "rows": [[1, "Texas", 21, "2.57%"], [2, "Missouri", 11, "1.35%"], [3, "Illinois", 9, "1.10%"],
+             [4, "California", 8, "0.98%"], [5, "New Jersey", 7, "0.86%"],
+             ["—", "Other 25 States", "~67", "8.20%"], ["Total", "Distinct States", 30, "3.67%"]],
+}
+
+
+def _equal_slice_pie_spec():
+    """The spec the platform published: seven slices, every one of them 1."""
+    from app.artifacts import chart_spec as CS
+
+    chart = CS.Chart(
+        type="pie", title="Records by state", data=CS.Binding(table_id="answer1", x="State", agg="count"),
+        categories=["Texas", "Missouri", "Illinois", "California", "New Jersey", "Other 25 States", "Distinct States"],
+        series=[CS.Series(name="Count", values=[1.0] * 7)],
+        provenance=CS.Provenance(table_id="answer1", table_title="Table from the assistant's earlier answer", agg="count"),
+    )
+    return S.parse_body("document", {
+        "title": "Records by state",
+        "blocks": [{"type": "paragraph", "text": "The share of records held by each state."},
+                   {"type": "chart", "chart": chart.model_dump(mode="python")}],
+    })
+
+
+def test_rerunning_the_same_binding_cannot_see_the_wrong_pie(owner):
+    """THE TAUTOLOGY, stated as a test. chart_values_check verifies a chart by
+    calling chart_data.recompute_matches, which re-runs the SAME binding: a
+    wrong binding agrees with itself. The audit is a different reading."""
+    from app.artifacts import chart_audit as CA
+    from app.artifacts import chart_data as CD
+    from app.artifacts import chart_spec as CS
+
+    table = {"id": "answer1", "title": "States", "columns": ["State", "Count", "Population"],
+             "rows": [["Texas", 21, 30], ["Missouri", 11, 6], ["Illinois", 9, 12], ["California", 8, 39], ["New Jersey", 7, 9]]}
+    resolved, _notes, msg = CD.resolve_chart(CS.Chart(type="pie", title="Records by state",
+                                                      data=CS.Binding(table_id="answer1", x="State", agg="count")), [table])
+    assert msg == "" and [s.values for s in resolved.series] == [[1.0] * 5], "five states, five equal slices"
+    assert CD.recompute_matches(resolved, [table]) == (True, []), "the same binding, the same answer"
+    spec = S.parse_body("document", {"title": "States", "blocks": [{"type": "chart", "chart": resolved.model_dump(mode="python")}]})
+    assert SC.chart_values_check(spec, [], [table]) is None, "the old check has nothing to say about it"
+    audit = CA.audit_spec(spec, [table])
+    assert audit.codes() == ["binding"] and "bound to the wrong column" in audit.findings[0].message
+    # And a re-bind does NOT fix this one — the table offers two measures, so
+    # chart_data leaves the row count standing. The person is told instead.
+    fixed, _ = CD.resolve_spec(spec, [table])
+    assert CA.audit_spec(fixed, [table]).codes() == ["binding"]
+
+
+def test_a_pie_of_equal_slices_fails_the_check_and_is_rebound_by_code(owner):
+    pipeline.set_composer(_composer(_equal_slice_pie_spec()))
+    row = _accept(owner, instruction="visualise this table on pie chart", formats=["docx"], format_reason="explicit: word",
+                  material={"tables": [_INCIDENT_TABLE]})
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    report = _report(owner, row)
+    assert report["outcome"] == "repaired" and report["repair"]["accepted"] is True, report
+    assert report["repair"]["kinds"] == ["code"] and report["model_calls"] == 0, "no model repairs a number"
+    published = json.loads(Path(store.version_dir(owner, row["artifact_id"], 1), "spec.json").read_text())
+    chart = published["document"]["blocks"][1]["chart"]
+    assert chart["categories"] == ["Other 25 States", "Texas", "Missouri", "Illinois", "California", "New Jersey"]
+    assert chart["series"][0]["values"] == [67.0, 21.0, 11.0, 9.0, 8.0, 7.0], "the Count column, not a row count"
+    assert "Distinct States" not in chart["categories"], "the summary row is not a slice"
+    results = {i["property"]: i["result"] for i in report["items"] if i["category"] == "chart"}
+    assert results["binding_plausible"] == "pass" and results["no_summary_category"] == "pass"
+    assert results["values_recomputed"] == "pass", "the published numbers survive a regrouping by hand"
+
+
+def test_an_unrepairable_wrong_pie_is_said_plainly_instead(owner, monkeypatch):
+    # Repair off, so what the person is told is what publishes.
+    monkeypatch.setattr(settings, "artifact_selfcheck_repair", False)
+    pipeline.set_composer(_composer(_equal_slice_pie_spec()))
+    row = _accept(owner, instruction="visualise this table on pie chart", formats=["docx"], format_reason="explicit: word",
+                  material={"tables": [_INCIDENT_TABLE]})
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed_with_warnings"
+    report = _report(owner, row)
+    assert report["outcome"] == "unmet"
+    unmet = " | ".join(report["unmet"])
+    assert "all 7 slices are 1" in unmet and "Count (Approx)" in unmet, report["unmet"]
+    assert "Distinct States" in unmet and "counted twice" in unmet, report["unmet"]
+    results = {(i["property"], i["result"]) for i in report["items"] if i["category"] == "chart"}
+    assert ("binding_plausible", "fail") in results and ("no_summary_category", "fail") in results, sorted(results)
+    from app.artifacts import db as adb
+
+    assert any("all 7 slices are 1" in w for w in adb.get_version(row["artifact_id"], 1, owner)["warnings"])
+
+
+def test_a_file_nobody_asked_for_is_reported_never_repaired(owner, monkeypatch):
+    """Production 2026-09-16 delivered a Word file AND a PDF for a request
+    that named neither. _validate_files only ever complains that a SELECTED
+    format is missing, so every check passed."""
+    async def render(work_dir, spec, formats, title_slug, version, effort, **kw):
+        report = await asyncio.to_thread(render_version, spec, list(formats) + ["pdf"], work_dir,
+                                         title_slug=title_slug, version=version, effort=effort)
+        return report.to_json()
+
+    monkeypatch.setattr(pipeline, "_render_in_subprocess", render)
+    pipeline.set_composer(_composer(F.doc_spec()))
+    row = _accept(owner, instruction="Make a Word report on vendor access", formats=["docx"], format_reason="explicit: word")
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed_with_warnings", fresh
+    report = _report(owner, row)
+    assert {f["format"] for f in store.read_json(os.path.join(store.version_dir(owner, row["artifact_id"], 1), "validation.json"))["files"]} == {"docx", "pdf"}
+    assert any("a PDF, which the request did not ask for" in line for line in report["unmet"]), report["unmet"]
+    assert report["repair"].get("accepted") is not True, "a repair can add a format, never withdraw a delivered file"
+
+
+def test_a_delivered_format_the_request_named_is_not_an_extra(owner):
+    pipeline.set_composer(_composer(F.doc_spec()))
+    row = _accept(owner, instruction="Make a Word report on vendor access and a PDF", formats=["docx", "pdf"],
+                  format_reason="explicit: word, pdf")
+    fresh = _run(row["id"])
+    assert fresh["status"] == "completed", fresh
+    report = _report(owner, row)
+    assert not any("did not ask for" in line for line in report["unmet"]), report["unmet"]
+
+
+# ------------------------------------------------------------- honesty --
+
+
+def test_a_must_that_could_not_be_verified_is_not_a_success():
+    item = RQ.ChecklistItem("c1", "chart", "chart", "values_recomputed", True, must=True)
+    report = SC.summarize([SC.ItemResult(item, "unverifiable", ["the chart's binding cannot be regrouped by a second reading"])])
+    assert report.unconfirmed == ["chart values that match the table regrouped by hand"]
+    assert report.unmet == ["not confirmed: chart values that match the table regrouped by hand — "
+                            "the chart's binding cannot be regrouped by a second reading"]
+    assert report.false_claim_guard["claimable"] == []
+
+
+def test_the_checker_failing_to_open_a_file_is_not_an_unconfirmed_requirement():
+    """_eval_format already says why: the validate stage reopened every file
+    with the format's own library, so a reader that cannot parse it is a fact
+    about the reader. It must not become a warning the person reads."""
+    item = RQ.ChecklistItem("c1", "format", "file", "format", "pdf", must=True)
+    unreadable = [I.Observation("file", "readable", False, "pdf", {"name": "x.pdf"})]
+    results = SC.evaluate(RQ.Checklist(items=[item]), unreadable, SC.EvalContext())
+    assert [r.result for r in results] == ["unverifiable"] and results[0].unreadable is True
+    assert SC.summarize(results).unmet == []
+
+
+def test_a_should_item_that_cannot_be_verified_stays_silent():
+    item = RQ.ChecklistItem("c1", "style", "heading", "color", "#1F3864", must=False)
+    report = SC.summarize([SC.ItemResult(item, "unverifiable")])
+    assert report.unconfirmed == [] and report.unmet == []

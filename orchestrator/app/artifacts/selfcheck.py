@@ -22,6 +22,20 @@ THE LOOP (bounded, one repair):
                  numbers in the native chart equal the values recomputed
                  from the bound tables (chart_data.recompute_matches when
                  the charts track is present) or the spec's series.
+                 CHARTS ARE ALSO AUDITED INDEPENDENTLY (chart_audit):
+                 recompute_matches re-runs the SAME binding, so a wrong
+                 binding agrees with itself and always passed — a pie of
+                 six states came out as seven equal slices while the check
+                 said its values matched (2026-09-16). chart_audit reads
+                 the finished chart against the table with its own code:
+                 equal slices over a table whose measure column is not
+                 flat, a "Total"/"Distinct States" category drawn beside
+                 the rows it sums, and a plain-python regrouping of the
+                 bound rows. FORMATS: the files on disk must be a subset
+                 of what the job was asked to make — nothing else in the
+                 pipeline looks for a file nobody asked for. A must-item
+                 that stayed UNVERIFIABLE is reported as "not confirmed",
+                 never left to read as a success.
   4. repair      only when a must-item failed, ARTIFACT_SELFCHECK_REPAIR is
                  on and the remaining budget covers a re-render (measured
                  from this job's own render/validate/preview times):
@@ -119,6 +133,12 @@ class ItemResult:
     result: str
     evidence: List[str] = field(default_factory=list)
     by_format: Dict[str, str] = field(default_factory=dict)
+    #: Unverifiable because THIS reader could not open the bytes, not because
+    #: the file is silent about the property. The validate stage already
+    #: reopened every published file with the format's own library, so that is
+    #: a fact about the checker: it is not reported to the person as an
+    #: unconfirmed requirement (see summarize).
+    unreadable: bool = False
 
     def to_dict(self) -> dict:
         return {**self.item.to_dict(), "result": self.result, "evidence": [e[:200] for e in self.evidence[:4]], "by_format": dict(self.by_format)}
@@ -133,10 +153,13 @@ class SelfcheckReport:
     unverifiable: int = 0
     contested: int = 0
     unmet: List[str] = field(default_factory=list)
+    #: Must-items no produced file could speak about. They are NOT successes:
+    #: they ride into `unmet` so the sentence says so (see summarize).
+    unconfirmed: List[str] = field(default_factory=list)
     false_claim_guard: Dict[str, List[str]] = field(default_factory=dict)
     model_calls: int = 0
     seconds: float = 0.0
-    outcome: str = "clean"  # clean | repaired | unmet | contested | error | skipped_budget | skipped_busy
+    outcome: str = "clean"  # clean | repaired | unmet | contested | unconfirmed | error | skipped_budget | skipped_busy
     repair: Dict[str, Any] = field(default_factory=dict)
     checklist: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
@@ -145,6 +168,7 @@ class SelfcheckReport:
         return {
             "items": self.items, "passed": self.passed, "failed": self.failed, "repaired": self.repaired,
             "unverifiable": self.unverifiable, "contested": self.contested, "unmet": list(self.unmet),
+            "unconfirmed": list(self.unconfirmed),
             "false_claim_guard": dict(self.false_claim_guard), "model_calls": self.model_calls,
             "seconds": round(self.seconds, 2), "outcome": self.outcome, "repair": dict(self.repair),
             "checklist": {k: v for k, v in self.checklist.items() if k != "items"}, "notes": list(self.notes)[:10],
@@ -327,6 +351,15 @@ class EvalContext:
     expected_chart_values: Optional[List[dict]] = None
     chart_values_ok: Optional[Tuple[bool, List[str]]] = None
     instruction: str = ""
+    #: The job's material tables, and chart_audit's SECOND reading of the
+    #: charts drawn from them (binding plausibility, summary categories, a
+    #: plain-python regrouping) — never chart_data's own recomputation.
+    tables: Sequence[Any] = ()
+    chart_audit: Optional[Any] = None
+    #: Every format this job may deliver: what it was asked to make plus any
+    #: format word the checklist read out of the request. A file outside it
+    #: is one nobody asked for.
+    allowed_formats: Optional[Set[str]] = None
 
 
 def _section_name_matches(wanted: str, actual: str) -> bool:
@@ -433,7 +466,9 @@ def _eval_layout(item: RQ.ChecklistItem, observations: Sequence[I.Observation]) 
     return res
 
 
-def _eval_format(item: RQ.ChecklistItem, observations: Sequence[I.Observation]) -> ItemResult:
+def _eval_format(item: RQ.ChecklistItem, observations: Sequence[I.Observation], ectx: Optional[EvalContext] = None) -> ItemResult:
+    if item.property == "formats_only":
+        return _eval_formats_only(item, observations, ectx)
     fmt = str(item.expected)
     unreadable = [o for o in observations if o.target == "file" and o.property == "readable" and o.format == fmt]
     present = fmt in _formats_present(observations)
@@ -441,17 +476,66 @@ def _eval_format(item: RQ.ChecklistItem, observations: Sequence[I.Observation]) 
         # The validate stage already reopened every file with the format's
         # own library; a file only THIS reader cannot parse is not evidence
         # that it was not delivered — it is evidence nothing could be checked.
-        return ItemResult(item, "unverifiable", [f"the checker could not open the {fmt} file"], {fmt: "unverifiable"})
+        return ItemResult(item, "unverifiable", [f"the checker could not open the {fmt} file"], {fmt: "unverifiable"}, unreadable=True)
     return ItemResult(item, "pass" if present else "fail", [] if present else [f"no {fmt} file was produced"], {fmt: "pass" if present else "fail"})
+
+
+#: docx "a Word file" … for the sentence that names a file nobody asked for.
+_FORMAT_WORDS = {"docx": "a Word file", "pdf": "a PDF", "xlsx": "an Excel file", "csv": "a CSV",
+                 "pptx": "a PowerPoint file", "png": "a PNG image", "svg": "an SVG image"}
+
+
+def _eval_formats_only(item: RQ.ChecklistItem, observations: Sequence[I.Observation], ectx: Optional[EvalContext]) -> ItemResult:
+    """The bytes on disk against what the job was asked to deliver.
+
+    _validate_files only ever complains that a SELECTED format is missing;
+    nothing in the pipeline looks the other way. Production 2026-09-16 asked
+    for a pie chart and got a Word file and a PDF, and every check passed
+    because each delivered file was itself well formed.
+    """
+    allowed = {str(f) for f in (ectx.allowed_formats if ectx is not None and ectx.allowed_formats is not None else (item.expected or []))}
+    present = _formats_present(observations)
+    if not present or not allowed:
+        return ItemResult(item, "unverifiable", ["no readable file to list the formats of"], {}, unreadable=not present)
+    extra = sorted(set(present) - allowed)
+    if not extra:
+        return ItemResult(item, "pass", [], {f: "pass" for f in present})
+    words = " and ".join(_FORMAT_WORDS.get(f, f"a {f} file") for f in extra)
+    return ItemResult(item, "fail", [f"the version holds {words}, which the request did not ask for"],
+                      {f: ("fail" if f in extra else "pass") for f in present})
 
 
 _CHART_FAMILY = {"histogram": ("histogram", "bar"), "bar": ("bar",), "stacked_bar": ("stacked_bar",), "donut": ("donut",), "pie": ("pie",),
                  "combo": ("bar", "line", "combo")}
 
 
+#: chart-item property -> the chart_audit finding code that fails it. These
+#: three are judged over the SPEC and its tables, never over the drawn file:
+#: a chart image cannot be read back, and the chart's own recomputation
+#: agrees with itself whatever the binding says.
+_AUDIT_PROPERTIES = {"binding_plausible": "binding", "no_summary_category": "summary_category", "values_recomputed": "values"}
+
+
+def _eval_audited(item: RQ.ChecklistItem, ectx: EvalContext) -> ItemResult:
+    audit = ectx.chart_audit
+    code = _AUDIT_PROPERTIES[item.property]
+    if audit is None or not getattr(audit, "charts", 0):
+        return ItemResult(item, "unverifiable", ["no chart bound to a table to check"], {})
+    messages = audit.messages(code)
+    if messages:
+        return ItemResult(item, "fail", list(messages)[:3], {"spec": "fail"})
+    if item.property == "values_recomputed" and audit.recomputed != "match":
+        # No chart's binding was simple enough to regroup by hand. Saying
+        # "pass" here is exactly the false success this check exists to stop.
+        return ItemResult(item, "unverifiable", ["the chart's binding cannot be regrouped by a second reading"], {})
+    return ItemResult(item, "pass", [], {"spec": "pass"})
+
+
 def _eval_chart(item: RQ.ChecklistItem, observations: Sequence[I.Observation], ectx: EvalContext) -> ItemResult:
     res = ItemResult(item, "unverifiable")
     prop = item.property
+    if prop in _AUDIT_PROPERTIES:
+        return _eval_audited(item, ectx)
     if prop == "values_match":
         if ectx.chart_values_ok is not None:
             ok, diffs = ectx.chart_values_ok
@@ -894,7 +978,7 @@ def evaluate(checklist: RQ.Checklist, observations: Sequence[I.Observation], ect
             elif item.category == "layout":
                 r = _eval_layout(item, observations)
             elif item.category == "format":
-                r = _eval_format(item, observations)
+                r = _eval_format(item, observations, ectx)
             elif item.category == "chart":
                 r = _eval_chart(item, observations, ectx)
             elif item.category == "content":
@@ -920,7 +1004,17 @@ def evaluate(checklist: RQ.Checklist, observations: Sequence[I.Observation], ect
             r.evidence.insert(0, f"file shows: {r.result}")
             r.result = "contested"
         results.append(r)
+    if _nothing_readable(observations):
+        # Not one file opened: every silence is the reader's, not the file's.
+        for r in results:
+            if r.result == "unverifiable":
+                r.unreadable = True
     return results
+
+
+def _nothing_readable(observations: Sequence[I.Observation]) -> bool:
+    return (not _formats_present(observations)) and any(
+        o.target == "file" and o.property == "readable" and not o.value for o in observations)
 
 
 def failing_musts(results: Sequence[ItemResult]) -> Set[str]:
@@ -944,6 +1038,23 @@ def accept_repair(before: Sequence[ItemResult], after: Sequence[ItemResult], *, 
     if not (fa < fb):
         return False, "not_improved"
     return True, ""
+
+
+# --------------------------------------------------------- chart audit (2) --
+
+
+def _audit(spec: Any, tables: Sequence[Any]) -> Optional[Any]:
+    """chart_audit.audit_spec, or None when the charts track is absent. A
+    second reading that raised would be worse than one that says nothing."""
+    try:
+        from . import chart_audit  # type: ignore
+
+        return chart_audit.audit_spec(spec, list(tables))
+    except ImportError:
+        return None
+    except Exception:  # noqa: BLE001 — the self-check never fails a job
+        log.warning("selfcheck: the chart audit could not run", exc_info=True)
+        return None
 
 
 # -------------------------------------------------------------- chart values --
@@ -1060,6 +1171,14 @@ def _spec_charts(spec: Any):
 # ----------------------------------------------------------------- repair --
 
 
+#: Chart failures whose fix is MECHANICAL: chart_data.resolve_spec re-binds
+#: and the files are rendered again (0 model calls). A wrong number is never
+#: repaired by a model. `formats_only` is deliberately absent — a repair can
+#: add a format, never withdraw a file that is already on disk, so a version
+#: holding a file nobody asked for is reported in words instead.
+REBINDABLE_CHART_PROPERTIES = frozenset({"values_match", "binding_plausible", "no_summary_category", "values_recomputed"})
+
+
 @dataclass
 class RepairPlan:
     spec: Any = None
@@ -1137,20 +1256,20 @@ async def plan_repair(results: Sequence[ItemResult], spec: Any, *, kind: str, op
             plan.kinds.append("code")
             changed = True
     for r in failed:
-        if r.item.category == "format":
+        if r.item.category == "format" and r.item.property == "format":
             fmt = str(r.item.expected)
             if fmt in T.FORMATS_FOR_KIND.get(kind, ()) and fmt not in formats:
                 plan.formats_added.append(fmt)
                 plan.item_ids.append(r.item.id)
                 plan.kinds.append("code")
                 changed = True
-    if any(r.item.property == "values_match" for r in failed):
+    if any(r.item.property in REBINDABLE_CHART_PROPERTIES for r in failed):
         try:
             from . import chart_data  # type: ignore
 
             fixed, _notes = await asyncio.to_thread(chart_data.resolve_spec, plan.spec, list(tables))
             plan.spec = fixed
-            plan.item_ids.extend(r.item.id for r in failed if r.item.property == "values_match")
+            plan.item_ids.extend(r.item.id for r in failed if r.item.property in REBINDABLE_CHART_PROPERTIES)
             plan.kinds.append("code")
             changed = True
         except ImportError:
@@ -1279,6 +1398,11 @@ def _unmet_line(r: ItemResult) -> str:
     return f"not met: {what}{ev}"[:240]
 
 
+def _unconfirmed_line(r: ItemResult) -> str:
+    ev = f" — {r.evidence[0]}" if r.evidence else ""
+    return f"not confirmed: {RQ.describe(r.item)}{ev}"[:240]
+
+
 def _claim_line(r: ItemResult) -> str:
     """What may be claimed for a met item. A font met by a mapped
     equivalent says which font the file uses, so the answer never claims
@@ -1299,7 +1423,21 @@ def summarize(results: Sequence[ItemResult], *, repaired_ids: Sequence[str] = ()
     report.contested = sum(r.result == "contested" for r in results)
     report.repaired = sum(1 for r in results if r.item.id in set(repaired_ids) and r.result == "pass")
     unmet = [r for r in results if r.result == "fail" and r.item.must] + [r for r in results if r.result == "contested"]
-    report.unmet = [_unmet_line(r) for r in unmet][:3]
+    # HONESTY (2026-09-16). A must-item nothing could check used to leave the
+    # report silent, so the person read a plain "Created X as PDF." for a
+    # requirement no reading had confirmed. It is named now — after the real
+    # failures, never in place of one.
+    #
+    # NOT every unverifiable must: only one whose whole KIND went unread. A
+    # chart drawn into a document is a picture, so its type and its native
+    # numbers cannot be read back from the file, while the audit over those
+    # same charts did check them; calling that unconfirmed would hang a
+    # warning on every charted Word file and teach people to ignore warnings.
+    checked = {r.item.category for r in results if r.item.must and r.result == "pass"}
+    unconfirmed = [r for r in results if r.item.must and not r.item.contested and r.result == "unverifiable"
+                   and not r.unreadable and r.item.category not in checked]
+    report.unconfirmed = [RQ.describe(r.item) for r in unconfirmed]
+    report.unmet = ([_unmet_line(r) for r in unmet] + [_unconfirmed_line(r) for r in unconfirmed])[:3]
     report.false_claim_guard = {
         "claimable": [_claim_line(r) for r in results if r.result == "pass" and r.item.category not in ("security", "house_style")],
         "not_claimable": [RQ.describe(r.item) for r in results if r.result in ("fail", "contested", "unverifiable") and r.item.category not in ("security",)],
@@ -1374,14 +1512,33 @@ async def _run(runner: Any, ctx: Any, stages: Dict[str, dict], progress: Dict[st
         if item.category == "format" and str(item.expected) not in formats:
             item.must = False
             item.note = "not among the formats this job was asked to make"
+    tables = list(material.get("tables") or [])
     # Charts in the spec: the numbers in the file are a must, whatever was asked.
     if any(True for _ in _spec_charts(spec)) and len(checklist.items) < RQ.MAX_ITEMS:
         checklist.items.append(RQ.ChecklistItem(f"c{len(checklist.items) + 1:02d}", "chart", "chart", "values_match", True, must=True, phrase="chart values from the data"))
+    # The SECOND reading (chart_audit): gated on what it can actually speak
+    # about for THIS spec, so a must-item is never added that is bound to
+    # come back unverifiable and warn the person about nothing.
+    first_audit = await asyncio.to_thread(_audit, spec, tables)
+    for prop, phrase, gate in (
+        ("binding_plausible", "a chart whose slices follow the table", getattr(first_audit, "has_part_of_whole", False)),
+        ("no_summary_category", "no totals slice in the chart", getattr(first_audit, "has_summary_sensitive", False)),
+        ("values_recomputed", "chart values regrouped from the table", getattr(first_audit, "recomputed", "unverifiable") != "unverifiable"),
+    ):
+        if gate and len(checklist.items) < RQ.MAX_ITEMS:
+            checklist.items.append(RQ.ChecklistItem(f"c{len(checklist.items) + 1:02d}", "chart", "chart", prop, True, must=True, phrase=phrase))
+    # Formats: `formats` is what this job was asked to make; a format word the
+    # checklist read out of the request counts as asked for too, even when the
+    # engine did not select it.
+    allowed_formats = set(formats) | {str(i.expected) for i in checklist.items if i.category == "format" and i.property == "format"}
+    if allowed_formats and len(checklist.items) < RQ.MAX_ITEMS:
+        checklist.items.append(RQ.ChecklistItem(f"c{len(checklist.items) + 1:02d}", "format", "file", "formats_only", sorted(allowed_formats),
+                                                must=True, phrase="only the files that were asked for"))
     model_calls = checklist.model_calls
 
-    tables = list(material.get("tables") or [])
     ectx = EvalContext(spec=spec, source_structure=checklist.source_structure, parent_spec=ctx.parent_spec, touched=_touched(job),
-                       instruction=str(job.get("instruction") or ""))
+                       instruction=str(job.get("instruction") or ""), tables=tables, chart_audit=first_audit,
+                       allowed_formats=set(allowed_formats))
     if operation == "edit" and ctx.parent_spec is not None:
         parent_n = await asyncio.to_thread(_parent_version_number, job)
         if parent_n:
@@ -1394,6 +1551,7 @@ async def _run(runner: Any, ctx: Any, stages: Dict[str, dict], progress: Dict[st
         observations = await asyncio.wait_for(asyncio.to_thread(_inspect_for_preservation, the_paths, the_spec), timeout=max(1.0, remaining()))
         ectx.spec = the_spec
         ectx.chart_values_ok = await asyncio.to_thread(chart_values_check, the_spec, observations, tables)
+        ectx.chart_audit = await asyncio.to_thread(_audit, the_spec, tables)
         # Items x observations (a 60-page PDF reads thousands), and a font
         # item may ask fc-match once per family: off the event loop.
         return await asyncio.to_thread(evaluate, checklist, observations, ectx)
@@ -1433,6 +1591,9 @@ async def _run(runner: Any, ctx: Any, stages: Dict[str, dict], progress: Dict[st
 
                 if plan.formats_added:
                     job["selected_formats"] = original_formats + [f for f in plan.formats_added if f not in original_formats]
+                    # A format the repair adds was asked for: it must not then
+                    # read as a file nobody wanted and reject its own repair.
+                    ectx.allowed_formats = set(allowed_formats) | set(plan.formats_added)
                 P._publish(runner.job_id, {"stage": CHECK_STAGE, "status": "running", "percent": None, "detail": "fixing what the check found", "elapsed_s": 0})
                 try:
                     accepted = await P._try_revision(runner, ctx, stages, plan.spec, "self-check repair", accept=judge)
@@ -1441,6 +1602,7 @@ async def _run(runner: Any, ctx: Any, stages: Dict[str, dict], progress: Dict[st
                     restore_failure = str(exc)
                 if not accepted:
                     job["selected_formats"] = original_formats
+                    ectx.allowed_formats = set(allowed_formats)
                     reason = decision.get("reason") or "render_failed"
                     metrics.inc("artifact_selfcheck_repair_rejected_total", "self-check repairs rejected", reason=reason)
                     report.repair = {"attempted": True, "accepted": False, "reason": reason, "kinds": plan.kinds, "notes": plan.notes}
@@ -1460,6 +1622,9 @@ async def _run(runner: Any, ctx: Any, stages: Dict[str, dict], progress: Dict[st
             report.outcome = "unmet"
         elif report.contested:
             report.outcome = "contested"
+        elif report.unconfirmed:
+            # Not "clean": nothing failed, but a must-item went unchecked.
+            report.outcome = "unconfirmed"
         elif checklist.model_skipped == "busy":
             report.outcome = "skipped_busy"
         else:
