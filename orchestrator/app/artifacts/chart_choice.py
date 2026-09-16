@@ -114,22 +114,63 @@ _CW = r"(?:\s+(?:chart|graph|plot))?"
 #: A chart word INSIDE the matched text. Measured 2026-09-16 on the merged
 #: tree: with first-pattern-wins, named_type("show our sales funnel as a bar
 #: chart") returned "funnel" and CC.choose drew a funnel with NO note — the
-#: person typed "bar chart". Scoring on this flag first, then on match
-#: length, puts the qualified phrase ahead of the bare subject noun.
-#: Substrings, not whole words: "waterfall" carries "fall", "heat map"
-#: carries "map".
-_QUALIFIED_RE = re.compile(r"chart|graph|plot|map|fall|stacked|horizontal", re.I)
+#: person typed "bar chart". Substrings, not whole words: "waterfall"
+#: carries "fall", "heat map" carries "map", "box and whisker" carries
+#: "whisker".
+_QUALIFIED_RE = re.compile(r"chart|graph|plot|map|fall|stacked|horizontal|whisker", re.I)
+
+#: "Draw it AS this type." These lead-ins introduce the type the person is
+#: ASKING for and nothing else, so a noun one of them introduces beats every
+#: bare noun in the same sentence.
+#:
+#: WHY A SECOND SIGNAL. The chart word above closed the hole only for the
+#: type nouns that carry one of its substrings — heat map, waterfall,
+#: stacked bar, horizontal bar, and any noun written with "chart"/"graph"/
+#: "plot". It left it open for every noun that does not, and measured
+#: 2026-09-16 on the first fix round named_type("show our sales funnel as a
+#: pie") still returned "funnel" (and the same for donut and gantt: the
+#: subject noun is simply the longer string). A lead-in is what makes the
+#: rule UNIFORM — it reads the same for pie, donut, gantt, box, radar and
+#: every other name, because it looks at the words in front of the noun
+#: instead of the letters inside it.
+_CONVERT_LEAD = (
+    r"(?:\bas|\bto|\binto|\blike|\bmake\s+(?:it|them|this|that)|"
+    r"\bturn\s+(?:it|them|this|that)\s+into|\bredraw\s+(?:it|them|this|that)\s+as|"
+    r"\bswitch\s+to|\bchange\s+to|\bconvert\s+to)"
+)
+
+#: A request verb handing the noun its own article: "draw a pie", "show me a
+#: gantt". Weaker than a conversion lead-in — "show the funnel" can still be
+#: the subject of the sentence — but stronger than a noun sitting inside a
+#: compound ("our sales funnel", "the housing bubble", "a text box").
+_ASK_LEAD = (
+    r"(?:\bdraw|\bshow(?:\s+me)?|\brender|\bplot|\bgive\s+me|\bcreate|\bgenerate|"
+    r"\bbuild|\bmake|\buse|\bwant|\bneed|\bprefer|\badd|\bvisuali[sz]e)"
+)
+
+#: The lead-in sitting immediately before the noun ("... as a |pie").
+_CONVERT_BEFORE_RE = re.compile(_CONVERT_LEAD + r"\s+(?:an?\s+|the\s+)?$", re.I)
+#: The lead-in the follow-up rows below already carry inside their own match
+#: ("|as a bar|").
+_CONVERT_INSIDE_RE = re.compile(r"\s*" + _CONVERT_LEAD + r"\b", re.I)
+_ASK_BEFORE_RE = re.compile(_ASK_LEAD + r"\s+(?:an?\s+|the\s+)?$", re.I)
+
+#: Type nouns that are also ordinary English: "a text box", "on our radar",
+#: "the housing bubble". They are matched BARE like every other name and
+#: then kept only when the sentence names them as a type — their own chart
+#: word, or a CONVERSION lead-in ("as a box", "make it a bubble") — the
+#: weaker "add a box" is not enough, because that is as likely to be a box
+#: round a title. Demanding the chart word outright (the first fix round)
+#: threw away the legitimate follow-up "as a box by team", which names a
+#: type and carries no chart word at all.
+_NEEDS_NAMING = frozenset({"box", "radar", "bubble"})
 
 #: The chart words a person writes. Order is now only a tie-break (see
 #: `named_type`): the BEST match wins, so "stacked bar" beats "bar" on
-#: length and "bar chart" beats a bare "funnel" on the chart word.
+#: length and "as a pie" beats a bare "funnel" on the lead-in.
 #: This is the ARTIFACT side of core.chart_decision._TYPE_PHRASES (which
 #: answers a different question — whether a chat answer should carry a chart
 #: at all) and covers the tier-2 types that one does not name.
-#:
-#: box / radar / bubble are ordinary English nouns ("a text box", "on our
-#: radar", "the housing bubble"), so each one REQUIRES its chart word; the
-#: rest are chart-only nouns and take the suffix optionally.
 _NAMED_PHRASES: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(?:100%?\s*stacked|percent(?:age)?\s+stacked)\s+(?:bar|column)s?\b", re.I), "percent_stacked_bar"),
     (re.compile(r"\bstacked\s+(?:horizontal\s+)?(?:area|areas)\b", re.I), "stacked_area"),
@@ -141,9 +182,11 @@ _NAMED_PHRASES: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\bwater\s*fall\b" + _CW, re.I), "waterfall"),
     (re.compile(r"\bfunnel\b" + _CW, re.I), "funnel"),
     (re.compile(r"\bgantt\b" + _CW, re.I), "gantt"),
-    (re.compile(r"\b(?:radar|spider)\s+(?:chart|graph|plot)\b", re.I), "radar"),
-    (re.compile(r"\bbubble\s+(?:chart|graph|plot)\b", re.I), "bubble"),
-    (re.compile(r"\bbox\s+(?:plot|chart|graph)\b|\bbox\s+and\s+whiskers?\b|\bwhisker\b", re.I), "box"),
+    # box / radar / bubble are matched bare and gated by _NEEDS_NAMING.
+    (re.compile(r"\b(?:radar|spider)\b" + _CW, re.I), "radar"),
+    (re.compile(r"\bbubbles?\b" + _CW, re.I), "bubble"),
+    (re.compile(r"\bbox\s+and\s+whiskers?(?:\s+(?:plot|chart|graph))?\b|"
+                r"\bbox\b(?:\s+(?:plot|chart|graph))?|\bwhiskers?\b", re.I), "box"),
     (re.compile(r"\bhistogram\b" + _CW, re.I), "histogram"),
     (re.compile(r"\bdistribution\s+(?:chart|graph|plot)\b", re.I), "histogram"),
     (re.compile(r"\bscatter(?:\s*(?:plot|chart|graph))?\b", re.I), "scatter"),
@@ -154,14 +197,34 @@ _NAMED_PHRASES: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\btrend\s+over\s+time\b", re.I), "line"),
     (re.compile(r"\b(?:bar|column)\s+(?:chart|graph|plot)\b", re.I), "bar"),
     (re.compile(r"\bbar\s*graph\b", re.I), "bar"),
-    # Follow-up phrasings. They carry no chart word, so the scoring already
-    # ranks them under any named type in the same sentence.
+    # Follow-up phrasings. They carry no chart word, so the lead-in they
+    # begin with is the whole of their claim to be a named type.
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?areas?\b", re.I), "area"),
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?lines?\b", re.I), "line"),
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?bars?\b", re.I), "bar"),
     (re.compile(r"\bmake\s+(?:it|them|that)\s+(?:an?\s+)?lines?\b", re.I), "line"),
     (re.compile(r"\bmake\s+(?:it|them|that)\s+(?:an?\s+)?bars?\b", re.I), "bar"),
 )
+
+
+def _naming_rank(text: str, m: "re.Match") -> int:
+    """How hard the sentence says this noun is the TYPE being asked for.
+
+    2 — a conversion lead-in ("as a pie", "make it a donut", "switch to a
+        gantt"): the words allow no other reading.
+    1 — the match carries a chart word of its own ("pie chart", "heat map",
+        "stacked bar"), or a request verb handed it an article ("draw a
+        pie").
+    0 — a bare noun in the middle of a phrase, which is what a SUBJECT reads
+        like: "our sales funnel", "the housing bubble", "a text box".
+    """
+    hit = m.group(0)
+    before = text[:m.start()]
+    if _CONVERT_INSIDE_RE.match(hit) or _CONVERT_BEFORE_RE.search(before):
+        return 2
+    if _QUALIFIED_RE.search(hit) or _ASK_BEFORE_RE.search(before):
+        return 1
+    return 0
 
 
 def named_type(text: str) -> Optional[str]:
@@ -180,19 +243,25 @@ def named_type(text: str) -> Optional[str]:
         text = _strip_false_positives(text)
     except Exception:  # noqa: BLE001 — the chat module is optional in this build
         pass
-    # BEST match wins, not the first one. Ranked on (a chart word inside the
-    # matched text, then the length of the match, then the table order), so
-    # "bar chart" outranks the "funnel" that names the subject, and "stacked
-    # bar" still outranks the "bar chart" inside it.
+    # BEST match wins, not the first one. Ranked on (how the sentence names
+    # the noun, then the length of the match, then the table order), so "as a
+    # pie" outranks the "funnel" that names the subject, and "stacked bar"
+    # still outranks the "bar chart" inside it. Every occurrence of a noun is
+    # scored, because the subject and the named type can be the same word
+    # ("our sales funnel — redraw it as a funnel chart").
     best: Optional[Tuple[Tuple[int, int, int], str]] = None
     for index, (pattern, ctype) in enumerate(_NAMED_PHRASES):
-        m = pattern.search(text)
-        if m is None:
-            continue
-        hit = m.group(0)
-        key = (1 if _QUALIFIED_RE.search(hit) else 0, len(hit), -index)
-        if best is None or key > best[0]:
-            best = (key, ctype)
+        for m in pattern.finditer(text):
+            rank = _naming_rank(text, m)
+            if ctype in _NEEDS_NAMING and rank < 2 and not _QUALIFIED_RE.search(m.group(0)):
+                # An ordinary English noun is a type only when the sentence
+                # can mean nothing else: "as a box", "box plot", "box and
+                # whisker" — never "a text box" and never the weaker
+                # "add a box", which is as likely to be a box round a title.
+                continue
+            key = (rank, len(m.group(0)), -index)
+            if best is None or key > best[0]:
+                best = (key, ctype)
     return best[1] if best else None
 
 
@@ -626,6 +695,31 @@ def about_charts(instruction: str) -> bool:
         return True
 
 
+def _keep_the_chart(chart: CS.Chart, sh: Shape, best: Choice, trend: bool) -> Optional[Choice]:
+    """The one thing the chooser is never silent about: a type this shape
+    cannot carry AT ALL.
+
+    None here means "no opinion about the type" — leave `chart.type` exactly
+    as it is. It must not also mean "draw whatever is there", because a type
+    can_draw refuses does not compute: chart_data.resolve_chart returns no
+    chart and resolve_spec swaps the block for a callout, a slide chart for a
+    bullet, and drops a sheet chart. Measured 2026-09-16 on the merged tree:
+    a bubble chart of Height/Weight with no size column sat inside
+    _family("scatter"), so choose() returned None, repair_binding changed
+    nothing and resolve_chart answered "A bubble chart needs a size column."
+    — the person asked for a report and got a sentence where the picture was.
+    """
+    why_not = can_draw(chart.type, sh)
+    if not why_not:
+        return None
+    return Choice(
+        best.type,
+        best.reason,
+        note=f"{_article(chart.type)} {why_not}, so the data is drawn as {_article(best.type)}: {best.reason}",
+        trendline=trend and best.type == "scatter",
+    )
+
+
 def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
            keep_accepted_type: bool = False) -> Optional[Choice]:
     """The type this chart should be drawn as, or None to leave it alone.
@@ -634,6 +728,10 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
     the shape carries it, and when it does not the returned note names both
     types and the reason. With no type named, `recommend` decides and the
     model's pick survives only inside the recommended family.
+
+    None is "no opinion about the type", NOT "do not draw": whatever else is
+    decided here, a type the shape cannot carry is still replaced, because
+    the alternative is no chart at all (see `_keep_the_chart`).
 
     `keep_accepted_type` is True when the chart already exists in a version
     the person has seen (an EDIT). Measured 2026-09-16: "make the title
@@ -644,8 +742,6 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
     """
     sh = shape_of(chart, table)
     if sh is None:
-        return None
-    if keep_accepted_type and not about_charts(instruction):
         return None
     want = named_type(instruction)
     best = recommend(sh)
@@ -660,6 +756,11 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
     # is drawn on any scatter whose straight line says something.
     trend = abs(sh.trend_r) >= TREND_MIN_R
 
+    if keep_accepted_type and not about_charts(instruction):
+        # An edit that is not about charts has no opinion about the type —
+        # and still may not leave behind a chart that will not draw.
+        return _keep_the_chart(chart, sh, best, trend)
+
     if want:
         why_not = can_draw(want, sh)
         if not why_not:
@@ -667,7 +768,7 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
             return Choice(want, f"you asked for {_article(want)}", trendline=trend and want == "scatter")
         fallback = best
         if fallback.type == want:
-            return None
+            return _keep_the_chart(chart, sh, best, trend)
         # A note explains a SUBSTITUTION. When the chart is already the
         # fallback type nothing is being substituted, and "so it is drawn as
         # a line" would claim a change that did not happen — measured
@@ -680,8 +781,15 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
         return Choice(fallback.type, fallback.reason, note=note, trendline=trend and fallback.type == "scatter")
 
     if chart.type in _family(best.type):
-        # The model's layout preference inside the right reading of the data.
-        return Choice(chart.type, best.reason, trendline=trend and chart.type == "scatter") if trend and chart.type == "scatter" else None
+        # The model's layout preference inside the right reading of the data
+        # — unless that preference is a type the shape cannot carry (a bubble
+        # with no size column sits in scatter's own family).
+        net = _keep_the_chart(chart, sh, best, trend)
+        if net is not None:
+            return net
+        if trend and chart.type == "scatter":
+            return Choice(chart.type, best.reason, trendline=True)
+        return None
     why_not = can_draw(chart.type, sh)
     detail = f"{_article(chart.type)} {why_not}, so " if why_not else "no chart type was asked for, so "
     return Choice(

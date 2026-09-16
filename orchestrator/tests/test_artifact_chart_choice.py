@@ -437,3 +437,150 @@ def test_an_x_column_the_table_does_not_have_is_not_a_reason_to_retype():
     # resolve_chart still writes the one true sentence about it.
     resolved, _, msg = CD.resolve_chart(kept, [STATES])
     assert resolved is None and "Zzzqqq" in msg
+
+
+# ------------------ the NAMED type beats a subject noun, for every name --
+
+#: One sentence per type name in _NAMED_PHRASES. Each one mentions a chart
+#: noun as the SUBJECT and names a different type as the thing to draw, so
+#: the only way to pass is to read how the sentence names the noun instead of
+#: how many letters it has. The first fix round scored on a chart word inside
+#: the match, which the subject "funnel" beats on length whenever the named
+#: type carries no such word: "as a pie" returned "funnel", and so did "as a
+#: donut" and "as a gantt".
+NAMED_OVER_SUBJECT = [
+    ("show our sales funnel as a pie", "pie"),
+    ("show our sales funnel as a donut", "donut"),
+    ("show our sales funnel as a bar", "bar"),
+    ("show our sales funnel as a horizontal bar", "horizontal_bar"),
+    ("show our sales funnel as a stacked bar", "stacked_bar"),
+    ("show our sales funnel as a stacked horizontal bar", "stacked_horizontal_bar"),
+    ("show our sales funnel as a 100% stacked bar", "percent_stacked_bar"),
+    ("show our sales funnel as a stacked area", "stacked_area"),
+    ("show our sales funnel as a line", "line"),
+    ("show our sales funnel as an area", "area"),
+    ("show our sales funnel as a scatter", "scatter"),
+    ("show our sales funnel as a bubble", "bubble"),
+    ("show our sales funnel as a box", "box"),
+    ("show our sales funnel as a radar", "radar"),
+    ("show our sales funnel as a heat map", "heatmap"),
+    ("show our sales funnel as a waterfall", "waterfall"),
+    ("show our sales funnel as a gantt", "gantt"),
+    ("show our sales funnel as a histogram", "histogram"),
+    ("show our sales funnel as a combo chart", "combo"),
+    # "funnel" is the named type here, so the subject has to be another noun.
+    ("show our donut range as a funnel", "funnel"),
+]
+
+
+@pytest.mark.parametrize("text, expected", NAMED_OVER_SUBJECT)
+def test_the_named_type_wins_over_a_subject_noun_for_every_type_name(text, expected):
+    assert CC.named_type(text) == expected
+
+
+def test_every_type_name_in_the_table_has_such_a_case():
+    # The rule is only uniform if nothing is missing from the list above.
+    assert {t for _, t in NAMED_OVER_SUBJECT} == {t for _, t in CC._NAMED_PHRASES}
+
+
+@pytest.mark.parametrize("text, expected", [
+    # A request verb with its own article names a type too, even in the same
+    # sentence as a longer subject noun.
+    ("draw a pie of our sales funnel", "pie"),
+    ("give me a donut of the conversion funnel", "donut"),
+    # The subject and the named type can be the SAME word: every occurrence
+    # is scored, not just the first.
+    ("our sales funnel — redraw it as a funnel chart", "funnel"),
+])
+def test_a_request_verb_with_an_article_also_names_the_type(text, expected):
+    assert CC.named_type(text) == expected
+
+
+# --------------- box / radar / bubble answer a bare follow-up again --
+
+@pytest.mark.parametrize("text, expected", [
+    ("as a box by team", "box"),
+    ("as a box plot by team", "box"),
+    ("make it a bubble", "bubble"),
+    ("turn it into a radar", "radar"),
+    ("switch to a box", "box"),
+    ("box and whisker plot", "box"),
+    ("box plot", "box"),
+    ("bubble chart of spend and revenue", "bubble"),
+    ("radar chart of the scores", "radar"),
+])
+def test_box_radar_and_bubble_are_named_without_their_chart_word(text, expected):
+    assert CC.named_type(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    # ...and the ordinary English readings still name no type at all.
+    "put the summary in a text box",
+    "on our radar",
+    "housing bubble",
+    "the deal is still on our radar for next quarter",
+    "tick the box for each region",
+    "the housing bubble burst in 2008",
+])
+def test_the_ordinary_english_readings_of_those_nouns_still_name_no_type(text):
+    assert CC.named_type(text) is None
+
+
+def test_as_a_box_by_team_retypes_the_chart_end_to_end():
+    # recommend() would draw a pie of the three team totals; the person asked
+    # for a box, and the shape carries one (20 rows per team).
+    sh = shape(SALARY_BY_TEAM, x="Team", y=["Salary"])
+    assert CC.recommend(sh).type == "pie" and CC.can_draw("box", sh) == ""
+    c = chart(type="pie", data=dict(table_id="upload6", x="Team", y=["Salary"]))
+    got = CC.choose(c, SALARY_BY_TEAM, "as a box by team")
+    assert got is not None and got.type == "box" and got.note == ""
+
+
+# ------ "no opinion about the type" is not "draw a chart that cannot be" --
+
+#: A bubble sits inside scatter's own family, so the unnamed path used to
+#: hand back None for it — and a bubble with no size column does not compute:
+#: resolve_chart answers "A bubble chart needs a size column." and resolve_spec
+#: replaces the picture with that sentence.
+def test_a_type_the_shape_cannot_carry_is_replaced_even_inside_the_right_family():
+    c = chart(type="bubble", data=dict(table_id="upload3", x="Height", y=["Weight"]))
+    sh = shape(HEIGHT_WEIGHT, x="Height", y=["Weight"])
+    assert CC.recommend(sh).type == "scatter" and "bubble" in CC._family("scatter")
+    assert CC.can_draw("bubble", sh) == "needs a third measure for the size of each point"
+
+    got = CC.choose(c, HEIGHT_WEIGHT, "put a chart in the report")
+    assert got is not None and got.type == "scatter"
+    assert "a bubble" in got.note and "a scatter" in got.note
+
+    fixed, notes = CD.repair_binding(c, [HEIGHT_WEIGHT], "put a chart in the report")
+    assert fixed.type == "scatter", notes
+    resolved, _, msg = CD.resolve_chart(fixed, [HEIGHT_WEIGHT])
+    assert resolved is not None and resolved.type == "scatter", msg
+
+
+def test_an_edit_that_is_not_about_charts_still_never_leaves_an_undrawable_chart():
+    # "make the title bigger" has no opinion about the type — but silence
+    # here costs the person the whole chart, not just the type they had.
+    c = chart(type="bubble", data=dict(table_id="upload3", x="Height", y=["Weight"]))
+    got = CC.choose(c, HEIGHT_WEIGHT, "make the title bigger", keep_accepted_type=True)
+    assert got is not None and got.type == "scatter" and "a bubble" in got.note
+
+    fixed, notes = CD.repair_binding(c, [HEIGHT_WEIGHT], "make the title bigger", keep_accepted_type=True)
+    assert fixed.type == "scatter", notes
+    resolved, _, msg = CD.resolve_chart(fixed, [HEIGHT_WEIGHT])
+    assert resolved is not None and resolved.type == "scatter", msg
+
+    # A chart the shape DOES carry is still left exactly as it is.
+    line = chart(type="line", data=dict(table_id="upload1", x="Date", y=["Amount"]))
+    assert CC.choose(line, MONTHLY, "make the title bigger", keep_accepted_type=True) is None
+
+
+@pytest.mark.parametrize("text", [
+    # A weak lead-in is not enough for those three nouns: an instruction can
+    # perfectly well be asking for a box round something.
+    "add a box around the summary",
+    "draw a box on the title slide",
+    "use a bubble for the callout",
+])
+def test_a_weak_lead_in_does_not_turn_an_english_noun_into_a_type(text):
+    assert CC.named_type(text) is None
