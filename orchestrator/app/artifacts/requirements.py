@@ -208,9 +208,18 @@ _CHART_TYPES: List[Tuple[str, str]] = [
     (r"\bradar", "radar"),
     (r"\bbubble", "bubble"),
     (r"\bdual\s*axis|\bcombo", "combo"),
-    (r"\bpareto", "pareto"),
-    (r"\btree\s*map", "treemap"),
-    (r"\bviolin", "violin"),
+    # The three tier-2 names that are also ordinary words. Measured
+    # 2026-09-16, the bare forms made "explain the Pareto principle in a one
+    # page doc", "write about pareto optimal allocations", "a slide about
+    # the violin in classical music" and "the treemap data structure
+    # explained" all demand a chart. "a pareto of the defect causes" is a
+    # real chart ask with no chart word in it, so pareto and treemap keep
+    # the bare form minus the senses that are never a chart; "violin" on its
+    # own is the instrument far more often than the plot, so it asks for a
+    # chart word the way "bullet" and "candle" below do.
+    (r"\bpareto\b(?!\s*(?:principle|optimal|optimality|efficien|frontier|distribution|law|rule|improvement))", "pareto"),
+    (r"\btree\s*map\b(?!.*\b(?:data\s*structure|hash\s*map|red[-\s]black|interface|class)\b)", "treemap"),
+    (r"\bviolin\s*(plot|chart|graph)|\bviolin\b(?=.*\b(?:chart|graph|plot)\b)", "violin"),
     # "candle" alone is a wax object; the chart always says candlestick, OHLC
     # or "candle chart".
     (r"\bcandlestick|\bohlc\b|\bcandle\s*(chart|graph|plot)", "candlestick"),

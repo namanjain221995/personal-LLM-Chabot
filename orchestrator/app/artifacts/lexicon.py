@@ -295,6 +295,14 @@ _CHART_RE = re.compile(_w(
     r"(?:bar|line|pie|donut|doughnut|area|scatter|bubble|column|stacked(?:\s+bar)?|combo|radar|funnel|waterfall|gantt(?:-style)?|box|"
     r"histogram|heat\s*map)\s+(?:chart|graph|plot)s?|charts?|graphs?|plots?|histograms?|heat\s*maps?|scatter\s*plots?|"
     r"box\s*plots?|gantt(?:-style)?\s+timeline|plot|"
+    # The tier-2 names of 2026-09-16, as nouns: without them the intent
+    # gate answered "visualise this table as a treemap" and "show this as a
+    # sunburst" with chart_request=False, and formats.decide — which takes
+    # the gate's verdict over its own regex — sent them to Word and PDF.
+    # Only the unambiguous nouns are here; "pareto chart", "violin plot"
+    # and "bullet chart" already match through charts?|graphs?|plots?,
+    # while their bare forms are ordinary words.
+    r"tree\s*maps?|sunbursts?|candlesticks?|ohlc|"
     # AS3 integration (live 2026-09-15): a chart type named as a noun, "scatter of Salary vs Experience".
     r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)"
 ))
@@ -305,7 +313,11 @@ _CHART_RE = re.compile(_w(
 #: event loop, and both would otherwise drift apart.
 CHART_TYPE_WORDS = (
     r"horizontal\s+bar|percent\s+stacked(?:\s+bar)?|stacked(?:\s+bar)?|bar|column|line|area|pie|donut|doughnut|"
-    r"scatter|bubble|histogram|combo|dual[\s-]axis|box(?:\s*plot)?|heat\s*map|waterfall|funnel|gantt|radar|spider"
+    r"scatter|bubble|histogram|combo|dual[\s-]axis|box(?:\s*plot)?|heat\s*map|waterfall|funnel|gantt|radar|spider|"
+    # Every reader of this vocabulary requires a "chart|graph|plot" after
+    # it, so the ordinary-word names are safe here: "make it a pareto chart
+    # instead" has to reach the set_chart edit the same way "bar chart" does.
+    r"tree\s*map|sunburst|candlestick|ohlc|pareto|violin|bullet"
 )
 
 _REQUEST_VERB_RE = re.compile(_w(

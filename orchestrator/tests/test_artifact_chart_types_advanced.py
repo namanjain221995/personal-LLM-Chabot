@@ -19,11 +19,19 @@ from app.artifacts import chart_spec as CS
 
 pytest.importorskip("matplotlib")
 
-PREVIEW = Path(os.environ.get(
-    "CHART_PREVIEW_DIR",
-    "/tmp/claude-1000/-home-techsphere-Documents-project-personal-LLM-Chabot/"
-    "c633fe6d-2f75-46c5-90e6-6fe41b6142e1/scratchpad/charts-preview",
-))
+#: Where the preview PNGs go. The default used to be one session's
+#: scratchpad path, so every run of the suite wrote outside the repo into a
+#: directory that exists on one machine; unset, the pictures now go to the
+#: pytest temp directory the fixture below hands out.
+PREVIEW = Path(os.environ["CHART_PREVIEW_DIR"]) if os.environ.get("CHART_PREVIEW_DIR") else None
+
+
+@pytest.fixture(autouse=True)
+def _preview_dir(tmp_path_factory):
+    global PREVIEW
+    if PREVIEW is None:
+        PREVIEW = tmp_path_factory.mktemp("charts-preview")
+    return PREVIEW
 
 
 def table(tid, columns, rows, title=""):
@@ -385,3 +393,256 @@ def test_the_new_types_keep_the_rules_the_old_ones_have():
     from app.artifacts import derived
 
     assert "violin" in derived._NON_AGG_TYPES and "candlestick" not in derived._NON_AGG_TYPES
+
+
+# ------------------------------------------- the verifier's findings, 09-16 --
+
+
+def test_every_cap_that_fills_categories_fits_the_field_it_feeds():
+    """MAX_CANDLES shipped at 300 against a `categories` field capped at
+    types.MAX_CHART_POINTS = 200, so a candlestick over 200 periods raised
+    an UNCAUGHT pydantic ValidationError out of resolve_chart. Every cap
+    that becomes one category must fit the field."""
+    from app.artifacts import types as T
+
+    for name in ("MAX_CATEGORIES", "MAX_CANDLES", "MAX_BULLETS", "MAX_GANTT_ROWS", "MAX_BOXES",
+                 "HEATMAP_MAX", "TREEMAP_MAX", "PARETO_MAX", "MAX_VIOLINS", "SUNBURST_MAX_INNER"):
+        assert getattr(CD, name) <= T.MAX_CHART_POINTS, name
+
+
+def test_a_year_of_daily_prices_draws_instead_of_raising():
+    """400 periods: the last MAX_CANDLES are shown and the chart validates.
+    Before the cap came down this raised
+    `ValidationError: ... categories / List should have at most 200 items
+    after validation, not 300`."""
+    rows = [[f"P{i:04d}", 100 + i * 0.1, 100 + i * 0.1 + 2, 100 + i * 0.1 - 2, 100 + i * 0.1 + 1] for i in range(400)]
+    t = table("upload_p", ["Period", "Open", "High", "Low", "Close"], rows)
+    c, notes = ok("candlestick", dict(table_id="upload_p", x="Period", y=["Open", "High", "Low", "Close"]), [t])
+    assert len(c.categories) == CD.MAX_CANDLES == 200
+    assert c.categories[-1] == "P0399"
+    assert any("too many to draw" in n for n in notes), notes
+
+
+def test_a_target_stated_on_every_row_is_not_summed():
+    """Two Revenue rows, 120 and 150, each stating Target 300 with bands
+    150/240/330. The measure adds up (270); the goal is a property of the
+    label, so it stays 300 and the bands stay 150/240/330. Summing them gave
+    target 600 and "270 · 45% of target" on the picture."""
+    t = table("upload_b", ["Metric", "Actual", "Target", "Poor", "Fair", "Good"], [
+        ["Revenue", 120, 300, 150, 240, 330],
+        ["Revenue", 150, 300, 150, 240, 330],
+    ])
+    c, notes = ok("bullet", dict(table_id="upload_b", x="Metric", y=["Actual", "Poor", "Fair", "Good"],
+                                 target="Target", agg="sum"), [t])
+    b = c.extra.bullets[0]
+    assert (b.actual, b.target) == (270.0, 300.0)
+    assert b.bands == [150.0, 240.0, 330.0]
+    assert not any("state more than one" in n for n in notes), notes
+
+
+def test_rows_that_disagree_on_the_target_are_named_not_averaged():
+    t = table("upload_b", ["Metric", "Actual", "Target"], [
+        ["Revenue", 120, 300],
+        ["Revenue", 150, 400],
+    ])
+    c, notes = ok("bullet", dict(table_id="upload_b", x="Metric", y=["Actual"], target="Target", agg="sum"), [t])
+    b = c.extra.bullets[0]
+    assert (b.actual, b.target) == (270.0, 400.0)
+    assert any("state more than one Target" in n for n in notes), notes
+
+
+def test_an_average_bullet_still_averages_the_measure_only():
+    t = table("upload_b", ["Metric", "Actual", "Target"], [
+        ["Revenue", 100, 300],
+        ["Revenue", 200, 300],
+    ])
+    c, _ = ok("bullet", dict(table_id="upload_b", x="Metric", y=["Actual"], target="Target", agg="avg"), [t])
+    assert (c.extra.bullets[0].actual, c.extra.bullets[0].target) == (150.0, 300.0)
+
+
+def test_an_all_negative_bullet_keeps_its_bars_inside_the_axes():
+    """Loss -30 against -100 and Drift -5 against -50. The span used to
+    collapse to 0.0 -> 1.0 and set xlim(0, 1.32), which drew every bar
+    outside the axes: a blank grid with a floating annotation."""
+    from app.artifacts.render import charts
+
+    t = table("upload_neg", ["Measure", "Actual", "Target"], [["Loss", -30, -100], ["Drift", -5, -50]])
+    c, _ = ok("bullet", dict(table_id="upload_neg", x="Measure", y=["Actual"], target="Target"), [t])
+    assert charts.render_png is not None
+    seen = []
+    import matplotlib.axes
+
+    original = matplotlib.axes.Axes.set_xlim
+
+    def spy(self, *a, **kw):
+        out = original(self, *a, **kw)
+        seen.append(self.get_xlim())
+        return out
+
+    matplotlib.axes.Axes.set_xlim = spy
+    try:
+        draw(c, "bullet-negative")
+    finally:
+        matplotlib.axes.Axes.set_xlim = original
+    lo, hi = seen[-1]
+    assert lo <= -100.0, seen
+    assert hi > 0.0, seen
+
+
+def test_a_violin_of_thin_groups_says_why_not_that_there_are_no_numbers():
+    t = table("t", ["Team", "Salary"], [["Alpha", 1], ["Alpha", 2], ["Bravo", 3]])
+    msg = refused("violin", dict(table_id="t", x="Team", y=["Salary"]), [t])
+    assert str(CD.MIN_VIOLIN_POINTS) in msg and "no numbers" not in msg, msg
+
+
+def test_the_sample_note_does_not_claim_a_count_the_spec_does_not_hold():
+    """A stride sample of 3,334 values stores 556, not MAX_VIOLIN_POINTS."""
+    rows = [["Big", i] for i in range(3_334)]
+    t = table("t", ["Team", "Salary"], rows)
+    c, notes = ok("violin", dict(table_id="t", x="Team", y=["Salary"]), [t])
+    stored = len(c.extra.violin[0].values)
+    assert stored < CD.MAX_VIOLIN_POINTS
+    note = next(n for n in notes if "even sample" in n)
+    assert "at most" in note, note
+
+
+
+def test_a_truncated_pareto_says_what_its_line_is_a_share_of():
+    """top_n 3 with no Other bucket over 50/25/15/6/3/1 runs to 100% over
+    three bars that are 90% of the table. The line may end at 100%, but the
+    chart has to say what the 100% is."""
+    c, notes = ok("pareto", dict(table_id="upload_defects", x="Cause", y=["Count"], top_n=3, other_bucket=False),
+                  [DEFECTS])
+    assert c.categories == ["Scratches", "Misprint", "Dents"]
+    assert [round(v, 1) for v in c.series[1].values] == [55.6, 83.3, 100.0]
+    assert any("not of the whole table" in n for n in notes), notes
+    assert "of the categories shown" in c.caption and "% of the total" not in c.caption, c.caption
+
+
+def test_an_untruncated_pareto_still_says_of_the_total():
+    c, notes = ok("pareto", dict(table_id="upload_defects", x="Cause", y=["Count"]), [DEFECTS])
+    assert not any("not of the whole table" in n for n in notes), notes
+    assert "% of the total" in c.caption, c.caption
+
+
+def test_treemap_labels_that_are_drawn_fit_the_tile_they_sit_in():
+    """The drawn text is MEASURED here, through a draw_event, and compared
+    with the rectangle it sits in.
+
+    The old guard asked for 0.62 treemap units per character against a box
+    100 units wide, while at width_px=1400 one unit is 3.9 pt and a
+    seventeen-character name at 8 pt is 17.1 units. Measured on the base
+    commit, all 24 names were drawn and 21 of them crossed their tile —
+    "Category number 12" by 3.84 units, "Category number 22/23" by 4.65,
+    both of them past the right edge of the axes at x=100.
+    """
+    import matplotlib.axes
+    from app.artifacts.render import charts
+
+    names = [f"Category number {i}" for i in range(24)]
+    values = [100 - i * 3 for i in range(24)]
+    t = table("t", ["Name", "Value"], [[n, v] for n, v in zip(names, values)])
+    c, _ = ok("treemap", dict(table_id="t", x="Name", y=["Value"]), [t])
+    box_of = dict(zip(names, charts.squarified([float(v) for v in values], 0.0, 0.0, 100.0, 62.0)))
+    artists = []
+    measured = []
+
+    def on_draw(event):
+        for name, ax, artist in artists:
+            bb = artist.get_window_extent(renderer=event.renderer)
+            (x0, _y0), (x1, _y1) = ax.transData.inverted().transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
+            measured.append((name, x0, x1))
+
+    original = matplotlib.axes.Axes.text
+
+    def spy(self, x, y, s, *a, **kw):
+        artist = original(self, x, y, s, *a, **kw)
+        if s in box_of:
+            if not artists:
+                self.get_figure().canvas.mpl_connect("draw_event", on_draw)
+            artists.append((s, self, artist))
+        return artist
+
+    matplotlib.axes.Axes.text = spy
+    try:
+        draw(c, "treemap-24")
+    finally:
+        matplotlib.axes.Axes.text = original
+    assert measured, "no name label was drawn at all"
+    for name, x0, x1 in measured:
+        left, _y, w, _h = box_of[name]
+        assert x0 >= left - 0.01 and x1 <= left + w + 0.01, (name, (x0, x1), (left, left + w))
+    assert len({n for n, _, _ in measured}) < len(names), "every tile still claims to fit its name"
+
+
+# ------------------------------------------------ the words that route it --
+
+
+@pytest.mark.parametrize("text", [
+    "visualise this table as a treemap",
+    "make a treemap of this table",
+    "show this as a sunburst",
+    "draw a candlestick of these prices",
+])
+def test_a_new_type_name_routes_to_a_picture_not_to_word_and_pdf(text):
+    from app.artifacts import formats as F
+
+    assert F._chart_image_formats(text) == ["png"], (text, F.decide(text).formats)
+
+
+@pytest.mark.parametrize("text", [
+    "explain the Pareto principle in a one page doc",
+    "write about pareto optimal allocations",
+    "a slide about the violin in classical music",
+    "the treemap data structure explained",
+])
+def test_an_ordinary_word_is_not_a_chart_request(text):
+    from app.artifacts import formats as F
+
+    assert F._chart_image_formats(text) == [], text
+    assert _requested_types(text) == [], text
+
+
+@pytest.mark.parametrize("text,kind", [
+    ("put the spend in a tree map", "treemap"),
+    ("a pareto of the defect causes", "pareto"),
+    ("a violin plot of salary by department", "violin"),
+    ("show spend by team in a treemap", "treemap"),
+])
+def test_the_guard_keeps_the_real_chart_asks(text, kind):
+    assert kind in _requested_types(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "visualise this table as a treemap",
+    "make a treemap of this table",
+    "show this as a sunburst",
+    "draw a candlestick of these prices",
+])
+def test_the_gate_sees_a_new_type_name_as_a_chart_ask(text):
+    """formats.decide takes the intent gate's verdict OVER its own regex
+    (`asked = words if chart_request is None else bool(chart_request)`), so
+    the words have to reach lexicon._CHART_RE as well: with only
+    formats._CHART_WORDS_RE extended, production still answered these four
+    with Word and PDF."""
+    from app.artifacts import formats as F
+    from app.artifacts import lexicon
+
+    assert lexicon.chart_signal(text) is True, text
+    assert F.decide(text, chart_request=lexicon.chart_signal(text)).formats == ["png"], text
+
+
+@pytest.mark.parametrize("text,kind", [
+    ("make it a pareto chart instead", "pareto"),
+    ("make it a treemap chart instead", "treemap"),
+    ("as a violin plot please", "violin"),
+    ("change it to a candlestick chart", "candlestick"),
+])
+def test_a_follow_up_can_change_the_chart_to_a_new_type(text, kind):
+    """lexicon.CHART_TYPE_WORDS is what routes "make it a X chart instead"
+    to a set_chart edit; every reader of it requires the chart word after
+    the name, so the six new names belong in it."""
+    from app.artifacts import edits
+
+    named = edits.chart_type_named(text)
+    assert named is not None and named[0] == kind, (text, named)

@@ -57,7 +57,15 @@ SUNBURST_MAX_INNER = 10
 MAX_VIOLINS = 12
 MAX_VIOLIN_POINTS = 600
 MIN_VIOLIN_POINTS = 5
-MAX_CANDLES = 300
+#: Each candle is one entry of Chart.categories, and that field is
+#: Field(..., max_length=types.MAX_CHART_POINTS) = 200. At 300 a table
+#: with more than 200 periods raised an uncaught pydantic
+#: ValidationError out of resolve_chart ("List should have at most 200
+#: items after validation, not 300"), which the spec path turned into
+#: "A chart could not be drawn from the data." and derived.py let
+#: escape. Measured 2026-09-16 on 400 periods. It may never exceed
+#: types.MAX_CHART_POINTS.
+MAX_CANDLES = 200
 MAX_BULLETS = 12
 OTHER = "Other"
 BLANK = "(blank)"
@@ -465,6 +473,11 @@ class ComputedChart:
     x_label: str = ""
     y_label: str = ""
     caption: str = ""
+    #: Categories the cap or top_n left out WITHOUT folding them into
+    #: "Other" — so the drawn bars are not the whole table. A pareto's
+    #: cumulative line and its caption are shares of a total, and that total
+    #: is only the table's when this is 0.
+    dropped: int = 0
 
 
 @dataclass
@@ -979,6 +992,7 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         limit = MAX_CATEGORIES
         notes.append(f"{len(order_keys):,} categories are too many to draw; the largest {MAX_CATEGORIES - 1} are shown and the rest are in {OTHER}")
     fold_other = False
+    dropped_unfolded = 0
     if limit is not None and len(order_keys) > limit:
         use_other = b.other_bucket
         keep_n = limit - 1 if use_other else limit
@@ -990,6 +1004,7 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         elif t in ("treemap", "pareto", "sunburst") and b.top_n is None:
             notes.append(f"a {t} shows at most {limit} categories; the {dropped} smallest are combined in {OTHER}")
         order_keys = [k for k in order_keys if k in kept]
+        dropped_unfolded = 0 if use_other else dropped
         if use_other:
             fold_other = True
             other_key = ("~other",)
@@ -1082,7 +1097,8 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         y_label = base if agg in ("sum", "none") else f"{CS.AGG_LABELS[agg]} {base}"
     else:
         y_label = CS.AGG_LABELS[agg] if agg not in ("sum", "none") else ""
-    return ComputedChart(categories=categories, series=series, extra=extra, provenance=prov, notes=notes, x_label=x_label, y_label=y_label[:60])
+    return ComputedChart(categories=categories, series=series, extra=extra, provenance=prov, notes=notes, x_label=x_label,
+                         y_label=y_label[:60], dropped=dropped_unfolded)
 
 
 def _unique_name(name: str, existing: Sequence[CS.Series]) -> str:
@@ -1238,6 +1254,10 @@ def _compute_box(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> Compute
     boxes: List[CS.BoxStats] = []
     samples: List[Tuple[str, List[float]]] = []
     notes: List[str] = []
+    #: True when the MIN_VIOLIN_POINTS filter, not a shortage of numbers, is
+    #: what emptied the chart: the refusal below has to say which, or it
+    #: reads "there are no numbers" over a table full of them.
+    thin_only = False
     if not b.y:
         raise ChartDataError(f"A {what} needs a numeric column (y).")
     cap = MAX_VIOLINS if violin else MAX_BOXES
@@ -1264,17 +1284,24 @@ def _compute_box(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> Compute
                     "too few for a distribution, so no violin is drawn for them"
                 )
                 ordered = [(k, v) for k, v in ordered if len(v) >= MIN_VIOLIN_POINTS]
+                thin_only = not ordered
         boxes = [_box_stats(k, v) for k, v in ordered if v]
         samples = [(k, v) for k, v in ordered if v]
     else:
         for i in range(len(b.y)):
             vals = [v for v in _numbers(frame.cols[f"y{i}"]) if v is not None]
             if violin and len(vals) < MIN_VIOLIN_POINTS:
+                thin_only = thin_only or bool(vals)
                 continue
             if vals:
                 boxes.append(_box_stats(frame.names[f"y{i}"], vals))
                 samples.append((frame.names[f"y{i}"], vals))
     if not boxes:
+        if thin_only:
+            raise ChartDataError(
+                f"Every group has fewer than {MIN_VIOLIN_POINTS} values, too few to draw a distribution; "
+                "a bar or box chart can show these numbers."
+            )
         raise ChartDataError(f"There are no numbers to draw a {what} from.")
     extra = CS.ChartExtra(box=boxes)
     if violin:
@@ -1288,7 +1315,10 @@ def _compute_box(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> Compute
                 trimmed += 1
             dists.append(CS.Distribution(name=name[:80], n=len(vals), values=kept))
         if trimmed:
-            notes.append(f"the curve of {trimmed} group{'s' if trimmed != 1 else ''} is drawn from an even sample of "
+            # "at most": the stride sample of 3,334 values stores 556, not
+            # 600, so naming the cap as the count would be a figure the spec
+            # does not hold.
+            notes.append(f"the curve of {trimmed} group{'s' if trimmed != 1 else ''} is drawn from an even sample of at most "
                          f"{MAX_VIOLIN_POINTS} of its values; the box inside it uses every value")
         extra = CS.ChartExtra(box=boxes, violin=dists)
     prov.agg = "none"
@@ -1360,6 +1390,14 @@ def _compute_pareto(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadlin
         result.series[0].model_copy(update={"kind": "bar"}),
         CS.Series(name="Cumulative %", values=cumulative, axis="secondary", kind="line"),
     ]
+    if result.dropped:
+        # top_n with other_bucket off drops the tail instead of folding it,
+        # so `total` above is the total of the BARS, not of the table: 50,
+        # 25, 15 out of 50/25/15/6/3/1 ran to 55.6/83.3/100% although those
+        # three bars are 90% of the real total. The line still has to end at
+        # 100%, so the denominator stays — what it is a share of is said.
+        notes.append(f"the cumulative line is a share of the {len(result.categories)} categories shown, "
+                     f"not of the whole table ({result.dropped} smaller categories are left out)")
     result.notes = result.notes + notes
     return result
 
@@ -1462,7 +1500,18 @@ def _compute_bullet(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadlin
             raise ChartDataError(f"The column {frame.names[role]!r} is not numeric, so it cannot be a bullet chart's measure.")
     ycols = [_numbers(frame.cols[r]) for r in roles]
     _check_deadline(deadline)
-    cells, engine = _aggregate(keys, [("all",)] * len(keys), ycols, agg)
+    gkeys = [("all",)] * len(keys)
+    # THE MEASURE IS AGGREGATED, THE GOAL IS NOT. A target and its bands are
+    # a property of the label, stated once per row; summing them multiplies
+    # the goal by the number of rows. Measured 2026-09-16: two Revenue rows
+    # of 120 and 150, each stating Target 300, drew actual 270 (right)
+    # against target 600 and bands 300/480/660 (all wrong), annotated
+    # "270 · 45% of target" instead of 90% — a number on the picture that
+    # the table does not contain. The thresholds are taken with max(), and a
+    # label whose rows disagree is named in a note rather than averaged away.
+    cells, engine = _aggregate(keys, gkeys, [ycols[0]], agg)
+    goal_cells, _ = _aggregate(keys, gkeys, ycols[1:], "max")
+    goal_low, _ = _aggregate(keys, gkeys, ycols[1:], "min")
     prov.engine = engine  # type: ignore[assignment]
     first_seen: Dict[Any, int] = {}
     for i, k in enumerate(keys):
@@ -1478,10 +1527,18 @@ def _compute_bullet(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadlin
         notes.append(f"{len(order)} rows are too many for one bullet chart; the first {MAX_BULLETS} are shown")
         order = order[:MAX_BULLETS]
     bullets: List[CS.Bullet] = []
+    disagreed: List[str] = []
     for k in order:
-        vals = cells.get((k, ("all",)), [0.0] * len(roles))
-        bands = sorted(vals[2:2 + len(band_roles)])
-        bullets.append(CS.Bullet(label=klabels[k][:80], actual=vals[0], target=vals[1], bands=bands))
+        actual = cells.get((k, ("all",)), [0.0])[0]
+        goals = goal_cells.get((k, ("all",)), [0.0] * (len(roles) - 1))
+        lows = goal_low.get((k, ("all",)), goals)
+        if any(abs(hi - lo) > 1e-9 for hi, lo in zip(goals, lows)):
+            disagreed.append(klabels[k])
+        bands = sorted(goals[1:1 + len(band_roles)])
+        bullets.append(CS.Bullet(label=klabels[k][:80], actual=actual, target=goals[0] if goals else 0.0, bands=bands))
+    if disagreed:
+        shown = ", ".join(disagreed[:3]) + (f" and {len(disagreed) - 3} more" if len(disagreed) > 3 else "")
+        notes.append(f"the rows for {shown} state more than one {frame.names['target']}; the largest is drawn")
     if not any(bl.target for bl in bullets):
         raise ChartDataError(f"Every {frame.names['target']} is zero, so there is no target to measure against.")
     if band_roles:
@@ -1540,8 +1597,9 @@ def _caption(chart: CS.Chart, result: ComputedChart, frame: _Frame) -> str:
         crossing = next((i for i, v in enumerate(result.series[1].values) if v >= 80.0), None)
         if crossing is not None:
             n = crossing + 1
+            whole = "the categories shown" if result.dropped else "the total"
             parts.append(f"the top {n} of {len(result.categories)} make up "
-                         f"{result.series[1].values[crossing]:.0f}% of the total")
+                         f"{result.series[1].values[crossing]:.0f}% of {whole}")
     parts.append(prov.table_title or prov.table_id)
     parts.append(f"{prov.rows_used:,} rows")
     if prov.filters:

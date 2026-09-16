@@ -1200,6 +1200,23 @@ def _draw_pareto(ax, ctx: _Ctx) -> bool:
     return True
 
 
+def _text_width_pt(text: str, size_pt: float) -> float:
+    """The drawn width of `text` at `size_pt`, in points.
+
+    matplotlib.textpath measures the real glyphs; the fallback (0.62 em per
+    character) is only for a font that cannot be loaded, and it is the
+    estimate that was measured to be about half of what a label needs.
+    """
+    if not text:
+        return 0.0
+    try:
+        from matplotlib.textpath import TextPath
+
+        return float(TextPath((0.0, 0.0), text, size=size_pt).get_extents().width)
+    except Exception:
+        return 0.62 * size_pt * len(text)
+
+
 def _draw_treemap(ax, ctx: _Ctx) -> bool:
     from matplotlib.patches import Rectangle
 
@@ -1211,18 +1228,32 @@ def _draw_treemap(ax, ctx: _Ctx) -> bool:
         ax.set_axis_off()
         return True
     rects = squarified([v for _, v in pairs], 0.0, 0.0, 100.0, 62.0)
+    # Points per treemap unit, MEASURED from the axes this figure actually
+    # got. The box is always 100 units wide, so a fixed per-character
+    # allowance in units only holds at one figure size: at the default
+    # width_px=1400 the axes are 4.64 pt per unit and "Category number 12"
+    # is 82-102 pt = 17.6-22.0 units wide, while the old guard
+    # (w >= 1.0 + 0.62 * len(name)) asked for 12.2 — so at the 24-tile cap
+    # names overprinted each other and spilled across tile borders
+    # (measured 2026-09-16).
+    pts_per_unit = ax.get_window_extent().width * 72.0 / ax.get_figure().dpi / 100.0
+    name_pt = max(7.0, ctx.d.axis_size_pt - 2)
+    value_pt = max(6.5, ctx.d.axis_size_pt - 3)
     for j, ((cat, value), (x, y, w, h)) in enumerate(zip(pairs, rects)):
         fill = ctx.category_colour(j, cat)
         ax.add_patch(Rectangle((x, y), w, h, facecolor=fill, edgecolor=ctx.bg, linewidth=1.4))
         share = value / total
         text_colour = _slice_label_style(ctx, fill)
-        # A label needs its own rectangle to sit in: roughly 0.8 point per
-        # character across and one line down at the label size.
         name = _tick_text(cat)
-        if w >= 1.0 + 0.62 * len(name) and h >= 5.0:
+        value_text = f"{ctx.label(value)} · {share * 100:.0f}%"
+        room = (w - 1.0) * pts_per_unit  # half a unit of padding each side
+        fits = (h >= 5.0 and pts_per_unit > 0
+                and _text_width_pt(name, name_pt) <= room
+                and _text_width_pt(value_text, value_pt) <= room)
+        if fits:
             ax.text(x + w / 2, y + h / 2 - 1.2, name, ha="center", va="center", **_label_kw(ctx, text_colour))
-            ax.text(x + w / 2, y + h / 2 + 2.6, f"{ctx.label(value)} · {share * 100:.0f}%", ha="center", va="center",
-                    **_text_kw(ctx.style.data_label, max(6.5, ctx.d.axis_size_pt - 3), text_colour))
+            ax.text(x + w / 2, y + h / 2 + 2.6, value_text, ha="center", va="center",
+                    **_text_kw(ctx.style.data_label, value_pt, text_colour))
         elif w >= 6.0 and h >= 5.0:
             ax.text(x + w / 2, y + h / 2, f"{share * 100:.0f}%", ha="center", va="center", **_label_kw(ctx, text_colour))
     ax.set_xlim(0, 100)
@@ -1366,7 +1397,17 @@ def _draw_bullet(ax, ctx: _Ctx) -> bool:
     rows = c.extra.bullets if c.extra else []
     base = ctx.style.color or ctx.d.palette[0]
     target_colour = ctx.style.series_colors.get("Target") or ctx.ink
-    span = max([max(r.actual, r.target, *(r.bands or [0.0])) for r in rows] or [1.0]) or 1.0
+    # The axis must hold every mark, including negative ones. The old span
+    # was max(actual, target, *(bands or [0.0])) per row, so a table whose
+    # numbers are ALL negative (Loss -30 against a target of -100) took the
+    # injected 0.0 as each row's maximum, collapsed the span to 0.0 -> 1.0
+    # and set xlim(0, 1.32): measured 2026-09-16, every bar was drawn outside
+    # the axes and the picture was a blank grid with a floating
+    # "-30 · 30% of target". The floor below keeps them on the canvas.
+    marks = [v for r in rows for v in (r.actual, r.target, *(r.bands or ()))]
+    top = max(marks) if marks else 0.0
+    floor = min(marks) if marks else 0.0
+    span = top if top > 0 else 1.0
     for j, r in enumerate(rows):
         edges = list(r.bands) or []
         previous = 0.0
@@ -1380,13 +1421,13 @@ def _draw_bullet(ax, ctx: _Ctx) -> bool:
                   label="Target" if j == 0 else None)
         share = (r.actual / r.target * 100.0) if r.target else None
         text = ctx.label(r.actual) + (f" · {share:.0f}% of target" if share is not None else "")
-        ax.annotate(text, xy=(max(r.actual, r.target, *(edges or [0.0])), j), xytext=(6, 0), textcoords="offset points",
+        ax.annotate(text, xy=(max([r.actual, r.target, *edges]), j), xytext=(6, 0), textcoords="offset points",
                     va="center", ha="left", **_label_kw(ctx, ctx.ink))
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([_tick_text(r.label) for r in rows])
     ax.invert_yaxis()
     ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_xlim(0, span * 1.32)
+    ax.set_xlim(min(0.0, floor * 1.15), span * 1.32)
     _value_axis(ax, ctx, "x")
     handles, labels = ax.get_legend_handles_labels()
     _legend(ax, ctx, handles, labels)

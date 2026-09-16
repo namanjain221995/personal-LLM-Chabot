@@ -510,7 +510,20 @@ _BEST_RE = re.compile(r"\bbest\s+(?:format|deliverable|output|file)\b", re.I)
 # --- AS3 integration BEGIN: standalone chart images ---
 #: "a bar chart ... as a png", "pie chart svg me": a chart image named next
 #: to chart words. A bare "png" ("draw a logo png") is not a chart file.
-_CHART_WORDS_RE = re.compile(r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot)\b|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ", re.I)
+#: The tier-2 names added on 2026-09-16 reach this list too: without them
+#: "visualise this table as a treemap" and "show this as a sunburst" matched
+#: no chart word, fell through to the document default and were answered
+#: with a Word file and a PDF — the exact answer this programme exists to
+#: stop. Only the names that are unambiguous chart nouns are listed bare;
+#: "pareto", "violin" and "bullet" are ordinary words ("the Pareto
+#: principle", "a slide about the violin", "bullet points"), and their chart
+#: forms already match through "chart", "graph" or "plot".
+_CHART_WORDS_RE = re.compile(
+    r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot"
+    r"|tree\s*map|sunburst|candlestick|ohlc|pareto\s*(?:diagram|analysis))\b"
+    r"|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ",
+    re.I,
+)
 _IMAGE_FORMAT_RE = re.compile(r"\b(?:png|\.png|svg|\.svg)\b", re.I)
 
 
