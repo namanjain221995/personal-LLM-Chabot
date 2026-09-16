@@ -156,11 +156,11 @@ def test_a_chart_less_parent_sends_the_type_change_to_the_planner():
 
 
 def test_an_unreadable_stored_shape_never_raises():
-    """main.py reads this on the chat streaming event loop with no guard
-    (app/main.py: `_as3_deliverable.of_version(...).to_json()`), so a corrupt
-    or foreign-written artifact_versions.deliverable row must be ignored, not
-    break the turn. Measured before the fix: from_json({'charts': 'many'})
-    raised ValueError: invalid literal for int() with base 10: 'many'."""
+    """main.py reads this on the chat streaming event loop
+    (app/main.py::_as3_deliverable_shape), so a corrupt or foreign-written
+    artifact_versions.deliverable row must be ignored, not break the turn.
+    Measured before the fix: from_json({'charts': 'many'}) raised ValueError:
+    invalid literal for int() with base 10: 'many'."""
     assert D.from_json({"charts": "many"}) == D.Deliverable()
     assert D.from_json({"charts": None}).charts == 0
     assert D.from_json({"charts": 2.0}).charts == 2
@@ -415,3 +415,217 @@ def test_a_chart_ask_delivers_a_chart_and_the_version_records_its_shape(owner, m
     follow_up = I.decide("make it a bar chart instead", has_artifacts=True, has_assistant_answer=True,
                          last_turn_is_artifact=True, last_deliverable=shape.to_json())
     assert follow_up.action == "edit" and follow_up.rule == "edit-chart-type"
+
+
+# ------------------------- (e) the edit turn can still reach the binding ----
+#
+# The recheck's BLOCKER, reproduced end to end. (d) above proves the plan is
+# deterministic and that apply_patch clears the numbers so that code recomputes
+# them — but nothing proved the RECOMPUTE could still happen. It could not: the
+# source table was a paste in the CREATE turn, the edit turn's material has no
+# `paste1`, and chart_data.resolve_spec replaces any chart whose table it cannot
+# find with a "the table 'paste1' is not available" callout. Measured on main
+# (075ee8b) too, with the parent untouched: the gap is older than this branch
+# and is not caused by the intent wiring.
+
+
+def _paste_table():
+    from app.artifacts.compose import DataTable
+
+    return DataTable(id="paste1", title="Records by state", columns=["State", "Count (Approx)"],
+                     rows=[["Texas", 21], ["Missouri", 11], ["Illinois", 9]])
+
+
+def test_a_published_chart_keeps_the_binding_it_was_computed_from():
+    """Turn 1: the chart is computed from the pasted table and the stored
+    version keeps the binding — which is what makes turn 2 an edit at all."""
+    from app.artifacts import chart_data as CD
+
+    resolved, notes = CD.resolve_spec(chart_document(), [_paste_table()])
+    chart = resolved.body.blocks[0].chart
+    assert notes == []
+    assert chart.categories == ["Texas", "Missouri", "Illinois"]
+    assert [s.values for s in chart.series] == [[21.0, 11.0, 9.0]]
+    assert chart.data.table_id == "paste1"
+
+
+def test_the_type_change_still_draws_a_chart_when_the_paste_is_gone():
+    """THE BLOCKER. Turn 2 has no pasted table: the person typed six words.
+    The chart must survive the type change with the SAME numbers — not become
+    a callout that says the table is missing."""
+    from app.artifacts import chart_data as CD
+
+    parent, _ = CD.resolve_spec(chart_document(), [_paste_table()])
+    plan = E.preplan("make it a bar chart instead", parent)
+    out = E.apply(parent, plan, instruction="make it a bar chart instead")
+    assert out.spec.body.blocks[0].chart.categories == [], "apply_patch clears the numbers on purpose"
+
+    # engines/artifact.py::_post_process, on the edit turn: no tables in the
+    # material, the parent version in hand.
+    recovered = CD.tables_from_parent_charts(out.spec, parent, [])
+    child, notes = CD.resolve_spec(out.spec, recovered)
+
+    blocks = child.body.blocks
+    assert [b.type for b in blocks] == ["chart"], f"the chart was lost: {notes}"
+    chart = blocks[0].chart
+    assert chart.type == "bar"
+    assert chart.categories == ["Texas", "Missouri", "Illinois"]
+    assert [s.values for s in chart.series] == [[21.0, 11.0, 9.0]]
+    assert not [n for n in notes if "not available" in n]
+
+
+def test_an_edit_that_is_not_about_the_chart_keeps_the_chart_too():
+    """The same gap, without the new deterministic path: ANY edit of a
+    document with a bound chart resolved the chart away."""
+    from app.artifacts import chart_data as CD
+
+    parent, _ = CD.resolve_spec(chart_document(), [_paste_table()])
+    child = parent.model_copy(deep=True)
+    child.body.title = "Records by state (final)"
+
+    recovered = CD.tables_from_parent_charts(child, parent, [])
+    out, notes = CD.resolve_spec(child, recovered)
+    assert [b.type for b in out.body.blocks] == ["chart"], f"the chart was lost: {notes}"
+    assert [s.values for s in out.body.blocks[0].chart.series] == [[21.0, 11.0, 9.0]]
+
+
+def test_the_rebuilt_table_never_answers_a_binding_that_changed():
+    """A rebuilt table is one row per category, so it can only reproduce the
+    parent's OWN binding. An edit that changes what is read — another measure
+    column, another aggregation, a filter — must NOT be answered from it."""
+    from app.artifacts import chart_data as CD
+
+    parent, _ = CD.resolve_spec(chart_document(), [_paste_table()])
+    for patch in ({"agg": "avg"}, {"y": ["Revenue"]}, {"x": "City"}, {"table_id": "upload1"}):
+        child = parent.model_copy(deep=True)
+        chart = child.body.blocks[0].chart
+        child.body.blocks[0].chart = chart.model_copy(update={
+            "data": chart.data.model_copy(update=patch), "categories": [], "series": [],
+        })
+        assert CD.tables_from_parent_charts(child, parent, []) == [], patch
+
+
+def test_a_count_chart_is_never_rebuilt_from_its_own_categories():
+    """agg='count' over a one-row-per-category table counts 1 per row, so the
+    rebuilt table cannot reproduce the parent. recompute_matches must reject
+    it and the chart keeps refusing, as it did before."""
+    from app.artifacts import chart_data as CD
+    from app.artifacts.compose import DataTable
+
+    rows = [["Texas"], ["Texas"], ["Missouri"]]
+    table = DataTable(id="paste1", title="Records", columns=["State"], rows=rows)
+    spec = S.parse_body("document", {"title": "Records by state", "blocks": [
+        {"type": "chart", "chart": {"type": "pie", "title": "Records by state",
+                                    "data": {"table_id": "paste1", "x": "State", "y": [], "agg": "count"}}},
+    ]})
+    parent, _ = CD.resolve_spec(spec, [table])
+    assert parent.body.blocks[0].chart.series, "the count chart computed"
+    child = parent.model_copy(deep=True)
+    assert CD.tables_from_parent_charts(child, parent, []) == []
+
+
+def test_a_real_table_in_the_turn_is_never_replaced_by_a_rebuilt_one():
+    from app.artifacts import chart_data as CD
+
+    parent, _ = CD.resolve_spec(chart_document(), [_paste_table()])
+    assert CD.tables_from_parent_charts(parent, parent, [_paste_table()]) == []
+
+
+def test_the_caption_the_person_saw_is_the_one_the_edit_keeps():
+    """The rebuilt table has one row per category, so its provenance counts
+    describe the rebuilt table — the CAPTION does not, because resolve_chart
+    keeps a caption the chart already carries."""
+    from app.artifacts import chart_data as CD
+    from app.artifacts.compose import DataTable
+
+    wide = DataTable(id="paste1", title="Records by state", columns=["State", "Count (Approx)"],
+                     rows=[["Texas", 7], ["Texas", 7], ["Texas", 7], ["Missouri", 11], ["Illinois", 9]])
+    parent, _ = CD.resolve_spec(chart_document(), [wide])
+    caption = parent.body.blocks[0].chart.caption
+    assert "5 rows" in caption, caption
+
+    plan = E.preplan("make it a bar chart instead", parent)
+    out = E.apply(parent, plan, instruction="make it a bar chart instead")
+    child, _notes = CD.resolve_spec(out.spec, CD.tables_from_parent_charts(out.spec, parent, []))
+    assert child.body.blocks[0].chart.caption == caption
+
+
+def test_the_engines_post_process_draws_the_edited_chart(monkeypatch):
+    """The same thing one layer up: engines/artifact.py::_post_process is what
+    every edit job runs after the ops are applied, and it is given the parent
+    version and the turn's tables (none)."""
+    from app.artifacts import chart_data as CD
+    from app.engines import artifact as engine
+
+    parent, _ = CD.resolve_spec(chart_document(), [_paste_table()])
+    plan = E.preplan("make it a bar chart instead", parent)
+    out = E.apply(parent, plan, instruction="make it a bar chart instead")
+
+    warnings: list[str] = []
+    spec = asyncio.run(engine._post_process(out.spec, [], warnings.append,
+                                            "make it a bar chart instead",
+                                            parent=parent, model_wrote=False))
+    blocks = spec.body.blocks
+    assert [b.type for b in blocks] == ["chart"], warnings
+    assert blocks[0].chart.type == "bar"
+    assert [s.values for s in blocks[0].chart.series] == [[21.0, 11.0, 9.0]]
+    assert not [w for w in warnings if "not available" in w]
+
+
+def test_the_chat_path_says_so_when_it_drops_an_unreadable_shape(caplog, monkeypatch):
+    """The guard in main.py swallowed everything and logged nothing, so a row
+    no writer in this build can produce — and therefore a bug in whatever
+    wrote it — was invisible. The turn still stands and the gate still gets
+    None; it is now on the record at the level the sibling guards on this
+    path use."""
+    from app import main as M
+
+    assert M._as3_deliverable_shape([]) is None
+    # deliverable.from_json/of_version are defensive now (the test above), so
+    # the only way left to reach this guard is a field the row grows later
+    # that they do not yet parse. That is the case it exists for.
+    def explode(_row):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(D, "of_version", explode)
+    with caplog.at_level("WARNING"):
+        assert M._as3_deliverable_shape([{"current": {"deliverable": {"kind": "chart"}}}]) is None
+    monkeypatch.undo()
+    records = [r for r in caplog.records if "deliverable shape unreadable" in r.getMessage()]
+    assert records, [r.getMessage() for r in caplog.records]
+    assert records[0].levelname == "WARNING"
+    assert "RuntimeError: boom" in records[0].getMessage()
+
+    # A readable row is still read, and nothing is logged for it.
+    caplog.clear()
+    shape = D.of_spec(chart_document(), kind="document", formats=["png"])
+    with caplog.at_level("WARNING"):
+        out = M._as3_deliverable_shape([{"current": {"deliverable": shape.to_json(), "formats": ["png"]}}])
+    assert out == shape.to_json()
+    assert not [r for r in caplog.records if "deliverable shape unreadable" in r.getMessage()]
+
+
+# ------------------------------- the residual the removed veto leaves ------
+
+
+CHART_WORD_FALSE_POSITIVES = [
+    "the org chart of the team", "chart a course for the project",
+    "explain the flow chart", "graph paper order form",
+    "the scatter of opinions in the team", "who drew the org chart",
+    "the pie chart guy from accounting", "what does a box plot mean",
+    "the line graph paper we ordered", "the sales funnel of our pipeline",
+    "chart our progress this quarter in writing",
+]
+
+
+@pytest.mark.parametrize("text", CHART_WORD_FALSE_POSITIVES)
+def test_a_chart_word_that_is_not_a_request_is_stopped_at_the_gate(text):
+    """The measured reason the verdict may only ADD (formats.py, at
+    `gate = bool(chart_request)`). A chart word in a sentence that asks for
+    nothing never reaches the engine on the rules path, so the veto that was
+    removed had nothing to veto: either the gate refuses the turn outright, or
+    the RULES themselves say chart_request — which the veto never touched."""
+    verdict = I.decide(text, has_assistant_answer=True)
+    assert verdict.action == "none" or verdict.chart_request is True, (
+        f"{text!r}: action={verdict.action} rule={verdict.rule} chart_request={verdict.chart_request}"
+    )

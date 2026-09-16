@@ -1839,6 +1839,106 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
                                     "categories": [], "series": [], "extra": None, "provenance": None}), notes
 
 
+def _table_from_chart(chart: CS.Chart) -> Optional[Any]:
+    """A chart's computed values read back as the table it was drawn from:
+    `categories` is the x column, each series is one y column, one row per
+    category. None when the chart's shape cannot be a table that way — a
+    scatter/bubble carries its own `x` per point, a repeated category would
+    re-aggregate into one row, a series that is not a y column (a `group_by`
+    split) has no column to be.
+
+    This is a CANDIDATE only. The caller must prove it reproduces the chart
+    it came from before using it (`recompute_matches`); see
+    `tables_from_parent_charts`.
+    """
+    b = chart.data
+    if b is None or not b.table_id:
+        return None
+    x = (b.x or "").strip()
+    ys = [str(y).strip() for y in (b.y or [])]
+    cats = [str(c) for c in (chart.categories or [])]
+    series = list(chart.series or [])
+    if not x or not ys or not cats or len(series) != len(ys):
+        return None
+    if len(set(cats)) != len(cats) or x in ys or len(set(ys)) != len(ys):
+        return None
+    if any(s.x is not None or s.sizes is not None for s in series):
+        return None
+    if any(len(s.values) != len(cats) for s in series):
+        return None
+    title = (chart.provenance.table_title if chart.provenance is not None else "") or b.table_id
+    rows = [[cats[i], *[s.values[i] for s in series]] for i in range(len(cats))]
+    return _make_table(id=b.table_id, title=title, columns=[x, *ys], rows=rows)
+
+
+def tables_from_parent_charts(spec: Any, parent: Any, tables: Sequence[Any]) -> List[Any]:
+    """The source tables an EDIT turn no longer has, rebuilt from the charts
+    the PARENT version already computed. Ids already in `tables` are left
+    alone — a real table in the turn always wins.
+
+    THE GAP THIS CLOSES (recheck BLOCKER, 2026-09-16). A chart carries its
+    BINDING, and `resolve_spec` replaces any chart whose `data.table_id` it
+    cannot find with a "the table 'paste1' is not available" callout. On an
+    edit turn that table is normally gone: the paste was in the CREATE turn
+    and `engines/artifact.py` gathers pastes at acceptance of a create, so
+    `material.tables` is empty. Measured by reloading a published version and
+    resolving it against no tables — on this branch AND on main (075ee8b),
+    with the parent untouched: the picture became that callout. So every edit
+    of a document or deck holding a bound chart lost the chart, and the
+    deterministic "make it a bar chart instead" lost it too, because
+    `chart_spec.apply_patch` clears the computed values on purpose so that
+    code — not the model — puts the numbers back.
+
+    WHY THE REBUILT TABLE IS NOT A GUESS. Two conditions, both required:
+
+      * the child's binding is byte-identical to the parent's, so nothing
+        about which rows are read, how they are combined or which columns
+        are plotted has changed — only the type, a label, a colour;
+      * re-running the PARENT's own chart over the rebuilt table reproduces
+        the parent's numbers exactly (`recompute_matches`). That is what
+        rules out every aggregation a one-row-per-category table cannot
+        carry: agg='count' would count 1 per row, a `filters` column is not
+        in the rebuilt table, a `group_by` makes series that are not y
+        columns, `sort`/`top_n` may reorder or drop.
+
+    Anything else gets no table and refuses exactly as it did before.
+
+    The rebuilt table has one row per category, so the `provenance` row
+    counts on the NEW chart describe the rebuilt table, not the original
+    rows. The sentence the person reads does not: `resolve_chart` keeps a
+    caption the chart already carries, and the parent's caption (with its
+    real row count) survives `apply_patch`.
+    """
+    out: List[Any] = []
+    if parent is None or spec is None:
+        return out
+    try:
+        parents = [_chart_of(c) for _p, c in CS.iter_chart_slots(parent)]
+        children = [_chart_of(c) for _p, c in CS.iter_chart_slots(spec)]
+    except Exception:  # a shape neither side can read is not a chart to restore
+        return out
+    if not parents or not children:
+        return out
+    have = {str(_table_attr(t, "id", "") or "") for t in (tables or [])}
+    for child in children:
+        if child.data is None or not child.data.table_id or child.data.table_id in have:
+            continue
+        want = child.data.model_dump(mode="json")
+        for pc in parents:
+            if pc.data is None or pc.data.model_dump(mode="json") != want:
+                continue
+            table = _table_from_chart(pc)
+            if table is None:
+                continue
+            ok, _diffs = recompute_matches(pc, [table])
+            if not ok:
+                continue
+            out.append(table)
+            have.add(child.data.table_id)
+            break
+    return out
+
+
 def _sheet_table(sheet: Dict[str, Any]) -> Any:
     name = str(sheet.get("name") or "Sheet")
     cols = [str(c.get("name") if isinstance(c, dict) else c) for c in (sheet.get("columns") or [])]

@@ -601,7 +601,30 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
     stops well before the verdict is consulted.
     """
     words = bool(_CHART_WORDS_RE.search(text or ""))
-    gate = bool(chart_request)  # None and False are the same: the words decide
+    # THE DECISION, AND THE RESIDUAL RISK IT LEAVES (recheck, 2026-09-16).
+    # None and False are the same here: the words decide. What that gives up
+    # is the one thing a False verdict could have done — veto a png that
+    # _CHART_WORDS_RE produced from a chart word in a sentence that is not a
+    # chart ask ("who drew the org chart", "what does a box plot mean").
+    # Measured on this tree over 30 such sentences:
+    #
+    #   * RULES path: 0 of 30 ever reached the veto. Every one of them is
+    #     action='none' rule='no-request' at the gate — the engine does not
+    #     run and no format is produced — or the RULES themselves return
+    #     chart_request=True ("the area chart of the office floor"), which
+    #     the veto never touched.
+    #   * CLASSIFIER path: 14 of 30, and only under a verdict that says
+    #     action='create' for a sentence that asked for no file at all. The
+    #     veto did not save those turns; it swapped one wrong deliverable for
+    #     another — a Word file and a PDF about "the pie chart guy from
+    #     accounting" instead of a png of him. The turn is already lost at
+    #     the gate, upstream of this function.
+    #
+    # Against that: the veto cost 202 of a 230-phrasing sweep of REAL chart
+    # asks their png (see the docstring), which is the 2026-09-16 incident
+    # itself. A false positive that must not reach the engine is stopped at
+    # the gate, not here.
+    gate = bool(chart_request)
     if not (words or gate):
         return []
     found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]

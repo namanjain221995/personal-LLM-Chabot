@@ -1439,9 +1439,30 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
                                            parent is not None)
         except Exception as exc:  # noqa: BLE001 — resolve still runs on the model's binding
             log.info("artifact: chart binding repair skipped: %s", type(exc).__name__)
+    chart_tables = list(tables_)
+    if parent is not None and _chart_data is not None and hasattr(_chart_data, "tables_from_parent_charts") and _has_charts(spec):
+        # THE EDIT TURN HAS NO PASTE (recheck BLOCKER, 2026-09-16). The chart
+        # was computed in the CREATE turn from a pasted or uploaded table;
+        # this turn is six words ("make it a bar chart instead") and
+        # material.tables is empty, so resolve_spec below found no 'paste1'
+        # and replaced the picture with a "the table is not available"
+        # callout — measured with the parent untouched, on this branch and on
+        # main (075ee8b), so every edit of a file holding a bound chart lost
+        # the chart. The parent's own chart is rebuilt into that table, and
+        # only when it provably reproduces the parent's numbers under an
+        # unchanged binding (chart_data.tables_from_parent_charts).
+        #
+        # Kept OUT of `tables_`: derived.enforce below reads that list to
+        # decide which figures a model wrote must be recomputed, and a table
+        # rebuilt from a chart is not the material it would check against.
+        try:
+            recovered = await asyncio.to_thread(_chart_data.tables_from_parent_charts, spec, parent, list(tables_))
+            chart_tables.extend(recovered or [])
+        except Exception as exc:  # noqa: BLE001 — the chart refuses as before
+            log.info("artifact: parent chart tables not rebuilt: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
         try:
-            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, list(tables_))  # type: ignore[attr-defined]
+            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, chart_tables)  # type: ignore[attr-defined]
             for n in notes or []:
                 warn(str(n))
         except Exception as exc:  # noqa: BLE001 — never fails the job

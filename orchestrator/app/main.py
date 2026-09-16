@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import AsyncIterator, List, Literal, Optional
+from typing import AsyncIterator, List, Literal, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -3738,6 +3738,44 @@ async def _replay_frames(row: dict, stored: dict, session_id: str) -> AsyncItera
     yield sse_event("done", {"session_id": session_id})
 
 
+# --- AS3 intent-capability BEGIN ---
+def _as3_deliverable_shape(published: Sequence[dict]) -> Optional[dict]:
+    """The SHAPE of the most recent published deliverable (V39), for the
+    intent gate — or None when there is nothing to read or the row cannot be
+    read. `published` is newest first and already carries its version row, so
+    this costs no query.
+
+    WHAT IS SWALLOWED, AND WHY THAT IS SAFE. Only the reading of ONE row's
+    `deliverable` JSON. `of_version`/`to_json` touch no I/O, no lock and no
+    other turn state, and the sole effect of a failure is None — which the
+    gate treats as "no previous deliverable", so "make it a bar chart
+    instead" is read as a NEW artifact instead of an edit of the last one.
+    That is exactly the pre-V39 behaviour: the worst case is a turn this
+    branch cannot improve, never a wrong answer or a lost one. It must not
+    raise, because the caller is the chat streaming path: `deliverable`
+    parses defensively now (a `charts` of 'many' used to raise ValueError
+    there, on the event loop) and this keeps that true if the row ever grows
+    a field that does not.
+
+    It is LOGGED, at the level the sibling guards on this path use (the
+    artifact denial backstop), because a row that cannot be read is a writer
+    bug somewhere else and nothing downstream will ever mention it again.
+    """
+    from .artifacts import deliverable as _deliverable
+
+    if not published:
+        return None
+    try:
+        return _deliverable.of_version((published[0].get("current") or {})).to_json()
+    except Exception as exc:  # noqa: BLE001 — the follow-up loses its hint, never the turn
+        logging.getLogger(__name__).warning(
+            "artifact deliverable shape unreadable, the follow-up hint is dropped: %s: %s",
+            type(exc).__name__, str(exc)[:200],
+        )
+        return None
+# --- AS3 intent-capability END ---
+
+
 @app.post("/chat")
 async def chat_route(http_request: Request) -> StreamingResponse:
     """POST /chat: the principal FIRST, the body second (2026-09-13).
@@ -5492,20 +5530,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _as3_artifact_id = ""  # not this viewer's published artifact: ignored
                 # The SHAPE of the most recent deliverable (V39), so "make it a
                 # bar chart instead" is read as a change to the chart that was
-                # just made. `_published` is newest first and already carries
-                # the version row, so this costs no query.
-                from .artifacts import deliverable as _as3_deliverable
-
-                # The shape is an OPTIMISATION, never a gate: a corrupt or
-                # foreign-written artifact_versions.deliverable row must cost
-                # the follow-up its hint, not break the chat turn. deliverable
-                # parses defensively now (a `charts` of 'many' used to raise
-                # ValueError here, on the streaming event loop); this guard
-                # keeps that true if the row ever grows a field that does not.
-                try:
-                    _as3_shape = _as3_deliverable.of_version((_published[0].get("current") or {})).to_json() if _published else None
-                except Exception:  # noqa: BLE001
-                    _as3_shape = None
+                # just made. An unreadable row costs the follow-up its hint and
+                # says so in the log; it never breaks the turn. The reasoning
+                # is on _as3_deliverable_shape, above the route.
+                _as3_shape = _as3_deliverable_shape(_published)
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
                     _as3_intent_llm.make_hook(
