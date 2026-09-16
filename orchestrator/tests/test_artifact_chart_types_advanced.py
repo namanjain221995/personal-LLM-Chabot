@@ -592,6 +592,7 @@ def test_a_new_type_name_routes_to_a_picture_not_to_word_and_pdf(text):
 
 @pytest.mark.parametrize("text", [
     "explain the Pareto principle in a one page doc",
+    "explain Pareto's principle in a one page doc",
     "write about pareto optimal allocations",
     "a slide about the violin in classical music",
     "the treemap data structure explained",
@@ -611,6 +612,52 @@ def test_an_ordinary_word_is_not_a_chart_request(text):
 ])
 def test_the_guard_keeps_the_real_chart_asks(text, kind):
     assert kind in _requested_types(text), text
+
+
+# ------------------------------- the guard reads the phrase, not the sentence --
+# Recheck 2026-09-16 of the first fix round. The rule is one rule in both
+# directions: a chart word that names a CHART is a chart, and the same word
+# used as a concept is not. The first round decided it by scanning the whole
+# sentence, which is neither.
+
+
+@pytest.mark.parametrize("text,kind", [
+    # BLOCKER: `\btree\s*map\b(?!.*\b(?:...|class)\b)` is unanchored, so a
+    # data-structure word anywhere later in the sentence cancelled a treemap
+    # that was named outright at the start of it. All three asked for a
+    # treemap and got no chart type at all.
+    ("a treemap of revenue by asset class", "treemap"),
+    ("a treemap of storage by folder and a note on the hash map cache", "treemap"),
+    ("a treemap of the outage causes, then explain the red-black tree", "treemap"),
+    # The pareto guard threw away an ask that names a chart outright, because
+    # "distribution" is one of the concept words and it never looked at what
+    # the concept word was modifying.
+    ("a pareto distribution chart of the failures", "pareto"),
+    ("plot a pareto distribution graph of the failures", "pareto"),
+    ("the pareto distribution diagram of defects", "pareto"),
+])
+def test_a_chart_word_that_names_a_chart_is_a_chart(text, kind):
+    assert kind in _requested_types(text), text
+
+
+@pytest.mark.parametrize("text", [
+    # The pareto guard could not see across an apostrophe-s, so every
+    # possessive form of the concept demanded a pareto chart.
+    "explain Pareto's principle in a one page doc",
+    "write about Pareto's law of the vital few",
+    "a note on Pareto's efficiency for the team",
+    "a doc about Pareto's optimality",
+    # and the plain forms stay concepts.
+    "write about pareto optimal allocations",
+    "explain the Pareto principle in a one page doc",
+    # treemap: the data-structure sense is the word next to it, which is
+    # exactly what the anchored guard keeps.
+    "the treemap data structure explained",
+    "document the TreeMap interface for the team",
+    "compare a treemap and a hash map in a doc",
+])
+def test_the_same_word_used_as_a_concept_is_not_a_chart(text):
+    assert _requested_types(text) == [], text
 
 
 @pytest.mark.parametrize("text", [

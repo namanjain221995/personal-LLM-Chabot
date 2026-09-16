@@ -217,8 +217,30 @@ _CHART_TYPES: List[Tuple[str, str]] = [
     # the bare form minus the senses that are never a chart; "violin" on its
     # own is the instrument far more often than the plot, so it asks for a
     # chart word the way "bullet" and "candle" below do.
-    (r"\bpareto\b(?!\s*(?:principle|optimal|optimality|efficien|frontier|distribution|law|rule|improvement))", "pareto"),
-    (r"\btree\s*map\b(?!.*\b(?:data\s*structure|hash\s*map|red[-\s]black|interface|class)\b)", "treemap"),
+    #
+    # The rule both guards below implement: the word is a CHART unless the
+    # PHRASE it sits in names a concept. The guard therefore reads only the
+    # words next to it. Recheck 2026-09-16 found the first round read the
+    # whole sentence instead: `(?!.*\bclass\b)` swallowed "a treemap of
+    # revenue by asset class", and the pareto guard both missed
+    # "Pareto's principle" (it cannot see across the apostrophe-s) and threw
+    # away "a pareto distribution chart of the failures", where the concept
+    # word is the modifier of a chart noun and the ask names a chart outright.
+    #
+    # pareto: a concept word (optionally after an apostrophe-s) right after
+    # it makes it a concept -- unless that concept word is itself heading a
+    # chart noun ("pareto distribution chart").
+    (r"\bpareto\b"
+     r"(?!(?:['’]s)?\s*"
+     r"(?:principles?|optimal(?:ity)?|efficien\w*|frontiers?|distributions?|laws?|rules?|improvements?)\b"
+     r"(?!\s*(?:charts?|graphs?|plots?|diagrams?)\b))", "pareto"),
+    # treemap: a data-structure noun it heads ("the treemap data structure",
+    # "the TreeMap interface"), or one it is compared with in the same breath
+    # ("a treemap vs a hash map"). Anything further away is another sentence.
+    (r"\btree\s*map\b"
+     r"(?!\s*(?:data\s*structure|interface|class|implementation|node)\b"
+     r"|\s+(?:vs\.?|versus|or|and|is|not)\s+(?:an?\s+|the\s+)?"
+     r"(?:hash\s*map|red[-\s]black|linked\s*list|b-?tree|array)\b)", "treemap"),
     (r"\bviolin\s*(plot|chart|graph)|\bviolin\b(?=.*\b(?:chart|graph|plot)\b)", "violin"),
     # "candle" alone is a wax object; the chart always says candlestick, OHLC
     # or "candle chart".
