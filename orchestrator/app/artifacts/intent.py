@@ -1242,7 +1242,16 @@ def decide(
         # a pronoun the reference rule resolves — stops being chat; the
         # reference condition on the same line keeps it off an unanchored
         # turn.
-        if not _is_remark(low) and (_EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)) \
+        # The WIDER verb list needs the words to point at the FILE, not at any
+        # noun in the room: "highlight the key risks in this contract" is a
+        # question about a contract in a conversation that happens to hold a
+        # file, and `highlight` + `this contract` made it an edit of that file
+        # (AS3 verifier case, re-measured 2026-09-16 on the merged tree).
+        _wider_edit = _MORE_EDIT_VERBS_RE.search(low) and (
+            last_turn_is_artifact or _mentions_hint(low, artifact_hints)
+            or _REFERENCE_FILE_RE.search(low) or _PRONOUN_OBJECT_RE.search(low)
+        )
+        if not _is_remark(low) and (_EDIT_VERBS_RE.search(low) or _wider_edit) \
                 and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
         if not _is_remark(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:

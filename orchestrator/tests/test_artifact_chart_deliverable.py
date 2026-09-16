@@ -54,13 +54,20 @@ def chart_document(chart_type: str = "pie", title: str = "Records by state"):
 
 
 def test_the_gates_verdict_decides_the_chart_deliverable():
-    """formats.py's own chart words are the smaller set: measured on this
-    branch they know neither "waterfall" nor a chart named as a noun with no
-    verb, so both asks fell through to the document default — a Word file and
-    a PDF for a one-line chart request."""
+    """formats.py's own chart words are the smaller set: the gate reads
+    lexicon-normalised text, so it understands asks the word rules cannot.
+
+    The two English cases this test began with — "give me a waterfall showing
+    revenue by quarter" and "scatter of Salary vs Experience" — are read by
+    the word rules themselves since 2026-09-16 (the noun-first shape and the
+    tier-2 names joined _CHART_WORDS_RE), so they no longer measure the gate.
+    The gate's own reading is pinned in its own suite; this test keeps the
+    English contract: these two asks are chart asks with or without it."""
     for text in ("give me a waterfall showing revenue by quarter", "scatter of Salary vs Experience"):
         assert I.decide(text, has_assistant_answer=True).chart_request is True, text
-        assert F.decide(text).formats == ["docx", "pdf"], text
+        assert F.decide(text).formats == ["png"], text
+        assert F.decide(text, chart_request=True).formats == ["png"], text
+
         assert F.decide(text, chart_request=True).formats == ["png"], text
         assert F.decide(text, chart_request=True).kind == "document", text
 
