@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import AsyncIterator, List, Literal, Optional
+from typing import AsyncIterator, List, Literal, Optional, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -2927,6 +2927,27 @@ async def _resolve_document_refs(
     return docs, images, None
 
 
+def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup: bool) -> bool:
+    """Does this turn ask what an ATTACHED file says?
+
+    The honest-visual refusal stands aside for exactly this turn: a map in a
+    photo, a PDF or a video is something to READ, and answering "I can't
+    draw a map" left the file unopened (verifier, 2026-09-16).
+
+    It stands aside for nothing else. Skipping the refusal for every turn
+    that merely CARRIES a file sent "plot these records on a map" with the
+    table attached as a PDF to the document engine, which draws nothing and
+    answers in prose — the 2026-09-16 incident itself (verifier recheck).
+    `visuals.asks_about_attachment_content` reads the words; this function
+    only adds the requirement that there be a file to read.
+    """
+    if not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup):
+        return False
+    from .artifacts import visuals as _t3_visuals
+
+    return _t3_visuals.asks_about_attachment_content(text)
+
+
 _MAX_VIDEO_REFS = 3
 
 
@@ -3715,6 +3736,44 @@ async def _replay_frames(row: dict, stored: dict, session_id: str) -> AsyncItera
     if isinstance(meta, dict) and meta:
         yield sse_event("meta", {**meta, **ids})
     yield sse_event("done", {"session_id": session_id})
+
+
+# --- AS3 intent-capability BEGIN ---
+def _as3_deliverable_shape(published: Sequence[dict]) -> Optional[dict]:
+    """The SHAPE of the most recent published deliverable (V39), for the
+    intent gate — or None when there is nothing to read or the row cannot be
+    read. `published` is newest first and already carries its version row, so
+    this costs no query.
+
+    WHAT IS SWALLOWED, AND WHY THAT IS SAFE. Only the reading of ONE row's
+    `deliverable` JSON. `of_version`/`to_json` touch no I/O, no lock and no
+    other turn state, and the sole effect of a failure is None — which the
+    gate treats as "no previous deliverable", so "make it a bar chart
+    instead" is read as a NEW artifact instead of an edit of the last one.
+    That is exactly the pre-V39 behaviour: the worst case is a turn this
+    branch cannot improve, never a wrong answer or a lost one. It must not
+    raise, because the caller is the chat streaming path: `deliverable`
+    parses defensively now (a `charts` of 'many' used to raise ValueError
+    there, on the event loop) and this keeps that true if the row ever grows
+    a field that does not.
+
+    It is LOGGED, at the level the sibling guards on this path use (the
+    artifact denial backstop), because a row that cannot be read is a writer
+    bug somewhere else and nothing downstream will ever mention it again.
+    """
+    from .artifacts import deliverable as _deliverable
+
+    if not published:
+        return None
+    try:
+        return _deliverable.of_version((published[0].get("current") or {})).to_json()
+    except Exception as exc:  # noqa: BLE001 — the follow-up loses its hint, never the turn
+        logging.getLogger(__name__).warning(
+            "artifact deliverable shape unreadable, the follow-up hint is dropped: %s: %s",
+            type(exc).__name__, str(exc)[:200],
+        )
+        return None
+# --- AS3 intent-capability END ---
 
 
 @app.post("/chat")
@@ -5469,6 +5528,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 _as3_artifact_id = str(request.artifact_id or "")
                 if _as3_artifact_id and _as3_artifact_id not in {str(a.get("id") or "") for a in _published}:
                     _as3_artifact_id = ""  # not this viewer's published artifact: ignored
+                # The SHAPE of the most recent deliverable (V39), so "make it a
+                # bar chart instead" is read as a change to the chart that was
+                # just made. An unreadable row costs the follow-up its hint and
+                # says so in the log; it never breaks the turn. The reasoning
+                # is on _as3_deliverable_shape, above the route.
+                _as3_shape = _as3_deliverable_shape(_published)
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
                     _as3_intent_llm.make_hook(
@@ -5486,6 +5551,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     upload_formats=_as3_upload_formats,
                     last_turn_is_artifact=_as3_last_is_card,
                     artifact_id=_as3_artifact_id or None,
+                    last_deliverable=_as3_shape,
                 )
                 # --- AS3 intent-capability END ---
             # --- AS3 intent-capability BEGIN ---
@@ -5590,6 +5656,46 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     **_as3_engine_kw,
                 )
                 # --- AS3 intent-capability END ---
+            elif (
+                artifact_intent is not None
+                and artifact_intent.unsupported_visual
+                # ...AND THE TURN IS NOT A QUESTION ABOUT AN ATTACHED FILE
+                # (verifier, 2026-09-16). This branch sits above the document
+                # and image routes, and the gate runs on every turn that is
+                # not a video upload, so "what does the map on page 2 show?"
+                # with a PDF attached and "can you show me what the map
+                # says?" with a photo attached were answered "I can't draw a
+                # map" and the file was never read — the vision/document
+                # engine was not called at all (measured on this tree before
+                # this line). A map in a file is something to READ, not
+                # something to draw. An attached turn that really does ask
+                # for a map is covered by capability.CAPABILITY_LINE's limits
+                # clause, which those engines' prompts carry. `video_followup`
+                # joins them: a question about a video the conversation
+                # already holds ("what does the map at 2:10 show?") is a
+                # question about that video.
+                #
+                # The carve-out is the QUESTION, not the attachment (verifier
+                # recheck, 2026-09-16): "plot these records on a map" with
+                # the table attached as a PDF used to skip the refusal too,
+                # and the document engine cannot draw, so that turn came back
+                # as prose — the incident this whole track exists to stop.
+                and not _asks_about_an_attachment(text, request, video_followup)
+            ):
+                # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
+                # map", twice: there is no geographic type in
+                # chart_spec.CHART_TYPES, so no job can end in the picture
+                # that was asked for. The gate answered "none" and named the
+                # visual; the sentence is written by code — what cannot be
+                # drawn, why, and the nearest chart over the same table — so
+                # the model can neither deny being able to make files nor
+                # produce the Word file and PDF this turn produced in
+                # production. No job is opened and nothing is gathered.
+                from .artifacts import visuals as _t3_visuals
+
+                answer = _t3_visuals.refusal_for(artifact_intent.unsupported_visual, history=history)
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "chat", "effort": request.effort})
             elif request.video_uploads or video_followup:
                 # 2026-09-09: a video attached now, or a question about one
                 # attached earlier. The engine waits for the detached analysis
@@ -5999,6 +6105,21 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             answer = f"{answer}{_as3_tail}"
                     if not _as3_rerouted:
                         _as3_metrics.inc("artifact_denial_seen_total", "answers that denied making a file (not rerouted)", engine=_as3_route)
+                elif _as3_capability.promise_in(answer):
+                    # The other half of the same guard: an answer that claims
+                    # a DELIVERY this platform does not perform — "I've
+                    # emailed the report to the team", "I have posted the deck
+                    # to Slack", "the Excel file is password-protected now".
+                    # The gate returns action='none' for these turns (there is
+                    # no file to make), so nothing else in the turn could
+                    # correct them (measured 2026-09-16, I1/I2/I6).
+                    from . import metrics as _as3_metrics
+
+                    _as3_metrics.inc("artifact_false_promise_total", "answers that claimed a delivery the platform cannot perform",
+                                     engine=_as3_route)
+                    _as3_tail = "\n\n" + _as3_capability.DELIVERY_LINE
+                    await emit("token", {"text": _as3_tail})
+                    answer = f"{answer}{_as3_tail}"
             # --- AS3 intent-capability END ---
             gen.answer = answer
             memory.add_exchange(scoped_session, text, answer)

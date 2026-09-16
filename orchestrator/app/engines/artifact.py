@@ -82,7 +82,11 @@ _TITLES = T.STAGE_TITLES
 #: Read with .get everywhere: a format this table does not name is said by
 #: its id, never a KeyError in the middle of a turn (the discovery of
 #: 2026-09-12 found `[]` indexing at the conversion refusal).
-_FORMAT_WORDS = {"pdf": "PDF", "docx": "Word", "pptx": "PowerPoint", "xlsx": "Excel", "csv": "CSV"}
+_FORMAT_WORDS = {"pdf": "PDF", "docx": "Word", "pptx": "PowerPoint", "xlsx": "Excel", "csv": "CSV",
+                 # types.py gained the chart images on 2026-09-15; without
+                 # them here the conversion refusal printed the raw ids
+                 # ("PowerPoint or PDF or png").
+                 "png": "PNG image", "svg": "SVG image"}
 _KIND_WORDS = {"document": "document", "presentation": "deck", "workbook": "workbook"}
 #: How many of the previous user turns are searched for a pasted table
 #: (CONTRACT-2 §11): the table is often the message BEFORE "now make it
@@ -678,6 +682,97 @@ def _count_word(n: int, noun: str) -> str:
     return f"{_COUNT_WORDS.get(n, f'{n:,}')} {noun}{'s' if n != 1 else ''}"
 
 
+def _or_list(words: Sequence[str]) -> str:
+    """"PowerPoint or PDF", "Excel, CSV, Word or PDF" — the Oxford join
+    `_format_list` already makes for "and". Until 2026-09-16 the conversion
+    refusal joined four names with " or " three times over."""
+    items = [str(w) for w in words if str(w).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " or " + items[-1]
+
+
+#: "convert it to X", "make it a X", "give me this as an X", "save it as
+#: X": the turn asks for the SAME file in another form. The reference has
+#: to be there — without it the words are a request for a NEW file, which
+#: the create path answers as it always has.
+_CONVERSION_ASK_RE = re.compile(
+    r"\b(?:convert|turn|change|save|export|render|give\s+me|make|need|want)\b[^.!?\n]{0,30}?"
+    r"\b(?:it|this|that|the\s+(?:deck|presentation|slides?|report|document|doc|file|pdf|docx|pptx|xlsx|workbook|spreadsheet|sheet|one))\b"
+    r"[^.!?\n]{0,25}?\b(?:to|into|as|in)\b"
+    r"|\b(?:convert|turn)\b[^.!?\n]{0,40}?\b(?:to|into)\b",
+    re.I,
+)
+
+
+def _refuse_unmakeable_conversion(instruction: str, intent: ArtifactIntent, candidates: Sequence[dict]) -> str:
+    """The sentence for "convert it to <something we do not make>", or "" .
+
+    Two shapes reach here, both with NO makeable format named: a format this
+    platform does not make at all (Google Slides, .txt, LaTeX), and a chart
+    image the artifact's kind cannot carry (an SVG of a deck). Both used to
+    fall through `if not ok:` into a fresh create.
+
+    The kind is the NEWEST artifact's, which is what "it" means in a
+    conversion follow-up; the sentence names no title, so picking the wrong
+    one of two files can only make the offer slightly wrong, never claim a
+    change that did not happen.
+    """
+    if intent.formats or not candidates:
+        return ""
+    if not _CONVERSION_ASK_RE.search(instruction or ""):
+        return ""
+    kind = str(candidates[0].get("kind") or "document")
+    names = F.unmakeable_names(instruction)
+    if names:
+        return (f"I don't make {_and_list_words(names)} files. I can make {_a_kind_word(kind)} as "
+                f"{_conversion_offer(kind)}.")
+    images = [f for f in F.named_image_formats(instruction) if f not in T.FORMATS_FOR_KIND.get(kind, ())]
+    if images:
+        what = _or_list([_FORMAT_WORDS.get(f, f.upper()) for f in images])
+        return (f"A {_KIND_WORDS.get(kind, kind)} cannot be converted to {what}. "
+                f"I can make it as {_conversion_offer(kind)}.")
+    return ""
+
+
+def _and_list_words(words: Sequence[str]) -> str:
+    items = [str(w) for w in words if str(w).strip()]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _a_kind_word(kind: str) -> str:
+    word = _KIND_WORDS.get(kind, kind)
+    return f"an {word}" if word[:1].lower() in "aeiou" else f"a {word}"
+
+
+def _cannot_clauses(instruction: str, *, all_warnings: Sequence[str] = ()) -> List[str]:
+    """The parts of this request the platform cannot do, as clauses for the
+    sentence. Measured 2026-09-16 (I3-I9): "Make a fillable PDF form",
+    "Build an interactive dashboard I can filter", "with tracked changes
+    turned on" and "Make a PDF and print two copies" each ended on a plain
+    "Created …" with the impossible half never mentioned."""
+    try:
+        from ..artifacts import requirements as R
+
+        said = {str(w) for w in all_warnings}
+        return [c for c in R.unsupported_asks(instruction or "") if c not in said]
+    except Exception as exc:  # noqa: BLE001 — the file still gets its sentence
+        log.info("artifact: capability clauses skipped: %s", type(exc).__name__)
+        return []
+
+
+def _conversion_offer(kind: str) -> str:
+    """The formats a conversion of this kind CAN produce, said to a person.
+    The chart images are left out: "I can make it as PowerPoint or PDF or
+    png" is true and useless — a PNG of a deck is not what anyone who asked
+    to convert a deck means (measured 2026-09-16, A1)."""
+    return _or_list([_FORMAT_WORDS.get(f, f) for f in T.FORMATS_FOR_KIND.get(kind, ()) if f not in T.IMAGE_FORMATS])
+
+
 def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, transform: Optional[Dict[str, Any]] = None,
               dataset: bool = False, data_only_note: str = "", instruction: str = "", converted_to: Sequence[str] = ()) -> str:
     """The one line the person reads (CONTRACT-2 §7). "Updated" ONLY when
@@ -739,10 +834,39 @@ def _sentence(ref: T.ArtifactRef, operation: str, warnings: Sequence[str], *, tr
     if data_only_note and operation == "create":
         note = data_only_note.strip().rstrip(".")
         line += f" {note[0].upper()}{note[1:]}."
-    said = [w for w in warnings if not _CELL_NOTE_RE.match(str(w))][:2]
-    if said:
-        line += " " + " ".join(f"_{w.rstrip('.')}._" for w in said)
+    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w))])
     return line
+
+
+def _warning_clause(warnings: Sequence[str], *, limit: int = 2) -> str:
+    """Up to `limit` warnings in full, then a COUNT of the rest. The slice
+    this replaces truncated: four "column not found" warnings were printed
+    as two and the person read two thirds of the truth, while the card's
+    `warnings` array carried all four (measured 2026-09-16, J1)."""
+    said = [str(w).strip() for w in warnings if str(w).strip()]
+    if not said:
+        return ""
+    out = " " + " ".join(f"_{w.rstrip('.')}._" for w in said[:limit])
+    if len(said) > limit:
+        out += f" _…and {len(said) - limit} more — see the card._"
+    return out
+
+
+#: The notes material_in leaves when a file could not be opened at all.
+_UNREADABLE_NOTE_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?:is not a readable document or table|could not be read)\b", re.IGNORECASE)
+#: What the readers DO open (material_in._read_one_upload).
+_READABLE_KINDS = "PDF, Word, Excel, CSV, Markdown and plain text"
+
+
+def _unreadable_clause(note: str) -> str:
+    """"I couldn't read resume.pages — I can read PDF, Word, …", or "" when
+    the note is not a read failure."""
+    m = _UNREADABLE_NOTE_RE.match(str(note or "").strip())
+    if not m:
+        return ""
+    name = m.group("name").strip().strip('"')
+    return f"I couldn't read {name} — I can read {_READABLE_KINDS}, so it was not used"
 
 
 #: A per-cell or per-sheet note ("sheet 'Audit', column 'Comments': row 21:
@@ -839,6 +963,17 @@ async def run_artifact_engine(
     #    whatever the later sentences say.
     existing = await db.run_in_thread(adb.list_artifacts, int(user_id), conversation_id)
     candidates = [a for a in existing if (a.get("current") or {}).get("status") in ("completed", "completed_with_warnings")]
+    # A CONVERSION whose target this platform cannot make is refused by
+    # name, never answered with a second file. Measured 2026-09-16: "convert
+    # it to a .txt file", "to SVG", "to a Google Slides file" and "an
+    # editable Google Doc" each created another artifact under the SAME
+    # title as the one the person pointed at, so nothing the person read
+    # said the conversion had not happened.
+    refusal = _refuse_unmakeable_conversion(instruction, intent, candidates)
+    if refusal:
+        await emit("token", {"text": refusal})
+        await emit("meta", {"route": "artifact", "effort": effort})
+        return refusal
     operation = intent.action if intent.action in ("edit", "convert") and not intent.new_artifact else "create"
     parent: Optional[Tuple[str, int]] = None
     parent_row: Optional[dict] = None
@@ -884,18 +1019,23 @@ async def run_artifact_engine(
             # "go back to version 1": the same formats that version had.
             ok = [f.get("format") for f in ((parent_row.get("current") or {}).get("files") or []) if f.get("format")]
         if not ok and re.search(r"\bconvert\b", instruction, re.I):
-            what = ", ".join(_FORMAT_WORDS.get(b, b) for b in bad) or "that format"
-            line = f"A {_KIND_WORDS.get(kind, kind)} cannot be converted to {what}. I can make it as {' or '.join(_FORMAT_WORDS.get(f, f) for f in T.FORMATS_FOR_KIND.get(kind, ()))}."
+            what = _or_list([_FORMAT_WORDS.get(b, b) for b in bad]) or "that format"
+            line = f"A {_KIND_WORDS.get(kind, kind)} cannot be converted to {what}. I can make it as {_conversion_offer(kind)}."
             await emit("token", {"text": line})
             await emit("meta", {"route": "artifact", "effort": effort})
             return line
         if not ok:
             # "Also give me this as Excel" after a deck: not a conversion the
-            # deck can take — a NEW workbook from the same conversation is
-            # what was asked for.
+            # deck can take, so a NEW file is built from the conversation —
+            # and the sentence must SAY so. Measured 2026-09-16 (A10): the
+            # second artifact came back under the same title as the deck,
+            # reported by the plain create sentence, so the two were
+            # indistinguishable in the card list.
+            was = _KIND_WORDS.get(kind, kind)
             operation, parent, parent_row = "create", None, None
-            decision = F.decide(instruction, explicit_only=intent.formats or None)
+            decision = F.decide(instruction, explicit_only=intent.formats or None, chart_request=bool(intent.chart_request))
             kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, f"new {decision.kind}: {decision.reason}", list(decision.warnings)
+            warnings.append(f"that {was} can't become {_a_kind_word(kind)}, so this is a new file built from the conversation")
             data_only_note = str(getattr(decision, "data_only_note", "") or "")
         else:
             # AS3: a convert KEEPS the formats the artifact has and adds the new one.
@@ -906,7 +1046,13 @@ async def run_artifact_engine(
             reason = f"convert: {', '.join(ok)}"
             warnings = [f"{', '.join(bad)} cannot be produced for a {kind}"] if bad else []
     else:
-        decision = F.decide(instruction, explicit_only=intent.formats or None)
+        # The GATE decided whether this is a chart, on normalised text with
+        # the negated clauses blanked; formats.py is told that verdict
+        # instead of running its own smaller chart vocabulary over the
+        # instruction a second time. Production 2026-09-16: "visualise this
+        # table on pie chart" came back as a Word file AND a PDF because the
+        # two readings disagreed.
+        decision = F.decide(instruction, explicit_only=intent.formats or None, chart_request=bool(intent.chart_request))
         kind, formats, template_id, reason, warnings = decision.kind, decision.formats, decision.template_id, decision.reason, list(decision.warnings)
         data_only_note = str(getattr(decision, "data_only_note", "") or "")
 
@@ -943,6 +1089,19 @@ async def run_artifact_engine(
             material.tables.extend(list(getattr(gathered, attr, []) or []))
         if getattr(gathered, "uploads_text", ""):
             material.uploads_text = str(gathered.uploads_text)
+        # What the reader could NOT read. `GatheredInput.notes` had exactly
+        # one consumer — `to_material_dict`, which persists it into
+        # material.json where nobody reads it — so an attachment this
+        # platform cannot open (resume.pages, an .exe, a corrupt .xlsx) was
+        # composed around in silence and the turn still ended on a plain
+        # "Created …" (measured 2026-09-16, D1). The notes now reach the
+        # composer, and the READ FAILURES reach the sentence.
+        notes = [str(n) for n in (getattr(gathered, "notes", None) or []) if str(n).strip()]
+        material.notes.extend(notes)
+        for note in notes:
+            clause = _unreadable_clause(note)
+            if clause and clause not in warnings:
+                warnings.append(clause)
     transform: Dict[str, Any] = {}
     if operation == "create":
         # The pasted table(s), parsed from the ORIGINAL text — never from
@@ -1014,7 +1173,7 @@ async def run_artifact_engine(
     except Exception:  # noqa: BLE001 — the ref still carries the job
         version_row = None
     ref = pipeline.ref_for(row, version_row)
-    all_warnings = list(warnings) + [w for w in ref.warnings if w not in warnings]
+    all_warnings = list(warnings) + [w for w in ref.warnings if w not in warnings] + _cannot_clauses(instruction, all_warnings=warnings)
     ref.warnings = all_warnings
     status = str(row.get("status") or "")
     if status in ("completed", "completed_with_warnings"):
@@ -1273,12 +1432,37 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
         # 2026-09-15: "heatmap of ticket count by Status and Priority" drew
         # a note "A heatmap needs a column for its rows").
         try:
-            spec = await asyncio.to_thread(_repair_bindings, spec, list(tables_), instruction, warn)
+            # `parent is not None` is this function's own test for an edit:
+            # a chart in a version the person already accepted is not
+            # retyped by an instruction that is not about charts.
+            spec = await asyncio.to_thread(_repair_bindings, spec, list(tables_), instruction, warn,
+                                           parent is not None)
         except Exception as exc:  # noqa: BLE001 — resolve still runs on the model's binding
             log.info("artifact: chart binding repair skipped: %s", type(exc).__name__)
+    chart_tables = list(tables_)
+    if parent is not None and _chart_data is not None and hasattr(_chart_data, "tables_from_parent_charts") and _has_charts(spec):
+        # THE EDIT TURN HAS NO PASTE (recheck BLOCKER, 2026-09-16). The chart
+        # was computed in the CREATE turn from a pasted or uploaded table;
+        # this turn is six words ("make it a bar chart instead") and
+        # material.tables is empty, so resolve_spec below found no 'paste1'
+        # and replaced the picture with a "the table is not available"
+        # callout — measured with the parent untouched, on this branch and on
+        # main (075ee8b), so every edit of a file holding a bound chart lost
+        # the chart. The parent's own chart is rebuilt into that table, and
+        # only when it provably reproduces the parent's numbers under an
+        # unchanged binding (chart_data.tables_from_parent_charts).
+        #
+        # Kept OUT of `tables_`: derived.enforce below reads that list to
+        # decide which figures a model wrote must be recomputed, and a table
+        # rebuilt from a chart is not the material it would check against.
+        try:
+            recovered = await asyncio.to_thread(_chart_data.tables_from_parent_charts, spec, parent, list(tables_))
+            chart_tables.extend(recovered or [])
+        except Exception as exc:  # noqa: BLE001 — the chart refuses as before
+            log.info("artifact: parent chart tables not rebuilt: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
         try:
-            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, list(tables_))  # type: ignore[attr-defined]
+            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, chart_tables)  # type: ignore[attr-defined]
             for n in notes or []:
                 warn(str(n))
         except Exception as exc:  # noqa: BLE001 — never fails the job
@@ -1304,7 +1488,8 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
     return spec
 
 
-def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Callable[[str], None]) -> Any:
+def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Callable[[str], None],
+                     keep_accepted_type: bool = False) -> Any:
     from ..artifacts import chart_spec as CS
 
     body = getattr(spec, "body", None)
@@ -1312,12 +1497,14 @@ def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Call
         return spec
     for b in list(getattr(body, "blocks", None) or []):
         if getattr(b, "type", "") == "chart" and b.chart.data is not None and not b.chart.series:
-            b.chart, notes = _chart_data.repair_binding(b.chart, tables_, instruction)
+            b.chart, notes = _chart_data.repair_binding(b.chart, tables_, instruction,
+                                                        keep_accepted_type=keep_accepted_type)
             for n in notes:
                 warn(str(n))
     for sl in list(getattr(body, "slides", None) or []):
         if getattr(sl, "chart", None) is not None and sl.chart.data is not None and not sl.chart.series:
-            sl.chart, notes = _chart_data.repair_binding(sl.chart, tables_, instruction)
+            sl.chart, notes = _chart_data.repair_binding(sl.chart, tables_, instruction,
+                                                         keep_accepted_type=keep_accepted_type)
             for n in notes:
                 warn(str(n))
     for sh in list(getattr(body, "sheets", None) or []):
@@ -1327,7 +1514,8 @@ def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Call
         fixed = []
         for c in sh.charts:
             if isinstance(c, CS.Chart) and c.data is not None and not c.series:
-                c, notes = _chart_data.repair_binding(c, [*tables_, own] if not c.data.table_id else tables_, instruction)
+                c, notes = _chart_data.repair_binding(c, [*tables_, own] if not c.data.table_id else tables_,
+                                                     instruction, keep_accepted_type=keep_accepted_type)
                 for n in notes:
                     warn(str(n))
             fixed.append(c)
@@ -1450,9 +1638,7 @@ def _edit_sentence(title: str, version: int, changes: Sequence[str], not_applied
     if data_only_note:
         note = data_only_note.strip().rstrip(".")
         line += f" {note[0].upper()}{note[1:]}."
-    said_w = [w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")][:2]
-    if said_w:
-        line += " " + " ".join(f"_{w.rstrip('.')}._" for w in said_w)
+    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")])
     return line
 
 
@@ -1651,10 +1837,20 @@ async def _run_edit(
             except Exception:  # noqa: BLE001
                 changed = []
             said = [c for c in said if c != "the document was rewritten as asked"]
-            said.append(("rewrote " + ", ".join(changed[:5]) + (" and more" if len(changed) > 5 else "")) if changed else "rewrote the file, but no section's text changed")
+            # A rewrite that changed no section is NOT a change to report:
+            # appending the clause made `said` non-empty, so the sentence
+            # read "Updated **X** v2: rewrote the file, but no section's
+            # text changed" — a claim and its own contradiction in one line
+            # (measured 2026-09-16, H1). With nothing appended,
+            # `_edit_sentence` says "Saved **X** v2, but nothing in it
+            # changed", which is what happened.
+            if changed:
+                said.append("rewrote " + ", ".join(changed[:5]) + (" and more" if len(changed) > 5 else ""))
         unmet = ((row.get("progress") or {}).get("selfcheck") or {}).get("unmet") or []
         line = _edit_sentence(ref.title or title, int(ref.version), said, not_applied, unmet=unmet, data_only_note=data_only_note,
-                              restored=restore_n, warnings=[w for w in warnings if w not in failed_pending and w != "nothing in the file changed"])
+                              restored=restore_n,
+                              warnings=[w for w in warnings if w not in failed_pending and w != "nothing in the file changed"]
+                              + _cannot_clauses(instruction, all_warnings=warnings))
     elif status == "cancelled":
         line = "The change was cancelled before it was finished."
     elif str(row.get("error") or "").startswith(UNCHANGED_EDIT_MARK):

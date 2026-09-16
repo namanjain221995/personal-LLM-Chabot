@@ -1165,6 +1165,74 @@ def _one_clause(m: Optional["re.Match[str]"], text: str, *groups: str) -> Option
     return m
 
 
+#: The chart-type vocabulary the intent gate reads (lexicon.CHART_TYPE_WORDS),
+#: so the pre-planner answers exactly the messages the gate routed here — with
+#: 0 model calls. The literal is the fallback for a build without the
+#: intent-capability track, like every other `_lexicon` use above.
+_CHART_TYPE_WORDS = getattr(
+    _lexicon, "CHART_TYPE_WORDS",
+    r"horizontal\s+bar|percent\s+stacked(?:\s+bar)?|stacked(?:\s+bar)?|bar|column|line|area|pie|donut|doughnut|"
+    r"scatter|bubble|histogram|combo|dual[\s-]axis|box(?:\s*plot)?|heat\s*map|waterfall|funnel|gantt|radar|spider",
+)
+#: "make it a bar chart instead", "the same as a line chart", "as a donut
+#: chart". The span starts at the "same/instead/as" words so `coverage`
+#: sees them consumed: the rule is taken only when the type change is the
+#: WHOLE request.
+_CHART_TYPE_CHANGE_RE = re.compile(
+    r"(?:\b(?:make|change|turn|redo|render|draw|show|convert|give|do)\b\s*)?(?:\b(?:me|it|this|that)\b\s*)?"
+    r"(?:\bthe\s+(?:chart|graph|plot)\b\s*)?"
+    r"(?:\b(?:same|instead|rather)\b\s*)?(?:\b(?:thing|one)\b\s*)?(?:\b(?:but|and)\b\s*)?"
+    r"(?:\b(?:as|to|into|in)\b\s*)?(?:\ban?\b\s*|\bthe\b\s*)?"
+    rf"\b(?P<t>{_CHART_TYPE_WORDS})\s+(?:chart|graph|plot)\b"
+    r"(?:\s*\b(?:instead|now|again|please)\b)*",
+    re.I,
+)
+#: chart_type_alias folds spaces to underscores, which leaves "heat map" as
+#: `heat_map`; CHART_TYPES spells it `heatmap`.
+_CHART_TYPE_SPELLING = {"heat map": "heatmap", "heatmap": "heatmap"}
+
+
+def chart_type_named(text: str) -> Optional[Tuple[str, Tuple[int, int]]]:
+    """(chart type, the span it was said in) when `text` names one, else None.
+    The type is canonical (chart_spec.CHART_TYPES) or None."""
+    m = _CHART_TYPE_CHANGE_RE.search(text or "")
+    if not m:
+        return None
+    raw = " ".join(m.group("t").lower().replace("-", " ").split())
+    raw = _CHART_TYPE_SPELLING.get(raw, raw)
+    if _chart_spec is not None and hasattr(_chart_spec, "chart_type_alias"):
+        canonical = str(_chart_spec.chart_type_alias(raw))
+        known = getattr(_chart_spec, "CHART_TYPES", ())
+    else:
+        canonical = {"column": "bar", "doughnut": "donut", "spider": "radar", "timeline": "gantt",
+                     "dual axis": "combo", "box plot": "box", "stacked": "stacked_bar",
+                     "percent stacked": "percent_stacked_bar", "percent stacked bar": "percent_stacked_bar",
+                     "horizontal bar": "horizontal_bar"}.get(raw, raw.replace(" ", "_"))
+        known = ("bar", "horizontal_bar", "line", "pie")
+    if canonical not in known:
+        return None
+    return canonical, (m.start(), m.end())
+
+
+def _parent_has_chart(parent: S.ArtifactSpec) -> bool:
+    """The set_chart pre-plan is only an answer when there IS a chart.
+
+    On a chart-less file "make it a bar chart instead" belongs to the
+    planner, which can ADD one. Measured before this guard: the pre-plan
+    emitted SetChart on a heading+paragraph document, `_apply_chart` raised
+    "the file has no chart", and the turn's only outcome was
+    not_applied=[{'op': 'set_chart', 'reason': 'the file has no chart'}] —
+    a refusal where the old planner simply drew the chart. `plan()` reaches
+    preplan unconditionally, so the UI's "Edit with a prompt" on ANY artifact
+    took that path."""
+    if _chart_spec is None or not hasattr(_chart_spec, "iter_chart_slots"):
+        return False
+    try:
+        return any(True for _ in _chart_spec.iter_chart_slots(parent))
+    except Exception:  # noqa: BLE001 — an unwalkable spec is no chart, never a crash
+        return False
+
+
 def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
     """The deterministic pre-planner (0 model calls). None when it does not
     explain ≥ 90% of the instruction's content words."""
@@ -1182,6 +1250,17 @@ def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
         m = _RESTORE_RE.search(text)
         if m and coverage(text, [(m.start(), m.end())]) >= PREPLAN_COVERAGE:
             return EditPlan(ops=[RestoreVersion(version=n)], summary=f"restore v{n}", planner="deterministic")
+
+    # A chart TYPE change and nothing else: "make it a bar chart instead",
+    # "now do the same as a line chart". chart_spec.apply_patch clears the
+    # computed categories/series, so chart_data re-runs the binding the
+    # parent version already carries — the model is never asked for the
+    # numbers a second time (production 2026-09-16). Anything more in the
+    # sentence fails `coverage` and goes to the planner as before.
+    named = chart_type_named(text) if _parent_has_chart(parent) else None
+    if named is not None and coverage(text, [named[1]]) >= PREPLAN_COVERAGE:
+        return EditPlan(ops=[SetChart(target=ChartRef(), patch={"type": named[0]})],
+                        summary=f"set_chart {named[0]}", planner="deterministic")
 
     # title / subtitle
     tm = re.search(

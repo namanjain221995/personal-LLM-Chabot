@@ -38,10 +38,20 @@ def test_a_chart_needs_a_binding_or_literal_numbers():
         CS.Chart(type="bar", categories=["a"], series=[{"name": "x", "values": [0]}])
 
 
-def test_twenty_types_and_the_tiers():
-    assert len(CS.CHART_TYPES) == 20 and len(set(CS.CHART_TYPES)) == 20
+def test_the_type_list_and_the_tiers():
+    """26 types since the 2026-09-16 round added pareto, treemap, violin,
+    candlestick, sunburst and bullet; the two tiers still partition them and
+    the Literal the model is validated against still matches the tuple."""
+    import typing
+
+    assert len(CS.CHART_TYPES) == 26 and len(set(CS.CHART_TYPES)) == 26
     assert set(CS.TIER1_TYPES) | set(CS.TIER2_TYPES) == set(CS.CHART_TYPES)
-    for alias, canonical in (("doughnut", "donut"), ("Box Plot", "box"), ("dual-axis", "combo"), ("timeline", "gantt"), ("column", "bar")):
+    assert not set(CS.TIER1_TYPES) & set(CS.TIER2_TYPES)
+    assert set(typing.get_args(CS.ChartType)) == set(CS.CHART_TYPES)
+    for alias, canonical in (("doughnut", "donut"), ("Box Plot", "box"), ("dual-axis", "combo"), ("timeline", "gantt"),
+                             ("column", "bar"), ("OHLC", "candlestick"), ("tree map", "treemap"),
+                             ("violin plot", "violin"), ("sun-burst", "sunburst"), ("bullet graph", "bullet"),
+                             ("pareto chart", "pareto")):
         assert bound(type=alias).type == canonical
 
 

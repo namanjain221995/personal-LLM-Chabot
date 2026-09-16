@@ -213,7 +213,11 @@ def _style_axes_xl(c, chart: CS.Chart, d: R.ChartStyleDefaults, *, value_axis=No
         va.scaling.logBase = 10
     if chart.y_label:
         va.title = _xl_title(chart.y_label, axis_size, axis_colour, False, font)
-    if chart.x_label and chart.type not in CS.PART_OF_WHOLE_TYPES:
+    # NO_AXIS_TYPES, not PART_OF_WHOLE_TYPES: the set of types drawn with no
+    # x/y axis pair is the one that must not print a category-axis title.
+    # They differ by "sunburst" only, which CONTAINER_SUPPORT never sends
+    # here today, so this is a contract fix rather than a behaviour change.
+    if chart.x_label and chart.type not in CS.NO_AXIS_TYPES:
         ca.title = _xl_title(chart.x_label, axis_size, axis_colour, False, font)
 
 

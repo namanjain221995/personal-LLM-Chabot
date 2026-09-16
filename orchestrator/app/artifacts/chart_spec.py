@@ -40,6 +40,7 @@ CHART_TYPES: Tuple[str, ...] = (
     "line", "area", "stacked_area", "pie", "donut", "scatter", "histogram", "combo",
     # tier 2 — images where a container has no native form
     "box", "heatmap", "waterfall", "funnel", "gantt", "radar", "bubble",
+    "pareto", "treemap", "violin", "candlestick", "sunburst", "bullet",
 )
 TIER1_TYPES: Tuple[str, ...] = CHART_TYPES[:13]
 TIER2_TYPES: Tuple[str, ...] = CHART_TYPES[13:]
@@ -49,16 +50,35 @@ ChartType = Literal[
     "bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar",
     "line", "area", "stacked_area", "pie", "donut", "scatter", "histogram", "combo",
     "box", "heatmap", "waterfall", "funnel", "gantt", "radar", "bubble",
+    "pareto", "treemap", "violin", "candlestick", "sunburst", "bullet",
 ]
 
 #: Types whose categories come from grouping rows by `x` and aggregating `y`.
 AGGREGATING_TYPES: Tuple[str, ...] = (
     "bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar",
     "line", "area", "stacked_area", "pie", "donut", "combo", "heatmap", "waterfall", "funnel", "radar",
+    "pareto", "treemap", "sunburst", "bullet",
 )
 BAR_FAMILY: Tuple[str, ...] = ("bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar")
 STACKED_TYPES: Tuple[str, ...] = ("stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar", "stacked_area")
-PART_OF_WHOLE_TYPES: Tuple[str, ...] = ("pie", "donut")
+
+#: One series over categories, each category coloured from the palette and
+#: each value a share of the total. A treemap is the rectangular form of a
+#: pie, so it obeys the same one-series rule and the same negative-value ban.
+PART_OF_WHOLE_TYPES: Tuple[str, ...] = ("pie", "donut", "treemap")
+
+#: Types drawn without an x/y axis pair, so an axis label computed from the
+#: binding would be printed next to nothing.
+NO_AXIS_TYPES: Tuple[str, ...] = PART_OF_WHOLE_TYPES + ("sunburst",)
+
+#: A share of a whole is only defined for non-negative parts.
+NON_NEGATIVE_TYPES: Tuple[str, ...] = ("pie", "donut", "funnel", "treemap", "sunburst", "pareto")
+
+#: Types with one series per value of `group_by`; the rest fold the split away.
+SPLIT_TYPES: Tuple[str, ...] = (
+    "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar", "line", "area", "stacked_area",
+    "bar", "horizontal_bar", "heatmap", "radar", "combo", "sunburst",
+)
 XY_TYPES: Tuple[str, ...] = ("scatter", "bubble")
 
 Agg = Literal["sum", "avg", "count", "min", "max", "median", "none"]
@@ -201,6 +221,10 @@ _TYPE_ALIASES = {
     "stacked": "stacked_bar", "stacked_column": "stacked_bar", "doughnut": "donut",
     "scatter_plot": "scatter", "hist": "histogram", "dual_axis": "combo", "bar_line": "combo",
     "box_plot": "box", "boxplot": "box", "timeline": "gantt", "spider": "radar",
+    "ohlc": "candlestick", "candle": "candlestick", "candle_chart": "candlestick", "stock": "candlestick",
+    "tree_map": "treemap", "mosaic": "treemap", "violin_plot": "violin", "violinplot": "violin",
+    "sun_burst": "sunburst", "pareto_chart": "pareto", "pareto_diagram": "pareto", "bullet_chart": "bullet",
+    "bullet_graph": "bullet", "kpi_bullet": "bullet",
     "line_chart": "line", "area_chart": "area", "pie_chart": "pie", "bar_chart": "bar",
     "percent_stacked": "percent_stacked_bar", "100_stacked_bar": "percent_stacked_bar",
 }
@@ -278,6 +302,7 @@ class Binding(_Strict):
     end: Optional[str] = Field(default=None, max_length=80, description="Gantt: end date column.")
     label: Optional[str] = Field(default=None, max_length=80, description="Gantt: task label column.")
     size: Optional[str] = Field(default=None, max_length=80, description="Bubble: size column.")
+    target: Optional[str] = Field(default=None, max_length=80, description="Bullet: the target / goal column the actual is measured against.")
     trendline: bool = False
 
     @field_validator("table_id")
@@ -492,12 +517,48 @@ class Trend(_Strict):
     r2: float
 
 
+class Distribution(_Strict):
+    """One group's SAMPLE, for a violin. The density curve is drawn from
+    these numbers; `n` is the group's true size (`values` may be a stride
+    sample of it, which the chart's notes say)."""
+
+    name: str = Field(max_length=80)
+    n: int = 0
+    values: List[float] = Field(default_factory=list, max_length=600)
+
+
+class Candle(_Strict):
+    """One open-high-low-close period."""
+
+    label: str = Field(max_length=80)
+    open: float = 0.0
+    high: float = 0.0
+    low: float = 0.0
+    close: float = 0.0
+
+
+class Bullet(_Strict):
+    """One actual measure against its target, with the qualitative band
+    upper bounds that came from the table (empty when none were bound)."""
+
+    label: str = Field(max_length=80)
+    actual: float = 0.0
+    target: float = 0.0
+    bands: List[float] = Field(default_factory=list, max_length=4)
+
+
 class ChartExtra(_Strict):
     bin_edges: List[float] = Field(default_factory=list, max_length=101)
     box: List[BoxStats] = Field(default_factory=list, max_length=60)
     spans: List[Span] = Field(default_factory=list, max_length=200)
     trendlines: List[Trend] = Field(default_factory=list, max_length=8)
     heatmap_rows: List[str] = Field(default_factory=list, max_length=60)
+    violin: List[Distribution] = Field(default_factory=list, max_length=12)
+    candles: List[Candle] = Field(default_factory=list, max_length=300)
+    bullets: List[Bullet] = Field(default_factory=list, max_length=12)
+    #: sunburst: how many outer-ring slices each inner slice owns, in
+    #: `categories` order — the ring geometry, not a value.
+    ring_counts: List[int] = Field(default_factory=list, max_length=200)
 
 
 class Provenance(_Strict):
@@ -608,6 +669,7 @@ class BindingPatch(_Strict):
     end: Optional[str] = Field(default=None, max_length=80)
     label: Optional[str] = Field(default=None, max_length=80)
     size: Optional[str] = Field(default=None, max_length=80)
+    target: Optional[str] = Field(default=None, max_length=80)
     trendline: Optional[bool] = None
 
 
@@ -739,7 +801,7 @@ GUIDED_STYLE_FIELDS: Tuple[str, ...] = (
 #: 15 misses; the grouping column now comes right after x and the
 #: type-specific fields last, each saying which type it is for.
 _GUIDED_BINDING_ORDER: Tuple[str, ...] = (
-    "table_id", "x", "group_by", "y", "agg", "date_bucket", "filters", "sort", "top_n", "bins", "trendline", "y2", "label", "start", "end", "size",
+    "table_id", "x", "group_by", "y", "agg", "date_bucket", "filters", "sort", "top_n", "bins", "trendline", "y2", "label", "start", "end", "size", "target",
 )
 _BINDING_HINTS: Dict[str, str] = {
     "group_by": "The second dimension ('by region', 'for each region', 'broken down by priority'): one series per value — stacked bars, one line per group, heatmap rows. Leave out when there is one dimension.",
@@ -749,6 +811,7 @@ _BINDING_HINTS: Dict[str, str] = {
     "start": "ONLY for gantt: the start date column.",
     "end": "ONLY for gantt: the end date column.",
     "size": "ONLY for bubble: the bubble size column.",
+    "target": "ONLY for bullet: the target / goal column the actual is compared with.",
     "trendline": "ONLY for scatter: true when a trend line is asked for.",
     "bins": "ONLY for histogram.",
 }
@@ -796,7 +859,7 @@ def guided_schema(model: type = Chart, tables: Sequence[Any] = ()) -> dict:
             req.append(key)
     schema["required"] = req
     defs = schema.get("$defs", {})
-    for name in ("Series", "ChartExtra", "Provenance", "BoxStats", "Span", "Trend"):
+    for name in ("Series", "ChartExtra", "Provenance", "BoxStats", "Span", "Trend", "Distribution", "Candle", "Bullet"):
         defs.pop(name, None)
     style = defs.get("ChartStyle")
     if style:
@@ -823,7 +886,7 @@ def guided_schema(model: type = Chart, tables: Sequence[Any] = ()) -> dict:
 
             if ids:
                 ordered["table_id"] = {**one_of(ids), "description": "The id of the table to chart."}
-            for key, names in (("x", every), ("group_by", every), ("label", every), ("start", dates or every), ("end", dates or every), ("size", numeric or every)):
+            for key, names in (("x", every), ("group_by", every), ("label", every), ("start", dates or every), ("end", dates or every), ("size", numeric or every), ("target", numeric or every)):
                 if key in ordered:
                     ordered[key] = {**one_of(names), "description": ordered[key].get("description", "")}
             for key in ("y", "y2"):
@@ -1003,6 +1066,16 @@ def prompt_guide(kind: str, tables: Sequence[Any]) -> str:
         "gantt needs label, start, end; bubble needs x, y, size; scatter needs numeric x and y (trendline: true for a trend line); histogram needs one numeric y (bins optional)."
     )
     lines.append(
+        "The advanced types and what each one needs: "
+        "pareto = x + one y (bars fall from largest to smallest and code adds the cumulative % line — for finding the few causes behind most of the total); "
+        "treemap = x + one y (a pie's rectangles: many parts of one whole, more than a pie can hold); "
+        "sunburst = x (inner ring) + group_by (outer ring) + y or agg count (a two-level breakdown); "
+        "violin = y (the numbers) + x or group_by (the groups) — the shape of a distribution per group, where box shows only its five numbers; "
+        "candlestick = x (the period) + exactly four y columns IN THE ORDER open, high, low, close; "
+        "bullet = x (the label) + y (the actual) + target (the goal column); any further y columns are the band upper bounds. "
+        "All of them, like every other type, are drawn from the table: never invent a target, a band or a price."
+    )
+    lines.append(
         "Filters compare real cell values: a date range is two filters with ISO dates "
         "({\"column\": \"Date\", \"op\": \"gte\", \"value\": \"2026-01-01\"}); \"Q1 and Q2\" is date_bucket quarter plus a date filter, never a filter on the text Q1. "
         "Stacked or one-line-per-group charts put the grouping column in group_by."
@@ -1012,9 +1085,19 @@ def prompt_guide(kind: str, tables: Sequence[Any]) -> str:
         '"group_by": "Region", "y": ["Amount"], "agg": "sum"}}. Example: {"type": "pie", "title": "Tickets by status", "data": {"table_id": "upload2", "x": "Status", "agg": "count"}, '
         '"style": {"category_colors": {"Open": "red"}}}.'
     )
+    # The SAME rule table chart_choice.recommend applies after the model
+    # answers: a type the guidance and the chooser disagree on is a type the
+    # person is told was changed, so the two lists are kept in one place.
+    from . import chart_choice  # lazy: chart_choice imports this module
+
+    lines.append(chart_choice.rules_text())
+    # The advanced types the chooser does not reach on its own: they answer a
+    # question the shape alone cannot ask (2026-09-16).
     lines.append(
-        "Type when the person does not say: dates on x → line; parts of a whole with at most 7 categories → pie; comparing categories → bar "
-        "(horizontal_bar when labels are long); two numeric measures → scatter; one numeric distribution → histogram."
+        "Advanced types, when the question calls for one: a ranked few-causes question (\"which states drive most of it\") → pareto; "
+        "parts of a whole with 8 to 24 categories → treemap; a breakdown inside a breakdown → sunburst; "
+        "one distribution per group where the shape matters → violin (box when only the quartiles matter); "
+        "open/high/low/close price columns → candlestick; an actual against a stated target → bullet."
     )
     lines.append("Types: " + ", ".join(CHART_TYPES) + ".")
     if kind == "workbook":
@@ -1027,6 +1110,7 @@ __all__ = [
     "CHART_TYPES", "TIER1_TYPES", "TIER2_TYPES", "LEGACY_TYPES", "AGGREGATING_TYPES", "BAR_FAMILY", "STACKED_TYPES",
     "PART_OF_WHOLE_TYPES", "XY_TYPES", "AGGS", "AGG_LABELS", "DATE_BUCKETS", "NUMBER_FORMATS", "DEFAULT_PALETTE",
     "Filter", "Binding", "ChartTextStyle", "ChartStyle", "Series", "BoxStats", "Span", "Trend", "ChartExtra", "Provenance",
+    "Distribution", "Candle", "Bullet", "NO_AXIS_TYPES", "NON_NEGATIVE_TYPES", "SPLIT_TYPES",
     "Chart", "SheetChart", "BindingPatch", "ChartStylePatch", "ChartPatch", "ChartRef", "apply_patch", "from_legacy",
     "to_legacy", "guided_schema", "strip_output_fields", "CONTAINER_SUPPORT", "support_for", "iter_chart_slots",
     "find_charts", "prompt_guide", "resolve_color", "allowed_font", "chart_from_model", "GUIDED_STYLE_FIELDS",

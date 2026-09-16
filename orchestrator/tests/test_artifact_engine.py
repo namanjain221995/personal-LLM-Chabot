@@ -184,7 +184,12 @@ def test_an_edit_makes_version_two_of_the_same_artifact(owner, monkeypatch):
     assert ref2["operation"] == "edit" and [f["format"] for f in ref2["files"]] == ["pdf"], "an edit keeps the formats"
     assert seen[1]["operation"] == "edit" and seen[1]["parent"] is not None and seen[1]["parent"].title == "Pricing Update"
     assert seen[1]["instruction"] == "Make it shorter."
-    assert answer.startswith("Updated **Pricing Update (edited)**")
+    # The stub rewrite in this test returns the same sections, so nothing in
+    # the file actually changes. Until 2026-09-16 the sentence read "Updated
+    # … v2: rewrote the file, but no section's text changed" — a claim and
+    # its own contradiction; it now says what happened. The version, the
+    # parent and the formats above are what this test is really about.
+    assert answer.startswith("Saved **Pricing Update (edited)** v2, but nothing in it changed")
     # Version 1 is still there, untouched.
     v1 = adb.get_version(ref1["artifact_id"], 1, owner)
     assert v1["status"] == "completed" and os.path.isfile(os.path.join(settings.reports_dir, "artifacts", str(owner), ref1["artifact_id"], "v1", v1["files"][0]["filename"]))

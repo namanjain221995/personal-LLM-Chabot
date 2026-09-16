@@ -75,7 +75,7 @@ _BUCKET_WORDS: Dict[str, Tuple[str, ...]] = {
 _FILLER = ("of", "the", "in", "per", "by", "(", ")", ":")
 _TOTAL_LABEL_RE = re.compile(r"^\s*(?:grand\s+|sub\s*-?\s*)?(?:total|sum|overall)s?\b", re.IGNORECASE)
 _NUMERIC_TYPES = ("integer", "number", "currency", "percent")
-_NON_AGG_TYPES = ("scatter", "bubble", "histogram", "box", "gantt")
+_NON_AGG_TYPES = ("scatter", "bubble", "histogram", "box", "violin", "gantt")
 
 
 def _fold(text: Any) -> str:

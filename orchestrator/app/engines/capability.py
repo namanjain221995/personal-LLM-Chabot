@@ -25,15 +25,49 @@ watched by its counters.
 from __future__ import annotations
 
 import re
-from typing import Pattern
+from typing import Pattern, Tuple
+
+#: THE CARVE-OUT (2026-09-16). "Do not say you cannot…" with no exception is
+#: what turned "plot this on a map" into a Word file and a PDF: the model had
+#: been told never to admit a limit, so it produced the nearest thing it was
+#: allowed to produce. The limit it may — must — admit is named here, and the
+#: list comes from artifacts/visuals.py, which derives it from
+#: chart_spec.CHART_TYPES, so the prompt cannot promise or deny the wrong set
+#: once a new chart type lands.
+def _limits_clause() -> str:
+    try:
+        from ..artifacts import visuals as _visuals
+
+        return " " + _visuals.limits_sentence()
+    except Exception:  # noqa: BLE001 — the file rules stand without it
+        return ""
+
+#: What this platform does NOT do once the file exists.
+DELIVERY_LINE_TEXT = (
+    "It does NOT send email, post to Slack or any other chat tool, print, schedule, encrypt, password-protect or digitally "
+    "sign anything: the person downloads the file from its card. Never say you have emailed, sent, posted, shared, scheduled "
+    "or protected something — say plainly that you cannot, and offer the file instead."
+)
+#: The same fact, said to a person, when a model promised a delivery anyway.
+DELIVERY_LINE = (
+    "To be clear: I can't send email, post to a chat tool, print, schedule or password-protect a file — I can only make the "
+    "file, and you download it from its card here."
+)
 
 CAPABILITY_LINE = (
     "This platform can create downloadable Word (DOCX), PDF, Excel (XLSX), CSV and PowerPoint files and charts from this "
     "conversation or an uploaded file. Do not say you cannot create or attach files, and do not give python-docx, openpyxl, "
     "matplotlib or copy-paste instructions as a substitute. Mention files only when the person asks for one; then tell them "
     "to ask directly, for example \"make this a Word document\". Never claim a file is being prepared unless the system has "
-    "shown a file card."
-)
+    "shown a file card. "
+    # The second half, added 2026-09-16. The first half only forbids a FALSE
+    # DENIAL of file creation, so "Email this report to the leadership team
+    # as a PDF", "Post the deck to our Slack channel" and "Password-protect
+    # the Excel file" reached the chat model with nothing said about
+    # delivery — and whatever it answered passed every check, including "I
+    # have emailed it" (measured 2026-09-16, I1/I2/I6).
+    + DELIVERY_LINE_TEXT
+) + _limits_clause()
 
 #: The prompt suffix, with its separator — one string concatenation per prompt.
 CAPABILITY_SUFFIX = "\n\n" + CAPABILITY_LINE
@@ -109,14 +143,85 @@ _SUBSTITUTE_PROSE_RE: Pattern[str] = re.compile(
 )
 
 
+#: At most this many denial matches are read before the answer is taken as a
+#: denial. The detector runs on every answer of four routes; the carve-out
+#: below must not turn a pathological answer into a scan of hundreds of
+#: sentences.
+_MAX_DENIAL_HITS = 20
+_SENTENCE_END = ".!?\n।"
+
+
+def _sentence_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
+    left = max((text.rfind(c, 0, start) for c in _SENTENCE_END), default=-1)
+    right = min((p for p in (text.find(c, end) for c in _SENTENCE_END) if p != -1), default=len(text))
+    return left + 1, right
+
+
+def _sentence_around(text: str, start: int, end: int) -> str:
+    left, right = _sentence_bounds(text, start, end)
+    return text[left: right]
+
+
+#: How far LEFT of the denial match the visual may be named and still be what
+#: the denial is ABOUT. "I can't put these on a map" puts the visual inside
+#: the match's own span; "I cannot create a PDF file of the map" puts it to
+#: the RIGHT, where it is the subject of a real file denial.
+_NEAR_CHARS = 25
+
+#: The reason a whole sentence may be read as an honest visual refusal even
+#: when the visual is named further away: it says the platform has no such
+#: chart type, or that the thing cannot be drawn. "I can't export the map as
+#: a PDF because no geographic chart type exists here" is true; "I cannot
+#: create a PDF file of the map" is the denial the backstop exists for.
+_REASON: Pattern[str] = re.compile(
+    r"\bno\s+(?:\w+\s+){0,2}chart\s+type\b|\bcan(?:'|\u2019)?(?:not|t)\s+be\s+drawn\b", re.I,
+)
+
+
+def _honest_visual_refusal(text: str, start: int, end: int) -> bool:
+    """Is this "I cannot…" about a visual this platform genuinely has no
+    chart type for? "I can't put these on a map, so I can't give you a PDF of
+    one either" is the truth, not the denial the backstop hunts for, and
+    answering it with a document is the 2026-09-16 incident (artifacts/
+    visuals.py owns the list).
+
+    NARROWED 2026-09-16 (verifier). Scanning the WHOLE sentence around the
+    match silenced real file denials that merely mention a map: measured on
+    this tree, denial_in("I cannot create a PDF file of the map.") was False,
+    as were "I cannot attach the excel sheet, but here is the map of the
+    data." and "I can't generate a Word document with the map for you." —
+    the backstop that makes the file the person asked for was switched off
+    for all three. The carve-out now needs the visual to be part of the
+    denial itself (inside the match, or just left of it), or the sentence to
+    carry the platform-limit reason.
+    """
+    try:
+        from ..artifacts import visuals as _visuals
+
+        left, right = _sentence_bounds(text, start, end)
+        span = text[max(left, start - _NEAR_CHARS): min(right, end)]
+        if _visuals.named_unsupported(span) is not None:
+            return True
+        sentence = text[left:right]
+        return bool(_REASON.search(sentence)) and _visuals.named_unsupported(sentence) is not None
+    except Exception:  # noqa: BLE001 — without the list every denial counts, as before
+        return False
+
+
 def denial_in(text: str) -> bool:
     """Does this answer deny that the assistant can create/attach a FILE — or
     hand over library code / copy-paste steps in place of the file?"""
     t = (text or "")[:20000]
     if not t:
         return False
-    if _EN_RE.search(t) or _EN_TEXT_ONLY_RE.search(t) or _HI_RE.search(t) or _GU_RE.search(t) or _HINGLISH_RE.search(t):
-        return True
+    hits = 0
+    for rx in (_EN_RE, _EN_TEXT_ONLY_RE, _HI_RE, _GU_RE, _HINGLISH_RE):
+        for m in rx.finditer(t):
+            hits += 1
+            if not _honest_visual_refusal(t, m.start(), m.end()):
+                return True
+            if hits >= _MAX_DENIAL_HITS:
+                return True
     if not _SUBSTITUTE_RE.search(t):
         return False
     # Library code for the file, introduced by prose that names the file
@@ -124,6 +229,58 @@ def denial_in(text: str) -> bool:
     fence = t.find("```")
     lead = t[: fence if 0 <= fence <= 1500 else 400]
     return bool(_SUBSTITUTE_PROSE_RE.search(t[:1500]) or re.search(rf"\b{_FILE_NOUN_EN}\b|\bformat\b", lead, re.I))
+
+
+#: A DELIVERY the platform cannot perform, claimed as done. "I've emailed
+#: the report to the team", "I have posted the deck to Slack", "it is
+#: password-protected now". The claim must be in the FIRST person and about
+#: a delivery, so "you can email the PDF to your team" is untouched.
+#: `emailed`, `posted`, `printed`, `encrypted`, `signed` and
+#: `password-protected` can only be deliveries; `sent`, `shared`,
+#: `uploaded`, `delivered` and `messaged` are ordinary words about an
+#: ANSWER too ("I sent you the numbers above"), so those need a file or a
+#: delivery target nearby.
+_SELF_EVIDENT = r"(?:e-?mailed|mailed|posted|slacked|forwarded|printed|encrypted|password[- ]protected|digitally\s+signed|scheduled)"
+_AMBIGUOUS = r"(?:sent|shared|uploaded|delivered|messaged|signed|attached)"
+_SUBJECT = r"(?:i(?:'ve|\u2019ve| have)?|we(?:'ve|\u2019ve| have)?)"
+_ADVERB = r"(?:just|now|already|successfully|also)\s+"
+_PROMISE_SURE_RE: Pattern[str] = re.compile(
+    rf"\b{_SUBJECT}\s+(?:{_ADVERB})?{_SELF_EVIDENT}\b"
+    rf"|\b(?:it|this|that|the\s+\w+)\s+(?:has|have|is|are|was|were)\s+been\s+{_SELF_EVIDENT}\b"
+    rf"|\b(?:i(?:'ll|\u2019ll| will)|we(?:'ll|\u2019ll| will))\s+(?:email|post|print|encrypt|password[- ]protect|schedule)\s+(?:it|this|that|them|the|you)\b",
+    re.I,
+)
+_PROMISE_MAYBE_RE: Pattern[str] = re.compile(
+    rf"\b{_SUBJECT}\s+(?:{_ADVERB})?{_AMBIGUOUS}\b"
+    rf"|\b(?:it|this|that|the\s+\w+)\s+(?:has|have|is|are|was|were)\s+been\s+{_AMBIGUOUS}\b",
+    re.I,
+)
+#: A file or a delivery target near an ambiguous verb.
+_DELIVERY_OBJECT_RE: Pattern[str] = re.compile(
+    rf"{_FILE_NOUN_EN}"
+    r"|\b(?:report|deck|presentation|proposal|memo|brief|chart|dashboard|e-?mail|inbox|slack|teams|whatsapp|channel|printer|"
+    r"calendar|recipients?|password|encryption|signature|drive|folder)\b",
+    re.I,
+)
+
+
+def promise_in(text: str) -> bool:
+    """Does this answer claim a DELIVERY this platform never performs —
+    emailing, posting, sharing, scheduling, printing, encrypting or signing
+    a file? The sibling of `denial_in`: that one catches a false "I can't",
+    this one a false "I did". CAPABILITY_LINE tells the model what the
+    platform can MAKE and, until 2026-09-16, said nothing about delivery, so
+    a model that answered "I've emailed it" passed every check."""
+    t = (text or "")[:20000]
+    if not t:
+        return False
+    if _PROMISE_SURE_RE.search(t):
+        return True
+    for m in _PROMISE_MAYBE_RE.finditer(t):
+        window = t[max(0, m.start() - 80): m.end() + 120]
+        if _DELIVERY_OBJECT_RE.search(window):
+            return True
+    return False
 
 
 _OFFERS = {
@@ -140,4 +297,5 @@ def offer_line(language: str = "en") -> str:
     return _OFFERS.get(language or "en", _OFFERS["en"])
 
 
-__all__ = ["CAPABILITY_LINE", "CAPABILITY_SUFFIX", "capability_suffix", "denial_in", "offer_line"]
+__all__ = ["CAPABILITY_LINE", "CAPABILITY_SUFFIX", "DELIVERY_LINE", "DELIVERY_LINE_TEXT", "capability_suffix",
+           "denial_in", "promise_in", "offer_line"]

@@ -209,6 +209,7 @@ def main() -> None:
     q_region = defaultdict(int)
     region_n = defaultdict(int)
     month_region = defaultdict(int)
+    region_product = defaultdict(int)
     for r in s_rows:
         d = dt.date.fromisoformat(r["Date"])
         m = f"{MONTH_ABBR[d.month]} 2026"
@@ -219,12 +220,14 @@ def main() -> None:
         by_product[r["Product"]] += r["Amount"]
         units_by_product[r["Product"]] += r["Units"]
         month_region[f"{m}|{r['Region']}"] += r["Amount"]
+        region_product[f"{r['Region']}|{r['Product']}"] += r["Amount"]
         if d.month <= 6:
             q_region[f"Q{(d.month - 1) // 3 + 1} 2026|{r['Region']}"] += r["Amount"]
     gt["sales"] = {
         "rows": len(s_rows), "amount_by_month": dict(by_month), "count_by_month": dict(count_by_month),
         "amount_by_region": dict(by_region), "amount_by_product": dict(by_product), "units_by_product": dict(units_by_product),
         "amount_by_quarter_region_h1": dict(q_region), "amount_by_month_region": dict(month_region),
+        "amount_by_region_product": dict(region_product),
         "avg_amount_by_region": {k: by_region[k] / region_n[k] for k in by_region}, "total_amount": sum(by_region.values()),
     }
     status = defaultdict(int)

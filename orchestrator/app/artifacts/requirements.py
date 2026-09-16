@@ -208,6 +208,46 @@ _CHART_TYPES: List[Tuple[str, str]] = [
     (r"\bradar", "radar"),
     (r"\bbubble", "bubble"),
     (r"\bdual\s*axis|\bcombo", "combo"),
+    # The three tier-2 names that are also ordinary words. Measured
+    # 2026-09-16, the bare forms made "explain the Pareto principle in a one
+    # page doc", "write about pareto optimal allocations", "a slide about
+    # the violin in classical music" and "the treemap data structure
+    # explained" all demand a chart. "a pareto of the defect causes" is a
+    # real chart ask with no chart word in it, so pareto and treemap keep
+    # the bare form minus the senses that are never a chart; "violin" on its
+    # own is the instrument far more often than the plot, so it asks for a
+    # chart word the way "bullet" and "candle" below do.
+    #
+    # The rule both guards below implement: the word is a CHART unless the
+    # PHRASE it sits in names a concept. The guard therefore reads only the
+    # words next to it. Recheck 2026-09-16 found the first round read the
+    # whole sentence instead: `(?!.*\bclass\b)` swallowed "a treemap of
+    # revenue by asset class", and the pareto guard both missed
+    # "Pareto's principle" (it cannot see across the apostrophe-s) and threw
+    # away "a pareto distribution chart of the failures", where the concept
+    # word is the modifier of a chart noun and the ask names a chart outright.
+    #
+    # pareto: a concept word (optionally after an apostrophe-s) right after
+    # it makes it a concept -- unless that concept word is itself heading a
+    # chart noun ("pareto distribution chart").
+    (r"\bpareto\b"
+     r"(?!(?:['’]s)?\s*"
+     r"(?:principles?|optimal(?:ity)?|efficien\w*|frontiers?|distributions?|laws?|rules?|improvements?)\b"
+     r"(?!\s*(?:charts?|graphs?|plots?|diagrams?)\b))", "pareto"),
+    # treemap: a data-structure noun it heads ("the treemap data structure",
+    # "the TreeMap interface"), or one it is compared with in the same breath
+    # ("a treemap vs a hash map"). Anything further away is another sentence.
+    (r"\btree\s*map\b"
+     r"(?!\s*(?:data\s*structure|interface|class|implementation|node)\b"
+     r"|\s+(?:vs\.?|versus|or|and|is|not)\s+(?:an?\s+|the\s+)?"
+     r"(?:hash\s*map|red[-\s]black|linked\s*list|b-?tree|array)\b)", "treemap"),
+    (r"\bviolin\s*(plot|chart|graph)|\bviolin\b(?=.*\b(?:chart|graph|plot)\b)", "violin"),
+    # "candle" alone is a wax object; the chart always says candlestick, OHLC
+    # or "candle chart".
+    (r"\bcandlestick|\bohlc\b|\bcandle\s*(chart|graph|plot)", "candlestick"),
+    (r"\bsun\s*burst", "sunburst"),
+    # "bullet" alone is a bullet point in every other sentence of a deck.
+    (r"\bbullet\s*(chart|graph)", "bullet"),
 ]
 _CHART_TYPE_RES = [(re.compile(rx, re.I), t) for rx, t in _CHART_TYPES]
 
@@ -909,12 +949,19 @@ def describe(item: ChecklistItem) -> str:
             return f"{label} at {e:g}pt" if isinstance(e, (int, float)) else f"{label} size {e}"
         return f"{label} {p}"
     if item.category == "format":
-        return {"docx": "a Word file", "pdf": "a PDF", "xlsx": "an Excel file", "csv": "a CSV", "pptx": "a PowerPoint file"}.get(str(e), f"a {e} file")
+        if p == "formats_only":
+            return "only the files that were asked for"
+        return {"docx": "a Word file", "pdf": "a PDF", "xlsx": "an Excel file", "csv": "a CSV", "pptx": "a PowerPoint file",
+                "png": "a PNG image", "svg": "an SVG image"}.get(str(e), f"a {e} file")
     if item.category == "layout":
         return {"orientation": f"{e} pages", "page_size": f"{e} paper", "margins": f"{e} margins", "page_numbers": "page numbers"}.get(p, p)
     if item.category == "chart":
         return {"type": f"a {str(e).replace('_', ' ')} chart", "series_color": f"chart colour {e}", "legend_position": f"legend at the {e}",
-                "data_labels": "data labels", "title": f"chart title '{e}'", "trendline": "a trend line", "values_match": "chart values from the data"}.get(p, p)
+                "data_labels": "data labels", "title": f"chart title '{e}'", "trendline": "a trend line", "values_match": "chart values from the data",
+                # The independent audit (artifacts/chart_audit.py).
+                "binding_plausible": "a chart whose slices follow the table's numbers",
+                "no_summary_category": "no totals row drawn as a slice or a bar",
+                "values_recomputed": "chart values that match the table regrouped by hand"}.get(p, p)
     if item.category == "content":
         return f"a section on {target.split(':', 1)[-1]}"
     if item.category == "data":
@@ -932,4 +979,75 @@ def describe(item: ChecklistItem) -> str:
     return p.replace("_", " ")
 
 
-__all__ = ["CATEGORIES", "MAX_ITEMS", "ChecklistItem", "Checklist", "COLOR_NAMES", "FONTS", "extract_rules", "merge", "build", "describe"]
+# --------------------------------------------------- what cannot be done --
+
+#: WHAT THIS PLATFORM CANNOT DO, in the words people ask for it.
+#:
+#: There is a vocabulary for what it CAN do (engines/capability.py's
+#: CAPABILITY_LINE) and, until 2026-09-16, none at all for what it cannot:
+#: "Make a fillable PDF form", "Build an interactive dashboard I can
+#: filter", "with tracked changes turned on", "with our company letterhead
+#: image", "Make a PDF and print two copies" and "Make an editable Figma
+#: file of this layout" each ended on a plain "Created **X** as PDF." with
+#: the impossible half of the request never mentioned (measured 2026-09-16,
+#: I3-I9; I5 asked for Figma and got a Word file with no comment).
+#:
+#: Each entry is (the words, the clause the person reads). The clause names
+#: the part that cannot be done and, where there is one, what was done
+#: instead — never an apology on its own.
+_CANNOT: Tuple[Tuple[str, str], ...] = (
+    (r"\bfillable\b|\bfill[- ]in(?:able)?\s+form\b|\bform\s+fields?\b|\bacro ?form\b",
+     "the form fields aren't fillable; the PDFs I make are flat"),
+    (r"\binteractive\s+(?:dashboard|report|chart|excel|sheet|workbook|pdf|deck|version|file)\b"
+     r"|\b(?:i|we|you)\s+can\s+filter\b|\bfilterable\b|\bslicers?\b|\bdrill[- ]downs?\b|\bclickable\s+(?:dashboard|filter|chart)\b",
+     "it isn't interactive — the file holds the numbers as a static sheet"),
+    (r"\btracked?\s+changes\b|\bredlines?\b|\bsuggesting\s+mode\b|\bcomment\s+bubbles?\b",
+     "tracked changes can't be turned on in the files I make"),
+    (r"\b(?:add|insert|put|place|include|use|with|using)\s+(?:(?:our|the|company|corporate|my|a|an|some|client'?s?)\s+){0,2}"
+     r"(?:letterhead|logos?|watermarks?|brand\s+images?|images?|photos?|pictures?|screenshots?|icons?)\b",
+     "I can't place an image, logo or letterhead in a file"),
+    (r"\bprint\s+(?:\w+\s+){0,2}?(?:cop(?:y|ies)|pages?|it|this|them|out)\b|\bsend\s+(?:it|this)\s+to\s+the\s+printer\b",
+     "I can't print — you can download the PDF and print it"),
+    (r"\b(?:e-?mail|send)\s+(?:(?:it|this|that|them|the|our|my|a|an)\s+)?(?:\w+\s+){0,2}?to\b"
+     r"|\bpost\s+(?:it|this|the\s+\w+)\s+to\b|\bslack\b|\bteams\s+channel\b",
+     "I can't email or post files — you download the file from its card here"),
+    (r"\bpassword[- ]protect\w*\b|\bencrypt\w*\b|\bdigitally\s+sign\w*\b|\bsign\s+it\s+digitally\b|\be-?sign\w*\b",
+     "I can't password-protect, encrypt or sign a file"),
+    (r"\b(?:embed|connect|link|pull\s+in)\w*\s+(?:an?\s+|the\s+)?(?:live|real[- ]time)\b"
+     r"|\blive\s+(?:dashboard|feed|chart|data)\s+(?:in|into|on|to)\b|\bauto[- ]updat\w+\b|\brefreshes?\s+automatically\b",
+     "I can't embed anything live — the file holds a snapshot of the numbers"),
+    (r"\b(?:add|insert|embed|include|put)\s+(?:an?\s+|the\s+|our\s+)?(?:videos?|gifs?|animations?|audio|sound|clips?|recordings?)\b",
+     "a file I make can't hold video or audio — a link to it can go in instead"),
+    (r"\b(?:add|with|include|write|put)\s+(?:\w+\s+){0,2}?macros?\b|\bvba\b",
+     "I can't put macros in a workbook"),
+)
+_CANNOT_RES: Tuple[Tuple["re.Pattern[str]", str], ...] = tuple((re.compile(rx, re.I), clause) for rx, clause in _CANNOT)
+#: A negated or hypothetical mention is not a request ("no need to
+#: password-protect it", "can a PDF hold video?").
+_NOT_ASKED_RE = re.compile(r"\b(?:don'?t|do not|no need to|without|never|not)\s+(?:\w+\s+){0,3}$", re.I)
+#: ...nor is a SUBJECT in front of the verb: "a report on how WE SEND data
+#: to vendors" describes the topic of the file, not what to do with it.
+_DESCRIBED_RE = re.compile(r"\b(?:we|they|you|he|she|it|who|that|which|users?|clients?|customers?|teams?|vendors?|staff)\s+$", re.I)
+
+
+def unsupported_asks(text: str) -> List[str]:
+    """The clauses for the parts of this request the platform cannot do, in
+    the order they were asked for. Empty when everything asked for is
+    possible. Read by engines/artifact.py, which puts them on the completion
+    sentence beside the other warnings — the person is told in the same
+    breath as "Created …", not left to discover it in the file."""
+    low = (text or "")[:4000]
+    out: List[str] = []
+    for rx, clause in _CANNOT_RES:
+        m = rx.search(low)
+        if not m or clause in out:
+            continue
+        before = low[max(0, m.start() - 40): m.start()]
+        if _NOT_ASKED_RE.search(before) or _DESCRIBED_RE.search(before):
+            continue
+        out.append(clause)
+    return out
+
+
+__all__ = ["CATEGORIES", "MAX_ITEMS", "ChecklistItem", "Checklist", "COLOR_NAMES", "FONTS", "extract_rules", "merge", "build",
+           "describe", "unsupported_asks"]

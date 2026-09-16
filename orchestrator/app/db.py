@@ -2770,6 +2770,26 @@ CREATE TABLE IF NOT EXISTS web_page_demand (
 """
 
 
+_MIGRATION_V39 = """
+-- V39 (2026-09-16): the SHAPE of a published deliverable, so a follow-up can
+-- reuse it. Append-only: one nullable-by-default jsonb on the version row,
+-- no index, no backfill (a version published before this says `{}` and the
+-- reader falls back to its `files`).
+--
+-- WHY. "visualise this table on pie chart" made a chart; "make it a bar chart
+-- instead" made a SECOND artifact and asked the model for the data again,
+-- because nothing on the row said the last deliverable was a chart. The
+-- binding is on disk in that version's spec.json, but the intent gate runs on
+-- the chat event loop before any artifact directory is opened, and the
+-- conversation's artifact list (db.list_artifacts) is already joined to this
+-- row — so the shape rides along at no extra query. Written by
+-- artifacts/pipeline._complete_from_dir from the published spec; the fields
+-- are artifacts/deliverable.Deliverable.
+ALTER TABLE artifact_versions
+    ADD COLUMN IF NOT EXISTS deliverable jsonb NOT NULL DEFAULT '{}'::jsonb;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2809,6 +2829,7 @@ _MIGRATIONS: tuple = (
     (36, _MIGRATION_V36),
     (37, _MIGRATION_V37),
     (38, _MIGRATION_V38),
+    (39, _MIGRATION_V39),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and

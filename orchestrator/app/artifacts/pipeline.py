@@ -81,6 +81,7 @@ from ..asr import ASRBusy, ASRUnavailable
 from ..config import settings
 from ..resilience import ModelUnavailable, recovery_window
 from . import db, store
+from . import deliverable as _deliverable
 from . import types as T
 from .spec import ArtifactSpec
 
@@ -1574,6 +1575,14 @@ async def _complete_from_dir(job_id: str, row: dict, directory: str, warnings: L
     files = list(validation.get("files") or [])
     all_warnings = _merge_warnings(manifest.get("warnings"), validation.get("warnings"), warnings)
     assumptions = list(getattr(spec.body, "assumptions", []) or []) if spec is not None else []
+    # The shape a follow-up inherits (V39): what this version IS, and — when
+    # it is one chart — how that chart was bound. Derived here because the
+    # published spec is already open; never a gate, so a build without the
+    # charts module simply records the formats.
+    shape: dict = {}
+    if spec is not None:
+        formats = [f["format"] for f in files if isinstance(f, dict) and f.get("format")]
+        shape = _deliverable.of_spec(spec, kind=str(spec.kind), formats=formats).to_json()
     status = await core_db.run_in_thread(
         db.publish_version,
         str(row["artifact_id"]), int(row["version"]), job_id,
@@ -1588,6 +1597,7 @@ async def _complete_from_dir(job_id: str, row: dict, directory: str, warnings: L
         template_id=str(getattr(spec.body, "template_id", "") or "") if spec is not None else None,
         template_version=T.TEMPLATE_VERSION,
         renderer_version=T.RENDERER_VERSION,
+        deliverable=shape,
     )
     return str(status)
 

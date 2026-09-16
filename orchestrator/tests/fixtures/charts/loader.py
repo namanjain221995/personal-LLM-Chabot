@@ -14,6 +14,7 @@ FILES = {
     "sales": "sales_daily.csv", "tickets": "tickets.xlsx", "employees": "employees.csv", "projects": "projects.csv",
     "cashflow": "cashflow.csv", "funnel": "funnel.csv", "dates_dmy": "dates_dmy.csv", "dates_mdy": "dates_mdy.csv",
     "dates_ambiguous": "dates_ambiguous.csv", "units": "units.docx",
+    "prices": "prices.csv", "targets": "targets.csv", "defects": "defects.csv",
 }
 
 

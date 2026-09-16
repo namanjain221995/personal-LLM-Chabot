@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import chart_spec as CS
+from . import chart_choice, chart_spec as CS
 
 PANDAS_ROW_CAP = 200_000
 DUCKDB_ROW_CAP = 2_000_000
@@ -44,6 +44,29 @@ MAX_XY_POINTS = 5_000
 MAX_GANTT_ROWS = 60
 MAX_BOXES = 20
 HEATMAP_MAX = 50
+#: A treemap stops being readable long before a pie does: a rectangle under
+#: ~1% of the area cannot hold its own label, so the tail goes to "Other".
+TREEMAP_MAX = 24
+#: A pareto is read left to right until the cumulative line passes 80%; past
+#: twenty bars the labels collide and the point is lost.
+PARETO_MAX = 20
+#: Two rings: at most this many inner slices, each split by MAX_GROUP_SERIES.
+SUNBURST_MAX_INNER = 10
+#: A violin needs enough points per group to have a shape, and the sample is
+#: stored in the spec, so both the group count and the sample are bounded.
+MAX_VIOLINS = 12
+MAX_VIOLIN_POINTS = 600
+MIN_VIOLIN_POINTS = 5
+#: Each candle is one entry of Chart.categories, and that field is
+#: Field(..., max_length=types.MAX_CHART_POINTS) = 200. At 300 a table
+#: with more than 200 periods raised an uncaught pydantic
+#: ValidationError out of resolve_chart ("List should have at most 200
+#: items after validation, not 300"), which the spec path turned into
+#: "A chart could not be drawn from the data." and derived.py let
+#: escape. Measured 2026-09-16 on 400 periods. It may never exceed
+#: types.MAX_CHART_POINTS.
+MAX_CANDLES = 200
+MAX_BULLETS = 12
 OTHER = "Other"
 BLANK = "(blank)"
 
@@ -100,6 +123,9 @@ _GROUPED = r"(?:\d{1,3}(?:,\d{2})*,\d{3}|\d{1,3}(?:,\d{3})+)"
 _NUMBER_BODY_RE = re.compile(rf"^(?P<n>{_GROUPED}(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)\s*(?P<suf>[^\d\s.,]+\.?)?$")
 
 
+_APPROX_PREFIX_RE = re.compile(r"^(?:~|≈|∼|≅|about|approx\.?|approximately|circa|ca\.?|c\.)\s*", re.I)
+
+
 def to_number(value: Any) -> Optional[float]:
     """A cell or a typed figure → float; None when it is not a number.
     Handles ₹/$/€/£, Western and Indian digit grouping (1,20,000), Devanagari
@@ -117,6 +143,11 @@ def to_number(value: Any) -> Optional[float]:
     neg = False
     if s.startswith("(") and s.endswith(")"):
         neg, s = True, s[1:-1].strip()
+    # "~67", "≈ 67", "approx. 67": an estimate is still a number. A column
+    # with one estimated cell was typed text (6 of 7 numeric, under the 0.9
+    # bar), its sum was refused, and the pie fell back to counting rows
+    # (production 2026-09-16).
+    s = _APPROX_PREFIX_RE.sub("", s).strip()
     # `s[:1] in "+-"` is True for an EMPTY string ("" is in every string):
     # a lone "-" cell (a blank in many exports) raised IndexError here, and
     # describe_table/prompt_guide crashed on it. Verifier 2026-09-15.
@@ -442,6 +473,11 @@ class ComputedChart:
     x_label: str = ""
     y_label: str = ""
     caption: str = ""
+    #: Categories the cap or top_n left out WITHOUT folding them into
+    #: "Other" — so the drawn bars are not the whole table. A pareto's
+    #: cumulative line and its caption are shares of a total, and that total
+    #: is only the table's when this is 0.
+    dropped: int = 0
 
 
 @dataclass
@@ -461,7 +497,8 @@ def _resolve_columns(binding: CS.Binding, table: Any, chart_type: str) -> Tuple[
     columns = list(_table_attr(table, "columns", []) or [])
     title = _table_attr(table, "title", "") or _table_attr(table, "id", "")
     wanted: Dict[str, Optional[str]] = {"x": binding.x, "group_by": binding.group_by, "start": binding.start,
-                                       "end": binding.end, "label": binding.label, "size": binding.size}
+                                       "end": binding.end, "label": binding.label, "size": binding.size,
+                                       "target": binding.target}
     for i, y in enumerate(binding.y):
         wanted[f"y{i}"] = y
     for i, y in enumerate(binding.y2):
@@ -490,7 +527,7 @@ _TOTAL_LABEL_RE = re.compile(
     r"^(?:grand\s*total|sub\s*-?\s*total|total(?:s)?(?:\s*\(.*\))?|overall(?:\s*total)?|कुल(?:\s*योग)?|योग|કુલ(?:\s*સરવાળો)?|સરવાળો)\s*:?$",
     re.IGNORECASE,
 )
-_TOTAL_ROW_TYPES = CS.AGGREGATING_TYPES + ("box",)
+_TOTAL_ROW_TYPES = CS.AGGREGATING_TYPES + ("box", "violin")
 
 
 def _is_total_label(value: Any) -> bool:
@@ -498,6 +535,17 @@ def _is_total_label(value: Any) -> bool:
         return False
     text = re.sub(r"[*_`]", "", value).strip()
     return bool(text) and len(text) <= 40 and _TOTAL_LABEL_RE.match(text) is not None
+
+
+def _is_total_row(row: Sequence[Any]) -> bool:
+    """A summary row, wherever it carries its marker.
+
+    The x cell alone is not enough: production 2026-09-16 plotted a row whose
+    RANK cell read "Total" and whose state cell read "Distinct States", so a
+    count of 30 states joined five states on a pie of per-state counts. Any
+    short label cell of the row marks the whole row.
+    """
+    return any(_is_total_label(cell) for cell in row)
 
 
 def _build_frame(binding: CS.Binding, table: Any, roles: Dict[str, int], deadline: Optional[float], chart_type: str = "") -> _Frame:
@@ -525,10 +573,10 @@ def _build_frame(binding: CS.Binding, table: Any, roles: Dict[str, int], deadlin
     filters_on_x = any(roles.get(f"f{i}") == x_idx for i in range(len(binding.filters)))
     if chart_type in _TOTAL_ROW_TYPES and x_idx is not None and kinds[x_idx].kind == "text" and not filters_on_x:
         before = len(keep)
-        dropped = [r for r in keep if _is_total_label(rows[r][x_idx] if x_idx < len(rows[r]) else None)]
+        dropped = [r for r in keep if _is_total_row(rows[r])]
         if dropped:
             labels = sorted({_label_of(rows[r][x_idx]) for r in dropped})[:3]
-            keep = [r for r in keep if not _is_total_label(rows[r][x_idx] if x_idx < len(rows[r]) else None)]
+            keep = [r for r in keep if not _is_total_row(rows[r])]
             notes.append(f"{before - len(keep)} total row{'s' if before - len(keep) != 1 else ''} ({', '.join(labels)}) left out so no figure is counted twice")
     cols: Dict[str, List[Any]] = {}
     for role, idx in roles.items():
@@ -734,6 +782,50 @@ def _numbers(values: List[Any]) -> List[Optional[float]]:
     return [to_number(v) for v in values]
 
 
+#: Columns that number or index the rows of a derived table rather than
+#: measure anything: plotting them says nothing about the subject.
+_NON_MEASURE_RE = re.compile(r"^(?:rank|ranking|sr\.?|s\.?\s*no\.?|no\.?|#|index|position|serial|row|year|month|day|date|id|code|pin|zip|phone|percent(?:age)?|%.*|.*%.*|share.*|.*\bpct\b.*)$", re.I)
+
+
+def _measure_column(table: Any, binding: CS.Binding, roles: Dict[str, int]) -> Optional[str]:
+    """The one numeric column a per-row table is really about, or None.
+
+    A table with one row per category ("State | Count | % of total") cannot be
+    summarised by COUNTING its rows: every category weighs 1 and the chart says
+    nothing. Production 2026-09-16 drew exactly that — six states, six equal
+    slices — because the measure column carried one estimated cell ("~67") and
+    the binding fell back to a row count. When the table offers exactly one
+    plottable measure, that is the chart's subject; when it offers none or
+    several, the count stands and the request is answered as written.
+    """
+    columns = [str(c) for c in (_table_attr(table, "columns", []) or [])]
+    taken = {roles.get("x"), roles.get("group_by")}
+    candidates: List[str] = []
+    for idx, name in enumerate(columns):
+        if idx in taken or _NON_MEASURE_RE.match(name.strip()):
+            continue
+        if infer_column(table, idx, full_scan=True).kind == "number":
+            candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _one_row_per_category(table: Any, roles: Dict[str, int]) -> bool:
+    """True when the x column holds a different label on every row."""
+    idx = roles.get("x")
+    rows = list(_table_attr(table, "rows", []) or [])
+    if idx is None or not rows:
+        return False
+    labels = [_label_of(r[idx]) for r in rows if idx < len(r) and not _is_total_row(r)]
+    return len(labels) > 1 and len(set(labels)) == len(labels)
+
+
+def frame_label(roles: Dict[str, int], table: Any) -> str:
+    """The x column's name, for a note about how the rows were read."""
+    columns = [str(c) for c in (_table_attr(table, "columns", []) or [])]
+    idx = roles.get("x")
+    return columns[idx] if idx is not None and idx < len(columns) else "category"
+
+
 def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) -> ComputedChart:
     """The chart's numbers from `table`. Raises ChartDataError with the
     sentence to show instead of the chart."""
@@ -742,6 +834,20 @@ def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) ->
     b = chart.data
     t = chart.type
     roles, notes = _resolve_columns(b, table, t)
+    if (
+        b.agg == "count" and not b.y and not b.y2
+        and t in CS.AGGREGATING_TYPES
+        and _one_row_per_category(table, roles)
+    ):
+        measure = _measure_column(table, b, roles)
+        if measure is not None:
+            b = b.model_copy(update={"y": [measure], "agg": "sum"})
+            chart = chart.model_copy(update={"data": b})
+            roles, extra_notes = _resolve_columns(b, table, t)
+            notes = notes + extra_notes + [
+                f"each row of this table is one {frame_label(roles, table)}, so counting rows would weigh them equally; "
+                f"{measure} was summed instead"
+            ]
     frame = _build_frame(b, table, roles, deadline, t)
     notes = notes + frame.notes
     title = str(_table_attr(table, "title", "") or _table_attr(table, "id", ""))
@@ -756,10 +862,16 @@ def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) ->
         result = _compute_xy(chart, frame, prov, deadline)
     elif t == "histogram":
         result = _compute_histogram(chart, frame, prov)
-    elif t == "box":
+    elif t in ("box", "violin"):
         result = _compute_box(chart, frame, prov)
     elif t == "gantt":
         result = _compute_gantt(chart, frame, prov)
+    elif t == "candlestick":
+        result = _compute_candlestick(chart, frame, prov)
+    elif t == "bullet":
+        result = _compute_bullet(chart, frame, prov, deadline)
+    elif t == "pareto":
+        result = _compute_pareto(chart, frame, prov, deadline)
     else:
         result = _compute_grouped(chart, frame, prov, deadline)
     result.notes = notes + result.notes
@@ -788,18 +900,58 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
     if not all_y and agg != "count":
         agg = "count"
         notes.append("no numeric column was named, so rows were counted")
+    blank_roles: List[str] = []
     for role in all_y:
         if frame.kinds[role].kind not in ("number", "empty") and agg != "count":
             raise ChartDataError(f"The column {frame.names[role]!r} is not numeric, so it cannot be plotted as a {CS.AGG_LABELS[agg].lower()}.")
+        if agg != "count" and frame.kinds[role].kind == "empty" and all(_is_blank(v) for v in frame.cols[role]):
+            # "empty" is on the whitelist above because infer_column reads the
+            # first 2,000 rows only: a number column that starts blank must
+            # still be plottable. A column blank in every row the chart would
+            # USE is a different thing — production 2026-09-16 asked for a map
+            # of PersonMailingLatitude / PersonMailingLongitude, which are null
+            # in 100% of that file, and a sum over nothing drew a row of zeros
+            # that looked like real data.
+            blank_roles.append(role)
+    if blank_roles:
+        # ONE bad measure must not take the good ones with it (verifier,
+        # 2026-09-16): y=[Count, Revenue, PersonMailingLatitude] over the
+        # incident's rows returned no chart at all and the message about the
+        # latitude column, losing two series that had real numbers. The
+        # all-blank column is dropped with a note; only a chart whose every
+        # measure is blank has nothing left to draw.
+        empty_named = (
+            f"The column {frame.names[blank_roles[0]]!r} is empty in every row"
+            if len(blank_roles) == 1 else
+            "The columns " + ", ".join(repr(frame.names[r]) for r in blank_roles) + " are empty in every row"
+        )
+        if len(blank_roles) == len(all_y):
+            raise ChartDataError(empty_named + ", so there is nothing to plot.")
+        if t == "combo" and y_roles and all(r in blank_roles for r in y_roles) and any(r not in blank_roles for r in y2_roles):
+            # A COMBO WITH NOTHING ON ITS MAIN AXIS (verifier recheck,
+            # 2026-09-16). Dropping the blank columns one by one can leave a
+            # combo whose every remaining series is a secondary-axis line:
+            # the bars the chart is named for are gone and the left axis is
+            # drawn empty beside them. That frame says nothing true about the
+            # data, so it is refused in the same words as a chart with no
+            # numbers at all rather than drawn.
+            raise ChartDataError(empty_named + ", so a combo chart has nothing to draw on its main axis.")
+        for role in blank_roles:
+            notes.append(f"the column {frame.names[role]} is empty in every row and was left out")
+        all_y = [r for r in all_y if r not in blank_roles]
+        y_roles = [r for r in y_roles if r in all_y]
+        y2_roles = [r for r in y2_roles if r in all_y]
     if t == "heatmap" and not b.group_by:
         raise ChartDataError("A heatmap needs a column for its rows (group_by).")
+    if t == "sunburst" and not b.group_by:
+        raise ChartDataError("A sunburst needs a second level: the column its outer ring splits by (group_by).")
     if "x" not in frame.cols:
         raise ChartDataError("The chart needs a category column (x).")
     prov.agg = agg
     keys, klabels, bucket, knotes = _keys_for(frame, "x", b, t)
     notes.extend(knotes)
     prov.date_bucket = bucket
-    grouped = bool(b.group_by) and t not in ("pie", "donut", "funnel", "waterfall")
+    grouped = bool(b.group_by) and t in CS.SPLIT_TYPES
     if b.group_by and not grouped:
         notes.append(f"a {t.replace('_', ' ')} has one series, so the split by {b.group_by} was not used")
     if grouped:
@@ -830,7 +982,8 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         calendar_text = info_x.kind == "text" and _month_or_weekday_order([klabels[k] for k in order_keys]) is not None
         if info_x.kind in ("date",) or calendar_text or (info_x.kind == "number" and t not in ("pie", "donut", "funnel")):
             sort = "x"
-        elif t in ("pie", "donut", "funnel", "bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar"):
+        elif t in ("pie", "donut", "funnel", "bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar",
+                   "percent_stacked_bar", "treemap", "sunburst", "pareto"):
             sort = "value_desc"
         else:
             sort = "none"
@@ -856,10 +1009,19 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         limit = min(limit or PIE_MAX_SLICES, PIE_MAX_SLICES)
     if t == "heatmap":
         limit = min(limit or HEATMAP_MAX, HEATMAP_MAX)
+    if t == "treemap":
+        limit = min(limit or TREEMAP_MAX, TREEMAP_MAX)
+    if t == "pareto":
+        limit = min(limit or PARETO_MAX, PARETO_MAX)
+    if t == "sunburst":
+        limit = min(limit or SUNBURST_MAX_INNER, SUNBURST_MAX_INNER)
+    if t == "bullet":
+        limit = min(limit or MAX_BULLETS, MAX_BULLETS)
     if limit is None and len(order_keys) > MAX_CATEGORIES:
         limit = MAX_CATEGORIES
         notes.append(f"{len(order_keys):,} categories are too many to draw; the largest {MAX_CATEGORIES - 1} are shown and the rest are in {OTHER}")
     fold_other = False
+    dropped_unfolded = 0
     if limit is not None and len(order_keys) > limit:
         use_other = b.other_bucket
         keep_n = limit - 1 if use_other else limit
@@ -868,7 +1030,10 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         dropped = len(order_keys) - keep_n
         if t in ("pie", "donut") and b.top_n is None:
             notes.append(f"a pie shows at most {PIE_MAX_SLICES} slices; {dropped} smaller categories are combined in {OTHER}")
+        elif t in ("treemap", "pareto", "sunburst") and b.top_n is None:
+            notes.append(f"a {t} shows at most {limit} categories; the {dropped} smallest are combined in {OTHER}")
         order_keys = [k for k in order_keys if k in kept]
+        dropped_unfolded = 0 if use_other else dropped
         if use_other:
             fold_other = True
             other_key = ("~other",)
@@ -899,8 +1064,10 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
             cells, _ = _aggregate(keys, gkeys, ycols, agg)
             group_order = [g for g in group_order if g in kept_g] + [other_g]
     categories = [klabels[k] for k in order_keys]
-    if t in ("pie", "donut", "funnel") and agg != "count":
-        negative = [(klabels[k], cells.get((k, ("all",)), [0.0])[0]) for k in order_keys if cells.get((k, ("all",)), [0.0])[0] < 0]
+    if t in CS.NON_NEGATIVE_TYPES and agg != "count":
+        negative = [(f"{klabels[k]}{'' if g == ('all',) else ' / ' + (glabels[g] or BLANK)}", cells[(k, g)][0])
+                    for k in order_keys for g in (group_order or [("all",)])
+                    if cells.get((k, g)) and cells[(k, g)][0] < 0]
         if negative:
             # matplotlib draws a negative wedge as nothing and the shares of
             # the rest come out wrong (verifier sample: "55%" of a cash flow
@@ -925,6 +1092,11 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
             notes.append(f"no rows for {shown}: the {CS.AGG_LABELS[agg].lower()} there is drawn as 0, which is not a measured value")
         if t == "heatmap":
             extra = CS.ChartExtra(heatmap_rows=[s.name for s in series][:60])
+        elif t == "sunburst":
+            # The outer ring is exactly the (category, group) cells that hold
+            # something; a zero cell would be a zero-width wedge, so it is not
+            # drawn and is not counted.
+            extra = CS.ChartExtra(ring_counts=[sum(1 for sr in series if sr.values[j] > 0) for j in range(len(order_keys))])
     else:
         if agg == "count":
             names = ["Count"]
@@ -954,7 +1126,8 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         y_label = base if agg in ("sum", "none") else f"{CS.AGG_LABELS[agg]} {base}"
     else:
         y_label = CS.AGG_LABELS[agg] if agg not in ("sum", "none") else ""
-    return ComputedChart(categories=categories, series=series, extra=extra, provenance=prov, notes=notes, x_label=x_label, y_label=y_label[:60])
+    return ComputedChart(categories=categories, series=series, extra=extra, provenance=prov, notes=notes, x_label=x_label,
+                         y_label=y_label[:60], dropped=dropped_unfolded)
 
 
 def _unique_name(name: str, existing: Sequence[CS.Series]) -> str:
@@ -1100,11 +1273,23 @@ def _box_stats(name: str, vals: List[float]) -> CS.BoxStats:
 
 
 def _compute_box(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> ComputedChart:
+    """Box and violin: the same grouping, the same five numbers. A violin
+    also carries each group's SAMPLE, because its width at a height is a
+    density estimated from those numbers and nothing else."""
     b = chart.data
     assert b is not None
+    violin = chart.type == "violin"
+    what = "violin plot" if violin else "box plot"
     boxes: List[CS.BoxStats] = []
+    samples: List[Tuple[str, List[float]]] = []
+    notes: List[str] = []
+    #: True when the MIN_VIOLIN_POINTS filter, not a shortage of numbers, is
+    #: what emptied the chart: the refusal below has to say which, or it
+    #: reads "there are no numbers" over a table full of them.
+    thin_only = False
     if not b.y:
-        raise ChartDataError("A box plot needs a numeric column (y).")
+        raise ChartDataError(f"A {what} needs a numeric column (y).")
+    cap = MAX_VIOLINS if violin else MAX_BOXES
     split = "group_by" if "group_by" in frame.cols else ("x" if "x" in frame.cols else None)
     if split:
         by: Dict[str, List[float]] = {}
@@ -1115,19 +1300,59 @@ def _compute_box(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> Compute
         ordered = list(by.items())
         mo = _month_or_weekday_order([k for k, _ in ordered])
         ordered.sort(key=(lambda kv: mo[kv[0]]) if mo else (lambda kv: -len(kv[1])))
-        if len(ordered) > MAX_BOXES:
-            ordered = sorted(ordered, key=lambda kv: -len(kv[1]))[:MAX_BOXES]
+        if len(ordered) > cap:
+            notes.append(f"{len(ordered)} groups are too many to draw; the {cap} with the most rows are shown")
+            ordered = sorted(ordered, key=lambda kv: -len(kv[1]))[:cap]
+        if violin:
+            # A density curve drawn through two or three points is a shape
+            # the data does not support; such a group is left out by name.
+            thin = [k for k, v in ordered if len(v) < MIN_VIOLIN_POINTS]
+            if thin:
+                notes.append(
+                    f"{', '.join(thin[:3])} ha{'s' if len(thin) == 1 else 've'} fewer than {MIN_VIOLIN_POINTS} values, "
+                    "too few for a distribution, so no violin is drawn for them"
+                )
+                ordered = [(k, v) for k, v in ordered if len(v) >= MIN_VIOLIN_POINTS]
+                thin_only = not ordered
         boxes = [_box_stats(k, v) for k, v in ordered if v]
+        samples = [(k, v) for k, v in ordered if v]
     else:
         for i in range(len(b.y)):
             vals = [v for v in _numbers(frame.cols[f"y{i}"]) if v is not None]
+            if violin and len(vals) < MIN_VIOLIN_POINTS:
+                thin_only = thin_only or bool(vals)
+                continue
             if vals:
                 boxes.append(_box_stats(frame.names[f"y{i}"], vals))
+                samples.append((frame.names[f"y{i}"], vals))
     if not boxes:
-        raise ChartDataError("There are no numbers to draw a box plot from.")
+        if thin_only:
+            raise ChartDataError(
+                f"Every group has fewer than {MIN_VIOLIN_POINTS} values, too few to draw a distribution; "
+                "a bar or box chart can show these numbers."
+            )
+        raise ChartDataError(f"There are no numbers to draw a {what} from.")
+    extra = CS.ChartExtra(box=boxes)
+    if violin:
+        dists = []
+        trimmed = 0
+        for name, vals in samples[:cap]:
+            kept = sorted(vals)
+            if len(kept) > MAX_VIOLIN_POINTS:
+                stride = math.ceil(len(kept) / MAX_VIOLIN_POINTS)
+                kept = kept[::stride][:MAX_VIOLIN_POINTS]
+                trimmed += 1
+            dists.append(CS.Distribution(name=name[:80], n=len(vals), values=kept))
+        if trimmed:
+            # "at most": the stride sample of 3,334 values stores 556, not
+            # 600, so naming the cap as the count would be a figure the spec
+            # does not hold.
+            notes.append(f"the curve of {trimmed} group{'s' if trimmed != 1 else ''} is drawn from an even sample of at most "
+                         f"{MAX_VIOLIN_POINTS} of its values; the box inside it uses every value")
+        extra = CS.ChartExtra(box=boxes, violin=dists)
     prov.agg = "none"
     return ComputedChart(categories=[bx.name for bx in boxes], series=[CS.Series(name="Median", values=[bx.median for bx in boxes])],
-                         extra=CS.ChartExtra(box=boxes), provenance=prov, notes=[],
+                         extra=extra, provenance=prov, notes=notes,
                          x_label=frame.names.get(split, "") if split else "", y_label=frame.names["y0"])
 
 
@@ -1162,6 +1387,198 @@ def _compute_gantt(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> Compu
                          extra=extra, provenance=prov, notes=notes, x_label="Date", y_label=frame.names["label"])
 
 
+def _compute_pareto(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadline: Optional[float]) -> ComputedChart:
+    """Bars from largest to smallest, plus the running share of the total.
+
+    A pareto ASSERTS an order: the reader stops where the line crosses 80%
+    and calls everything left of it the vital few. Drawn in any other order
+    that sentence is false, so the descending sort is not a default here —
+    it is forced, and a binding that asked for another order is told so.
+    The cumulative percentage is of the bars that are DRAWN (the "Other"
+    bucket is one of them), so the line always ends at 100%.
+    """
+    b = chart.data
+    assert b is not None
+    notes: List[str] = []
+    if b.sort not in ("auto", "value_desc"):
+        notes.append("a pareto chart is read from the largest bar down, so the categories were sorted by value")
+    inner = chart.model_copy(update={"data": b.model_copy(update={"sort": "value_desc"})})
+    result = _compute_grouped(inner, frame, prov, deadline)
+    if not result.series:
+        raise ChartDataError("There is nothing to rank in this table.")
+    values = list(result.series[0].values)
+    total = sum(values)
+    if total <= 0:
+        raise ChartDataError("A pareto chart needs a positive total; every value here is zero.")
+    running = 0.0
+    cumulative: List[float] = []
+    for v in values:
+        running += v
+        cumulative.append(running / total * 100.0)
+    result.series = [
+        result.series[0].model_copy(update={"kind": "bar"}),
+        CS.Series(name="Cumulative %", values=cumulative, axis="secondary", kind="line"),
+    ]
+    if result.dropped:
+        # top_n with other_bucket off drops the tail instead of folding it,
+        # so `total` above is the total of the BARS, not of the table: 50,
+        # 25, 15 out of 50/25/15/6/3/1 ran to 55.6/83.3/100% although those
+        # three bars are 90% of the real total. The line still has to end at
+        # 100%, so the denominator stays — what it is a share of is said.
+        notes.append(f"the cumulative line is a share of the {len(result.categories)} categories shown, "
+                     f"not of the whole table ({result.dropped} smaller categories are left out)")
+    result.notes = result.notes + notes
+    return result
+
+
+def _compute_candlestick(chart: CS.Chart, frame: _Frame, prov: CS.Provenance) -> ComputedChart:
+    """Open-high-low-close per period, aggregated the way a candle is: the
+    OPEN of a period is its first row, the CLOSE its last, the HIGH the
+    largest high and the LOW the smallest low. Averaging any of the four
+    would draw a candle no trade ever made."""
+    b = chart.data
+    assert b is not None
+    if len(b.y) != 4:
+        raise ChartDataError(
+            "A candlestick chart needs exactly four numeric columns, in the order open, high, low, close"
+            f" ({len(b.y)} {'was' if len(b.y) == 1 else 'were'} given)."
+        )
+    if "x" not in frame.cols:
+        raise ChartDataError("A candlestick chart needs a period column (x): the date or label of each candle.")
+    keys, klabels, bucket, notes = _keys_for(frame, "x", b, chart.type)
+    prov.date_bucket = bucket
+    prov.agg = "none"
+    ohlc = [_numbers(frame.cols[f"y{i}"]) for i in range(4)]
+    order: List[Any] = []
+    acc: Dict[Any, List[float]] = {}
+    skipped = 0
+    for row, key in enumerate(keys):
+        o, h, l, c = (col[row] for col in ohlc)
+        if o is None or h is None or l is None or c is None:
+            skipped += 1
+            continue
+        if key not in acc:
+            acc[key] = [o, h, l, c]
+            order.append(key)
+        else:
+            cell = acc[key]
+            cell[1] = max(cell[1], h)
+            cell[2] = min(cell[2], l)
+            cell[3] = c
+    if skipped:
+        notes.append(f"{skipped:,} rows without all four numbers were left out")
+    if not order:
+        raise ChartDataError("No row has an open, a high, a low and a close.")
+    order.sort(key=lambda k: (k[0] == "~blank", k))
+    wrong = [klabels[k] for k in order if acc[k][1] < max(acc[k][0], acc[k][3]) or acc[k][2] > min(acc[k][0], acc[k][3])]
+    if wrong:
+        # high < max(open, close) is not a market that happened; it is the
+        # four columns bound in the wrong order, which a silent chart would
+        # draw as upside-down wicks.
+        raise ChartDataError(
+            f"{len(wrong)} period{'s' if len(wrong) != 1 else ''} ({', '.join(wrong[:3])}) "
+            "have a high below, or a low above, the open and close: the four columns look out of order — "
+            "bind them as open, high, low, close."
+        )
+    if len(order) > MAX_CANDLES:
+        notes.append(f"{len(order):,} periods are too many to draw; the last {MAX_CANDLES} are shown")
+        order = order[-MAX_CANDLES:]
+    candles = [CS.Candle(label=klabels[k][:80], open=acc[k][0], high=acc[k][1], low=acc[k][2], close=acc[k][3]) for k in order]
+    names = [frame.names[f"y{i}"] for i in range(4)]
+    series = [CS.Series(name=_clip_name(names[i]), values=[getattr(cd, f) for cd in candles])
+              for i, f in enumerate(("open", "high", "low", "close"))]
+    x_label = frame.names.get("x", "")
+    if bucket:
+        x_label = f"{x_label} ({bucket})"
+    return ComputedChart(categories=[cd.label for cd in candles], series=series, extra=CS.ChartExtra(candles=candles),
+                         provenance=prov, notes=notes, x_label=x_label, y_label="")
+
+
+def _clip_name(name: str) -> str:
+    return (str(name) or "Series")[:80]
+
+
+def _compute_bullet(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadline: Optional[float]) -> ComputedChart:
+    """One actual against one target per label, with the qualitative bands
+    the table supplied.
+
+    NO BAND IS INVENTED. The usual bullet chart shades "poor / fair / good"
+    behind the measure; those thresholds are a judgement, not a measurement,
+    so they are drawn only from columns the binding names (y[1:]) and are
+    absent otherwise. A band the code made up (60% and 80% of target, say)
+    would read as the organisation's own thresholds.
+    """
+    b = chart.data
+    assert b is not None
+    if not b.y:
+        raise ChartDataError("A bullet chart needs the actual value column (y).")
+    if "target" not in frame.cols:
+        raise ChartDataError("A bullet chart needs the target column it compares the actual with (target).")
+    if "x" not in frame.cols:
+        raise ChartDataError("A bullet chart needs a label column (x).")
+    notes: List[str] = []
+    agg = b.agg if b.agg != "count" else "sum"
+    keys, klabels, bucket, knotes = _keys_for(frame, "x", b, chart.type)
+    notes.extend(knotes)
+    prov.agg = agg
+    prov.date_bucket = bucket
+    band_roles = [f"y{i}" for i in range(1, len(b.y))][:4]
+    roles = ["y0", "target"] + band_roles
+    for role in roles:
+        if frame.kinds[role].kind not in ("number", "empty"):
+            raise ChartDataError(f"The column {frame.names[role]!r} is not numeric, so it cannot be a bullet chart's measure.")
+    ycols = [_numbers(frame.cols[r]) for r in roles]
+    _check_deadline(deadline)
+    gkeys = [("all",)] * len(keys)
+    # THE MEASURE IS AGGREGATED, THE GOAL IS NOT. A target and its bands are
+    # a property of the label, stated once per row; summing them multiplies
+    # the goal by the number of rows. Measured 2026-09-16: two Revenue rows
+    # of 120 and 150, each stating Target 300, drew actual 270 (right)
+    # against target 600 and bands 300/480/660 (all wrong), annotated
+    # "270 · 45% of target" instead of 90% — a number on the picture that
+    # the table does not contain. The thresholds are taken with max(), and a
+    # label whose rows disagree is named in a note rather than averaged away.
+    cells, engine = _aggregate(keys, gkeys, [ycols[0]], agg)
+    goal_cells, _ = _aggregate(keys, gkeys, ycols[1:], "max")
+    goal_low, _ = _aggregate(keys, gkeys, ycols[1:], "min")
+    prov.engine = engine  # type: ignore[assignment]
+    first_seen: Dict[Any, int] = {}
+    for i, k in enumerate(keys):
+        first_seen.setdefault(k, i)
+    order = list(first_seen)
+    if b.sort == "value_desc":
+        order.sort(key=lambda k: (-cells.get((k, ("all",)), [0.0])[0], first_seen[k]))
+    elif b.sort == "value_asc":
+        order.sort(key=lambda k: (cells.get((k, ("all",)), [0.0])[0], first_seen[k]))
+    elif b.sort == "x":
+        order.sort(key=lambda k: (k[0] == "~blank", k))
+    if len(order) > MAX_BULLETS:
+        notes.append(f"{len(order)} rows are too many for one bullet chart; the first {MAX_BULLETS} are shown")
+        order = order[:MAX_BULLETS]
+    bullets: List[CS.Bullet] = []
+    disagreed: List[str] = []
+    for k in order:
+        actual = cells.get((k, ("all",)), [0.0])[0]
+        goals = goal_cells.get((k, ("all",)), [0.0] * (len(roles) - 1))
+        lows = goal_low.get((k, ("all",)), goals)
+        if any(abs(hi - lo) > 1e-9 for hi, lo in zip(goals, lows)):
+            disagreed.append(klabels[k])
+        bands = sorted(goals[1:1 + len(band_roles)])
+        bullets.append(CS.Bullet(label=klabels[k][:80], actual=actual, target=goals[0] if goals else 0.0, bands=bands))
+    if disagreed:
+        shown = ", ".join(disagreed[:3]) + (f" and {len(disagreed) - 3} more" if len(disagreed) > 3 else "")
+        notes.append(f"the rows for {shown} state more than one {frame.names['target']}; the largest is drawn")
+    if not any(bl.target for bl in bullets):
+        raise ChartDataError(f"Every {frame.names['target']} is zero, so there is no target to measure against.")
+    if band_roles:
+        notes.append("the shaded bands are " + ", ".join(frame.names[r] for r in band_roles))
+    series = [CS.Series(name=_clip_name(frame.names["y0"]), values=[bl.actual for bl in bullets]),
+              CS.Series(name=_clip_name(frame.names["target"]), values=[bl.target for bl in bullets])]
+    y_label = frame.names["y0"] if agg in ("sum", "none") else f"{CS.AGG_LABELS[agg]} {frame.names['y0']}"
+    return ComputedChart(categories=[bl.label for bl in bullets], series=series, extra=CS.ChartExtra(bullets=bullets),
+                         provenance=prov, notes=notes, x_label=frame.names.get("x", ""), y_label=y_label[:60])
+
+
 _PROVENANCE_PHRASE = {
     "answer": "from the assistant's earlier answer",
     "prompt": "figures typed in the request",
@@ -1181,25 +1598,37 @@ def _caption(chart: CS.Chart, result: ComputedChart, frame: _Frame) -> str:
     elif t == "histogram":
         role = "y0" if b.y else "x"
         parts.append(f"Distribution of {frame.names.get(role, '')} ({len(result.categories)} bins)")
-    elif t == "box":
+    elif t in ("box", "violin"):
         split = frame.names.get("group_by") or frame.names.get("x")
         parts.append(f"Distribution of {frame.names.get('y0', '')}" + (f" by {split}" if split else ""))
+    elif t == "candlestick":
+        cols = ", ".join(frame.names[f"y{i}"] for i in range(min(4, len(b.y))))
+        parts.append(f"{cols} per {prov.date_bucket or frame.names.get('x', '')} ({len(result.categories)} periods)")
+    elif t == "bullet":
+        parts.append(f"{frame.names.get('y0', '')} against {frame.names.get('target', '')} by {frame.names.get('x', '')}")
     elif t == "gantt":
         parts.append(f"{frame.names['label']} from {frame.names['start']} to {frame.names['end']}")
     else:
         by = frame.names.get("x", "")
         if prov.date_bucket:
             by = prov.date_bucket
-        if b.group_by and t not in ("pie", "donut", "funnel", "waterfall"):
+        if b.group_by and t in CS.SPLIT_TYPES:
             by = f"{by} and {frame.names.get('group_by', b.group_by)}"
         if prov.agg == "count":
             parts.append(f"Count of rows by {by}")
         else:
             ys = [frame.names[f"y{i}"] for i in range(len(b.y))] + [frame.names[f"y2_{i}"] for i in range(len(b.y2))]
-            if b.group_by and t not in ("pie", "donut", "funnel", "waterfall"):
+            if b.group_by and t in CS.SPLIT_TYPES:
                 ys = ys[:1]
             label = CS.AGG_LABELS[prov.agg] if prov.agg != "none" else "Value"
             parts.append(f"{label} of {' and '.join(ys)} by {by}")
+    if t == "pareto" and result.series and len(result.series) > 1 and result.series[1].values:
+        crossing = next((i for i, v in enumerate(result.series[1].values) if v >= 80.0), None)
+        if crossing is not None:
+            n = crossing + 1
+            whole = "the categories shown" if result.dropped else "the total"
+            parts.append(f"the top {n} of {len(result.categories)} make up "
+                         f"{result.series[1].values[crossing]:.0f}% of {whole}")
     parts.append(prov.table_title or prov.table_id)
     parts.append(f"{prov.rows_used:,} rows")
     if prov.filters:
@@ -1273,9 +1702,9 @@ def resolve_chart(chart: Any, tables: Sequence[Any], *, default_table: Any = Non
         "categories": result.categories, "series": result.series, "extra": result.extra,
         "provenance": result.provenance, "caption": result.caption,
     }
-    if not c.x_label and result.x_label and c.type not in CS.PART_OF_WHOLE_TYPES:
+    if not c.x_label and result.x_label and c.type not in CS.NO_AXIS_TYPES:
         update["x_label"] = result.x_label[:60]
-    if not c.y_label and result.y_label and c.type not in CS.PART_OF_WHOLE_TYPES:
+    if not c.y_label and result.y_label and c.type not in CS.NO_AXIS_TYPES:
         update["y_label"] = result.y_label[:60]
     colour_notes: List[str] = []
     if c.style is not None and (c.style.category_colors or c.style.series_colors):
@@ -1311,7 +1740,7 @@ def _align_colour_keys(mapping: Dict[str, str], names: Sequence[str]) -> Tuple[D
     return out, missing
 
 
-_GROUP_TYPES = ("stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar", "stacked_area", "heatmap")
+_GROUP_TYPES = ("stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar", "stacked_area", "heatmap", "sunburst")
 _SECOND_DIMENSION_TYPES = ("line", "area", "bar", "horizontal_bar", "radar")
 
 
@@ -1321,7 +1750,8 @@ def _mentions(text: str, name: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(name.casefold())}(?![\w])", text.casefold()) is not None
 
 
-def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = "") -> Tuple[CS.Chart, List[str]]:
+def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = "", *,
+                   keep_accepted_type: bool = False) -> Tuple[CS.Chart, List[str]]:
     """Deterministic clean-up of a binding the model wrote, BEFORE compute:
 
     - fields that belong to other chart types are dropped (y2 off a combo,
@@ -1330,7 +1760,14 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
     - a grouped type (stacked, heatmap) with no group_by, or a line/bar over
       dates whose request names a second text column, gets that column as
       group_by — only when exactly one such column is named in the request
-      or the title, with a note.
+      or the title, with a note;
+    - the TYPE is checked against the table's shape by chart_choice: a type
+      the person named in `instruction` wins whenever the shape carries it,
+      otherwise the chooser's type is used and the note names both and why.
+      `keep_accepted_type` (an EDIT of a chart the person has already seen)
+      holds that last step back unless the instruction is about charts —
+      measured 2026-09-16, "make the title bigger" turned an accepted line
+      chart into a pie because every chart in the spec is re-checked.
 
     Live run 2026-09-15: 7 of 20 misses were a skipped group_by and 3 were
     stray y2/label/size fields. Nothing here invents a column or a number."""
@@ -1348,6 +1785,8 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
         upd.update(label=None, start=None, end=None)
     if t != "bubble" and b.size:
         upd["size"] = None
+    if t != "bullet" and b.target:
+        upd["target"] = None
     if t != "scatter" and b.trendline:
         upd["trendline"] = False
     table, _ = _find_table(b.table_id, list(tables))
@@ -1375,10 +1814,129 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
         if len(candidates) == 1 and (t in _GROUP_TYPES or x_is_date):
             upd["group_by"] = candidates[0]
             notes.append(f"the chart is split by {candidates[0]}, as the request names it")
-    if not upd:
+
+    # The type, LAST: the chooser reads the binding as repaired above (a
+    # group_by just filled in changes the shape), and the person's own words
+    # outrank both the model and the chooser.
+    type_upd: Dict[str, Any] = {}
+    if table is not None:
+        probe = chart if not upd else chart.model_copy(update={"data": CS.Binding.model_validate({**b.model_dump(), **upd})})
+        choice = chart_choice.choose(probe, table, instruction, keep_accepted_type=keep_accepted_type)
+        if choice is not None:
+            if choice.type != t:
+                type_upd["type"] = choice.type
+            if choice.trendline != probe.data.trendline and choice.type == "scatter":
+                upd["trendline"] = choice.trendline
+            # Only ever beside a type that really changed: a note is the
+            # sentence that explains a substitution, and choose() writes
+            # none when there was not one.
+            if choice.note and choice.type != t:
+                notes.append(choice.note)
+    if not upd and not type_upd:
         return chart, notes
     data = {**b.model_dump(), **upd}
-    return chart.model_copy(update={"data": CS.Binding.model_validate(data), "categories": [], "series": [], "extra": None, "provenance": None}), notes
+    return chart.model_copy(update={"data": CS.Binding.model_validate(data), **type_upd,
+                                    "categories": [], "series": [], "extra": None, "provenance": None}), notes
+
+
+def _table_from_chart(chart: CS.Chart) -> Optional[Any]:
+    """A chart's computed values read back as the table it was drawn from:
+    `categories` is the x column, each series is one y column, one row per
+    category. None when the chart's shape cannot be a table that way — a
+    scatter/bubble carries its own `x` per point, a repeated category would
+    re-aggregate into one row, a series that is not a y column (a `group_by`
+    split) has no column to be.
+
+    This is a CANDIDATE only. The caller must prove it reproduces the chart
+    it came from before using it (`recompute_matches`); see
+    `tables_from_parent_charts`.
+    """
+    b = chart.data
+    if b is None or not b.table_id:
+        return None
+    x = (b.x or "").strip()
+    ys = [str(y).strip() for y in (b.y or [])]
+    cats = [str(c) for c in (chart.categories or [])]
+    series = list(chart.series or [])
+    if not x or not ys or not cats or len(series) != len(ys):
+        return None
+    if len(set(cats)) != len(cats) or x in ys or len(set(ys)) != len(ys):
+        return None
+    if any(s.x is not None or s.sizes is not None for s in series):
+        return None
+    if any(len(s.values) != len(cats) for s in series):
+        return None
+    title = (chart.provenance.table_title if chart.provenance is not None else "") or b.table_id
+    rows = [[cats[i], *[s.values[i] for s in series]] for i in range(len(cats))]
+    return _make_table(id=b.table_id, title=title, columns=[x, *ys], rows=rows)
+
+
+def tables_from_parent_charts(spec: Any, parent: Any, tables: Sequence[Any]) -> List[Any]:
+    """The source tables an EDIT turn no longer has, rebuilt from the charts
+    the PARENT version already computed. Ids already in `tables` are left
+    alone — a real table in the turn always wins.
+
+    THE GAP THIS CLOSES (recheck BLOCKER, 2026-09-16). A chart carries its
+    BINDING, and `resolve_spec` replaces any chart whose `data.table_id` it
+    cannot find with a "the table 'paste1' is not available" callout. On an
+    edit turn that table is normally gone: the paste was in the CREATE turn
+    and `engines/artifact.py` gathers pastes at acceptance of a create, so
+    `material.tables` is empty. Measured by reloading a published version and
+    resolving it against no tables — on this branch AND on main (075ee8b),
+    with the parent untouched: the picture became that callout. So every edit
+    of a document or deck holding a bound chart lost the chart, and the
+    deterministic "make it a bar chart instead" lost it too, because
+    `chart_spec.apply_patch` clears the computed values on purpose so that
+    code — not the model — puts the numbers back.
+
+    WHY THE REBUILT TABLE IS NOT A GUESS. Two conditions, both required:
+
+      * the child's binding is byte-identical to the parent's, so nothing
+        about which rows are read, how they are combined or which columns
+        are plotted has changed — only the type, a label, a colour;
+      * re-running the PARENT's own chart over the rebuilt table reproduces
+        the parent's numbers exactly (`recompute_matches`). That is what
+        rules out every aggregation a one-row-per-category table cannot
+        carry: agg='count' would count 1 per row, a `filters` column is not
+        in the rebuilt table, a `group_by` makes series that are not y
+        columns, `sort`/`top_n` may reorder or drop.
+
+    Anything else gets no table and refuses exactly as it did before.
+
+    The rebuilt table has one row per category, so the `provenance` row
+    counts on the NEW chart describe the rebuilt table, not the original
+    rows. The sentence the person reads does not: `resolve_chart` keeps a
+    caption the chart already carries, and the parent's caption (with its
+    real row count) survives `apply_patch`.
+    """
+    out: List[Any] = []
+    if parent is None or spec is None:
+        return out
+    try:
+        parents = [_chart_of(c) for _p, c in CS.iter_chart_slots(parent)]
+        children = [_chart_of(c) for _p, c in CS.iter_chart_slots(spec)]
+    except Exception:  # a shape neither side can read is not a chart to restore
+        return out
+    if not parents or not children:
+        return out
+    have = {str(_table_attr(t, "id", "") or "") for t in (tables or [])}
+    for child in children:
+        if child.data is None or not child.data.table_id or child.data.table_id in have:
+            continue
+        want = child.data.model_dump(mode="json")
+        for pc in parents:
+            if pc.data is None or pc.data.model_dump(mode="json") != want:
+                continue
+            table = _table_from_chart(pc)
+            if table is None:
+                continue
+            ok, _diffs = recompute_matches(pc, [table])
+            if not ok:
+                continue
+            out.append(table)
+            have.add(child.data.table_id)
+            break
+    return out
 
 
 def _sheet_table(sheet: Dict[str, Any]) -> Any:

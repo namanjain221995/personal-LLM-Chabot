@@ -1,6 +1,6 @@
 """Authored chart requests (no user content) with the VALUES they must produce.
 
-REQUESTS: 71 requests over the synthetic fixtures in tests/fixtures/charts/.
+REQUESTS: 77 requests over the synthetic fixtures in tests/fixtures/charts/.
 Each names the table the person uploaded, the chart types that count as a
 correct reading, and a ground-truth key (a path into ground_truth.json) or a
 literal expectation for the category → value mapping of the first series (or
@@ -26,6 +26,9 @@ U = "upload_units"
 P = "upload_projects"
 C = "upload_cashflow"
 F = "upload_funnel"
+D = "upload_defects"
+PR = "upload_prices"
+TG = "upload_targets"
 H1 = [{"column": "Date", "op": "lt", "value": "2026-07-01"}]
 
 
@@ -119,9 +122,25 @@ REQUESTS: List[Dict[str, Any]] = [
     R("ty04", "typo", "scater plot salry vs experiance with trnd line", E, ("scatter",), "trend", {"type": "scatter", "data": {"table_id": E, "x": "Experience", "y": ["Salary"], "trendline": True}}, check="trend"),
     R("ty05", "typo", "histogarm of hours", T, ("histogram",), None, {"type": "histogram", "data": {"table_id": T, "y": ["Hours"]}}, check="histogram_total:60"),
     R("ty06", "typo", "stacked bar q1 q2 sales by regon", SA, ("stacked_bar", "stacked_horizontal_bar"), "sales.amount_by_quarter_region_h1", {"type": "stacked_bar", "data": {"table_id": SA, "x": "Date", "date_bucket": "quarter", "group_by": "Region", "y": ["Amount"], "filters": H1}}, grouped=True),
+    # ---- the advanced types (2026-09-16) ----
+    R("ad01", "en", "Pareto chart of the defect causes.", D, ("pareto",),
+      {"Scratches": 50, "Misprint": 25, "Dents": 15, "Loose seal": 6, "Wrong label": 3, "Other damage": 1},
+      {"type": "pareto", "data": {"table_id": D, "x": "Cause", "y": ["Count"]}}),
+    R("ad02", "en", "Show the defect mix as a treemap.", D, ("treemap",),
+      {"Scratches": 50, "Misprint": 25, "Dents": 15, "Loose seal": 6, "Wrong label": 3, "Other damage": 1},
+      {"type": "treemap", "data": {"table_id": D, "x": "Cause", "y": ["Count"]}}),
+    R("ad03", "en", "Violin plot of salary by department.", E, ("violin",), None,
+      {"type": "violin", "data": {"table_id": E, "x": "Department", "y": ["Salary"]}}, check="violin_n:80"),
+    R("ad04", "en", "Candlestick chart of the daily open, high, low and close.", PR, ("candlestick",), None,
+      {"type": "candlestick", "data": {"table_id": PR, "x": "Day", "y": ["Open", "High", "Low", "Close"]}}, check="candles:5"),
+    R("ad05", "en", "Sunburst of revenue by region and product.", SA, ("sunburst",), "sales.amount_by_region_product",
+      {"type": "sunburst", "data": {"table_id": SA, "x": "Region", "group_by": "Product", "y": ["Amount"]}}, grouped=True),
+    R("ad06", "en", "Bullet chart of each measure against its target.", TG, ("bullet",), None,
+      {"type": "bullet", "data": {"table_id": TG, "x": "Measure", "y": ["Actual", "Poor", "Fair", "Good"], "target": "Target"}},
+      check="bullets:3"),
 ]
 
-assert len(REQUESTS) == 71, len(REQUESTS)
+assert len(REQUESTS) == 77, len(REQUESTS)
 assert sum(1 for r in REQUESTS if r["lang"] != "en") >= 26
 
 
@@ -186,7 +205,11 @@ assert len(PROMPT_DATA_CASES) >= 50, len(PROMPT_DATA_CASES)
 # ------------------------------------------------------------------ scoring --
 
 
-def _truth(gt: Dict[str, Any], key: str) -> Any:
+def _truth(gt: Dict[str, Any], key: Any) -> Any:
+    if isinstance(key, dict):
+        # A request may carry its expectation literally (the advanced types
+        # chart six-row tables whose sums are readable in the file itself).
+        return key
     if key == "units.q1":
         return {k: v[0] for k, v in gt["units"].items()}
     if key == "units.combo":
@@ -215,7 +238,8 @@ def score(req: Dict[str, Any], chart: Any, gt: Dict[str, Any], tables: Optional[
             got = {f"{cat}|{s.name}": v for s in chart.series for cat, v in zip(chart.categories, s.values) if v}
             want = {k: v for k, v in truth.items() if v}
         elif req["truth"] == "projects" or req["truth"] == "cashflow" or req["truth"] == "funnel" or isinstance(truth, dict):
-            if chart.type in ("pie", "donut", "bar", "horizontal_bar", "funnel", "waterfall", "gantt", "line", "area") and chart.series:
+            if chart.type in ("pie", "donut", "bar", "horizontal_bar", "funnel", "waterfall", "gantt", "line", "area",
+                              "pareto", "treemap") and chart.series:
                 got = dict(zip(chart.categories, chart.series[0].values))
             else:
                 return False, "no series"
@@ -249,6 +273,29 @@ def score(req: Dict[str, Any], chart: Any, gt: Dict[str, Any], tables: Optional[
     elif check.startswith("box_n:"):
         if not chart.extra or sum(b.n for b in chart.extra.box) != int(check.split(":")[1]):
             return False, "box plot does not cover every row"
+    elif check.startswith("violin_n:"):
+        if not chart.extra or not chart.extra.violin:
+            return False, "no distribution to draw a violin from"
+        if sum(d.n for d in chart.extra.violin) != int(check.split(":")[1]):
+            return False, "the violins do not cover every row"
+        if [b.name for b in chart.extra.box] != [d.name for d in chart.extra.violin]:
+            return False, "the quartile box and the curve are not the same groups"
+    elif check.startswith("candles:"):
+        candles = chart.extra.candles if chart.extra else []
+        if len(candles) != int(check.split(":")[1]):
+            return False, f"{len(candles)} candles"
+        for cd in candles:
+            if not (cd.low <= min(cd.open, cd.close) and max(cd.open, cd.close) <= cd.high):
+                return False, f"candle {cd.label} is not a valid open-high-low-close"
+    elif check.startswith("bullets:"):
+        rows = chart.extra.bullets if chart.extra else []
+        if len(rows) != int(check.split(":")[1]):
+            return False, f"{len(rows)} bullet rows"
+        table = next(t for t in (tables or []) if t.id == req["table"])
+        want = {str(r[0]): (float(r[1]), float(r[2])) for r in table.rows}
+        for row in rows:
+            if row.label not in want or not (close(row.actual, want[row.label][0]) and close(row.target, want[row.label][1])):
+                return False, f"bullet {row.label}: {row.actual} against {row.target}"
     elif check.startswith("points:"):
         if sum(len(s.values) for s in chart.series) != int(check.split(":")[1]):
             return False, "points"

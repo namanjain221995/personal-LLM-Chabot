@@ -158,6 +158,12 @@ V2_BINDINGS = {
     "gantt": dict(table_id="upload_projects", label="Task", start="Start", end="End"),
     "radar": dict(table_id="upload_units", x="Product", y=["Q1", "Q2", "Q3", "Q4"]),
     "bubble": dict(table_id="upload_employees", x="Experience", y=["Salary"], size="Age"),
+    "pareto": dict(table_id="upload_defects", x="Cause", y=["Count"]),
+    "treemap": dict(table_id="upload_sales", x="Product", y=["Amount"]),
+    "violin": dict(table_id="upload_employees", x="Department", y=["Salary"]),
+    "candlestick": dict(table_id="upload_prices", x="Day", y=["Open", "High", "Low", "Close"]),
+    "sunburst": dict(table_id="upload_sales", x="Region", group_by="Product", y=["Amount"]),
+    "bullet": dict(table_id="upload_targets", x="Measure", y=["Actual", "Poor", "Fair", "Good"], target="Target"),
 }
 
 
@@ -180,7 +186,7 @@ def _table(**kw):
     return DataTable(**kw)
 
 
-def test_bindings_cover_all_twenty_types():
+def test_bindings_cover_every_declared_type():
     assert set(V2_BINDINGS) == set(CS.CHART_TYPES)
 
 

@@ -21,6 +21,16 @@ a guess in natural language: `decide()` returns a `FormatDecision` with
 the rule that fired, which is stored in the job's metadata so a person can
 see why a deck came back as a .pptx.
 
+WHAT IS NOT MADE IS SAID (2026-09-16). The drop list could only ever see
+formats the alias table already recognised, so "an xlsx, a csv, a Word file
+and a LaTeX file" made three files and never mentioned LaTeX, and "as JSON"
+and "as an .epub" came back as a Word file and a PDF with nothing said.
+`unmakeable_formats` reads the format-shaped words this platform does NOT
+make and `decide_base` warns on them — and a KIND the person named that a
+format word overruled ("make a presentation as an xlsx" → a spreadsheet)
+is warned about too: substituting the kind is a bigger change than dropping
+a format, and it was the one made in silence.
+
 WHAT COUNTS AS NAMING A FORMAT. The alias table below reads the words
 people actually type — `spread sheet`, `xlxs`, `exel`, `powerpint`, `ppt`,
 a bare `word` inside a list of formats, `comma-separated` — because the
@@ -37,12 +47,28 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import types as T
 
+#: Data asked for by the shape or by the count: "sample records", "250
+#: realistic sample rows of support tickets". `_DATASET` below is compiled
+#: from this one string, so the KIND and the csv default are decided by the
+#: same words — until 2026-09-16 only the default read it, and by then the
+#: kind had defaulted to document (MEASURE 1 B29: 250 rows of data were
+#: delivered as a Word file and a PDF).
+_DATASET_WORDS = (
+    r"\b(data ?sets?|data files?|sample data|sample records|synthetic data|dummy data|test data|mock data|"
+    r"(?:\d[\d,]*\s+(?:\w+\s+){0,2}?(?:records|rows|entries)))\b"
+)
+
 # Order matters: the first rule whose words match decides the kind.
 _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
     # (kind, rule name, pattern)
     ("presentation", "deck words", r"\b(presentation|slides?|slide ?deck|deck|pitch ?deck|powerpoint|power ?point|pptx?|keynote)\b"),
     ("workbook", "spreadsheet words", r"\b(spread ?sheet|work ?book|excel|xlsx?|tracker|budget|calculator|financial model|pivot|dashboard sheet|data extract|csv|data ?set|data file|sample data|sample records|table file|synthetic data|dummy data|test data|mock data)\b"),
     ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|one[- ]page|proposal|policy|letter|handout|summary|write[- ]?up|whitepaper|white paper|guide|manual|plan|pdf|docx|word)\b"),
+    # Counted rows, LAST: after the document rule, so "write a report on the
+    # 250 rows we logged" is still a report, and "generate 250 realistic
+    # sample rows of support tickets" — which names no other kind — is the
+    # data file the person asked for.
+    ("workbook", "dataset words", _DATASET_WORDS),
 )
 
 #: The alias table: what a person types → the format id. Every alternative
@@ -53,8 +79,26 @@ _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
 #: sheet" and "sheet 2" are not.
 _ALIAS: Dict[str, str] = {
     "pdf": r"(?:pdfs?|\.pdf)",
-    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?)",
-    "pptx": r"(?:pptx|\.pptx|powerpoint|power ?point|powerpint|ppts?|slide ?decks?|slides)",
+    # The normaliser writes a destination BEFORE its postposition ("वर्ड में
+    # कन्वर्ट कर दो", "aane word ma convert karo" -> "word _in_ _convert_"),
+    # so no English-order alias could see it and all four "convert it to
+    # Word" cases lost their format and exported the previous ANSWER instead
+    # (measure2 harness, 2026-09-16; pdf/excel/ppt pass because they
+    # self-name). `_convert_` and `_give_` are emitted only by
+    # lexicon.normalize from Indic or romanised input, so requiring one of
+    # them keeps a bare English "the word me is a pronoun" — which the
+    # postposition rule also rewrites to "word _in_" — out of this.
+    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?|"
+            r"word _in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word (?:_convert_|_give_))",
+    # `deck` names the pptx only where a FORMAT belongs — "a deck version",
+    # "as a deck", "in deck format". Measured 2026-09-16: "create a pdf on
+    # the security review" → "and a deck version" found no explicit format,
+    # so the conversion never ran, while intent.py's own `_FORMAT_WORD` and
+    # `_ARTIFACT_NOUNS` both held the word. A bare `deck` stays a KIND word
+    # (`_KIND_RULES`): in "give me a Word version of the deck" and "I need a
+    # deck for Monday" it is the source and the thing itself, not a target.
+    "pptx": r"(?:pptx|\.pptx|powerpoint|power ?point|powerpint|ppts?|slide ?decks?|slides"
+            r"|(?:pitch ?)?decks?\s+(?:version|copy|format|file)|(?<=as a )deck|(?<=as an )deck|(?<=into a )deck|(?<=to a )deck|(?<=in )deck(?= format))",
     "xlsx": r"(?:xlsx|\.xlsx|xlxs|xls|exel|excell?|spread ?sheets?|work ?books?|worksheets?|(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )sheets?(?!\s*\d))",
     "csv": r"(?:csvs?|\.csv|comma[- ]separated(?: values?)?|data ?sets?|data files?)",
 }
@@ -76,6 +120,98 @@ _WORD_IN_LIST = re.compile(
     rf"\b{_OTHER_FORMAT}{_LIST_SEP}(word)\b|\b(word){_LIST_SEP}{_OTHER_FORMAT}\b",
     re.I,
 )
+
+#: FORMATS THIS PLATFORM DOES NOT MAKE, by the names people type. The table
+#: exists so a request for one can be REFUSED by name. Measured 2026-09-16:
+#: "as an xlsx, a csv, a Word file and a LaTeX file" made three files and
+#: never mentioned LaTeX, "Export this conversation as JSON" and "the
+#: proposal as an .epub" made a Word file and a PDF with no clause about the
+#: format that was asked for, and "a Google Slides file" made a SECOND deck
+#: because `Slides` matched the pptx alias. Two groups: a name that can only
+#: be a file format is read anywhere; a name that is an ordinary word too
+#: ("numbers", "pages", "text") is read only where a format belongs.
+_UNMAKEABLE_ANYWHERE: Tuple[Tuple[str, str], ...] = (
+    # `doc` normalises to `docx` before this runs (lexicon.normalize), so
+    # "an editable Google Doc" arrives as "google docx".
+    ("Google Docs", r"google\s+docs?x?(?:\s+(?:file|document))?|google\s+documents?"),
+    ("Google Sheets", r"google\s+sheets?"),
+    ("Google Slides", r"google\s+slides?|g[- ]?slides?"),
+    ("Keynote", r"keynote"),
+    ("Figma", r"figma"),
+    ("LaTeX", r"latex|\.tex\b"),
+    ("EPUB", r"epub|\.epub\b"),
+    ("RTF", r"rtf|\.rtf\b"),
+    ("ODT", r"odt|\.odt\b|open ?document text"),
+    ("InDesign", r"indesign|\.indd\b"),
+    ("Photoshop", r"photoshop|\.psd\b"),
+    # `numbers` and `pages` are ordinary words ("as numbers", "in two
+    # pages"), so only their file forms are read at all.
+    ("Numbers", r"\.numbers\b|numbers\s+(?:file|document|spreadsheet)|apple\s+numbers"),
+    ("Pages", r"\.pages\b|pages\s+(?:file|document)|apple\s+pages"),
+)
+#: The same, but only where the sentence puts a format: after "as/in/into/to"
+#: (with or without an article), or in front of "file/document/version/
+#: format", or written as an extension.
+_UNMAKEABLE_IN_PLACE: Tuple[Tuple[str, str], ...] = (
+    ("JSON", r"json"),
+    ("HTML", r"html|htm"),
+    ("XML", r"xml"),
+    ("Markdown", r"markdown|md"),
+    # `text` on its own is left out: "summarise it as text" asks for a chat
+    # answer, not a file this platform refuses to make.
+    ("plain text", r"txt|plain text"),
+    ("YAML", r"yaml|yml"),
+)
+_UNMAKEABLE_PLACE = (
+    r"(?:\b(?:as|in|into|to)\s+(?:an?\s+|the\s+)?(?:editable\s+|plain\s+|simple\s+|raw\s+)?(?:%(p)s)\b"
+    r"|\b(?:%(p)s)\s+(?:files?|documents?|versions?|format|formats)\b"
+    r"|(?<![\w.])\.(?:%(p)s)\b)"
+)
+_UNMAKEABLE_RES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
+    [(name, re.compile(rf"\b(?:{pat})\b", re.I)) for name, pat in _UNMAKEABLE_ANYWHERE]
+    + [(name, re.compile(_UNMAKEABLE_PLACE % {"p": pat}, re.I)) for name, pat in _UNMAKEABLE_IN_PLACE]
+)
+#: The chart-image formats, named by a person. They are real formats (types
+#: .FORMATS), but only for the kinds that carry them, so they are read here
+#: for the CONVERSION refusal and nowhere else: the deliverable rules own
+#: `_chart_image_formats` below.
+_IMAGE_NAME_RE = re.compile(r"\b(?:pngs?|\.png|svgs?|\.svg)\b", re.I)
+
+
+def unmakeable_formats(text: str) -> List[Tuple[str, int, int]]:
+    """(display name, start, end) for every format-shaped word the request
+    names that this platform does not make. First mention wins; the spans
+    let `_mentions` drop an alias hit that lives inside one ("Slides" inside
+    "Google Slides")."""
+    out: List[Tuple[str, int, int]] = []
+    seen = set()
+    for name, rx in _UNMAKEABLE_RES:
+        m = rx.search(text or "")
+        if m and name not in seen:
+            seen.add(name)
+            out.append((name, m.start(), m.end()))
+    out.sort(key=lambda t: t[1])
+    return out
+
+
+def unmakeable_names(text: str) -> List[str]:
+    """Just the names, in the order they were said."""
+    return [n for n, _s, _e in unmakeable_formats(text)]
+
+
+def _without_unmakeable(text: str) -> str:
+    """`text` with every unmakeable format name blanked, for the rules that
+    read what KIND of artifact the words describe."""
+    out = text or ""
+    for _name, start, end in reversed(unmakeable_formats(out)):
+        out = out[:start] + " " * (end - start) + out[end:]
+    return out
+
+
+def named_image_formats(text: str) -> List[str]:
+    """The chart-image formats the words name ("convert it to SVG")."""
+    return list(dict.fromkeys(m.group(0).lower().lstrip(".").rstrip("s") for m in _IMAGE_NAME_RE.finditer(text or "")))
+
 
 _ANY_ALIAS = "|".join(_ALIAS.values()) + "|cvs"
 #: A format named as the SOURCE of a transformation is not a deliverable:
@@ -116,7 +252,7 @@ _DECK = re.compile(r"\b(deck|slides?|presentation|pitch|powerpoint|power ?point|
 #: A table someone hands over to be transformed: "this audit table",
 #: "the rows above", "the pasted data".
 _TABLE_TRANSFORM = re.compile(r"\b(this|the|these|those|attached|pasted|above|following|my|our)\s+(?:\w+\s+){0,2}?(?:tables?|rows|data|records|audit|log|list|results|entries)\b", re.I)
-_DATASET = re.compile(r"\b(data ?sets?|data files?|sample data|sample records|synthetic data|dummy data|test data|mock data|(?:\d[\d,]*\s+(?:\w+\s+){0,2}?(?:records|rows|entries)))\b", re.I)
+_DATASET = re.compile(_DATASET_WORDS, re.I)
 _SPREADSHEET = re.compile(r"\b(spread ?sheet|tracker|dashboard|work ?book|excel|xlsx|calculator|financial model|budget)\b", re.I)
 
 _TEMPLATE_HINTS: Tuple[Tuple[str, str], ...] = (
@@ -177,7 +313,10 @@ def _mentions(text: str) -> List[Tuple[int, str]]:
     with source mentions left out. Positions are what `explicit_formats`
     orders by."""
     text = text or ""
-    spans = _source_spans(text)
+    # A format name INSIDE the name of a format we do not make is not a
+    # deliverable: "a Google Slides file" matched the pptx alias on `Slides`
+    # and produced a second deck (measured 2026-09-16, A7).
+    spans = _source_spans(text) + [(s, e) for _n, s, e in unmakeable_formats(text)]
     found: List[Tuple[int, str]] = []
     for fmt, pattern in _ALIAS.items():
         for m in re.finditer(rf"\b{pattern}\b", text, re.I):
@@ -241,6 +380,52 @@ def kind_for(text: str, explicit: Sequence[str]) -> Tuple[str, str]:
         if re.search(pattern, text or "", re.I):
             return kind, rule
     return "document", "default"
+
+
+#: The kind word for a sentence, and the words people use for each kind.
+_KIND_WORDS = {"document": "document", "presentation": "presentation", "workbook": "workbook"}
+_A_KIND = {"document": "a document", "presentation": "a presentation", "workbook": "an Excel workbook"}
+
+
+#: The words that name a KIND of artifact and are NOT also the name of a
+#: format. "A PDF report plus an Excel with the data" names a document by
+#: `report` and no workbook at all — the format names have to stay out of
+#: this table or every mixed list would look like a substituted kind.
+_KIND_ONLY_RULES: Tuple[Tuple[str, str, str], ...] = (
+    ("presentation", "deck words", r"\b(presentation|pitch ?deck|slide ?deck)\b"),
+    ("workbook", "spreadsheet words", r"\b(spread ?sheet|work ?book|tracker|budget|calculator|financial model|data ?set|sample data|sample records)\b"),
+    ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|proposal|policy|letter|handout|whitepaper|white paper|guide|manual)\b"),
+)
+
+
+def _kind_from_words(text: str) -> Tuple[str, str]:
+    """The kind the request's WORDS name, read without any format name —
+    the reading `kind_for` skips whenever a format was said. ("", "") when
+    the words name no kind of their own."""
+    for kind, rule, pattern in _KIND_ONLY_RULES:
+        if re.search(pattern, text or "", re.I):
+            return kind, rule
+    return "", ""
+
+
+def _and_list(words: Sequence[str]) -> str:
+    items = [str(w) for w in words if str(w).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _a_format(fmt: str) -> str:
+    name = _FORMAT_NAMES.get(fmt, fmt.upper())
+    if fmt in ("docx", "xlsx", "pptx"):
+        name += " file"
+    return f"an {name}" if name[0] in "AEIOUX" else f"a {name}"
+
+
+def _a_kind(kind: str) -> str:
+    return _A_KIND.get(kind, f"a {kind}")
 
 
 def template_for(kind: str, text: str) -> str:
@@ -325,24 +510,153 @@ _BEST_RE = re.compile(r"\bbest\s+(?:format|deliverable|output|file)\b", re.I)
 # --- AS3 integration BEGIN: standalone chart images ---
 #: "a bar chart ... as a png", "pie chart svg me": a chart image named next
 #: to chart words. A bare "png" ("draw a logo png") is not a chart file.
-_CHART_WORDS_RE = re.compile(r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot)\b|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ", re.I)
+#: The tier-2 names added on 2026-09-16 reach this list too: without them
+#: "visualise this table as a treemap" and "show this as a sunburst" matched
+#: no chart word, fell through to the document default and were answered
+#: with a Word file and a PDF — the exact answer this programme exists to
+#: stop. Only the names that are unambiguous chart nouns are listed bare;
+#: "pareto", "violin" and "bullet" are ordinary words ("the Pareto
+#: principle", "a slide about the violin", "bullet points"), and their chart
+#: forms already match through "chart", "graph" or "plot".
+_CHART_WORDS_RE = re.compile(
+    r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot"
+    r"|tree\s*map|sunburst|candlestick|ohlc|waterfalls?|violin\s*plots?"
+    # "a pareto of defects by cause" names the chart; "the Pareto principle"
+    # does not, so the bare word is read only where a subject follows it.
+    r"|pareto\s*(?:diagram|analysis)|pareto(?=\s+(?:of|by|for|showing|comparing)\b))\b"
+    r"|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ",
+    re.I,
+)
 _IMAGE_FORMAT_RE = re.compile(r"\b(?:png|\.png|svg|\.svg)\b", re.I)
 
 
-def _chart_image_formats(text: str) -> List[str]:
-    if not _CHART_WORDS_RE.search(text or ""):
+#: The verbs a chart request is made with. "visualise this table on pie
+#: chart", "plot it", "draw a bar graph", "isko pie chart me dikhao".
+_CHART_ASK_RE = re.compile(
+    r"\b(?:visuali[sz]e|visuali[sz]ing|plot|plotted|graph|chart|draw|render|show|display|give|make|create|build|generate)\b"
+    r"|दिखा|बना|दिखाओ|बनाओ|બતાવ|બનાવ",
+    re.I,
+)
+
+
+#: A chart named as the SUBJECT, not as a verb: "histogram of hours worked",
+#: "scatter of salary vs experience", "pie of sales by region", "heat map of
+#: usage by day". Measured 2026-09-16 (understanding audit C07/C12): with the
+#: ask verbs alone these shapes stayed on the document default, so a one-line
+#: chart request came back as a Word file and a PDF.
+_CHART_NOUN_ASK_RE = re.compile(
+    r"^\W*(?:an?|the)?\s*(?:[\w-]+\s+){0,2}?"
+    r"(?:histograms?|heat\s*maps?|scatters?(?:\s*plots?)?|box\s*plots?|violins?|pies?|donuts?|doughnuts?|funnels?|"
+    r"gantts?|treemaps?|sunbursts?|paretos?|candlesticks?|bullets?|radars?|bubbles?|waterfalls?|charts?|graphs?|plots?)"
+    r"\s+(?:of|by|for|showing|comparing|per|vs\.?|versus)\b",
+    re.I,
+)
+#: A story's plot, not a chart: "plot of the movie Inception". The same word
+#: names both, and the story reading wins when the sentence says so.
+_STORY_PLOT_RE = re.compile(
+    r"\bplots?\s+(?:of|in|for|from)\s+(?:the\s+|this\s+|that\s+|a\s+|an\s+)?"
+    r"(?:movie|film|book|novel|story|show|series|play|episode|game|anime|manga|song|opera|poem)s?\b",
+    re.I,
+)
+
+
+def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> List[str]:
+    """The image formats a chart request names — and PNG when it names none.
+
+    A person who asks to "visualise this table on pie chart" has named the
+    deliverable: a chart. Until 2026-09-16 this returned [] unless the text
+    also said "png" or "svg", so the request fell through to the document
+    default and production answered a one-line chart ask with a two-page Word
+    file and a PDF. The image default applies only when nothing else in the
+    text names a deliverable (kind_for stays at its "default" rule) — "a
+    report with a pie chart" is still a report, and an explicit format still
+    decides.
+
+    `chart_request` is the INTENT GATE's verdict (intent.ArtifactIntent.
+    chart_request), and it ADDS to the two regexes below — it never REPLACES
+    them. The gate reads lexicon-normalised text — typos, Hindi, Gujarati,
+    Hinglish and Gujlish folded to the rule vocabulary, negated clauses
+    blanked — and its chart vocabulary is the larger one: measured on this
+    branch, "give me a waterfall showing revenue by quarter" and "scatter of
+    Salary vs Experience" were chart_request=True at the gate and docx+pdf
+    here, because `waterfall` is not in _CHART_WORDS_RE and neither phrase
+    has a verb _CHART_ASK_RE knows. Everything after the verdict — a named
+    image format, an explicit format, another deliverable noun — still reads
+    the text, so "a report with a pie chart" stays a report.
+
+    WHY A FALSE VERDICT IS A NO-OP AND NOT A VETO. Letting chart_request=False
+    blank the png reintroduced the 2026-09-16 incident on the CLASSIFIER path,
+    which is exactly where the rules are silent and the model is the only
+    judge: "can you put this in a pie chart" is rule-decided action='none'
+    (rule 'no-request'), intent._should_consult sends it to intent_llm, and a
+    verdict of action='create' with chart_request=False turned ['png'] into
+    ['docx', 'pdf'] — a Word file and a PDF for a one-line pie-chart ask.
+    Measured on this tree: 202 of a 230-phrasing sweep (10 chart verbs x 23
+    chart nouns) lost their png to the veto. It bought nothing in exchange —
+    when the gate really does read a negation ("don't put this in a pie
+    chart", "no pie chart") it returns action='none' with rule 'no-request',
+    so the engine never runs and no format is produced at all; and a
+    negation that DOES reach the engine ("don't make a pie chart, just write
+    a report") already names another deliverable, which `kind_for` below
+    stops well before the verdict is consulted.
+    """
+    words = bool(_CHART_WORDS_RE.search(text or ""))
+    # THE DECISION, AND THE RESIDUAL RISK IT LEAVES (recheck, 2026-09-16).
+    # None and False are the same here: the words decide. What that gives up
+    # is the one thing a False verdict could have done — veto a png that
+    # _CHART_WORDS_RE produced from a chart word in a sentence that is not a
+    # chart ask ("who drew the org chart", "what does a box plot mean").
+    # Measured on this tree over 30 such sentences:
+    #
+    #   * RULES path: 0 of 30 ever reached the veto. Every one of them is
+    #     action='none' rule='no-request' at the gate — the engine does not
+    #     run and no format is produced — or the RULES themselves return
+    #     chart_request=True ("the area chart of the office floor"), which
+    #     the veto never touched.
+    #   * CLASSIFIER path: 14 of 30, and only under a verdict that says
+    #     action='create' for a sentence that asked for no file at all. The
+    #     veto did not save those turns; it swapped one wrong deliverable for
+    #     another — a Word file and a PDF about "the pie chart guy from
+    #     accounting" instead of a png of him. The turn is already lost at
+    #     the gate, upstream of this function.
+    #
+    # Against that: the veto cost 202 of a 230-phrasing sweep of REAL chart
+    # asks their png (see the docstring), which is the 2026-09-16 incident
+    # itself. A false positive that must not reach the engine is stopped at
+    # the gate, not here.
+    gate = bool(chart_request)
+    if not (words or gate):
         return []
     found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]
-    return list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
+    images = list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
+    if images:
+        return images
+    if explicit_formats(text or ""):
+        return []
+    if kind_for(text or "", [])[1] != "default":
+        return []
+    if not (gate or (words and (_CHART_ASK_RE.search(text or "") or _CHART_NOUN_ASK_RE.match(text or "")))):
+        return []
+    # "the plot of this novel by chapter" names no chart: `plot` is an ask
+    # verb here and a story word there, and the story reading wins when the
+    # sentence says so (understanding audit, 2026-09-16).
+    if _STORY_PLOT_RE.search(text or "") and not _CHART_WORDS_RE.search(_STORY_PLOT_RE.sub(" ", text or "")):
+        return []
+    return ["png"]
 
 
-def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
+def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None,
+           chart_request: Optional[bool] = None) -> FormatDecision:
     """decide_base (below), plus the chart image formats a request names:
     alone ("pie chart as png") they are the only files; next to a document
     format or a document word they are companions. A CSV asked for with
     styling the styling parser can read ("with a blue header row") also gets
-    the Excel file, as the styling words below already do."""
-    return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only))
+    the Excel file, as the styling words below already do.
+
+    `chart_request` is the intent gate's verdict, and it only ever ADDS a
+    chart reading: True says "chart" where these words could not, None (the
+    default) and False both leave the decision to this module's own words."""
+    return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only, chart_request=chart_request))
 
 
 def _with_styled_csv(text: str, d: FormatDecision) -> FormatDecision:
@@ -362,8 +676,9 @@ def _with_styled_csv(text: str, d: FormatDecision) -> FormatDecision:
     return d
 
 
-def _decide_images(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> FormatDecision:
-    images = [f for f in _chart_image_formats(text) if not explicit_only or f not in explicit_only]
+def _decide_images(text: str, *, explicit_only: Optional[Sequence[str]] = None,
+                   chart_request: Optional[bool] = None) -> FormatDecision:
+    images = [f for f in _chart_image_formats(text, chart_request=chart_request) if not explicit_only or f not in explicit_only]
     if not images:
         return decide_base(text, explicit_only=explicit_only)
     rest = [f for f in (explicit_only or []) if f not in T.IMAGE_FORMATS]
@@ -399,13 +714,48 @@ def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> 
     The "X or Y" rule still reads the text, because the list it was handed
     is the one the intent gate found in that same text.
     """
+    from . import lexicon
+
     text = text or ""
+    # The kind and the formats are read from the SAME words. `explicit_formats`
+    # has read the text through `lexicon.normalize` since AS3, while kind_for
+    # and template_for got the raw string — so the two halves of one decision
+    # disagreed whenever the normaliser was what recognised the deck: "need a
+    # presentaion on cyber security" and "एक प्रेजेंटेशन बनाओ" both came back as a
+    # Word file and a PDF although the intent gate had read them correctly
+    # (MEASURE 1 B18/B24, 2026-09-16; kind_for(normalize(text)) is
+    # ("presentation", "deck words") for both). Measured cost of the extra
+    # normalise: 126 us on a 98-character instruction, inside a decide() call
+    # that then takes 293 us in total — once per artifact turn, not per token.
+    norm = lexicon.normalize(text)
     explicit = list(dict.fromkeys(explicit_only)) if explicit_only is not None else explicit_formats(text)
     explicit, or_note = _apply_or(explicit, text)
-    kind, rule = kind_for(text, explicit)
+    # The name of a format we do not make says nothing about the KIND
+    # either: "convert it to a Google Slides file" was read as deck words
+    # and produced a second .pptx (measured 2026-09-16, A7).
+    kind, rule = kind_for(_without_unmakeable(norm), explicit)
     allowed = T.FORMATS_FOR_KIND[kind]
     warnings: List[str] = []
     note = ""
+    # A format the person NAMED that this platform does not make is said
+    # plainly, the way a format we DO make but cannot carry already is
+    # ("xlsx cannot be produced for a presentation"). Until 2026-09-16 the
+    # drop list could only see formats `explicit_formats` recognised, so
+    # LaTeX, JSON and EPUB vanished from the request without a word.
+    unmakeable = unmakeable_names(text)
+    if unmakeable:
+        warnings.append(f"I don't make {_and_list(unmakeable)} files")
+    # A KIND the person named, overruled by a format word. `kind_for` lets
+    # the first explicit format pick the kind, so "make a presentation as an
+    # xlsx" returned a workbook with no warning at all — a bigger change
+    # than any dropped format, made silently (measured 2026-09-16, G6).
+    if explicit and explicit_only is None:
+        said_kind, _said_rule = _kind_from_words(text)
+        if said_kind and said_kind != kind:
+            warnings.append(
+                f"a {_KIND_WORDS.get(said_kind, said_kind)} cannot be {_a_format(explicit[0])}; "
+                f"I made {_a_kind(kind)} of the same content instead"
+            )
 
     if explicit:
         formats = [f for f in explicit if f in allowed]
@@ -434,16 +784,16 @@ def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> 
                 note = f"the CSV carries the data only; the formatting is in the {names} file{'s' if len(styled) > 1 else ''}"
         if or_note:
             reason += f" ({or_note})"
-        return FormatDecision(kind, formats, template_for(kind, text), reason, explicit=True, warnings=warnings, data_only_note=note)
+        return FormatDecision(kind, formats, template_for(kind, norm), reason, explicit=True, warnings=warnings, data_only_note=note)
 
     if _BEST_RE.search(text):
         kind, formats, reason = _best_formats(text)
-        return FormatDecision(kind, formats, template_for(kind, text), reason, explicit=False, warnings=warnings)
+        return FormatDecision(kind, formats, template_for(kind, norm), reason, explicit=False, warnings=warnings)
 
     formats = list(_default_formats(kind, text))
     if kind == "workbook" and formats == ["csv"]:
         rule = "dataset words"
-    return FormatDecision(kind, formats, template_for(kind, text), rule, explicit=False, warnings=warnings)
+    return FormatDecision(kind, formats, template_for(kind, norm), rule, explicit=False, warnings=warnings)
 
 
 def _default_formats(kind: str, text: str) -> Sequence[str]:
