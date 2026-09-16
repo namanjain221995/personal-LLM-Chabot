@@ -5475,7 +5475,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # the version row, so this costs no query.
                 from .artifacts import deliverable as _as3_deliverable
 
-                _as3_shape = _as3_deliverable.of_version((_published[0].get("current") or {})).to_json() if _published else None
+                # The shape is an OPTIMISATION, never a gate: a corrupt or
+                # foreign-written artifact_versions.deliverable row must cost
+                # the follow-up its hint, not break the chat turn. deliverable
+                # parses defensively now (a `charts` of 'many' used to raise
+                # ValueError here, on the streaming event loop); this guard
+                # keeps that true if the row ever grows a field that does not.
+                try:
+                    _as3_shape = _as3_deliverable.of_version((_published[0].get("current") or {})).to_json() if _published else None
+                except Exception:  # noqa: BLE001
+                    _as3_shape = None
                 artifact_intent = await artifact_intent_rules.decide_with_hook(
                     text,
                     _as3_intent_llm.make_hook(

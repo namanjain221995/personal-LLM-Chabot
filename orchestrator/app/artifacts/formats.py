@@ -549,8 +549,8 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
     decides.
 
     `chart_request` is the INTENT GATE's verdict (intent.ArtifactIntent.
-    chart_request), and when the caller has one it replaces the two regexes
-    below. The gate reads lexicon-normalised text — typos, Hindi, Gujarati,
+    chart_request), and it ADDS to the two regexes below — it never REPLACES
+    them. The gate reads lexicon-normalised text — typos, Hindi, Gujarati,
     Hinglish and Gujlish folded to the rule vocabulary, negated clauses
     blanked — and its chart vocabulary is the larger one: measured on this
     branch, "give me a waterfall showing revenue by quarter" and "scatter of
@@ -559,10 +559,26 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
     has a verb _CHART_ASK_RE knows. Everything after the verdict — a named
     image format, an explicit format, another deliverable noun — still reads
     the text, so "a report with a pie chart" stays a report.
+
+    WHY A FALSE VERDICT IS A NO-OP AND NOT A VETO. Letting chart_request=False
+    blank the png reintroduced the 2026-09-16 incident on the CLASSIFIER path,
+    which is exactly where the rules are silent and the model is the only
+    judge: "can you put this in a pie chart" is rule-decided action='none'
+    (rule 'no-request'), intent._should_consult sends it to intent_llm, and a
+    verdict of action='create' with chart_request=False turned ['png'] into
+    ['docx', 'pdf'] — a Word file and a PDF for a one-line pie-chart ask.
+    Measured on this tree: 202 of a 230-phrasing sweep (10 chart verbs x 23
+    chart nouns) lost their png to the veto. It bought nothing in exchange —
+    when the gate really does read a negation ("don't put this in a pie
+    chart", "no pie chart") it returns action='none' with rule 'no-request',
+    so the engine never runs and no format is produced at all; and a
+    negation that DOES reach the engine ("don't make a pie chart, just write
+    a report") already names another deliverable, which `kind_for` below
+    stops well before the verdict is consulted.
     """
     words = bool(_CHART_WORDS_RE.search(text or ""))
-    asked = words if chart_request is None else bool(chart_request)
-    if not (words or asked):
+    gate = bool(chart_request)  # None and False are the same: the words decide
+    if not (words or gate):
         return []
     found = [m.group(0).lower().lstrip(".") for m in _IMAGE_FORMAT_RE.finditer(text or "")]
     images = list(dict.fromkeys(f for f in found if f in T.IMAGE_FORMATS))
@@ -572,7 +588,7 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
         return []
     if kind_for(text or "", [])[1] != "default":
         return []
-    if not asked or (chart_request is None and not _CHART_ASK_RE.search(text or "")):
+    if not (gate or (words and _CHART_ASK_RE.search(text or ""))):
         return []
     return ["png"]
 
@@ -585,8 +601,9 @@ def decide(text: str, *, explicit_only: Optional[Sequence[str]] = None,
     styling the styling parser can read ("with a blue header row") also gets
     the Excel file, as the styling words below already do.
 
-    `chart_request` is the intent gate's verdict; None (the default) leaves
-    the chart decision to this module's own words."""
+    `chart_request` is the intent gate's verdict, and it only ever ADDS a
+    chart reading: True says "chart" where these words could not, None (the
+    default) and False both leave the decision to this module's own words."""
     return _with_styled_csv(text, _decide_images(text, explicit_only=explicit_only, chart_request=chart_request))
 
 

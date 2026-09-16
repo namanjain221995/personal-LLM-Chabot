@@ -76,17 +76,39 @@ class Deliverable:
         return out
 
 
+def _int(value: Any) -> int:
+    """A stored row is data, never a promise: a `charts` that is not a number
+    is no chart. main.py reads this on the chat STREAMING event loop with no
+    guard (`_as3_deliverable.of_version(...).to_json()`), and a corrupt or
+    foreign-written artifact_versions.deliverable row must be ignored, not
+    break the turn. Measured before this: {'charts': 'many'} raised
+    ValueError: invalid literal for int() with base 10: 'many'."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _formats(value: Any) -> Tuple[str, ...]:
+    """A bare string is not a list of formats — iterating one gave
+    formats=('p', 'n', 'g') for a stored {'formats': 'png'}."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return ()
+    return tuple(str(f) for f in value if isinstance(f, str))
+
+
 def from_json(obj: Any) -> Deliverable:
     """A stored row → a Deliverable. Anything unreadable is the empty one:
-    a version published before V39 has `{}` and simply says nothing."""
+    a version published before V39 has `{}` and simply says nothing. This
+    function NEVER raises — see `_int`."""
     if not isinstance(obj, Mapping):
         return Deliverable()
-    formats = tuple(str(f) for f in (obj.get("formats") or []) if isinstance(f, str))
+    formats = _formats(obj.get("formats"))
     binding = obj.get("binding")
     return Deliverable(
         kind=str(obj.get("kind") or ""),
         formats=formats,
-        charts=int(obj.get("charts") or 0),
+        charts=_int(obj.get("charts")),
         chart_type=str(obj.get("chart_type") or ""),
         chart_title=str(obj.get("chart_title") or ""),
         binding=dict(binding) if isinstance(binding, Mapping) else None,
@@ -141,9 +163,13 @@ def of_version(row: Any) -> Deliverable:
     stored = from_json(row.get("deliverable"))
     if stored.formats or stored.charts:
         return stored
-    files = row.get("files") if isinstance(row.get("files"), Iterable) else ()
-    formats = [str(f.get("format")) for f in files if isinstance(f, Mapping) and f.get("format")]
-    return Deliverable(kind=str(row.get("kind") or ""), formats=tuple(formats or [str(f) for f in (row.get("formats") or [])]))
+    files = row.get("files") if isinstance(row.get("files"), Iterable) and not isinstance(row.get("files"), (str, bytes)) else ()
+    formats = tuple(str(f.get("format")) for f in files if isinstance(f, Mapping) and f.get("format"))
+    # The pre-V39 fallback stayed lenient about ELEMENT type (it str()'d
+    # whatever the row held); only the bare-string container is rejected.
+    raw = row.get("formats")
+    legacy = tuple(str(f) for f in raw if f) if isinstance(raw, (list, tuple)) else ()
+    return Deliverable(kind=str(row.get("kind") or ""), formats=formats or legacy)
 
 
 __all__ = ["Deliverable", "BINDING_FIELDS", "from_json", "of_spec", "of_version"]

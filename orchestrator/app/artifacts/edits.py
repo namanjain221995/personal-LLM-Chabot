@@ -1214,6 +1214,25 @@ def chart_type_named(text: str) -> Optional[Tuple[str, Tuple[int, int]]]:
     return canonical, (m.start(), m.end())
 
 
+def _parent_has_chart(parent: S.ArtifactSpec) -> bool:
+    """The set_chart pre-plan is only an answer when there IS a chart.
+
+    On a chart-less file "make it a bar chart instead" belongs to the
+    planner, which can ADD one. Measured before this guard: the pre-plan
+    emitted SetChart on a heading+paragraph document, `_apply_chart` raised
+    "the file has no chart", and the turn's only outcome was
+    not_applied=[{'op': 'set_chart', 'reason': 'the file has no chart'}] —
+    a refusal where the old planner simply drew the chart. `plan()` reaches
+    preplan unconditionally, so the UI's "Edit with a prompt" on ANY artifact
+    took that path."""
+    if _chart_spec is None or not hasattr(_chart_spec, "iter_chart_slots"):
+        return False
+    try:
+        return any(True for _ in _chart_spec.iter_chart_slots(parent))
+    except Exception:  # noqa: BLE001 — an unwalkable spec is no chart, never a crash
+        return False
+
+
 def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
     """The deterministic pre-planner (0 model calls). None when it does not
     explain ≥ 90% of the instruction's content words."""
@@ -1238,7 +1257,7 @@ def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
     # parent version already carries — the model is never asked for the
     # numbers a second time (production 2026-09-16). Anything more in the
     # sentence fails `coverage` and goes to the planner as before.
-    named = chart_type_named(text)
+    named = chart_type_named(text) if _parent_has_chart(parent) else None
     if named is not None and coverage(text, [named[1]]) >= PREPLAN_COVERAGE:
         return EditPlan(ops=[SetChart(target=ChartRef(), patch={"type": named[0]})],
                         summary=f"set_chart {named[0]}", planner="deterministic")

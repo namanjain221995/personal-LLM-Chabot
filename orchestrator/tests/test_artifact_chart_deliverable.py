@@ -76,9 +76,13 @@ def test_a_report_with_a_chart_is_still_a_report():
 
 
 def test_a_verdict_of_no_chart_does_not_invent_an_image_but_a_named_one_still_wins():
-    # The gate blanks a negated clause before it decides, so "don't chart it"
-    # cannot leave a png behind.
-    assert F.decide("visualise this table on pie chart", chart_request=False).formats == ["docx", "pdf"]
+    # A verdict of False is a NO-OP, not a veto: the words still decide. It
+    # used to blank this png and hand back the incident's own docx+pdf, and
+    # it bought nothing for it — a real negation ("don't put this in a pie
+    # chart") is action='none' at the gate, so the engine never runs.
+    assert F.decide("visualise this table on pie chart", chart_request=False).formats == ["png"]
+    # A verdict of False adds NO chart where the words name none.
+    assert F.decide("write up what we found", chart_request=False).formats == F.decide("write up what we found").formats
     # A format the person NAMED is theirs whatever the verdict says.
     assert F.decide("pie chart of this as an svg", chart_request=False).formats == ["svg"]
     assert F.decide("make a pie chart of this as png", chart_request=False).formats == ["png"]
@@ -90,6 +94,74 @@ def test_the_text_rules_are_unchanged_when_no_verdict_is_passed():
                  "write a Word report on Q3 with a pie chart", "Create a professional PDF about this.",
                  "Create a dataset of 500 customers"):
         assert F.decide(text, chart_request=None).formats == F.decide(text).formats, text
+
+
+def test_a_classifier_verdict_of_no_chart_does_not_veto_the_texts_own_png():
+    """The verifier's BLOCKER, 2026-09-16: the gate's verdict ADDS to this
+    module's reading, it never REPLACES it. "can you put this in a pie chart"
+    is rule-decided action='none' (rule 'no-request'), so _should_consult
+    sends it to the classifier; a verdict of action='create' with
+    chart_request=False used to blank the png the sentence's own words had
+    produced, and the turn answered a one-line pie-chart ask with a Word file
+    AND a PDF — the incident verbatim. Measured before the fix on this tree:
+    202 of a 230-phrasing sweep (10 chart verbs x 23 chart nouns) lost the
+    png to the veto."""
+    for text in ("can you put this in a pie chart", "can you turn this into a bar graph",
+                 "could you see this as a donut chart", "visualise this table on pie chart"):
+        assert F.decide(text).formats == ["png"], text
+        assert F.decide(text, chart_request=False).formats == F.decide(text).formats, text
+
+
+def test_the_classifier_path_keeps_the_png_end_to_end():
+    """The whole seam, not just the function: rules say 'none', the hook
+    answers create/chart_request=False, and the png still survives."""
+    text = "can you put this in a pie chart"
+    rules = I.decide(text, has_assistant_answer=True)
+    assert rules.action == "none" and rules.rule == "no-request", rules
+    assert I._should_consult(rules, text) is True
+
+    async def hook(_text, **_kw):
+        return IL.IntentVerdict(action="create", target="answer", formats=[],
+                                chart_request=False, confidence=0.9)
+
+    out = asyncio.run(I.decide_with_hook(text, hook, has_assistant_answer=True))
+    assert out.action == "create" and out.llm_used is True
+    assert F.decide(text, chart_request=out.chart_request).formats == ["png"]
+
+
+def test_a_chart_less_parent_sends_the_type_change_to_the_planner():
+    """The pre-plan is only an answer when there IS a chart. On a chart-less
+    document the old pre-plan emitted SetChart and _apply_chart raised "the
+    file has no chart", so the turn's only outcome was a refusal — while the
+    planner can simply ADD the chart. edits.plan() reaches preplan
+    unconditionally, so the UI's "Edit with a prompt" on any artifact took
+    this path."""
+    plain = S.parse_body("document", {"title": "Records by state", "blocks": [
+        {"type": "heading", "level": 1, "text": "Records by state"},
+        {"type": "paragraph", "text": "Texas has the most records."},
+    ]})
+    for text in ("make it a bar chart instead", "as a donut chart", "now do the same as a line chart",
+                 "make it a pie chart", "turn it into a heat map chart",
+                 "show the chart as a waterfall chart"):
+        assert E.preplan(text, plain) is None, text
+    # ...and the parent that DOES hold a chart is untouched.
+    assert E.preplan("make it a bar chart instead", chart_document()) is not None
+
+
+def test_an_unreadable_stored_shape_never_raises():
+    """main.py reads this on the chat streaming event loop with no guard
+    (app/main.py: `_as3_deliverable.of_version(...).to_json()`), so a corrupt
+    or foreign-written artifact_versions.deliverable row must be ignored, not
+    break the turn. Measured before the fix: from_json({'charts': 'many'})
+    raised ValueError: invalid literal for int() with base 10: 'many'."""
+    assert D.from_json({"charts": "many"}) == D.Deliverable()
+    assert D.from_json({"charts": None}).charts == 0
+    assert D.from_json({"charts": 2.0}).charts == 2
+    # A bare string is not a list of formats: it used to decode to ('p','n','g').
+    assert D.from_json({"formats": "png"}).formats == ()
+    assert D.from_json({"formats": ["png"]}).formats == ("png",)
+    assert D.of_version({"deliverable": {"charts": "many"}, "formats": "png"}) == D.Deliverable()
+    assert D.of_version({"deliverable": {"charts": "many"}, "formats": ["png"]}).formats == ("png",)
 
 
 # ------------------------------------------ (b) the classifier may say chart --
