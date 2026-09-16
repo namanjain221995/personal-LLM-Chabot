@@ -626,6 +626,21 @@ _KYA_WHAT_RE = re.compile(r"\b(?:kya|shu|su)\s+(?:likh|daal|dal|rakh|hona|hovu|l
 #: "make it a docx", "turn this into an excel": the format is the TARGET (verifier 2026-09-15).
 _MAKE_IT_FORMAT_RE = re.compile(rf"\b(?:make|turn|change|switch)\s+(?:it|this|that|_this_)\s+(?:in)?to\s+(?:an?\s+)?{_FORMAT_WORD}\b|\b(?:make|turn)\s+(?:it|this|that|_this_)\s+(?:an?\s+)?{_FORMAT_WORD}\b", re.I)
 _STATEMENT_RE = re.compile(r"^\W*(?:i|we|they|he|she)\s+(?:have|had|keep|kept|store|use|used|got|received|opened|saw|read)\b", re.I)
+#: A remark that ENDS in a request is an instruction: "i opened the docx on
+#: my phone and the table is cut off, can you fix it?" is not small talk. The
+#: two 2026-09-16 rounds disagreed here — one read the opening as a remark,
+#: the other read the closing as an edit — and the closing is the ask.
+_ASK_CLAUSE_RE = re.compile(
+    r"\b(?:can|could|would|will)\s+you\b|\bplease\b|\bkindly\b|\bpls\b"
+    r"|\b(?:fix|correct|redo|resend|update|change|adjust)\s+(?:it|this|that|the)\b",
+    re.I,
+)
+
+
+def _is_remark(low: str) -> bool:
+    """A statement ABOUT the file with no request in it."""
+    return bool(_STATEMENT_RE.match(low)) and not _ASK_CLAUSE_RE.search(low)
+
 #: Chart phrasing that asks for one: a verb, "chart of|with|for", a chart
 #: phrase leading the message, or a data colon.
 _CHART_ASK_RE = re.compile(
@@ -1180,7 +1195,8 @@ def decide(
         # not an instruction; a bare "do it again" is, and `do` leads both —
         # so the question mark, not the opening word, decides here.
         if _anchored_anaphor and _SAME_AGAIN_RE.search(low) and not _SAY_AGAIN_RE.search(low) \
-                and not ("?" in raw and _QUESTION_ABOUT_RE.match(low)) and not LX.reads_source(low):
+                and not ("?" in raw and _QUESTION_ABOUT_RE.match(low)) and not LX.reads_source(low) \
+                and not _is_remark(low) and not _chart_type_change(low):
             if explicit and (_CONVERT_RE.search(low) or _AS_FORMAT_RE.search(low) or _positional_create(low)):
                 return made("convert", reference=_which(low, artifact_hints),
                             reference_hint=_hint(low, artifact_hints, exclude=_target_words(explicit)), rule="anaphor-convert")
@@ -1210,10 +1226,10 @@ def decide(
         # a pronoun the reference rule resolves — stops being chat; the
         # reference condition on the same line keeps it off an unanchored
         # turn.
-        if not _STATEMENT_RE.match(low) and (_EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)) \
+        if not _is_remark(low) and (_EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)) \
                 and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
-        if not _STATEMENT_RE.match(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
+        if not _is_remark(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make
         #     the headings dark blue", "make the document landscape", "font
@@ -1231,7 +1247,7 @@ def decide(
         # A REMARK is not an instruction, whatever its words point at: "I
         # opened the docx on my phone and the table is cut off" reached the
         # element rule with `table` and `cut` and re-rendered the file.
-        asks = asks and anchored and not _STATEMENT_RE.match(low)
+        asks = asks and anchored and not _is_remark(low)
         if style and asks and not (explicit and _AS_FORMAT_RE.search(low) and _CREATE_RE.search(low)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
                         rule="edit-style", style_request=True)
@@ -1245,7 +1261,12 @@ def decide(
         # one report ("make it two pages", "make it a pie", …) were all
         # answered as chat, because `make` is an edit verb only in front of
         # a closed adjective list.
-        if asks and _MAKE_IT_RE.match(low) and not _MAKE_IT_FORMAT_RE.search(low):
+        # …but "make it a bar chart instead" when NOTHING chart-shaped was
+        # made changes nothing: there is no chart to retype, so it is a new
+        # chart and the create rules below own it (the shape-aware branch
+        # above already took the case where a chart IS there).
+        if asks and _MAKE_IT_RE.match(low) and not _MAKE_IT_FORMAT_RE.search(low) \
+                and not (_chart_type_change(low) and (prev_shape is None or not prev_shape.has_chart)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
                         rule="edit-pronoun-object")
         # A short verbless comparative on the file or one of its parts:
