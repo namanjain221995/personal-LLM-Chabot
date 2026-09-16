@@ -2927,6 +2927,27 @@ async def _resolve_document_refs(
     return docs, images, None
 
 
+def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup: bool) -> bool:
+    """Does this turn ask what an ATTACHED file says?
+
+    The honest-visual refusal stands aside for exactly this turn: a map in a
+    photo, a PDF or a video is something to READ, and answering "I can't
+    draw a map" left the file unopened (verifier, 2026-09-16).
+
+    It stands aside for nothing else. Skipping the refusal for every turn
+    that merely CARRIES a file sent "plot these records on a map" with the
+    table attached as a PDF to the document engine, which draws nothing and
+    answers in prose — the 2026-09-16 incident itself (verifier recheck).
+    `visuals.asks_about_attachment_content` reads the words; this function
+    only adds the requirement that there be a file to read.
+    """
+    if not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup):
+        return False
+    from .artifacts import visuals as _t3_visuals
+
+    return _t3_visuals.asks_about_attachment_content(text)
+
+
 _MAX_VIDEO_REFS = 3
 
 
@@ -5610,23 +5631,28 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             elif (
                 artifact_intent is not None
                 and artifact_intent.unsupported_visual
-                # ...AND NOTHING IS ATTACHED (verifier, 2026-09-16). This
-                # branch sits above the document and image routes, and the
-                # gate runs on every turn that is not a video upload, so
-                # "what does the map on page 2 show?" with a PDF attached and
-                # "can you show me what the map says?" with a photo attached
-                # were answered "I can't draw a map" and the file was never
-                # read — the vision/document engine was not called at all
-                # (measured on this tree before this line). A map in a file
-                # is something to READ, not something to draw; the drawing
-                # refusal only applies when the turn has no file to look at.
-                # An attached turn that really does ask for a map is covered
-                # by capability.CAPABILITY_LINE's limits clause, which those
-                # engines' prompts carry.
-                # `video_followup` joins them: a question about a video the
-                # conversation already holds ("what does the map at 2:10
-                # show?") is a question about that video.
-                and not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup)
+                # ...AND THE TURN IS NOT A QUESTION ABOUT AN ATTACHED FILE
+                # (verifier, 2026-09-16). This branch sits above the document
+                # and image routes, and the gate runs on every turn that is
+                # not a video upload, so "what does the map on page 2 show?"
+                # with a PDF attached and "can you show me what the map
+                # says?" with a photo attached were answered "I can't draw a
+                # map" and the file was never read — the vision/document
+                # engine was not called at all (measured on this tree before
+                # this line). A map in a file is something to READ, not
+                # something to draw. An attached turn that really does ask
+                # for a map is covered by capability.CAPABILITY_LINE's limits
+                # clause, which those engines' prompts carry. `video_followup`
+                # joins them: a question about a video the conversation
+                # already holds ("what does the map at 2:10 show?") is a
+                # question about that video.
+                #
+                # The carve-out is the QUESTION, not the attachment (verifier
+                # recheck, 2026-09-16): "plot these records on a map" with
+                # the table attached as a PDF used to skip the refusal too,
+                # and the document engine cannot draw, so that turn came back
+                # as prose — the incident this whole track exists to stop.
+                and not _asks_about_an_attachment(text, request, video_followup)
             ):
                 # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
                 # map", twice: there is no geographic type in

@@ -920,13 +920,22 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
         # latitude column, losing two series that had real numbers. The
         # all-blank column is dropped with a note; only a chart whose every
         # measure is blank has nothing left to draw.
+        empty_named = (
+            f"The column {frame.names[blank_roles[0]]!r} is empty in every row"
+            if len(blank_roles) == 1 else
+            "The columns " + ", ".join(repr(frame.names[r]) for r in blank_roles) + " are empty in every row"
+        )
         if len(blank_roles) == len(all_y):
-            raise ChartDataError(
-                f"The column {frame.names[blank_roles[0]]!r} is empty in every row, so there is nothing to plot."
-                if len(blank_roles) == 1 else
-                "The columns " + ", ".join(repr(frame.names[r]) for r in blank_roles)
-                + " are empty in every row, so there is nothing to plot."
-            )
+            raise ChartDataError(empty_named + ", so there is nothing to plot.")
+        if t == "combo" and y_roles and all(r in blank_roles for r in y_roles) and any(r not in blank_roles for r in y2_roles):
+            # A COMBO WITH NOTHING ON ITS MAIN AXIS (verifier recheck,
+            # 2026-09-16). Dropping the blank columns one by one can leave a
+            # combo whose every remaining series is a secondary-axis line:
+            # the bars the chart is named for are gone and the left axis is
+            # drawn empty beside them. That frame says nothing true about the
+            # data, so it is refused in the same words as a chart with no
+            # numbers at all rather than drawn.
+            raise ChartDataError(empty_named + ", so a combo chart has nothing to draw on its main axis.")
         for role in blank_roles:
             notes.append(f"the column {frame.names[role]} is empty in every row and was left out")
         all_y = [r for r in all_y if r not in blank_roles]
