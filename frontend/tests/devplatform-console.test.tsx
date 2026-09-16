@@ -1118,7 +1118,10 @@ describe('the limits form', () => {
     fireEvent.change(tpm, { target: { value: '5' } });
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: 'Save limits' }));
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    // waitFor's own default is 1 s: on a loaded CI runner the save round trip
+    // crossed it and the failure read "expected false to be true" (run
+    // 2026-09-16), a timeout wearing an assertion's clothes.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(put.url).toBe(`/api/devplatform/projects/${PROJECT.id}/limits`);
     expect(JSON.parse(String(put.init.body))).toEqual({ input_tpm: 5 });
@@ -1221,7 +1224,10 @@ describe('usage limits when the server does not enforce them', () => {
     fireEvent.change(maxOut, { target: { value: '2048' } });
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: 'Save limits' }));
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    // waitFor's own default is 1 s: on a loaded CI runner the save round trip
+    // crossed it and the failure read "expected false to be true" (run
+    // 2026-09-16), a timeout wearing an assertion's clothes.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(JSON.parse(String(put.init.body))).toEqual({ max_output_tokens: 2048 });
     // This case renders the console twice and drives userEvent through a full
@@ -1510,7 +1516,10 @@ describe('the models table', () => {
     ]);
     const user = userEvent.setup();
     await user.click(screen.getByRole('switch', { name: /publish techsara-35b/i }));
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    // waitFor's own default is 1 s: on a loaded CI runner the save round trip
+    // crossed it and the failure read "expected false to be true" (run
+    // 2026-09-16), a timeout wearing an assertion's clothes.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
     expect(calls.find((c) => c.method === 'PUT')!.url).toBe('/api/devplatform/models/techsara-35b');
     expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
   });
@@ -2124,7 +2133,10 @@ describe('the models page lists every model the platform runs', () => {
 
     const user = userEvent.setup();
     await user.click(screen.getByRole('switch', { name: /publish techsara-whisper/i }));
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true));
+    // waitFor's own default is 1 s: on a loaded CI runner the save round trip
+    // crossed it and the failure read "expected false to be true" (run
+    // 2026-09-16), a timeout wearing an assertion's clothes.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
     expect(calls.find((c) => c.method === 'PUT')!.url).toBe('/api/devplatform/models/techsara-whisper');
   });
 
