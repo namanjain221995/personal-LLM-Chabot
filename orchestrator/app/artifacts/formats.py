@@ -37,12 +37,28 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import types as T
 
+#: Data asked for by the shape or by the count: "sample records", "250
+#: realistic sample rows of support tickets". `_DATASET` below is compiled
+#: from this one string, so the KIND and the csv default are decided by the
+#: same words — until 2026-09-16 only the default read it, and by then the
+#: kind had defaulted to document (MEASURE 1 B29: 250 rows of data were
+#: delivered as a Word file and a PDF).
+_DATASET_WORDS = (
+    r"\b(data ?sets?|data files?|sample data|sample records|synthetic data|dummy data|test data|mock data|"
+    r"(?:\d[\d,]*\s+(?:\w+\s+){0,2}?(?:records|rows|entries)))\b"
+)
+
 # Order matters: the first rule whose words match decides the kind.
 _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
     # (kind, rule name, pattern)
     ("presentation", "deck words", r"\b(presentation|slides?|slide ?deck|deck|pitch ?deck|powerpoint|power ?point|pptx?|keynote)\b"),
     ("workbook", "spreadsheet words", r"\b(spread ?sheet|work ?book|excel|xlsx?|tracker|budget|calculator|financial model|pivot|dashboard sheet|data extract|csv|data ?set|data file|sample data|sample records|table file|synthetic data|dummy data|test data|mock data)\b"),
     ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|one[- ]page|proposal|policy|letter|handout|summary|write[- ]?up|whitepaper|white paper|guide|manual|plan|pdf|docx|word)\b"),
+    # Counted rows, LAST: after the document rule, so "write a report on the
+    # 250 rows we logged" is still a report, and "generate 250 realistic
+    # sample rows of support tickets" — which names no other kind — is the
+    # data file the person asked for.
+    ("workbook", "dataset words", _DATASET_WORDS),
 )
 
 #: The alias table: what a person types → the format id. Every alternative
@@ -126,7 +142,7 @@ _DECK = re.compile(r"\b(deck|slides?|presentation|pitch|powerpoint|power ?point|
 #: A table someone hands over to be transformed: "this audit table",
 #: "the rows above", "the pasted data".
 _TABLE_TRANSFORM = re.compile(r"\b(this|the|these|those|attached|pasted|above|following|my|our)\s+(?:\w+\s+){0,2}?(?:tables?|rows|data|records|audit|log|list|results|entries)\b", re.I)
-_DATASET = re.compile(r"\b(data ?sets?|data files?|sample data|sample records|synthetic data|dummy data|test data|mock data|(?:\d[\d,]*\s+(?:\w+\s+){0,2}?(?:records|rows|entries)))\b", re.I)
+_DATASET = re.compile(_DATASET_WORDS, re.I)
 _SPREADSHEET = re.compile(r"\b(spread ?sheet|tracker|dashboard|work ?book|excel|xlsx|calculator|financial model|budget)\b", re.I)
 
 _TEMPLATE_HINTS: Tuple[Tuple[str, str], ...] = (
@@ -457,10 +473,23 @@ def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> 
     The "X or Y" rule still reads the text, because the list it was handed
     is the one the intent gate found in that same text.
     """
+    from . import lexicon
+
     text = text or ""
+    # The kind and the formats are read from the SAME words. `explicit_formats`
+    # has read the text through `lexicon.normalize` since AS3, while kind_for
+    # and template_for got the raw string — so the two halves of one decision
+    # disagreed whenever the normaliser was what recognised the deck: "need a
+    # presentaion on cyber security" and "एक प्रेजेंटेशन बनाओ" both came back as a
+    # Word file and a PDF although the intent gate had read them correctly
+    # (MEASURE 1 B18/B24, 2026-09-16; kind_for(normalize(text)) is
+    # ("presentation", "deck words") for both). Measured cost of the extra
+    # normalise: 126 us on a 98-character instruction, inside a decide() call
+    # that then takes 293 us in total — once per artifact turn, not per token.
+    norm = lexicon.normalize(text)
     explicit = list(dict.fromkeys(explicit_only)) if explicit_only is not None else explicit_formats(text)
     explicit, or_note = _apply_or(explicit, text)
-    kind, rule = kind_for(text, explicit)
+    kind, rule = kind_for(norm, explicit)
     allowed = T.FORMATS_FOR_KIND[kind]
     warnings: List[str] = []
     note = ""
@@ -492,16 +521,16 @@ def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> 
                 note = f"the CSV carries the data only; the formatting is in the {names} file{'s' if len(styled) > 1 else ''}"
         if or_note:
             reason += f" ({or_note})"
-        return FormatDecision(kind, formats, template_for(kind, text), reason, explicit=True, warnings=warnings, data_only_note=note)
+        return FormatDecision(kind, formats, template_for(kind, norm), reason, explicit=True, warnings=warnings, data_only_note=note)
 
     if _BEST_RE.search(text):
         kind, formats, reason = _best_formats(text)
-        return FormatDecision(kind, formats, template_for(kind, text), reason, explicit=False, warnings=warnings)
+        return FormatDecision(kind, formats, template_for(kind, norm), reason, explicit=False, warnings=warnings)
 
     formats = list(_default_formats(kind, text))
     if kind == "workbook" and formats == ["csv"]:
         rule = "dataset words"
-    return FormatDecision(kind, formats, template_for(kind, text), rule, explicit=False, warnings=warnings)
+    return FormatDecision(kind, formats, template_for(kind, norm), rule, explicit=False, warnings=warnings)
 
 
 def _default_formats(kind: str, text: str) -> Sequence[str]:

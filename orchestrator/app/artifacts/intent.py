@@ -128,6 +128,15 @@ _ARTIFACT_NOUNS = (
     r"policy|letter|handout|write[- ]?up|whitepaper|white paper|summary document|"
     r"deliverables?|files?|dashboard|"
     r"csv|cvs|comma[- ]separated(?: values?)?(?: file)?|data ?set|data file|table file|sample data|"
+    # The spreadsheet nouns formats._KIND_RULES has classified all along
+    # (formats._KIND_RULES, the "spreadsheet words" rule). The two vocabularies had drifted:
+    # "create a budget calculator" was refused here as no-request while
+    # formats.kind_for read it as ("workbook", "spreadsheet words") — the gate
+    # turned down a request the format policy already knew how to fulfil
+    # (MEASURE 1 B33, 2026-09-16). A BARE `budget` stays out: "give me the
+    # budget for q3" is a question for the dataset engine, so only the
+    # compound names a file.
+    r"calculator|financial model|budget\s+(?:calculator|tracker|planner|sheet|spread ?sheet|template|model|workbook)|"
     rf"{_DATA_NOUNS})"
 )
 _FORMAT_WORD = (
@@ -160,8 +169,8 @@ _POSITIONAL_CREATE_RE = re.compile(
 #: the verb — but not "another slide" or "a new section", which are parts.
 _FILE_NOUNS = (
     r"(?:pdf|docx|word(?:\s+(?:document|file|doc))?|powerpoint|power ?point|pptx?|presentation|slide ?deck|deck|pitch ?deck|"
-    r"excel|xlsx|spread ?sheet|work ?book|tracker|document|doc|report|sop|memo|brief|one[- ]pagers?|proposal|policy|letter|"
-    r"handout|write[- ]?up|whitepaper|csv|data ?set|data file|file|dashboard)"
+    r"excel|xlsx|spread ?sheet|work ?book|tracker|calculator|financial model|document|doc|report|sop|memo|brief|"
+    r"one[- ]pagers?|proposal|policy|letter|handout|write[- ]?up|whitepaper|csv|data ?set|data file|file|dashboard)"
 )
 _NEW_FILE_RE = re.compile(rf"\b(?:new|another|separate|fresh|second|different)\s+(?:\w+\s+){{0,2}}?{_FILE_NOUNS}\b", re.I)
 #: "as a PDF" / "in Word" / "to Excel" — the deliverable named as a form.
@@ -603,6 +612,18 @@ _ONLY_CHART_TYPE_RE = re.compile(
     rf"(?:{LX.CHART_TYPE_WORDS})\s+(?:chart|graph|plot)\s*(?:please|instead|now|again)?\s*[.!?]?\s*$",
     re.I,
 )
+#: An instruction said as a NEED rather than as a verb: "the deck needs our
+#: logo on every slide", "the report is missing the summary section", "the
+#: document should have a table of contents". Measured as no-request — the
+#: instruction was dropped — because no verb list held these words
+#: (MEASURE 1 E20, 2026-09-16). Third person only, and a NOUN complement
+#: only: "i need this as a pdf" is a hand-over of the answer (`needs` never
+#: matches `i need`), "the report needs TO go out by friday" and "the deck
+#: should have BEEN sent" are remarks about the world, not about the file.
+_NEEDS_EDIT_RE = re.compile(
+    r"\b(?:needs(?!\s+to\b)|is\s+missing|are\s+missing|should\s+(?:have(?!\s+been\b)|include|show|say|list))\b",
+    re.I,
+)
 #: The person asked for the answer HERE: "in the chat", "no download",
 #: "just tell me", "in 3 lines", "yahin chat me".
 _CHAT_ONLY_RE = re.compile(
@@ -908,6 +929,17 @@ def decide(
 
     # 2. Follow-ups on an existing artifact.
     if has_artifacts:
+        # A REMARK about the file is not an instruction. "i opened the docx
+        # on my phone and the table is cut off" was read as rule="edit" and
+        # the platform silently re-rendered the artifact (MEASURE 1 A26,
+        # 2026-09-16): `cut` is an edit verb (_EDIT_VERBS_RE) and `the docx` a
+        # reference, and `table` is an element, so three branches below fired
+        # on a sentence that asked for nothing. The convert branch already
+        # refused this same sentence; the edit branches now read the same
+        # shape. A request marker anywhere in the sentence takes it back —
+        # "i opened the docx and the table is cut off, can you fix it?" is an
+        # edit — so only a report with nothing asked in it is dropped.
+        remark = bool(_STATEMENT_RE.match(low)) and not _ASKING_RE.search(low)
         version = _VERSION_RE.search(low)
         if version and re.search(r"\b(?:go back|revert|restore|use|return|switch|undo)\b", low):
             return made("edit", reference="named", reference_hint=f"version {version.group(1)}",
@@ -962,14 +994,14 @@ def decide(
             rule = _export_shape(low, explicit)
             if rule and not re.search(r"\b(?:also|too|as well|same|version|copy)\b", low):
                 return made("export", reference="previous_answer", rule=rule)
-        if _EDIT_VERBS_RE.search(low) and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
+        if _EDIT_VERBS_RE.search(low) and not remark and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
-        if _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
+        if _IMPERATIVE_EDIT_RE.match(low) and not remark and len(low.split()) <= 12:
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make
         #     the headings dark blue", "make the document landscape", "font
         #     Arial kar do". A question ABOUT the look is not an edit.
-        asks = not _QUESTION_ABOUT_RE.match(low) or re.match(r"^\W*(?:can|could|would|will)\s+(?:you|the|it|we)\b", low)
+        asks = (not _QUESTION_ABOUT_RE.match(low) or re.match(r"^\W*(?:can|could|would|will)\s+(?:you|the|it|we)\b", low)) and not remark
         # Verifier 2026-09-15: in a conversation that holds any file, "give
         # me bullet points on climate change" (change), "highlight the main
         # takeaways from our discussion" and "bold claim: …, discuss" were
@@ -983,7 +1015,8 @@ def decide(
         if style and asks and not (explicit and _AS_FORMAT_RE.search(low) and _CREATE_RE.search(low)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
                         rule="edit-style", style_request=True)
-        if asks and _ELEMENT_RE.search(low) and (_EDIT_VERBS_RE.search(low) or _PUT_IN_ARTIFACT_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)):
+        if asks and _ELEMENT_RE.search(low) and (_EDIT_VERBS_RE.search(low) or _PUT_IN_ARTIFACT_RE.search(low)
+                                                 or _MORE_EDIT_VERBS_RE.search(low) or _NEEDS_EDIT_RE.search(low)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-element")
         # "Also as PDF" with nothing else said.
         if explicit and re.match(r"^\s*(?:also|and|plus|too)?\s*(?:as|in)\s+(?:an?\s+)?\w+(?:\s+\w+)?\s*(?:too|as well|please)?\s*[.!]?\s*$", low):
