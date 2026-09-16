@@ -362,7 +362,10 @@ def test_csv_with_styling_also_delivers_a_styled_xlsx(tmp_path):
 #: base tree, cb0b4e3): styling adds 0 characters to guided decoding.
 #: AS3 integration: plus the charts track's GUIDED Chart v2 (binding, the
 #: guided ChartStyle subset, filters) — still no styling characters.
-BASE_SCHEMA_LENGTHS = {"document": 13146, "presentation": 11046, "workbook": 19530}
+#: 2026-09-16: +1826 for the six advanced chart types (their names in the
+#: `type` enum and the bullet chart's `target` column). The number is pinned
+#: so that anything ELSE creeping into guided decoding is caught here.
+BASE_SCHEMA_LENGTHS = {"document": 14972, "presentation": 12872, "workbook": 21356}
 
 
 @pytest.mark.parametrize("kind", sorted(BASE_SCHEMA_LENGTHS))

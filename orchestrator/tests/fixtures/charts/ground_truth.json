@@ -304,6 +304,24 @@
    "South": 109959,
    "West": 125150
   },
+  "amount_by_region_product": {
+   "East|Alpha": 22319,
+   "East|Bravo": 31051,
+   "East|Charlie": 32998,
+   "East|Delta": 12066,
+   "North|Alpha": 21769,
+   "North|Bravo": 19695,
+   "North|Charlie": 30483,
+   "North|Delta": 27501,
+   "South|Alpha": 31911,
+   "South|Bravo": 27318,
+   "South|Charlie": 25169,
+   "South|Delta": 25561,
+   "West|Alpha": 30874,
+   "West|Bravo": 36084,
+   "West|Charlie": 34477,
+   "West|Delta": 23715
+  },
   "avg_amount_by_region": {
    "East": 2660.3783783783783,
    "North": 2762.4444444444443,

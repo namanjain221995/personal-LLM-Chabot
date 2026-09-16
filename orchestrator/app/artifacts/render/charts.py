@@ -89,6 +89,69 @@ def contrast_ratio(a: str, b: str) -> float:
     return (hi + 0.05) / (lo + 0.05)
 
 
+def _mix(hex_colour: str, towards: str, amount: float) -> str:
+    """`hex_colour` blended `amount` (0..1) of the way to `towards`."""
+    a, b = _rgb(hex_colour), _rgb(towards)
+    return _to_hex(tuple(a[i] + (b[i] - a[i]) * amount for i in range(3)))
+
+
+def _worst_ratio(row: Sequence[float], side: float) -> float:
+    """The worst width/height ratio of a row of areas laid along `side`."""
+    total = sum(row)
+    if total <= 0 or side <= 0:
+        return float("inf")
+    hi, lo = max(row), min(row)
+    if lo <= 0:
+        return float("inf")
+    return max(side * side * hi / (total * total), total * total / (side * side * lo))
+
+
+def squarified(values: Sequence[float], x: float, y: float, width: float, height: float) -> List[Tuple[float, float, float, float]]:
+    """Bruls, Huizing & van Wijk's squarified treemap: one (x, y, w, h) per
+    value, area-proportional and as close to square as the order allows.
+
+    Written here rather than taken from a package because the whole chart
+    path has no plotting dependency beyond matplotlib, and because an area
+    that is not proportional to its value is a lie a library would hide.
+    Values must be positive and in descending order (chart_data sorts them);
+    a non-positive value has no area and is dropped by the caller.
+    """
+    total = float(sum(values))
+    if total <= 0 or width <= 0 or height <= 0:
+        return []
+    scale = width * height / total
+    remaining = [float(v) * scale for v in values]
+    out: List[Tuple[float, float, float, float]] = []
+    while remaining:
+        side = min(width, height)
+        row = [remaining[0]]
+        taken = 1
+        while taken < len(remaining) and _worst_ratio(row + [remaining[taken]], side) <= _worst_ratio(row, side):
+            row.append(remaining[taken])
+            taken += 1
+        area = sum(row)
+        if width >= height:
+            thickness = area / height if height else 0.0
+            oy = y
+            for a in row:
+                h = a / thickness if thickness else 0.0
+                out.append((x, oy, thickness, h))
+                oy += h
+            x += thickness
+            width -= thickness
+        else:
+            thickness = area / width if width else 0.0
+            ox = x
+            for a in row:
+                w = a / thickness if thickness else 0.0
+                out.append((ox, y, w, thickness))
+                ox += w
+            y += thickness
+            height -= thickness
+        remaining = remaining[taken:]
+    return out
+
+
 def _to_hex(colour: Any) -> str:
     if isinstance(colour, str) and colour.startswith("#") and len(colour) == 7:
         return colour.upper()
@@ -398,10 +461,13 @@ def _size(c: CS.Chart, width_px: Optional[int], height_px: Optional[int], orient
         h = height_px / dpi
     else:
         h = max(3.0, min(w * 0.5625, 7.5))
-    if c.type in ("pie", "donut", "radar") and not (st and st.height_in) and not height_px:
+    if c.type in ("pie", "donut", "radar", "sunburst", "treemap") and not (st and st.height_in) and not height_px:
         h = max(h, min(w * 0.62, 7.5))
     if c.type == "gantt" and not (st and st.height_in):
         h = max(h, min(10.0, 1.2 + 0.38 * max(1, len(c.categories))))
+    if c.type == "bullet" and not (st and st.height_in):
+        # Each row is one measure; a bullet row reads at about half an inch.
+        h = max(2.2, min(8.0, 1.0 + 0.52 * max(1, len(c.categories))))
     return w, h, dpi
 
 
@@ -514,14 +580,14 @@ def _decorate(fig, ax, ctx: _Ctx, section_heading: str, include_caption: bool, l
     if c.subtitle:
         kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
         ax.text(0.0, 1.02, c.subtitle, transform=ax.transAxes, ha="left", va="bottom", **kw)
-    if c.type not in ("pie", "donut", "radar", "heatmap", "funnel"):
+    if c.type not in ("pie", "donut", "radar", "heatmap", "funnel", "treemap", "sunburst"):
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
         for side in ("left", "bottom"):
             ax.spines[side].set_color(d.grid_color if ctx.bg == WHITE else ctx.muted)
         axis_kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
         ax.tick_params(colors=axis_kw["color"], labelsize=axis_kw["fontsize"])
-        horizontal = c.type in ("horizontal_bar", "stacked_horizontal_bar", "gantt", "box") and c.type != "box"
+        horizontal = c.type in ("horizontal_bar", "stacked_horizontal_bar", "gantt", "bullet")
         if st.gridlines:
             ax.grid(True, axis="x" if horizontal else "y", color=d.grid_color, linewidth=0.8)
             ax.set_axisbelow(True)
@@ -531,9 +597,9 @@ def _decorate(fig, ax, ctx: _Ctx, section_heading: str, include_caption: bool, l
         yl = c.y_label
         if c.type in ("horizontal_bar", "stacked_horizontal_bar"):
             xl, yl = yl, xl
-        if xl and c.type not in ("gantt",):
+        if xl and c.type not in ("gantt", "bullet"):
             ax.set_xlabel(xl, **axis_kw)
-        if yl:
+        if yl and c.type != "bullet":
             ax.set_ylabel(yl, **axis_kw)
     if not legend_handled:
         _legend(ax, ctx)
@@ -1092,16 +1158,253 @@ def _draw_radar(ax, ctx: _Ctx) -> bool:
     return True
 
 
+def _draw_pareto(ax, ctx: _Ctx) -> bool:
+    """Bars (series 0) with the cumulative % (series 1) on a right-hand axis
+    fixed to 0-100, plus the 80% line the chart exists to be read against."""
+    c = ctx.chart
+    cats = list(c.categories)
+    idx = list(range(len(cats)))
+    bars = list(c.series[0].values)
+    colour = ctx.series_colour(0, c.series[0].name)
+    colours = [ctx.style.category_colors.get(cat, colour) for cat in cats]
+    ax.bar(idx, bars, width=0.72, color=colours, label=c.series[0].name)
+    if _labels_on(ctx, len(cats)):
+        for i, v in zip(idx, bars):
+            ax.annotate(ctx.label(v), xy=(i, v), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
+                        **_label_kw(ctx, ctx.ink))
+    _category_ticks(ax, cats, ctx)
+    _value_axis(ax, ctx)
+    ax.margins(y=0.14)
+    if ctx.style.y_min is None and not ctx.style.log_y:
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(min(0.0, lo), hi)
+    cum = list(c.series[1].values) if len(c.series) > 1 else []
+    line_colour = ctx.series_colour(1, c.series[1].name) if len(c.series) > 1 else ctx.ink
+    ax2 = ax.twinx()
+    ax2.spines["top"].set_visible(False)
+    ax2.spines["right"].set_color(ctx.d.grid_color)
+    ax2.plot(idx, cum, color=line_colour, linewidth=2, marker="o", markersize=4, label=c.series[1].name if len(c.series) > 1 else "")
+    ax2.set_ylim(0, 105)
+    from matplotlib.ticker import FuncFormatter
+
+    ax2.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.0f}%"))
+    ax2.tick_params(colors=ctx.muted, labelsize=ctx.d.axis_size_pt)
+    ax2.set_ylabel(c.y2_label or "Cumulative %", **_text_kw(ctx.style.axis, ctx.d.axis_size_pt, ctx.muted))
+    ax2.axhline(80, color=ctx.muted, linewidth=0.9, linestyle=(0, (4, 3)))
+    ax2.annotate("80%", xy=(1.0, 80), xycoords=("axes fraction", "data"), xytext=(-2, 3),
+                 textcoords="offset points", ha="right", va="bottom", **_label_kw(ctx, ctx.muted))
+    ax2.grid(False)
+    handles, labels = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    _legend(ax, ctx, handles + h2, labels + l2)
+    return True
+
+
+def _draw_treemap(ax, ctx: _Ctx) -> bool:
+    from matplotlib.patches import Rectangle
+
+    c = ctx.chart
+    pairs = [(cat, float(v)) for cat, v in zip(c.categories, c.series[0].values) if v > 0]
+    total = sum(v for _, v in pairs)
+    if not pairs or total <= 0:
+        ax.text(0.5, 0.5, "No positive values to chart", ha="center", va="center", color=ctx.muted, transform=ax.transAxes)
+        ax.set_axis_off()
+        return True
+    rects = squarified([v for _, v in pairs], 0.0, 0.0, 100.0, 62.0)
+    for j, ((cat, value), (x, y, w, h)) in enumerate(zip(pairs, rects)):
+        fill = ctx.category_colour(j, cat)
+        ax.add_patch(Rectangle((x, y), w, h, facecolor=fill, edgecolor=ctx.bg, linewidth=1.4))
+        share = value / total
+        text_colour = _slice_label_style(ctx, fill)
+        # A label needs its own rectangle to sit in: roughly 0.8 point per
+        # character across and one line down at the label size.
+        name = _tick_text(cat)
+        if w >= 1.0 + 0.62 * len(name) and h >= 5.0:
+            ax.text(x + w / 2, y + h / 2 - 1.2, name, ha="center", va="center", **_label_kw(ctx, text_colour))
+            ax.text(x + w / 2, y + h / 2 + 2.6, f"{ctx.label(value)} · {share * 100:.0f}%", ha="center", va="center",
+                    **_text_kw(ctx.style.data_label, max(6.5, ctx.d.axis_size_pt - 3), text_colour))
+        elif w >= 6.0 and h >= 5.0:
+            ax.text(x + w / 2, y + h / 2, f"{share * 100:.0f}%", ha="center", va="center", **_label_kw(ctx, text_colour))
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 62)
+    ax.invert_yaxis()  # the largest rectangle reads top-left, as a treemap must
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for side in ax.spines.values():
+        side.set_visible(False)
+    ax.set_aspect("auto")
+    return True
+
+
+def _draw_violin(ax, ctx: _Ctx) -> bool:
+    """matplotlib's violinplot over each group's sample, with that group's
+    quartile box drawn inside it — the curve shows the shape, the box keeps
+    the five numbers a reader can quote."""
+    c = ctx.chart
+    dists = c.extra.violin if c.extra else []
+    boxes = {b.name: b for b in (c.extra.box if c.extra else [])}
+    if not dists:
+        return _draw_box(ax, ctx)
+    positions = list(range(1, len(dists) + 1))
+    parts = ax.violinplot([list(d.values) for d in dists], positions=positions, widths=0.78,
+                          showextrema=False, showmedians=False)
+    base = ctx.style.color or ctx.d.palette[0]
+    for j, body in enumerate(parts["bodies"]):
+        fill = ctx.style.category_colors.get(dists[j].name, base)
+        body.set_facecolor(fill)
+        body.set_edgecolor(fill)
+        body.set_alpha(0.42)
+    for j, d in enumerate(dists):
+        bx = boxes.get(d.name)
+        if bx is None:
+            continue
+        ax.vlines(positions[j], bx.whisker_low, bx.whisker_high, color=ctx.muted, linewidth=1.0)
+        ax.vlines(positions[j], bx.q1, bx.q3, color=ctx.ink, linewidth=5.0)
+        ax.plot([positions[j]], [bx.median], marker="o", markersize=4.0, color=WHITE, markeredgecolor=ctx.ink, markeredgewidth=0.8)
+    ax.set_xticks(positions)
+    ax.set_xticklabels([_tick_text(d.name) for d in dists],
+                       rotation=30 if len(dists) > 6 or any(len(d.name) > 10 for d in dists) else 0,
+                       ha="right" if len(dists) > 6 or any(len(d.name) > 10 for d in dists) else "center")
+    ax.set_xlim(0.4, len(dists) + 0.6)
+    _value_axis(ax, ctx)
+    return True
+
+
+def _draw_candlestick(ax, ctx: _Ctx) -> bool:
+    from matplotlib.patches import Patch, Rectangle
+
+    c = ctx.chart
+    candles = c.extra.candles if c.extra else []
+    up = ctx.style.series_colors.get("Up") or ctx.style.color or ctx.d.palette[0]
+    down = ctx.style.series_colors.get("Down") or ctx.d.palette[1]
+    # Wide candles overlap; the body keeps a gap at any count.
+    body_w = 0.62 if len(candles) <= 60 else max(0.2, 40.0 / len(candles))
+    for i, cd in enumerate(candles):
+        colour = up if cd.close >= cd.open else down
+        ax.vlines(i, cd.low, cd.high, color=colour, linewidth=1.0)
+        lo, hi = min(cd.open, cd.close), max(cd.open, cd.close)
+        height = hi - lo
+        if height <= 0:
+            ax.hlines(lo, i - body_w / 2, i + body_w / 2, color=colour, linewidth=1.6)
+        else:
+            ax.add_patch(Rectangle((i - body_w / 2, lo), body_w, height, facecolor=colour, edgecolor=colour, linewidth=0.8))
+    _category_ticks(ax, [cd.label for cd in candles], ctx)
+    _value_axis(ax, ctx)
+    ax.set_xlim(-0.8, len(candles) - 0.2)
+    lows = [cd.low for cd in candles] or [0.0]
+    highs = [cd.high for cd in candles] or [1.0]
+    pad = (max(highs) - min(lows)) * 0.06 or 1.0
+    if ctx.style.y_min is None and ctx.style.y_max is None and not ctx.style.log_y:
+        # A price axis does NOT start at zero: the whole point is the range.
+        ax.set_ylim(min(lows) - pad, max(highs) + pad)
+    handles = [Patch(color=up, label="Close at or above open"), Patch(color=down, label="Close below open")]
+    _legend(ax, ctx, handles, [h.get_label() for h in handles])
+    return True
+
+
+def _draw_sunburst(ax, ctx: _Ctx) -> bool:
+    """Two rings from one grouped computation: the inner ring is a category's
+    total, the outer ring its `group_by` parts, each the parent's colour
+    lightened so the parent is still readable."""
+    c = ctx.chart
+    cats = list(c.categories)
+    per_cat = [[float(s.values[j]) for s in c.series] for j in range(len(cats))]
+    inner = [sum(v for v in row if v > 0) for row in per_cat]
+    total = sum(inner)
+    if total <= 0:
+        ax.text(0.5, 0.5, "No positive values to chart", ha="center", va="center", color=ctx.muted, transform=ax.transAxes)
+        ax.set_axis_off()
+        return True
+    keep = [j for j, v in enumerate(inner) if v > 0]
+    palette = ctx.style.palette or list(ctx.d.palette)
+    inner_colours = [ctx.style.category_colors.get(cats[j]) or palette[pos % len(palette)] for pos, j in enumerate(keep)]
+    outer_values: List[float] = []
+    outer_colours: List[str] = []
+    outer_labels: List[str] = []
+    for pos, j in enumerate(keep):
+        parts = [(k, v) for k, v in enumerate(per_cat[j]) if v > 0]
+        for step, (k, v) in enumerate(parts):
+            outer_values.append(v)
+            outer_colours.append(_mix(inner_colours[pos], WHITE, 0.18 + 0.52 * (step / max(1, len(parts) - 1)) if len(parts) > 1 else 0.3))
+            outer_labels.append(c.series[k].name)
+    edge = {"linewidth": 1.0, "edgecolor": ctx.bg}
+    ax.pie([inner[j] for j in keep], colors=inner_colours, radius=0.66, startangle=90, counterclock=False,
+           wedgeprops={**edge, "width": 0.42})
+    wedges, _texts = ax.pie(outer_values, colors=outer_colours, radius=1.0, startangle=90, counterclock=False,
+                            wedgeprops={**edge, "width": 0.32})
+    for pos, j in enumerate(keep):
+        share = inner[j] / total
+        if share < 0.05:
+            continue
+        start = sum(1 for q in range(pos) for v in per_cat[keep[q]] if v > 0)
+        run = sum(1 for v in per_cat[j] if v > 0)
+        if not run:
+            continue
+        a0, a1 = wedges[start].theta1, wedges[start + run - 1].theta2
+        ang = math.radians((a0 + a1) / 2)
+        colour = _slice_label_style(ctx, inner_colours[pos])
+        ax.text(0.46 * math.cos(ang), 0.46 * math.sin(ang), _tick_text(cats[j]), ha="center", va="center", **_label_kw(ctx, colour))
+    for wedge, value, label, fill in zip(wedges, outer_values, outer_labels, outer_colours):
+        if value / total < 0.045:
+            continue
+        ang = math.radians((wedge.theta1 + wedge.theta2) / 2)
+        colour = _slice_label_style(ctx, fill)
+        ax.text(0.84 * math.cos(ang), 0.84 * math.sin(ang), _tick_text(label), ha="center", va="center",
+                **_text_kw(ctx.style.data_label, max(6.5, ctx.d.axis_size_pt - 3), colour))
+    ax.text(0, 0, ctx.label(total), ha="center", va="center", **_text_kw(ctx.style.title, ctx.d.title_size_pt, ctx.ink, bold=True))
+    ax.axis("equal")
+    return True
+
+
+#: Qualitative bands are context, never the measure: they stay grey so the
+#: actual bar and the target line are the only coloured marks on the row.
+_BAND_GREYS: Tuple[str, ...] = ("#E7ECF2", "#D7DEE7", "#C5CFDB", "#B3C0CF")
+
+
+def _draw_bullet(ax, ctx: _Ctx) -> bool:
+    c = ctx.chart
+    rows = c.extra.bullets if c.extra else []
+    base = ctx.style.color or ctx.d.palette[0]
+    target_colour = ctx.style.series_colors.get("Target") or ctx.ink
+    span = max([max(r.actual, r.target, *(r.bands or [0.0])) for r in rows] or [1.0]) or 1.0
+    for j, r in enumerate(rows):
+        edges = list(r.bands) or []
+        previous = 0.0
+        for b_i, edge in enumerate(edges):
+            ax.barh(j, max(0.0, edge - previous), left=previous, height=0.66,
+                    color=_BAND_GREYS[min(b_i, len(_BAND_GREYS) - 1)], linewidth=0)
+            previous = edge
+        fill = ctx.style.category_colors.get(r.label, base)
+        ax.barh(j, r.actual, height=0.3, color=fill, label="Actual" if j == 0 else None, zorder=3)
+        ax.vlines(r.target, j - 0.24, j + 0.24, color=target_colour, linewidth=2.6, zorder=4,
+                  label="Target" if j == 0 else None)
+        share = (r.actual / r.target * 100.0) if r.target else None
+        text = ctx.label(r.actual) + (f" · {share:.0f}% of target" if share is not None else "")
+        ax.annotate(text, xy=(max(r.actual, r.target, *(edges or [0.0])), j), xytext=(6, 0), textcoords="offset points",
+                    va="center", ha="left", **_label_kw(ctx, ctx.ink))
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([_tick_text(r.label) for r in rows])
+    ax.invert_yaxis()
+    ax.set_ylim(len(rows) - 0.5, -0.5)
+    ax.set_xlim(0, span * 1.32)
+    _value_axis(ax, ctx, "x")
+    handles, labels = ax.get_legend_handles_labels()
+    _legend(ax, ctx, handles, labels)
+    return True
+
+
 _DRAWERS = {
     "bar": _draw_bars, "horizontal_bar": _draw_bars, "stacked_bar": _draw_bars, "stacked_horizontal_bar": _draw_bars,
     "percent_stacked_bar": _draw_bars, "line": _draw_line, "area": _draw_area, "stacked_area": _draw_area,
     "pie": _draw_pie, "donut": _draw_pie, "scatter": _draw_scatter, "bubble": _draw_scatter, "histogram": _draw_histogram,
     "combo": _draw_combo, "box": _draw_box, "heatmap": _draw_heatmap, "waterfall": _draw_waterfall, "funnel": _draw_funnel,
-    "gantt": _draw_gantt, "radar": _draw_radar,
+    "gantt": _draw_gantt, "radar": _draw_radar, "pareto": _draw_pareto, "treemap": _draw_treemap,
+    "violin": _draw_violin, "candlestick": _draw_candlestick, "sunburst": _draw_sunburst, "bullet": _draw_bullet,
 }
 
 
 __all__ = [
     "ChartStyleDefaults", "defaults_from", "contrast_ratio", "format_value", "indian_group", "chart_warnings",
     "font_for_script", "scripts_in", "render_png", "render_svg", "render_chart_png", "render_standalone", "clean_svg",
+    "squarified",
 ]

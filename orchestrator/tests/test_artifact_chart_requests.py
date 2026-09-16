@@ -25,8 +25,8 @@ def tables():
 
 
 def test_request_set_shape():
-    assert len(CR.REQUESTS) == 71
-    assert len({r["id"] for r in CR.REQUESTS}) == 71
+    assert len(CR.REQUESTS) == 77
+    assert len({r["id"] for r in CR.REQUESTS}) == 77
     langs = collections.Counter(r["lang"] for r in CR.REQUESTS)
     assert sum(n for lang, n in langs.items() if lang != "en") >= 26
     covered = {r["oracle"]["type"] for r in CR.REQUESTS}

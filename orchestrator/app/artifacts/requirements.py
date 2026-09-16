@@ -208,6 +208,15 @@ _CHART_TYPES: List[Tuple[str, str]] = [
     (r"\bradar", "radar"),
     (r"\bbubble", "bubble"),
     (r"\bdual\s*axis|\bcombo", "combo"),
+    (r"\bpareto", "pareto"),
+    (r"\btree\s*map", "treemap"),
+    (r"\bviolin", "violin"),
+    # "candle" alone is a wax object; the chart always says candlestick, OHLC
+    # or "candle chart".
+    (r"\bcandlestick|\bohlc\b|\bcandle\s*(chart|graph|plot)", "candlestick"),
+    (r"\bsun\s*burst", "sunburst"),
+    # "bullet" alone is a bullet point in every other sentence of a deck.
+    (r"\bbullet\s*(chart|graph)", "bullet"),
 ]
 _CHART_TYPE_RES = [(re.compile(rx, re.I), t) for rx, t in _CHART_TYPES]
 
