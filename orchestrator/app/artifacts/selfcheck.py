@@ -139,6 +139,16 @@ class ItemResult:
     #: a fact about the checker: it is not reported to the person as an
     #: unconfirmed requirement (see summarize).
     unreadable: bool = False
+    #: Unverifiable because no format this version PUBLISHED can carry the
+    #: evidence: a chart in a .docx or a .pdf is a picture, so its type and
+    #: its series cannot be read back from the bytes — only .xlsx and .pptx
+    #: keep a chart's own numbers. Measured 2026-09-16: a Word document whose
+    #: only chart was a literal scatter published as completed_with_warnings
+    #: with "not confirmed: a scatter chart", which is a warning about a
+    #: document with nothing wrong with it. Like `unreadable`, it is not
+    #: reported as an unconfirmed requirement; unlike a passing check it is
+    #: still never claimable (false_claim_guard is untouched).
+    absent_from_files: bool = False
 
     def to_dict(self) -> dict:
         return {**self.item.to_dict(), "result": self.result, "evidence": [e[:200] for e in self.evidence[:4]], "by_format": dict(self.by_format)}
@@ -489,9 +499,15 @@ def _eval_formats_only(item: RQ.ChecklistItem, observations: Sequence[I.Observat
     """The bytes on disk against what the job was asked to deliver.
 
     _validate_files only ever complains that a SELECTED format is missing;
-    nothing in the pipeline looks the other way. Production 2026-09-16 asked
-    for a pie chart and got a Word file and a PDF, and every check passed
-    because each delivered file was itself well formed.
+    nothing in the pipeline looks the other way, so a RENDERER that writes a
+    file the job did not select went unreported.
+
+    WHAT THIS DOES NOT COVER, because the claim was measured and is false:
+    the 2026-09-16 pie-chart incident. There the intent step itself chose
+    "document · Word, PDF", so selected_formats was ["docx", "pdf"] and
+    `allowed` (a superset of it) admits both delivered files — this check
+    passes that job. Choosing the wrong formats for a chart request is
+    formats._chart_image_formats's business, not this item's.
     """
     allowed = {str(f) for f in (ectx.allowed_formats if ectx is not None and ectx.allowed_formats is not None else (item.expected or []))}
     present = _formats_present(observations)
@@ -531,7 +547,25 @@ def _eval_audited(item: RQ.ChecklistItem, ectx: EvalContext) -> ItemResult:
     return ItemResult(item, "pass", [], {"spec": "pass"})
 
 
+#: The only formats whose files keep a chart's own type and numbers. A chart
+#: in a document, a PDF or an image is drawn as a picture: the renderer's
+#: output is pixels, so no reading of the bytes can confirm the chart's type
+#: or its series. The SECOND reading (chart_audit) covers those charts over
+#: the spec instead.
+NATIVE_CHART_FORMATS: Tuple[str, ...] = ("xlsx", "pptx")
+
+
 def _eval_chart(item: RQ.ChecklistItem, observations: Sequence[I.Observation], ectx: EvalContext) -> ItemResult:
+    res = _eval_chart_result(item, observations, ectx)
+    if (res.result == "unverifiable" and item.property not in _AUDIT_PROPERTIES
+            and not set(_formats_present(observations)) & set(NATIVE_CHART_FORMATS)):
+        # Nothing this version published could have carried the answer (see
+        # ItemResult.absent_from_files). The audit read the same charts.
+        res.absent_from_files = True
+    return res
+
+
+def _eval_chart_result(item: RQ.ChecklistItem, observations: Sequence[I.Observation], ectx: EvalContext) -> ItemResult:
     res = ItemResult(item, "unverifiable")
     prop = item.property
     if prop in _AUDIT_PROPERTIES:
@@ -1263,11 +1297,20 @@ async def plan_repair(results: Sequence[ItemResult], spec: Any, *, kind: str, op
                 plan.item_ids.append(r.item.id)
                 plan.kinds.append("code")
                 changed = True
-    if any(r.item.property in REBINDABLE_CHART_PROPERTIES for r in failed):
+    if any(r.item.property in REBINDABLE_CHART_PROPERTIES for r in failed) and any(
+            getattr(c, "data", None) is not None for c in _spec_charts(spec)):
         try:
             from . import chart_data  # type: ignore
 
-            fixed, _notes = await asyncio.to_thread(chart_data.resolve_spec, plan.spec, list(tables))
+            # allow_literal, and only when SOME chart is bound at all: a chart
+            # that carries its own numbers has no binding to re-bind, and
+            # resolve_spec's answer for one is to replace it with a callout
+            # ("... was not drawn because its numbers did not come from a
+            # table"). Measured 2026-09-16 without both guards: a document
+            # whose only chart was a literal waterfall came back with the
+            # chart REPLACED by that callout, the repair accepted, and the
+            # person who asked for a chart got a note instead.
+            fixed, _notes = await asyncio.to_thread(chart_data.resolve_spec, plan.spec, list(tables), allow_literal=True)
             plan.spec = fixed
             plan.item_ids.extend(r.item.id for r in failed if r.item.property in REBINDABLE_CHART_PROPERTIES)
             plan.kinds.append("code")
@@ -1435,7 +1478,7 @@ def summarize(results: Sequence[ItemResult], *, repaired_ids: Sequence[str] = ()
     # warning on every charted Word file and teach people to ignore warnings.
     checked = {r.item.category for r in results if r.item.must and r.result == "pass"}
     unconfirmed = [r for r in results if r.item.must and not r.item.contested and r.result == "unverifiable"
-                   and not r.unreadable and r.item.category not in checked]
+                   and not r.unreadable and not r.absent_from_files and r.item.category not in checked]
     report.unconfirmed = [RQ.describe(r.item) for r in unconfirmed]
     report.unmet = ([_unmet_line(r) for r in unmet] + [_unconfirmed_line(r) for r in unconfirmed])[:3]
     report.false_claim_guard = {

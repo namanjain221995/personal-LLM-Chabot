@@ -7,10 +7,13 @@ self-consistent, so that comparison passes every time: production 2026-09-16
 drew a pie of six states as seven equal 14 % slices (a row count over a table
 that already held one row per state) and the check reported the values as
 matching. Nothing here calls compute, resolve_chart or recompute_matches.
-Only two PARSERS are borrowed from chart_data — `to_number` (so "~67" and
-"1,200" read as figures, exactly as the cells were read) and `to_date` (to
-recognise a date column and stand aside) — plus `_TOTAL_LABEL_RE`, the
-Hindi/Gujarati summary vocabulary, which would be wrong to fork.
+Only PARSERS and RULES ABOUT ROWS are borrowed from chart_data — `to_number`
+(so "~67" and "1,200" read as figures, exactly as the cells were read),
+`to_date` (to recognise a date column and stand aside), `_TOTAL_LABEL_RE`,
+the Hindi/Gujarati summary vocabulary, `_is_total_row` (WHICH ROWS THE
+COMPUTATION DROPPED: a second reading that dropped a different set would
+report a mismatch against itself, measured 2026-09-16) and the name of the
+`Other` fold. Forking any of them would make this a different question.
 
 THREE CHECKS, all deterministic, no model:
 
@@ -23,7 +26,10 @@ THREE CHECKS, all deterministic, no model:
                     total, subtotal, sum, overall, all <x>, distinct <x>,
                     कुल, योग, કુલ, સરવાળો — drawn as a slice or a bar. It is
                     the sum of the others; beside them every figure counts
-                    twice.
+                    twice. Not on a waterfall or a funnel, whose closing or
+                    opening bar IS the chart, and a QUALIFIED word ("All
+                    Saints Hospital") only when the qualifier names the
+                    chart's own dimension or the arithmetic agrees.
   values            The plotted numbers against a plain-python regrouping of
                     the bound table's rows: group the x column, apply the
                     aggregate to the y column, compare. Deliberately narrow —
@@ -44,7 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import chart_spec as CS
-from .chart_data import _TOTAL_LABEL_RE, to_date, to_number
+from .chart_data import OTHER, _TOTAL_LABEL_RE, _is_total_row, to_date, to_number
 
 log = logging.getLogger(__name__)
 
@@ -55,16 +61,37 @@ EPSILON = 1e-6
 
 #: Types whose categories are groups of rows, so a summary row drawn beside
 #: them double-counts. `box` joins them for the same reason chart_data does.
-_SUMMARY_SENSITIVE_TYPES: Tuple[str, ...] = CS.AGGREGATING_TYPES + ("box",)
+#:
+#: WATERFALL AND FUNNEL ARE EXCLUDED. Their closing/opening bar IS the chart:
+#: a waterfall of Opening/Sales/Costs/Total is drawn precisely to land on that
+#: Total, and a funnel's top stage ("Total Visits") is the mouth of the
+#: funnel. Measured 2026-09-16 with them included: a document whose only
+#: chart was the literal waterfall [100, 50, -30, 120] published as
+#: `completed_with_warnings`, and the repair (below) REPLACED the chart with
+#: a callout — the person asked for a chart and the self-check deleted it.
+_SUMMARY_SENSITIVE_TYPES: Tuple[str, ...] = tuple(
+    t for t in CS.AGGREGATING_TYPES if t not in ("waterfall", "funnel")) + ("box",)
 
-#: The summary words _TOTAL_LABEL_RE does not carry: a bare "sum", "all
-#: <something>", and the shape that made the 2026-09-16 pie wrong — a state
-#: column whose summary row read "Distinct States". Only ever matched against
-#: a label of at most 40 characters (is_summary_label checks that first), so
+#: The summary words _TOTAL_LABEL_RE does not carry, in two halves, because
+#: they are not equally safe. DECISIVE on their own: a bare "sum", "sum of
+#: X", "combined", "everything", a bare "all". Only ever matched against a
+#: label of at most 40 characters (is_summary_label checks that first), so
 #: the alternation cannot be walked into a backtracking cost.
-_SUMMARY_EXTRA_RE = re.compile(
-    r"^(?:sum(?:\s*of\s+.{1,30})?|all|all\s+[\w\s.'-]{1,30}|distinct\s+[\w\s.'-]{1,30}|unique\s+[\w\s.'-]{1,30}"
-    r"|total\s+[\w\s.'-]{1,30}|combined|everything)\s*:?$",
+_SUMMARY_PLAIN_RE = re.compile(
+    r"^(?:sum(?:\s*of\s+.{1,30})?|all|combined|everything)\s*:?$",
+    re.IGNORECASE,
+)
+
+#: QUALIFIED: the shape that made the 2026-09-16 pie wrong — a state column
+#: whose summary row read "Distinct States". The qualifier is what makes it a
+#: summary OF something, and it is also what ordinary business names look
+#: like: measured, this alternation alone calls "All Saints Hospital", "Total
+#: Rewards", "Distinct Designs Ltd" and "Unique Fitness" summaries. A drawn
+#: category is therefore only flagged when the qualifier names the chart's
+#: own grouping dimension ("Distinct States" over x="State") or when its
+#: value really is the sum of the other categories — see _summary_categories.
+_SUMMARY_QUALIFIED_RE = re.compile(
+    r"^(?:all|distinct|unique|total)\s+(?P<of>[\w\s.'-]{1,30}?)\s*:?$",
     re.IGNORECASE,
 )
 
@@ -155,20 +182,48 @@ def _column_index(table: Any, name: Optional[str]) -> Optional[int]:
 # ---------------------------------------------------------- summary rows --
 
 
-def is_summary_label(value: Any) -> bool:
-    """"Total", "Grand Total", "Sum", "All regions", "Distinct States", कुल …"""
+def _clean_label(value: Any) -> str:
     if not isinstance(value, str):
-        return False
+        return ""
     text = re.sub(r"[*_`]", "", value).strip()
-    if not text or len(text) > 40:
+    return text if text and len(text) <= 40 else ""
+
+
+def is_summary_label(value: Any) -> bool:
+    """"Total", "Grand Total", "Sum", "All regions", "Distinct States", कुल …
+
+    The VOCABULARY, and nothing else. Whether a drawn category that carries a
+    qualified summary word is really a summary is decided against the chart
+    it was drawn in (check_summary_categories), because the same words spell
+    ordinary names — "All Saints Hospital", "Total Rewards"."""
+    text = _clean_label(value)
+    if not text:
         return False
-    return bool(_TOTAL_LABEL_RE.match(text) or _SUMMARY_EXTRA_RE.match(text))
+    return bool(_TOTAL_LABEL_RE.match(text) or _SUMMARY_PLAIN_RE.match(text) or _SUMMARY_QUALIFIED_RE.match(text))
+
+
+def _qualifier(value: Any) -> Optional[str]:
+    """The "<x>" of "all <x>" / "distinct <x>" / "unique <x>" / "total <x>",
+    when that qualified form is the ONLY reason the label reads as a summary.
+    None when a decisive word ("Total", "Sum", कुल) already settled it."""
+    text = _clean_label(value)
+    if not text or _TOTAL_LABEL_RE.match(text) or _SUMMARY_PLAIN_RE.match(text):
+        return None
+    m = _SUMMARY_QUALIFIED_RE.match(text)
+    return m.group("of") if m else None
 
 
 def _is_summary_row(row: Sequence[Any]) -> bool:
-    """Any short label cell marks the whole row: the 2026-09-16 table said
-    "Total" in its RANK cell and "Distinct States" in its state cell."""
-    return any(is_summary_label(c) for c in row)
+    """chart_data's OWN rule, deliberately.
+
+    The regrouping below must drop exactly the rows chart_data dropped, or it
+    reports a mismatch against itself. Measured 2026-09-16 with the widened
+    vocabulary here: a Month|Metric|Value table whose Metric cells read
+    "Total Revenue" lost four of its six rows in this reading only, and a
+    correct bar of [110, 85, 64] was reported as "Jan is drawn as 110; the
+    sum of Value over the table's rows is 10". The widened vocabulary stays
+    where the contract puts it — over the FINAL chart.categories."""
+    return _is_total_row(row)
 
 
 # ------------------------------------------------------ (a) binding check --
@@ -206,6 +261,26 @@ def _measure_columns_with_spread(chart: CS.Chart, table: Any) -> List[Tuple[str,
     return out
 
 
+def _own_column_is_flat(chart: CS.Chart, table: Any) -> bool:
+    """The chart NAMES one numeric column of the table and that column really
+    does hold the same number on every row, so the equal slices ARE the data.
+
+    Measured 2026-09-16 without this: Team|Members|Founded =
+    [[Alpha, 5, 2011], [Beta, 5, 2015], [Gamma, 5, 2019]] with a correct pie
+    of Members [5, 5, 5] was reported as "it is bound to the wrong column",
+    naming the YEAR column as the one it should have used. A year passes
+    every part of the guard the report claimed — three categories, one
+    series, a name that is not a row number."""
+    b = chart.data
+    if b is None or len(b.y) != 1:
+        return False
+    idx = _column_index(table, b.y[0])
+    if idx is None:
+        return False
+    present = [n for n in (to_number(_cell(r, idx)) for r in _rows(table) if not _is_summary_row(r)) if n is not None]
+    return len(present) >= 3 and len({round(n, 9) for n in present}) == 1
+
+
 def check_binding(chart: CS.Chart, table: Any) -> List[Finding]:
     """A pie of >= 3 equal slices over a table whose measure column is not
     flat is a binding bug, not a finding about the data."""
@@ -213,6 +288,8 @@ def check_binding(chart: CS.Chart, table: Any) -> List[Finding]:
         return []
     values = _plotted_values(chart)
     if len(chart.categories) < 3 or len(values) != len(chart.categories) or not _all_equal(values):
+        return []
+    if _own_column_is_flat(chart, table):
         return []
     spread = _measure_columns_with_spread(chart, table)
     if not spread:
@@ -236,12 +313,78 @@ def _fmt(v: float) -> str:
 # ----------------------------------------------- (b) summary-label check --
 
 
+def _word_forms(word: str) -> set:
+    """{"states", "state"}, {"boxes", "box"}, {"cities", "city"} — every
+    reading of one word, so a PLURAL qualifier lines up with the SINGULAR
+    column name it was written from ("Distinct States" over x="State").
+    English is irregular enough that guessing one form is wrong either way
+    ("states" minus "es" is "stat"), so both candidates are kept."""
+    forms = {word}
+    if word.endswith("ies") and len(word) > 4:
+        forms.add(word[:-3] + "y")
+    if word.endswith("es") and len(word) > 3:
+        forms.add(word[:-2])
+    if word.endswith("s") and len(word) > 2:
+        forms.add(word[:-1])
+    return forms
+
+
+def _dimension_words(chart: CS.Chart) -> set:
+    """What this chart says it is ABOUT, in its own words: the columns it
+    groups by and measures, and its series names, folded and singularised."""
+    names: List[str] = []
+    b = chart.data
+    if b is not None:
+        names += [b.x or "", b.group_by or ""] + [str(y) for y in (b.y or [])]
+    names += [str(s.name or "") for s in chart.series]
+    out: set = set()
+    for n in names:
+        folded = _fold(n)
+        if folded:
+            out |= _word_forms(folded)
+    return out
+
+
+def _is_the_sum_of_the_others(index: int, values: Sequence[float]) -> bool:
+    """The drawn value at `index` equals the other drawn values added up —
+    the arithmetic that makes a summary slice a double count."""
+    if len(values) < 3:
+        return False
+    others = [v for i, v in enumerate(values) if i != index]
+    total = float(sum(others))
+    return abs(values[index] - total) <= max(EPSILON * abs(total), 1e-9)
+
+
+def _summary_categories(chart: CS.Chart, labels: Sequence[Any], values: Sequence[float]) -> List[Any]:
+    """The labels of `labels` that are really a summary of the others.
+
+    A decisive word ("Total", "Grand Total", "Sum", कुल) needs no support. A
+    QUALIFIED one ("Distinct States", "All regions") must either name the
+    chart's own dimension — x="State" for "Distinct States", which is the
+    2026-09-16 incident — or be the arithmetic sum of the other categories.
+    Without that support the same words are ordinary names, measured:
+    "All Saints Hospital", "Total Rewards", "Distinct Designs Ltd",
+    "Unique Fitness" all match the vocabulary."""
+    dims = _dimension_words(chart)
+    out: List[Any] = []
+    for i, label in enumerate(labels):
+        if not is_summary_label(label):
+            continue
+        of = _qualifier(label)
+        if of is not None and not (_word_forms(_fold(of)) & dims) and not (
+                i < len(values) and _is_the_sum_of_the_others(i, values)):
+            continue
+        out.append(label)
+    return out
+
+
 def check_summary_categories(chart: CS.Chart) -> List[Finding]:
     if chart.type not in _SUMMARY_SENSITIVE_TYPES:
         return []
-    named = [c for c in chart.categories if is_summary_label(c)]
+    named = _summary_categories(chart, list(chart.categories), _plotted_values(chart))
     if chart.extra is not None:
-        named += [b.name for b in (chart.extra.box or []) if is_summary_label(b.name)]
+        boxes = [b.name for b in (chart.extra.box or [])]
+        named += _summary_categories(chart, boxes, [])
     if not named:
         return []
     title = chart.title or "the chart"
@@ -383,6 +526,14 @@ def recompute(chart: CS.Chart, table: Any) -> Tuple[str, List[str]]:
     compared = 0
     for category, drawn in zip(chart.categories, plotted):
         fold = _fold(category)
+        if fold == _fold(OTHER):
+            # chart_data folds the tail of a pie into a bucket it CALLS
+            # "Other" (PIE_MAX_SLICES = 7). A table row that happens to be
+            # labelled "Other" is then compared with that fold: measured
+            # 2026-09-16 on a ten-category spend table, "Other is drawn as
+            # 282; the sum of Spend over the table's rows is 3" — a correct
+            # chart told its numbers are wrong.
+            continue
         if fold not in counts:
             # "Other", a top_n trim, a renamed category: not this check's
             # business, and never a failure invented from an absence.
