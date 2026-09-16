@@ -1663,7 +1663,8 @@ def _mentions(text: str, name: str) -> bool:
     return re.search(rf"(?<![\w]){re.escape(name.casefold())}(?![\w])", text.casefold()) is not None
 
 
-def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = "") -> Tuple[CS.Chart, List[str]]:
+def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = "", *,
+                   keep_accepted_type: bool = False) -> Tuple[CS.Chart, List[str]]:
     """Deterministic clean-up of a binding the model wrote, BEFORE compute:
 
     - fields that belong to other chart types are dropped (y2 off a combo,
@@ -1676,6 +1677,10 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
     - the TYPE is checked against the table's shape by chart_choice: a type
       the person named in `instruction` wins whenever the shape carries it,
       otherwise the chooser's type is used and the note names both and why.
+      `keep_accepted_type` (an EDIT of a chart the person has already seen)
+      holds that last step back unless the instruction is about charts —
+      measured 2026-09-16, "make the title bigger" turned an accepted line
+      chart into a pie because every chart in the spec is re-checked.
 
     Live run 2026-09-15: 7 of 20 misses were a skipped group_by and 3 were
     stray y2/label/size fields. Nothing here invents a column or a number."""
@@ -1729,13 +1734,16 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
     type_upd: Dict[str, Any] = {}
     if table is not None:
         probe = chart if not upd else chart.model_copy(update={"data": CS.Binding.model_validate({**b.model_dump(), **upd})})
-        choice = chart_choice.choose(probe, table, instruction)
+        choice = chart_choice.choose(probe, table, instruction, keep_accepted_type=keep_accepted_type)
         if choice is not None:
             if choice.type != t:
                 type_upd["type"] = choice.type
             if choice.trendline != probe.data.trendline and choice.type == "scatter":
                 upd["trendline"] = choice.trendline
-            if choice.note:
+            # Only ever beside a type that really changed: a note is the
+            # sentence that explains a substitution, and choose() writes
+            # none when there was not one.
+            if choice.note and choice.type != t:
                 notes.append(choice.note)
     if not upd and not type_upd:
         return chart, notes

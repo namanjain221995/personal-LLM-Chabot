@@ -1432,7 +1432,11 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
         # 2026-09-15: "heatmap of ticket count by Status and Priority" drew
         # a note "A heatmap needs a column for its rows").
         try:
-            spec = await asyncio.to_thread(_repair_bindings, spec, list(tables_), instruction, warn)
+            # `parent is not None` is this function's own test for an edit:
+            # a chart in a version the person already accepted is not
+            # retyped by an instruction that is not about charts.
+            spec = await asyncio.to_thread(_repair_bindings, spec, list(tables_), instruction, warn,
+                                           parent is not None)
         except Exception as exc:  # noqa: BLE001 — resolve still runs on the model's binding
             log.info("artifact: chart binding repair skipped: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
@@ -1463,7 +1467,8 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
     return spec
 
 
-def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Callable[[str], None]) -> Any:
+def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Callable[[str], None],
+                     keep_accepted_type: bool = False) -> Any:
     from ..artifacts import chart_spec as CS
 
     body = getattr(spec, "body", None)
@@ -1471,12 +1476,14 @@ def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Call
         return spec
     for b in list(getattr(body, "blocks", None) or []):
         if getattr(b, "type", "") == "chart" and b.chart.data is not None and not b.chart.series:
-            b.chart, notes = _chart_data.repair_binding(b.chart, tables_, instruction)
+            b.chart, notes = _chart_data.repair_binding(b.chart, tables_, instruction,
+                                                        keep_accepted_type=keep_accepted_type)
             for n in notes:
                 warn(str(n))
     for sl in list(getattr(body, "slides", None) or []):
         if getattr(sl, "chart", None) is not None and sl.chart.data is not None and not sl.chart.series:
-            sl.chart, notes = _chart_data.repair_binding(sl.chart, tables_, instruction)
+            sl.chart, notes = _chart_data.repair_binding(sl.chart, tables_, instruction,
+                                                         keep_accepted_type=keep_accepted_type)
             for n in notes:
                 warn(str(n))
     for sh in list(getattr(body, "sheets", None) or []):
@@ -1486,7 +1493,8 @@ def _repair_bindings(spec: Any, tables_: List[Any], instruction: str, warn: Call
         fixed = []
         for c in sh.charts:
             if isinstance(c, CS.Chart) and c.data is not None and not c.series:
-                c, notes = _chart_data.repair_binding(c, [*tables_, own] if not c.data.table_id else tables_, instruction)
+                c, notes = _chart_data.repair_binding(c, [*tables_, own] if not c.data.table_id else tables_,
+                                                     instruction, keep_accepted_type=keep_accepted_type)
                 for n in notes:
                     warn(str(n))
             fixed.append(c)

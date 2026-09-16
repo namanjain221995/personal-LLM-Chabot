@@ -106,36 +106,56 @@ _DURATION_RE = re.compile(
 
 # ------------------------------------------------------- the named type --
 
-#: The chart words a person writes, longest phrase first so "stacked bar"
-#: beats "bar" and "donut chart" beats "chart". This is the ARTIFACT side of
-#: core.chart_decision._TYPE_PHRASES (which answers a different question —
-#: whether a chat answer should carry a chart at all) and covers the tier-2
-#: types that one does not name.
+#: An optional chart word after a type's own noun. "funnel chart" is the
+#: person naming a type; "sales funnel" is a subject. The suffix is what
+#: lets the scoring below tell the two apart by the length of the match.
+_CW = r"(?:\s+(?:chart|graph|plot))?"
+
+#: A chart word INSIDE the matched text. Measured 2026-09-16 on the merged
+#: tree: with first-pattern-wins, named_type("show our sales funnel as a bar
+#: chart") returned "funnel" and CC.choose drew a funnel with NO note — the
+#: person typed "bar chart". Scoring on this flag first, then on match
+#: length, puts the qualified phrase ahead of the bare subject noun.
+#: Substrings, not whole words: "waterfall" carries "fall", "heat map"
+#: carries "map".
+_QUALIFIED_RE = re.compile(r"chart|graph|plot|map|fall|stacked|horizontal", re.I)
+
+#: The chart words a person writes. Order is now only a tie-break (see
+#: `named_type`): the BEST match wins, so "stacked bar" beats "bar" on
+#: length and "bar chart" beats a bare "funnel" on the chart word.
+#: This is the ARTIFACT side of core.chart_decision._TYPE_PHRASES (which
+#: answers a different question — whether a chat answer should carry a chart
+#: at all) and covers the tier-2 types that one does not name.
+#:
+#: box / radar / bubble are ordinary English nouns ("a text box", "on our
+#: radar", "the housing bubble"), so each one REQUIRES its chart word; the
+#: rest are chart-only nouns and take the suffix optionally.
 _NAMED_PHRASES: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(?:100%?\s*stacked|percent(?:age)?\s+stacked)\s+(?:bar|column)s?\b", re.I), "percent_stacked_bar"),
     (re.compile(r"\bstacked\s+(?:horizontal\s+)?(?:area|areas)\b", re.I), "stacked_area"),
     (re.compile(r"\bstacked\s+horizontal\s+(?:bar|column)s?\b", re.I), "stacked_horizontal_bar"),
     (re.compile(r"\bstacked\s+(?:bar|column)s?\b", re.I), "stacked_bar"),
     (re.compile(r"\bhorizontal\s+(?:bar|column)s?\b", re.I), "horizontal_bar"),
-    (re.compile(r"\b(?:donut|doughnut)\b", re.I), "donut"),
-    (re.compile(r"\bheat\s*map\b", re.I), "heatmap"),
-    (re.compile(r"\bwater\s*fall\b", re.I), "waterfall"),
-    (re.compile(r"\bfunnel\b", re.I), "funnel"),
-    (re.compile(r"\bgantt\b", re.I), "gantt"),
-    (re.compile(r"\bradar\b|\bspider\s+(?:chart|graph|plot)\b", re.I), "radar"),
-    (re.compile(r"\bbubble\b", re.I), "bubble"),
-    (re.compile(r"\bbox\s*(?:plot|and\s+whisker)?\b|\bwhisker\b", re.I), "box"),
-    (re.compile(r"\bhistogram\b", re.I), "histogram"),
+    (re.compile(r"\b(?:donut|doughnut)\b" + _CW, re.I), "donut"),
+    (re.compile(r"\bheat\s*map\b" + _CW, re.I), "heatmap"),
+    (re.compile(r"\bwater\s*fall\b" + _CW, re.I), "waterfall"),
+    (re.compile(r"\bfunnel\b" + _CW, re.I), "funnel"),
+    (re.compile(r"\bgantt\b" + _CW, re.I), "gantt"),
+    (re.compile(r"\b(?:radar|spider)\s+(?:chart|graph|plot)\b", re.I), "radar"),
+    (re.compile(r"\bbubble\s+(?:chart|graph|plot)\b", re.I), "bubble"),
+    (re.compile(r"\bbox\s+(?:plot|chart|graph)\b|\bbox\s+and\s+whiskers?\b|\bwhisker\b", re.I), "box"),
+    (re.compile(r"\bhistogram\b" + _CW, re.I), "histogram"),
     (re.compile(r"\bdistribution\s+(?:chart|graph|plot)\b", re.I), "histogram"),
-    (re.compile(r"\bscatter(?:\s*plot)?\b", re.I), "scatter"),
+    (re.compile(r"\bscatter(?:\s*(?:plot|chart|graph))?\b", re.I), "scatter"),
     (re.compile(r"\bcombo\s+(?:chart|graph)\b|\bdual[-\s]axis\b", re.I), "combo"),
-    (re.compile(r"\bpie(?:\s+chart)?\b", re.I), "pie"),
+    (re.compile(r"\bpie(?:\s+(?:chart|graph|plot))?\b", re.I), "pie"),
     (re.compile(r"\barea\s+(?:chart|graph|plot)\b", re.I), "area"),
     (re.compile(r"\b(?:line|trend)\s+(?:chart|graph|plot|line)\b", re.I), "line"),
     (re.compile(r"\btrend\s+over\s+time\b", re.I), "line"),
     (re.compile(r"\b(?:bar|column)\s+(?:chart|graph|plot)\b", re.I), "bar"),
     (re.compile(r"\bbar\s*graph\b", re.I), "bar"),
-    # Follow-up phrasings, last so a named type above always wins.
+    # Follow-up phrasings. They carry no chart word, so the scoring already
+    # ranks them under any named type in the same sentence.
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?areas?\b", re.I), "area"),
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?lines?\b", re.I), "line"),
     (re.compile(r"\b(?:as|to|into)\s+(?:an?\s+)?bars?\b", re.I), "bar"),
@@ -160,10 +180,20 @@ def named_type(text: str) -> Optional[str]:
         text = _strip_false_positives(text)
     except Exception:  # noqa: BLE001 — the chat module is optional in this build
         pass
-    for pattern, ctype in _NAMED_PHRASES:
-        if pattern.search(text):
-            return ctype
-    return None
+    # BEST match wins, not the first one. Ranked on (a chart word inside the
+    # matched text, then the length of the match, then the table order), so
+    # "bar chart" outranks the "funnel" that names the subject, and "stacked
+    # bar" still outranks the "bar chart" inside it.
+    best: Optional[Tuple[Tuple[int, int, int], str]] = None
+    for index, (pattern, ctype) in enumerate(_NAMED_PHRASES):
+        m = pattern.search(text)
+        if m is None:
+            continue
+        hit = m.group(0)
+        key = (1 if _QUALIFIED_RE.search(hit) else 0, len(hit), -index)
+        if best is None or key > best[0]:
+            best = (key, ctype)
+    return best[1] if best else None
 
 
 #: Types that are the same reading of the data in a different layout. When
@@ -280,6 +310,15 @@ def shape_of(chart: CS.Chart, table: Any) -> Optional[Shape]:
     sh.has_y2 = bool(b.y2)
 
     x_idx, _ = CD.match_column(b.x, columns)
+    if b.x and x_idx is None:
+        # The docstring's own contract. Measured 2026-09-16: with x="Zzzqqq"
+        # over ["State","Count"] the shape came back with x_kind="" and
+        # recommend() read that as "no category column", so repair_binding
+        # retyped the chart to a histogram and wrote "there is no category
+        # column" beside resolve_chart's true "The column 'Zzzqqq' was not
+        # found in m." One of those two sentences was false. A misspelled
+        # column is chart_data's callout, not a reason to change the type.
+        return None
     if x_idx is not None:
         info = CD.infer_column(table, x_idx)
         sh.x_name, sh.x_kind = info.name, info.kind
@@ -461,7 +500,13 @@ def recommend(sh: Shape) -> Choice:
             return Choice("stacked_bar", f"{m} is split by {sh.group_name} and the parts add up to each {sh.x_name} total")
         return Choice("bar", f"{m} is compared across {sh.x_name}, one bar per {sh.group_name}")
 
-    if sh.measures and sh.x_kind == "text" and sh.agg in ("none", "median") and sh.rows_per_category >= MIN_BOX_ROWS_PER_CATEGORY:
+    # `not one_row_per_category` is what can_draw("box", sh) checks. Without
+    # it the two disagreed: 10,000 rows with 10,000 distinct labels count as
+    # n_categories == DISTINCT_CAP (400), so rows_per_category read 25 and
+    # recommend() returned a box of 10,000 groups of one row each — a type
+    # can_draw refuses for the same shape.
+    if (sh.measures and sh.x_kind == "text" and sh.agg in ("none", "median")
+            and not sh.one_row_per_category and sh.rows_per_category >= MIN_BOX_ROWS_PER_CATEGORY):
         return Choice("box", f"{sh.x_name} has about {sh.rows_per_category:.0f} rows each, so {m} is shown as a distribution per group")
 
     if sh.x_kind in ("text", "number"):
@@ -557,19 +602,59 @@ def label(chart_type: str) -> str:
     return chart_type.replace("_", " ")
 
 
-def choose(chart: CS.Chart, table: Any, instruction: str = "") -> Optional[Choice]:
+def about_charts(instruction: str) -> bool:
+    """True when the person's words are about a chart at all.
+
+    The gate on retyping a chart somebody has already accepted: "make the
+    title bigger" is not a chart instruction, so it must not steer a type.
+    `core.chart_decision.explicit_chart_request` already owns this judgement
+    for the chat side (it fires on chart/graph/plot/visualise, on a named
+    type, on "dashboard", on "show this visually", and on a typo of any of
+    them); a type this module names is a chart instruction by definition.
+    """
+    if not instruction:
+        # No words at all: the caller is asking the chooser to decide, not
+        # handing it an instruction to read.
+        return True
+    if named_type(instruction) is not None:
+        return True
+    try:
+        from ..core.chart_decision import explicit_chart_request  # noqa: PLC0415
+
+        return bool(explicit_chart_request(instruction))
+    except Exception:  # noqa: BLE001 — the chat module is optional in this build
+        return True
+
+
+def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
+           keep_accepted_type: bool = False) -> Optional[Choice]:
     """The type this chart should be drawn as, or None to leave it alone.
 
     `instruction` is the person's own words: a type named there WINS whenever
     the shape carries it, and when it does not the returned note names both
     types and the reason. With no type named, `recommend` decides and the
     model's pick survives only inside the recommended family.
+
+    `keep_accepted_type` is True when the chart already exists in a version
+    the person has seen (an EDIT). Measured 2026-09-16: "make the title
+    bigger" over an accepted line chart came back as a pie, because the
+    unnamed path retypes every chart in the spec whatever the edit was
+    about. On an edit an instruction that is not about charts changes no
+    type at all; a fresh compose keeps the whole rule table.
     """
     sh = shape_of(chart, table)
     if sh is None:
         return None
+    if keep_accepted_type and not about_charts(instruction):
+        return None
     want = named_type(instruction)
     best = recommend(sh)
+
+    # The invariant: never hand back a type can_draw refuses for this shape.
+    # recommend()'s rules are checked against the same Shape, but this makes
+    # it hold for any future rule as well.
+    if can_draw(best.type, sh):
+        best = Choice(_bar_flavour(sh), f"{sh.measure_name} is compared across {sh.x_name or 'the categories'}")
 
     # A trend line is a property of the FIT, not of who picked the type: it
     # is drawn on any scatter whose straight line says something.
@@ -580,15 +665,19 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "") -> Optional[Choic
         if not why_not:
             # Their type, their chart — even when `recommend` prefers another.
             return Choice(want, f"you asked for {_article(want)}", trendline=trend and want == "scatter")
-        fallback = best if can_draw(best.type, sh) == "" else Choice(_bar_flavour(sh), f"{sh.measure_name} is compared across {sh.x_name or 'the categories'}")
+        fallback = best
         if fallback.type == want:
             return None
-        return Choice(
-            fallback.type,
-            fallback.reason,
-            note=(f"{_article(want)} {why_not}, so it is drawn as {_article(fallback.type)}: {fallback.reason}"),
-            trendline=trend and fallback.type == "scatter",
-        )
+        # A note explains a SUBSTITUTION. When the chart is already the
+        # fallback type nothing is being substituted, and "so it is drawn as
+        # a line" would claim a change that did not happen — measured
+        # 2026-09-16 on "pie chart of statuses please" against an untouched
+        # line chart of Date/Amount, which is not even the chart the
+        # instruction was about.
+        note = ""
+        if fallback.type != chart.type:
+            note = f"{_article(want)} {why_not}, so it is drawn as {_article(fallback.type)}: {fallback.reason}"
+        return Choice(fallback.type, fallback.reason, note=note, trendline=trend and fallback.type == "scatter")
 
     if chart.type in _family(best.type):
         # The model's layout preference inside the right reading of the data.
@@ -643,5 +732,5 @@ def rules_text() -> str:
 __all__ = [
     "AUTO_PIE_CATEGORIES", "NAMED_PIE_CATEGORIES", "VERTICAL_BAR_CATEGORIES", "LONG_LABEL_CHARS", "TREND_MIN_R",
     "MIN_HEATMAP_SIDE", "MIN_BOX_ROWS_PER_CATEGORY", "RULES", "Shape", "Choice",
-    "shape_of", "recommend", "can_draw", "choose", "named_type", "rules_text", "label",
+    "shape_of", "recommend", "can_draw", "choose", "named_type", "about_charts", "rules_text", "label",
 ]

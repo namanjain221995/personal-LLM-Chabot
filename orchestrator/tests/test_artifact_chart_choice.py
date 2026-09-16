@@ -309,3 +309,131 @@ def test_the_model_guidance_carries_the_same_rule_table():
 def test_a_chart_with_no_binding_or_no_table_is_left_alone():
     assert CC.shape_of(chart(type="pie", categories=["a", "b"], series=[dict(name="s", values=[1, 2])]), STATES) is None
     assert CC.choose(chart(type="pie", data=dict(table_id="answer1", x="State")), None) is None
+
+
+# ----------------------------------- the words are read, not just scanned --
+
+#: Salesforce's own Opportunity stage picklist. "Sales funnel" is the SUBJECT
+#: here; "bar chart" is the type the person actually typed.
+SF_STAGES = table("sf", ["Stage", "Deals"], [
+    ["Prospecting", 500], ["Qualification", 300], ["Proposal/Price Quote", 120],
+    ["Negotiation/Review", 60], ["Closed Won", 25],
+])
+
+
+@pytest.mark.parametrize("text, expected", [
+    # A bare subject noun must never beat the type the person literally named.
+    ("show our sales funnel as a bar chart", "bar"),
+    ("bar chart of pie sales by region", "bar"),
+    ("bar chart of the conversion funnel", "bar"),
+    ("line chart of the gantt milestones", "line"),
+    ("bar chart of heat map coverage", "bar"),
+    ("line chart of the waterfall project", "line"),
+    # ...and the type named with its own chart word still wins over another's.
+    ("a funnel chart, not a bar chart", "funnel"),
+    # Everything the shipped behaviour already gets right stays right.
+    ("visualise this table on pie chart", "pie"),
+    ("stacked bar chart", "stacked_bar"),
+    ("100% stacked bar", "percent_stacked_bar"),
+    ("stacked horizontal bar chart", "stacked_horizontal_bar"),
+    ("horizontal bar chart", "horizontal_bar"),
+    ("box plot", "box"),
+    ("trend over time", "line"),
+    ("as a pie", "pie"),
+    ("draw a gantt chart", "gantt"),
+    ("make it a doughnut", "donut"),
+    ("scatter plot of height and weight", "scatter"),
+    ("heat map of tickets", "heatmap"),
+    # Ordinary English that happens to contain a chart type's noun is not a
+    # request for that type — the person named no chart at all.
+    ("put the summary in a text box", None),
+    ("on our radar", None),
+    ("housing bubble", None),
+    ("make the title bigger", None),
+])
+def test_the_type_the_person_named_wins_over_a_bare_subject_noun(text, expected):
+    assert CC.named_type(text) == expected
+
+
+def test_a_bar_chart_of_a_sales_funnel_is_drawn_as_a_bar():
+    # End to end: the shape IS a funnel (a trusted stage order that only
+    # shrinks), so the chooser would recommend one — but the person typed
+    # "bar chart", and their own words win.
+    sh = shape(SF_STAGES, x="Stage", y=["Deals"])
+    assert sh.stage_order and CC.recommend(sh).type == "funnel"
+    c = chart(type="bar", data=dict(table_id="sf", x="Stage", y=["Deals"]))
+    got = CC.choose(c, SF_STAGES, "draw the sales funnel as a bar chart")
+    assert got is None or (got.type == "bar" and got.note == "")
+
+
+# ------------------------------- recommend never names a type it refuses --
+
+#: 10,000 distinct names: one row per category at the DISTINCT_CAP, so
+#: rows_per_category reads 25 while every group really holds one row.
+ONE_ROW_EACH = table("wide", ["Name", "Score"], [[f"Name {i:05d}", i % 97] for i in range(10_000)])
+
+
+def test_recommend_never_names_a_type_can_draw_refuses_for_the_same_shape():
+    sh = shape(ONE_ROW_EACH, x="Name", y=["Score"], agg="none")
+    assert sh.one_row_per_category and sh.n_categories == CC.DISTINCT_CAP
+    got = CC.recommend(sh)
+    assert CC.can_draw(got.type, sh) == "", f"recommend() named {got.type}, which can_draw refuses"
+    assert got.type != "box"
+    # ...and the unnamed path of choose() ships nothing can_draw refuses either.
+    c = chart(type="bar", data=dict(table_id="wide", x="Name", y=["Score"], agg="none"))
+    picked = CC.choose(c, ONE_ROW_EACH, "put a chart in the report")
+    if picked is not None:
+        assert CC.can_draw(picked.type, sh) == "", picked
+
+
+# ------------------------------- an edit that is not about charts is left --
+
+
+def test_an_edit_that_names_no_chart_leaves_an_accepted_chart_alone():
+    c = chart(type="line", data=dict(table_id="answer1", x="State", y=["Count (Approx)"]))
+    kept, notes = CD.repair_binding(c, [STATES], "make the title bigger", keep_accepted_type=True)
+    assert kept.type == "line" and not [n for n in notes if "drawn as" in n], notes
+    # An edit that IS about charts keeps the whole benefit of the chooser.
+    fixed, notes = CD.repair_binding(c, [STATES], "turn this into a pie chart", keep_accepted_type=True)
+    assert fixed.type == "pie"
+
+
+def test_the_edit_path_does_not_retype_charts_the_instruction_never_mentions():
+    import asyncio
+
+    from app.artifacts import spec as S
+    from app.engines import artifact as engine
+
+    def doc():
+        return S.parse_body("document", {"title": "States", "blocks": [{"type": "chart", "chart": {
+            "type": "line", "title": "Records by State",
+            "data": {"table_id": "answer1", "x": "State", "y": ["Count (Approx)"]}}}]})
+
+    warned: list = []
+    out = asyncio.run(engine._post_process(doc(), [STATES], warned.append, "make the title bigger",
+                                           parent=doc(), model_wrote=False))
+    assert out.body.blocks[0].chart.type == "line", warned
+    assert not [w for w in warned if "drawn as" in w], warned
+
+
+# ------------------------------- a note never claims a change that is not --
+
+
+def test_a_note_is_written_only_when_the_type_actually_changed():
+    c = chart(type="line", data=dict(table_id="upload1", x="Date", y=["Amount"]))
+    kept, notes = CD.repair_binding(c, [MONTHLY], "pie chart of statuses please")
+    assert kept.type == "line"
+    assert not [n for n in notes if "drawn as a line" in n], notes
+
+
+# -------------------------- a misspelled column is chart_data's callout --
+
+
+def test_an_x_column_the_table_does_not_have_is_not_a_reason_to_retype():
+    c = chart(type="bar", data=dict(table_id="answer1", x="Zzzqqq", y=["Count (Approx)"]))
+    assert CC.shape_of(c, STATES) is None
+    kept, notes = CD.repair_binding(c, [STATES], "")
+    assert kept.type == "bar" and notes == [], notes
+    # resolve_chart still writes the one true sentence about it.
+    resolved, _, msg = CD.resolve_chart(kept, [STATES])
+    assert resolved is None and "Zzzqqq" in msg
