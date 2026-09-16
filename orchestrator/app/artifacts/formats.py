@@ -520,7 +520,10 @@ _BEST_RE = re.compile(r"\bbest\s+(?:format|deliverable|output|file)\b", re.I)
 #: forms already match through "chart", "graph" or "plot".
 _CHART_WORDS_RE = re.compile(
     r"\b(?:chart|charts|graph|graphs|plot|plots|histogram|heat\s*map|pie|donut|scatter|gantt|funnel|box\s*plot"
-    r"|tree\s*map|sunburst|candlestick|ohlc|pareto\s*(?:diagram|analysis))\b"
+    r"|tree\s*map|sunburst|candlestick|ohlc|waterfalls?|violin\s*plots?"
+    # "a pareto of defects by cause" names the chart; "the Pareto principle"
+    # does not, so the bare word is read only where a subject follows it.
+    r"|pareto\s*(?:diagram|analysis)|pareto(?=\s+(?:of|by|for|showing|comparing)\b))\b"
     r"|चार्ट|ग्राफ|ચાર્ટ|ગ્રાફ",
     re.I,
 )
@@ -532,6 +535,27 @@ _IMAGE_FORMAT_RE = re.compile(r"\b(?:png|\.png|svg|\.svg)\b", re.I)
 _CHART_ASK_RE = re.compile(
     r"\b(?:visuali[sz]e|visuali[sz]ing|plot|plotted|graph|chart|draw|render|show|display|give|make|create|build|generate)\b"
     r"|दिखा|बना|दिखाओ|बनाओ|બતાવ|બનાવ",
+    re.I,
+)
+
+
+#: A chart named as the SUBJECT, not as a verb: "histogram of hours worked",
+#: "scatter of salary vs experience", "pie of sales by region", "heat map of
+#: usage by day". Measured 2026-09-16 (understanding audit C07/C12): with the
+#: ask verbs alone these shapes stayed on the document default, so a one-line
+#: chart request came back as a Word file and a PDF.
+_CHART_NOUN_ASK_RE = re.compile(
+    r"^\W*(?:an?|the)?\s*(?:[\w-]+\s+){0,2}?"
+    r"(?:histograms?|heat\s*maps?|scatters?(?:\s*plots?)?|box\s*plots?|violins?|pies?|donuts?|doughnuts?|funnels?|"
+    r"gantts?|treemaps?|sunbursts?|paretos?|candlesticks?|bullets?|radars?|bubbles?|waterfalls?|charts?|graphs?|plots?)"
+    r"\s+(?:of|by|for|showing|comparing|per|vs\.?|versus)\b",
+    re.I,
+)
+#: A story's plot, not a chart: "plot of the movie Inception". The same word
+#: names both, and the story reading wins when the sentence says so.
+_STORY_PLOT_RE = re.compile(
+    r"\bplots?\s+(?:of|in|for|from)\s+(?:the\s+|this\s+|that\s+|a\s+|an\s+)?"
+    r"(?:movie|film|book|novel|story|show|series|play|episode|game|anime|manga|song|opera|poem)s?\b",
     re.I,
 )
 
@@ -588,7 +612,12 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
         return []
     if kind_for(text or "", [])[1] != "default":
         return []
-    if not (gate or (words and _CHART_ASK_RE.search(text or ""))):
+    if not (gate or (words and (_CHART_ASK_RE.search(text or "") or _CHART_NOUN_ASK_RE.match(text or "")))):
+        return []
+    # "the plot of this novel by chapter" names no chart: `plot` is an ask
+    # verb here and a story word there, and the story reading wins when the
+    # sentence says so (understanding audit, 2026-09-16).
+    if _STORY_PLOT_RE.search(text or "") and not _CHART_WORDS_RE.search(_STORY_PLOT_RE.sub(" ", text or "")):
         return []
     return ["png"]
 
