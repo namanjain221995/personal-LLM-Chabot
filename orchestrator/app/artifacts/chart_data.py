@@ -900,6 +900,7 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
     if not all_y and agg != "count":
         agg = "count"
         notes.append("no numeric column was named, so rows were counted")
+    blank_roles: List[str] = []
     for role in all_y:
         if frame.kinds[role].kind not in ("number", "empty") and agg != "count":
             raise ChartDataError(f"The column {frame.names[role]!r} is not numeric, so it cannot be plotted as a {CS.AGG_LABELS[agg].lower()}.")
@@ -911,7 +912,26 @@ def _compute_grouped(chart: CS.Chart, frame: _Frame, prov: CS.Provenance, deadli
             # of PersonMailingLatitude / PersonMailingLongitude, which are null
             # in 100% of that file, and a sum over nothing drew a row of zeros
             # that looked like real data.
-            raise ChartDataError(f"The column {frame.names[role]!r} is empty in every row, so there is nothing to plot.")
+            blank_roles.append(role)
+    if blank_roles:
+        # ONE bad measure must not take the good ones with it (verifier,
+        # 2026-09-16): y=[Count, Revenue, PersonMailingLatitude] over the
+        # incident's rows returned no chart at all and the message about the
+        # latitude column, losing two series that had real numbers. The
+        # all-blank column is dropped with a note; only a chart whose every
+        # measure is blank has nothing left to draw.
+        if len(blank_roles) == len(all_y):
+            raise ChartDataError(
+                f"The column {frame.names[blank_roles[0]]!r} is empty in every row, so there is nothing to plot."
+                if len(blank_roles) == 1 else
+                "The columns " + ", ".join(repr(frame.names[r]) for r in blank_roles)
+                + " are empty in every row, so there is nothing to plot."
+            )
+        for role in blank_roles:
+            notes.append(f"the column {frame.names[role]} is empty in every row and was left out")
+        all_y = [r for r in all_y if r not in blank_roles]
+        y_roles = [r for r in y_roles if r in all_y]
+        y2_roles = [r for r in y2_roles if r in all_y]
     if t == "heatmap" and not b.group_by:
         raise ChartDataError("A heatmap needs a column for its rows (group_by).")
     if t == "sunburst" and not b.group_by:

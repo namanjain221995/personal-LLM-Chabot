@@ -25,7 +25,7 @@ watched by its counters.
 from __future__ import annotations
 
 import re
-from typing import Pattern
+from typing import Pattern, Tuple
 
 #: THE CARVE-OUT (2026-09-16). "Do not say you cannot…" with no exception is
 #: what turned "plot this on a map" into a Word file and a PDF: the model had
@@ -151,10 +151,31 @@ _MAX_DENIAL_HITS = 20
 _SENTENCE_END = ".!?\n।"
 
 
-def _sentence_around(text: str, start: int, end: int) -> str:
+def _sentence_bounds(text: str, start: int, end: int) -> Tuple[int, int]:
     left = max((text.rfind(c, 0, start) for c in _SENTENCE_END), default=-1)
     right = min((p for p in (text.find(c, end) for c in _SENTENCE_END) if p != -1), default=len(text))
-    return text[left + 1: right]
+    return left + 1, right
+
+
+def _sentence_around(text: str, start: int, end: int) -> str:
+    left, right = _sentence_bounds(text, start, end)
+    return text[left: right]
+
+
+#: How far LEFT of the denial match the visual may be named and still be what
+#: the denial is ABOUT. "I can't put these on a map" puts the visual inside
+#: the match's own span; "I cannot create a PDF file of the map" puts it to
+#: the RIGHT, where it is the subject of a real file denial.
+_NEAR_CHARS = 25
+
+#: The reason a whole sentence may be read as an honest visual refusal even
+#: when the visual is named further away: it says the platform has no such
+#: chart type, or that the thing cannot be drawn. "I can't export the map as
+#: a PDF because no geographic chart type exists here" is true; "I cannot
+#: create a PDF file of the map" is the denial the backstop exists for.
+_REASON: Pattern[str] = re.compile(
+    r"\bno\s+(?:\w+\s+){0,2}chart\s+type\b|\bcan(?:'|\u2019)?(?:not|t)\s+be\s+drawn\b", re.I,
+)
 
 
 def _honest_visual_refusal(text: str, start: int, end: int) -> bool:
@@ -162,11 +183,27 @@ def _honest_visual_refusal(text: str, start: int, end: int) -> bool:
     chart type for? "I can't put these on a map, so I can't give you a PDF of
     one either" is the truth, not the denial the backstop hunts for, and
     answering it with a document is the 2026-09-16 incident (artifacts/
-    visuals.py owns the list)."""
+    visuals.py owns the list).
+
+    NARROWED 2026-09-16 (verifier). Scanning the WHOLE sentence around the
+    match silenced real file denials that merely mention a map: measured on
+    this tree, denial_in("I cannot create a PDF file of the map.") was False,
+    as were "I cannot attach the excel sheet, but here is the map of the
+    data." and "I can't generate a Word document with the map for you." —
+    the backstop that makes the file the person asked for was switched off
+    for all three. The carve-out now needs the visual to be part of the
+    denial itself (inside the match, or just left of it), or the sentence to
+    carry the platform-limit reason.
+    """
     try:
         from ..artifacts import visuals as _visuals
 
-        return _visuals.named_unsupported(_sentence_around(text, start, end)) is not None
+        left, right = _sentence_bounds(text, start, end)
+        span = text[max(left, start - _NEAR_CHARS): min(right, end)]
+        if _visuals.named_unsupported(span) is not None:
+            return True
+        sentence = text[left:right]
+        return bool(_REASON.search(sentence)) and _visuals.named_unsupported(sentence) is not None
     except Exception:  # noqa: BLE001 — without the list every denial counts, as before
         return False
 

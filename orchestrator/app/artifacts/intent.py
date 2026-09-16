@@ -1108,9 +1108,25 @@ def decide(
     #     creation rules — the conversation usually already holds the file
     #     the earlier chart request made — and only when the words name no
     #     OTHER deliverable: "put the map in a PDF report" still makes the
-    #     report, whose chart is refused where charts are refused.
+    #     report, whose chart is refused where charts are refused, and
+    #     "if a map is not possible, draw a pie chart of the states" draws
+    #     the pie chart. That second guard is `names_a_drawable_type`: until
+    #     2026-09-16 the check read FILE formats only (F.kind_for), so a
+    #     message naming a map AND a chart this platform CAN draw was
+    #     refused outright and nothing was drawn (verifier).
     _visual = VIS.asked_for(low)
-    if _visual is not None and not explicit and F.kind_for(low, [])[1] == "default":
+    if _visual is None and VIS.named_unsupported(low) is not None:
+        # THE ASK VERB IS NORMALISED AWAY (verifier gap, 2026-09-16).
+        # `low` is the lexicon's normalisation, where "dikhao"/"दिखाओ"
+        # becomes the token `_read_`: "isko map pe dikhao" and
+        # "इसे नक्शे पर दिखाओ" kept the map but lost the verb, so both fell
+        # through to no-request — no file, and no honest sentence either.
+        # The person's own words still carry the verb, and this only runs
+        # when the NORMALISED text already names the visual, so a clause the
+        # normalisation blanked ("I don't want a map") cannot come back.
+        _visual = VIS.asked_for(raw.lower())
+    if (_visual is not None and not explicit and F.kind_for(low, [])[1] == "default"
+            and not VIS.names_a_drawable_type(low)):
         return made("none", rule=f"unsupported-visual:{_visual.token}", instruction="",
                     unsupported_visual=_visual.token)
 

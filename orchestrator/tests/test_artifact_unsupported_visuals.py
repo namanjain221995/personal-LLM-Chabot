@@ -73,13 +73,26 @@ def test_unsupported_is_exactly_named_minus_chart_types():
 
 
 def test_a_name_that_becomes_a_chart_type_stops_being_a_refusal(monkeypatch):
-    """Track 4's list is the source of truth: the day `treemap` lands in
-    CHART_TYPES, "show a treemap of spend" is a chart request again, with no
-    edit here."""
-    assert V.asked_for("show a treemap of spend").token == "treemap"
-    monkeypatch.setattr(CS, "CHART_TYPES", CS.CHART_TYPES + ("treemap",))
-    assert V.asked_for("show a treemap of spend") is None
-    assert "treemap" not in {v.token for v in V.unsupported()}
+    """Track 4's list is the source of truth: the day a name lands in
+    CHART_TYPES it is a chart request again, with no edit here."""
+    assert V.asked_for("make a word cloud of the feedback").token == "wordcloud"
+    monkeypatch.setattr(CS, "CHART_TYPES", CS.CHART_TYPES + ("wordcloud",))
+    assert V.asked_for("make a word cloud of the feedback") is None
+    assert "wordcloud" not in {v.token for v in V.unsupported()}
+
+
+@pytest.mark.parametrize("text", [
+    # Track 4 landed these four while this file was being written, and the
+    # derived list picked them up on the same import: they are charts now,
+    # so refusing them would be the platform lying the other way round.
+    "show a treemap of spend",
+    "plot a violin plot of salary by team",
+    "draw a sunburst of the product tree",
+    "give me a candlestick chart of the price",
+])
+def test_the_types_that_have_since_landed_are_no_longer_refused(text):
+    assert V.asked_for(text) is None
+    assert I.decide(text).unsupported_visual == ""
 
 
 def test_every_nearest_view_offered_is_itself_drawable():
@@ -94,9 +107,9 @@ def test_every_nearest_view_offered_is_itself_drawable():
     ("इसे नक्शे पर दिखाओ", "map"),
     ("make a choropleth of records by state", "choropleth"),
     ("draw a sankey of the funnel stages", "sankey"),
-    ("show a treemap of spend", "treemap"),
     ("make a word cloud of the feedback", "wordcloud"),
-    ("plot a violin plot of salary by team", "violin"),
+    ("draw a network diagram of how the services talk", "network"),
+    ("show me a venn diagram of the two lists", "venn"),
 ])
 def test_named_visuals_this_platform_cannot_draw(text, token):
     visual = V.asked_for(text)
@@ -121,8 +134,8 @@ def test_words_that_are_not_a_request_for_an_undrawable_visual(text):
 
 
 def test_a_name_without_an_ask_is_a_remark_not_a_request():
-    assert V.named_unsupported("the treemap in that paper is unreadable") is not None
-    assert V.asked_for("the treemap in that paper is unreadable") is None
+    assert V.named_unsupported("the word cloud in that paper is unreadable") is not None
+    assert V.asked_for("the word cloud in that paper is unreadable") is None
 
 
 # ------------------------------------------- (b) no document job is opened --

@@ -5607,7 +5607,27 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     **_as3_engine_kw,
                 )
                 # --- AS3 intent-capability END ---
-            elif artifact_intent is not None and artifact_intent.unsupported_visual:
+            elif (
+                artifact_intent is not None
+                and artifact_intent.unsupported_visual
+                # ...AND NOTHING IS ATTACHED (verifier, 2026-09-16). This
+                # branch sits above the document and image routes, and the
+                # gate runs on every turn that is not a video upload, so
+                # "what does the map on page 2 show?" with a PDF attached and
+                # "can you show me what the map says?" with a photo attached
+                # were answered "I can't draw a map" and the file was never
+                # read — the vision/document engine was not called at all
+                # (measured on this tree before this line). A map in a file
+                # is something to READ, not something to draw; the drawing
+                # refusal only applies when the turn has no file to look at.
+                # An attached turn that really does ask for a map is covered
+                # by capability.CAPABILITY_LINE's limits clause, which those
+                # engines' prompts carry.
+                # `video_followup` joins them: a question about a video the
+                # conversation already holds ("what does the map at 2:10
+                # show?") is a question about that video.
+                and not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup)
+            ):
                 # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
                 # map", twice: there is no geographic type in
                 # chart_spec.CHART_TYPES, so no job can end in the picture

@@ -43,6 +43,13 @@ class Visual:
     why: str
     nearest: str
     pattern: str
+    #: May the nearest chart be offered when the conversation holds NO table?
+    #: For the geographic family yes — "on a map" is always asked of values
+    #: that exist, so "the same values by category as a bar chart" fits. For a
+    #: flow diagram it does not: "draw a flow diagram of the onboarding
+    #: process" has no values at all, and offering a bar chart of them was
+    #: an offer of nothing (verifier, 2026-09-16).
+    offer_without_table: bool = True
 
     @property
     def supported(self) -> bool:
@@ -65,6 +72,10 @@ _MAP_PATTERN = (
     rf"|\b(?:an?|the)\s+{_NOT_A_MAP}maps?\b"
     rf"|{_NOT_A_MAP}\bmaps?\s+(?:chart|view|visuali[sz]ation|of\b)"
     rf"|\b(?:geo|geographic(?:al)?|geo[- ]?spatial|world|country|state[- ]wise|india|indian|us|usa|regional|location)\s+maps?\b"
+    # Latin-script Hinglish: "isko map pe dikhao", "ise map par dikhao". The
+    # postposition is what makes it "on a map"; "map parameters" keeps its
+    # word boundary and is not touched (verifier gap, 2026-09-16).
+    rf"|{_NOT_A_MAP}\bmaps?\s+(?:pe|par|pr)\b"
     rf"|नक्शा|नक्शे|मैप|નકશો|નકશા|મેપ"
 )
 
@@ -78,7 +89,7 @@ _NAMED: Tuple[Visual, ...] = (
            r"\bgeo(?:graphic(?:al)?|[- ]?spatial)?\s+(?:charts?|plots?|graphs?|visuali[sz]ations?)\b|\bgeo\s?charts?\b"),
     Visual("map", "a map", _GEO_WHY, "bar", _MAP_PATTERN),
     Visual("sankey", "a Sankey diagram", "this platform draws no flow diagrams, so there is no type that shows a quantity moving from one stage to the next", "bar",
-           r"\bsankeys?\b|\bflow\s+diagrams?\b"),
+           r"\bsankeys?\b|\bflow\s+diagrams?\b", offer_without_table=False),
     Visual("treemap", "a treemap", "this platform has no nested-area chart type", "pie", r"\btree\s?maps?\b"),
     Visual("sunburst", "a sunburst", "this platform has no nested-area chart type", "pie", r"\bsun\s?bursts?\b"),
     Visual("wordcloud", "a word cloud", "this platform has no word-cloud type", "bar", r"\bword\s?clouds?\b|\btag\s?clouds?\b"),
@@ -96,6 +107,9 @@ _ASK_RE = re.compile(
     r"\b(?:plot|plotted|plotting|chart|charted|graph|graphed|draw|drawn|show|shows|showing|display|render|visuali[sz]e|"
     r"visuali[sz]ing|visuali[sz]ation|map\s+(?:it|this|these|them)|mark|overlay|see|view|make|create|generate|build|give|"
     r"put|need|want|can\s+you|could\s+you)\b"
+    # The same asks in Latin-script Hinglish, so "isko map pe dikhao" is read
+    # as a request and answered, not dropped (verifier gap, 2026-09-16).
+    r"|\b(?:dikhao|dikha\s+do|dikhaiye|dikhaao|banao|bana\s+do|batao)\b"
     r"|दिखा|बना|બતાવ|બનાવ",
     re.I,
 )
@@ -113,6 +127,33 @@ _TYPE_WORDS: Dict[str, str] = {
 def type_words(token: str) -> str:
     """"bar" → "bar chart". Used in the refusal and in the capability line."""
     return _TYPE_WORDS.get(token, f"{token.replace('_', ' ')} chart")
+
+
+#: A chart type named only to RULE IT OUT is not a request for it: "draw
+#: this on a map, not a bar chart" asks for the map, and drawing the bar
+#: chart would draw the very thing the person rejected.
+_NEGATED_BEFORE = re.compile(r"\b(?:not|no|instead\s+of|rather\s+than|without|besides|other\s+than)\s+(?:an?\s+|the\s+)?$", re.I)
+
+
+def names_a_drawable_type(text: str) -> bool:
+    """Does this text name a chart type this platform CAN draw?
+
+    THE MESSAGE THAT NAMES BOTH (verifier, 2026-09-16). "if a map is not
+    possible, draw a pie chart of the states" and "plot this on a map or a
+    bar chart if you can't" were answered with the map refusal and no chart:
+    the gate's no-other-deliverable guard only looked at FILE formats
+    (formats.kind_for), so a named CHART type did not count as the other
+    deliverable. The words come from the same single source as everything
+    else here — `type_words` over `chart_spec.CHART_TYPES`.
+    """
+    t = (text or "")[:4000]
+    if not t:
+        return False
+    for token in CS.CHART_TYPES:
+        for m in re.finditer(rf"\b{re.escape(type_words(token))}\b", t, re.I):
+            if not _NEGATED_BEFORE.search(t[max(0, m.start() - 24): m.start()]):
+                return True
+    return False
 
 
 def supported() -> Tuple[str, ...]:
@@ -170,11 +211,32 @@ def refusal_sentence(visual: Visual, *, category: str = "", measure: str = "") -
     """
     said = f"I can't draw {visual.phrase} — {visual.why}."
     nearest = visual.nearest
+    have_table = bool(category)
     if not nearest or nearest not in CS.CHART_TYPES:
-        return said + " Nothing this platform draws is close to it, so the numbers are best left as the table above."
+        # "so the numbers are best left as the table above" asserted a table
+        # that is not there whenever the question arrived without one
+        # ("can you show me a network diagram of how these services talk to
+        # each other" — no table in that conversation; verifier 2026-09-16).
+        # Only the branch that really found one says "above".
+        if have_table:
+            return said + " Nothing this platform draws is close to it, so the numbers are best left as the table above."
+        return said + " Nothing this platform draws is close to it, so I can describe it in words instead."
+    if not have_table and not visual.offer_without_table:
+        # A process has no values yet: ask for them rather than offering a
+        # bar chart of numbers nobody has given.
+        return f"{said} If you give me the values behind it, I can draw them as a {type_words(nearest)}."
     what = f"{measure} by {category}" if measure and category else (f"records by {category}" if category else "the same values by category")
     view = f"{what} as a {type_words(nearest)}"
-    return f"{said} The closest view of the same data is {view}. Ask for \"{view}\" and I will draw it."
+    # THE QUOTED PHRASE IS ONE THE GATE ANSWERS (verifier, 2026-09-16). The
+    # offer used to read: Ask for "Count (Approx) by State as a bar chart" —
+    # and `intent.decide` on exactly that string returned
+    # action=none rule=no-request, because it has no verb. A person who
+    # copied the sentence got nothing, which is the same "it does not do what
+    # it said" the incident was about. `ask_for` is verb-led, and
+    # tests/test_vt3_adversarial.py feeds the quoted substring back through
+    # decide() so the sentence and the gate cannot drift apart again.
+    ask_for = f"draw {view}"
+    return f"{said} The closest view of the same data is {view}. Ask for \"{ask_for}\" and I will draw it."
 
 
 def fallback_sentence() -> str:
@@ -260,6 +322,6 @@ def limits_sentence() -> str:
 
 
 __all__ = [
-    "Visual", "supported", "unsupported", "by_token", "named_unsupported", "asked_for",
+    "Visual", "supported", "unsupported", "by_token", "named_unsupported", "asked_for", "names_a_drawable_type",
     "refusal_sentence", "refusal_for", "nearest_columns", "limits_sentence", "type_words",
 ]
