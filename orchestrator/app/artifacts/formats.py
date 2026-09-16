@@ -21,6 +21,16 @@ a guess in natural language: `decide()` returns a `FormatDecision` with
 the rule that fired, which is stored in the job's metadata so a person can
 see why a deck came back as a .pptx.
 
+WHAT IS NOT MADE IS SAID (2026-09-16). The drop list could only ever see
+formats the alias table already recognised, so "an xlsx, a csv, a Word file
+and a LaTeX file" made three files and never mentioned LaTeX, and "as JSON"
+and "as an .epub" came back as a Word file and a PDF with nothing said.
+`unmakeable_formats` reads the format-shaped words this platform does NOT
+make and `decide_base` warns on them — and a KIND the person named that a
+format word overruled ("make a presentation as an xlsx" → a spreadsheet)
+is warned about too: substituting the kind is a bigger change than dropping
+a format, and it was the one made in silence.
+
 WHAT COUNTS AS NAMING A FORMAT. The alias table below reads the words
 people actually type — `spread sheet`, `xlxs`, `exel`, `powerpint`, `ppt`,
 a bare `word` inside a list of formats, `comma-separated` — because the
@@ -80,7 +90,15 @@ _ALIAS: Dict[str, str] = {
     # postposition rule also rewrites to "word _in_" — out of this.
     "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?|"
             r"word _in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word (?:_convert_|_give_))",
-    "pptx": r"(?:pptx|\.pptx|powerpoint|power ?point|powerpint|ppts?|slide ?decks?|slides)",
+    # `deck` names the pptx only where a FORMAT belongs — "a deck version",
+    # "as a deck", "in deck format". Measured 2026-09-16: "create a pdf on
+    # the security review" → "and a deck version" found no explicit format,
+    # so the conversion never ran, while intent.py's own `_FORMAT_WORD` and
+    # `_ARTIFACT_NOUNS` both held the word. A bare `deck` stays a KIND word
+    # (`_KIND_RULES`): in "give me a Word version of the deck" and "I need a
+    # deck for Monday" it is the source and the thing itself, not a target.
+    "pptx": r"(?:pptx|\.pptx|powerpoint|power ?point|powerpint|ppts?|slide ?decks?|slides"
+            r"|(?:pitch ?)?decks?\s+(?:version|copy|format|file)|(?<=as a )deck|(?<=as an )deck|(?<=into a )deck|(?<=to a )deck|(?<=in )deck(?= format))",
     "xlsx": r"(?:xlsx|\.xlsx|xlxs|xls|exel|excell?|spread ?sheets?|work ?books?|worksheets?|(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )sheets?(?!\s*\d))",
     "csv": r"(?:csvs?|\.csv|comma[- ]separated(?: values?)?|data ?sets?|data files?)",
 }
@@ -102,6 +120,98 @@ _WORD_IN_LIST = re.compile(
     rf"\b{_OTHER_FORMAT}{_LIST_SEP}(word)\b|\b(word){_LIST_SEP}{_OTHER_FORMAT}\b",
     re.I,
 )
+
+#: FORMATS THIS PLATFORM DOES NOT MAKE, by the names people type. The table
+#: exists so a request for one can be REFUSED by name. Measured 2026-09-16:
+#: "as an xlsx, a csv, a Word file and a LaTeX file" made three files and
+#: never mentioned LaTeX, "Export this conversation as JSON" and "the
+#: proposal as an .epub" made a Word file and a PDF with no clause about the
+#: format that was asked for, and "a Google Slides file" made a SECOND deck
+#: because `Slides` matched the pptx alias. Two groups: a name that can only
+#: be a file format is read anywhere; a name that is an ordinary word too
+#: ("numbers", "pages", "text") is read only where a format belongs.
+_UNMAKEABLE_ANYWHERE: Tuple[Tuple[str, str], ...] = (
+    # `doc` normalises to `docx` before this runs (lexicon.normalize), so
+    # "an editable Google Doc" arrives as "google docx".
+    ("Google Docs", r"google\s+docs?x?(?:\s+(?:file|document))?|google\s+documents?"),
+    ("Google Sheets", r"google\s+sheets?"),
+    ("Google Slides", r"google\s+slides?|g[- ]?slides?"),
+    ("Keynote", r"keynote"),
+    ("Figma", r"figma"),
+    ("LaTeX", r"latex|\.tex\b"),
+    ("EPUB", r"epub|\.epub\b"),
+    ("RTF", r"rtf|\.rtf\b"),
+    ("ODT", r"odt|\.odt\b|open ?document text"),
+    ("InDesign", r"indesign|\.indd\b"),
+    ("Photoshop", r"photoshop|\.psd\b"),
+    # `numbers` and `pages` are ordinary words ("as numbers", "in two
+    # pages"), so only their file forms are read at all.
+    ("Numbers", r"\.numbers\b|numbers\s+(?:file|document|spreadsheet)|apple\s+numbers"),
+    ("Pages", r"\.pages\b|pages\s+(?:file|document)|apple\s+pages"),
+)
+#: The same, but only where the sentence puts a format: after "as/in/into/to"
+#: (with or without an article), or in front of "file/document/version/
+#: format", or written as an extension.
+_UNMAKEABLE_IN_PLACE: Tuple[Tuple[str, str], ...] = (
+    ("JSON", r"json"),
+    ("HTML", r"html|htm"),
+    ("XML", r"xml"),
+    ("Markdown", r"markdown|md"),
+    # `text` on its own is left out: "summarise it as text" asks for a chat
+    # answer, not a file this platform refuses to make.
+    ("plain text", r"txt|plain text"),
+    ("YAML", r"yaml|yml"),
+)
+_UNMAKEABLE_PLACE = (
+    r"(?:\b(?:as|in|into|to)\s+(?:an?\s+|the\s+)?(?:editable\s+|plain\s+|simple\s+|raw\s+)?(?:%(p)s)\b"
+    r"|\b(?:%(p)s)\s+(?:files?|documents?|versions?|format|formats)\b"
+    r"|(?<![\w.])\.(?:%(p)s)\b)"
+)
+_UNMAKEABLE_RES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = tuple(
+    [(name, re.compile(rf"\b(?:{pat})\b", re.I)) for name, pat in _UNMAKEABLE_ANYWHERE]
+    + [(name, re.compile(_UNMAKEABLE_PLACE % {"p": pat}, re.I)) for name, pat in _UNMAKEABLE_IN_PLACE]
+)
+#: The chart-image formats, named by a person. They are real formats (types
+#: .FORMATS), but only for the kinds that carry them, so they are read here
+#: for the CONVERSION refusal and nowhere else: the deliverable rules own
+#: `_chart_image_formats` below.
+_IMAGE_NAME_RE = re.compile(r"\b(?:pngs?|\.png|svgs?|\.svg)\b", re.I)
+
+
+def unmakeable_formats(text: str) -> List[Tuple[str, int, int]]:
+    """(display name, start, end) for every format-shaped word the request
+    names that this platform does not make. First mention wins; the spans
+    let `_mentions` drop an alias hit that lives inside one ("Slides" inside
+    "Google Slides")."""
+    out: List[Tuple[str, int, int]] = []
+    seen = set()
+    for name, rx in _UNMAKEABLE_RES:
+        m = rx.search(text or "")
+        if m and name not in seen:
+            seen.add(name)
+            out.append((name, m.start(), m.end()))
+    out.sort(key=lambda t: t[1])
+    return out
+
+
+def unmakeable_names(text: str) -> List[str]:
+    """Just the names, in the order they were said."""
+    return [n for n, _s, _e in unmakeable_formats(text)]
+
+
+def _without_unmakeable(text: str) -> str:
+    """`text` with every unmakeable format name blanked, for the rules that
+    read what KIND of artifact the words describe."""
+    out = text or ""
+    for _name, start, end in reversed(unmakeable_formats(out)):
+        out = out[:start] + " " * (end - start) + out[end:]
+    return out
+
+
+def named_image_formats(text: str) -> List[str]:
+    """The chart-image formats the words name ("convert it to SVG")."""
+    return list(dict.fromkeys(m.group(0).lower().lstrip(".").rstrip("s") for m in _IMAGE_NAME_RE.finditer(text or "")))
+
 
 _ANY_ALIAS = "|".join(_ALIAS.values()) + "|cvs"
 #: A format named as the SOURCE of a transformation is not a deliverable:
@@ -203,7 +313,10 @@ def _mentions(text: str) -> List[Tuple[int, str]]:
     with source mentions left out. Positions are what `explicit_formats`
     orders by."""
     text = text or ""
-    spans = _source_spans(text)
+    # A format name INSIDE the name of a format we do not make is not a
+    # deliverable: "a Google Slides file" matched the pptx alias on `Slides`
+    # and produced a second deck (measured 2026-09-16, A7).
+    spans = _source_spans(text) + [(s, e) for _n, s, e in unmakeable_formats(text)]
     found: List[Tuple[int, str]] = []
     for fmt, pattern in _ALIAS.items():
         for m in re.finditer(rf"\b{pattern}\b", text, re.I):
@@ -267,6 +380,52 @@ def kind_for(text: str, explicit: Sequence[str]) -> Tuple[str, str]:
         if re.search(pattern, text or "", re.I):
             return kind, rule
     return "document", "default"
+
+
+#: The kind word for a sentence, and the words people use for each kind.
+_KIND_WORDS = {"document": "document", "presentation": "presentation", "workbook": "workbook"}
+_A_KIND = {"document": "a document", "presentation": "a presentation", "workbook": "an Excel workbook"}
+
+
+#: The words that name a KIND of artifact and are NOT also the name of a
+#: format. "A PDF report plus an Excel with the data" names a document by
+#: `report` and no workbook at all — the format names have to stay out of
+#: this table or every mixed list would look like a substituted kind.
+_KIND_ONLY_RULES: Tuple[Tuple[str, str, str], ...] = (
+    ("presentation", "deck words", r"\b(presentation|pitch ?deck|slide ?deck)\b"),
+    ("workbook", "spreadsheet words", r"\b(spread ?sheet|work ?book|tracker|budget|calculator|financial model|data ?set|sample data|sample records)\b"),
+    ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|proposal|policy|letter|handout|whitepaper|white paper|guide|manual)\b"),
+)
+
+
+def _kind_from_words(text: str) -> Tuple[str, str]:
+    """The kind the request's WORDS name, read without any format name —
+    the reading `kind_for` skips whenever a format was said. ("", "") when
+    the words name no kind of their own."""
+    for kind, rule, pattern in _KIND_ONLY_RULES:
+        if re.search(pattern, text or "", re.I):
+            return kind, rule
+    return "", ""
+
+
+def _and_list(words: Sequence[str]) -> str:
+    items = [str(w) for w in words if str(w).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _a_format(fmt: str) -> str:
+    name = _FORMAT_NAMES.get(fmt, fmt.upper())
+    if fmt in ("docx", "xlsx", "pptx"):
+        name += " file"
+    return f"an {name}" if name[0] in "AEIOUX" else f"a {name}"
+
+
+def _a_kind(kind: str) -> str:
+    return _A_KIND.get(kind, f"a {kind}")
 
 
 def template_for(kind: str, text: str) -> str:
@@ -489,10 +648,32 @@ def decide_base(text: str, *, explicit_only: Optional[Sequence[str]] = None) -> 
     norm = lexicon.normalize(text)
     explicit = list(dict.fromkeys(explicit_only)) if explicit_only is not None else explicit_formats(text)
     explicit, or_note = _apply_or(explicit, text)
-    kind, rule = kind_for(norm, explicit)
+    # The name of a format we do not make says nothing about the KIND
+    # either: "convert it to a Google Slides file" was read as deck words
+    # and produced a second .pptx (measured 2026-09-16, A7).
+    kind, rule = kind_for(_without_unmakeable(norm), explicit)
     allowed = T.FORMATS_FOR_KIND[kind]
     warnings: List[str] = []
     note = ""
+    # A format the person NAMED that this platform does not make is said
+    # plainly, the way a format we DO make but cannot carry already is
+    # ("xlsx cannot be produced for a presentation"). Until 2026-09-16 the
+    # drop list could only see formats `explicit_formats` recognised, so
+    # LaTeX, JSON and EPUB vanished from the request without a word.
+    unmakeable = unmakeable_names(text)
+    if unmakeable:
+        warnings.append(f"I don't make {_and_list(unmakeable)} files")
+    # A KIND the person named, overruled by a format word. `kind_for` lets
+    # the first explicit format pick the kind, so "make a presentation as an
+    # xlsx" returned a workbook with no warning at all — a bigger change
+    # than any dropped format, made silently (measured 2026-09-16, G6).
+    if explicit and explicit_only is None:
+        said_kind, _said_rule = _kind_from_words(text)
+        if said_kind and said_kind != kind:
+            warnings.append(
+                f"a {_KIND_WORDS.get(said_kind, said_kind)} cannot be {_a_format(explicit[0])}; "
+                f"I made {_a_kind(kind)} of the same content instead"
+            )
 
     if explicit:
         formats = [f for f in explicit if f in allowed]

@@ -939,4 +939,75 @@ def describe(item: ChecklistItem) -> str:
     return p.replace("_", " ")
 
 
-__all__ = ["CATEGORIES", "MAX_ITEMS", "ChecklistItem", "Checklist", "COLOR_NAMES", "FONTS", "extract_rules", "merge", "build", "describe"]
+# --------------------------------------------------- what cannot be done --
+
+#: WHAT THIS PLATFORM CANNOT DO, in the words people ask for it.
+#:
+#: There is a vocabulary for what it CAN do (engines/capability.py's
+#: CAPABILITY_LINE) and, until 2026-09-16, none at all for what it cannot:
+#: "Make a fillable PDF form", "Build an interactive dashboard I can
+#: filter", "with tracked changes turned on", "with our company letterhead
+#: image", "Make a PDF and print two copies" and "Make an editable Figma
+#: file of this layout" each ended on a plain "Created **X** as PDF." with
+#: the impossible half of the request never mentioned (measured 2026-09-16,
+#: I3-I9; I5 asked for Figma and got a Word file with no comment).
+#:
+#: Each entry is (the words, the clause the person reads). The clause names
+#: the part that cannot be done and, where there is one, what was done
+#: instead — never an apology on its own.
+_CANNOT: Tuple[Tuple[str, str], ...] = (
+    (r"\bfillable\b|\bfill[- ]in(?:able)?\s+form\b|\bform\s+fields?\b|\bacro ?form\b",
+     "the form fields aren't fillable; the PDFs I make are flat"),
+    (r"\binteractive\s+(?:dashboard|report|chart|excel|sheet|workbook|pdf|deck|version|file)\b"
+     r"|\b(?:i|we|you)\s+can\s+filter\b|\bfilterable\b|\bslicers?\b|\bdrill[- ]downs?\b|\bclickable\s+(?:dashboard|filter|chart)\b",
+     "it isn't interactive — the file holds the numbers as a static sheet"),
+    (r"\btracked?\s+changes\b|\bredlines?\b|\bsuggesting\s+mode\b|\bcomment\s+bubbles?\b",
+     "tracked changes can't be turned on in the files I make"),
+    (r"\b(?:add|insert|put|place|include|use|with|using)\s+(?:(?:our|the|company|corporate|my|a|an|some|client'?s?)\s+){0,2}"
+     r"(?:letterhead|logos?|watermarks?|brand\s+images?|images?|photos?|pictures?|screenshots?|icons?)\b",
+     "I can't place an image, logo or letterhead in a file"),
+    (r"\bprint\s+(?:\w+\s+){0,2}?(?:cop(?:y|ies)|pages?|it|this|them|out)\b|\bsend\s+(?:it|this)\s+to\s+the\s+printer\b",
+     "I can't print — you can download the PDF and print it"),
+    (r"\b(?:e-?mail|send)\s+(?:(?:it|this|that|them|the|our|my|a|an)\s+)?(?:\w+\s+){0,2}?to\b"
+     r"|\bpost\s+(?:it|this|the\s+\w+)\s+to\b|\bslack\b|\bteams\s+channel\b",
+     "I can't email or post files — you download the file from its card here"),
+    (r"\bpassword[- ]protect\w*\b|\bencrypt\w*\b|\bdigitally\s+sign\w*\b|\bsign\s+it\s+digitally\b|\be-?sign\w*\b",
+     "I can't password-protect, encrypt or sign a file"),
+    (r"\b(?:embed|connect|link|pull\s+in)\w*\s+(?:an?\s+|the\s+)?(?:live|real[- ]time)\b"
+     r"|\blive\s+(?:dashboard|feed|chart|data)\s+(?:in|into|on|to)\b|\bauto[- ]updat\w+\b|\brefreshes?\s+automatically\b",
+     "I can't embed anything live — the file holds a snapshot of the numbers"),
+    (r"\b(?:add|insert|embed|include|put)\s+(?:an?\s+|the\s+|our\s+)?(?:videos?|gifs?|animations?|audio|sound|clips?|recordings?)\b",
+     "a file I make can't hold video or audio — a link to it can go in instead"),
+    (r"\b(?:add|with|include|write|put)\s+(?:\w+\s+){0,2}?macros?\b|\bvba\b",
+     "I can't put macros in a workbook"),
+)
+_CANNOT_RES: Tuple[Tuple["re.Pattern[str]", str], ...] = tuple((re.compile(rx, re.I), clause) for rx, clause in _CANNOT)
+#: A negated or hypothetical mention is not a request ("no need to
+#: password-protect it", "can a PDF hold video?").
+_NOT_ASKED_RE = re.compile(r"\b(?:don'?t|do not|no need to|without|never|not)\s+(?:\w+\s+){0,3}$", re.I)
+#: ...nor is a SUBJECT in front of the verb: "a report on how WE SEND data
+#: to vendors" describes the topic of the file, not what to do with it.
+_DESCRIBED_RE = re.compile(r"\b(?:we|they|you|he|she|it|who|that|which|users?|clients?|customers?|teams?|vendors?|staff)\s+$", re.I)
+
+
+def unsupported_asks(text: str) -> List[str]:
+    """The clauses for the parts of this request the platform cannot do, in
+    the order they were asked for. Empty when everything asked for is
+    possible. Read by engines/artifact.py, which puts them on the completion
+    sentence beside the other warnings — the person is told in the same
+    breath as "Created …", not left to discover it in the file."""
+    low = (text or "")[:4000]
+    out: List[str] = []
+    for rx, clause in _CANNOT_RES:
+        m = rx.search(low)
+        if not m or clause in out:
+            continue
+        before = low[max(0, m.start() - 40): m.start()]
+        if _NOT_ASKED_RE.search(before) or _DESCRIBED_RE.search(before):
+            continue
+        out.append(clause)
+    return out
+
+
+__all__ = ["CATEGORIES", "MAX_ITEMS", "ChecklistItem", "Checklist", "COLOR_NAMES", "FONTS", "extract_rules", "merge", "build",
+           "describe", "unsupported_asks"]

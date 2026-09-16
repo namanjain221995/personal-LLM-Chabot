@@ -6022,6 +6022,21 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             answer = f"{answer}{_as3_tail}"
                     if not _as3_rerouted:
                         _as3_metrics.inc("artifact_denial_seen_total", "answers that denied making a file (not rerouted)", engine=_as3_route)
+                elif _as3_capability.promise_in(answer):
+                    # The other half of the same guard: an answer that claims
+                    # a DELIVERY this platform does not perform — "I've
+                    # emailed the report to the team", "I have posted the deck
+                    # to Slack", "the Excel file is password-protected now".
+                    # The gate returns action='none' for these turns (there is
+                    # no file to make), so nothing else in the turn could
+                    # correct them (measured 2026-09-16, I1/I2/I6).
+                    from . import metrics as _as3_metrics
+
+                    _as3_metrics.inc("artifact_false_promise_total", "answers that claimed a delivery the platform cannot perform",
+                                     engine=_as3_route)
+                    _as3_tail = "\n\n" + _as3_capability.DELIVERY_LINE
+                    await emit("token", {"text": _as3_tail})
+                    answer = f"{answer}{_as3_tail}"
             # --- AS3 intent-capability END ---
             gen.answer = answer
             memory.add_exchange(scoped_session, text, answer)

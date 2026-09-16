@@ -42,13 +42,31 @@ def _limits_clause() -> str:
     except Exception:  # noqa: BLE001 — the file rules stand without it
         return ""
 
+#: What this platform does NOT do once the file exists.
+DELIVERY_LINE_TEXT = (
+    "It does NOT send email, post to Slack or any other chat tool, print, schedule, encrypt, password-protect or digitally "
+    "sign anything: the person downloads the file from its card. Never say you have emailed, sent, posted, shared, scheduled "
+    "or protected something — say plainly that you cannot, and offer the file instead."
+)
+#: The same fact, said to a person, when a model promised a delivery anyway.
+DELIVERY_LINE = (
+    "To be clear: I can't send email, post to a chat tool, print, schedule or password-protect a file — I can only make the "
+    "file, and you download it from its card here."
+)
 
 CAPABILITY_LINE = (
     "This platform can create downloadable Word (DOCX), PDF, Excel (XLSX), CSV and PowerPoint files and charts from this "
     "conversation or an uploaded file. Do not say you cannot create or attach files, and do not give python-docx, openpyxl, "
     "matplotlib or copy-paste instructions as a substitute. Mention files only when the person asks for one; then tell them "
     "to ask directly, for example \"make this a Word document\". Never claim a file is being prepared unless the system has "
-    "shown a file card."
+    "shown a file card. "
+    # The second half, added 2026-09-16. The first half only forbids a FALSE
+    # DENIAL of file creation, so "Email this report to the leadership team
+    # as a PDF", "Post the deck to our Slack channel" and "Password-protect
+    # the Excel file" reached the chat model with nothing said about
+    # delivery — and whatever it answered passed every check, including "I
+    # have emailed it" (measured 2026-09-16, I1/I2/I6).
+    + DELIVERY_LINE_TEXT
 ) + _limits_clause()
 
 #: The prompt suffix, with its separator — one string concatenation per prompt.
@@ -176,6 +194,58 @@ def denial_in(text: str) -> bool:
     return bool(_SUBSTITUTE_PROSE_RE.search(t[:1500]) or re.search(rf"\b{_FILE_NOUN_EN}\b|\bformat\b", lead, re.I))
 
 
+#: A DELIVERY the platform cannot perform, claimed as done. "I've emailed
+#: the report to the team", "I have posted the deck to Slack", "it is
+#: password-protected now". The claim must be in the FIRST person and about
+#: a delivery, so "you can email the PDF to your team" is untouched.
+#: `emailed`, `posted`, `printed`, `encrypted`, `signed` and
+#: `password-protected` can only be deliveries; `sent`, `shared`,
+#: `uploaded`, `delivered` and `messaged` are ordinary words about an
+#: ANSWER too ("I sent you the numbers above"), so those need a file or a
+#: delivery target nearby.
+_SELF_EVIDENT = r"(?:e-?mailed|mailed|posted|slacked|forwarded|printed|encrypted|password[- ]protected|digitally\s+signed|scheduled)"
+_AMBIGUOUS = r"(?:sent|shared|uploaded|delivered|messaged|signed|attached)"
+_SUBJECT = r"(?:i(?:'ve|\u2019ve| have)?|we(?:'ve|\u2019ve| have)?)"
+_ADVERB = r"(?:just|now|already|successfully|also)\s+"
+_PROMISE_SURE_RE: Pattern[str] = re.compile(
+    rf"\b{_SUBJECT}\s+(?:{_ADVERB})?{_SELF_EVIDENT}\b"
+    rf"|\b(?:it|this|that|the\s+\w+)\s+(?:has|have|is|are|was|were)\s+been\s+{_SELF_EVIDENT}\b"
+    rf"|\b(?:i(?:'ll|\u2019ll| will)|we(?:'ll|\u2019ll| will))\s+(?:email|post|print|encrypt|password[- ]protect|schedule)\s+(?:it|this|that|them|the|you)\b",
+    re.I,
+)
+_PROMISE_MAYBE_RE: Pattern[str] = re.compile(
+    rf"\b{_SUBJECT}\s+(?:{_ADVERB})?{_AMBIGUOUS}\b"
+    rf"|\b(?:it|this|that|the\s+\w+)\s+(?:has|have|is|are|was|were)\s+been\s+{_AMBIGUOUS}\b",
+    re.I,
+)
+#: A file or a delivery target near an ambiguous verb.
+_DELIVERY_OBJECT_RE: Pattern[str] = re.compile(
+    rf"{_FILE_NOUN_EN}"
+    r"|\b(?:report|deck|presentation|proposal|memo|brief|chart|dashboard|e-?mail|inbox|slack|teams|whatsapp|channel|printer|"
+    r"calendar|recipients?|password|encryption|signature|drive|folder)\b",
+    re.I,
+)
+
+
+def promise_in(text: str) -> bool:
+    """Does this answer claim a DELIVERY this platform never performs —
+    emailing, posting, sharing, scheduling, printing, encrypting or signing
+    a file? The sibling of `denial_in`: that one catches a false "I can't",
+    this one a false "I did". CAPABILITY_LINE tells the model what the
+    platform can MAKE and, until 2026-09-16, said nothing about delivery, so
+    a model that answered "I've emailed it" passed every check."""
+    t = (text or "")[:20000]
+    if not t:
+        return False
+    if _PROMISE_SURE_RE.search(t):
+        return True
+    for m in _PROMISE_MAYBE_RE.finditer(t):
+        window = t[max(0, m.start() - 80): m.end() + 120]
+        if _DELIVERY_OBJECT_RE.search(window):
+            return True
+    return False
+
+
 _OFFERS = {
     "en": "I can make this a file for you — just ask directly, for example \"make this a Word document\".",
     "hinglish": "Main isse file bana sakta hoon — seedha boliye, jaise \"isko Word document bana do\".",
@@ -190,4 +260,5 @@ def offer_line(language: str = "en") -> str:
     return _OFFERS.get(language or "en", _OFFERS["en"])
 
 
-__all__ = ["CAPABILITY_LINE", "CAPABILITY_SUFFIX", "capability_suffix", "denial_in", "offer_line"]
+__all__ = ["CAPABILITY_LINE", "CAPABILITY_SUFFIX", "DELIVERY_LINE", "DELIVERY_LINE_TEXT", "capability_suffix",
+           "denial_in", "promise_in", "offer_line"]

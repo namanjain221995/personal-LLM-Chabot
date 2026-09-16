@@ -73,6 +73,30 @@ event loop. Only `decide_with_hook` may consult the model, and only when
 the rules found no request, a file word is present and no negative shape
 fired.
 
+THE FOLLOW-UP ROUND (2026-09-16). Measured over 188 turns of 62 real
+conversations, 47 were wrong, and the shape of the error was always the
+same: the turn pointed at something and nothing here resolved it.
+
+  * "the same" had no rule at all. "Do the same for headcount", "same but
+    shorter", "do it again", "and the same again but as a line" and "now do
+    the same on a map" were answered as chat (`_SAME_AGAIN_RE`), while "one
+    more like that but for onboarding" asks for an ADDITIONAL file and keeps
+    its own rule (`_ANOTHER_LIKE_RE`).
+  * `make` was an edit verb only in front of a closed adjective list, so
+    "make it two pages", "make it a pie" and "make it five slides" were
+    chat; a comparative with no verb ("and the report longer", "a bit more
+    spacing") had no rule either.
+  * The hand-over of the previous ANSWER needed a pronoun AND a verb:
+    "now as a docx", "all of that as a briefing doc", "both of those as one
+    pdf", "download this table" and "pdf of the second summary" made a new
+    file out of the words, or nothing.
+  * One content word broke a reference: "put the revenue table in excel"
+    invented a workbook rather than exporting the table the answer had.
+  * A REMARK was an instruction: "I opened the docx on my phone and the
+    table is cut off" silently re-rendered the file.
+
+Each rule below carries the case it was written against.
+
 "IN THE REPORT" IS A PLACE. "The numbers in the report are wrong" was a
 create (the destination rule read "in the report" as a deliverable). A
 definite article makes it a location; "in a report", "as a PDF" and "in
@@ -182,13 +206,21 @@ _ADJ = (
     r"styled|colou?red|colou?rful|landscape|portrait|one[- ]page|short|detailed|official|presentable|shareable|pretty|"
     r"decent|executive|corporate|branded|full|complete|final|ms|microsoft|proper|properly|nicely)"
 )
+#: ONE word between the article and the format word that the closed `_ADJ`
+#: list does not know: "as a briefing doc", "as one pdf", "in a combined
+#: excel". A DETERMINER is excluded, because "in the report" is a place and
+#: not a form (the rule at the top of this file) and a bare word gap would
+#: have taken it. Measured 2026-09-16 (follow-up corpus): "all of that as a
+#: briefing doc" and "both of those as one pdf" named no destination at all,
+#: so both were answered in chat.
+_GAP_WORD = r"(?:(?!the\s|this\s|that\s|these\s|those\s|my\s|our\s|your\s|his\s|her\s|its\s|their\s|a\s|an\s)\w+\s+)"
 #: "as a PDF", "in Word", "into an Excel", "to csv", "in a classy pdf" — the
 #: deliverable named as a form; and the postposition forms ("pdf _in_",
 #: "docx file _in_") the normaliser writes for "pdf me", "पीडीएफ में",
 #: "પીડીએફમાં" (AS3 (d)). "in the report" is a place, not a form.
 _AS_FORMAT_RE = re.compile(
-    rf"\bas\s+(?:an?\s+|the\s+)?(?:{_ADJ}\s+){{0,2}}(?:{_FORMAT_WORD})\b"
-    rf"|\b(?:in|into|to)\s+(?:an?\s+)?(?:{_ADJ}\s+){{0,2}}(?:{_FORMAT_WORD})\b"
+    rf"\bas\s+(?:an?\s+|the\s+|one\s+|two\s+|three\s+|\d+\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
+    rf"|\b(?:in|into|to)\s+(?:an?\s+|one\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
     rf"|\b(?:{_FORMAT_WORD}|sheet)(?:\s+(?:file|format|version|copy|doc))?\s+_in_\b{LX.DEST_AFTER}",
     re.I,
 )
@@ -308,7 +340,11 @@ _CONVERT_RE = re.compile(
     re.I,
 )
 _PREVIOUS_ANSWER_RE = re.compile(
-    r"\b(?:(?:the|your|that) (?:previous|last|above|earlier|prior) (?:answer|reply|response|message|summary|explanation)|"
+    # `original|first|initial` (2026-09-16): after "summarise the incident" →
+    # "make that a pdf" (card) → "also give me the ORIGINAL answer as a word
+    # file", the turn converted the PDF instead of exporting the answer,
+    # because only previous|last|above|earlier|prior named an answer here.
+    r"\b(?:(?:the|your|that) (?:previous|last|above|earlier|prior|original|first|initial) (?:answer|reply|response|message|summary|explanation)|"
     r"(?:what|everything) you (?:just )?(?:said|wrote|explained)|your answer|that answer|this answer|the answer above|the above)\b",
     re.I,
 )
@@ -454,11 +490,76 @@ def _positional_create(low: str) -> bool:
 #: A bare reference to what came before: "it", "this", "the above audit",
 #: "your last response", and the normaliser's `_this_` (isko, इसे, આને).
 _BARE_REF_RE = re.compile(
+    # `both` only where it stands alone ("pdf of both please", "both of
+    # them") — "a pdf of both the sales and marketing plans" names two new
+    # topics and is a create.
     r"\b(?:it|this|that|these|those|_this_|everything|all\s+of\s+(?:it|this|that)|all\s+that|"
+    r"both(?=\s*(?:please|too|$|[.,!?])|\s+of\s+(?:them|those|these|it))|"
     r"the\s+above(?:\s+\w+)?|above\s+(?:answer|report|audit|content|text|one|response|reply|table|list)|"
     r"(?:the|your|that|this|my)\s+(?:last\s+|previous\s+|above\s+|earlier\s+|whole\s+|full\s+)?"
+    # ONE describing word of the person's own ("the REVENUE table", "the
+    # SECOND summary"). Measured 2026-09-16: "put the revenue table in excel"
+    # made a brand-new workbook out of the words, with no link to the table
+    # the answer two turns back had printed, because one content word between
+    # the determiner and the noun broke the reference. Prepositions and
+    # determiners are excluded so "the numbers IN THE report" does not become
+    # a reference to a report.
+    r"(?:(?!the\s|a\s|an\s|my\s|our\s|your\s|in\s|on\s|of\s|for\s|with\s|and\s|or\s|is\s|are\s|was\s|were\s)\w+\s+){0,1}"
     r"(?:answer|reply|response|report|audit|summary|analysis|content|text|findings|explanation|plan|write[- ]?up|table|list|output)"
     r"(?:\s+above)?)\b",
+    re.I,
+)
+#: A bare ANAPHOR: the turn points at what was just made without naming it.
+#: "do the same for headcount", "same but shorter", "do it again", "and the
+#: same again but as a line". Measured 2026-09-16 (follow-up corpus): 9 of
+#: 47 wrong turns were one of these, and "the same" resolved to nothing
+#: anywhere in the layer — every one was answered as chat.
+_SAME_AGAIN_RE = re.compile(
+    r"\b(?:the\s+same(?:\s+(?:thing|one|again|chart|file))?|do\s+the\s+same|same\s+(?:but|except|only|again|chart|thing)|"
+    r"(?:do|try|run|build|make|generate)\s+(?:it|this|that|_this_)\s+again|try\s+again|once\s+more|"
+    # "graph this as bars INSTEAD": a replacement of what was just made.
+    r"instead)\b"
+    # "and for last year too": the same file, a different subject, said with
+    # the verb elided entirely (S56 of the corpus).
+    r"|^\W*(?:and|also|plus)\s+(?:for|with|on)\s+(?:\w+\s+){0,3}?(?:too|as\s+well)\b",
+    re.I,
+)
+#: ...but "one more like that" asks for an ADDITIONAL file modelled on the
+#: last one, which is a create, not an edit of it (S27 of the corpus).
+_ANOTHER_LIKE_RE = re.compile(
+    r"\b(?:one|another|a\s+second|a\s+similar|a\s+new)\s+(?:more\s+)?(?:like|similar\s+to|modell?ed\s+on|based\s+on|in\s+the\s+style\s+of)\s+"
+    r"(?:that|this|it|the\s+\w+)\b",
+    re.I,
+)
+#: A turn that only REPEATS what was said, never a change to the file:
+#: "explain that again", "say it again" (the anaphor rule's veto).
+_SAY_AGAIN_RE = re.compile(r"\b(?:explain|describe|tell|say|repeat|read|show\s+me)\b", re.I)
+#: A finite copula: what separates an instruction from a description of
+#: something that already exists ("this data is in excel").
+_COPULA_RE = re.compile(r"\b(?:is|are|was|were|has|have|had|comes|came|looks|seems|stays|remains)\b", re.I)
+#: "make it five slides", "keep it to two pages": a SIZE, not a conversion
+#: target — `slides`, `pages` and `sheets` are format and kind words too, so
+#: the conversion rules read them as the deliverable and re-rendered the
+#: file instead of shortening it (measured 2026-09-16, S10 of the corpus).
+_COUNT_PART_RE = re.compile(
+    r"\b(?:\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)[- ](?:pages?|slides?|sheets?|columns?|rows?|paragraphs?|sections?|bullets?|lines?|words?)\b",
+    re.I,
+)
+#: "make it two pages", "make it a pie", "turn it into bullets": a verb with
+#: a PRONOUN object and any complement changes the file that was just made.
+#: "make it a docx" is a CONVERSION and is decided before this.
+_MAKE_IT_RE = re.compile(
+    r"^\W*(?:(?:please|now|ok|okay|and|also|then|but)\s+)*(?:make|turn|set|keep|leave|render)\s+(?:it|this|that|them|_this_)\s+\S",
+    re.I,
+)
+#: An edit said with no verb at all, as a comparative: "and the report
+#: longer", "a bit more spacing", "the title bigger". The comparative is a
+#: closed list, because a generic `\w+er` reads "the customer list" and "the
+#: weather is colder" as edits.
+_COMPARATIVE_EDIT_RE = re.compile(
+    r"^\W*(?:(?:and|but|also|plus|now|please|ok|okay)\s+)*(?:(?:the|its|it)\s+)?(?:\w+\s+){0,2}?"
+    r"(?:a\s+bit\s+|a\s+little\s+|slightly\s+|much\s+)?"
+    r"(?:more|less|bigger|smaller|shorter|longer|wider|narrower|tighter|cleaner|simpler|darker|lighter|bolder|neater|fewer)\b",
     re.I,
 )
 #: Hand-over verbs of a follow-up: the words that pass something over.
@@ -477,6 +578,14 @@ _FORMAT_ONLY_RE = re.compile(
     rf"^\W*(?:(?:a|an|the|just|only|also|and)\s+)?(?:{_ADJ}\s+)?(?:{_FORMAT_WORD})(?:\s+(?:file|version|copy|format|doc))?"
     rf"(?:\s+(?:of|for)\s+(?:it|this|that|_this_|the\s+above|everything|all\s+of\s+(?:it|this|that)))?"
     rf"(?:\s+(?:please|too|as\s+well|also))*\W*$",
+    re.I,
+)
+#: A named format whose object is the reference: "pdf of the second
+#: summary", "a word file of the above audit". The reference itself is
+#: matched by `_BARE_REF_RE` in `_export_shape`; this only fixes the shape.
+_FORMAT_OF_REF_RE = re.compile(
+    rf"^\W*(?:(?:a|an|the|just|only|also|and|please|now|then)\s+)*(?:{_ADJ}\s+){{0,2}}(?:{_FORMAT_WORD})"
+    rf"(?:\s+(?:file|version|copy|format|doc))?\s+(?:of|for)\s+",
     re.I,
 )
 #: The normaliser's verb-final forms: "docx file _in_ _give_", "pdf _give_".
@@ -520,7 +629,16 @@ _STATEMENT_RE = re.compile(r"^\W*(?:i|we|they|he|she)\s+(?:have|had|keep|kept|st
 #: Chart phrasing that asks for one: a verb, "chart of|with|for", a chart
 #: phrase leading the message, or a data colon.
 _CHART_ASK_RE = re.compile(
-    r"\b(?:make|create|generate|build|draw|plot|render|give|show\s+me|prepare|produce|visuali[sz]e|_give_|need|want)\b"
+    r"\b(?:make|create|generate|build|draw|plot|render|give|show(?:\s+me)?|prepare|produce|visuali[sz]e|_give_|need|want)\b"
+    # A chart word used AS THE VERB on a bare reference: "chart it", "graph
+    # this", "plot that table". Measured 2026-09-16: "chart it" after a
+    # table answer produced no file at all — the chart word switched the
+    # export path off (step 3b) and then failed this gate, so the request
+    # fell through to chat. "plot that" already passed here, so this closes
+    # an inconsistency rather than opening a class. The story-plot and
+    # maths-graph vetoes still run in front of it (`chart_ask` below).
+    r"|^\W*(?:(?:now|please|ok|okay|and|also)\s+)*(?:chart|graph|plot|visuali[sz]e|map)\s+"
+    r"(?:it|this|that|these|those|_this_|the\s+(?:table|data|numbers|results|rows|above|figures))\b"
     # Noun-first ("Histogram of hours", "box plot of salary by department")
     # only at the start, and never a story's plot or a maths graph to explain
     # (verifier 2026-09-15: "plot of the movie Inception" and "explain the
@@ -586,7 +704,21 @@ _NOUN_PHRASE_REQUEST_RE = re.compile(
 )
 #: Edit verbs the pre-AS3 list did not have ("complete the document",
 #: "apply a formula", "fill in the owner column").
-_MORE_EDIT_VERBS_RE = re.compile(r"\b(?:complete|finish|fill\s+in|apply|set|highlight|sort|restyle|reformat|merge|split|translate)\b", re.I)
+#: `mention|call out|spell out|point out|redesign|rebrand` were added on
+#: 2026-09-16: "mention the SLA in the intro" was dropped as chat because
+#: no list here held the verb.
+_MORE_EDIT_VERBS_RE = re.compile(
+    r"\b(?:complete|finish|fill\s+in|apply|set|highlight|sort|restyle|reformat|redesign|rebrand|merge|split|translate|"
+    r"mention|call\s+out|spell\s+out|point\s+out|"
+    # Changes to an existing file that this platform cannot make. They
+    # belong to the EDIT path so the answer is "not applied: signing a PDF
+    # is not supported" on the file the person pointed at — measured
+    # 2026-09-16 (H4/H5): "Sign it digitally and password-protect the PDF"
+    # and "Embed a live Salesforce dashboard in it" were read as CREATES and
+    # minted a second artifact under the same title.
+    r"sign|password[- ]protect|encrypt|watermark|embed)\b",
+    re.I,
+)
 #: "a bar chart", "line graph", "pie plot" — the type vocabulary lives in
 #: lexicon.CHART_TYPE_WORDS, which edits.py reads too.
 _CHART_TYPE_RE = re.compile(rf"\b(?:{LX.CHART_TYPE_WORDS})\s+(?:chart|graph|plot)\b", re.I)
@@ -774,6 +906,14 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
         asked = "?" in low or re.search(r"\bplease\b", low)
         if verb or (asked and not LX.reads_source(low)):
             return "export-followup"
+        # An ELLIPTICAL hand-over: a reference, a destination and no finite
+        # verb at all — "all of that as a briefing doc", "both of those as
+        # one pdf". Measured 2026-09-16: both were answered in chat, the
+        # destination never seen. A sentence with a copula ("this data is in
+        # excel", "I have this in Excel") is a statement and stays chat,
+        # which is why the verb/question test above was the only way in.
+        if len(low.split()) <= 8 and not _COPULA_RE.search(low) and not _STATEMENT_RE.match(low) and not LX.reads_source(low):
+            return "export-elliptical"
         return None
     if ref and verb and explicit:
         return "export-followup-handover"
@@ -785,6 +925,26 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
         return "export-format-only"
     if explicit and verb and not _content_words(low):
         return "export-content-free"
+    # "now as a docx", "then as a pdf": a destination, a named format and
+    # nothing else — the most common export follow-up in the product, and
+    # until 2026-09-16 the one shape with no rule: it has no pronoun (so
+    # `ref` is false), no verb, and `_FORMAT_ONLY_RE` has no room for a
+    # leading "now as a". `_FUNCTION_WORDS_RE` already counts `now`, `as`,
+    # `a` and the format names, so this fires only on a content-free
+    # destination.
+    if dest and explicit and not _content_words(low):
+        return "export-destination-only"
+    # "download this table", "save that": a KEEPING verb on a bare
+    # reference, with the format left to the policy (a table becomes a
+    # workbook). `reads_source` keeps "download the pdf I attached" a read.
+    if ref and not explicit and _KEEP_VERB_RE.search(low) and not LX.reads_source(low) and not _UPLOAD_SOURCE_RE.search(low):
+        return "export-keep-verb"
+    # "pdf of the second summary", "a word file of the above audit": a named
+    # format whose OBJECT is the reference. `_FORMAT_ONLY_RE` reads only the
+    # pronoun objects ("pdf of this"), so a named answer was made from the
+    # words instead of exported.
+    if explicit and ref and _FORMAT_OF_REF_RE.match(low):
+        return "export-format-of-reference"
     # Without a reference, only a CONTENT-FREE postposition hands the answer
     # over ("pdf bana do"); "sales ki report banao" names a new topic and is a
     # create (verifier 2026-09-15: it exported the previous answer).
@@ -879,7 +1039,19 @@ def decide(
             kw.setdefault("target", "artifact")
         else:
             refs = _upload_formats_named(low, uploads)
-            kw.setdefault("target", "upload" if refs or (uploads and _UPLOAD_SOURCE_RE.search(low)) else "conversation")
+            if refs or (uploads and _UPLOAD_SOURCE_RE.search(low)):
+                target = "upload"
+            elif has_assistant_answer and _BARE_REF_RE.search(low) and not _NEW_TOPIC_RE.search(low):
+                # "visualise this table on pie chart", "pie chart of that",
+                # "chart it": the file is made FROM the answer being pointed
+                # at, not from the conversation at large. Measured
+                # 2026-09-16: the owner's own trigger case reported its
+                # source as `conversation`, so nothing downstream could tell
+                # that the table in the previous answer was the material.
+                target = "previous_answer"
+            else:
+                target = "conversation"
+            kw.setdefault("target", target)
             kw.setdefault("upload_refs", refs)
         kw.setdefault("style_request", style and action != "none")
         kw.setdefault("chart_request", chart and action != "none")
@@ -972,8 +1144,18 @@ def decide(
         # table is cut off") is not a request. A real target ("as a docx",
         # "make it a docx", "convert") still converts.
         _styled_place = style and not (_CONVERT_RE.search(low) or _AS_FORMAT_RE.search(low) or _MAKE_IT_FORMAT_RE.search(low))
+        # An EDIT that NAMES the file it changes is not a conversion of the
+        # newest one: "not that one, change the leave policy pdf" re-rendered
+        # the hiring-plan deck (measured 2026-09-16, S57) because this branch
+        # hard-codes reference="latest", and "make the deck shorter" must not
+        # become a re-render just because `deck` also names the pptx format.
+        # A real conversion still says so ("as a pdf", "convert", "make it a
+        # docx") and is not caught here.
+        _edit_named = bool((_EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low))
+                           and (_mentions_hint(low, artifact_hints) or _REFERENCE_FILE_RE.search(low))
+                           and not (_CONVERT_RE.search(low) or _AS_FORMAT_RE.search(low) or _MAKE_IT_FORMAT_RE.search(low)))
         if last_turn_is_artifact and explicit and not _positional_create(low) and not _NEW_TOPIC_RE.search(low) and not _styled_place \
-                and not _STATEMENT_RE.match(low) and (
+                and not _STATEMENT_RE.match(low) and not _edit_named and not _COUNT_PART_RE.search(low) and (
             _BARE_REF_RE.search(low) or _FOLLOWUP_VERB_RE.search(low) or _AS_FORMAT_RE.search(low) or _FORMAT_ONLY_RE.match(low)
         ):
             return made("convert", reference="latest", reference_hint=_hint(low, artifact_hints, exclude=_target_words(explicit)),
@@ -981,6 +1163,31 @@ def decide(
         if _CONVERT_RE.search(low) and explicit:
             return made("convert", reference=_which(low, artifact_hints),
                         reference_hint=_hint(low, artifact_hints, exclude=_target_words(explicit)), rule="convert")
+        # 2a-bis. A bare ANAPHOR points at the file that was just made: "do
+        #     the same for headcount", "same but shorter", "do it again",
+        #     "and the same again but as a line". Measured 2026-09-16: nine
+        #     of the forty-seven wrong turns in the follow-up corpus were one
+        #     of these, and every one was answered as chat — "the same"
+        #     resolved to nothing anywhere in the layer. "One more like that"
+        #     is the other shape: an ADDITIONAL file modelled on it, which
+        #     stays a create (S27). Both need the words to be anchored to a
+        #     file — the last turn was its card, or the title is named —
+        #     so "do the same" in a fresh conversation is still chat.
+        _anchored_anaphor = last_turn_is_artifact or _mentions_hint(low, artifact_hints)
+        if _anchored_anaphor and _ANOTHER_LIKE_RE.search(low):
+            return made("create", rule="another-like")
+        # A QUESTION about what was done ("did you do the same for q2?") is
+        # not an instruction; a bare "do it again" is, and `do` leads both —
+        # so the question mark, not the opening word, decides here.
+        if _anchored_anaphor and _SAME_AGAIN_RE.search(low) and not _SAY_AGAIN_RE.search(low) \
+                and not ("?" in raw and _QUESTION_ABOUT_RE.match(low)) and not LX.reads_source(low):
+            if explicit and (_CONVERT_RE.search(low) or _AS_FORMAT_RE.search(low) or _positional_create(low)):
+                return made("convert", reference=_which(low, artifact_hints),
+                            reference_hint=_hint(low, artifact_hints, exclude=_target_words(explicit)), rule="anaphor-convert")
+            if not _positional_create(low):
+                # "also make a deck of the same" names a NEW file with the
+                # old content: the create rules below own it.
+                return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="anaphor-edit")
         # 2b. A new file, said first: "Create a professional PDF report on
         #     X. Make it visually professional." is a create, not an edit
         #     of the last artifact (CONTRACT-2 §5; discovery C2).
@@ -994,9 +1201,19 @@ def decide(
             rule = _export_shape(low, explicit)
             if rule and not re.search(r"\b(?:also|too|as well|same|version|copy)\b", low):
                 return made("export", reference="previous_answer", rule=rule)
-        if _EDIT_VERBS_RE.search(low) and not remark and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
+        # A REMARK about the file is not an instruction: "I opened the docx
+        # on my phone and the table is cut off" silently re-rendered the
+        # artifact, because `cut` is an edit verb and `the docx` a reference
+        # (measured 2026-09-16). `_STATEMENT_RE` already knew this shape and
+        # was read only by the create rules. `_MORE_EDIT_VERBS_RE` joins the
+        # edit verbs here so "sort it by value" — a verb this list holds and
+        # a pronoun the reference rule resolves — stops being chat; the
+        # reference condition on the same line keeps it off an unanchored
+        # turn.
+        if not _STATEMENT_RE.match(low) and (_EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)) \
+                and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
-        if _IMPERATIVE_EDIT_RE.match(low) and not remark and len(low.split()) <= 12:
+        if not _STATEMENT_RE.match(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make
         #     the headings dark blue", "make the document landscape", "font
@@ -1011,13 +1228,31 @@ def decide(
         # be the file card.
         anchored = last_turn_is_artifact or bool(_FILE_PART_RE.search(low) or _PRONOUN_OBJECT_RE.search(low)
                                                   or _REFERENCE_FILE_RE.search(low) or _mentions_hint(low, artifact_hints))
-        asks = asks and anchored
+        # A REMARK is not an instruction, whatever its words point at: "I
+        # opened the docx on my phone and the table is cut off" reached the
+        # element rule with `table` and `cut` and re-rendered the file.
+        asks = asks and anchored and not _STATEMENT_RE.match(low)
         if style and asks and not (explicit and _AS_FORMAT_RE.search(low) and _CREATE_RE.search(low)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
                         rule="edit-style", style_request=True)
         if asks and _ELEMENT_RE.search(low) and (_EDIT_VERBS_RE.search(low) or _PUT_IN_ARTIFACT_RE.search(low)
                                                  or _MORE_EDIT_VERBS_RE.search(low) or _NEEDS_EDIT_RE.search(low)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-element")
+        # "make it two pages", "make it a pie", "keep it to one slide": a
+        # verb with a PRONOUN object and any complement changes the file.
+        # A FORMAT complement ("make it a docx") is a conversion and was
+        # decided above. Measured 2026-09-16: five consecutive follow-ups on
+        # one report ("make it two pages", "make it a pie", …) were all
+        # answered as chat, because `make` is an edit verb only in front of
+        # a closed adjective list.
+        if asks and _MAKE_IT_RE.match(low) and not _MAKE_IT_FORMAT_RE.search(low):
+            return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
+                        rule="edit-pronoun-object")
+        # A short verbless comparative on the file or one of its parts:
+        # "and the report longer", "a bit more spacing".
+        if asks and _COMPARATIVE_EDIT_RE.match(low) and len(low.split()) <= 8:
+            return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
+                        rule="edit-comparative")
         # "Also as PDF" with nothing else said.
         if explicit and re.match(r"^\s*(?:also|and|plus|too)?\s*(?:as|in)\s+(?:an?\s+)?\w+(?:\s+\w+)?\s*(?:too|as well|please)?\s*[.!]?\s*$", low):
             return made("convert", reference="latest", rule="convert-short")

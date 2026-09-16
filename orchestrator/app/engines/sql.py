@@ -973,6 +973,25 @@ _MAX_CATEGORY_VALUES = 15
 _MAX_PROFILED_COLUMNS = 20
 
 
+#: Said by the ENGINE whenever a query matched no rows, before the model's
+#: narration. The authoritative block below tells the model what zero rows
+#: mean and asks it to say so — but an instruction is not a mechanism, and
+#: the incident that block documents (five people with 84 interviews between
+#: them reported as having none) is precisely the failure of trusting a model
+#: to relay a caveat. Measured 2026-09-16 (E3): neither branch emitted a
+#: fixed sentence; the live branch had this text only as a fallback for an
+#: EMPTY model answer.
+ZERO_ROWS_LINE = (
+    "The query ran and matched no rows. That is not evidence the records do not exist: a wrong join, a name spelled "
+    "differently in the data, an unparseable date or a narrower filter than intended all return an empty result."
+)
+
+
+def zero_rows_prefix(computed: dict) -> str:
+    """`ZERO_ROWS_LINE` plus a blank line when the result was empty, else ""."""
+    return ZERO_ROWS_LINE + "\n\n" if (computed or {}).get("empty_result") else ""
+
+
 def deterministic_summary(
     columns: Sequence[str], rows: Sequence[Sequence]
 ) -> dict:
@@ -1461,6 +1480,10 @@ async def run_sql_engine(
              f"{json.dumps(live_computed, default=str)[:6000]}\n\n"
              f"Rows ({len(live_rows)}):\n{describe_rows(live_rows)}"},
         ]
+        _zero = zero_rows_prefix(live_computed)
+        if _zero:
+            parts.append(_zero)
+            await emit("token", {"text": _zero})
         async for kind, delta in llm.stream_chat_events(msgs, max_tokens=4000):
             await emit(kind, {"text": delta})
             if kind == "token":
@@ -1598,6 +1621,10 @@ async def run_sql_engine(
     )
 
     parts: List[str] = []
+    _zero = zero_rows_prefix(computed)
+    if _zero:
+        parts.append(_zero)
+        await emit("token", {"text": _zero})
     async for token in llm.stream_chat_completion(
         _narrative_messages(
             message,
