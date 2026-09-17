@@ -18,8 +18,6 @@ import threading
 from bisect import bisect_left
 from typing import Callable, Dict, List, Tuple
 
-from .core import effort_policy as _effort_policy
-
 _lock = threading.Lock()
 
 #: name -> {label-tuple: value}
@@ -322,13 +320,6 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     # Counters of the same programme, closed the same way (names AND values).
     "knowledge_topical_precheck_total": {"result": set(TOPICAL_PRECHECK_RESULTS)},
     "recall_block_dropped_total": {"reason": set(RECALL_DROP_REASONS)},
-    # Fast adaptive thinking (engines/chat.py, 2026-09-15): every Fast chat
-    # turn the policy judged, by decision and the classifier's closed reason
-    # vocabulary (core/effort_policy.REASONS).
-    "fast_adaptive_thinking_total": {
-        "decision": {"think", "direct"},
-        "reason": set(_effort_policy.REASONS),
-    },
     "fast_lane_total": {
         "result": set(FAST_LANE_RESULTS),
         "category": set(FAST_LANE_CATEGORIES),

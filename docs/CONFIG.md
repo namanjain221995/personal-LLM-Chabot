@@ -55,8 +55,18 @@ should be made from.
 | `MAX_OUTPUT_TOKENS` | `65536` | Completion floor for thinking-on requests (streaming, collector, and tools paths), so thinking + answer always fit. |
 | `GEN_WALL_CLOCK_S` | `1800` | Hang guard per generation stream: past it the stream is killed, an ERROR is logged, and what was produced is returned with an inline note. 1800 s ≈ 84k tokens at 46.6 tok/s — far beyond any real answer; it exists for degenerate loops only. Also guards each best-of-N candidate via the non-streaming collector. |
 | `EXTRA_HIGH_SAMPLES` | `3` | Best-of-N candidates at `max`, generated CONCURRENTLY; a thinking-off guided-JSON judge picks the winner (losers logged at INFO). `1` disables sampling. |
-| `FAST_ADAPTIVE_THINKING` | `true` | Fast chat turns (engines/chat.py) whose prompt a deterministic classifier (`app/core/effort_policy.py`, no model call, < 5 ms; English, Hindi, Gujarati, Hinglish) recognises as multi-step reasoning — puzzles, maths/word problems, logic, ratios and measurement, code debugging, proofs — think instead of reasoning inside the answer. Recorded as trace stage `ADAPTIVE_THINKING`, counter `fast_adaptive_thinking_total{decision,reason}` and meta `adaptive_thinking`. `false`: every Fast turn thinking-off again. Never applies to Think/Max or the public `/v1` API. |
-| `FAST_THINKING_BUDGET` | `2400` | Thinking tokens such a turn may spend, whatever `THINKING_BUDGET_MODE` says: added to the answer ceiling (reasoning and answer share max_tokens); past budget × `THINKING_BUDGET_GRACE` the thought is closed and the answer is written from it, thinking off. One thought per turn: when the answer runs long, its continuation segments write on thinking-off. Live eval 2026-09-15: median 616 / max 1,733 reasoning tokens on 15 puzzles, accuracy 14/15 → 15/15, median total 3.6 s → 7.5 s. |
+
+**Fast never thinks (owner rule, 2026-09-17).** There is no setting for this. A
+turn whose `effort` is Fast is marked for its whole life (`llm.mark_fast_turn`,
+set by the chat worker), and while that mark is set every main-model request
+this process builds sends `enable_thinking` false — whatever effort, `thinking=`
+flag or answer plan the caller passed, and with no thinking budget and no
+`MAX_OUTPUT_TOKENS` floor. The two PR #71 settings that let a Fast turn think —
+the adaptive-thinking switch and the thinking budget it spent — are gone with
+the behaviour they configured, so setting either one does nothing; the
+classifier in `app/core/effort_policy.py` remains, with no runtime caller
+(`git log --grep 'adaptive-thinking'` for their names and why they went). The
+public `/v1` API never enters the chat worker and is unaffected.
 
 ### Re-enabling budgets (if ever needed)
 

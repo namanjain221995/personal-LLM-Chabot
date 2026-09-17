@@ -1,4 +1,9 @@
-"""The Fast adaptive-thinking classifier and its grant (core/effort_policy.py).
+"""The multi-step-reasoning classifier (core/effort_policy.py).
+
+It has no runtime caller since 2026-09-17 — Fast never thinks, and the rule is
+enforced for the whole turn in `llm`, not judged per prompt (the grant API this
+file also covered went with it). The classifier and its gates stay, so a future
+round that wants it for something honest starts from a measured baseline.
 
 The gates the owner set (2026-09-15): on a labelled set of >= 150 prompts
 (>= 60 must-think, >= 90 must-not, in English, Hindi, Gujarati and Hinglish,
@@ -7,7 +12,6 @@ the false-positive rate on must-not <= 3%, deterministic and < 5 ms a prompt.
 """
 from __future__ import annotations
 
-import asyncio
 import time
 
 import pytest
@@ -133,52 +137,3 @@ def test_pathological_long_input_stays_bounded(text):
     # does not flake, and still fails by three orders of magnitude on the
     # catastrophic backtracking it guards against.
     assert _best_ms(text) < 25.0
-
-
-# ---------------------------------------------------------------------------
-# The grant
-# ---------------------------------------------------------------------------
-
-
-def test_grant_is_scoped_and_restored():
-    assert effort_policy.current_grant() is None
-    with effort_policy.grant(1200, "ratio") as outer:
-        assert effort_policy.current_grant() == outer
-        assert outer.budget_tokens == 1200 and outer.reason == "ratio"
-        with effort_policy.grant(50):
-            assert effort_policy.current_grant().budget_tokens == 50
-        assert effort_policy.current_grant() == outer
-    assert effort_policy.current_grant() is None
-
-
-def test_grant_is_released_when_the_body_raises():
-    with pytest.raises(RuntimeError):
-        with effort_policy.grant(10):
-            raise RuntimeError("stream died")
-    assert effort_policy.current_grant() is None
-
-
-@pytest.mark.parametrize("budget", [0, -5])
-def test_a_grant_is_always_bounded(budget):
-    with pytest.raises(ValueError):
-        with effort_policy.grant(budget):
-            pass  # pragma: no cover
-
-
-def test_a_grant_never_reaches_a_task_started_outside_it():
-    seen = {}
-
-    async def other_request():
-        await asyncio.sleep(0.01)
-        seen["other"] = effort_policy.current_grant()
-
-    async def main():
-        task = asyncio.create_task(other_request())  # created before the grant
-        with effort_policy.grant(300):
-            await asyncio.sleep(0.02)
-            seen["inside"] = effort_policy.current_grant()
-        await task
-
-    asyncio.run(main())
-    assert seen["inside"].budget_tokens == 300
-    assert seen["other"] is None

@@ -461,3 +461,25 @@ def test_salesforce_meta_reports_the_turn_effort(offline_chat, monkeypatch):
         )
     assert meta["route"] == "rag"
     assert meta["effort"] == "fast"
+
+
+# ---------------------------------------------------------------------------
+# 4. The flag, the grant API and the counter are gone
+# ---------------------------------------------------------------------------
+
+
+def test_adaptive_thinking_settings_grant_api_and_counter_are_gone():
+    """PR #71's adaptive thinking is removed, not merely switched off: an env
+    flag left behind is a way back to a behaviour the owner ruled out."""
+    from app import metrics
+    from app.core import effort_policy
+
+    assert not hasattr(settings, "fast_adaptive_thinking")
+    assert not hasattr(settings, "fast_thinking_budget")
+    for name in ("grant", "claim_grant", "current_grant", "ThinkingGrant",
+                 "THOUGHT_CLOSURE", "_Slot"):
+        assert not hasattr(effort_policy, name), name
+    # The classifier itself stays (out of scope this round, no runtime caller).
+    assert effort_policy.classify("what is 5G").think is False
+    assert "fast_adaptive_thinking_total" not in metrics._LABELS_BY_METRIC
+    assert "fast_adaptive_thinking_total" not in metrics._ALLOWED_BY_METRIC
