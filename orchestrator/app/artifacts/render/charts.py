@@ -34,17 +34,19 @@ from __future__ import annotations
 import io
 import math
 import re
+import textwrap
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .. import chart_colours as CC
 from .. import chart_spec as CS
 
 INK = "#1F2937"
 WHITE = "#FFFFFF"
 MUTED = "#5F6B7A"
-GRID = "#E5E9F0"
+GRID = CC.GRID
 NAVY = "#1F3864"
 DPI_EMBED = 200
 PORTRAIT_WIDTH_IN = 6.3
@@ -366,7 +368,13 @@ class _Ctx:
     bg: str
     fmt: Optional[str]
     fraction_percent: bool
+    #: What chart_colours chose for this chart, consulted only after every
+    #: explicit field of the chart's own style (chart_colours.PRECEDENCE).
+    scheme: CC.Scheme = CC.EMPTY
     warnings: List[str] = field(default_factory=list)
+    #: Set by a drawer when every mark it drew carries its own label, so the
+    #: value gridlines can come off — the numbers are already on the page.
+    labels_complete: bool = False
 
     def series_colour(self, i: int, name: str = "") -> str:
         s = self.chart.series[i] if i < len(self.chart.series) else None
@@ -376,16 +384,48 @@ class _Ctx:
             return self.style.series_colors[name]
         if i == 0 and self.style.color and (len(self.chart.series) == 1 or self.chart.type == "combo"):
             return self.style.color
-        palette = self.style.palette or list(self.d.palette)
-        return palette[i % len(palette)]
+        if self.style.palette:
+            return self.style.palette[i % len(self.style.palette)]
+        auto = self.scheme.series_colour(i, name)
+        if auto:
+            return auto
+        return self.d.palette[i % len(self.d.palette)]
 
     def category_colour(self, j: int, label: str) -> str:
         if label in self.style.category_colors:
             return self.style.category_colors[label]
-        palette = self.style.palette or list(self.d.palette)
-        if self.chart.type in CS.PART_OF_WHOLE_TYPES:
-            return palette[j % len(palette)]
-        return self.style.color or palette[0]
+        part = self.chart.type in CS.NO_AXIS_TYPES
+        if self.style.color and not part:
+            return self.style.color
+        if self.style.palette:
+            palette = self.style.palette
+            return palette[j % len(palette)] if (part or self.scheme.by_category) else palette[0]
+        auto = self.scheme.category_colour(j, label)
+        if auto:
+            return auto
+        return self.d.palette[j % len(self.d.palette)] if part else self.d.palette[0]
+
+    def base_colour(self) -> str:
+        """The one colour of a chart that paints a single measure (a box, a
+        violin, a bullet row) — the drawer varies shade, not hue."""
+        if self.style.color:
+            return self.style.color
+        if self.style.palette:
+            return self.style.palette[0]
+        return self.scheme.series_colour(0) or self.scheme.category_colour(0) or self.d.palette[0]
+
+    def by_category(self) -> bool:
+        """A one-series chart whose BARS take a colour each: the person named
+        category colours, or the scheme's rule paints per category."""
+        return len(self.chart.series) <= 1 and (bool(self.style.category_colors) or self.scheme.by_category)
+
+    def signed_colours(self) -> Tuple[str, str, str]:
+        """(gain, loss, total) for a chart of a signed measure."""
+        st = self.style
+        gain, loss, total = self.scheme.signed or (self.d.palette[0], self.d.palette[1], NAVY)
+        return (st.series_colors.get("Increase") or st.color or gain,
+                st.series_colors.get("Decrease") or loss,
+                st.series_colors.get("Total") or total)
 
     def label(self, v: float) -> str:
         return format_value(v, self.fmt, fraction_percent=self.fraction_percent)
@@ -405,11 +445,18 @@ def render_svg(chart: Any, resolved: Any = None, *, orientation: str = "portrait
     return _render(chart, resolved, "svg", None, None, orientation, section_heading, include_caption)
 
 
-def render_chart_png(chart: Any, out_path: str | Path) -> Path:
+def render_chart_png(chart: Any, out_path: str | Path, resolved: Any = None) -> Path:
     """Back-compat entry the document/deck renderers call: 8 x 4.5 in at 160
-    dpi (1280 x 720 before tight layout), written to `out_path`."""
+    dpi (1280 x 720 before tight layout), written to `out_path`.
+
+    `resolved` is optional only for the callers that have no style to give.
+    Pass it whenever one exists: the document's colour plan rides on it
+    (`ResolvedStyle.chart_plan`), and without it every chart of a document
+    falls back to the chart-by-chart rules and the first palette slot — the
+    one blue for revenue, head count and churn alike that this round is
+    about."""
     c = _as_chart(chart)
-    data = _render(c, None, "png", 1280, 720, "portrait", "", False, dpi_override=160, fixed_size=True)
+    data = _render(c, resolved, "png", 1280, 720, "portrait", "", False, dpi_override=160, fixed_size=True)
     out = Path(out_path)
     out.write_bytes(data)
     return out
@@ -491,7 +538,11 @@ def _render(chart: Any, resolved: Any, fmt: str, width_px: Optional[int], height
     muted = d.axis_text_color if contrast_ratio(d.axis_text_color, bg) >= 4.5 else ink
     all_values = [v for s in c.series for v in s.values]
     fraction = bool(all_values) and max(abs(v) for v in all_values) <= 1.0 and style.number_format == "percent"
-    ctx = _Ctx(chart=c, style=style, d=d, ink=ink, muted=muted, bg=bg, fmt=style.number_format, fraction_percent=fraction)
+    # The scheme is built on the HOUSE palette: a palette the person asked
+    # for wins before the scheme is ever consulted (chart_colours.PRECEDENCE).
+    scheme = CC.scheme_for(c, plan=getattr(resolved, "chart_plan", None), palette=d.palette)
+    ctx = _Ctx(chart=c, style=style, d=d, ink=ink, muted=muted, bg=bg, fmt=style.number_format,
+               fraction_percent=fraction, scheme=scheme)
     w, h, dpi = _size(c, width_px, height_px, orientation, dpi_override)
     rc = {
         "text.parse_math": False,
@@ -513,7 +564,11 @@ def _render(chart: Any, resolved: Any, fmt: str, width_px: Optional[int], height
             drawer = _DRAWERS.get(c.type, _draw_bars)
             legend_handled = drawer(ax, ctx)
             _decorate(fig, ax, ctx, section_heading, include_caption, legend_handled)
+            # Rotation first: a bottom legend is placed under the tick
+            # labels AS DRAWN, and rotated names are twice as tall.
+            _rotate_crowded_ticks(fig)
             _place_bottom_legends(fig)
+            _align_titles_left(fig)
             if include_caption and c.caption:
                 _caption_below(fig, ctx)
             if inspect is not None:
@@ -579,7 +634,8 @@ def _decorate(fig, ax, ctx: _Ctx, section_heading: str, include_caption: bool, l
         ax.set_title(title, loc="left", pad=22 if c.subtitle else 12, **kw)
     if c.subtitle:
         kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
-        ax.text(0.0, 1.02, c.subtitle, transform=ax.transAxes, ha="left", va="bottom", **kw)
+        # Kept on the axes so `_align_titles_left` can move it with the title.
+        ax._ts_subtitle = ax.text(0.0, 1.02, c.subtitle, transform=ax.transAxes, ha="left", va="bottom", **kw)
     if c.type not in ("pie", "donut", "radar", "heatmap", "funnel", "treemap", "sunburst"):
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
@@ -588,7 +644,13 @@ def _decorate(fig, ax, ctx: _Ctx, section_heading: str, include_caption: bool, l
         axis_kw = _text_kw(st.axis, d.axis_size_pt, ctx.muted)
         ax.tick_params(colors=axis_kw["color"], labelsize=axis_kw["fontsize"])
         horizontal = c.type in ("horizontal_bar", "stacked_horizontal_bar", "gantt", "bullet")
-        if st.gridlines:
+        # A category axis needs no tick marks: the label already says which
+        # bar it belongs to, and the little strokes only add noise.
+        if c.type not in CS.XY_TYPES + ("histogram",):
+            ax.tick_params(axis="y" if horizontal else "x", length=0)
+        # Gridlines exist so a reader can estimate a value. When every mark
+        # already carries its number, they are noise behind the data.
+        if st.gridlines and not ctx.labels_complete:
             ax.grid(True, axis="x" if horizontal else "y", color=d.grid_color, linewidth=0.8)
             ax.set_axisbelow(True)
         else:
@@ -620,6 +682,74 @@ def _place_bottom_legends(fig) -> None:
             continue
         y = ax.transAxes.inverted().transform((0, box.y0))[1]
         leg.set_bbox_to_anchor((0.5, y - 0.02), transform=ax.transAxes)
+
+
+def _rotate_crowded_ticks(fig) -> None:
+    """Rotate category labels that still do not FIT after wrapping.
+
+    `_wrap_tick` breaks a long label over two lines, which is the readable
+    fix, but whether two lines fit depends on how wide the chart is and how
+    many categories share it — five one-word stages in a half-page figure
+    collide while the same five in a full-page figure do not. Character
+    counts cannot see that; the drawn text can, so this measures it."""
+    renderer = fig.canvas.get_renderer()
+    for ax in fig.axes:
+        if not getattr(ax, "_ts_measure_ticks", False):
+            continue
+        ticks = [t for t in ax.get_xticklabels() if t.get_text()]
+        if len(ticks) < 2:
+            continue
+        slot = ax.get_window_extent(renderer).width / max(1, len(ax.get_xticks()))
+        widest = max(t.get_window_extent(renderer).width for t in ticks)
+        if widest <= slot * 0.98:
+            continue
+        # Set through the axis rather than on the Text artists: a fixed tick
+        # formatter rewrites their strings on every redraw, and a figure is
+        # drawn again on save.
+        # A wrapped label rotated 45 degrees is two lines running diagonally;
+        # one line reads better once it is on the slant.
+        ax.set_xticklabels([t.get_text().replace("\n", " ") for t in ax.get_xticklabels()],
+                           rotation=45, ha="right", rotation_mode="anchor")
+        ax._ts_measure_ticks = False
+
+
+def title_artist(ax):
+    """The Text that carries the chart's title. An Axes keeps THREE title
+    artists — left, centre and right — and `ax.title` is the centre one, so
+    a title set with loc='left' is not on it."""
+    for name in ("_left_title", "title"):
+        artist = getattr(ax, name, None)
+        if artist is not None and artist.get_text():
+            return artist
+    return ax.title
+
+
+def _align_titles_left(fig) -> None:
+    """The title (and the subtitle under it) starts at the FIGURE's left
+    edge, over the value-axis labels, the way a report graphic is set —
+    matplotlib's loc='left' means the left of the plot box, which leaves the
+    title hanging in the middle of the image once the tick labels are wide."""
+    renderer = fig.canvas.get_renderer()
+    for ax in fig.axes:
+        title = title_artist(ax)
+        subtitle = getattr(ax, "_ts_subtitle", None)
+        if not title.get_text() and subtitle is None:
+            continue
+        if title.get_text() and title.get_horizontalalignment() != "left":
+            continue
+        was = [(a, a.get_visible()) for a in (title, subtitle) if a is not None]
+        for artist, _ in was:
+            artist.set_visible(False)
+        box = ax.get_tightbbox(renderer)
+        for artist, visible in was:
+            artist.set_visible(visible)
+        if box is None:
+            continue
+        x = min(0.0, ax.transAxes.inverted().transform((box.x0, 0))[0])
+        if title.get_text():
+            title.set_position((x, title.get_position()[1]))
+        if subtitle is not None:
+            subtitle.set_x(x)
 
 
 def _caption_below(fig, ctx: _Ctx) -> None:
@@ -657,11 +787,25 @@ def _legend(ax, ctx: _Ctx, handles=None, labels=None) -> None:
         ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), **common)
 
 
+def _whole_numbers(ctx: _Ctx) -> bool:
+    """Every value the chart plots is a whole number — a head count, an
+    order count, a number of tickets. Halves on the axis of such a chart are
+    numbers that cannot exist."""
+    if ctx.style.number_format in ("decimal1", "decimal2", "percent"):
+        return False
+    values = [v for s in ctx.chart.series for v in s.values]
+    if not values:
+        return False
+    return all(abs(v - round(v)) < 1e-9 for v in values)
+
+
 def _value_axis(ax, ctx: _Ctx, axis: str = "y") -> None:
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
 
     st = ctx.style
     fmt = FuncFormatter(lambda v, _pos: ctx.label(v))
+    if _whole_numbers(ctx) and not st.log_y:
+        (ax.yaxis if axis == "y" else ax.xaxis).set_major_locator(MaxNLocator(nbins="auto", integer=True))
     if axis == "y":
         ax.yaxis.set_major_formatter(fmt)
         if st.log_y:
@@ -685,15 +829,37 @@ def _tick_text(label: str) -> str:
     return label if len(label) <= TICK_LABEL_MAX else label[: TICK_LABEL_MAX - 1].rstrip() + "…"
 
 
+#: A category label longer than this asks for a second line.
+TICK_WRAP_WIDTH = 12
+
+
+def _wrap_tick(label: str, width: int = TICK_WRAP_WIDTH) -> str:
+    """`label` over at most TWO lines, broken at a space. A two-line label
+    stays horizontal and readable; rotating it 45 degrees is what everyone
+    does instead, and it is the harder thing to read."""
+    if len(label) <= width or " " not in label.strip():
+        return label
+    lines = textwrap.wrap(label, width=max(width, math.ceil(len(label) / 2)), max_lines=2, placeholder="…")
+    return "\n".join(lines) if lines else label
+
+
 def _category_ticks(ax, categories: Sequence[str], ctx: _Ctx, axis: str = "x") -> None:
     categories = [_tick_text(c) for c in categories]
     idx = list(range(len(categories)))
     if axis == "x":
         ax.set_xticks(idx)
         many = len(categories) > 24
-        rotation = 45 if any(len(c) > 8 for c in categories) or many else 0
-        labels = [c if not many or i % max(1, len(categories) // 24) == 0 else "" for i, c in enumerate(categories)]
+        wrapped = [_wrap_tick(c) for c in categories]
+        # Rotation is the LAST resort: only when wrapping left a line still
+        # too long for the slot, or when there are too many slots to fit.
+        longest = max((len(line) for c in wrapped for line in c.split("\n")), default=0)
+        rotation = 45 if many or longest > TICK_WRAP_WIDTH else 0
+        labels = [c if not many or i % max(1, len(categories) // 24) == 0 else "" for i, c in enumerate(wrapped)]
         ax.set_xticklabels(labels, rotation=rotation, ha="right" if rotation else "center")
+        # Character counts only guess at width. `_rotate_crowded_ticks` measures
+        # the drawn labels against the slots they have to fit in, and rotates
+        # the ones that still collide.
+        ax._ts_measure_ticks = not rotation
     else:
         ax.set_yticks(idx)
         ax.set_yticklabels(list(categories))
@@ -704,6 +870,10 @@ def _labels_on(ctx: _Ctx, n_categories: int) -> bool:
         return True
     if ctx.style.data_labels == "off":
         return False
+    # A status chart always shows its labels: colour alone must never be the
+    # only thing that says "critical" (chart_colours, the status rule).
+    if ctx.scheme.force_labels:
+        return True
     return n_categories <= LABEL_MAX_CATEGORIES
 
 
@@ -743,7 +913,8 @@ def _draw_bars(ax, ctx: _Ctx) -> bool:
     labels_on = _labels_on(ctx, len(cats))
     base = [0.0] * len(cats)
     width = 0.8 if stacked else 0.8 / max(1, n)
-    single_cat_colours = n == 1 and bool(ctx.style.category_colors)
+    single_cat_colours = ctx.by_category()
+    ctx.labels_complete = labels_on and bool(cats) and all(values[k][j] != 0 for k in range(n) for j in idx)
     for k, s in enumerate(c.series):
         colour = ctx.series_colour(k, s.name)
         colours = [ctx.category_colour(j, cats[j]) if single_cat_colours else colour for j in idx]
@@ -757,6 +928,11 @@ def _draw_bars(ax, ctx: _Ctx) -> bool:
             _bar_labels(ax, ctx, bars, vals, colours, stacked, horizontal, percent)
         if stacked:
             base = [b + v for b, v in zip(base, vals)]
+    if stacked and not percent and labels_on and n > 1:
+        # A stack's total is the number the reader is after; without it the
+        # only way to get it is to add the segments up by eye.
+        _stack_totals(ax, ctx, idx, base, horizontal)
+        ctx.labels_complete = True
     if horizontal:
         _category_ticks(ax, cats, ctx, axis="y")
         ax.invert_yaxis()
@@ -776,7 +952,28 @@ def _draw_bars(ax, ctx: _Ctx) -> bool:
         from matplotlib.ticker import FuncFormatter
 
         (ax.xaxis if horizontal else ax.yaxis).set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.0f}%"))
+    if ctx.scheme.legend and n == 1:
+        # A signed chart has two meanings and one series, so the legend has
+        # to come from the meanings: nothing on the axis says which is which.
+        from matplotlib.patches import Patch
+
+        gain, loss, total = ctx.signed_colours()
+        seen = {"Increase": gain, "Decrease": loss, "Total": total}
+        handles = [Patch(color=seen.get(name, colour), label=name) for name, colour in ctx.scheme.legend]
+        _legend(ax, ctx, handles, [h.get_label() for h in handles])
+        return True
     return False
+
+
+def _stack_totals(ax, ctx: _Ctx, idx: Sequence[int], totals: Sequence[float], horizontal: bool) -> None:
+    for i, total in zip(idx, totals):
+        text = ctx.label(total)
+        if horizontal:
+            ax.annotate(text, xy=(total, i), xytext=(4, 0), textcoords="offset points", ha="left", va="center",
+                        **_label_kw(ctx, ctx.ink))
+        else:
+            ax.annotate(text, xy=(i, total), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
+                        **_label_kw(ctx, ctx.ink))
 
 
 def _bar_labels(ax, ctx: _Ctx, bars, vals, colours, stacked: bool, horizontal: bool, percent: bool) -> None:
@@ -988,7 +1185,7 @@ def _draw_box(ax, ctx: _Ctx) -> bool:
     boxes = c.extra.box if c.extra else []
     stats = [{"label": b.name, "whislo": b.whisker_low, "q1": b.q1, "med": b.median, "q3": b.q3, "whishi": b.whisker_high,
               "fliers": list(b.outliers), "mean": b.mean} for b in boxes]
-    colour = ctx.style.color or ctx.d.palette[0]
+    colour = ctx.base_colour()
     art = ax.bxp(stats, showfliers=True, patch_artist=True, widths=0.55,
                  medianprops={"color": ctx.ink, "linewidth": 2}, whiskerprops={"color": ctx.muted},
                  capprops={"color": ctx.muted}, flierprops={"marker": "o", "markersize": 3.5, "markerfacecolor": ctx.muted, "markeredgecolor": ctx.muted})
@@ -1049,9 +1246,7 @@ def _draw_waterfall(ax, ctx: _Ctx) -> bool:
     c = ctx.chart
     deltas = list(c.series[0].values)
     cats = list(c.categories) + ["Total"]
-    up = ctx.style.series_colors.get("Increase") or ctx.style.color or ctx.d.palette[0]
-    down = ctx.style.series_colors.get("Decrease") or ctx.d.palette[1]
-    total_colour = ctx.style.series_colors.get("Total") or NAVY
+    up, down, total_colour = ctx.signed_colours()
     running = 0.0
     bottoms, heights, colours = [], [], []
     for v in deltas:
@@ -1089,7 +1284,7 @@ def _draw_funnel(ax, ctx: _Ctx) -> bool:
     top = max(vals) or 1.0
     cats = list(c.categories)
     for j, (cat, v) in enumerate(zip(cats, vals)):
-        colour = ctx.style.category_colors.get(cat) or ctx.style.color or ctx.d.palette[0]
+        colour = ctx.category_colour(j, cat)
         left = (top - v) / 2
         ax.barh(j, v, left=left, height=0.72, color=colour)
         share = f" ({v / vals[0] * 100:.0f}%)" if vals[0] and j > 0 else ""
@@ -1279,7 +1474,7 @@ def _draw_violin(ax, ctx: _Ctx) -> bool:
     positions = list(range(1, len(dists) + 1))
     parts = ax.violinplot([list(d.values) for d in dists], positions=positions, widths=0.78,
                           showextrema=False, showmedians=False)
-    base = ctx.style.color or ctx.d.palette[0]
+    base = ctx.base_colour()
     for j, body in enumerate(parts["bodies"]):
         fill = ctx.style.category_colors.get(dists[j].name, base)
         body.set_facecolor(fill)
@@ -1347,8 +1542,7 @@ def _draw_sunburst(ax, ctx: _Ctx) -> bool:
         ax.set_axis_off()
         return True
     keep = [j for j, v in enumerate(inner) if v > 0]
-    palette = ctx.style.palette or list(ctx.d.palette)
-    inner_colours = [ctx.style.category_colors.get(cats[j]) or palette[pos % len(palette)] for pos, j in enumerate(keep)]
+    inner_colours = [ctx.category_colour(pos, cats[j]) for pos, j in enumerate(keep)]
     outer_values: List[float] = []
     outer_colours: List[str] = []
     outer_labels: List[str] = []
@@ -1395,7 +1589,7 @@ _BAND_GREYS: Tuple[str, ...] = ("#E7ECF2", "#D7DEE7", "#C5CFDB", "#B3C0CF")
 def _draw_bullet(ax, ctx: _Ctx) -> bool:
     c = ctx.chart
     rows = c.extra.bullets if c.extra else []
-    base = ctx.style.color or ctx.d.palette[0]
+    base = ctx.base_colour()
     target_colour = ctx.style.series_colors.get("Target") or ctx.ink
     # The axis must hold every mark, including negative ones. The old span
     # was max(actual, target, *(bands or [0.0])) per row, so a table whose
@@ -1447,5 +1641,6 @@ _DRAWERS = {
 __all__ = [
     "ChartStyleDefaults", "defaults_from", "contrast_ratio", "format_value", "indian_group", "chart_warnings",
     "font_for_script", "scripts_in", "render_png", "render_svg", "render_chart_png", "render_standalone", "clean_svg",
+    "title_artist",
     "squarified",
 ]

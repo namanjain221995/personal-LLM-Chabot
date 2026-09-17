@@ -111,7 +111,13 @@ LegendPosition = Literal["bottom", "top", "left", "right", "none"]
 #: The default series order from the style guide (§1): reordered for colour
 #: vision deficiency — the first five are pairwise >= 25 CIELAB apart under
 #: simulated deuteranopia (tests/test_artifact_render_charts.py measures it).
-DEFAULT_PALETTE: Tuple[str, ...] = ("#2F6FB2", "#E07B00", "#0E9D9A", "#C0566B", "#6D5AE6", "#8A5A44", "#3F8F4F", "#5F6B7A")
+#: Slots 6-8 were re-stepped on 2026-09-17: the old #8A5A44 and #5F6B7A sat
+#: under the 0.10 OKLCH chroma floor (they read as grey), and #5F6B7A against
+#: #3F8F4F was 14.8 OKLab ΔE apart under NORMAL vision. The replacements pass
+#: the band, the chroma floor and the ΔE >= 15 floor, which
+#: tests/test_artifact_chart_colours.py recomputes. chart_colours.CHART_PALETTE
+#: and style.CHART_PALETTE carry the same eight values.
+DEFAULT_PALETTE: Tuple[str, ...] = ("#2F6FB2", "#E07B00", "#0E9D9A", "#C0566B", "#6D5AE6", "#319047", "#993F94", "#B38C15")
 
 #: Fonts a chart may ask for, until style.FONT_ALLOWLIST lands. Keys are
 #: case-folded; the value is the display name matplotlib and Office get.

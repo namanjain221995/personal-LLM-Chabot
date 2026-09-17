@@ -33,6 +33,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from .. import spec as S
 from .. import style as ST
+from .. import chart_colours as CC
 from . import theme
 from .html import BULLET_GAP_EM, DeckPlan, PlannedSlide, cell_text, deck_band, plan_deck
 
@@ -256,6 +257,13 @@ def _label(text: str) -> str:
     return (out or "-")[:120]
 
 
+def _legacy_colour(scheme, index: int, name: str, *, category: bool = False) -> str:
+    """The scheme's colour for a legacy (unstyled) deck chart, falling back
+    to the legacy painter's own palette when no rule claims the mark."""
+    got = scheme.category_colour(index, name) if category else scheme.series_colour(index, name)
+    return got or theme.series_colour(index)
+
+
 def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
     # --- AS3 integration: Chart v2 types and requested chart styling go to
     # the charts track's writer (a picture where PowerPoint has no such chart).
@@ -268,6 +276,10 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
     from pptx.enum.chart import XL_LEGEND_POSITION
     from pptx.util import Inches, Pt
 
+    # Legacy deck charts used theme.PALETTE (teal first) while documents used
+    # the artifact palette (blue first), so the same chart was two different
+    # colours in two files. They read the same scheme now.
+    scheme = CC.scheme_for(chart, plan=getattr(_style(), "chart_plan", None))
     data = CategoryChartData()
     # python-pptx writes the chart's data into an EMBEDDED workbook with
     # XlsxWriter, whose write() turns any string starting with '=' into a
@@ -313,7 +325,7 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
         points = plot.series[0].points
         for i in range(len(chart.categories)):
             points[i].format.fill.solid()
-            points[i].format.fill.fore_color.rgb = _rgb(theme.series_colour(i))
+            points[i].format.fill.fore_color.rgb = _rgb(_legacy_colour(scheme, i, str(chart.categories[i]), category=True))
     else:
         if len(chart.categories) <= theme.CHART_LABEL_MAX_CATEGORIES and chart.type != "line":
             plot.has_data_labels = True
@@ -324,14 +336,20 @@ def _native_chart(slide, x, y, w, h, chart: S.Chart, body_pt: float) -> None:
             plot.data_labels.font.italic = bool(labels_ts.italic)
             plot.data_labels.font.color.rgb = _rgb(labels_ts.color or R.tokens.ink)
         for i, series in enumerate(plot.series):
+            name = chart.series[i].name if i < len(chart.series) else ""
+            colour = _rgb(_legacy_colour(scheme, i, name))
             fill = series.format.line if chart.type == "line" else series.format.fill
             if chart.type == "line":
-                fill.color.rgb = _rgb(theme.series_colour(i))
+                fill.color.rgb = colour
                 fill.width = Pt(2.25)
                 series.smooth = False
             else:
                 fill.solid()
-                fill.fore_color.rgb = _rgb(theme.series_colour(i))
+                fill.fore_color.rgb = colour
+                if len(chart.series) == 1 and scheme.by_category:
+                    for j, cat in enumerate(chart.categories):
+                        series.points[j].format.fill.solid()
+                        series.points[j].format.fill.fore_color.rgb = _rgb(_legacy_colour(scheme, j, str(cat), category=True))
         if chart.type != "pie":
             va = c.value_axis
             va.has_major_gridlines = True

@@ -63,10 +63,25 @@ one call for the engine (prompt-edits / intent-capability wire it in; this track
    orange/amber/yellow/teal/green/pink used as text on white becomes the same hue's text-safe
    variant, with a note; a hex code is used as given.
 6. **Chart palette for colour-vision deficiency.** `style.CHART_PALETTE` =
-   blue #2F6FB2, orange #E07B00, teal #0E9D9A, rose #C0566B, purple #6D5AE6, brown #8A5A44,
-   green #3F8F4F, grey #5F6B7A; the first five are ≥ 25 CIELAB apart under simulated deuteranopia
-   (tested). `theme.PALETTE` is unchanged because `core/charts_png.py` must match it; the charts
-   track moves the painters to `ResolvedStyle.chart_defaults`.
+   blue #2F6FB2, orange #E07B00, teal #0E9D9A, rose #C0566B, purple #6D5AE6, green #319047,
+   plum #993F94, gold #B38C15; the first five are ≥ 25 CIELAB apart under simulated deuteranopia
+   (tested). Slots 6-8 were re-stepped on 2026-09-17 — the old brown #8A5A44 and grey #5F6B7A were
+   under the 0.10 OKLCH chroma floor, and #5F6B7A against the old green #3F8F4F was 14.8 OKLab ΔE
+   apart under NORMAL vision; `tests/test_artifact_chart_colours.py` recomputes the band, the
+   chroma floor and the ΔE ≥ 15 floor. `chart_spec.DEFAULT_PALETTE` and
+   `chart_colours.CHART_PALETTE` carry the same eight values. `theme.PALETTE` is unchanged because
+   `core/charts_png.py` must match it, and the legacy deck/workbook chart writers now read
+   `chart_colours` instead, so a chart is one colour in every format.
+6a. **Which colour a chart's marks get (`chart_colours`).** Nobody styles most charts, so the
+   scheme decides at render time, after every explicit field (`series.color`,
+   `style.series_colors`, `style.category_colors`, `style.color`, `style.palette`) and never by
+   writing `chart.style`. One nominal series is ONE colour — the slot of the chart's subject (x
+   column plus measure), assigned in first-appearance order across the document by
+   `style.resolve` → `ResolvedStyle.chart_plan`. Status values take the reserved status marks with
+   mandatory labels; a signed measure takes gain #2F6FB2 / loss #C0566B / neutral #5F6B7A and a
+   legend, never green against red; a funnel takes a one-hue ramp whose light end clears 2:1 on
+   white; a requested ranking colours the leader and greys the rest; pies, stacks and multi-series
+   charts key a categorical slot by category or series NAME across the document.
 7. **Parity is checked on produced files.** `tests/artifact_file_readers.py` reads DOCX XML (style
    inheritance resolved), PPTX runs, XLSX cells + evaluated CF, and PDF page objects through PDFium
    (text fill colour, font name, size with form-XObject matrices applied, background rectangles,

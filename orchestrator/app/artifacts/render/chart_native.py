@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .. import chart_colours as CC
 from .. import chart_spec as CS
 from . import charts as R
 
@@ -235,6 +236,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
     if not c_spec.series:
         raise ValueError("the chart has no computed values; resolve it first")
     d = R.defaults_from(resolved)
+    scheme = _scheme(c_spec, resolved, d)
     st = c_spec.style or CS.ChartStyle()
     helper = helper_ws if helper_ws is not None else chart_data_sheet(ws.parent)
     geo = _write_block(helper, c_spec)
@@ -293,7 +295,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
                     ln.y_axis.majorGridlines = None
                 for j, s in enumerate(ln.series):
                     k = line_idx[j]
-                    colour = _hex(_series_colour(c_spec, k, d))
+                    colour = _hex(_series_colour(c_spec, k, d, scheme))
                     s.graphicalProperties.line.solidFill = colour
                     s.graphicalProperties.line.width = 28575
                     s.marker = Marker(symbol=_XL_MARKERS[(j + 1) % len(_XL_MARKERS)], size=6)
@@ -330,7 +332,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
             yref = Reference(helper, min_col=geo["series_cols"][k], min_row=hdr, max_row=first + ln_n - 1)
             xs = XLSeries(yref, xref, title_from_data=True)
             xs.marker = Marker(symbol=_XL_MARKERS[k % len(_XL_MARKERS)] if len(c_spec.series) >= 3 else "circle", size=5)
-            colour = _hex(_series_colour(c_spec, k, d))
+            colour = _hex(_series_colour(c_spec, k, d, scheme))
             xs.marker.graphicalProperties = _gp_fill(colour)
             xs.graphicalProperties.line.noFill = True
             if c_spec.extra and any(tr.series == s.name for tr in c_spec.extra.trendlines):
@@ -344,7 +346,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
             yref = Reference(helper, min_col=geo["series_cols"][k], min_row=first, max_row=first + ln_n - 1)
             zref = Reference(helper, min_col=geo["size_cols"][k], min_row=first, max_row=first + ln_n - 1)
             bs = XLSeries(values=yref, xvalues=xref, zvalues=zref, title=s.name)
-            bs.graphicalProperties.solidFill = _hex(_series_colour(c_spec, k, d))
+            bs.graphicalProperties.solidFill = _hex(_series_colour(c_spec, k, d, scheme))
             c.series.append(bs)
     else:  # pragma: no cover - CONTAINER_SUPPORT keeps this unreachable
         raise ValueError(f"no native xlsx form for {t}")
@@ -361,7 +363,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
         s0 = c.series[0]
         for i, cat in enumerate(c_spec.categories):
             pt = DataPoint(idx=i)
-            pt.graphicalProperties = _gp_fill(_hex(st.category_colors.get(cat) or (st.palette or list(d.palette))[i % len(st.palette or d.palette)]))
+            pt.graphicalProperties = _gp_fill(_hex(_category_colour(c_spec, i, cat, d, scheme)))
             s0.dPt.append(pt)
     elif t not in CS.XY_TYPES:
         series_list = list(c.series)
@@ -369,7 +371,7 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
         many = len(series_list) >= 3
         for j, xs in enumerate(series_list):
             k = idx_map[j] if j < len(idx_map) else j
-            colour = _hex(_series_colour(c_spec, k, d))
+            colour = _hex(_series_colour(c_spec, k, d, scheme))
             if t in ("line", "radar"):
                 xs.graphicalProperties.line.solidFill = colour
                 xs.graphicalProperties.line.width = 28575
@@ -381,19 +383,18 @@ def add_xlsx_chart(ws, chart: Any, anchor: str, resolved: Any = None, helper_ws:
             else:
                 xs.graphicalProperties.solidFill = colour
                 xs.graphicalProperties.line.solidFill = colour
-                if len(series_list) == 1 and st.category_colors:
+                if _by_category(c_spec, scheme):
                     for i, cat in enumerate(c_spec.categories):
-                        if cat in st.category_colors:
-                            pt = DataPoint(idx=i)
-                            pt.graphicalProperties = _gp_fill(_hex(st.category_colors[cat]))
-                            xs.dPt.append(pt)
+                        pt = DataPoint(idx=i)
+                        pt.graphicalProperties = _gp_fill(_hex(_category_colour(c_spec, i, cat, d, scheme)))
+                        xs.dPt.append(pt)
 
     # Data labels: outside in ink; stacked segments inside only where
     # white/ink reaches 4.5:1 on the series colour.
     labels_on = _labels_on(c_spec)
     if labels_on and t in CS.STACKED_TYPES:
         for k, xs in enumerate(c.series):
-            fill = _series_colour(c_spec, k, d)
+            fill = _series_colour(c_spec, k, d, scheme)
             colour = d.label_color_for(fill)
             if R.contrast_ratio(colour, fill) < 4.5:
                 continue
@@ -452,7 +453,13 @@ def _gp_fill(colour_hex: str):
     return gp
 
 
-def _series_colour(chart: CS.Chart, k: int, d: R.ChartStyleDefaults) -> str:
+def _scheme(chart: CS.Chart, resolved: Any, d: R.ChartStyleDefaults) -> CC.Scheme:
+    """The automatic colours for a NATIVE chart — the same scheme the PNG
+    painter reads, so one chart is the same colours in every format."""
+    return CC.scheme_for(chart, plan=getattr(resolved, "chart_plan", None), palette=d.palette)
+
+
+def _series_colour(chart: CS.Chart, k: int, d: R.ChartStyleDefaults, scheme: CC.Scheme = CC.EMPTY) -> str:
     st = chart.style or CS.ChartStyle()
     s = chart.series[k]
     if s.color:
@@ -461,8 +468,32 @@ def _series_colour(chart: CS.Chart, k: int, d: R.ChartStyleDefaults) -> str:
         return st.series_colors[s.name]
     if k == 0 and st.color and (len(chart.series) == 1 or chart.type == "combo"):
         return st.color
-    palette = st.palette or list(d.palette)
-    return palette[k % len(palette)]
+    if st.palette:
+        return st.palette[k % len(st.palette)]
+    auto = scheme.series_colour(k, s.name)
+    if auto:
+        return auto
+    return d.palette[k % len(d.palette)]
+
+
+def _category_colour(chart: CS.Chart, j: int, label: str, d: R.ChartStyleDefaults, scheme: CC.Scheme = CC.EMPTY) -> str:
+    st = chart.style or CS.ChartStyle()
+    if label in st.category_colors:
+        return st.category_colors[label]
+    part = chart.type in CS.NO_AXIS_TYPES
+    if st.color and not part:
+        return st.color
+    if st.palette:
+        return st.palette[j % len(st.palette)] if (part or scheme.by_category) else st.palette[0]
+    auto = scheme.category_colour(j, label)
+    if auto:
+        return auto
+    return d.palette[j % len(d.palette)] if part else d.palette[0]
+
+
+def _by_category(chart: CS.Chart, scheme: CC.Scheme) -> bool:
+    st = chart.style or CS.ChartStyle()
+    return len(chart.series) <= 1 and (bool(st.category_colors) or scheme.by_category)
 
 
 # ------------------------------------------------------------------- PPTX --
@@ -501,6 +532,7 @@ def add_pptx_chart(slide, chart: Any, box: Tuple[float, float, float, float], re
     if not c_spec.series:
         raise ValueError("the chart has no computed values; resolve it first")
     d = R.defaults_from(resolved)
+    scheme = _scheme(c_spec, resolved, d)
     st = c_spec.style or CS.ChartStyle()
     t = c_spec.type
     x, y, w, h = box
@@ -562,13 +594,12 @@ def add_pptx_chart(slide, chart: Any, box: Tuple[float, float, float, float], re
               MSO_LINE_DASH_STYLE.LONG_DASH, MSO_LINE_DASH_STYLE.LONG_DASH_DOT, MSO_LINE_DASH_STYLE.SQUARE_DOT, MSO_LINE_DASH_STYLE.DASH_DOT_DOT)
     if t in ("pie", "donut"):
         pts = plot.series[0].points
-        palette = st.palette or list(d.palette)
         for i, cat in enumerate(c_spec.categories):
             pts[i].format.fill.solid()
-            pts[i].format.fill.fore_color.rgb = RGBColor.from_string(_hex(st.category_colors.get(cat) or palette[i % len(palette)]))
+            pts[i].format.fill.fore_color.rgb = RGBColor.from_string(_hex(_category_colour(c_spec, i, cat, d, scheme)))
     else:
         for k, ser in enumerate(plot.series):
-            colour = RGBColor.from_string(_hex(_series_colour(c_spec, k, d)))
+            colour = RGBColor.from_string(_hex(_series_colour(c_spec, k, d, scheme)))
             if t in ("line", "radar", "scatter"):
                 if t != "scatter":
                     ser.format.line.color.rgb = colour
@@ -584,15 +615,14 @@ def add_pptx_chart(slide, chart: Any, box: Tuple[float, float, float, float], re
             else:
                 ser.format.fill.solid()
                 ser.format.fill.fore_color.rgb = colour
-                if n_series == 1 and st.category_colors:
+                if _by_category(c_spec, scheme):
                     for i, cat in enumerate(c_spec.categories):
-                        if cat in st.category_colors:
-                            ser.points[i].format.fill.solid()
-                            ser.points[i].format.fill.fore_color.rgb = RGBColor.from_string(_hex(st.category_colors[cat]))
+                        ser.points[i].format.fill.solid()
+                        ser.points[i].format.fill.fore_color.rgb = RGBColor.from_string(_hex(_category_colour(c_spec, i, cat, d, scheme)))
     labels_on = _labels_on(c_spec)
     if labels_on and t in CS.STACKED_TYPES:
         for k, ser in enumerate(plot.series):
-            fill = _series_colour(c_spec, k, d)
+            fill = _series_colour(c_spec, k, d, scheme)
             colour = d.label_color_for(fill)
             if R.contrast_ratio(colour, fill) < 4.5:
                 continue
@@ -653,7 +683,7 @@ def add_pptx_chart(slide, chart: Any, box: Tuple[float, float, float, float], re
         if len(ch.plots) > 1:
             for j, ser in enumerate(ch.plots[1].series):
                 k = line_idx[j]
-                colour = RGBColor.from_string(_hex(_series_colour(c_spec, k, d)))
+                colour = RGBColor.from_string(_hex(_series_colour(c_spec, k, d, scheme)))
                 ser.format.line.color.rgb = colour
                 ser.format.line.width = Pt(2.25)
                 ser.format.line.dash_style = dashes[(j + 1) % len(dashes)]

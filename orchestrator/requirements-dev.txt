@@ -18,7 +18,8 @@ lancedb==0.37.1  # exact, same as requirements.txt (tests must see the productio
 pandas>=2.2
 pyarrow==25.0.1  # exact, same as requirements.txt
 openpyxl>=3.1
-matplotlib>=3.8
+matplotlib==3.11.2  # exact, same as requirements.txt (the chart tests
+# read tick locators and artist geometry, which move between releases)
 pydantic>=2.7
 # V2 auth (V2-DESIGN §3c): argon2 password hashing + signed session cookies.
 argon2-cffi>=23.1
