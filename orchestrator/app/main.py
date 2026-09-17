@@ -5224,7 +5224,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines import image_memory
 
                 image_followup_images = image_memory.images_for_followup(
-                    conv_key, request.text
+                    conv_key, request.text, viewer
                 )
 
             # Phase A/B: assemble THIS session's context — rolling summary +
@@ -5865,7 +5865,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # The picture stays in the conversation for the next
                 # question about it (engines/image_memory.py).
                 image_memory.remember(
-                    conv_key, request.images_data, question=text, answer=answer
+                    conv_key,
+                    request.images_data,
+                    question=text,
+                    answer=answer,
+                    # The conversation key is whatever the client sent, so
+                    # the viewer is part of the key: image bytes never cross
+                    # an account (engines/image_memory.py).
+                    user_id=viewer,
                 )
             elif image_followup_images:
                 # A second question about the image the person already sent.

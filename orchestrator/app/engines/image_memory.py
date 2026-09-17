@@ -22,8 +22,11 @@ restart loses it and the next turn behaves exactly as it did before this
 module existed. Nothing is written to disk and nothing is written to the
 database, so no image outlives the conversation that produced it.
 
-SCOPE IS THE CONVERSATION. `recall` takes the conversation key the turn is
-already scoped to, so one chat can never see another's image.
+SCOPE IS THE VIEWER AND THE CONVERSATION. `chat`'s conversation key is
+whatever the client sent (`request.conversation_id or scoped_session`), so
+the key here is that value PLUS the viewer's id. Two accounts that happened
+to send the same conversation id — or one that guessed another's — get
+different entries, and image bytes never cross an account.
 """
 from __future__ import annotations
 
@@ -87,14 +90,23 @@ class _Remembered:
 _store: "OrderedDict[str, _Remembered]" = OrderedDict()
 
 
+def scope(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> str:
+    """The store's key: the viewer and the conversation, never one alone."""
+    if not conversation_id:
+        return ""
+    return f"u{user_id}:{conversation_id}" if user_id is not None else str(conversation_id)
+
+
 def remember(
     conversation_id: Optional[str],
     images: Sequence[str],
     *,
     question: str = "",
     answer: str = "",
+    user_id: "Optional[object]" = None,
 ) -> None:
     """Keep this turn's images for the rest of the conversation."""
+    conversation_id = scope(conversation_id, user_id)
     if not conversation_id or not images:
         return
     kept: List[str] = []
@@ -129,8 +141,9 @@ def _total_chars() -> int:
     return sum(len(i) for entry in _store.values() for i in entry.images)
 
 
-def recall(conversation_id: Optional[str]) -> List[str]:
+def recall(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> List[str]:
     """The conversation's remembered images, or [] once they have expired."""
+    conversation_id = scope(conversation_id, user_id)
     if not conversation_id:
         return []
     entry = _store.get(conversation_id)
@@ -143,8 +156,8 @@ def recall(conversation_id: Optional[str]) -> List[str]:
     return list(entry.images)
 
 
-def forget(conversation_id: Optional[str]) -> None:
-    _store.pop(conversation_id or "", None)
+def forget(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
+    _store.pop(scope(conversation_id, user_id), None)
 
 
 def clear() -> None:
@@ -218,10 +231,12 @@ def _overlaps(message: str, context: str) -> bool:
     return len(hits) >= _OVERLAP_FLOOR
 
 
-def is_about_the_image(conversation_id: Optional[str], message: str) -> bool:
+def is_about_the_image(
+    conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
+) -> bool:
     """Should this text-only turn be answered with the remembered image?"""
-    entry = _store.get(conversation_id or "")
-    if entry is None or not recall(conversation_id):
+    entry = _store.get(scope(conversation_id, user_id))
+    if entry is None or not recall(conversation_id, user_id):
         return False
     text = message or ""
     if not text.strip():
@@ -233,8 +248,10 @@ def is_about_the_image(conversation_id: Optional[str], message: str) -> bool:
     return _overlaps(text, entry.context)
 
 
-def images_for_followup(conversation_id: Optional[str], message: str) -> List[str]:
+def images_for_followup(
+    conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
+) -> List[str]:
     """The remembered images when this turn is about them, else []."""
-    if not is_about_the_image(conversation_id, message):
+    if not is_about_the_image(conversation_id, message, user_id):
         return []
-    return recall(conversation_id)
+    return recall(conversation_id, user_id)

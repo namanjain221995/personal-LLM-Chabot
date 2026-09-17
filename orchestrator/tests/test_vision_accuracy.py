@@ -415,6 +415,17 @@ def test_a_conversation_that_never_sent_an_image_has_nothing_to_recall():
     assert image_memory.images_for_followup("conv-z", FOLLOWUP) == []
 
 
+def test_another_account_with_the_same_conversation_id_sees_nothing():
+    """/chat's conversation key is whatever the client sent, so the viewer
+    has to be part of the key or one account's photo could be recalled into
+    another's turn."""
+    image_memory.remember("shared-id", [IMG], question=TURN1, answer=ANSWER1, user_id=7)
+    assert image_memory.recall("shared-id", 7) == [IMG]
+    assert image_memory.recall("shared-id", 8) == []
+    assert image_memory.images_for_followup("shared-id", FOLLOWUP, 8) == []
+    assert image_memory.images_for_followup("shared-id", FOLLOWUP, 7) == [IMG]
+
+
 def test_the_memory_expires(monkeypatch):
     image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
     monkeypatch.setenv("IMAGE_MEMORY_TTL_S", "0.0001")
