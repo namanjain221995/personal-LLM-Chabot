@@ -87,7 +87,11 @@ class _Remembered:
     at: float = field(default_factory=time.monotonic)
 
 
-_store: "OrderedDict[str, _Remembered]" = OrderedDict()
+#: NOT named `_store`: `tests/test_exclusion_invariants.py` proves that the
+#: shared web corpus's `_store` is reached from one function only, and it
+#: matches on the bare NAME across app/ — a second `_store` anywhere in the
+#: package breaks that proof.
+_remembered_images: "OrderedDict[str, _Remembered]" = OrderedDict()
 
 
 def scope(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> str:
@@ -120,10 +124,10 @@ def remember(
         kept.append(img)
     if not kept:
         return
-    _store[conversation_id] = _Remembered(
+    _remembered_images[conversation_id] = _Remembered(
         images=kept, context=f"{question}\n{answer}".lower()
     )
-    _store.move_to_end(conversation_id)
+    _remembered_images.move_to_end(conversation_id)
     _evict()
 
 
@@ -131,14 +135,14 @@ def _evict() -> None:
     """Drop the least recently used conversations until the store fits."""
     limit = max_conversations()
     budget = max_total_chars()
-    while len(_store) > limit:
-        _store.popitem(last=False)
-    while len(_store) > 1 and _total_chars() > budget:
-        _store.popitem(last=False)
+    while len(_remembered_images) > limit:
+        _remembered_images.popitem(last=False)
+    while len(_remembered_images) > 1 and _total_chars() > budget:
+        _remembered_images.popitem(last=False)
 
 
 def _total_chars() -> int:
-    return sum(len(i) for entry in _store.values() for i in entry.images)
+    return sum(len(i) for entry in _remembered_images.values() for i in entry.images)
 
 
 def recall(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> List[str]:
@@ -146,23 +150,23 @@ def recall(conversation_id: Optional[str], user_id: "Optional[object]" = None) -
     conversation_id = scope(conversation_id, user_id)
     if not conversation_id:
         return []
-    entry = _store.get(conversation_id)
+    entry = _remembered_images.get(conversation_id)
     if entry is None:
         return []
     if time.monotonic() - entry.at > ttl_s():
-        _store.pop(conversation_id, None)
+        _remembered_images.pop(conversation_id, None)
         return []
-    _store.move_to_end(conversation_id)
+    _remembered_images.move_to_end(conversation_id)
     return list(entry.images)
 
 
 def forget(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
-    _store.pop(scope(conversation_id, user_id), None)
+    _remembered_images.pop(scope(conversation_id, user_id), None)
 
 
 def clear() -> None:
     """Test hook."""
-    _store.clear()
+    _remembered_images.clear()
 
 
 # --- is this turn about the picture? ---------------------------------------
@@ -235,7 +239,7 @@ def is_about_the_image(
     conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
 ) -> bool:
     """Should this text-only turn be answered with the remembered image?"""
-    entry = _store.get(scope(conversation_id, user_id))
+    entry = _remembered_images.get(scope(conversation_id, user_id))
     if entry is None or not recall(conversation_id, user_id):
         return False
     text = message or ""
