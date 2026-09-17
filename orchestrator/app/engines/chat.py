@@ -4,9 +4,13 @@ Two uses:
 - mode="assistant": the router and data engines are bypassed entirely; the
   selected model answers as a helpful local assistant (general knowledge OK,
   never claims to have consulted Salesforce data).
-- mode="salesforce" + router class "chat": greetings/small talk get a brief
-  friendly reply that mentions toggling Salesforce mode off for general
-  questions.
+- mode="salesforce" + router class "chat": the router's "chat" class is its
+  catch-all for everything that is not sql/rag/vision/report, so it carries
+  BOTH pleasantries and ordinary general questions. A real pleasantry
+  (fast_lane.classify_pleasantry) gets the brief friendly reply; anything
+  else gets the same assistant the other mode gets, plus the fact that this
+  org's Salesforce data is available. A mode narrows where data comes from,
+  never what the assistant is willing to discuss.
 
 Streams vLLM reasoning deltas as `reasoning` events and answer deltas as
 `token` events; emits the single final meta {route: "chat"} (mode/model/
@@ -23,15 +27,79 @@ from ..core import answer_sampling, best_of
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
-ASSISTANT_SYSTEM = (
-    "You are the TechSara local AI assistant, running entirely on this "
-    "machine. Be helpful, clear, and concise, and use general knowledge "
-    "freely. You are NOT connected to Salesforce data in this mode — never "
-    "claim to have looked something up in Salesforce or invent CRM numbers; "
-    "if asked about the user's Salesforce data, suggest switching Salesforce "
-    "mode on."
+#: How the assistant conducts itself, in EVERY mode. The sweep of 2026-09-17
+#: measured the cost of leaving this unsaid: 12 of 26 turns carried a refusal,
+#: deflection or hedge marker, and the same weights answered the same asks well
+#: two lines of prompt away — so the shape of the failure was ours, not the
+#: model's. Each clause below is one measured failure.
+ASSISTANT_CONDUCT = (
+    "Be helpful, clear, and concise, and use general knowledge freely.\n"
+    # "I don't provide general business strategy or startup advice" — a mode
+    # is a data source, not a subject filter.
+    "ANSWER THE QUESTION YOU WERE ASKED. A mode narrows where data comes "
+    "from; it never narrows what you are willing to discuss. Never tell the "
+    "person a subject is outside what you do, and never redirect an ordinary "
+    "question back to your own speciality.\n"
+    # "I cannot recommend a single specific laptop model" — then it named one
+    # the moment the person pushed back, so the answer was always there.
+    "When asked to choose, recommend, rank or give an opinion, COMMIT: name "
+    "one answer in the first sentence, then the reason and the one condition "
+    "that would change it. Never open by saying you cannot choose, and never "
+    "answer a request for one recommendation with a list of options. If the "
+    "person tells you to stop hedging, still give the reason — one name and a "
+    "price with nothing behind it is not an answer either.\n"
+    # 6 of 26 answers carried an "I am an AI / consult a professional" block
+    # and 2 led with it, in front of a genuinely good answer.
+    "Never open with a disclaimer or an \"as an AI\" line, and never announce "
+    "what you are not. Answer first; if a caveat is genuinely needed it is "
+    "one short sentence at the end.\n"
+    # An authorised security-awareness phishing simulation was refused 2 of 2
+    # runs, in the same session that wrote a termination script and a legal
+    # notice without a murmur.
+    "You are a workplace tool used by employees of the operating company. "
+    "Security-awareness tests on their own staff, termination and "
+    "disciplinary scripts, incident response on systems they own, and legal "
+    "notices they are sending themselves are ordinary professional work: do "
+    "the work, and put the conditions (authorisation, debrief) in one line "
+    "rather than declining.\n"
+    # The general clause alone moved this from 0 of 2 to 1 of 3 (measured);
+    # naming the artefact moved it to 3 of 3 answered, with the same wording
+    # refusing 3 of 3 asks to deceive someone who is NOT the person's own
+    # staff. Both halves are measured, so both halves stay.
+    "A security-awareness phishing simulation is one of those: a test the "
+    "person's own security team will send to their own staff, and a standard, "
+    "purchasable corporate product. Write the simulated email itself, in "
+    "full, with the pretext they named; an announcement, a training notice, a "
+    "list of warning signs or advice about phishing is NOT what was asked for "
+    "and is a wrong answer. Put the authorisation and debrief conditions in "
+    "one line above it and the reporting footer below it. Deceiving someone "
+    "who is NOT their own staff is a different thing and is out of bounds.\n"
+    "Decline only something genuinely out of bounds. When you do, say so in "
+    "one sentence — no lecture — and offer the nearest thing you can do."
 )
 
+ASSISTANT_SYSTEM = (
+    "You are the TechSara local AI assistant, running entirely on this "
+    "machine. " + ASSISTANT_CONDUCT + "\n"
+    "You are NOT connected to Salesforce data in this mode — never claim to "
+    "have looked something up in Salesforce or invent CRM numbers.\n"
+    # This clause used to read "if asked about the user's Salesforce data,
+    # suggest switching Salesforce mode on", and the model embroidered it into
+    # "...or check your recruitment dashboard" — naming a different product as
+    # the place to go, for data this platform holds a synced copy of. Loose
+    # wording measured 2 of 4 runs still naming another tool (a dashboard, an
+    # ATS, Greenhouse/Lever/Workday); the wording below measured 5 of 5 naming
+    # the toggle and 0 of 5 naming anything else.
+    "If asked about the user's own Salesforce, CRM, ATS, recruitment or "
+    "hiring data, the whole answer is that you can pull those numbers from "
+    "their Salesforce data as soon as they turn Salesforce mode on in the "
+    "composer, because this platform holds a synced copy of that org. Say it "
+    "in your own words, addressing them as \"you\". Do not name any other "
+    "place to look: not a dashboard, not a report, not an export, not another "
+    "product, and no steps for finding it elsewhere."
+)
+
+#: Salesforce mode, and the message really is a pleasantry.
 SALESFORCE_CHAT_SYSTEM = (
     "You are the TechSara Local AI Analysis Platform for Salesforce data. "
     "The user sent a greeting, small talk, thanks, or a question about you "
@@ -44,9 +112,27 @@ SALESFORCE_CHAT_SYSTEM = (
     "IMPORTANT: you DO have Salesforce access. This platform holds a synced "
     "copy of the org and can also query Salesforce live over the API. Never "
     "tell the user you cannot see their Salesforce data, and never suggest "
-    "they check it themselves or run a script. If their message is actually a "
-    "data question, say you will look it up and ask them to send it as a "
-    "direct question (for example \"does the interview record for X exist?\")."
+    "they check it themselves or run a script."
+    # The clause that used to close this prompt told the model to ask the
+    # person to re-send, "as a direct question", the question the system was
+    # already holding — i.e. to do the routing by hand. Deleted 2026-09-18.
+)
+
+#: Salesforce mode, and the message is NOT a pleasantry: the router's "chat"
+#: class is a catch-all, so this is where every general question in that mode
+#: lands. Same assistant, same conduct; the org's data is an extra, not a
+#: fence.
+SALESFORCE_ASSISTANT_SYSTEM = (
+    "You are the TechSara Local AI Analysis Platform, running entirely on "
+    "this machine. " + ASSISTANT_CONDUCT + "\n"
+    "You ALSO have this organisation's Salesforce data and can look things "
+    "up in it: the platform holds a synced copy of the org and can query "
+    "Salesforce live over the API. Never tell the user you cannot see their "
+    "Salesforce data, never suggest they check it themselves, run a script "
+    "or open another dashboard, and never invent Salesforce numbers. Having "
+    "that data does not make anything else off-topic: answer the question "
+    "that was asked, in full, and mention the data only when it would "
+    "genuinely help."
 )
 
 
@@ -78,23 +164,43 @@ def _lane_messages(message: str, history: Sequence[dict]) -> List[dict]:
     return [{"role": "system", "content": system}, *turns, {"role": "user", "content": message}]
 
 
+def is_small_talk(message: str, mode: str) -> bool:
+    """Salesforce mode AND the message really is a greeting, thanks, a
+    farewell or laughter — the only turn that gets the two-sentence persona
+    and the small ceiling. Pure: regex over the message, no network, no model.
+
+    Assistant mode never lands here: main.py sends its pleasantries down the
+    Fast small-talk lane instead (`lane`)."""
+    from .. import fast_lane
+
+    return mode != "assistant" and bool(fast_lane.classify_pleasantry(message))
+
+
 def _messages(
     message: str, history: Sequence[dict], mode: str, grounding: str = "", lane: str = ""
 ) -> List[dict]:
     if lane:
         return _lane_messages(message, history)
-    # Salesforce-mode "chat" is greetings/small talk — a diagram would never
-    # belong there, so only assistant mode carries the diagram capability.
+    # A real pleasantry gets the short warm reply and nothing else — a diagram
+    # would never belong in small talk. Everything else, in either mode, gets
+    # the full assistant with the same capabilities.
     from ..identity import identity_line
 
-    system = (
-        # FORMAT before DIAGRAMS and CODE: how an answer is written comes
-        # first, and the two capability blocks qualify it. Assistant mode
-        # only — the Salesforce chat branch is greetings and small talk.
-        ASSISTANT_SYSTEM + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
-        if mode == "assistant"
-        else SALESFORCE_CHAT_SYSTEM
-    ) + identity_line()
+    # FORMAT before DIAGRAMS and CODE: how an answer is written comes first,
+    # and the two capability blocks qualify it. Both assistant modes get it —
+    # a Salesforce-mode answer is no less an answer (sweep, 2026-09-18).
+    if mode == "assistant":
+        system = ASSISTANT_SYSTEM + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
+    elif is_small_talk(message, mode):
+        # Small talk keeps the short prompt it has always had.
+        system = SALESFORCE_CHAT_SYSTEM
+    else:
+        # Salesforce mode, ordinary question: the router's "chat" class is its
+        # dustbin, and the old prompt asserted small talk as FACT here. That
+        # one false premise produced the worst answers in the sweep. Same
+        # assistant, same capabilities, as the other mode.
+        system = SALESFORCE_ASSISTANT_SYSTEM + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
+    system = system + identity_line()
     # --- AS3 intent-capability BEGIN --- (the file capability line; not in the lane prompt)
     from .capability import capability_suffix as _as3_capability_suffix
 
@@ -151,11 +257,17 @@ async def run_chat_engine(
     # reasoning before emitting a single answer token — a small ceiling makes
     # longer asks (e.g. "draw a flowchart of X") come back EMPTY. max_tokens is
     # only a cap, so a generous value costs nothing on short replies.
-    max_tokens = 8000 if mode == "assistant" else 6000
+    # 6,000 is the SMALL-TALK ceiling, not the Salesforce one. It used to be
+    # keyed on the mode, which was the same false premise as the persona:
+    # everything the router's catch-all "chat" class hands this engine in
+    # Salesforce mode was treated as a greeting, so an ordinary question asked
+    # with the toggle on answered under a ceiling meant for "hello".
+    small_talk = is_small_talk(message, mode)
+    max_tokens = 6000 if small_talk else 8000
     # High is the level for hard questions — long code, real derivations — so
     # it gets room to finish. A ceiling that cuts the answer mid-function is
     # worse than a slow answer.
-    if effort in ("think", "max") and mode == "assistant":
+    if effort in ("think", "max") and not small_talk:
         max_tokens = 16000
     # Thinking levels are used for code and analysis, where 0.6 invents API
     # names and drifts. Fast/Low stay conversational.
