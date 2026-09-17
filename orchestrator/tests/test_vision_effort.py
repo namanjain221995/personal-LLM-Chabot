@@ -253,8 +253,18 @@ def _parse_sse(body: str):
 
 
 def _fake_engine(recorder):
-    async def fake(message, images, history, emit, *, effort="think", max_tokens=None):
+    async def fake(
+        message,
+        images,
+        history,
+        emit,
+        *,
+        effort="think",
+        max_tokens=None,
+        conversation_id=None,
+    ):
         recorder["effort"] = effort
+        recorder["conversation_id"] = conversation_id
         await emit("token", {"text": "seen"})
         await emit("meta", {"route": "vision"})
         return "seen"
@@ -382,12 +392,15 @@ def test_ocr_runs_only_off_the_fast_path(monkeypatch, effort, expect_ocr):
 
     calls: list = []
 
-    async def fake_ocr(images, **kw):  # the route passes a deadline + cap (2026-09-03)
+    async def fake_ocr(images, **kw):  # the route passes a prompt, deadline + cap
         calls.append(list(images))
-        return ["Vendor: TechSara" for _ in images]
+        return [ocr_module.OcrRead("Vendor: TechSara", "ok") for _ in images]
 
     monkeypatch.setattr(settings, "ocr_enabled", True)
-    monkeypatch.setattr(ocr_module, "ocr_images", fake_ocr)
+    # 2026-09-18: the route reads through `read_images`, not the flattened
+    # `ocr_images` — a degenerate read must never reach the prompt. What this
+    # test asserts is unchanged: Fast runs no pass, Think/Max do.
+    monkeypatch.setattr(ocr_module, "read_images", fake_ocr)
     rec: dict = {}
     monkeypatch.setattr(llm, "stream_chat_events", _fake_stream(rec))
     asyncio.run(vision.run_vision_engine("what is this", IMG, [], _collect, effort=effort))

@@ -65,6 +65,40 @@ def document_prompt() -> str:
     """
     return (os.environ.get("OCR_PROMPT") or "").strip() or _DEFAULT_PROMPT
 
+
+#: The prompt the INTERACTIVE IMAGE route sends (2026-09-18). The document
+#: default above is deliberately untouched — a scanned invoice is not a
+#: photo a person is waiting on — but the chat image route was measured on
+#: 2026-09-17 against this deployment's live sidecar with six images, and
+#: "document parsing" was wrong on every one of them:
+#:
+#:   whiteboard photo    "ovi" prefixed to the transcript
+#:   photographed table  "ovi otp 1.1.1.1" prefixed to the transcript
+#:   UI screenshot       11.6 s, past the 10 s deadline, transcript thrown away
+#:   matplotlib chart    25.4 s and 2,307 characters of invented years
+#:                       ("...na konferansu 2017, 2018, ... 2062")
+#:   dark blurred sign   "1. 2017年1月1日" — text the picture does not contain
+#:
+#: The last line is the one that cost a person a wrong phone extension: the
+#: main model read that fabricated date in the transcript, wrote "this seems
+#: like a hallucination ... it looks like a phone number or extension" in its
+#: reasoning, and answered "ext. 4472" for a sign that reads 4471.
+#:
+#: The same six images with the prompt "OCR" lost the "ovi" prefixes, and the
+#: chart read dropped from 2,307 characters of fiction to a 73-character
+#: caption in 1.0 s. `video/screen.py` reached the same conclusion on video
+#: frames in 2026-09-11 and already sends "OCR".
+#:
+#: WHY os.environ AND NOT config.py: same reason `screen.video_ocr_prompt`
+#: gives — nobody on this programme owns config.py, and IMAGE_OCR_PROMPT is
+#: read per call so an operator can change it without a rebuild.
+_DEFAULT_IMAGE_PROMPT = "OCR"
+
+
+def image_ocr_prompt() -> str:
+    """The prompt this deployment sends the OCR engine for a chat image."""
+    return (os.environ.get("IMAGE_OCR_PROMPT") or "").strip() or _DEFAULT_IMAGE_PROMPT
+
 # At most this many pages/images transcribed concurrently — the OCR service
 # has a small memory slice and one uploaded PDF can be 8 pages. Follows
 # OCR_CONCURRENCY when the profile declares one (2026-08-29; it was hard-coded
@@ -434,4 +468,47 @@ def transcript_block(transcripts: Sequence[str], label: str) -> str:
     parts = [f"\n\nOCR transcript of the {label} (Unlimited-OCR):"]
     for i, t in enumerate(transcripts, 1):
         parts.append(f"\n--- {label.capitalize()} {i} ---\n{t.strip() or '(nothing legible)'}")
+    return "\n".join(parts)
+
+
+#: What the main model is told the transcript IS. The old wording — "(Transcript
+#: from the OCR model — if it disagrees with the pixels, trust the pixels.)" —
+#: was appended to the same user message as the image and read as text the
+#: model itself had made out. It was not: on 2026-09-17 every one of six
+#: transcripts carried characters the picture does not contain, and one of
+#: them ("1. 2017年1月1日") became a wrong extension in the answer. So the
+#: block now says, in order: whose output this is, that it is not a reading,
+#: and the one rule that stops it becoming an invented digit.
+_EVIDENCE_HEADER = (
+    "OCR transcript produced by a SEPARATE OCR model (Unlimited-OCR) from "
+    "the {label}. This is machine output, not text you read: it can contain "
+    "characters, numbers and whole lines the picture does not. Treat it as a "
+    "hint only. Where it disagrees with the pixels the pixels win, and never "
+    "report a number, code, extension, amount or date from this transcript "
+    "that you cannot also read in the {label} itself."
+)
+
+
+def evidence_block(reads: Sequence[OcrRead], label: str) -> str:
+    """Format the reads that SUCCEEDED as one clearly labelled OCR block.
+
+    Only `ok` reads are here. A degenerate read is the model looping and a
+    failed read is nobody having read the image — neither is evidence, and
+    `ocr_images` forwarding degenerate text verbatim (its own docstring says
+    it does) is how a loop reached the prompt. Returns '' when nothing was
+    read, so the caller appends no block at all rather than an empty header.
+
+    Images keep their position: with three attached and only the second read,
+    the block says "Image 2 of 3", so the model cannot attach a transcript to
+    the wrong picture.
+    """
+    usable = [(i, r) for i, r in enumerate(reads, 1) if r.status == "ok" and r.text.strip()]
+    if not usable:
+        return ""
+    head = "\n\n" + _EVIDENCE_HEADER.format(label=label)
+    if len(reads) == 1:
+        return f"{head}\n{usable[0][1].text.strip()}"
+    parts = [head]
+    for i, read in usable:
+        parts.append(f"\n--- {label.capitalize()} {i} of {len(reads)} ---\n{read.text.strip()}")
     return "\n".join(parts)

@@ -2927,7 +2927,12 @@ async def _resolve_document_refs(
     return docs, images, None
 
 
-def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup: bool) -> bool:
+def _asks_about_an_attachment(
+    text: str,
+    request: "ChatRequest",
+    video_followup: bool,
+    image_followup: bool = False,
+) -> bool:
     """Does this turn ask what an ATTACHED file says?
 
     The honest-visual refusal stands aside for exactly this turn: a map in a
@@ -2941,7 +2946,17 @@ def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup:
     `visuals.asks_about_attachment_content` reads the words; this function
     only adds the requirement that there be a file to read.
     """
-    if not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup):
+    if not (
+        request.image_data
+        or request.pdf_uploads
+        or request.pdf_data
+        or video_followup
+        # 2026-09-18: an image the conversation already holds is a file to
+        # READ for exactly the same reason a video is — "what does the map
+        # in that photo show?" must not be answered "I can't draw a map"
+        # one turn after the photo was read fine.
+        or image_followup
+    ):
         return False
     from .artifacts import visuals as _t3_visuals
 
@@ -5181,6 +5196,37 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             request.text, conversation_videos
                         )
 
+            # 2026-09-18: images attached EARLIER in this conversation. The
+            # composer sends the bytes only on the turn the file is attached
+            # to and resends the history as text, so the second question
+            # about a photo ("what was the invoice number again?") used to
+            # route to rag and answer "I don't see the note you're referring
+            # to ... please upload it here" — about a picture the person had
+            # sent one turn before, with the answer in it (audit,
+            # 2026-09-17). Documents survive a turn and videos have a
+            # follow-up test; images now have one too. The test is words
+            # only — no model call — and when it does not fire the turn
+            # routes exactly as it did before.
+            image_followup_images: list = []
+            if (
+                request.text
+                and not request.images_data
+                and not request.pdf_data
+                and not request.pdf_uploads
+                and not request.video_uploads
+                and not video_followup
+                and not deep_research_on
+                and not request.agent
+                and not github_ref
+                and not url_list
+                and not lane.entered
+            ):
+                from .engines import image_memory
+
+                image_followup_images = image_memory.images_for_followup(
+                    conv_key, request.text
+                )
+
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
             # request would otherwise overflow the window. Scoped entirely to
@@ -5714,7 +5760,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # the table attached as a PDF used to skip the refusal too,
                 # and the document engine cannot draw, so that turn came back
                 # as prose — the incident this whole track exists to stop.
-                and not _asks_about_an_attachment(text, request, video_followup)
+                and not _asks_about_an_attachment(
+                    text, request, video_followup, bool(image_followup_images)
+                )
             ):
                 # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
                 # map", twice: there is no geographic type in
@@ -5799,6 +5847,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # An attached image ALWAYS goes to the vision engine — text-only
                 # engines (chat/agent/sql/rag) cannot see it, and silently
                 # answering "I can't view images" is worse than routing here.
+                from .engines import image_memory
                 from .engines.vision import run_vision_engine
 
                 answer = await run_vision_engine(
@@ -5811,6 +5860,26 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # 2026-08-28 the engine ignored it and always thought,
                     # so "Fast" on an image was the slowest path in the app.
                     effort=request.effort,
+                    conversation_id=conv_key,
+                )
+                # The picture stays in the conversation for the next
+                # question about it (engines/image_memory.py).
+                image_memory.remember(
+                    conv_key, request.images_data, question=text, answer=answer
+                )
+            elif image_followup_images:
+                # A second question about the image the person already sent.
+                # Same engine, same effort, the remembered bytes — so the
+                # turn answers from the picture instead of denying it exists.
+                from .engines.vision import run_vision_engine
+
+                answer = await run_vision_engine(
+                    text,
+                    image_followup_images,
+                    history,
+                    emit,
+                    effort=request.effort,
+                    conversation_id=conv_key,
                 )
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a

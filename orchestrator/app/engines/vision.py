@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import OrderedDict
 from typing import Awaitable, Callable, List, Optional, Sequence
 
 from .. import llm
@@ -51,6 +52,22 @@ _SYSTEM = (
     "- Ground every claim in what is visible: quote text, labels, numbers and "
     "UI elements exactly as they appear. Say plainly when something is cut "
     "off, blurry or not visible. Never invent values.\n"
+    "- NEVER COMPLETE A NUMBER YOU CANNOT READ — this rule outranks every "
+    "other instruction here. Before you write any number, code, extension, "
+    "amount, date, serial or identifier, check it character by character in "
+    "the image. Write only the characters you can actually make out and put "
+    "a question mark where a character is not legible (for example "
+    "\"ext. 447?\"), then say plainly which characters are unreadable and "
+    "what would make them readable (more light, closer, sharper). A question "
+    "mark is never to be replaced by a digit because of context, a similar "
+    "document, what such a line usually says, a plausible pattern, or an OCR "
+    "transcript. A hedged guess (\"it appears to be 4472\", \"it likely "
+    "reads…\") is a WRONG answer, not a careful one: the person will dial it "
+    "or pay it. The same holds for a whole line you cannot see: say it is "
+    "unreadable rather than what it probably says.\n"
+    "- Before claiming a maximum, minimum, \"worst\", \"best\" or \"largest\", "
+    "check the claim against every value you read and state the test you "
+    "used — a superlative your own listed numbers contradict is an error.\n"
     "- Use the conversation so far and any notes about the user to tailor the "
     "answer: names, repositories, tools, paths and files already mentioned "
     "are context — reuse them verbatim instead of placeholders.\n"
@@ -179,6 +196,52 @@ def vision_max_tokens(max_tokens: Optional[int] = None) -> int:
     return min(want, limit) if limit > 0 else want
 
 
+#: Conversations where the OCR sidecar has already missed its deadline once.
+#: THE PASS RUNS BEFORE THE MAIN MODEL CAN START, so a miss is 10 s of a
+#: person watching "Reading the text in the image…" for a transcript that is
+#: then thrown away. Measured 2026-09-17 against the live sidecar: a 1280x800
+#: UI screenshot needs 11.6 s and a matplotlib chart 25.4 s, both past
+#: OCR_VISION_DEADLINE_S (10.0) — and a chat full of screenshots pays that
+#: every single turn. One miss benches the pass for the rest of THAT
+#: conversation; the pixels answered those images perfectly well without it
+#: (the Fast path, which never runs the pass, read the same images correctly
+#: in 0.8-1.1 s). Bounded and in-process on purpose: it is a latency hint,
+#: losing it on a restart costs one slow turn and nothing else.
+_OCR_BENCH_LIMIT = 512
+_ocr_benched: "OrderedDict[str, bool]" = OrderedDict()
+
+
+def ocr_is_benched(conversation_id: Optional[str]) -> bool:
+    """Has the OCR pass already failed to beat its deadline here?"""
+    return bool(conversation_id) and conversation_id in _ocr_benched
+
+
+def _bench_ocr_if_it_missed_the_deadline(
+    conversation_id: Optional[str], reads: Sequence
+) -> None:
+    """Bench the pass for this conversation after a deadline miss.
+
+    Only a DEADLINE miss benches it. A sidecar that is down fails instantly
+    and costs the turn nothing, so it keeps its chance to come back.
+    """
+    if not conversation_id:
+        return
+    if not any(
+        getattr(r, "status", "") == "failed" and "deadline" in (getattr(r, "error", "") or "")
+        for r in reads
+    ):
+        return
+    _ocr_benched[conversation_id] = True
+    _ocr_benched.move_to_end(conversation_id)
+    while len(_ocr_benched) > _OCR_BENCH_LIMIT:
+        _ocr_benched.popitem(last=False)
+
+
+def forget_ocr_bench(conversation_id: Optional[str]) -> None:
+    """Test/operational hook: give this conversation the pass back."""
+    _ocr_benched.pop(conversation_id or "", None)
+
+
 async def run_vision_engine(
     message: str,
     images: "Optional[str | Sequence[str]]",
@@ -187,6 +250,7 @@ async def run_vision_engine(
     *,
     effort: str = DEFAULT_EFFORT,
     max_tokens: Optional[int] = None,
+    conversation_id: Optional[str] = None,
 ) -> str:
     """Answer about attached image(s) at the effort the caller asked for.
 
@@ -196,6 +260,11 @@ async def run_vision_engine(
     mechanism is `stream_chat_events` turning the effort into the chat
     template's `enable_thinking`; this engine's only job is to stop
     overriding it.
+
+    `conversation_id` is only for the OCR pre-pass: it is how a conversation
+    whose images the sidecar cannot read inside its deadline stops paying
+    that deadline on every later turn. Nothing else reads it, and a caller
+    that has no conversation (the bare API, graph.py) may leave it None.
     """
     imgs = [images] if isinstance(images, str) else list(images or [])
     if not imgs:
@@ -203,6 +272,18 @@ async def run_vision_engine(
 
     level = llm.normalize_effort(effort)
     user_content = build_user_content(message + extraction_hint(message), imgs)
+
+    # Is the picture legible at all? Measured from the pixels, in
+    # milliseconds, before anything is sent (engines/image_quality.py). The
+    # prompt rule alone left the audit's dark sign answered "ext. 4472" in
+    # two runs of six; a picture whose contrast is 8 of 255 is one the model
+    # cannot tell a reading from an expectation on, so the app says so.
+    # Silent for an ordinary image, and never a gate.
+    from .image_quality import legibility_note
+
+    note = legibility_note(imgs)
+    if note:
+        user_content.append({"type": "text", "text": note})
 
     # Unlimited-OCR pass (2026-08-06): screenshots, invoices and photographed
     # documents get a dedicated OCR transcript alongside the pixels — the OCR
@@ -214,30 +295,35 @@ async def run_vision_engine(
     # 1280x800 screenshot (0.66 s straight to vLLM); the main model reads
     # screenshots at that resolution itself. Think/Max keep the transcript —
     # that is where dense scans and small print earn it.
-    from .ocr import ocr_images, transcript_block
+    from .ocr import evidence_block, image_ocr_prompt, read_images
 
-    if settings.ocr_enabled and level != "fast":
+    if settings.ocr_enabled and level != "fast" and not ocr_is_benched(conversation_id):
         # 2026-09-03: bounded. Measured on a text-dense 1280x800 screenshot
         # at Think: 47 s before the first visible token, all of it the OCR
         # sidecar decoding a long transcript the main model did not need to
         # read the screenshot. The transcript is capped and time-boxed; when
         # it misses the deadline the answer proceeds from the pixels.
+        #
+        # 2026-09-18, three changes, all from the same measurement (see
+        # `ocr.image_ocr_prompt`):
+        #   * the prompt is the one that was measured to WORK on chat images,
+        #     not the document default that prefixed "ovi…" to every read and
+        #     invented a date on the dark sign;
+        #   * `read_images`, not `ocr_images` — the flat view forwards a
+        #     DEGENERATE read's text verbatim, so a loop reached the prompt as
+        #     if it were the picture's text. Only `ok` reads are appended now;
+        #   * the block says whose output it is and that it is not a reading.
         await emit("status", {"text": "Reading the text in the image…"})
-        transcripts = await ocr_images(
+        reads = await read_images(
             imgs,
+            prompt=image_ocr_prompt(),
             max_output_tokens=settings.ocr_vision_max_tokens,
             deadline_s=settings.ocr_vision_deadline_s,
         )
-        block = transcript_block(transcripts, "image")
+        _bench_ocr_if_it_missed_the_deadline(conversation_id, reads)
+        block = evidence_block(reads, "image")
         if block:
-            user_content.append(
-                {
-                    "type": "text",
-                    "text": block
-                    + "\n(Transcript from the OCR model — if it disagrees "
-                    "with the pixels, trust the pixels.)",
-                }
-            )
+            user_content.append({"type": "text", "text": block})
 
     messages: List[dict] = [
         {"role": "system", "content": _SYSTEM},
