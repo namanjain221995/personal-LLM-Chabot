@@ -2790,6 +2790,32 @@ ALTER TABLE artifact_versions
 """
 
 
+_MIGRATION_V40 = """
+-- V40 (2026-09-18): PROVENANCE for a saved fact — where it came from and the
+-- words it came from. Append-only: two nullable columns, no index, no
+-- backfill.
+--
+-- WHY. `user_facts` recorded only which conversation a row was written in, so
+-- a row could not be told apart from any other: a fact the person stated about
+-- themselves, a line the extractor inferred, and a sentence lifted out of a CV
+-- somebody pasted all looked identical, and every one of them was injected
+-- into later turns under "treat as true for this user". The 2026-09-17 sweep
+-- found an account whose name, email and employer had been overwritten by a
+-- third party's CV with nothing on the rows to show it.
+--
+-- `source` is how the row was written — 'stated' (extracted from the user's
+-- own message, facts.remember_from_message), 'manual' (the person added it
+-- through /memory/facts). NULL means the row predates this migration and its
+-- origin is unknown, which is exactly what the repair query looks for.
+-- `source_excerpt` is a short verbatim fragment of the message the fact was
+-- taken from, so a person (or an operator) can see the words behind a fact
+-- instead of trusting the extractor's paraphrase.
+ALTER TABLE user_facts
+    ADD COLUMN IF NOT EXISTS source         text,
+    ADD COLUMN IF NOT EXISTS source_excerpt text;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2830,6 +2856,7 @@ _MIGRATIONS: tuple = (
     (37, _MIGRATION_V37),
     (38, _MIGRATION_V38),
     (39, _MIGRATION_V39),
+    (40, _MIGRATION_V40),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -6081,10 +6108,15 @@ def get_sf_conversation_state(conversation_id: str) -> Optional[dict]:
 
 
 def list_user_facts(user_id: int, limit: int = 500) -> List[dict]:
-    """The user's durable facts, most recently updated first."""
+    """The user's durable facts, most recently updated first.
+
+    `source` / `source_excerpt` (V40) say where each row came from; both are
+    None for a row written before that migration.
+    """
     with read_connection() as con:
         rows = con.execute(
-            "SELECT id, fact, source_conversation_id, created_at, updated_at"
+            "SELECT id, fact, source_conversation_id, source, source_excerpt,"
+            "       created_at, updated_at"
             "  FROM user_facts WHERE user_id = %s"
             " ORDER BY updated_at DESC, id DESC LIMIT %s",
             (user_id, limit),
@@ -6094,6 +6126,8 @@ def list_user_facts(user_id: int, limit: int = 500) -> List[dict]:
             "id": int(r["id"]),
             "fact": r["fact"],
             "source_conversation_id": r["source_conversation_id"],
+            "source": r["source"],
+            "source_excerpt": r["source_excerpt"],
             "created_at": _iso(r["created_at"]),
             "updated_at": _iso(r["updated_at"]),
         }
@@ -6102,16 +6136,38 @@ def list_user_facts(user_id: int, limit: int = 500) -> List[dict]:
 
 
 def add_user_fact(
-    user_id: int, fact: str, source_conversation_id: Optional[str] = None
+    user_id: int,
+    fact: str,
+    source_conversation_id: Optional[str] = None,
+    *,
+    source: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
 ) -> dict:
+    """Store one durable fact with its provenance (V40).
+
+    `source` is how the row was written — "stated" for the extractor reading
+    the user's own message, "manual" for the person adding it themselves —
+    and `source_excerpt` is the fragment of that message the fact came from.
+    Both stay None only for a caller that genuinely cannot say.
+    """
     now = _now()
+    excerpt = _text(source_excerpt)[:500] if source_excerpt else None
     with connection() as con:
         row = con.execute(
             "INSERT INTO user_facts"
-            " (user_id, fact, source_conversation_id, created_at, updated_at)"
-            " VALUES (%s, %s, %s, %s, %s)"
+            " (user_id, fact, source_conversation_id, source, source_excerpt,"
+            "  created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT (user_id, lower(fact)) DO NOTHING RETURNING id",
-            (user_id, _text(fact), source_conversation_id, now, now),
+            (
+                user_id,
+                _text(fact),
+                source_conversation_id,
+                source,
+                excerpt,
+                now,
+                now,
+            ),
         ).fetchone()
         if row is None:  # a concurrent extraction stored the same fact first
             row = con.execute(
@@ -6123,23 +6179,46 @@ def add_user_fact(
         "id": int(row["id"]),
         "fact": fact,
         "source_conversation_id": source_conversation_id,
+        "source": source,
+        "source_excerpt": excerpt,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
 
 
-def update_user_fact(user_id: int, fact_id: int, fact: str) -> Optional[dict]:
-    """Rewrite one fact. None when the id is missing or another user's (§3c)."""
+def update_user_fact(
+    user_id: int,
+    fact_id: int,
+    fact: str,
+    *,
+    source: Optional[str] = None,
+    source_excerpt: Optional[str] = None,
+) -> Optional[dict]:
+    """Rewrite one fact. None when the id is missing or another user's (§3c).
+
+    A rewrite re-states the fact from a NEW message, so it carries that
+    message's provenance (V40); a caller that passes neither leaves the
+    stored provenance alone.
+    """
     now = _now()
+    excerpt = _text(source_excerpt)[:500] if source_excerpt else None
     with connection() as con:
         row = con.execute(
-            "UPDATE user_facts SET fact = %s, updated_at = %s"
-            " WHERE id = %s AND user_id = %s RETURNING id",
-            (_text(fact), now, fact_id, user_id),
+            "UPDATE user_facts SET fact = %s, updated_at = %s,"
+            "       source = COALESCE(%s, source),"
+            "       source_excerpt = COALESCE(%s, source_excerpt)"
+            " WHERE id = %s AND user_id = %s RETURNING id, source, source_excerpt",
+            (_text(fact), now, source, excerpt, fact_id, user_id),
         ).fetchone()
     if row is None:
         return None
-    return {"id": int(row["id"]), "fact": fact, "updated_at": now.isoformat()}
+    return {
+        "id": int(row["id"]),
+        "fact": fact,
+        "source": row["source"],
+        "source_excerpt": row["source_excerpt"],
+        "updated_at": now.isoformat(),
+    }
 
 
 def delete_user_fact(user_id: int, fact_id: int) -> bool:

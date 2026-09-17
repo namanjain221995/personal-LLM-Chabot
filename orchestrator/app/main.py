@@ -4891,7 +4891,24 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     if settings.fact_extraction_enabled:
                         fact_task = asyncio.create_task(
                             facts.remember_after_route(
-                                fact_gate, user_id, request.text, request.conversation_id
+                                fact_gate,
+                                user_id,
+                                request.text,
+                                request.conversation_id,
+                                # A turn that carries a document or an image
+                                # is a turn ABOUT that material. Third-party
+                                # content is never a fact about the person
+                                # (the sweep found a pasted CV overwriting an
+                                # account's own name, email and employer), so
+                                # such a turn writes no memory at all.
+                                attachments=bool(
+                                    request.pdf
+                                    or request.pdf_uploads
+                                    or request.video_uploads
+                                    or request.images
+                                    or request.image
+                                    or request.image_base64
+                                ),
                             )
                         )
                         _background_tasks.add(fact_task)

@@ -831,6 +831,16 @@ class Settings:
         )
         self.fact_extraction_enabled: bool = _bool("FACT_EXTRACTION_ENABLED", True)
         self.memory_max_facts: int = _int("MEMORY_MAX_FACTS", 200)
+        # 2026-09-18 (memory integrity): the longest message the fact
+        # extractor will read. A durable self-disclosure is a sentence or two
+        # ("my name is Naman", "I'm vegetarian"); a message this long is a
+        # pasted document — a CV, a contract, someone else's profile — and
+        # nothing in a document the person pasted is a fact ABOUT the person.
+        # The composer folds a paste inline with no marker (frontend
+        # lib/pasted.ts), so length is the only signal the orchestrator has.
+        self.memory_self_disclosure_max_chars: int = _int(
+            "MEMORY_SELF_DISCLOSURE_MAX_CHARS", 1200
+        )
 
         # --- Phase C: context meter.
         self.context_meter_enabled: bool = _bool("CONTEXT_METER_ENABLED", True)

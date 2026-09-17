@@ -11,6 +11,27 @@ Extraction runs CONCURRENTLY with answer generation (it reads only the user's
 message, not the answer), so it adds zero latency; its result rides out on
 the final meta as `memory_updated` when it lands before the answer finishes.
 Everything degrades to "no memory update" on failure — never a failed chat.
+
+MEMORY INTEGRITY (2026-09-18). The extractor is a prompt, and until this
+round whatever it returned was written to the table unchecked and then read
+back to the model under "treat as true for this user". The platform sweep
+found what that costs: a pasted CV overwrote an account's own name, email and
+employer with a stranger's; "please forget that I'm vegetarian" was stored as
+"The user is not vegetarian" and produced steakhouse recommendations; a
+headcount moved from an old employer to a new one and was answered flatly;
+and 39% of the live store was one-off task requests replayed as a to-do list.
+Four rules now stand between the model and the table:
+
+  1. Only the person's own words about themselves. A turn carrying an
+     attachment writes nothing, and fenced/quoted material and pasted-length
+     messages are not the person speaking (`own_words`).
+  2. A "forget that" may only DELETE (`_FORGET_RE`, db.delete_user_fact); it
+     can never add or rewrite, so an erasure request cannot leave a negated
+     copy of the thing behind.
+  3. Only what was stated: a fact may not contain a number or a name the
+     message did not contain (`ungrounded_in`), and every row records where
+     it came from (`source`, `source_excerpt` — db V40).
+  4. A one-off task request is not a durable fact (`is_durable`).
 """
 from __future__ import annotations
 
@@ -40,17 +61,103 @@ _MESSAGE_MIN_CHARS = 8
 _EXTRACT_SYSTEM = """You maintain a user's long-term memory for a chat assistant.
 
 Given the user's newest message and their currently saved facts, decide what
-to remember. A fact is a short, durable, third-person statement about the
-user or the world as the user declares it ("Sahil Patel is the CEO of
+to remember. A fact is a short, durable, third-person statement the user
+STATED about themselves or about the world ("Sahil Patel is the CEO of
 TechSara", "The user's name is Naman", "The user prefers answers in Hindi").
 
-Do NOT store: questions, requests, greetings, opinions about the current
-task, anything transient ("today", "this file"), or anything already saved.
+Store ONLY what the message says in so many words. Never infer, never
+combine a saved fact with a new one, and never carry a detail (a number, a
+name) from one subject to another: if the user changes employer, the old
+employer's headcount is NOT the new employer's.
+
+The message may quote or contain a document, a CV, an email or another
+person's words. That material is not the user. Only first-person statements
+the user makes about themselves become facts about them.
+
+Do NOT store: questions, requests ("give me 200 practice questions"),
+greetings, opinions about the current task, anything transient ("today",
+"this file"), or anything already saved.
+
 If a new statement contradicts or updates a saved fact, replace that fact.
+When the user asks you to FORGET something, put that saved fact's id in
+"remove" — never store a negated version of it.
 
 Reply with ONLY a JSON object, no other text:
-{"add": ["<new fact>", ...], "replace": [{"id": <saved fact id>, "fact": "<rewritten fact>"}, ...]}
-Use {"add": [], "replace": []} when there is nothing durable to remember."""
+{"add": ["<new fact>", ...], "replace": [{"id": <saved fact id>, "fact": "<rewritten fact>"}, ...], "remove": [<saved fact id>, ...]}
+Use {"add": [], "replace": [], "remove": []} when there is nothing to do."""
+
+#: A message that asks the assistant to forget something. Such a message
+#: never CREATES memory — the sweep found "please forget that I'm vegetarian"
+#: stored as "The user is not vegetarian", so the erasure request itself
+#: became a permanent record of the thing (and the assistant then recommended
+#: steakhouses). Every add/replace is dropped for these messages; only a
+#: delete may come out of one.
+_FORGET_RE = re.compile(
+    r"\b(?:forget|un-?remember|erase)\b"
+    r"|\b(?:stop|don'?t|do not|no longer)\s+(?:remember|remembering|storing|saving)\b"
+    r"|\b(?:delete|remove|drop|clear)\s+(?:that|this|the|my)?\s*(?:saved\s+)?"
+    r"(?:memory|memories|fact|facts)\b",
+    re.I,
+)
+
+#: A one-off task request wearing a fact's clothes. 51 of the 132 rows in the
+#: production store matched this shape ("The user is asking about all movie
+#: names in the Spider-Man franchise", "The user wants 200 LeetCode
+#: questions"), and they came back to the person as a to-do list when they
+#: asked what the assistant remembered about them. The extractor prompt
+#: already forbids them; the model ignores it, so the filter is code.
+_TRANSIENT_FACT_RE = re.compile(
+    r"^the user(?:'s)?\s+(?:is\s+|was\s+|has\s+|have\s+|had\s+)?"
+    r"(?:currently\s+|now\s+|also\s+)?"
+    r"(?:asking|asked|asks|request|requests|requested|requesting|want|wants|"
+    r"wanted|need|needs|needed|looking|discussing|trying)\b",
+    re.I,
+)
+
+#: …unless the same sentence states a STANDING preference, which is durable
+#: however it is phrased. Two shapes count: an explicit standing word
+#: ("always", "prefers"), and a wish about HOW the assistant should answer
+#: ("The user wants responses in layman terms") — the production store holds
+#: real ones of both kinds, and losing them would trade one regression for
+#: another. A wish about WHAT to produce ("200 LeetCode questions", "an ATM
+#: UI in Python") matches neither and stays out.
+_DURABLE_PREFERENCE_RE = re.compile(
+    r"\b(?:always|never|prefers?|preference|by default|from now on)\b"
+    r"|\b(?:answers?|responses?|replies|explanations?|output|tone|style|"
+    r"wording|format|formatting|language|units)\b"
+    r"\s+(?:in|to be|as|with|using|written|formatted)\b",
+    re.I,
+)
+
+#: Fenced blocks and quoted lines are material the person put in front of the
+#: assistant, not the person speaking. They are cut out before the extractor
+#: sees the message, so nothing inside them can become a fact and nothing
+#: inside them can GROUND one either.
+_FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+_QUOTED_LINE_RE = re.compile(r"^\s*>.*$", re.M)
+
+#: Grounding: a stored fact may only contain numbers and names the message
+#: itself contains. `_NAME_RE` is deliberately crude — a capitalized word is
+#: a name often enough, and the cost of a false positive is one fact not
+#: saved, while the cost of a false negative is an invented one treated as
+#: true forever.
+_NUMBER_RE = re.compile(r"\d+")
+_NAME_RE = re.compile(r"\b[A-Z][A-Za-z][A-Za-z'’-]+\b")
+_NAME_STOPWORDS = frozenset(
+    """The This That There These Those They Their Them User Users And But
+    For Not With From Into Also When What Who Where Why How Has Have Had
+    Does Did Will Would Should Could Every Always Never Prefers Prefer
+    Wants Want Likes Like Uses Use Works Work Lives Live Needs Need""".split()
+)
+
+#: Words too common to identify WHICH saved fact a "forget that" points at.
+_MATCH_STOPWORDS = frozenset(
+    """please forget remember memory memories fact facts that this these
+    those about from with your you mine thing things stuff anymore longer
+    what when where which have here there stop don't dont delete remove
+    drop clear stored saved again also just only more been very said told
+    tell said know known sure okay date outdated wrong""".split()
+)
 
 
 def facts_block(facts: List[dict]) -> Optional[str]:
@@ -99,7 +206,84 @@ def parse_extraction(raw: str) -> dict:
             continue
         if isinstance(fact, str) and fact.strip():
             replace.append({"id": fact_id, "fact": _flatten(fact)})
-    return {"add": add, "replace": replace}
+    raw_remove = data.get("remove")
+    remove = []
+    for item in raw_remove if isinstance(raw_remove, list) else []:
+        try:
+            remove.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    add = [f for f in add if is_durable(f)]
+    replace = [item for item in replace if is_durable(item["fact"])]
+    return {"add": add, "replace": replace, "remove": remove}
+
+
+def is_durable(fact: str) -> bool:
+    """False for a one-off task request dressed as a fact.
+
+    "The user is asking about all movie names in the Spider-Man franchise" is
+    what the person wanted once, not who they are; saved, it comes back as a
+    to-do list the next time they ask what the assistant remembers. A standing
+    preference stays, however it is phrased.
+    """
+    text = " ".join((fact or "").split())
+    if not text:
+        return False
+    if _DURABLE_PREFERENCE_RE.search(text):
+        return True
+    return _TRANSIENT_FACT_RE.match(text) is None
+
+
+def own_words(text: str) -> Optional[str]:
+    """The part of a message that is the PERSON speaking, or None.
+
+    Fenced blocks and quoted lines are material, not speech, and come out.
+    What is left is the person's own words — unless it is longer than a
+    self-disclosure can plausibly be, in which case the message is a pasted
+    document (a CV, a contract, an email thread) and none of it is a fact
+    about the person. The composer folds a paste inline with no marker
+    (frontend/lib/pasted.ts), so length is the only signal there is.
+    """
+    body = _FENCE_RE.sub(" ", text or "")
+    body = _QUOTED_LINE_RE.sub(" ", body)
+    body = body.strip()
+    if not body:
+        return None
+    if len(body) > settings.memory_self_disclosure_max_chars:
+        return None
+    return body
+
+
+def ungrounded_in(fact: str, *sources: Optional[str]) -> Optional[str]:
+    """The first number or name in `fact` that no source contains, or None.
+
+    The extractor is a prompt, and prompts invent. A person who says "I left
+    Northwind Freight, I'm at Halcyon Rail now" has not said how big Halcyon
+    Rail is — but the extractor rewrote the old employer's headcount onto the
+    new one and the next chat answered "your engineering team at Halcyon Rail
+    has 29 engineers". A fact may only carry numbers and names that were
+    actually said.
+    """
+    return _ungrounded_number(fact, *sources) or _ungrounded_name(fact, *sources)
+
+
+def _ungrounded_number(fact: str, *sources: Optional[str]) -> Optional[str]:
+    hay = " ".join(s or "" for s in sources).lower()
+    for number in _NUMBER_RE.findall(fact or ""):
+        if number not in hay:
+            return number
+    return None
+
+
+def _ungrounded_name(fact: str, *sources: Optional[str]) -> Optional[str]:
+    hay = " ".join(s or "" for s in sources).lower()
+    for match in _NAME_RE.finditer(fact or ""):
+        token = match.group(0)
+        if match.start() == 0 or token in _NAME_STOPWORDS:
+            continue
+        if token.lower() not in hay:
+            return token
+    return None
 
 
 def _flatten(text: str) -> str:
@@ -114,12 +298,36 @@ def _normalized(text: str) -> str:
     return " ".join((text or "").lower().split()).rstrip(".")
 
 
+def _content_words(text: str) -> set:
+    return {
+        w
+        for w in re.findall(r"[a-z][a-z'’-]{3,}", (text or "").lower())
+        if w not in _MATCH_STOPWORDS
+    }
+
+
+def _fact_named_by(text: str, existing: List[dict]) -> Optional[int]:
+    """The id of the ONE saved fact a "forget that" names, or None.
+
+    The model is asked for the id and usually gives one; when it does not,
+    the request is still an erasure, and "forget that I'm vegetarian" points
+    at the row that says vegetarian. Exactly one match, or nothing happens —
+    deleting the wrong memory is worse than deleting none.
+    """
+    words = _content_words(text)
+    if not words:
+        return None
+    hits = [f["id"] for f in existing if words & _content_words(f["fact"])]
+    return hits[0] if len(hits) == 1 else None
+
+
 async def remember_after_route(
     gate: "asyncio.Future[bool]",
     user_id: int,
     user_text: str,
     conversation_id: Optional[str],
     *,
+    attachments: bool = False,
     complete=None,
 ) -> List[dict]:
     """`remember_from_message`, held until the turn knows its route.
@@ -138,7 +346,13 @@ async def remember_after_route(
     the task never waits forever."""
     if not await gate:
         return []
-    return await remember_from_message(user_id, user_text, conversation_id, complete=complete)
+    return await remember_from_message(
+        user_id,
+        user_text,
+        conversation_id,
+        attachments=attachments,
+        complete=complete,
+    )
 
 
 async def remember_from_message(
@@ -146,18 +360,33 @@ async def remember_from_message(
     user_text: str,
     conversation_id: Optional[str],
     *,
+    attachments: bool = False,
     complete=None,
 ) -> List[dict]:
     """Extract and store durable facts from one user message.
 
-    Returns the facts that were added or rewritten (empty when none).
-    `complete` defaults to llm.router_chat_completion — injectable for tests.
+    Returns the facts that were added, rewritten or deleted (empty when
+    none); a deleted one carries `"deleted": True`. `complete` defaults to
+    llm.router_chat_completion — injectable for tests.
+
+    WHAT MAY BECOME A FACT (2026-09-18). Only the person's own words about
+    themselves. A turn that carries an ATTACHMENT is a turn about a document,
+    so it writes no memory at all, and a message long enough to be a pasted
+    document is treated the same way (`own_words`). What the extractor then
+    proposes is checked rather than trusted: nothing transient (`is_durable`),
+    no number or name the message did not contain (`ungrounded_in`), and a
+    message that asks to FORGET something may only delete.
     """
     if not settings.fact_extraction_enabled:
         return []
-    text = (user_text or "").strip()
-    if len(text) < _MESSAGE_MIN_CHARS:
+    # A document the person uploaded is third-party content: it is material
+    # for the turn, never a statement the person made about themselves.
+    if attachments:
         return []
+    text = own_words(user_text)
+    if not text or len(text) < _MESSAGE_MIN_CHARS:
+        return []
+    forget_request = bool(_FORGET_RE.search(text))
     try:
         existing = await db.run_in_thread(
             db.list_user_facts, user_id, settings.memory_max_facts
@@ -183,12 +412,57 @@ async def remember_from_message(
         ops = parse_extraction(raw)
         if not ops:
             return []
+        by_id = {f["id"]: f for f in existing}
         known = {_normalized(f["fact"]): f["id"] for f in existing}
         stored: List[dict] = []
         added = 0
+        # A delete happens because the PERSON asked for one. The extractor
+        # may point at the row, but an unprompted "remove" on an ordinary
+        # message would let a prompt quietly drop somebody's memory.
+        removals = (
+            [i for i in ops.get("remove", []) if i in by_id]
+            if forget_request
+            else []
+        )
+        if forget_request:
+            # An erasure request never writes memory. Left to itself the
+            # extractor answers "please forget that I'm vegetarian" with a
+            # REPLACE — "The user is not vegetarian" — which is the erased
+            # thing, kept forever and stated as the person's own words.
+            ops["add"] = []
+            ops["replace"] = []
+            if not removals:
+                target = _fact_named_by(text, existing)
+                if target is not None:
+                    removals = [target]
+        for fact_id in removals:
+            deleted = await db.run_in_thread(db.delete_user_fact, user_id, fact_id)
+            if deleted:
+                row = dict(by_id[fact_id])
+                row["deleted"] = True
+                stored.append(row)
+                known.pop(_normalized(row["fact"]), None)
         for item in ops.get("replace", []):
+            row = by_id.get(item["id"])
+            if row is None:  # an id this user does not own, or already gone
+                continue
+            # A rewrite may re-use the names already in the fact it rewrites,
+            # but every NUMBER must come from this message — carrying the old
+            # employer's headcount onto the new employer is exactly the
+            # invention this guards.
+            missing = _ungrounded_number(item["fact"], text) or _ungrounded_name(
+                item["fact"], text, row["fact"]
+            )
+            if missing is not None:
+                log.info("fact rewrite dropped: %r not in the message", missing)
+                continue
             updated = await db.run_in_thread(
-                db.update_user_fact, user_id, item["id"], item["fact"]
+                db.update_user_fact,
+                user_id,
+                item["id"],
+                item["fact"],
+                source="stated",
+                source_excerpt=text,
             )
             if updated:
                 known[_normalized(item["fact"])] = updated["id"]
@@ -196,11 +470,20 @@ async def remember_from_message(
         for fact in ops.get("add", []):
             if _normalized(fact) in known:  # extractor re-suggested a saved fact
                 continue
+            missing = ungrounded_in(fact, text)
+            if missing is not None:
+                log.info("fact dropped: %r not in the message", missing)
+                continue
             # Replaces rewrite existing rows; only genuine adds consume slots.
             if len(existing) + added >= settings.memory_max_facts:
                 break
             created = await db.run_in_thread(
-                db.add_user_fact, user_id, fact, conversation_id
+                db.add_user_fact,
+                user_id,
+                fact,
+                conversation_id,
+                source="stated",
+                source_excerpt=text,
             )
             known[_normalized(fact)] = created["id"]
             stored.append(created)
