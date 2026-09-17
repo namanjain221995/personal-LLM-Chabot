@@ -42,6 +42,14 @@ document" — which answered ABOUT the document and refused to advise. It now
 comes from engines/source_use.py, per question: a document is a SOURCE, not
 a cage, and a field question still gets the strict extractor rules.
 
+    The switch there is a scored classifier, not a list of patterns, and its
+    two thresholds differ on purpose: one decision signal makes a question
+    advisory, strict extraction needs two points of high-precision field
+    evidence. Getting a question wrong towards advice costs a sentence;
+    getting it wrong towards extraction is the incident above. source_use.
+    classify() returns the evidence it used, which is what to print first
+    when an answer comes back the wrong shape.
+
 Emits meta route "vision" — same visual-understanding engine as before.
 """
 from __future__ import annotations
@@ -99,7 +107,9 @@ def _system_for(question: str) -> str:
     and sent the owner to the vendor. The persona now answers the question
     that was asked, from the document plus general knowledge plus what this
     conversation already says about the person, each part labelled; the
-    strict extractor rules come back for a field question.
+    strict extractor rules come back for a field question — but only on
+    evidence that a field of the document is really being named, never on a
+    bare word that is also ordinary English ("in the long term").
     """
     return source_use.system_text(question) + _AS3_CAPABILITY
 

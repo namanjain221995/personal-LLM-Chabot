@@ -21,7 +21,8 @@ import pytest
 from app.engines import source_use
 from app.engines.document import run_pdf_engine_multi
 from tests.document_answer_grader import (cites_document, gives_recommendation,
-                                          opens_with_refusal, referral_only)
+                                          opens_with_refusal, referral_only,
+                                          source_named_headings)
 
 #: The owner's question, exactly as he typed it (conversation
 #: b8b9202e-9966-40c5-8e3c-e3a8c8c881eb, 2026-09-17, Fast mode).
@@ -83,21 +84,66 @@ def test_the_extractor_cage_is_gone():
 
 
 def test_the_prompt_names_all_three_sources_and_labels_them():
+    """All three sources are still described — in prose, not as three labels.
+
+    The names used to be three shouty headings in the prompt, and the model
+    mirrored them into the answer (see the test below). They are described
+    instead, so the answer has no template to copy.
+    """
     system = source_use.system_text(OWNER_QUESTION)
     assert "SOURCE, not a limit" in system
-    for source in ("THE DOCUMENT", "GENERAL KNOWLEDGE", "THIS CONVERSATION"):
-        assert source in system, f"{source} missing from the document prompt"
+    assert "what the document itself says" in system
+    assert "where the document is silent, answer from your own knowledge" in system
+    assert "what this conversation already tells you about the person" in system
     assert "which part is which" in system
 
 
 def test_the_three_sources_are_not_an_answer_template():
-    """Live, the model turned the three source names into three headings and
-    wrote a "THIS CONVERSATION: no context was provided" section under them."""
+    """The model copies the prompt's SHAPE, so the shape had to go.
+
+    The first cut named the three sources in capitals and then banned those
+    exact strings as headings. Live it did not hold: one graded run of the
+    owner's turn came back as "### 1. The Document's Limitations", "### 2.
+    General Knowledge: DGX Spark Requirements", "### 3. This Conversation:
+    Your Scale", and another printed the three names in bold verbatim. Now the
+    prompt carries no such labels at all, plus a positive rule and a ban that
+    does not depend on capitalisation. tests/test_live_document_reasoning.py
+    checks the ANSWER; this checks the instrument.
+    """
     for question in (OWNER_QUESTION, "extract the invoice total", "summarize this"):
         system = source_use.system_text(question)
-        assert "sources, not a template for the answer" in system
-        assert "never use THE DOCUMENT, GENERAL KNOWLEDGE or THIS CONVERSATION as headings" in system
-        assert "never write a section to say a source is empty" in system
+        assert "WHERE THE ANSWER COMES FROM, NOT HOW IT IS LAID OUT" in system
+        assert "Lay the answer out by the QUESTION, never by source" in system
+        assert "Every heading and every bold label names the SUBJECT underneath it" in system
+        # A flat ban did not hold live; a check the model can run on each
+        # heading as it writes it did.
+        assert "CHECK EVERY HEADING AND EVERY BOLD LABEL" in system
+        # The model routed around a heading-only rule: with the ### headings
+        # clean it split each section into "**The Document's Figures:**" and
+        # "**My Knowledge (DGX Spark Power):**" instead.
+        assert "including a label inside a section" in system
+        assert "in any form or capitalisation" in system
+        assert "No section exists to report what a source holds or lacks" in system
+        # And the rule quotes no BAD heading. Naming one seeded it: the prompt
+        # that spelled out the rewrite for "The Document's Limits (Capacity)"
+        # got "**The Document's Limits:**" back twice in the next live answer.
+        # Every example in the prompt is of a good heading.
+        assert "The Document" not in system
+        assert "Document's" not in system
+        assert "Where a fact came from is said in the sentence that uses it" in system
+        assert "never as a heading" in system
+        # Nothing left in the prompt for the model to mirror. What mirrored was
+        # the LABEL form the old prompt used — "- THE DOCUMENT: its own figures
+        # ..." — and the answers copied it as "### 1. The Document's
+        # Limitations". Two of the three names are gone from the prompt
+        # outright; "the document" survives only as ordinary words inside the
+        # no-fabrication rule, never as a label.
+        for label in ("GENERAL KNOWLEDGE", "THIS CONVERSATION"):
+            assert label not in system, f"{label} is still a template in the prompt"
+        for label in ("THE DOCUMENT", "GENERAL KNOWLEDGE", "THIS CONVERSATION"):
+            assert f"- {label}" not in system, f"{label} is still a bullet label"
+            assert f"{label}:" not in system, f"{label} is still a heading label"
+            assert f"**{label}**" not in system
 
 
 def test_a_silent_document_is_one_line_AFTER_the_answer():
@@ -136,6 +182,12 @@ def test_structure_rules_ride_on_every_document_answer():
         assert "markdown headings" in system
         assert "**bold labels**" in system
         assert "Do not restate or summarize the document before answering" in system
+        # Said again in the FORMAT block, which is the last thing the model
+        # reads and where a layout rule actually gets applied.
+        assert "never the source the fact came from" in system
+        # Said last as well as in BASE: a layout rule is obeyed best where the
+        # layout rules are, and this one had to be measured four times.
+        assert "rewrite it as the thing it is about before you write it" in system
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +220,15 @@ def test_decision_questions_get_the_advisory_block(question):
     assert "ABOUT THE THING, NOT THE PAPERWORK" in system
     assert "they mean the thing the document describes" in system
     assert "Judge the thing." in system
+    # A ban alone kept losing to the model's instinct to tour its sources, so
+    # the decision answer gets a skeleton of its own. Live, one run came back
+    # as "### 1. What the Document Says", "### 2. What I Know (General
+    # Contract & Business Context)", "### 3. What This Conversation Tells Me
+    # About You" — the three sources rebuilt out of words no ban had named.
+    assert "SHAPE OF THIS ANSWER" in system
+    assert "each under a heading naming THAT THING" in system
+    assert "never a tour of your sources" in system
+    assert "the answer laid out backwards" in system
 
 
 @pytest.mark.parametrize(
@@ -289,7 +350,8 @@ def test_what_the_person_already_said_is_in_the_prompt(prompt_recorder):
         str(m.get("content")) for m in messages if m.get("role") != "system"
     )
     assert "2 DGX Sparks" in turns
-    assert "THIS CONVERSATION" in messages[0]["content"]
+    assert "what this conversation already tells you about the person" in messages[0]["content"]
+    assert "context you must use" in messages[0]["content"]
 
 
 def test_the_follow_up_turn_keeps_the_rule_once_the_document_is_history():
@@ -337,6 +399,76 @@ def test_the_graders_accept_an_answer_that_answers_the_question():
     assert gives_recommendation(THE_GOOD_ANSWER)
     assert cites_document(THE_GOOD_ANSWER, BROCHURE_FIGURES)
     assert not referral_only(THE_GOOD_ANSWER)
+
+
+#: Verbatim opening of A_owner_vertiv run 5, 2026-09-18, live. The verdict is
+#: right, the sentence is about the PRODUCT, and the grader scored it a
+#: refusal — which would have failed the live test for being correct.
+_A_VERDICT_THAT_READS_LIKE_A_REFUSAL = (
+    "**Recommendation: No, the Vertiv SmartRow is not a full solution for your "
+    "20-node DGX Spark cluster.**\n\n"
+    "While the SmartRow provides the physical infrastructure (power, cooling, "
+    "containment), it does not include the compute hardware, networking, or "
+    "software stack required to run DGX Sparks. Furthermore, based on the power "
+    "specifications provided in the document, the standard SmartRow configurations "
+    "are likely insufficient for a full 20-node cluster."
+)
+
+
+def test_a_verdict_about_the_product_is_not_a_refusal_about_the_paper():
+    """The subject decides. "does not include" is the refusal when its subject
+    is the paper and a verdict when its subject is the product."""
+    assert not opens_with_refusal(_A_VERDICT_THAT_READS_LIKE_A_REFUSAL)
+    assert gives_recommendation(_A_VERDICT_THAT_READS_LIKE_A_REFUSAL)
+    # ... and the refusals it must still catch, including the one the second
+    # recheck reproduced live on the delivered patch.
+    assert opens_with_refusal(
+        "**Not stated in the document.**\n\nThe provided Master Services "
+        "Agreement excerpt contains specific commercial and legal terms, but it "
+        "does not contain any information regarding the long-term strategic fit."
+    )
+    assert opens_with_refusal(
+        "The document does not mention NVIDIA DGX Spark. Check with the vendor."
+    )
+    assert opens_with_refusal(
+        "The brochure you shared does not cover DGX Spark compatibility."
+    )
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        # Verbatim first lines of live runs from 2026-09-18 that the grader
+        # scored as giving no recommendation, although each opens with one.
+        "**Verdict: No, this is not the right long-term choice.**",
+        "**Short Answer: No, this is not the right choice for the long term.**",
+        "**Recommendation: No, the Vertiv SmartRow is not a full solution.**",
+        "Bottom line: this is the wrong product for two nodes.",
+        "I would not renew on these terms.",
+        "This would be a poor choice at your scale.",
+    ],
+)
+def test_the_grader_can_see_a_verdict_that_is_not_the_word_recommend(opening):
+    """A verdict the grader cannot see is a live test that fails for being
+    right. None of these forms may rescue the answer this round fixes."""
+    assert gives_recommendation(opening), opening
+
+
+def test_widening_the_recommendation_grader_did_not_rescue_the_bad_answer():
+    """The constraint every addition above is written under."""
+    assert not gives_recommendation(THE_BAD_ANSWER)
+    assert referral_only(THE_BAD_ANSWER)
+    # "The short answer is no" is the bad answer's own opening and stays out.
+    assert not gives_recommendation("The short answer is no.")
+
+
+def test_a_refusal_is_not_assembled_out_of_two_innocent_sentences():
+    """Sentence by sentence: a verdict in one and the word "document" in the
+    next must not add up to a refusal neither of them made."""
+    assert not opens_with_refusal(
+        "The SmartRow does not include the compute hardware. "
+        "The document lists 2 to 12 racks, which covers your 20 nodes."
+    )
 
 
 def test_saying_the_document_is_silent_is_allowed_after_the_answer():
@@ -444,7 +576,7 @@ def test_a_fully_answered_question_gets_no_unasked_section(question):
     system = source_use.system_text(question)
     assert "ANSWER THE QUESTION AND STOP" in system
     assert '"context for your setup"' in system
-    assert "no next steps, no recommendation" in system
+    assert "no next steps, no offer of further analysis" in system
     assert "do not pad it with general knowledge" in system
     assert "DECISION QUESTION" not in system
     assert "EXTRACTION QUESTION" not in system
@@ -460,7 +592,7 @@ def test_stopping_does_not_gag_a_contradiction(question):
     that is part of the answer, not the padding the rule above bans."""
     assert source_use.question_mode(question) == ""
     system = source_use.system_text(question)
-    assert "ONE exception" in system
+    assert "ONE more exception" in system
     assert "contradicts what is normally true" in system
     assert "what the usual figure is" in system
 
@@ -620,3 +752,532 @@ def test_the_contract_turn_builds_a_strict_prompt(prompt_recorder):
     assert "EXTRACTION QUESTION" in system
     assert "DECISION QUESTION" not in system
     assert "OVERRIDES the general-knowledge permission above" in system
+
+
+# ---------------------------------------------------------------------------
+# THE MODE BATTERY (2026-09-18)
+#
+# 204 questions, each labelled with the mode a careful person would choose,
+# pinned so the switch cannot drift. It exists because the second recheck
+# found the classifier reproducing the original incident on a phrasing nobody
+# had written down: "is this the right choice for us in the long term?" took
+# the strict extraction block, because the word "term" inside "long term"
+# matched the contract field. Every trap that found is a row here.
+#
+# The labels follow the rule the round is built on: strict extraction only on
+# high-precision evidence, and ANY ask for a judgement makes the answer
+# advisory (extract+advise when fields are named too), never extraction alone.
+#
+# Covered on purpose: contract and invoice field asks, blunt and polite;
+# decision questions with and without a first-person pronoun; "long term",
+# "short term", "in terms of", "the whole party", "the total picture", "the
+# amount of heat"; mixed asks; plain factual questions the document answers;
+# summaries.
+# ---------------------------------------------------------------------------
+
+MODE_BATTERY = [
+    ('extract', 'extract the invoice number, the total, the tax amount, the PO number and the payment terms', 'invoice-blunt'),
+    ('extract', 'what is the invoice total?', 'invoice-blunt'),
+    ('extract', 'invoice total?', 'invoice-blunt'),
+    ('extract', 'total and due date', 'invoice-blunt'),
+    ('extract', 'what is the grand total?', 'invoice-blunt'),
+    ('extract', "what's the subtotal?", 'invoice-blunt'),
+    ('extract', 'what is the tax amount?', 'invoice-blunt'),
+    ('extract', 'list the line items', 'invoice-blunt'),
+    ('extract', 'list all the line items with quantities', 'invoice-blunt'),
+    ('extract', 'what is the due date?', 'invoice-blunt'),
+    ('extract', 'who is the vendor?', 'invoice-blunt'),
+    ('extract', 'what currency is the invoice in?', 'invoice-blunt'),
+    ('extract', 'pull the numbers out of this invoice for our books', 'invoice-blunt'),
+    ('extract', 'copy the table on page 3', 'invoice-blunt'),
+    ('extract', 'give me the vendor name and the amount', 'invoice-blunt'),
+    ('extract', 'what is the PO number?', 'invoice-blunt'),
+    ('extract', "what's the payment terms on this invoice?", 'invoice-blunt'),
+    ('extract', 'transcribe the address block at the top', 'invoice-blunt'),
+    ('extract', 'read out the serial number on page 2', 'invoice-blunt'),
+    ('extract', 'what is the amount due?', 'invoice-blunt'),
+    ('extract', 'balance due?', 'invoice-blunt'),
+    ('extract', 'how much do we owe and when is it due?', 'invoice-blunt'),
+    ('extract', 'what is the unit price of the cooling unit?', 'invoice-blunt'),
+    ('extract', 'quantity on line 2?', 'invoice-blunt'),
+    ('extract', 'what is the discount?', 'invoice-blunt'),
+    ('extract', 'is there a PO number on this invoice?', 'invoice-blunt'),
+    ('extract', 'date of issue?', 'invoice-blunt'),
+    ('extract', 'what is the date on this invoice?', 'invoice-blunt'),
+    ('extract', 'what does the invoice say the total is?', 'invoice-blunt'),
+    ('extract', 'extract the line items from this invoice', 'invoice-blunt'),
+    ('extract', 'could you please tell me the grand total and the due date?', 'invoice-polite'),
+    ('extract', 'I need the total from this invoice and the tax amount', 'invoice-polite'),
+    ('extract', 'I need to know the total', 'invoice-polite'),
+    ('extract', 'would you mind giving me the invoice number and the vendor name?', 'invoice-polite'),
+    ('extract', 'can you give me the totals for each line?', 'invoice-polite'),
+    ('extract', 'I want the line items', 'invoice-polite'),
+    ('extract', 'if you could pull the payment terms that would be great', 'invoice-polite'),
+    ('extract', 'just the total please', 'invoice-polite'),
+    ('extract', 'send me the totals for both invoices', 'invoice-polite'),
+    ('extract', 'confirm the due date for me', 'invoice-polite'),
+    ('extract', 'kindly provide the effective date and the annual fee', 'invoice-polite'),
+    ('extract', 'fees and dates please', 'invoice-polite'),
+    ('extract', 'total?', 'invoice-polite'),
+    ('extract', 'does the datasheet give a price?', 'invoice-polite'),
+    ('extract', 'what is the effective date and the annual fee?', 'invoice-polite'),
+    ('extract', 'Who are the parties to this contract, what is the term, and what is the governing law?', 'contract'),
+    ('extract', 'what is the governing law?', 'contract'),
+    ('extract', 'what is the term of this contract?', 'contract'),
+    ('extract', "what's the contract term?", 'contract'),
+    ('extract', 'how long is the initial term?', 'contract'),
+    ('extract', "what's the termination notice period in this contract?", 'contract'),
+    ('extract', 'what are the parties and the fees?', 'contract'),
+    ('extract', 'who signed this agreement and on what date?', 'contract'),
+    ('extract', 'who signed it?', 'contract'),
+    ('extract', 'what is the notice period?', 'contract'),
+    ('extract', "what's the notice to terminate?", 'contract'),
+    ('extract', 'when does this agreement expire?', 'contract'),
+    ('extract', 'what is the contract value?', 'contract'),
+    ('extract', 'what is the billing address?', 'contract'),
+    ('extract', 'what is the interest rate on late payment?', 'contract'),
+    ('extract', 'please list the parties to this agreement', 'contract'),
+    ('extract', 'list all the parties named in the contract', 'contract'),
+    ('extract', 'what is the jurisdiction?', 'contract'),
+    ('extract', 'what is the commencement date?', 'contract'),
+    ('extract', 'what is the renewal date?', 'contract'),
+    ('extract', 'fill in the form fields: vendor, issue date, due date, currency, discount', 'contract'),
+    ('extract', 'transcribe the table verbatim', 'contract'),
+    ('extract', 'quote the termination clause word for word', 'contract'),
+    ('extract', 'what is the annual fee under this agreement?', 'contract'),
+    ('extract', 'copy the wording of clause 5', 'contract'),
+    ('extract', 'quote the section on data residency', 'contract'),
+    ('extract', 'quote clause 11 exactly', 'contract'),
+    ('extract', 'i need the po number and the vendor address', 'contract'),
+    ('extract', 'can you extract everything?', 'contract'),
+    ('extract', 'any chance you can pull the totals?', 'contract'),
+    ('extract', "what's the effective date?", 'contract'),
+    ('extract', 'what is the policy number?', 'contract'),
+    ('extract', 'list the benefits of this product', 'contract'),
+    ('advise', 'as I have dgx spark ?? is help Full ??', 'decision-first-person'),
+    ('advise', 'I want to place dgx spark on their rack for cooling', 'decision-first-person'),
+    ('advise', 'will this work for my setup? I run 12 servers with 25 GbE NICs', 'decision-first-person'),
+    ('advise', 'am I allowed to put our customer database on a US cloud region?', 'decision-first-person'),
+    ('advise', 'should we use this method? we serve a 35B MoE at 1M context', 'decision-first-person'),
+    ('advise', 'do I need this for 20 nodes', 'decision-first-person'),
+    ('advise', 'can I place my servers in this?', 'decision-first-person'),
+    ('advise', 'is this a good fit for us?', 'decision-first-person'),
+    ('advise', 'which model should we buy for a 40 kW row?', 'decision-first-person'),
+    ('advise', 'we have 20 DGX Sparks - is this overkill?', 'decision-first-person'),
+    ('advise', 'should I renew this contract?', 'decision-first-person'),
+    ('advise', 'can we host our GPUs in this enclosure?', 'decision-first-person'),
+    ('advise', 'is it worth the money for a small deployment?', 'decision-first-person'),
+    ('advise', 'what do you recommend for my setup?', 'decision-first-person'),
+    ('advise', 'should I use this for my cluster?', 'decision-first-person'),
+    ('advise', 'is this helpful for me?', 'decision-first-person'),
+    ('advise', 'is it worth it for 10 nodes?', 'decision-first-person'),
+    ('advise', 'do we really need the larger unit?', 'decision-first-person'),
+    ('advise', 'would you recommend this', 'decision-first-person'),
+    ('advise', "I'm torn between the 10 kW and the 45 kW unit - which should I pick?", 'decision-first-person'),
+    ('advise', "i'm thinking of racking these in it", 'decision-first-person'),
+    ('advise', "we'd be installing two of them here", 'decision-first-person'),
+    ('advise', 'my plan is to host the cluster in one of these', 'decision-first-person'),
+    ('advise', 'i was going to buy two', 'decision-first-person'),
+    ('advise', 'our options are this or a standard rack', 'decision-first-person'),
+    ('advise', 'is this worth buying', 'decision-no-pronoun'),
+    ('advise', 'is that worth the money', 'decision-no-pronoun'),
+    ('advise', 'does this make sense for a two-node cluster?', 'decision-no-pronoun'),
+    ('advise', 'is this suitable for a small office?', 'decision-no-pronoun'),
+    ('advise', 'is this overkill for two nodes?', 'decision-no-pronoun'),
+    ('advise', 'is this enough cooling for 20 nodes?', 'decision-no-pronoun'),
+    ('advise', 'would this be helpful for a 40 kW row?', 'decision-no-pronoun'),
+    ('advise', 'does this fit a 600 mm rack?', 'decision-no-pronoun'),
+    ('advise', 'is it any good?', 'decision-no-pronoun'),
+    ('advise', 'which one is better for a small server room?', 'decision-no-pronoun'),
+    ('advise', 'should this be deployed in an office?', 'decision-no-pronoun'),
+    ('advise', 'is a SmartRow overkill here?', 'decision-no-pronoun'),
+    ('advise', 'can this be used for GPU racks?', 'decision-no-pronoun'),
+    ('advise', 'pros and cons?', 'decision-no-pronoun'),
+    ('advise', 'is it better than a standard rack?', 'decision-no-pronoun'),
+    ('advise', 'is a third party allowed to access the data?', 'decision-no-pronoun'),
+    ('advise', 'would this be suitable for an office server room?', 'decision-no-pronoun'),
+    ('advise', 'is the price fair for two racks?', 'decision-no-pronoun'),
+    ('advise', 'what would you do in my position?', 'decision-first-person'),
+    ('advise', 'should we sign this or walk away?', 'decision-first-person'),
+    ('advise', 'how does this compare to a standard rack?', 'decision-no-pronoun'),
+    ('advise', 'is there anything I should worry about?', 'decision-first-person'),
+    ('advise', 'does this cover 20 nodes?', 'decision-no-pronoun'),
+    ('advise', 'can it handle 20 nodes?', 'decision-no-pronoun'),
+    ('advise', 'is this the right choice for us in the long term?', 'trap-long-term'),
+    ('advise', 'will this work for my setup in the long term? I run 12 servers with 25 GbE NICs in a 600 mm deep rack, rear-to-front airflow', 'trap-long-term'),
+    ('advise', 'we plan to grow - does this help us in the short term?', 'trap-short-term'),
+    ('advise', 'long term, is this a sensible investment?', 'trap-long-term'),
+    ('advise', 'in terms of cooling, will this work for my rack?', 'trap-in-terms-of'),
+    ('', 'in terms of power, what does this unit draw?', 'trap-in-terms-of'),
+    ('', 'what is the total picture here?', 'trap-total-picture'),
+    ('advise', 'does the total picture make sense for a 20-node build?', 'trap-total-picture'),
+    ('', 'who was at the whole party?', 'trap-whole-party'),
+    ('advise', 'the whole party is coming to see the rack - will it fit in the room?', 'trap-whole-party'),
+    ('advise', 'the party was a total disaster, does this help?', 'trap-whole-party'),
+    ('advise', 'the whole party wants to know: is it worth it?', 'trap-whole-party'),
+    ('', 'how many parties attended the launch party?', 'trap-whole-party'),
+    ('', 'what rate of airflow does it need over a long period?', 'trap-long-term'),
+    ('', 'over the short term the value of the team matters more', 'trap-short-term'),
+    ('', 'in the long term, what is the total cost of ownership?', 'trap-long-term'),
+    ('', 'up to date figures please', 'trap-total-picture'),
+    ('', "in the short run it's fine - long term?", 'trap-short-term'),
+    ('advise', 'over a long period, does this hold up?', 'trap-long-term'),
+    ('advise', 'the total picture: should we sign?', 'trap-total-picture'),
+    ('advise', 'third party access - is it permitted?', 'trap-whole-party'),
+    ('advise', 'will this handle the amount of heat two racks produce?', 'trap-amount-of'),
+    ('advise', 'is the amount of cooling enough for 20 DGX Sparks?', 'trap-amount-of'),
+    ('extract', 'what is the total, in terms of the line items?', 'trap-in-terms-of'),
+    ('extract', 'short term this looks fine, but what is the term of the contract?', 'trap-short-term'),
+    ('extract+advise', 'extract the payment terms and tell me whether I should renew', 'mixed'),
+    ('extract+advise', 'what is the annual fee, and do you recommend we sign?', 'mixed'),
+    ('extract+advise', 'give me the total and tell me if it is worth it', 'mixed'),
+    ('extract+advise', 'what is the term and the notice period - should we renew?', 'mixed'),
+    ('extract+advise', 'list the line items and tell me if we are being overcharged', 'mixed'),
+    ('extract+advise', 'what is the total and is it worth it?', 'mixed'),
+    ('extract+advise', 'pull the fees out and tell me whether this is good value', 'mixed'),
+    ('extract+advise', 'who are the parties, and should we sign with them?', 'mixed'),
+    ('extract+advise', 'what is the due date, and do I need to pay early?', 'mixed'),
+    ('extract+advise', 'invoice total please, and is that reasonable for two racks?', 'mixed'),
+    ('extract+advise', 'list the reasons why I should buy this', 'mixed'),
+    ('', 'what cooling capacity does this product offer?', 'factual'),
+    ('', 'what does clause 11 say?', 'factual'),
+    ('', 'what supply water temperature should I run for this unit?', 'factual'),
+    ('', 'what pressure should we hold the loop at?', 'factual'),
+    ('', 'what does this document say about fire suppression?', 'factual'),
+    ('', 'explain section 3 in plain English', 'factual'),
+    ('', 'how many pages is this?', 'factual'),
+    ('', 'what is the product name?', 'factual'),
+    ('', 'what problem does this paper solve?', 'factual'),
+    ('', 'what is this document about?', 'factual'),
+    ('', 'translate page 2 to English', 'factual'),
+    ('', 'translate the whole thing', 'factual'),
+    ('', 'what happens in the event of termination?', 'factual'),
+    ('', 'how many racks does the enclosure hold?', 'factual'),
+    ('', 'what airflow direction does it use?', 'factual'),
+    ('', 'what is the operating temperature range?', 'factual'),
+    ('', 'does the document mention DGX Spark?', 'factual'),
+    ('', 'what sections does this contract have?', 'factual'),
+    ('', 'what does the paper measure at 128k context?', 'factual'),
+    ('', 'what UPS capacity is included?', 'factual'),
+    ('', 'does it come with monitoring?', 'factual'),
+    ('', 'how much will this cost us?', 'factual'),
+    ('', 'any hidden fees?', 'factual'),
+    ('', "what's the catch?", 'factual'),
+    ('', 'what language is this in?', 'factual'),
+    ('', 'does the contract auto-renew?', 'factual'),
+    ('', 'what is my liability under this agreement?', 'factual'),
+    ('', 'read the first paragraph back to me', 'factual'),
+    ('', 'what is the total number of racks?', 'factual'),
+    ('', 'explain the termination process', 'factual'),
+    ('', 'long-term support: is it included?', 'factual'),
+    ('', 'summarize this document', 'summary'),
+    ('', 'give me a summary of the key points I need', 'summary'),
+    ('', 'summarise this in three bullets', 'summary'),
+    ('', 'I need a summary', 'summary'),
+    ('', 'tl;dr?', 'summary'),
+    ('', 'summarize the contract', 'summary'),
+    ('', 'summarize the invoice', 'summary'),
+    ('', 'give me an executive summary', 'summary'),
+    ('', 'what are the main points?', 'summary'),
+    ('', 'what is the key takeaway?', 'summary'),
+]
+
+
+@pytest.mark.parametrize("want,question,group", MODE_BATTERY)
+def test_the_mode_battery_has_no_mismatch(want, question, group):
+    signals = source_use.classify(question)
+    assert signals.mode == want, (
+        f"[{group}] {question!r}\n"
+        f"  want {want or 'neutral'!r}, got {signals.mode or 'neutral'!r}\n"
+        f"  field={signals.field_score} decision={signals.decision_score} "
+        f"evidence={signals.evidence}"
+    )
+
+
+def test_the_battery_still_covers_every_group_it_was_built_for():
+    """The battery may grow. It may not quietly lose the cases that caught the
+    regressions — a shrunken battery passes for the wrong reason."""
+    from collections import Counter
+
+    groups = Counter(group for _, _, group in MODE_BATTERY)
+    modes = Counter(want for want, _, _ in MODE_BATTERY)
+    assert len(MODE_BATTERY) >= 120, len(MODE_BATTERY)
+    assert len({q for _, q, _ in MODE_BATTERY}) == len(MODE_BATTERY), "duplicate question"
+    for group, least in (
+        ("invoice-blunt", 20),
+        ("invoice-polite", 10),
+        ("contract", 20),
+        ("decision-first-person", 15),
+        ("decision-no-pronoun", 15),
+        ("mixed", 8),
+        ("factual", 15),
+        ("summary", 8),
+    ):
+        assert groups[group] >= least, f"{group}: {groups[group]} < {least}"
+    for trap in ("trap-long-term", "trap-short-term", "trap-in-terms-of",
+                 "trap-total-picture", "trap-whole-party", "trap-amount-of"):
+        assert groups[trap] >= 1, f"{trap} dropped out of the battery"
+    for mode in ("extract", "advise", "extract+advise", ""):
+        assert modes[mode] >= 10, f"{mode or 'neutral'}: only {modes[mode]} rows"
+
+
+# ---------------------------------------------------------------------------
+# The second recheck's findings, one test each (2026-09-18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # BLOCKER: reproduced live, twice out of two runs, on the CONTRACT
+        # fixture. mode was extract, the answer opened "**Not stated in the
+        # document.**" and gave no verdict — the owner's complaint verbatim.
+        "is this the right choice for us in the long term?",
+        "will this work for my setup in the long term?",
+        "we plan to grow - does this help us in the short term?",
+        "long term, is this a sensible investment?",
+        "in terms of cooling, will this work for my rack?",
+        "will this handle the amount of heat our racks produce?",
+        "is the amount of cooling enough for 20 DGX Sparks?",
+    ],
+)
+def test_ordinary_english_never_routes_a_decision_to_extraction(question):
+    """"long term" is not the contract's term, and the cost of confusing them
+    is the whole incident. The words are masked out before any field pattern
+    runs, so no lookbehind can be missing one."""
+    signals = source_use.classify(question)
+    assert signals.mode == "advise", (question, signals)
+    assert signals.field_score < 2, signals.evidence
+    assert "EXTRACTION QUESTION" not in source_use.system_text(question)
+
+
+@pytest.mark.parametrize(
+    "question,expected",
+    [
+        ("what is the term of this contract?", "extract"),
+        ("what's the contract term?", "extract"),
+        ("how long is the initial term?", "extract"),
+        ("Who are the parties to this contract, what is the term, and what is the governing law?", "extract"),
+        ("what is the total on this invoice?", "extract"),
+    ],
+)
+def test_the_mask_is_not_over_applied(question, expected):
+    """The fix may not buy safety by losing the real field asks: a term OF A
+    CONTRACT and a total ON AN INVOICE are still extraction."""
+    assert source_use.question_mode(question) == expected, question
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # MEDIUM: these were NEUTRAL, and NEUTRAL told the model not to
+        # recommend — so a person asking for a recommendation got none.
+        "does this make sense for a two-node cluster?",
+        "is this suitable for a small office?",
+        "is this overkill for two nodes?",
+        "is this enough cooling for 20 nodes?",
+        "would this be helpful for a 40 kW row?",
+        "does this fit a 600 mm rack?",
+        "is this worth buying",
+        "is it any good?",
+        "can this be used for GPU racks?",
+        "should this be deployed in an office?",
+    ],
+)
+def test_a_decision_without_a_pronoun_is_still_a_decision(question):
+    """A judgement does not stop being a judgement because the person left
+    themselves out of the sentence."""
+    assert source_use.question_mode(question) == "advise", question
+    assert "DECISION QUESTION" in source_use.system_text(question)
+
+
+def test_neutral_never_forbids_a_recommendation():
+    """Rule 3 of the review, made mechanical. NEUTRAL means "answer exactly
+    what was asked and stop", never "refuse to judge" — the first cut said
+    "no next steps, no recommendation" in so many words, and every question
+    the switch failed to recognise as a decision inherited that refusal."""
+    system = source_use.system_text("summarize this document")
+    assert "no recommendation" not in system
+    assert "STOPPING IS NOT REFUSING TO JUDGE" in system
+    assert "if the question does turn on one, give it plainly" in system
+    assert "Never answer a question about whether something suits this person" in system
+    # ... and it still stops the padding it was added for.
+    assert "Do not append a section the person did not ask for" in system
+    assert "Do not volunteer a verdict nobody asked for" in system
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # LOW: field asks that used to fall to NEUTRAL, where BASE's
+        # general-knowledge permission applies to an extraction task.
+        "who signed this agreement and on what date?",
+        "who signed it?",
+        "what is the contract value?",
+        "what is the billing address?",
+        "when does this agreement expire?",
+        "what is the interest rate on late payment?",
+    ],
+)
+def test_the_remaining_field_asks_reach_the_strict_block(question):
+    assert source_use.question_mode(question) == "extract", question
+    assert "EXTRACTION QUESTION" in source_use.system_text(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "extract the payment terms and tell me whether I should renew",
+        "what is the annual fee, and do you recommend we sign?",
+        "give me the total and tell me if it is worth it",
+        "who are the parties, and should we sign with them?",
+        "what is the total and is it worth it?",
+        "invoice total please, and is that reasonable for two racks?",
+    ],
+)
+def test_a_decision_signal_beats_a_field_match(question):
+    """Rule 2 of the review: a judgement asked for ANYWHERE in the question
+    makes the answer extract+advise, never extraction alone. The fields are
+    still answered first, under the strict rules."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals)
+    system = source_use.system_text(question)
+    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "i'm thinking of racking these in it",
+        "we'd be installing two of them here",
+        "my plan is to host the cluster in one of these",
+        "our options are this or a standard rack",
+        "I want to place dgx spark on their rack for cooling",
+    ],
+)
+def test_the_weak_decision_tier_catches_what_is_not_even_a_question(question):
+    """No question mark, no decision word — a person saying what they mean to
+    do with the thing. First person plus a word about DOING something with it
+    is worth one point, and one point is enough. The owner's own follow-up
+    turn, "I want to place dgx spark on their rack for cooling", is this
+    shape."""
+    signals = source_use.classify(question)
+    assert signals.mode == "advise", (question, signals)
+    assert signals.decision_score == source_use._WEAK or any(
+        kind == "decision-marker" for kind, _ in signals.evidence
+    ), signals.evidence
+
+
+def test_the_thresholds_are_asymmetric_on_purpose():
+    """The safe-failure rule, in the code rather than in a comment: one
+    decision signal is enough to make a question advisory, strict extraction
+    needs two points of high-precision evidence, and a single bare word that
+    is also ordinary English is worth less than that."""
+    assert source_use._DECISION_THRESHOLD < source_use._FIELD_THRESHOLD
+    assert source_use._WEAK < source_use._FIELD_THRESHOLD
+    bare = source_use.classify("what happens in the event of termination?")
+    assert bare.field_score < source_use._FIELD_THRESHOLD, bare.evidence
+    assert bare.mode == ""
+
+
+def test_the_classifier_says_why():
+    """A misroute has to be readable in one line. The 2026-09-18 blocker was
+    one lookbehind that excluded "long-term" and not "long term", and it took
+    two live runs against the engine to find it."""
+    named = source_use.classify("what is the due date and the PO number?")
+    assert named.mode == "extract"
+    assert any(kind == "field-noun" for kind, _ in named.evidence), named.evidence
+
+    framed = source_use.classify("what is the term of this contract?")
+    assert framed.mode == "extract"
+    assert any(kind.startswith("frame-") for kind, _ in framed.evidence), framed.evidence
+
+    decided = source_use.classify("is this the right choice for us in the long term?")
+    assert decided.mode == "advise"
+    assert any(kind == "decision-marker" for kind, _ in decided.evidence), decided.evidence
+    assert not any(kind.startswith("frame-") for kind, _ in decided.evidence), decided.evidence
+
+
+def test_help_is_only_a_decision_signal_in_a_frame():
+    """"can you help me extract the total" is an extraction ask with the word
+    help in it; "does this help us" is a decision."""
+    assert source_use.question_mode("can you help me extract the total?") == "extract"
+    assert source_use.question_mode("does this help us at 20 nodes?") == "advise"
+
+
+# ---------------------------------------------------------------------------
+# The heading grader — the LOW the recheck could only check by eye
+# ---------------------------------------------------------------------------
+
+
+def test_the_heading_grader_catches_the_headings_the_recheck_saw():
+    """Pinned against the real lines from the 2026-09-18 live runs. Reading
+    the prompt cannot show whether the rule held; only an answer can, so the
+    live test asserts this list is empty."""
+    seen_live = (
+        "### 1. The Document\u2019s Limitations (Why it\u2019s not \"Full\")\n"
+        "### 2. General Knowledge: DGX Spark Requirements\n"
+        "### 3. This Conversation: Your Scale (2 \u2192 20 Nodes)\n"
+        "**THE DOCUMENT**\n**GENERAL KNOWLEDGE**\n**THIS CONVERSATION**\n"
+    )
+    assert len(source_named_headings(seen_live)) == 6, source_named_headings(seen_live)
+
+
+def test_the_heading_grader_catches_the_forms_this_round_measured():
+    """Every tightening of BASE moved the failure, and the grader had to move
+    with it. These are real heading lines from this round's live runs."""
+    seen_live = (
+        "**The Document\u2019s Limits:**\n"
+        "### 1. What the Document Says (Constraints)\n"
+        "### 1. The Document\u2019s Specifications\n"
+        "### What the Document Does Not Say\n"
+        "### 3. This Conversation: Your Scale\n"
+        # with the ### headings clean, the split moved to the bold labels
+        "**The Document\u2019s Figures:**\n"
+        "**My Knowledge (DGX Spark Power):**\n"
+        # and rebuilt again out of words no ban had named
+        "### 1. What the Document Says\n"
+        "### 2. What I Know (General Contract & Business Context)\n"
+        "### 3. What This Conversation Tells Me About You\n"
+    )
+    assert len(source_named_headings(seen_live)) == 10, source_named_headings(seen_live)
+
+
+def test_the_heading_grader_is_anchored_so_it_can_be_disproved():
+    """A grader that flagged every heading containing the word "document"
+    could never be satisfied, and the live assertion would be theatre. The
+    subject has to BE the source: in "Critical Gaps in the Document" the
+    subject is the gaps, and a numbered list item with a bold lead-in is not a
+    heading at all."""
+    ordinary = (
+        "### 4. Critical Gaps in the Document\n"
+        "1.  **Rack Count vs. Server Count:** The document says \"up to 12 racks.\"\n"
+        "3.  **No Specific DGX Spark Mention:** The document does not mention DGX.\n"
+        "**Verdict on Power:**\n"
+        "### Summary Table\n"
+        "### Recommendation & Next Steps\n"
+        "**What Would Change This Answer?**\n"
+        "### The 24-month term\n"
+        "### Getting out\n"
+    )
+    assert source_named_headings(ordinary) == []
+
+
+def test_the_heading_grader_leaves_a_good_answer_alone():
+    good = (
+        "### Recommendation: No, not for two Sparks\n"
+        "### Power draw at 20 nodes\n"
+        "**Total:** 5,200.00 USD\n"
+        "**Due Date:** 2026-09-01\n"
+        "## Cooling headroom\n"
+        "The document says 4 x 45 kW units, which is far above what two Sparks draw.\n"
+        "### What would settle it\n"
+        # real headings from this round's live answers, all of them fine
+        "### 4. \"Full Help\" Assessment\n"
+        "### Comparison: SmartRow vs. Standard Rack for Your Scale\n"
+        "### Why This Fits Your Long-Term Needs\n"
+        "### What\u2019s Missing (and Why It Matters)\n"
+        "### Capacity\n"
+        "### Contract terms\n"
+    )
+    assert source_named_headings(good) == []

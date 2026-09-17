@@ -25,7 +25,8 @@ import pytest
 from app.config import settings
 from app.engines.document import run_pdf_engine_multi
 from tests.document_answer_grader import (cites_document, gives_recommendation,
-                                          opens_with_refusal, referral_only)
+                                          opens_with_refusal, referral_only,
+                                          source_named_headings)
 from tests.test_document_reasoning import (BROCHURE, BROCHURE_FIGURES,
                                            OWNER_QUESTION)
 
@@ -95,3 +96,110 @@ def test_an_invoice_extraction_stays_inside_the_document(live):
     assert "1,250.00" in answer or "1250.00" in answer
     assert "2026-09-01" in answer
     assert "Acme Racks" in answer
+
+
+#: The contract the 2026-09-18 recheck reproduced the blocker against.
+CONTRACT = """\
+MASTER SERVICES AGREEMENT
+
+This Agreement is made between Northwind Group Ltd ("Customer") and
+Acme Racks Ltd ("Supplier").
+Clause 2. Term. The initial term is 24 months from the Effective Date of
+    2026-03-15.
+Clause 5. Fees. 18,000 USD per year, invoiced annually in advance.
+Clause 11. Termination for convenience. Either party may terminate on
+    90 days written notice.
+"""
+
+#: The phrasing that reproduced the original incident on the delivered patch.
+LONG_TERM_QUESTION = "is this the right choice for us in the long term?"
+
+
+def _answer_about(question: str, body: str, name: str = "doc.pdf", history=()) -> str:
+    b64 = base64.b64encode(body.encode()).decode()
+    return asyncio.run(
+        run_pdf_engine_multi(
+            question, [(name, b64)], list(history), Rec().emit, effort="fast"
+        )
+    )
+
+
+@pytest.mark.parametrize("run", [0, 1, 2])
+def test_a_long_term_decision_question_gets_a_verdict_not_a_refusal(live, run):
+    """The 2026-09-18 blocker, live, three times.
+
+    On the delivered patch the word "term" inside "long term" matched the
+    contract field, the question took the strict extraction block, and both
+    runs opened "**Not stated in the document.** The provided Master Services
+    Agreement excerpt ... does not contain any information regarding the
+    long-term strategic fit ... Therefore, I cannot determine if this is the
+    'right choice' based on the document alone." That is the owner's original
+    complaint, reproduced by the round that exists to prevent it.
+    """
+    from app.engines import source_use
+
+    assert source_use.question_mode(LONG_TERM_QUESTION) == "advise"
+    answer = _answer_about(LONG_TERM_QUESTION, CONTRACT, "msa.pdf")
+    assert answer.strip(), "the live engine returned nothing"
+    assert not opens_with_refusal(answer), f"opened with a refusal:\n{answer}"
+    assert gives_recommendation(answer), f"no recommendation:\n{answer}"
+
+
+INVOICE_WITHOUT_TAX = (
+    "INVOICE\n\nInvoice number: INV-2026-0912\nVendor: Acme Racks Ltd\n"
+    "Date of issue: 2026-08-01\nTotal: 5,200.00 USD\nDue: 2026-09-01\n"
+)
+
+
+@pytest.mark.parametrize(
+    "question,body,name",
+    [
+        ("I need the total from this invoice and the tax amount",
+         INVOICE_WITHOUT_TAX, "invoice.pdf"),
+        ("Who are the parties to this contract, what is the term, and what is "
+         "the governing law?", CONTRACT, "msa.pdf"),
+        ("what does clause 11 say?", CONTRACT, "msa.pdf"),
+    ],
+)
+def test_a_short_answer_never_names_a_source_in_a_heading(live, question, body, name):
+    """Extraction and neutral answers: 0 of 27 across five live passes on
+    2026-09-18 — the short modes do not do this at all, so a flat zero here
+    is a real assertion and not an aspiration."""
+    answer = _answer_about(question, body, name)
+    bad = source_named_headings(answer)
+    assert not bad, f"headings named a source, not a subject: {bad}\n{answer}"
+
+
+def test_a_long_answer_hardly_ever_names_a_source_in_a_heading(live):
+    """The rule BASE could only be READ to hold, until this.
+
+    A graded run of the owner's turn came back structured as "### 1. The
+    Document's Limitations", "### 2. General Knowledge: DGX Spark
+    Requirements", "### 3. This Conversation: Your Scale"; another printed the
+    three names in bold verbatim; a later one rebuilt the same tour as "### 1.
+    What the Document Says", "### 2. What I Know", "### 3. What This
+    Conversation Tells Me About You".
+
+    The threshold is 1, not 0, and that is a measurement, not a hedge. Five
+    live passes on 2026-09-18, 3 to 12 long answers each: the rate fell from 2
+    of 3 on the delivered patch to 1 of 12, and stayed at 1 of 12 through
+    three further tightenings of BASE, ADVISORY and the FORMAT block. The last
+    survivor was "**What This Conversation Tells Me**". It did not reach a
+    reliable zero, and a prompt rule never gives one — the strict extraction
+    block has the same property (an answer sometimes adds advice it was told
+    not to). A flat `== 0` here would be a flaky test claiming a guarantee the
+    mechanism cannot make. Two or more of six is the regression this catches,
+    and the delivered patch would fail it.
+    """
+    history = [
+        {"role": "user", "content": "I have 2 DGX Sparks and plan to grow to 20."},
+        {"role": "assistant", "content": "Noted — a 20-node DGX Spark cluster."},
+    ]
+    answers = [_answer(OWNER_QUESTION, history) for _ in range(4)]
+    answers += [_answer_about(LONG_TERM_QUESTION, CONTRACT, "msa.pdf") for _ in range(2)]
+    named = {i: source_named_headings(a) for i, a in enumerate(answers)}
+    offending = [i for i, bad in named.items() if bad]
+    assert len(offending) <= 1, (
+        "more than one of six long answers laid itself out by source: "
+        + repr({i: named[i] for i in offending})
+    )
