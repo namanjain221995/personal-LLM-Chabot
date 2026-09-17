@@ -121,7 +121,10 @@ def test_fast_salesforce_is_structured(recorder):
 
 
 @pytest.mark.parametrize("effort, mode, max_tokens", [
-    ("think", "assistant", 16000), ("medium", "assistant", 16000), ("think", "salesforce", 6000),
+    # Salesforce mode used to be capped at the small-talk ceiling on every
+    # turn; since 2026-09-18 only actual small talk is (this question is a
+    # maths proof, so it gets the full room in either mode).
+    ("think", "salesforce", 16000),
     ("max", "assistant", 16000),
 ])
 def test_think_and_max_are_unchanged(recorder, effort, mode, max_tokens):
