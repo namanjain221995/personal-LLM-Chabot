@@ -557,7 +557,7 @@ def test_a_no_op_edit_creates_no_job_and_no_version(env, owner, monkeypatch):
     aid = seed(owner, nine_section_doc(), ["docx", "pdf"])
     assert counts(aid) == (1, 1)
     real_preplan = E.preplan
-    monkeypatch.setattr(E, "preplan", lambda instruction, parent: None)
+    monkeypatch.setattr(E, "preplan", lambda instruction, parent, **kw: None)
     env["planner"].reply = {"ops": []}
     answer, meta = turn(owner, "change the heading colour to dark blue", gen="noop1")
     assert counts(aid) == (1, 1) and "artifacts" not in meta and "Updated" not in answer

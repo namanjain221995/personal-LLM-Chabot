@@ -1,0 +1,64 @@
+{
+  "spec_version": 1,
+  "kind": "document",
+  "document": {
+    "title": "Customer Base Report",
+    "subtitle": "customers-100.csv",
+    "blocks": [
+      {
+        "type": "heading",
+        "level": 1,
+        "text": "Customer Base Report"
+      },
+      {
+        "type": "paragraph",
+        "text": "This report reads the customer list uploaded to this conversation."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Overview"
+      },
+      {
+        "type": "paragraph",
+        "text": "The file holds one row per customer, with a country, a city and a subscription date."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Geography"
+      },
+      {
+        "type": "paragraph",
+        "text": "Customers are spread across several countries."
+      },
+      {
+        "type": "callout",
+        "kind": "note",
+        "title": "Customers by country",
+        "text": "The chart could not be drawn: the table 'customers-100.csv' is not available."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Growth"
+      },
+      {
+        "type": "paragraph",
+        "text": "Sign-ups continued through the period the file covers."
+      },
+      {
+        "type": "heading",
+        "level": 2,
+        "text": "Recommendations"
+      },
+      {
+        "type": "bullets",
+        "items": [
+          "Keep the country field required.",
+          "Review the oldest records."
+        ]
+      }
+    ]
+  }
+}

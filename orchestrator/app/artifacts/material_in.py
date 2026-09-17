@@ -24,6 +24,23 @@ THE EVENT LOOP. Parsing a 200,000-row workbook or a 30,000-character DOCX
 is CPU work: every reader runs in `asyncio.to_thread` under one 15-second
 deadline (the Fast pre-pass lesson: a CPU-bound step on the loop stalls
 every stream and heartbeat in the process).
+
+A DATASET UPLOADED IN AN EARLIER TURN IS STILL THE MATERIAL (2026-09-17).
+Until this round the conversation's dataset workspace was read only when
+`intent.target == "upload"`, and that target is set only when a file is
+attached to THIS turn (`main.py` builds the upload formats from
+`request.pdf_uploads` alone, and intent.py refuses an upload target without
+them). So the owner's "Big report" over a CSV uploaded one turn earlier
+composed with `tables=[]`: every chart the model bound to the filename
+became a "the table … is not available" callout, and a PNG-only request
+failed outright. `gather` now loads the conversation's ready CSV/XLSX
+uploads whenever the turn has no attachment and the file is being made from
+the conversation — every create except an export or a previous-answer
+target, and every edit — inside the SAME budget (`MAX_UPLOAD_ROWS`, five
+files, `GATHER_DEADLINE_S`). The most recent dataset, or the one the words
+name, is read first. This is also where `engines/artifact._upload_tables`
+went: that fallback ran only when `gathered is None`, which production
+never passes, so it was dead code.
 """
 from __future__ import annotations
 
@@ -405,10 +422,11 @@ async def gather(
                 read.append(res)
                 out.upload_tables.extend(res["tables"])
                 budget -= sum(len(t.rows) for t in res["tables"])
-            if not items and intent is not None and intent.target == "upload" and conversation_id:
-                read.extend(await asyncio.to_thread(_earlier_documents, conversation_id))
-                if workspace:
-                    more, more_notes = await asyncio.to_thread(_workspace_tables, workspace, conversation_id, len(out.upload_tables) + 1, budget)
+            if not items and conversation_id:
+                if intent is not None and intent.target == "upload":
+                    read.extend(await asyncio.to_thread(_earlier_documents, conversation_id))
+                if workspace and (wants_conversation_datasets(intent) or (intent is not None and intent.target == "upload")):
+                    more, more_notes = await asyncio.to_thread(_workspace_tables, workspace, conversation_id, len(out.upload_tables) + 1, budget, text)
                     out.upload_tables.extend(more)
                     out.notes.extend(more_notes)
     except TimeoutError:
@@ -479,21 +497,122 @@ def _earlier_documents(conversation_id: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _workspace_tables(workspace: str, conversation_id: str, start: int, budget: int) -> Tuple[List[Any], List[str]]:
-    """Blocking. CSV/XLSX files in the conversation's dataset workspace."""
+#: Dataset files this reader opens. `.tsv` reaches `read_csv_bytes`, whose
+#: sniffer already reads tabs.
+DATASET_EXTENSIONS = (".csv", ".tsv", ".xlsx")
+
+#: `uploads.notes` of a row that is NOT a dataset: the document rail writes
+#: "document" and video/api writes "video". The dataset rail writes the
+#: archive notes it collected, or nothing at all.
+_NOT_A_DATASET = frozenset({"document", "video"})
+
+
+def wants_conversation_datasets(intent: Optional[I.ArtifactIntent]) -> bool:
+    """Whether this turn's file may be made FROM a dataset the conversation
+    already holds.
+
+    Every create except an export (which is the previous ANSWER, converted as
+    written) or a previous_answer target, and every edit — whatever
+    `intent.target` says, because that target can only be "upload" when a
+    file is attached to THIS turn. A convert re-renders a stored spec with no
+    model call and needs no material.
+    """
+    if intent is None:
+        return False
+    if str(getattr(intent, "action", "") or "") not in ("create", "edit"):
+        return False
+    if str(getattr(intent, "target", "") or "") == "previous_answer":
+        return False
+    return True
+
+
+def _names_file(text: str, filename: str) -> bool:
+    """The request names this file — with or without its extension."""
+    low = " ".join((text or "").split()).casefold()
+    if not low or not filename:
+        return False
+    name = filename.casefold()
+    stem = os.path.splitext(name)[0]
+    return bool(name in low or (len(stem) >= 4 and stem in low))
+
+
+def dataset_uploads(conversation_id: str, text: str = "") -> List[Dict[str, Any]]:
+    """Blocking. The conversation's dataset uploads, the one the words name
+    first and otherwise the most recent first, capped at `_MAX_UPLOADS`."""
     from .. import db
-    from ..core.upload_paths import UploadPathError, resolve_upload_file
 
     try:
         uploads = db.get_uploads(conversation_id)
-    except Exception:  # noqa: BLE001
-        return [], []
+    except Exception as exc:  # noqa: BLE001 — no uploads is the common case
+        log.info("material_in: uploads unavailable: %s", type(exc).__name__)
+        return []
+    rows: List[Dict[str, Any]] = []
+    for up in uploads:
+        name = str(up.get("filename") or "")
+        if "/" in name or "\\" in name or not name.lower().endswith(DATASET_EXTENSIONS):
+            continue
+        if str(up.get("notes") or "").strip().casefold() in _NOT_A_DATASET:
+            continue
+        rows.append(up)
+    # db.get_uploads orders by created_at alone, and two uploads finalised in
+    # the same microsecond then come back in scan order. The id breaks the tie
+    # so the same conversation always reads the same file first.
+    rows.sort(key=lambda u: (str(u.get("created_at") or ""), str(u.get("id") or "")), reverse=True)
+    named = [u for u in rows if _names_file(text, str(u.get("filename") or ""))]
+    chosen = {str(u.get("id") or "") for u in named}
+    rest = [u for u in rows if str(u.get("id") or "") not in chosen]
+    return [*named, *rest][:_MAX_UPLOADS]
+
+
+def _profile_tables(up: Dict[str, Any], name: str, start: int) -> List[Any]:
+    """The rows the dataset profile kept whole, when the file itself is gone.
+
+    Only `full_content` profiles: a SAMPLED profile would be a silently short
+    dataset, which is worse than saying the file could not be read."""
+    profiles = up.get("profile")
+    if isinstance(profiles, dict):
+        profiles = [profiles]
+    if not isinstance(profiles, list):
+        return []
+    out: List[Any] = []
+    for prof in profiles:
+        if not isinstance(prof, dict) or prof.get("kind") != "table" or not prof.get("full_content"):
+            continue
+        rows_json = prof.get("full_rows")
+        columns = [str(c.get("name")) for c in (prof.get("columns") or []) if isinstance(c, dict) and c.get("name")]
+        if not isinstance(rows_json, list) or not columns:
+            continue
+        rows = [[(None if r.get(c) in (None, "") else r.get(c)) for c in columns] for r in rows_json if isinstance(r, dict)]
+        if not rows:
+            continue
+        out.append(_data_table(id=f"upload{start + len(out)}", title=str(prof.get("file") or name)[:120],
+                               columns=columns, rows=rows, source_id="upload_profile"))
+    return out
+
+
+def _workspace_tables(workspace: str, conversation_id: str, start: int, budget: int, text: str = "") -> Tuple[List[Any], List[str]]:
+    """Blocking. The CSV/XLSX datasets of this conversation as DataTables.
+
+    The file on disk is read first (the whole file, up to the caller's row
+    budget). When the TTL sweep has taken the bytes, the stored profile's
+    `full_rows` stand in — those are the complete file too, for a file small
+    enough to have been kept whole. An upload that never became a dataset
+    (failed, rejected, still uploading) is skipped WITH A NOTE, because a
+    report written around a file the person believes was read is the failure
+    this whole path exists to stop."""
+    from ..core.upload_paths import UploadPathError, resolve_upload_file
+
     tables: List[Any] = []
     notes: List[str] = []
-    for up in uploads[-_MAX_UPLOADS:]:
+    for up in dataset_uploads(conversation_id, text):
+        if budget <= 0:
+            notes.append(f"{up.get('filename')}: the row budget was already used by the earlier files, so it was not read.")
+            break
         name = str(up.get("filename") or "")
         low = name.lower()
-        if not low.endswith((".csv", ".xlsx")) or "/" in name or "\\" in name:
+        status = str(up.get("status") or "")
+        if status != "ready":
+            notes.append(f"{name} could not be used: the upload is {status or 'not ready'}.")
             continue
         path = None
         for sub in ("extracted", "_original"):
@@ -504,17 +623,25 @@ def _workspace_tables(workspace: str, conversation_id: str, start: int, budget: 
             if cand.is_file():
                 path = cand
                 break
-        if path is None:
-            continue
-        try:
-            if low.endswith(".xlsx"):
-                more, n = read_xlsx(str(path), name=name, start=start + len(tables), row_budget=budget)
-            else:
-                with open(path, "rb") as fh:
-                    t, n = read_csv_bytes(fh.read(), name=name, table_id=f"upload{start + len(tables)}", row_budget=budget)
-                more = [t] if t is not None else []
-        except Exception as exc:  # noqa: BLE001
-            notes.append(f"{name} could not be read ({type(exc).__name__}).")
+        more: List[Any] = []
+        n: List[str] = []
+        if path is not None:
+            try:
+                if low.endswith(".xlsx"):
+                    more, n = read_xlsx(str(path), name=name, start=start + len(tables), row_budget=budget)
+                else:
+                    with open(path, "rb") as fh:
+                        t, n = read_csv_bytes(fh.read(), name=name, table_id=f"upload{start + len(tables)}", row_budget=budget)
+                    more = [t] if t is not None else []
+            except Exception as exc:  # noqa: BLE001 — one bad file is a note
+                notes.append(f"{name} could not be read ({type(exc).__name__}).")
+                continue
+        if not more:
+            more = _profile_tables(up, name, start + len(tables))
+            if more:
+                n = [f"{name} is no longer stored; the {sum(len(t.rows) for t in more):,} rows kept with the upload were used."]
+        if not more:
+            notes.append(f"{name} is no longer stored, so it could not be read.")
             continue
         tables.extend(more)
         notes.extend(n)
@@ -544,4 +671,5 @@ def to_material_dict(g: GatheredInput) -> Dict[str, Any]:
 
 
 __all__ = ["GatheredInput", "gather", "previous_answer", "tables_from_markdown", "read_xlsx", "read_csv_bytes",
-           "pdf_tables_approximate", "to_material_dict", "PREVIOUS_ANSWER_MAX_CHARS", "MAX_UPLOAD_ROWS"]
+           "pdf_tables_approximate", "to_material_dict", "dataset_uploads", "wants_conversation_datasets",
+           "DATASET_EXTENSIONS", "PREVIOUS_ANSWER_MAX_CHARS", "MAX_UPLOAD_ROWS"]

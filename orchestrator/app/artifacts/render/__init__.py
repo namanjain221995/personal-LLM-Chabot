@@ -425,6 +425,28 @@ def _standalone_images(spec: S.ArtifactSpec, fmt: str, out: Path, resolved, *, s
         raise _safe(fmt, "the chart writer reported an error") from exc
 
 
+#: What `chart_data.resolve_spec` leaves behind in place of a chart it could
+#: not compute — a note callout in a document, a bullet on a slide.
+_CHART_REFUSAL_RE = re.compile(r"\b(?:could not be drawn|was not drawn|cannot be drawn|not drawn because)\b", re.I)
+
+
+def _chart_refusals(spec: S.ArtifactSpec) -> List[str]:
+    """Every "the chart could not be drawn …" sentence this spec carries."""
+    body = getattr(spec, "body", None)
+    out: List[str] = []
+    for block in list(getattr(body, "blocks", None) or []):
+        if getattr(block, "type", "") == "callout":
+            text = str(getattr(block, "text", "") or "").strip()
+            if _CHART_REFUSAL_RE.search(text):
+                out.append(text)
+    for slide in list(getattr(body, "slides", None) or []):
+        for bullet in list(getattr(slide, "bullets", None) or []):
+            text = str(bullet or "").strip()
+            if _CHART_REFUSAL_RE.search(text):
+                out.append(text)
+    return out
+
+
 def _render_images_only(spec: S.ArtifactSpec, formats: Sequence[str], out: Path, *, title_slug: str, version: int, effort: str,
                         transform: Optional[Dict[str, object]]) -> RenderReport:
     """A version that is only chart images: every image validated, the first
@@ -445,6 +467,14 @@ def _render_images_only(spec: S.ArtifactSpec, formats: Sequence[str], out: Path,
             for n, path in enumerate(_standalone_images(spec, fmt, out, resolved, stem=f"{title_slug}-v{version}-chart"), start=1):
                 paths[_key("primary", fmt, f"chart-{n}")] = path
     if not paths:
+        # A chart that could NOT be bound left the reason where the picture
+        # was ("The chart could not be drawn: the table 'customers-100.csv'
+        # is not available."). Answering "The artifact has no charts to draw
+        # as images" instead threw that reason away and told the person
+        # nothing they could act on (owner report, 2026-09-17).
+        why = _chart_refusals(spec)
+        if why:
+            raise RenderError("invalid_request", why[0] if why[0].endswith(".") else why[0] + ".")
         raise RenderError("invalid_request", "The artifact has no charts to draw as images.")
     try:
         validation = V.validate_all({k: str(p) for k, p in paths.items()}, None)

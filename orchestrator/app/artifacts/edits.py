@@ -183,6 +183,32 @@ class SetChart(_Strict):
     patch: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AddChart(_Strict):
+    """A NEW chart drawn from the turn's tables (2026-09-17).
+
+    "also i want Plots on this docs" had no operation at all: the planner's
+    only chart op was `set_chart`, which PATCHES a chart that already exists,
+    so the request fell through to a whole-document `regenerate` that came
+    back "the change could not be made".
+
+    `x`, `y` and `agg` are bound only when the columns really exist in the
+    named table; otherwise `chart_choice.suggest_charts` decides what the
+    table can carry. `count` is how many charts a plural request asks for.
+    NO NUMBERS ARE CARRIED: the op writes a binding and the compute stage
+    fills it, so the model never types a figure into a chart."""
+
+    op: Literal["add_chart"] = "add_chart"
+    after: Optional[SectionRef] = None
+    chart_type: Optional[str] = Field(default=None, max_length=40)
+    x: Optional[str] = Field(default=None, max_length=80)
+    y: List[str] = Field(default_factory=list, max_length=4)
+    agg: Optional[str] = Field(default=None, max_length=20)
+    title: Optional[str] = Field(default=None, max_length=120)
+    table_id: Optional[str] = Field(default=None, max_length=80)
+    count: int = Field(default=1, ge=1, le=3)
+    instruction: str = Field(default="", max_length=2000)
+
+
 class ReplaceSection(_Strict):
     op: Literal["replace_section"] = "replace_section"
     target: SectionRef
@@ -296,7 +322,7 @@ class Regenerate(_Strict):
 
 EditOp = Annotated[
     Union[
-        SetTitle, SetSubtitle, SetOrientation, SetPage, SetStyle, SetChart, ReplaceSection, InsertSection,
+        SetTitle, SetSubtitle, SetOrientation, SetPage, SetStyle, SetChart, AddChart, ReplaceSection, InsertSection,
         DeleteBlocks, RenameHeading, AddColumn, RenameColumn, RenameSheet, DeleteColumn, ReorderColumns, AddRows, DeleteRows,
         UpdateCells, SetSlideTitle, ReplaceSlide, InsertSlide, DeleteSlide, RestoreVersion, Regenerate,
     ],
@@ -305,7 +331,7 @@ EditOp = Annotated[
 _OP_ADAPTER: TypeAdapter = TypeAdapter(EditOp)
 
 OP_NAMES: Tuple[str, ...] = (
-    "set_title", "set_subtitle", "set_orientation", "set_page", "set_style", "set_chart", "replace_section",
+    "set_title", "set_subtitle", "set_orientation", "set_page", "set_style", "set_chart", "add_chart", "replace_section",
     "insert_section", "delete_blocks", "rename_heading", "add_column", "rename_column", "delete_column",
     "reorder_columns", "add_rows", "delete_rows", "update_cells", "set_slide_title", "replace_slide", "rename_sheet",
     "insert_slide", "delete_slide", "restore_version", "regenerate",
@@ -770,15 +796,32 @@ def parse_style(text: str, kind: str) -> Tuple[Dict[str, Any], List[str], List[T
 # --------------------------------------------------------------- outline --
 
 
-def _top_level(blocks: Sequence[dict]) -> int:
+def _split_level(blocks: Sequence[dict]) -> int:
+    """The heading level a document is addressed at.
+
+    Normally the smallest level present. A report written under ONE top-level
+    heading — the shape every "Big report" comes back in — has exactly one
+    section at that level, so "add a chart after Methodology" could not name
+    anything and the planner rewrote the whole file instead (owner report,
+    2026-09-17). Such a document is addressed one level DOWN, and its single
+    H1 keeps its own unit (the preamble, which `_section_unit` addresses
+    because it starts with a heading)."""
     levels = [int(b.get("level") or 1) for b in blocks if b.get("type") == "heading"]
-    return min(levels) if levels else 1
+    if not levels:
+        return 1
+    level = min(levels)
+    if sum(1 for lv in levels if lv == level) == 1:
+        deeper = sorted({lv for lv in levels if lv > level})
+        if deeper:
+            return deeper[0]
+    return level
 
 
 def _sections(blocks: Sequence[dict]) -> List[Dict[str, Any]]:
-    """Blocks split at top-level headings: [{key, heading, blocks}], the
-    first being the preamble (possibly empty, key "pre")."""
-    level = _top_level(blocks)
+    """Blocks split at the addressing heading level: [{key, heading, blocks}],
+    the first being the preamble (possibly empty, key "pre"). The preamble
+    carries a heading of its own when the document opens with one."""
+    level = _split_level(blocks)
     out: List[Dict[str, Any]] = [{"key": "pre", "heading": "", "blocks": []}]
     n = 0
     for b in blocks:
@@ -787,6 +830,9 @@ def _sections(blocks: Sequence[dict]) -> List[Dict[str, Any]]:
             out.append({"key": f"s{n}", "heading": str(b.get("text") or ""), "blocks": [b]})
         else:
             out[-1]["blocks"].append(b)
+    first = out[0]["blocks"]
+    if first and first[0].get("type") == "heading":
+        out[0]["heading"] = str(first[0].get("text") or "")
     return out
 
 
@@ -801,14 +847,19 @@ def outline(spec: S.ArtifactSpec, *, max_values: int = 12, low_cardinality: int 
     if isinstance(body, S.DocumentSpec):
         lines.append(f"orientation: {body.orientation}")
         data = body.model_dump(mode="json", exclude_none=True)
-        for i, sec in enumerate(_sections(data["blocks"])):
+        numbered = 0
+        for sec in _sections(data["blocks"]):
             if sec["key"] == "pre" and not sec["blocks"]:
                 continue
             kinds: Dict[str, int] = {}
             for b in sec["blocks"]:
                 kinds[b["type"]] = kinds.get(b["type"], 0) + 1
             subs = [b["text"] for b in sec["blocks"][1:] if b.get("type") == "heading"]
-            label = f"section {i}" if sec["key"] != "pre" else "preamble"
+            # The number is the position among the sections that HAVE a
+            # heading, which is what "section 3" means to `resolve_section`.
+            if sec["heading"]:
+                numbered += 1
+            label = f"section {numbered}" if sec["heading"] else "preamble"
             lines.append(f"- [{label}] {sec['heading'] or '(before the first heading)'} — " + ", ".join(f"{v} {k}" for k, v in kinds.items())
                          + (f"; subheadings: {'; '.join(subs[:8])}" if subs else ""))
             for b in sec["blocks"]:
@@ -994,6 +1045,11 @@ _PLAN_SCHEMA = {
                     "derived_columns": {"type": "array", "items": {"type": "string", "maxLength": 80}, "maxItems": 20},
                     "style_phrase": {"type": "string", "maxLength": 300},
                     "chart_type": {"type": "string", "maxLength": 40},
+                    "table_id": {"type": "string", "maxLength": 80},
+                    "x": {"type": "string", "maxLength": 80},
+                    "y": {"type": "array", "items": {"type": "string", "maxLength": 80}, "maxItems": 4},
+                    "agg": {"type": "string", "enum": ["sum", "avg", "count", "min", "max", "none"]},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 3},
                 },
                 "required": ["op"],
             },
@@ -1022,6 +1078,11 @@ _PLAN_SYSTEM = (
     "- set_orientation: orientation = portrait | landscape.\n"
     "- set_style: style_phrase = the person's styling words (colours, fonts, sizes, bold/italic).\n"
     "- set_chart: target = the chart's title or number; chart_type = bar | horizontal_bar | line | pie; text = a new chart title.\n"
+    "- add_chart: a NEW chart drawn from a table in the TABLES block. table_id = that table's id; x = the column on the "
+    "category or time axis; y = the numeric column(s) to plot, left out to COUNT the rows; agg = sum | avg | count | min | max; "
+    "chart_type (optional); after (optional) = the heading the chart follows; text = the chart title; count = how many "
+    "charts a plural request asks for (1-3). Use it whenever the person asks to ADD a chart, plot or graph. Never write "
+    "numbers: the values are computed from the table.\n"
     "- replace_section: target = the section heading; instruction = what to change in it.\n"
     "- insert_section: after = the heading it follows; text = the new heading; instruction = what to write.\n"
     "- delete_blocks: target = the section heading.  rename_heading: target = the heading; name = the new heading text.\n"
@@ -1068,6 +1129,19 @@ def _flat_to_op(d: dict, instruction: str, kind: str) -> Any:
         if d.get("target") and re.fullmatch(r"\s*(?:chart\s*)?(\d+)\s*", str(d["target"]), re.I):
             idx = int(re.sub(r"\D", "", str(d["target"])))
         return SetChart(target=ChartRef(index=idx, title=None if idx else (d.get("target") or None)), patch=patch)
+    if op == "add_chart":
+        ys = d.get("y") if isinstance(d.get("y"), list) else ([d["y"]] if d.get("y") else [])
+        return _OP_ADAPTER.validate_python({
+            "op": op, "after": {"text": d["after"]} if d.get("after") else None,
+            "chart_type": d.get("chart_type") or None,
+            "x": d.get("x") or d.get("column") or None,
+            "y": [str(y) for y in ys][:4],
+            "agg": d.get("agg") or None,
+            "title": d.get("text") or d.get("name") or None,
+            "table_id": d.get("table_id") or d.get("sheet") or None,
+            "count": int(d["count"]) if str(d.get("count") or "").isdigit() and 1 <= int(d["count"]) <= 3 else 1,
+            "instruction": (d.get("instruction") or instruction or "")[:2000],
+        })
     if op in ("replace_section", "delete_blocks", "replace_slide", "delete_slide"):
         return _OP_ADAPTER.validate_python({"op": op, "target": target, **({"instruction": d.get("instruction") or instruction} if op.startswith("replace") else {})})
     if op == "insert_section":
@@ -1233,7 +1307,55 @@ def _parent_has_chart(parent: S.ArtifactSpec) -> bool:
         return False
 
 
-def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
+#: "add a chart", "also i want Plots on this docs", "include graphs",
+#: "make it a bar chart" on a file that has no chart yet. The span covers the
+#: WHOLE phrase — lead-in, verb, article, an optional named type, the chart
+#: noun and the trailing "on this doc / please" — so `coverage` only accepts
+#: it when adding charts is the entire request. Anything more goes to the
+#: planner, which can bind columns.
+_ADD_CHART_RE = re.compile(
+    r"(?:\b(?:also|and|plus|now|then|next)\b[,]?\s*)*"
+    r"(?:\b(?:i|we)\s+(?:would\s+)?(?:want|need|like)\b\s*|"
+    r"\b(?:add|include|insert|put|give|show|draw|create|make|generate|render)\b\s*(?:me\s+)?)"
+    r"(?:\b(?:it|this|that|them|these|those)\b\s*)?"
+    r"(?:\b(?:some|the|few|couple)\b\s*(?:of\s*)?)*"
+    r"(?:\b(?P<n>an|a|one|two|three|1|2|3)\b\s*)?"
+    rf"(?:(?P<type>{_CHART_TYPE_WORDS})\s+)?"
+    r"(?P<what>charts?|graphs?|plots?|visuals?|visuali[sz]ations?|diagrams?)"
+    r"(?:\s*\b(?:of|for|from|on|in|to|into|with|onto|over)\b\s*"
+    r"(?:\b(?:this|that|the|these|those|it|my|our)\b\s*)*"
+    r"(?:\b(?:docs?|documents?|files?|reports?|pages?|decks?|slides?|data|dataset|datasets|table|tables|one)\b\s*)*)*"
+    r"(?:\s*\b(?:after|below|under|following)\b\s+(?:the\s+)?(?P<after>[^.,;]{1,80})\s*)?"
+    r"(?:[,]?\s*\b(?:instead|now|again|please|too|also|as\s+well)\b)*[.!]?\s*",
+    re.I,
+)
+#: What a greedy "after <heading>" capture swallows past the heading itself.
+_TRAILING_NOISE_RE = re.compile(r"(?:\s+(?:section|sections|heading|part|chapter|instead|now|again|please|too|also|as\s+well))+\s*[.!]?\s*$", re.I)
+
+#: How many charts a spelled number asks for.
+_CHART_COUNT_WORDS = {"a": 1, "an": 1, "one": 1, "1": 1, "two": 2, "2": 2, "three": 3, "3": 3}
+#: A plural chart noun asks for more than one; the cap is `AddChart.count`.
+_PLURAL_CHARTS = 3
+
+
+def _add_chart_preplan(text: str) -> Optional[AddChart]:
+    """"also i want Plots on this docs" → one AddChart, zero model calls."""
+    m = _ADD_CHART_RE.search(text)
+    if m is None or coverage(text, [(m.start(), m.end())]) < PREPLAN_COVERAGE:
+        return None
+    named = m.group("type")
+    ctype = None
+    if named and _chart_spec is not None and hasattr(_chart_spec, "chart_type_alias"):
+        canonical = str(_chart_spec.chart_type_alias(" ".join(named.lower().replace("-", " ").split())))
+        ctype = canonical if canonical in getattr(_chart_spec, "CHART_TYPES", ()) else None
+    plural = m.group("what").lower().endswith("s")
+    count = _CHART_COUNT_WORDS.get((m.group("n") or "").lower(), _PLURAL_CHARTS if plural else 1)
+    after = _TRAILING_NOISE_RE.sub("", (m.group("after") or "")).strip(" \t.!")
+    return AddChart(chart_type=ctype, count=count, instruction=text[:2000],
+                    after=SectionRef(text=after[:200]) if after else None)
+
+
+def preplan(instruction: str, parent: S.ArtifactSpec, *, tables: Sequence[Any] = ()) -> Optional[EditPlan]:
     """The deterministic pre-planner (0 model calls). None when it does not
     explain ≥ 90% of the instruction's content words."""
     text = " ".join((instruction or "").split())
@@ -1257,10 +1379,25 @@ def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
     # parent version already carries — the model is never asked for the
     # numbers a second time (production 2026-09-16). Anything more in the
     # sentence fails `coverage` and goes to the planner as before.
-    named = chart_type_named(text) if _parent_has_chart(parent) else None
-    if named is not None and coverage(text, [named[1]]) >= PREPLAN_COVERAGE:
+    named = chart_type_named(text)
+    retype = named is not None and coverage(text, [named[1]]) >= PREPLAN_COVERAGE
+    if retype and _parent_has_chart(parent):
         return EditPlan(ops=[SetChart(target=ChartRef(), patch={"type": named[0]})],
                         summary=f"set_chart {named[0]}", planner="deterministic")
+
+    # ADD a chart, and nothing else. The columns are chosen by
+    # `chart_choice.suggest_charts` when the request names none, so this
+    # costs no model call at all — the shape the owner's "also i want Plots
+    # on this docs" needs (2026-09-17).
+    #
+    # A CONVERSION is not an add: "make it a bar chart instead" asks for the
+    # chart the person is looking at to be RETYPED. On a chart-less parent
+    # that request keeps going to the planner, which sees the turn's tables
+    # and can bind the columns itself; deciding it here would answer a
+    # different question with a chart of the chooser's choosing.
+    add = None if retype else _add_chart_preplan(text)
+    if add is not None:
+        return EditPlan(ops=[add], summary=f"add_chart x{add.count}", planner="deterministic")
 
     # title / subtitle
     tm = re.search(
@@ -1354,23 +1491,59 @@ def preplan(instruction: str, parent: S.ArtifactSpec) -> Optional[EditPlan]:
     return EditPlan(ops=ops, summary="; ".join(type(o).__name__ for o in ops), planner="deterministic")
 
 
+def tables_outline(tables_: Sequence[Any], *, max_values: int = 8, low_cardinality: int = 12) -> str:
+    """What the planner may know about the turn's tables: the id, the row
+    count, the column names and the values of the LOW-CARDINALITY columns.
+
+    Never a data row. Cells uploaded in an earlier turn are untrusted text,
+    and the planner's answer chooses operations — so the prompt carries the
+    SHAPE it needs to name a column and nothing a sentence could hide in
+    (security review of this round's material change)."""
+    from . import chart_data as CD
+
+    lines: List[str] = []
+    for t in list(tables_)[:5]:
+        columns = [str(c) for c in (getattr(t, "columns", None) or [])]
+        rows = getattr(t, "rows", None) or []
+        parts: List[str] = []
+        for i, name in enumerate(columns[:40]):
+            try:
+                info = CD.infer_column(t, i)
+            except Exception:  # noqa: BLE001 — a shape the profiler cannot read is just a name
+                parts.append(name)
+                continue
+            if info.kind == "text" and 0 < info.n_distinct <= low_cardinality:
+                parts.append(f"{name} (text: {', '.join(str(v) for v in info.distinct[:max_values])})")
+            else:
+                parts.append(f"{name} ({info.kind})")
+        lines.append(f'- {getattr(t, "id", "")} "{getattr(t, "title", "")}" ({len(rows):,} rows): ' + "; ".join(parts))
+    return "\n".join(lines)[:3000]
+
+
 async def plan(instruction: str, parent: S.ArtifactSpec, *, lineage: Sequence[int] = (), language: str = "en",
-               effort: str = "fast", call: Optional[PlannerCall] = None) -> EditPlan:
+               effort: str = "fast", call: Optional[PlannerCall] = None, tables: Sequence[Any] = ()) -> EditPlan:
     """Step 1 the pre-planner (0 calls); step 2 ONE JSON call over the
     outline. A planner that fails or times out returns a `regenerate`
     plan marked 'fallback' — the old whole-document edit — so an edit is
     never refused because the planner was slow; its sentence lists what
-    changed."""
+    changed.
+
+    `tables` are the turn's data tables (this conversation's uploads, a
+    paste, figures typed in the request). They reach the prompt as SHAPE
+    only, through `tables_outline`, so `add_chart` can name a real column."""
     started = time.perf_counter()
-    det = preplan(instruction, parent)
+    det = preplan(instruction, parent, tables=tables)
     if det is not None:
         _count("deterministic", started)
         return det
     call = call or planner_call
     timeout_s = PLANNER_TIMEOUT_FAST_S if effort == "fast" else PLANNER_TIMEOUT_S
+    shapes = tables_outline(tables) if tables else ""
     messages = [
         {"role": "system", "content": _PLAN_SYSTEM},
-        {"role": "user", "content": f"OUTLINE\n{outline(parent)}\n\nREQUEST\n{(instruction or '')[:3000]}"},
+        {"role": "user", "content": f"OUTLINE\n{outline(parent)}\n"
+                                    + (f"\nTABLES (data you may bind a chart to)\n{shapes}\n" if shapes else "")
+                                    + f"\nREQUEST\n{(instruction or '')[:3000]}"},
     ]
     try:
         obj = await call(messages, _PLAN_SCHEMA, timeout_s)
@@ -1469,11 +1642,13 @@ def _spec_of(w: _Work) -> S.ArtifactSpec:
 
 
 def _section_headings(w: _Work) -> List[str]:
-    return [u["value"][0].get("text", "") for u in w.units if u["key"] != "pre" and u["value"] and u["value"][0].get("type") == "heading"]
+    # The preamble is included when it STARTS with a heading: a report under
+    # one H1 keeps that H1 addressable while its H2s are the sections.
+    return [u["value"][0].get("text", "") for u in w.units if u["value"] and u["value"][0].get("type") == "heading"]
 
 
 def _section_unit(w: _Work, ref: SectionRef) -> Tuple[int, Dict[str, Any]]:
-    heads = [i for i, u in enumerate(w.units) if u["value"] and u["value"][0].get("type") == "heading" and not (u["key"] == "pre")]
+    heads = [i for i, u in enumerate(w.units) if u["value"] and u["value"][0].get("type") == "heading"]
     idx, reason = resolve_section(ref.text, [w.units[i]["value"][0].get("text", "") for i in heads])
     if idx is None:
         if reason == "ambiguous target":
@@ -1591,6 +1766,8 @@ def _apply_op(w: _Work, op: Any, *, parent: S.ArtifactSpec, deletes_total: int) 
         return _apply_style(w, op)
     if name == "set_chart":
         return _apply_chart(w, op)
+    if name == "add_chart":
+        return _apply_add_chart(w, op)
     if name == "rename_heading":
         if kind != "document":
             raise _NotApplied("only a document has headings")
@@ -2378,6 +2555,183 @@ def _apply_chart(w: _Work, op: SetChart) -> str:
     return "; ".join(said)
 
 
+#: The callout `chart_data.resolve_spec` leaves where a chart could not be
+#: bound. `add_chart` replaces it IN PLACE: that is exactly where the person
+#: expects the picture, and leaving it behind beside a new chart would show
+#: the same failure twice.
+_CHART_FAILURE_RE = re.compile(r"\b(?:could not be drawn|was not drawn|cannot be drawn|not drawn because)\b", re.I)
+
+#: A section that closes a report. A "Charts" section goes BEFORE it, never
+#: after the conclusion.
+_CLOSING_SECTION_RE = re.compile(
+    r"^\s*(?:\d+[.)]\s*)?(?:conclusion|conclusions|recommendation|recommendations|next\s+steps?|summary\s+and\s+"
+    r"recommendations?|closing|appendix|appendices|references|sources)\b", re.I)
+
+
+def chart_failure_text(block: Any) -> str:
+    """The sentence of a "the chart could not be drawn" callout, or ""."""
+    if not isinstance(block, dict) or block.get("type") != "callout":
+        return ""
+    text = str(block.get("text") or "")
+    return text if _CHART_FAILURE_RE.search(text) else ""
+
+
+def _table_for_chart(op: AddChart, tables_: Sequence[Any]) -> Any:
+    """Which table an add_chart draws from: the one it names, else the first
+    uploaded/pasted one, else the first table there is."""
+    if op.table_id:
+        want = str(op.table_id).strip().casefold()
+        stem = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", want)
+        for t in tables_:
+            title = str(getattr(t, "title", "") or "").strip().casefold()
+            if str(getattr(t, "id", "") or "").casefold() == want or title == want:
+                return t
+            if stem and re.sub(r"\.[A-Za-z0-9]{1,8}$", "", title) == stem:
+                return t
+    for t in tables_:
+        if str(getattr(t, "id", "") or "").startswith(("upload", "paste")):
+            return t
+    return tables_[0]
+
+
+def _charts_for(op: AddChart, table: Any, instruction: str) -> Tuple[List[Any], str]:
+    """(charts, reason it could not) for one add_chart, from ONE table.
+
+    A column the person NAMED is never silently swapped for a suggestion: an
+    x that is not in the table comes back as a reason that lists what is."""
+    from . import chart_choice as CC
+    from . import chart_data as CD
+
+    columns = [str(c) for c in (getattr(table, "columns", None) or [])]
+    title = str(getattr(table, "title", "") or getattr(table, "id", "") or "the table")
+    if op.x:
+        idx, _note = CD.match_column(op.x, columns)
+        if idx is None:
+            return [], f"“{op.x}” is not a column of {title} (its columns are {', '.join(columns[:12])})"
+        ys: List[str] = []
+        for y in op.y:
+            j, _n = CD.match_column(y, columns)
+            if j is None:
+                return [], f"“{y}” is not a column of {title} (its columns are {', '.join(columns[:12])})"
+            ys.append(columns[j])
+        ctype = op.chart_type or ""
+        if _chart_spec is not None and hasattr(_chart_spec, "chart_type_alias"):
+            ctype = str(_chart_spec.chart_type_alias(ctype)) if ctype else ""
+            if ctype not in getattr(_chart_spec, "CHART_TYPES", ()):
+                ctype = ""
+        agg = op.agg or ("sum" if ys else "count")
+        chart = _chart_spec.Chart.model_validate({
+            "type": ctype or ("line" if CD.infer_column(table, idx).kind == "date" else "bar"),
+            "title": (op.title or f"{', '.join(ys) or 'Records'} by {columns[idx]}")[:120],
+            "data": {"table_id": str(getattr(table, "id", "") or ""), "x": columns[idx], "y": ys, "agg": agg},
+        })
+        return [chart], ""
+    charts, _reasons = CC.suggest_charts(table, instruction=instruction, limit=max(1, int(op.count)))
+    if not charts:
+        return [], f"nothing in {title} can be compared in a chart (its columns name rows rather than group them)"
+    if op.chart_type and _chart_spec is not None:
+        want = str(_chart_spec.chart_type_alias(op.chart_type))
+        if want in getattr(_chart_spec, "CHART_TYPES", ()):
+            charts = [c.model_copy(update={"type": want}) for c in charts]
+    if op.title:
+        charts[0] = charts[0].model_copy(update={"title": op.title[:120]})
+    return charts, ""
+
+
+def _insert_position(w: _Work, op: AddChart) -> int:
+    """Where a new chart section goes: after the section the person named,
+    else before the closing section, else at the end."""
+    if op.after is not None:
+        return _section_unit(w, op.after)[0] + 1
+    for i, u in enumerate(w.units):
+        head = u["value"][0] if u["value"] and u["value"][0].get("type") == "heading" else None
+        if head is not None and _CLOSING_SECTION_RE.match(str(head.get("text") or "")):
+            return i
+    return len(w.units)
+
+
+def _apply_add_chart(w: _Work, op: AddChart) -> str:
+    """Add one or more charts, bound by code to a table of this turn."""
+    if _chart_spec is None or not hasattr(_chart_spec, "Chart"):
+        raise _NotApplied("charts need the charts engine, which this build does not have yet")
+    tables_ = [t for t in (w.tables or []) if getattr(t, "columns", None) and getattr(t, "rows", None)]
+    if not tables_ and w.kind != "workbook":
+        raise _NotApplied("there is no data table in this conversation to draw a chart from — upload the file again, or paste the table")
+    if w.kind == "workbook":
+        return _add_chart_to_sheet(w, op, tables_)
+
+    table = _table_for_chart(op, tables_)
+    charts, why = _charts_for(op, table, op.instruction or w.instruction)
+    if not charts:
+        raise _NotApplied(why or "the chart could not be bound to the data")
+    blocks = [{"type": "chart", "chart": c.model_dump(mode="json", exclude_none=True)} for c in charts]
+
+    if w.kind == "presentation":
+        pos = len(w.units)
+        if op.after is not None:
+            pos = _slide_unit(w, op.after)[0] + 1
+        for n, (blk, chart) in enumerate(zip(blocks, charts)):
+            w.inserted += 1
+            key = f"newchart{w.inserted}"
+            w.units.insert(pos + n, {"key": key, "value": {"layout": "chart", "title": chart.title[:120], "chart": blk["chart"]}})
+            w.touched.add(key)
+        return _added_phrase(charts)
+
+    # A failed chart is replaced where it already is.
+    placed = 0
+    for u in w.units:
+        for i, b in enumerate(list(u["value"])):
+            if placed >= len(blocks):
+                break
+            if chart_failure_text(b):
+                u["value"][i] = blocks[placed]
+                w.touched.add(u["key"])
+                placed += 1
+    if placed >= len(blocks):
+        return _added_phrase(charts)
+
+    rest = blocks[placed:]
+    if op.after is not None or not _section_headings(w):
+        pos = _insert_position(w, op)
+        unit = w.units[pos - 1] if pos > 0 else w.units[0]
+        unit["value"].extend(rest)
+        w.touched.add(unit["key"])
+        return _added_phrase(charts)
+    # The level the document is ADDRESSED at, not the first heading's: in a
+    # report under one H1 the sections are H2s, and a "Charts" H1 would sit
+    # outside the report rather than inside it.
+    level = int(next((u["value"][0].get("level") or 1 for u in w.units
+                      if u["key"] != "pre" and u["value"] and u["value"][0].get("type") == "heading"), 1))
+    w.inserted += 1
+    key = f"newchart{w.inserted}"
+    w.units.insert(_insert_position(w, op), {"key": key, "value": [{"type": "heading", "level": level, "text": "Charts"}, *rest]})
+    w.touched.add(key)
+    return _added_phrase(charts)
+
+
+def _add_chart_to_sheet(w: _Work, op: AddChart, tables_: Sequence[Any]) -> str:
+    """A workbook chart is drawn from its own sheet's rows."""
+    from . import compose as _compose
+
+    unit = _sheet_unit(w, None)
+    sh = unit["value"]
+    columns = [str(c.get("name") if isinstance(c, dict) else c) for c in (sh.get("columns") or [])]
+    own = _compose.DataTable(id="", title=str(sh.get("name") or "Sheet"), columns=columns, rows=[list(r) for r in (sh.get("rows") or [])])
+    charts, why = _charts_for(op, own, op.instruction or w.instruction)
+    if not charts:
+        raise _NotApplied(why or "the chart could not be bound to the sheet")
+    sh["charts"] = [*(sh.get("charts") or []), *[c.model_dump(mode="json", exclude_none=True) for c in charts]]
+    w.touched.add(unit["key"])
+    return _added_phrase(charts)
+
+
+def _added_phrase(charts: Sequence[Any]) -> str:
+    names = [f"“{c.title}”" for c in charts if getattr(c, "title", "")]
+    if len(charts) == 1:
+        return f"chart {names[0]} added" if names else "a chart added"
+    return f"{len(charts)} charts added" + (f" ({', '.join(names)})" if names else "")
+
+
 def apply(parent: S.ArtifactSpec, plan_: EditPlan, *, tables: Sequence[Any] = (), section_writer: Any = None,
           instruction: str = "") -> EditOutcome:
     """Apply a plan to the parent. Deterministic ops change the working
@@ -2642,5 +2996,5 @@ __all__ = [
     "EditOp", "EditPlan", "EditOutcome", "SectionRef", "ChartRef", "Where", "plan", "preplan", "apply", "resolve_pending",
     "preservation_guard", "restore_pending_guard", "ops_for_style", "ops_for_layout", "canonical_json", "is_destructive",
     "outline", "resolve_section", "changed_sections", "undo_signal", "restore_target", "restore_request", "has_delete_words", "parse_style",
-    "coverage", "DESTRUCTIVE_OPS", "PENDING_OPS", "MAX_PENDING",
+    "coverage", "DESTRUCTIVE_OPS", "PENDING_OPS", "MAX_PENDING", "AddChart", "tables_outline", "chart_failure_text",
 ]
