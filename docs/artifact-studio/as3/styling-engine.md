@@ -77,8 +77,10 @@ one call for the engine (prompt-edits / intent-capability wire it in; this track
    `style.series_colors`, `style.category_colors`, `style.color`, `style.palette`) and never by
    writing `chart.style`. One nominal series is ONE colour — the slot of the chart's subject (x
    column plus measure), assigned in first-appearance order across the document by
-   `style.resolve` → `ResolvedStyle.chart_plan`. Status values take the reserved status marks with
-   mandatory labels; a signed measure takes gain #2F6FB2 / loss #C0566B / neutral #5F6B7A and a
+   `style.resolve` → `ResolvedStyle.chart_plan`. A chart whose column NAME says status
+   (`style.STATUS_COLUMN_RE`, the same gate the table engine uses) AND whose values are all status
+   values takes the reserved status marks with mandatory labels — the name is required, or a
+   High/Medium/Low spend band comes back critical-red and success-green; a signed measure takes gain #2F6FB2 / loss #C0566B / neutral #5F6B7A and a
    legend, never green against red; a funnel takes a one-hue ramp whose light end clears 2:1 on
    white; a requested ranking colours the leader and greys the rest; pies, stacks and multi-series
    charts key a categorical slot by category or series NAME across the document.

@@ -261,10 +261,26 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
 
     # 1. Charts (documents and presentations; workbook charts are native).
     with timed("charts"):
-        for ordinal, chart in enumerate(H.spec_charts(spec), start=1):
+        # The document's automatic colour plan rides on the resolved style
+        # (ResolvedStyle.chart_plan), so the PNG the DOCX, the PDF and the
+        # deck preview embed has to be drawn WITH one. Measured on this tree
+        # without it: a two-subject document ("Revenue by region", "Head
+        # count by region") put #2F6FB2 in both word/media images and in the
+        # rendered PDF, while the native PPTX and XLSX charts of the same two
+        # subjects were #2F6FB2 and #E07B00 — one chart, two colours,
+        # depending on which file the reader opened.
+        #
+        # Resolving a second time here is safe and cheap: chart_plan and
+        # chart_defaults do not depend on the `type_scale` the kind branches
+        # pass below (resolve() applies a type_scale to TypeSizes.title ..
+        # kpi_value only, never to TypeSizes.chart_title/chart_axis), and
+        # plan_for costs about 1 ms on a 40-chart document.
+        spec_charts = H.spec_charts(spec)
+        chart_style = ST.resolve(spec) if spec_charts else None
+        for ordinal, chart in enumerate(spec_charts, start=1):
             name = H.chart_filename(ordinal)
             try:
-                C.render_chart_png(chart, out / name)
+                C.render_chart_png(chart, out / name, chart_style)
             except ImportError as exc:
                 raise RenderError("dependency_unavailable", "The chart library is not installed on this server.") from exc
             except Exception as exc:

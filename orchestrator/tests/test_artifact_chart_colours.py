@@ -193,6 +193,62 @@ def test_status_categories_use_status_tokens():
     assert CC.scheme_for(mixed).rule != "status"
 
 
+@pytest.mark.parametrize("x_column, categories, why", [
+    ("Spend band", ["High", "Medium", "Low"], "a High/Medium/Low spend band is an ordinary nominal column"),
+    ("Churned", ["Yes", "No"], "a Yes/No split is an ordinary nominal column"),
+    ("Region", ["Open", "Closed"], "a shop being open or closed is not a status"),
+])
+def test_ordinary_nominal_categories_are_not_painted_with_the_status_palette(x_column, categories, why):
+    """The status palette is RESERVED, and firing it on the VALUES alone made
+    colour lie about the data. Measured before the column-name gate:
+
+        x='Spend band' High/Medium/Low -> ('#902731', '#B28D2A', '#2F8247')
+        x='Churned'    Yes/No          -> ('#2F8247', '#902731')
+
+    i.e. the biggest spend band in CRITICAL red, the smallest in SUCCESS
+    green, and "Churned: Yes" green. Every other status colouring in the
+    product is gated on the column NAME (style._status_column,
+    render/xlsx._status_col, both via style.STATUS_COLUMN_RE); so is this
+    one now."""
+    chart = bound(x_column, "Revenue", categories=categories, values=[30.0, 20.0, 10.0][:len(categories)])
+    scheme = CC.scheme_for(chart)
+    assert scheme.rule != "status", why
+    assert not set(scheme.categories) & set(CC.STATUS_MARKS.values()), scheme.categories
+    assert scheme.force_labels is False, "a nominal chart does not get mandatory labels either"
+
+
+@pytest.mark.parametrize("x_column, title", [
+    ("Status", "Tickets by status"),
+    ("Health", "Accounts by health"),
+    ("Region", "Tickets by risk"),          # the name can come from the title
+])
+def test_a_chart_that_says_it_is_about_status_still_gets_the_status_palette(x_column, title):
+    """The other half of the gate: the values AND the name. This is the case
+    the reserved palette exists for, and it must not have been lost."""
+    chart = bound(x_column, "Tickets", title=title, categories=["Done", "In progress", "Blocked"],
+                  values=[7.0, 3.0, 2.0])
+    scheme = CC.scheme_for(chart)
+    assert scheme.rule == "status" and scheme.force_labels
+    assert colours_of(chart) == [CC.STATUS_MARKS["success"], CC.STATUS_MARKS["warning"], CC.STATUS_MARKS["danger"]]
+
+
+def test_a_long_report_does_not_run_out_of_subject_colours_at_six():
+    """SUBJECT_SLOTS was 5 against an 8-colour palette, so the SIXTH subject
+    of a document wrapped back to slot 1: measured on this seven-chart
+    report, "Revenue by Region" and "Margin by Region" both came out
+    #2F6FB2 — the reported complaint again, inside exactly the long report
+    the sectioned writer now produces. Two subjects live in two different
+    charts and are never side by side, so the deuteranopia ADJACENCY floor
+    that justified five does not apply to them."""
+    measures = ["Revenue", "Headcount", "Churn", "Pipeline", "Cost", "Margin", "Tickets"]
+    charts = [bound("Region", m) for m in measures]
+    plan = CC.plan_for(document(*charts))
+    colours = [colours_of(c, plan)[0] for c in charts]
+    assert len(set(colours)) == len(measures), dict(zip(measures, colours))
+    assert colours == list(CC.CHART_PALETTE[:len(measures)])
+    assert CC.SUBJECT_SLOTS == len(CC.CHART_PALETTE)
+
+
 def test_the_status_marks_are_separable_even_though_they_are_green_amber_red():
     """Green / amber / red is what a status chart is read as, and it is the
     one triple a red-green reader cannot separate by HUE. These four are

@@ -35,10 +35,13 @@ THE RULES (`rule_for`), first match wins:
   time        a single series over a date x, or a line or an area: ONE
               colour. A time series is one thing measured repeatedly, and
               colouring its points differently says the opposite.
-  status      every category (or, on a stack, every series) is a status
-              VALUE (style.STATUS_VALUES): the reserved status tokens, plus
-              mandatory labels — status colour is never the only carrier of
-              the meaning.
+  status      the chart SAYS it is about status (style.STATUS_COLUMN_RE
+              matches its x column, group_by, axis label, title or
+              subtitle) AND every category (or, on a stack, every series)
+              is a status VALUE (style.STATUS_VALUES): the reserved status
+              tokens, plus mandatory labels — status colour is never the
+              only carrier of the meaning. Both halves are required: a
+              High/Medium/Low spend band is an ordinary nominal column.
   categorical pie, donut, treemap, sunburst, stacked and multi-series: a
               categorical slot per category or series NAME, assigned across
               the whole document, so "North" is one colour in every chart.
@@ -84,10 +87,15 @@ from . import chart_spec as CS
 #: `tests/test_artifact_chart_colours.py` recomputes all three checks.
 CHART_PALETTE: Tuple[str, ...] = CS.DEFAULT_PALETTE
 
-#: A chart's SUBJECT is drawn from the first five slots only: they are the
-#: five that are pairwise separated under simulated deuteranopia, and a
-#: document rarely has more than five distinct subjects.
-SUBJECT_SLOTS = 5
+#: How many slots a chart's SUBJECT may be drawn from. This was 5 — the five
+#: that are pairwise separated under simulated deuteranopia — but that floor
+#: governs marks that sit SIDE BY SIDE inside one chart, and two subjects
+#: live in two different charts and are never adjacent. At 5, the sixth
+#: subject of a document wrapped back to slot 1: measured on a seven-chart
+#: report, "Revenue by Region" and "Margin by Region" both came out #2F6FB2,
+#: which is the reported complaint again inside exactly the long report this
+#: round is meant to produce.
+SUBJECT_SLOTS = len(CHART_PALETTE)
 
 #: A signed measure. Blue rises, rose falls, grey is a total or a starting
 #: balance. Never green against red.
@@ -337,6 +345,28 @@ def _names_of(chart: CS.Chart) -> List[str]:
     return [s.name for s in chart.series]
 
 
+def _status_named(chart: CS.Chart) -> bool:
+    """Does this chart SAY it is about status? `status_classes` reads the
+    VALUES, and values alone are not enough. Measured on this tree before
+    the gate: x='Spend band' with High/Medium/Low came back
+    ('#902731', '#B28D2A', '#2F8247') — the biggest spend band painted
+    CRITICAL RED and the smallest SUCCESS GREEN — and x='Churned' with
+    Yes/No came back ('#2F8247', '#902731'), so "Churned: Yes" was green.
+    Everywhere else in the product this colouring is gated on the COLUMN
+    NAME (style._status_column, render/xlsx._status_col, both via
+    style.STATUS_COLUMN_RE); the chart rule uses the same gate, over the
+    binding's x column and group_by, the axis label, the title and the
+    subtitle. A chart that is really about status says so in one of them.
+    """
+    from . import style as ST  # local: style imports this module's plan builder
+
+    parts = [chart.x_label, chart.title, chart.subtitle]
+    b = chart.data
+    if b is not None:
+        parts += [b.x or "", b.group_by or ""]
+    return bool(ST.STATUS_COLUMN_RE.search(" ".join(str(p or "") for p in parts)))
+
+
 def rule_for(chart: CS.Chart) -> str:
     """Which colour rule this chart falls under. Pure, and independent of
     the document plan, so the plan can be built from it."""
@@ -351,7 +381,7 @@ def rule_for(chart: CS.Chart) -> str:
     # Statuses can be the CATEGORIES of one series ("Tickets by status") or
     # the SERIES of a stack ("Status by team"). Either way the colour means
     # the status, not "slot 4".
-    if status_classes(_names_of(chart)):
+    if status_classes(_names_of(chart)) and _status_named(chart):
         return "status"
     if t in CS.PART_OF_WHOLE_TYPES or t == "sunburst" or t in CS.STACKED_TYPES or n > 1:
         return "categorical"

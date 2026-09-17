@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+from app.artifacts import chart_colours as CC
 from app.artifacts import chart_spec as CS
 
 pytest.importorskip("matplotlib")
@@ -176,9 +177,17 @@ def test_the_grid_is_the_chart_gridline_token():
 
 
 def test_a_status_chart_always_shows_its_labels():
-    """Colour alone must never carry 'critical'."""
-    c = chart(categories=["Done", "In progress", "Blocked"], series=[CS.Series(name="Tickets", values=[7.0, 3.0, 2.0])],
+    """Colour alone must never carry 'critical'.
+
+    The title says "by status" on purpose: since the status rule was given
+    the same column-name gate the rest of the product uses
+    (style.STATUS_COLUMN_RE), status VALUES alone no longer make a status
+    chart, and with the old "Tickets by team" title this test would have
+    gone on passing while exercising the ordinary nominal rule instead."""
+    c = chart(title="Tickets by status", categories=["Done", "In progress", "Blocked"],
+              series=[CS.Series(name="Tickets", values=[7.0, 3.0, 2.0])],
               style=CS.ChartStyle(data_labels="auto"))
+    assert CC.scheme_for(c).rule == "status" and CC.scheme_for(c).force_labels
     got = drawn(c)
     bar_labels: List[str] = [t.get_text() for t in got["ax"].texts]
     assert {"7", "3", "2"} <= set(bar_labels), bar_labels
