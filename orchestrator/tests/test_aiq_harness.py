@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -395,6 +397,203 @@ def test_code_that_never_finishes_is_killed_and_fails(tmp_path, toolchain):
     assert any(s["timed_out"] for s in rec["steps"]), rec["steps"]
 
 
+# ----------------------------------------- the sandbox really contains (Q-1) --
+#
+# Measured on the integrated tree before the fix, on BOTH Sparks: `unshare -rn
+# true` fails with "write failed /proc/self/uid_map: Operation not permitted",
+# so the namespace prefix was always empty. A coding case's own check.py then
+# printed, with the step still reporting ok=True:
+#     NETWORK REACHED: the head's vLLM port answered
+#     docker on PATH: /usr/bin/docker | socket exists: True
+#     DOCKER DAEMON ANSWERED: b'HTTP/1.1 200 OK'
+#     parent filesystem: [(…/orchestrator/app/main.py, True), (/etc/passwd, True)]
+#     WROTE OUTSIDE THE WORKDIR: /tmp/aiq-escape.txt   (and the file was there)
+#     fork refused after 842 children
+# The QA user is in the `docker` group, so that code could have removed the
+# worker's vLLM container, which is rank 1 of the production TP=2 model.
+
+#: a checker that does nothing but import what the model wrote, so the hostile
+#: snippet below is the whole of the turn
+IMPORT_ONLY = "import solution\nprint('checked')\n"
+
+
+def _hostile(tmp_path, toolchain, body, timeout=30):
+    spec = {"lang": "python", "timeout": timeout, "files": {"check.py": IMPORT_ONLY}}
+    rec = CS.run_code(spec, f"```python\n{body}\n```", str(tmp_path), toolchain)
+    assert not rec.get("unavailable"), rec.get("unavailable")
+    out = "\n".join((s["stdout"] or "") + (s["stderr"] or "") for s in rec["steps"])
+    return rec, out
+
+
+def _contained(toolchain):
+    """Skip only where docker genuinely cannot hold the code on this host.
+
+    Deliberately asks docker itself rather than the module under test: a
+    sandbox that quietly stopped containing would otherwise skip its own
+    containment tests, which is how this defect survived a green suite.
+    """
+    docker = shutil.which("docker")
+    images = getattr(CS, "PYTHON_IMAGES", ["python:3.12-slim", "python:3.11-slim"])
+    if docker and any(subprocess.run([docker, "image", "inspect", name.strip()],
+                                     capture_output=True, timeout=60).returncode == 0 for name in images):
+        return
+    pytest.skip(f"no docker or no sandbox image on this host (tried {', '.join(images)})")
+
+
+@NOT_ROOT
+def test_the_sandbox_gives_model_written_code_no_network(tmp_path, toolchain):
+    _contained(toolchain)
+    rec, out = _hostile(tmp_path, toolchain, """
+import socket, urllib.request
+for label, probe in (("head vLLM", lambda: socket.create_connection(("10.100.184.1", 8000), 3)),
+                     ("internet", lambda: urllib.request.urlopen("http://1.1.1.1", timeout=3))):
+    try:
+        probe()
+        print("REACHED", label)
+    except Exception as exc:
+        print("blocked", label, type(exc).__name__)
+""")
+    assert "REACHED" not in out, out
+    assert "blocked head vLLM" in out and "blocked internet" in out, out
+    assert rec["toolchain"]["isolated_network"] is True
+
+
+@NOT_ROOT
+def test_the_sandbox_keeps_model_written_code_away_from_the_docker_daemon(tmp_path, toolchain):
+    _contained(toolchain)
+    rec, out = _hostile(tmp_path, toolchain, """
+import os, shutil, socket
+print("docker on PATH:", shutil.which("docker"))
+print("socket exists:", os.path.exists("/var/run/docker.sock"))
+try:
+    s = socket.socket(socket.AF_UNIX); s.connect("/var/run/docker.sock")
+    s.sendall(b"GET /containers/json HTTP/1.1\\r\\nHost: d\\r\\n\\r\\n")
+    print("DAEMON ANSWERED", s.recv(120).split(b"\\r\\n")[0])
+except Exception as exc:
+    print("daemon blocked", type(exc).__name__)
+""")
+    assert "DAEMON ANSWERED" not in out, out
+    assert "docker on PATH: None" in out and "socket exists: False" in out, out
+    assert "daemon blocked" in out, out
+    assert rec["toolchain"]["isolated_docker"] is True
+
+
+@NOT_ROOT
+def test_the_sandbox_shows_the_code_nothing_of_this_machine(tmp_path, toolchain):
+    _contained(toolchain)
+    escape = tmp_path / "escaped-outside-the-workdir.txt"
+    rec, out = _hostile(tmp_path, toolchain, f"""
+import glob, os
+print("repo file:", os.path.exists({str(REPO / 'orchestrator' / 'app' / 'main.py')!r}))
+print("home entries:", len(glob.glob({str(Path.home() / '*')!r})))
+print("workdir writable:", os.access(".", os.W_OK))
+try:
+    open({str(escape)!r}, "w").write("escaped")
+    print("WROTE OUTSIDE THE WORKDIR")
+except Exception as exc:
+    print("outside write blocked", type(exc).__name__)
+""")
+    assert "repo file: False" in out and "home entries: 0" in out, out
+    assert "workdir writable: True" in out, "the scratch directory is the one writable place"
+    assert not escape.exists(), "a write outside the working directory reached this machine"
+    assert rec["toolchain"]["read_only_root"] is True
+
+
+@NOT_ROOT
+def test_a_fork_bomb_dies_inside_the_sandbox(tmp_path, toolchain):
+    _contained(toolchain)
+    before = len([n for n in os.listdir("/proc") if n.isdigit()])
+    rec, out = _hostile(tmp_path, toolchain, """
+import os, time
+n, end = 0, time.time() + 6
+try:
+    while time.time() < end:
+        if os.fork() == 0:
+            time.sleep(4); os._exit(0)
+        n += 1
+except OSError as exc:
+    print("fork refused after", n, "children")
+else:
+    print("FORKED", n, "children without refusal")
+""")
+    assert "FORKED" not in out, out
+    refused = int(out.split("fork refused after")[1].split()[0])
+    assert refused <= CS.SANDBOX_PIDS, f"{refused} tasks is above the container's --pids-limit"
+    after = len([n for n in os.listdir("/proc") if n.isdigit()])
+    assert after - before < CS.SANDBOX_PIDS, "the fork bomb reached this machine's process table"
+
+
+@NOT_ROOT
+def test_a_runaway_allocation_dies_inside_the_memory_cap(tmp_path, toolchain):
+    _contained(toolchain)
+    rec, out = _hostile(tmp_path, toolchain, """
+block, held = bytearray(32 * 1024 * 1024), []
+for i in range(400):                      # 12.5 GiB if nothing stops it
+    held.append(bytearray(block))
+    print("held", (i + 1) * 32, "MiB", flush=True)
+print("ALLOCATED 12 GiB")
+""", timeout=120)
+    assert "ALLOCATED" not in out, out
+    assert not rec["ok"], "a step that was killed for memory must not pass"
+    held = [int(line.split()[1]) for line in out.splitlines() if line.startswith("held ")]
+    assert held and max(held) < 4096, f"reached {max(held)} MiB under a {CS.SANDBOX_MEMORY} cap"
+
+
+@NOT_ROOT
+def test_the_container_argv_carries_every_guard(toolchain, tmp_path):
+    _contained(toolchain)
+    argv = CS._docker_argv(toolchain, "python", str(tmp_path), "aiq-sandbox-test", ["python3", "solution.py"])
+    line = " ".join(argv)
+    for guard in ("--network none", "--cap-drop ALL", "--security-opt no-new-privileges", "--read-only",
+                  f"--memory {CS.SANDBOX_MEMORY}", f"--cpus {CS.SANDBOX_CPUS}", f"--pids-limit {CS.SANDBOX_PIDS}",
+                  f"--user {os.getuid()}:{os.getgid()}"):
+        assert guard in line, f"{guard} is missing from {line}"
+    assert "docker.sock" not in line, "the sandbox must never see the daemon socket"
+    assert f"{tmp_path}:{CS.WORK}" in line and line.count("--volume") == 1, "only the scratch directory is bound"
+
+
+def test_a_host_that_cannot_isolate_runs_no_model_code(monkeypatch, tmp_path):
+    """Failing closed is the whole fix: before it, an unisolated host ran the
+    code anyway and only recorded isolated_network: False."""
+    monkeypatch.setenv("AIQ_SANDBOX_BACKEND", CS.HOST)
+    monkeypatch.delenv("AIQ_ALLOW_UNISOLATED_CODE", raising=False)
+    tc = CS.Toolchain(str(tmp_path / "root"))
+    for lang in ("python", "sql", "bash", "typescript"):
+        ok, why = tc.available(lang)
+        assert not ok and "NOT run" in why, (lang, ok, why)
+    rec = CS.run_code({"lang": "python", "files": {"check.py": IMPORT_ONLY}},
+                      "```python\nopen('/tmp/aiq-should-never-exist', 'w').write('x')\n```",
+                      str(tmp_path / "work"), tc)
+    assert rec["unavailable"] and rec["steps"] == []
+    assert not os.path.exists(os.path.join(str(tmp_path / "work"), "solution.py")), "it wrote the source anyway"
+    assert not os.path.exists("/tmp/aiq-should-never-exist")
+
+
+@NOT_ROOT
+def test_running_on_the_host_has_to_be_asked_for_and_says_so(monkeypatch, tmp_path):
+    monkeypatch.setenv("AIQ_SANDBOX_BACKEND", CS.HOST)
+    monkeypatch.setenv("AIQ_ALLOW_UNISOLATED_CODE", "1")
+    tc = CS.Toolchain(str(tmp_path / "root"))
+    assert tc.available("python") == (True, "")
+    rec = CS.run_code({"lang": "python", "files": {"check.py": IMPORT_ONLY}},
+                      "```python\nvalue = 1\n```", str(tmp_path / "work"), tc)
+    assert rec["ok"], rec["steps"]
+    assert rec["toolchain"]["backend"] == CS.HOST and rec["toolchain"]["isolated_docker"] is False
+    assert "docker socket reachable" in rec["warning"]
+
+
+def test_the_host_fallback_still_takes_the_network_away():
+    """`unshare -rn` is refused on both Sparks; `unshare -Un` is not, and an
+    unmapped user namespace keeps the real uid for filesystem checks."""
+    tc = CS.Toolchain(tempfile.mkdtemp(prefix="aiq-net-"))
+    if not tc.net_prefix:
+        pytest.skip("this host allows no network namespace at all")
+    probe = "import socket\ntry:\n socket.create_connection(('10.100.184.1', 8000), 3); print('REACHED')\nexcept OSError as e:\n print('blocked', e.errno)"
+    p = subprocess.run([*tc.net_prefix, sys.executable, "-c", probe], capture_output=True, text=True, timeout=60)
+    assert "REACHED" not in p.stdout, p.stdout
+    assert "blocked" in p.stdout, (p.stdout, p.stderr)
+
+
 # ---------------------------------------------------------------- the gate --
 
 def _summary(overall, categories, dimensions, **headline):
@@ -407,9 +606,13 @@ def _summary(overall, categories, dimensions, **headline):
             "cases": [{"id": "P01", "category": "csv_plot", "score": 1.0, "all_pass": True, "failed": []}]}
 
 
-GOOD_CATEGORIES = {"csv_plot_without_p06": 0.85, "followup_edit": 0.88, "big_report": 0.84, "format_rewrite": 0.93,
-                   "howto": 1.0, "tables": 1.0, "coding": 0.9}
-GOOD_DIMENSIONS = {"charts": 0.9, "structure": 0.95, "length": 0.85, "thinking": 1.0, "code": 0.9}
+# Every category the case list defines and every dimension a run produces: a
+# gate row is derived for each, so a summary that simply omits one is a run
+# that did not measure it, and "meets every threshold" has to mean all of them.
+GOOD_CATEGORIES = {"csv_plot_without_p06": 0.85, "csv_plot": 0.82, "followup_edit": 0.88, "big_report": 0.84,
+                   "format_rewrite": 0.93, "howto": 1.0, "tables": 1.0, "fast_factual": 0.95, "coding": 0.9}
+GOOD_DIMENSIONS = {"charts": 0.9, "structure": 0.95, "length": 0.85, "thinking": 1.0, "code": 0.9,
+                   "fidelity": 0.92, "deliverable": 0.97}
 
 
 def test_the_gate_passes_a_run_that_meets_every_threshold():
@@ -440,6 +643,49 @@ def test_the_coding_rows_are_reported_but_do_not_block():
     report = G.gate_report(_summary(0.9, {**GOOD_CATEGORIES, "coding": 0.1}, {**GOOD_DIMENSIONS, "code": 0.1}))
     assert report["passed"]
     assert [r["metric"] for r in report["rows"] if not r["ok"]] == ["category:coding", "dimension:code"]
+
+
+# ------------------------------------------- the gate cannot be blind (Q-2) --
+
+def test_a_run_where_only_fast_factual_regresses_fails_the_gate():
+    """Measured on the integrated tree before this fix: gate_report returned
+    passed=True with fast_factual 0.95 -> 0.40, csv_plot 0.86 -> 0.10 and
+    fidelity 0.90 -> 0.10, and no row named any of them. Fast no longer thinks,
+    so fast_factual is the category that measures this round's own risk."""
+    base = _summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS)
+    report = G.gate_report(_summary(0.9, {**GOOD_CATEGORIES, "fast_factual": 0.40}, GOOD_DIMENSIONS), base)
+    row = next(r for r in report["rows"] if r["metric"] == "category:fast_factual")
+    assert row["value"] == 0.40 and row["baseline"] == 0.95 and row["blocking"] and not row["ok"]
+    assert not report["passed"]
+
+
+@pytest.mark.parametrize("metric,key,field", [("category:csv_plot", "by_category", "mean_score"),
+                                              ("dimension:fidelity", "by_dimension", "rate"),
+                                              ("dimension:deliverable", "by_dimension", "rate")])
+def test_every_category_and_dimension_the_run_produces_is_read(metric, key, field):
+    base = _summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS)
+    bad = _summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS)
+    bad[key][metric.split(":", 1)[1]][field] = 0.10
+    report = G.gate_report(bad, base)
+    row = next(r for r in report["rows"] if r["metric"] == metric)
+    assert row["value"] == 0.10 and row["blocking"] and not row["ok"]
+    assert not report["passed"]
+
+
+def test_a_category_added_to_the_case_list_is_gated_without_editing_the_gate(monkeypatch):
+    """The point of deriving the rows: a new category cannot be ungated."""
+    monkeypatch.setattr(G, "CASES", list(G.CASES) + [{"id": "ZZ1", "category": "brand_new", "turns": []}])
+    metrics = [m for m, _, _ in G.gate_rows(_summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS))]
+    assert "category:brand_new" in metrics
+    report = G.gate_report(_summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS))
+    row = next(r for r in report["rows"] if r["metric"] == "category:brand_new")
+    assert row["value"] is None and row["blocking"] and not row["ok"], "a category with no result must not pass"
+    assert not report["passed"]
+
+
+def test_the_gate_reads_every_category_the_suite_has():
+    metrics = {m for m, _, _ in G.gate_rows(_summary(0.9, GOOD_CATEGORIES, GOOD_DIMENSIONS))}
+    assert {f"category:{c['category']}" for c in C.CASES} <= metrics
 
 
 def test_a_baseline_run_scored_by_todays_checks_passes_no_gate(baseline_summary):

@@ -64,13 +64,43 @@ Fast turn carrying reasoning, and an edit that claims a chart it did not add.
 The coding rows are reported, not blocking. `--gate` exits non-zero when it
 fails, and writes `gate.json` next to the results.
 
+"No category below its worker baseline" is not only the list above: `gate_rows`
+derives one more row for every category in `cases.py` and every category or
+dimension the run produced that the list does not name, each held to the
+baseline (floor 0.0). A category the run never produced scores `None` and
+fails, so a partial run cannot pass the gate and a category added to `cases.py`
+cannot be silently ungated. Until 2026-09-18 the list WAS the gate, and a
+control run passed with `fast_factual` falling 0.95 → 0.40 — the one category
+this round's own risk list says must hold, now that Fast never thinks.
+
 ## Rules this harness keeps
 
 * Fixtures are synthetic (`make_fixtures.py`, fixed seeds): no user data, no
   production conversation, no production database, no production container.
 * Secrets and the scratch venv live under `$AIQ_RUNTIME`, outside the repo.
-* The model's code runs with no network, under ulimits, in a throwaway
-  directory, and never as root (`code_sandbox.py`).
+* The model's code runs in a throwaway container with `--network none`, no
+  docker socket, `--cap-drop ALL`, a `--read-only` root with only the turn's
+  own working directory bound writable, `--memory` / `--cpus` / `--pids-limit`
+  caps and a wall-clock kill, and never as root (`code_sandbox.py`).
+  `unshare -rn` is refused on BOTH Sparks (`write failed /proc/self/uid_map:
+  Operation not permitted`), so the namespace prefix this used to rely on never
+  did anything: before 2026-09-18 model-written code reached the head's vLLM
+  port, got `HTTP/1.1 200 OK` from `/var/run/docker.sock` — the QA user is in
+  the `docker` group — read the repository and wrote outside its directory.
+  Where docker cannot give that isolation, every coding case reports
+  UNAVAILABLE and nothing the model wrote is executed. Setting
+  `AIQ_ALLOW_UNISOLATED_CODE` to 1 opts back in to the host path deliberately,
+  and says so in the record and in the gate's console line.
+* The sandbox images are never pulled, so the harness makes no network call of
+  its own: `python:3.12-slim` (Python, SQL and bash) and `node:20-alpine` plus
+  the repository's own `frontend/node_modules/typescript`, bound read-only, for
+  TypeScript. `docker pull node:20-alpine` on the worker is what enables the
+  four TypeScript cases there; without it they report unavailable rather than
+  running unmeasured. Override with `AIQ_SANDBOX_PYTHON_IMAGE`,
+  `AIQ_SANDBOX_NODE_IMAGE`, `AIQ_TYPESCRIPT_LIB`, `AIQ_SANDBOX_MEMORY`,
+  `AIQ_SANDBOX_CPUS`, `AIQ_SANDBOX_PIDS`. Every sandbox container carries the
+  label `aiq-sandbox`, so `docker rm -f $(docker ps -q --filter label=aiq-sandbox)`
+  sweeps anything a killed harness left running.
 * `reference_solutions.py` is the control: CI proves every coding checker
   accepts a correct answer, so a broken checker cannot masquerade as a model
   regression.

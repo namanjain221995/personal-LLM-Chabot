@@ -20,10 +20,25 @@ P06 is scored separately (it asks for a chart without asking for a file, so
 the route it takes is a judgement call, not a defect), and the coding cases
 are reported but do not block: they arrived with this harness, after the
 round's acceptance was agreed.
+
+The rows below are the thresholds the acceptance NAMES. They are not the whole
+gate: measured 2026-09-18 on the integrated tree, GATE held 13 rows while the
+suite had 8 categories and 7 dimensions, and `gate_report` iterated only the
+list — so category:fast_factual, category:csv_plot, dimension:fidelity and
+dimension:deliverable were never read. The control returned passed=True with
+fast_factual falling 0.95 -> 0.40, csv_plot 0.86 -> 0.10 and fidelity
+0.90 -> 0.10, and `[r for r in rows if "fast_factual" in r["metric"]]` was `[]`
+— exactly the category the round's own risk list says must hold, because Fast
+no longer thinks. So every category in the CASE LIST and every dimension in the
+run gets a row derived automatically: an unnamed one carries floor 0.0 and is
+still held to its baseline, and a category the run never produced scores None,
+which fails. A new category cannot be added to cases.py and go ungated.
 """
 from __future__ import annotations
 
 from typing import Dict, List, Optional
+
+from cases import CASES
 
 #: (metric, floor, blocking). "category:x" and "dimension:x" read the summary.
 GATE: List[tuple] = [
@@ -41,6 +56,15 @@ GATE: List[tuple] = [
     ("category:coding", 0.80, False),
     ("dimension:code", 0.80, False),
 ]
+
+#: Reported, never blocking: the coding cases arrived after the round's
+#: acceptance was agreed. Every other category and dimension blocks.
+NON_BLOCKING = {"category:coding", "dimension:code"}
+
+#: A derived row has no agreed threshold of its own, so it is held only to the
+#: baseline (minus the 0.03 run-to-run tolerance). That is enough: the whole
+#: point is that a regression cannot hide in a category nobody listed.
+DERIVED_FLOOR = 0.0
 
 #: (count in the headline, what it means, the headline key that lists WHERE)
 ZERO_COUNTS = [
@@ -65,10 +89,37 @@ def _value(summary: dict, metric: str) -> Optional[float]:
     raise KeyError(metric)
 
 
+def case_categories() -> List[str]:
+    """Every category the suite defines, in case order. Read from CASES, not
+    from a run, so a category that produced no result at all still gets a row
+    and fails on value None rather than disappearing."""
+    out: List[str] = []
+    for c in CASES:
+        if c["category"] not in out:
+            out.append(c["category"])
+    return out
+
+
+def gate_rows(summary: dict) -> List[tuple]:
+    """The named thresholds, then one derived row for every category the case
+    list defines and every category or dimension the run produced."""
+    rows = list(GATE)
+    named = {m for m, _, _ in rows}
+    derived: List[str] = [f"category:{c}" for c in case_categories()]
+    derived += [f"category:{c}" for c in sorted(summary.get("by_category") or {})]
+    derived += [f"dimension:{d}" for d in sorted(summary.get("by_dimension") or {})]
+    for metric in derived:
+        if metric in named:
+            continue
+        named.add(metric)
+        rows.append((metric, DERIVED_FLOOR, metric not in NON_BLOCKING))
+    return rows
+
+
 def gate_report(summary: dict, baseline: Optional[dict] = None) -> dict:
     """Every gate row with its value, its floor and its baseline."""
     rows = []
-    for metric, floor, blocking in GATE:
+    for metric, floor, blocking in gate_rows(summary):
         got = _value(summary, metric)
         base = _value(baseline, metric) if baseline else None
         # "no category below its worker baseline": the baseline is a floor too,
@@ -86,7 +137,12 @@ def gate_report(summary: dict, baseline: Optional[dict] = None) -> dict:
         counts.append({"count": key, "what": what, "value": n, "ok": n == 0, "blocking": True,
                        "where": where if isinstance(where, list) else [where]})
     failing = failing_cases(summary, baseline)
+    # A coding row reading 0.00 because the sandbox refused to run anything is
+    # not a model result, and the console must not let it read as one.
+    unavailable = summary["headline"].get("code_turns_unavailable") or []
     return {"rows": rows, "counts": counts, "failing_cases": failing,
+            "code_unavailable": ({"turns": len(unavailable), "why": sorted(set(unavailable))[0]}
+                                 if unavailable else None),
             "p06": next(({"score": c["score"], "failed": c["failed"]} for c in summary["cases"] if c["id"] == "P06"), None),
             "passed": all(r["ok"] for r in rows if r["blocking"]) and all(c["ok"] for c in counts)}
 
@@ -120,6 +176,9 @@ def print_gate(report: dict) -> None:
         print(f"  {'ok  ' if c['ok'] else 'FAIL'} must be zero: {c['what']:<70s} {c['value']}")
         if not c["ok"] and c["where"]:
             print(f"       {c['where']}")
+    if report.get("code_unavailable"):
+        print(f"  note: the code sandbox ran nothing for {report['code_unavailable']['turns']} coding turn(s): "
+              f"{report['code_unavailable']['why']}")
     if report["p06"]:
         print(f"  P06 (scored separately): {report['p06']['score']:.2f} {', '.join(report['p06']['failed'])}")
     if report["failing_cases"]:
