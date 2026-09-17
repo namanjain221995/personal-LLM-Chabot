@@ -17,13 +17,30 @@ every number.
 THE MAPPING (CONTRACT-3 §B.1). English only, which is the owner's rule for
 this round:
 
-    big, large, long, detailed, in-depth, thorough      3,000 words
-    comprehensive, complete, full, extensive, exhaustive 4,500 words
+    big, large, lengthy, detailed, in-depth, thorough   3,000 words
+    long, longer, expanded, extended NEXT TO the
+        deliverable ("a long report", not "the long
+        tail" or "how long does onboarding take")       3,000 words
+    comprehensive, extensive, exhaustive                4,500 words
+    complete, full, whole, entire NEXT TO the
+        deliverable ("the full report", not "the
+        full quarter")                                  4,500 words
     "N pages"                                           N x 450 words
     "N words"                                           N words
     "at least N", "N+", "N or more"                     the same, as a floor
     "N slides"                                          N slides
     short, brief, one-page, summary, concise            no growth target
+
+WHY THE PROXIMITY GUARD (QA B-3, measured on the integration tree
+2026-09-18). `long` fired wherever it appeared, so "how long does
+onboarding take? write a note", "a report on the long tail of small
+customers", "why the queue is no longer draining", "our extended warranty
+programme" and "the expanded team onboarding" each asked for 3,000 words.
+3,000 is over compose.SECTIONED_WRITER_WORDS, so every one of them took the
+sectioned path — nine model calls, each re-prefilling the whole material on
+the TP=2 engine that also serves live chat — for a request nobody sized.
+The size a request asks for has to be EXPLICIT, which for these four words
+means describing the deliverable.
 
 A growth word and a shrink word in the same request mean growth: "a
 comprehensive report, not a summary" and "a big report with an executive
@@ -94,22 +111,41 @@ class LengthTarget:
 
 # ------------------------------------------------------------- the words --
 
-#: Size words that mean one thing. They fire wherever they appear.
-_BIG_WORDS = (r"(?:big|bigger|biggest|large|larger|long(?:er)?(?![-\s](?:term|run|standing))|lengthy|detailed|"
-              r"in[-\s]?depth|in\s+detail|thorough|elaborate|expanded|extended)")
-_COMPREHENSIVE_WORDS = r"(?:comprehensive|extensive|exhaustive)"
-_BIG_RE = re.compile(rf"\b{_BIG_WORDS}\b", re.IGNORECASE)
-_COMPREHENSIVE_RE = re.compile(rf"\b{_COMPREHENSIVE_WORDS}\b", re.IGNORECASE)
-
 #: Size words that are also ordinary English ("the full year", "a complete
-#: list of ids"). They count only when they describe the DELIVERABLE, so
-#: they need one of its nouns within three words. Without this guard, "a
-#: report on the full quarter" asked for 4,500 words.
+#: list of ids", "the long tail"). They count only when they describe the
+#: DELIVERABLE, so they need one of its nouns within two words. Without
+#: this guard, "a report on the full quarter" asked for 4,500 words.
 _DELIVERABLE = (r"(?:report|document|doc|docs|documentation|write[-\s]?up|writeup|paper|analysis|study|review|guide|"
                 r"overview|breakdown|deep[-\s]?dive|memo|brief(?:ing)?|dossier|deck|presentation|slides?|file|pdf|docx|word)")
+
+#: What may stand between a size word and the deliverable it describes:
+#: more adjectives ("a long detailed report"), never a verb. "how long IS
+#: the report?" asks a question; before 2026-09-18 it ordered a 3,000-word
+#: one, because `long` fired wherever it appeared.
+_NOT_AN_ADJECTIVE = (r"(?:is|are|was|were|be|been|being|do|does|did|will|would|can|could|should|shall|may|might|"
+                     r"must|has|have|had|take|takes|took|get|gets|got)")
+_ADJECTIVES_BETWEEN = rf"(?:\s+(?!{_NOT_AN_ADJECTIVE}\b)\w+){{0,2}}"
+
+#: Size words that mean one thing. They fire wherever they appear.
+_BIG_WORDS = (r"(?:big|bigger|biggest|large|larger|lengthy|detailed|"
+              r"in[-\s]?depth|in\s+detail|thorough|elaborate)")
+#: Growth words that are ALSO ordinary English, so they get the same
+#: deliverable-proximity guard as complete/full/whole/entire. Measured on
+#: the integrated tree (QA B-3, 2026-09-18): "how long does onboarding
+#: take? write a note", "the long tail of small customers", "why the queue
+#: is no longer draining", "our extended warranty programme" and "the
+#: expanded team onboarding" each asked for 3,000 words — over
+#: SECTIONED_WRITER_WORDS, so each took the nine-call sectioned path on the
+#: TP=2 engine that also serves live chat.
+_BIG_NEAR_WORDS = r"(?:long|longer|expanded|extended)"
+_COMPREHENSIVE_WORDS = r"(?:comprehensive|extensive|exhaustive)"
+_BIG_RE = re.compile(rf"\b{_BIG_WORDS}\b", re.IGNORECASE)
+_BIG_NEAR_RE = re.compile(rf"\b{_BIG_NEAR_WORDS}\b{_ADJECTIVES_BETWEEN}\s+{_DELIVERABLE}\b", re.IGNORECASE)
+_COMPREHENSIVE_RE = re.compile(rf"\b{_COMPREHENSIVE_WORDS}\b", re.IGNORECASE)
+
 _AMBIGUOUS_RE = re.compile(
     rf"\b(?:complete|full|whole|entire)\b(?!\s+(?:the|this|that|these|those|my|your|our|their|it)\b)"
-    rf"(?:\s+\w+){{0,2}}\s+{_DELIVERABLE}\b",
+    rf"{_ADJECTIVES_BETWEEN}\s+{_DELIVERABLE}\b",
     re.IGNORECASE,
 )
 
@@ -184,7 +220,7 @@ def shrink_asked(instruction: str) -> bool:
     for a big one. Public because the composer's data-report floor and its
     growth pass both have to honour it."""
     text = instruction or ""
-    if _BIG_RE.search(text) or _COMPREHENSIVE_RE.search(text) or _AMBIGUOUS_RE.search(text):
+    if _BIG_RE.search(text) or _BIG_NEAR_RE.search(text) or _COMPREHENSIVE_RE.search(text) or _AMBIGUOUS_RE.search(text):
         return False
     words, _slides = _numbered(text)
     if words:
@@ -224,6 +260,9 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
 
     candidates: List[Tuple[int, str]] = list(numbered_words)
     m = _BIG_RE.search(text)
+    if m:
+        candidates.append((BIG_WORDS, m.group(0)))
+    m = _BIG_NEAR_RE.search(text)
     if m:
         candidates.append((BIG_WORDS, m.group(0)))
     m = _COMPREHENSIVE_RE.search(text)

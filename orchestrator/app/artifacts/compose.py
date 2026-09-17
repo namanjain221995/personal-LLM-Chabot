@@ -901,6 +901,13 @@ SECTION_DEADLINE_FRACTION = 0.75
 SECTION_RESERVE_S = 60.0
 #: How many short sections one extension pass may grow.
 SECTION_EXTEND_MAX = 3
+#: How the answer opens when the sectioned writer was chosen. A prefix, so
+#: the engine and the tests can find the note without matching the numbers.
+LONG_DOCUMENT_NOTE = "written as a long document"
+#: What a correction must keep of the draft it replaces, once a size was
+#: asked for. _worse()'s own floor is half; half of a nine-call document is
+#: still four pages lost in one call (QA B-1, 2026-09-18).
+CORRECTION_KEEP_FRACTION = 0.9
 
 
 def _stage_budget_s() -> float:
@@ -912,6 +919,31 @@ def _stage_budget_s() -> float:
         return float(_pipeline.stage_timeout("compose"))
     except Exception:  # noqa: BLE001 — a missing pipeline is not a failed job
         return 900.0
+
+
+async def _pace() -> float:
+    """Let live chat through between two section calls.
+
+    pipeline.pace() is consulted ONCE for the whole compose stage, before
+    the composer runs. That was the right place when compose was one call.
+    The sectioned writer makes up to 14 back-to-back calls over several
+    minutes on the same TP=2 engine a person is chatting to, and prefix
+    caching is off on the pinned build, so every one of them re-prefills
+    the whole material (memory: gdn-mtp-remediation-2026-09-11). QA
+    measured pace() consulted 0 times across a 3-section run on the
+    integration tree, 2026-09-18. pace() is bounded by
+    VIDEO_PACE_MAX_WAIT_S, so this cannot overrun the stage, and the
+    deadline check above it already owns stopping.
+
+    Lazily imported, like _stage_budget_s: a test or a tool that never
+    imports the pipeline still composes.
+    """
+    try:
+        from . import pipeline as _pipeline
+
+        return float(await _pipeline.pace())
+    except Exception:  # noqa: BLE001 — pacing is advisory, never a failed job
+        return 0.0
 
 
 def _words_in_blocks(blocks: Sequence[Any]) -> int:
@@ -1040,6 +1072,7 @@ async def compose_sectioned(
     deadline = time.monotonic() + max(0.0, _stage_budget_s() * SECTION_DEADLINE_FRACTION)
     warnings: List[str] = []
     calls = 0
+    paced = 0.0
 
     await say(10.0, "planning the sections")
     plan = await outline(req, budget, target=target, max_tokens=4_000)
@@ -1065,6 +1098,7 @@ async def compose_sectioned(
                 "allowed ran out")
             break
         await say(15.0 + 55.0 * i / len(items), f"writing section {i + 1} of {len(items)}")
+        paced += await _pace()
         heading = str(item.get("heading") or "").strip()
         try:
             async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
@@ -1101,6 +1135,7 @@ async def compose_sectioned(
             if time.monotonic() + SECTION_RESERVE_S >= deadline:
                 break
             await say(72.0 + 3.0 * n, f"expanding section {i + 1}")
+            paced += await _pace()
             try:
                 async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                     grown = await _write_one_section(
@@ -1122,6 +1157,8 @@ async def compose_sectioned(
         sections.pop()
         blocks = [b for sec in sections for b in sec]
         warnings.append("the document was cut to the last section that fits the file's page limit")
+    if paced:
+        warnings.append(f"the document waited {paced:.0f}s between sections so chat could answer")
     assumptions = [str(a)[:200] for a in (plan.get("assumptions") or []) if isinstance(a, str)][:20]
     raw: Dict[str, Any] = {
         "title": (str(plan.get("title") or "").strip() or str(req.instruction or "Report").strip())[:120] or "Report",
@@ -1161,6 +1198,15 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
             req, budget, target, say=say, requested=requested)
         calls += sect_calls
+        # SAY THAT A LONG DOCUMENT WAS CHOSEN, and say what chose it. The
+        # sectioned writer is the expensive path — one model call per
+        # section, minutes of the shared engine — and until 2026-09-18 the
+        # person was never told their wording had bought it. It goes FIRST
+        # so the answer's two-warning clause carries it (engines/
+        # artifact.py::_warning_clause).
+        result_warnings.append(
+            f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about {target.words:,} words, "
+            f"written in {len((outline_json or {}).get('sections') or []) or 1} sections over {sect_calls} model calls")
         result_warnings.extend(sect_warnings)
     else:
         if budget.outline_pass and req.operation != "edit":
@@ -1194,6 +1240,20 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         calls += repaired
         result_warnings.extend(n for n in notes if n not in result_warnings)
         why = _worse(spec, candidate, allow_shrink=allow_shrink)
+        if not why and target.words and not allow_shrink:
+            # A correction is ONE call over the whole file; the draft it
+            # replaces may be the work of nine. _worse() only refuses a
+            # correction that keeps less than HALF, so a 47% cut passed:
+            # QA measured 6,005 words across Overview/Findings/
+            # Recommendations coming back as 3,205 across Overview/Appendix,
+            # losing two sections the draft already had (integration tree,
+            # 2026-09-18). When a size was asked for, a correction that
+            # does not keep 0.9 of the draft is not a correction.
+            before_words = len(S.text_of(spec).split())
+            after_words = len(S.text_of(candidate).split())
+            if before_words >= 40 and after_words < before_words * CORRECTION_KEEP_FRACTION:
+                why = (f"would have cut the document from {before_words:,} words to {after_words:,}, "
+                       f"against the {target.words:,} words that were asked for")
         if why:
             result_warnings.append(f"a correction {why} and was not applied; the draft before it is what you see")
             log.info("artifact compose: a correction (%s) %s; kept the draft", detail, why)
