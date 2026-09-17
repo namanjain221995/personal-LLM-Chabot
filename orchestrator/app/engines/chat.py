@@ -14,15 +14,12 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
-import logging
 from typing import Awaitable, Callable, List, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
 from ..config import settings
 from ..core import answer_sampling, best_of
-
-log = logging.getLogger(__name__)
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
