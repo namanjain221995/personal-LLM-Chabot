@@ -1,0 +1,754 @@
+{
+ "headline": {
+  "cases": 40,
+  "overall_score": 0.761,
+  "cases_all_pass": 19,
+  "fast_turns": 46,
+  "fast_turns_thinking": 2,
+  "fast_thinking_case_ids": [
+   "Q04",
+   "Q05"
+  ],
+  "file_turns": 25,
+  "doc_pages_median": 2,
+  "doc_pages": [
+   2,
+   7,
+   4,
+   2,
+   12,
+   8,
+   3,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   3,
+   3,
+   1,
+   1,
+   1,
+   5,
+   2,
+   2,
+   0,
+   0,
+   2
+  ],
+  "chart_images": 2,
+  "chart_images_single_hue": 2,
+  "chart_dominant_hues": [
+   200
+  ],
+  "chat_turns_with_markdown_structure": 15,
+  "chat_turns": 21,
+  "no_charts_to_draw": 9,
+  "no_charts_to_draw_where": [
+   "P01 t1 job e0e502ea",
+   "P02 t1 job 831dc9eb",
+   "P03 t1 job 586fe03b",
+   "P04 t1 job 038f725f",
+   "P05 t1 job e32c9e0e",
+   "P07 t1 job f800d68b",
+   "P08 t1 job b75b6a2d",
+   "E05 t1 job 1149d015",
+   "E05 t2 job 20057109"
+  ],
+  "table_not_available": 2,
+  "table_not_available_where": [
+   "R06 t1 job 311c3364",
+   "E02 t2 job 1114298b"
+  ],
+  "false_chart_claims": 0,
+  "false_chart_claims_where": [],
+  "code_turns": 0,
+  "code_turns_unavailable": [],
+  "code_turns_built": 0
+ },
+ "job_ids": {
+  "F01": [],
+  "F02": [],
+  "F03": [],
+  "F04": [
+   "dd8bb8e4a4204a7a9897044874222c04"
+  ],
+  "F05": [],
+  "F06": [],
+  "R01": [
+   "c71c8bc84e75428399eee8f559393690"
+  ],
+  "R02": [
+   "206d700114ad4f13a83dde899eabacd2"
+  ],
+  "R03": [
+   "5232186a28034a46a2854dba18111ac9"
+  ],
+  "R04": [
+   "a5def4b34a9546e3bad34a62ba04a113"
+  ],
+  "R05": [
+   "c9b8f6ef54a640d9adcce3c98e3231c0"
+  ],
+  "R06": [
+   "311c336419ea47c5bf9fc6f65a14951a"
+  ],
+  "P01": [
+   "e0e502ea38574afba8cc48cef840ef57"
+  ],
+  "P02": [
+   "831dc9eb0ecd4a5fb509cdccf6461fa3"
+  ],
+  "P03": [
+   "586fe03bd00b46b1b2f0c8e57051f4bb"
+  ],
+  "P04": [
+   "038f725f76f34719b8aa2defb114b8c5"
+  ],
+  "P05": [
+   "e32c9e0e2891406faa65c0bd53ce9623"
+  ],
+  "P06": [],
+  "P07": [
+   "f800d68bf6b346fb8f10bb92b4e427fc"
+  ],
+  "P08": [
+   "b75b6a2d6543443cbf4933d082961031"
+  ],
+  "E01": [
+   "b55c25bf224d46ad98d4d09a72a58271",
+   "34c33f37247142deb700907e2d1f70a8"
+  ],
+  "E02": [
+   "2859563fdd594b6296c06d1edafff0fd",
+   "1114298bdb384f62a918c380b26e7115"
+  ],
+  "E03": [
+   "45c30c1c458f4220b7d0aafb137afb40",
+   "dac5d364835a4dcdb94c4d435218a857"
+  ],
+  "E04": [
+   "e500b3197c6e4d74a4fecc55a731f05e",
+   "d04b4a3fef0b410d93a849670fe7cbb3"
+  ],
+  "E05": [
+   "1149d015af27455c8beb6a1b2a786ae3",
+   "200571096eec4b5e9c645a5525d7b44e"
+  ],
+  "E06": [
+   "494fdd86c6ae402f89e6285a2c0b142d"
+  ],
+  "Q01": [],
+  "Q02": [],
+  "Q03": [],
+  "Q04": [],
+  "Q05": [],
+  "Q06": [],
+  "T01": [],
+  "T02": [],
+  "T03": [],
+  "T04": [],
+  "H01": [],
+  "H02": [],
+  "H03": [],
+  "H04": []
+ },
+ "by_category": {
+  "big_report": {
+   "cases": 6,
+   "mean_score": 0.737,
+   "all_pass": 1
+  },
+  "csv_plot": {
+   "cases": 8,
+   "mean_score": 0.363,
+   "all_pass": 0
+  },
+  "fast_factual": {
+   "cases": 6,
+   "mean_score": 0.933,
+   "all_pass": 4
+  },
+  "followup_edit": {
+   "cases": 6,
+   "mean_score": 0.765,
+   "all_pass": 2
+  },
+  "format_rewrite": {
+   "cases": 6,
+   "mean_score": 0.821,
+   "all_pass": 4
+  },
+  "howto": {
+   "cases": 4,
+   "mean_score": 1.0,
+   "all_pass": 4
+  },
+  "tables": {
+   "cases": 4,
+   "mean_score": 1.0,
+   "all_pass": 4
+  },
+  "csv_plot_without_p06": {
+   "cases": 7,
+   "mean_score": 0.301,
+   "all_pass": 0
+  }
+ },
+ "by_dimension": {
+  "charts": {
+   "passed": 2,
+   "total": 23,
+   "rate": 0.087
+  },
+  "deliverable": {
+   "passed": 109,
+   "total": 136,
+   "rate": 0.801
+  },
+  "fidelity": {
+   "passed": 23,
+   "total": 39,
+   "rate": 0.59
+  },
+  "length": {
+   "passed": 16,
+   "total": 25,
+   "rate": 0.64
+  },
+  "structure": {
+   "passed": 30,
+   "total": 37,
+   "rate": 0.811
+  },
+  "thinking": {
+   "passed": 44,
+   "total": 46,
+   "rate": 0.957
+  }
+ },
+ "by_check": {
+  "artifact": {
+   "passed": 44,
+   "total": 45,
+   "rate": 0.978
+  },
+  "chart_type_any": {
+   "passed": 0,
+   "total": 4,
+   "rate": 0.0
+  },
+  "charts_multicolour": {
+   "passed": 1,
+   "total": 8,
+   "rate": 0.125
+  },
+  "charts_real_values": {
+   "passed": 0,
+   "total": 14,
+   "rate": 0.0
+  },
+  "doc_growth": {
+   "passed": 1,
+   "total": 1,
+   "rate": 1.0
+  },
+  "doc_min_headings": {
+   "passed": 3,
+   "total": 3,
+   "rate": 1.0
+  },
+  "doc_min_pages": {
+   "passed": 5,
+   "total": 8,
+   "rate": 0.625
+  },
+  "doc_min_tables": {
+   "passed": 3,
+   "total": 3,
+   "rate": 1.0
+  },
+  "doc_min_words": {
+   "passed": 0,
+   "total": 5,
+   "rate": 0.0
+  },
+  "forbidden": {
+   "passed": 5,
+   "total": 5,
+   "rate": 1.0
+  },
+  "formats_any": {
+   "passed": 11,
+   "total": 11,
+   "rate": 1.0
+  },
+  "job_completed": {
+   "passed": 16,
+   "total": 25,
+   "rate": 0.64
+  },
+  "max_chars": {
+   "passed": 8,
+   "total": 8,
+   "rate": 1.0
+  },
+  "min_bold": {
+   "passed": 1,
+   "total": 2,
+   "rate": 0.5
+  },
+  "min_bullets": {
+   "passed": 4,
+   "total": 6,
+   "rate": 0.667
+  },
+  "min_chars": {
+   "passed": 2,
+   "total": 3,
+   "rate": 0.667
+  },
+  "min_charts": {
+   "passed": 1,
+   "total": 15,
+   "rate": 0.067
+  },
+  "min_code_blocks": {
+   "passed": 2,
+   "total": 2,
+   "rate": 1.0
+  },
+  "min_headings": {
+   "passed": 4,
+   "total": 6,
+   "rate": 0.667
+  },
+  "min_numbered": {
+   "passed": 4,
+   "total": 4,
+   "rate": 1.0
+  },
+  "min_table": {
+   "passed": 5,
+   "total": 5,
+   "rate": 1.0
+  },
+  "must_contain": {
+   "passed": 18,
+   "total": 20,
+   "rate": 0.9
+  },
+  "no_failure_text": {
+   "passed": 34,
+   "total": 46,
+   "rate": 0.739
+  },
+  "no_runon": {
+   "passed": 4,
+   "total": 5,
+   "rate": 0.8
+  },
+  "order": {
+   "passed": 0,
+   "total": 1,
+   "rate": 0.0
+  },
+  "same_artifact": {
+   "passed": 4,
+   "total": 5,
+   "rate": 0.8
+  },
+  "thinking_off": {
+   "passed": 44,
+   "total": 46,
+   "rate": 0.957
+  }
+ },
+ "cases": [
+  {
+   "id": "F01",
+   "category": "format_rewrite",
+   "score": 0.3,
+   "all_pass": false,
+   "failed": [
+    "min_headings",
+    "min_bullets",
+    "min_bold",
+    "no_runon",
+    "min_chars",
+    "must_contain",
+    "order"
+   ]
+  },
+  {
+   "id": "F02",
+   "category": "format_rewrite",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "F03",
+   "category": "format_rewrite",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "F04",
+   "category": "format_rewrite",
+   "score": 0.625,
+   "all_pass": false,
+   "failed": [
+    "artifact",
+    "min_headings",
+    "min_bullets"
+   ]
+  },
+  {
+   "id": "F05",
+   "category": "format_rewrite",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "F06",
+   "category": "format_rewrite",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "R01",
+   "category": "big_report",
+   "score": 0.75,
+   "all_pass": false,
+   "failed": [
+    "doc_min_pages",
+    "doc_min_words"
+   ]
+  },
+  {
+   "id": "R02",
+   "category": "big_report",
+   "score": 0.75,
+   "all_pass": false,
+   "failed": [
+    "doc_min_pages",
+    "doc_min_words"
+   ]
+  },
+  {
+   "id": "R03",
+   "category": "big_report",
+   "score": 0.5,
+   "all_pass": false,
+   "failed": [
+    "must_contain",
+    "doc_min_pages",
+    "doc_min_words",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "R04",
+   "category": "big_report",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "R05",
+   "category": "big_report",
+   "score": 0.875,
+   "all_pass": false,
+   "failed": [
+    "doc_min_words"
+   ]
+  },
+  {
+   "id": "R06",
+   "category": "big_report",
+   "score": 0.545,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "doc_min_words",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P01",
+   "category": "csv_plot",
+   "score": 0.333,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P02",
+   "category": "csv_plot",
+   "score": 0.286,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P03",
+   "category": "csv_plot",
+   "score": 0.333,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P04",
+   "category": "csv_plot",
+   "score": 0.25,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P05",
+   "category": "csv_plot",
+   "score": 0.286,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P06",
+   "category": "csv_plot",
+   "score": 0.8,
+   "all_pass": false,
+   "failed": [
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P07",
+   "category": "csv_plot",
+   "score": 0.286,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "P08",
+   "category": "csv_plot",
+   "score": 0.333,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "E01",
+   "category": "followup_edit",
+   "score": 0.8,
+   "all_pass": false,
+   "failed": [
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "E02",
+   "category": "followup_edit",
+   "score": 0.692,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "E03",
+   "category": "followup_edit",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "E04",
+   "category": "followup_edit",
+   "score": 0.833,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "min_charts"
+   ]
+  },
+  {
+   "id": "E05",
+   "category": "followup_edit",
+   "score": 0.267,
+   "all_pass": false,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values",
+    "no_failure_text",
+    "job_completed",
+    "same_artifact",
+    "min_charts",
+    "chart_type_any",
+    "charts_multicolour",
+    "charts_real_values"
+   ]
+  },
+  {
+   "id": "E06",
+   "category": "followup_edit",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "Q01",
+   "category": "fast_factual",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "Q02",
+   "category": "fast_factual",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "Q03",
+   "category": "fast_factual",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "Q04",
+   "category": "fast_factual",
+   "score": 0.8,
+   "all_pass": false,
+   "failed": [
+    "thinking_off"
+   ]
+  },
+  {
+   "id": "Q05",
+   "category": "fast_factual",
+   "score": 0.8,
+   "all_pass": false,
+   "failed": [
+    "thinking_off"
+   ]
+  },
+  {
+   "id": "Q06",
+   "category": "fast_factual",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "T01",
+   "category": "tables",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "T02",
+   "category": "tables",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "T03",
+   "category": "tables",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "T04",
+   "category": "tables",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "H01",
+   "category": "howto",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "H02",
+   "category": "howto",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "H03",
+   "category": "howto",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  },
+  {
+   "id": "H04",
+   "category": "howto",
+   "score": 1.0,
+   "all_pass": true,
+   "failed": []
+  }
+ ]
+}
