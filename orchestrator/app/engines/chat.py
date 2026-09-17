@@ -14,15 +14,13 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
-import contextlib
 import logging
-from typing import Awaitable, Callable, List, Optional, Sequence
+from typing import Awaitable, Callable, List, Sequence
 
-from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
-from .. import continuation, llm, metrics
+from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
+from .. import continuation, llm
 from ..config import settings
-from ..core import answer_sampling, best_of, effort_policy
-from ..core import tracing as query_tracing
+from ..core import answer_sampling, best_of
 
 log = logging.getLogger(__name__)
 
@@ -93,7 +91,10 @@ def _messages(
     from ..identity import identity_line
 
     system = (
-        ASSISTANT_SYSTEM + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
+        # FORMAT before DIAGRAMS and CODE: how an answer is written comes
+        # first, and the two capability blocks qualify it. Assistant mode
+        # only — the Salesforce chat branch is greetings and small talk.
+        ASSISTANT_SYSTEM + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
         if mode == "assistant"
         else SALESFORCE_CHAT_SYSTEM
     ) + identity_line()
@@ -120,39 +121,6 @@ def _messages(
         + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": message}]
     )
-
-
-async def _adaptive_thinking(
-    message: str, model_choice: str, effort: str
-) -> Optional[effort_policy.ThinkingDecision]:
-    """Decide whether this thinking-off turn should think after all.
-
-    None when the policy does not apply: it is switched off, or the turn
-    already thinks (Think / Max). Every decision it does make — think or not —
-    is counted and recorded on the query trace, by reason and signal names
-    only, never the prompt.
-    """
-    if not settings.fast_adaptive_thinking or llm.wants_thinking(model_choice, effort):
-        return None
-    decision = effort_policy.classify(message)
-    budget = settings.fast_thinking_budget if decision.think else 0
-    metrics.inc(
-        "fast_adaptive_thinking_total",
-        "Fast turns by adaptive-thinking decision (think = bounded thinking on)",
-        decision="think" if decision.think else "direct",
-        reason=decision.reason,
-    )
-    await query_tracing.event(
-        "ADAPTIVE_THINKING",
-        component="orchestrator.app.engines.chat",
-        details={**decision.as_trace(), "effort": effort, "budget_tokens": budget},
-    )
-    if decision.think:
-        log.info(
-            "adaptive thinking: Fast turn thinks (reason=%s signals=%s budget=%d classify=%.2fms)",
-            decision.reason, ",".join(decision.signals), budget, decision.elapsed_ms,
-        )
-    return decision
 
 
 async def run_chat_engine(
@@ -278,30 +246,27 @@ async def run_chat_engine(
         if guard.verdict is not None:
             raise continuation.StopGeneration(continuation.STOP_REPETITION)
 
-    # ADAPTIVE THINKING (core/effort_policy.py). A Fast turn whose prompt is
-    # a multi-step reasoning task thinks — bounded by FAST_THINKING_BUDGET on
-    # top of the answer ceiling — instead of reasoning, and looping, inside
-    # the answer. The reasoning streams through `_out` as `reasoning` events
-    # like any Think turn's. The grant covers exactly this generation.
-    decision = await _adaptive_thinking(message, model_choice, effort)
-    thinks = decision is not None and decision.think
-    scope = (
-        effort_policy.grant(settings.fast_thinking_budget, decision.reason)
-        if thinks
-        else contextlib.nullcontext()
+    # THINKING IS THE PERSON'S CHOICE, NOT THIS ENGINE'S (2026-09-17). Fast
+    # turns used to be classified here (core/effort_policy.py) and a prompt
+    # that looked like a multi-step reasoning task was given a bounded
+    # thinking grant. In production every grant it opened was a false
+    # positive — a pasted job description reads as a "measurement" problem
+    # because it contains "can", "fill" and a rate per hour — and each one
+    # cost the person 11-47 s of reasoning on a turn they had asked to be
+    # fast. Fast now never thinks: this engine asks for the completion the
+    # effort implies and nothing else. The loop guard below, not a thought,
+    # is what stops an answer that reasons itself in circles.
+    long = await continuation.stream_long_completion(
+        _messages(message, history, mode, grounding),
+        on_delta=_out,
+        model_choice=model_choice,
+        effort=effort,
+        temperature=temperature,
+        segment_max_tokens=max_tokens,
+        total_max_tokens=total_max_tokens,
+        deadline_s=settings.continuation_deadline_s or None,
+        **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
-    with scope:
-        long = await continuation.stream_long_completion(
-            _messages(message, history, mode, grounding),
-            on_delta=_out,
-            model_choice=model_choice,
-            effort=effort,
-            temperature=temperature,
-            segment_max_tokens=max_tokens,
-            total_max_tokens=total_max_tokens,
-            deadline_s=settings.continuation_deadline_s or None,
-            **({} if answer_plan is None else {"answer_plan": answer_plan}),
-        )
     for piece in guard.finish():
         await emit("token", {"text": piece})
 
@@ -316,11 +281,6 @@ async def run_chat_engine(
     if guard.verdict is not None:
         meta["loop_guard"] = guard.verdict.as_meta()
         await answer_guard.record(guard.verdict, effort=effort, route="chat")
-    if thinks:
-        meta["adaptive_thinking"] = {
-            "reason": decision.reason,
-            "budget_tokens": settings.fast_thinking_budget,
-        }
     await emit("meta", meta)
     return guard.shown
 

@@ -48,6 +48,48 @@ NO_DATA_MESSAGE = (
     "from your synced Salesforce org."
 )
 
+# Formatting: the chat UI renders every answer as Markdown, and the prompt
+# never said so. Asked "be helpful, clear, and concise" and nothing else, the
+# model answered in plain lines — no headings, no bold labels, no bullets —
+# while the same question put to ChatGPT came back sectioned (owner report,
+# 2026-09-17).
+#
+# The second half of the same report is a REWRITE: a person pasted a
+# plain-text sample, pasted the source to rewrite, and asked for "the same
+# format". Two things went wrong. The plain-text sample was copied literally,
+# plain text and all, so the answer had no Markdown at all; and a section the
+# source said nothing about was filled with invented content. In one synthetic
+# reproduction the model answered with the SAMPLE's own content instead of the
+# source's. So the rule names both sides explicitly: the sample decides the
+# SHAPE, the source decides the CONTENT, and an empty section says so.
+#
+# Chat only (engines/chat.py, assistant mode). The Fast small-talk lane and
+# the Salesforce chat prompt are short on purpose, and the search, url,
+# document, rag and dataset prompts have formatting rules of their own.
+FORMAT_INSTRUCTION = (
+    "\n\nFORMAT: answers are rendered as Markdown. When the content has "
+    "structure, show it: ## and ### headings for sections, - bullets for "
+    "lists of items, **bold** for labels and key terms (for example "
+    "**Location:** Austin, TX), and a Markdown table when you compare things "
+    "or give rows of values. Leave a blank line between paragraphs, headings, "
+    "lists and tables. A short conversational reply — a greeting, an "
+    "acknowledgement, a one- or two-sentence answer — stays plain prose, with "
+    "no headings.\n"
+    "REWRITES: when the user gives a sample, template or earlier answer and "
+    "asks for the same format, the same shape or the same way, the SAMPLE "
+    "decides the shape — its sections, their order, its labels and its level "
+    "of detail — and the SOURCE they asked you to rewrite decides the "
+    "content. Rewrite the source into that shape; never hand back the "
+    "sample's own content as the answer. A plain-text sample still comes back "
+    "as Markdown: its section names become headings, its 'Label: value' lines "
+    "keep the label in bold, and its item lines become bullets. Fill every "
+    "section from the source alone; where the source has nothing for a "
+    "section, write 'Not specified' rather than inventing entries for it.\n"
+    "Length follows the ask: when the user asks for something big or complete "
+    "(a full report, every item, a detailed rewrite), write all of it instead "
+    "of a summary."
+)
+
 # Diagrams: the UI renders ```mermaid blocks as real, zoomable, downloadable
 # diagrams. The instruction is deliberately conservative — an earlier, more
 # eager version made the model decorate ordinary answers with diagrams and

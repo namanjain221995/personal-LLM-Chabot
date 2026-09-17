@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from app import fast_lane, llm, metrics
-from app.engines import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION
+from app.engines import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION
 from app.engines import chat as chat_engine
 from app.facts import FACTS_HEADER
 from tests.test_freshness import CASES as FRESHNESS_CASES
@@ -443,6 +443,7 @@ def test_the_lane_prompt_is_the_persona_the_facts_and_two_clipped_exchanges():
     assert "Prefers short answers" in system["content"]
     assert "other conversations" not in system["content"]
     assert DIAGRAM_INSTRUCTION not in system["content"] and CODE_INSTRUCTION not in system["content"]
+    assert FORMAT_INSTRUCTION not in system["content"]
     assert "mermaid" not in system["content"] and "```python" not in system["content"]
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user", "assistant", "user"]
     assert messages[1]["content"].startswith("second question")
@@ -460,7 +461,11 @@ def test_the_non_lane_prompt_is_unchanged():
         {"role": "assistant", "content": "a"},
     ]
     expected_system = ASSISTANT = (
-        chat_engine.ASSISTANT_SYSTEM + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION + identity_line()
+        chat_engine.ASSISTANT_SYSTEM
+        + FORMAT_INSTRUCTION
+        + DIAGRAM_INSTRUCTION
+        + CODE_INSTRUCTION
+        + identity_line()
     )
     # --- AS3 intent-capability BEGIN --- the non-lane prompt now ends with the file capability line
     from app.engines.capability import CAPABILITY_SUFFIX
