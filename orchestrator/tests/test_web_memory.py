@@ -248,7 +248,7 @@ def test_search_answer_honours_the_effort(monkeypatch):
     async def fake_fetch(results, message="", **attribution):
         return [search._Source(n=1, title="T", url="https://a.example/x", text="body")]
 
-    async def fake_rerank(message, results, target):
+    async def fake_rerank(message, results, target, per_domain=0):
         return results
 
     async def fake_memory(message, sources, budget=3):

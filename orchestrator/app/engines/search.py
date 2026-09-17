@@ -63,11 +63,18 @@ _MIN_SOURCES = 8
 # scale: 60 x 8000 would be 480k chars of prefill for ONE step. The top-ranked
 # sources keep the full budget (so High is never shallower than Medium on the
 # pages that matter most) and the long tail is kept short.
-# WHY THE RERANKER ONLY REORDERS THE FETCH BUDGET, AND NOT A WIDER POOL.
-# It looks like a bug that _collect_results truncates to the budget before
-# _rerank_results sees anything — the cross-encoder can only reorder the
-# handful engine rank already chose. It was tried (2026-08-30): gather 3x the
-# budget, rerank down. It measurably made results WORSE on every query tested.
+# WHY THE RERANKER GETS A CANDIDATE POOL, AND WHAT HAD TO COME WITH IT.
+# Until 2026-09-18 _collect_results truncated to the fetch budget before
+# _rerank_results saw anything, and run_search_engine then called it with
+# `target=len(results)` — so `keep` was the whole list and the cross-encoder
+# could only REORDER what engine rank had already chosen. Nothing could be
+# dropped. The platform audit measured the cost: on "today's weather forecast
+# for Surat", 7 of the 15 sources read and cited were keyword noise (two
+# weather.com pages for Kolar, Karnataka 1,500 km away, "Electric current —
+# Wikipedia", a JEE physics worksheet), while weather.com/Surat sat in the
+# pool the engines returned and was never fetched.
+#
+# Widening the pool HAD been tried once (2026-08-30) and made results worse:
 #
 #   "vLLM continuous batching throughput"
 #     narrow -> anyscale.com, microsoft.com, arpitbhayani.me
@@ -76,16 +83,46 @@ _MIN_SOURCES = 8
 #     narrow -> github.com, huggingface.co, openlm.ai
 #     wide   -> 2coffee.dev, daconta.us, orcarouter.ai
 #
-# The reason is that the two signals measure different things. Engine rank is
-# an AUTHORITY prior — Bing and Google already know anyscale.com outranks a
-# personal blog on this topic. The reranker scores TOPICAL match on title +
-# snippet, and knows nothing about authority; a keyword-dense blog post beats
-# an authoritative page on that measure. Widening the pool throws the
-# authority prior away and ranks purely on topicality. Keep both: engine rank
-# selects, the reranker reorders within that selection.
+# That experiment is the reason for the shape of the fix rather than an
+# argument against it. Engine rank is an AUTHORITY prior — Bing and Google
+# already know anyscale.com outranks a personal blog on this topic — and the
+# cross-encoder scores TOPICAL match on title+snippet alone, so ranking a wide
+# pool purely on topicality promotes whichever keyword-dense blog repeats the
+# query terms most. The pool only widens now that the sort key carries an
+# authority term of its own (`web_memory.authority_of`, the score this module
+# has always computed and nothing has ever read) and a relevance floor drops
+# the noise outright. Engine rank still selects the pool; relevance x
+# authority selects what is read.
 
 _TIER_A_SOURCES = 10
 _TIER_B_CHARS = 2500
+
+# How many candidates per source actually read. The reranker needs something
+# to choose BETWEEN; at 1x it can only reorder. Five is enough that the right
+# page is in the pool (the audit's weather.com/Surat sat at engine rank 23 of
+# 72) without paying for a second round of provider calls — the provider is
+# already asked for `settings.search_max_results` per query and this only
+# changes how many of them survive the merge.
+_CANDIDATE_MULTIPLIER = 5
+# Relevance below this is not a worse answer, it is a different subject: the
+# audit scored the seven junk sources of one production batch at 0.0045,
+# 0.0037, 0.0020, 0.0002, 0.0000, 0.0000, 0.0000, while every genuine page for
+# the same question scored >= 0.9995. Anything in that gap is noise.
+_RERANK_FLOOR = 0.05
+# Authority moves a relevance score by at most half (official = 100 -> x1.50,
+# reference = 70 -> x1.35, neutral = 40 -> x1.20, UGC/low = 15 -> x1.075).
+# Deliberately small: it is a tie-breaker between pages that BOTH answer the
+# question, and must never lift an off-topic page over a relevant one.
+_AUTHORITY_DIVISOR = 200.0
+# `web_memory.authority_of` scores the HOST and cannot tell a project's own
+# release notes from a site that rewrites them: docs.vllm.ai,
+# github.com/vllm-project/vllm/releases, whatsnew.fyi and patchletter.com are
+# all neutral 40, which is exactly how the audit's vLLM answer came to cite
+# three aggregators and leave docs.vllm.ai uncited at [12]. `core/provenance`
+# classifies the PAGE and does tell them apart — 'docs', 'press', 'reference'
+# against 'unknown' — so the class earns a second, smaller step.
+_FIRST_HAND_TYPES = frozenset({"official", "academic", "docs", "press", "reference"})
+_FIRST_HAND_BONUS = 0.15
 
 _FETCH_CONCURRENCY = 16
 # Extraction is CPU-bound and trafilatura is not thread-safe — one worker.
@@ -113,6 +150,53 @@ def warm_extractor():
 def source_budget(effort: str) -> int:
     """How many sources this level reads per search."""
     return _SOURCE_BUDGET.get(llm.normalize_effort(effort), _SOURCE_BUDGET["think"])
+
+
+def candidate_budget(effort: str) -> int:
+    """How many candidates the reranker gets to choose the read set FROM."""
+    return source_budget(effort) * _CANDIDATE_MULTIPLIER
+
+
+def domain_cap(effort: str) -> int:
+    """Pages allowed from any one site in the set actually READ."""
+    return _MAX_PER_DOMAIN.get(llm.normalize_effort(effort), _MAX_PER_DOMAIN["think"])
+
+
+def _today_iso() -> str:
+    """Today HERE, as the prompts say it.
+
+    NOTHING on the ordinary search route knew the date. Deep Research has
+    carried `state.today` since 2026-09-03 (its module docstring still opens
+    with "NO NOTION OF TIME" as the defect it was built to close); the search
+    route never got it, so the audit's "what is the latest iPhone?" answer read
+    a page saying "Pre-order iPhone 18 Pro now", decided the phone had shipped,
+    and wrote that a device "became available in October 2026" — a month in the
+    future — because the only calendar in the prompt was the model's training
+    data. One function, so a test can move the clock.
+
+    LOCAL, not UTC. This box runs IST (UTC+05:30), so between 00:00 and 05:30
+    every night UTC is still yesterday — measured on the first live run of
+    this change at 00:54 IST, where a "today's weather for Surat" answer came
+    back stamped "As of 2026-09-17". A person asking what today's weather is
+    means their today. `_now_stamp` carries the UTC reading alongside it so
+    nothing downstream has to guess which calendar a date is on.
+    """
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _now_stamp() -> str:
+    """'2026-09-18 00:54 IST (2026-09-17 19:24 UTC)'.
+
+    The TIME, not just the day. A spot price, a match score or a forecast is
+    minutes old, and the audit's gold answer "gave a date but no time of day"
+    — which reads as though it were true for the whole day.
+    """
+    local = datetime.now().astimezone()
+    utc = datetime.now(timezone.utc)
+    return (
+        f"{local.date().isoformat()} {local:%H:%M} {local.tzname() or 'local time'} "
+        f"({utc:%Y-%m-%d %H:%M} UTC)"
+    )
 
 
 def _normalize_url(url: str) -> str:
@@ -190,6 +274,31 @@ class _Source:
     @property
     def domain(self) -> str:
         return urlparse(self.url).hostname or self.url
+
+    def label(self) -> str:
+        """'official · published 2026-08-28 · read 2026-09-18'.
+
+        The provenance this dataclass has carried since 2026-09-03 and the
+        prompt never showed. Deep Research renders the same line
+        (`deep_research._Source.label`); the search route rendered title and
+        URL alone, so a page dated three weeks ago and a page dated three years
+        ago were indistinguishable in the context block, and "undated" —
+        the state an SEO rewrite is usually in — could not be told from fresh.
+        """
+        bits: List[str] = []
+        if self.source_type and self.source_type != "unknown":
+            bits.append(self.source_type)
+        if self.published_at:
+            bits.append(f"published {self.published_at.date().isoformat()}")
+        elif self.modified_at:
+            bits.append(f"updated {self.modified_at.date().isoformat()}")
+        else:
+            bits.append("undated")
+        if self.modified_at and self.published_at and self.modified_at > self.published_at:
+            bits.append(f"updated {self.modified_at.date().isoformat()}")
+        if self.fetched_at:
+            bits.append(f"read {self.fetched_at.date().isoformat()}")
+        return " · ".join(bits)
 
 
 #: Why a source ended up on a head slice instead of query-centred passages,
@@ -345,9 +454,14 @@ async def rewrite_queries(
     """
     cap = query_budget(effort)
     system = (
+        f"Today is {_today_iso()}. "
         f"Turn the user's request into 1 to {cap} concise web-search queries. "
         "Each query must look for something DIFFERENT — do not paraphrase the "
-        "same search. Respond with ONLY a JSON array of strings, no prose."
+        "same search. Never put a year or a version number into a query unless "
+        "the user gave one: the newest release you remember is older than the "
+        "web, and searching for it finds last year's answer. Search for the "
+        "CURRENT one instead. Respond with ONLY a JSON array of strings, no "
+        "prose."
     )
     # conversation_turns, NOT recent_turns. main.py pins the user's saved
     # facts, the cross-chat recall block and the excerpts of pages/documents
@@ -365,7 +479,81 @@ async def rewrite_queries(
         queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
     except Exception:
         queries = []
+    queries = _strip_unasked_pins(message, history, queries)
     return (queries or [message])[:cap]
+
+
+#: A token that is nothing but a calendar year.
+_BARE_YEAR_RE = re.compile(r"^[\(\[\"']*(?:19|20)\d{2}[\)\]\"'.,:;?!]*$")
+#: A token that is nothing but a version number — "v0.4.0", "0.4.0", "v2.1".
+#: Anchored and whole-token ON PURPOSE: "GPT-5.2" and "Qwen3-VL-8B" are names,
+#: not pins, and a substring rule would gut them.
+_BARE_VERSION_RE = re.compile(r"^v?\d+(?:\.\d+)+[\)\]\"'.,:;?!]*$", re.I)
+
+
+def _strip_unasked_pins(
+    message: str, history: Sequence[dict], queries: List[str]
+) -> List[str]:
+    """Remove a year or version the CONVERSATION never mentioned.
+
+    Audit finding 3. The rewriter runs on the router model, whose training
+    cutoff is fixed, and it volunteers that cutoff as a search term: asked
+    "what is the latest version of vLLM and what changed in it?" it produced
+    "what's new in vLLM v0.4.0"; asked "what is the latest iPhone model?" it
+    produced "Apple iPhone launch date 2024"; asked "who is the CEO of Intel?"
+    it produced "Intel CEO 2024". Three of the audit's eight cases, and
+    production `web_searches` rows show the same shape on live traffic
+    ("… official statement on AGI status 2025", run on 2026-09-07). Each one
+    spends a third of the query budget asking the web to confirm what the
+    model already believes — the exact motion that turns a stale memory into a
+    cited fact.
+
+    The prompt above now says not to. This is the half that does not depend on
+    a 8B model obeying an instruction: a pin the conversation never contained
+    cannot have come from the person, so it comes out. A pin the person DID
+    give ("what changed in Python 3.13?", or a follow-up whose referent
+    "GPT-5.2" was named two turns ago) is theirs and is kept — which is why
+    `history` is consulted and not just `message`.
+
+    Token-wise, never substring-wise. A substring rule that deleted every
+    digit-dot-digit run would turn "GPT-5.2 reasoning score" into
+    "GPT- reasoning score" and break the S2 follow-up resolution built on it.
+    """
+    if not queries:
+        return queries
+    said = message + " " + " ".join(
+        str(t.get("content") or "") for t in conversation_turns(history, 4)
+    )
+    said_tokens = {t.strip("()[]\"'.,:;?!").lower() for t in said.split()}
+    has_year = any(_BARE_YEAR_RE.match(t) for t in said.split())
+    has_version = any(_BARE_VERSION_RE.match(t) for t in said.split())
+    if has_year and has_version:
+        return queries
+
+    out: List[str] = []
+    seen: set = set()
+    for q in queries:
+        tokens = q.split()
+        kept = [
+            t
+            for t in tokens
+            if t.strip("()[]\"'.,:;?!").lower() in said_tokens
+            or not (
+                (not has_year and _BARE_YEAR_RE.match(t))
+                or (not has_version and _BARE_VERSION_RE.match(t))
+            )
+        ]
+        # A query stripped down to nothing is worse than a pinned one. Two
+        # content words is the floor — "Intel CEO" searches, "CEO" does not.
+        cleaned = " ".join(kept).strip() if len(kept) >= 2 else q
+        key = cleaned.lower()
+        if key in seen:
+            # Stripping can collide two rewrites into one search; a duplicate
+            # query spends a slot of the budget on an answer we already have.
+            continue
+        seen.add(key)
+        out.append(cleaned)
+    return out
 
 
 #: A question this short is carrying its subject somewhere else — the previous
@@ -475,8 +663,15 @@ async def _collect_results(
     emit: Optional[Emit] = None,
     categories: str = "",
     degraded: Optional[dict] = None,
+    candidates: Optional[int] = None,
 ) -> List[SearchResult]:
     """Search every query and merge the results fairly.
+
+    `candidates` is how many merged results to return. Default (None) is the
+    fetch budget, which is what every caller wanted while the reranker could
+    only reorder. A caller that reranks DOWN to the budget afterwards passes
+    `candidate_budget(effort)` instead, so the cross-encoder has something to
+    choose between; see the note above `_TIER_A_SOURCES`.
 
     The old version concatenated results query by query and then head-sliced
     the whole list to 10. With more than one query that silently discarded the
@@ -554,8 +749,18 @@ async def _collect_results(
             raise errors[-1]
         return []
 
-    target = source_budget(effort)
-    per_domain_cap = _MAX_PER_DOMAIN.get(llm.normalize_effort(effort), _MAX_PER_DOMAIN["think"])
+    budget = source_budget(effort)
+    target = candidates if candidates and candidates > 0 else budget
+    per_domain_cap = domain_cap(effort)
+    # The domain cap is a rule about what is READ, not about what may be
+    # considered. Applied unchanged to a 5x pool it starves exactly the case
+    # this pool exists for: weather.com holds a page for every city, and three
+    # wrong ones at better engine rank would keep the right one out. It scales
+    # with the pool here, and the real cap is re-applied after reranking
+    # (`_rerank_results(..., per_domain=...)`), so the read set is as broad as
+    # it ever was — just chosen better.
+    if target > budget:
+        per_domain_cap = max(1, -(-per_domain_cap * target // max(budget, 1)))
     seen: set = set()
     domains: dict = {}
     out: List[SearchResult] = []
@@ -587,9 +792,12 @@ async def _collect_results(
 
 
 async def _rerank_results(
-    message: str, results: List[SearchResult], target: int
+    message: str,
+    results: List[SearchResult],
+    target: int,
+    per_domain: int = 0,
 ) -> List[SearchResult]:
-    """Order candidate results by RELEVANCE, not engine rank.
+    """Choose the read set by RELEVANCE x AUTHORITY, not by engine rank.
 
     Engine rank was the only pre-read quality signal, and it measurably fails:
     in both probe runs the rank-1 source for "latest vLLM release" was an
@@ -598,10 +806,28 @@ async def _rerank_results(
     a cross-encoder rather than an embedding model). Any failure returns the
     input order — reranking is an upgrade, never a gate.
 
-    `target` is the number of results to KEEP. Callers hand in a candidate
-    pool several times larger than the fetch budget, so this is where "the
-    best 8 of 120" happens; before 2026-08-30 the pool was truncated to the
-    budget upstream and this function could only reorder what it was given.
+    `target` is the number of results to KEEP, and it must be the FETCH
+    BUDGET, not `len(results)`. Both production callers passed the latter
+    until 2026-09-18, which made `keep` the whole input and left this function
+    unable to drop anything at all — the audit read seven keyword-noise pages
+    out of fifteen because of it.
+
+    Three things decide the order, and the second and third are new:
+
+    * RELEVANCE, the cross-encoder's score for the question against
+      title+snippet. Anything below `_RERANK_FLOOR` is a different subject
+      rather than a worse answer, and is dropped outright — unless the whole
+      batch is below it, because reranking is an upgrade and never a gate:
+      a search that found only weak matches still answers from them, and the
+      coverage check and the prompt say so.
+    * AUTHORITY, `web_memory.authority_of` — the 0-100 prior this module has
+      computed on every source since 2026-09-03 and which, until now, NOTHING
+      read. It multiplies by at most 1.5 (see `_AUTHORITY_DIVISOR`), enough to
+      put github.com/vllm-project/vllm/releases above whatsnew.fyi when both
+      answer the question, never enough to promote an off-topic page.
+    * `per_domain`, the read-set domain cap, re-applied here because
+      `_collect_results` widened its own cap to build the pool. Applied in
+      score order, so it is the BEST page from a site that survives.
     """
     keep = target if target > 0 else len(results)
     if len(results) <= 2:
@@ -611,6 +837,7 @@ async def _rerank_results(
     # above the passage naming the office holder; the model's own prompt
     # format separates them by three orders of magnitude.
     from .. import rerank
+    from ..web_memory import authority_of
 
     try:
         scores = await rerank.score(
@@ -618,9 +845,81 @@ async def _rerank_results(
         )
     except rerank.RerankUnavailable:
         return results[:keep]
-    order = sorted(range(len(results)), key=lambda i: scores[i], reverse=True)
-    return [results[i] for i in order][:keep]
 
+    def _prior(url: str) -> float:
+        """Host authority x page class, in [1.0, ~1.73]. Never zero: this
+        multiplies relevance, it does not replace it."""
+        prior = 1.0 + authority_of(url) / _AUTHORITY_DIVISOR
+        if provenance.source_type(url) in _FIRST_HAND_TYPES:
+            prior *= 1.0 + _FIRST_HAND_BONUS
+        return prior
+
+    def _ranked(i: int) -> float:
+        return scores[i] * _prior(results[i].url)
+
+    order = sorted(range(len(results)), key=_ranked, reverse=True)
+    # The floor is applied to the RAW relevance score. An authority bonus may
+    # order two pages that both answer the question; it may never carry an
+    # irrelevant one over the bar because it happens to be on a .gov domain.
+    relevant = [i for i in order if scores[i] >= _RERANK_FLOOR]
+    if not relevant:
+        log.info(
+            "rerank: every candidate scored below the floor (best %.4f) — "
+            "keeping the top %d unfiltered",
+            max(scores) if scores else 0.0, keep,
+        )
+        relevant = order
+    if per_domain > 0:
+        per_dom: dict = {}
+        capped: List[int] = []
+        for i in relevant:
+            dom = _registrable_domain(results[i].url)
+            if per_dom.get(dom, 0) >= per_domain:
+                continue
+            per_dom[dom] = per_dom.get(dom, 0) + 1
+            capped.append(i)
+        # Same relaxation as `_collect_results`: a niche question where one
+        # site genuinely holds the answer must not be starved below the floor
+        # the fetch stage needs.
+        if len(capped) < min(keep, _MIN_SOURCES):
+            capped.extend(i for i in relevant if i not in set(capped))
+        relevant = capped
+    dropped = len(results) - len(relevant)
+    if dropped:
+        log.debug("rerank dropped %d of %d candidates", dropped, len(results))
+    return [results[i] for i in relevant][:keep]
+
+
+def _drop_unread_sources(sources: List[_Source]) -> List[_Source]:
+    """Take the SEARCH SNIPPET ONLY sources back out, once enough pages were read.
+
+    Audit finding 7. A source whose page could not be fetched (403, robots,
+    timeout) is rebuilt from the search engine's one-line blurb and goes into
+    the prompt labelled `_SNIPPET_LABEL`, with the system prompt telling the
+    model in as many words to treat it "as a pointer, never as evidence for a
+    specific number or quotation". That is an instruction and nothing checked
+    it: the audit's weather answer wrote "current temperatures hovering around
+    30°C with broken clouds [2][3]" where [2] was a timeanddate.com page that
+    had 403'd, so the whole of [2] in the prompt was a 150-character blurb.
+    Six of that turn's fifteen sources were snippets; 3.5 per turn across the
+    eight cases.
+
+    The deterministic half of the fix, in the shape this repo already uses for
+    `_coverage_gap`: when `_MIN_SOURCES` pages were genuinely read, a blurb
+    adds nothing that can be cited, so it does not reach the prompt OR the
+    panel — the panel then stops counting unread pages as sources, which is
+    the same lie in the other direction. Below that floor they stay: a thin
+    result set is exactly when a pointer is worth having, and the label and
+    the prompt rule still apply to it.
+
+    Renumbers contiguously, because `[n]` in the answer indexes this list.
+    """
+    read = [s for s in sources if not s.from_snippet]
+    if len(read) < _MIN_SOURCES or len(read) == len(sources):
+        return sources
+    for new_n, s in enumerate(read, start=1):
+        s.n = new_n
+    return read
 
 
 #: Pages served from the store during THIS request, for the research panel
@@ -907,8 +1206,15 @@ _SNIPPET_LABEL = " — SEARCH SNIPPET ONLY, the page itself could not be read"
 
 
 def _context_block(sources: List[_Source]) -> str:
+    """The numbered sources, each with its provenance line.
+
+    `[n] title (url) — official · published 2026-08-28 · read 2026-09-18`.
+    Without the dates the model had no way to tell a pre-order announcement
+    from a shipping one, and no way to weigh a three-year-old page against
+    today's; it filled the gap from training data (audit finding 1).
+    """
     blocks = [
-        f"[{s.n}] {s.title} ({s.url})"
+        f"[{s.n}] {s.title} ({s.url}) — {s.label()}"
         f"{_SNIPPET_LABEL if s.from_snippet else ''}\n{s.text}"
         for s in sources
     ]
@@ -983,6 +1289,21 @@ def _answer_messages(
     gap: Optional[List[str]] = None,
 ) -> List[dict]:
     system = (
+        f"Today is {_now_stamp()}. The numbered sources below were fetched from "
+        "the live web during this request and are NEWER than your training "
+        "data: where a source contradicts what you remember, the source wins. "
+        "Each source carries its own dates — read them. A date LATER than "
+        "today has not happened yet: write \"expected\", \"announced for\" or "
+        "\"scheduled\", never the past tense, and never call something released, "
+        "shipped, launched or available unless a source says it already is. "
+        "Where the answer can move, stamp it: \"as of "
+        f"{_today_iso()}\".\n"
+        "EVERY factual claim you make — a date, a number, a name, a version, a "
+        "status — must be supported by one of the numbered sources. If the "
+        "sources do not support a claim, DO NOT MAKE IT: say what the sources "
+        "do establish and state the uncertainty plainly. An answer that names "
+        "what is still unknown is correct; one that fills the gap from memory "
+        "is not.\n"
         "You answer using the numbered web sources provided. Cite the sources "
         "you rely on inline with bracketed numbers like [1] or [2]. Prefer the "
         "most recent and authoritative sources; if they conflict or don't cover "
@@ -1203,7 +1524,6 @@ async def _persist_and_index(
         pass
 
 
-
 def _degraded_note(degraded: dict) -> str:
     """One human line about a reduced search, for a `status` event.
 
@@ -1276,7 +1596,9 @@ async def research_step(
     """
     try:
         queries = await rewrite_queries(question, history, effort)
-        results = await _collect_results(queries, effort, emit)
+        results = await _collect_results(
+            queries, effort, emit, candidates=candidate_budget(effort)
+        )
     except SearchUnavailableError:
         return "", []
     if not results:
@@ -1284,12 +1606,16 @@ async def research_step(
     # The rewrite resolved the referent; every consumer below gets it, not the
     # bare phrase (finding S2).
     asked = resolve_question(question, queries)
-    results = await _rerank_results(asked, results, len(results))
+    results = await _rerank_results(
+        asked, results, source_budget(effort), per_domain=domain_cap(effort)
+    )
     if emit is not None:
         await emit("research", {"phase": "reading", "count": len(results)})
     sources = _apply_char_tiers(
-        await _fetch_sources(
-            results, asked, user_id=user_id, conversation_id=conversation_id
+        _drop_unread_sources(
+            await _fetch_sources(
+                results, asked, user_id=user_id, conversation_id=conversation_id
+            )
         ),
         asked,
     )
@@ -1310,7 +1636,12 @@ async def research_step(
         thinking=llm.wants_thinking("smart", effort),
     )
     if emit is not None:
-        await emit("research", {"phase": "read", "count": len(sources)})
+        # Pages opened, not rows in the panel — same correction as
+        # `run_search_engine`.
+        await emit(
+            "research",
+            {"phase": "read", "count": sum(1 for s in sources if not s.from_snippet)},
+        )
     return answer, _meta_sources(sources, answer)
 
 
@@ -1327,7 +1658,10 @@ async def run_search_engine(
     degraded: dict = {}
     try:
         queries = await rewrite_queries(message, history, effort)
-        results = await _collect_results(queries, effort, emit, degraded=degraded)
+        results = await _collect_results(
+            queries, effort, emit, degraded=degraded,
+            candidates=candidate_budget(effort),
+        )
     except SearchUnavailableError:
         return await _fallback(
             message, history, emit,
@@ -1349,16 +1683,22 @@ async def run_search_engine(
     # form; `history` still carries the user's literal words.
     asked = resolve_question(message, queries)
 
-    # Relevance-ordered selection: score the candidate snippets with the
+    # Relevance-ordered SELECTION: score the candidate snippets with the
     # reranker BEFORE spending fetch time on them, so "best 15 of the pool"
     # replaces "first 15 by engine rank" (which put an anime page at [1]).
-    results = await _rerank_results(asked, results, len(results))
+    # `source_budget(effort)`, never `len(results)` — handing this the fetch
+    # budget as the pool is what made the comment above untrue for a fortnight.
+    results = await _rerank_results(
+        asked, results, source_budget(effort), per_domain=domain_cap(effort)
+    )
 
     await emit("status", {"text": f"Reading {len(results)} sources…"})
     await emit("research", {"phase": "reading", "count": len(results)})
     sources = _apply_char_tiers(
-        await _fetch_sources(
-            results, asked, user_id=user_id, conversation_id=conversation_id
+        _drop_unread_sources(
+            await _fetch_sources(
+                results, asked, user_id=user_id, conversation_id=conversation_id
+            )
         ),
         asked,
     )
@@ -1370,7 +1710,13 @@ async def run_search_engine(
     # Paragraphs from pages read in EARLIER searches, dated, after the live set.
     sources = await _memory_sources(asked, sources)
 
-    await emit("research", {"phase": "read", "count": len(sources)})
+    # What was READ, not what is in the panel: `len(sources)` counted
+    # snippet-only rows and store-memory rows as pages someone opened, so the
+    # panel said "15 read" for a turn in which six pages had 403'd.
+    await emit(
+        "research",
+        {"phase": "read", "count": sum(1 for s in sources if not s.from_snippet)},
+    )
 
     # Remember this search — log, pages, vectors — behind the answer.
     _spawn(
