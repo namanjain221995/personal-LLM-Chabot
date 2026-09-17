@@ -3859,7 +3859,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             extras["model"] = llm.served_model_id("smart")
         elif route in ("sql", "rag", "report"):
             extras["model"] = llm.served_model_id("smart")
-            extras["effort"] = "think"  # engine default; picker not applied
+            # Until 2026-09-17 this said "think" whatever the person chose,
+            # on the belief that the data engines were pinned to that level.
+            # They are not: their narratives stream through the same
+            # `llm.*` functions as every other route, and on a Fast turn
+            # those send `enable_thinking` false (llm.mark_fast_turn). meta
+            # is trust metadata, so it reports the level that actually
+            # served the answer rather than a constant.
+            extras["effort"] = request.effort
         else:  # "chat": assistant mode or the salesforce chat class (§3a)
             extras["model"] = llm.served_model_id(request.model)
             extras["effort"] = request.effort
@@ -4443,6 +4450,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # same per-task scope).
         context.reset_trim_notice()
         llm.reset_usage()
+        # FAST NEVER THINKS (owner rule, 2026-09-17). Declared once, here,
+        # for the whole turn: every main-model call this task makes — the
+        # answer, a search fallback, a repo Q&A, a compaction summary, the
+        # route classifier's fallback, an agent step — reads it inside
+        # llm.reasoning_extra_body and sends `enable_thinking` false. A
+        # ContextVar with the same per-task scope as the accounting above, so
+        # it reaches every engine without a parameter and cannot leak into
+        # another request. The public /v1 API has its own task and never
+        # passes here, so it is unaffected (by design).
+        llm.mark_fast_turn(llm.normalize_effort(request.effort) == "fast")
         trace_context = query_trace.activate()
         # While a model call inside this turn waits for a restarting engine,
         # the person sees why instead of a silent spinner (app/resilience.py).
@@ -5784,7 +5801,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.repo import run_repo_engine
 
                 answer = await run_repo_engine(
-                    text, github_ref, conv_key, history, emit
+                    text, github_ref, conv_key, history, emit, request.effort
                 )
             elif crawl_url is not None:
                 # Phase 3.5: crawl the whole site into the web store.

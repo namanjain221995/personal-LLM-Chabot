@@ -1222,7 +1222,19 @@ def _degraded_note(degraded: dict) -> str:
     return f"Partial search results — {detail}."
 
 
-async def _fallback(message: str, history: Sequence[dict], emit: Emit, note: str) -> str:
+async def _fallback(
+    message: str,
+    history: Sequence[dict],
+    emit: Emit,
+    note: str,
+    effort: str = "think",
+) -> str:
+    """Answer from model knowledge when the search pipeline produced nothing.
+
+    Runs at the TURN's effort. Left at the default it ran at "think" — so the
+    one path a Fast turn reaches when SearXNG is unreachable was also the one
+    path that spent a reasoning pass the person had switched off.
+    """
     await emit("status", {"text": note})
     parts: List[str] = []
     msgs = [
@@ -1232,7 +1244,9 @@ async def _fallback(message: str, history: Sequence[dict], emit: Emit, note: str
         *recent_turns(history, settings.chat_history_turns),
         {"role": "user", "content": message},
     ]
-    async for kind, delta in llm.stream_chat_events(msgs, max_tokens=8000):
+    async for kind, delta in llm.stream_chat_events(
+        msgs, effort=llm.normalize_effort(effort), max_tokens=8000
+    ):
         await emit(kind, {"text": delta})
         if kind == "token":
             parts.append(delta)
@@ -1288,7 +1302,12 @@ async def research_step(
         )
     )
     answer = await llm.chat_completion(
-        _answer_messages(asked, sources, history), temperature=0.2, max_tokens=5000
+        _answer_messages(asked, sources, history),
+        temperature=0.2,
+        max_tokens=5000,
+        # A plan step's answer is written at the turn's level, not at
+        # chat_completion's thinking-on default.
+        thinking=llm.wants_thinking("smart", effort),
     )
     if emit is not None:
         await emit("research", {"phase": "read", "count": len(sources)})
@@ -1311,7 +1330,8 @@ async def run_search_engine(
         results = await _collect_results(queries, effort, emit, degraded=degraded)
     except SearchUnavailableError:
         return await _fallback(
-            message, history, emit, "Web search unavailable — answering from model knowledge."
+            message, history, emit,
+            "Web search unavailable — answering from model knowledge.", effort,
         )
     if degraded:
         # An existing event type, never a new one: `status` is what the panel
@@ -1319,7 +1339,8 @@ async def run_search_engine(
         await emit("status", {"text": _degraded_note(degraded)})
     if not results:
         return await _fallback(
-            message, history, emit, "No web results found — answering from model knowledge."
+            message, history, emit,
+            "No web results found — answering from model knowledge.", effort,
         )
 
     # The rewrite already resolved "and its score?" into a query naming the
@@ -1343,7 +1364,8 @@ async def run_search_engine(
     )
     if not sources:
         return await _fallback(
-            message, history, emit, "Couldn't read the sources — answering from model knowledge."
+            message, history, emit,
+            "Couldn't read the sources — answering from model knowledge.", effort,
         )
     # Paragraphs from pages read in EARLIER searches, dated, after the live set.
     sources = await _memory_sources(asked, sources)

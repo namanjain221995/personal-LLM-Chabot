@@ -121,6 +121,67 @@ def _record_usage(prompt: int, completion: int) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# FAST NEVER THINKS (owner rule, 2026-09-17).
+#
+# "Fast" is this deployment's one model with its reasoning pass switched off,
+# and the owner's rule is absolute: a turn the person asked for at Fast must
+# not spend a single token thinking, on ANY path it reaches.
+#
+# Effort was previously a per-CALL argument, so the rule held only where a
+# caller remembered to pass it. It did not hold for the dozens of calls a Fast
+# turn makes underneath the answer — a search fallback, a repo Q&A, a
+# compaction summary, the route classifier's main-model fallback, a chart
+# question, an agent step — every one of which defaults to thinking ON because
+# `wants_thinking`'s default effort is "think". Nor did it hold against a
+# caller that asked for thinking explicitly (`thinking=True`) or an answer
+# plan that turned it on.
+#
+# So the rule is enforced ONCE, where every request to the main model is
+# shaped, instead of at the call sites: a turn-scoped ContextVar, set by the
+# chat worker from `request.effort` and read by every function below. While it
+# is set, `enable_thinking` is false, no thinking budget is added and the
+# thinking floor on max_tokens does not apply — whatever effort, `thinking=`
+# flag or answer plan the caller passed.
+#
+# SCOPE. A ContextVar with the same per-asyncio-task scope as the token
+# accounting above: it reaches every engine the turn calls without threading a
+# parameter through them, and it can never leak into another request. The
+# public /v1 API never enters the chat worker (publicapi/streaming.py has its
+# own task and its own `reset_usage`), so it is unaffected by design — /v1
+# thinking behaviour is the caller's to choose.
+#
+# Call sites still pass their own effort and `thinking=` (fixed in the same
+# change, so `meta` tells the truth about a Think turn). This is the floor
+# under them, not a replacement for them.
+# ---------------------------------------------------------------------------
+
+_fast_turn: ContextVar[bool] = ContextVar("_fast_turn", default=False)
+
+
+def mark_fast_turn(on: bool) -> None:
+    """Declare whether the turn running in this context is a Fast turn.
+
+    Called once per chat request, beside `reset_usage()`. True means: nothing
+    this turn sends to the main model may think.
+    """
+    _fast_turn.set(bool(on))
+
+
+def fast_turn() -> bool:
+    """True while a Fast turn is in force in this context."""
+    return bool(_fast_turn.get())
+
+
+def _thinking_allowed(enabled: object) -> bool:
+    """The caller's thinking decision, with the Fast rule applied.
+
+    The ONE place a thinking decision is turned into a yes/no, so a path that
+    forgets the rule cannot exist.
+    """
+    return bool(enabled) and not fast_turn()
+
+
 def _capture_usage(chunk) -> None:
     """Read the usage a response reports: the usage chunk vLLM sends last on
     a stream (it carries no choices, so every streaming loop here already
@@ -854,6 +915,7 @@ async def chat_completion(
     stream_chat_completion); this is the same fix for the non-streaming one.
     """
     model_id = model or settings.llm_model
+    thinking = _thinking_allowed(thinking)  # Fast never thinks
     client = _openai_client()
     sized, budget = await _fit(
         normalize_system(messages),
@@ -895,7 +957,7 @@ async def chat_completion_with_reasoning(
     as the streaming path.
     """
     model_id = model or settings.llm_model
-    thinking_on = wants_thinking("smart", effort)
+    thinking_on = _thinking_allowed(wants_thinking("smart", effort))  # Fast never thinks
     budget_tokens = thinking_budget(effort) if thinking_on else None
     requested = max_tokens
     if thinking_on:
@@ -956,6 +1018,7 @@ async def stream_chat_completion(
 ) -> AsyncIterator[str]:
     """Streaming chat completion; yields text deltas."""
     model_id = model or settings.llm_model
+    thinking = _thinking_allowed(thinking)  # Fast never thinks
     client = _openai_client()
     sized, budget = await _fit(
         normalize_system(messages),
@@ -1089,12 +1152,16 @@ def reasoning_extra_body(
     Native and third-party OpenAI-compatible runtimes frequently reject
     unknown ``extra_body`` fields with HTTP 400.  Capability profiles opt into
     this extension explicitly; an unsupported backend receives no key at all.
+
+    On a Fast turn (`mark_fast_turn`) the switch is false whatever the caller
+    asked for: this is the last gate every main-model request passes through
+    on its way to `enable_thinking`.
     """
     if not capabilities.supports_reasoning:
         return None
     if not capabilities.allows_extra_body("chat_template_kwargs"):
         return None
-    return thinking_body(enabled)
+    return thinking_body(_thinking_allowed(enabled))
 
 
 def _delta_value(delta: object, name: str):
@@ -1285,6 +1352,9 @@ async def stream_chat_events(
       sampling-only plan (`.enable_thinking` None, the default Fast plan)
       changes sampling keys and nothing else: thinking switch, budget and
       floor are exactly as without a plan.
+    - on a Fast turn (`mark_fast_turn`) none of that can turn thinking on:
+      `.enable_thinking` True is overridden, the switch goes out false and the
+      MAX_OUTPUT_TOKENS floor does not apply.
 
     `engine_state.note_chunk()` is called on every engine chunk: a chunk on
     any stream is serving evidence for every silent one.
@@ -1300,6 +1370,12 @@ async def stream_chat_events(
     # Only a plan that DECIDES thinking sizes the call itself; a sampling-only
     # plan must not disturb a thinking decision made elsewhere.
     plan_sizes_call = plan_thinking is not None
+    # FAST NEVER THINKS. Last word over the effort, over a plan that decided
+    # thinking on, and over the grant below: on a Fast turn this call sends
+    # `enable_thinking` false, asks for no thinking budget and is not floored
+    # at MAX_OUTPUT_TOKENS.
+    if fast_turn():
+        thinking_on = False
     plan_sampling = (getattr(answer_plan, "sampling", None) or {}) if answer_plan is not None else {}
     # Validated before anything is sent: a key this layer never sends (a seed)
     # is a caller bug, not a request to forward.
@@ -1316,7 +1392,10 @@ async def stream_chat_events(
     # changes. A plan that decides thinking itself (`plan_sizes_call`) is
     # authoritative and leaves any grant unclaimed; a sampling-only plan (the
     # Fast default) does not, and the granted call keeps its plan sampling.
-    grant = None if (thinking_on or plan_sizes_call) else _effort_policy.claim_grant()
+    grant = (
+        None if (thinking_on or plan_sizes_call or fast_turn())
+        else _effort_policy.claim_grant()
+    )
     granted = grant is not None
     if granted:
         thinking_on, budget_tokens = True, grant.budget_tokens
@@ -1670,6 +1749,7 @@ async def chat_with_tools(
     client = _openai_client()
     model_id = model or settings.llm_model
     requested = max_tokens
+    thinking = _thinking_allowed(thinking)  # Fast never thinks
     if thinking:
         budget_tokens = thinking_budget(effort)
         if budget_tokens and max_tokens is not None:
@@ -1736,6 +1816,7 @@ async def json_completion(
     model_id = model or settings.llm_model
     reset_finish_reason()
     requested = max_tokens
+    thinking = _thinking_allowed(thinking)  # Fast never thinks
     if thinking:
         budget_tokens = thinking_budget(effort) if effort else None
         if budget_tokens and max_tokens is not None:

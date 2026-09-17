@@ -928,7 +928,12 @@ def _enriched_error(error: str, failed_sql: str, schema: dict) -> str:
 
 
 async def _ask_chart_model(messages: List[dict]) -> str:
-    return await llm.chat_completion(messages, temperature=0.0, max_tokens=2500)
+    # A chart spec is a small structured answer over columns the caller
+    # already computed. Thinking draws from the same 2,500 tokens and has
+    # returned an empty spec; off at every effort.
+    return await llm.chat_completion(
+        messages, temperature=0.0, max_tokens=2500, thinking=False
+    )
 
 
 async def attach_chart(
