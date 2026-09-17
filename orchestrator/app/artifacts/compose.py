@@ -1240,7 +1240,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         calls += repaired
         result_warnings.extend(n for n in notes if n not in result_warnings)
         why = _worse(spec, candidate, allow_shrink=allow_shrink)
-        if not why and target.words and not allow_shrink:
+        # `target.explicit`, not `target.words`: DATA_REPORT_FLOOR gives words
+        # to any report over tables, which is code's own judgement and comes
+        # from a single call with no sectioned draft to protect (verifier,
+        # 2026-09-18). The floor is for a length the PERSON named.
+        if not why and target.explicit and target.words and not allow_shrink:
             # A correction is ONE call over the whole file; the draft it
             # replaces may be the work of nine. _worse() only refuses a
             # correction that keeps less than HALF, so a 47% cut passed:

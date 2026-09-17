@@ -1,0 +1,531 @@
+{
+ "rows": [
+  {
+   "metric": "overall",
+   "value": 0.761,
+   "floor": 0.88,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:csv_plot_without_p06",
+   "value": 0.301,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:followup_edit",
+   "value": 0.765,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:big_report",
+   "value": 0.737,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:format_rewrite",
+   "value": 0.821,
+   "floor": 0.9,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:howto",
+   "value": 1.0,
+   "floor": 1.0,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": true,
+   "blocking": true
+  },
+  {
+   "metric": "category:tables",
+   "value": 1.0,
+   "floor": 1.0,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": true,
+   "blocking": true
+  },
+  {
+   "metric": "dimension:charts",
+   "value": 0.087,
+   "floor": 0.85,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "dimension:structure",
+   "value": 0.811,
+   "floor": 0.9,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "dimension:length",
+   "value": 0.64,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "dimension:thinking",
+   "value": 0.957,
+   "floor": 1.0,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": true
+  },
+  {
+   "metric": "category:coding",
+   "value": null,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": false
+  },
+  {
+   "metric": "dimension:code",
+   "value": null,
+   "floor": 0.8,
+   "baseline": null,
+   "baseline_floor": null,
+   "ok": false,
+   "blocking": false
+  }
+ ],
+ "counts": [
+  {
+   "count": "no_charts_to_draw",
+   "what": "'The artifact has no charts to draw as images'",
+   "value": 9,
+   "ok": false,
+   "blocking": true,
+   "where": [
+    "P01 t1 job e0e502ea",
+    "P02 t1 job 831dc9eb",
+    "P03 t1 job 586fe03b",
+    "P04 t1 job 038f725f",
+    "P05 t1 job e32c9e0e",
+    "P07 t1 job f800d68b",
+    "P08 t1 job b75b6a2d",
+    "E05 t1 job 1149d015",
+    "E05 t2 job 20057109"
+   ]
+  },
+  {
+   "count": "table_not_available",
+   "what": "a chart warning 'the table \u2026 is not available' in a dataset conversation",
+   "value": 2,
+   "ok": false,
+   "blocking": true,
+   "where": [
+    "R06 t1 job 311c3364",
+    "E02 t2 job 1114298b"
+   ]
+  },
+  {
+   "count": "fast_turns_thinking",
+   "what": "a Fast turn that thought",
+   "value": 2,
+   "ok": false,
+   "blocking": true,
+   "where": [
+    "Q04",
+    "Q05"
+   ]
+  },
+  {
+   "count": "false_chart_claims",
+   "what": "an edit that said it added a chart when none was added",
+   "value": 0,
+   "ok": true,
+   "blocking": true,
+   "where": []
+  }
+ ],
+ "failing_cases": [
+  {
+   "id": "F01",
+   "category": "format_rewrite",
+   "score": 0.3,
+   "failed": [
+    "min_headings",
+    "min_bullets",
+    "min_bold",
+    "no_runon",
+    "min_chars",
+    "must_contain",
+    "order"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [],
+   "regression": false
+  },
+  {
+   "id": "F04",
+   "category": "format_rewrite",
+   "score": 0.625,
+   "failed": [
+    "artifact",
+    "min_headings",
+    "min_bullets"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "dd8bb8e4a4204a7a9897044874222c04"
+   ],
+   "regression": false
+  },
+  {
+   "id": "R01",
+   "category": "big_report",
+   "score": 0.75,
+   "failed": [
+    "doc_min_pages",
+    "doc_min_words"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "c71c8bc84e75428399eee8f559393690"
+   ],
+   "regression": false
+  },
+  {
+   "id": "R02",
+   "category": "big_report",
+   "score": 0.75,
+   "failed": [
+    "doc_min_pages",
+    "doc_min_words"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "206d700114ad4f13a83dde899eabacd2"
+   ],
+   "regression": false
+  },
+  {
+   "id": "R03",
+   "category": "big_report",
+   "score": 0.5,
+   "failed": [
+    "must_contain",
+    "doc_min_pages",
+    "doc_min_words",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "5232186a28034a46a2854dba18111ac9"
+   ],
+   "regression": false
+  },
+  {
+   "id": "R05",
+   "category": "big_report",
+   "score": 0.875,
+   "failed": [
+    "doc_min_words"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "c9b8f6ef54a640d9adcce3c98e3231c0"
+   ],
+   "regression": false
+  },
+  {
+   "id": "R06",
+   "category": "big_report",
+   "score": 0.545,
+   "failed": [
+    "no_failure_text",
+    "doc_min_words",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "311c336419ea47c5bf9fc6f65a14951a"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P01",
+   "category": "csv_plot",
+   "score": 0.333,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "e0e502ea38574afba8cc48cef840ef57"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P02",
+   "category": "csv_plot",
+   "score": 0.286,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "831dc9eb0ecd4a5fb509cdccf6461fa3"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P03",
+   "category": "csv_plot",
+   "score": 0.333,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "586fe03bd00b46b1b2f0c8e57051f4bb"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P04",
+   "category": "csv_plot",
+   "score": 0.25,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "038f725f76f34719b8aa2defb114b8c5"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P05",
+   "category": "csv_plot",
+   "score": 0.286,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "chart_type_any",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "e32c9e0e2891406faa65c0bd53ce9623"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P06",
+   "category": "csv_plot",
+   "score": 0.8,
+   "failed": [
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [],
+   "regression": false
+  },
+  {
+   "id": "P07",
+   "category": "csv_plot",
+   "score": 0.286,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "f800d68bf6b346fb8f10bb92b4e427fc"
+   ],
+   "regression": false
+  },
+  {
+   "id": "P08",
+   "category": "csv_plot",
+   "score": 0.333,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "b75b6a2d6543443cbf4933d082961031"
+   ],
+   "regression": false
+  },
+  {
+   "id": "E01",
+   "category": "followup_edit",
+   "score": 0.8,
+   "failed": [
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "b55c25bf224d46ad98d4d09a72a58271",
+    "34c33f37247142deb700907e2d1f70a8"
+   ],
+   "regression": false
+  },
+  {
+   "id": "E02",
+   "category": "followup_edit",
+   "score": 0.692,
+   "failed": [
+    "no_failure_text",
+    "min_charts",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "2859563fdd594b6296c06d1edafff0fd",
+    "1114298bdb384f62a918c380b26e7115"
+   ],
+   "regression": false
+  },
+  {
+   "id": "E04",
+   "category": "followup_edit",
+   "score": 0.833,
+   "failed": [
+    "no_failure_text",
+    "min_charts"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "e500b3197c6e4d74a4fecc55a731f05e",
+    "d04b4a3fef0b410d93a849670fe7cbb3"
+   ],
+   "regression": false
+  },
+  {
+   "id": "E05",
+   "category": "followup_edit",
+   "score": 0.267,
+   "failed": [
+    "no_failure_text",
+    "job_completed",
+    "min_charts",
+    "charts_real_values",
+    "no_failure_text",
+    "job_completed",
+    "same_artifact",
+    "min_charts",
+    "chart_type_any",
+    "charts_multicolour",
+    "charts_real_values"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [
+    "1149d015af27455c8beb6a1b2a786ae3",
+    "200571096eec4b5e9c645a5525d7b44e"
+   ],
+   "regression": false
+  },
+  {
+   "id": "Q04",
+   "category": "fast_factual",
+   "score": 0.8,
+   "failed": [
+    "thinking_off"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [],
+   "regression": false
+  },
+  {
+   "id": "Q05",
+   "category": "fast_factual",
+   "score": 0.8,
+   "failed": [
+    "thinking_off"
+   ],
+   "baseline_score": null,
+   "baseline_failed": null,
+   "job_ids": [],
+   "regression": false
+  }
+ ],
+ "p06": {
+  "score": 0.8,
+  "failed": [
+   "charts_real_values"
+  ]
+ },
+ "passed": false
+}

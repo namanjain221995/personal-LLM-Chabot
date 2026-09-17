@@ -272,6 +272,13 @@ def test_the_code_block_of_the_right_language_is_what_runs():
 
 @NOT_ROOT
 def test_a_correct_python_answer_passes_and_a_wrong_one_fails(tmp_path, toolchain):
+    # A host with no container backend cannot run model-written code at all,
+    # and an unrunnable check is a SKIP, never a pass or a KeyError four lines
+    # down (verifier, 2026-09-18). test_every_coding_checker_accepts_a_correct
+    # _answer above uses the same guard.
+    available, why = toolchain.available("python")
+    if not available:
+        pytest.skip(why)
     good = CS.run_code(_case("CD01"), PARSE_DURATION_GOOD, str(tmp_path / "good"), toolchain)
     assert good["ok"], good["steps"]
     checks = _check({"code": _case("CD01")}, _turn(PARSE_DURATION_GOOD, code_result=good))
@@ -293,6 +300,13 @@ def test_an_answer_with_no_code_at_all_fails_every_code_check(tmp_path, toolchai
 
 @NOT_ROOT
 def test_a_sql_answer_is_executed_against_the_case_schema(tmp_path, toolchain):
+    # A host with no container backend cannot run model-written code at all,
+    # and an unrunnable check is a SKIP, never a pass or a KeyError four lines
+    # down (verifier, 2026-09-18). test_every_coding_checker_accepts_a_correct
+    # _answer above uses the same guard.
+    available, why = toolchain.available("sql")
+    if not available:
+        pytest.skip(why)
     good = """```sql
 SELECT c.country,
        COALESCE(SUM(o.amount), 0) AS total,
@@ -318,6 +332,13 @@ ORDER BY 2 DESC;
 
 @NOT_ROOT
 def test_a_bash_answer_is_run_against_a_fixture_directory(tmp_path, toolchain):
+    # A host with no container backend cannot run model-written code at all,
+    # and an unrunnable check is a SKIP, never a pass or a KeyError four lines
+    # down (verifier, 2026-09-18). test_every_coding_checker_accepts_a_correct
+    # _answer above uses the same guard.
+    available, why = toolchain.available("bash")
+    if not available:
+        pytest.skip(why)
     good = r"""```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -391,6 +412,13 @@ def test_every_coding_case_has_a_reference_answer():
 
 @NOT_ROOT
 def test_code_that_never_finishes_is_killed_and_fails(tmp_path, toolchain):
+    # A host with no container backend cannot run model-written code at all,
+    # and an unrunnable check is a SKIP, never a pass or a KeyError four lines
+    # down (verifier, 2026-09-18). test_every_coding_checker_accepts_a_correct
+    # _answer above uses the same guard.
+    available, why = toolchain.available("python")
+    if not available:
+        pytest.skip(why)
     spec = {"lang": "python", "timeout": 5, "files": {"check.py": "import solution\nprint('ok')\n"}}
     rec = CS.run_code(spec, "```python\nwhile True:\n    pass\n```", str(tmp_path), toolchain)
     assert not rec["ok"]

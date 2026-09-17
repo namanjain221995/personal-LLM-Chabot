@@ -473,7 +473,12 @@ def run_code(spec: dict, answer: str, workdir: str, tc: Toolchain) -> dict:
                  "toolchain": {"tsc": tc.tsc, "node": tc.node, **tc.isolation()}}
     ok, why = tc.available(lang)
     if not ok:
+        # Every caller reads rec["ok"]; before the container backend became the
+        # documented fallback this path was unreachable for python/sql/bash, so
+        # four callers raised KeyError instead of skipping when a host has no
+        # backend (verifier, 2026-09-18). An unrunnable check is not a pass.
         rec["unavailable"] = why
+        rec["ok"] = False
         return rec
     if rec["toolchain"]["backend"] == HOST:
         # AIQ_ALLOW_UNISOLATED_CODE=1 was set: the record has to carry that,
