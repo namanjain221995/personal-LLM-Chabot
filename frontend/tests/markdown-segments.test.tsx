@@ -15,16 +15,22 @@
 
 import { renderToStaticMarkup } from 'react-dom/server';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { describe, expect, it } from 'vitest';
+import { CHAT_REMARK_PLUGINS } from '@/components/Markdown';
 import { splitMarkdown } from '@/lib/markdownSegments';
 
-/** The app's exact plugin configuration (see components/Markdown.tsx). */
+/**
+ * The app's plugin configuration, IMPORTED rather than restated: a local copy
+ * would keep passing after components/Markdown.tsx changed its pipeline, and
+ * this file's whole value is that it speaks about the renderer people use.
+ * remark-breaks arriving here is what makes the soft-break cases below a real
+ * test of the splitter.
+ */
 const render = (text: string) =>
   renderToStaticMarkup(
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={CHAT_REMARK_PLUGINS}
       rehypePlugins={[[rehypeHighlight, { detect: false }]]}
     >
       {text}
@@ -201,6 +207,33 @@ Three.
 
 Emoji: 🚀🎉 and punctuation — “quoted” … ¡olé!
 `,
+  // The shape the owner reported on 2026-09-17: a rewrite comes back as
+  // label-per-line text with no blank lines inside a section. Every one of
+  // these newlines is now a <br>, so the splitter has to stay correct when a
+  // single paragraph is several visible lines.
+  softBreakLabels: `Job Title: Data Engineer
+Location: Austin, TX
+Employment Type: Full-time
+
+Responsibilities
+Build pipelines.
+Own the warehouse.
+
+Done.
+`,
+  softBreakBlockAndList: `Summary
+Two lines, one paragraph.
+
+> a quote
+> and its second line
+
+- item one
+  a lazy continuation line
+- item two
+
+Closing line one
+closing line two
+`,
   citations: `Answer text [1] with citations [2].
 
 More prose [3].
@@ -259,6 +292,19 @@ Third.
 const partial = 'still streaming
 `,
 };
+
+describe('the pipeline under test is the one the app renders with', () => {
+  it('is a live plugin list, not an empty or missing one', () => {
+    // Without this, dropping CHAT_REMARK_PLUGINS would leave every case below
+    // comparing two plugin-less renders of the same text — still equal, and
+    // proving nothing. Each plugin is checked by its effect: remark-gfm turns
+    // a pipe table into a <table>, remark-breaks turns a single newline into
+    // a <br>.
+    expect(CHAT_REMARK_PLUGINS.length).toBeGreaterThan(0);
+    expect(render('| a |\n|---|\n| 1 |\n')).toContain('<table>');
+    expect(render('one\ntwo\n')).toContain('<br');
+  });
+});
 
 describe('splitMarkdown renders identically to the unsplit document', () => {
   for (const [name, doc] of Object.entries(DOCS)) {
