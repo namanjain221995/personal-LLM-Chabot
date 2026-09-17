@@ -25,6 +25,7 @@ from app.artifacts import compose as C
 from app.artifacts import db as adb
 from app.artifacts import edits as E
 from app.artifacts import intent as I
+from app.artifacts import material_in as MI
 from app.artifacts import pipeline, store
 from app.artifacts import spec as S
 from app.artifacts import tables as X
@@ -510,12 +511,12 @@ def owner():
     return int(db.create_user("edits-owner", "hash"))
 
 
-def seed(owner, spec, formats, conv="conv-ed", gen="seed"):
+def seed(owner, spec, formats, conv="conv-ed", gen="seed", allow_warnings=False, material=None):
     """A published v1 of `spec` through the real pipeline (the composer
     returns the import payload)."""
     job = pipeline.accept(user_id=owner, conversation_id=conv, generation_id=gen, operation="create", instruction="seed",
                           kind=spec.kind, formats=list(formats), format_reason=f"{engine.IMPORT_REASON}: test", effort="fast",
-                          mode="assistant", template_id="generic", material={})
+                          mode="assistant", template_id="generic", material=material or {})
     engine._attach_payload(owner, job["artifact_id"], int(job["version"]), "import", {"spec": spec.model_dump(mode="json", by_alias=True, exclude_none=True)})
 
     async def go():
@@ -523,19 +524,23 @@ def seed(owner, spec, formats, conv="conv-ed", gen="seed"):
         return await pipeline.wait_for(job["id"])
 
     row = asyncio.run(go())
-    assert row["status"] == "completed", row
+    assert row["status"] in (("completed",) if not allow_warnings else ("completed", "completed_with_warnings")), row
     return row["artifact_id"]
 
 
-def turn(owner, text, *, action="edit", conv="conv-ed", gen="t", artifact_id=None, rule="edit", version=None, reference="latest", history=(), formats=()):
+def turn(owner, text, *, action="edit", conv="conv-ed", gen="t", artifact_id=None, rule="edit", version=None, reference="latest", history=(), formats=(),
+         intent=None, gathered=None):
+    """One turn through the real engine. `intent` passes a verdict built by
+    the rules themselves (`I.decide`) instead of the shorthand above, and
+    `gathered` is the turn's material (material_in.GatheredInput)."""
     events = []
 
     async def emit(kind, data):
         events.append((kind, data))
 
-    intent = I.ArtifactIntent(action, formats=list(formats), reference=reference, rule=rule, instruction=text, version=version, raw_text=text)
+    intent = intent or I.ArtifactIntent(action, formats=list(formats), reference=reference, rule=rule, instruction=text, version=version, raw_text=text)
     answer = asyncio.run(engine.run_artifact_engine(text, list(history), emit, intent=intent, conversation_id=conv, user_id=owner,
-                                                    generation_id=gen, effort="fast", artifact_id=artifact_id))
+                                                    generation_id=gen, effort="fast", artifact_id=artifact_id, gathered=gathered))
     metas = [d for k, d in events if k == "meta"]
     assert len(metas) == 1
     return answer, metas[0]
@@ -781,3 +786,97 @@ def test_a_failed_section_write_beside_an_applied_change_still_publishes(env, ow
     answer, meta = turn(owner, "rewrite scope and retitle it Kept Title", gen="fail-mixed")
     assert meta["artifacts"][0]["version"] == 2 and adb.get_artifact(aid, owner)["current_version"] == 2
     assert answer.startswith("Updated **Kept Title** v2"), answer
+
+
+# ------------------------------- the owner's two sentences, end to end --
+
+
+def customers_table(table_id: str = "upload1"):
+    """The conversation's dataset, as `material_in.gather` leaves it."""
+    countries = ["Aurelia"] * 17 + ["Borvia"] * 11 + ["Caldia"] * 8 + ["Dornia"] * 4
+    rows = [[f"C-{i:03d}", countries[i], (i % 9) + 1] for i in range(40)]
+    return C.DataTable(id=table_id, title="customers-100.csv", columns=["Customer Id", "Country", "Seats"],
+                       rows=rows, source_id="upload")
+
+
+def chart_doc() -> S.ArtifactSpec:
+    """A published document holding a BOUND chart — the only kind that
+    survives a render: `chart_data.resolve_spec` replaces an unbound chart
+    with a "its numbers were not bound to a table" callout."""
+    return S.parse_body("document", {"title": "Pricing", "blocks": [
+        {"type": "heading", "level": 1, "text": "Seats"},
+        {"type": "chart", "chart": {"type": "bar", "title": "Seats by country",
+                                    "data": {"table_id": "upload1", "x": "Country", "agg": "count"}}},
+        {"type": "heading", "level": 1, "text": "Notes"},
+        {"type": "paragraph", "text": "Prices hold until the quarter ends."}]})
+
+
+def test_the_owners_plots_sentence_adds_the_chart_instead_of_re_rendering_the_file(env, owner):
+    """A-F1, end to end through the engine with the verdict THE RULES give.
+
+    "also i want Plots on this docs" is read as a format conversion
+    (measured on the integrated tree e543bef, 2026-09-18: action='convert',
+    rule='convert-artifact-turn', formats=['docx'], chart_request=True, and
+    `intent._should_consult` False, so the classifier never sees it). The
+    convert branch re-renders the stored spec, so the owner's sentence
+    published a second version of the same document with no plot in it —
+    twice, in his own conversation. Asking for a plot is a CHANGE to the
+    file, so the turn runs as an edit."""
+    aid = seed(owner, nine_section_doc(), ["docx"], conv="conv-plots", gen="seed-plots")
+    intent = I.decide("also i want Plots on this docs", has_artifacts=True, artifact_hints=["Security Audit"],
+                      has_assistant_answer=True, last_turn_is_artifact=True)
+    assert (intent.action, intent.rule, intent.chart_request) == ("convert", "convert-artifact-turn", True)
+    gathered = MI.GatheredInput(upload_tables=[customers_table()])
+    answer, meta = turn(owner, "also i want Plots on this docs", conv="conv-plots", gen="plots",
+                        intent=intent, gathered=gathered)
+    ref = meta["artifacts"][0]
+    assert ref["artifact_id"] == aid and ref["version"] == 2, "the same file, one version on"
+    child = store.read_spec(store.version_dir(owner, aid, 2))
+    charts = [b.chart for b in child.body.blocks if getattr(b, "type", "") == "chart"]
+    assert charts, f"no plot was added: {answer}"
+    assert charts[0].data.table_id == "upload1", "bound to the conversation's dataset"
+    assert charts[0].categories and sum(int(v) for v in charts[0].series[0].values) == 40, \
+        "the compose stage counted the real rows"
+    assert "Not applied" not in answer and "nothing in it changed" not in answer, answer
+    assert "chart" in answer.lower(), answer
+
+
+def test_a_conversion_that_says_nothing_about_charts_is_still_a_conversion(env, owner):
+    """GUARD for the rule above: "also give me it as a PDF" in the same state
+    (chart_request False) keeps the conversion, so the person gets the file
+    format they asked for."""
+    aid = seed(owner, nine_section_doc(), ["docx"], conv="conv-pdf", gen="seed-pdf")
+    intent = I.decide("also give me it as a PDF", has_artifacts=True, artifact_hints=["Security Audit"],
+                      has_assistant_answer=True, last_turn_is_artifact=True)
+    assert (intent.action, intent.chart_request) == ("convert", False)
+    answer, meta = turn(owner, "also give me it as a PDF", conv="conv-pdf", gen="pdf", intent=intent)
+    ref = meta["artifacts"][0]
+    assert ref["artifact_id"] == aid and {f["format"] for f in ref["files"]} >= {"docx", "pdf"}, answer
+    child = store.read_spec(store.version_dir(owner, aid, 2))
+    assert child.body.blocks == nine_section_doc().body.blocks, "a conversion re-renders, it does not edit"
+
+
+def test_an_edit_that_changes_the_chart_reports_the_change_it_made(env, owner):
+    """A-F2, end to end. "make the chart a line chart" pre-plans `set_chart`,
+    applies it, and publishes a v2 whose chart really IS a line chart — and
+    gains no NEW chart, because changing one adds none. The `gained <= 0`
+    withdrawal then stripped the clause and appended a refusal. Measured on
+    the integrated tree (e543bef, 2026-09-18), v2 holding ('chart', 'line'),
+    the answer was verbatim:
+
+        Saved **Pricing** v2, but nothing in it changed. Not applied: the
+        chart (the data could not be drawn as a chart).
+
+    which is the owner's own "the change could not be made" complaint, back
+    on the `set_chart` path PR #77 shipped two days earlier."""
+    material = engine._material_dict(C.Material(instruction="seed", tables=[customers_table()]))
+    aid = seed(owner, chart_doc(), ["docx"], conv="conv-pie", gen="seed-pie", material=material, allow_warnings=True)
+    answer, meta = turn(owner, "make the chart a line chart", conv="conv-pie", gen="pie",
+                        gathered=MI.GatheredInput(upload_tables=[customers_table()]))
+    assert meta["artifacts"][0]["version"] == 2
+    child = store.read_spec(store.version_dir(owner, aid, 2))
+    charts = [b.chart for b in child.body.blocks if getattr(b, "type", "") == "chart"]
+    assert [c.type for c in charts] == ["line"], "the chart really changed"
+    assert "Not applied" not in answer, answer
+    assert "nothing in it changed" not in answer, answer
+    assert answer.startswith("Updated **Pricing** v2: line chart"), answer

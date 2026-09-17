@@ -516,24 +516,46 @@ def wants_conversation_datasets(intent: Optional[I.ArtifactIntent]) -> bool:
     `intent.target` says, because that target can only be "upload" when a
     file is attached to THIS turn. A convert re-renders a stored spec with no
     model call and needs no material.
+
+    THE EXCEPTION IS A CONVERT WHOSE WORDS ASK FOR A CHART (2026-09-18). The
+    rules read the owner's second reported sentence, "also i want Plots on
+    this docs", as a conversion: measured on the integrated tree, `I.decide`
+    with the report's card as the last turn answers action='convert',
+    rule='convert-artifact-turn', formats=['docx'], chart_request=True. A plot
+    has to be DRAWN FROM the data, so refusing the dataset to that turn left
+    nothing to draw and the same document was published again, twice, with no
+    plot in it. `engines/artifact` runs such a turn as an edit; this is the
+    same judgement on the material side, and it has to be made here because
+    `gather` runs before the parent artifact is picked.
     """
     if intent is None:
         return False
-    if str(getattr(intent, "action", "") or "") not in ("create", "edit"):
-        return False
     if str(getattr(intent, "target", "") or "") == "previous_answer":
+        return False
+    action = str(getattr(intent, "action", "") or "")
+    if action == "convert" and bool(getattr(intent, "chart_request", False)):
+        return True
+    if action not in ("create", "edit"):
         return False
     return True
 
 
 def _names_file(text: str, filename: str) -> bool:
-    """The request names this file — with or without its extension."""
+    """The request names this file — with or without its extension.
+
+    A bare stem counts only when it LOOKS like a filename (it carries a
+    digit, a dash or an underscore). The plain 4-character substring test
+    read the ordinary English word in "please give Big report" as naming
+    report.csv, so that file was read first and became upload1 — the table
+    the composer and `add_chart` bind to first, and the one that takes the
+    shared row budget (QA A-F8, 2026-09-18). "sales.csv", "q3-numbers" and
+    "customers-100" still match."""
     low = " ".join((text or "").split()).casefold()
     if not low or not filename:
         return False
     name = filename.casefold()
     stem = os.path.splitext(name)[0]
-    return bool(name in low or (len(stem) >= 4 and stem in low))
+    return bool(name in low or (len(stem) >= 4 and re.search(r"[0-9_-]", stem) and stem in low))
 
 
 def dataset_uploads(conversation_id: str, text: str = "") -> List[Dict[str, Any]]:

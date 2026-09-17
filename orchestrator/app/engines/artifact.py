@@ -58,7 +58,7 @@ import datetime as _dt
 import logging
 import re
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import db
 from ..artifacts import compose as C
@@ -999,13 +999,15 @@ async def run_artifact_engine(
         if parent_row is None:
             # Nothing to edit: the words were about a file, but there is none — make one.
             operation = "create"
-        elif operation == "edit":
-            return await _run_edit(
-                text=text, history=history, emit=emit, intent=intent, parent_row=parent_row, candidates=candidates,
-                conversation_id=conversation_id, user_id=int(user_id), generation_id=generation_id, effort=effort, mode=mode,
-                intent_id=intent_id, instruction=instruction, raw_text=raw_text, gathered=gathered,
-            )
         else:
+            if operation == "convert" and _chart_request_is_an_edit(parent_row, intent, instruction):
+                operation = "edit"
+            if operation == "edit":
+                return await _run_edit(
+                    text=text, history=history, emit=emit, intent=intent, parent_row=parent_row, candidates=candidates,
+                    conversation_id=conversation_id, user_id=int(user_id), generation_id=generation_id, effort=effort, mode=mode,
+                    intent_id=intent_id, instruction=instruction, raw_text=raw_text, gathered=gathered,
+                )
             version = int(intent.version or parent_row.get("current_version") or 1)
             parent = (str(parent_row["id"]), version)
 
@@ -1953,8 +1955,11 @@ async def _run_edit(
         # without a plot).
         if _about_charts(instruction) and parent_spec is not None:
             gained = await _charts_gained(int(user_id), str(row["artifact_id"]), int(row["version"]), parent_spec)
-            if gained is not None and gained <= 0:
-                said = [c for c in said if "chart" not in c.lower()]
+            if _withdraw_chart_claim(instruction, outcome.applied_ops, gained):
+                # The clause of an op that CHANGED a chart stays: it is true,
+                # and it is not a claim that one was added.
+                kept = _clauses_of_ops(outcome, _CHART_OPS_WITHOUT_GAIN)
+                said = [c for c in said if "chart" not in c.lower() or c in kept]
                 if not any("chart" in str(n.get("op", "")) or "chart" in str(n.get("reason", "")).lower() for n in not_applied):
                     not_applied.append({"op": "add_chart", "reason": "the data could not be drawn as a chart"})
         unmet = ((row.get("progress") or {}).get("selfcheck") or {}).get("unmet") or []
@@ -1999,6 +2004,81 @@ def _about_charts(instruction: str) -> bool:
         return bool(CC.about_charts(instruction))
     except Exception:  # noqa: BLE001 — the chooser is optional in this build
         return False
+
+
+#: Ops that change (`set_chart`) or remove (`delete_blocks`) a chart the file
+#: ALREADY has. Neither gains a chart, by design.
+_CHART_OPS_WITHOUT_GAIN = ("set_chart", "delete_blocks")
+
+
+def _withdraw_chart_claim(instruction: str, applied_ops: Sequence[str], gained: Optional[int]) -> bool:
+    """Whether the answer must take its chart clause back: the words asked for
+    a chart and the PUBLISHED version gained none.
+
+    `gained <= 0` alone is not that failure. Changing a chart adds none and
+    deleting one subtracts, so on 2026-09-18 "make the chart a line chart"
+    published a v2 whose chart really WAS a line chart and answered "Saved
+    **Pricing** v2, but nothing in it changed. Not applied: the chart (the
+    data could not be drawn as a chart)" — the owner's own complaint,
+    reinstated on the `set_chart` path PR #77 shipped two days earlier. An
+    edit that claimed an ADDITION and published no new chart is still
+    withdrawn, whatever else it did. `gained` None means the published spec
+    could not be read, and then the plan's own words stand."""
+    if not _about_charts(instruction) or gained is None or gained > 0:
+        return False
+    ops = list(applied_ops or [])
+    if "add_chart" in ops:
+        return True
+    return not any(op in _CHART_OPS_WITHOUT_GAIN for op in ops)
+
+
+def _clauses_of_ops(outcome: Any, ops: Sequence[str]) -> Set[str]:
+    """The sentence clauses `edits.apply` wrote for those ops. `applied` and
+    `applied_ops` are appended together, op by op, so they line up."""
+    said = list(getattr(outcome, "applied", None) or [])
+    names = list(getattr(outcome, "applied_ops", None) or [])
+    return {c for c, op in zip(said, names) if op in ops}
+
+
+#: A format named as the TARGET of a conversion: "as a PDF", "to pdf", "into
+#: Word". "on this docs", "in this excel" and "on this doc" name the file the
+#: person ALREADY has, and the rules return those as a convert carrying that
+#: format too (measured 2026-09-18), which is why the format alone cannot
+#: decide what the sentence asked for.
+_CONVERT_TARGET_RE = re.compile(
+    r"\b(?:as|into|in|to)\s+(?:an?\s+|the\s+)?(?:new\s+)?"
+    r"(?:pdf|word|docx?|excel|xlsx?|csv|powerpoint|pptx?|slides?|deck|png|svg|image)s?\b", re.I)
+
+
+def _chart_request_is_an_edit(parent_row: dict, intent: ArtifactIntent, instruction: str) -> bool:
+    """A "convert" whose words ASK FOR A CHART is a change to the file rather
+    than a re-render of it — unless the sentence also spells out a conversion
+    to a format the artifact does not have yet.
+
+    THE OWNER'S SECOND REPORTED SENTENCE (2026-09-18). "also i want Plots on
+    this docs", sent right after the report's card, is read by the rules as
+    action='convert', rule='convert-artifact-turn', formats=['docx'] (from the
+    word "docs"), chart_request=True — measured on the integrated tree. The
+    convert branch re-renders the stored spec, so the plot was never planned,
+    and `intent._should_consult` is False for that verdict, so the LLM
+    classifier never saw the sentence either. The document was already Word,
+    so nothing was being converted at all.
+
+    BOTH SIGNALS ARE NEEDED. "also i want Plots on this docs" carries
+    formats=['docx'] from the word "docs" alone, and the same sentence over a
+    PDF-only report would look like a real conversion if the format decided
+    it; "give me this as a PDF with the chart" and "convert it to pdf and add
+    a chart" spell the conversion out, and an edit would not produce the file
+    they asked for. So a conversion is kept only when it ADDS a format AND the
+    words name that format as the target. A version named for a restore stays
+    a conversion."""
+    if not bool(getattr(intent, "chart_request", False)) or getattr(intent, "version", None):
+        return False
+    kind = str(parent_row.get("kind") or "document")
+    ok, _bad = F.formats_for_conversion(kind, list(intent.formats or []))
+    have = {str(f.get("format")) for f in ((parent_row.get("current") or {}).get("files") or []) if f.get("format")}
+    adds = [f for f in ok if f not in have]
+    return not (adds and _CONVERT_TARGET_RE.search(instruction or ""))
 
 
 def _chart_count(spec: Any) -> int:

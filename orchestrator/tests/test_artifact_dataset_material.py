@@ -219,3 +219,60 @@ def test_the_reader_runs_off_the_event_loop(workspace):
     assert len(g.upload_tables[0].rows) == 100
     assert seen["thread"] != "MainThread", "the reader ran in a worker thread"
     assert worst < 0.25, f"the loop stalled for {worst:.3f}s while the CSV was read"
+
+
+# ----------------------------------- the owner's second sentence (A-F1) --
+
+
+def test_a_convert_that_asks_for_a_chart_loads_the_conversations_dataset(workspace):
+    """THE OWNER'S SECOND REPORTED SENTENCE. "also i want Plots on this docs",
+    sent in the state he sent it (the report's card was the last turn), is read
+    by the rules as a FORMAT CONVERSION — measured on the integrated tree
+    (e543bef, 2026-09-18): action='convert', rule='convert-artifact-turn',
+    formats=['docx'], chart_request=True. A conversion re-renders the stored
+    spec, and this gate refused the data to every convert, so no CSV was read
+    and no plot could be drawn. Nothing else could rescue it either:
+    `intent._should_consult` is False for that verdict, so the LLM classifier
+    is never asked.
+    """
+    conv = "conv-dataset-plots"
+    _dataset_upload(workspace, conv)
+    intent = I.decide("also i want Plots on this docs", has_artifacts=True, artifact_hints=["Customer Report"],
+                      has_assistant_answer=True, last_turn_is_artifact=True)
+    assert (intent.action, intent.chart_request) == ("convert", True), (intent.action, intent.rule)
+    assert M.wants_conversation_datasets(intent) is True
+    g = _gather(conv, workspace, intent, text="also i want Plots on this docs")
+    assert [t.id for t in g.upload_tables] == ["upload1"], "the dataset the plot must be drawn from"
+    assert len(g.upload_tables[0].rows) == 100
+
+
+def test_a_conversion_that_says_nothing_about_charts_still_loads_nothing(workspace):
+    """GUARD for the rule above. "also give me it as a PDF" is a real
+    conversion (chart_request False): it re-renders the stored spec and needs
+    no material, so the CSVs stay unread."""
+    conv = "conv-dataset-pdf"
+    _dataset_upload(workspace, conv)
+    intent = I.decide("also give me it as a PDF", has_artifacts=True, artifact_hints=["Customer Report"],
+                      has_assistant_answer=True, last_turn_is_artifact=True)
+    assert (intent.action, intent.chart_request) == ("convert", False), (intent.action, intent.rule)
+    assert M.wants_conversation_datasets(intent) is False
+    assert _gather(conv, workspace, intent, text="also give me it as a PDF").upload_tables == []
+
+
+def test_an_ordinary_english_word_does_not_name_a_file(workspace):
+    """A-F8. The stem match is a >= 4-character substring, so the ordinary
+    word "report" in "please give Big report" read report.csv as the file the
+    person NAMED and read it before the newest upload. Both files are still
+    read, but the first one becomes upload1 — the table the composer and
+    `add_chart` bind to first, and the one that wins the shared row budget."""
+    assert M._names_file("I want proper this data understand ?? please give Big report ??", "report.csv") is False
+    assert M._names_file("chart the sales.csv", "sales.csv") is True
+    assert M._names_file("chart the customers-100 file", "customers-100.csv") is True
+
+    conv = "conv-dataset-word"
+    _dataset_upload(workspace, conv, filename="report.csv", body=b"A,B\n1,2\n")
+    _dataset_upload(workspace, conv, upload_id=SECOND_UPLOAD_ID, filename="customers-100.csv")
+    g = _gather(conv, workspace, I.ArtifactIntent("create", target="conversation", instruction="Big report"),
+                text="please give Big report")
+    assert [t.title for t in g.upload_tables] == ["customers-100.csv", "report.csv"], \
+        "the newest upload is upload1; an English word does not promote report.csv"
