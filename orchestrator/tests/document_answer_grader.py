@@ -162,8 +162,36 @@ _SOURCE_HEADING_RE = re.compile(
     r"|what\s+(?:this|our|the)\s+conversation"
     r"|not\s+in\s+the\s+documents?|missing\s+from\s+the\s+documents?"
     r"|sources?\s*$|sources?\s*[:\u2013\u2014-]"
+    # The source as the bare SUBJECT of the label, with no "what" in front:
+    # "**The Document Says:**", "**Document Silence:**", "**Document Says:**"
+    # -- 10 such labels across 4 of the 24 answers the 2026-09-18 round
+    # graded, and not one of them matched any alternative above.
+    r"|documents?\s+(?:says?|state[sd]?|shows?|tells?|mentions?|contains?|covers?|"
+    r"provides?|gives?|lacks?|omits?|misses|silence|gaps?|limits?|limitations?|"
+    r"figures?|specifications?|specs?|evidence|coverage|content|excerpt)"
     r")",
     re.I,
+)
+
+#: A bold LABEL that LEADS a line and has the line's own content after it:
+#: "**The Document Says:** The compact configuration uses 2 x 10 kW units",
+#: with or without a bullet or a number in front of it.
+#:
+#: BASE says "CHECK EVERY HEADING AND EVERY BOLD LABEL BEFORE YOU WRITE IT,
+#: including a label inside a section". _HEADING_LINE_RE deliberately requires
+#: the bold phrase to be the WHOLE line, because "**Total:** 5,200.00 USD" is
+#: a field label and not a heading -- so the label half of that rule had no
+#: instrument at all, and the 2026-09-18 round could only check it by eye.
+#: This gives it one. The TEST stays the same either way: the label's text is
+#: put through _SOURCE_HEADING_RE, so an ordinary label is still ordinary and
+#: the measurement can still come out clean.
+#:
+#: WHAT IT MEASURED THE FIRST TIME IT EXISTED: short answers clean, 0 of 6
+#: across two passes -- asserted in the live test. Long answers 4 of 12, which
+#: is worse than the heading rate of 1 of 12 and is recorded rather than
+#: pinned: see test_a_long_answer_does_not_do_the_same_thing_in_its_bold_labels.
+_BOLD_LEAD_IN_RE = re.compile(
+    r"^\s*(?:[-*+\u2022]\s+|\d+[.)]\s+)?\*\*(?P<label>[^*]{1,90})\*\*"
 )
 
 
@@ -182,6 +210,28 @@ def source_named_headings(answer: str) -> list[str]:
             continue
         text = m.group("hash") or m.group("num") or m.group("bold") or ""
         text = _HEADING_LEAD_RE.sub("", text).strip()
+        if _SOURCE_HEADING_RE.match(text):
+            found.append(line.strip())
+    return found
+
+
+def source_named_labels(answer: str) -> list[str]:
+    """Bold LEAD-IN labels that name a source instead of a subject.
+
+    Kept apart from source_named_headings() on purpose: they are different
+    behaviours with different measured rates, and folding them together would
+    silently re-baseline an assertion that was measured on headings alone (0
+    of 27 short answers, 1 of 12 long ones). A line that IS a heading is not
+    counted here, so no line is ever reported twice.
+    """
+    found = []
+    for line in (answer or "").splitlines():
+        if _HEADING_LINE_RE.match(line):
+            continue
+        lead = _BOLD_LEAD_IN_RE.match(line)
+        if not lead:
+            continue
+        text = _HEADING_LEAD_RE.sub("", lead.group("label")).strip()
         if _SOURCE_HEADING_RE.match(text):
             found.append(line.strip())
     return found

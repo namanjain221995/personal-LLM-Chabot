@@ -80,7 +80,35 @@ being NAMED", and that is a question about the word's CONTEXT. So:
   3. the two thresholds differ on purpose: one decision signal is enough to
      make a question advisory, strict extraction needs two points of field
      evidence. That asymmetry IS the safe-failure rule, in the code, instead
-     of in a comment nobody can test.
+     of in a comment nobody can test;
+  4. and ONE function, `_apply_precedence`, turns the two scores into a mode.
+     Neither scorer knows where in the sentence the other one fired, and no
+     pattern gets to decide the mode by where it is anchored.
+
+WHY STEP 4 EXISTS (2026-09-18). The cut before this one narrowed "should"
+with `_VALUE_WH_RE`, anchored `^` to the start of the WHOLE question, and used
+it to DISCARD a "should" clause found anywhere later in it: "what supply water
+temperature should I run for this unit?" wants a number, not a verdict. The
+narrowing is right and the discarding was not. "what is the invoice total, and
+should we accept it?" lost its judgement half and took the strict EXTRACTION
+block, which says "do not add advice, a recommendation, a next step, a caution
+or an offer of further help" — while "tell me the invoice total, and should we
+accept it?", differing in its FIRST WORD ONLY, was answered in full. Live on
+one invoice fixture, three runs of each wording, the misrouted phrasing
+refused the judgement 2 of 3 ("The document does not provide enough
+information to determine if the prices are fair or if the order is valid, so I
+cannot advise on whether you should accept it", then a list of things to go
+and check) while the correctly routed one answered it every time. With the
+precedence below, the same misrouted wording answers both halves 3 of 3:
+"**Total** ... **5,200.00 USD**" then "**Should we accept it?** **Yes.**"
+
+A clause-scoped anchor would have been the same instrument again. So a
+narrowed signal is now HELD rather than dropped, and the precedence — not a
+regex — decides what holding it may cost: it may send a question to NEUTRAL,
+which answers what was asked and still permits a verdict, and it may never
+send one to strict EXTRACTION. A generated cross-product of value-wh openers x
+field names x judgement asks pins the whole class in the suite: 9,504
+questions, 6,336 of which took strict extraction before this change.
 
 The evidence is returned with the mode (`classify`), so a misroute can be read
 off in one line instead of bisected through a lookbehind chain.
@@ -95,7 +123,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field as _dataclass_field
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 #: The persona and the three sources, said to every document answer.
 #:
@@ -339,7 +367,12 @@ def _mask_ordinary_english(question: str) -> str:
 _EXTRACT_VERB_RE = re.compile(
     r"\b(?:extract|transcribe|itemi[sz]e|verbatim|word[- ]for[- ]word"
     r"|fill\s+(?:in|out)"
-    r"|copy\s+(?:the|this|that)\s+(?:table|text|list|wording|clause|paragraph|section|block)"
+    # "copy" took a fixed noun list (table/text/list/wording/clause/paragraph/
+    # section/block), so "copy the addresses into a table" fell to neutral --
+    # the brief lists copy as an extraction verb whatever follows it. A
+    # DETERMINER plus any noun replaces the list. "copy that, thanks" still
+    # does not match: there is no word after the determiner.
+    r"|copy\s+(?:out\s+)?(?:the|this|that|these|those|all|every|each)\s+\w+"
     r"|pull\s+(?:the\s+|out\s+the\s+)?(?:numbers?|figures?|values?|fields?|data|amounts?"
     r"|totals?|fees?|line\s+items?|details?|terms?|dates?|prices?|quantit(?:y|ies))"
     r"|read\s+(?:out|off)\s+the"
@@ -529,7 +562,28 @@ _DECISION_RE = re.compile(
     r"(?:\w+\s+){0,2}?(?:place|put|install|mount|deploy|use|buy|host|rack|migrate|"
     r"store|run|order|purchase|grow|expand)\b"
     r"|\bfits?\b|\bcompatib(?:le|ility)\b"
-    r"|\bworks?\s+(?:for|with)\s+(?:my|our|us|me|a|an|the|this|that)\b",
+    r"|\bworks?\s+(?:for|with)\s+(?:my|our|us|me|a|an|the|this|that)\b"
+    # ASKING FOR AN ASSESSMENT OF A FIGURE (2026-09-18 MEDIUM). "what is the
+    # invoice total, and is that a red flag?" scored ZERO decision evidence
+    # and, because the field half scored 2, took the strict extraction block.
+    # A missing DECISION word beside a present FIELD word is the unsafe
+    # direction, and the previous cut had only measured the field list's
+    # residuals. These are the copula-plus-evaluation shapes QA measured:
+    # "is that a problem for us?", "is that a red flag?", "is that normal?",
+    # "how bad is that for us?", "what do you make of it?".
+    r"|\b(?:is|are|was|were|isn'?t|aren'?t|does|do|seems?|sounds?|looks?|feels?)\s+"
+    r"(?:it|this|that|these|those|they|there)\s+(?:really\s+|actually\s+|even\s+)?"
+    r"(?:an?\s+|any\s+)?(?:problems?|issues?|concerns?|concerning|risky|risks?|"
+    r"red\s+flags?|warning\s+signs?|deal[- ]?breakers?|blockers?|worr(?:y|ying|ies)|"
+    r"worrisome|normal|typical|standard|usual|unusual|odd|strange|common|"
+    r"acceptable|unacceptable|bad|dangerous|serious|significant|excessive|"
+    r"unreasonable|unfair|out\s+of\s+line|high|low|a\s+lot|much)\b"
+    r"|\bhow\s+(?:bad|risky|serious|concerning|worrying|normal|unusual|common|safe|"
+    r"significant|exposed|much\s+of\s+(?:an?\s+)?(?:problem|risk|concern|issue))\b"
+    r"|\bred\s+flags?\b|\bdeal[- ]?breakers?\b|\bcause\s+for\s+concern\b"
+    r"|\bwhat\s+do\s+you\s+(?:make\s+of|think\s+(?:of|about))\b"
+    r"|\bworr(?:y|ied|ies|ying)\b|\bconcerned\b"
+    r"|\banything\s+(?:i|we)\s+should\b|\banything\s+(?:odd|wrong|unusual)\b",
     re.I,
 )
 
@@ -546,6 +600,15 @@ _SHOULD_RE = re.compile(
 #: temperature should I run for this unit?" wants the number the document
 #: gives, and the advisory block's "clear yes / no / it depends" is the wrong
 #: shape for it. A decision VERB after "should" overrides the exception.
+#:
+#: THIS PATTERN DOES NOT DECIDE THE MODE, AND MUST NOT (2026-09-18). It is
+#: anchored to the start of the whole question while the "should" it speaks
+#: about can sit anywhere in it, so on its own it read "what is the invoice
+#: total, and should we accept it?" as a pure value ask and threw the
+#: judgement away. What it produces is HELD evidence, not discarded evidence,
+#: and _apply_precedence() gives it back the moment a field ask is also
+#: proven. See that function for the rule; lengthening this alternation is
+#: not the fix and never was.
 _VALUE_WH_RE = re.compile(
     r"^\W*(?:what|what's|whats|when|who|where|how\s+(?:much|many|long|often))\b", re.I
 )
@@ -587,11 +650,20 @@ class Signals:
     2026-09-18 blocker was one lookbehind that excluded "long-term" and not
     "long term", and it took two live runs to find. `evidence` says which
     pattern fired on which words.
+
+    `held_decision_score` is decision evidence that WAS found and then set
+    aside by a narrowing rule (today only the value-wh reading of "should").
+    It is carried separately instead of being dropped, because dropping it is
+    what produced the 2026-09-18 blocker: the classifier recorded
+    ("should-inside-a-value-question", "should we") as evidence and routed the
+    question to strict extraction anyway. `decision_score` is the score AFTER
+    the precedence has run, so `wants_advice` already accounts for it.
     """
 
     mode: str
     field_score: int = 0
     decision_score: int = 0
+    held_decision_score: int = 0
     evidence: List[Tuple[str, str]] = _dataclass_field(default_factory=list)
 
     @property
@@ -601,6 +673,14 @@ class Signals:
     @property
     def wants_advice(self) -> bool:
         return self.decision_score >= _DECISION_THRESHOLD
+
+    @property
+    def decision_signal_anywhere(self) -> bool:
+        """True when the question carries a judgement ask at all — including
+        one a narrowing rule set aside. The module's rule is that this can
+        never be answered by strict extraction, and `mode` is asserted against
+        it directly in the suite."""
+        return (self.decision_score + self.held_decision_score) >= _DECISION_THRESHOLD
 
 
 def _field_evidence(masked: str) -> Tuple[int, List[Tuple[str, str]]]:
@@ -671,7 +751,22 @@ def _words_between(text: str, start: int, end: int) -> int:
     return len(text[start:end].split())
 
 
-def _decision_evidence(question: str) -> Tuple[int, List[Tuple[str, str]]]:
+@dataclass
+class _Decision:
+    """The judgement evidence in a question, split by how firmly it counts.
+
+    `held` is evidence a narrowing rule set aside. It is returned rather than
+    dropped so that _apply_precedence() — not a regex — decides what a set
+    aside signal is allowed to cost.
+    """
+
+    score: int = 0
+    held: int = 0
+    why: List[Tuple[str, str]] = _dataclass_field(default_factory=list)
+    held_why: List[Tuple[str, str]] = _dataclass_field(default_factory=list)
+
+
+def _decision_evidence(question: str) -> _Decision:
     """Points for "the person asked for a judgement", and why.
 
     Reads the question UNMASKED. The mask exists to stop ordinary English
@@ -679,31 +774,105 @@ def _decision_evidence(question: str) -> Tuple[int, List[Tuple[str, str]]]:
     decision signal read out of "best practice" costs a sentence of context,
     which is the direction this module is allowed to be wrong in.
     """
-    score = 0
-    why: List[Tuple[str, str]] = []
+    out = _Decision()
 
     hit = _DECISION_RE.search(question)
     if hit:
-        score += _STRONG
-        why.append(("decision-marker", hit.group(0).strip()))
+        out.score += _STRONG
+        out.why.append(("decision-marker", hit.group(0).strip()))
 
     should = _SHOULD_RE.search(question)
     if should:
         decides = bool(_DECIDE_AFTER_SHOULD_RE.search(question))
         if decides or not _VALUE_WH_RE.match(question):
-            score += _STRONG
-            why.append(("should", should.group(0)))
+            out.score += _STRONG
+            out.why.append(("should", should.group(0)))
         else:
-            why.append(("should-inside-a-value-question", should.group(0)))
+            # HELD, not discarded. _VALUE_WH_RE is anchored to the start of
+            # the whole question and this "should" may be two clauses later.
+            out.held += _STRONG
+            out.held_why.append(("should-inside-a-value-question", should.group(0)))
 
-    if score < _DECISION_THRESHOLD:
+    if out.score < _DECISION_THRESHOLD:
         person = _FIRST_PERSON_RE.search(question)
         suits = _SUITABILITY_RE.search(question)
         if person and suits:
-            score += _WEAK
-            why.append(("first-person-plus-suitability", suits.group(0)))
+            out.score += _WEAK
+            out.why.append(("first-person-plus-suitability", suits.group(0)))
 
-    return score, why
+    return out
+
+
+def _apply_precedence(
+    field_score: int,
+    decision: _Decision,
+    field_why: Sequence[Tuple[str, str]] = (),
+) -> Signals:
+    """Turn two scores over the WHOLE question into a mode.
+
+    THE ASYMMETRY, as one statement instead of as regex anchoring. Both scores
+    are computed over the entire question, neither pattern knows where in the
+    sentence the other one fired, and this function alone decides what wins.
+
+    The one rule that needs saying out loud, because breaking it IS the
+    incident this module exists to prevent:
+
+        SETTING A DECISION SIGNAL ASIDE MAY SEND A QUESTION TO NEUTRAL. IT MAY
+        NEVER SEND ONE TO STRICT EXTRACTION.
+
+    A narrowing rule (today only _VALUE_WH_RE) says "this 'should' is asking
+    for a value, not for a verdict". That reading is safe while nothing else
+    in the question asks for a value — the question falls to NEUTRAL, which
+    answers what was asked and still permits a judgement. It stops being safe
+    the moment the FIELD score reaches its threshold, because the question has
+    then proved twice over that it contains a value ask, so the "should" is a
+    SECOND and separate thing being asked, and the strict EXTRACTION block
+    would answer it with "do not add advice, a recommendation, a next step, a
+    caution or an offer of further help".
+
+    Measured 2026-09-18, live, twelve runs on one invoice fixture, only the
+    first word of the question differing. BEFORE: "what is the total, and
+    should we accept it?" (mode extract) refused the judgement half 2 of 3 --
+    "I cannot provide a definitive \"yes\" or \"no\" because the document does
+    not contain your purchase order, budget approval, or contract terms" --
+    while "tell me the total, and should we accept it?" (mode extract+advise)
+    answered it 3 of 3. AFTER: both wordings are extract+advise and both give
+    the figure and then "**Should we accept it?** **Yes.**"
+
+    So held evidence is restored exactly when the fields would otherwise win,
+    and the result is extract+advise. The post-condition is checked below and
+    pinned by a generated cross-product in the suite.
+    """
+    restored = bool(decision.held) and field_score >= _FIELD_THRESHOLD
+
+    why = list(field_why) + list(decision.why)
+    if restored:
+        why += [("should-restored-beside-a-field-ask", t) for _, t in decision.held_why]
+    else:
+        why += list(decision.held_why)
+
+    sig = Signals(
+        mode="",
+        field_score=field_score,
+        decision_score=decision.score + (decision.held if restored else 0),
+        held_decision_score=0 if restored else decision.held,
+        evidence=why,
+    )
+    if sig.wants_fields and sig.wants_advice:
+        sig.mode = "extract+advise"
+    elif sig.wants_advice:
+        sig.mode = "advise"
+    elif sig.wants_fields:
+        sig.mode = "extract"
+
+    # The rule above as a NET rather than as a hope. Nothing reaches it while
+    # the scores keep their documented values — restoring held evidence above
+    # already rules the combination out — but the two directions cost very
+    # different things (a sentence of context against the owner's complaint),
+    # so the cheap direction is the one a future edit falls into.
+    if sig.mode == "extract" and sig.decision_signal_anywhere:
+        sig.mode = "extract+advise"
+    return sig
 
 
 def classify(question: str) -> Signals:
@@ -719,26 +888,16 @@ def classify(question: str) -> Signals:
          high-precision field evidence.
       4. neither                 -> neutral, which answers what was asked and
          stops. It does not forbid a verdict (see NEUTRAL).
+
+    Both scores are taken over the whole question; _apply_precedence() holds
+    the whole of rule 1, including what happens to a decision signal a
+    narrowing rule set aside.
     """
     q = question or ""
     masked = _mask_ordinary_english(q)
 
     field_score, field_why = _field_evidence(masked)
-    decision_score, decision_why = _decision_evidence(q)
-
-    sig = Signals(
-        mode="",
-        field_score=field_score,
-        decision_score=decision_score,
-        evidence=field_why + decision_why,
-    )
-    if sig.wants_fields and sig.wants_advice:
-        sig.mode = "extract+advise"
-    elif sig.wants_advice:
-        sig.mode = "advise"
-    elif sig.wants_fields:
-        sig.mode = "extract"
-    return sig
+    return _apply_precedence(field_score, _decision_evidence(q), field_why)
 
 
 def question_mode(question: str) -> str:

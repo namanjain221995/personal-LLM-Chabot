@@ -26,7 +26,8 @@ from app.config import settings
 from app.engines.document import run_pdf_engine_multi
 from tests.document_answer_grader import (cites_document, gives_recommendation,
                                           opens_with_refusal, referral_only,
-                                          source_named_headings)
+                                          source_named_headings,
+                                          source_named_labels)
 from tests.test_document_reasoning import (BROCHURE, BROCHURE_FIGURES,
                                            OWNER_QUESTION)
 
@@ -168,6 +169,12 @@ def test_a_short_answer_never_names_a_source_in_a_heading(live, question, body, 
     answer = _answer_about(question, body, name)
     bad = source_named_headings(answer)
     assert not bad, f"headings named a source, not a subject: {bad}\n{answer}"
+    # ... and the BOLD LABEL half of the same rule, which had no instrument
+    # until source_named_labels() (2026-09-18). Zero here is a measurement:
+    # 0 of 6 short answers across two passes, the same result the heading
+    # assertion above rests on.
+    labels = source_named_labels(answer)
+    assert not labels, f"a bold label named a source, not a subject: {labels}\n{answer}"
 
 
 def test_a_long_answer_hardly_ever_names_a_source_in_a_heading(live):
@@ -203,3 +210,34 @@ def test_a_long_answer_hardly_ever_names_a_source_in_a_heading(live):
         "more than one of six long answers laid itself out by source: "
         + repr({i: named[i] for i in offending})
     )
+
+
+def test_a_long_answer_does_not_do_the_same_thing_in_its_bold_labels(live):
+    """NOT an assertion — a MEASUREMENT printed where the next round can read
+    it, and deliberately not a threshold.
+
+    BASE's rule covers "every heading AND every bold label ... including a
+    label inside a section". The heading half is measured and held at 1 of 6
+    by the test above. The label half had no instrument at all until
+    source_named_labels(), and the first two passes with one say it is a
+    commoner failure than the heading, not a rarer one: 1 of 6 long answers in
+    pass one ("*   **Document Says:** ..." three times in one answer), 3 of 6
+    in pass two ("*   **What the document says:** ...", "*   **The Document
+    Says:** ...", "*   **Document Limit:** ..."), so 4 of 12. Short answers
+    were clean both times, 0 of 6, and that IS asserted above.
+
+    A threshold pinned at that rate would be a test that passes while the rule
+    is broken a third of the time, and one pinned lower would fail on the
+    prompt as it stands. Closing it needs a BASE change measured over many
+    runs, which is a piece of work and not a line in this one. So this records
+    the number and fails only if the instrument itself stops working.
+    """
+    history = [
+        {"role": "user", "content": "I have 2 DGX Sparks and plan to grow to 20."},
+        {"role": "assistant", "content": "Noted — a 20-node DGX Spark cluster."},
+    ]
+    answers = [_answer(OWNER_QUESTION, history) for _ in range(2)]
+    answers += [_answer_about(LONG_TERM_QUESTION, CONTRACT, "msa.pdf")]
+    labelled = {i: source_named_labels(a) for i, a in enumerate(answers)}
+    assert all(a.strip() for a in answers), "the live engine returned nothing"
+    print("source-named bold labels per long answer:", labelled)

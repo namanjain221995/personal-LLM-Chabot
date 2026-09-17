@@ -15,6 +15,7 @@ invoice question stays strictly inside the document.
 """
 import asyncio
 import base64
+import itertools
 
 import pytest
 
@@ -22,7 +23,8 @@ from app.engines import source_use
 from app.engines.document import run_pdf_engine_multi
 from tests.document_answer_grader import (cites_document, gives_recommendation,
                                           opens_with_refusal, referral_only,
-                                          source_named_headings)
+                                          source_named_headings,
+                                          source_named_labels)
 
 #: The owner's question, exactly as he typed it (conversation
 #: b8b9202e-9966-40c5-8e3c-e3a8c8c881eb, 2026-09-17, Fast mode).
@@ -1206,6 +1208,270 @@ def test_help_is_only_a_decision_signal_in_a_frame():
 
 
 # ---------------------------------------------------------------------------
+# "A decision signal ANYWHERE beats a field frame ANYWHERE" — as a property,
+# and then as a generated search over the class the blocker belonged to.
+#
+# The 2026-09-18 QA round closed the headline incident and left this open:
+# _VALUE_WH_RE is anchored to the START of the whole question, and it was used
+# to DISCARD a "should" clause found anywhere later in it. Six hand-written
+# rows of test_a_decision_signal_beats_a_field_match were all green because
+# not one of them opened with a value-wh word. Examples cannot find a hole
+# they were written without knowing about, so this section asserts the
+# property and then searches the space instead of sampling it.
+# ---------------------------------------------------------------------------
+
+
+def test_the_precedence_gives_a_held_signal_back_when_the_fields_win():
+    """The rule, read straight off _apply_precedence with no regex involved.
+
+    A narrowing rule may send a question to NEUTRAL, which answers what was
+    asked and still permits a verdict. It may never send one to strict
+    EXTRACTION, whose block says "do not add advice, a recommendation, a next
+    step, a caution or an offer of further help".
+    """
+    def held_only():
+        return source_use._Decision(
+            held=source_use._STRONG,
+            held_why=[("should-inside-a-value-question", "should we")],
+        )
+
+    below = source_use._apply_precedence(0, held_only())
+    assert below.mode == "", below
+    assert below.held_decision_score == source_use._STRONG
+    assert below.decision_signal_anywhere
+
+    at = source_use._apply_precedence(source_use._FIELD_THRESHOLD, held_only())
+    assert at.mode == "extract+advise", at
+    assert at.held_decision_score == 0, "the held signal is spent, not kept"
+    assert any(
+        kind == "should-restored-beside-a-field-ask" for kind, _ in at.evidence
+    ), at.evidence
+
+
+def test_extraction_alone_is_unreachable_from_any_score_that_carries_a_judgement():
+    """The whole score space, not a sample: 1,000 combinations of the three
+    numbers the precedence sees. Every one that leaves as "extract" carries no
+    judgement evidence at all, held or counted."""
+    seen = {"extract": 0, "extract+advise": 0, "advise": 0, "": 0}
+    for field, score, held in itertools.product(range(10), repeat=3):
+        sig = source_use._apply_precedence(
+            field, source_use._Decision(score=score, held=held)
+        )
+        seen[sig.mode] += 1
+        if sig.mode == "extract":
+            assert not sig.decision_signal_anywhere, (field, score, held, sig)
+    assert seen["extract"], "the search never reached extraction, so it proves nothing"
+    assert seen["extract+advise"], seen
+
+
+#: One opener for every word _VALUE_WH_RE names — what / what's / whats / when
+#: / who / where / how much / how many / how long / how often — because the
+#: anchor was what made the first word of a question decide whether its second
+#: half was answered.
+_WH_OPENERS = (
+    "what is the {field}",
+    "what's the {field}",
+    "whats the {field}",
+    "what does this document give as the {field}",
+    "when was the {field} last changed",
+    "who set the {field}",
+    "where does it state the {field}",
+    "how much of a difference does the {field} make",
+    "how many times does it repeat the {field}",
+    "how long has the {field} been in force",
+    "how often does the {field} change",
+)
+
+#: Real fields of a real document, each of which reaches the strict threshold
+#: on its own (asserted below, so a combination cannot pass by the field half
+#: quietly failing to register).
+_FIELD_HEADS = (
+    "invoice total",
+    "tax amount",
+    "due date",
+    "notice period",
+    "payment terms",
+    "governing law",
+    "PO number",
+    "termination clause",
+    "annual fee",
+    "billing address",
+    "interest rate",
+    "line items",
+)
+
+#: Judgement asks in the words people use. The last five are the 2026-09-18
+#: MEDIUM: they scored ZERO decision evidence, so beside a named field they
+#: produced strict extraction — a missing decision word next to a present
+#: field word is the unsafe direction.
+_DECISION_TAILS = (
+    "should we accept it?",
+    "should I be worried about that?",
+    "should that worry me?",
+    "should we renegotiate it?",
+    "should I be happy with that?",
+    "should we be paying late fees?",
+    "should that be a concern at our size?",
+    "should we sign?",
+    "is that reasonable?",
+    "do you recommend we sign?",
+    "is it worth it?",
+    "would you recommend this?",
+    "is that too expensive?",
+    "is that a red flag?",
+    "is that a problem for us?",
+    "is that normal?",
+    "how bad is that for us?",
+    "what do you make of it?",
+)
+
+#: How the two halves are joined. "and" was the shape QA reproduced; a dash, a
+#: full stop and "but" are the same question typed by someone else, and a
+#: clause-scoped pattern would have had to get all four right.
+_JOINS = (", and ", " - ", ". ", " but ")
+
+
+def _generated_questions():
+    for opener, field, tail, join in itertools.product(
+        _WH_OPENERS, _FIELD_HEADS, _DECISION_TAILS, _JOINS
+    ):
+        yield opener.format(field=field) + join + tail
+
+
+def test_every_generated_field_head_reaches_extraction_on_its_own():
+    """Control 1 for the search. Without this, a combination could pass
+    because the field never registered, and the search would prove nothing."""
+    wrong = [
+        (q, source_use.classify(q))
+        for opener, field in itertools.product(_WH_OPENERS, _FIELD_HEADS)
+        for q in [opener.format(field=field) + "?"]
+        if source_use.question_mode(q) != "extract"
+    ]
+    assert not wrong, wrong[:10]
+
+
+def test_every_generated_decision_tail_carries_a_signal_on_its_own():
+    """Control 2 for the search: each tail is a judgement ask by itself, so a
+    combination that routes to extraction is a signal being DISCARDED and not
+    a signal that was never there."""
+    missing = [t for t in _DECISION_TAILS if not source_use.classify(t).decision_signal_anywhere]
+    assert not missing, missing
+
+
+def test_no_generated_combination_routes_to_extraction_alone():
+    """THE SEARCH. 9,504 questions: every value-wh opener x every field x
+    every decision tail x every join.
+
+    Measured on the classifier this test ships with: 0 violations. Measured on
+    the same search against the classifier as it stood before this change:
+    6,336 of 9,504 (66.7%) routed to strict "extract", which is the block that
+    says "do not add advice, a recommendation, a next step, a caution or an
+    offer of further help" — the owner's complaint, reproduced live by QA 3 of
+    3 on a controlled invoice pair.
+
+    It is pinned as a search rather than as rows so that a future edit cannot
+    reintroduce the class by finding a wording nobody thought to write down.
+    """
+    total = 0
+    bad = []
+    for question in _generated_questions():
+        total += 1
+        if source_use.question_mode(question) == "extract":
+            bad.append((question, source_use.classify(question).evidence))
+    assert total == 9504, total
+    assert not bad, f"{len(bad)} of {total} routed to extraction alone, e.g. {bad[:5]}"
+
+
+def test_the_generated_search_covers_both_halves_it_was_built_for():
+    """A search is only worth its coverage. If a later edit trims a table,
+    this fails before the search quietly gets easier."""
+    assert len(_WH_OPENERS) == 11 and len(_FIELD_HEADS) == 12
+    assert len(_DECISION_TAILS) == 18 and len(_JOINS) == 4
+    openers = " ".join(_WH_OPENERS)
+    for word in ("what is", "what's", "whats", "when", "who", "where",
+                 "how much", "how many", "how long", "how often"):
+        assert word in openers, word
+    # every opener really is a value-wh opener as the narrowing rule reads it
+    for opener in _WH_OPENERS:
+        assert source_use._VALUE_WH_RE.match(opener.format(field="total")), opener
+
+
+def test_the_first_word_of_a_question_no_longer_decides_if_it_is_answered():
+    """QA's minimal pair, live 6 runs on one invoice fixture: the misrouted
+    phrasing refused the judgement half 3 of 3 ("The document does not provide
+    enough information to determine if the invoice should be accepted"), the
+    correctly routed one gave a verdict 3 of 3 ("**Yes, accept it.**")."""
+    tell = source_use.classify("tell me the invoice total, and should we accept it?")
+    what = source_use.classify("what is the invoice total, and should we accept it?")
+    assert tell.mode == "extract+advise", tell
+    assert what.mode == "extract+advise", what
+    assert tell.mode == what.mode
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the notice period, and should we renegotiate it?",
+        "what are the payment terms, and should I be happy with them?",
+        "when is payment due, and should we be paying late fees?",
+        "what is the termination clause, and should that worry me?",
+        "what does it cost, and should that be a concern at our size?",
+        "what notice period should I be giving?",
+        "who signed this, and should I be worried about that?",
+    ],
+)
+def test_the_wordings_qa_reproduced_are_answered_in_both_halves(question):
+    """Every one of these was verified routing to strict extraction before
+    this change; each is a field ask AND a judgement ask."""
+    system = source_use.system_text(question)
+    assert source_use.question_mode(question) == "extract+advise", source_use.classify(question)
+    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "is that a problem for us?",
+        "is that a red flag?",
+        "is that normal?",
+        "how bad is that for us?",
+        "what do you make of it?",
+        "is this a deal-breaker?",
+        "is that cause for concern?",
+        "should I be concerned?",
+    ],
+)
+def test_asking_for_an_assessment_is_a_decision_signal(tail):
+    """The 2026-09-18 MEDIUM. Alone these are safe — they fall to neutral,
+    which permits a judgement — but beside a named field they produced strict
+    extraction, and that is the direction this module may not be wrong in."""
+    assert source_use.classify(tail).decision_signal_anywhere, source_use.classify(tail)
+    assert source_use.question_mode(f"what is the invoice total, and {tail}") == "extract+advise"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "copy the addresses into a table",
+        "copy out the payment schedule",
+        "copy this clause",
+        "copy the table on page 3",
+        "copy every line item",
+    ],
+)
+def test_copy_is_an_extraction_verb_whatever_noun_follows(question):
+    """LOW: the verb took a fixed noun list, so "copy the addresses into a
+    table" fell to neutral. The brief lists copy as an extraction verb."""
+    assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+def test_copy_still_needs_something_to_copy():
+    """The widened verb is a determiner plus a noun, not the bare word: an
+    acknowledgement is not an extraction request."""
+    assert source_use.question_mode("copy that, thanks") != "extract"
+
+
+# ---------------------------------------------------------------------------
 # The heading grader — the LOW the recheck could only check by eye
 # ---------------------------------------------------------------------------
 
@@ -1281,3 +1547,61 @@ def test_the_heading_grader_leaves_a_good_answer_alone():
         "### Contract terms\n"
     )
     assert source_named_headings(good) == []
+
+
+# ---------------------------------------------------------------------------
+# The bold LABEL grader — the half of BASE's rule that had no instrument
+# ---------------------------------------------------------------------------
+
+
+def test_the_label_grader_catches_the_bullet_lead_ins_the_round_measured():
+    """BASE says "CHECK EVERY HEADING AND EVERY BOLD LABEL BEFORE YOU WRITE
+    IT, including a label inside a section". 4 of the 24 answers the
+    2026-09-18 live round graded carried 10 such labels and
+    source_named_headings() returned [] for every one of them: it matches a
+    bold phrase only when the phrase is the WHOLE line, and these are bullet
+    lead-ins with the line's content after them. These are the real lines."""
+    seen_live = (
+        "**The Document Says:** The compact configuration uses 2 x 10 kW units.\n"
+        "- **Document says:** 4 x 45 kW row cooling.\n"
+        "* **General Knowledge:** a DGX Spark draws about 240 W.\n"
+        "1. **Document Silence:** nothing about DGX, Spark or NVIDIA.\n"
+        "**Document Says:** up to 12 racks.\n"
+    )
+    assert len(source_named_labels(seen_live)) == 5, source_named_labels(seen_live)
+
+
+def test_the_label_grader_leaves_an_ordinary_bold_label_alone():
+    """The same disprovability the heading grader was built with. A bold label
+    with content after it is the NORMAL way to print a field, and a grader
+    that flagged those could never be satisfied."""
+    ordinary = (
+        "**Total:** 5,200.00 USD\n"
+        "**Due Date:** 2026-09-01\n"
+        "- **Power headroom:** 10 kW per row.\n"
+        "1.  **Rack Count vs. Server Count:** The document says \"up to 12 racks.\"\n"
+        "3.  **No Specific DGX Spark Mention:** The document does not mention DGX.\n"
+        "* **Cooling capacity:** 4 x 45 kW.\n"
+        "**Verdict:** Yes, but it is overkill for two Sparks.\n"
+    )
+    assert source_named_labels(ordinary) == []
+
+
+def test_a_line_is_never_both_a_heading_and_a_label():
+    """The two graders are separate because they measure different behaviours
+    at different rates, and a line counted twice would inflate either one."""
+    both = "**THE DOCUMENT**\n**The Document Says:**\n### 1. What the Document Says\n"
+    assert len(source_named_headings(both)) == 3, source_named_headings(both)
+    assert source_named_labels(both) == []
+
+
+def test_the_heading_grader_now_sees_the_source_as_a_bare_subject():
+    """"**The Document Says:**" matched no alternative of the heading pattern
+    before this round: every "document says" form it had required a "what" in
+    front of it. It was invisible even as a standalone heading."""
+    assert source_named_headings("**The Document Says:**\n") == ["**The Document Says:**"]
+    assert source_named_headings("### Document Silence\n") == ["### Document Silence"]
+    # ... and still anchored, so the live assertion can still come out clean.
+    assert source_named_headings("### 4. Critical Gaps in the Document\n") == []
+    assert source_named_headings("### Document Retention\n") == []
+
