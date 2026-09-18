@@ -11,6 +11,7 @@ import time
 import pytest
 
 from app.engines import source_use
+from tests.document_answer_grader import opens_with_refusal
 from tests import document_judgement_corpus as corpus
 
 
@@ -178,3 +179,33 @@ def test_a_scale_today_and_a_planned_scale_each_get_a_verdict():
     for mode in ("extract", "advise"):
         system = source_use.system_for_mode(mode)
         assert "the person's scale today and a planned scale, give a verdict for EACH" in system
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Verdict: No, this document does not help you.",
+        "**Verdict: No, the brochure does not help you with DGX Spark.**",
+        "**Short answer: No.** This document won't help you here.",
+        "No - the datasheet isn't helpful for your setup.",
+        "Verdict: the brochure is not useful for your two Sparks.",
+    ],
+)
+def test_the_grader_sees_a_verdict_about_the_document_as_a_refusal(answer):
+    """L3's instrument. The first line is verbatim from the live check; each
+    passed opens_with_refusal() on 4e7cf8e."""
+    assert opens_with_refusal(answer), answer
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "Verdict: No, the SmartRow does not help you at two nodes.",
+        "Yes - for 20 Sparks it helps; the brochure lists 45 kW of cooling.",
+        "No. The unit is not helpful for a 2-node desk setup, though the document "
+        "lists 2 to 12 racks.",
+    ],
+)
+def test_the_grader_leaves_a_verdict_about_the_product_alone(answer):
+    """The subject decides: a verdict about the PRODUCT is an answer."""
+    assert not opens_with_refusal(answer), answer

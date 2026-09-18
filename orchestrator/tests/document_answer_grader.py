@@ -90,8 +90,29 @@ _REFERRAL_RE = re.compile(
 )
 
 
+#: A VERDICT whose subject is the paper: "Verdict: No, this document does not
+#: help you." opened 4 of 13 live answers to the owner's turn on 4e7cf8e and
+#: passed this grader, because "help" is not a coverage verb. It is the
+#: refusal again -- the person asked about the product, and the answer judged
+#: the brochure. The document word must be the SUBJECT of the negated verb:
+#: "the SmartRow does not help you at two nodes" is a verdict about the
+#: product, and "the unit is not helpful ..., though the document lists 2 to
+#: 12 racks" names the document only as a source.
+_DOC_VERDICT_REFUSAL_RE = re.compile(
+    r"\b(?:this|the|that|your|these|those)\s+(?:[\w-]+\s+){0,2}?"
+    r"(?:document|documents|brochure|datasheet|data\s+sheet|spec\s+sheet|pdf|file|paper|"
+    r"attachment|catalogue|catalog|manual|excerpt|text|invoice|contract|agreement)\s+"
+    r"(?:itself\s+)?(?:alone\s+)?"
+    r"(?:does\s*not|doesn'?t|do\s*not|don'?t|will\s*not|won'?t|would\s*not|wouldn'?t|"
+    r"cannot|can'?t|is\s*not|isn'?t|are\s*not|aren'?t)\s+(?:really\s+|actually\s+|fully\s+)?"
+    r"(?:help|helpful|useful|relevant|answer|apply|suit|suitable|work|support)\b",
+    re.I,
+)
+
+
 def opens_with_refusal(answer: str) -> bool:
-    """True when the FIRST two sentences are about the DOCUMENT's silence.
+    """True when the FIRST two sentences are about the DOCUMENT's silence, or
+    give a verdict about the document instead of the thing asked about.
 
     Sentence by sentence, not over the pair joined together: a verdict about
     the product in one sentence and the word "document" in the next must not
@@ -101,6 +122,8 @@ def opens_with_refusal(answer: str) -> bool:
         if _ANCHORED_REFUSAL_RE.search(sentence):
             return True
         if _REFUSAL_RE.search(sentence) and _DOC_SUBJECT_RE.search(sentence):
+            return True
+        if _DOC_VERDICT_REFUSAL_RE.search(sentence):
             return True
     return False
 
