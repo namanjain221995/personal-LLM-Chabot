@@ -33,6 +33,7 @@ import asyncio
 import logging
 import os
 import re
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -120,6 +121,10 @@ _MIN_OUTPUT_TOKENS = 512
 
 _TIMEOUT_S = 120.0
 
+#: What `_ocr_one` appends to a transcript cut off at the output ceiling.
+#: `video/screen.py` strips the same words before indexing a frame's text.
+TRUNCATED_NOTE = "[transcript truncated at the OCR output limit]"
+
 
 def _capability(name: str, default: int) -> int:
     caps = getattr(settings, "ocr_capabilities", None) or getattr(
@@ -159,13 +164,92 @@ _LINE_REGION_RE = re.compile(
 )
 
 
+#: THE MODEL'S PREAMBLE IS NOT TEXT ON THE IMAGE. Recorded against this
+#: deployment's engine, all of them classified `ok` until 2026-09-18:
+#:   '":"' and "result '"      the WHOLE answer, prompt "OCR", on four legible
+#:                             video slides (speech-video audit, 2026-09-17);
+#:   'result\nSERVER ROOM B'   prompt "OCR", a dark sign (2026-09-18);
+#:   'ovi\nSERVER ROOM B\n…'   prompt "document parsing", the same sign;
+#:   "ovi …"                   in front of every "document parsing" read of six
+#:                             video frames (2026-09-11).
+#: A shape is dropped only as a whole FIRST LINE, or — "ovi" alone — as a first
+#: token with more text after it on that line, and only lower-case, the way
+#: the model writes it. So a slide whose first word is "Results", "Result",
+#: "Ovid" or "oviparous" keeps it, and a loop that happens to begin "ovišnje…"
+#: is left whole for `is_degenerate` to judge. "output", "result." and
+#: "result:" joined the list from the 96-read measurement described at
+#: `_drop_line_before_layout`.
+_PREAMBLE_LINE_RE = re.compile(
+    r"""\A[ \t]*(?:
+        ["'`]*[ \t]*:[ \t]*\d*[ \t]*["'`]*    # ':'  '":"'  ': 3'
+      | (?:result|output)[ \t]*[.:"'`]?       # 'result'  "result '"  'result.'  'output'
+      | ovi                                   # 'ovi'
+    )[ \t]*(?:\n|\Z)""",
+    re.X,
+)
+_PREAMBLE_TOKEN_RE = re.compile(r"\Aovi[ \t]+(?=\S)")
+#: The start of a line the engine wrote as a region (see `_drop_line_before_layout`).
+_LAYOUT_LINE_RE = re.compile(r"\s*(?:<\|det\|>|(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\])")
+
+
+def _strip_preamble(text: str) -> str:
+    """Drop the model's leading preamble line(s); a no-op on real text.
+
+    Repeated until nothing matches, so that cleaning twice — `_ocr_one`
+    cleans, then `classify` cleans what it is given — is cleaning once.
+    """
+    out = text
+    while True:
+        match = _PREAMBLE_LINE_RE.match(out) or _PREAMBLE_TOKEN_RE.match(out)
+        if not match:
+            return out
+        out = out[match.end():].lstrip()
+
+
+def _drop_line_before_layout(text: str) -> str:
+    """Drop the first line when it stands OUTSIDE the engine's layout.
+
+    This engine writes what it reads as region lines, "type [x, y, x, y]text",
+    and a line without a region can only continue the region above it. So a
+    first line with no region, followed by region lines, belongs to no region:
+    it is the model talking. Measured 2026-09-18 on 96 reads of 16 labelled
+    synthetic images (both prompts, three paths): 73 answers had that shape and
+    in all 73 the first line was chatter — "ovi" or "ovišnje pjeske je" from
+    "document parsing", and from "OCR": "result", "output", ":", ", T", ": I",
+    "(提示: )", "and non-text figures", ", or outputatted values.", and three
+    300-440-character critiques of its own output ("result, which consists of
+    underscores. …"). No shape list could have named those; the region lines
+    say where the reading starts.
+
+    ONE line, not every line before the first region: in one of the 73 the
+    second line was the window title, written without a region.
+
+    A region line is recognised in both of the engine's spellings: the bare
+    "type [x, y, x, y]" the served model emits today, and the model card's
+    "<|det|>type [x, y, x, y]<|/det|>", which is what the same answer looks
+    like when vLLM is asked to keep special tokens (probed 2026-09-18) — so
+    this runs on the raw answer, before either marker is removed.
+    """
+    lines = text.strip().split("\n")
+    if len(lines) < 2 or _LAYOUT_LINE_RE.match(lines[0]):
+        return text
+    if any(_LAYOUT_LINE_RE.match(line) for line in lines[1:]):
+        return "\n".join(lines[1:])
+    return text
+
+
 def clean_transcript(raw: str) -> str:
-    """Drop layout-control markup, keep the recognized text."""
-    out = _DET_RE.sub("", raw or "")
+    """Drop layout-control markup and the model's preamble, keep the text.
+
+    Idempotent: the layout rule needs region markers, which the first pass
+    removes, and the preamble rule repeats until nothing matches.
+    """
+    out = _drop_line_before_layout(raw or "")
+    out = _DET_RE.sub("", out)
     out = _TAG_RE.sub("", out)
     out = _BBOX_RE.sub("", out)
     out = _LINE_REGION_RE.sub("", out)
-    return out.strip()
+    return _strip_preamble(out.strip())
 
 
 # ------------------------------------------------------------ degeneracy --
@@ -254,7 +338,8 @@ class OcrRead:
 
     `status` is one of:
       ok          text was read;
-      empty       the model answered and there was nothing legible;
+      empty       the model answered and there was nothing legible — or
+                  nothing but its own preamble or punctuation (`classify`);
       degenerate  the model looped — a FAILED read, never an empty screen;
       failed      the call raised, or the batch deadline passed first.
     `text` is kept for a degenerate read so a human can see what came back,
@@ -278,13 +363,46 @@ class OcrRead:
         return {"text": self.text, "status": self.status, "error": self.error}
 
 
+#: Fewer content characters than this, after cleaning, is not a read of the
+#: image: it is what is left when the model answered with punctuation ('":"',
+#: "'", a bare table rule). Two, not three, so a short real read — "Q3", "OK",
+#: "東京" — is still one. A content character is a letter or a digit, or a sign
+#: that belongs to a number ("5%", "$5", "#1", "7°"), and at least one of them
+#: must be a letter or digit. The cost is a lone character ("7" on a door):
+#: `empty`, which every caller treats as "nothing to add", while the pixels
+#: still reach the main model on the image route.
+_MIN_CONTENT_CHARS = 2
+_NUMBER_SIGNS = frozenset("%‰°#")
+
+
+def _content_chars(body: str) -> int:
+    """Content characters the IMAGE contributed (the truncation note is ours)."""
+    text = body.replace(TRUNCATED_NOTE, "")
+    alnum = sum(1 for ch in text if ch.isalnum())
+    if not alnum:
+        return 0
+    signs = sum(1 for ch in text if ch in _NUMBER_SIGNS or unicodedata.category(ch) == "Sc")
+    return alnum + signs
+
+
 def classify(text: str) -> OcrRead:
-    """A raw (cleaned) transcript -> the read it actually is."""
-    body = (text or "").strip()
+    """A raw or cleaned transcript -> the read it actually is.
+
+    `empty` now also covers an answer that was only the model's preamble or
+    punctuation (2026-09-18). Every consumer already reads `empty` as "the
+    model answered and there was nothing to use" — the video stage's count,
+    screen_text.txt, the chat image route's evidence block, and the public
+    Files API's `ocr_empty_pages` (apifiles/ocr_pages.py), which leaves such a
+    page exactly as its text layer left it — and until this change those
+    four took '":"' for the image's text.
+    """
+    body = clean_transcript(text)
     if not body:
         return OcrRead("", "empty")
     if is_degenerate(body):
         return OcrRead(body, "degenerate", "the OCR model repeated itself instead of reading the image")
+    if _content_chars(body) < _MIN_CONTENT_CHARS:
+        return OcrRead("", "empty")
     return OcrRead(body, "ok")
 
 
@@ -327,7 +445,7 @@ async def _ocr_one(
         # A page denser than the output ceiling comes back cut off mid-content.
         # Saying so is the difference between the main model treating the tail
         # as absent and treating it as "not transcribed here" (2026-08-29).
-        text += "\n[transcript truncated at the OCR output limit]"
+        text += "\n" + TRUNCATED_NOTE
     return text
 
 
@@ -446,7 +564,13 @@ async def ocr_images(
     A degenerate read keeps its text here so that this function's answer is
     the same one the document and interactive image routes have always got;
     the loop is logged by `read_images` and reported as a failed read to
-    anyone who asks for the structured form.
+    anyone who asks for the structured form. KNOWN GAP (2026-09-18): the
+    only caller left is the document route (document.py), which appends
+    whatever comes back to the page, loop included; that file belongs to the
+    document team this round, so the contract stands until it moves to
+    `read_images`. What did change underneath it: a preamble-only answer is
+    now `empty` and so arrives here as '', and an `ok` read arrives without
+    its "ovi"/"result" first line.
     """
     reads = await read_images(
         images, max_output_tokens=max_output_tokens, deadline_s=deadline_s

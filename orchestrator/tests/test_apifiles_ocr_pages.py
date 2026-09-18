@@ -71,6 +71,8 @@ class StubOcr:
         self.degenerate: set = set()
         self.fail_pages: set = set()
         self.down = False
+        # page -> the engine's raw answer, verbatim, when a test needs one.
+        self.raw: Dict[int, str] = {}
 
     def transcript(self, page: int) -> str:
         if page in self.degenerate:
@@ -102,7 +104,7 @@ async def _chat(request: Request):
             "object": "chat.completion",
             "created": int(time.time()),
             "model": "stub-ocr",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": STUB.transcript(page)}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": STUB.raw.get(page, STUB.transcript(page))}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
     )
@@ -210,6 +212,25 @@ def test_only_thin_pages_are_read_in_page_order_with_the_ocr_prompt_and_land_on_
         recorded = [json.loads(line) for line in fh]
     assert {r["page"]: r["status"] for r in recorded} == {3: "ok", 5: "ok", 7: "ok", 9: "ok", 11: "degenerate"}
     assert next(r for r in recorded if r["page"] == 11)["text"] == ""
+
+
+def test_a_preamble_only_read_leaves_the_page_alone_and_a_preamble_line_is_never_merged(tmp_path):
+    """The public side shares `engines.ocr.classify` with the chat app. Until
+    2026-09-18 the engine's preamble — '":"', "result '", a "result" line in
+    front of the text, all recorded on this deployment's engine with the
+    "OCR" prompt this stage sends — was an `ok` read, so it became a page's
+    text or was glued onto it and could be cited from the Files API."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: '":"', 5: "result '", 7: "result\n" + STUB.transcript(7)}
+    before = {p["page"]: p for p in pages_of(derived)}
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert pages[3] == before[3] and pages[5] == before[5]
+    assert pages[7]["source"] == "ocr" and pages[7]["text"] == STUB.transcript(7)
+    assert '":"' not in json.dumps(pages) and "result" not in json.dumps(pages)
+    assert facts["ocr_empty_pages"] == 2 and facts["ocr_pages"] == 3
+    recorded = ocr_pages.load_recorded(derived)
+    assert {p: r["status"] for p, r in recorded.items()} == {3: "empty", 5: "empty", 7: "ok", 9: "ok", 11: "ok"}
 
 
 def test_the_page_budget_reads_the_first_thin_pages_and_lists_the_rest_as_skipped(tmp_path):
