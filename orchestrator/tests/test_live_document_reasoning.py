@@ -19,17 +19,20 @@ own figures quoted, and no refusal in the opening lines.
 import asyncio
 import base64
 import os
+import re
 
 import pytest
 
 from app.config import settings
 from app.engines.document import run_pdf_engine_multi
-from tests.document_answer_grader import (cites_document, gives_recommendation,
-                                          opens_with_refusal, referral_only,
-                                          source_named_headings,
-                                          source_named_labels)
+from tests.document_answer_grader import (cites_document, explains_a_missing_field,
+                                          gives_recommendation, opens_with_refusal,
+                                          referral_only, source_named_headings,
+                                          source_named_labels, states_a_computation)
 from tests.test_document_reasoning import (BROCHURE, BROCHURE_FIGURES,
                                            OWNER_QUESTION)
+from tests.test_document_reasoning import \
+    INVOICE_WITHOUT_TAX as ITEMISED_INVOICE_WITHOUT_TAX
 
 LIVE = os.environ.get("LIVE_VLLM_BASE_URL", "").strip()
 
@@ -241,3 +244,25 @@ def test_a_long_answer_does_not_do_the_same_thing_in_its_bold_labels(live):
     labelled = {i: source_named_labels(a) for i, a in enumerate(answers)}
     assert all(a.strip() for a in answers), "the live engine returned nothing"
     print("source-named bold labels per long answer:", labelled)
+
+
+@pytest.mark.parametrize("run", [0, 1, 2])
+def test_a_strict_answer_shows_no_working_and_explains_no_missing_field(live, run):
+    """F6 (round 6), live. The ITEMISED tax-free invoice -- two line items, a
+    total, no tax line -- is the one that drew the padding: on 57dcede 4 of 8
+    strict answers added a sentence about the missing tax ("The invoice lists
+    a total of 5,200.00 USD but does not provide a separate line item or
+    breakdown for tax"), and a round-5 verifier run stated a FALSE sum, "2 x
+    1,000.00 + 1 x 4,200.00 = 5,200.00". A strict answer copies fields; it
+    never computes and never explains an absence. Zero is a measurement, not
+    a hope: with the round-6 strict block, 16 of 16 runs in two batches had no
+    computation and no explanation, the total, and the tax "not stated"."""
+    from app.engines import source_use
+
+    question = "I need the total from this invoice and the tax amount"
+    assert source_use.question_mode(question) == "extract"
+    answer = _answer_about(question, ITEMISED_INVOICE_WITHOUT_TAX, "invoice.pdf")
+    assert "5,200.00" in answer or "5200.00" in answer, answer
+    assert re.search(r"tax[^\n]{0,60}not stated", answer, re.I), answer
+    assert not states_a_computation(answer), f"stated a computation:\n{answer}"
+    assert not explains_a_missing_field(answer), f"explained a missing field:\n{answer}"

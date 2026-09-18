@@ -128,6 +128,19 @@ question count, more decision words) and what each measured are in the
 "step 4" section below; the strict block was rewritten at the same time so
 that a misroute the clause test still misses costs less (see EXTRACTION).
 
+WHAT ROUND 6 ADDED (2026-09-18). The round-5 verifier's blind search, in its
+own vocabulary, still left 3,690 of 31,200 judgement asks in strict
+extraction alone (11.83%), and every one was a SHAPE the clause test did not
+know, not a word it lacked: an imperative with a noun object ("... and assess
+the risk"), an "okay" stripped as filler ("Okay for us?"), a modal about the
+person's own action whose verb a page also states facts with ("Would we sign
+it?"), and a statement of view ("that seems high to me"). Each is now a shape
+in step 4; the same search leaves 448 of 31,200 (1.44%), all in one
+documented class. The strict block also stopped showing working: it said
+nothing about BASE's own "show the arithmetic" and "say the document is
+silent in one line", and on an itemised tax-free invoice it obeyed both (see
+EXTRACTION).
+
 Consumed by app/engines/document.py. `HISTORY_DOC_GUIDANCE` is the same rule
 in one paragraph, for the pinned "documents the user uploaded earlier" block
 that main.py puts in front of LATER turns — those turns route to chat, where
@@ -138,7 +151,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field as _dataclass_field
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 #: The persona and the three sources, said to every document answer.
 #:
@@ -260,6 +273,21 @@ ADVISORY = (
 #: figure in any answer from either block, total and "not stated" in every
 #: one, median length 76 / 86.5 chars here against 193 / 126.5 on the old
 #: block.
+#:
+#: NO WORKING, AND NOTHING MORE ABOUT A MISSING FIELD (2026-09-18, round 6).
+#: BASE tells every answer to "show the arithmetic" for a figure it worked
+#: out, and to say the document is silent "in ONE line after" the answer.
+#: This block did not override either, and on the ITEMISED tax-free invoice
+#: (two line items, a total, no tax line) it obeyed both: live, 4 of 8
+#: answers on 57dcede added "The invoice lists a total of 5,200.00 USD but
+#: does not provide a separate line item or breakdown for tax", and a round-5
+#: verifier run stated a sum that is false on its own terms, "2 x 1,000.00 +
+#: 1 x 4,200.00 = 5,200.00". Two sentences now override both, for the fields
+#: only (EXTRACT_THEN_ADVISE shares this text, and its judgement may still
+#: work with numbers). Live, Fast, the same question: 0 computations, 0
+#: explanations, the total and the tax "not stated" in 16 of 16 runs over two
+#: batches. A calculation the person ASKS for is routed to NEUTRAL instead of
+#: here (_COMPUTE_RE), so this ban never refuses one.
 _STRICT_FIELDS = (
     "\nTHIS IS AN EXTRACTION QUESTION. Return ONLY what is actually in the document for "
     "each field asked: the fields, values and figures as written, with page numbers where "
@@ -268,7 +296,15 @@ _STRICT_FIELDS = (
     "knowledge, do not infer it from the rest of the document, do not estimate it, and do "
     "not write 0, 0.00 or \"none\" for a field the document never gives; write \"not "
     "stated in the document\" — that line is the whole answer for that field, with no "
-    "sentence about why it is missing. Answer what was asked and stop: do not add advice, "
+    "sentence about why it is missing. It is also the one line about the document's "
+    "silence that the rules above ask for: say nothing more about a missing field anywhere "
+    "in the answer \u2014 not what the document shows instead, not why the field is "
+    "missing, not what its value might be. NO ARITHMETIC IN THE FIELDS: copy every figure "
+    "exactly as printed. Do not add, multiply or check figures to produce or confirm a "
+    "field, and write no sum, no equation and no working beside the fields, not even to "
+    "show where a total comes from \u2014 for the fields, this overrides the permission "
+    "above to show your arithmetic. "
+    "Answer what was asked and stop: do not add advice, "
     "a recommendation, a next step, a caution or an offer of further help that the person "
     "did not ask for, and do not raise a discrepancy the person did not ask about. Give the "
     "fields, not the reasoning that found them: no thinking out loud, no self-correction "
@@ -500,7 +536,15 @@ _UNAMBIGUOUS_FIELD_RE = re.compile(
     r"invoice|signature|signing|execution|completion|payment)\s+dates?"
     r"|dates?\s+of\s+(?:issue|signature|signing|execution|completion)"
     r"|governing\s+law|jurisdiction|choice\s+of\s+law"
-    r"|notice\s+period|period\s+of\s+notice"
+    r"|notice\s+period|period\s+of\s+notice|grace\s+period|cure\s+period"
+    # Contract fields the round-5 verifier found reaching no strict block at
+    # all ("what's the liability cap", "how long is the non-compete"): a gap
+    # on this side costs a sentence, so they are added as found, not guessed.
+    r"|liability\s+(?:cap|limit)|(?:cap|limit|limitation)\s+(?:on|of)\s+liability"
+    r"|indemnit(?:y|ies)\s+(?:cap|limit)|non[- ]?compete"
+    r"|minimum\s+(?:commitment|spend|purchase|order|term|fee|charge|volume)"
+    r"|(?:monthly|annual|yearly|base)\s+rent|auto[- ]?renewal|automatic\s+renewal"
+    r"|roll(?:s|ed|ing)?[- ]?over|notice\s+requirements?|lump[- ]sum|sum\s+(?:insured|assured)"
     r"|termination\s+(?:clause|date|notice|provision|fee|charge|right|for\s+convenience)"
     r"|(?:notice|right)\s+of\s+termination|notice\s+to\s+terminate"
     r"|signator(?:y|ies)|signatures?|signed\s+(?:by|this|that|the|it|on)"
@@ -821,6 +865,52 @@ _SUITABILITY_RE = re.compile(
 # outside the lexicon ("how is it split across the line items?") goes to
 # extract+advise — the cheap direction, a sentence of context. All 3,130 dev
 # and 1,330 held-out pure field asks in the corpus stay strict.
+#
+# ROUND 6 (2026-09-18). The round-5 verifier's blind search found the SHAPES
+# above did not cover everything a person types, and each fix below is a
+# shape, with the vocabulary it needs kept on the side whose gaps are cheap:
+#
+#   * an imperative with ANY object, not only a pronoun ("assess the risk",
+#     "point out the weak spots", "comment on the pricing") -- _imperative();
+#     verbs that only hand content over ("summarise", "identify", "name") are
+#     the FIELD side's list, _HANDOVER_VERBS;
+#   * a split after "and / but / then" wherever a new ask starts, not only
+#     before a question word -- _split_conjoined_asks();
+#   * "ok / okay" is filler only when punctuation or a question follows it --
+#     _strip_leading_filler(); otherwise it is the question;
+#   * a modal about the person's own action ("would we sign it?") --
+#     _OWN_ACTION_RE; "can we terminate early?" is left to the residual;
+#   * "any / anything ..." without its "is there" -- _EXISTENTIAL_RE;
+#   * a VIEW that judges the value ("that seems high to me", "our CFO thinks
+#     it's excessive") -- _judges_the_value(); a view about the paper or an
+#     event ("I think the supplier emailed it on Monday") is not one;
+#   * a capitalised question word mid-text starts a sentence;
+#   * a CALCULATION ("what is the sum of the line items?") is not a field,
+#     and goes to NEUTRAL (see _apply_precedence), because the strict block
+#     no longer does arithmetic.
+#
+# MEASURED, strict extraction alone. The verifier's corpus (its own
+# vocabulary, 16 field heads): 3,690 of 31,200 on 57dcede, 448 of 31,200
+# here; its targeted sweep 8,316 of 10,272, now 176 of 14,124 ("are we
+# covered?", "can we terminate?" -- decided, see
+# test_can_we_is_left_to_the_residual_on_purpose). This round's own corpus,
+# decision vocabulary OFF: 27,510 of 36,600, now 1,380; with it on, the
+# held-out tails were first measured on the finished detector at 840 of
+# 16,200 (8,130 on 57dcede). Pure field asks: 12,375 of 12,375 kept strict
+# (11,290 on 57dcede), including four sets of context statements two of
+# which were written to attack the view rule.
+#
+# WHAT IS STILL LEFT, by class:
+#   R1  a REVERSED order whose first clause is a bare fragment with its "?"
+#       dropped ("so, fair, and what is the annual fee?") -- round 5's, kept
+#       for round 5's reason ("for the Leeds office, what is ...?").
+#   R2  "... and fair?" / "... and good or bad?" after a bare "and" or "but":
+#       an adjective conjunct looks like "... and shipping?", another field.
+#       All 448 of the verifier's remaining rows are this class. The strict
+#       block's safety net answers these (7 of 8 live in round 5).
+#   R3  an imperative whose object has no determiner ("poke holes in the
+#       terms"), which looks like a noun phrase ("late fees in the
+#       contract"). Found by the held-out rows and left, not fitted.
 
 _AUX_WORDS = (
     r"(?:is|are|was|were|am|isn'?t|aren'?t|wasn'?t|weren'?t|do|does|did|don'?t|doesn'?t|"
@@ -852,11 +942,28 @@ _VALUE_HOW_RE = re.compile(
 _EMBEDDED_RE = re.compile(
     r"^(?:(?:[\w'-]+\s+){0,4}?whether|(?:[\w'-]+\s+){1,4}?if)\b\s*(?P<body>.*)$", re.I
 )
-#: An imperative aimed at a thing: a verb and then an object pronoun ("flag
-#: it", "sanity-check it", "send me"). A noun fragment is almost never
-#: followed by an object pronoun, which is what makes this a shape and not a
-#: verb list.
-_IMPERATIVE_RE = re.compile(r"^[a-z][\w-]*\s+(?:it|them|me|us|that|this|these|those)\b", re.I)
+#: An imperative aimed at a thing: a verb, then its object ("flag it", "assess
+#: the risk", "point out the weak spots", "look for anything unfair").
+#:
+#: Round 5 required an object PRONOUN, so the same ask with a NOUN object was
+#: invisible: the round-5 verifier's "... and assess the risk", "... and
+#: evaluate the terms", "... and flag any risks" and 15 more routed 160 of 160
+#: generated questions each to strict extraction alone, while "... and assess
+#: it" was answered. The object may now open with any determiner, quantifier,
+#: possessive or indefinite pronoun. What keeps a noun phrase ("the total",
+#: "in the contract") out is the first word, which must be open-class; what
+#: keeps "interest on the late payment" or "fees the supplier charges" (a
+#: noun, then a phrase) from counting as an ask is _imperative() below.
+_OBJECT_PRONOUN_RE = re.compile(r"^(?:it|them|me|us|that|this|these|those)$", re.I)
+_IMPERATIVE_RE = re.compile(
+    r"^(?P<verb>[a-z][\w-]*)"
+    r"(?:\s+(?:out|up|over|through|down|back|off))?"
+    r"(?:(?P<prep>(?:\s+(?:on|for|at|in|into|about|with|against|to)){1,2})\s+[\w$\u20ac\u00a3]"
+    r"|\s+(?P<obj>it|them|me|us|that|this|these|those|the|a|an|any|all|some|each|every|"
+    r"both|our|my|your|their|its|his|her|anything|everything|something|whether|why|how|"
+    r"what|where)\b)",
+    re.I,
+)
 #: Where one clause ends and the next begins. After "and / but / so / or" a
 #: new clause starts with a question, a request ("... and list the line
 #: items") or a first-person statement ("... but I need the total"); a noun
@@ -870,11 +977,103 @@ _ASK_START = (
 )
 _CLAUSE_SPLIT_RE = re.compile(
     r"(?P<q>\?)+|[!;]+|\.(?=\s|$)|\s[-–—]+\s|[–—]|,\s"
-    r"|\s+(?=(?:and|but|so|or|plus|also)\s+" + _ASK_START + r")",
+    r"|\s+(?=(?:and|but|so|or|plus|also)\s+" + _ASK_START + r")"
+    # A CAPITALISED question word inside the text starts a sentence even with
+    # the full stop missing: "Tell me if that's steep What is the annual
+    # fee?" (the round-5 verifier's run-on, 22 of 22 strict extraction alone).
+    # Case-sensitive on purpose -- lower-case "what" is often mid-sentence.
+    r"|(?-i:\s+(?=(?:What|When|Who|Whom|Whose|Which|Where|Why|How|Is|Are|Was|Were|Do|"
+    r"Does|Did|Can|Could|Would|Should|Will|Shall)\b))",
     re.I,
 )
+#: Discourse filler in front of a clause. "ok" / "okay" are NOT in it: they are
+#: also the judgement itself ("Okay for us?", "Ok to sign?"), and stripping
+#: them left "for us" and "to sign", which a field can answer -- the round-5
+#: verifier's "what is the annual fee in this contract? Okay for us?" routed
+#: strict extraction alone 8 of 8 live runs, each opening "I cannot determine
+#: if this is \"okay\"...". _strip_leading_filler() removes them only where
+#: they ARE filler.
 _LEADING_FILLER_RE = re.compile(
-    r"^(?:(?:and|but|so|or|plus|also|then|oh|well|ok|okay|please|just|now)\b[\s,]*)+", re.I
+    r"^(?:(?:and|but|so|or|plus|also|then|oh|well|please|just|now)\b[\s,]*)+", re.I
+)
+_OK_RE = re.compile(r"^(?:ok|okay)\b(?P<punct>\s*[,.;:!–—-]+)?\s*", re.I)
+#: A modal about the person's OWN action: "would we sign it?", "could I renew
+#: on these terms?". The residual cannot see these -- "sign", "renew", "pay"
+#: are words a page states facts with -- and the round-5 verifier's "Would we
+#: sign it?" beside a field routed strict extraction 64 of 64. "can / may /
+#: will / shall we" are left to the residual on purpose: "can we terminate
+#: early?" asks what the contract permits, which is a field.
+_OWN_ACTION_RE = re.compile(r"^(?:would|could|should|might|ought)(?:n'?t)?\s+(?:i|we)\b", re.I)
+#: "any / anything ..." is "is there any ..." with the question left off:
+#: "anything here that would stop you", "any red flags".
+_EXISTENTIAL_RE = re.compile(r"^(?:any|anything|anyone|anybody)\b", re.I)
+#: A calculation asked for: not a field the page prints. "calculated" is NOT
+#: here: "how is it calculated?" asks what the page says about a field, as
+#: "is it paid as a lump sum?" and "the sum insured" do.
+_COMPUTE_RE = re.compile(
+    r"(?<!lump )\bsum\b(?!\s+(?:insured|assured))"
+    r"|\b(?:sums|summed|summing|calculate|calculates|calculating|calculations?"
+    r"|compute|computes|computing|computation|multipl(?:y|ies|ied|ying)"
+    r"|subtract(?:s|ed|ing)?|difference\s+between|averages?|convert(?:s|ed|ing)?"
+    r"|add(?:s|ed|ing)?\s+(?:(?:it|them|these|those)\s+)?(?:up|together)|altogether|combined)\b"
+    r"|^\W*total\s+(?:up\s+)?(?:the|all|these|those|them|it)\b",
+    re.I,
+)
+#: A statement of the person's own VIEW: an attitude verb or noun ("that seems
+#: high to me", "our CFO thinks it's excessive", "my gut says ..."). See the
+#: F7 note in _open_asks().
+_ATTITUDE_WORDS = frozenset("""
+seem seems seemed feel feels felt feeling look looks looked sound sounds sounded think
+thinks thought believe believes reckon reckons suspect suspects guess fear fears doubt
+doubts gut instinct hunch impression unsure like strikes struck
+""".split())
+#: ... and what a view says when it is SETTLED: "short term this looks fine,
+#: but what is the term of the contract?" (a pinned battery row) states a view
+#: and asks for nothing. A word missing here makes a settled view count as an
+#: ask -- extract+advise, the cheap direction -- so this is the list that may
+#: be incomplete.
+_SETTLED_WORDS = frozenset("""
+fine ok okay good great standard normal typical usual clear correct right reasonable
+acceptable sensible solid straightforward simple accurate consistent complete
+""".split())
+#: ... and a view counts only when it JUDGES the thing asked about: a pronoun
+#: or a field noun, a copula or a perception verb, then an evaluative word --
+#: "that seems high", "it's too much", "the notice period is short", "we are
+#: overpaying", "feels like a lot" -- or an attitude noun with an adjective
+#: ("a bad feeling"). The first cut counted any attitude statement with a
+#: word left over: it cost 540 of 900 held-out context rows ("I think this is
+#: the final version"), and with a word list fitted to those it still cost 7
+#: of 10 statements written afterwards (1,260 of 1,800 generated field asks):
+#: "I think the supplier emailed it on Monday", "I suspect there's a second
+#: page", "it looks like an older layout". Those predicate an event, a thing
+#: or a noun phrase, not a quality of the value, and this shape does not match
+#: them; a second set written before this shape then kept 1,800 of 1,800. A
+#: view about the PAPER ("the scan is a bit blurry") has no pronoun or field
+#: subject and does not count either.
+_VIEW_PREDICATION_RE = re.compile(
+    r"(?:^|\b(?:it|that|this|they|these|those|we|i|(?:the|its|our|their|this|that)\s+"
+    r"(?P<np>(?:[\w-]+\s+){0,2}?[\w-]+)))"
+    r"(?:'s|\u2019s|'re|\u2019re|'m|\u2019m|\s+(?:is|are|am|was|were|be|seems?|seemed|"
+    r"feels?|felt|looks?|looked|sounds?|sounded|appears?))"
+    r"(?:\s+(?:too|very|quite|rather|pretty|really|so|way|far|overly|slightly|somewhat|"
+    r"super|extremely|being|like|a\s+bit|a\s+little|a\s+touch|kind\s+of|sort\s+of))*"
+    r"\s+(?P<pred>a\s+lot|a\s+bit\s+much|[a-z][\w-]*)\b"
+    r"|\b(?:a|my|our)\s+(?P<adj>[a-z][\w-]*)\s+(?:feeling|hunch|impression|sense|instinct)\b",
+    re.I,
+)
+_ATTITUDE_RE = re.compile(
+    r"^(?:[\w'-]+\s+){0,4}?(?:" + "|".join(sorted(_ATTITUDE_WORDS - {"like"})) + r")\b"
+    r"|\bnot\s+sure\b",
+    re.I,
+)
+#: A courtesy: "appreciate it", "love it", "thank you". Imperative-shaped, and
+#: asks nothing (the round-5 verifier: both lost strict extraction).
+_COURTESY_RE = re.compile(
+    r"^(?:(?:i|we)(?:'d|\s+would|\s+really|\s+do|\s+truly)?\s+)?"
+    r"(?:really\s+|truly\s+|greatly\s+|much\s+)?(?:appreciate[sd]?|love|thanks?)\b"
+    r"(?:\s+(?:it|that|this|you|u))?"
+    r"(?:\s+(?:a\s+lot|so\s+much|very\s+much|in\s+advance|loads|heaps|kindly|again))*\W*$",
+    re.I,
 )
 #: Verbs and frames that ask to be HANDED something. A clause with one of these
 #: and a field named outright is a field ask however it is phrased — "can you
@@ -908,7 +1107,7 @@ in on at of for to from by with within per about into onto across between after 
 during until till via as up out off down through throughout upon regarding against
 and or but nor so if whether then also plus
 what whats which who whom whose when where how
-please kindly thanks thank exactly precisely again now currently
+please kindly thanks thank exactly precisely again now currently key main
 """.split())
 
 #: What a document states ABOUT a field: when, how, by whom, in what form it
@@ -925,7 +1124,8 @@ non-refundable renewable renew renews auto-renew auto-renews net gross separatel
 separate annually monthly yearly quarterly weekly daily annual upfront advance arrears
 written printed attached named called start starts begin begins end ends expire expires
 terminate terminates calculated based set effective valid located found appear appears
-itemised itemized broken payee
+itemised itemized broken payee automatically automatic added early late immediately
+addressed sent received required requirement requirements
 """.split())
 
 #: A value, not a claim about one: numbers, currencies, units of time, months,
@@ -957,6 +1157,21 @@ put format show keep make present arrange sort sorted order table list bullet bu
 csv json markdown brief briefly short simple plain english copy paste group grouped
 """.split())
 
+#: Verbs that hand the document's content over, whatever else they do with it.
+#: An imperative's verb counts towards the residual (round 6: "assess the
+#: risk", "critique the pricing" -- judging IS the ask), so without this list
+#: "summarise the payment terms", "identify the parties to this agreement",
+#: "name the parties", "print the line items" -- field asks that took strict
+#: extraction on 57dcede -- went to extract+advise. This is the FIELD side's
+#: list: a verb missing from it sends a field ask to extract+advise, which
+#: costs a sentence. Verbs that also mean judging ("review", "check",
+#: "verify", "look into") are left out on purpose.
+_HANDOVER_VERBS = frozenset("""
+summarise summarize summary describe outline restate recap break breakdown highlight note
+mark underline bold identify locate spell detail name cite print grab display write repeat
+explain tabulate point pinpoint enumerate retrieve return output collect gather compile
+""".split())
+
 
 def _clauses(question: str) -> List[Tuple[str, bool]]:
     """The question's clauses, each with whether a "?" closed it."""
@@ -966,12 +1181,140 @@ def _clauses(question: str) -> List[Tuple[str, bool]]:
     for m in _CLAUSE_SPLIT_RE.finditer(text):
         piece = text[pos:m.start()]
         if piece.strip():
-            out.append((piece, bool(m.group("q"))))
+            out.extend(_with_closer(_split_conjoined_asks(piece), bool(m.group("q"))))
         pos = m.end()
     tail = text[pos:]
     if tail.strip():
-        out.append((tail, False))
+        out.extend(_with_closer(_split_conjoined_asks(tail), False))
     return out
+
+
+def _with_closer(pieces: List[str], closed_by_q: bool) -> List[Tuple[str, bool]]:
+    """Only the last of a run of conjoined clauses was closed by the "?"."""
+    return [(p, closed_by_q and i == len(pieces) - 1) for i, p in enumerate(pieces)]
+
+
+_CONJUNCTION_RE = re.compile(r"\s(?:and|but|then|plus|also|so)\s+", re.I)
+
+
+def _split_conjoined_asks(piece: str) -> List[str]:
+    """Split "<field ask> and <another ask>" where _CLAUSE_SPLIT_RE's regex
+    cannot tell a new ask from another noun: "... and assess the risk", "...
+    and I think it's steep", "... and not sure if that's fair". Round 5 split
+    after "and" only before a question word, a request verb or a pronoun
+    object, so with a bare " and " each of these rode inside the field clause
+    and was never tested (the verifier's forward "and"/"but" joins)."""
+    out: List[str] = []
+    start = 0
+    for m in _CONJUNCTION_RE.finditer(piece):
+        if m.start() >= start and _opens_a_new_ask(piece[m.end():]):
+            out.append(piece[start:m.start()])
+            start = m.end()
+    out.append(piece[start:])
+    return [p for p in out if p.strip()]
+
+
+def _opens_a_new_ask(text: str) -> bool:
+    """Whether the words after a conjunction begin a clause of their own."""
+    text = _strip_leading_filler(text.strip())
+    if _COURTESY_RE.match(text):
+        return False
+    if _OK_RE.match(text):
+        return True  # not stripped as filler, so the "ok" is the question
+    shape = _imperative(text)
+    if shape is not None:
+        return bool(shape[1])
+    return bool(
+        re.match(r"(?:i|we|i'm|im|we're|i'd|we'd|i've|we've)\b", text, re.I)
+        or _ATTITUDE_RE.match(text)
+        or _EMBEDDED_RE.match(text)
+        or _EXISTENTIAL_RE.match(text)
+    )
+
+
+def _strip_leading_filler(text: str, closed_by_q: bool = False) -> str:
+    """Drop discourse filler from the front of a clause, and "ok" / "okay"
+    only where they are filler: followed by punctuation ("Okay, what is the
+    tax?"), by a question of their own ("ok so what's the total"), or alone
+    and not asked ("ok"). "Okay for us?", "Ok to sign?" and a bare "okay?"
+    keep them -- there the word is the question."""
+    while True:
+        stripped = _LEADING_FILLER_RE.sub("", text)
+        ok = _OK_RE.match(stripped)
+        if not ok:
+            return stripped
+        rest = stripped[ok.end():]
+        if ok.group("punct") or (not rest.strip() and not closed_by_q) or (
+            rest.strip() and _opens_an_ask(_LEADING_FILLER_RE.sub("", rest))
+        ):
+            text = rest
+            continue
+        return stripped
+
+
+def _opens_an_ask(text: str) -> bool:
+    """Whether a clause begins with a question or a request of its own."""
+    lower = text.lower()
+    return bool(
+        re.match(_POLAR_START, lower) or re.match(_WH_START, lower)
+        or _EMBEDDED_RE.match(text) or _REQUEST_VERB_RE.match(text)
+        or _imperative(text) is not None
+    )
+
+
+def _judges_the_value(clause: str) -> bool:
+    """A statement of view whose predicate evaluates the value (see
+    _VIEW_PREDICATION_RE)."""
+    text = " " + _mask_ordinary_english(clause)
+    # Every word start, not finditer: "our CFO thinks it's excessive" first
+    # matches with "CFO thinks it" as the noun phrase, which hides "it's".
+    starts = [0] + [w.start() for w in re.finditer(r"\b\w", text)]
+    for m in filter(None, (_VIEW_PREDICATION_RE.match(text, i) for i in starts)):
+        word = m.group("adj") or m.group("pred")
+        np = m.group("np")
+        if np and not (_UNAMBIGUOUS_FIELD_RE.search(np) or _AMBIGUOUS_FIELD_RE.search(np)):
+            continue  # "the scan is a bit blurry": about the paper, not a value
+        if re.fullmatch(r"a\s+(?:lot|bit\s+much)", word, re.I):
+            return True
+        if [w for w in _residual(word) if w not in _ATTITUDE_WORDS and w not in _SETTLED_WORDS]:
+            return True
+    return False
+
+
+def _is_field_word(word: str) -> bool:
+    return any(rx.fullmatch(word) for rx in (_UNAMBIGUOUS_FIELD_RE, _AMBIGUOUS_FIELD_RE,
+                                             _DOC_WORD_RE))
+
+
+def _imperative(clause: str) -> Optional[Tuple[str, List[str]]]:
+    """(verb, residual) when the clause is a verb and its object, else None.
+
+    What counts towards the residual depends on how sure the shape is:
+
+      * a verb with a DIRECT object ("assess the risk", "critique the
+        pricing") -- the verb counts, like any other word: judging IS the ask;
+      * a verb with a PREPOSITION before its object ("comment on the
+        pricing", "look for anything unfair") -- only what follows counts,
+        because a noun takes the same shape ("interest on the late payment",
+        a field ask, leaves nothing);
+      * a FIELD word in the verb slot ("rate it out of 10", "total the line
+        items", "fees the supplier charges") -- the verb counts only before an
+        object pronoun, the one shape a noun almost never has.
+    """
+    m = _IMPERATIVE_RE.match(clause)
+    if not m:
+        return None
+    verb = m.group("verb").lower()
+    if verb in _CLOSED_CLASS or verb in _VALUE_WORDS or verb in _DOC_PART_WORDS:
+        return None
+    field_verb = _is_field_word(verb)
+    pronoun = bool(_OBJECT_PRONOUN_RE.match(m.group("obj") or ""))
+    if m.group("prep") or (field_verb and not pronoun):
+        return verb, _residual(clause[m.end("verb"):], imperative=True)
+    left = _residual(clause, imperative=True)
+    if field_verb:
+        left.insert(0, verb)
+    return verb, left
 
 
 def _residual(text: str, *, imperative: bool = False) -> List[str]:
@@ -988,7 +1331,8 @@ def _residual(text: str, *, imperative: bool = False) -> List[str]:
         if "'" in word:
             word = word.split("'", 1)[0]
         if (word in _CLOSED_CLASS or word in _FACT_WORDS or word in _VALUE_WORDS
-                or word in _DOC_PART_WORDS or (imperative and word in _FORMAT_WORDS)):
+                or word in _DOC_PART_WORDS
+                or (imperative and (word in _FORMAT_WORDS or word in _HANDOVER_VERBS))):
             continue
         left.append(word)
     return left
@@ -1041,8 +1385,17 @@ def _open_asks(question: str) -> List[Tuple[str, str]]:
     """
     found: List[Tuple[str, str]] = []
     for raw, closed_by_q in _clauses(question):
-        clause = _LEADING_FILLER_RE.sub("", raw.strip()).strip(" ,.")
-        if not clause:
+        clause = _strip_leading_filler(raw.strip(), closed_by_q).strip(" ,.")
+        if not clause or _COURTESY_RE.match(clause):
+            continue
+        if _COMPUTE_RE.search(_mask_ordinary_english(clause)):
+            found.append(("compute", clause))
+            continue
+        if _OK_RE.match(clause):
+            # An "ok" that survived the filler strip IS the question ("Okay
+            # for us?", "ok to sign, and what is the fee?"), with or without
+            # its question mark.
+            found.append(("ok", clause))
             continue
         lower = clause.lower()
         masked = _mask_ordinary_english(clause)
@@ -1052,8 +1405,9 @@ def _open_asks(question: str) -> List[Tuple[str, str]]:
         if strong and _REQUEST_VERB_RE.search(clause):
             found.extend(_asks_riding_on_a_field_clause(clause))
             continue
-        body, kind, imperative = clause, "", False
+        body, kind = clause, ""
         emb = _EMBEDDED_RE.match(clause)
+        imperative = _imperative(clause)
         if re.match(_WH_START, lower):
             if re.match(r"(?:(?:on|in|at|for|by|from|to|under|of|with)\s+)?why\b", lower):
                 found.append(("why", clause))
@@ -1069,6 +1423,9 @@ def _open_asks(question: str) -> List[Tuple[str, str]]:
             kind = "wh-value" if value_wh else "how"
         elif re.match(_POLAR_START, lower):
             kind = "polar"
+            if _OWN_ACTION_RE.match(lower):
+                found.append(("own-action", clause))
+                continue
             # "is there a late fee?", "does the contract state the fee?"
             if strong and re.match(r"(?:is|are|was|were)\s+there\b", lower):
                 found.extend(_asks_riding_on_a_field_clause(clause))
@@ -1078,23 +1435,43 @@ def _open_asks(question: str) -> List[Tuple[str, str]]:
             if re.match(_WH_START, body.lower()) and strong:
                 found.extend(_asks_riding_on_a_field_clause(clause))
                 continue
-        elif _IMPERATIVE_RE.match(clause):
+        elif imperative is not None:
             # No field skip here: a request verb with a field was skipped
             # above, and "sanity-check it against what the market charges"
             # carries a wh-frame ("what the market charges") without asking
             # for any field.
-            kind, imperative = "imperative", True
+            if _addresses_the_assistant(clause):
+                found.append(("imperative-to-assistant", clause))
+                continue
+            if imperative[1]:
+                found.append(("imperative", clause))
+                continue
+            if not closed_by_q:
+                continue
+            # "Alright for us?", "Fine by you?": a word + a preposition is an
+            # imperative only by shape; typed with a "?" it is as likely a
+            # fragment whose FIRST word is the question, so every word counts.
+            kind = "fragment"
+        elif _EXISTENTIAL_RE.match(clause):
+            kind = "existential"
         elif closed_by_q:
             kind = "fragment"
         elif _addresses_the_assistant(clause, possessive_only=True):
             found.append(("statement-to-assistant", clause))
+            continue
+        elif _ATTITUDE_RE.match(clause):
+            # F7 (round 6): "that seems high to me", "our CFO thinks it's
+            # excessive". A VIEW that judges the value asks for a reaction;
+            # a view about the paper or an event does not (_judges_the_value).
+            if _judges_the_value(clause):
+                found.append(("view", clause))
             continue
         else:
             continue  # a statement or a noun phrase: nothing is asked
         if _addresses_the_assistant(body):
             found.append((kind + "-to-assistant", clause))
             continue
-        left = _residual(body, imperative=imperative)
+        left = _residual(body)
         if left:
             found.append((kind, clause))
     return found
@@ -1342,8 +1719,17 @@ def _apply_precedence(
     # fields strictly and then an answer, exactly as a decision word would —
     # "what is the annual fee in this contract, and is that in line with the
     # market?" is the same question as "... and is that reasonable?".
-    if sig.mode == "extract" and sig.asks_beyond_fields:
+    judged = [(k, t) for k, t in sig.open_asks if k != "compute"]
+    if sig.mode == "extract" and judged:
         sig.mode = "extract+advise"
+        sig.evidence.extend(("open-ask-" + kind, text) for kind, text in sig.open_asks)
+    elif sig.mode == "extract" and sig.open_asks:
+        # Round 6: a CALCULATION asked beside a field ("what is the sum of the
+        # line items?", "add up the line items") is not a field the page
+        # prints, and the strict block now forbids arithmetic (see
+        # _STRICT_FIELDS). NEUTRAL answers it under BASE's rule: a figure you
+        # worked out is yours, with the arithmetic shown.
+        sig.mode = ""
         sig.evidence.extend(("open-ask-" + kind, text) for kind, text in sig.open_asks)
 
     # The rule above as a NET rather than as a hope. Nothing reaches it while

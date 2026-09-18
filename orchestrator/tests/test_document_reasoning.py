@@ -21,10 +21,10 @@ import pytest
 
 from app.engines import source_use
 from app.engines.document import run_pdf_engine_multi
-from tests.document_answer_grader import (cites_document, gives_recommendation,
-                                          opens_with_refusal, referral_only,
-                                          source_named_headings,
-                                          source_named_labels)
+from tests.document_answer_grader import (cites_document, explains_a_missing_field,
+                                          gives_recommendation, opens_with_refusal,
+                                          referral_only, source_named_headings,
+                                          source_named_labels, states_a_computation)
 
 #: The owner's question, exactly as he typed it (conversation
 #: b8b9202e-9966-40c5-8e3c-e3a8c8c881eb, 2026-09-17, Fast mode).
@@ -1920,3 +1920,508 @@ def test_both_judgement_halves_share_one_set_of_rules():
     for phrase in ("in line with the market", "reasonable?", "competitive"):
         assert phrase not in source_use._JUDGEMENT_RULES
         assert phrase not in source_use._ASKED_IS_ANSWERED
+
+
+# ---------------------------------------------------------------------------
+# ROUND 6: the shapes the round-5 clause test did not see (2026-09-18)
+#
+# The round-5 verifier's blind search (its own vocabulary, written before it
+# read the detector) left 3,690 of 31,200 judgement asks in strict extraction
+# alone on 57dcede (11.83%), and its targeted search found the shapes: an
+# imperative with a NOUN object ("... and assess the risk", 160 of 160 per
+# tail), "okay" stripped as filler ("Okay for us?"), a modal about the
+# person's own action whose verb is a fact word ("Would we sign it?", 64 of
+# 64), statements of view ("that seems high to me", 1,616 of 3,200). Every
+# test below that is about STRUCTURE runs with the decision vocabulary
+# switched off, so it can only pass on the shape; each one was proved by
+# deleting its rule and watching it fail (quoted per test).
+# ---------------------------------------------------------------------------
+
+_R6_ALL_TAILS = corpus.ROUND6_TAILS + corpus.ROUND6_HELD_OUT_TAILS
+
+
+@pytest.fixture()
+def vocabulary_off(monkeypatch):
+    monkeypatch.setattr(source_use, "_decision_evidence", lambda q: source_use._Decision())
+
+
+def test_the_round6_rows_are_judgement_asks_by_their_own_wording():
+    assert len(corpus.ROUND6_TAILS) >= 30 and len(corpus.ROUND6_HELD_OUT_TAILS) >= 25
+    every = [t for t, _, _ in _ALL_TAILS + _R6_ALL_TAILS]
+    assert len(set(every)) == len(every), "duplicate tail"
+    for tail, kind, because in _R6_ALL_TAILS:
+        assert kind in corpus.KINDS, (tail, kind)
+        assert because.lower() in tail.lower(), (tail, because)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # the verifier's F1 wordings: a noun object, every join
+        "what is the annual fee in this contract, and assess the risk",
+        "what is the annual fee in this contract and assess the risk",
+        "Extract the payment terms and assess the risk.",
+        "what is the annual fee in this contract - evaluate the terms",
+        "what is the annual fee in this contract but flag any risks",
+        "Highlight any concerns. What is the annual fee in this contract?",
+        "what is the annual fee in this contract; assess our exposure",
+        # a preposition before the object: only the object counts
+        "what is the annual fee in this contract, and comment on the pricing",
+        "what is the annual fee in this contract and check for hidden costs",
+        # a field word in the verb slot, before an object pronoun
+        "what is the annual fee in this contract, and rate it out of 10",
+    ],
+)
+def test_an_imperative_with_any_object_beside_a_field_is_not_extraction_alone(
+    vocabulary_off, question
+):
+    """F1. Proved: with _IMPERATIVE_RE's object cut back to round 5's object
+    pronouns, every noun-object row here routes "extract"; with
+    _split_conjoined_asks() returning the piece unsplit, the bare-"and" rows
+    and "Extract the payment terms and assess the risk." route "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence, signals.open_asks)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "summarise the payment terms",
+        "identify the parties to this agreement",
+        "name the parties to the contract",
+        "print the line items",
+        "describe the termination clause",
+        "what is the invoice total, and summarise the line items",
+        "list the line items and put them in a table",
+        "sort the line items by price",
+    ],
+)
+def test_an_imperative_that_hands_a_field_over_is_still_a_field_ask(question):
+    """The cost side of F1: a verb that HANDS the content over is not a
+    judgement. All of these took strict extraction on 57dcede. Proved: with
+    _HANDOVER_VERBS emptied, the first six route "extract+advise"."""
+    assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee in this contract? Okay for us?",
+        "what is the annual fee in this contract? Ok to sign?",
+        "what is the annual fee in this contract and okay for us?",
+        "okay for us, and what is the annual fee in this contract?",
+        "what is the annual fee in this contract? Okay?",
+        "what is the annual fee in this contract? Alright for us?",
+    ],
+)
+def test_an_ok_that_is_the_question_is_not_stripped_as_filler(vocabulary_off, question):
+    """F2. Live on 57dcede, "... Okay for us?" routed strict extraction and 8
+    of 8 runs opened "I cannot determine if this is \"okay\"". Proved: with
+    "ok|okay" put back into _LEADING_FILLER_RE and _strip_leading_filler()
+    reduced to it, the first five rows route "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence, signals.open_asks)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Okay, what is the invoice total?",
+        "ok so what's the due date?",
+        "ok what is the notice period",
+        "what is the invoice total? ok",
+        "okay - and the due date?",
+    ],
+)
+def test_an_ok_that_is_filler_still_is(question):
+    """The other side of F2: an "ok" followed by punctuation, by a question
+    of its own, or standing alone unasked is filler, and a field ask stays
+    strict."""
+    assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee in this contract? Would we sign it?",
+        "what is the annual fee in this contract, and could we renew on these terms?",
+        "what is the notice period - might we be charged less elsewhere?",
+        "what is the invoice total? would I pay that?",
+    ],
+)
+def test_a_modal_about_the_persons_own_action_is_not_a_field_ask(vocabulary_off, question):
+    """F3: "sign", "renew", "pay", "charged" are fact words, so the residual
+    of "would we sign it?" is empty. Proved: with _OWN_ACTION_RE made to match
+    nothing, every row routes "extract" (64 of 64 for the verifier's wording
+    on 57dcede)."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence, signals.open_asks)
+    assert ("own-action", signals.open_asks[0][1]) == signals.open_asks[0]
+
+
+def test_can_we_is_left_to_the_residual_on_purpose():
+    """"can we terminate early?" asks what the termination clause permits,
+    which the page states; "would we" asks what the person should do. A
+    DECISION, recorded: the round-5 verifier listed "can we terminate?" and
+    "are we covered?" among its fact-word judgement tails, and routing "can /
+    are we + fact verb" away from strict would also take "can we pay in
+    euros?" and "are we invoiced annually?" with it."""
+    for question in ("what is the notice period, and can we terminate early?",
+                     "what are the payment terms, and can we pay in euros?",
+                     "what is the annual fee in this contract? are we invoiced annually?"):
+        assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee in this contract, that seems high to me",
+        "what is the annual fee in this contract and our CFO thinks it's excessive",
+        "Our CFO thinks it's excessive. What is the annual fee in this contract?",
+        "what is the annual fee in this contract, and I have a bad feeling about it",
+        "what is the invoice total - feels like a lot",
+    ],
+)
+def test_a_statement_of_view_beside_a_field_asks_for_a_reaction(vocabulary_off, question):
+    """F7, decided: a VIEW stated beside a field ask ("that seems high to me")
+    asks for a reaction, and strict extraction alone cannot give one; 1,616
+    of 3,200 of the verifier's statement rows took it on 57dcede. Proved: with
+    the view branch of _open_asks() removed, every row routes "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence, signals.open_asks)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "short term this looks fine, but what is the term of the contract?",
+        "what is the annual fee in this contract? looks fine to me",
+        "it looks standard, but what is the invoice total?",
+        "we got this invoice yesterday. what is the invoice total?",
+    ],
+)
+def test_a_settled_view_or_plain_context_is_not_an_ask(question):
+    """The cost side of F7. A settled view asks for nothing, and plain
+    context has no view in it. Proved: with _SETTLED_WORDS emptied, the first
+    three route "extract+advise" (the first is a pinned battery row)."""
+    assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee in this contract, and anything unusual in it",
+        "any red flags, and what is the invoice total?",
+    ],
+)
+def test_an_is_there_with_the_is_there_left_off_is_still_asked(vocabulary_off, question):
+    """"anything unusual in it" is "is there anything unusual in it?". Proved:
+    with _EXISTENTIAL_RE made to match nothing, both route "extract"."""
+    assert source_use.question_mode(question) == "extract+advise", source_use.classify(question)
+
+
+def test_a_capitalised_question_word_starts_a_sentence_without_its_full_stop(vocabulary_off):
+    """The verifier's run-on ("? " joining a tail that had no "?"). Proved:
+    with the case-sensitive alternative removed from _CLAUSE_SPLIT_RE, this
+    routes "extract"."""
+    question = "Tell me if that's steep What is the annual fee in this contract?"
+    assert source_use.question_mode(question) == "extract+advise", source_use.classify(question)
+    # lower case is not a sentence start: this stays one clause, one field ask
+    assert source_use.question_mode("tell me what is the invoice total") == "extract"
+
+
+# --- F4: the three round-5 mutants that survived every test -----------------
+
+
+@pytest.mark.parametrize("follow", ["is it quoted per unit?", "is it per seat?",
+                                    "is that per user?", "is it charged per device?"])
+def test_a_pricing_basis_is_a_value_for_every_field_head(follow):
+    """F4, mutant 1: the round-5 bar was ">= 95% of 4,460", which the
+    pricing bases' removal passed. This is exact, per follow-up and head.
+    Proved: with "unit units seat seats user users ... pieces" removed from
+    _VALUE_WORDS, every head fails for every row."""
+    lost = [h for h in corpus.FIELD_HEADS
+            if source_use.question_mode(h + "? " + follow) != "extract"]
+    assert not lost, (follow, lost[:5])
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the invoice total, and I wonder if that's steep",
+        "what is the annual fee in this contract - curious whether that's normal",
+    ],
+)
+def test_the_embedded_ask_is_the_only_rule_that_sees_these(vocabulary_off, question):
+    """F4, mutant 2: the embedded "if / whether" shape. Neither row has a
+    polar, wh, imperative, view or fragment shape of its own. Proved: with
+    _EMBEDDED_RE made to match nothing, both route "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence)
+    assert signals.open_asks and signals.open_asks[0][0] == "embedded", signals.open_asks
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the invoice total, and why is the tax amount so high?",
+        "why is the late fee 5%?",
+    ],
+)
+def test_a_why_about_a_named_field_is_not_a_field_ask(vocabulary_off, question):
+    """F4, mutant 3: the "why" rule. A why-question that names a field is a
+    value-wh with a field in it, so without the rule it rides the field
+    clause and asks nothing. Proved: with the rule removed, both route
+    "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals.evidence)
+    assert ("why" in [k for k, _ in signals.open_asks]), signals.open_asks
+
+
+# --- F5 and the field side ----------------------------------------------------
+
+
+@pytest.mark.parametrize("follow", corpus.ROUND6_FACT_FOLLOW_UPS)
+def test_a_fact_follow_up_or_a_courtesy_keeps_every_field_head_strict(follow):
+    """F5: "is there a grace period?" and "does it renew automatically?" lost
+    strict extraction 192 of 1,440 times on 57dcede, and "appreciate it" /
+    "love it" were read as imperatives. Proved: without "grace period" in the
+    field lexicon, without "automatically" in _FACT_WORDS, without
+    "auto[- ]?renewal", or without _COURTESY_RE, the matching rows fail for
+    every head."""
+    lost = []
+    for head, join in itertools.product(corpus.FIELD_HEADS, (", and ", "? ", " - ", ". ")):
+        question = head + join + follow
+        if source_use.question_mode(question) != "extract":
+            lost.append(question)
+    assert not lost, lost[:5]
+
+
+@pytest.mark.parametrize("head", corpus.ROUND6_UNREACHED_FIELD_HEADS)
+def test_the_natural_contract_heads_now_reach_strict_extraction(head):
+    """Nine natural field heads reached no strict block on 57dcede; these five
+    are contract fields the lexicon simply lacked. Proved: without the
+    round-6 field names each routes "" (neutral). The other four are left by
+    design: "what does the SLA promise for uptime" and "what does the quote
+    say for installation" are the "what does X say" shape, which is neutral
+    on purpose; "how many days do we have to cure a breach" carries the
+    decision phrase "do we have to"."""
+    assert source_use.question_mode(head + "?") == "extract", source_use.classify(head + "?")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the sum of the line items?",
+        "add up the line items",
+        "total the line items",
+        "how much do the line items add up to?",
+        "what is the difference between the subtotal and the total?",
+    ],
+)
+def test_a_calculation_is_not_a_field_and_never_reaches_the_strict_block(question):
+    """F6's other half. The strict block now forbids arithmetic in the fields,
+    so a calculation the person ASKED for must not land there and be refused.
+    It goes to NEUTRAL, where BASE says a worked-out figure is yours, with the
+    arithmetic shown. Proved: with _COMPUTE_RE made to match nothing, every
+    row routes "extract" or "extract+advise"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "", (question, signals.evidence, signals.open_asks)
+    system = source_use.system_text(question)
+    assert "EXTRACTION QUESTION" not in system and "ANSWER THE QUESTION AND STOP" in system
+
+
+def test_how_it_is_calculated_is_still_a_fact_about_the_field():
+    """The cost side of the compute route: these ask what the page SAYS about
+    a field. Proved: with the lookarounds on "sum" removed from _COMPUTE_RE,
+    the lump-sum row routes "" (neutral)."""
+    for question in ("what is the late fee and how is it calculated?",
+                     "what is the annual fee? is VAT added?",
+                     "what is the annual fee, and is it paid as a lump sum?"):
+        assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+def test_the_compute_route_only_ever_leaves_extraction_for_neutral():
+    """A compute ask may send a field question to NEUTRAL, never to strict
+    extraction, and it does not override a judgement asked beside it."""
+    ask = [("compute", "add up the line items")]
+    judged = ask + [("polar", "is that in line with the market?")]
+    for field, score, held in itertools.product(range(6), repeat=3):
+        d = source_use._Decision(score=score, held=held)
+        only = source_use._apply_precedence(field, d, open_asks=ask)
+        both = source_use._apply_precedence(field, d, open_asks=judged)
+        assert only.mode != "extract" and both.mode != "extract", (field, score, held)
+        if source_use._apply_precedence(field, d).mode == "extract":
+            assert only.mode == "" and both.mode == "extract+advise"
+
+
+# --- the round-6 search and the field side, over the whole corpus -----------
+
+#: What the round-6 search may still leave in strict extraction alone, with
+#: the decision vocabulary off. Both classes are documented in source_use
+#: (step 4, "ROUND 6"). R1 is round 5's: a REVERSED order whose first clause
+#: is a bare fragment with its "?" removed ("so, fair, and what is the annual
+#: fee?"). R3 is new and was found by the held-out rows: an imperative whose
+#: object has no determiner ("poke holes in the terms") looks like a noun
+#: phrase ("late fees in the contract"), and it was left, not fitted.
+_R6_R1_FRAGMENT_TAILS = frozenset({"so, fair?", "well, too high?", "so, a good price?"})
+_R6_R3_BARE_OBJECT_TAILS = frozenset({"poke holes in the terms"})
+
+
+def test_no_round6_tail_rides_a_field_ask_into_strict_extraction_on_structure_alone(
+    vocabulary_off,
+):
+    """30 field heads x 61 round-6 tails (34 dev, 27 held out) x 10 joins x
+    both orders = 36,600 questions, decision vocabulary OFF. Measured: 27,510
+    in strict extraction alone on 57dcede; 1,380 at this commit, all inside
+    R1 (810) and R3 (570). The held-out tails were first measured on the
+    finished detector at 840 of 16,200 with the vocabulary ON (8,130 on
+    57dcede)."""
+    total, outside, residual = 0, [], 0
+    for head, (tail, _, _), join in itertools.product(corpus.FIELD_HEADS, _R6_ALL_TAILS,
+                                                      corpus.JOINS):
+        for direction, question in (("fwd", head + join + tail),
+                                    ("rev", tail.rstrip("?") + join + head + "?")):
+            total += 1
+            if source_use.question_mode(question) != "extract":
+                continue
+            if (direction == "rev" and tail in _R6_R1_FRAGMENT_TAILS and join != "? ") or (
+                tail in _R6_R3_BARE_OBJECT_TAILS
+            ):
+                residual += 1
+            else:
+                outside.append(question)
+    assert total == 36_600, total
+    assert not outside, f"{len(outside)} new holes, e.g. {outside[:5]}"
+    assert residual <= 1_380, residual
+
+
+def _pure_field_asks():
+    asks = [h + "?" for h in corpus.FIELD_HEADS + corpus.ROUND6_UNREACHED_FIELD_HEADS]
+    follows = (corpus.FACT_FOLLOW_UPS + corpus.HELD_OUT_FACT_FOLLOW_UPS
+               + corpus.ROUND6_FACT_FOLLOW_UPS + corpus.ROUND6_HELD_OUT_FACT_FOLLOW_UPS)
+    for head, follow, join in itertools.product(corpus.FIELD_HEADS, follows,
+                                                (", and ", "? ", " - ", ". ")):
+        asks.append(head + join + follow)
+    for (a, b), join in itertools.product(corpus.FIELD_PAIRS, corpus.JOINS):
+        asks.append(a + join + b)
+    contexts = (corpus.ROUND6_CONTEXT + corpus.ROUND6_HELD_OUT_CONTEXT
+                + corpus.ROUND6_FRESH_CONTEXT + corpus.ROUND6_FRESH_CONTEXT_2)
+    for head, context, join in itertools.product(corpus.FIELD_HEADS, contexts,
+                                                 (". ", ", ", " - ")):
+        said = context[0].upper() + context[1:]
+        asks += [said + join + head + "?", head + "? " + said + "."]
+    return asks
+
+
+def test_pure_field_asks_stay_strict_with_every_round6_rule_in_place():
+    """The bar: at least 97% of pure field asks keep strict extraction. The
+    set is 12,375 asks: the round-5 set, the round-6 fact follow-ups
+    (including "is there a grace period?" and "does it renew
+    automatically?") and courtesies, and four sets of context statements,
+    two of them written to attack the view rule. Measured at this commit:
+    12,375 of 12,375. First measurements, recorded because they are what
+    changed the code: the held-out fact follow-ups kept 1,080 of 1,440
+    ("does it roll over automatically?", "is there a notice requirement?",
+    "who is it addressed to?" -- field-lexicon gaps, now in it); the first
+    view rule kept 360 of 900 held-out context rows, and with an exemption
+    list fitted to those it still kept only 540 of 1,800 on a fresh set, so
+    it was replaced by the predication shape, which then kept 1,800 of 1,800
+    on a second set written before it."""
+    asks = _pure_field_asks()
+    assert len(asks) == 12_375, len(asks)
+    lost = [q for q in asks if source_use.question_mode(q) != "extract"]
+    kept = len(asks) - len(lost)
+    assert kept >= 0.97 * len(asks), f"{kept}/{len(asks)} strict; lost e.g. {lost[:8]}"
+
+
+def test_the_view_rule_costs_no_context_statement():
+    """F7's cost, pinned at what it measured: 0 of 3,600 generated field asks
+    beside the two fresh context sets ("I think the supplier emailed it on
+    Monday", "looks like the scan is a bit blurry") leave strict extraction.
+    Proved: with _judges_the_value() replaced by the first cut (any word left
+    over once attitude and settled words are removed), 480 of the first
+    set's 600 and 540 of the second's 600 leave it."""
+    lost = []
+    for head, context in itertools.product(
+        corpus.FIELD_HEADS, corpus.ROUND6_FRESH_CONTEXT + corpus.ROUND6_FRESH_CONTEXT_2
+    ):
+        said = context[0].upper() + context[1:]
+        for question in (said + ". " + head + "?", head + "? " + said + "."):
+            if source_use.question_mode(question) != "extract":
+                lost.append(question)
+    assert not lost, lost[:5]
+
+
+# --- F6: a strict answer shows no working and explains no missing field -----
+
+#: Real answers from the round-5 verifier's live runs on the itemised tax-free
+#: invoice (INVOICE_WITHOUT_TAX), strict extraction, Fast. The first states a
+#: sum that is false on its own terms (2 x 1,000.00 + 1 x 4,200.00 is
+#: 6,200.00, not 5,200.00).
+_PADDED_WITH_A_FALSE_SUM = (
+    "**Total:** 5,200.00 USD (from the invoice)\n\n**Tax Amount:** Not stated in the "
+    "document\n\nThe invoice lists a total of 5,200.00 USD but does not provide a separate "
+    "line item for tax, nor does it specify a tax rate or amount. The total appears to be "
+    "the sum of the line items (2 x 1,000.00 + 1 x 4,200.00 = 5,200.00), suggesting either "
+    "no tax was applied, tax is included in the unit prices, or the tax amount is zero. "
+    "Without a specific tax line or rate mentioned, the exact tax amount cannot be "
+    "determined from the document."
+)
+_PADDED = (
+    "**Total:** 5,200.00 USD (from the invoice)\n\n**Tax Amount:** Not stated in the "
+    "document. The invoice lists a total of 5,200.00 USD but does not provide a separate "
+    "line item for tax, nor does it specify if tax is included in the line items or the "
+    "total."
+)
+_CLEAN = "**Total:** 5,200.00 USD\n**Tax Amount:** not stated in the document"
+
+
+def test_the_computation_grader_sees_the_false_sum_and_nothing_in_a_clean_answer():
+    assert states_a_computation(_PADDED_WITH_A_FALSE_SUM) == ["2 x 1", "000.00 + 1", "= 5"]
+    assert states_a_computation(_PADDED) == []
+    assert states_a_computation(_CLEAN) == []
+    # a date is not arithmetic, and neither is a field quoted with its unit
+    assert states_a_computation("**Due:** 2026-09-01\n**Rack:** 42U, qty 2") == []
+
+
+def test_the_explanation_grader_sees_padding_and_not_the_field_line():
+    assert len(explains_a_missing_field(_PADDED_WITH_A_FALSE_SUM)) == 3
+    assert explains_a_missing_field(_PADDED) == [
+        "The invoice lists a total of 5,200.00 USD but does not provide a separate line "
+        "item for tax, nor does it specify if tax is included in the line items or the total."
+    ]
+    assert explains_a_missing_field(_CLEAN) == []
+    # a clean contract answer that quotes a clause is not an explanation
+    assert explains_a_missing_field(
+        "**Parties:** Northwind Group Ltd and Acme Racks Ltd\n**Notice:** 90 days written "
+        "notice (Clause 11)") == []
+
+
+def test_the_strict_block_forbids_working_and_talk_about_a_missing_field():
+    """F6. BASE tells every answer to "show the arithmetic" for a figure it
+    worked out and to say the document is silent "in ONE line after" the
+    answer; on the itemised tax-free invoice the strict block obeyed both,
+    live: 4 of 8 answers on 57dcede added a sentence about the missing tax,
+    and a verifier run stated a false sum. The block now overrides both for
+    the fields. Live with this text, Fast, 16 runs over two batches: 0
+    computations, 0 explanations, the total in 16 of 16, the tax "not
+    stated" in 16 of 16 (an earlier wording that banned arithmetic in the
+    whole answer measured the same over 16; it was scoped to the fields so
+    that extract+advise, which shares this text, can still reason with
+    numbers). Proved: with the two sentences removed the prompt assertions
+    below fail, and the live test re-measures the behaviour."""
+    q = "I need the total from this invoice and the tax amount"
+    assert source_use.question_mode(q) == "extract"
+    system = source_use.system_text(q)
+    assert "NO ARITHMETIC IN THE FIELDS" in system
+    assert "copy every figure exactly as printed" in system
+    assert "for the fields, this overrides the permission above to show your arithmetic" in system
+    assert "say nothing more about a missing field anywhere in the answer" in system
+    # the strict text is shared with extract+advise, and it binds the fields
+    # only there too: the judgement half may still work with the numbers
+    both = source_use.system_text("what is the annual fee, and is that reasonable?")
+    assert "NO ARITHMETIC IN THE FIELDS" in both
+    assert "The strict rules above bind the FIELDS only" in both
+    # the rule names no failing wording: the model copies what a prompt quotes
+    assert "=" not in source_use._STRICT_FIELDS and " x " not in source_use._STRICT_FIELDS
