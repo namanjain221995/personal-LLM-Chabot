@@ -50,7 +50,8 @@ with the main model (the vision model on this deployment) and `gather` takes
 the text through `image_texts`, exactly like a document's: its pipe tables
 become upload tables, the text becomes `uploads_text`. `image_turn` makes the
 turn a create FROM the upload, and an image nothing could be read from is
-never replaced by the previous answer (main.py says so in one sentence).
+never replaced by the previous answer: main.py says so in one sentence, unless
+the words carry a brief of their own (`settle_image_turn`).
 """
 from __future__ import annotations
 
@@ -60,6 +61,7 @@ import csv
 import dataclasses
 import datetime as _dt
 import io
+import itertools
 import logging
 import os
 import re
@@ -388,25 +390,62 @@ IMAGE_READ_PROMPT = (
     "You transcribe images for a file builder. Copy the text in the image exactly as printed: every character, "
     "digit, comma, unit and code. Write each table as a GitHub Markdown pipe table: its header row, the separator "
     "row, then one row per printed row, with the same columns in the same order. Never merge, split, add or total "
-    "columns or rows. Put any other text (a title, a note) on plain lines above or below its table. Where one "
-    "character cannot be read, write ? in its place. Write nothing else: no commentary, no code fences. If no text "
-    "in the image can be read, answer exactly NO_READABLE_TEXT"
+    "columns or rows. Write a | that is printed inside a cell as \\|. Put any other text (a title, a note) on plain "
+    "lines above or below its table. Where one character cannot be read, write ? in its place. Write nothing else: "
+    "no commentary, no code fences. If no text in the image can be read, answer exactly NO_READABLE_TEXT"
 )
 NO_READABLE_TEXT = "NO_READABLE_TEXT"
-#: One read, per image. The table photo took 4.8-7.1 s; a dense page is a
-#: few thousand tokens at ~100 tokens/s, and the engine is shared.
-IMAGE_READ_DEADLINE_S = 60.0
+#: All the reads of one turn. The engine is shared, and a read is decoded at
+#: whatever the load leaves it: live 2026-09-18 with 12-14 requests running,
+#: a 10-pupil x 31-day register (975 output tokens) took 145.4 s, about 6.7
+#: tokens/s, so the first bound here (60 s, set on an idle engine where the
+#: 230-token stock table took 4.8-7.1 s) failed both live register turns as
+#: "send it again", and a resend meets the same load (2026-09-19, 6 running:
+#: the same read in 37.1 s). 300 s covers a 20-pupil register (1,681 tokens)
+#: at 6.7 tokens/s; the stream keeps its heartbeat while the turn waits, and
+#: a hung call is still cut here.
+IMAGE_READ_DEADLINE_S = 300.0
 _IMAGE_READ_CONCURRENCY = 2
 
 _DATA_URL_MIME_RE = re.compile(r"^data:image/([\w.+-]+);base64,", re.I)
 _IMAGE_MAGIC = ((b"\xff\xd8\xff", "jpg"), (b"\x89PNG", "png"), (b"GIF8", "gif"), (b"RIFF", "webp"), (b"BM", "bmp"))
 _FENCE_LINE_RE = re.compile(r"^[ \t]*```[\w-]*[ \t]*$", re.M)
+#: "answer sheet", "answer key": a thing printed on paper, not the earlier answer.
+_NOT_THE_ANSWER = r"(?!\s+(?:sheet|key|book|booklet|script|card|grid|box)s?\b)"
+#: "the last table IN THIS PHOTO" is the photo's table (QA r1c, 2026-09-19:
+#: it kept the export, and the previous answer's table sat beside the photo's).
+_NOT_IN_THE_ATTACHMENT = (r"(?!\s+(?:in|on|from|of|inside|within)\s+(?:this|these|that|the|my)\s+(?:attached\s+)?"
+                          r"(?:photo|image|picture|pic|screenshot|scan|attachment)s?\b)")
+_SOURCE_NOUN = rf"(?:answer|response|reply|message|table|output|summary){_NOT_THE_ANSWER}{_NOT_IN_THE_ATTACHMENT}"
 #: Words that make the conversation's earlier answer the source even with an
 #: image attached: "put your previous answer into excel", "the table above".
+#: QA 2026-09-18 (5a6c6c5): a bare "above" and "this chat" anywhere sent
+#: "make an excel from this photo, keep the header row above the data" and
+#: "turn this chat screenshot into a word document" to the previous answer,
+#: 3 of 3 live runs. So "above" counts only beside the noun ("the table
+#: above", "the above answer", not "above the data"), and a "table above" that
+#: goes on into a layout ("the totals table above the details") does not.
 _ANSWER_SOURCE_RE = re.compile(
-    r"\b(?:your\s+(?:\w+\s+)?(?:answer|response|reply|table|summary)"
-    r"|(?:previous|last|earlier|above)\s+(?:\w+\s+)?(?:answer|response|reply|message|table|output)"
-    r"|(?:the|that)\s+answer|(?:the\s+)?above|(?:this|our|the)\s+(?:chat|conversation))\b",
+    rf"\b(?:your\s+(?:\w+\s+)?{_SOURCE_NOUN}"
+    rf"|(?:previous|last|earlier)\s+(?:\w+\s+)?{_SOURCE_NOUN}"
+    rf"|above\s+{_SOURCE_NOUN}"
+    r"|(?:answer|response|reply|table|output)\s+above(?!\s+(?:the|a|an|all|each|every|it|them|this|that|its|their)\b)"
+    rf"|(?:the|that)\s+answer{_NOT_THE_ANSWER}{_NOT_IN_THE_ATTACHMENT}"
+    r"|(?:this|our|the)\s+(?:chat|conversation)(?!\s+(?:screenshot|screen\s*shot|photo|image|picture|pic|snap)s?\b))\b",
+    re.I,
+)
+#: The attachment named by the words: then it is read even when the earlier
+#: answer is named too ("make an excel from this photo and your last answer").
+_NAMES_ATTACHMENT_RE = re.compile(
+    r"\b(?:photo|image|picture|pic|screenshot|screen\s*shot|snap|scan|attached|attachment)s?\b", re.I
+)
+#: A source the words turn DOWN is not named: "an excel of this photo, not
+#: the answer" built "Regional Sales" from the previous answer, 0 of 36 stock
+#: cells, live on 5a6c6c5.
+_NEGATED_SOURCE_RE = re.compile(
+    r"(?:\b(?:not|never|no|without|instead\s+of|rather\s+than|other\s+than|ignor(?:e|ing))|n['’]t\s+(?:use|want|need|include|take))"
+    r"\s+(?:(?:from|using|use|with|in|on|of)\s+)?(?:the|your|that|this|these|our|my|any)?\s*(?:\w+\s+)?"
+    r"(?:answer|response|reply|table|summary|output|message|photo|image|picture|pic|screenshot|scan|attachment)s?\b",
     re.I,
 )
 
@@ -444,15 +483,18 @@ def image_turn(intent: Optional[I.ArtifactIntent], text: str, formats: Sequence[
     previous answer whenever one exists (`rule=export-followup`, measured on
     4810da0 with and without upload_formats=['jpg']), and "this" can only be
     the attachment. So a create or an export becomes a create FROM the
-    upload, unless the words name the earlier answer. An edit keeps its
-    target and reads the image; a convert re-renders a stored file and reads
-    nothing."""
+    upload, unless the words name the earlier answer. Then the export stays,
+    and the image is read beside the answer only when the words name the
+    image too. When the rules themselves chose the upload as the source, it
+    is the source. An edit keeps its target and reads the image; a convert
+    re-renders a stored file and reads nothing."""
     if intent is None or not intent.wants_file or intent.action == "convert":
         return intent, False
     if intent.action == "edit":
         return intent, True
-    if _ANSWER_SOURCE_RE.search(text or ""):
-        return intent, False
+    words = _NEGATED_SOURCE_RE.sub(" ", text or "")
+    if _ANSWER_SOURCE_RE.search(words) and intent.target != "upload":
+        return intent, bool(_NAMES_ATTACHMENT_RE.search(words))
     return dataclasses.replace(intent, action="create", target="upload", new_artifact=True,
                                upload_refs=[str(f) for f in formats][:5], rule=f"{intent.rule}+image"), True
 
@@ -465,9 +507,103 @@ def _readable_text(raw: str) -> str:
     # Only "?" and table rules left: no character was read.
     if not re.search(r"[^\W_]", text.replace(NO_READABLE_TEXT, "")):
         return ""
+    return "" if _looped(text) else text
+
+
+_ROW_RE = re.compile(r"^\s*\|")
+_CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+
+
+def _looped(text: str) -> bool:
+    """Whether the transcript is the model looping, with prose and table
+    rows judged apart.
+
+    `ocr.is_degenerate` over a whole transcript counts unique tokens, and an
+    honest P/A attendance register is almost all "|", "P" and "A": live on
+    5a6c6c5 (QA, 2026-09-18) three complete reads of a legible 10-pupil x
+    31-day register scored 0.077-0.078 against its 0.08 floor, a flawless
+    20-pupil one 0.054, and all were refused as unreadable. A table loops in
+    its own ways, each checked here: one row repeated back to back for most
+    of the table (the prose rule's 8 lines and 40%), a row far wider than its
+    header, or a cell that is itself a loop."""
     from ..engines.ocr import is_degenerate
 
-    return "" if is_degenerate(text) else text
+    lines = text.splitlines()
+    if is_degenerate("\n".join(ln for ln in lines if not _ROW_RE.match(ln))):
+        return True
+    rows: List[str] = []
+    cells: set = set()
+    width, in_table = 0, False
+    for ln in lines:
+        if not _ROW_RE.match(ln):
+            in_table = False
+            continue
+        parts = _CELL_SPLIT_RE.split(ln.strip().strip("|"))
+        if not in_table:
+            width, in_table = len(parts), True  # a table's first row is its header
+        elif len(parts) > 2 * width + 8:
+            return True
+        cells.update(p.strip() for p in parts)
+        # A run of blank rows is a form's empty lines, not a loop.
+        if re.search(r"[^\W_]", ln):
+            rows.append(" ".join(ln.split()))
+    run = max((sum(1 for _ in g) for _, g in itertools.groupby(rows)), default=0)
+    if len(rows) >= 8 and run >= 0.4 * len(rows):
+        return True
+    return any(is_degenerate(c) for c in cells if len(c) > 1)
+
+
+def _rejoin_split_cells(md: str) -> str:
+    """The transcript with a "|" printed inside a cell put back in its cell.
+
+    The read prompt asks for such a "|" as "\\|", and live on the invoice
+    photo (2026-09-19, 2 of 2 reads) the model still wrote the cell
+    "+CMD|' /C calc'!A0" as `| +CMD| /C calc!A0 |`; `tables_from_markdown`
+    kept "+CMD" and dropped the rest. The model spaces the pipes BETWEEN
+    cells (" | ", every table read that day), so in a row wider than its
+    header a pipe with text hard against it is the printed one. Spaced extra
+    cells are the model's own extra columns (the live register reads had 1-5
+    in every row) and are left as they were: no "|" in them was printed."""
+    lines = md.split("\n")
+    width = 0
+    for i, ln in enumerate(lines):
+        if "|" in ln and i + 1 < len(lines) and md_import._TABLE_SEP_RE.match(lines[i + 1]):
+            head = _CELL_SPLIT_RE.split(_row_inner(ln))
+            spaced = all(_spaced(head[k], head[k + 1]) for k in range(len(head) - 1))
+            width = len(head) if spaced else 0
+            continue
+        if not width or md_import._TABLE_SEP_RE.match(ln):
+            continue
+        if not ln.strip() or "|" not in ln:
+            width = 0
+            continue
+        parts = _CELL_SPLIT_RE.split(_row_inner(ln))
+        while len(parts) > width and not parts[-1].strip():
+            parts.pop()
+        extra = len(parts) - width
+        tight = [k for k in range(len(parts) - 1)
+                 if parts[k].strip() and parts[k + 1].strip() and not _spaced(parts[k], parts[k + 1])]
+        if extra <= 0 or not tight or len(tight) > extra:
+            continue
+        merged = [parts[0]]
+        for k in range(1, len(parts)):
+            if k - 1 in tight:
+                merged[-1] += "\\|" + parts[k]
+            else:
+                merged.append(parts[k])
+        lines[i] = "|" + "|".join(merged) + "|"
+    return "\n".join(lines)
+
+
+def _row_inner(line: str) -> str:
+    s = line.strip()
+    s = s[1:] if s.startswith("|") else s
+    return s[:-1] if s.endswith("|") and not s.endswith("\\|") else s
+
+
+def _spaced(left: str, right: str) -> bool:
+    """Whether the pipe between these two cells has space on both sides."""
+    return left[-1:].isspace() and right[:1].isspace()
 
 
 @dataclass
@@ -542,16 +678,122 @@ async def read_images_text(images: Sequence[str], names: Optional[Sequence[str]]
     return out
 
 
-def image_refusal(intent: Optional[I.ArtifactIntent], reading: Optional[ImageReading], *, has_documents: bool) -> str:
+#: A brief the words carry without the photo: "a flyer FOR the grand opening
+#: of Rosa's Bakery", "a deck ABOUT coral reef conservation".
+_TOPIC_RE = re.compile(
+    r"\b(?:for|about|on|announcing|promoting|advertising|inviting|celebrating|introducing|explaining)\s+([^.,;:!?\n]+)", re.I
+)
+#: ...unless that topic lies IN the photo: "for the class 7B marks in this
+#: photo", or on the paper it shows: "for the expenses in the receipt" was a
+#: brief on the first cut, so an unreadable receipt went on from the
+#: conversation, whose previous answer then filled the file.
+_IN_THE_PHOTO_RE = re.compile(
+    r"\b(?:in|on|from|of|inside|within)\s+(?:this|these|that|those|the|my)\s+(?:attached\s+)?"
+    r"(?:photo|image|picture|pic|screenshot|scan|attachment|receipt|bill|invoice|register|sheet|page|document|doc|"
+    r"notes?|whiteboard|board|form|table|list|menu|label|slip|statement|chart|printout|letter|notice|ledger|notebook|"
+    r"paper|report)s?\b", re.I
+)
+#: The photo as an ingredient of the file, not its source: "using this photo",
+#: "with the attached picture as the cover", "put this image on the front".
+_PHOTO_AS_INGREDIENT_RE = re.compile(
+    r"\b(?:using|use|with|add|adding|include|including|put|place|insert)\s+(?:this|these|the|my)\s+(?:attached\s+)?"
+    r"(?:photo|image|picture|pic|logo|screenshot)s?\b", re.I
+)
+#: Words that point at the attachment as the thing to turn into the file.
+_POINTS_AT_ATTACHMENT_RE = re.compile(
+    r"\b(?:this(?!\s+(?:week|weekend|month|year|morning|afternoon|evening|night|season|quarter|term|semester|summer|winter|"
+    r"spring|autumn|fall|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b)|these|attached|here)\b", re.I
+)
+_PHOTO_WORDS_RE = re.compile(
+    r"\b(?:photos?|images?|pictures?|pics?|screenshots?|scans?|scanned|attached|attachments?|tables?|registers?|sheets?|"
+    r"lists?|data|these|those|them|here|from|using|use|on|at|by)\b", re.I
+)
+
+
+def words_carry_a_subject(text: str) -> bool:
+    """Whether the words make a file by themselves when the photo has no text.
+
+    QA 2026-09-18: "make a one-page PDF flyer for the grand opening of Rosa's
+    Bakery on 5 October, 8am to 2pm, 20% off all pastries, using this photo",
+    with a photo of pastries, was made 3 of 3 times on 4810da0 and refused 3
+    of 3 on 5a6c6c5. A count of content words cannot tell that brief from a
+    description of the photo ("convert this bank statement to excel with one
+    row per transaction and a running balance" has 6), so the test is the
+    photo's ROLE: the words carry a topic of their own (for/about/on + two
+    content words, not located in the photo), and once "using this photo" is
+    taken out nothing still points at the attachment as the thing to convert."""
+    low = str(text or "")
+    if _POINTS_AT_ATTACHMENT_RE.search(_PHOTO_AS_INGREDIENT_RE.sub(" ", low)):
+        return False
+    for m in _TOPIC_RE.finditer(low):
+        topic = m.group(1)
+        if _IN_THE_PHOTO_RE.search(topic):
+            continue
+        if len(I._FUNCTION_WORDS_RE.sub(" ", _PHOTO_WORDS_RE.sub(" ", topic.lower())).split()) >= 2:
+            return True
+    return False
+
+
+#: A spreadsheet holds data, and a photo attached to a spreadsheet request
+#: is that data, never decoration: "make an excel for the September expenses
+#: using this photo" reads as a brief by its words alone.
+_SHEET_FORMATS = frozenset({"xlsx", "csv"})
+_SHEET_WORDS_RE = re.compile(r"\b(?:excel|xlsx|xls|csv|spread\s*sheets?|work\s*books?)\b", re.I)
+
+
+def photo_is_decoration(intent: Optional[I.ArtifactIntent], text: str) -> bool:
+    """Whether the words are the file's brief and the attached photo only an
+    ingredient of it (`words_carry_a_subject`), which a spreadsheet never is."""
+    if intent is None:
+        return False
+    formats = {str(f).lower() for f in (intent.formats or [])}
+    if formats and formats <= _SHEET_FORMATS:
+        return False
+    if not formats and _SHEET_WORDS_RE.search(text or ""):
+        return False
+    return words_carry_a_subject(text)
+
+
+def image_refusal(intent: Optional[I.ArtifactIntent], reading: Optional[ImageReading], *, has_documents: bool,
+                  text: str = "") -> str:
     """The sentence that REPLACES the file, or "" when the turn goes on.
 
-    Only a create whose whole material was the image stops here: with
-    nothing read, the job would be built from the previous answer, which is
-    the defect. An attached document is still material, and an edit is made
-    from its artifact, so both go on with the unread image as a note."""
-    if reading is None or reading.texts or has_documents or intent is None or intent.action != "create":
+    Only a create made FROM the image stops here, and only when nothing was
+    read, no attached document resolved (`has_documents` is what resolved,
+    not what the request named), and the photo was the source, not an
+    ingredient of a brief in the words: with nothing read the job would be
+    built from the previous answer, which is the defect. An attached
+    document is still material, an export of a named answer and an edit have
+    their own, and a brief (`photo_is_decoration`) makes its file with the
+    unread photo as a note."""
+    if reading is None or reading.texts or has_documents or intent is None:
+        return ""
+    if intent.action != "create" or intent.target != "upload" or photo_is_decoration(intent, text):
         return ""
     return reading.refusal()
+
+
+def settle_image_turn(intent: Optional[I.ArtifactIntent], reading: Optional[ImageReading], *, text: str,
+                      has_documents: bool) -> Tuple[Optional[I.ArtifactIntent], str]:
+    """(the intent to build with, the refusal sentence or "") once the
+    attached images were read and the turn's document references resolved.
+
+    A photo that is only an ingredient of a brief in the words
+    (`photo_is_decoration`) does not make the file FROM the upload: the file
+    is made from the conversation, as it was before the photo came, and
+    whatever the photo showed joins it. Read or not: with target "upload"
+    and no image text, `gather` pulls the conversation's earlier documents
+    in instead; with image text, the photo alone was the material and the
+    conversation was hidden (QA r1b, 2026-09-18: a brief's topic demoted).
+    Otherwise a create from an image nothing was read from ends in the
+    refusal sentence."""
+    refusal = image_refusal(intent, reading, has_documents=has_documents, text=text)
+    if refusal or intent is None or reading is None:
+        return intent, refusal
+    if intent.action == "create" and intent.target == "upload" and photo_is_decoration(intent, text):
+        intent = dataclasses.replace(intent, target="conversation", upload_refs=intent.upload_refs if reading.texts else [],
+                                     rule=f"{intent.rule}+brief")
+    return intent, ""
 
 
 def unreadable_image_line(count: int = 1, *, failed: bool = False) -> str:
@@ -642,7 +884,8 @@ async def gather(
                 # Read like a markdown upload: the transcript's pipe tables
                 # are the rows the file is built from, copied by code.
                 out.upload_names.append(str(name))
-                tables = await asyncio.to_thread(tables_from_markdown, str(body or ""), id_prefix="upload",
+                body = _rejoin_split_cells(str(body or ""))
+                tables = await asyncio.to_thread(tables_from_markdown, body, id_prefix="upload",
                                                  source_id="upload_image", start=len(out.upload_tables) + 1)
                 for k, t in enumerate(tables, 1):
                     if re.fullmatch(r"Table \d+", t.title):  # no heading above it: say whose table it is
@@ -929,4 +1172,6 @@ def to_material_dict(g: GatheredInput) -> Dict[str, Any]:
 __all__ = ["GatheredInput", "gather", "previous_answer", "tables_from_markdown", "read_xlsx", "read_csv_bytes",
            "pdf_tables_approximate", "to_material_dict", "dataset_uploads", "wants_conversation_datasets",
            "DATASET_EXTENSIONS", "PREVIOUS_ANSWER_MAX_CHARS", "MAX_UPLOAD_ROWS", "image_names", "image_turn",
-           "ImageReading", "read_images_text", "image_refusal", "unreadable_image_line", "UNREADABLE_IMAGE_LINE", "IMAGE_READ_PROMPT"]
+           "ImageReading", "read_images_text", "image_refusal", "settle_image_turn", "words_carry_a_subject",
+           "photo_is_decoration",
+           "unreadable_image_line", "UNREADABLE_IMAGE_LINE", "IMAGE_READ_PROMPT"]

@@ -19,6 +19,19 @@ renderer stubbed and the model call that reads the image stubbed at
    previous answer: the turn says so in one sentence and opens no job;
 4. words that name the earlier answer keep the export (the image is not
    read), and a question about an image still goes to the vision engine.
+
+ROUND 2 (QA, 2026-09-18, against 5a6c6c5), pinned at the end of this file:
+an honest repetitive table is not a model loop; "above", "the answer" and
+"this chat" inside words about the photo do not hand the turn to the previous
+answer; a brief in the words makes its file when the photo has no text; the
+refusal is decided on the documents that RESOLVED; the transcript is never
+stored and at most two reads run at once.
+
+REPAIR ROUND 1 (2026-09-19), at the end: a source noun located IN the photo
+("the last table in this photo") names the photo; a brief keeps the
+conversation even when its photo is read; the paper the words name, or a
+spreadsheet request, is never a brief; a "|" printed inside a cell stays in
+its cell, and extra cells the model added are not joined into one.
 """
 from __future__ import annotations
 
@@ -28,6 +41,7 @@ import hashlib
 import io
 import json
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -472,3 +486,340 @@ def test_an_engine_error_on_the_image_read_makes_no_file_either(capture, monkeyp
         final, tokens = _turn(client, composer, "make this table into an excel file", conv="img-engine-down")
     assert "artifacts" not in final and seen == {}
     assert tokens == material_in.unreadable_image_line(1, failed=True)
+
+
+# ------------------------------------------ round 2: QA's mutation guards --
+
+
+def test_an_image_transcript_is_never_written_to_the_document_store(capture, reader, monkeypatch):
+    """The store is pinned into every later turn as "documents the user
+    uploaded"; a model's reading of a photo is not one. No builder test
+    pins this: dropping "image" from the skip list stays green there."""
+    composer, _seen = capture
+    from app import db
+
+    saved: list = []
+    real = db.save_document
+
+    def spy(conversation_id, filename, text, total_pages=0):
+        saved.append(filename)
+        return real(conversation_id, filename, text, total_pages)
+
+    monkeypatch.setattr(db, "save_document", spy)
+    with TestClient(app) as client:
+        final, _tokens = _turn(client, composer, "make this table into an excel file", conv="qa-docstore")
+    assert final.get("artifacts")
+    assert not [n for n in saved if n.startswith("image")], saved
+
+
+def test_five_images_one_hanging_keeps_the_four_and_honours_the_deadline(monkeypatch):
+    from app.artifacts import material_in
+
+    seen = {"n": 0, "peak": 0, "live": 0}
+
+    async def completion(messages, **kwargs):
+        seen["n"] += 1
+        seen["live"] += 1
+        seen["peak"] = max(seen["peak"], seen["live"])
+        try:
+            if seen["n"] == 3:
+                await asyncio.sleep(30)
+            await asyncio.sleep(0.01)
+            return TABLE_MD
+        finally:
+            seen["live"] -= 1
+
+    monkeypatch.setattr(llm, "chat_completion", completion)
+    t0 = time.monotonic()
+    got = asyncio.run(material_in.read_images_text([IMG] * 5, deadline_s=0.5))
+    took = time.monotonic() - t0
+    assert took < 2.0, took
+    assert len(got.texts) == 4 and got.failed == 1 and got.total == 5
+    assert seen["peak"] <= 2, "at most two reads at a time on the shared engine"
+
+
+# ------------------------------------ round 2: an honest table is no loop --
+
+
+#: A 12-pupil P/A register: the shape the QA fixture was, rows mostly "P".
+_REGISTER = "\n".join(
+    ["| No | Name | " + " | ".join(str(d) for d in range(1, 32)) + " |", "|" + "---|" * 33]
+    + [f"| {i} | Pupil {chr(64 + i)} | " + " | ".join("A" if (i * d) % 11 == 0 else "P" for d in range(1, 32)) + " |"
+       for i in range(1, 13)]
+)
+_HDR = "| Code | Item | Qty |\n|---|---|---|\n"
+
+
+@pytest.mark.parametrize("text", [
+    _REGISTER,
+    # A printed form's empty lines are blank rows back to back, not a loop.
+    "Visitor log\n\n| Name | Time | Sign |\n|---|---|---|\n| Asha | 9:10 | AS |\n| Ravi | 9:40 | RK |\n" + "|  |  |  |\n" * 20,
+], ids=["register", "form-with-blank-rows"])
+def test_an_honest_repetitive_table_is_read_not_refused_as_a_loop(text):
+    assert material_in._readable_text(text) == text.strip()
+
+
+@pytest.mark.parametrize("text", [
+    _HDR + "| A1 | bolt | 1 |\n| A2 | nut | 2 |\n" + "| A3 | washer | 3 |\n" * 30,
+    _HDR + "| A1 | bolt | 1 |\n| A2 |" + " P |" * 3000,
+    _HDR + "| A1 | " + "M8 " * 400 + "| 1 |\n| A2 | nut | 2 |",
+    "Stock count\n" + "nije " * 200 + "\n\n" + _HDR + "| A1 | bolt | 1 |",
+], ids=["one-row-repeated", "a-row-far-wider-than-its-header", "a-looping-cell", "looping-prose-beside-a-table"])
+def test_a_table_that_loops_is_still_unreadable(text):
+    assert material_in._readable_text(text) == ""
+
+
+# ------------------------- round 2: words that name the photo or the answer --
+
+
+@pytest.mark.parametrize("words", [
+    "make an excel from this photo and your previous answer",
+    "put your previous answer into excel, and add the table in the attached image",
+])
+def test_the_photo_named_beside_the_answer_is_read_and_the_export_is_kept(words):
+    from app.artifacts import intent as I
+
+    intent = I.ArtifactIntent("export", formats=["xlsx"], target="previous_answer", rule="export-followup")
+    out, reads = material_in.image_turn(intent, words, ["jpg"])
+    assert out is intent and reads is True
+
+
+@pytest.mark.parametrize("words", [
+    "put your previous answer into excel, not this photo",
+    "put your previous answer in excel and ignore the photo",
+])
+def test_a_photo_the_words_turn_down_is_not_read(words):
+    from app.artifacts import intent as I
+
+    intent = I.ArtifactIntent("export", formats=["xlsx"], target="previous_answer", rule="export-followup")
+    assert material_in.image_turn(intent, words, ["jpg"]) == (intent, False)
+
+
+@pytest.mark.parametrize("words", [
+    "make an excel of this, don't use the previous answer",
+    "keep the totals table above the details and make this an excel",
+    "make the answer key in this scan into a word doc",
+])
+def test_a_negated_answer_or_a_layout_above_leaves_the_photo_the_source(words):
+    from app.artifacts import intent as I
+
+    intent = I.ArtifactIntent("export", formats=["xlsx"], target="previous_answer", rule="export-followup")
+    out, reads = material_in.image_turn(intent, words, ["jpg"])
+    assert reads is True and (out.action, out.target) == ("create", "upload")
+
+
+def test_an_upload_the_rules_chose_as_the_source_is_read_whatever_else_is_named():
+    """QA: 'convert the attached image to excel with the totals row above the
+    details' was already target=upload at the gate, the image was not read,
+    and gather pulled the conversation's earlier documents in instead."""
+    from app.artifacts import intent as I
+
+    intent = I.ArtifactIntent("create", formats=["xlsx"], target="upload", rule="create")
+    out, reads = material_in.image_turn(intent, "convert the attached image to excel like the table above", ["jpg"])
+    assert reads is True and (out.action, out.target) == ("create", "upload")
+
+
+def test_the_photo_and_the_named_answer_both_reach_the_material(capture, reader):
+    composer, seen = capture
+    calls, _state = reader
+    with TestClient(app) as client:
+        final, _tokens = _turn(client, composer, "make an excel from this photo and your previous answer", conv="img-both")
+    assert final.get("artifacts")
+    assert [c["has_image"] for c in calls] == [True]
+    assert _table(seen["material"], HEADER) is not None, "the photo's table"
+    assert _table(seen["material"], ["Region", "Sales"]) is not None, "and the answer's"
+
+
+# ----------------------------- round 2: a brief in the words, a photo with no text --
+
+
+@pytest.mark.parametrize("words", [
+    "make a one-page PDF flyer for the grand opening of Rosa's Bakery on 5 October, 8am to 2pm, 20% off all pastries, using this photo",
+    "create a presentation about coral reef conservation using this image",
+    "make a pdf report on our Q3 sales with this photo as the cover",
+    "make a birthday invitation for Maya's 6th birthday party on Saturday at 4pm with this photo",
+    "make a flyer for this Saturday's grand opening using the attached photo",
+    "make an invitation for Maya's party. Put this photo on the front",
+])
+def test_a_brief_in_the_words_carries_its_own_subject(words):
+    assert material_in.words_carry_a_subject(words) is True
+
+
+@pytest.mark.parametrize("words", [
+    "make this table into an excel file",
+    "make this attendance register into an excel file",
+    "make an excel file from this photo",
+    "turn this receipt from Sharma Hardware Store in Pune into a spreadsheet with a total",
+    # Six content words, and all of them describe the photo.
+    "convert this bank statement to excel with one row per transaction and a running balance",
+    "make an excel for the class 7B marks in this photo",
+    "make this register for 5 October into an excel file",
+    "make an excel for my accountant from this photo",
+    "put this in an excel for me",
+])
+def test_words_about_the_photo_carry_no_subject_of_their_own(words):
+    assert material_in.words_carry_a_subject(words) is False
+
+
+def test_settle_goes_on_from_the_conversation_only_on_a_brief():
+    from app.artifacts import intent as I
+
+    nothing = material_in.ImageReading(notes=["image.jpg: no text in it could be read, so it was not used."], total=1)
+    create = I.ArtifactIntent("create", formats=["pdf"], target="upload", rule="create+image")
+    brief = "make a flyer for the grand opening of Rosa's Bakery using this photo"
+    out, refusal = material_in.settle_image_turn(create, nothing, text=brief, has_documents=False)
+    assert refusal == "" and (out.action, out.target, out.upload_refs) == ("create", "conversation", [])
+    out, refusal = material_in.settle_image_turn(create, nothing, text="make this table into an excel file", has_documents=False)
+    assert out is create and refusal == material_in.UNREADABLE_IMAGE_LINE
+    assert material_in.settle_image_turn(create, nothing, text="make this table into an excel file", has_documents=True) == (create, "")
+    # A photo that WAS read is still only an ingredient of the brief: the
+    # file is made from the conversation, the photo's text beside it.
+    read = material_in.ImageReading(texts=[("image.jpg", TABLE_MD)], total=1)
+    create_read = I.ArtifactIntent("create", formats=["pdf"], target="upload", upload_refs=["jpg"], rule="create+image")
+    out, refusal = material_in.settle_image_turn(create_read, read, text=brief, has_documents=False)
+    assert refusal == "" and (out.action, out.target, out.upload_refs) == ("create", "conversation", ["jpg"])
+    source = I.ArtifactIntent("create", formats=["xlsx"], target="upload", rule="create+image")
+    assert material_in.settle_image_turn(source, read, text="make this table into an excel file", has_documents=False) == (source, "")
+
+
+def test_a_brief_with_a_text_free_photo_is_made_from_the_words_not_exported(capture, reader):
+    """With a previous answer in the conversation the rules read the flyer
+    brief as an export of it ('export-followup-handover', because of 'this
+    photo'). A photo with no text must not hand the file back to that answer."""
+    composer, seen = capture
+    _calls, state = reader
+    state["reply"] = "NO_READABLE_TEXT"
+    with TestClient(app) as client:
+        final, tokens = _turn(
+            client, composer,
+            "make a one-page PDF flyer for the grand opening of Rosa's Bakery on 5 October, 8am to 2pm, "
+            "20% off all pastries, using this photo",
+            conv="img-brief-history",
+        )
+    assert "couldn't read" not in tokens
+    assert final.get("artifacts") and seen["operation"] == "create"
+    notes = seen["material"].get("notes") or []
+    assert not any("previous answer into the file" in n for n in notes), "not an export of the previous answer"
+    assert any(n.startswith("image.jpg: no text") for n in notes), "the unread photo is said"
+
+
+# --------------------------- round 2: what resolved, not what was referenced --
+
+
+def test_an_unreadable_photo_beside_a_swept_upload_gets_the_sentence_and_no_job(capture, reader, monkeypatch):
+    composer, seen = capture
+    _calls, state = reader
+    state["reply"] = "NO_READABLE_TEXT"
+
+    async def resolved(request, conv):
+        return [], [], "stock.csv is no longer available on the server — please re-attach it."
+
+    monkeypatch.setattr(app_main, "_resolve_document_refs", resolved)
+    with TestClient(app) as client:
+        final, tokens = _turn(client, composer, "make this table into an excel file", conv="img-swept",
+                              pdf_uploads=[{"upload_id": "0" * 32, "name": "stock.csv"}])
+    assert "artifacts" not in final and seen == {}
+    assert tokens == material_in.UNREADABLE_IMAGE_LINE
+
+
+# ------------------------------------------------- round 2: a "|" in a cell --
+
+
+def test_the_read_asks_for_a_printed_pipe_escaped_and_the_cell_stays_whole():
+    """QA: the cell "+CMD|' /C calc'!A0" was stored as '+CMD' — the prompt
+    never asked for the escape the table reader already honours."""
+    assert "\\|" in material_in.IMAGE_READ_PROMPT
+    md = "| Code | Formula |\n|---|---|\n| X1 | +CMD\\|' /C calc'!A0 |"
+    got = asyncio.run(material_in.gather(history=[], image_texts=[("image.jpg", md)], save_documents=False))
+    assert got.upload_tables[0].rows == [["X1", "+CMD|' /C calc'!A0"]]
+
+
+def test_the_read_deadline_outlasts_a_dense_table_on_a_loaded_engine():
+    """Live 2026-09-18, 12-14 requests running: 975 output tokens in 145.4 s
+    (6.7 tokens/s per stream). A 60 s bound failed both live register turns
+    with "send it again". The 20-pupil register is 1,681 tokens."""
+    assert material_in.IMAGE_READ_DEADLINE_S * 6.7 >= 1681
+
+
+# ------------------------------------- repair round 1 (2026-09-19) --
+
+
+@pytest.mark.parametrize("words", [
+    "create a spreadsheet from the last table in this photo",
+    "make an excel of your table in the attached image",
+])
+def test_a_source_noun_located_in_the_photo_names_the_photo_not_the_answer(capture, reader, words):
+    """QA r1c: "the last table in this photo" matched "last ... table", so
+    the export of the previous answer was kept and its Region/Sales table
+    sat in the material beside the photo's."""
+    composer, seen = capture
+    calls, _state = reader
+    with TestClient(app) as client:
+        final, _tokens = _turn(client, composer, words, conv="img-last-table")
+    assert [c["has_image"] for c in calls] == [True]
+    assert final.get("artifacts")
+    assert _table(seen["material"], HEADER) is not None, "the photo's table is the material"
+    assert _table(seen["material"], ["Region", "Sales"]) is None, "not the previous answer's table"
+
+
+@pytest.mark.parametrize("words", [
+    "make an excel for the expenses in the receipt",
+    "make an excel for the expenses on the bill",
+    "make a word document for the minutes on the whiteboard",
+    # A spreadsheet request: the photo is its data, whatever the words say.
+    "make an excel for the September expenses using this photo",
+    "make a spreadsheet for tracking the September expenses using this photo",
+])
+def test_an_unreadable_photo_of_the_papers_the_words_name_is_refused_not_filled_from_the_answer(capture, reader, words):
+    """The first cut read each of these as a brief of its own, so with an
+    unreadable photo the file went on from the conversation, and the
+    conversation's previous answer filled it: the B8b defect."""
+    composer, seen = capture
+    _calls, state = reader
+    state["reply"] = "NO_READABLE_TEXT"
+    with TestClient(app) as client:
+        final, tokens = _turn(client, composer, words, conv="img-paper-unread")
+    assert "artifacts" not in final and seen == {}, "no file from the previous answer"
+    assert tokens == material_in.UNREADABLE_IMAGE_LINE
+
+
+def test_a_brief_with_a_readable_photo_keeps_the_conversation_and_adds_the_photo(capture, reader):
+    """QA r1b: every create became a create FROM the photo, so a brief whose
+    photo had text lost the conversation's material (the previous answer's
+    tables were dropped) and was made from the photo alone."""
+    composer, seen = capture
+    _calls, state = reader
+    state["reply"] = "Rosa's Bakery\nFresh bread since 1998"
+    with TestClient(app) as client:
+        final, tokens = _turn(
+            client, composer,
+            "make a one-page PDF flyer for the grand opening of Rosa's Bakery on 5 October, 8am to 2pm, "
+            "20% off all pastries, using this photo",
+            conv="img-brief-read",
+        )
+    assert final.get("artifacts") and "couldn't read" not in tokens
+    material = seen["material"]
+    assert "Fresh bread since 1998" in (material.get("uploads_text") or ""), "the photo's text joins the material"
+    assert _table(material, ["Region", "Sales"]) is not None, "the conversation's material is kept for a brief"
+
+
+def test_a_pipe_printed_inside_a_cell_stays_in_its_cell():
+    """Live 2026-09-19, the invoice photo, 2 of 2 reads: the model wrote the
+    cell "+CMD|' /C calc'!A0" as `| +CMD| /C calc!A0 |` although the prompt
+    asks for "\\|", and the table kept "+CMD", the rest dropped unsaid."""
+    md = ("Invoices due\n\n| Code | Supplier | Amount | Link |\n|---|---|---|---|\n"
+          "| INV-303 | Cobalt Co | 455 | @SUM(1,2) |\n| INV-304 | Delta Inc | 990 | +CMD| /C calc!A0 |\n"
+          "| INV-305 | Echo Ltd | 12 | x | |")
+    got = asyncio.run(material_in.gather(history=[], image_texts=[("image.jpg", md)], save_documents=False))
+    rows = got.upload_tables[0].rows
+    assert rows[1] == ["INV-304", "Delta Inc", "990", "+CMD| /C calc!A0"]
+    assert rows[0] == ["INV-303", "Cobalt Co", "455", "@SUM(1,2)"] and rows[2] == ["INV-305", "Echo Ltd", "12", "x"]
+
+
+def test_extra_cells_the_model_added_are_not_joined_into_one():
+    """The live register reads (2026-09-19) had 1-5 extra spaced cells in
+    every row: the model's own extra columns, not a printed "|". A first
+    cut joined them into the last cell ("P | P | A | P")."""
+    md = "| No | Name | 1 | 2 |\n|---|---|---|---|\n| 1 | Asha | P | A | P | P |\n| 2 | Ravi | P | P |"
+    got = asyncio.run(material_in.gather(history=[], image_texts=[("image.jpg", md)], save_documents=False))
+    assert got.upload_tables[0].rows == [["1", "Asha", "P", "A"], ["2", "Ravi", "P", "P"]]

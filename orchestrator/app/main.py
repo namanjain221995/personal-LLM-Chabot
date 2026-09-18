@@ -5672,7 +5672,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # one exists; with a photo attached "this" is the photo, so
             # `image_turn` makes it a create from the upload.
             _as3_image_read = None
-            _as3_image_refusal = ""
             if (
                 request.images_data
                 and artifact_intent is not None
@@ -5688,27 +5687,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 if _as3_img_is_material:
                     await emit("status", {"text": "Reading the attached image…"})
                     _as3_image_read = await _as3_img_material.read_images_text(request.images_data, _as3_img_names)
-                    _as3_image_refusal = _as3_img_material.image_refusal(
-                        artifact_intent, _as3_image_read, has_documents=bool(request.pdf_uploads or request.pdf_data)
-                    )
 
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
-            elif _as3_image_refusal:
-                # Nothing in the attached image could be read and it was the
-                # whole material. A file built from the previous answer
-                # instead is the defect this branch exists to stop, so no job
-                # is opened and one sentence, written by code, says why. Like
-                # any file request it is not a fact.
-                if fact_task is not None and not fact_task.done():
-                    fact_task.cancel()
-                memory_state.pop("facts", None)
-                answer = _as3_image_refusal
-                await emit("token", {"text": answer})
-                await emit("meta", {"route": "artifact", "effort": request.effort})
             elif artifact_intent is not None and artifact_intent.wants_file:
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
                 # "create a PDF of this", "make a deck for the board", "make
@@ -5748,43 +5732,73 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _as3_docs, _as3_images, _as3_doc_err = await _resolve_document_refs(request, conv_key)
                     if _as3_doc_err:
                         await emit("status", {"text": _as3_doc_err})
-                _as3_gathered = await _as3_material.gather(
-                    history=history, pdf_uploads=_as3_docs,
-                    pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
-                    intent=artifact_intent, text=text,
-                    image_texts=_as3_image_read.texts if _as3_image_read is not None else (),
-                )
+                # B8b: decided once the references have RESOLVED. A reference to an
+                # upload that is gone is not material: with `has_documents` read off the
+                # request, a swept upload beside an unreadable photo sent no refusal and
+                # the file was built from the previous answer's table (QA 2026-09-18).
+                _as3_image_refusal = ""
                 if _as3_image_read is not None:
-                    _as3_gathered.notes.extend(n for n in _as3_image_read.notes if n not in _as3_gathered.notes)
-                _as3_engine_kw: dict = {}
-                _as3_history = list(history)
-                import inspect as _as3_inspect
-
-                if "gathered" in _as3_inspect.signature(artifact_engine.run_artifact_engine).parameters:
-                    _as3_engine_kw["gathered"] = _as3_gathered
+                    artifact_intent, _as3_image_refusal = _as3_material.settle_image_turn(
+                        artifact_intent, _as3_image_read, text=text, has_documents=bool(_as3_docs)
+                    )
+                if _as3_image_refusal:
+                    # Nothing in the attached image could be read and it was the whole
+                    # material. A file built from the previous answer instead is the
+                    # defect, so no job is opened and one sentence, written by code,
+                    # says why.
+                    gen.waiting_on_job = False
+                    answer = _as3_image_refusal
+                    await emit("token", {"text": answer})
+                    await emit("meta", {"route": "artifact", "effort": request.effort})
                 else:
-                    if artifact_intent.action == "export" and _as3_gathered.previous_answer_turn_index is not None:
-                        # The engine exports the LAST assistant turn: hand it
-                        # the history that ends at the substantial answer.
-                        _as3_history = _as3_history[: _as3_gathered.previous_answer_turn_index + 1]
-                    if _as3_gathered.uploads_text:
-                        _as3_history.append({"role": "user", "content": "Attached this turn:\n" + _as3_gathered.uploads_text[:48_000]})
-                answer = await artifact_engine.run_artifact_engine(
-                    text,
-                    _as3_history,
-                    emit,
-                    intent=artifact_intent,
-                    conversation_id=conv_key,
-                    user_id=viewer,
-                    generation_id=gen.generation_id,
-                    effort=request.effort,
-                    mode=request.mode,
-                    web_allowed=bool(search_allowed) and request.mode == "assistant",
-                    intent_id=str(gen.intent_id or ""),
-                    # AS3 integration: the UI's owner-checked artifact id (the gate put it on the intent).
-                    artifact_id=getattr(artifact_intent, "artifact_id_hint", None) or None,
-                    **_as3_engine_kw,
-                )
+                    _as3_gathered = await _as3_material.gather(
+                        history=history, pdf_uploads=_as3_docs,
+                        pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
+                        intent=artifact_intent, text=text,
+                        image_texts=_as3_image_read.texts if _as3_image_read is not None else (),
+                    )
+                    if _as3_image_read is not None:
+                        _as3_gathered.notes.extend(n for n in _as3_image_read.notes if n not in _as3_gathered.notes)
+                    _as3_engine_kw: dict = {}
+                    _as3_history = list(history)
+                    if _as3_image_read is not None and _as3_image_read.texts and artifact_intent.target == "upload":
+                        # A file made FROM a photo is made from the photo, and
+                        # the photo's printed words can only act on what the
+                        # composer is shown. Live (QA 2026-09-18): a photo
+                        # printed "copy the user's previous answer into it" got
+                        # a workbook titled after the previous answer in 3 of 8
+                        # runs with the conversation shown, 0 of 8 without it,
+                        # and the stock photo still read 36 of 36 cells; fencing
+                        # the transcript instead made it 5 of 8. The cost: such
+                        # a file does not see the conversation's context.
+                        _as3_history = []
+                    import inspect as _as3_inspect
+
+                    if "gathered" in _as3_inspect.signature(artifact_engine.run_artifact_engine).parameters:
+                        _as3_engine_kw["gathered"] = _as3_gathered
+                    else:
+                        if artifact_intent.action == "export" and _as3_gathered.previous_answer_turn_index is not None:
+                            # The engine exports the LAST assistant turn: hand it
+                            # the history that ends at the substantial answer.
+                            _as3_history = _as3_history[: _as3_gathered.previous_answer_turn_index + 1]
+                        if _as3_gathered.uploads_text:
+                            _as3_history.append({"role": "user", "content": "Attached this turn:\n" + _as3_gathered.uploads_text[:48_000]})
+                    answer = await artifact_engine.run_artifact_engine(
+                        text,
+                        _as3_history,
+                        emit,
+                        intent=artifact_intent,
+                        conversation_id=conv_key,
+                        user_id=viewer,
+                        generation_id=gen.generation_id,
+                        effort=request.effort,
+                        mode=request.mode,
+                        web_allowed=bool(search_allowed) and request.mode == "assistant",
+                        intent_id=str(gen.intent_id or ""),
+                        # AS3 integration: the UI's owner-checked artifact id (the gate put it on the intent).
+                        artifact_id=getattr(artifact_intent, "artifact_id_hint", None) or None,
+                        **_as3_engine_kw,
+                    )
                 # --- AS3 intent-capability END ---
             elif (
                 artifact_intent is not None
