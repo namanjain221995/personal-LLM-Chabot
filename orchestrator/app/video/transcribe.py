@@ -21,6 +21,12 @@ checks the first surviving segment of the later clip against the tail of
 the earlier one textually, because Whisper's timestamps at a clip boundary
 drift by up to a second.
 
+CUE TIMES. The engine's timestamps are not anchored to the speech: it opens a
+cue where the previous one ended (in the pause), and it can squeeze a long
+utterance into a short stamp seconds late (21.8 s on a live clip,
+2026-09-18). Each window carries the VAD regions it covers, and
+`snap_to_regions` holds its cues to them before the seams are stitched.
+
 LOOPS. After stitching, `loops.collapse` removes what the decoder repeated
 rather than heard — a phrase cycling inside one cue, or one cue emitted
 dozens of times over a few seconds. 17.9% of a real 2h23m transcript was
@@ -174,6 +180,93 @@ def stitch(
         end = max(s.end_s, start)
         fixed.append(Segment(start, end, s.text, s.language))
     return fixed
+
+
+# ------------------------------------------------------------------- snap --
+
+#: How far into a speech region a cue may reach at its edge before that
+#: region counts as holding some of the cue's words. The engine opens a cue
+#: where the previous cue ended, and ends it a little before the speech does:
+#: on the live 70 s clip (2026-09-18) the cue for words at 18.40 s began at
+#: 16.12 s, 0.49 s inside the previous region's tail — 0.27 s of that is the
+#: detector's padding (`regions_from_flags` pads 0.2 s) and frame rounding,
+#: 0.22 s the engine closing the earlier cue before its last word ended —
+#: and none of its words were there. A cue that reaches further into two
+#: regions is one sentence across a pause and keeps both.
+_REGION_EDGE_S = 0.6
+
+#: A fast English speaker (~220 words a minute) is ~20 characters a second.
+#: The engine's honest cues on the two live clips ran 10.2-17.5 characters a
+#: second; the one it mis-stamped ran 116.1 — 288 characters, 22 s of speech,
+#: squeezed into 2.48 s and placed 21.8 s late (2026-09-18). A cue whose words
+#: cannot be spoken in its span at this rate, by more than
+#: `_STAMP_SHORTFALL_S`, carries wrong times, not fast speech.
+_FAST_SPEECH_CHARS_PER_S = 25.0
+_STAMP_SHORTFALL_S = 1.0
+
+
+def _speech_from(t: float, regs: Sequence[Tuple[float, float]]) -> Optional[float]:
+    """The first instant at or after `t` with more than an edge of speech."""
+    for a, b in regs:
+        if b - max(a, t) > _REGION_EDGE_S:
+            return max(a, t)
+    return None
+
+
+def snap_to_regions(
+    segments: Sequence[Segment], regions: Sequence[Tuple[float, float]]
+) -> List[Segment]:
+    """One window's cues (video time, the engine's order) held to the speech
+    the VAD found in that window.
+
+    * A cue's start or end in a pause moves to the edge of the speech it
+      belongs to. Everything it has INSIDE its regions is kept, so a real
+      utterance is never cut shorter than its own span there; only an edge
+      of `_REGION_EDGE_S` or less in a neighbouring region is let go.
+    * A cue entirely inside a pause moves to the next region's start, with
+      its own length.
+    * A cue stamped too short to hold its words (see
+      `_FAST_SPEECH_CHARS_PER_S`) starts at the first speech no earlier cue
+      covers. That is where the engine's compressed cue came from on the
+      live clip (the auditor, on another clip, measured a cue 9.5 s late).
+      A cue whose span fits its words is NOT pulled back over uncovered
+      speech: the engine leaving a region without words is also what music
+      or noise the VAD took for speech looks like, and a cue moved onto it
+      would be early by the length of the music.
+
+    Monotonic, non-overlapping time is `stitch`'s job, afterwards: it also
+    drops an engine repeat by its overlap in time, which forcing the order
+    here first would hide from it.
+
+    No regions (a window nobody ran the detector for): nothing moves.
+    """
+    if not regions or not segments:
+        return list(segments)
+    regs = sorted(regions)
+    out: List[Segment] = []
+    covered = regs[0][0]  # speech before this instant already has a cue
+    for seg in segments:
+        start, end = seg.start_s, max(seg.end_s, seg.start_s)
+        needs_s = len(seg.text.strip()) / _FAST_SPEECH_CHARS_PER_S
+        if needs_s - (end - start) > _STAMP_SHORTFALL_S:
+            first_speech = _speech_from(covered, regs)
+            if first_speech is not None and first_speech < start:
+                start = first_speech
+        touched = [(r, min(end, r[1]) - max(start, r[0])) for r in regs if min(end, r[1]) > max(start, r[0])]
+        while len(touched) > 1 and touched[0][1] <= _REGION_EDGE_S:
+            touched.pop(0)
+        while len(touched) > 1 and touched[-1][1] <= _REGION_EDGE_S:
+            touched.pop()
+        if touched:
+            start, end = max(start, touched[0][0][0]), min(end, touched[-1][0][1])
+        elif not any(a <= start <= b for a, b in regs):
+            following = next((r for r in regs if r[0] > start), None)
+            if following is not None:
+                start, end = following[0], min(following[1], following[0] + (end - start))
+        end = max(end, start)
+        out.append(Segment(start, end, seg.text, seg.language))
+        covered = max(covered, end)
+    return out
 
 
 def dominant_language(segments: Sequence[Segment]) -> Optional[str]:
@@ -340,15 +433,20 @@ async def transcribe_audio(
             finally:
                 tally["in_flight"] -= 1
             tally["engine_ms"] += int(result.engine_ms or 0)
-            results[i] = [
-                Segment(
-                    start_s=window.start_s + float(s.get("start", 0.0)),
-                    end_s=window.start_s + float(s.get("end", 0.0)),
-                    text=str(s.get("text") or "").strip(),
-                    language=(str(s.get("language")) if s.get("language") else result.language_code),
-                )
-                for s in (result.segments or [])
-            ]
+            # The engine's times are in-clip and not anchored to the speech;
+            # the window's own VAD regions are (see `snap_to_regions`).
+            results[i] = snap_to_regions(
+                [
+                    Segment(
+                        start_s=window.start_s + float(s.get("start", 0.0)),
+                        end_s=window.start_s + float(s.get("end", 0.0)),
+                        text=str(s.get("text") or "").strip(),
+                        language=(str(s.get("language")) if s.get("language") else result.language_code),
+                    )
+                    for s in (result.segments or [])
+                ],
+                window.regions,
+            )
             tally["done_s"] += window.duration_s
             await _say()
 
