@@ -93,6 +93,10 @@ class _Remembered:
     #: message is compared against when it names no picture at all.
     context: str = ""
     at: float = field(default_factory=time.monotonic)
+    #: Text turns this conversation has sent since the image turn (every
+    #: turn main.py asks `images_for_followup` about). "That chart" points
+    #: at the picture only while the picture is the last thing shown.
+    turns_after: int = 0
 
 
 #: NOT named `_store`: `tests/test_exclusion_invariants.py` proves that the
@@ -264,7 +268,8 @@ def clear() -> None:
 #   (2) it points back at a thing the image turn talked about: "the note",
 #       "that chart", "the dashboard" - the noun must appear in the image
 #       turn, or be a thing that is only ever looked at ("the sign") with a
-#       reading verb beside it ("read the sign again");
+#       reading verb beside it ("read the sign again"), or be named with a
+#       demonstrative ("that chart") on the turn right after the picture;
 #   (3) it asks again for something the image turn said: "what was the
 #       invoice number again?";
 #   (4) it asks about a place IN the picture: "and the total at the
@@ -315,6 +320,17 @@ _BACK_REFERENCE = re.compile(
     re.I,
 )
 _SEEN_RE = re.compile(r"^(" + _SEEN_THINGS + r")$", re.I)
+#: "that chart", "this table": a demonstrative points at what was just
+#: shown. Measured live at Fast (2026-09-18): after a dashboard screenshot
+#: in a dataset conversation, "Which region is smallest in that chart?"
+#: went to the dataset engine, which answered that the profile "does not
+#: show a chart" - the model's answer about the dashboard had never said
+#: the word "chart", so the back-reference test above could not see it.
+_DEMONSTRATIVE = re.compile(
+    r"\b(?:that|this|those|these)\s+(?:[\w'-]+\s+){0,2}?"
+    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b",
+    re.I,
+)
 _READING_VERB = re.compile(
     r"\b(read|reads|say|says|said|written|write|show|shows|showing|shown|see|"
     r"visible|zoom|look|looks|legible|printed)\b",
@@ -374,8 +390,10 @@ def _is_a_question(text: str) -> bool:
     return "?" in text or bool(_QUESTION_START.search(text))
 
 
-def _points_at_the_picture(text: str, context: str) -> bool:
-    """The four shapes of evidence above, for one message."""
+def _points_at_the_picture(text: str, context: str, *, just_shown: bool = False) -> bool:
+    """The four shapes of evidence above, for one message. `just_shown`:
+    the image turn is the conversation's previous text turn, so "that
+    chart" can only mean the chart in the picture."""
     if _NAMES_A_PICTURE.search(text) and not _FIGURATIVE.search(text) and not _MAKES_A_PICTURE.search(text):
         return True
     if _OTHER_SOURCE.search(text) or _MAKES_A_PICTURE.search(text):
@@ -387,6 +405,8 @@ def _points_at_the_picture(text: str, context: str) -> bool:
             return True
         if _SEEN_RE.match(noun) and _READING_VERB.search(text):
             return True
+    if just_shown and _DEMONSTRATIVE.search(text):
+        return True
     if _AGAIN.search(text) and (_is_a_question(text) or _READING_VERB.search(text)):
         if _stems(text) & said_before:
             return True
@@ -405,7 +425,11 @@ def is_about_the_image(
     text = message or ""
     if not text.strip():
         return False
-    return _points_at_the_picture(text, entry.context)
+    just_shown = entry.turns_after == 0
+    # Every turn main.py asks about counts, fired or not: after one more
+    # text turn "that chart" may be a chart the assistant made in between.
+    entry.turns_after += 1
+    return _points_at_the_picture(text, entry.context, just_shown=just_shown)
 
 
 def images_for_followup(

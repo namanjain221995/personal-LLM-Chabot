@@ -344,6 +344,30 @@ def test_a_turn_about_the_image_fires(label, question, answer, message):
     assert image_memory.images_for_followup("conv", message, 1) == [IMG]
 
 
+#: The dashboard answer the live engine actually gave: it never says "chart".
+ANSWER_DASH_LIVE = (
+    "The dashboard shows **Q3 revenue of $1.42M**, up 8% on Q2, from 12,408 orders. "
+    "North America brought in $0.62M, Europe $0.48M and APAC $0.32M."
+)
+
+
+def test_that_chart_right_after_the_picture_is_the_picture():
+    """Live at Fast, in a dataset conversation: "Which region is smallest in
+    that chart?" went to the dataset engine, which said the profile "does
+    not show a chart", because the image turn's answer never said "chart"."""
+    image_memory.remember("conv", [IMG], question=TURN_DASH, answer=ANSWER_DASH_LIVE, user_id=1)
+    assert image_memory.images_for_followup("conv", "Which region is smallest in that chart?", 1) == [IMG]
+
+
+def test_that_chart_two_turns_later_is_not_assumed_to_be_the_picture():
+    """One text turn later the chart may be one the assistant made."""
+    image_memory.remember("conv", [IMG], question=TURN_DASH, answer=ANSWER_DASH_LIVE, user_id=1)
+    assert image_memory.images_for_followup("conv", "Plot revenue by region as a bar chart", 1) == []
+    assert image_memory.images_for_followup("conv", "Which region is smallest in that chart?", 1) == []
+    # ...while a turn that names the picture still reaches it
+    assert image_memory.images_for_followup("conv", "Which region is smallest in the screenshot?", 1) == [IMG]
+
+
 def _route_of(client, conv, question, answer, message, *, dataset=False, remember=True, **extra):
     """Run the image turn, then `message`, and return the second turn's route."""
     assert _image_turn(client, conv, question).status_code == 200
