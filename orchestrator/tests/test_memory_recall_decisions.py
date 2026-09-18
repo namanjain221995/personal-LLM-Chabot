@@ -191,3 +191,170 @@ def test_questions_about_our_own_history_refer_to_the_past(question):
 )
 def test_world_fact_questions_do_not_refer_to_the_past(question):
     assert not memory_semantic.refers_to_past_conversation(question)
+
+
+# --- QA round 1, 2026-09-18 ---------------------------------------------------
+# "last time we/you/I" matched the ordinary idiom of a world-fact question,
+# and the regex read the WHOLE message, pasted material included. Either way
+# a closed evidence gate was opened and a stale assistant answer recalled
+# (live, real embedder: 2/2 world-fact leaks at f449785, 0/2 at 4810da0).
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "When was the last time we landed on the moon?",
+        "When was the last time we had a recession in the US?",
+        "When was the last time I could see Halley's comet from Earth?",
+        "Last time I checked bitcoin was 60k, what is the bitcoin price now?",
+        "Meeting notes: we agreed to ship on Friday.\nWhat is the bitcoin price now?",
+        "Transcript:\nA: did we decide on the vendor?\nB: yes\n\nSummarise this transcript.",
+    ],
+)
+def test_a_last_time_idiom_or_a_paste_does_not_refer_to_the_past(question):
+    assert not memory_semantic.refers_to_past_conversation(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "last time we talked you recommended a book, which one?",
+        "what did I tell you about my allergy?",
+        "in our last chat we picked a colour palette, remind me",
+        "Remind me what you suggested for the logo in the other chat",
+        "Hi again.\n\nwhat did we decide last time about the database?",
+    ],
+)
+def test_more_questions_about_our_own_history(question):
+    assert memory_semantic.refers_to_past_conversation(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What did we agree to in the Paris climate agreement?",
+        "Who did we pick in the first round of the NBA draft?",
+        "Why did we go with the metric system?",
+        "When did we decide to leave the gold standard?",
+    ],
+)
+def test_a_national_we_is_a_known_false_positive(question):
+    """KNOWN TRADE-OFF, pinned so a change to it is deliberate. "What did we
+    decide about the pricing tiers?" and "What did we agree to in the Paris
+    Agreement?" have the same shape; only meaning separates them, and the
+    first is the question this module exists for. The cost is bounded: these
+    ask about a settled past, where a recalled earlier answer is rarely stale
+    — the gate's measured failure (2026-09-03) was a CHANGING fact."""
+    assert memory_semantic.refers_to_past_conversation(question)
+
+
+def test_only_the_typed_question_is_read_on_a_huge_paste(monkeypatch):
+    """The regex ran over the whole request text on the event loop — 1.0 to
+    1.9 s on a 10 MB paste (QA). It now reads at most 2,000 characters of the
+    last line."""
+    seen = []
+    real = memory_semantic._PAST_REFERENCE_RE
+
+    class Spy:
+        def search(self, text):
+            seen.append(len(text))
+            return real.search(text)
+
+    monkeypatch.setattr(memory_semantic, "_PAST_REFERENCE_RE", Spy())
+    paste = ("we agreed to ship " * 600_000) + "\n" + "x" * 50_000 + " what did we decide?"
+    assert memory_semantic.refers_to_past_conversation(paste)
+    assert seen and max(seen) <= 2_000
+
+
+def test_a_world_fact_question_about_a_recession_does_not_recall_a_stale_answer(owner):
+    uid = owner
+    db.create_conversation(uid, "conv-econ", "Economy")
+    db.add_message(uid, "conv-econ", "user", "When did the US last have a recession?")
+    db.add_message(uid, "conv-econ", "assistant", "The last US recession was in 2020, brief and sharp.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    question = "When was the last time we had a recession in the US?"
+    include_assistant = _include_assistant_as_main_py_passes_it(question)
+    assert include_assistant is False
+    block = _block(uid, question, include_assistant)
+    assert "2020" not in block
+    assert "(you answered)" not in block
+
+
+def test_a_user_row_after_the_question_is_never_paired_as_its_answer(owner):
+    """The pair is the ASSISTANT's turn; the person's own next message (here
+    unrelated, scoring 0) is not an answer and must not ride in on the pair."""
+    uid = owner
+    db.create_conversation(uid, "conv-cache", "Cache choice")
+    db.add_message(uid, "conv-cache", "user", "Which database is right for the session cache?")
+    db.add_message(uid, "conv-cache", "user", "Unrelated: book me a table for lunch on Friday.")
+    db.add_message(uid, "conv-cache", "assistant", "Redis, with a one-hour expiry on sessions.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    hits = asyncio.run(
+        memory_semantic.semantic_hits(uid, QUESTION, "conv-new", limit=5, pair_answers=True)
+    )
+    snippets = [h["snippet"] for h in hits]
+    assert "Which database is right for the session cache?" in snippets
+    assert not any("book me a table" in s for s in snippets)
+
+
+def test_two_pairs_fit_a_limit_of_two(owner):
+    """Each question with its answer is ONE unit: limit=2 returns both
+    questions and both answers, not one question and its answer."""
+    uid = owner
+    db.create_conversation(uid, "conv-wh", "Warehouse")
+    db.add_message(uid, "conv-wh", "user", "Which database should hold the analytics warehouse?")
+    db.add_message(uid, "conv-wh", "assistant", "We'll use ClickHouse for analytics.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    hits = asyncio.run(
+        memory_semantic.semantic_hits(uid, QUESTION, "conv-new", limit=2, pair_answers=True)
+    )
+    assert sorted((h["role"], h["snippet"]) for h in hits) == sorted(
+        [
+            ("user", "Which database should we use for the billing service?"),
+            ("assistant", DECISION),
+            ("user", "Which database should hold the analytics warehouse?"),
+            ("assistant", "We'll use ClickHouse for analytics."),
+        ]
+    )
+
+
+def test_a_decision_after_a_clarifying_question_is_recalled(owner):
+    """Q -> the assistant asks a clarifying question -> the person answers ->
+    the assistant decides. Paired with the clarifying question alone, the
+    decision was recalled 0/3 live (QA, 2026-09-18)."""
+    uid = owner
+    db.create_conversation(uid, "conv-an", "Analytics store")
+    db.add_message(uid, "conv-an", "user", "Postgres or MySQL for the analytics database?")
+    db.add_message(uid, "conv-an", "assistant", "What query patterns do you expect, mostly large aggregates?")
+    db.add_message(uid, "conv-an", "user", "Yes, mostly big aggregates over billions of events.")
+    db.add_message(uid, "conv-an", "assistant", "Then go with ClickHouse instead of either of those.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    block = _block(uid, QUESTION, _include_assistant_as_main_py_passes_it(QUESTION))
+    assert "Then go with ClickHouse instead of either of those." in block
+    assert DECISION in block
+
+
+def test_a_full_answer_ending_in_an_offer_does_not_pull_in_the_next_exchange(owner):
+    uid = owner
+    db.create_conversation(uid, "conv-audit", "Audit log")
+    db.add_message(uid, "conv-audit", "user", "Which database should keep the audit log?")
+    db.add_message(
+        uid,
+        "conv-audit",
+        "assistant",
+        "Keep it in Postgres: an append-only table with a monotonically increasing id, "
+        "row-level security so only the auditor role can read it, a nightly job that "
+        "hashes each day's rows into a chain so tampering shows, and partitions by "
+        "month so old months can be detached to cold storage without locking the "
+        "table. Want me to sketch the schema?",
+    )
+    db.add_message(uid, "conv-audit", "user", "Unrelated: suggest a lunch spot near the office.")
+    db.add_message(uid, "conv-audit", "assistant", "Try the thali place on the corner, it opens at noon.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    hits = asyncio.run(
+        memory_semantic.semantic_hits(uid, QUESTION, "conv-new", limit=5, pair_answers=True)
+    )
+    snippets = " ".join(h["snippet"] for h in hits)
+    assert "Keep it in Postgres" in snippets
+    assert "thali" not in snippets
+    assert "lunch spot" not in snippets

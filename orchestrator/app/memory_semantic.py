@@ -62,7 +62,11 @@ _PAST_REFERENCE_RE = re.compile(
     r"say|tell|recommend|suggest|advise|mention)\b"
     r"|\byou\s+(?:told|said|recommended|suggested|advised|mentioned|promised)\b"
     r"|(?<!if )\b(?:i|we)\s+(?:told|asked)\s+you\b"  # not "what if I asked you to …"
-    r"|\blast\s+time\s+(?:we|you|i)\b"
+    # "last time we TALKED", not "the last time we landed on the moon" or
+    # "last time I checked, bitcoin was 60k": the bare idiom opened the gate
+    # for world-fact questions and recalled a stale answer (QA, 2026-09-18).
+    r"|\blast\s+time\s+(?:we|you)\s+"
+    r"(?:talked|spoke|chatted|discussed|asked|told|said|decided|agreed)\b"
     r"|\b(?:our|my)\s+(?:last|previous|earlier|other|old)\s+"
     r"(?:chat|conversation|session|discussion)\b"
     # "the last session" alone is also Parliament's; a CHAT is always ours.
@@ -73,10 +77,23 @@ _PAST_REFERENCE_RE = re.compile(
 )
 
 
+#: How much of the typed question `refers_to_past_conversation` reads.
+_PAST_REFERENCE_MAX_CHARS = 2_000
+
+
 def refers_to_past_conversation(query: str) -> bool:
     """True when `query` asks about what was said or decided in the person's
-    own earlier conversations, not about the world."""
-    return bool(_PAST_REFERENCE_RE.search(query or ""))
+    own earlier conversations, not about the world.
+
+    Only the typed question is read: the last non-empty line, at most
+    2,000 characters of it. The composer folds a paste into the message
+    with no marker, so pasted meeting notes saying "we agreed to ship on
+    Friday" opened the gate for the bitcoin question under them, and the
+    whole-text scan cost 1.0-1.9 s of event loop on a 10 MB paste (QA,
+    2026-09-18)."""
+    text = (query or "").rstrip()
+    line = text[text.rfind("\n") + 1 :][-_PAST_REFERENCE_MAX_CHARS:]
+    return bool(_PAST_REFERENCE_RE.search(line))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -211,9 +228,24 @@ def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict])
     return scored
 
 
+#: An assistant turn this short that ends in "?" is a clarifying question,
+#: not the answer: "Postgres or MySQL for the event store?" -> "What query
+#: patterns do you expect?" -> "Mostly big aggregates." -> "Then go with
+#: ClickHouse." Paired with the clarifying question alone, the decision
+#: was recalled 0/3 live (QA, 2026-09-18). A full answer that ends in an
+#: offer ("…Want me to sketch the schema?") is longer than this.
+_CLARIFYING_MAX_CHARS = 300
+
+
+def _is_role(row: dict, role: str) -> bool:
+    return (row.get("role") or "").lower() == role
+
+
 def _answer_index(candidates: List[dict]) -> dict:
-    """user message_id -> the assistant row that answered it: the next
-    embedded row of the same conversation, when that row is the assistant's.
+    """user message_id -> the rows that answered it: the next embedded row of
+    the same conversation, when that row is the assistant's — and, when that
+    row is a clarifying question, the person's reply and the assistant turn
+    after it (one round).
 
     Built from the candidate rows only (no extra query). A reply shorter than
     the backfill's 15-character minimum has no row, so the next row may be a
@@ -224,11 +256,21 @@ def _answer_index(candidates: List[dict]) -> dict:
     answers: dict = {}
     for rows in by_conversation.values():
         rows.sort(key=lambda r: r["message_id"])
-        for asked, following in zip(rows, rows[1:]):
-            if (asked.get("role") or "").lower() == "user" and (
-                following.get("role") or ""
-            ).lower() == "assistant":
-                answers[asked["message_id"]] = following
+        for i, asked in enumerate(rows[:-1]):
+            following = rows[i + 1]
+            if not (_is_role(asked, "user") and _is_role(following, "assistant")):
+                continue
+            chain = [following]
+            reply = (following.get("content") or "").strip()
+            if (
+                reply.endswith("?")
+                and len(reply) <= _CLARIFYING_MAX_CHARS
+                and i + 3 < len(rows)
+                and _is_role(rows[i + 2], "user")
+                and _is_role(rows[i + 3], "assistant")
+            ):
+                chain += [rows[i + 2], rows[i + 3]]
+            answers[asked["message_id"]] = chain
     return answers
 
 
@@ -359,8 +401,8 @@ async def semantic_hits(
     answered it, whatever that answer's own score: for "what did we decide"
     the QUESTION is what resembles the query, and the answer holding the
     decision scored under the relative floor (real embedder, 2026-09-18:
-    0.599 against 0.75 x 0.804 = 0.603). A question and its answer count as
-    one hit against `limit`.
+    0.599 against 0.75 x 0.804 = 0.603). A question and its answer (with a
+    clarifying round, when there was one) count as one hit against `limit`.
     """
     if (
         not settings.cross_chat_semantic_enabled
@@ -409,8 +451,7 @@ async def semantic_hits(
             seen_snippets.add(snippet)
             hits.append(_hit(c, snippet, score))
             units += 1
-            answer = answers.get(c["message_id"])
-            if answer is not None:
+            for answer in answers.get(c["message_id"], ()):
                 answer_snippet = _snippet(answer["content"])
                 if answer_snippet not in seen_snippets:
                     seen_snippets.add(answer_snippet)

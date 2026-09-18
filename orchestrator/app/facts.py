@@ -130,6 +130,15 @@ _TRANSIENT_FACT_RE = re.compile(
     re.I,
 )
 
+#: What may follow "to be called" in a name preference: a capitalised word
+#: that is not a day or a deadline ("called Monday morning" is a task), or
+#: "by their (first|nick…) name".
+_A_NAME = (
+    r"(?:(?!(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|"
+    r"Today|Tonight|Tomorrow|ASAP)\b)(?-i:[A-Z])"
+    r"|by\s+(?:my|their|his|her)\s+(?:first\s+|last\s+|middle\s+|full\s+)?(?:nick)?name\b)"
+)
+
 #: …unless the same sentence states a STANDING preference, which is durable
 #: however it is phrased. Two shapes count: an explicit standing word
 #: ("always", "prefers"), and a wish about HOW the assistant should answer
@@ -144,10 +153,12 @@ _DURABLE_PREFERENCE_RE = re.compile(
     r"\s+(?:in|to be|as|with|without|free of|avoiding|using|written|formatted)\b"
     # How the person wants to be addressed ("The user wants to be called
     # Sam"). "Wants" made it a task request, so the name was never saved.
-    # "Called back tomorrow" is a task and stays out.
-    r"|\bto be (?:called|addressed|referred to)\b(?!\s+(?:back|later|tomorrow|at|on|in)\b)"
-    r"|\bgoes by\b"
-    r"|\b(?:address|call|refer to)\s+(?:me|them|him|her|the user)\s+as\b",
+    # The shape must END in a name: listing what may not follow ("back",
+    # "tomorrow") let "wants to be called when the build finishes" and "is
+    # asking what the band goes by" in as durable (QA, 2026-09-18).
+    r"|\bto be (?:called|addressed(?: as)?|referred to as)\s+" + _A_NAME +
+    r"|\bgoes by\s+" + _A_NAME +
+    r"|\b(?:address|call|refer to)\s+(?:me|them|him|her|the user)\s+as\s+" + _A_NAME,
     re.I,
 )
 
@@ -209,34 +220,64 @@ _MATCH_STOPWORDS = frozenset(
 #: "Forget my employer" shares no word with "The user works at Cognitiv", so
 #: the id-less fallback found nothing and the erasure was a silent no-op
 #: (QA-mem-forget-employer, 2026-09-18). A few profile nouns, only in the
-#: shape that names the person's OWN profile ("my employer", "where I live"),
-#: map to the words such a fact is written with. Still exactly one match or
-#: nothing.
+#: shape that names the person's OWN profile ("my employer", "where I live")
+#: AND ends the request there: "forget my work problems, tell me a joke"
+#: puts a topic aside, and deleted the employer fact when this matched any
+#: "forget my work…" (QA, 2026-09-18).
 _PROFILE_NOUN_RE = re.compile(
     r"\b(?:forget|erase|un-?remember|remembering|storing|saving|delete|remove|drop|clear)"
     r"\s+(?:about\s+)?(?:"
     r"my\s+(?:current\s+|old\s+|home\s+)?"
     # not "my company's old logo": the noun itself is what is to be forgotten
     r"(?P<noun>employer|company|job|work(?:place)?|home|address|city|name)\b(?!['’])"
-    r"|(?:where|who)\s+i\s+(?P<verb>work|live)\b)",
+    r"|(?:where|who)\s+i\s+(?P<verb>work|live)(?:\s+(?:at|for|in))?\b)"
+    r"(?=\s*(?:,?\s*(?:please|now|too|as\s+well)\s*)?(?:[.!?;\n]|$))",
     re.I,
 )
-_PROFILE_SYNONYMS = (
+#: …mapped to the SHAPE of the fact that states that attribute of the person.
+#: A bag of the words such a fact is written with ("named", "works",
+#: "based", "working") matched "The user's dog is named Rex", "The user's
+#: wife works at Google" and "The user prefers answers based on primary
+#: sources", and exactly-one-match does not help when the one match is the
+#: wrong fact: QA hard-deleted each of them with an id-less "forget my
+#: name / employer / where I live" (2026-09-18). The subject must be the
+#: user and the verb the attribute.
+_PROFILE_FACT_SHAPES = (
     (
         frozenset({"employer", "company", "job", "work", "workplace"}),
-        frozenset({"employer", "company", "job", "work", "works", "worked",
-                   "working", "workplace", "employed", "employee"}),
+        re.compile(
+            r"^the user\s+(?:(?:currently|now|still)\s+)?"
+            r"(?:(?:works|worked|is\s+working)\s+(?:at|for)|is\s+employed\s+(?:at|by|with))\b"
+            r"|^the user['’]s\s+(?:(?:current|new)\s+)?(?:employer|company|workplace|job)\s+is\b",
+            re.I,
+        ),
     ),
     (
         frozenset({"home", "address", "city", "live"}),
-        frozenset({"home", "address", "city", "live", "lives", "lived",
-                   "living", "resides", "based"}),
+        re.compile(
+            r"^the user\s+(?:(?:currently|now|still)\s+)?"
+            r"(?:lives|lived|resides|is\s+(?:based|living))\s+in\b"
+            r"|^the user['’]s\s+(?:(?:current|home)\s+)?(?:home|address|city|hometown)\s+is\b",
+            re.I,
+        ),
     ),
     (
         frozenset({"name"}),
-        frozenset({"name", "named", "called"}),
+        re.compile(
+            r"^the user['’]s\s+(?:(?:first|full|last)\s+)?name\s+is\b"
+            r"|^the user\s+(?:is\s+(?:called|named)|goes\s+by|"
+            r"(?:wants|prefers|likes)\s+to\s+be\s+(?:called|addressed))\b",
+            re.I,
+        ),
     ),
 )
+
+#: A clause: the unit a "forget" and its "don't forget" exception are judged
+#: in. Judged over the whole message, a reminder in the second sentence
+#: ("…Don't forget I like spicy food though") cancelled the erasure in the
+#: first, and the extractor's negated rewrite was written instead (QA,
+#: 2026-09-18).
+_CLAUSE_RE = re.compile(r"[^.!?;,\n]+")
 
 
 def facts_block(facts: List[dict]) -> Optional[str]:
@@ -408,6 +449,17 @@ def _content_words(text: str) -> set:
     }
 
 
+def _erasure_spans(text: str) -> List[tuple]:
+    """(start, end) of each clause of `text` that asks to forget something:
+    a forget verb, and not a reminder or a confession ("don't forget …",
+    "I always forget …") in the same clause."""
+    return [
+        m.span()
+        for m in _CLAUSE_RE.finditer(text or "")
+        if _FORGET_RE.search(m.group(0)) and not _NOT_A_FORGET_RE.search(m.group(0))
+    ]
+
+
 def _fact_named_by(text: str, existing: List[dict]) -> Optional[int]:
     """The id of the ONE saved fact a "forget that" names, or None.
 
@@ -415,34 +467,45 @@ def _fact_named_by(text: str, existing: List[dict]) -> Optional[int]:
     the request is still an erasure, and "forget that I'm vegetarian" points
     at the row that says vegetarian. Exactly one match, or nothing happens —
     deleting the wrong memory is worse than deleting none.
+
+    Only the erasure clauses name the fact: in "Forget it, what's the
+    weather in Pune?" the question's "Pune" deleted "The user lives in Pune"
+    (present at 4810da0). A request that names a profile attribute ("forget
+    my name") is matched by the fact's shape alone, so "The user's dog's
+    name is Rex" is not the person's name.
     """
-    words = _content_words(text)
-    hits = (
-        [f["id"] for f in existing if words & _content_words(f["fact"])]
-        if words
-        else []
-    )
-    if not hits:
-        hits = _profile_fact_ids(text, existing)
+    spans = _erasure_spans(text)
+    shapes = _profile_shapes(text, spans)
+    if shapes:
+        hits = [
+            f["id"]
+            for f in existing
+            if any(shape.match(" ".join((f["fact"] or "").split())) for shape in shapes)
+        ]
+    else:
+        words: set = set()
+        for start, end in spans:
+            words |= _content_words(text[start:end])
+        hits = (
+            [f["id"] for f in existing if words & _content_words(f["fact"])]
+            if words
+            else []
+        )
     return hits[0] if len(hits) == 1 else None
 
 
-def _profile_fact_ids(text: str, existing: List[dict]) -> List[int]:
-    """Ids of the facts written with the words of the profile noun the
-    request names ("my employer" -> works/employer/job/...), or []."""
-    fact_words: set = set()
+def _profile_shapes(text: str, spans: List[tuple]) -> list:
+    """The fact shapes of the profile attributes an erasure clause of `text`
+    names ("forget my employer." -> the works-at shape), or []."""
+    shapes: list = []
     for match in _PROFILE_NOUN_RE.finditer(text or ""):
+        if not any(start <= match.start() < end for start, end in spans):
+            continue
         said = (match.group("noun") or match.group("verb") or "").lower()
-        for asked, written in _PROFILE_SYNONYMS:
-            if said in asked:
-                fact_words |= written
-    if not fact_words:
-        return []
-    return [
-        f["id"]
-        for f in existing
-        if fact_words & set(re.findall(r"[a-z]+", (f["fact"] or "").lower()))
-    ]
+        for asked, shape in _PROFILE_FACT_SHAPES:
+            if said in asked and shape not in shapes:
+                shapes.append(shape)
+    return shapes
 
 
 async def remember_after_route(
@@ -510,9 +573,7 @@ async def remember_from_message(
     text = own_words(user_text)
     if not text or len(text) < _MESSAGE_MIN_CHARS:
         return []
-    forget_request = bool(_FORGET_RE.search(text)) and not _NOT_A_FORGET_RE.search(
-        text
-    )
+    forget_request = bool(_erasure_spans(text))
     try:
         existing = await db.run_in_thread(
             db.list_user_facts, user_id, settings.memory_max_facts

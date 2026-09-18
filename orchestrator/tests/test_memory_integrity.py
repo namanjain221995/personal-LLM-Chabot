@@ -13,7 +13,13 @@ import asyncio
 import pytest
 
 from app import db
-from app.facts import parse_extraction, remember_from_message
+from app.facts import (
+    is_durable,
+    parse_extraction,
+    remember_from_message,
+    strip_ungrounded_suffixes,
+    ungrounded_in,
+)
 
 
 @pytest.fixture()
@@ -610,3 +616,196 @@ def test_ordinary_forget_sentences_delete_no_profile_fact(owner, message):
         remember_from_message(owner, message, "c1", complete=_fake_complete(_NO_OPS))
     )
     assert len(_texts(owner)) == 4
+
+
+# --- 7. QA round 1 on the release-2 changes, 2026-09-18 ----------------------
+# The synonym fallback above matched a BAG of words ("named", "works",
+# "based", "working"), and exactly-one-match does not help when the single
+# match is the wrong fact: every case in the next two tests hard-deleted an
+# unrelated fact at f449785 and deleted nothing at 4810da0.
+
+
+def _forget(uid, message, reply=_NO_OPS):
+    return asyncio.run(
+        remember_from_message(uid, message, "c1", complete=_fake_complete(reply))
+    )
+
+
+def _deleted(stored):
+    return [f["fact"] for f in stored if f.get("deleted")]
+
+
+@pytest.mark.parametrize(
+    "message,facts",
+    [
+        ("Please forget my name.", ["The user's dog is named Rex", "The user lives in Pune"]),
+        ("Please forget my name.", ["The user's manager is called Priya", "The user lives in Pune"]),
+        ("Please forget my name.", ["The user's dog is named Bruno"]),
+        # the content word "name" deleted this one already at 4810da0
+        ("Please forget my name.", ["The user's dog's name is Rex", "The user lives in Pune"]),
+        (
+            "Forget where I live, please.",
+            ["The user prefers answers based on primary sources", "The user works at Cognitiv"],
+        ),
+        ("Please forget where I live.", ["The user's startup is based in Berlin"]),
+        ("Please forget my job.", ["The user is working on a novel about sailors", "The user lives in Pune"]),
+        ("Please forget my employer.", ["The user's wife works at Google", "The user lives in Pune"]),
+        ("Please forget my employer.", ["The user prefers to work late at night"]),
+        ("Please forget my company.", ["The user uses Linux for work"]),
+    ],
+)
+def test_the_synonym_table_never_deletes_a_fact_about_something_else(owner, message, facts):
+    for fact in facts:
+        db.add_user_fact(owner, fact, "c1")
+    stored = _forget(owner, message)
+    assert _deleted(stored) == [], f"{message!r} deleted {_deleted(stored)}"
+    assert sorted(_texts(owner)) == sorted(facts)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Forget my work problems, tell me a joke.",
+        "Forget my job interview nerves, let's focus on the essay.",
+        "forget my job title for now, just write the cover letter",
+        "Forget my work, tell me a joke.",
+    ],
+)
+def test_setting_a_topic_aside_is_not_an_erasure_of_the_profile(owner, message):
+    """"Forget my work problems" puts a topic aside; only a request that ENDS
+    at the profile noun ("forget my employer.") names the saved fact."""
+    db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    db.add_user_fact(owner, "The user is vegetarian", "c1")
+    stored = _forget(owner, message)
+    assert _deleted(stored) == []
+    assert len(_texts(owner)) == 2
+
+
+def test_forget_it_before_an_unrelated_question_deletes_nothing(owner):
+    """Older than the synonym table (present at 4810da0): the content word
+    "Pune" of the QUESTION deleted the home fact. Only the clause that holds
+    the forget verb names what is to be forgotten."""
+    db.add_user_fact(owner, "The user lives in Pune", "c1")
+    db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    stored = _forget(owner, "Forget it, what's the weather in Pune?")
+    assert _deleted(stored) == []
+    assert len(_texts(owner)) == 2
+
+
+def test_a_profile_noun_in_a_reminder_clause_is_not_what_is_erased(owner):
+    """Only a profile noun inside an ERASURE clause names a fact: here the
+    erasure is "Forget that", and "don't forget my name" asks to keep it."""
+    db.add_user_fact(owner, "The user's name is Naman", "c1")
+    db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    stored = _forget(owner, "Forget that. But don't forget my name.")
+    assert _deleted(stored) == []
+    assert len(_texts(owner)) == 2
+
+
+@pytest.mark.parametrize(
+    "message,facts,expected",
+    [
+        ("Please forget my name.", ["The user's name is Naman", "The user's dog is named Rex"], "The user's name is Naman"),
+        ("Please forget my name.", ["The user wants to be called Sam", "The user lives in Pune"], "The user wants to be called Sam"),
+        ("Forget where I live.", ["The user is based in Berlin", "The user's startup is based in Berlin"], "The user is based in Berlin"),
+        ("Please forget my employer now.", ["The user's employer is Cognitiv", "The user's wife works at Google"], "The user's employer is Cognitiv"),
+        ("Please forget my job.", ["The user works for Northwind", "The user is working on a novel about sailors"], "The user works for Northwind"),
+    ],
+)
+def test_the_synonym_table_deletes_the_fact_that_states_the_attribute(owner, message, facts, expected):
+    for fact in facts:
+        db.add_user_fact(owner, fact, "c1")
+    stored = _forget(owner, message)
+    assert _deleted(stored) == [expected]
+    assert sorted(_texts(owner)) == sorted(f for f in facts if f != expected)
+
+
+def test_dont_forget_elsewhere_does_not_cancel_a_real_erasure(owner):
+    """The "don't forget" exception was applied to the WHOLE message, so a
+    reminder in a second sentence masked the erasure in the first: the
+    extractor's remove id was discarded, and its negated rewrite — the
+    steakhouse bug of section 2 — was written instead."""
+    veg = db.add_user_fact(owner, "The user is vegetarian", "c1")
+    db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    message = "Please forget that I'm vegetarian. Don't forget I like spicy food though."
+    stored = _forget(
+        owner,
+        message,
+        '{"add": [], "replace": [{"id": %d, "fact": "The user is not vegetarian"}],'
+        ' "remove": [%d]}' % (veg["id"], veg["id"]),
+    )
+    assert _deleted(stored) == ["The user is vegetarian"]
+    assert _texts(owner) == ["The user works at Cognitiv"]
+
+
+def test_a_negated_rewrite_is_never_written_when_the_reminder_follows(owner):
+    veg = db.add_user_fact(owner, "The user is vegetarian", "c1")
+    db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    _forget(
+        owner,
+        "Please forget that I'm vegetarian. Don't forget I like spicy food though.",
+        '{"add": [], "replace": [{"id": %d, "fact": "The user is not vegetarian"}],'
+        ' "remove": []}' % veg["id"],
+    )
+    assert "The user is not vegetarian" not in _texts(owner)
+
+
+def test_forget_my_employer_with_a_reminder_after_it_still_erases(owner):
+    """The extractor pointed at the row (it does, 3/3 live for this shape of
+    request); the reminder in the next clause discarded its id."""
+    employer = _profile(owner)
+    stored = _forget(
+        owner,
+        "Please forget my employer, and don't forget to answer in English.",
+        '{"add": [], "replace": [], "remove": [%d]}' % employer["id"],
+    )
+    assert [f["id"] for f in stored if f.get("deleted")] == [employer["id"]]
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "The user wants to be called when the build finishes",
+        "The user needs to be called by the recruiter this week",
+        "The user is asking what the band goes by",
+        "The user wants to be called back tomorrow",
+        "The user wants to be called Monday morning about the contract",
+        "The user needs to be called ASAP about the invoice",
+        "The user wants to be called Tonight after the match",
+        "The user wants the assistant to call them as soon as the report is ready",
+    ],
+)
+def test_a_one_off_request_is_still_not_durable(fact):
+    """The name-preference shapes listed what may NOT follow "to be called"
+    (back, later, …) and let everything else in; they now require a name."""
+    assert not is_durable(fact)
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "The user wants to be called Sam",
+        "The user wants to be addressed as Dr. Rao",
+        "The user wants to be referred to as Ms. Iyer",
+        "The user prefers to be called by their first name",
+        "The user wants to be called by their nickname",
+        "The user goes by Nam",
+        "The user wants the assistant to address them as Captain",
+        "The user is looking after two children",
+    ],
+)
+def test_a_name_preference_is_durable(fact):
+    assert is_durable(fact)
+
+
+def test_a_suffix_after_an_ungrounded_name_is_left_for_the_grounding_check():
+    """The suffix is cut only after a name the message contains; after an
+    invented one the fact is returned whole, so `ungrounded_in` sees the
+    invention with its suffix and nothing is quietly rewritten."""
+    fact = "The user works at Halcyon Rail Group"
+    assert strip_ungrounded_suffixes(fact, "I work at a rail company.") == fact
+    assert ungrounded_in(fact, "I work at a rail company.") == "Halcyon"
+    assert (
+        strip_ungrounded_suffixes("The user works at TechSara Solutions", "I work at TechSara.")
+        == "The user works at TechSara"
+    )
