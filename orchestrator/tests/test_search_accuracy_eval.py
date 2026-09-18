@@ -214,10 +214,10 @@ def test_the_resolved_question_reaches_rerank_the_store_and_the_prompt(monkeypat
     async def fake_rewrite(message, hist, effort="medium"):
         return ["GPT-5.2 reasoning score BenchLM leaderboard"]
 
-    async def fake_collect(queries, effort="medium", emit=None, categories="", degraded=None):
+    async def fake_collect(queries, effort="medium", emit=None, categories="", degraded=None, candidates=None):
         return results
 
-    async def fake_rerank(message, res, target):
+    async def fake_rerank(message, res, target, per_domain=0):
         seen["rerank"] = message
         return res
 
@@ -312,10 +312,10 @@ def test_the_coverage_gap_is_recorded_in_meta(monkeypatch):
     async def fake_rewrite(message, hist, effort="medium"):
         return [message]
 
-    async def fake_collect(queries, effort="medium", emit=None, categories="", degraded=None):
+    async def fake_collect(queries, effort="medium", emit=None, categories="", degraded=None, candidates=None):
         return [SearchResult(title="m", url="https://b.test/m", snippet="s")]
 
-    async def fake_rerank(message, res, target):
+    async def fake_rerank(message, res, target, per_domain=0):
         return res
 
     async def fake_fetch(res, message="", **kw):

@@ -898,11 +898,12 @@ def test_the_chat_engine_streams_an_ordinary_answer_in_the_models_own_pieces(scr
     assert tokens(events) == deltas
     assert answer == text
     assert [e for e, _ in events].count("reasoning") == 1
-    # The guard adds no meta of its own. ("How do I mix 2:5?" is a ratio
-    # prompt, so at Fast the adaptive-thinking policy reports its grant.)
+    # The guard adds no meta of its own, and nothing else does either: the
+    # chat engine no longer classifies a Fast turn, so "How do I mix 2:5?"
+    # (a ratio prompt, which used to be granted a thought) carries the bare
+    # route again.
     meta = dict(events[-1][1])
     assert events[-1][0] == "meta" and "loop_guard" not in meta
-    meta.pop("adaptive_thinking", None)
     assert meta == {"route": "chat"}
 
 

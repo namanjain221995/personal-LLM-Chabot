@@ -261,7 +261,16 @@ async def make_plan(
                         ),
                     }
                 )
-            raw = await llm.chat_completion(prompt, temperature=0.1, max_tokens=6000)
+            # The planner follows the TURN's level. Left at
+            # chat_completion's thinking-on default it reasoned even when the
+            # person chose Fast — and at Fast `llm.mark_fast_turn` would have
+            # to override it anyway, so meta would have been lying.
+            raw = await llm.chat_completion(
+                prompt,
+                temperature=0.1,
+                max_tokens=6000,
+                thinking=llm.wants_thinking("smart", effort),
+            )
             plan = parse_agent_plan(raw)
             return plan if salesforce else _coerce_no_salesforce(plan)
         except (QueuedForRecovery, LeaseLost):
@@ -399,7 +408,10 @@ async def _run_step_impl(
 
         hits = await select_context(step.input)
         answer = await llm.chat_completion(
-            _answer_messages(step.input, hits, []), temperature=0.2, max_tokens=5000
+            _answer_messages(step.input, hits, []),
+            temperature=0.2,
+            max_tokens=5000,
+            thinking=llm.wants_thinking("smart", effort),
         )
         citations = build_citations(hits, base_url=settings.sf_lightning_base_url)
         return answer, f"{len(hits)} record(s)", {"citations": citations}
@@ -480,6 +492,7 @@ async def _run_step_impl(
             ],
             temperature=0.2,
             max_tokens=4000,
+            thinking=llm.wants_thinking("smart", effort),
         )
         return (note + answer, "search returned nothing readable", {})
 
@@ -494,6 +507,7 @@ async def _run_step_impl(
         ],
         temperature=0.3,
         max_tokens=5000,
+        thinking=llm.wants_thinking("smart", effort),
     )
     return answer, _shorten(answer, 80), {}
 

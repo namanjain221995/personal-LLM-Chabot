@@ -6,6 +6,7 @@ import zipfile
 
 import pytest
 
+from app.artifacts import chart_colours as CC
 from app.artifacts import spec as S
 from app.artifacts import types as T
 from app.artifacts.render import html as H
@@ -98,7 +99,11 @@ def test_native_chart_carries_the_data_and_the_palette(tmp_path):
     assert list(bar.plots[0].categories) == ["Q1", "Q2", "Q3", "Q4"]
     assert [s.name for s in bar.series] == ["FY25", "FY26"]
     assert list(bar.series[1].values) == [130.0, 150.0, 170.0, 210.0]
-    assert str(bar.series[0].format.fill.fore_color.rgb) == theme.PALETTE[0].lstrip("#").upper()
+    # A legacy deck chart takes the ARTIFACT colours (chart_colours), not the
+    # legacy painter's teal-first theme.PALETTE: the same chart must be the
+    # same colour in the PNG, the DOCX, the PDF, the PPTX and the XLSX.
+    assert str(bar.series[0].format.fill.fore_color.rgb) == CC.CHART_PALETTE[0].lstrip("#").upper()
+    assert str(bar.series[1].format.fill.fore_color.rgb) == CC.CHART_PALETTE[1].lstrip("#").upper()
     assert bar.has_legend and not charts[2].plots[0].series[0].smooth
     assert charts[3].has_legend  # a pie always gets a legend
 

@@ -92,7 +92,7 @@ def _key(project_row, workspace_id, *, public_id="pub0000000000001", **kwargs) -
 # --------------------------------------------------------------- migration --
 
 
-def test_the_migration_list_ends_at_v39_and_the_test_database_is_fully_migrated():
+def test_the_migration_list_ends_at_v40_and_the_test_database_is_fully_migrated():
     versions = [version for version, _ddl in db._MIGRATIONS]
 
     # V35 (2026-09-13): api_responses.max_output_tokens and finish_reason.
@@ -101,13 +101,15 @@ def test_the_migration_list_ends_at_v39_and_the_test_database_is_fully_migrated(
     # V38 (2026-09-14): web corpus state, retrieval demand, url hash index.
     # V39 (2026-09-16): artifact_versions.deliverable — the shape a follow-up
     #                   inherits (artifacts/deliverable.Deliverable).
-    assert versions == list(range(1, 40))
-    assert db.LATEST_SCHEMA_VERSION == 39
-    assert db.schema_version() == 39
+    # V40 (2026-09-18): user_facts.source / .source_excerpt — where a saved
+    #                   fact came from, and the words it came from.
+    assert versions == list(range(1, 41))
+    assert db.LATEST_SCHEMA_VERSION == 40
+    assert db.schema_version() == 40
     # Applying an applied migration is a no-op, which is what makes the
     # startup path safe to run on every boot.
     db.init_schema()
-    assert db.schema_version() == 39
+    assert db.schema_version() == 40
 
 
 def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():

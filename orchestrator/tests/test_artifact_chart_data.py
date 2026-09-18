@@ -546,3 +546,28 @@ def test_a_pie_of_negative_values_is_refused_with_a_reason(tables):
     assert c is None and "negative" in msg and "waterfall" in msg
     w, _, _ = CD.resolve_chart(chart(type="waterfall", data={"table_id": "upload_cashflow", "x": "Item", "y": ["Amount"]}), list(tables.values()))
     assert w is not None
+
+
+def test_find_table_matches_a_title_without_its_extension():
+    """The model binds to the file the person NAMED; the person drops the
+    extension. Until 2026-09-17 "customers-100" found nothing and the chart
+    became a "the table … is not available" callout (owner report)."""
+    table = CD._make_table("upload1", "customers-100.csv", ["Country"], [["Aurelia"], ["Borovia"], ["Aurelia"]])
+    assert CD._find_table("customers-100", [table])[0] is table
+    assert CD._find_table("customers-100.csv", [table])[0] is table
+    assert CD._find_table("Customers-100", [table])[0] is table
+    assert CD._find_table("upload1", [table])[0] is table
+    assert CD._find_table("orders", [table])[0] is None, "a different name is still a different table"
+
+    c, _notes, msg = CD.resolve_chart(
+        chart(type="bar", data={"table_id": "customers-100", "x": "Country", "agg": "count"}), [table])
+    assert c is not None, msg
+    assert list(c.categories) == ["Aurelia", "Borovia"] and [int(v) for v in c.series[0].values] == [2, 1]
+
+
+def test_a_sheet_title_with_its_workbook_name_is_not_matched_by_the_stem():
+    """GUARD. read_xlsx titles a sheet "tickets.xlsx · Tickets"; stripping a
+    trailing extension must not make that equal to "tickets"."""
+    sheet = CD._make_table("upload1", "tickets.xlsx · Tickets", ["Status"], [["Open"]])
+    assert CD._find_table("tickets", [sheet])[0] is None
+    assert CD._find_table("tickets.xlsx · Tickets", [sheet])[0] is sheet

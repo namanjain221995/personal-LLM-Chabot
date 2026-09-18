@@ -261,10 +261,26 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
 
     # 1. Charts (documents and presentations; workbook charts are native).
     with timed("charts"):
-        for ordinal, chart in enumerate(H.spec_charts(spec), start=1):
+        # The document's automatic colour plan rides on the resolved style
+        # (ResolvedStyle.chart_plan), so the PNG the DOCX, the PDF and the
+        # deck preview embed has to be drawn WITH one. Measured on this tree
+        # without it: a two-subject document ("Revenue by region", "Head
+        # count by region") put #2F6FB2 in both word/media images and in the
+        # rendered PDF, while the native PPTX and XLSX charts of the same two
+        # subjects were #2F6FB2 and #E07B00 — one chart, two colours,
+        # depending on which file the reader opened.
+        #
+        # Resolving a second time here is safe and cheap: chart_plan and
+        # chart_defaults do not depend on the `type_scale` the kind branches
+        # pass below (resolve() applies a type_scale to TypeSizes.title ..
+        # kpi_value only, never to TypeSizes.chart_title/chart_axis), and
+        # plan_for costs about 1 ms on a 40-chart document.
+        spec_charts = H.spec_charts(spec)
+        chart_style = ST.resolve(spec) if spec_charts else None
+        for ordinal, chart in enumerate(spec_charts, start=1):
             name = H.chart_filename(ordinal)
             try:
-                C.render_chart_png(chart, out / name)
+                C.render_chart_png(chart, out / name, chart_style)
             except ImportError as exc:
                 raise RenderError("dependency_unavailable", "The chart library is not installed on this server.") from exc
             except Exception as exc:
@@ -425,6 +441,28 @@ def _standalone_images(spec: S.ArtifactSpec, fmt: str, out: Path, resolved, *, s
         raise _safe(fmt, "the chart writer reported an error") from exc
 
 
+#: What `chart_data.resolve_spec` leaves behind in place of a chart it could
+#: not compute — a note callout in a document, a bullet on a slide.
+_CHART_REFUSAL_RE = re.compile(r"\b(?:could not be drawn|was not drawn|cannot be drawn|not drawn because)\b", re.I)
+
+
+def _chart_refusals(spec: S.ArtifactSpec) -> List[str]:
+    """Every "the chart could not be drawn …" sentence this spec carries."""
+    body = getattr(spec, "body", None)
+    out: List[str] = []
+    for block in list(getattr(body, "blocks", None) or []):
+        if getattr(block, "type", "") == "callout":
+            text = str(getattr(block, "text", "") or "").strip()
+            if _CHART_REFUSAL_RE.search(text):
+                out.append(text)
+    for slide in list(getattr(body, "slides", None) or []):
+        for bullet in list(getattr(slide, "bullets", None) or []):
+            text = str(bullet or "").strip()
+            if _CHART_REFUSAL_RE.search(text):
+                out.append(text)
+    return out
+
+
 def _render_images_only(spec: S.ArtifactSpec, formats: Sequence[str], out: Path, *, title_slug: str, version: int, effort: str,
                         transform: Optional[Dict[str, object]]) -> RenderReport:
     """A version that is only chart images: every image validated, the first
@@ -445,6 +483,14 @@ def _render_images_only(spec: S.ArtifactSpec, formats: Sequence[str], out: Path,
             for n, path in enumerate(_standalone_images(spec, fmt, out, resolved, stem=f"{title_slug}-v{version}-chart"), start=1):
                 paths[_key("primary", fmt, f"chart-{n}")] = path
     if not paths:
+        # A chart that could NOT be bound left the reason where the picture
+        # was ("The chart could not be drawn: the table 'customers-100.csv'
+        # is not available."). Answering "The artifact has no charts to draw
+        # as images" instead threw that reason away and told the person
+        # nothing they could act on (owner report, 2026-09-17).
+        why = _chart_refusals(spec)
+        if why:
+            raise RenderError("invalid_request", why[0] if why[0].endswith(".") else why[0] + ".")
         raise RenderError("invalid_request", "The artifact has no charts to draw as images.")
     try:
         validation = V.validate_all({k: str(p) for k, p in paths.items()}, None)

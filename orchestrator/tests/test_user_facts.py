@@ -66,16 +66,26 @@ def test_facts_block_lists_facts():
 
 
 def test_parse_extraction_tolerates_prose_and_garbage():
+    # `remove` joined the contract on 2026-09-18 (memory integrity): a
+    # "forget that" must delete the fact, not store a negated copy of it.
     assert parse_extraction("") == {}
     assert parse_extraction("no json here") == {}
-    assert parse_extraction('{"add": "not-a-list"}') == {"add": [], "replace": []}
+    assert parse_extraction('{"add": "not-a-list"}') == {
+        "add": [],
+        "replace": [],
+        "remove": [],
+    }
     parsed = parse_extraction(
         'Sure! {"add": ["X is Y"], "replace": [{"id": 3, "fact": "Z"}]}'
     )
-    assert parsed == {"add": ["X is Y"], "replace": [{"id": 3, "fact": "Z"}]}
+    assert parsed == {
+        "add": ["X is Y"],
+        "replace": [{"id": 3, "fact": "Z"}],
+        "remove": [],
+    }
     # non-integer ids and blank facts are dropped, not fatal
     parsed = parse_extraction('{"replace": [{"id": "abc", "fact": "Z"}, {"id": 4}]}')
-    assert parsed == {"add": [], "replace": []}
+    assert parsed == {"add": [], "replace": [], "remove": []}
 
 
 # --- remember_from_message with an injected extractor ---

@@ -132,9 +132,15 @@ async def route_request(
     except Exception:
         pass
 
-    # Fallback: classify with gpt-oss-120b (§8).
+    # Fallback: the main model classifies when the router endpoint did not.
+    # NEVER thinking: this is a 50-token JSON classification, and a reasoning
+    # pass over it draws from the same 50 tokens — the model thinks, produces
+    # no JSON, `parse_route` returns None and every routing decision lands on
+    # "rag". True at every effort, so this does not follow the picker.
     try:
-        raw = await llm.chat_completion(_messages(message), temperature=0.0, max_tokens=50)
+        raw = await llm.chat_completion(
+            _messages(message), temperature=0.0, max_tokens=50, thinking=False
+        )
         route = parse_route(raw)
         if route:
             return route

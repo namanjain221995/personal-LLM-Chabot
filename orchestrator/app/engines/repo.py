@@ -119,7 +119,11 @@ def _expand_for_code(kws: List[str]) -> List[str]:
 
 
 async def _code_qa(
-    message: str, conversation_id: str, history: Sequence[dict], emit: Emit
+    message: str,
+    conversation_id: str,
+    history: Sequence[dict],
+    emit: Emit,
+    effort: str = "think",
 ) -> str:
     kws = _expand_for_code(keywords(message, max_keywords=12))
     chunks = await db.run_in_thread(
@@ -132,8 +136,13 @@ async def _code_qa(
         )
 
     parts: List[str] = []
+    # The picker reaches this answer. Left at the default, every repo Q&A ran
+    # at "think" — a reasoning pass a person who chose Fast never asked for
+    # (and on a Fast turn `llm.mark_fast_turn` would have to override it).
     async for kind, delta in llm.stream_chat_events(
-        _qa_messages(message, chunks, history), max_tokens=10000
+        _qa_messages(message, chunks, history),
+        effort=llm.normalize_effort(effort),
+        max_tokens=10000,
     ):
         await emit(kind, {"text": delta})
         if kind == "token":
@@ -163,9 +172,14 @@ async def run_repo_engine(
     conversation_id: str,
     history: Sequence[dict],
     emit: Emit,
+    effort: str = "think",
 ) -> str:
     """New repo URL → clone + index + overview; otherwise answer code questions
-    from the already-indexed repo."""
+    from the already-indexed repo.
+
+    `effort` is the turn's level, so the overview and the code Q&A think only
+    when the person asked for thinking. The default keeps the pre-2026-09-17
+    behaviour for any caller that does not pass one."""
     if ref is not None and await db.run_in_thread(db.get_repo, conversation_id, ref.key) is None:
         overview = await _clone_and_index(ref, conversation_id, emit)
         if overview is None:
@@ -175,7 +189,9 @@ async def run_repo_engine(
             return note
         parts: List[str] = []
         async for kind, delta in llm.stream_chat_events(
-            _overview_messages(ref, overview), max_tokens=8000
+            _overview_messages(ref, overview),
+            effort=llm.normalize_effort(effort),
+            max_tokens=8000,
         ):
             await emit(kind, {"text": delta})
             if kind == "token":
@@ -187,4 +203,4 @@ async def run_repo_engine(
         return "".join(parts)
 
     # follow-up question about an already-indexed repo
-    return await _code_qa(message, conversation_id, history, emit)
+    return await _code_qa(message, conversation_id, history, emit, effort)

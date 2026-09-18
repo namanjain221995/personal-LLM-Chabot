@@ -69,10 +69,20 @@ _REFERENCE = {
 }
 
 #: Shapes that correlate with rewritten, undated, second-hand content.
+#:
+#: Two of these patterns were wrong in a way that only mattered once anything
+#: READ the score (2026-09-18, audit finding 4). `\.blog$` is anchored to the
+#: end of the STRING and this is matched against a whole URL, so it never
+#: fired once in production: "https://jamesm.blog/a" ends in "/a", and the
+#: audit's comparison answer was written entirely out of `jamesm.blog`,
+#: `aibytes.blog` and two other rewrite farms while nvidia.com sat uncited.
+#: And bare `seo` matched any three letters in that order anywhere in a URL —
+#: "seoul" among them, so every weather, news and travel page for a city of
+#: ten million was scored as an SEO farm.
 _LOW_QUALITY = re.compile(
     r"(blogspot|wordpress\.com|medium\.com|quora|answers\.|"
     r"examhub|examsdaily|study ?iq|affairscloud|jagranjosh|adda247|"
-    r"\.blog$|/blog/|seo|listicle)",
+    r"\.blog(/|$)|/blog/|\bseo\b|listicle)",
     re.I,
 )
 

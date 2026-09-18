@@ -66,6 +66,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 from .. import spec as S
 from .. import style as ST
 from .. import types as T
+from .. import chart_colours as CC
 from . import theme
 
 _NUMBER_FORMATS = {
@@ -844,6 +845,48 @@ def is_v2_native(chart: Any) -> bool:
 # --- AS3 integration END ---
 
 
+def _legacy_chart_colours(c, chart: S.Chart, scheme, *, lines: bool = True) -> None:
+    """Colour an openpyxl chart written by the LEGACY workbook path from the
+    artifact colour scheme. Before this, the legacy path used theme.PALETTE
+    (teal first) while the same chart in a document used the artifact palette
+    (blue first), so one chart was two colours in two files."""
+    from openpyxl.chart.marker import DataPoint
+
+    per_category = len(chart.series) <= 1 and scheme.by_category and chart.type != "pie"
+    for i, series in enumerate(c.series):
+        name = chart.series[i].name if i < len(chart.series) else ""
+        colour = (scheme.series_colour(i, name) or theme.series_colour(i)).lstrip("#").upper()
+        if chart.type == "line":
+            series.graphicalProperties.line.solidFill = colour
+            if lines:
+                series.graphicalProperties.line.width = 28575  # 2.25 pt in EMU
+                series.smooth = False
+        elif chart.type != "pie":
+            series.graphicalProperties.solidFill = colour
+            if lines:
+                series.graphicalProperties.line.solidFill = colour
+            if per_category:
+                for j, cat in enumerate(chart.categories):
+                    point_colour = scheme.category_colour(j, str(cat)) or theme.series_colour(j)
+                    pt = DataPoint(idx=j)
+                    pt.graphicalProperties = _gp_solid(point_colour.lstrip("#").upper())
+                    series.dPt.append(pt)
+    if chart.type == "pie" and c.series:
+        for j, cat in enumerate(chart.categories):
+            point_colour = scheme.category_colour(j, str(cat)) or theme.series_colour(j)
+            pt = DataPoint(idx=j)
+            pt.graphicalProperties = _gp_solid(point_colour.lstrip("#").upper())
+            c.series[0].dPt.append(pt)
+
+
+def _gp_solid(colour_hex: str):
+    from openpyxl.chart.shapes import GraphicalProperties
+
+    gp = GraphicalProperties(solidFill=colour_hex)
+    gp.line.solidFill = colour_hex
+    return gp
+
+
 def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int, R: Optional[ST.ResolvedStyle] = None) -> None:
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
@@ -853,7 +896,9 @@ def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int, R: Optional[ST.R
     # block to the right, so the chart still references real cells.
     aux_col = n_cols + 12
     layout["chart_blocks"] = {}
+    plan = getattr(R, "chart_plan", None)
     for k, chart in enumerate(sheet.charts):
+        scheme = CC.scheme_for(chart, plan=plan)
         if is_v2_native(chart) and chart.series:
             # AS3 integration: the charts track's native writer (values on
             # the "Chart data" sheet; an image where Excel has no such chart).
@@ -905,15 +950,7 @@ def _draw_charts(ws, sheet: S.Sheet, layout: dict, n_cols: int, R: Optional[ST.R
         for ref, titles_from_data in data_refs:
             c.add_data(ref, titles_from_data=titles_from_data)
         c.set_categories(cats_ref)
-        for i, series in enumerate(c.series):
-            colour = theme.series_colour(i).lstrip("#").upper()
-            if chart.type == "line":
-                series.graphicalProperties.line.solidFill = colour
-                series.graphicalProperties.line.width = 28575  # 2.25 pt in EMU
-                series.smooth = False
-            elif chart.type != "pie":
-                series.graphicalProperties.solidFill = colour
-                series.graphicalProperties.line.solidFill = colour
+        _legacy_chart_colours(c, chart, scheme)
         if chart.type != "pie":
             c.y_axis.title = chart.y_label or None
             c.legend.position = "b"
@@ -929,7 +966,8 @@ def _bold():
     return Font(bold=True, name=theme.CLASSIC_BODY_FONT)
 
 
-def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]]) -> None:
+def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]],
+               R: Optional[ST.ResolvedStyle] = None) -> None:
     """The first sheet: a title, one KPI cell per total (a live formula into
     the data sheet) and a copy of every chart."""
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -979,11 +1017,12 @@ def _dashboard(wb, spec: S.WorkbookSpec, layouts: List[Tuple[S.Sheet, str, dict]
         data_ws = wb[title]
         # openpyxl charts are bound to one worksheet; rebuilding them here
         # against the data sheet keeps the dashboard chart live.
-        _draw_dashboard_charts(ws, data_ws, sheet, layout, chart_row)
+        _draw_dashboard_charts(ws, data_ws, sheet, layout, chart_row, R)
         chart_row += 18 * len(sheet.charts)
 
 
-def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row: int) -> None:
+def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row: int,
+                           R: Optional[ST.ResolvedStyle] = None) -> None:
     from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 
     row = start_row
@@ -1015,12 +1054,7 @@ def _draw_dashboard_charts(ws, data_ws, sheet: S.Sheet, layout: dict, start_row:
             for j in series_cols:
                 c.add_data(Reference(data_ws, min_col=j + 1, min_row=1, max_row=1 + n_points), titles_from_data=True)
             c.set_categories(Reference(data_ws, min_col=cat_col + 1, min_row=2, max_row=1 + n_points))
-        for i, series in enumerate(c.series):
-            colour = theme.series_colour(i).lstrip("#").upper()
-            if chart.type == "line":
-                series.graphicalProperties.line.solidFill = colour
-            elif chart.type != "pie":
-                series.graphicalProperties.solidFill = colour
+        _legacy_chart_colours(c, chart, CC.scheme_for(chart, plan=getattr(R, "chart_plan", None)), lines=False)
         ws.add_chart(c, f"B{row}")
         row += 18
 
@@ -1044,7 +1078,7 @@ def render_xlsx(spec: S.WorkbookSpec, out_path: str | Path, *, warnings: Optiona
         ws = wb.create_sheet(title=title)
         layouts.append((sheet, title, _write_sheet(ws, sheet, warnings, R)))
     if spec.template_id == "dashboard":
-        _dashboard(wb, spec, layouts)
+        _dashboard(wb, spec, layouts, R)
     sheet_notes = [(sh.name, sh.notes) for sh in spec.sheets[: T.MAX_SHEETS] if sh.notes]
     if spec.sources or spec.assumptions or sheet_notes:
         ws = wb.create_sheet(title="Notes" if "notes" not in {t.lower() for t in wb.sheetnames} else "Notes-2")

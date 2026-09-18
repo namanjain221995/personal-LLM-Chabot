@@ -8,8 +8,9 @@
  */
 
 import { isValidElement, memo, useMemo, type ReactNode } from 'react';
-import ReactMarkdown, { type Components } from 'react-markdown';
+import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 import rehypeHighlight from 'rehype-highlight';
 import { isMermaidLanguage } from '@/lib/mermaid';
 import { splitMarkdown } from '@/lib/markdownSegments';
@@ -57,6 +58,32 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
+/**
+ * The remark pipeline every chat answer is parsed with — exported so that
+ * tests/markdown-segments.test.tsx proves its equivalence claim about the
+ * REAL configuration instead of a copy that can drift away from it.
+ *
+ * `remark-breaks` turns a single newline inside a paragraph into a `<br>`.
+ * CommonMark folds one into a space, which is right for hand-written prose
+ * that was hard-wrapped at 80 columns and wrong for everything a model
+ * writes: `Job Title: Data Engineer\nLocation: Austin, TX` is two facts, and
+ * it was arriving on screen as one run-on line (owner report, 2026-09-17).
+ * ChatGPT, Claude.ai and GitHub comments all break on the newline; this is
+ * the behaviour a reader already expects from a chat answer.
+ *
+ * It only rewrites `break` positions inside phrasing content, so everything
+ * whose newlines carry meaning is untouched and renders byte for byte as it
+ * did before: fenced code (```mermaid included, so `language-mermaid` still
+ * reaches MermaidBlock), indented code, inline code, GFM tables, and the
+ * two-space hard break that was already a `<br>`. It runs AFTER remark-gfm so
+ * that gfm has already claimed its own syntax — tables, footnotes, autolinks
+ * — before any newline becomes a break.
+ */
+export const CHAT_REMARK_PLUGINS: NonNullable<Options['remarkPlugins']> = [
+  remarkGfm,
+  remarkBreaks,
+];
+
 const components: Components = {
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   code: ({ children, className, ...props }) => (
@@ -91,7 +118,7 @@ const components: Components = {
 const MarkdownChunk = memo(function MarkdownChunk({ text }: { text: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={CHAT_REMARK_PLUGINS}
       // detect:false — only fenced blocks with a language tag get
       // highlighted; guessing on plain blocks colors prose-y output.
       // Unknown languages (```mermaid included) pass through untouched.

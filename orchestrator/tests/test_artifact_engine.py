@@ -662,30 +662,6 @@ def test_the_material_round_trip_keeps_the_transform_and_the_row_count():
     assert engine._material_from_dict({}).row_count is None and engine._material_from_dict({"row_count": True}).row_count is None
 
 
-def test_upload_tables_read_a_csv_from_the_workspace_or_the_profiles_full_rows(tmp_path, monkeypatch):
-    conv = "conv-up"
-    up_id = "0123456789abcdef0123456789abcdef"
-    root = tmp_path / "uploads" / conv / up_id / "extracted"
-    root.mkdir(parents=True)
-    # Two blank lines: csv.reader yields [] for them, and until 2026-09-12
-    # they became all-None rows that the XLSX validator could not count
-    # (a reopened sheet has no trailing empty rows) — a refused render.
-    (root / "leads.csv").write_text("Id,Name,Score\n007,Asha,9\n\n008,,7\n\n", encoding="utf-8")
-    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
-    profiles = [
-        {"file": "leads.csv", "kind": "table", "rows": 2, "columns": [{"name": "Id"}, {"name": "Name"}, {"name": "Score"}]},
-        {"file": "gone.csv", "kind": "table", "rows": 1, "columns": [{"name": "k"}, {"name": "v"}], "full_content": True, "full_rows": [{"k": "a", "v": ""}]},
-        {"file": "big.csv", "kind": "table", "rows": 5000, "columns": [{"name": "k"}], "sample_rows": [{"k": "x"}]},
-        {"file": "notes.txt", "kind": "other"},
-    ]
-    monkeypatch.setattr(db, "get_uploads", lambda c: [{"id": up_id, "filename": "leads.csv", "status": "ready", "profile": profiles}] if c == conv else [])
-    tables_ = engine._upload_tables(conv)
-    assert [t.id for t in tables_] == ["upload1", "upload2"]
-    assert tables_[0].columns == ["Id", "Name", "Score"] and tables_[0].rows == [["007", "Asha", "9"], ["008", None, "7"]], "from the file: leading zeros and blanks kept"
-    assert tables_[1].rows == [["a", None]], "the file is gone: the profile's full rows stand in"
-    assert not any(t.title == "big.csv" for t in tables_), "a sampled profile is not a dataset"
-
-
 def _ref(files, *, kind="workbook", title="IR Session Audit"):
     return T.ArtifactRef(artifact_id="a" * 32, version=1, job_id="j" * 32, title=title, kind=kind, status="completed", files=files)
 
@@ -936,3 +912,151 @@ def test_the_sentence_says_which_rows_the_model_typed_beside_the_preserved_ones(
     transform = {"rows": 34, "typed_rows": 5, "typed_sheets": ["Dashboard", "Summary"]}
     line = engine._sentence(_ref([xlsx]), "create", [], transform=transform, instruction="make an excel of these rows")
     assert line.endswith("5 rows on the Dashboard and Summary sheets were written by the model, not copied from the paste.")
+
+
+# ------------------------------------------- the conversation's dataset --
+
+
+def _csv_upload(tmp_path, monkeypatch, conv, *, filename="customers-100.csv", body=None):
+    """One dataset upload as app/uploads._finalise_dataset leaves it."""
+    import json
+
+    upload_id = "0123456789abcdef0123456789abcdef"
+    root = tmp_path / "uploads" / conv / upload_id / "extracted"
+    root.mkdir(parents=True, exist_ok=True)
+    rows = body if body is not None else (
+        b"Country,Plan\n" + b"".join(f"C{i % 4},{'Pro' if i % 2 else 'Free'}\n".encode() for i in range(100)))
+    (root / filename).write_bytes(rows)
+    db.save_upload(upload_id, conv, filename, len(rows), "ready", json.dumps([]), None)
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    return upload_id
+
+
+class _FakeCtx:
+    """The parts of pipeline.ComposeContext the create path reads."""
+
+    def __init__(self, material, **kw):
+        self.material = material
+        self.instruction = kw.get("instruction", "Big report")
+        self.operation = "create"
+        self.kind = "document"
+        self.formats = kw.get("formats", ["docx"])
+        self.template_id = "generic"
+        self.effort = "fast"
+        self.parent_spec = None
+        self.job = {"format_reason": "report"}
+        self.budget = T.EFFORT_BUDGETS["fast"]
+        self.stages: list = []
+        self.warnings: list = []
+
+    async def progress_stage(self, stage, status, detail):
+        self.stages.append((stage, status, detail))
+
+    async def progress(self, pct, detail):
+        return None
+
+    def warn(self, text):
+        self.warnings.append(str(text))
+
+    def record_transform(self, transform):
+        return None
+
+
+def _gather_detail(material_dict, **kw):
+    """The gather step's detail, read off the real composer path."""
+    from app.artifacts import compose as C
+
+    ctx = _FakeCtx(material_dict, **kw)
+
+    class _Stop(C.ComposeError):
+        pass
+
+    async def stop(req, progress=None):
+        raise C.ComposeError("model_failure", "stop here")
+
+    original = C.compose
+    C.compose = stop
+    try:
+        asyncio.run(engine.compose_for_pipeline(ctx))
+    except Exception:  # noqa: BLE001 — the stage we want already ran
+        pass
+    finally:
+        C.compose = original
+    return next(d for stage, status, d in ctx.stages if stage == "gather" and status == "done")
+
+
+def test_the_gather_step_names_the_file_and_its_rows(owner, monkeypatch, tmp_path):
+    """"2 data table(s)" and "from the conversation" were equally true when
+    the CSV had been read and when it had not (owner report, 2026-09-17)."""
+    from app.artifacts import material_in as M
+    from app.artifacts.compose import DataTable, Material
+
+    conv = "conv-gather-detail"
+    _csv_upload(tmp_path, monkeypatch, conv)
+    gathered = asyncio.run(M.gather(history=[], conversation_id=conv, workspace=str(tmp_path),
+                                    intent=I.ArtifactIntent("create", target="conversation"),
+                                    text="Big report", save_documents=False))
+    assert [t.title for t in gathered.upload_tables] == ["customers-100.csv"]
+    assert len(gathered.upload_tables[0].rows) == 100
+
+    material = Material(instruction="Big report")
+    material.tables.extend(gathered.upload_tables)
+    assert _gather_detail(engine._material_dict(material)) == "customers-100.csv, 100 rows"
+
+    # …and with nothing gathered the step still says so.
+    assert _gather_detail(engine._material_dict(Material(instruction="Big report"))) == "from the conversation"
+
+
+def test_edit_apply_receives_the_dataset_tables(owner, monkeypatch, tmp_path):
+    """E.apply is where a chart is ADDED, by code, before acceptance. It saw
+    only the pasted and typed tables, so "add plots to this doc" had nothing
+    to bind to however well the material was gathered."""
+    from app.artifacts import edits as E
+    from app.artifacts import material_in as M
+
+    conv = "conv-edit-tables"
+    _csv_upload(tmp_path, monkeypatch, conv)
+    _install(monkeypatch)
+    _turn(owner, "Create a Word report about the customers.", conv=conv, gen="gen-create")
+
+    seen_apply: list = []
+    seen_plan: list = []
+    real_apply, real_plan = E.apply, E.plan
+
+    def watched_apply(parent, plan_, *, tables=(), **kw):
+        seen_apply.append([str(getattr(t, "id", "")) for t in tables])
+        return real_apply(parent, plan_, tables=tables, **kw)
+
+    async def watched_plan(instruction, parent, **kw):
+        seen_plan.append([str(getattr(t, "id", "")) for t in (kw.get("tables") or ())])
+        return await real_plan(instruction, parent, **kw)
+
+    monkeypatch.setattr(E, "apply", watched_apply)
+    monkeypatch.setattr(E, "plan", watched_plan)
+
+    text = "add plots to this doc"
+    gathered = asyncio.run(M.gather(history=[], conversation_id=conv, workspace=str(tmp_path),
+                                    intent=I.ArtifactIntent("edit", target="artifact"),
+                                    text=text, save_documents=False))
+    events = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    intent = I.decide(text, has_artifacts=True, artifact_hints=["Pricing Update"])
+    assert intent.action == "edit", intent
+    answer = asyncio.run(engine.run_artifact_engine(text, [], emit, intent=intent, conversation_id=conv,
+                                                    user_id=owner, generation_id="gen-edit", gathered=gathered))
+    assert seen_plan and "upload1" in seen_plan[0], seen_plan
+    assert seen_apply and "upload1" in seen_apply[0], seen_apply
+    assert "could not be made" not in answer, answer
+
+
+def test_a_dataset_conversation_reports_the_rows_it_read(owner, monkeypatch, tmp_path):
+    assert engine._table_details([]) == []
+    from app.artifacts.compose import DataTable
+
+    one = DataTable(id="upload1", title="customers-100.csv", columns=["A"], rows=[["x"]] * 100)
+    assert engine._table_details([one]) == ["customers-100.csv, 100 rows"]
+    many = [DataTable(id=f"upload{i}", title=f"f{i}.csv", columns=["A"], rows=[["x"]]) for i in range(1, 6)]
+    assert engine._table_details(many)[-1] == "and 2 more tables"

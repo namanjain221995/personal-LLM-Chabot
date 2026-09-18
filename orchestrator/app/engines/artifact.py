@@ -58,7 +58,7 @@ import datetime as _dt
 import logging
 import re
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import db
 from ..artifacts import compose as C
@@ -69,7 +69,6 @@ from ..artifacts import types as T
 from ..artifacts import db as adb
 from ..artifacts import intent as intent_rules
 from ..artifacts.intent import ArtifactIntent
-from ..config import settings
 
 log = logging.getLogger(__name__)
 
@@ -278,74 +277,76 @@ def _pasted_tables(raw_text: str, history: Sequence[dict]) -> Tuple[List[C.DataT
     return out, transform, notes
 
 
-def _upload_tables(conversation_id: str) -> List[C.DataTable]:
-    """Blocking. The CSV files uploaded to this conversation's dataset
-    workspace, read through the same rows the dataset engine profiles
-    (db.get_uploads → the stored profile, `core.upload_paths.
-    resolve_upload_file` for the bytes): the file itself when it is still
-    on disk (up to MAX_ROWS_PER_SHEET rows through csv.reader), else the
-    profile's `full_rows` when the file was small enough to be kept whole.
-    An .xlsx or a file the profile only sampled is left out — a sampled
-    table would be a silently short dataset. At most two, as "upload1"
-    and "upload2"; a turn with a pasted table does not look here."""
-    import csv as _csv
+#: How many tables the gather step names before it counts the rest.
+_NAMED_TABLES = 3
 
-    from ..core.upload_paths import UploadPathError, resolve_upload_file
 
+def _table_details(tables_: Sequence[Any]) -> List[str]:
+    """"customers-100.csv, 100 rows" for the gather step.
+
+    The step used to read "from the conversation" or "2 data table(s)",
+    which is exactly as true when the CSV was read as when it was not — the
+    owner could not tell a report written from his file from one written
+    around it (report of 2026-09-17)."""
+    named = []
+    for t in list(tables_)[:_NAMED_TABLES]:
+        title = str(getattr(t, "title", "") or getattr(t, "id", "") or "a table").strip()
+        named.append(f"{title[:60]}, {len(getattr(t, 'rows', None) or []):,} rows")
+    rest = len(list(tables_)) - len(named)
+    if rest > 0:
+        named.append(f"and {rest} more table{'s' if rest != 1 else ''}")
+    return named
+
+
+def _image_only(formats: Sequence[str]) -> bool:
+    """The version IS the chart images: there is no document to fall back on."""
+    fmts = [str(f) for f in formats if str(f)]
+    return bool(fmts) and all(f in ("png", "svg") for f in fmts)
+
+
+#: What to say when a picture was asked for and no data reached the turn.
+_NO_TABLE_FOR_CHART = (
+    "I can only draw a chart from data I can read as a table. "
+    "Attach the file again (CSV or Excel), or paste the table into the message, and I'll plot it."
+)
+
+
+#: Every `GatheredInput.notes` line that means "this file did not become a
+#: table": an unreadable attachment, an expired dataset, a failed upload.
+_FILE_MISSED_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?:is not a readable document or table|could not be read"
+    r"|could not be used|is no longer stored)\b", re.IGNORECASE)
+
+
+async def _conversation_figures(material: "C.Material") -> bool:
+    """Whether the CONVERSATION itself carries a series of figures a chart
+    could be drawn from — "Q1 120, Q2 140" in the answer above.
+
+    `material.tables` is the strong signal, but it is not the only data a
+    chart can come from, and refusing a picture that the composer could have
+    drawn would be worse than the failure this guard exists to stop. The
+    parser is the charts track's own (`chart_data.parse_prompt_data`), which
+    caps its input; it runs off the event loop like every other reader."""
+    if _chart_data is None or not hasattr(_chart_data, "parse_prompt_data"):
+        return False
+    text = "\n".join(t for t in (material.previous_answer, material.history_text, material.uploads_text) if t)[-20_000:]
+    if not text.strip():
+        return False
     try:
-        uploads = db.get_uploads(conversation_id)
-    except Exception as exc:  # noqa: BLE001 — no uploads is the common case
-        log.info("artifact: uploads unavailable: %s", type(exc).__name__)
-        return []
-    out: List[C.DataTable] = []
-    for up in uploads:
-        if len(out) >= 2:
-            break
-        profiles = up.get("profile")
-        if isinstance(profiles, dict):
-            profiles = [profiles]
-        if not isinstance(profiles, list):
-            continue
-        for prof in profiles:
-            if not isinstance(prof, dict) or prof.get("kind") != "table":
-                continue
-            name = str(prof.get("file") or "")
-            columns = [str(c.get("name")) for c in (prof.get("columns") or []) if isinstance(c, dict) and c.get("name")]
-            rows: List[List[Any]] = []
-            read = False
-            if name.lower().endswith(".csv") and "/" not in name and "\\" not in name:
-                try:
-                    path = resolve_upload_file(settings.workspace_dir, conversation_id, str(up.get("id") or ""), name)
-                except UploadPathError:
-                    path = None
-                if path is not None and path.is_file():
-                    try:
-                        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
-                            reader = _csv.reader(fh)
-                            header = next(reader, None)
-                            if header:
-                                columns = [str(h) for h in header]
-                                for record in reader:
-                                    if len(rows) >= T.MAX_ROWS_PER_SHEET:
-                                        break
-                                    if not any(c.strip() for c in record):
-                                        continue  # a blank line is not a row (csv.reader yields [] for it)
-                                    cells = [c if c != "" else None for c in record]
-                                    cells = (cells + [None] * len(columns))[: len(columns)]
-                                    rows.append(cells)
-                                read = True
-                    except (OSError, UnicodeError, _csv.Error) as exc:
-                        log.info("artifact: upload %s could not be read: %s", name, type(exc).__name__)
-            if not read and prof.get("full_content") and isinstance(prof.get("full_rows"), list) and columns:
-                rows = [[(None if r.get(c) in (None, "") else r.get(c)) for c in columns] for r in prof["full_rows"] if isinstance(r, dict)]
-                read = True
-            if not read or not columns or not rows:
-                continue
-            table_id = f"upload{len(out) + 1}"
-            out.append(C.DataTable(id=table_id, title=name or "Uploaded table", columns=columns, rows=rows[: T.MAX_ROWS_PER_SHEET]))
-            if len(out) >= 2:
-                break
-    return out
+        return await asyncio.to_thread(lambda: _chart_data.parse_prompt_data(text) is not None)
+    except Exception as exc:  # noqa: BLE001 — an unreadable conversation is no figures
+        log.info("artifact: conversation figures not parsed: %s", type(exc).__name__)
+        return False
+
+
+def _unreadable_names(notes: Sequence[str]) -> List[str]:
+    """The files that did not reach the material, from `GatheredInput.notes`."""
+    out: List[str] = []
+    for note in notes:
+        m = _FILE_MISSED_RE.match(str(note).strip())
+        if m and m.group("name").strip():
+            out.append(m.group("name").strip().strip('"'))
+    return list(dict.fromkeys(out))
 
 
 def _previous_answer(history: Sequence[dict]) -> str:
@@ -527,7 +528,7 @@ async def _compose_for_pipeline_inner(ctx: "pipeline.ComposeContext"):
             # acceptance and the attach, or a drain that won the race).
             # Rebuilt from what the job row carries — never a whole-document
             # rewrite, which would retype a restore or an untouched section.
-            payload = await _rebuild_edit_payload(ctx, reason)
+            payload = await _rebuild_edit_payload(ctx, reason, material.tables)
         if payload is not None:
             return await _compose_edit(ctx, payload, material)
         ctx.warn("the planned change was not found, so the edit was made by rewriting the document")
@@ -548,15 +549,14 @@ async def _compose_for_pipeline_inner(ctx: "pipeline.ComposeContext"):
                 # of an answer failed "The content could not be written"
                 # with the real composer (live run 2026-09-15).
                 raw = {"kind": "document", "document": raw}
-            return await _post_process(S.load(raw), material.tables, ctx.warn, ctx.instruction)
+            return await _post_process(S.load(raw), material.tables, ctx.warn, ctx.instruction, formats=ctx.formats)
     if ctx.operation == "edit" and ctx.parent_spec is not None:
         _tables_from_parent(material, ctx.parent_spec)
     await ctx.progress_stage("intent", "done", f"{_KIND_WORDS.get(ctx.kind, ctx.kind)} · {', '.join(_FORMAT_WORDS.get(f, f) for f in ctx.formats)} · {ctx.template_id.replace('_', ' ')}")
     gathered = []
     if material.sources:
         gathered.append(f"{len(material.sources)} source(s)")
-    if material.tables:
-        gathered.append(f"{len(material.tables)} data table(s)")
+    gathered.extend(_table_details(material.tables))
     if material.uploads_text:
         gathered.append("uploaded material")
     await ctx.progress_stage("gather", "done", " · ".join(gathered) or "from the conversation")
@@ -607,12 +607,12 @@ async def _compose_for_pipeline_inner(ctx: "pipeline.ComposeContext"):
         ctx.warn(f"{kept} rewritten cell{'s' if kept != 1 else ''} kept the original wording (a timestamp, a quoted phrase or a figure would have changed)")
     spec = result.spec
     derived_report: Dict[str, Any] = {}
-    if (material.tables and (_chart_data is not None or _style is not None)) or _has_charts(result.spec):
+    if (material.tables and (_chart_data is not None or _style is not None)) or _has_charts(result.spec) or _image_only(ctx.formats):
         # AS3 integration: a chart is resolved even with no table in the
         # material — a binding to nothing becomes a note, never a chart
         # with numbers the model wrote.
         spec = await _post_process(result.spec, material.tables, ctx.warn, ctx.instruction, derived_report=derived_report,
-                                   parent=ctx.parent_spec if ctx.operation == "edit" else None)
+                                   parent=ctx.parent_spec if ctx.operation == "edit" else None, formats=ctx.formats)
     transform = dict(result.transform or {})
     gone = set(derived_report.get("computed") or []) | set(derived_report.get("dropped") or [])
     for w in typed_notes:
@@ -680,6 +680,15 @@ def _format_list(files: Sequence[T.FileRef]) -> str:
 
 def _count_word(n: int, noun: str) -> str:
     return f"{_COUNT_WORDS.get(n, f'{n:,}')} {noun}{'s' if n != 1 else ''}"
+
+
+def _and_list(words: Sequence[str]) -> str:
+    items = [str(w) for w in words if str(w).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _or_list(words: Sequence[str]) -> str:
@@ -990,13 +999,15 @@ async def run_artifact_engine(
         if parent_row is None:
             # Nothing to edit: the words were about a file, but there is none — make one.
             operation = "create"
-        elif operation == "edit":
-            return await _run_edit(
-                text=text, history=history, emit=emit, intent=intent, parent_row=parent_row, candidates=candidates,
-                conversation_id=conversation_id, user_id=int(user_id), generation_id=generation_id, effort=effort, mode=mode,
-                intent_id=intent_id, instruction=instruction, raw_text=raw_text, gathered=gathered,
-            )
         else:
+            if operation == "convert" and _chart_request_is_an_edit(parent_row, intent, instruction):
+                operation = "edit"
+            if operation == "edit":
+                return await _run_edit(
+                    text=text, history=history, emit=emit, intent=intent, parent_row=parent_row, candidates=candidates,
+                    conversation_id=conversation_id, user_id=int(user_id), generation_id=generation_id, effort=effort, mode=mode,
+                    intent_id=intent_id, instruction=instruction, raw_text=raw_text, gathered=gathered,
+                )
             version = int(intent.version or parent_row.get("current_version") or 1)
             parent = (str(parent_row["id"]), version)
 
@@ -1116,11 +1127,6 @@ async def run_artifact_engine(
             return line
         material.tables.extend(pasted)
         material.notes.extend(table_notes)
-        if kind == "workbook" and not pasted and gathered is None:
-            try:
-                material.tables.extend(await db.run_in_thread(_upload_tables, conversation_id))
-            except Exception as exc:  # noqa: BLE001 — an upload is an enhancement to the material
-                log.info("artifact: upload tables skipped: %s", type(exc).__name__)
         material.transform = {k: v for k, v in transform.items() if k not in ("warnings", "truncated", "total_rows")}
         if intent.row_count:
             material.row_count = int(intent.row_count)
@@ -1138,6 +1144,20 @@ async def run_artifact_engine(
         material.notes.append("No external sources were gathered; write from the conversation and say where something is an assumption.")
     if import_payload is not None and operation != "create":
         import_payload = None
+
+    # A PNG or SVG version IS its charts, and a chart is numbers from a
+    # table. With no table the job could only ever end "The artifact has no
+    # charts to draw as images" (owner report, 2026-09-17), after a compose
+    # and a render that were never going to produce a file. Say what is
+    # missing instead, and open no job at all.
+    if _image_only(formats) and not material.tables and not await _conversation_figures(material):
+        missed = _unreadable_names([str(n) for n in (getattr(gathered, "notes", None) or [])])
+        line = _NO_TABLE_FOR_CHART
+        if missed:
+            line = f"I couldn't read {_and_list(missed)} as a table. {line}"
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "artifact", "effort": effort})
+        return line
 
     # 4. Accept — persisted before any model call, keyed on the send's
     #    durable identity plus what it targets, so the same send answers
@@ -1390,11 +1410,18 @@ async def _load_payload(ctx: "pipeline.ComposeContext", key: str) -> Optional[di
         await asyncio.sleep(0.1)
 
 
-async def _rebuild_edit_payload(ctx: "pipeline.ComposeContext", reason: str) -> Optional[dict]:
+async def _rebuild_edit_payload(ctx: "pipeline.ComposeContext", reason: str,
+                                tables_: Sequence[Any] = ()) -> Optional[dict]:
     """The edit payload re-derived inside the job: a restore from the
     version its format_reason names; any other planned edit re-planned
     and re-applied over the job's parent spec (deterministic ops cost
-    nothing; a model plan is the same one call the engine made)."""
+    nothing; a model plan is the same one call the engine made).
+
+    `tables_` are the job's own material tables — the same data `_run_edit`
+    planned over. Without them an `add_chart` rebuilt here would be refused
+    "there is no data table in this conversation", so a restart between
+    acceptance and the attach would silently drop the chart the person
+    asked for."""
     from ..artifacts import edits as E
 
     m = re.search(r"restore v(\d+)", reason or "")
@@ -1404,8 +1431,8 @@ async def _rebuild_edit_payload(ctx: "pipeline.ComposeContext", reason: str) -> 
     if parent is None:
         return None
     try:
-        plan = await E.plan(ctx.instruction, parent, effort=ctx.effort)
-        outcome = await asyncio.to_thread(E.apply, parent, plan, instruction=ctx.instruction)
+        plan = await E.plan(ctx.instruction, parent, effort=ctx.effort, tables=list(tables_))
+        outcome = await asyncio.to_thread(E.apply, parent, plan, tables=list(tables_), instruction=ctx.instruction)
     except Exception as exc:  # noqa: BLE001
         log.info("artifact edit: re-plan failed: %s", type(exc).__name__)
         return None
@@ -1416,15 +1443,80 @@ async def _rebuild_edit_payload(ctx: "pipeline.ComposeContext", reason: str) -> 
     return outcome.to_payload()
 
 
+def _named_column(instruction: str, tables_: Sequence[Any]) -> str:
+    """A column of one of the tables that the person named in their own
+    words, or "". Their column is never replaced by a suggestion.
+
+    Whole words only: a substring test made "please plan it" name a column
+    called Plan, and a suggestion would then be withheld from a request that
+    named nothing."""
+    text = " ".join((instruction or "").split())
+    if not text:
+        return ""
+    for t in tables_:
+        for c in (getattr(t, "columns", None) or []):
+            name = " ".join(str(c).split())
+            if len(name) >= 3 and re.search(rf"\b{re.escape(name)}\b", text, re.I):
+                return name
+    return ""
+
+
+async def _suggest_charts_for_images(spec: Any, tables_: Sequence[Any], warn: Callable[[str], None], instruction: str) -> Any:
+    """A PNG/SVG request whose composed spec carries no chart gets charts
+    CHOSEN BY CODE from the tables (chart_choice.suggest_charts).
+
+    Only when the person named neither a type nor a column: if they asked
+    for something specific and it did not bind, the honest answer names the
+    column that is missing — a different chart would answer a question they
+    did not ask."""
+    from ..artifacts import chart_choice as CC
+    from ..artifacts import spec as S
+
+    body = getattr(spec, "body", None)
+    if body is None or not isinstance(body, S.DocumentSpec) or not tables_:
+        return spec
+    table = next((t for t in tables_ if str(getattr(t, "id", "")).startswith(("upload", "paste"))), tables_[0])
+    named = CC.named_type(instruction) or _named_column(instruction, tables_)
+    if named:
+        columns = ", ".join(str(c) for c in (getattr(table, "columns", None) or [])[:12])
+        warn(f"no chart was drawn for “{named}”; {getattr(table, 'title', '') or 'the table'} has these columns: {columns}")
+        return spec
+    charts, reasons = await asyncio.to_thread(CC.suggest_charts, table, instruction=instruction, limit=3)
+    if not charts:
+        warn(f"nothing in {getattr(table, 'title', '') or 'the table'} can be compared in a chart, so none was drawn")
+        return spec
+    blocks = list(getattr(body, "blocks", None) or [])
+    blocks = [b for b in blocks if getattr(b, "type", "") != "callout" or not _CHART_FAILED_RE.search(str(getattr(b, "text", "") or ""))]
+    blocks.extend(S.ChartBlock(chart=c) for c in charts)
+    for r in reasons:
+        warn(f"the chart was chosen from the data: {r}")
+    # `ArtifactSpec.body` is a PROPERTY over `document`/`presentation`/
+    # `workbook`; model_copy(update={"body": …}) silently changes nothing.
+    return spec.model_copy(update={spec.kind: body.model_copy(update={"blocks": blocks})})
+
+
+#: The callout `chart_data.resolve_spec` leaves where a chart could not be drawn.
+_CHART_FAILED_RE = re.compile(r"\b(?:could not be drawn|was not drawn|cannot be drawn|not drawn because)\b", re.I)
+
+
 async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str], None], instruction: str = "", *,
-                        parent: Any = None, derived_report: Optional[Dict[str, Any]] = None, model_wrote: bool = True) -> Any:
+                        parent: Any = None, derived_report: Optional[Dict[str, Any]] = None, model_wrote: bool = True,
+                        formats: Sequence[str] = ()) -> Any:
     """AS3 (d): after any compose/apply, the CPU-bound post-processing in a
     thread — chart values from the bound tables, then (B1) every aggregate a
     sheet shows computed from those tables by code, then the style
     normalised — whichever of those modules this build has. `parent` is the
     version an edit started from: a sheet it kept unchanged is not re-checked.
     `model_wrote` is False for an edit whose ops were all deterministic: the
-    figures in it are the person's own (an added row), not a model's."""
+    figures in it are the person's own (an added row), not a model's.
+    `formats` is what the version will be rendered as: a PNG/SVG-only
+    version with no chart in it has nothing to render, so charts are chosen
+    from the data before anything is resolved."""
+    if _image_only(formats) and tables_ and not _has_charts(spec):
+        try:
+            spec = await _suggest_charts_for_images(spec, list(tables_), warn, instruction)
+        except Exception as exc:  # noqa: BLE001 — the render refusal still says why
+            log.info("artifact: chart suggestions skipped: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "repair_binding") and _has_charts(spec):
         # AS3 integration: the charts track's deterministic binding repair
         # (a skipped group_by named in the request, stray fields of another
@@ -1585,7 +1677,8 @@ async def _compose_edit(ctx: "pipeline.ComposeContext", payload: dict, material:
         _refuse_unchanged_edit(ctx, payload, spec, unwritten)
     if material.tables or (_chart_data is not None):
         spec = await _post_process(spec, material.tables, ctx.warn, ctx.instruction, parent=ctx.parent_spec,
-                                   model_wrote=any(p.get("kind") in ("regenerate", "section", "slide") for p in pending))
+                                   model_wrote=any(p.get("kind") in ("regenerate", "section", "slide") for p in pending),
+                                   formats=ctx.formats)
     return spec
 
 
@@ -1645,7 +1738,7 @@ def _edit_sentence(title: str, version: int, changes: Sequence[str], not_applied
 def _op_words(op: str) -> str:
     return {
         "set_style": "the styling", "set_title": "the title", "set_subtitle": "the subtitle", "set_orientation": "the orientation",
-        "set_page": "the page setup", "set_chart": "the chart change", "replace_section": "the section rewrite",
+        "set_page": "the page setup", "set_chart": "the chart change", "add_chart": "the chart", "replace_section": "the section rewrite",
         "insert_section": "the new section", "delete_blocks": "the section delete", "rename_heading": "the heading rename",
         "add_column": "the new column", "rename_column": "the column rename", "delete_column": "the column delete",
         "reorder_columns": "the column order", "add_rows": "the new rows", "delete_rows": "the row delete",
@@ -1738,11 +1831,19 @@ async def _run_edit(
                 language = str(_lexicon_mod.language_of(instruction))
             except Exception:  # noqa: BLE001
                 language = "en"
-        plan = await E.plan(instruction, parent_spec, lineage=sorted(published), language=language, effort=effort)
         pasted, _transform, _notes = await asyncio.to_thread(_pasted_tables, raw_text, [])
         edit_tables = list(pasted)
         if gathered is not None:
-            edit_tables.extend(list(getattr(gathered, "prompt_tables", []) or []))
+            # EVERY table this turn has, not just the pasted and typed ones
+            # (2026-09-17). `material.tables` below already copied the
+            # conversation's uploads into the job, but `E.apply` — which is
+            # what actually adds a chart, by code, before acceptance — saw
+            # only `pasted + prompt_tables`, so "add plots to this doc" had
+            # nothing to bind to.
+            for attr in ("prompt_tables", "upload_tables", "answer_tables"):
+                edit_tables.extend(list(getattr(gathered, attr, []) or []))
+        plan = await E.plan(instruction, parent_spec, lineage=sorted(published), language=language, effort=effort,
+                            tables=edit_tables)
         if plan.summary == "undo":  # an undo the intent did not see as one
             parent_version = current.get("parent_version")
             if not parent_version:
@@ -1846,6 +1947,21 @@ async def _run_edit(
             # changed", which is what happened.
             if changed:
                 said.append("rewrote " + ", ".join(changed[:5]) + (" and more" if len(changed) > 5 else ""))
+        # An edit whose WORDS were about charts, but whose published version
+        # gained none, must not say a chart was added. The PUBLISHED spec is
+        # the only thing that can answer that — the plan's own phrase was
+        # written before the compose stage resolved anything (owner report,
+        # 2026-09-17: "also i want Plots on this docs" answered twice
+        # without a plot).
+        if _about_charts(instruction) and parent_spec is not None:
+            gained = await _charts_gained(int(user_id), str(row["artifact_id"]), int(row["version"]), parent_spec)
+            if _withdraw_chart_claim(instruction, outcome.applied_ops, gained):
+                # The clause of an op that CHANGED a chart stays: it is true,
+                # and it is not a claim that one was added.
+                kept = _clauses_of_ops(outcome, _CHART_OPS_WITHOUT_GAIN)
+                said = [c for c in said if "chart" not in c.lower() or c in kept]
+                if not any("chart" in str(n.get("op", "")) or "chart" in str(n.get("reason", "")).lower() for n in not_applied):
+                    not_applied.append({"op": "add_chart", "reason": "the data could not be drawn as a chart"})
         unmet = ((row.get("progress") or {}).get("selfcheck") or {}).get("unmet") or []
         line = _edit_sentence(ref.title or title, int(ref.version), said, not_applied, unmet=unmet, data_only_note=data_only_note,
                               restored=restore_n,
@@ -1865,6 +1981,128 @@ async def _run_edit(
     await emit("token", {"text": line})
     await emit("meta", {"route": "artifact", "effort": effort, "artifacts": [ref.to_json()]})
     return line
+
+
+#: A chart noun in any number. `core.chart_decision.explicit_chart_request`
+#: owns this judgement for the chat side, but it reads only the SINGULAR
+#: forms: measured 2026-09-17, it answers False for "also i want Plots on
+#: this docs" and for "include graphs" — the two requests this round is
+#: about. Until that list gains the plurals (noted for the integrator), the
+#: nouns are checked here as well.
+_CHART_WORDS_RE = re.compile(r"\b(?:charts?|graphs?|plots?|visuali[sz]ations?|diagrams?)\b", re.I)
+
+
+def _about_charts(instruction: str) -> bool:
+    """The person's words ask for a chart at all."""
+    if not instruction:
+        return False
+    if _CHART_WORDS_RE.search(instruction):
+        return True
+    try:
+        from ..artifacts import chart_choice as CC
+
+        return bool(CC.about_charts(instruction))
+    except Exception:  # noqa: BLE001 — the chooser is optional in this build
+        return False
+
+
+#: Ops that change (`set_chart`) or remove (`delete_blocks`) a chart the file
+#: ALREADY has. Neither gains a chart, by design.
+_CHART_OPS_WITHOUT_GAIN = ("set_chart", "delete_blocks")
+
+
+def _withdraw_chart_claim(instruction: str, applied_ops: Sequence[str], gained: Optional[int]) -> bool:
+    """Whether the answer must take its chart clause back: the words asked for
+    a chart and the PUBLISHED version gained none.
+
+    `gained <= 0` alone is not that failure. Changing a chart adds none and
+    deleting one subtracts, so on 2026-09-18 "make the chart a line chart"
+    published a v2 whose chart really WAS a line chart and answered "Saved
+    **Pricing** v2, but nothing in it changed. Not applied: the chart (the
+    data could not be drawn as a chart)" — the owner's own complaint,
+    reinstated on the `set_chart` path PR #77 shipped two days earlier. An
+    edit that claimed an ADDITION and published no new chart is still
+    withdrawn, whatever else it did. `gained` None means the published spec
+    could not be read, and then the plan's own words stand."""
+    if not _about_charts(instruction) or gained is None or gained > 0:
+        return False
+    ops = list(applied_ops or [])
+    if "add_chart" in ops:
+        return True
+    return not any(op in _CHART_OPS_WITHOUT_GAIN for op in ops)
+
+
+def _clauses_of_ops(outcome: Any, ops: Sequence[str]) -> Set[str]:
+    """The sentence clauses `edits.apply` wrote for those ops. `applied` and
+    `applied_ops` are appended together, op by op, so they line up."""
+    said = list(getattr(outcome, "applied", None) or [])
+    names = list(getattr(outcome, "applied_ops", None) or [])
+    return {c for c, op in zip(said, names) if op in ops}
+
+
+#: A format named as the TARGET of a conversion: "as a PDF", "to pdf", "into
+#: Word". "on this docs", "in this excel" and "on this doc" name the file the
+#: person ALREADY has, and the rules return those as a convert carrying that
+#: format too (measured 2026-09-18), which is why the format alone cannot
+#: decide what the sentence asked for.
+_CONVERT_TARGET_RE = re.compile(
+    r"\b(?:as|into|in|to)\s+(?:an?\s+|the\s+)?(?:new\s+)?"
+    r"(?:pdf|word|docx?|excel|xlsx?|csv|powerpoint|pptx?|slides?|deck|png|svg|image)s?\b", re.I)
+
+
+def _chart_request_is_an_edit(parent_row: dict, intent: ArtifactIntent, instruction: str) -> bool:
+    """A "convert" whose words ASK FOR A CHART is a change to the file rather
+    than a re-render of it — unless the sentence also spells out a conversion
+    to a format the artifact does not have yet.
+
+    THE OWNER'S SECOND REPORTED SENTENCE (2026-09-18). "also i want Plots on
+    this docs", sent right after the report's card, is read by the rules as
+    action='convert', rule='convert-artifact-turn', formats=['docx'] (from the
+    word "docs"), chart_request=True — measured on the integrated tree. The
+    convert branch re-renders the stored spec, so the plot was never planned,
+    and `intent._should_consult` is False for that verdict, so the LLM
+    classifier never saw the sentence either. The document was already Word,
+    so nothing was being converted at all.
+
+    BOTH SIGNALS ARE NEEDED. "also i want Plots on this docs" carries
+    formats=['docx'] from the word "docs" alone, and the same sentence over a
+    PDF-only report would look like a real conversion if the format decided
+    it; "give me this as a PDF with the chart" and "convert it to pdf and add
+    a chart" spell the conversion out, and an edit would not produce the file
+    they asked for. So a conversion is kept only when it ADDS a format AND the
+    words name that format as the target. A version named for a restore stays
+    a conversion."""
+    if not bool(getattr(intent, "chart_request", False)) or getattr(intent, "version", None):
+        return False
+    kind = str(parent_row.get("kind") or "document")
+    ok, _bad = F.formats_for_conversion(kind, list(intent.formats or []))
+    have = {str(f.get("format")) for f in ((parent_row.get("current") or {}).get("files") or []) if f.get("format")}
+    adds = [f for f in ok if f not in have]
+    return not (adds and _CONVERT_TARGET_RE.search(instruction or ""))
+
+
+def _chart_count(spec: Any) -> int:
+    try:
+        from ..artifacts import chart_spec as _CS
+
+        return sum(1 for _ in _CS.iter_chart_slots(spec))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def _charts_gained(user_id: int, artifact_id: str, version: int, parent: Any) -> Optional[int]:
+    """How many charts the PUBLISHED version has that the parent did not, or
+    None when the published spec could not be read."""
+    from ..artifacts import store
+
+    try:
+        child = await db.run_in_thread(store.read_spec, store.version_dir(user_id, artifact_id, version))
+    except Exception as exc:  # noqa: BLE001 — the sentence keeps the plan's own words
+        log.info("artifact: published spec unreadable for the chart claim: %s", type(exc).__name__)
+        return None
+    if child is None:
+        return None
+    return _chart_count(child) - _chart_count(parent)
 
 
 def _quoted(text: str) -> str:

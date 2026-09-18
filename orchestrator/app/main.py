@@ -2927,7 +2927,12 @@ async def _resolve_document_refs(
     return docs, images, None
 
 
-def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup: bool) -> bool:
+def _asks_about_an_attachment(
+    text: str,
+    request: "ChatRequest",
+    video_followup: bool,
+    image_followup: bool = False,
+) -> bool:
     """Does this turn ask what an ATTACHED file says?
 
     The honest-visual refusal stands aside for exactly this turn: a map in a
@@ -2941,7 +2946,17 @@ def _asks_about_an_attachment(text: str, request: "ChatRequest", video_followup:
     `visuals.asks_about_attachment_content` reads the words; this function
     only adds the requirement that there be a file to read.
     """
-    if not (request.image_data or request.pdf_uploads or request.pdf_data or video_followup):
+    if not (
+        request.image_data
+        or request.pdf_uploads
+        or request.pdf_data
+        or video_followup
+        # 2026-09-18: an image the conversation already holds is a file to
+        # READ for exactly the same reason a video is — "what does the map
+        # in that photo show?" must not be answered "I can't draw a map"
+        # one turn after the photo was read fine.
+        or image_followup
+    ):
         return False
     from .artifacts import visuals as _t3_visuals
 
@@ -3859,7 +3874,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             extras["model"] = llm.served_model_id("smart")
         elif route in ("sql", "rag", "report"):
             extras["model"] = llm.served_model_id("smart")
-            extras["effort"] = "think"  # engine default; picker not applied
+            # Until 2026-09-17 this said "think" whatever the person chose,
+            # on the belief that the data engines were pinned to that level.
+            # They are not: their narratives stream through the same
+            # `llm.*` functions as every other route, and on a Fast turn
+            # those send `enable_thinking` false (llm.mark_fast_turn). meta
+            # is trust metadata, so it reports the level that actually
+            # served the answer rather than a constant.
+            extras["effort"] = request.effort
         else:  # "chat": assistant mode or the salesforce chat class (§3a)
             extras["model"] = llm.served_model_id(request.model)
             extras["effort"] = request.effort
@@ -4443,6 +4465,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # same per-task scope).
         context.reset_trim_notice()
         llm.reset_usage()
+        # FAST NEVER THINKS (owner rule, 2026-09-17). Declared once, here,
+        # for the whole turn: every main-model call this task makes — the
+        # answer, a search fallback, a repo Q&A, a compaction summary, the
+        # route classifier's fallback, an agent step — reads it inside
+        # llm.reasoning_extra_body and sends `enable_thinking` false. A
+        # ContextVar with the same per-task scope as the accounting above, so
+        # it reaches every engine without a parameter and cannot leak into
+        # another request. The public /v1 API has its own task and never
+        # passes here, so it is unaffected (by design).
+        llm.mark_fast_turn(llm.normalize_effort(request.effort) == "fast")
         trace_context = query_trace.activate()
         # While a model call inside this turn waits for a restarting engine,
         # the person sees why instead of a silent spinner (app/resilience.py).
@@ -4874,7 +4906,24 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     if settings.fact_extraction_enabled:
                         fact_task = asyncio.create_task(
                             facts.remember_after_route(
-                                fact_gate, user_id, request.text, request.conversation_id
+                                fact_gate,
+                                user_id,
+                                request.text,
+                                request.conversation_id,
+                                # A turn that carries a document or an image
+                                # is a turn ABOUT that material. Third-party
+                                # content is never a fact about the person
+                                # (the sweep found a pasted CV overwriting an
+                                # account's own name, email and employer), so
+                                # such a turn writes no memory at all.
+                                attachments=bool(
+                                    request.pdf
+                                    or request.pdf_uploads
+                                    or request.video_uploads
+                                    or request.images
+                                    or request.image
+                                    or request.image_base64
+                                ),
                             )
                         )
                         _background_tasks.add(fact_task)
@@ -4889,8 +4938,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                                 # event loop's callback handler.
                                 return
                             if saved:
+                                # A deleted row comes back flagged; it must not
+                                # ride out as "memory updated" with the very
+                                # sentence the person asked to erase.
                                 memory_state["facts"] = [
-                                    f["fact"] for f in saved
+                                    f["fact"] for f in saved if not f.get("deleted")
                                 ]
 
                         fact_task.add_done_callback(_facts_done)
@@ -5146,6 +5198,37 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         video_followup = await video_engine.is_about_video(
                             request.text, conversation_videos
                         )
+
+            # 2026-09-18: images attached EARLIER in this conversation. The
+            # composer sends the bytes only on the turn the file is attached
+            # to and resends the history as text, so the second question
+            # about a photo ("what was the invoice number again?") used to
+            # route to rag and answer "I don't see the note you're referring
+            # to ... please upload it here" — about a picture the person had
+            # sent one turn before, with the answer in it (audit,
+            # 2026-09-17). Documents survive a turn and videos have a
+            # follow-up test; images now have one too. The test is words
+            # only — no model call — and when it does not fire the turn
+            # routes exactly as it did before.
+            image_followup_images: list = []
+            if (
+                request.text
+                and not request.images_data
+                and not request.pdf_data
+                and not request.pdf_uploads
+                and not request.video_uploads
+                and not video_followup
+                and not deep_research_on
+                and not request.agent
+                and not github_ref
+                and not url_list
+                and not lane.entered
+            ):
+                from .engines import image_memory
+
+                image_followup_images = image_memory.images_for_followup(
+                    conv_key, request.text, viewer
+                )
 
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
@@ -5680,7 +5763,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # the table attached as a PDF used to skip the refusal too,
                 # and the document engine cannot draw, so that turn came back
                 # as prose — the incident this whole track exists to stop.
-                and not _asks_about_an_attachment(text, request, video_followup)
+                and not _asks_about_an_attachment(
+                    text, request, video_followup, bool(image_followup_images)
+                )
             ):
                 # A VISUAL WITH NO CHART TYPE (2026-09-16). "plot this on a
                 # map", twice: there is no geographic type in
@@ -5765,6 +5850,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # An attached image ALWAYS goes to the vision engine — text-only
                 # engines (chat/agent/sql/rag) cannot see it, and silently
                 # answering "I can't view images" is worse than routing here.
+                from .engines import image_memory
                 from .engines.vision import run_vision_engine
 
                 answer = await run_vision_engine(
@@ -5777,6 +5863,33 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # 2026-08-28 the engine ignored it and always thought,
                     # so "Fast" on an image was the slowest path in the app.
                     effort=request.effort,
+                    conversation_id=conv_key,
+                )
+                # The picture stays in the conversation for the next
+                # question about it (engines/image_memory.py).
+                image_memory.remember(
+                    conv_key,
+                    request.images_data,
+                    question=text,
+                    answer=answer,
+                    # The conversation key is whatever the client sent, so
+                    # the viewer is part of the key: image bytes never cross
+                    # an account (engines/image_memory.py).
+                    user_id=viewer,
+                )
+            elif image_followup_images:
+                # A second question about the image the person already sent.
+                # Same engine, same effort, the remembered bytes — so the
+                # turn answers from the picture instead of denying it exists.
+                from .engines.vision import run_vision_engine
+
+                answer = await run_vision_engine(
+                    text,
+                    image_followup_images,
+                    history,
+                    emit,
+                    effort=request.effort,
+                    conversation_id=conv_key,
                 )
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a
@@ -5784,7 +5897,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.repo import run_repo_engine
 
                 answer = await run_repo_engine(
-                    text, github_ref, conv_key, history, emit
+                    text, github_ref, conv_key, history, emit, request.effort
                 )
             elif crawl_url is not None:
                 # Phase 3.5: crawl the whole site into the web store.

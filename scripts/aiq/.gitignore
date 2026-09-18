@@ -1,0 +1,9 @@
+# A run is evidence for one session, not repository content. Only the frozen
+# baseline (the production image sha256:cec61feca1f7 = main 9ef4602) is kept,
+# because every later score is compared with it and tests/test_aiq_harness.py
+# re-scores it in CI.
+runs/*
+!runs/baseline-20260917/
+# The scratch venv, the downloaded files and the code the model wrote.
+.runtime/
+__pycache__/

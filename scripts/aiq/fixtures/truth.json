@@ -1,0 +1,147 @@
+{
+ "customers-100.csv": {
+  "rows": 100,
+  "columns": [
+   "Index",
+   "Customer Id",
+   "First Name",
+   "Last Name",
+   "Company",
+   "City",
+   "Country",
+   "Phone 1",
+   "Phone 2",
+   "Email",
+   "Subscription Date",
+   "Website"
+  ],
+  "count_by": {
+   "Country": {
+    "Japan": 8,
+    "Germany": 10,
+    "France": 5,
+    "India": 22,
+    "Australia": 6,
+    "United States": 18,
+    "South Africa": 3,
+    "United Kingdom": 12,
+    "Canada": 7,
+    "Brazil": 9
+   },
+   "Company": {
+    "Blue Harbor Ltd": 9,
+    "Pioneer Labs": 10,
+    "Summit Energy": 16,
+    "Vertex Logistics": 10,
+    "Nimbus Analytics": 10,
+    "Kestrel Foods": 5,
+    "Lumen Media": 10,
+    "Sparrow Retail": 13,
+    "Orchid Health": 9,
+    "Granite Works": 8
+   },
+   "Subscription Year": {
+    "2022": 34,
+    "2021": 41,
+    "2020": 25
+   }
+  },
+  "numeric_columns": [
+   "Index"
+  ]
+ },
+ "sales-2025.csv": {
+  "rows": 144,
+  "columns": [
+   "Month",
+   "Region",
+   "Product",
+   "Units",
+   "Revenue",
+   "Cost"
+  ],
+  "sum_by": {
+   "Region": {
+    "Revenue": {
+     "North": 167382.0,
+     "South": 106662.0,
+     "East": 133668.0,
+     "West": 197874.0
+    }
+   },
+   "Month": {
+    "Revenue": {
+     "2025-01": 47016.0,
+     "2025-02": 50637.0,
+     "2025-03": 38868.0,
+     "2025-04": 42526.0,
+     "2025-05": 47957.0,
+     "2025-06": 45102.0,
+     "2025-07": 54626.0,
+     "2025-08": 47103.0,
+     "2025-09": 46360.0,
+     "2025-10": 67575.0,
+     "2025-11": 62456.0,
+     "2025-12": 55360.0
+    }
+   },
+   "Product": {
+    "Units": {
+     "Starter": 2395,
+     "Pro": 2280,
+     "Enterprise": 389
+    }
+   }
+  },
+  "total_revenue": 605586.0,
+  "numeric_columns": [
+   "Units",
+   "Revenue",
+   "Cost"
+  ]
+ },
+ "incidents-2025.csv": {
+  "rows": 180,
+  "columns": [
+   "Incident Id",
+   "Opened",
+   "Team",
+   "Service",
+   "Severity",
+   "Status",
+   "Hours Lost"
+  ],
+  "count_by": {
+   "Team": {
+    "Search": 47,
+    "Payments": 47,
+    "Mobile": 46,
+    "Platform": 40
+   },
+   "Status": {
+    "Resolved": 90,
+    "Open": 34,
+    "In Progress": 30,
+    "Failed": 26
+   },
+   "Severity": {
+    "Medium": 61,
+    "Low": 85,
+    "High": 34
+   }
+  },
+  "sum_by": {
+   "Team": {
+    "Hours Lost": {
+     "Search": 172.1,
+     "Payments": 212.7,
+     "Mobile": 169.5,
+     "Platform": 161.5
+    }
+   }
+  },
+  "numeric_columns": [
+   "Hours Lost"
+  ]
+ }
+}

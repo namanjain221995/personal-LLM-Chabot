@@ -800,6 +800,272 @@ def choose(chart: CS.Chart, table: Any, instruction: str = "", *,
     )
 
 
+# ------------------------------------------------------- suggestions --
+#
+# CHARTS DECIDED BY CODE, WITH NO MODEL CALL (2026-09-17). Two turns in the
+# owner's report ended with no picture at all: "I want plot" over a CSV the
+# composer had written no chart for, and "also i want Plots on this docs".
+# Nothing in the pipeline could look at a table and say what is worth
+# drawing — `recommend` only types a chart somebody has ALREADY bound. These
+# functions read the table's own shape and return BINDINGS (never numbers:
+# chart_data.compute still does that, in its worker thread).
+
+#: A column whose values are nearly all different carries no comparison: a
+#: count of it is a row of 1s and a bar of it is one bar per row.
+NEAR_UNIQUE_SHARE = 0.8
+#: A text column is worth a category axis when a real share of the rows
+#: repeat: at most this many distinct values per row.
+CATEGORY_DISTINCT_SHARE = 0.5
+#: …and its biggest group has to hold at least this many rows.
+MIN_TOP_COUNT = 3
+#: A category axis longer than this folds its tail into "Other".
+TAIL_MAX_CATEGORIES = 15
+TAIL_TOP_N = 10
+#: Rows read to profile a column for a suggestion. `infer_column`'s own
+#: sample; the distinct counts below are taken over the same rows.
+SUGGEST_SAMPLE = 20_000
+
+#: Columns that NAME a row rather than describe it. Charting one is always
+#: noise, whatever its cardinality says.
+_ID_NAME_RE = re.compile(
+    r"^(?:.*\b)?(?:id|ids|uuid|guid|key|code|ref|reference|index|idx|serial|"
+    r"sr\.?\s*no\.?|s\.?\s*no\.?|no\.?|number|email|e-?mail|phone|phone\s*\d+|mobile|"
+    r"tel|telephone|fax|website|url|uri|link|address|postcode|zip|pin|slug|hash|token)"
+    r"(?:\b.*)?$",
+    re.I,
+)
+
+#: The date bucket a span of this many days is counted in. Read in order.
+_BUCKET_BY_SPAN: Tuple[Tuple[int, str], ...] = ((366 * 3, "month"), (366 * 10, "quarter"), (10 ** 9, "year"))
+
+#: "top 10 countries" — the person's own tail, which the fold below obeys
+#: instead of imposing its own.
+_TOP_N_RE = re.compile(r"\btop\s+(\d{1,2})\b", re.I)
+
+
+def top_n_named(instruction: str) -> Optional[int]:
+    """The `top N` the person typed, when it is a tail a chart can carry."""
+    m = _TOP_N_RE.search(instruction or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 1 <= n <= 50 else None
+
+
+def _is_id_name(name: str) -> bool:
+    return bool(_ID_NAME_RE.match(" ".join(str(name).split())))
+
+
+@dataclass
+class _Col:
+    index: int
+    name: str
+    kind: str
+    n_distinct: int
+    top_count: int
+    n_rows: int
+
+    @property
+    def near_unique(self) -> bool:
+        return self.n_rows > 0 and self.n_distinct >= NEAR_UNIQUE_SHARE * self.n_rows
+
+
+def _profile_column(table: Any, index: int, sample: int = SUGGEST_SAMPLE) -> _Col:
+    """One column as (kind, distinct, biggest group), over an evenly spread
+    sample — so a 200,000-row table costs what a 20,000-row one costs."""
+    from . import chart_data as CD  # lazy: chart_data imports this module
+
+    columns = [str(c) for c in (CD._table_attr(table, "columns", []) or [])]
+    rows = list(CD._table_attr(table, "rows", []) or [])
+    scan = _spread(rows, sample)
+    info = CD.infer_column(table, index, sample=sample)
+    counts: Dict[str, int] = {}
+    for r in scan:
+        v = r[index] if index < len(r) else None
+        if CD._is_blank(v):
+            continue
+        label = CD._label_of(v)
+        counts[label] = counts.get(label, 0) + 1
+    return _Col(index=index, name=columns[index] if index < len(columns) else f"Column {index + 1}",
+                kind=info.kind, n_distinct=len(counts),
+                top_count=max(counts.values()) if counts else 0, n_rows=len(scan))
+
+
+def _profile(table: Any, sample: int = SUGGEST_SAMPLE) -> List[_Col]:
+    """Every column of `table`. Only `suggest_charts` needs them all; the
+    guards below profile the ONE column they are about."""
+    from . import chart_data as CD  # lazy
+
+    n = len(list(CD._table_attr(table, "columns", []) or []))
+    return [_profile_column(table, i, sample) for i in range(n)]
+
+
+def _date_bucket(table: Any, col: _Col) -> str:
+    """month / quarter / year, from the span the column actually covers."""
+    from . import chart_data as CD  # lazy
+
+    rows = list(CD._table_attr(table, "rows", []) or [])
+    info = CD.infer_column(table, col.index, sample=SUGGEST_SAMPLE)
+    order = info.date_order or "dmy"
+    dates = [d for d in (CD.to_date(r[col.index] if col.index < len(r) else None, order) for r in _spread(rows, SUGGEST_SAMPLE)) if d is not None]
+    if len(dates) < 2:
+        return "month"
+    span = (max(dates) - min(dates)).days
+    for limit, bucket in _BUCKET_BY_SPAN:
+        if span <= limit:
+            return bucket
+    return "year"
+
+
+def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tuple[List[CS.Chart], List[str]]:
+    """(charts, reasons) — chart BINDINGS this table can honestly carry.
+
+    Dates first (how many rows per month / quarter / year, as a line), then
+    the text columns that really are categories, then the numeric measures.
+    Id-like and near-unique columns are never suggested: a bar per e-mail
+    address is not a chart. No numbers are computed here — every chart comes
+    back with `data` only, and `chart_data.compute` fills it in the job's
+    worker thread.
+
+    CPU-bound (one pass per column): call it through `asyncio.to_thread`.
+    """
+    from . import chart_data as CD  # lazy
+
+    tid = str(CD._table_attr(table, "id", "") or "")
+    cols = _profile(table)
+    charts: List[CS.Chart] = []
+    reasons: List[str] = []
+    named = top_n_named(instruction)
+
+    def usable(c: _Col) -> bool:
+        return not _is_id_name(c.name) and c.n_rows > 0
+
+    dates = [c for c in cols if c.kind == "date" and usable(c)]
+    texts = [c for c in cols if c.kind == "text" and usable(c) and not c.near_unique
+             and c.n_distinct <= CATEGORY_DISTINCT_SHARE * c.n_rows and c.top_count >= MIN_TOP_COUNT]
+    texts.sort(key=lambda c: (-c.top_count, c.n_distinct, c.index))
+    measures = [c for c in cols if c.kind == "number" and usable(c) and not _PERIOD_RE.match(c.name)]
+
+    for col in dates:
+        if len(charts) >= limit:
+            break
+        bucket = _date_bucket(table, col)
+        charts.append(CS.Chart(type="line", title=f"Records by {col.name}"[:120], x_label=col.name[:60], y_label="Records",
+                               data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count", date_bucket=bucket, sort="x")))
+        reasons.append(f"{col.name} is a date, so the rows are counted per {bucket}")
+
+    for col in texts:
+        if len(charts) >= limit:
+            break
+        top_n = named or (TAIL_TOP_N if col.n_distinct > TAIL_MAX_CATEGORIES else None)
+        charts.append(CS.Chart(type=_bar_flavour_for(col), title=f"Records by {col.name}"[:120], x_label=col.name[:60], y_label="Records",
+                               data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count", sort="value_desc",
+                                               top_n=top_n, other_bucket=True)))
+        tail = f", so the {top_n - 1} largest are shown and the rest are grouped as Other" if top_n else ""
+        reasons.append(f"{col.name} has {col.n_distinct} values in {col.n_rows:,} rows{tail or ', so the rows are counted per value'}")
+
+    for col in measures:
+        if len(charts) >= limit:
+            break
+        if texts:
+            cat = texts[0]
+            charts.append(CS.Chart(type=_bar_flavour_for(cat), title=f"{col.name} by {cat.name}"[:120], x_label=cat.name[:60], y_label=col.name[:60],
+                                   data=CS.Binding(table_id=tid, x=cat.name, y=[col.name], agg="sum", sort="value_desc",
+                                                   top_n=named or (TAIL_TOP_N if cat.n_distinct > TAIL_MAX_CATEGORIES else None), other_bucket=True)))
+            reasons.append(f"{col.name} is a number, so it is totalled by {cat.name}")
+        else:
+            charts.append(CS.Chart(type="histogram", title=f"Distribution of {col.name}"[:120], x_label=col.name[:60],
+                                   data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count")))
+            reasons.append(f"{col.name} is a number with no category column beside it, so its distribution is drawn")
+
+    return charts[:limit], reasons[:limit]
+
+
+def _bar_flavour_for(col: "_Col") -> str:
+    """bar or horizontal_bar for a category axis of this many values."""
+    if col.n_distinct > VERTICAL_BAR_CATEGORIES:
+        return "horizontal_bar"
+    return "bar"
+
+
+def skipped_columns(table: Any) -> List[str]:
+    """The columns `suggest_charts` will not chart, for a sentence that has
+    to say which ones are missing."""
+    return [c.name for c in _profile(table) if c.kind != "date" and (_is_id_name(c.name) or c.near_unique)]
+
+
+def fold_long_tail(chart: CS.Chart, table: Any, instruction: str = "") -> Tuple[Optional[CS.Binding], str]:
+    """(binding, note) when a bar axis is too long to read, else (None, "").
+
+    More than `TAIL_MAX_CATEGORIES` bars is a picture nobody reads and a
+    legend nobody matches. The person's own `top N` wins; a binding that
+    already carries one is left alone."""
+    b = chart.data
+    if b is None or chart.type not in ("bar", "horizontal_bar") or b.top_n is not None or not b.x:
+        return None, ""
+    from . import chart_data as CD  # lazy
+
+    columns = [str(c) for c in (CD._table_attr(table, "columns", []) or [])]
+    idx, _ = CD.match_column(b.x, columns)
+    if idx is None:
+        return None, ""
+    col = _profile_column(table, idx)
+    if col.kind == "date" or col.n_distinct <= TAIL_MAX_CATEGORIES:
+        # A date axis is BUCKETED before it is drawn (one bar per month, not
+        # per timestamp), so its raw cardinality is not the number of bars.
+        return None, ""
+    top_n = top_n_named(instruction) or TAIL_TOP_N
+    # `Binding.top_n` is the CATEGORY CAP, and `chart_data.compute` spends one
+    # of those slots on the Other bucket: a cap of 10 draws the 9 largest
+    # beside Other. The note says the number the person will count.
+    note = (f"{col.name} has {col.n_distinct} values, so the chart shows the {top_n - 1} largest "
+            f"and groups the rest as {_other_label()}")
+    return b.model_copy(update={"top_n": top_n, "other_bucket": True}), note
+
+
+def _other_label() -> str:
+    from . import chart_data as CD  # lazy
+
+    return CD.OTHER
+
+
+def not_worth_drawing(chart: CS.Chart, table: Any, computed: Any = None) -> str:
+    """Why a COUNTING chart of this column says nothing, or "".
+
+    Only counting charts (`agg='count'` with no measure): a bar per row is
+    what a near-unique column produces, and a tallest bar of two rows is a
+    row of equal bars. A chart with a real measure is never refused here — a
+    revenue bar per product is one row per category by design."""
+    b = chart.data
+    if b is None or b.y or b.agg != "count" or not b.x:
+        return ""
+    if chart.type not in ("bar", "horizontal_bar", "pie", "donut"):
+        return ""
+    from . import chart_data as CD  # lazy
+
+    columns = [str(c) for c in (CD._table_attr(table, "columns", []) or [])]
+    idx, _ = CD.match_column(b.x, columns)
+    if idx is None:
+        return ""
+    col = _profile_column(table, idx)
+    if col.n_rows < 10 or col.kind == "date":
+        # A DATE axis is bucketed before it is counted (one bar per month,
+        # not per timestamp), so its raw cardinality says nothing about the
+        # picture. Every daily sales file would be refused otherwise.
+        return ""
+    if col.near_unique:
+        return (f"{col.name} has {col.n_distinct} different values in {col.n_rows:,} rows, "
+                f"so counting them draws one bar per row")
+    if computed is not None:
+        values = [v for s in (getattr(computed, "series", None) or []) for v in (getattr(s, "values", None) or [])]
+        top = max(values) if values else 0.0
+    else:
+        top = float(col.top_count)
+    if top <= 2:
+        return f"no {col.name} appears more than {int(top)} time{'s' if int(top) != 1 else ''}, so every bar would be the same height"
+    return ""
+
+
 # ------------------------------------------------- the same table, for the model --
 
 #: The rule table, in the order `recommend` applies it. chart_spec.prompt_guide
@@ -841,4 +1107,6 @@ __all__ = [
     "AUTO_PIE_CATEGORIES", "NAMED_PIE_CATEGORIES", "VERTICAL_BAR_CATEGORIES", "LONG_LABEL_CHARS", "TREND_MIN_R",
     "MIN_HEATMAP_SIDE", "MIN_BOX_ROWS_PER_CATEGORY", "RULES", "Shape", "Choice",
     "shape_of", "recommend", "can_draw", "choose", "named_type", "about_charts", "rules_text", "label",
+    "suggest_charts", "skipped_columns", "fold_long_tail", "not_worth_drawing", "top_n_named",
+    "NEAR_UNIQUE_SHARE", "CATEGORY_DISTINCT_SHARE", "MIN_TOP_COUNT", "TAIL_MAX_CATEGORIES", "TAIL_TOP_N",
 ]

@@ -75,6 +75,13 @@ async def summarize(existing: str, turns: Sequence[dict]) -> str:
         build_messages(existing, turns),
         temperature=0.0,
         max_tokens=settings.summary_max_tokens,
+        # Never. Rewriting a transcript into notes is a copying task, not a
+        # reasoning one, and reasoning is drawn from the SAME budget as the
+        # summary: at chat_completion's thinking-on default a long fold could
+        # spend the whole allowance thinking and return nothing, silently
+        # losing the compacted turns. True at every effort, so this does not
+        # follow the picker.
+        thinking=False,
     )
     return (text or "").strip() or existing
 
@@ -101,6 +108,7 @@ async def condense(summary: str) -> str:
         ],
         temperature=0.0,
         max_tokens=settings.summary_max_tokens,
+        thinking=False,  # a condensation is copying, not reasoning (see summarize)
     )
     return (text or "").strip() or summary
 

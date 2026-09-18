@@ -36,6 +36,20 @@ LATENCY (2026-09-03). Two changes, both measured on the deployed model:
     of extracting on the answer's critical path — the way ChatGPT processes
     a file while you are still typing the question.
 
+THE PERSONA (2026-09-17). The answer prompt used to be a pure extractor —
+"a careful document analyst ... answer using what is actually in the
+document" — which answered ABOUT the document and refused to advise. It now
+comes from engines/source_use.py, per question: a document is a SOURCE, not
+a cage, and a field question still gets the strict extractor rules.
+
+    The switch there is a scored classifier, not a list of patterns, and its
+    two thresholds differ on purpose: one decision signal makes a question
+    advisory, strict extraction needs two points of high-precision field
+    evidence. Getting a question wrong towards advice costs a sentence;
+    getting it wrong towards extraction is the incident above. source_use.
+    classify() returns the evidence it used, which is what to print first
+    when an answer comes back the wrong shape.
+
 Emits meta route "vision" — same visual-understanding engine as before.
 """
 from __future__ import annotations
@@ -47,7 +61,7 @@ import os
 import re
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple, Union
 
-from . import DIAGRAM_INSTRUCTION, recent_turns
+from . import DIAGRAM_INSTRUCTION, recent_turns, source_use
 from .. import llm
 from ..config import settings
 from ..core.pdf import (MAX_PDF_PAGES, extract_pdf_pages, render_pdf_pages,
@@ -76,21 +90,29 @@ LAYOUT_PAGES = 2
 #: The pre-extraction cache file inside an upload's `extracted/` directory.
 CACHE_NAME = "document.json"
 
-_SYSTEM = (
-    "You are a careful document analyst. You are given a document's extracted "
-    "text (the ENTIRE document was read; the excerpt shown is the part most "
-    "relevant to the question) and, for PDFs, images of its first pages. "
-    "Answer using what is actually in the document. When asked to extract "
-    "fields (invoices, contracts, forms), return the structured values you "
-    "find. Do not invent details that are not present."
-)
 # --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
 from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
 
 _AS3_CAPABILITY = _as3_capability_suffix()
-
-_SYSTEM = _SYSTEM + _AS3_CAPABILITY
 # --- AS3 intent-capability END ---
+
+
+def _system_for(question: str) -> str:
+    """The system prompt for THIS question (see engines/source_use.py).
+
+    Until 2026-09-17 this was one fixed string — "You are a careful document
+    analyst ... Answer using what is actually in the document" — a pure
+    extractor persona. Asked whether a rack-cooling brochure helped HIS two
+    DGX Sparks, the platform reported that the document does not mention DGX
+    and sent the owner to the vendor. The persona now answers the question
+    that was asked, from the document plus general knowledge plus what this
+    conversation already says about the person, each part labelled; the
+    strict extractor rules come back for a field question — but only on
+    evidence that a field of the document is really being named, never on a
+    bare word that is also ordinary English ("in the long term").
+    """
+    return source_use.system_text(question) + _AS3_CAPABILITY
+
 
 #: Words that mean the QUESTION is about what the page looks like, where the
 #: text layer alone cannot answer and the renders earn their tokens.
@@ -468,7 +490,7 @@ async def run_pdf_engine_multi(
         content.append({"type": "text", "text": owner_note})
 
     messages = (
-        [{"role": "system", "content": _SYSTEM + DIAGRAM_INSTRUCTION}]
+        [{"role": "system", "content": _system_for(instruction) + DIAGRAM_INSTRUCTION}]
         + recent_turns(history, settings.chat_history_turns)
         + [{"role": "user", "content": content}]
     )

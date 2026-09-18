@@ -194,5 +194,15 @@ def test_legacy_wire_values_normalize_to_the_ladder():
 
 
 def test_max_gets_the_high_output_ceiling():
+    """Think and max get 16,000 tokens for a real question, not for small talk.
+
+    The condition moved on 2026-09-18: it read `mode == "assistant"`, which
+    capped every Salesforce-mode answer at the ceiling meant for "hello". It
+    now keys on whether the turn IS small talk, so an ordinary question gets
+    the same room in either mode - the sweep's worst answers came from that
+    false premise.
+    """
     src = inspect.getsource(chat.run_chat_engine)
-    assert 'effort in ("think", "max") and mode == "assistant"' in src
+    assert 'if effort in ("think", "max") and not small_talk:' in src
+    assert "max_tokens = 16000" in src
+    assert "max_tokens = 6000 if small_talk else 8000" in src

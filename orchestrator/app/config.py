@@ -726,22 +726,6 @@ class Settings:
         #: when tools are attached (a server-side cut inside a <think> block
         #: can corrupt tool-call arguments).
         self.server_thinking_budget: bool = _bool("SERVER_THINKING_BUDGET", False)
-        #: ADAPTIVE THINKING at Fast (core/effort_policy.py, 2026-09-15). Fast
-        #: answers with the reasoning pass off; a prompt the deterministic
-        #: classifier recognises as multi-step reasoning (puzzles, maths and
-        #: word problems, logic, ratios, code debugging, proofs) thinks
-        #: instead of reasoning — and looping — inside the answer. Off returns
-        #: every Fast turn to thinking-off.
-        self.fast_adaptive_thinking: bool = _bool("FAST_ADAPTIVE_THINKING", True)
-        #: Thinking tokens such a turn may spend. ADDED to the answer ceiling
-        #: (reasoning and answer share one max_tokens pool), enforced
-        #: client-side at budget x THINKING_BUDGET_GRACE, after which the
-        #: thought is closed and the same engine writes the answer from it
-        #: with thinking off. Sized from the live evaluation (2026-09-15, 15
-        #: checkable puzzles and word problems): median 616 and max 1,733
-        #: reasoning tokens, all inside the 3,000 cap; ~6 s median to the
-        #: first answer token at ~100 tok/s.
-        self.fast_thinking_budget: int = max(1, _int("FAST_THINKING_BUDGET", 2400))
         #: Best-of-N at extra_high: candidates generated CONCURRENTLY, a
         #: thinking-off guided-JSON judge picks the winner (core/best_of.py).
         #: 1 keeps the extra_high thinking budget but skips the sampling.
@@ -847,6 +831,16 @@ class Settings:
         )
         self.fact_extraction_enabled: bool = _bool("FACT_EXTRACTION_ENABLED", True)
         self.memory_max_facts: int = _int("MEMORY_MAX_FACTS", 200)
+        # 2026-09-18 (memory integrity): the longest message the fact
+        # extractor will read. A durable self-disclosure is a sentence or two
+        # ("my name is Naman", "I'm vegetarian"); a message this long is a
+        # pasted document — a CV, a contract, someone else's profile — and
+        # nothing in a document the person pasted is a fact ABOUT the person.
+        # The composer folds a paste inline with no marker (frontend
+        # lib/pasted.ts), so length is the only signal the orchestrator has.
+        self.memory_self_disclosure_max_chars: int = _int(
+            "MEMORY_SELF_DISCLOSURE_MAX_CHARS", 1200
+        )
 
         # --- Phase C: context meter.
         self.context_meter_enabled: bool = _bool("CONTEXT_METER_ENABLED", True)

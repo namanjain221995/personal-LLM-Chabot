@@ -806,8 +806,11 @@ DUE_COLUMN_RE = re.compile(r"\b(due|deadline|target date|due date|eta)\b", re.IG
 SCORE_SCALE = ("#F8696B", "#FFEB84", "#63BE7B")
 
 #: Series colours for charts, reordered for colour-vision deficiency (the
-#: first five are >= 25 CIELAB apart under simulated deuteranopia).
-CHART_PALETTE: Tuple[str, ...] = ("#2F6FB2", "#E07B00", "#0E9D9A", "#C0566B", "#6D5AE6", "#8A5A44", "#3F8F4F", "#5F6B7A")
+#: first five are >= 25 CIELAB apart under simulated deuteranopia). Slots 6-8
+#: were re-stepped on 2026-09-17 to clear the chroma floor and the
+#: normal-vision ΔE floor; chart_spec.DEFAULT_PALETTE and
+#: chart_colours.CHART_PALETTE carry the same eight values.
+CHART_PALETTE: Tuple[str, ...] = ("#2F6FB2", "#E07B00", "#0E9D9A", "#C0566B", "#6D5AE6", "#319047", "#993F94", "#B38C15")
 
 PAGE_SIZES_MM: Dict[str, Tuple[float, float]] = {"A4": (210, 297), "Letter": (215.9, 279.4), "Legal": (215.9, 355.6), "A3": (297, 420), "A5": (148, 210)}
 MARGINS_MM: Dict[str, Optional[Tuple[float, float, float, float]]] = {
@@ -888,6 +891,12 @@ class ResolvedStyle:
     #: The palette differs from the house default (a preset other than
     #: classic, or a primary colour): template band colours give way to it.
     custom_palette: bool = False
+    #: The document's automatic chart colour plan (chart_colours.Plan), read
+    #: in document order by `resolve`, so a subject and a category name keep
+    #: one colour across every chart of the artifact. Typed `Any` because
+    #: chart_colours imports this module; None means "no plan", and every
+    #: renderer then falls back to the chart-by-chart rules.
+    chart_plan: Any = None
     warnings: List[str] = field(default_factory=list)
     _warned: set = field(default_factory=set)
 
@@ -988,10 +997,14 @@ class ResolvedStyle:
         title = self.element("chart_title")
         axis = self.element("chart_axis")
         face = self.face(title.font_family)
+        from . import chart_colours as CC  # local: chart_colours imports this module
+
         return ChartStyleDefaults(
             palette=CHART_PALETTE, font_family=face.name, font_stack=face.css_stack,
             title_size_pt=float(title.size_pt or 12), axis_size_pt=float(axis.size_pt or 10),
-            grid_color=self.tokens.grid, axis_text_color=axis.color or self.tokens.muted, title_color=title.color or INK,
+            # A chart gridline is lighter than the table hairline: it sits
+            # behind the data rather than bounding it.
+            grid_color=CC.GRID, axis_text_color=axis.color or self.tokens.muted, title_color=title.color or INK,
         )
 
     # --- page ---------------------------------------------------------
@@ -1182,11 +1195,19 @@ def resolve(spec: Any, *, type_scale: Any = None) -> ResolvedStyle:
         header_text=hf.header_text or "", footer_text=hf.footer_text or "",
         slide_ratio=p.slide_ratio or "16:9", background=p.background, orientation_explicit=p.orientation is not None, margins=p.margins or "normal",
     )
+    # The chart colour plan is a property of the DOCUMENT (first-appearance
+    # order across every chart), so it is read once here rather than by each
+    # renderer. `spec` is often a body or None, and then there is no plan.
+    from . import chart_colours as CC  # local: chart_colours imports this module
+
+    chart_plan = CC.plan_for(spec) if spec is not None else None
+
     return ResolvedStyle(
         preset=style.preset, tokens=tokens, body_face=body_face, heading_face=heading_face, sizes=sizes, page=page,
         rules=list(style.rules), conditional=list(style.conditional), scales=list(style.scales), banded=style.banded,
         freeze_header=style.freeze_header, auto_status_colors=style.auto_status_colors, auto_score_scale=style.auto_score_scale,
         explicit=explicit, custom_palette=explicit and (style.preset != "classic" or c.primary is not None),
+        chart_plan=chart_plan,
     )
 
 

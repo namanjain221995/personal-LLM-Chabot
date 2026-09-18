@@ -61,7 +61,12 @@ def add_facts(body: FactsIn, user: UserRow = Depends(require_user)) -> dict:
             break
         existing.add(key)
         stored.append(
-            db.add_user_fact(user_id, fact, body.source_conversation_id)
+            # Provenance (V40): the person added this one themselves, so it
+            # is 'manual' — never 'stated', which means the extractor read it
+            # out of a message.
+            db.add_user_fact(
+                user_id, fact, body.source_conversation_id, source="manual"
+            )
         )
     return {"stored": stored, "skipped": len(body.facts) - len(stored)}
 

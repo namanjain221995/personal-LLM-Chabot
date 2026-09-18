@@ -56,7 +56,20 @@ _SYSTEM = (
     "and the sample shown. You CANNOT compute new aggregates over rows you "
     "were not shown — if asked for something that needs the full data (a sum, "
     "a group-by, a correlation), say so plainly and describe what the profile "
-    "does show. Never invent numbers that are not in the profile."
+    "does show. Never invent numbers that are not in the profile.\n\n"
+    # 2026-09-17: "Compare revenue by region in a chart" was answered with a
+    # mermaid pie whose four values the model typed out. Every one was wrong
+    # — East 138,653 against a true 133,668, North 133,968 against 167,382 —
+    # and even the ranking was wrong, because a chart drawn in a prompt is a
+    # guess dressed as a measurement. Prose is allowed to say "roughly";
+    # a chart is not, so the chart is refused rather than softened.
+    "CHARTS: never draw a chart or a diagram — a mermaid pie, an xychart, an "
+    "ASCII plot — whose numbers you computed or estimated from the data. "
+    "Those numbers would be guesses shown as measurements. Give exact figures "
+    "only where the file's full_rows let you compute them, and say where each "
+    "one came from. When a chart is what the person wants, tell them this "
+    "platform can build one from the file itself and ask them to request it "
+    "(for example \"make a bar chart of revenue by region\")."
 )
 # --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
 from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402

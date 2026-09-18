@@ -1658,6 +1658,11 @@ def _chart_of(value: Any) -> CS.Chart:
     return CS.Chart.model_validate(value)
 
 
+#: A table TITLE is a filename ("customers-100.csv", "tickets.xlsx · Sheet1").
+#: Its trailing extension is dropped when a binding is matched by title.
+_TITLE_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+
+
 def _find_table(table_id: str, tables: Sequence[Any], default: Any = None) -> Tuple[Any, str]:
     if not table_id:
         if default is not None:
@@ -1672,6 +1677,16 @@ def _find_table(table_id: str, tables: Sequence[Any], default: Any = None) -> Tu
     for t in tables:
         if str(_table_attr(t, "id", "")).casefold() == want or str(_table_attr(t, "title", "")).strip().casefold() == want:
             return t, ""
+    # The model binds to the file the person named, and the person drops the
+    # extension: "customers-100" is `upload1` titled "customers-100.csv".
+    # Without this the chart became a "the table … is not available" callout
+    # (owner report, 2026-09-17).
+    stem = _TITLE_EXT_RE.sub("", want).strip()
+    if stem:
+        for t in tables:
+            title = str(_table_attr(t, "title", "")).strip().casefold()
+            if title and (_TITLE_EXT_RE.sub("", title).strip() == stem):
+                return t, ""
     ids = [str(_table_attr(t, "id", "")) for t in tables]
     close = difflib.get_close_matches(table_id, ids, n=1, cutoff=0.85)
     if close:
@@ -1698,6 +1713,13 @@ def resolve_chart(chart: Any, tables: Sequence[Any], *, default_table: Any = Non
         result = compute(c, table, deadline=deadline)
     except ChartDataError as exc:
         return None, [str(exc)], str(exc)
+    # A counting chart of a column that names its rows is one bar per row,
+    # and one whose tallest bar is two rows is a row of equal bars. Both are
+    # pictures of nothing, and both used to be drawn (the owner's "plot" of
+    # a customer list). The sentence says WHICH column and why.
+    pointless = chart_choice.not_worth_drawing(c, table, result)
+    if pointless:
+        return None, [f"{c.title or 'a chart'}: {pointless}"], f"The chart was not drawn: {pointless}."
     update: Dict[str, Any] = {
         "categories": result.categories, "series": result.series, "extra": result.extra,
         "provenance": result.provenance, "caption": result.caption,
@@ -1814,6 +1836,16 @@ def repair_binding(chart: CS.Chart, tables: Sequence[Any], instruction: str = ""
         if len(candidates) == 1 and (t in _GROUP_TYPES or x_is_date):
             upd["group_by"] = candidates[0]
             notes.append(f"the chart is split by {candidates[0]}, as the request names it")
+
+    # A category axis longer than a person can read folds its tail into
+    # "Other" — unless they named their own `top N`, which wins. The note is
+    # a version warning, so the file never quietly shows ten of forty bars.
+    if table is not None:
+        probe_b = CS.Binding.model_validate({**b.model_dump(), **upd}) if upd else b
+        folded, tail_note = chart_choice.fold_long_tail(chart.model_copy(update={"data": probe_b}), table, instruction)
+        if folded is not None:
+            upd.update(top_n=folded.top_n, other_bucket=folded.other_bucket)
+            notes.append(tail_note)
 
     # The type, LAST: the chooser reads the binding as repaired above (a
     # group_by just filled in changes the shape), and the person's own words

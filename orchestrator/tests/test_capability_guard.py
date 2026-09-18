@@ -97,7 +97,12 @@ def test_the_capability_line_is_in_every_answering_prompt_and_not_in_the_lane_or
     assert line in chat._messages("hello", [], "assistant")[0]["content"]
     assert line in chat._messages("hello", [], "salesforce")[0]["content"]
     assert line in agent._SYNTH_SYSTEM
-    assert line in document._SYSTEM
+    # Track G (2026-09-18) replaced document._SYSTEM with _system_for(question),
+    # which assembles BASE + the question's mode block + STRUCTURE. The capability
+    # line must ride on EVERY mode, so all four are checked, not one string.
+    for question in ("summarise this", "what is the total on this invoice?",
+                     "is this helpful for my setup?", "extract the parties and tell me if I should renew"):
+        assert line in document._system_for(question), question
     assert line in vision._SYSTEM
     assert line in dataset._SYSTEM
     # The Fast small-talk lane keeps its own short persona prompt, and tool

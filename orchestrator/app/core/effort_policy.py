@@ -1,46 +1,35 @@
-"""Adaptive thinking for the Fast effort — does THIS prompt need to reason?
+"""Does THIS prompt read as multi-step reasoning? A deterministic classifier.
 
-Fast is the main model with its reasoning pass switched off (llm.wants_thinking).
-That is the right call for a greeting, a lookup, a summary or a translation, and
-the wrong one for a multi-step puzzle: with nowhere else to reason, the model
-reasons inside the answer, contradicts itself and loops (owner report
-2026-09-14: a 2:5 hot/cold water puzzle repeated the same three steps with
-apologies in between). Thinking is where that work belongs, so for those prompts
-Fast thinks — within a bound — and for everything else it stays exactly as fast
-as it was.
+NO RUNTIME CALLER since 2026-09-17. This module used to decide, per Fast turn,
+whether the model should think anyway (PR #71, "adaptive thinking"); that
+behaviour is gone. The owner's rule is that a turn asked for at Fast never
+thinks, on any path, and it is enforced in `llm` for the whole turn
+(`llm.mark_fast_turn`) rather than judged per prompt. The judgement was also
+wrong often enough to matter: in production all four grants it opened were
+false positives — a pasted job description scored as a "measurement" problem —
+costing 11-47 s each.
 
-TWO PIECES, both pure (no network, no model call, no heavy import):
+`classify(text)` is kept because it is pure, cheap and labelled, and a future
+round may want it for something honest (shaping a Fast prompt, or offering
+"switch to Think"). It must not be wired back to `enable_thinking`.
 
-- `classify(text)` — a deterministic scorer over a small lexicon and a few
-  regular expressions, in English, Hindi (Latin and Devanagari), Gujarati
-  (script and Latin) and Hinglish. It fires on multi-step reasoning: puzzles,
-  maths and word problems, logic, measurement and ratio problems, code
-  debugging and tracing, "prove / derive / why exactly". It stays quiet on
-  greetings, chit-chat, factual lookups (numbers included: "what is 5G", "top
-  10 movies 2024", "iPhone 15 price"), summaries, translations, writing tasks
-  and live-value questions. Measured well under a millisecond per prompt; the
-  labelled set and its precision / false-positive gates live in
-  tests/test_effort_policy.py.
-
-- `grant(budget_tokens)` — a context manager that scopes a thinking grant to
-  the work inside it. `llm.stream_chat_events` takes it with `claim_grant()`
-  in ONE place, right where it decides `enable_thinking`, and only when
-  thinking would otherwise be off; the first generation that claims it
-  thinks, later ones (a long answer's continuation segments) do not. A ContextVar, so a grant can
-  never leak into another request, and nothing that runs outside the scope —
-  the /v1 public API, JSON and tool calls, best-of judges — can see it.
-
-The decision to open a grant is the chat engine's (engines/chat.py); this
-module only answers the question and carries the answer.
+`classify(text)` — a deterministic scorer over a small lexicon and a few
+regular expressions, in English, Hindi (Latin and Devanagari), Gujarati
+(script and Latin) and Hinglish. It fires on multi-step reasoning: puzzles,
+maths and word problems, logic, measurement and ratio problems, code
+debugging and tracing, "prove / derive / why exactly". It stays quiet on
+greetings, chit-chat, factual lookups (numbers included: "what is 5G", "top
+10 movies 2024", "iPhone 15 price"), summaries, translations, writing tasks
+and live-value questions. Measured well under a millisecond per prompt; the
+labelled set and its precision / false-positive gates live in
+tests/test_effort_policy.py. Pure: no network, no model call, no heavy import.
 """
 from __future__ import annotations
 
-import contextlib
 import re
 import time
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 #: Only the head and the tail of a long message are scored. The question sits
 #: at one end ("here is my code ... why does it hang?"); a pasted document is
@@ -520,83 +509,3 @@ def classify(text: Optional[str]) -> ThinkingDecision:
         reason = "word_problem" if strongest == "word_problem_vocab" else strongest
         return _done(True, reason, score, names)
     return _done(False, "no_signal", score, names)
-
-
-# ---------------------------------------------------------------------------
-# The grant: a bounded thinking allowance scoped to one piece of work.
-# ---------------------------------------------------------------------------
-
-
-#: Appended to an overrun thought before it is closed (llm.stream_chat_events'
-#: forced closure under a grant). Without it the answer written from an
-#: unfinished thought carried on deliberating in the answer itself ("Wait, I'm
-#: overcomplicating…") — the very failure adaptive thinking exists to remove.
-THOUGHT_CLOSURE = (
-    "\n\nI have thought about this long enough. Now I will write the final answer "
-    "directly and concisely, with no further deliberation, second-guessing or "
-    "restarts: the best method or result I found, and if no exact solution "
-    "exists, I will say so plainly and give the best practical approach."
-)
-
-
-@dataclass(frozen=True)
-class ThinkingGrant:
-    """Thinking tokens a thinking-off generation may spend (on top of its
-    answer ceiling — reasoning and answer share one max_tokens pool)."""
-
-    budget_tokens: int
-    reason: str = ""
-
-
-class _Slot:
-    """The grant in force plus whether a generation has already used it."""
-
-    __slots__ = ("grant", "claimed")
-
-    def __init__(self, value: ThinkingGrant) -> None:
-        self.grant = value
-        self.claimed = False
-
-
-_grant: ContextVar[Optional[_Slot]] = ContextVar("adaptive_thinking_grant", default=None)
-
-
-@contextlib.contextmanager
-def grant(budget_tokens: int, reason: str = "") -> Iterator[ThinkingGrant]:
-    """Let the generations started inside this block think, bounded.
-
-    A budget below 1 is refused rather than silently meaning "unbounded":
-    unbounded thinking at Fast is exactly what this module must not produce.
-    """
-    budget = int(budget_tokens)
-    if budget < 1:
-        raise ValueError("an adaptive thinking grant needs a positive budget")
-    value = ThinkingGrant(budget_tokens=budget, reason=reason)
-    token = _grant.set(_Slot(value))
-    try:
-        yield value
-    finally:
-        _grant.reset(token)
-
-
-def current_grant() -> Optional[ThinkingGrant]:
-    """The grant in force for this context, or None."""
-    slot = _grant.get()
-    return slot.grant if slot is not None else None
-
-
-def claim_grant() -> Optional[ThinkingGrant]:
-    """The grant, for the FIRST generation that asks inside its scope; None
-    for every later one.
-
-    A grant pays for one thought. When the answer written from it runs long,
-    `continuation.stream_long_completion` asks for more of the same answer in
-    further calls — those write text, they do not re-solve the problem, and
-    letting each of them think again cost up to another budget per segment
-    (measured live 2026-09-15: a two-segment answer thought twice, 38 s to
-    91 s)."""
-    slot = _grant.get()
-    if slot is None or slot.claimed:
-        return None
-    slot.claimed = True
-    return slot.grant

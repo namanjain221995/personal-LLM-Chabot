@@ -55,7 +55,9 @@ pyarrow==25.0.1
 # requirement is the binding constraint and must stay free to resolve.
 numpy>=1.26
 openpyxl>=3.1
-matplotlib>=3.8
+matplotlib==3.11.2  # exact: the chart painter's tick, wrap and
+# title geometry is verified against this build (the one in the production
+# image), and CI must draw the same picture as production.
 # 2.8: `Field(fail_fast=True)`, which bounds the 422 of every list in the
 # chat and history bodies (app/history.py `read_validated_body`, 2026-09-13).
 pydantic>=2.8
