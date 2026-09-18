@@ -46,15 +46,47 @@ VIDEO_EXTENSIONS = (".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mpg", ".m
 #: and index run as for any recording. The composer's list is the same one
 #: (frontend/lib/attachments.ts).
 AUDIO_EXTENSIONS = (".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac", ".aac")
+#: Declared audio/* (or HLS) but not a recording: a playlist is a TEXT list of
+#: paths or URLs, MIDI is a score with nothing to hear until a synthesiser
+#: plays it. Browsers type .m3u as audio/mpegurl or audio/x-mpegurl and .pls
+#: as audio/x-scpls; QA measured all three reaching ffmpeg on the audio/*
+#: rule (2026-09-18), where they fail at the probe at best. The composer's
+#: list is the same one (frontend/lib/attachments.ts NOT_RECORDING_*).
+NOT_RECORDING_TYPES = frozenset({
+    "audio/mpegurl", "audio/x-mpegurl", "application/vnd.apple.mpegurl",
+    "application/x-mpegurl", "audio/x-scpls", "audio/scpls",
+    "audio/midi", "audio/x-midi", "audio/mid", "audio/sp-midi",
+})
+NOT_RECORDING_EXTENSIONS = (".m3u", ".m3u8", ".pls", ".hls", ".mid", ".midi", ".kar")
 
 
 def looks_like_video(filename: str, content_type: str = "") -> bool:
     """True for a file the video pipeline should analyse, audio included."""
-    lower = (filename or "").lower()
+    lower = (filename or "").strip().lower()
+    if lower.endswith(NOT_RECORDING_EXTENSIONS):
+        return False
     if lower.endswith(VIDEO_EXTENSIONS + AUDIO_EXTENSIONS):
         return True
-    declared = (content_type or "").lower()
+    declared = (content_type or "").split(";")[0].strip().lower()
+    if declared in NOT_RECORDING_TYPES:
+        return False
     return declared.startswith("video/") or declared.startswith("audio/")
+
+
+def _stored_name(filename: str) -> str:
+    """The name the source is stored under — its extension is what ffmpeg sees.
+
+    The upload keeps whatever name the person (or a direct POST) gave, and
+    ffmpeg 6.1 demuxes a file NAMED *.m3u/*.m3u8 as HLS and opens the local
+    media paths it lists (QA, 2026-09-18: a 96,078-byte WAV decoded from
+    another directory). A known media extension is kept; anything else is
+    stored as .bin and probed by its bytes, which HLS does not match without
+    a playlist extension.
+    """
+    lower = (filename or "").strip().lower()
+    if lower.endswith(VIDEO_EXTENSIONS + AUDIO_EXTENSIONS):
+        return filename
+    return "source.bin"
 
 
 async def require_video(request: Request) -> None:
@@ -84,14 +116,15 @@ async def attach_upload(
     """Register an uploaded video and start (or reuse) its analysis."""
     cap = settings.video_max_upload_mb * 1024 * 1024
     if size > cap:
+        kind = "recording" if (filename or "").strip().lower().endswith(AUDIO_EXTENSIONS) else "video"
         raise HTTPException(
             status_code=413,
-            detail=f"That video is larger than {settings.video_max_upload_mb} MB.",
+            detail=f"That {kind} is larger than {settings.video_max_upload_mb} MB.",
         )
     content_hash = await asyncio.to_thread(store.hash_file, raw_path)
     media_type = mimetypes.guess_type(filename)[0] or ""
     row = await db.run_in_thread(db.upsert_video_analysis, content_hash, size, media_type, filename)
-    await asyncio.to_thread(store.adopt_source, content_hash, raw_path, filename)
+    await asyncio.to_thread(store.adopt_source, content_hash, raw_path, _stored_name(filename))
     await db.run_in_thread(
         db.link_video_attachment, int(row["id"]), conversation_id, user_id, upload_id, filename
     )
@@ -130,6 +163,15 @@ _DESCRIBED_BY = re.compile(r"^(\d+/\d+ frames described) by \S+$")
 
 
 def _public_detail(stage: str, detail: str) -> str:
+    """A stage detail as the person may read it: no model, no engine address.
+
+    Rows written before 2026-09-18 stored a failed or deferred stage's
+    `str(exc)` as it was, and ModelUnavailable's text carries the engine's
+    base URL (QA measured "model at http://…:8000/v1 unavailable after 780s"
+    in both the fusion detail and `error`); the pipeline now scrubs it when
+    it writes, this scrubs what is already stored.
+    """
+    detail = pipeline.public_text(detail)
     if stage == "vision":
         match = _DESCRIBED_BY.match(detail)
         if match:
@@ -152,13 +194,13 @@ def status_payload(row: dict) -> dict:
         if latest.get("stage") == name and latest.get("status") == "running":
             entry["status"] = "running"
             entry["percent"] = latest.get("percent")
-            entry["detail"] = latest.get("detail") or entry.get("detail", "")
+            entry["detail"] = _public_detail(name, str(latest.get("detail") or "")) or entry.get("detail", "")
             entry["elapsed_s"] = latest.get("elapsed_s")
         timeline.append(entry)
     return {
         "status": row["status"],
         "stage": row.get("stage"),
-        "error": row.get("error") or "",
+        "error": pipeline.public_text(str(row.get("error") or "")),
         "duration_ms": row.get("duration_ms"),
         "has_audio": row.get("has_audio"),
         "has_video": row.get("has_video"),

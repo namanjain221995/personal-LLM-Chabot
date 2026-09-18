@@ -505,6 +505,19 @@ const VIDEO_EXTENSIONS = new Set([
 ]);
 const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'flac', 'aac'];
 const AUDIO_EXTENSION_SET = new Set(AUDIO_EXTENSIONS);
+/* Typed audio/* (or HLS) by browsers, but not a recording: a playlist is a
+   TEXT list of paths or URLs (.m3u is audio/mpegurl in /etc/mime.types and
+   audio/x-mpegurl on Firefox/Windows, .pls is audio/x-scpls), and MIDI is a
+   score ffmpeg has nothing to decode from. QA measured all three playlist
+   types reaching ffmpeg on the audio/* rule (2026-09-18); before B12 they
+   were documents and were read as text, which is what they are. The server's
+   list is the same one (orchestrator/app/video/api.py NOT_RECORDING_*). */
+const NOT_RECORDING_TYPES = new Set([
+  'audio/mpegurl', 'audio/x-mpegurl', 'application/vnd.apple.mpegurl',
+  'application/x-mpegurl', 'audio/x-scpls', 'audio/scpls',
+  'audio/midi', 'audio/x-midi', 'audio/mid', 'audio/sp-midi',
+]);
+const NOT_RECORDING_EXTENSIONS = new Set(['m3u', 'm3u8', 'pls', 'hls', 'mid', 'midi', 'kar']);
 
 export type MediaKind = 'video' | 'audio';
 
@@ -513,11 +526,17 @@ export type MediaKind = 'video' | 'audio';
  *
  * The declared type answers first because it is the only witness for a
  * nameless file, and a browser recording (`clip.webm`, `audio/webm`) is
- * audio whatever its container is called. The name answers when the type is
+ * audio whatever its container is called. (A MediaRecorder WebM carries no
+ * container duration, and media.probe still refuses it — QA, 2026-09-18 —
+ * for video and audio alike; routing it here is still right.) The name answers when the type is
  * empty, which is what Windows reports for an extension it has no mapping for.
+ * A playlist or a MIDI score is never media, whatever it is typed.
  */
 export function mediaKindFor(name: string, mime?: string | null): MediaKind | null {
   const declared = normaliseMime(mime);
+  if (NOT_RECORDING_TYPES.has(declared) || NOT_RECORDING_EXTENSIONS.has(extensionOf(name))) {
+    return null;
+  }
   if (declared.startsWith('audio/')) return 'audio';
   if (declared.startsWith('video/')) return 'video';
   const ext = extensionOf(name);

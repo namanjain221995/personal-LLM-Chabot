@@ -427,6 +427,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     /** Highlighted row of the slash-command picker while it is showing. */
     const [commandIndex, setCommandIndex] = useState(0);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
+    /**
+     * The chips as the NEXT render will see them, for the MAX_DOCS ruling.
+     * One pick of six files calls appendDocument six times before React has
+     * run a single setAttachments updater, so neither `attachments` nor a
+     * flag set inside the updater can say "that was the sixth" in time: the
+     * toast never showed and the sixth file vanished (QA, 2026-09-18).
+     * appendDocument advances this synchronously; the effect below re-syncs
+     * it with every committed change (removals, datasets, inline reads).
+     */
+    const acceptedRef = useRef<Attachment[]>([]);
+    useEffect(() => {
+      acceptedRef.current = attachments;
+    }, [attachments]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
     /**
@@ -602,6 +615,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onSend(trimmed, outgoing, options);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
+      acceptedRef.current = [];
       setAttachments([]);
       // The uploads belong to the send now: its promises are already held by
       // the caller, and nothing here may abort them any more.
@@ -742,6 +756,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         delete next[clientId];
         return next;
       });
+      acceptedRef.current = acceptedRef.current.filter((a) => a.clientId !== clientId);
       setAttachments((prev) => prev.filter((a) => a.clientId !== clientId));
     }
 
@@ -758,16 +773,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
     /** Documents stack to MAX_DOCS and displace images/datasets (2026-09-02). */
     function appendDocument(att: Attachment) {
-      let refused = false;
+      const streamed = (list: Attachment[]) =>
+        list.filter((a) => a.kind === 'pdf' || a.kind === 'video').length;
+      const accepted = acceptedRef.current.filter((a) => a.kind !== 'dataset');
+      if (streamed(accepted) >= MAX_DOCS) {
+        toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
+        return;
+      }
+      acceptedRef.current = [...accepted, att];
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
-        if (kept.filter((a) => a.kind === 'pdf' || a.kind === 'video').length >= MAX_DOCS) {
-          refused = true;
-          return prev;
-        }
+        if (streamed(kept) >= MAX_DOCS) return prev; // raced past the cap
         return [...kept, att];
       });
-      if (refused) toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
     }
 
     function handleFile(file: File) {
@@ -858,18 +876,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // Never read a 512 MB archive into memory: keep the File handle and
         // stream it to /api/upload when the message is sent. A dataset (like
         // a PDF) stands alone — it replaces whatever was attached.
-        setAttachments([
-          {
-            clientId: newClientId(),
-            attachment_id: newAttachmentId(),
-            name: file.name,
-            bytes: file.size,
-            kind: 'dataset',
-            dataUrl: '',
-            base64: '',
-            file,
-          },
-        ]);
+        const dataset: Attachment = {
+          clientId: newClientId(),
+          attachment_id: newAttachmentId(),
+          name: file.name,
+          bytes: file.size,
+          kind: 'dataset',
+          dataUrl: '',
+          base64: '',
+          file,
+        };
+        acceptedRef.current = [dataset];
+        setAttachments([dataset]);
         return;
       }
       if (isPdf && file.size > INLINE_DOC_BYTES) {

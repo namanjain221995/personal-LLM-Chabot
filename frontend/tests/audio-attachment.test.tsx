@@ -253,3 +253,80 @@ describe('mediaKindFor', () => {
     expect(mediaKindFor('notes', '')).toBeNull();
   });
 });
+
+/* ---- QA round 1 repairs (2026-09-18) ---------------------------------- */
+
+describe('a file typed audio/* that is not a recording stays a document', () => {
+  // A playlist is a text list of paths; ffmpeg demuxes a file NAMED .m3u or
+  // .m3u8 as HLS and opens what it lists. MIDI is a score with nothing to
+  // decode. Before B12 these were documents; the audio/* rule must not
+  // claim them.
+  it.each([
+    ['radio.m3u', 'audio/mpegurl'],
+    ['radio.m3u', 'audio/x-mpegurl'],
+    ['radio.m3u', ''],
+    ['stations.pls', 'audio/x-scpls'],
+    ['live.m3u8', 'application/vnd.apple.mpegurl'],
+    ['live.m3u8', 'audio/mpegurl'],
+    ['tune.mid', 'audio/midi'],
+    ['tune.midi', 'audio/x-midi'],
+    ['ringtone', 'audio/sp-midi'],
+  ])('%s (%s) is not media', (name, type) => {
+    expect(mediaKindFor(name, type)).toBeNull();
+  });
+
+  it('a playlist picked in the composer is chipped as a document, not AUDIO', async () => {
+    const forms = recordUploads();
+    renderApp(ChatApp, Providers);
+    await attach([new File(['#EXTM3U\n/home/me/a.mp3\n'], 'radio.m3u', { type: 'audio/x-mpegurl' })]);
+    const chip = chipOf('radio.m3u');
+    expect(chip.textContent).not.toContain('AUDIO');
+    expect(chip.textContent).not.toContain('VIDEO');
+    await sendText('what is in this list?');
+    const body = chatBodies[0] as Record<string, unknown>;
+    expect(body.video_uploads).toBeUndefined();
+    expect(forms.map((f) => f.get('purpose'))).not.toContain('video');
+  });
+});
+
+describe('the five-document cap says so', () => {
+  // appendDocument used to set `refused` inside the setAttachments updater,
+  // which React runs AFTER the `if (refused) toast(...)` check for every
+  // file but the first of a batch: the sixth streamed file (video, audio,
+  // big PDF, archive) vanished with no message (QA, 2026-09-18).
+  it.each([
+    ['audio', (i: number) => media(`part-${i}.mp3`, 'audio/mpeg')],
+    ['video', (i: number) => media(`clip-${i}.mp4`, 'video/mp4')],
+  ])('six %s files in one pick: five chips and the toast', async (_kind, make) => {
+    const input = renderComposer();
+    const files = Array.from({ length: 6 }, (_, i) => make(i));
+    await act(async () => {
+      fireEvent.change(input, { target: { files } });
+    });
+    expect(screen.getAllByLabelText(/Remove attachment (part|clip)-/)).toHaveLength(5);
+    expect(screen.queryByLabelText(/Remove attachment (part|clip)-5\./)).toBeNull();
+    await waitFor(() => expect(screen.getByText('You can attach up to 5 documents.')).toBeTruthy());
+  });
+
+  it('the cap counts across picks, and a removed chip frees its place', async () => {
+    const input = renderComposer();
+    await act(async () => {
+      fireEvent.change(input, {
+        target: { files: Array.from({ length: 5 }, (_, i) => media(`a-${i}.m4a`, 'audio/mp4')) },
+      });
+    });
+    expect(screen.queryByText('You can attach up to 5 documents.')).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Remove attachment a-0.m4a'));
+    });
+    await act(async () => {
+      fireEvent.change(input, {
+        target: { files: [media('b-0.m4a', 'audio/mp4'), media('b-1.m4a', 'audio/mp4')] },
+      });
+    });
+    expect(chipOf('b-0.m4a').textContent).toContain('AUDIO');
+    expect(screen.queryByLabelText('Remove attachment b-1.m4a')).toBeNull();
+    await waitFor(() => expect(screen.getByText('You can attach up to 5 documents.')).toBeTruthy());
+    expect(screen.getAllByLabelText(/Remove attachment [ab]-/)).toHaveLength(5);
+  });
+});
