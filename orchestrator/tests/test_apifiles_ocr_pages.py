@@ -233,6 +233,38 @@ def test_a_preamble_only_read_leaves_the_page_alone_and_a_preamble_line_is_never
     assert {p: r["status"] for p, r in recorded.items()} == {3: "empty", 5: "empty", 7: "ok", 9: "ok", 11: "ok"}
 
 
+def test_a_scanned_page_whose_text_is_shaped_like_a_region_keeps_all_of_it(tmp_path):
+    """QA 2026-09-18, live answers (3 of 3 runs): the engine writes a slide's
+    'input [1, 3, 224, 224]' as 'text [x, y, x, y]input [1, 3, 224, 224]'.
+    The answer was cleaned twice, and the second pass took the exposed
+    content for a region: page 3 became '' with source 'text' (its OCR
+    thrown away and counted as an empty page) and page 5 lost its title."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {
+        3: "title [58, 109, 397, 190]Tensor Shapes\ntext [74, 279, 421, 335]input [1, 3, 224, 224]",
+        5: " result\ntitle [60, 109, 368, 188]Colour picker\ntext [77, 279, 327, 335][0, 0, 255, 255]\n"
+           "text [74, 380, 268, 436]Primary blue",
+    }
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert (pages[3]["source"], pages[3]["text"]) == ("ocr", "Tensor Shapes\ninput [1, 3, 224, 224]")
+    assert (pages[5]["source"], pages[5]["text"]) == ("ocr", "Colour picker\n[0, 0, 255, 255]\nPrimary blue")
+    assert facts["ocr_empty_pages"] == 0
+
+
+def test_a_page_the_reader_looped_on_with_preamble_tokens_is_degenerate_not_empty(tmp_path):
+    """A loop of the model's own "ovi" is a failed read (ocr_degenerate_pages),
+    not a blank page (ocr_empty_pages): stripping the preamble one token at a
+    time used to eat the whole loop."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: "ovi " * 700}
+    facts = run_stage(derived, source)
+    recorded = ocr_pages.load_recorded(derived)
+    assert recorded[3]["status"] == "degenerate", recorded[3]
+    assert facts["ocr_degenerate_pages"] == 1 and facts["ocr_empty_pages"] == 0
+    assert "ovi" not in json.dumps(pages_of(derived))
+
+
 def test_the_page_budget_reads_the_first_thin_pages_and_lists_the_rest_as_skipped(tmp_path):
     derived, source = scanned_pdf(tmp_path)
     facts = run_stage(derived, source, budget=2)

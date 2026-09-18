@@ -446,6 +446,29 @@ def test_a_preamble_only_read_is_not_counted_as_a_frame_with_readable_text():
     assert (summary["ok"], summary["empty"], summary["unread"]) == (2, 2, 0)
 
 
+def test_a_reader_that_looped_on_its_preamble_is_unavailable_not_a_blank_screen():
+    """QA 2026-09-18: 'ovi ' x 700 was stripped one "ovi" at a time down to
+    nothing, so both frames were `empty` and the stage said "ok" — a loop
+    cached as two blank screens."""
+    reads = [ocr.classify("ovi " * 700), ocr.classify(":\n" * 400)]
+    summary = screen._summarise(reads, frames=2, prompt="OCR")
+    assert summary["status"] == "unavailable"
+    assert (summary["degenerate"], summary["empty"]) == (2, 0)
+
+
+def test_a_mixed_batch_counts_each_state_once():
+    reads = [
+        ocr.classify("Weekly Planning Meeting"),
+        ocr.classify('":"'),
+        ocr.classify("nije " * 400),
+        ocr.OcrRead("", "failed", "APITimeoutError: x"),
+    ]
+    summary = screen._summarise(reads, frames=4, prompt="OCR")
+    assert summary["detail"] == "1/4 frames had readable text · 1 unreadable (the reader looped) · 1 not read"
+    assert summary["status"] == "partial"
+    assert (summary["ok"], summary["empty"], summary["degenerate"], summary["failed"]) == (1, 1, 1, 1)
+
+
 def test_preamble_junk_never_reaches_the_on_screen_text_or_screen_text_txt(monkeypatch, tmp_path):
     from app.video.artifacts import screen_text_txt
 

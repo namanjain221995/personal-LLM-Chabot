@@ -159,8 +159,16 @@ _BBOX_RE = re.compile(r"\[\[\d+(?:,\s*\d+){3}\]\]")
 # each line starts "type [x, y, x, y]Content" — e.g.
 # "text [31, 306, 212, 347]Vendor: TechSara". Strip the region-type word and
 # bbox, keep Content.
+#
+# The indent before the type word is `[^\S\n]*`, not `\s*` (2026-09-18): with
+# re.M every line start inside a run of blank lines was a fresh match attempt
+# that scanned to the end of the run, so N newlines cost N²/2 steps —
+# "Invoice 42" plus 32,000 newlines (about 2,000 output tokens) held the event
+# loop for 11.8 s; now 4 ms. The price is that blank lines just above a
+# region line are no longer folded into it. None of the 296 answers recorded
+# this round had one, and this step's output is byte-identical on all 296.
 _LINE_REGION_RE = re.compile(
-    r"^\s*(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\]\s*", re.M
+    r"^[^\S\n]*(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\]\s*", re.M
 )
 
 
@@ -179,31 +187,65 @@ _LINE_REGION_RE = re.compile(
 #: is left whole for `is_degenerate` to judge. "output", "result." and
 #: "result:" joined the list from the 96-read measurement described at
 #: `_drop_line_before_layout`.
+#:
+#: Every quantifier is possessive (`*+`, `?+`; Python 3.11+). The engine's
+#: answer is untrusted text derived from an uploaded image and this runs on
+#: the event loop. With plain `*`, the three whitespace runs around the colon
+#: could split one run of spaces in cubically many ways before giving up:
+#: ':' plus 1,600 spaces (15 output tokens on this tokenizer) took 4.9 s, and
+#: ':' plus 2,500 spaces held the loop for 38 s. The adjacent classes are
+#: disjoint or may match nothing, so possessive matching accepts exactly the
+#: same lines.
 _PREAMBLE_LINE_RE = re.compile(
-    r"""\A[ \t]*(?:
-        ["'`]*[ \t]*:[ \t]*\d*[ \t]*["'`]*    # ':'  '":"'  ': 3'
-      | (?:result|output)[ \t]*[.:"'`]?       # 'result'  "result '"  'result.'  'output'
-      | ovi                                   # 'ovi'
-    )[ \t]*(?:\n|\Z)""",
+    r"""\A[ \t]*+(?:
+        ["'`]*+[ \t]*+:[ \t]*+\d*+[ \t]*+["'`]*+    # ':'  '":"'  ': 3'
+      | (?:result|output)[ \t]*+[.:"'`]?+          # 'result'  "result '"  'result.'  'output'
+      | ovi                                        # 'ovi'
+    )[ \t]*+(?:\n|\Z)""",
     re.X,
 )
 _PREAMBLE_TOKEN_RE = re.compile(r"\Aovi[ \t]+(?=\S)")
+#: The most preamble lines one answer carries. Measured on the 296 raw answers
+#: recorded this round: 40 had one, none had two. One more is allowed; past
+#: that, the leading run is the model LOOPING on a preamble ("ovi ovi ovi …",
+#: ":\n:\n:\n…"), which is a failed read and must reach `is_degenerate` whole —
+#: stripping it line by line turned such a loop into an `empty` screen.
+_MAX_PREAMBLE_LINES = 2
 #: The start of a line the engine wrote as a region (see `_drop_line_before_layout`).
-_LAYOUT_LINE_RE = re.compile(r"\s*(?:<\|det\|>|(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\])")
+#: The type word is the engine's own vocabulary, not "any lower-case word":
+#: of the 1,254 region-shaped line starts in the 296 answers recorded this
+#: round, 1,236 carried one of these (text 887, title 164, image 75, header 52,
+#: table 31, page_number 13, chart 7, footer 7) and 9 were the model's
+#: "result" fused into the first region. That one stays a type: 6 of the 9
+#: held the image's first line ("result [0, 0, 999, 540]Tensor Shapes"), and
+#: 3 held a self-critique, which stays in the text rather than risk the 6.
+#: The other 9 were the image's own text: "input [1, 3, 224, 224]",
+#: "conv1 [1, 64, 112, 112]" and a bare "[1, 2, 3, 4]" on a slide or a REPL.
+#: Taken for layout, such a line drops the real line above it whenever the
+#: engine answers without a preamble ('>>> sorted(xs)' above '[1, 2, 3, 4]',
+#: QA 2026-09-18). A type this list lacks only means a chatter first line is
+#: kept, as it was before this rule existed.
+_LAYOUT_TYPES = ("text", "title", "image", "header", "table", "page_number", "chart", "footer", "result")
+_LAYOUT_LINE_RE = re.compile(
+    r"[^\S\n]*(?:<\|det\|>|(?:%s)[^\S\n]*\[\d+(?:,\s*\d+){3}\])" % "|".join(_LAYOUT_TYPES)
+)
 
 
 def _strip_preamble(text: str) -> str:
     """Drop the model's leading preamble line(s); a no-op on real text.
 
-    Repeated until nothing matches, so that cleaning twice — `_ocr_one`
-    cleans, then `classify` cleans what it is given — is cleaning once.
+    At most `_MAX_PREAMBLE_LINES`: a longer run of them is a loop, and the
+    text comes back untouched so that `is_degenerate` sees all of it.
     """
     out = text
-    while True:
+    for _ in range(_MAX_PREAMBLE_LINES):
         match = _PREAMBLE_LINE_RE.match(out) or _PREAMBLE_TOKEN_RE.match(out)
         if not match:
             return out
         out = out[match.end():].lstrip()
+    if _PREAMBLE_LINE_RE.match(out) or _PREAMBLE_TOKEN_RE.match(out):
+        return text
+    return out
 
 
 def _drop_line_before_layout(text: str) -> str:
@@ -241,15 +283,26 @@ def _drop_line_before_layout(text: str) -> str:
 def clean_transcript(raw: str) -> str:
     """Drop layout-control markup and the model's preamble, keep the text.
 
-    Idempotent: the layout rule needs region markers, which the first pass
-    removes, and the preamble rule repeats until nothing matches.
+    Run it ONCE, on the engine's raw answer — `classify` is where that
+    happens. It is not idempotent and cannot be: removing the engine's region
+    markers exposes the image's own text at the start of a line, and text
+    such as "input [1, 3, 224, 224]" or "[0, 0, 255, 255]" is then shaped
+    exactly like a region. A second pass took it for one, dropped the title
+    above it and stripped the line itself (measured live 2026-09-18: a slide
+    "Python lists / [1, 2, 3, 4] / [5, 6, 7, 8]" came back `empty`).
+
+    A first line the engine wrote AS a region is text from the image, so the
+    preamble rule does not touch it: "text [24, 95, 144, 193]output" is the
+    word "output" on a screenshot, not the model's "output" preamble.
     """
     out = _drop_line_before_layout(raw or "")
+    first = out.lstrip().split("\n", 1)[0]
+    in_layout = bool(_LAYOUT_LINE_RE.match(first))
     out = _DET_RE.sub("", out)
     out = _TAG_RE.sub("", out)
     out = _BBOX_RE.sub("", out)
-    out = _LINE_REGION_RE.sub("", out)
-    return _strip_preamble(out.strip())
+    out = _LINE_REGION_RE.sub("", out).strip()
+    return out if in_layout else _strip_preamble(out)
 
 
 # ------------------------------------------------------------ degeneracy --
@@ -386,7 +439,11 @@ def _content_chars(body: str) -> int:
 
 
 def classify(text: str) -> OcrRead:
-    """A raw or cleaned transcript -> the read it actually is.
+    """The engine's RAW answer -> the read it actually is.
+
+    This is the one place a transcript is cleaned (`clean_transcript`), so
+    it must be handed the answer as the engine wrote it, never text that was
+    already cleaned.
 
     `empty` now also covers an answer that was only the model's preamble or
     punctuation (2026-09-18). Every consumer already reads `empty` as "the
@@ -440,8 +497,11 @@ async def _ocr_one(
         timeout=_TIMEOUT_S,
     )
     choice = resp.choices[0]
-    text = clean_transcript(choice.message.content or "")
-    if getattr(choice, "finish_reason", None) == "length" and text:
+    # The RAW answer goes back: `classify` cleans it, once. Cleaning here as
+    # well made every read a second pass over already-cleaned text, which is
+    # not safe (see `clean_transcript`).
+    text = choice.message.content or ""
+    if getattr(choice, "finish_reason", None) == "length" and clean_transcript(text):
         # A page denser than the output ceiling comes back cut off mid-content.
         # Saying so is the difference between the main model treating the tail
         # as absent and treating it as "not transcribed here" (2026-08-29).
@@ -496,9 +556,14 @@ async def read_images(
                 return OcrRead("", "failed", f"{type(exc).__name__}: {str(exc)[:200]}")
         read = classify(raw)
         if read.status == "degenerate":
+            # A checksum, not the text: the first 80 characters of a loop can
+            # be the person's own document ahead of it, and this line goes to
+            # the container log. The checksum still shows two logs are the
+            # same loop.
             log.warning(
-                "OCR returned %d characters of repetition for image %d (prompt %r): %s",
-                len(read.text), idx, prompt or document_prompt(), read.text[:80],
+                "OCR returned %d characters of repetition for image %d (prompt %r), crc32 %08x",
+                len(read.text), idx, prompt or document_prompt(),
+                zlib.crc32(read.text.encode("utf-8", "replace")),
             )
         return read
 
