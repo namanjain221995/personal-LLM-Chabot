@@ -1,0 +1,816 @@
+"""Adversarial QA of the three unverified vision commits (2026-09-18).
+
+5921a57 (image memory, legibility measurement, "?" rule, OCR pre-pass),
+a1d7a46 (memory keyed by viewer) and aa47aa1 (`_remembered_images`) were
+integrated at 4810da0 without their QA having run. This file is that QA:
+eight probes, each reproduced before anything was changed. Probe images are
+synthesized with PIL from a known ground truth (the audit's own images are
+gone); the live runs went in-process to the engine at Fast, thinking off, at
+most two at a time, and nothing was written to any database.
+
+FINDINGS (reproduction -> verdict), written before the first fix:
+
+1. ISOLATION -> NOT CONFIRMED, 0 cross-account recalls. /chat 404s a
+   conversation id the viewer does not own before any route runs; the
+   conversation_id=None fallback key is `u{viewer}-{session_id}`; the store
+   key is `u{viewer}:{conv_key}`; admin inspection and public shares are
+   read-only and never import the store. Matrix: two accounts on one
+   conversation id, the same session_id with no conversation id, a signed-in
+   share viewer, a super admin inspecting a member, and the owner in another
+   conversation -> the owner's photo reached the vision engine only in the
+   owner's own conversation. Pinned below as a regression guard.
+
+2. FOLLOW-UP FALSE POSITIVES -> CONFIRMED, HIGH. After an image turn, 9 of
+   10 turns NOT about the image fired the word test and were answered by the
+   vision engine with the stale photo: "ok thanks!" (leading "ok"), "And
+   what's the weather usually like in Mumbai in July?" (leading "and"),
+   "Recommend a good book on negotiation too." ("too"), "Please note that
+   I'm away tomorrow..." and "Sign the email as Priya..." ("note" and "sign"
+   as verbs), "Summarise the attached PDF for me" ("attached"), "Make a bar
+   chart of monthly revenue from the sales file." ("chart") and, in a
+   dataset conversation after a dashboard screenshot, "What is the total
+   revenue by region?" with or without "in the dataset" (three words shared
+   with the image turn). Also "Generate a picture of a cat wearing a hat"
+   and "Keep the big picture in mind...". In main.py the image branch sits
+   ABOVE the dataset, search, agent and chat branches, so each of those
+   turns changes route versus 9ef4602 (the route-level test below: chat ->
+   vision, dataset -> vision). Root cause: every noun that can name a
+   picture ("note", "sign", "chart", "attached") and every continuation word
+   ("and", "ok", "too", "again") fires on its own, and any two words shared
+   with the image turn fire too. The 10 turns ABOUT the image all fired.
+
+3. BUDGET, TTL, EVICTION -> CONFIRMED, MEDIUM (a) and LOW (b).
+   (a) The TTL releases nothing: an expired entry is dropped only when ITS
+   conversation asks again. Measured: 70 conversations of ~1 MB images, TTL
+   passed, one more image remembered -> 47 entries and 62,666,884 base64
+   characters still held. The module docstring's "a browser tab left open
+   overnight does not pin megabytes" was false.
+   (b) One image over IMAGE_MEMORY_MAX_CHARS is not remembered at all: a
+   20 MB photo is 27,962,028 base64 characters against the 24,000,000
+   budget, so its follow-up gets the original "I don't see the note" turn.
+   Bounds held: 70 conversations kept 47 (62.7 M <= 64 M characters).
+
+4. image_quality FALSE POSITIVES -> CONFIRMED, MEDIUM. The first three
+   images probed were not flagged (a dark sharp screenshot with a sidebar:
+   contrast 10.5, edges 24.8; a faded-marker whiteboard: 8.9 / 21.8; a
+   sparse clean scan: 11.2 / 33.1). Sparser dark images were: a dark
+   screenshot with a title and three rows (8.6 / 19.2), a dark terminal with
+   two sharp lines (4.5 / 13.5), a dark IDE with six lines (3.5 / 12.8) and
+   a sharp night photo of a lit sign (9.3 / 11.3) were all "hard", so the
+   prompt told the model characters "may not be resolvable". Live at Fast on
+   the terminal, 5 runs: values right 5/5, but 2/5 answers carried the
+   false "very dark and low contrast" disclaimer. Root cause: `edges` is
+   the standard deviation of FIND_EDGES over the whole thumbnail, which the
+   filter's one-pixel frame dominates - a UNIFORM 225 image scores 21.4 and
+   a uniform 16 image 1.5 - so it measures brightness, not sharpness, and
+   empty area dilutes real edges. The same artifact hides a bright picture
+   whose text is blurred away (contrast 1.2, "edges" 22.3, not flagged).
+
+5. "?" OVER-FIRING ON CLEAR IMAGES -> NOT CONFIRMED. Live at Fast, five clear
+   images (invoice, metrics panel, room sign, receipt, release notes), "List
+   every number on this image exactly as written": 0 digits replaced by
+   "?", 0 of 33 ground-truth numbers missing.
+
+6. THE UNREADABLE FINAL DIGIT AT FAST -> CONFIRMED, CRITICAL, 1 of 5. A
+   synthetic dark, blurred "Emergency contact: ext. 4471" sign whose last
+   digit is a visible but unresolvable blob: 4 runs answered "ext. 447?";
+   one answered "ext. 447?" and then listed completions - 'it could be a
+   digit or punctuation (e.g., "4471", "4472", "447."), but I cannot confirm
+   which' - putting the true extension and a wrong one in front of a person
+   who will dial one of them. (With the last digit smudged to near
+   invisibility, 10 of 10 runs answered "ext. 447" and 6 of those said all
+   characters are legible - a truncation the app cannot see; recorded, not
+   fixed here.)
+
+7. SUPERLATIVE (B25c) -> CONFIRMED, 5 of 5 at Fast. A synthetic stock-count
+   photo (deltas +4, -8, 0, +35, -4, 0, +2, -21), "Which item has the worst
+   discrepancy between the system count and the counted quantity?": every
+   run LED with "EL-5533 ... Delta -21 ... the largest absolute difference",
+   then listed +35 and wrote "Wait - correction: CR-2255". The headline a
+   person reads first contradicted the answer's own numbers in 5/5.
+
+8. THINK RUNAWAY -> CONFIRMED (code + the builder's measurement). At
+   Think/Max `stream_chat_events` floors the call at MAX_OUTPUT_TOKENS
+   (65,536) and the only other bound is GEN_WALL_CLOCK_S (1,800 s); nothing
+   in the vision route stops a stream that reasons and never answers. The
+   builder measured 208,010 reasoning characters, 1,621 s and no answer on
+   9ef4602 (1 of 4 runs). Reproduced offline: a reasoning-only stream is
+   consumed to its end and the turn returns an empty answer.
+
+Every CONFIRMED finding has a test below that fails on 4810da0.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import json
+import re
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw, ImageFilter
+
+from app import context, db, llm
+from app.config import settings
+from app.engines import image_memory
+from app.engines import router as router_engine
+from app.engines import vision
+from app.main import app
+
+IMG = "aGVsbG8="
+
+#: The audit's two turns (tests/test_vision_accuracy.py uses the same pair).
+TURN1 = "From this note: what number do I call, and how much is still owed after the deposit?"
+ANSWER1 = (
+    "**Number to call:** +31 6 24 88 17 05.\n\n"
+    "**Still owed:** 4,820 EUR invoiced minus the 1,250 EUR deposit already paid "
+    "= **3,570 EUR**."
+)
+#: A dashboard screenshot asked about in a DATASET conversation.
+TURN_DASH = "What does this dashboard say our Q3 revenue was?"
+ANSWER_DASH = (
+    "The dashboard shows **Q3 revenue of $1.42M**, up 8% on Q2. The chart underneath "
+    "breaks revenue down by region: North America leads, then Europe, then APAC. "
+    "The total orders figure is 12,408."
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean(monkeypatch):
+    monkeypatch.setitem(context._window_cache, settings.openai_base_url, settings.model_max_context)
+    image_memory.clear()
+    yield
+    image_memory.clear()
+
+
+async def _collect(_event, _data):
+    return None
+
+
+def _parse_sse(body: str):
+    events = []
+    for block in body.split("\n\n"):
+        if not block.strip():
+            continue
+        lines = block.split("\n")
+        events.append((lines[0][len("event: "):], json.loads(lines[1][len("data: "):])))
+    return events
+
+
+def _meta(resp) -> dict:
+    metas = [d for e, d in _parse_sse(resp.text) if e == "meta"]
+    return metas[-1] if metas else {}
+
+
+# ---------------------------------------------------------------------------
+# Route-level harness: which engine answered the turn
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def engines(monkeypatch):
+    """Every engine a text follow-up can reach, faked to say who it is."""
+    seen: dict = {"vision": [], "routes": []}
+
+    # The image turn answers what the live engine answered, because main.py
+    # remembers that answer and the word test reads it.
+    answers = {TURN1: ANSWER1, TURN_DASH: ANSWER_DASH}
+
+    async def fake_vision(message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None):
+        seen["vision"].append({"message": message, "images": list(images), "conversation_id": conversation_id})
+        text = answers.get(message, "vision answer")
+        await emit("token", {"text": text})
+        await emit("meta", {"route": "vision"})
+        return text
+
+    async def fake_chat(text, history, emit, **kw):
+        await emit("token", {"text": "chat answer"})
+        await emit("meta", {"route": "chat"})
+        return "chat answer"
+
+    async def fake_dataset(message, conversation_id, history, emit, **kw):
+        await emit("token", {"text": "dataset answer"})
+        await emit("meta", {"route": "dataset"})
+        return "dataset answer"
+
+    async def fake_document(text, docs, history, emit, **kw):
+        await emit("token", {"text": "document answer"})
+        await emit("meta", {"route": "document"})
+        return "document answer"
+
+    async def route_chat(message, has_image=False, history=()):
+        return "vision" if has_image else "chat"
+
+    from app.engines import chat as chat_engine
+    from app.engines import dataset as dataset_engine
+    from app.engines import document as document_engine
+
+    monkeypatch.setattr(vision, "run_vision_engine", fake_vision)
+    monkeypatch.setattr(chat_engine, "run_chat_engine", fake_chat)
+    monkeypatch.setattr(dataset_engine, "run_dataset_engine", fake_dataset)
+    monkeypatch.setattr(document_engine, "run_pdf_engine_multi", fake_document)
+    monkeypatch.setattr(router_engine, "route_request", route_chat)
+    return seen
+
+
+def _image_turn(client, conv, question, **extra):
+    body = {"message": question, "image": IMG, "effort": "think", **extra}
+    if conv:
+        body["conversation_id"] = conv
+    return client.post("/chat", json=body)
+
+
+def _text_turn(client, conv, message, history=(), **extra):
+    body = {"message": message, "effort": "think", "history": list(history), **extra}
+    if conv:
+        body["conversation_id"] = conv
+    return client.post("/chat", json=body)
+
+
+# ---------------------------------------------------------------------------
+# Probe 1. Isolation: no image crosses an account (NOT CONFIRMED -> guard)
+# ---------------------------------------------------------------------------
+
+
+def test_the_isolation_matrix_recalls_no_image_across_accounts(engines, as_user):
+    alice = as_user("alice")
+    follow = "What else is written in the photo?"
+    with TestClient(app) as client:
+        # the owner's image turn, in a conversation AND in a session-only chat
+        assert _image_turn(client, "iso-conv-a", TURN1).status_code == 200
+        assert _image_turn(client, None, TURN1, session_id="same-session").status_code == 200
+        owner_images = [c["images"] for c in engines["vision"]]
+        engines["vision"].clear()
+
+        # (a) another account sends the SAME conversation id
+        as_user("bob")
+        r = _text_turn(client, "iso-conv-a", follow)
+        assert r.status_code == 404
+        # (b) conversation_id None, the SAME session_id, another account
+        r = _text_turn(client, None, follow, session_id="same-session")
+        assert r.status_code == 200
+        # (c) a super admin who may inspect the member's conversation
+        as_user("root", role="super_admin")
+        inspected = client.get(f"/admin/api/members/{alice['id']}/conversations/iso-conv-a")
+        assert inspected.status_code == 200, inspected.text
+        r = _text_turn(client, "iso-conv-a", follow)
+        assert r.status_code == 404
+        # (d) the owner, in ANOTHER conversation of her own
+        as_user("alice")
+        r = _text_turn(client, "iso-conv-other", follow)
+        assert r.status_code == 200
+        cross = [c for c in engines["vision"] if c["images"] in owner_images]
+        assert cross == [], "an image reached a turn outside its own conversation and account"
+
+        # positive control: the owner in her own conversation DOES get it back
+        r = _text_turn(client, "iso-conv-a", follow)
+        assert r.status_code == 200 and engines["vision"][-1]["images"] == [IMG]
+
+
+def test_a_share_viewer_cannot_reach_the_owner_s_image(engines, as_user, anonymous_mode):
+    """The public share page is a text snapshot; the only door to the image
+    store is /chat, which a share viewer cannot open on the owner's id."""
+    import inspect
+
+    from app import share_api
+    from app.authn import admin_api, shares_api
+
+    for module in (share_api, shares_api, admin_api):
+        assert "image_memory" not in inspect.getsource(module)
+    with TestClient(app) as client:
+        r = _text_turn(client, "iso-conv-a", "What else is written in the photo?")
+        assert r.status_code == 401
+    assert engines["vision"] == []
+
+
+# ---------------------------------------------------------------------------
+# Probe 2. Follow-up routing: 10 off the image, 10 on it (CONFIRMED)
+# ---------------------------------------------------------------------------
+
+#: (label, image-turn question, image-turn answer, next message)
+OFF_IMAGE = [
+    ("a new topic", TURN1, ANSWER1, "What's the capital of Australia?"),
+    ("a thanks", TURN1, ANSWER1, "ok thanks!"),
+    ("a dataset question", TURN_DASH, ANSWER_DASH, "What is the total revenue by region?"),
+    ("a dataset question naming it", TURN_DASH, ANSWER_DASH, "What is the total revenue by region in the dataset?"),
+    ("a PDF question", TURN1, ANSWER1, "Summarise the attached PDF for me"),
+    ("'note' as a verb", TURN1, ANSWER1, "Please note that I'm away tomorrow; draft an out-of-office reply."),
+    ("a leading 'and'", TURN1, ANSWER1, "And what's the weather usually like in Mumbai in July?"),
+    ("'sign' as a verb", TURN1, ANSWER1, "Sign the email as Priya and make it more formal."),
+    ("a chart to MAKE", TURN_DASH, ANSWER_DASH, "Make a bar chart of monthly revenue from the sales file."),
+    ("a trailing 'too'", TURN1, ANSWER1, "Recommend a good book on negotiation too."),
+]
+
+ON_IMAGE = [
+    ("the audit's own", TURN1, ANSWER1, "What was the invoice number again, and what day was the meeting moved to?"),
+    ("names the photo", TURN1, ANSWER1, "What else is written in the photo?"),
+    ("the note, by position", TURN1, ANSWER1, "Who signed the note at the bottom?"),
+    ("a place in the picture", TURN1, ANSWER1, "and the total at the bottom?"),
+    ("names the screenshot", TURN_DASH, ANSWER_DASH, "Zoom into the screenshot: what's the APAC figure?"),
+    ("that chart", TURN_DASH, ANSWER_DASH, "Which region is smallest in that chart?"),
+    ("the dashboard", TURN_DASH, ANSWER_DASH, "What date range is the dashboard showing?"),
+    ("names the picture", TURN1, ANSWER1, "Is the phone number in the picture Dutch?"),
+    ("read it again", TURN1, ANSWER1, "Can you read the number to call again, digit by digit?"),
+    ("names the image", TURN_DASH, ANSWER_DASH, "Is there a legend in the image?"),
+]
+
+#: Further turns that must not fire: a picture to MAKE, a place that is not
+#: in the picture, a figure of speech, a data noun with no picture behind it.
+OFF_IMAGE_EXTRA = [
+    (TURN1, ANSWER1, "Generate a picture of a cat wearing a hat"),
+    (TURN1, ANSWER1, "What's at the bottom of the Mariana Trench?"),
+    (TURN1, ANSWER1, "Keep the big picture in mind: what should our Q4 priorities be?"),
+    (TURN1, ANSWER1, "What does the table show for Q3?"),
+]
+
+
+@pytest.mark.parametrize("label,question,answer,message", OFF_IMAGE, ids=[r[0] for r in OFF_IMAGE])
+def test_a_turn_not_about_the_image_does_not_fire(label, question, answer, message):
+    image_memory.remember("conv", [IMG], question=question, answer=answer, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+@pytest.mark.parametrize("question,answer,message", OFF_IMAGE_EXTRA)
+def test_further_turns_not_about_the_image_do_not_fire(question, answer, message):
+    image_memory.remember("conv", [IMG], question=question, answer=answer, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+@pytest.mark.parametrize("label,question,answer,message", ON_IMAGE, ids=[r[0] for r in ON_IMAGE])
+def test_a_turn_about_the_image_fires(label, question, answer, message):
+    image_memory.remember("conv", [IMG], question=question, answer=answer, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == [IMG]
+
+
+def _route_of(client, conv, question, answer, message, *, dataset=False, remember=True, **extra):
+    """Run the image turn, then `message`, and return the second turn's route."""
+    assert _image_turn(client, conv, question).status_code == 200
+    if not remember:
+        image_memory.clear()
+    if dataset:
+        db.save_upload(f"up-{conv}"[:32], conv, "sales.csv", 1024, "ready", None, None)
+    history = [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+    resp = _text_turn(client, conv, message, history=history, **extra)
+    assert resp.status_code == 200, resp.text
+    return _meta(resp).get("route")
+
+
+def test_off_image_turns_route_exactly_as_they_would_with_no_image(engines):
+    """The same turn, in the same conversation shape, with and without a
+    remembered image: the route must not change. When the word test does not
+    fire, main.py's dispatch for the turn is the one it had before 5921a57."""
+    changed = []
+    with TestClient(app) as client:
+        for i, (label, question, answer, message) in enumerate(OFF_IMAGE):
+            dataset = question == TURN_DASH
+            control = _route_of(client, f"off-c-{i}", question, answer, message, dataset=dataset, remember=False)
+            engines["vision"].clear()
+            treated = _route_of(client, f"off-t-{i}", question, answer, message, dataset=dataset)
+            # one vision call is the image turn itself; a second is the leak
+            if treated != control or len(engines["vision"]) != 1:
+                changed.append((label, control, treated))
+        # a PDF turn: the document carries its own route whatever was remembered
+        engines["vision"].clear()
+        pdf = base64.b64encode(b"%PDF-1.4 tiny").decode()
+        r = _route_of(client, "off-pdf", TURN1, ANSWER1, "What does this say?", pdf=pdf, pdf_filename="a.pdf")
+        if r != "document" or len(engines["vision"]) != 1:
+            changed.append(("a PDF turn", "document", r))
+    assert changed == [], changed
+
+
+def test_on_image_turns_reach_the_vision_engine_with_the_image(engines):
+    missed = []
+    with TestClient(app) as client:
+        for i, (label, question, answer, message) in enumerate(ON_IMAGE):
+            engines["vision"].clear()
+            route = _route_of(client, f"on-{i}", question, answer, message)
+            second = engines["vision"][-1] if len(engines["vision"]) == 2 else None
+            if route != "vision" or second is None or second["images"] != [IMG]:
+                missed.append(label)
+    assert missed == [], missed
+
+
+# ---------------------------------------------------------------------------
+# Probe 3. Budget, TTL, eviction (CONFIRMED: a, b)
+# ---------------------------------------------------------------------------
+
+
+def _noisy_png(side: int, seed: int = 1) -> str:
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    arr = rng.integers(0, 255, (side, side, 3), dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def test_an_expired_image_does_not_stay_in_memory(monkeypatch):
+    """Finding 3a: the TTL released nothing - 47 expired conversations and
+    62.7 M characters were still held after one more image arrived."""
+    for i in range(5):
+        image_memory.remember(f"c{i}", [IMG * 1000], question="q", answer="a", user_id=1)
+    monkeypatch.setenv("IMAGE_MEMORY_TTL_S", "0.001")
+    time.sleep(0.01)
+    image_memory.remember("fresh", [IMG], question="q", answer="a", user_id=2)
+    assert list(image_memory._remembered_images) == ["u2:fresh"]
+    assert image_memory._total_chars() == len(IMG)
+
+
+def test_an_image_over_the_per_conversation_budget_is_kept_smaller(monkeypatch):
+    """Finding 3b: a 20 MB photo (27,962,028 characters against 24,000,000)
+    was not remembered at all. Scaled down here: a 1,400 px noisy PNG against
+    a budget it does not fit."""
+    big = _noisy_png(1400)
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(big) // 3))
+    image_memory.remember("conv", [big], question="what is this?", answer="noise", user_id=1)
+    kept = image_memory.recall("conv", 1)
+    assert len(kept) == 1, "the image was dropped instead of kept smaller"
+    assert len(kept[0]) <= len(big) // 3
+    raw = base64.b64decode(kept[0].split(",", 1)[-1])
+    with Image.open(io.BytesIO(raw)) as im:
+        assert max(im.size) <= 1600
+
+
+def test_seventy_conversations_stay_inside_both_budgets(monkeypatch):
+    one = "A" * 1_000_000
+    for i in range(70):
+        image_memory.remember(f"c{i}", [one + str(i)], question="q", answer="a", user_id=1)
+    assert len(image_memory._remembered_images) <= image_memory.max_conversations()
+    assert image_memory._total_chars() <= image_memory.max_total_chars()
+    assert image_memory.recall("c69", 1)  # the newest survives
+    assert image_memory.recall("c0", 1) == []  # the oldest went first
+
+
+# ---------------------------------------------------------------------------
+# Probe 4. image_quality: a readable picture is never "unreadable" (CONFIRMED)
+# ---------------------------------------------------------------------------
+
+_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+_SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_SANS_B = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+def _font(path, size):
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:  # a runner without DejaVu still draws, with PIL's own
+        return ImageFont.load_default(size)
+
+
+def _b64(im: Image.Image, fmt: str = "PNG", **kw) -> str:
+    buf = io.BytesIO()
+    im.save(buf, format=fmt, **kw)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _noise(im: Image.Image, amount: int, seed: int) -> Image.Image:
+    import numpy as np
+
+    rng = np.random.default_rng(seed)
+    arr = np.asarray(im).astype(np.int16)
+    mask = rng.random(arr.shape[:2]) < 0.33
+    delta = rng.integers(-amount, amount + 1, arr.shape[:2])
+    if arr.ndim == 3:
+        delta = delta[..., None]
+        mask = mask[..., None]
+    arr = np.where(mask, arr + delta, arr)
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), im.mode)
+
+
+def dark_terminal() -> str:
+    im = Image.new("RGB", (1280, 800), (24, 24, 27))
+    d = ImageDraw.Draw(im)
+    d.text((20, 20), "$ curl -s localhost:8080/health", font=_font(_MONO, 16), fill=(190, 190, 190))
+    d.text((20, 44), '{"status":"ok","version":"3.8.1","uptime_s":86412}', font=_font(_MONO, 16), fill=(190, 190, 190))
+    return _b64(im)
+
+
+def dark_ide() -> str:
+    im = Image.new("RGB", (1600, 1000), (30, 30, 30))
+    d = ImageDraw.Draw(im)
+    for i in range(6):
+        d.text((40, 40 + i * 24), f"line {i + 1}: port = 80{i}1  # retry={i * 3}", font=_font(_MONO, 15), fill=(160, 160, 160))
+    return _b64(im)
+
+
+def night_lit_sign() -> str:
+    im = Image.new("RGB", (1600, 1200), (12, 12, 16))
+    d = ImageDraw.Draw(im)
+    d.rectangle((600, 500, 1000, 600), fill=(40, 40, 50))
+    d.text((630, 525), "OPEN 24/7  TEL 4471", font=_font(_SANS_B, 34), fill=(240, 220, 120))
+    return _b64(im.filter(ImageFilter.GaussianBlur(0.8)), "JPEG", quality=90)
+
+
+def dark_sharp_screenshot() -> str:
+    im = Image.new("RGB", (1280, 800), (22, 24, 28))
+    d = ImageDraw.Draw(im)
+    d.text((280, 40), "Model picker", font=_font(_SANS_B, 28), fill=(200, 200, 205))
+    for i, (a, b) in enumerate([("Smart", "GPT-OSS 120B"), ("Fast", "Qwen3 4B"), ("Vision", "Qwen3-VL 8B")]):
+        y = 110 + i * 60
+        d.rectangle((280, y, 1200, y + 48), outline=(60, 62, 70))
+        d.text((300, y + 12), a, font=_font(_SANS, 20), fill=(170, 172, 180))
+        d.text((520, y + 12), b, font=_font(_SANS, 20), fill=(170, 172, 180))
+    return _b64(im)
+
+
+def faded_whiteboard(blur: float = 3.0) -> str:
+    im = Image.new("RGB", (1600, 1200), (226, 228, 224))
+    d = ImageDraw.Draw(im)
+    for i, t in enumerate(["Sprint 14 retro", "- deploy freeze Thu 18:00", "- budget left: 3,400", "- next demo: 22 Oct"]):
+        d.text((120, 140 + i * 170), t, font=_font(_SANS, 70), fill=(150, 176, 160))
+    im = _noise(im.filter(ImageFilter.GaussianBlur(blur)), 3, 7)
+    return _b64(im, "JPEG", quality=92)
+
+
+def sparse_scan() -> str:
+    im = Image.new("L", (1131, 1600), 255)
+    d = ImageDraw.Draw(im)
+    for i, t in enumerate(["TechSara Solutions", "Your reference number is TS-40917.", "Regards, Accounts"]):
+        d.text((110, 150 + i * 34), t, font=_font(_SANS, 22), fill=0)
+    return _b64(im)
+
+
+def unreadable_sign() -> str:
+    """Dark, out of focus, last digit smudged: the honest reading is 447?."""
+    im = Image.new("RGB", (1200, 900), (10, 10, 12))
+    d = ImageDraw.Draw(im)
+    d.rectangle((180, 250, 1020, 650), fill=(30, 30, 33))
+    d.text((300, 320), "SERVER ROOM B", font=_font(_SANS_B, 64), fill=(62, 62, 64))
+    d.text((230, 470), "Emergency contact: ext. 4471", font=_font(_SANS, 46), fill=(58, 58, 60))
+    im = _noise(im.filter(ImageFilter.GaussianBlur(4.5)), 6, 44)
+    return _b64(im, "JPEG", quality=70)
+
+
+def bright_blurred_away() -> str:
+    im = Image.new("L", (1600, 1200), 235)
+    ImageDraw.Draw(im).text((200, 500), "Emergency contact: ext. 4471", font=_font(_SANS, 60), fill=200)
+    return _b64(im.filter(ImageFilter.GaussianBlur(9)), "JPEG", quality=85)
+
+
+READABLE = {
+    "dark terminal, two lines": dark_terminal,
+    "dark IDE, six lines": dark_ide,
+    "night photo of a lit sign": night_lit_sign,
+    "dark sharp screenshot": dark_sharp_screenshot,
+    "faded whiteboard": faded_whiteboard,
+    "sparse clean scan": sparse_scan,
+}
+
+
+@pytest.mark.parametrize("name", list(READABLE))
+def test_a_readable_picture_is_never_declared_unreadable(name):
+    from app.engines import image_quality
+
+    quality = image_quality.measure(READABLE[name]())
+    assert quality is not None and quality.hard is False, quality
+    assert image_quality.legibility_note([READABLE[name]()]) == ""
+
+
+@pytest.mark.parametrize("make", [unreadable_sign, bright_blurred_away])
+def test_an_unreadable_picture_is_still_flagged(make):
+    from app.engines import image_quality
+
+    quality = image_quality.measure(make())
+    assert quality is not None and quality.hard is True, quality
+
+
+def test_a_blank_frame_is_not_mistaken_for_sharp_edges():
+    """The old statistic gave a UNIFORM 225 image 'edges 21.4': the filter's
+    one-pixel frame, not anything in the picture."""
+    from app.engines import image_quality
+
+    blank = image_quality.measure(_b64(Image.new("L", (1600, 1200), 225)))
+    assert blank is not None and blank.edges < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Probes 5 and 6. The "?" rule: never complete a digit, never mask a clear one
+# ---------------------------------------------------------------------------
+
+
+def _scripted_stream(recorder, script):
+    """A fake `stream_chat_events` whose Nth call yields script[N]."""
+
+    async def fake(messages, *, model_choice="smart", effort="medium", **kwargs):
+        n = len(recorder.setdefault("calls", []))
+        recorder["calls"].append({"messages": list(messages), "effort": effort, **kwargs})
+        for pair in script[min(n, len(script) - 1)]:
+            yield pair
+
+    return fake
+
+
+def _run(message, images, *, effort="fast", history=()):
+    events: list = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    answer = asyncio.run(vision.run_vision_engine(message, images, list(history), emit, effort=effort))
+    streamed = "".join(d.get("text", "") for k, d in events if k == "token")
+    return answer, streamed, events
+
+
+#: The live run that listed completions (probe 6, 4810da0, Fast), split the
+#: way a stream splits it - across the digits.
+_COMPLETING = [
+    ("token", "The emergency contact extension on the sign is:\n\n**ext. 44"),
+    ("token", "7?**\n\n- The characters \"447\" are visible.\n- The final digit is not legible.\n"),
+    ("token", "- It could be a digit or punctuation (e.g., \"44"),
+    ("token", "71\", \"4472\", \"447.\"), but I cannot confirm which."),
+]
+
+
+def test_a_number_marked_unreadable_is_never_completed_later(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, [_COMPLETING]))
+    answer, streamed, _ = _run("What is the extension?", IMG)
+    for text in (answer, streamed):
+        assert "447?" in text
+        assert not re.search(r"447\d", text), text
+
+
+def test_a_completion_written_before_the_mark_is_corrected(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    script = [[("token", "It looks like ext. 4472. "), ("token", "Strictly, only 447? is legible.")]]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
+    answer, streamed, _ = _run("What is the extension?", IMG)
+    assert streamed == answer
+    tail = answer.split("447?", 1)[1]
+    assert "not legible" in tail.lower() or "cannot be read" in tail.lower(), answer
+
+
+def test_clear_numbers_pass_through_untouched(monkeypatch):
+    """Probe 5's other half: a clear answer's digits are never touched."""
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    text = "Total due: 1,284.56 EUR; call +44 20 7946 0958; build 58821; v2.14.3; 73.4 %."
+    rec: dict = {}
+    chunks = [("token", text[i:i + 3]) for i in range(0, len(text), 3)]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, [chunks]))
+    answer, streamed, _ = _run("List the numbers", IMG)
+    assert answer == text and streamed == text
+
+
+# ---------------------------------------------------------------------------
+# Probe 7. A superlative is computed by code, not guessed (CONFIRMED)
+# ---------------------------------------------------------------------------
+
+STOCK_JSON = json.dumps(
+    {
+        "tables": [
+            {
+                "columns": ["SKU", "Item", "System qty", "Counted qty", "Delta"],
+                "rows": [
+                    ["AB-1021", "Hex bolt M8", "240", "244", "+4"],
+                    ["BK-3310", "Bracket, steel", "118", "110", "-8"],
+                    ["CL-0907", "Cable clip 10 mm", "500", "500", "0"],
+                    ["CR-2255", "Crate, plastic", "60", "95", "+35"],
+                    ["DR-4480", "Drill bit 6 mm", "75", "71", "-4"],
+                    ["EG-1188", "Edge guard", "32", "32", "0"],
+                    ["EK-7002", "Earth kit", "14", "16", "+2"],
+                    ["EL-5533", "Elbow joint 90", "88", "67", "-21"],
+                ],
+            }
+        ]
+    }
+)
+STOCK_Q = "Which item has the worst discrepancy between the system count and the counted quantity?"
+
+
+def _answer_call(rec):
+    """The call whose output reached the person: the last one."""
+    return rec["calls"][-1]
+
+
+def _user_text(call) -> str:
+    return "\n".join(
+        p["text"] for p in call["messages"][-1]["content"] if p.get("type") == "text"
+    )
+
+
+def test_a_superlative_question_gets_the_winner_computed_by_code(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    script = [[("token", STOCK_JSON)], [("token", "CR-2255 (+35).")]]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
+    answer, _, _ = _run(STOCK_Q, IMG)
+    assert len(rec["calls"]) == 2, "no table was read before the answer"
+    text = _user_text(_answer_call(rec))
+    assert "largest absolute value 35 (CR-2255)" in text, text
+    assert "smallest -21 (EL-5533)" in text, text
+    # the transcription call never reaches the person
+    assert STOCK_JSON not in answer
+
+
+def test_a_question_without_a_superlative_makes_no_extra_call(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, [[("token", "ok")]]))
+    _run("What does the delta column mean?", IMG)
+    assert len(rec["calls"]) == 1
+
+
+def test_an_unusable_transcription_is_silence(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    script = [[("token", "I see a table but cannot transcribe it.")], [("token", "answer")]]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
+    answer, _, _ = _run(STOCK_Q, IMG)
+    assert answer == "answer"
+    assert "Computed by the app" not in _user_text(_answer_call(rec))
+
+
+# ---------------------------------------------------------------------------
+# Probe 8. The Think runaway is bounded (CONFIRMED)
+# ---------------------------------------------------------------------------
+
+_REASONING_ONLY = [("reasoning", "hmm ")] * 5000
+
+
+def test_a_reasoning_only_stream_is_cut_at_the_allowance_then_answered(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    monkeypatch.setenv("VISION_REASONING_ALLOWANCE", "200")
+    consumed = {"n": 0}
+
+    async def fake(messages, *, model_choice="smart", effort="medium", **kwargs):
+        calls = rec.setdefault("calls", [])
+        calls.append(kwargs)
+        if len(calls) == 1:
+            for pair in _REASONING_ONLY:
+                consumed["n"] += 1
+                yield pair
+        else:
+            yield ("token", "ext. 447?")
+
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", fake)
+    answer, streamed, _ = _run("What is the extension?", IMG, effort="think")
+    assert consumed["n"] <= 201, f"read {consumed['n']} reasoning deltas past an allowance of 200"
+    assert len(rec["calls"]) == 2
+    first, second = rec["calls"]
+    assert getattr(first.get("answer_plan"), "enable_thinking", None) is True
+    assert first["max_tokens"] == 200 + vision.vision_max_tokens()
+    assert getattr(second.get("answer_plan"), "enable_thinking", None) is False
+    assert answer == streamed == "ext. 447?"
+
+
+def test_the_allowance_is_also_a_clock(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    monkeypatch.setenv("VISION_REASONING_ALLOWANCE_S", "0.05")
+    rec: dict = {}
+
+    async def fake(messages, *, model_choice="smart", effort="medium", **kwargs):
+        rec.setdefault("calls", []).append(kwargs)
+        if len(rec["calls"]) == 1:
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                yield ("reasoning", "slow ")
+        else:
+            yield ("token", "answer")
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake)
+    started = time.monotonic()
+    answer, _, _ = _run("What is this?", IMG, effort="think")
+    assert time.monotonic() - started < 0.6
+    assert answer == "answer" and len(rec["calls"]) == 2
+
+
+def test_when_both_passes_produce_nothing_the_person_gets_one_honest_sentence(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    monkeypatch.setenv("VISION_REASONING_ALLOWANCE", "50")
+    rec: dict = {}
+    script = [_REASONING_ONLY, []]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
+    answer, streamed, _ = _run("What is this?", IMG, effort="think")
+    assert len(rec["calls"]) == 2
+    assert answer and answer == streamed
+    assert answer.count(".") == 1 and "image" in answer.lower()
+
+
+def test_an_answer_that_arrives_inside_the_allowance_is_left_alone(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    monkeypatch.setenv("VISION_REASONING_ALLOWANCE", "200")
+    rec: dict = {}
+    script = [[("reasoning", "think ")] * 150 + [("token", "the answer")]]
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
+    answer, _, events = _run("What is this?", IMG, effort="think")
+    assert answer == "the answer" and len(rec["calls"]) == 1
+    assert sum(1 for k, _ in events if k == "reasoning") == 150
+
+
+def test_fast_sends_exactly_what_it_sent_before(monkeypatch):
+    """No plan, the same ceiling: the allowance is a Think/Max mechanism."""
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    rec: dict = {}
+    monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, [[("token", "ok")]]))
+    _run("What is this?", IMG, effort="fast")
+    (call,) = rec["calls"]
+    assert call.get("answer_plan") is None
+    assert call["max_tokens"] == vision.vision_max_tokens()
