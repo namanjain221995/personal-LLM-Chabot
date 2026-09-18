@@ -20,6 +20,10 @@
  * through THIS tree to whichever dialog hosts the panel, and that host closes
  * on Escape. So the panel claims an Escape that belongs to a nested dialog,
  * closes the nested one itself and stops it there — the host stays open.
+ *
+ * Keys behind a modal: see useModalKeyGuard. ChatApp's window-level
+ * shortcuts (Escape stops the answer that is streaming, "/" focuses the
+ * composer) must never act behind an open dialog.
  */
 
 import {
@@ -30,6 +34,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
 import type { FetchLike } from '@/lib/auth';
@@ -37,9 +42,12 @@ import { formatDay, formatWhen } from '@/lib/format';
 import {
   CLEAR_ALL_PHRASE,
   clearFacts,
+  clipText,
   deleteFact,
   excerptQuote,
   factKey,
+  factShownAt,
+  isSessionEnded,
   isUnknownSource,
   listFacts,
   sourceLabel,
@@ -52,31 +60,133 @@ import { IconAlert, IconTrash, IconX } from './icons';
 
 /** A fact quoted inside a sentence (confirm body, button label), kept short. */
 function shortFact(fact: string, max = 80): string {
-  const flat = fact.replace(/\s+/g, ' ').trim();
-  return flat.length <= max ? flat : `${flat.slice(0, max).trimEnd()}…`;
+  return clipText(fact, max);
 }
 
-/** Keep Tab inside a modal: from the last control back to the first, and back. */
-function trapTab(e: ReactKeyboardEvent<HTMLElement>, root: HTMLElement | null) {
+const FOCUSABLE =
+  'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
+
+function focusables(root: HTMLElement): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE));
+}
+
+/**
+ * Keep Tab inside a modal: from the last control back to the first, and back.
+ * The panel itself holds focus after a click on plain text inside it (it has
+ * tabIndex -1), so Shift+Tab from the panel wraps to the last control rather
+ * than leaving for the page behind.
+ */
+export function trapTab(e: ReactKeyboardEvent<HTMLElement>, root: HTMLElement | null) {
   if (e.key !== 'Tab' || !root) return;
-  const focusable = Array.from(
-    root.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-    ),
-  );
+  const focusable = focusables(root);
   if (focusable.length === 0) return;
   const first = focusable[0];
   const last = focusable[focusable.length - 1];
-  if (e.shiftKey && document.activeElement === first) {
+  const active = document.activeElement;
+  if (e.shiftKey && (active === first || active === root)) {
     e.preventDefault();
     last.focus();
-  } else if (!e.shiftKey && document.activeElement === last) {
+  } else if (!e.shiftKey && active === last) {
     e.preventDefault();
     first.focus();
   }
 }
 
+const MODAL = '[aria-modal="true"]';
+
+/** The dialog painted on top: portals append to <body> in the order they open. */
+function topModal(): Element | null {
+  const all = document.querySelectorAll(MODAL);
+  return all.length ? all[all.length - 1] : null;
+}
+
+/**
+ * Keys pressed while a modal is open belong to the modal, including the ones
+ * whose target is not inside it.
+ *
+ * Why: clicking plain text in a dialog used to move focus to <body> (the
+ * panel could not hold focus), so the next keydown never passed through the
+ * panel's React handler. It reached ChatApp's window-level shortcuts instead:
+ * Escape stopped the answer streaming behind the modal and left the modal
+ * open, and "/" moved focus to the composer behind it (QA in Chromium,
+ * 2026-09-18: chip 3/3, clear-all 2/2, Settings 1/1). The panels now take
+ * tabIndex -1 so a click keeps focus inside, and this guard catches whatever
+ * still lands outside every dialog: a focused control that unmounted (Retry
+ * after it loads), or anything else that drops focus to <body>.
+ *
+ * It listens on window in the CAPTURE phase, ahead of every document and
+ * window listener (ArtifactPanel and ActivityPanel close on a document
+ * Escape too), and it ignores any key whose target is inside a dialog: those
+ * are the dialog's own handlers' to decide. For the rest, only the topmost
+ * dialog acts. If that is a ConfirmDialog, which owns Escape through its own
+ * document listener, Escape is let through to it; every other key is stopped
+ * so no global shortcut fires behind the stack.
+ */
+export function useModalKeyGuard(
+  open: boolean,
+  panelRef: RefObject<HTMLElement | null>,
+  onEscape: () => void,
+) {
+  const onEscapeRef = useRef(onEscape);
+  useEffect(() => {
+    onEscapeRef.current = onEscape;
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest(MODAL)) return;
+      if (topModal() !== panel) {
+        if (e.key !== 'Escape') e.stopPropagation();
+        return;
+      }
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onEscapeRef.current();
+      } else if (e.key === 'Tab') {
+        // Focus is outside the dialog; the browser's next stop would be the
+        // page behind it. Bring it back in instead.
+        e.preventDefault();
+        const inside = focusables(panel);
+        (e.shiftKey ? inside[inside.length - 1] : inside[0])?.focus();
+      }
+    }
+    // Registered when the dialog opens, and only then: a dialog opened on top
+    // of this one registers later, so this listener always runs before its
+    // child's and can never see the child already closed by the same key.
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [open, panelRef]);
+}
+
+/**
+ * The React half of the same rule, for a modal panel's onKeyDown. A key whose
+ * target is inside the panel stops here, so nothing behind the modal sees it,
+ * and the caller handles it. A key that arrives through the React tree from a
+ * dialog portalled OUTSIDE the panel (a nested ConfirmDialog) belongs to that
+ * dialog: Escape is left for it, and any other key is still stopped so it
+ * cannot reach a global shortcut. Returns whether the caller should act.
+ */
+export function ownModalKey(
+  e: ReactKeyboardEvent<HTMLElement>,
+  panel: HTMLElement | null,
+): boolean {
+  const inside = !!panel && e.target instanceof Node && panel.contains(e.target);
+  if (inside || e.key !== 'Escape') e.stopPropagation();
+  return inside;
+}
+
 /* ------------------------------------------------------------ the panel */
+
+/**
+ * A 401 is not a connection problem: "check your connection" sent people to
+ * the wrong fix (QA, 2026-09-18).
+ */
+const SESSION_ENDED = 'Your session has ended. Sign in again, then try again.';
 
 interface MemoryPanelProps {
   /** Injectable for tests — same idiom as SecuritySettings. */
@@ -121,9 +231,13 @@ export function MemoryPanel({
       try {
         const rows = await listFacts(fetchFn, signal);
         if (!signal?.aborted) setFacts(rows);
-      } catch {
+      } catch (err) {
         if (!signal?.aborted) {
-          setLoadError('Could not load your memory. Check your connection and try again.');
+          setLoadError(
+            isSessionEnded(err)
+              ? SESSION_ENDED
+              : 'Could not load your memory. Check your connection and try again.',
+          );
         }
       }
     },
@@ -158,8 +272,12 @@ export function MemoryPanel({
       setFacts(list.filter((f) => f.id !== fact.id));
       setFocusAfter(next ? next.id : 'top');
       toast('Deleted from memory');
-    } catch {
-      setActionError(`“${shortFact(fact.fact, 60)}” was not deleted. Try again.`);
+    } catch (err) {
+      setActionError(
+        `“${shortFact(fact.fact, 60)}” was not deleted. ${
+          isSessionEnded(err) ? SESSION_ENDED : 'Try again.'
+        }`,
+      );
       setFocusAfter(fact.id);
     } finally {
       setBusy(false);
@@ -175,8 +293,10 @@ export function MemoryPanel({
       setFacts([]);
       setFocusAfter('top');
       toast(n === 1 ? 'Deleted 1 saved fact' : `Deleted ${n} saved facts`);
-    } catch {
-      setActionError('Your memory was not deleted. Try again.');
+    } catch (err) {
+      setActionError(
+        `Your memory was not deleted. ${isSessionEnded(err) ? SESSION_ENDED : 'Try again.'}`,
+      );
       clearButtonRef.current?.focus();
     } finally {
       setBusy(false);
@@ -343,7 +463,9 @@ function FactRow({
 }) {
   const quote = excerptQuote(fact.source_excerpt);
   const unknown = isUnknownSource(fact.source);
-  const when = fact.created_at ?? fact.updated_at;
+  const when = factShownAt(fact);
+  const rewritten =
+    !!fact.created_at && !!fact.updated_at && fact.updated_at !== fact.created_at;
   return (
     <li data-testid="memory-fact" className="flex items-start gap-3 px-3 py-2.5">
       <div className="min-w-0 flex-1">
@@ -369,11 +491,11 @@ function FactRow({
           {when && (
             <time
               dateTime={when}
-              title={`Saved ${formatWhen(when)}${
-                fact.updated_at && fact.updated_at !== fact.created_at
-                  ? ` · updated ${formatWhen(fact.updated_at)}`
-                  : ''
-              }`}
+              title={
+                rewritten
+                  ? `Updated ${formatWhen(when)} · first saved ${formatWhen(fact.created_at!)}`
+                  : `Saved ${formatWhen(when)}`
+              }
             >
               {formatDay(when)}
             </time>
@@ -431,11 +553,13 @@ function ClearAllDialog({
     inputRef.current?.focus({ preventScroll: true });
   }, [open]);
 
+  useModalKeyGuard(open, panelRef, onCancel);
+
   if (!open || typeof document === 'undefined') return null;
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!ownModalKey(e, panelRef.current)) return;
     if (e.key === 'Escape') {
-      e.stopPropagation();
       onCancel();
       return;
     }
@@ -452,9 +576,12 @@ function ClearAllDialog({
         role="alertdialog"
         aria-modal="true"
         aria-label="Delete everything the assistant remembers?"
+        // A click on the warning text keeps focus in the dialog (see
+        // useModalKeyGuard for what happened when it fell to <body>).
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onKeyDown}
-        className="w-full max-w-sm rounded-ts border border-border bg-surface p-4 shadow-2xl"
+        className="w-full max-w-sm rounded-ts border border-border bg-surface p-4 shadow-2xl focus:outline-none"
       >
         <div className="flex items-start gap-3">
           <IconAlert size={18} className="mt-0.5 shrink-0 text-danger" />
@@ -537,7 +664,8 @@ interface MemoryDialogProps {
  * The panel as a modal, for the "Memory updated" chip. SettingsDialog's
  * recipe: portalled to <body> (a transformed ancestor would otherwise capture
  * position:fixed), z-[70], Escape handled on the panel so a nested dialog's
- * Escape closes only that dialog.
+ * Escape closes only that dialog, and useModalKeyGuard for keys that land
+ * outside it.
  */
 export function MemoryDialog({ open, onClose, fetchFn, highlight }: MemoryDialogProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -547,19 +675,19 @@ export function MemoryDialog({ open, onClose, fetchFn, highlight }: MemoryDialog
     if (open) closeRef.current?.focus({ preventScroll: true });
   }, [open]);
 
+  useModalKeyGuard(open, panelRef, onClose);
+
   if (!open || typeof document === 'undefined') return null;
 
   function onPanelKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    // A nested confirm portals outside this panel and keeps its own Escape
+    // and Tab order.
+    if (!ownModalKey(e, panelRef.current)) return;
     if (e.key === 'Escape') {
-      e.stopPropagation();
       onClose();
       return;
     }
-    // Only while focus is in THIS panel: a nested confirm portals outside it
-    // and keeps its own Tab order.
-    if (panelRef.current?.contains(document.activeElement)) {
-      trapTab(e, panelRef.current);
-    }
+    trapTab(e, panelRef.current);
   }
 
   return createPortal(
@@ -572,9 +700,12 @@ export function MemoryDialog({ open, onClose, fetchFn, highlight }: MemoryDialog
         role="dialog"
         aria-modal="true"
         aria-label="Memory"
+        // A click on a fact's text keeps focus in the dialog, so Escape still
+        // reaches onPanelKeyDown.
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onPanelKeyDown}
-        className="palette-panel flex max-h-[85dvh] w-full max-w-lg flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl"
+        className="palette-panel flex max-h-[85dvh] w-full max-w-lg flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl focus:outline-none"
       >
         <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-ink">Memory</h2>

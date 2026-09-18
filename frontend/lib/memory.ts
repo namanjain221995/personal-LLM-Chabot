@@ -52,6 +52,36 @@ export function isUnknownSource(source: string | null | undefined): boolean {
 const EXCERPT_MAX = 140;
 
 /**
+ * Split into what a reader sees as characters. `String.slice` cuts UTF-16
+ * code units, so an emoji straddling the limit became a lone surrogate that
+ * Chromium painted as a visible U+FFFD (QA, 2026-09-18: "aaaa…a�…"). A
+ * grapheme split also keeps a family emoji or a flag whole; code points are
+ * the fallback where Intl.Segmenter is missing, and never split a surrogate
+ * pair either.
+ */
+function characters(text: string): string[] {
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+    const seg = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    return Array.from(seg.segment(text), (s) => s.segment);
+  }
+  return Array.from(text);
+}
+
+/**
+ * One line of text, at most `max` characters, with "…" where it was cut.
+ * Whitespace is collapsed and the ends trimmed; nothing else is rewritten.
+ */
+export function clipText(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  // Cheap exit: a string no longer than `max` code units cannot be longer
+  // than `max` characters.
+  if (flat.length <= max) return flat;
+  const chars = characters(flat);
+  if (chars.length <= max) return flat;
+  return `${chars.slice(0, max).join('').trimEnd()}…`;
+}
+
+/**
  * The source excerpt as a short, one-line quote — or null when there is
  * nothing to quote. The excerpt is the person's own words, so it is only
  * trimmed and whitespace-collapsed, never rewritten.
@@ -59,8 +89,23 @@ const EXCERPT_MAX = 140;
 export function excerptQuote(excerpt: string | null | undefined): string | null {
   const flat = (excerpt ?? '').replace(/\s+/g, ' ').trim();
   if (!flat) return null;
-  if (flat.length <= EXCERPT_MAX) return flat;
-  return `${flat.slice(0, EXCERPT_MAX).trimEnd()}…`;
+  return clipText(flat, EXCERPT_MAX);
+}
+
+/**
+ * The date a row shows: when its CURRENT text was written. db.update_user_fact
+ * rewrites fact, source, source_excerpt and updated_at but leaves created_at,
+ * so a fact rewritten today from a message sent today showed its first-save
+ * date under today's quote (QA, 2026-09-18: "I moved to Globex last week…"
+ * dated Mar 2) and the rows, sorted by updated_at, read out of order.
+ */
+export function factShownAt(fact: Pick<MemoryFact, 'created_at' | 'updated_at'>): string | null {
+  return fact.updated_at ?? fact.created_at;
+}
+
+/** A timestamp the panel can format, or null (formatDay echoes junk back). */
+function timestamp(value: unknown): string | null {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null;
 }
 
 /**
@@ -81,6 +126,19 @@ export class MemoryRequestError extends Error {
   }
 }
 
+/** A 200 whose body is not the {facts: [...]} list the orchestrator sends. */
+export class MemoryShapeError extends Error {
+  constructor() {
+    super('memory list response has no facts array');
+    this.name = 'MemoryShapeError';
+  }
+}
+
+/** Did the server say the session is gone (as opposed to a network fault)? */
+export function isSessionEnded(err: unknown): boolean {
+  return err instanceof MemoryRequestError && err.status === 401;
+}
+
 function isFact(value: unknown): value is MemoryFact {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
@@ -94,14 +152,17 @@ export async function listFacts(
 ): Promise<MemoryFact[]> {
   const res = await fetchFn('/api/memory/facts', { cache: 'no-store', signal });
   if (!res.ok) throw new MemoryRequestError(res.status);
-  const body = (await res.json()) as { facts?: unknown };
-  if (!Array.isArray(body.facts)) return [];
+  const body = (await res.json()) as { facts?: unknown } | null;
+  // memory_api.list_facts always answers {facts: [...]}. Any other body is a
+  // response we do not understand, and saying "Nothing saved yet" about it
+  // would tell a person their memory is empty when it may not be.
+  if (!body || !Array.isArray(body.facts)) throw new MemoryShapeError();
   return body.facts.filter(isFact).map((f) => ({
     ...f,
     source: typeof f.source === 'string' ? f.source : null,
     source_excerpt: typeof f.source_excerpt === 'string' ? f.source_excerpt : null,
-    created_at: typeof f.created_at === 'string' ? f.created_at : null,
-    updated_at: typeof f.updated_at === 'string' ? f.updated_at : null,
+    created_at: timestamp(f.created_at),
+    updated_at: timestamp(f.updated_at),
   }));
 }
 

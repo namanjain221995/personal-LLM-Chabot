@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DELETE,
   GET,
+  OPTIONS,
   PATCH,
   POST,
   PUT,
@@ -162,6 +163,24 @@ describe('memory proxy — everything else is a 404 that never leaves this proce
         );
         expect(res.status).toBe(404);
       }
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('OPTIONS is a 404 too, not an Allow header listing the methods', async () => {
+    // Without an OPTIONS export, Next answered 204 with
+    // "allow: DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT" (QA, 2026-09-18).
+    const calls = capture();
+    for (const parts of [['facts'], ['facts', '42'], ['anything']]) {
+      const res = await OPTIONS(
+        new Request(`http://localhost:3001/api/memory/${parts.join('/')}`, {
+          method: 'OPTIONS',
+          headers: { cookie: 'ts_session=abc' },
+        }),
+        ctx(...parts),
+      );
+      expect(res.status).toBe(404);
+      expect(res.headers.get('allow')).toBeNull();
     }
     expect(calls).toHaveLength(0);
   });
