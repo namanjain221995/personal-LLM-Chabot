@@ -145,6 +145,28 @@ def test_memory_facts_are_owner_scoped(alice, bob):
     assert bob.delete(f"/memory/facts/{fact_id}").json() == {"deleted": fact_id}
 
 
+def test_clearing_all_memory_deletes_only_the_callers_facts(alice, bob):
+    """B11: DELETE /memory/facts?confirm=all empties the CALLER's memory and
+    nobody else's; without the confirmation it refuses."""
+    bob.post(
+        "/memory/facts",
+        json={"facts": ["Bob prefers green dashboards", "Bob lives in Leeds"]},
+    )
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea", "Alice cycles"]})
+
+    assert alice.delete("/memory/facts").status_code == 422
+    assert alice.delete("/memory/facts?confirm=yes").status_code == 422
+    assert len(alice.get("/memory/facts").json()["facts"]) == 2  # refused means untouched
+
+    assert alice.delete("/memory/facts?confirm=all").json() == {"deleted": 2}
+    assert alice.get("/memory/facts").json()["facts"] == []
+    assert sorted(f["fact"] for f in bob.get("/memory/facts").json()["facts"]) == [
+        "Bob lives in Leeds",
+        "Bob prefers green dashboards",
+    ]
+    assert alice.delete("/memory/facts?confirm=all").json() == {"deleted": 0}
+
+
 # ---------------------------------------------------------------------------
 # Live generations: stop / attach / active
 # ---------------------------------------------------------------------------

@@ -109,7 +109,10 @@ _FORGET_RE = re.compile(
 #: …") are not erasure requests.
 _NOT_A_FORGET_RE = re.compile(
     r"\bforget\s+to\b"
-    r"|\b(?:i|we)\s+(?:always|often|sometimes|usually|keep|kept|never)?\s*forget\b",
+    r"|\b(?:i|we)\s+(?:always|often|sometimes|usually|keep|kept|never)?\s*forget\b"
+    # "Don't forget my name is Naman" asks to REMEMBER; at 4810da0 it deleted
+    # the name fact through the content word "name" (2026-09-18).
+    r"|\b(?:don['’]?t|do not|never|won['’]?t)\s+forget\b",
     re.I,
 )
 
@@ -123,7 +126,7 @@ _TRANSIENT_FACT_RE = re.compile(
     r"^the user(?:'s)?\s+(?:is\s+|was\s+|has\s+|have\s+|had\s+)?"
     r"(?:currently\s+|now\s+|also\s+)?"
     r"(?:asking|asked|asks|request|requests|requested|requesting|want|wants|"
-    r"wanted|need|needs|needed|looking|discussing|trying)\b",
+    r"wanted|need|needs|needed|looking(?!\s+after)|discussing|trying)\b",
     re.I,
 )
 
@@ -138,7 +141,13 @@ _DURABLE_PREFERENCE_RE = re.compile(
     r"\b(?:always|never|prefers?|preference|by default|from now on)\b"
     r"|\b(?:answers?|responses?|replies|explanations?|output|tone|style|"
     r"wording|format|formatting|language|units)\b"
-    r"\s+(?:in|to be|as|with|without|free of|avoiding|using|written|formatted)\b",
+    r"\s+(?:in|to be|as|with|without|free of|avoiding|using|written|formatted)\b"
+    # How the person wants to be addressed ("The user wants to be called
+    # Sam"). "Wants" made it a task request, so the name was never saved.
+    # "Called back tomorrow" is a task and stays out.
+    r"|\bto be (?:called|addressed|referred to)\b(?!\s+(?:back|later|tomorrow|at|on|in)\b)"
+    r"|\bgoes by\b"
+    r"|\b(?:address|call|refer to)\s+(?:me|them|him|her|the user)\s+as\b",
     re.I,
 )
 
@@ -173,6 +182,20 @@ _NAME_STOPWORDS = frozenset(
     Wants Want Likes Like Uses Use Works Work Lives Live Needs Need""".split()
 )
 
+#: A legal-form word the extractor appends to a company the person named
+#: ("I work at TechSara" -> "works at TechSara Solutions"). Ungrounded, it
+#: dropped the whole fact (QA-mem-techsara-solutions, 2026-09-18); it is cut
+#: instead — but only where the fact names an organisation ("at", "for",
+#: "joined" …) and only after a name the message contains, so "leads the
+#: Platform Group" after "I lead the platform team" still fails closed.
+_CORPORATE_SUFFIX = r"(?:Solutions|Inc|Ltd|LLC|Technologies|Labs|Group|Corp|Pvt|Limited)"
+_CORPORATE_SUFFIX_CHAIN_RE = re.compile(
+    r"(?P<lead>\b(?i:at|for|with|by|of|from|joined|founded|runs|owns)\s+)"
+    r"(?P<name>[A-Z][\w&'’-]*(?:\s+[A-Z][\w&'’-]*)*?)"
+    r"(?P<chain>(?:,?\s+" + _CORPORATE_SUFFIX + r"\b\.?)+)"
+)
+_CORPORATE_SUFFIX_RE = re.compile(r",?\s+(?P<word>" + _CORPORATE_SUFFIX + r")\b\.?")
+
 #: Words too common to identify WHICH saved fact a "forget that" points at.
 _MATCH_STOPWORDS = frozenset(
     """please forget remember memory memories fact facts that this these
@@ -180,6 +203,39 @@ _MATCH_STOPWORDS = frozenset(
     what when where which have here there stop don't dont delete remove
     drop clear stored saved again also just only more been very said told
     tell said know known sure okay date outdated wrong""".split()
+)
+
+
+#: "Forget my employer" shares no word with "The user works at Cognitiv", so
+#: the id-less fallback found nothing and the erasure was a silent no-op
+#: (QA-mem-forget-employer, 2026-09-18). A few profile nouns, only in the
+#: shape that names the person's OWN profile ("my employer", "where I live"),
+#: map to the words such a fact is written with. Still exactly one match or
+#: nothing.
+_PROFILE_NOUN_RE = re.compile(
+    r"\b(?:forget|erase|un-?remember|remembering|storing|saving|delete|remove|drop|clear)"
+    r"\s+(?:about\s+)?(?:"
+    r"my\s+(?:current\s+|old\s+|home\s+)?"
+    # not "my company's old logo": the noun itself is what is to be forgotten
+    r"(?P<noun>employer|company|job|work(?:place)?|home|address|city|name)\b(?!['’])"
+    r"|(?:where|who)\s+i\s+(?P<verb>work|live)\b)",
+    re.I,
+)
+_PROFILE_SYNONYMS = (
+    (
+        frozenset({"employer", "company", "job", "work", "workplace"}),
+        frozenset({"employer", "company", "job", "work", "works", "worked",
+                   "working", "workplace", "employed", "employee"}),
+    ),
+    (
+        frozenset({"home", "address", "city", "live"}),
+        frozenset({"home", "address", "city", "live", "lives", "lived",
+                   "living", "resides", "based"}),
+    ),
+    (
+        frozenset({"name"}),
+        frozenset({"name", "named", "called"}),
+    ),
 )
 
 
@@ -313,6 +369,25 @@ def _ungrounded_name(fact: str, *sources: Optional[str]) -> Optional[str]:
     return None
 
 
+def strip_ungrounded_suffixes(fact: str, *sources: Optional[str]) -> str:
+    """`fact` without the corporate suffixes no source contains, when they
+    follow an organisation name every word of which a source contains.
+    Anything else is left for `ungrounded_in` to judge."""
+    hay = " ".join(s or "" for s in sources).lower()
+
+    def cut(match: "re.Match[str]") -> str:
+        name = match.group("name")
+        if any(word.lower() not in hay for word in name.split()):
+            return match.group(0)
+        chain = _CORPORATE_SUFFIX_RE.sub(
+            lambda w: w.group(0) if w.group("word").lower() in hay else "",
+            match.group("chain"),
+        )
+        return match.group("lead") + name + chain
+
+    return _CORPORATE_SUFFIX_CHAIN_RE.sub(cut, fact or "")
+
+
 def _flatten(text: str) -> str:
     """One whitespace-normalized line, capped. A fact with embedded newlines
     would escape its bullet in facts_block and read as fresh top-level system
@@ -342,10 +417,32 @@ def _fact_named_by(text: str, existing: List[dict]) -> Optional[int]:
     deleting the wrong memory is worse than deleting none.
     """
     words = _content_words(text)
-    if not words:
-        return None
-    hits = [f["id"] for f in existing if words & _content_words(f["fact"])]
+    hits = (
+        [f["id"] for f in existing if words & _content_words(f["fact"])]
+        if words
+        else []
+    )
+    if not hits:
+        hits = _profile_fact_ids(text, existing)
     return hits[0] if len(hits) == 1 else None
+
+
+def _profile_fact_ids(text: str, existing: List[dict]) -> List[int]:
+    """Ids of the facts written with the words of the profile noun the
+    request names ("my employer" -> works/employer/job/...), or []."""
+    fact_words: set = set()
+    for match in _PROFILE_NOUN_RE.finditer(text or ""):
+        said = (match.group("noun") or match.group("verb") or "").lower()
+        for asked, written in _PROFILE_SYNONYMS:
+            if said in asked:
+                fact_words |= written
+    if not fact_words:
+        return []
+    return [
+        f["id"]
+        for f in existing
+        if fact_words & set(re.findall(r"[a-z]+", (f["fact"] or "").lower()))
+    ]
 
 
 async def remember_after_route(
@@ -479,6 +576,7 @@ async def remember_from_message(
             # but every NUMBER must come from this message — carrying the old
             # employer's headcount onto the new employer is exactly the
             # invention this guards.
+            item["fact"] = strip_ungrounded_suffixes(item["fact"], text, row["fact"])
             missing = _ungrounded_number(item["fact"], text) or _ungrounded_name(
                 item["fact"], text, row["fact"]
             )
@@ -497,6 +595,7 @@ async def remember_from_message(
                 known[_normalized(item["fact"])] = updated["id"]
                 stored.append(updated)
         for fact in ops.get("add", []):
+            fact = strip_ungrounded_suffixes(fact, text)
             if _normalized(fact) in known:  # extractor re-suggested a saved fact
                 continue
             missing = ungrounded_in(fact, text)

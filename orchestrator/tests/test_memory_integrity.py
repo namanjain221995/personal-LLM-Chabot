@@ -437,3 +437,176 @@ def test_a_deleted_fact_is_not_announced_as_memory_updated():
 
     src = inspect.getsource(main)
     assert 'f["fact"] for f in saved if not f.get("deleted")' in src
+
+
+# --- 6. Release-2 backlog, 2026-09-18 ---------------------------------------
+# Three facts the person did state were refused by the guards above, and an
+# erasure the person did ask for was a silent no-op. Each test failed at
+# 4810da0.
+
+
+@pytest.mark.parametrize(
+    "fact,message",
+    [
+        ("The user wants to be called Sam", "Please call me Sam from now on."),
+        ("The user wants to be addressed as Dr. Rao", "I'd like you to address me as Dr. Rao."),
+        ("The user is looking after two children", "I'm looking after two children at home."),
+    ],
+)
+def test_a_name_preference_and_a_life_situation_are_durable(owner, fact, message):
+    """QA-mem-called-sam: 'wants' and 'looking' made both read as task
+    requests, so how the person wants to be addressed was never saved."""
+    asyncio.run(
+        remember_from_message(
+            owner,
+            message,
+            "c1",
+            complete=_fake_complete(
+                '{"add": [%s], "replace": []}' % __import__("json").dumps(fact)
+            ),
+        )
+    )
+    assert _texts(owner) == [fact]
+
+
+def test_a_call_back_request_is_still_a_task(owner):
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "Can someone call me back tomorrow about the invoice?",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user wants to be called back tomorrow"], "replace": []}'
+            ),
+        )
+    )
+    assert _texts(owner) == []
+
+
+def test_a_corporate_suffix_the_person_did_not_say_is_stripped_not_fatal(owner):
+    """QA-mem-techsara-solutions: the extractor completed "TechSara" to its
+    registered name, "Solutions" was not in the message, and the whole fact
+    was dropped."""
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "I work at TechSara as a backend engineer.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user works at TechSara Solutions"], "replace": []}'
+            ),
+        )
+    )
+    assert _texts(owner) == ["The user works at TechSara"]
+
+
+def test_a_suffix_chain_after_an_ungrounded_name_still_fails_closed(owner):
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "I work at a logistics company as a backend engineer.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user works at Northwind Freight Pvt Ltd"], "replace": []}'
+            ),
+        )
+    )
+    assert _texts(owner) == []
+
+
+def test_a_suffix_the_person_did_say_is_kept(owner):
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "I work at TechSara Solutions as a backend engineer.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user works at TechSara Solutions"], "replace": []}'
+            ),
+        )
+    )
+    assert _texts(owner) == ["The user works at TechSara Solutions"]
+
+
+def test_a_rewrite_with_an_ungrounded_suffix_keeps_the_grounded_name(owner):
+    old = db.add_user_fact(owner, "The user works at Cognitiv", "c1")
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "I moved jobs - I'm at TechSara now.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": [], "replace": [{"id": %d,'
+                ' "fact": "The user works at TechSara Labs"}]}' % old["id"]
+            ),
+        )
+    )
+    assert _texts(owner) == ["The user works at TechSara"]
+
+
+def _profile(uid):
+    db.add_user_fact(uid, "The user's name is Naman", "c1")
+    db.add_user_fact(uid, "The user lives in Ahmedabad", "c1")
+    employer = db.add_user_fact(uid, "The user works at Cognitiv", "c1")
+    db.add_user_fact(uid, "The user prefers answers in Hindi", "c1")
+    return employer
+
+
+_NO_OPS = '{"add": [], "replace": [], "remove": []}'
+
+
+def test_forget_my_employer_deletes_exactly_the_employer_fact(owner):
+    """QA-mem-forget-employer: the request says "employer", the fact says
+    "works at", no content word is shared, and the id-less fallback found
+    nothing — the person was told nothing and the fact stayed."""
+    employer = _profile(owner)
+    stored = asyncio.run(
+        remember_from_message(
+            owner, "Please forget my employer.", "c1", complete=_fake_complete(_NO_OPS)
+        )
+    )
+    assert [f["id"] for f in stored if f.get("deleted")] == [employer["id"]]
+    assert sorted(_texts(owner)) == [
+        "The user lives in Ahmedabad",
+        "The user prefers answers in Hindi",
+        "The user's name is Naman",
+    ]
+
+
+def test_forget_where_i_live_deletes_the_home_fact(owner):
+    _profile(owner)
+    asyncio.run(
+        remember_from_message(
+            owner, "Forget where I live, please.", "c1", complete=_fake_complete(_NO_OPS)
+        )
+    )
+    assert "The user lives in Ahmedabad" not in _texts(owner)
+    assert len(_texts(owner)) == 3
+
+
+def test_a_synonym_that_names_two_facts_deletes_neither(owner):
+    _profile(owner)
+    db.add_user_fact(owner, "The user worked at Northwind Freight before", "c1")
+    asyncio.run(
+        remember_from_message(
+            owner, "Please forget my employer.", "c1", complete=_fake_complete(_NO_OPS)
+        )
+    )
+    assert len(_texts(owner)) == 5
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I always forget my password, any tips?",
+        "Don't forget to add the tests.",
+        "Don't forget my name is Naman when you sign the letter.",
+        "Forget about work for a second, recommend a film.",
+    ],
+)
+def test_ordinary_forget_sentences_delete_no_profile_fact(owner, message):
+    _profile(owner)
+    asyncio.run(
+        remember_from_message(owner, message, "c1", complete=_fake_complete(_NO_OPS))
+    )
+    assert len(_texts(owner)) == 4

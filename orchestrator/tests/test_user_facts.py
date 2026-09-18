@@ -187,6 +187,21 @@ def test_memory_routes_roundtrip(client):
     assert client.delete(f"/memory/facts/{fact_id}").status_code == 404
 
 
+def test_clear_all_memory_reaches_past_one_listing_page(client, monkeypatch):
+    """B11: the route deletes row by row through db.delete_user_fact, so it
+    must not stop at the first page the listing returns."""
+    from app import db as app_db
+
+    client.post("/memory/facts", json={"facts": [f"Fact number {i}" for i in range(7)]})
+    real_list = app_db.list_user_facts
+    monkeypatch.setattr(
+        app_db, "list_user_facts", lambda user_id, limit=500: real_list(user_id, min(limit, 3))
+    )
+    assert client.delete("/memory/facts?confirm=all").json() == {"deleted": 7}
+    monkeypatch.setattr(app_db, "list_user_facts", real_list)
+    assert client.get("/memory/facts").json()["facts"] == []
+
+
 def test_parse_extraction_flattens_newlines():
     """Review fix: an embedded newline would escape the facts bullet list and
     read as a fresh top-level system line — a durable prompt injection."""

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -43,6 +44,39 @@ _EMBED_BATCH = 64
 # 500 rows at 1024 dimensions, on the event loop. `recall.cosine_many` scores
 # the batch in one pass, which brings 500 rows back under ~2 ms.
 _CANDIDATE_LIMIT = 500
+
+#: A question about the person's OWN earlier conversations: "what did we
+#: decide last time", "remind me what we agreed", "what did you tell me".
+#: The freshness classifier marks these as needing evidence (reason
+#: 'default'), which drops every assistant turn from recall — and the
+#: assistant's answer is where a decision is usually stated (measured
+#: 2026-09-18 with the real embedder, five synthetic decision chats: 0/5
+#: blocks carried the decision). Every alternative names US or YOU as the
+#: party, so "what did the central bank decide" and "the last time India won"
+#: stay world-fact questions and keep the evidence gate.
+_PAST_REFERENCE_RE = re.compile(
+    r"\b(?:we|you and i|you and me)\s+(?:had\s+|have\s+|already\s+|finally\s+)?"
+    r"(?:decided|agreed|settled|discussed|talked|chose|picked|concluded|went with)\b"
+    r"|\bdid\s+(?:we|you|i)\s+(?:(?:finally|already|ever|ultimately)\s+)?"
+    r"(?:decide|agree|settle|discuss|talk|choose|pick|conclude|go\s+with|end\s+up|"
+    r"say|tell|recommend|suggest|advise|mention)\b"
+    r"|\byou\s+(?:told|said|recommended|suggested|advised|mentioned|promised)\b"
+    r"|(?<!if )\b(?:i|we)\s+(?:told|asked)\s+you\b"  # not "what if I asked you to …"
+    r"|\blast\s+time\s+(?:we|you|i)\b"
+    r"|\b(?:our|my)\s+(?:last|previous|earlier|other|old)\s+"
+    r"(?:chat|conversation|session|discussion)\b"
+    # "the last session" alone is also Parliament's; a CHAT is always ours.
+    r"|\b(?:in|from)\s+(?:another\s+(?:chat|conversation)|"
+    r"(?:the|that|an?)\s+(?:last|previous|earlier|other|old|different)\s+chat)\b"
+    r"|\bour\s+(?:decision|agreement|conclusion)\b",
+    re.I,
+)
+
+
+def refers_to_past_conversation(query: str) -> bool:
+    """True when `query` asks about what was said or decided in the person's
+    own earlier conversations, not about the world."""
+    return bool(_PAST_REFERENCE_RE.search(query or ""))
 
 
 def _env_float(name: str, default: float) -> float:
@@ -177,6 +211,27 @@ def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict])
     return scored
 
 
+def _answer_index(candidates: List[dict]) -> dict:
+    """user message_id -> the assistant row that answered it: the next
+    embedded row of the same conversation, when that row is the assistant's.
+
+    Built from the candidate rows only (no extra query). A reply shorter than
+    the backfill's 15-character minimum has no row, so the next row may be a
+    later answer in the same conversation; a user row next means no pair."""
+    by_conversation: dict = {}
+    for row in candidates:
+        by_conversation.setdefault(row["conversation_id"], []).append(row)
+    answers: dict = {}
+    for rows in by_conversation.values():
+        rows.sort(key=lambda r: r["message_id"])
+        for asked, following in zip(rows, rows[1:]):
+            if (asked.get("role") or "").lower() == "user" and (
+                following.get("role") or ""
+            ).lower() == "assistant":
+                answers[asked["message_id"]] = following
+    return answers
+
+
 def _embedding_available() -> bool:
     """False on profiles with no embedding service (cpu, external-without-
     embeddings), where the launcher sets EMBED_MODEL=disabled and points
@@ -277,16 +332,35 @@ def _backfill_in_background(user_id: int) -> None:
     task.add_done_callback(lambda t: _backfills.pop(user_id, None) if _backfills.get(user_id) is t else None)
 
 
+def _hit(row: dict, snippet: str, score: float) -> dict:
+    return {
+        "title": row["title"],
+        "role": row["role"],
+        "snippet": snippet,
+        "conversation_id": row["conversation_id"],
+        "score": score,
+    }
+
+
 async def semantic_hits(
     user_id: int,
     query: str,
     exclude_conversation_id: Optional[str],
     limit: int = 3,
+    *,
+    pair_answers: bool = False,
 ) -> List[dict]:
     """Nearest stored messages from the user's other conversations.
 
     Returns [{title, role, snippet, conversation_id, score}] sorted by
     similarity; [] when disabled, nothing qualifies, or embedding fails.
+
+    `pair_answers=True` follows each user hit with the assistant turn that
+    answered it, whatever that answer's own score: for "what did we decide"
+    the QUESTION is what resembles the query, and the answer holding the
+    decision scored under the relative floor (real embedder, 2026-09-18:
+    0.599 against 0.75 x 0.804 = 0.603). A question and its answer count as
+    one hit against `limit`.
     """
     if (
         not settings.cross_chat_semantic_enabled
@@ -306,7 +380,10 @@ async def semantic_hits(
             return []
         query_vec = await llm.embed_query(query)
         scored = await db.run_in_thread(_rank_candidates, query, query_vec, candidates)
+        answers = await db.run_in_thread(_answer_index, candidates) if pair_answers else {}
+        score_of = {c["message_id"]: s for s, c in scored} if pair_answers else {}
         hits: List[dict] = []
+        units = 0
         seen_snippets: set = set()
         # A RELATIVE floor as well as the absolute one. The absolute floor
         # alone (0.30) behaves badly on a small corpus: with nothing genuinely
@@ -322,7 +399,7 @@ async def semantic_hits(
         best = scored[0][0] if scored else 0.0
         relative_floor = best * settings.semantic_recall_relative_floor
         for score, c in scored:
-            if score < settings.semantic_recall_min_score or len(hits) >= limit:
+            if score < settings.semantic_recall_min_score or units >= limit:
                 break
             if score < relative_floor:
                 break
@@ -330,15 +407,16 @@ async def semantic_hits(
             if snippet in seen_snippets:
                 continue  # the same text stored in several conversations
             seen_snippets.add(snippet)
-            hits.append(
-                {
-                    "title": c["title"],
-                    "role": c["role"],
-                    "snippet": snippet,
-                    "conversation_id": c["conversation_id"],
-                    "score": score,
-                }
-            )
+            hits.append(_hit(c, snippet, score))
+            units += 1
+            answer = answers.get(c["message_id"])
+            if answer is not None:
+                answer_snippet = _snippet(answer["content"])
+                if answer_snippet not in seen_snippets:
+                    seen_snippets.add(answer_snippet)
+                    hits.append(
+                        _hit(answer, answer_snippet, score_of.get(answer["message_id"], 0.0))
+                    )
         return hits
     except Exception:
         log.warning("semantic recall failed", exc_info=True)
@@ -365,6 +443,13 @@ async def cross_chat_block(
     costs) it is not evidence — recalled verbatim it becomes the answer, and
     the model attaches the current sources' citations to it (measured
     2026-09-03: 0/3 vs 3/3 answers driven by one recalled reply).
+
+    …except when the question is ABOUT those earlier chats ("what did we
+    decide last time?", `refers_to_past_conversation`). The evidence gate
+    exists for world facts; the person's own history is the thing asked
+    for, and what the assistant said in it is part of that history. Such a
+    question keeps assistant turns whatever the caller passed, and each
+    recalled question brings the answer that followed it.
     """
     # The backfill (embedding this user's messages that have no vector yet)
     # used to run INLINE before every answer: one synchronous batch of up to
@@ -372,8 +457,14 @@ async def cross_chat_block(
     # It now runs behind the answer; recall sees the new vectors from the
     # next turn on, which is when they can matter.
     _backfill_in_background(user_id)
+    past = refers_to_past_conversation(query)
+    if past:
+        include_assistant = True
+    # Passed only when set, so every other question makes exactly the call
+    # it made before (test_knowledge_unified fakes the old signature).
+    pairing = {"pair_answers": True} if past else {}
     semantic = await semantic_hits(
-        user_id, query, exclude_conversation_id, limit=semantic_limit
+        user_id, query, exclude_conversation_id, limit=semantic_limit, **pairing
     )
     if not include_assistant:
         semantic = [h for h in semantic if (h.get("role") or "").lower() != "assistant"]

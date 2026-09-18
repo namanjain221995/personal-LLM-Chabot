@@ -2,13 +2,15 @@
 
 The same §3c contract as history.py: everything is scoped to the requesting
 user inside the SQL, and a fact that is missing or another user's is a 404.
-POST accepts a list so a ChatGPT-export import is one bulk call.
+POST accepts a list so a ChatGPT-export import is one bulk call. DELETE on
+the collection clears the caller's whole memory, and only with
+`confirm=all`.
 """
 from __future__ import annotations
 
 
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Annotated, List, Optional
 
 from pydantic import BaseModel, Field, StringConstraints
@@ -76,3 +78,34 @@ def delete_fact(fact_id: int, user: UserRow = Depends(require_user)) -> dict:
     if not db.delete_user_fact(int(user["id"]), fact_id):
         raise HTTPException(status_code=404, detail="fact not found")
     return {"deleted": fact_id}
+
+
+#: One listing page per pass of the clear-all loop.
+_CLEAR_PAGE = 500
+
+
+@router.delete("/facts")
+def clear_facts(
+    confirm: Optional[str] = Query(default=None, max_length=16),
+    user: UserRow = Depends(require_user),
+) -> dict:
+    """Delete every fact the caller has saved (B11).
+
+    Irreversible, so a bare DELETE on the collection — a client bug, a
+    replayed request — is refused: only `confirm=all` clears. Rows go
+    through db.delete_user_fact one by one, the same owner-scoped statement
+    as the single delete, and the loop keeps listing until nothing is left,
+    because the listing is capped per call."""
+    if confirm != "all":
+        raise HTTPException(
+            status_code=422, detail="clearing all memory needs confirm=all"
+        )
+    user_id = int(user["id"])
+    deleted = 0
+    while True:
+        page = db.list_user_facts(user_id, _CLEAR_PAGE)
+        removed = sum(1 for f in page if db.delete_user_fact(user_id, f["id"]))
+        deleted += removed
+        if not page or removed == 0:
+            break
+    return {"deleted": deleted}
