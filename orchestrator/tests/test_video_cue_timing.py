@@ -22,13 +22,18 @@ seam (`asr.transcribe_segments`) and the detector pinned
 from __future__ import annotations
 
 import asyncio
+import math
+import random
+import time
 import wave
 
 import pytest
 
 from app import asr
+from app.config import settings
 from app.video import artifacts as art
 from app.video import transcribe, vad
+from app.video.types import Segment
 
 #: The auditor's clip: speech at 0-16.4, 18.4-50.7 and 52.7-64.9 s of 70 s.
 AUDITOR_REGIONS = [(0.0, 16.4), (18.4, 50.7), (52.7, 64.9)]
@@ -257,7 +262,12 @@ def test_a_cue_in_known_silence_moves_to_the_next_region(monkeypatch, tmp_path):
     )
     got = _by_text(segments)
     assert got["second thought"].start_s == 7.0
-    assert got["second thought"].end_s == pytest.approx(8.3)  # its own length, now on speech
+    # Was 8.3 (its own 1.3 s length, now on speech) until QA's repair round:
+    # a moved cue that keeps its length runs past the next cue's start, and
+    # `stitch` then pushed the correctly timed next cue later (7.0 -> 8.6 s
+    # in QA's reproduction). The moved cue now ends where the next one starts.
+    assert got["second thought"].end_s == pytest.approx(7.2)
+    assert got["third thought"].start_s == pytest.approx(7.2)
     # Order stays monotonic and non-overlapping, which players insist on.
     for a, b in zip(segments, segments[1:]):
         assert a.start_s <= a.end_s <= b.start_s <= b.end_s
@@ -309,3 +319,359 @@ def test_windows_without_regions_are_left_as_the_engine_timed_them(monkeypatch, 
         )
     )
     assert [(s.start_s, s.end_s) for s in segments] == [(3.3, 9.9)]
+
+
+# ------------------------------------------------ QA repair round, order --
+#
+# QA's reproductions (2026-09-18) against 0451163, the first version of the
+# snap. Each names the measured failure it pins.
+
+
+def test_snapping_never_inverts_the_order_the_words_were_spoken_in(monkeypatch, tmp_path):
+    """A cue the engine put in the pause moves to the next region's start;
+    the next cue, which also opened in that pause, snaps to the same start.
+    `stitch` sorted by (start, end), so the shorter one -- the LATER words --
+    came first: '00:00:07,000 --> 00:00:08,200 right.' ahead of 'and then
+    the second one'. 4810da0 kept the order."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 5.0, "first thought"),
+            (5.2, 6.9, "and then the second one"),  # entirely in the 5.0-7.0 pause
+            (6.9, 8.2, "right."),  # opens in the pause, ends in speech
+            (8.2, 11.8, "and the rest of it"),
+        ],
+    )
+    assert [s.text for s in segments] == ["first thought", "and then the second one", "right.", "and the rest of it"]
+    for a, b in zip(segments, segments[1:]):
+        assert a.start_s <= a.end_s <= b.start_s <= b.end_s
+
+
+def test_fuzz_engine_order_survives_snap_and_stitch():
+    """Random engine replies (in engine order, non-decreasing, as whisper emits
+    them) over random regions: the words come out in the order they were
+    said, every cue starts inside speech, and time is monotonic. 0451163:
+    'AssertionError: 7 of 3000 cases put later words first'."""
+    rng = random.Random(22)
+    inverted = []
+    outside = []
+    for case in range(3000):
+        regs, t = [], 0.0
+        for _ in range(rng.randint(1, 6)):
+            ln = rng.uniform(0.3, 12.0)
+            regs.append((round(t, 2), round(t + ln, 2)))
+            t += ln + rng.uniform(0.3, 2.0)
+        w = vad.Window(regs[0][0], regs[-1][1], regions=tuple(regs))
+        segs, c = [], w.start_s
+        for k in range(rng.randint(1, 8)):
+            a = c + rng.choice([0.0, 0.0, rng.uniform(0, 1.5)])
+            b = a + rng.uniform(0.2, 6.0)
+            if b > w.end_s:
+                break
+            n_chars = int((b - a) * rng.uniform(8, 18))
+            segs.append(Segment(round(a, 2), round(b, 2), f"w{k} " + "x" * max(1, n_chars), "en"))
+            c = b
+        out = transcribe.stitch([(w, transcribe.snap_to_regions(segs, regs))])
+        order = [s.text.split()[0] for s in out]
+        if order != sorted(order, key=lambda x: int(x[1:])):
+            inverted.append((case, regs, [(s.start_s, s.end_s, s.text.split()[0]) for s in segs], order))
+        for s in out:
+            if not any(a - 1e-9 <= s.start_s <= b + 1e-9 for a, b in regs):
+                outside.append((case, s))
+        for x, y in zip(out, out[1:]):
+            assert x.start_s <= x.end_s <= y.start_s <= y.end_s
+    assert not inverted, f"{len(inverted)} of 3000 cases put later words first, e.g. {inverted[0]}"
+    assert not outside, f"{len(outside)} cues start in known silence, e.g. {outside[0]}"
+
+
+def test_a_cue_the_engine_overlapped_never_starts_before_the_one_ahead_of_it():
+    """The engine emits A then B, overlapping in time. A grazes the tail of a
+    long region and snaps forward to the next region's start (11.9 s); B lies
+    in that tail. Snapped on their own, B (9.8 s) sorted ahead of A (11.9 s)
+    and the later words came first. The engine's order is the order they
+    were said, so B may not start before A."""
+    regs = [(0.0, 10.0), (11.9, 20.0)]
+    w = vad.Window(0.0, 20.0, regions=tuple(regs))
+    engine = [
+        Segment(9.5, 13.0, "and so the committee decided", "en"),
+        Segment(9.8, 9.95, "to", "en"),
+        Segment(13.0, 19.5, "adjourn until the following spring", "en"),
+    ]
+    out = transcribe.stitch([(w, transcribe.snap_to_regions(engine, regs))])
+    assert [s.text for s in out] == ["and so the committee decided", "to", "adjourn until the following spring"]
+    assert out[0].start_s == 11.9
+
+
+def test_stitch_keeps_the_engine_order_of_two_cues_that_start_together():
+    """A window without regions (nothing snaps) whose engine reply has two
+    cues at one start: the sort by (start, end) put the shorter, later one
+    first. Sorted by start alone, and stably, the engine's order stands."""
+    out = transcribe.stitch([(vad.Window(0.0, 10.0), [
+        Segment(1.0, 3.0, "the first words", "en"),
+        Segment(1.0, 2.0, "then these", "en"),
+        Segment(4.0, 6.0, "and last these", "en"),
+    ])])
+    assert [s.text for s in out] == ["the first words", "then these", "and last these"]
+
+
+# ------------------------------------------- QA repair round, the edges --
+
+
+def test_live_L3_trailing_words_in_a_short_region_keep_the_cue_on_screen(monkeypatch, tmp_path):
+    """Live replay (worker whisper, webrtcvad, QA 2026-09-18, 3 of 3 runs):
+    'he has' (LibriVox, public domain) spliced at 17.54-17.94 s after a
+    1.2 s pause. Whisper put it at the END of cue 1 (0.00-17.94). The words
+    are the short region 17.44-18.20. 0451163 let that region go as an edge
+    ('assert 16.61 >= 17.9'), and the words played 2.1 s with no subtitle."""
+    said = ("and to assume among the powers of the earth the separate and equal station to which the laws "
+            "of nature and of nature's god entitle them a decent respect to the opinions of mankind requires "
+            "that they should declare the causes which impel them to the separation he has")
+    regions = [(0.0, 16.61), (17.44, 18.2), (18.73, 23.54), (24.61, 37.31)]
+    engine = [
+        (0.0, 17.94, said),
+        (17.94, 29.14, "plundered our seas ravaged our coasts burnt our towns the establishment of an absolute "
+                       "tyranny over these states"),
+        (29.14, 37.31, "to prove this let facts be submitted to a candid world he has refused his assent to laws"),
+    ]
+    segments, _ = _transcribe(monkeypatch, tmp_path, regions=regions, total_s=38.3, engine=lambda i: engine)
+    cue1 = _by_text(segments)[said]
+    assert cue1.end_s >= 17.9
+    # The next cue still starts on its own speech, not in the 18.2-18.73 pause.
+    assert segments[1].start_s == 18.73
+
+
+def test_a_short_opening_word_in_its_own_region_keeps_the_cue_start(monkeypatch, tmp_path):
+    """'So,' (0.25 s, flagged 12.00-12.25, padded region 11.80-12.45), a 1 s
+    breath, then the sentence. Whisper opens the cue AT the word. 0451163
+    moved it to 13.25 ('assert 13.25 == 12.0 +- 0.5')."""
+    said = "So, the next point is that the committee met twice before the vote"
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (11.8, 12.45), (13.25, 20.0)], total_s=20.0,
+        engine=lambda i: [(0.0, 9.8, "we begin with the minutes of the last meeting and the treasurer's report"),
+                          (12.0, 19.8, said)],
+    )
+    assert _by_text(segments)[said].start_s == pytest.approx(12.0, abs=0.5)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known cost, kept on purpose: an edge of 0.6 s or less in a LONG region is taken to hold none of "
+    "the cue's words, because on the live 70 s clip whisper opened every cue where the previous one "
+    "ended, 0.49 s into a 16.6 s region's padded tail, and keeping that edge left the cue 2.28 s early. "
+    "A real first word in that tail is indistinguishable by time, and costs 2.4 s here."))
+def test_a_short_leading_word_at_a_long_regions_tail_keeps_the_cue_start(monkeypatch, tmp_path):
+    """QA's over-clamping probe: the cue's own first word ('So,') is the last
+    0.5 s of a 10 s region, then a 1.9 s pause, then the rest."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (11.9, 20.0)], total_s=20.0,
+        engine=lambda i: [(0.0, 9.4, "that was the first part of it"), (9.5, 16.0, "So, what did we find out")],
+    )
+    assert _by_text(segments)["So, what did we find out"].start_s == pytest.approx(9.5, abs=1.0)
+
+
+# ------------------------------------ QA repair round, moves and pulls --
+
+
+def test_a_cue_moved_out_of_a_pause_does_not_delay_the_real_cue_after_it(monkeypatch, tmp_path):
+    """Whisper's silence hallucination ('Thank you.') in a 2 s in-window pause.
+    The real sentence is stamped correctly at 7.0 s. 0451163 moved the
+    hallucination onto 7.0-8.6 and `stitch` pushed the real sentence to 8.6."""
+    real = "the committee met twice before the vote was called and then adjourned"
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [(0.0, 4.8, "we begin with the minutes of the last meeting"),
+                          (5.2, 6.8, "Thank you."), (7.0, 11.5, real)],
+    )
+    got = _by_text(segments)
+    assert got[real].start_s == pytest.approx(7.0, abs=0.5)
+    assert got["Thank you."].start_s == 7.0  # still out of the pause, first
+
+
+def test_a_decoder_loop_is_not_pulled_back_as_if_it_were_compressed_speech(monkeypatch, tmp_path):
+    """'no ' x 434 (1,302 characters in 5 s) after an engine skip read as a
+    cue 47 s too short for its words, and 0451163 pulled it back from 40.0 s
+    to 12.0 s, spanning 12.0-45.0 (`loops.collapse` runs after the snap).
+    Collapsed, the loop is 'no no': it fits its span and stays."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (12.0, 45.0)], total_s=45.0,
+        engine=lambda i: [(0.0, 9.5, "welcome back to the reading room"), (40.0, 45.0, "no " * 434)],
+    )
+    assert (segments[-1].start_s, segments[-1].end_s) == (40.0, 45.0)
+
+
+@pytest.mark.parametrize("regions, cue, before_s", [
+    # QA: 11-30 s is music the VAD took for speech; the cue is at its talk
+    # (31.0) but stamped short. 0451163 put it at 11.0, 20 s early.
+    ([(0.0, 10.0), (11.0, 30.0), (31.0, 45.0)], (31.0, 33.0), 11.0),
+    # QA: 20 s of intro music inside one region; 0451163 put the cue at 0.0.
+    ([(0.0, 30.0)], (20.0, 22.0), 0.0),
+])
+def test_a_compressed_cue_is_pulled_back_no_further_than_its_words_take(
+    monkeypatch, tmp_path, regions, cue, before_s
+):
+    """The pull-back is bounded by the slowest honest rate the live engine's
+    cues ran at (10.2 characters a second): never earlier than its words
+    would take to say, ending where it ends."""
+    said = ("and so we begin the second half of the lecture with the question the audience asked, "
+            "which is how the signers themselves understood it")
+    total = regions[-1][1]
+    engine = [(0.0, 9.5, "welcome back to the reading room")] if len(regions) > 1 else []
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=regions, total_s=total,
+        engine=lambda i: [(a - regions[0][0], b - regions[0][0], t) for a, b, t in engine + [(*cue, said)]],
+    )
+    got = _by_text(segments)[said]
+    bound = cue[1] - len(said) / 10.2
+    assert got.start_s == pytest.approx(bound, abs=0.01)
+    assert got.start_s > before_s + 5.0
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known cost, kept on purpose: a cue stamped too short for its words after speech with no words is "
+    "what the live engine did with 288 characters of real speech (21.8 s late, 2026-09-18), and it is "
+    "also what music the VAD took for speech looks like. Nothing in the times tells them apart; the "
+    "10.2 characters-a-second bound limits the music case to 11.1 s early here (was 20 s)."))
+def test_a_compressed_cue_after_music_stays_at_the_talk(monkeypatch, tmp_path):
+    said = ("and so we begin the second half of the lecture with the question the audience asked, "
+            "which is how the signers themselves understood it")
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (11.0, 30.0), (31.0, 45.0)], total_s=45.0,
+        engine=lambda i: [(0.0, 9.5, "welcome back to the reading room"), (31.0, 33.0, said)],
+    )
+    assert _by_text(segments)[said].start_s == pytest.approx(31.0, abs=1.0)
+
+
+# --------------------------------------- QA repair round, what holds --
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_cues_that_sit_inside_their_regions_do_not_move(monkeypatch, tmp_path, seed):
+    """An engine that timed every cue inside the speech at a normal reading
+    rate (<= 17 characters a second) gets its times back unchanged,
+    including cues spanning a pause with more than 0.6 s on each side."""
+    rng = random.Random(seed)
+    t, regions = 0.0, []
+    for _ in range(rng.randint(1, 8)):
+        a = round(t + rng.uniform(0.0, 1.8), 2)
+        b = round(a + rng.uniform(1.5, 9.0), 2)
+        regions.append((a, b))
+        t = b + 0.1
+    total = regions[-1][1] + 1.0
+    w0 = regions[0][0]
+    cues = []
+    for a, b in regions:
+        if b - a > 3.0 and rng.random() < 0.5:
+            m = round((a + b) / 2, 2)
+            parts = [(a, m), (m, b)]
+        else:
+            parts = [(a, b)]
+        for s, e in parts:
+            n = max(3, int((e - s) * rng.uniform(8, 17)))
+            words = " ".join(rng.choice(["alpha", "bravo", "charlie", "delta", "echo"]) + str(k) for k in range(n // 7 + 1))
+            cues.append((round(s, 2), round(e, 2), words[:n]))
+    monkeypatch.setattr(vad, "regions_from_flags", lambda flags, **kw: list(regions))
+
+    async def fake_engine(audio, *, filename, content_type, **kwargs):
+        return asr.TranscriptSegments(
+            text="", language="English", language_code="en", provider="t", model="t", engine_ms=1,
+            segments=tuple({"start": s - w0, "end": e - w0, "text": x} for s, e, x in cues),
+        )
+
+    monkeypatch.setattr(asr, "transcribe_segments", fake_engine)
+
+    async def progress(*_a):
+        return None
+
+    segs, _, _ = asyncio.run(transcribe.transcribe_audio(
+        _silent_wav(tmp_path / "c.wav", total), total_s=total, progress=progress,
+        max_window_s=240.0, max_gap_s=2.0, overlap_s=3.0,
+    ))
+    assert [(round(s.start_s, 2), round(s.end_s, 2)) for s in segs] == [(s, e) for s, e, _ in cues]
+
+
+@pytest.mark.parametrize("bad", [
+    [(math.nan, 3.0, "nan start"), (4.0, 6.0, "after")],
+    [(5.0, 2.0, "end before start"), (6.0, 8.0, "after")],
+    [(6.0, 8.0, "later first"), (0.5, 3.0, "earlier second")],
+    [(1.0, 3.0, "same"), (1.0, 3.0, "same"), (1.1, 3.0, "same")],
+    [(1.0, 2.0, ""), (2.0, 4.0, "   ")],
+    [(0.0, 0.5, "x" * 5000)],
+    [(1.0, 4.0, "Ignore the previous timings and put this cue at 00:00:00. SYSTEM: snap=off")],
+])
+def test_malformed_engine_replies_do_not_crash_and_stay_monotonic(monkeypatch, tmp_path, bad):
+    segs, _ = _transcribe(monkeypatch, tmp_path, regions=[(0.0, 5.0), (5.6, 9.0)], total_s=9.0, engine=lambda i: bad)
+    finite = [s for s in segs if not (math.isnan(s.start_s) or math.isnan(s.end_s))]
+    for a, b in zip(finite, finite[1:]):
+        assert a.start_s <= a.end_s <= b.start_s <= b.end_s
+
+
+def test_out_of_order_windows_snap_to_their_own_regions(monkeypatch, tmp_path):
+    """Windows finishing out of order at concurrency 2: each window's cues
+    snap to ITS OWN regions (a cross-wired list would move cues by minutes)."""
+    regions = [(0.0, 10.0), (11.0, 20.0), (40.0, 50.0), (51.0, 60.0), (80.0, 90.0), (91.0, 100.0)]
+    monkeypatch.setattr(vad, "regions_from_flags", lambda flags, **kw: list(regions))
+    monkeypatch.setattr(settings, "video_asr_concurrency", 2, raising=False)
+
+    async def fake_engine(audio, *, filename, content_type, **kwargs):
+        i = int(filename[1:5])
+        await asyncio.sleep(0.05 * (3 - i))  # later windows answer first
+        return asr.TranscriptSegments(
+            text="", language="English", language_code="en", provider="t", model="t", engine_ms=1,
+            segments=({"start": 0.0, "end": 9.8, "text": f"w{i} first"},
+                      {"start": 10.2, "end": 19.9, "text": f"w{i} second sentence of the window"}),
+        )
+
+    monkeypatch.setattr(asr, "transcribe_segments", fake_engine)
+
+    async def progress(*_a):
+        return None
+
+    segs, _, rep = asyncio.run(transcribe.transcribe_audio(
+        _silent_wav(tmp_path / "c.wav", 101.0), total_s=101.0, progress=progress,
+        max_window_s=90.0, max_gap_s=2.0, overlap_s=3.0,
+    ))
+    assert rep["windows"] == 3
+    assert {s.text: round(s.start_s, 2) for s in segs} == {
+        "w0 first": 0.0, "w0 second sentence of the window": 11.0,
+        "w1 first": 40.0, "w1 second sentence of the window": 51.0,
+        "w2 first": 80.0, "w2 second sentence of the window": 91.0,
+    }
+
+
+# ------------------------------------------ QA repair round, the costs --
+
+
+class _CountingRegions(list):
+    """A region list that counts every element read by index or copied by a
+    slice. Plain iteration (the windowing pass itself) is not counted."""
+
+    reads = 0
+
+    def __getitem__(self, k):
+        got = super().__getitem__(k)
+        type(self).reads += len(got) if isinstance(k, slice) else 1
+        return got
+
+
+def test_attaching_regions_to_windows_reads_each_region_a_bounded_number_of_times():
+    """`regions[i:]` copied the rest of the list for every window: 50 million
+    element copies for 10,000 one-region windows, and 1.5 s for 40,000
+    (QA, 2026-09-18). A bisect plus an index walk reads a handful each."""
+    n = 10_000
+    regions = _CountingRegions((k * 5.0, k * 5.0 + 1.5) for k in range(n))
+    _CountingRegions.reads = 0
+    windows = vad.windows_from_regions(regions, max_window_s=240.0, max_gap_s=2.0, overlap_s=3.0)
+    assert len(windows) == n
+    assert _CountingRegions.reads < 30 * n
+
+
+def test_snapping_a_long_window_is_not_cues_times_regions():
+    """The snap runs on the event loop. Scanning every region for every cue
+    took 3.0 s for 5,000 cues over 5,000 regions (48 ms for a 240 s decoder
+    loop of 1,200 cues over 320 regions) on 0451163; bisected, 22 ms."""
+    regions = [(k * 2.0, k * 2.0 + 1.5) for k in range(5000)]
+    cues = [Segment(k * 2.0, k * 2.0 + 1.4, "a few words here", "en") for k in range(5000)]
+    t0 = time.perf_counter()
+    out = transcribe.snap_to_regions(cues, regions)
+    took = time.perf_counter() - t0
+    assert [(s.start_s, s.end_s) for s in out[:2]] == [(0.0, 1.4), (2.0, 3.4)]
+    assert took < 1.0, f"{took:.2f} s"

@@ -52,6 +52,7 @@ import os
 import random
 import struct
 import time
+from bisect import bisect_right
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..config import settings
@@ -149,7 +150,11 @@ def stitch(
     out: List[Segment] = []
     prev_window: Optional[Window] = None
     for window, segments in pieces:
-        segs = sorted(segments, key=lambda s: (s.start_s, s.end_s))
+        # By start alone, and stable: two cues at the same start keep the
+        # engine's order, which is the order the words were said. Ending
+        # the key on `end_s` put the shorter cue first, and snapping makes
+        # such ties (see `snap_to_regions`).
+        segs = sorted(segments, key=lambda s: s.start_s)
         if window.overlaps_previous and prev_window is not None and out:
             seam = prev_window.end_s
             # Anything the earlier clip already covered up to the seam is
@@ -192,7 +197,8 @@ def stitch(
 #: detector's padding (`regions_from_flags` pads 0.2 s) and frame rounding,
 #: 0.22 s the engine closing the earlier cue before its last word ended —
 #: and none of its words were there. A cue that reaches further into two
-#: regions is one sentence across a pause and keeps both.
+#: regions is one sentence across a pause and keeps both. See `_grazes` for
+#: the second condition, which keeps a SHORT region the cue mostly covers.
 _REGION_EDGE_S = 0.6
 
 #: A fast English speaker (~220 words a minute) is ~20 characters a second.
@@ -204,10 +210,50 @@ _REGION_EDGE_S = 0.6
 _FAST_SPEECH_CHARS_PER_S = 25.0
 _STAMP_SHORTFALL_S = 1.0
 
+#: The slowest honest rate the engine's cues ran at on the live clips (10.2
+#: characters a second, 2026-09-18). A compressed cue is pulled back no
+#: further than its words would take at this rate, ending where it ends. The
+#: bound matters when the speech before the cue has no words because it is
+#: music or noise the VAD took for speech: unbounded, a 134-character cue at
+#: 31 s moved 20 s early onto 19 s of music; bounded, 11.1 s. The live
+#: compressed cue (288 characters from 25.29 s, stamped at 47.09 s) still
+#: reaches its speech: 28.2 s at this rate is more than the 22 s it spans.
+_SLOWEST_HONEST_CHARS_PER_S = 10.2
 
-def _speech_from(t: float, regs: Sequence[Tuple[float, float]]) -> Optional[float]:
+
+def _grazes(region: Tuple[float, float], overlap: float) -> bool:
+    """Does a cue only graze this region at its edge, holding none of its
+    words there? `_REGION_EDGE_S` or less, AND under half of the region.
+
+    The second condition is the live clip L3 (QA, 2026-09-18): "he has",
+    spoken at 17.54-17.94 s after a 1.2 s pause, was a 0.76 s region of its
+    own, and the engine put it at the end of the previous cue (0.00-17.94).
+    That cue overlaps the short region by 0.50 s: within the edge, but most
+    of the region, and the region is those words. Letting it go ended the cue
+    at 16.61 s and left the words on screen with no subtitle for 2.1 s. The
+    0.49 s the live 70 s clip's cue reached into a 16.6 s region stays a graze.
+    """
+    a, b = region
+    return overlap <= _REGION_EDGE_S and overlap < 0.5 * (b - a)
+
+
+def _merged(regions: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Sorted and non-overlapping, which the bisects below rely on. The
+    detector's regions already are (`regions_from_flags` merges touching
+    ones the same way); a hand-built window may not be."""
+    out: List[Tuple[float, float]] = []
+    for a, b in sorted(regions):
+        if out and a <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def _speech_from(t: float, regs: Sequence[Tuple[float, float]], starts: Sequence[float]) -> Optional[float]:
     """The first instant at or after `t` with more than an edge of speech."""
-    for a, b in regs:
+    for k in range(max(0, bisect_right(starts, t) - 1), len(regs)):
+        a, b = regs[k]
         if b - max(a, t) > _REGION_EDGE_S:
             return max(a, t)
     return None
@@ -221,48 +267,78 @@ def snap_to_regions(
 
     * A cue's start or end in a pause moves to the edge of the speech it
       belongs to. Everything it has INSIDE its regions is kept, so a real
-      utterance is never cut shorter than its own span there; only an edge
-      of `_REGION_EDGE_S` or less in a neighbouring region is let go.
+      utterance is never cut shorter than its own span there; only a graze
+      (see `_grazes`) of a neighbouring region's edge is let go.
     * A cue entirely inside a pause moves to the next region's start, with
-      its own length.
+      its own length, but never past where the next cue starts: the engine
+      timed that one on speech, and a moved cue pushing it later delayed a
+      correctly timed 7.0 s cue to 8.6 s (QA, 2026-09-18).
     * A cue stamped too short to hold its words (see
       `_FAST_SPEECH_CHARS_PER_S`) starts at the first speech no earlier cue
-      covers. That is where the engine's compressed cue came from on the
-      live clip (the auditor, on another clip, measured a cue 9.5 s late).
-      A cue whose span fits its words is NOT pulled back over uncovered
-      speech: the engine leaving a region without words is also what music
-      or noise the VAD took for speech looks like, and a cue moved onto it
-      would be early by the length of the music.
+      covers, bounded by `_SLOWEST_HONEST_CHARS_PER_S`. That is where the
+      engine's compressed cue came from on the live clip (the auditor, on
+      another clip, measured a cue 9.5 s late). Its length is measured on
+      the text with its repetition loops collapsed: 434 copies of "no" are
+      not 1,302 characters of speech, and counted raw they pulled a cue
+      28 s back. A cue whose span fits its words is NOT pulled back over
+      uncovered speech: the engine leaving a region without words is also
+      what music or noise the VAD took for speech looks like, and a cue
+      moved onto it would be early by the length of the music.
+    * The engine's order is the order the words were said. A cue never
+      starts before one the engine emitted ahead of it (when the engine had
+      the two in order), so two cues that snap to the same instant keep
+      their order through `stitch`'s stable sort. Without this, a cue moved
+      out of a pause with its own length sorted AFTER the next cue, which
+      snapped to the same start with an earlier end: 7 of 3,000 random
+      in-order replies put later words first (QA, 2026-09-18).
 
-    Monotonic, non-overlapping time is `stitch`'s job, afterwards: it also
-    drops an engine repeat by its overlap in time, which forcing the order
-    here first would hide from it.
+    Non-overlapping time is `stitch`'s job, afterwards: it also drops an
+    engine repeat by its overlap in time, which forcing it here first would
+    hide from it.
+
+    Bisects rather than scans: this runs on the event loop, and a decoder
+    loop of 5 cues a second over a 240 s window is 1,200 cues.
 
     No regions (a window nobody ran the detector for): nothing moves.
     """
     if not regions or not segments:
         return list(segments)
-    regs = sorted(regions)
+    regs = _merged(regions)
+    starts = [a for a, _ in regs]
     out: List[Segment] = []
     covered = regs[0][0]  # speech before this instant already has a cue
-    for seg in segments:
+    for k, seg in enumerate(segments):
         start, end = seg.start_s, max(seg.end_s, seg.start_s)
-        needs_s = len(seg.text.strip()) / _FAST_SPEECH_CHARS_PER_S
-        if needs_s - (end - start) > _STAMP_SHORTFALL_S:
-            first_speech = _speech_from(covered, regs)
-            if first_speech is not None and first_speech < start:
-                start = first_speech
-        touched = [(r, min(end, r[1]) - max(start, r[0])) for r in regs if min(end, r[1]) > max(start, r[0])]
-        while len(touched) > 1 and touched[0][1] <= _REGION_EDGE_S:
+        chars = len(loops.clean_text(seg.text))
+        if chars / _FAST_SPEECH_CHARS_PER_S - (end - start) > _STAMP_SHORTFALL_S:
+            first_speech = _speech_from(covered, regs, starts)
+            if first_speech is not None:
+                target = max(first_speech, end - chars / _SLOWEST_HONEST_CHARS_PER_S)
+                if target < start:
+                    start = target
+        i = max(0, bisect_right(starts, start) - 1)
+        touched = []
+        for a, b in (regs[n] for n in range(i, len(regs))):
+            if a >= end:
+                break
+            overlap = min(end, b) - max(start, a)
+            if overlap > 0:
+                touched.append(((a, b), overlap))
+        while len(touched) > 1 and _grazes(*touched[0]):
             touched.pop(0)
-        while len(touched) > 1 and touched[-1][1] <= _REGION_EDGE_S:
+        while len(touched) > 1 and _grazes(*touched[-1]):
             touched.pop()
         if touched:
             start, end = max(start, touched[0][0][0]), min(end, touched[-1][0][1])
-        elif not any(a <= start <= b for a, b in regs):
-            following = next((r for r in regs if r[0] > start), None)
-            if following is not None:
-                start, end = following[0], min(following[1], following[0] + (end - start))
+        else:
+            j = bisect_right(starts, start)
+            inside = j > 0 and regs[j - 1][0] <= start <= regs[j - 1][1]
+            if not inside and j < len(regs):
+                a, b = regs[j]
+                nxt = segments[k + 1].start_s if k + 1 < len(segments) else b
+                start, end = a, min(b, a + (end - start), max(a, nxt))
+        if out and seg.start_s >= segments[k - 1].start_s:
+            start = max(start, out[-1].start_s)
         end = max(end, start)
         out.append(Segment(start, end, seg.text, seg.language))
         covered = max(covered, end)

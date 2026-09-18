@@ -252,10 +252,13 @@ def _regions_within(
 ) -> Tuple[Tuple[float, float], ...]:
     """The sorted, non-overlapping `regions` that overlap [start_s, end_s],
     clipped to it. A bisect, because a four-hour lecture has thousands of
-    regions and hundreds of windows."""
+    regions and hundreds of windows — and an index walk after it, not
+    `regions[i:]`, which copied the rest of the list for every window: 1.5 s
+    for 40,000 one-region windows (QA, 2026-09-18). An islice would still
+    step through the first `i`."""
     i = max(0, bisect_right(regions, (start_s, float("inf"))) - 1)
     out: List[Tuple[float, float]] = []
-    for a, b in regions[i:]:
+    for a, b in (regions[k] for k in range(i, len(regions))):
         if a >= end_s:
             break
         if b > start_s:
