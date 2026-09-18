@@ -113,6 +113,21 @@ questions, 6,336 of which took strict extraction before this change.
 The evidence is returned with the mode (`classify`), so a misroute can be read
 off in one line instead of bisected through a lookbehind chain.
 
+WHY A CLAUSE TEST ON TOP OF THE WORDS (2026-09-18, round 5). Both scores above
+are vocabularies, and the decision one can never be finished: round 4's
+verifier found 8,676 of 11,475 generated "field ask + judgement ask" questions
+taking strict extraction alone, because the judgement half used an adjective
+no pattern listed ("... and is that in line with the market?"). So a question
+that names a field is now also split into clauses, and a clause that asks
+something no field can answer — what is left of it once field words, value
+words and function words are removed is not empty — keeps the question out of
+strict extraction alone. The lexicon that test needs is the FIELD side's,
+where a gap costs a sentence; an adjective nobody listed counts towards a
+judgement. The instrument, the alternatives it beat (a shape regex, a
+question count, more decision words) and what each measured are in the
+"step 4" section below; the strict block was rewritten at the same time so
+that a misroute the clause test still misses costs less (see EXTRACTION).
+
 Consumed by app/engines/document.py. `HISTORY_DOC_GUIDANCE` is the same rule
 in one paragraph, for the pinned "documents the user uploaded earlier" block
 that main.py puts in front of LATER turns — those turns route to chat, where
@@ -213,29 +228,107 @@ ADVISORY = (
 #: "This overrides" is load-bearing: BASE grants general knowledge where the
 #: document is silent, and QA watched that permission fill in a contract's
 #: governing law with speculation about New York and England & Wales.
-EXTRACTION = (
-    "\nTHIS IS AN EXTRACTION QUESTION. Return ONLY what is actually in the document: the "
-    "fields, values and figures as written, with page numbers where that helps. This "
-    "OVERRIDES the general-knowledge permission above — for this answer the document is "
-    "the only source. Do not fill a missing field from general knowledge, do not infer it "
-    "from the rest of the document, do not estimate it, and do not write 0, 0.00 or "
-    "\"none\" for a field the document never gives; write \"not stated in the document\". "
-    "For this answer do not add advice, a recommendation, a next step, a caution or an "
-    "offer of further help, and do not raise a discrepancy the person did not ask "
-    "about. Give the fields, not the reasoning that found them: no thinking out loud, "
-    "no self-correction in the answer."
+#:
+#: WHAT THE STRICT RULES ARE FOR, AND WHAT THEY ARE NOT (2026-09-18, round 5).
+#: The block exists for three things: never invent a value (the "**Tax
+#: Amount:** 0.00 USD" QA caught on an invoice with no tax line), answer only
+#: what was asked, and no padding. Until this round it ALSO said "For this
+#: answer do not add advice, a recommendation, a next step, a caution or an
+#: offer of further help" with no qualifier, so every judgement ask the switch
+#: failed to see was forbidden outright: live, "what is the annual fee in this
+#: contract, and is that in line with the market?" (mode extract) answered
+#: "Therefore, I cannot assess its competitiveness based on the provided
+#: text." The switch now sees that wording (the clause test, "step 4" below),
+#: but no classifier sees every wording — it still leaves 1,140 of 50,400
+#: generated judgement asks in this block. So a misroute must cost a
+#: sentence, not a refusal: the ban now covers what the person did NOT ask
+#: for, and _ASKED_IS_ANSWERED says a question they did ask is answered. The
+#: field rules are untouched and still bind the fields, and the last line of
+#: _ASKED_IS_ANSWERED keeps the missing-field rule out of its reach.
+#:
+#: Measured live, Fast, graded on the first sentence of the judgement half.
+#: A real residual ("what is the annual fee in this contract and good or
+#: bad?", still routed extract): old block 0 of 5 answered, this block 5 of 5
+#: ("**Verdict: Good** / This is a good rate."). The verifier's market
+#: question FORCED into this block: old 0 of 8, this block 7 of 15 — a
+#: question that needs outside figures is the hard case, and the strict
+#: framing still wins about half the time, which is why the switch and not
+#: this block is the fix. The tax-free invoice ("I need the total from this
+#: invoice and the tax amount"), 16 runs per block over two fixtures: no tax
+#: figure in any answer from either block, total and "not stated" in every
+#: one, median length 76 / 86.5 chars here against 193 / 126.5 on the old
+#: block.
+_STRICT_FIELDS = (
+    "\nTHIS IS AN EXTRACTION QUESTION. Return ONLY what is actually in the document for "
+    "each field asked: the fields, values and figures as written, with page numbers where "
+    "that helps. For those fields this OVERRIDES the general-knowledge permission above — "
+    "for a field, the document is the only source. Do not fill a missing field from general "
+    "knowledge, do not infer it from the rest of the document, do not estimate it, and do "
+    "not write 0, 0.00 or \"none\" for a field the document never gives; write \"not "
+    "stated in the document\" — that line is the whole answer for that field, with no "
+    "sentence about why it is missing. Answer what was asked and stop: do not add advice, "
+    "a recommendation, a next step, a caution or an offer of further help that the person "
+    "did not ask for, and do not raise a discrepancy the person did not ask about. Give the "
+    "fields, not the reasoning that found them: no thinking out loud, no self-correction "
+    "in the answer."
 )
+
+#: How a judgement is answered once the fields are given — shared by the
+#: strict block's safety net and by EXTRACT_THEN_ADVISE, so a question that
+#: lands in either one gets the same instruction.
+#:
+#: Measured 2026-09-18, live, the verifier's pair on the MSA fixture, both
+#: routed extract+advise, five runs of each wording per text, graded on the
+#: first sentence of the judgement half. With the extract+advise text of
+#: 4810da0 ("THEN ... the judgement: a clear yes / no / it depends, the
+#: reasoning, and the numbers it turns on ..."): "is that in line with the
+#: market?" 1 of 5, "is that reasonable?" 3 of 5. The failures open with what
+#: the document lacks — "The document does not provide market benchmarks or
+#: industry averages for comparison.", "It is not possible to determine if
+#: this fee is reasonable based on the provided text alone." — and end with a
+#: list of things to go and check: the strict field rules leak into the half
+#: they do not govern. With the rules below: 4 of 5 and 5 of 5; the one miss
+#: opens "Whether 18,000 USD is in line with the market depends entirely on
+#: the scope of services provided, which is not detailed in the excerpt."
+#: So the rules say which half the strict rules bind, where the verdict goes,
+#: and what a closing referral may be.
+#:
+#: They name no failing wording on purpose: the model copies what a prompt
+#: quotes (see BASE), and a list of example wordings is a vocabulary again.
+_JUDGEMENT_RULES = (
+    "Its FIRST sentence is the verdict: yes, no, or it depends on the one thing it turns "
+    "on \u2014 never a sentence about what the document lacks. Then the reasoning and the "
+    "numbers it turns on: the document's figures where it has them and, where it has none, "
+    "typical figures from general knowledge, said to be yours. The strict rules above bind "
+    "the FIELDS only. For the judgement, general knowledge is a source, and the document "
+    "being silent is the reason to use it, not a reason to withhold the judgement. Naming "
+    "what would settle it is one closing line at most, never a list of things to go and "
+    "check."
+)
+
+#: The strict block's safety net for a judgement ask the switch did not see.
+_ASKED_IS_ANSWERED = (
+    "\nNOTHING THE PERSON ASKED IS FORBIDDEN. If the question also asks for a judgement "
+    "\u2014 whether a value is fair or usual, high or low, how it compares with what others "
+    "pay, whether it is a risk, what to do about it \u2014 that part was asked, so answer "
+    "it after the fields, under its own heading. " + _JUDGEMENT_RULES + " A field the "
+    "document does not give is never such a part: it stays \"not stated in the document\", "
+    "with nothing added."
+)
+
+EXTRACTION = _STRICT_FIELDS + _ASKED_IS_ANSWERED
 
 #: Added when the question names fields AND asks for a judgement.
 #: Extraction wins for the fields; the advice follows them, clearly separated.
-EXTRACT_THEN_ADVISE = EXTRACTION + (
+#: Built on the field rules alone: the judgement half below replaces the
+#: safety net, it does not sit beside it.
+EXTRACT_THEN_ADVISE = _STRICT_FIELDS + (
     "\nTHE PERSON ALSO ASKED FOR A JUDGEMENT. Answer in two parts, in this order. FIRST "
     "the fields, under their own heading, under the strict rules above. THEN, under a "
     "separate heading, the judgement: a clear yes / no / it depends, the reasoning, and "
-    "the numbers it turns on — the document's figures where it has them, general "
-    "knowledge where it does not, each labelled. Nothing in the second part may change, "
-    "fill in or round a field in the first part, and a field that is not stated stays "
-    "not stated even if the advice would be easier with a number there."
+    "the numbers it turns on. " + _JUDGEMENT_RULES + " Nothing in the second part may "
+    "change, fill in or round a field in the first part, and a field that is not stated "
+    "stays not stated even if the advice would be easier with a number there."
 )
 
 #: Added when the question is neither — it asks what the document says.
@@ -642,6 +735,368 @@ _SUITABILITY_RE = re.compile(
 )
 
 
+# --- step 4: asks a field cannot answer (STRUCTURE, not vocabulary) ---------
+#
+# WHY THIS STEP EXISTS (2026-09-18, round 5). Steps 1-3 decide the mode from
+# two vocabularies, and the decision vocabulary is the one that cannot be
+# finished: it has to know every adjective a person may use to ask for a
+# judgement. Round 4's verifier generated 11,475 "field ask + judgement ask"
+# questions and 8,676 took strict extraction alone; live, "what is the annual
+# fee in this contract, and is that in line with the market?" came back "I
+# cannot assess its competitiveness based on the provided text" while "...and
+# is that reasonable?" — one word different, and that word in _DECISION_RE —
+# got a verdict 3 of 3. This round's own corpus (tests/document_judgement_
+# corpus.py, committed before this code) measured the same thing: 66 of 84
+# judgement tails carry no decision signal at all, and 39,600 of 50,400
+# generated questions took strict extraction alone.
+#
+# The instrument is a CLAUSE test. The failing questions are two asks joined
+# together, and whether the second one can be answered by the strict block is
+# a question about what it asks, not about which adjective it uses:
+#
+#   1. split the question into clauses (punctuation, spaced dashes, commas,
+#      and "and/but/so/or" when a new question starts after it);
+#   2. find the clauses that ASK something — a polar question ("is that ...",
+#      "would a lawyer ..."), a wh-question, an embedded one ("tell me if
+#      ...", "whether ..."), an imperative aimed at a thing ("flag it if
+#      ..."), or a fragment typed with a question mark ("on the high side?");
+#   3. an ask is answerable from the document's values only when, once its
+#      field words, document words, words for what a page states about a
+#      field (payable, signed, included, per year), closed-class words
+#      (articles, pronouns, auxiliaries, prepositions) and value tokens
+#      (numbers, currencies, dates, units) are taken away, NOTHING is left.
+#      "is it payable in advance?" leaves nothing; "is that in line with the
+#      market?" leaves "line market"; "is that competitive?" leaves
+#      "competitive". A wh-question
+#      that names a field outright ("what is the unit price of the cooling
+#      unit") asks for that field's value, whatever else it names.
+#
+# The lexicon in step 3 is the FIELD side's — words that a value-answerable
+# clause may contain — and it is closed-ish (function words, units, what a
+# document states about a field). An adjective nobody listed is NOT in it, so
+# an unknown word counts towards a judgement, never away from one. That is the
+# safe-failure rule of the module docstring applied to the vocabulary itself:
+# the lexicon that must be complete is the one whose gaps cost a sentence.
+#
+# REJECTED, each measured on the same 50,400-question dev search and the same
+# 3,130 pure field asks (tests/document_judgement_corpus.py), by swapping this
+# step for the alternative and leaving everything else alone:
+#
+#   * a SHAPE regex for "<join> is/does/would ... that/it": it keys on the
+#     join and on a pronoun, which is the _VALUE_WH_RE mistake again (a
+#     pattern anchored where one wording happens to put the ask). It left
+#     29,100 of 50,400 in strict extraction — embedded asks ("tell me if
+#     ..."), fragments ("on the high side?"), wh-asks ("how does that stack up
+#     ...") and every reversed order walk past it — and it cost 1,320 of 3,130
+#     pure field asks their strict block, because "is it payable in advance?"
+#     has exactly the shape "is that in line with the market?" has.
+#   * a QUESTION COUNT (two or more asks, by "?" or by interrogative clause):
+#     the verifier's own failing wording has ONE question mark, so 12,954 of
+#     50,400 stayed in strict extraction; and "how much do we owe and when is
+#     it due?" has two interrogative clauses that are both field asks, so it
+#     kept only 734 of 3,130 pure field asks strict and flipped a pinned
+#     battery row. How many things were asked cannot tell a second field ask
+#     from a judgement; what each one asks can.
+#   * more DECISION WORDS: every round so far added the adjective the last
+#     round's search found ("red flag", "normal", "a problem for us") and the
+#     next search found another. _DECISION_RE is kept, unchanged, as a
+#     supplement — it still decides "advise" on its own for questions with no
+#     field in them, where this step has nothing to say.
+#
+# MEASURED WITH THIS STEP: 1,140 of 50,400 dev questions still take strict
+# extraction alone (39,600 before), and 600 of 18,000 on the held-out tails,
+# which were written with the corpus and first measured on the finished
+# detector (16,200 before). 1,080 and 540 of those are REVERSED orders whose
+# first clause is a bare fragment with its question mark removed by the
+# generator ("in line with the market, and what is the annual fee?"); the rest
+# are "... and good or bad?" / "... and thumbs up or thumbs down?", an
+# adjective conjunct this step deliberately does not guess at (see
+# _PREP_CONJUNCT_RE). Those residuals are why the EXTRACTION block itself no
+# longer forbids answering a question the person asked (see EXTRACTION).
+#
+# What it costs: a field ask followed by a follow-up that names something
+# outside the lexicon ("how is it split across the line items?") goes to
+# extract+advise — the cheap direction, a sentence of context. All 3,130 dev
+# and 1,330 held-out pure field asks in the corpus stay strict.
+
+_AUX_WORDS = (
+    r"(?:is|are|was|were|am|isn'?t|aren'?t|wasn'?t|weren'?t|do|does|did|don'?t|doesn'?t|"
+    r"didn'?t|can|could|will|would|shall|should|may|might|must|has|have|had|can'?t|"
+    r"cannot|couldn'?t|won'?t|wouldn'?t|shouldn'?t|hasn'?t|haven'?t|ought)"
+)
+#: What may follow the auxiliary in a polar question: its subject. Closed
+#: class — pronouns, determiners, quantifiers, a number.
+_SUBJECT_WORDS = (
+    r"(?:it|that|this|these|those|they|there|we|i|you|he|she|the|a|an|our|my|your|their|"
+    r"its|any|such|anyone|anything|someone|something|most|many|all|every|each|some|\d)"
+)
+_POLAR_START = _AUX_WORDS + r"\s+" + _SUBJECT_WORDS + r"\b"
+_WH_START = (
+    r"(?:(?:on|in|at|for|by|from|to|under|of|with|until|since)\s+)?"
+    r"(?:what|what'?s|whats|which|who|who'?s|whom|whose|when|where|why|how)\b"
+)
+#: "how much / many / long ..." asks for a value; bare "how" asks for a manner
+#: ("how does that stack up against the market?") and is treated as open.
+_VALUE_HOW_RE = re.compile(
+    r"^(?:(?:on|in|at|for|by|from|to|under|of|with|until|since)\s+)?how\s+(?:much|many|long|"
+    r"often|far|soon|old|big|large|early|late|frequently|quickly)\b",
+    re.I,
+)
+#: An ask inside a request: "tell me IF ...", "let me know WHETHER ...", "I
+#: wonder if ...", "flag it if ...". Up to four words may lead in; a bare
+#: clause-initial "if" is a condition ("if you could pull the terms that
+#: would be great"), not a question, so "if" needs at least one word before it.
+_EMBEDDED_RE = re.compile(
+    r"^(?:(?:[\w'-]+\s+){0,4}?whether|(?:[\w'-]+\s+){1,4}?if)\b\s*(?P<body>.*)$", re.I
+)
+#: An imperative aimed at a thing: a verb and then an object pronoun ("flag
+#: it", "sanity-check it", "send me"). A noun fragment is almost never
+#: followed by an object pronoun, which is what makes this a shape and not a
+#: verb list.
+_IMPERATIVE_RE = re.compile(r"^[a-z][\w-]*\s+(?:it|them|me|us|that|this|these|those)\b", re.I)
+#: Where one clause ends and the next begins. After "and / but / so / or" a
+#: new clause starts with a question, a request ("... and list the line
+#: items") or a first-person statement ("... but I need the total"); a noun
+#: after "and" ("the total and the due date") is still the same clause.
+_ASK_START = (
+    r"(?:" + _POLAR_START + r"|" + _WH_START + r"|whether\b"
+    r"|[a-z][\w-]*\s+(?:it|them|me|us)\b"
+    r"|(?:tell|give|show|send|list|pull|extract|provide|confirm|share|read|copy|quote|fetch|"
+    r"find|transcribe|itemi[sz]e|fill)\b"
+    r"|(?:i|we)\s+(?:need|want|would\s+like|'d\s+like|require)\b)"
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?P<q>\?)+|[!;]+|\.(?=\s|$)|\s[-–—]+\s|[–—]|,\s"
+    r"|\s+(?=(?:and|but|so|or|plus|also)\s+" + _ASK_START + r")",
+    re.I,
+)
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:(?:and|but|so|or|plus|also|then|oh|well|ok|okay|please|just|now)\b[\s,]*)+", re.I
+)
+#: Verbs and frames that ask to be HANDED something. A clause with one of these
+#: and a field named outright is a field ask however it is phrased — "can you
+#: give me the totals", "any chance you can pull the totals?", "I need the
+#: total from this invoice?" — and is checked for this before its shape is,
+#: so "would you mind giving me the invoice number" is not read as asking OUR
+#: view the way "would you accept that?" is.
+_REQUEST_VERB_RE = re.compile(
+    r"\b(?:tell|telling|give|giving|show|showing|send|sending|list|listing|pull|pulling|"
+    r"extract|extracting|provide|providing|confirm|confirming|share|sharing|read|reading|"
+    r"copy|copying|quote|quoting|fetch|find|get|getting|transcribe|itemi[sz]e|fill|help)\b"
+    r"|\b(?:i|we)\s+(?:need|want|would\s+like|'d\s+like|require)\b",
+    re.I,
+)
+_TOKEN_RE = re.compile(r"[$€£₹]|\d[\w,.:/%]*|[a-z]+(?:[-'][a-z]+)*", re.I)
+
+#: Words that carry no question of their own: articles, determiners,
+#: pronouns (not "you"), auxiliaries, non-comparative prepositions,
+#: conjunctions, wh-words, politeness. Comparatives (more, less, above,
+#: below, over, under, than) and degree words (too, very) are deliberately
+#: NOT here: "is that above the going rate?" is a judgement.
+_CLOSED_CLASS = frozenset("""
+a an the this that these those its their our my his her any some each every both either
+neither all no another other such same whole entire full own only just
+it they them we us i me he she him one ones there here anything something everything
+nothing anywhere somewhere elsewhere else
+is are was were be been being am do does did done has have had having will would shall
+should can could may might must ought cannot isn aren wasn weren don doesn didn hasn
+haven hadn won wouldn shouldn couldn s re d ll ve t m
+in on at of for to from by with within per about into onto across between after before
+during until till via as up out off down through throughout upon regarding against
+and or but nor so if whether then also plus
+what whats which who whom whose when where how
+please kindly thanks thank exactly precisely again now currently
+""".split())
+
+#: What a document states ABOUT a field: when, how, by whom, in what form it
+#: is paid, stated, signed or counted. A follow-up made only of these ("is it
+#: payable in advance?", "is it listed as a separate line?") is a fact on the
+#: page, not a judgement.
+_FACT_WORDS = frozenset("""
+payable paid pay pays owed owe owes stated state states say says said list listed lists
+show shows shown give gives given specify specifies specified mention mentions mentioned
+include includes included including inclusive exclusive excluding excluded contain
+contains contained cover covers covered signed sign signs dated issued issue quoted
+quote charged billed invoiced apply applies applied fixed variable refundable
+non-refundable renewable renew renews auto-renew auto-renews net gross separately
+separate annually monthly yearly quarterly weekly daily annual upfront advance arrears
+written printed attached named called start starts begin begins end ends expire expires
+terminate terminates calculated based set effective valid located found appear appears
+itemised itemized broken payee
+""".split())
+
+#: A value, not a claim about one: numbers, currencies, units of time, months,
+#: and the basis a price is quoted on ("per unit", "per seat"). The pricing
+#: bases were added after the held-out follow-ups were first measured: "is it
+#: quoted per unit?" was the only one of the ten that lost strict extraction
+#: (120 of 1,330 held-out pure field asks, 90.98% kept), and a price's basis is
+#: a value printed on the page like its currency.
+_VALUE_WORDS = frozenset("""
+usd eur gbp inr aud cad chf jpy cny sgd aed dollar dollars euro euros pound pounds rupee
+rupees yen day days week weeks month months year years quarter quarters hour hours annum
+calendar business working january february march april may june july august september
+october november december jan feb mar apr jun jul aug sep sept oct nov dec two three four
+five six seven eight nine ten twelve fifteen twenty thirty sixty ninety hundred thousand
+million unit units seat seats user users licence licences license licenses node nodes
+device devices piece pieces
+""".split())
+
+#: Parts of a document a follow-up may point at ("which clause is it in?").
+_DOC_PART_WORDS = frozenset("""
+line lines row rows item items column columns entry entries paragraph paragraphs heading
+headings footnote footnotes header footer box field fields part
+""".split())
+
+#: How a request asks for the answer to be LAID OUT, which an imperative may
+#: add without asking anything new ("... and put them in a table").
+_FORMAT_WORDS = frozenset("""
+put format show keep make present arrange sort sorted order table list bullet bullets
+csv json markdown brief briefly short simple plain english copy paste group grouped
+""".split())
+
+
+def _clauses(question: str) -> List[Tuple[str, bool]]:
+    """The question's clauses, each with whether a "?" closed it."""
+    out: List[Tuple[str, bool]] = []
+    pos = 0
+    text = question or ""
+    for m in _CLAUSE_SPLIT_RE.finditer(text):
+        piece = text[pos:m.start()]
+        if piece.strip():
+            out.append((piece, bool(m.group("q"))))
+        pos = m.end()
+    tail = text[pos:]
+    if tail.strip():
+        out.append((tail, False))
+    return out
+
+
+def _residual(text: str, *, imperative: bool = False) -> List[str]:
+    """The words of a clause left once everything a VALUE could contain is
+    taken away. Empty means the clause is answerable from the document."""
+    blank = text
+    for rx in (_UNAMBIGUOUS_FIELD_RE, _AMBIGUOUS_FIELD_RE, _DOC_WORD_RE, _EXTRACT_VERB_RE):
+        blank = rx.sub(lambda m: " " * (m.end() - m.start()), blank)
+    left = []
+    for tok in _TOKEN_RE.findall(blank.replace("’", "'")):
+        word = tok.lower()
+        if word[0].isdigit() or word in ("$", "€", "£", "₹"):
+            continue
+        if "'" in word:
+            word = word.split("'", 1)[0]
+        if (word in _CLOSED_CLASS or word in _FACT_WORDS or word in _VALUE_WORDS
+                or word in _DOC_PART_WORDS or (imperative and word in _FORMAT_WORDS)):
+            continue
+        left.append(word)
+    return left
+
+
+def _addresses_the_assistant(text: str, *, possessive_only: bool = False) -> bool:
+    """"you" / "your" outside "thank you": the person wants OUR view.
+
+    `possessive_only` is for clauses that are not questions: "your thoughts"
+    and "your view on whether that's fair" ask for a view, while "if you can
+    find it" is a condition on a field ask.
+    """
+    rx = r"\byours?\b" if possessive_only else r"\byou(?:r|rs|'d|'re|'ll)?\b"
+    return bool(re.search(rx, re.sub(r"\bthank\s+you\b", "", text, flags=re.I), re.I))
+
+
+#: Inside a field clause, a conjunct that opens with a preposition or an
+#: indefinite pronoun is a predicate about the field, not another field:
+#: "what is the annual fee and in line with the market?", "... and anything
+#: we ought to be careful about there?". A conjunct that opens with a noun or
+#: a determiner ("... and the due date", "... and cooling unit prices") is
+#: another field and is never tested: without a part-of-speech tagger a bare
+#: noun and a bare adjective look alike, and guessing there would cost field
+#: asks, not judgement asks.
+_PREP_CONJUNCT_RE = re.compile(
+    r"\s(?:and|but)\s+(?P<c>(?:in|on|at|with|against|compared|relative|versus|vs|above|"
+    r"below|anything|something|any)\b.*)$",
+    re.I,
+)
+
+
+def _asks_riding_on_a_field_clause(clause: str) -> List[Tuple[str, str]]:
+    """A clause that names a field outright still asks for more when it also
+    asks for OUR view ("give me the grand total and your thoughts?") or tacks
+    a predicate on with "and in ..." ("what is the annual fee and in line
+    with the market?")."""
+    if _addresses_the_assistant(clause, possessive_only=True):
+        return [("field-clause-to-assistant", clause)]
+    conj = _PREP_CONJUNCT_RE.search(clause)
+    if conj and not re.match(_WH_START, conj.group("c").lower()) and _residual(conj.group("c")):
+        return [("predicate-conjunct", conj.group("c"))]
+    return []
+
+
+def _open_asks(question: str) -> List[Tuple[str, str]]:
+    """Clauses that ask something the document's values cannot answer.
+
+    Returns (kind, clause) pairs; empty means every ask in the question is a
+    field ask, a fact about a field, or not an ask at all. See step 4 above.
+    """
+    found: List[Tuple[str, str]] = []
+    for raw, closed_by_q in _clauses(question):
+        clause = _LEADING_FILLER_RE.sub("", raw.strip()).strip(" ,.")
+        if not clause:
+            continue
+        lower = clause.lower()
+        masked = _mask_ordinary_english(clause)
+        strong = _field_evidence(masked)[0] >= _FIELD_THRESHOLD
+        # A request to hand a field over is a field ask however it is phrased:
+        # "can you give me the totals", "any chance you can pull the totals?"
+        if strong and _REQUEST_VERB_RE.search(clause):
+            found.extend(_asks_riding_on_a_field_clause(clause))
+            continue
+        body, kind, imperative = clause, "", False
+        emb = _EMBEDDED_RE.match(clause)
+        if re.match(_WH_START, lower):
+            if re.match(r"(?:(?:on|in|at|for|by|from|to|under|of|with)\s+)?why\b", lower):
+                found.append(("why", clause))
+                continue
+            value_wh = not re.match(
+                r"(?:(?:on|in|at|for|by|from|to|under|of|with)\s+)?how\b", lower
+            ) or bool(_VALUE_HOW_RE.match(lower))
+            if value_wh and strong:
+                # "what is the unit price of the cooling unit" asks for the
+                # field's value whatever else it names.
+                found.extend(_asks_riding_on_a_field_clause(clause))
+                continue
+            kind = "wh-value" if value_wh else "how"
+        elif re.match(_POLAR_START, lower):
+            kind = "polar"
+            # "is there a late fee?", "does the contract state the fee?"
+            if strong and re.match(r"(?:is|are|was|were)\s+there\b", lower):
+                found.extend(_asks_riding_on_a_field_clause(clause))
+                continue
+        elif emb:
+            kind, body = "embedded", emb.group("body")
+            if re.match(_WH_START, body.lower()) and strong:
+                found.extend(_asks_riding_on_a_field_clause(clause))
+                continue
+        elif _IMPERATIVE_RE.match(clause):
+            # No field skip here: a request verb with a field was skipped
+            # above, and "sanity-check it against what the market charges"
+            # carries a wh-frame ("what the market charges") without asking
+            # for any field.
+            kind, imperative = "imperative", True
+        elif closed_by_q:
+            kind = "fragment"
+        elif _addresses_the_assistant(clause, possessive_only=True):
+            found.append(("statement-to-assistant", clause))
+            continue
+        else:
+            continue  # a statement or a noun phrase: nothing is asked
+        if _addresses_the_assistant(body):
+            found.append((kind + "-to-assistant", clause))
+            continue
+        left = _residual(body, imperative=imperative)
+        if left:
+            found.append((kind, clause))
+    return found
+
+
 @dataclass
 class Signals:
     """What the classifier saw, and what it concluded.
@@ -658,6 +1113,10 @@ class Signals:
     ("should-inside-a-value-question", "should we") as evidence and routed the
     question to strict extraction anyway. `decision_score` is the score AFTER
     the precedence has run, so `wants_advice` already accounts for it.
+
+    `open_asks` are clauses that ask something no field of the document can
+    answer (step 4). They carry no decision WORD, which is the point: they
+    are the judgement asks the vocabulary is blind to.
     """
 
     mode: str
@@ -665,6 +1124,7 @@ class Signals:
     decision_score: int = 0
     held_decision_score: int = 0
     evidence: List[Tuple[str, str]] = _dataclass_field(default_factory=list)
+    open_asks: List[Tuple[str, str]] = _dataclass_field(default_factory=list)
 
     @property
     def wants_fields(self) -> bool:
@@ -681,6 +1141,12 @@ class Signals:
         never be answered by strict extraction, and `mode` is asserted against
         it directly in the suite."""
         return (self.decision_score + self.held_decision_score) >= _DECISION_THRESHOLD
+
+    @property
+    def asks_beyond_fields(self) -> bool:
+        """True when some clause asks what a field cannot answer. Like a
+        decision signal, it can never be answered by strict extraction alone."""
+        return bool(self.open_asks)
 
 
 def _field_evidence(masked: str) -> Tuple[int, List[Tuple[str, str]]]:
@@ -807,6 +1273,7 @@ def _apply_precedence(
     field_score: int,
     decision: _Decision,
     field_why: Sequence[Tuple[str, str]] = (),
+    open_asks: Sequence[Tuple[str, str]] = (),
 ) -> Signals:
     """Turn two scores over the WHOLE question into a mode.
 
@@ -827,8 +1294,9 @@ def _apply_precedence(
     the moment the FIELD score reaches its threshold, because the question has
     then proved twice over that it contains a value ask, so the "should" is a
     SECOND and separate thing being asked, and the strict EXTRACTION block
-    would answer it with "do not add advice, a recommendation, a next step, a
-    caution or an offer of further help".
+    then said "do not add advice, a recommendation, a next step, a caution or
+    an offer of further help" (qualified since round 5 to what the person did
+    not ask for — see EXTRACTION).
 
     Measured 2026-09-18, live, twelve runs on one invoice fixture, only the
     first word of the question differing. BEFORE: "what is the total, and
@@ -857,6 +1325,7 @@ def _apply_precedence(
         decision_score=decision.score + (decision.held if restored else 0),
         held_decision_score=0 if restored else decision.held,
         evidence=why,
+        open_asks=list(open_asks),
     )
     if sig.wants_fields and sig.wants_advice:
         sig.mode = "extract+advise"
@@ -865,12 +1334,21 @@ def _apply_precedence(
     elif sig.wants_fields:
         sig.mode = "extract"
 
+    # Step 4 (round 5): a clause that asks what no field can answer is a
+    # second ask with no decision WORD in it. Beside a field ask it gets the
+    # fields strictly and then an answer, exactly as a decision word would —
+    # "what is the annual fee in this contract, and is that in line with the
+    # market?" is the same question as "... and is that reasonable?".
+    if sig.mode == "extract" and sig.asks_beyond_fields:
+        sig.mode = "extract+advise"
+        sig.evidence.extend(("open-ask-" + kind, text) for kind, text in sig.open_asks)
+
     # The rule above as a NET rather than as a hope. Nothing reaches it while
     # the scores keep their documented values — restoring held evidence above
     # already rules the combination out — but the two directions cost very
     # different things (a sentence of context against the owner's complaint),
     # so the cheap direction is the one a future edit falls into.
-    if sig.mode == "extract" and sig.decision_signal_anywhere:
+    if sig.mode == "extract" and (sig.decision_signal_anywhere or sig.asks_beyond_fields):
         sig.mode = "extract+advise"
     return sig
 
@@ -891,13 +1369,17 @@ def classify(question: str) -> Signals:
 
     Both scores are taken over the whole question; _apply_precedence() holds
     the whole of rule 1, including what happens to a decision signal a
-    narrowing rule set aside.
+    narrowing rule set aside — and, since round 5, to a clause that asks what
+    no field can answer (step 4). That clause test runs only when the fields
+    would otherwise win: it exists to stop strict extraction ALONE, and a
+    question with no field in it has no strict block to be saved from.
     """
     q = question or ""
     masked = _mask_ordinary_english(q)
 
     field_score, field_why = _field_evidence(masked)
-    return _apply_precedence(field_score, _decision_evidence(q), field_why)
+    open_asks = _open_asks(q) if field_score >= _FIELD_THRESHOLD else []
+    return _apply_precedence(field_score, _decision_evidence(q), field_why, open_asks)
 
 
 def question_mode(question: str) -> str:

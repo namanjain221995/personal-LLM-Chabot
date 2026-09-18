@@ -1605,3 +1605,318 @@ def test_the_heading_grader_now_sees_the_source_as_a_bare_subject():
     assert source_named_headings("### 4. Critical Gaps in the Document\n") == []
     assert source_named_headings("### Document Retention\n") == []
 
+
+
+# ---------------------------------------------------------------------------
+# ROUND 5: a judgement ask with NO decision word beside a field ask (2026-09-18)
+#
+# Round 4's verifier generated 11,475 "field ask + judgement ask" questions and
+# 8,676 took strict extraction alone. Live, "what is the annual fee in this
+# contract, and is that in line with the market?" came back "I cannot assess
+# its competitiveness based on the provided text", while "... and is that
+# reasonable?" — one word different, and that word in _DECISION_RE — got a
+# verdict. The round-4 search could not find this by construction: its control
+# (test_every_generated_decision_tail_carries_a_signal_on_its_own, above)
+# asserted that every tail already registered as a decision signal.
+#
+# The corpus these tests read, tests/document_judgement_corpus.py, was
+# committed BEFORE the detector (see its docstring and git history), and it is
+# not filtered through source_use. The controls below are the opposite of the
+# round-4 one: the tails are judgement asks by their OWN wording (a hand
+# label anchored to a fragment of the tail), and the search runs with the
+# decision vocabulary SWITCHED OFF, so it can only pass on structure.
+#
+# Measured on the full search (30 field heads x 114 tails x 10 joins x both
+# orders), strict extraction alone:
+#                          4810da0 (before)    this change
+#   dev tails (84)         39,600 / 50,400      1,140 / 50,400
+#   held-out tails (30)    16,200 / 18,000        600 / 18,000
+# and 66 of the 84 dev tails carry no decision signal at all.
+# ---------------------------------------------------------------------------
+
+from tests import document_judgement_corpus as corpus  # noqa: E402
+
+_ALL_TAILS = corpus.JUDGEMENT_TAILS + corpus.HELD_OUT_TAILS
+
+#: The two residual classes the clause test leaves, both documented in
+#: source_use (step 4, "MEASURED WITH THIS STEP"). The search below may fail
+#: ONLY inside these; a failure anywhere else is a new hole.
+#:
+#: R1: REVERSED order, where the generator removed the tail's question mark
+#: and put a bare fragment first ("in line with the market, and what is the
+#: annual fee?"). With no "?" and no question shape, nothing marks it as an
+#: ask, and treating every leading fragment as one would cost real field asks
+#: ("for the Leeds office, what is the billing address?").
+_R1_FRAGMENT_TAILS = frozenset({
+    "in line with the market?",
+    "on the high side?",
+    "good or bad?",
+    "anything we ought to be careful about there?",
+    "thumbs up or thumbs down?",
+    "any thoughts on that?",
+    "too high?",
+})
+#: R2: FORWARD order, an adjective-led fragment glued on with a bare "and" or
+#: "but" ("what is the invoice total and good or bad?"). Without a
+#: part-of-speech tagger "and good or bad" looks like "and cooling unit
+#: prices", which is another field.
+_R2_ADJECTIVE_TAILS = frozenset({"good or bad?", "thumbs up or thumbs down?", "too high?"})
+
+
+def _documented_residual(direction, tail, join):
+    if direction == "rev":
+        return tail in _R1_FRAGMENT_TAILS and join != "? "
+    return tail in _R2_ADJECTIVE_TAILS and join in (" and ", " but ")
+
+
+def test_the_corpus_tails_are_judgement_asks_by_their_own_wording():
+    """The control that REPLACES round 4's. It does not ask whether any
+    pattern recognises a tail; it checks the hand label against the tail's own
+    words, so a label cannot drift away from what it describes."""
+    assert len(corpus.JUDGEMENT_TAILS) >= 80 and len(corpus.HELD_OUT_TAILS) >= 30
+    assert len({t for t, _, _ in _ALL_TAILS}) == len(_ALL_TAILS), "duplicate tail"
+    from collections import Counter
+
+    kinds = Counter(kind for _, kind, _ in _ALL_TAILS)
+    for tail, kind, because in _ALL_TAILS:
+        assert kind in corpus.KINDS, (tail, kind)
+        assert because.lower() in tail.lower(), (tail, because)
+    for kind in corpus.KINDS:
+        assert kinds[kind] >= 3, (kind, kinds[kind])
+
+
+def test_the_search_is_not_built_from_the_vocabulary_it_tests():
+    """The round-4 search could only return zero because every tail it used
+    was already a decision signal. Most of these are not — measured at this
+    commit, 66 of the 84 dev tails and 27 of the 30 held-out tails carry no
+    decision signal at all — and the search below runs with the decision
+    vocabulary switched off, so it keeps searching where the vocabulary is
+    blind however that vocabulary grows."""
+    blind = [t for t, _, _ in _ALL_TAILS if not source_use.classify(t).decision_signal_anywhere]
+    assert len(blind) >= len(_ALL_TAILS) // 2, (len(blind), len(_ALL_TAILS))
+    # the verifier's own tail is among the blind ones
+    assert "is that in line with the market?" in blind
+
+
+def test_every_corpus_field_head_reaches_extraction_on_its_own():
+    """Control 1: a combination cannot pass because its field half quietly
+    failed to register."""
+    wrong = [h for h in corpus.FIELD_HEADS if source_use.question_mode(h + "?") != "extract"]
+    assert not wrong, wrong
+    assert len(corpus.FIELD_HEADS) >= 25 and len(corpus.JOINS) >= 6
+
+
+def test_no_judgement_tail_rides_a_field_ask_into_strict_extraction_on_structure_alone(monkeypatch):
+    """THE SEARCH, with the decision vocabulary OFF: 30 field heads x 114
+    judgement tails x 10 joins x both orders = 68,400 questions. Every
+    question that still leaves as strict "extract" must be one of the two
+    documented residual classes above.
+
+    Measured at this commit, vocabulary off: 2,070 of 68,400 in those two
+    classes and 0 outside them. On 4810da0, vocabulary ON, 55,800 of 68,400
+    took strict extraction alone. Decision evidence can only move a question
+    AWAY from "extract" (see _apply_precedence), so passing with it off is the
+    stronger statement.
+    """
+    monkeypatch.setattr(source_use, "_decision_evidence", lambda q: source_use._Decision())
+    total = 0
+    outside = []
+    residual = 0
+    for head, (tail, _, _), join in itertools.product(corpus.FIELD_HEADS, _ALL_TAILS, corpus.JOINS):
+        for direction, question in (
+            ("fwd", head + join + tail),
+            ("rev", tail.rstrip("?") + join + head + "?"),
+        ):
+            total += 1
+            if source_use.question_mode(question) != "extract":
+                continue
+            if _documented_residual(direction, tail, join):
+                residual += 1
+            else:
+                outside.append(question)
+    assert total == 68_400, total
+    assert not outside, f"{len(outside)} new holes, e.g. {outside[:5]}"
+    assert residual <= 2_070, residual
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # the verifier's live reproduction, and the same ask in other shapes
+        "what is the annual fee in this contract, and is that in line with the market?",
+        "what is the annual fee in this contract and is that in line with the market?",
+        "is that in line with the market? what is the annual fee in this contract",
+        "what is the annual fee in this contract - how does that stack up against the market?",
+        "give me the grand total and tell me if that's in line with the market",
+        "what's the due date, and can we actually meet that?",
+        "what is the notice period; would a lawyer be happy with that?",
+        "list the line items and flag it if that looks unusual",
+        "what is the invoice total, and your thoughts?",
+        "what are the payment terms. is that one-sided?",
+    ],
+)
+def test_a_judgement_ask_with_no_decision_word_beside_a_field_is_not_extraction_alone(question):
+    """Every one of these took strict extraction alone on 4810da0: the field
+    half scored, the judgement half carried no decision word. Now the clause
+    test sees a second ask that no field can answer."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract+advise", (question, signals)
+    assert signals.asks_beyond_fields, signals
+    system = source_use.system_text(question)
+    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
+
+
+def test_the_verifiers_pair_now_takes_one_route_and_structure_is_what_caught_it():
+    """The minimal pair: one word different, one routed to strict extraction
+    and refused, the other answered 3 of 3. Both are extract+advise now — and
+    the market one is caught by the clause test, not by a decision word."""
+    market = source_use.classify(
+        "what is the annual fee in this contract, and is that in line with the market?")
+    reasonable = source_use.classify(
+        "what is the annual fee in this contract, and is that reasonable?")
+    assert market.mode == reasonable.mode == "extract+advise"
+    assert not market.decision_signal_anywhere, market.evidence
+    assert any(kind.startswith("open-ask-") for kind, _ in market.evidence), market.evidence
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "is the annual fee in this contract in line with the market?",
+        "is the notice period long?",
+        "is the interest rate on late payment steep?",
+        "are the payment terms one-sided?",
+    ],
+)
+def test_a_one_clause_judgement_about_a_named_field_is_not_extraction_alone(question):
+    """The same class without a join: a polar question whose subject is a
+    field and whose predicate is not something the page can state."""
+    assert source_use.question_mode(question) == "extract+advise", source_use.classify(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee, and is it payable in advance?",
+        "what is the invoice total, and does it include VAT?",
+        "what is the due date, and is it a business day?",
+        "what is the notice period, and does it apply to both parties?",
+        "what is the late fee and how is it calculated?",
+        "what is the total, and which clause is it in?",
+        "extract the line items and put them in a table",
+        "what is the total, and can you list the line items?",
+        "is there a PO number on this invoice?",
+        "does the datasheet give a price?",
+        "I need the total from this invoice?",
+        "what is the fee in this contract and in USD?",
+    ],
+)
+def test_a_fact_about_a_field_is_still_a_field_ask(question):
+    """The other direction. A follow-up the page CAN answer — when, how, in
+    what currency, in which clause — leaves nothing once field words, value
+    words and function words are taken away, and stays strict."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract", (question, signals.evidence, signals.open_asks)
+
+
+def test_strict_extraction_survives_for_pure_field_asks():
+    """Bar: at least 300 pure field asks, at least 95% strict. The corpus
+    builds 4,460 (field heads alone, a field head plus a fact follow-up, two
+    field heads joined), including ten follow-ups held out until the detector
+    was finished. Measured at this commit: 4,460 of 4,460 strict. On the
+    frozen detector the held-out follow-ups first measured 1,210 of 1,330
+    (90.98%) — all 120 losses were "is it quoted per unit?" — which is what
+    added pricing bases to _VALUE_WORDS."""
+    asks = [h + "?" for h in corpus.FIELD_HEADS]
+    for head, follow, join in itertools.product(
+        corpus.FIELD_HEADS,
+        corpus.FACT_FOLLOW_UPS + corpus.HELD_OUT_FACT_FOLLOW_UPS,
+        (", and ", "? ", " - ", ". "),
+    ):
+        asks.append(head + join + follow)
+    for (a, b), join in itertools.product(corpus.FIELD_PAIRS, corpus.JOINS):
+        asks.append(a + join + b)
+    assert len(asks) >= 300, len(asks)
+    lost = [q for q in asks if source_use.question_mode(q) != "extract"]
+    kept = len(asks) - len(lost)
+    assert kept >= 0.95 * len(asks), f"{kept}/{len(asks)} strict; lost e.g. {lost[:8]}"
+
+
+def test_the_clause_test_never_sends_a_question_to_strict_extraction():
+    """It can only take a question OUT of "extract". Over the precedence's
+    whole score space, with and without an open ask: an open ask beside
+    fields is extract+advise, and without fields it changes nothing."""
+    ask = [("polar", "is that in line with the market?")]
+    for field, score, held in itertools.product(range(6), repeat=3):
+        without = source_use._apply_precedence(field, source_use._Decision(score=score, held=held))
+        with_ask = source_use._apply_precedence(
+            field, source_use._Decision(score=score, held=held), open_asks=ask)
+        assert with_ask.mode != "extract", (field, score, held)
+        if without.mode != "extract":
+            assert with_ask.mode == without.mode, (field, score, held)
+        else:
+            assert with_ask.mode == "extract+advise"
+
+
+def test_the_clause_test_only_runs_beside_a_field_ask():
+    """A question with no field in it has no strict block to be saved from,
+    so its mode is exactly what the two vocabularies made it."""
+    for question in ("is that in line with the market?", "summarize this document",
+                     "what does clause 11 say?", OWNER_QUESTION):
+        signals = source_use.classify(question)
+        assert signals.open_asks == [], (question, signals.open_asks)
+
+
+# --- the strict block no longer turns a misroute into a refusal --------------
+
+
+def test_the_strict_block_forbids_only_what_was_not_asked():
+    """The old block said "For this answer do not add advice, a
+    recommendation, a next step, a caution or an offer of further help" with
+    no qualifier. Forced into it live, the verifier's market question opened
+    its judgement with "The document does not provide market benchmarks ..."
+    0 of 8 times answered; the rewritten block answered 7 of 15, and an
+    actual residual ("what is the annual fee in this contract and good or
+    bad?", still routed extract) went from 0 of 5 answered to 5 of 5."""
+    system = source_use.system_text("what is the invoice total?")
+    assert source_use.question_mode("what is the invoice total?") == "extract"
+    assert "For this answer do not add advice" not in system
+    assert "that the person did not ask for" in system
+    assert "NOTHING THE PERSON ASKED IS FORBIDDEN" in system
+    assert "that part was asked, so answer it" in system
+    assert "The strict rules above bind the FIELDS only" in system
+    assert "Its FIRST sentence is the verdict" in system
+    assert "never a list of things to go and check" in system
+
+
+def test_the_strict_block_still_never_invents_a_value():
+    """What the block exists for, unchanged in force: the "**Tax Amount:**
+    0.00 USD" fabrication. Live on the tax-free invoice, 16 runs each: the
+    rewritten block kept the total, wrote "not stated" for the tax and printed
+    no tax figure 16 of 16, at median 76 and 86.5 chars on the two fixtures;
+    the old block was clean 16 of 16 too, at medians of 193 and 126.5."""
+    q = "I need the total from this invoice and the tax amount"
+    system = source_use.system_text(q)
+    assert source_use.question_mode(q) == "extract"
+    assert "for a field, the document is the only source" in system
+    assert 'write "not stated in the document"' in system
+    assert "that line is the whole answer for that field" in system
+    assert "with no sentence about why it is missing" in system
+    assert "A field the document does not give is never such a part" in system
+    assert "Answer what was asked and stop" in system
+
+
+def test_both_judgement_halves_share_one_set_of_rules():
+    """A judgement that lands in extract+advise and one that lands in strict
+    extraction get the same instruction for how to answer it, and the
+    extract+advise block does not carry the safety net as well."""
+    both = source_use.system_text("what is the annual fee, and is that reasonable?")
+    strict = source_use.system_text("what is the annual fee?")
+    assert source_use._JUDGEMENT_RULES in both
+    assert source_use._JUDGEMENT_RULES in strict
+    assert "NOTHING THE PERSON ASKED IS FORBIDDEN" not in both
+    assert both.index("ALSO ASKED FOR A JUDGEMENT") < both.index(source_use._JUDGEMENT_RULES)
+    # the rules quote no failing wording: the model copies what a prompt quotes
+    for phrase in ("in line with the market", "reasonable?", "competitive"):
+        assert phrase not in source_use._JUDGEMENT_RULES
+        assert phrase not in source_use._ASKED_IS_ANSWERED
