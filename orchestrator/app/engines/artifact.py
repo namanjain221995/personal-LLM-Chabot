@@ -851,14 +851,25 @@ def _warning_clause(warnings: Sequence[str], *, limit: int = 2) -> str:
     """Up to `limit` warnings in full, then a COUNT of the rest. The slice
     this replaces truncated: four "column not found" warnings were printed
     as two and the person read two thirds of the truth, while the card's
-    `warnings` array carried all four (measured 2026-09-16, J1)."""
-    said = [str(w).strip() for w in warnings if str(w).strip()]
+    `warnings` array carried all four (measured 2026-09-16, J1). Operator
+    notes are not said (T.reader_warnings, hotfix 1.1)."""
+    said = [str(w).strip() for w in T.reader_warnings(warnings) if str(w).strip()]
     if not said:
         return ""
     out = " " + " ".join(f"_{w.rstrip('.')}._" for w in said[:limit])
     if len(said) > limit:
         out += f" _…and {len(said) - limit} more — see the card._"
     return out
+
+
+def _log_operator_notes(ref: T.ArtifactRef, warnings: Sequence[str]) -> None:
+    """The notes `T.reader_warnings` keeps from the person, for operators,
+    once per turn. Each is cut short: a chart title or a figure list is
+    derived from the person's data."""
+    notes = [str(w)[:200] for w in warnings if T.is_operator_note(w)]
+    if notes:
+        log.info("artifact %s v%s: operator notes not shown to the reader: %s", ref.artifact_id, ref.version,
+                 " | ".join(notes[:6]))
 
 
 #: The notes material_in leaves when a file could not be opened at all.
@@ -1195,6 +1206,7 @@ async def run_artifact_engine(
     ref = pipeline.ref_for(row, version_row)
     all_warnings = list(warnings) + [w for w in ref.warnings if w not in warnings] + _cannot_clauses(instruction, all_warnings=warnings)
     ref.warnings = all_warnings
+    _log_operator_notes(ref, all_warnings)
     status = str(row.get("status") or "")
     if status in ("completed", "completed_with_warnings"):
         report = dict(material.transform) if operation == "create" else {}
@@ -1928,6 +1940,7 @@ async def _run_edit(
     status = str(row.get("status") or "")
     if status in ("completed", "completed_with_warnings"):
         warnings = list(ref.warnings)
+        _log_operator_notes(ref, warnings)
         failed_pending = [w for w in warnings if str(w).startswith("not applied:")]
         said = [c for c in changes if not any(_quoted(c) and _quoted(c) in w for w in failed_pending)]
         not_applied = list(outcome.not_applied) + [{"op": "", "reason": w[len("not applied: "):]} for w in failed_pending]

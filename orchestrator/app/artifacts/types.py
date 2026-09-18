@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 # ----------------------------------------------------------------- kinds --
 
@@ -368,6 +368,46 @@ class FileRef:
         return out
 
 
+#: Two of the composer's notes are written for OPERATORS (hotfix 1.1,
+#: 2026-09-19) and were read to the owner verbatim, on the card and in the
+#: sentence: "_Top 5 Countries: the table 'table1' is not available._" (a
+#: chart binding to an id only the model knew) and "_figures not in the
+#: material (derived or assumed): 10 percent, 50 percent…_" (the composer's
+#: own figure check). The version row keeps them as written; what reaches a
+#: reader is `reader_warnings`.
+_TABLE_MISSING_NOTE_RE = re.compile(r"^.+?: the table (?:'[^']*'|\"[^\"]*\") is not available\.?$", re.S)
+#: compose.FIGURES_WARNING's opening words (compose imports this module).
+_FIGURES_NOTE_PREFIX = "figures not in the material"
+
+
+def is_operator_note(warning: object) -> bool:
+    text = str(warning or "").strip()
+    return text.startswith(_FIGURES_NOTE_PREFIX) or bool(_TABLE_MISSING_NOTE_RE.match(text))
+
+
+def reader_warnings(warnings: Sequence[object]) -> List[str]:
+    """The warnings a person reads, in order. Operator notes are left out;
+    charts that could not be bound are said once, counted, in plain words,
+    where the first of them stood — that one helps: the person asked for
+    those charts."""
+    out: List[str] = []
+    missing = 0
+    slot = -1
+    for w in warnings or ():
+        text = str(w)
+        if _TABLE_MISSING_NOTE_RE.match(text.strip()):
+            missing += 1
+            if slot < 0:
+                slot = len(out)
+            continue
+        if is_operator_note(text):
+            continue
+        out.append(text)
+    if missing:
+        out.insert(slot, f"{missing} chart{'s' if missing != 1 else ''} could not be drawn from your data")
+    return out
+
+
 @dataclass
 class ArtifactRef:
     """What the chat meta and the API say about one version of one artifact.
@@ -437,7 +477,8 @@ class ArtifactRef:
                 f"{self.base_path}/sheets" if self.preview_kind == "grid" else ""
             ),
             "thumbnail_url": f"{self.base_path}/preview/1.png?w=240" if self.preview_pages else "",
-            "warnings": list(self.warnings),
+            # The card is read by a person: operator notes stay on the row.
+            "warnings": reader_warnings(self.warnings),
             "created_at": self.created_at,
             "operation": self.operation,
             "status_url": f"/artifacts/jobs/{self.job_id}",
