@@ -73,6 +73,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .. import continuation, db, llm, rerank
 from .. import continuity
@@ -84,6 +85,7 @@ from ..config import settings
 # query-centred `_select_text` — see `_trim_evidence` for what the head slice
 # was costing (C1).
 from ..core import provenance
+from ..core.org_brief import BUSINESS_TIMEZONE
 from ..core.sf_intel.planner import extract_json_object
 from ..freshness import Freshness, Verdict, classify_offline
 from ..memory_recall import keywords
@@ -97,8 +99,6 @@ from .search import (
     _collect_results,
     _fetch_sources,
     _normalize_url,
-    _now_stamp,
-    _registrable_domain,
     _select_text,
     _spawn,
     _persist_and_index,
@@ -503,6 +503,9 @@ class Claim:
     as_of: Optional[date]
     hint: str  # current | historical | unclear
     iteration: int
+    #: The date after today the extractor gave as the claim's as_of: the
+    #: claim is about the future ("will reach 5 GW by 2031"). None otherwise.
+    forecast_for: Optional[date] = None
 
 
 @dataclass
@@ -528,6 +531,13 @@ class Resolution:
     #: False when no supporting source states `value` in its own words
     #: (`_quote_in`). The report must not present it as an established fact.
     stated_verbatim: bool = True
+    #: [{value, as_of, for, sources}] — predictions for a date after today,
+    #: kept apart from a reported value (B17): neither newer evidence that
+    #: replaces it nor a source that disputes it.
+    forecasts: List[dict] = field(default_factory=list)
+    #: Set when the resolved value itself is such a prediction: only
+    #: forecasts were found for the subquestion.
+    forecast_for: Optional[date] = None
 
     def line(self) -> str:
         head = f"[{self.subq}] {self.question} — {self.status.upper()}"
@@ -554,6 +564,15 @@ class Resolution:
                 + "".join(f"[{n}]" for n in c.get("sources", []))
                 + ")"
             )
+        for f in self.forecasts[:3]:
+            tail += (
+                f' · forecast: "{f["value"]}" (for {f["for"][:4]}'
+                f"{('; made ' + f['as_of']) if f.get('as_of') else ''}; "
+                + "".join(f"[{n}]" for n in f.get("sources", []))
+                + ")"
+            )
+        if self.forecast_for:
+            tail += f" · a FORECAST for {self.forecast_for.year}, not a reported value"
         if not self.stated_verbatim:
             tail += " · NOT STATED VERBATIM by any cited source"
         return head + tail + f" · confidence {self.confidence:.2f}"
@@ -571,6 +590,8 @@ class Resolution:
             "conflicts": list(self.conflicts),
             "confidence": round(self.confidence, 2),
             "stated_verbatim": self.stated_verbatim,
+            "forecasts": list(self.forecasts),
+            "forecast_for": self.forecast_for.isoformat() if self.forecast_for else "",
         }
 
 
@@ -671,6 +692,9 @@ class ResearchState:
     #: Sources allowed past DEEP_RESEARCH_MAX_SOURCES — the verification
     #: round's reserve, and zero everywhere else (B23c).
     source_headroom: int = 0
+    #: Search results the relevance floor turned down, over the whole run.
+    #: A run that read nothing because of it must not blame the provider.
+    off_topic_dropped: int = 0
     #: source.n → folded text + sentence spans, so the verbatim check in
     #: `_resolve` folds each page once per run rather than once per round.
     folded: Dict[int, "_Prepared"] = field(default_factory=dict, repr=False)
@@ -1031,6 +1055,43 @@ def _stale_years(text: str, now_year: int) -> bool:
     return bool(years) and max(years) <= now_year - 3
 
 
+def _site_of(url: str) -> str:
+    """The registrable domain the run-wide site caps count:
+    rocm.docs.amd.com -> amd.com, news.bbc.co.uk -> bbc.co.uk.
+
+    Not `search._registrable_domain`. It treats ANY label of three characters
+    or fewer before a TLD of three or fewer as a two-label public suffix (a
+    rule meant for co.uk), so a vendor with a short name became several
+    sites: measured on 4810da0, rocm.docs.amd.com -> docs.amd.com,
+    community.amd.com -> community.amd.com, developer.ibm.com ->
+    developer.ibm.com, spam1.abc.io -> spam1.abc.io. That let a run that had
+    already read amd.com to its cap follow more amd.com links, and it let any
+    short domain mint a fresh "site" per subdomain, which is what an SEO farm
+    needs to take over a run's sources (QA, 2026-09-18). Here the second-level
+    suffix applies only under a two-letter country TLD, with the
+    second-level labels `provenance.registrable_label` already uses.
+    """
+    labels = [p for p in provenance.domain_of(url).split(".") if p]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if len(labels[-1]) == 2 and labels[-2] in provenance._PUBLIC_SECOND_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _relevance_query(state: ResearchState) -> str:
+    """What the relevance floor scores a page against: the question the PLAN
+    resolved, not the raw message.
+
+    A follow-up sent with Deep Research on ("Tell me more") has no subject of
+    its own; the planner rebuilds it from history into the subquestions.
+    Measured 2026-09-18 on the live reranker, 33 real SearXNG results for the
+    planner's JWST query: "Tell me more" alone kept 0 of 33 (max score
+    0.023), the same message plus the subquestions kept 30 of 33 (QA).
+    """
+    return "\n".join([state.question, *state.subquestions])
+
+
 async def _rank_candidates(
     state: ResearchState, results: List[SearchResult], effort: str = "think"
 ) -> List[SearchResult]:
@@ -1061,8 +1122,9 @@ async def _rank_candidates(
     "no" from a broken model), so a uniformly off-topic pool is still read.
 
     Over-cap sites go to the BACK: at most `domain_cap(effort)` pages per
-    registrable domain lead the order, and the rest are read only when the
-    round has nothing else. `_collect_results` widens its own per-site cap
+    registrable domain lead the order, counting the pages the run has already
+    read from it, and the rest are read only when the round has nothing else
+    (a planner's `site:` query, say). `_collect_results` widens its own per-site cap
     with the 5x candidate pool (3 -> 15 per site at Think), so without this a
     single site could fill a round.
     """
@@ -1070,13 +1132,14 @@ async def _rank_candidates(
         return []
     try:
         relevance: Optional[List[float]] = await rerank.score(
-            state.question, [f"{r.title}\n{r.snippet}"[:1000] for r in results]
+            _relevance_query(state), [f"{r.title}\n{r.snippet}"[:1000] for r in results]
         )
     except rerank.RerankUnavailable:
         relevance = None
     if relevance is not None:
         keep = [i for i in range(len(results)) if relevance[i] >= _RERANK_FLOOR]
         if len(keep) < len(results):
+            state.off_topic_dropped += len(results) - len(keep)
             _rlog(
                 state, "rerank floor: %d of %d candidate(s) below %.2f dropped",
                 len(results) - len(keep), len(results), _RERANK_FLOOR,
@@ -1103,11 +1166,18 @@ async def _rank_candidates(
         scored.append((score, i, r))
     scored.sort(key=lambda t: (-t[0], t[1]))
     cap = domain_cap(effort)
+    # Counted over the WHOLE run, as link following counts: this started at
+    # zero every round, so each round gave the same site `cap` more lead
+    # slots. Live at Fast (cap 2, QA 2026-09-18): doc.rust-lang.org supplied
+    # 6 of 36 sources and postgresql.org 10, all through search rounds.
     per_site: Dict[str, int] = {}
+    for s in state.sources:
+        site = _site_of(s.url)
+        per_site[site] = per_site.get(site, 0) + 1
     lead: List[SearchResult] = []
     back: List[SearchResult] = []
     for _s, _i, r in scored:
-        site = _registrable_domain(r.url)
+        site = _site_of(r.url)
         if per_site.get(site, 0) >= cap:
             back.append(r)
             continue
@@ -1214,7 +1284,7 @@ def _candidate_links(
     cap = domain_cap(effort)
     per_site: Dict[str, int] = {}
     for s in state.sources:
-        site = _registrable_domain(s.url)
+        site = _site_of(s.url)
         per_site[site] = per_site.get(site, 0) + 1
     per_page: Dict[int, int] = {}
     out: List[Tuple[str, SourceRecord]] = []
@@ -1223,7 +1293,7 @@ def _candidate_links(
         key = _normalize_url(link)
         if key in seen or per_page.get(src.n, 0) >= 2:
             continue
-        site = _registrable_domain(link)
+        site = _site_of(link)
         if per_site.get(site, 0) >= cap:
             continue
         seen.add(key)
@@ -1233,6 +1303,41 @@ def _candidate_links(
         if len(out) >= limit:
             break
     return out
+
+
+async def _on_topic_pages(state: ResearchState, fetched: list) -> list:
+    """The followed pages the relevance floor keeps.
+
+    A link has no snippet to score before it is opened (its SearchResult is
+    the bare URL), so the floor search results pass in `_rank_candidates` is
+    applied here, to the page itself, before it takes a source slot. Live at
+    a0a9b6f (QA 2026-09-18), a battery-price run followed links to a uranium
+    price forecast, an 18650 pack calculator and a product page: none was
+    cited, and each spent a slot of the source cap or the verification
+    reserve. Same rules as the search floor: no reranker, or a degenerate
+    one, keeps every page.
+    """
+    if not fetched:
+        return fetched
+    query = _relevance_query(state)
+    try:
+        relevance = await rerank.score(
+            query,
+            [f"{s.title}\n{_select_text(s.text or '', query, 1000)}"[:1000] for s in fetched],
+        )
+    except rerank.RerankUnavailable:
+        return fetched
+    if len(relevance) != len(fetched):
+        return fetched  # not one score per page: no basis to drop any of them
+    kept = [s for s, r in zip(fetched, relevance) if r >= _RERANK_FLOOR]
+    if len(kept) < len(fetched):
+        state.off_topic_dropped += len(fetched) - len(kept)
+        _rlog(
+            state, "rerank floor: %d of %d followed page(s) below %.2f dropped: %s",
+            len(fetched) - len(kept), len(fetched), _RERANK_FLOOR,
+            "; ".join(s.url for s, r in zip(fetched, relevance) if r < _RERANK_FLOOR),
+        )
+    return kept
 
 
 async def _follow_links(
@@ -1262,6 +1367,7 @@ async def _follow_links(
     except Exception:  # noqa: BLE001
         log.warning("link fetch round failed", exc_info=True)
         return []
+    fetched = await _on_topic_pages(state, fetched)
     by_url = {link: src for link, src in picks}
     added: List[SourceRecord] = []
     for src in fetched:
@@ -1471,16 +1577,52 @@ async def _gather_bounded(
 # ---------------------------------------------------------------------------
 
 
-def _parse_as_of(value: object) -> Optional[date]:
-    """When a claim held, or None — and None for any date after today (B17).
+def _clock() -> datetime:
+    """Now, in the business timezone (`org_brief.BUSINESS_TIMEZONE`, IST).
+
+    Not the process clock. The production orchestrator container sets no TZ
+    and runs in UTC (QA 2026-09-18: /etc/localtime -> Etc/UTC), so the
+    process's "local" date is YESTERDAY for the person between 00:00 and
+    05:30 IST: the run was stamped with the wrong day, and `_parse_as_of`
+    refused a claim dated the person's today as a future date — measured at
+    00:55 IST on 2026-09-19, `_parse_as_of('2026-09-19')` was None under
+    TZ=UTC. The Salesforce path already reads this zone for the same reason
+    (`org_brief.business_today`). One function, so a test can stop the clock.
+    """
+    try:
+        return datetime.now(ZoneInfo(BUSINESS_TIMEZONE))
+    except ZoneInfoNotFoundError:  # an image without tzdata: the process zone
+        return datetime.now().astimezone()
+
+
+def _today() -> date:
+    """The person's calendar date — the one `_parse_as_of` bounds claims by
+    and `_resolve` ages them against."""
+    return _clock().date()
+
+
+def _stamp(now: datetime) -> str:
+    """'2026-09-19 00:55 IST (2026-09-18 19:25 UTC)': the business-zone date
+    and time, with UTC beside it — the shape of the search route's stamp."""
+    utc = now.astimezone(timezone.utc)
+    return (
+        f"{now.date().isoformat()} {now:%H:%M} {now.tzname() or 'local time'} "
+        f"({utc:%Y-%m-%d %H:%M} UTC)"
+    )
+
+
+def _parse_as_of(value: object, *, allow_future: bool = False) -> Optional[date]:
+    """When a claim held, or None — and None for any date after today (B17),
+    unless `allow_future` asks for the date a forecast names.
 
     The extractor dates a claim from whatever year its sentence names, so
     "capacity will reach 5 GW by 2031" arrived as_of 2031-01-01 (measured on
     4810da0: there was no upper bound). That made a forecast the NEWEST
     evidence in the run, and `_resolve` ranked it current and filed every
     real dated claim as superseded history. A date that has not happened yet
-    says when something is predicted, never when it held. Today is the local
-    date, the same calendar `_resolve` ages claims against.
+    says when something is predicted, never when it held. Today is the
+    business-zone date (`_today`), the same calendar `_resolve` ages claims
+    against.
     """
     text = str(value or "").strip()
     if not text:
@@ -1495,9 +1637,42 @@ def _parse_as_of(value: object) -> Optional[date]:
             when = date(int(y), int(mo or 1), int(d or 1))
         except ValueError:
             return None
-    if when is not None and when > date.today():
+    if when is not None and when > _today() and not allow_future:
         return None
     return when
+
+
+#: A year as a value writes it: 2034, FY2027, the 2030s.
+_YEARISH_RE = re.compile(r"\b(?:fy)?(?:19|20)\d{2}s?\b", re.I)
+
+#: The parts of a value that only say WHEN: a year (2034, FY2027, 2030s), an
+#: ISO date, a quarter or half (Q3, H2), a day beside a month name.
+_WHEN_PART_RE = re.compile(
+    r"\b(?:fy)?(?:19|20)\d{2}s?(?:-\d{1,2}){0,2}\b"
+    r"|\b(?:q[1-4]|h[12])\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?=(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?\b",
+    re.I,
+)
+
+def _names_a_date(value: str) -> bool:
+    """The value IS a date or a timeline ("2034", "Q3 2027", "First plasma:
+    2034; D-T operations: 2039"): it names a year, and every other number in
+    it is part of a date."""
+    if not _YEARISH_RE.search(value or ""):
+        return False
+    return not re.search(r"\d", _WHEN_PART_RE.sub(" ", value))
+
+
+def _is_forecast(c: Claim) -> bool:
+    """A prediction of a QUANTITY for a date after today: "5 GW by 2031".
+
+    Not a schedule. "First plasma is now planned for 2034" names the future
+    date as its value; it is a statement about the plan, true as of the page
+    that states it, and the live ITER run (QA, 2026-09-18) needs it dated by
+    that page — the 2034 plan from a 2026-09-18 article is the current one,
+    and the older iter.org date is history."""
+    return c.forecast_for is not None and not _names_a_date(c.value)
 
 
 def _claim_time(state: ResearchState, c: Claim) -> Optional[date]:
@@ -1584,15 +1759,18 @@ async def _extract_claims(
         hint = str(item.get("status") or "unclear").lower()
         if hint not in ("current", "historical", "unclear"):
             hint = "unclear"
+        as_of = _parse_as_of(item.get("as_of"))
+        named = None if as_of else _parse_as_of(item.get("as_of"), allow_future=True)
         state.claims.append(
             Claim(
                 subq=subq,
                 text=text[:600],
                 value=" ".join(str(item.get("value") or "").split())[:300],
                 source_n=source_n,
-                as_of=_parse_as_of(item.get("as_of")),
+                as_of=as_of,
                 hint=hint,
                 iteration=state.iterations,
+                forecast_for=named,
             )
         )
         added += 1
@@ -1639,11 +1817,12 @@ def _resolve(state: ResearchState) -> None:
     SUPERSEDED (an earlier value with an earlier date — a change over time)
     or CONFLICTING (a different value of comparable date and authority — a
     real disagreement the report must surface). Claims the source itself
-    presents as history never compete for "current".
+    presents as history never compete for "current", and a forecast competes
+    only when nothing but forecasts was found (B17).
     """
     subqs = state.subquestions or [state.question]
     max_age = state.temporal.max_age_seconds if state.temporal else 14 * 86400
-    today = date.today()
+    today = _today()
     for i, subq in enumerate(subqs, 1):
         claims = [c for c in state.claims if c.subq == i]
         if not claims:
@@ -1691,6 +1870,11 @@ def _resolve(state: ResearchState) -> None:
             times = [t for t in (_claim_time(state, c) for c in cs) if t]
             when = max(times) if times else None
             historical = bool(cs) and all(c.hint == "historical" for c in cs)
+            forecast_for = (
+                max(c.forecast_for for c in cs)
+                if cs and all(_is_forecast(c) for c in cs)
+                else None
+            )
             scored.append(
                 {
                     "key": key, "claims": cs, "support": canonical,
@@ -1698,9 +1882,25 @@ def _resolve(state: ResearchState) -> None:
                     "authority": auth, "primary": primary,
                     "primary_weight": primary_weight, "when": when,
                     "historical": historical, "value": (cs[0].value or cs[0].text)[:200],
+                    "forecast_for": forecast_for,
                 }
             )
         candidates = [g for g in scored if not g["historical"]] or scored
+        # B17. A forecast is dated by the page that makes it (`_claim_time`
+        # falls back to the publication date once its future year is
+        # refused), so an outlook article published after a dated fact was
+        # the NEWEST evidence and won: QA 2026-09-18, "5 GW by 2031" from a
+        # 2026-08-20 article beat "3 GW" as of 2026-07-24 and filed it as
+        # superseded. A prediction does not compete with a reported value at
+        # all — not even when the subquestion asks about the plan too: live,
+        # the real extractor dated "5 GW by 2031" as_of 2031 for "How much
+        # battery storage does the region have, and how much is planned?",
+        # and a rule that let forecasts compete for subquestions naming a
+        # plan made it CURRENT again and filed the measured 3 GW as history.
+        # The forecast is listed beside the value instead, for the writer.
+        present = [g for g in candidates if not g["forecast_for"]]
+        if present:
+            candidates = present
         known = [g["when"] for g in candidates if g["when"]]
         newest = max(known) if known else None
         oldest = min(known) if known else None
@@ -1727,6 +1927,7 @@ def _resolve(state: ResearchState) -> None:
         winner["support"].sort()
         superseded: List[dict] = []
         conflicts: List[dict] = []
+        forecasts: List[dict] = []
         for g in scored:
             if g is winner or g["key"] == winner["key"]:
                 continue
@@ -1736,6 +1937,12 @@ def _resolve(state: ResearchState) -> None:
                 "sources": g["support"],
                 "authority": g["authority"],
             }
+            if g["forecast_for"] and not winner["forecast_for"]:
+                # Neither history nor a dispute: a value predicted for a
+                # different date than the one the subquestion asks about.
+                entry["for"] = g["forecast_for"].isoformat()
+                forecasts.append(entry)
+                continue
             if g["historical"]:
                 superseded.append(entry)
                 continue
@@ -1805,6 +2012,8 @@ def _resolve(state: ResearchState) -> None:
             conflicts=conflicts,
             confidence=confidence,
             stated_verbatim=stated,
+            forecasts=forecasts,
+            forecast_for=winner["forecast_for"],
         )
     for r in state.resolutions.values():
         _rlog(state, "resolution %s", r.line())
@@ -2479,6 +2688,12 @@ async def _persist_claims(state: ResearchState) -> None:
     for res in state.resolutions.values():
         if res.status not in (STATUS_CURRENT, STATUS_CONFLICTING):
             continue
+        if res.forecast_for:
+            # A prediction resolved in place of the present value (only
+            # forecasts were found). Stored as 'current', the shared store
+            # would hand it to every Fast-mode question as the fact (B17).
+            _rlog(state, "claim not persisted (forecast for %d): %r", res.forecast_for.year, res.value[:80])
+            continue
         wanted.append((res.status, res.value, res.as_of, res.confidence, list(res.support)))
         for s in res.superseded[:3]:
             wanted.append(
@@ -3044,17 +3259,18 @@ async def _run(
     # budget cancelled the queued wait and the run "completed" with an
     # empty report.
     await wait_admitted(what="deep_research", base_url=settings.openai_base_url)
-    # LOCAL, with UTC beside it — the stamp the search route uses. This was
-    # the UTC date, which on this box (IST, UTC+05:30) is yesterday between
-    # 00:00 and 05:30 local time, while `_resolve` ages claims against the
-    # local `date.today()`: one run, two calendars.
-    now = datetime.now().astimezone()
+    # The business-zone date and time, with UTC beside it, from the same clock
+    # `_parse_as_of` and `_resolve` read — one calendar for the whole run.
+    # This was the UTC date (4810da0), then the process-local one; the
+    # production container runs in UTC, so both were yesterday for the
+    # person between 00:00 and 05:30 IST (see `_clock`).
+    now = _clock()
     state = ResearchState(
         research_id=uuid.uuid4().hex,
         conversation_id=conversation_id,
         question=message,
         user_id=user_id,
-        today=_now_stamp(),
+        today=_stamp(now),
         now_year=now.year,
     )
     # Offline on purpose: the router model is never consulted mid-run. The
@@ -3250,11 +3466,20 @@ async def _run(
             # search errors are swallowed per round), never via the exception
             # handler below.
             timed_out = bool(state.cut_short)
+            # Blaming the provider was false when the search DID return
+            # results and the relevance floor turned every one of them down
+            # (QA 2026-09-18, the "Tell me more" follow-up before the floor
+            # scored the plan): say which of the two happened.
+            off_topic = state.off_topic_dropped
             await _close_run(
                 run_row, state, "failed", "", [],
                 "the time budget ended the run before any source was read"
                 if timed_out
-                else "no readable sources",
+                else (
+                    f"no on-topic sources ({off_topic} result(s) below the relevance floor)"
+                    if off_topic
+                    else "no readable sources"
+                ),
             )
             text = (
                 "I could not gather any readable sources for this question — "
@@ -3263,9 +3488,15 @@ async def _run(
                     "finished. Nothing was invented to fill the gap. Try "
                     "again, or give research a longer time budget."
                     if timed_out
-                    else "the search provider returned nothing usable. Nothing "
-                    "was invented to fill the gap. Try rephrasing, or ask with "
-                    "Web Search for a single-pass answer."
+                    else (
+                        "the searches returned results, but none of them was "
+                        "about this question. Nothing was invented to fill the "
+                        "gap. Try naming the subject in the question itself."
+                        if off_topic
+                        else "the search provider returned nothing usable. Nothing "
+                        "was invented to fill the gap. Try rephrasing, or ask with "
+                        "Web Search for a single-pass answer."
+                    )
                 )
             )
             await emit("token", {"text": text})

@@ -38,6 +38,11 @@ from app.config import settings
 from app.engines import deep_research as dr
 from app.engines.search import _Source
 from app.search.base import SearchResult
+from tests.test_llm_public_stream_kwargs import world  # noqa: F401 — the fake-engine fixture
+
+#: The real model client, before any test stubs it.
+_REAL_STREAM = dr.llm.stream_chat_events
+_REAL_FINISH_REASON = dr.llm.get_finish_reason
 
 #: The note a budget cut appends — the whole stored report in the audit's runs.
 _NOTE = "[the run reached its time budget and the report stops here"
@@ -228,20 +233,26 @@ def test_a_stream_still_writing_is_not_cut_at_its_allowance(monkeypatch):
 
 def test_a_stream_that_never_ends_is_stopped_at_the_hard_ceiling(monkeypatch):
     """Progress buys time, not unlimited time: a stream that keeps writing
-    forever is stopped at the ceiling, keeps every word it wrote, and says
-    why."""
+    far past the allowance is stopped at the ceiling, keeps every word it
+    wrote, and says why.
+
+    "Never ends" is 200 tokens, 10 s, here: the ceiling is about 2 s, and a
+    fake that truly never ended made this test HANG with the ceiling removed
+    (QA mutation M17, killed after 12 minutes; on CI a 60-minute job timeout,
+    not a named failure). Removed, this now fails on the assertions below.
+    """
 
     async def endless(n, kw):
-        i = 0
-        while True:
+        for i in range(200):
             yield ("token", f"sentence {i} of an endless report [1]. ")
-            i += 1
             await asyncio.sleep(0.05)
+        yield ("token", "the last sentence nobody should have waited for.")
 
     calls, closed = _wire(monkeypatch, endless)
     monkeypatch.setattr(dr, "_REPORT_OVERRUN_S", 1.0)
     out, events, elapsed = _run(monkeypatch)
-    assert elapsed < 10, f"the ceiling did not hold ({elapsed:.1f}s)"
+    assert "the last sentence nobody should have waited for" not in out, "the ceiling did not cut the stream"
+    assert elapsed < 8, f"the ceiling did not hold ({elapsed:.1f}s)"
     assert "sentence 0 of an endless report" in out
     assert "reached its time budget" in out, "the cut was silent"
     run = _run_meta(events)
@@ -298,3 +309,108 @@ def test_the_report_stage_keeps_the_admission_promise_honest():
         adm.running["user:1"] = [time.monotonic()]
         left = adm.frees_in_s()
     assert left >= 600.0 + dr._REPORT_OVERRUN_S - 1.0
+
+
+# ---------------------------------------------------------------------------
+# QA's B3 edges (2026-09-18), kept as regression pins. Each passed at
+# a0a9b6f; every "forever" fake is bounded so a missing guard FAILS by name
+# instead of hanging the job.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("effort", ["think", "max"])
+def test_the_thinking_off_switch_reaches_the_wire(world, monkeypatch, effort):  # noqa: F811
+    """The tests above read the kwargs of a stubbed stream. This drives the
+    REAL llm.stream_chat_events and continuation against the fake engine and
+    reads the request body the engine received."""
+    world.engine.pieces = ["The", " answer", " is", " written", " here", " [1]."]
+    calls, closed = _wire(monkeypatch, None)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+    # _wire stubbed the model; the real client goes back for this one.
+    monkeypatch.setattr(dr.llm, "stream_chat_events", _REAL_STREAM)
+    monkeypatch.setattr(dr.llm, "get_finish_reason", _REAL_FINISH_REASON)
+    events, emit = _emitter()
+    out = asyncio.run(dr.run_deep_research_engine("q", [], emit, effort=effort, conversation_id="c1"))
+    assert world.engine.calls, "no report request reached the engine"
+    for call in world.engine.calls:
+        kw = (call.get("extra_body") or {}).get("chat_template_kwargs") or {}
+        assert kw.get("enable_thinking") is False, call.get("extra_body")
+    assert "The answer is written here" in out
+    assert closed["status"] == "done"
+
+
+def test_a_stream_of_citation_markers_only_is_failed_not_done(monkeypatch):
+    """"[1] " restarts the idle clock but is not a word: the call runs to the
+    ceiling, and a report of markers alone is never 'done'."""
+
+    async def only_markers(n, kw):
+        for _ in range(500):  # 10 s; the ceiling is about 1.8 s
+            yield ("token", "[1] ")
+            await asyncio.sleep(0.02)
+
+    calls, closed = _wire(monkeypatch, only_markers)
+    monkeypatch.setattr(dr, "_REPORT_OVERRUN_S", 0.8)
+    out, events, elapsed = _run(monkeypatch)
+    assert elapsed < 8, f"{elapsed:.1f}s"
+    assert closed["status"] == "failed", (closed["status"], closed["report"][:80])
+    assert "no report text" in out
+
+
+def test_the_failure_sentence_never_claims_a_retry_that_was_not_made(monkeypatch):
+    """Whitespace keeps the idle clock alive to the ceiling; the retry then
+    starts past it and is cancelled at once. The sentence must not say "then
+    one ... retry" for a call the engine never got (QA2)."""
+
+    async def whitespace(n, kw):
+        for _ in range(200):  # 10 s; the ceiling is about 1.5 s
+            yield ("token", " ")
+            await asyncio.sleep(0.05)
+
+    calls, closed = _wire(monkeypatch, whitespace)
+    monkeypatch.setattr(dr, "_REPORT_OVERRUN_S", 0.5)
+    out, events, elapsed = _run(monkeypatch)
+    assert elapsed < 8, f"{elapsed:.1f}s"
+    assert closed["status"] == "failed"
+    if "retry" in out:
+        assert len(calls) == 2, f"sentence claims a retry, but {len(calls)} call(s) reached the engine: {out!r}"
+
+
+def test_a_closed_tab_mid_report_is_a_cancel_not_an_idle_cut(monkeypatch):
+    """A cancel from outside stays a cancel: the idle deadline must not turn
+    it into a TimeoutError the retry path swallows."""
+
+    async def slow_writer(n, kw):
+        for i in range(400):
+            yield ("token", f"word{i} ")
+            await asyncio.sleep(0.01)
+
+    calls, closed = _wire(monkeypatch, slow_writer)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+    events, emit = _emitter()
+
+    async def main():
+        task = asyncio.create_task(dr.run_deep_research_engine("q", [], emit, conversation_id="c1"))
+        while not any(k == "token" for k, _ in events):
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+    assert closed["status"] == "cancelled", closed
+    assert "word0" in closed["report"]
+    assert len(calls) == 1, "a cancelled report was retried"
+
+
+def test_an_engine_error_before_any_token_is_a_failure_not_a_retry(monkeypatch):
+    async def dies(n, kw):
+        raise ConnectionError("engine gone")
+        yield  # pragma: no cover
+
+    calls, closed = _wire(monkeypatch, dies)
+    monkeypatch.setattr(settings, "deep_research_timeout_s", 600.0)
+    out, events, elapsed = _run(monkeypatch)
+    assert closed["status"] == "failed"
+    assert "The research run failed" in out
+    assert len(calls) == 1

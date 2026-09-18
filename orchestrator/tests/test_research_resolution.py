@@ -717,11 +717,18 @@ def test_prose_claims_do_not_outvote_a_real_value():
 
 
 def test_a_date_after_today_is_not_an_as_of_date():
-    today = date.today()
+    # The person's today (business zone), not the process's: the production
+    # container runs UTC, a day behind between 00:00 and 05:30 IST, and CI
+    # runs UTC too — `date.today()` here would make this test flaky there.
+    today = dr._today()
     assert dr._parse_as_of("2031") is None
     assert dr._parse_as_of("2031-06") is None
     assert dr._parse_as_of("2031-06-30") is None
-    assert dr._parse_as_of("June 30, 2031") is None, "the free-text path is bounded too"
+    # The free-text path is bounded too. `provenance.parse_date` reads RFC and
+    # ISO timestamps, not "June 30, 2031" (None on 4810da0 as well, so that
+    # proved nothing — QA 2026-09-18); this form is 2031-06-30 on 4810da0.
+    assert dr._parse_as_of("Mon, 30 Jun 2031 10:00:00 GMT") is None, "the free-text path is bounded too"
+    assert dr._parse_as_of("Mon, 03 Mar 2025 10:00:00 GMT") == date(2025, 3, 3)
     assert dr._parse_as_of((today + timedelta(days=1)).isoformat()) is None
     # Today and the past are unchanged.
     assert dr._parse_as_of(today.isoformat()) == today
@@ -762,3 +769,178 @@ def test_a_forecast_claim_no_longer_supersedes_a_dated_fact():
     by_value = {c.value: c for c in st.claims}
     assert by_value["5 GW"].as_of is None, "the forecast year was kept as a date"
     assert by_value["3 GW"].as_of == date(2026, 7, 24)
+
+
+# ---------------------------------------------------------------------------
+# B17, second road (QA 2026-09-18). Refusing the future year was not enough:
+# `_claim_time` then dates the forecast by its PAGE, and an outlook article
+# published after the fact's date made the forecast the newest evidence again.
+# At a0a9b6f: CURRENT "5 GW" (as of 2026-08-20) · superseded "3 GW". A
+# prediction now stays out of the contest for the present value, and it is
+# listed as a forecast — neither history nor a dispute. It competes only when
+# nothing but forecasts was found. A SCHEDULE ("first plasma in 2034") is not
+# a forecast of a quantity: its value is the date, and it stays dated by its
+# page, which is what the live ITER run needed.
+# ---------------------------------------------------------------------------
+
+
+def _extract(st, sources, claims):
+    async def fake_json_completion(messages, **kw):
+        return json.dumps({"claims": claims})
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(dr.llm, "json_completion", fake_json_completion):
+        asyncio.run(dr._extract_claims(st, sources, "think", None))
+    dr._resolve(st)
+
+
+def test_qa_forecast_from_a_later_published_article_does_not_supersede_the_fact():
+    """QA's reproduction, verbatim in substance: both sources carry a
+    publication date, as real news articles do."""
+    st = _state(question="how much capacity does the grid have now", subqs=("installed capacity",))
+    fact = _src(st, "https://grid.example/report", "Installed capacity was 3 GW as of July 2026. " * 10,
+                authority=70, kind="news", published=datetime(2026, 7, 25, tzinfo=timezone.utc))
+    forecast = _src(st, "https://outlook.example/forecast",
+                    "Installed capacity will reach 5 GW by 2031 under the plan. " * 10,
+                    authority=70, kind="news", published=datetime(2026, 8, 20, tzinfo=timezone.utc))
+    _extract(st, [fact, forecast], [
+        {"subquestion": 1, "claim": "Installed capacity was 3 GW", "value": "3 GW",
+         "source": fact.n, "as_of": "2026-07-24", "status": "current"},
+        {"subquestion": 1, "claim": "Installed capacity will reach 5 GW", "value": "5 GW",
+         "source": forecast.n, "as_of": "2031", "status": "current"},
+    ])
+    res = st.resolutions[1]
+    assert res.value == "3 GW", f"the forecast outranked the dated fact: {res.line()}"
+    assert all(s["value"] != "3 GW" for s in res.superseded), f"the fact was filed as history: {res.line()}"
+    # Neither a dispute nor history: a forecast, with the year it is for.
+    assert res.status == dr.STATUS_CURRENT, res.line()
+    assert not res.conflicts and not res.superseded, res.line()
+    assert [(f["value"], f["for"][:4]) for f in res.forecasts] == [("5 GW", "2031")]
+    assert '· forecast: "5 GW" (for 2031; made 2026-08-20; [2])' in res.line(), res.line()
+    assert res.forecast_for is None
+
+
+def test_a_forecast_on_a_dated_page_does_not_become_the_current_value():
+    """QA2's variant: relative dates, the fact 56 days old, the outlook 5."""
+    st = _state(question="how much capacity does the grid have", subqs=("installed capacity",))
+    fact = _src(st, "https://grid.example/report", "Installed capacity was 3 GW. " * 10,
+                authority=70, kind="news", published=_now() - timedelta(days=50))
+    forecast = _src(st, "https://outlook.example/forecast",
+                    "Installed capacity will reach 5 GW by 2031 under the plan. " * 10,
+                    authority=70, kind="news", published=_now() - timedelta(days=5))
+    _extract(st, [fact, forecast], [
+        {"subquestion": 1, "claim": "Installed capacity was 3 GW", "value": "3 GW",
+         "source": fact.n, "as_of": (date.today() - timedelta(days=56)).isoformat(), "status": "current"},
+        {"subquestion": 1, "claim": "Installed capacity will reach 5 GW", "value": "5 GW",
+         "source": forecast.n, "as_of": "2031", "status": "current"},
+    ])
+    res = st.resolutions[1]
+    assert res.value == "3 GW", res.line()
+    assert all(s["value"] != "3 GW" for s in res.superseded), res.line()
+
+
+def test_a_schedule_is_still_dated_by_the_page_that_states_it():
+    """What must NOT change (the live ITER run, QA 2026-09-18): "first plasma
+    in 2034" from a page published today is the current plan, and the older
+    iter.org date is history. Its value IS the future date, so it is a
+    statement about the plan, not a forecast of a quantity."""
+    st = _state(question="when is ITER's first plasma", subqs=("What is the confirmed date for ITER's first plasma?",))
+    old = _src(st, "https://www.iter.org/schedule", "First plasma was scheduled for 2025. " * 10,
+               authority=100, kind="official", published=datetime(2024, 7, 3, tzinfo=timezone.utc))
+    new = _src(st, "https://news.example/iter-2034", "ITER's first plasma is now scheduled for 2034. " * 10,
+               authority=40, kind="news", published=_now() - timedelta(days=1))
+    _extract(st, [old, new], [
+        {"subquestion": 1, "claim": "First plasma was scheduled for 2025", "value": "2025",
+         "source": old.n, "as_of": "2024-07-03", "status": "current"},
+        {"subquestion": 1, "claim": "First plasma is now scheduled for 2034", "value": "2034",
+         "source": new.n, "as_of": "2034", "status": "current"},
+    ])
+    res = st.resolutions[1]
+    assert res.value == "2034", res.line()
+    assert any(s["value"] == "2025" for s in res.superseded), res.line()
+    # getattr: this pins behaviour that held before the forecast fields existed.
+    assert not getattr(res, "forecasts", None) and getattr(res, "forecast_for", None) is None
+
+
+def test_a_subquestion_that_also_asks_about_the_plan_keeps_the_fact_current():
+    """Live, 2026-09-19 (Fast, thinking off, the real extractor on these two
+    pages): for this subquestion the extractor dated "5 GW" as_of 2031. The
+    uncommitted repair then let forecasts compete whenever a subquestion named
+    a plan, and the result was `CURRENT: "5 GW" (as of 2026-08-20) ·
+    superseded: "3 GW"` — the B17 failure again. A prediction never makes a
+    measured value history, whatever the subquestion asks."""
+    st = _state(question="battery storage",
+                subqs=("How much battery storage capacity does the region have, and how much is planned?",))
+    fact = _src(st, "https://grid.example/report", "As of 24 July 2026 capacity was 3 GW. " * 10,
+                authority=70, kind="news", published=datetime(2026, 7, 25, tzinfo=timezone.utc))
+    forecast = _src(st, "https://outlook.example/forecast",
+                    "Capacity will reach 5 GW by 2031, the regulator's outlook projects. " * 10,
+                    authority=70, kind="news", published=datetime(2026, 8, 20, tzinfo=timezone.utc))
+    _extract(st, [fact, forecast], [
+        {"subquestion": 1, "claim": "Capacity was 3 GW", "value": "3 GW",
+         "source": fact.n, "as_of": "2026-07-24", "status": "current"},
+        {"subquestion": 1, "claim": "Capacity will reach 5 GW by 2031", "value": "5 GW",
+         "source": forecast.n, "as_of": "2031", "status": "unclear"},
+    ])
+    res = st.resolutions[1]
+    assert (res.status, res.value) == (dr.STATUS_CURRENT, "3 GW"), res.line()
+    assert not res.superseded and not res.conflicts, res.line()
+    assert [(f["value"], f["for"][:4]) for f in res.forecasts] == [("5 GW", "2031")], res.line()
+
+
+def test_among_forecasts_alone_the_newer_outlook_is_current():
+    """When only predictions were found, they compete with each other as
+    before — the newer outlook is current, the older one its history — and
+    the value is marked as a forecast."""
+    st = _state(question="battery prices", subqs=("What do industry forecasts expect for pack prices in 2030?",))
+    older = _src(st, "https://a.example/outlook-2023", "Pack prices will fall to $80/kWh by 2030. " * 10,
+                 authority=70, kind="news", published=datetime(2023, 12, 1, tzinfo=timezone.utc))
+    newer = _src(st, "https://b.example/outlook-2025", "Pack prices will fall to $60/kWh by 2030. " * 10,
+                 authority=70, kind="news", published=datetime(2025, 12, 1, tzinfo=timezone.utc))
+    _extract(st, [older, newer], [
+        {"subquestion": 1, "claim": "Prices will fall to $80/kWh", "value": "$80/kWh",
+         "source": older.n, "as_of": "2030", "status": "current"},
+        {"subquestion": 1, "claim": "Prices will fall to $60/kWh", "value": "$60/kWh",
+         "source": newer.n, "as_of": "2030", "status": "current"},
+    ])
+    res = st.resolutions[1]
+    assert res.value == "$60/kWh", res.line()
+    assert [s["value"] for s in res.superseded] == ["$80/kWh"], res.line()
+    assert res.forecast_for == date(2030, 1, 1), res.line()
+    assert "a FORECAST for 2030, not a reported value" in res.line(), res.line()
+
+
+def test_only_a_forecast_found_is_marked_and_not_stored_as_the_present_value(monkeypatch):
+    """When a subquestion that asks what IS finds nothing but a prediction,
+    the prediction is still what the evidence has — but the table says it is
+    a forecast, and the shared claim store does not keep it as 'current'."""
+    st = _state(question="how much capacity does the grid have", subqs=("installed capacity",))
+    src = _src(st, "https://outlook.example/forecast",
+               "Installed capacity will reach 5 GW by 2031 under the plan. " * 10,
+               authority=70, kind="news", published=_now() - timedelta(days=5))
+    _extract(st, [src], [
+        {"subquestion": 1, "claim": "Installed capacity will reach 5 GW", "value": "5 GW",
+         "source": src.n, "as_of": "2031", "status": "current"},
+    ])
+    res = st.resolutions[1]
+    assert res.value == "5 GW"
+    assert res.forecast_for == date(2031, 1, 1)
+    assert "a FORECAST for 2031, not a reported value" in res.line(), res.line()
+    persisted = _capture(monkeypatch)
+
+    async def no_pages(urls):
+        return {}
+
+    monkeypatch.setattr(dr, "_page_ids", no_pages)
+    asyncio.run(dr._persist_claims(st))
+    assert persisted == [], persisted
+
+
+def test_the_value_shape_rule():
+    """A value that only says WHEN is a schedule; one with a quantity is not."""
+    for when in ("2034", "Q3 2027", "March 2027", "30 June 2031", "2031-06-30", "FY2027",
+                 "2025 to 2034", "First plasma: 2034; D-T operations: 2039"):
+        assert dr._names_a_date(when), when
+    for quantity in ("5 GW", "$60/kWh by 2030", "3.15", "", "Person B"):
+        assert not dr._names_a_date(quantity), quantity
