@@ -306,8 +306,11 @@ def _wire(monkeypatch, *, verify, claims, gap=None):
             return [SearchResult(title="Official", url="https://org.gov.example/official", snippet="s")]
         return _results(4)
 
-    async def fake_rerank(message, res, target):
-        return res
+    async def fake_rerank(query, documents, **kw):
+        # No reranker, so `_rank_candidates` keeps engine order — what the
+        # identity fake of `_rerank_results` gave before Deep Research
+        # scored its own candidates (B7b, the relevance floor).
+        raise dr.rerank.RerankUnavailable("offline test")
 
     async def fake_fetch(res, message=""):
         fetched_batches.append([r.url for r in res])
@@ -333,7 +336,7 @@ def _wire(monkeypatch, *, verify, claims, gap=None):
     monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
     monkeypatch.setattr(dr.llm, "stream_chat_events", fake_stream)
     monkeypatch.setattr(dr, "_collect_results", fake_collect)
-    monkeypatch.setattr(dr, "_rerank_results", fake_rerank)
+    monkeypatch.setattr(dr.rerank, "score", fake_rerank)
     monkeypatch.setattr(dr, "_fetch_sources", fake_fetch)
     monkeypatch.setattr(dr, "_spawn", lambda coro: coro.close())
     monkeypatch.setattr(dr.db, "create_research_run", lambda *a, **k: 1)
@@ -699,3 +702,63 @@ def test_prose_claims_do_not_outvote_a_real_value():
     assert res.status == dr.STATUS_CURRENT
     assert not res.conflicts
     assert "Alice" in (res.value or "")
+
+
+# ---------------------------------------------------------------------------
+# B17 — a forecast year is not a date the fact held
+#
+# `_parse_as_of` had no upper bound: `_parse_as_of('2031')` returned
+# 2031-01-01 (measured on 4810da0). The extractor writes a claim's `as_of` from
+# whatever year the sentence names, so "capacity will reach 5 GW by 2031"
+# arrived dated 2031 — the NEWEST date in the run by five years — and `_resolve`
+# then ranked it current and filed every real, dated claim as superseded
+# history. A date after today is a forecast, not evidence of when anything held.
+# ---------------------------------------------------------------------------
+
+
+def test_a_date_after_today_is_not_an_as_of_date():
+    today = date.today()
+    assert dr._parse_as_of("2031") is None
+    assert dr._parse_as_of("2031-06") is None
+    assert dr._parse_as_of("2031-06-30") is None
+    assert dr._parse_as_of("June 30, 2031") is None, "the free-text path is bounded too"
+    assert dr._parse_as_of((today + timedelta(days=1)).isoformat()) is None
+    # Today and the past are unchanged.
+    assert dr._parse_as_of(today.isoformat()) == today
+    assert dr._parse_as_of("2026-07-24") == date(2026, 7, 24)
+    assert dr._parse_as_of(str(today.year)) == date(today.year, 1, 1)
+
+
+def test_a_forecast_claim_no_longer_supersedes_a_dated_fact():
+    """Through the real extraction path: the model dates one claim 2031 (a
+    forecast) and one 2026-07-24 (a reported fact). The fact must stay current;
+    at 4810da0 the forecast won and the fact was filed as superseded."""
+    st = _state(question="how much capacity does the grid have", subqs=("installed capacity",))
+    fact = _src(st, "https://grid.example/report", "Installed capacity was 3 GW as of July 2026. " * 10,
+                authority=70, kind="news")
+    forecast = _src(st, "https://outlook.example/forecast",
+                    "Installed capacity will reach 5 GW by 2031 under the plan. " * 10,
+                    authority=70, kind="news")
+    extracted = {"claims": [
+        {"subquestion": 1, "claim": "Installed capacity was 3 GW", "value": "3 GW",
+         "source": fact.n, "as_of": "2026-07-24", "status": "current"},
+        {"subquestion": 1, "claim": "Installed capacity will reach 5 GW", "value": "5 GW",
+         "source": forecast.n, "as_of": "2031", "status": "current"},
+    ]}
+
+    async def fake_json_completion(messages, **kw):
+        return json.dumps(extracted)
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(dr.llm, "json_completion", fake_json_completion):
+        asyncio.run(dr._extract_claims(st, [fact, forecast], "think", None))
+    dr._resolve(st)
+    res = st.resolutions[1]
+    assert res.value == "3 GW", f"the forecast outranked the dated fact: {res.line()}"
+    assert res.as_of == date(2026, 7, 24)
+    assert all(s["value"] != "3 GW" for s in res.superseded), "the fact was filed as history"
+    # Why: the forecast's year never became its date.
+    by_value = {c.value: c for c in st.claims}
+    assert by_value["5 GW"].as_of is None, "the forecast year was kept as a date"
+    assert by_value["3 GW"].as_of == date(2026, 7, 24)
