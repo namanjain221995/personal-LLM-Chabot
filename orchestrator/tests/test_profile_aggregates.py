@@ -324,6 +324,16 @@ def _wide_file(tmp_path) -> str:
     return str(path)
 
 
+def _rendered(agg) -> int:
+    """The block's length as dataset.format_profile prints it for a sheet of a
+    workbook (json indent=1, four levels deep), measured by rendering it."""
+    wrapped = [{"sheets": [{"aggregates": agg}]}]
+    shell = [{"sheets": [{"aggregates": 0}]}]
+    return len(json.dumps(wrapped, ensure_ascii=False, indent=1, default=str)) - len(
+        json.dumps(shell, indent=1)
+    ) + 1
+
+
 def _width(entry) -> int:
     """How wide a breakdown is: its row count (groups or months)."""
     return len(entry["rows"])
@@ -354,7 +364,9 @@ def test_a_60_column_file_respects_every_cap(tmp_path, monkeypatch):
         assert months == sorted(months) and months[-1] == "2024-12" and months[0] == "2020-01"
 
     # The size cap holds, and it dropped the WIDEST breakdowns first.
-    assert len(json.dumps(capped, ensure_ascii=False, default=str)) <= profiler.AGG_MAX_CHARS
+    # Measured as the prompt renders it (indent=1, at a sheet's depth), not
+    # compact: QA measured the prompt block at 1.42x the compact size.
+    assert _rendered(capped) <= profiler.AGG_MAX_CHARS
     kept = capped["by_group"] + capped["by_month"]
     everything = full["by_group"] + full["by_month"]
     dropped = [e for e in everything if e not in kept]
@@ -386,8 +398,176 @@ def test_the_size_cap_does_not_drop_a_breakdown_for_having_bigger_numbers(tmp_pa
     full = profiler.profile_tabular(str(path))["aggregates"]
     widths = {e["measure"]: len(json.dumps(e)) for e in full["by_month"]}
     assert widths["revenue"] > widths["discount"], "the revenue totals ARE the widest text"
-    monkeypatch.setattr(profiler, "AGG_MAX_CHARS", len(json.dumps(full, ensure_ascii=False)) - 1)
+    # One character under the block's RENDERED size (the cap measures what
+    # the prompt prints since QA round 1; this set compact size - 1 before).
+    monkeypatch.setattr(profiler, "AGG_MAX_CHARS", _rendered(full) - 1)
     capped = profiler.profile_tabular(str(path))["aggregates"]
     kept = [e["measure"] for e in capped["by_month"]]
     assert kept == ["quantity", "revenue"], "the last of three equally wide breakdowns went"
     assert any("by_month order_date x discount" in why for why in capped["omitted"])
+
+
+# ---------------------------------------------------------------------------
+# QA round 1 fixes (2026-09-18): the sniff window, dropped rows, raw group
+# values, names in reasons, JSON exactness, median rounding
+# ---------------------------------------------------------------------------
+
+
+def _late_cents(tmp_path, *, header=True, n=25_500, switch=25_000):
+    """Whole-dollar revenue for `switch` rows, then cents: the sniffer (20,000
+    rows) types the column BIGINT, and DuckDB rounds '2051.01' into it."""
+    rng = random.Random(1)
+    lines = ["order_id,region,revenue"] if header else []
+    truth = {"all": Decimal(0)}
+    for i in range(n):
+        r = Decimal(rng.randrange(1, 10**4)) if i < switch else Decimal(rng.randrange(100, 10**6)) / 100
+        region = "NSEW"[i % 4]
+        truth["all"] += r
+        truth[region] = truth.get(region, Decimal(0)) + r
+        lines.append(f"{i + 1},{region},{r}")
+    path = tmp_path / ("late.csv" if header else "late_noheader.csv")
+    path.write_text("\n".join(lines) + "\n")
+    return str(path), truth
+
+
+def test_cents_past_the_sniff_window_are_summed_to_the_cent(tmp_path):
+    """Measured at 9045dbf: sum 127,559,755 against a true 127,559,748.92 and
+    nothing in omitted. The column is re-read as DOUBLE, what the sniffer
+    picks when it sees a decimal, so the total is exact, not just flagged."""
+    path, truth = _late_cents(tmp_path)
+    prof = profiler.profile_tabular(path)
+    col = _col(prof, "revenue")
+    assert col["dtype"] == "DOUBLE" and prof["rows"] == 25_500
+    assert _dec(col["sum"]) == truth["all"]
+    entry = _group(prof, "region", "revenue")
+    assert {r["value"]: _dec(r["sum"]) for r in entry["rows"]} == {k: v for k, v in truth.items() if k != "all"}
+    assert prof["aggregates"]["omitted"] == []
+
+
+def test_a_header_less_file_is_re_checked_too(tmp_path):
+    """Read as text, a header-less file can be taken to HAVE a header: the
+    check then asks the sniffer, instead of silently skipping."""
+    path, truth = _late_cents(tmp_path, header=False, n=12_500, switch=12_000)
+    prof = profiler.profile_tabular(path)
+    third = prof["columns"][2]
+    assert third["dtype"] == "DOUBLE"
+    assert _dec(third["sum"]) == truth["all"]
+
+
+class _Spy:
+    def __init__(self, con, seen):
+        self._con, self._seen = con, seen
+
+    def execute(self, sql, *a, **k):
+        self._seen.append(sql)
+        return self._con.execute(sql, *a, **k)
+
+    def close(self):
+        self._con.close()
+
+
+def _statements(monkeypatch, path):
+    seen = []
+    real = profiler._duck
+    monkeypatch.setattr(profiler, "_duck", lambda: _Spy(real(), seen))
+    prof = profiler.profile_tabular(str(path))
+    monkeypatch.setattr(profiler, "_duck", real)
+    return prof, seen
+
+
+@pytest.mark.parametrize("rows, rereads", [(9_000, 0), (12_000, 1)])
+def test_only_a_file_longer_than_the_sniff_window_is_read_a_second_time(tmp_path, monkeypatch, rows, rereads):
+    path = tmp_path / "n.csv"
+    path.write_text("qty,amount\n" + "".join(f"{i % 7},{i}.25\n" for i in range(rows)))
+    prof, seen = _statements(monkeypatch, path)
+    assert "error" not in prof and prof["rows"] == rows
+    assert sum("all_varchar" in s for s in seen) == rereads
+    assert sum("read_csv_auto" in s for s in seen) == 2, "DESCRIBE and the one COPY, as before"
+
+
+def test_rows_the_reader_dropped_are_said_first_in_omitted(tmp_path):
+    """QA: one bad date at data row 22,001 (past the sniff window) dropped a
+    250,000.00 row from every total with computed='exact' and omitted=[]."""
+    rng = random.Random(9)
+    lines = ["order_date,region,revenue"]
+    truth = Decimal(0)
+    for i in range(25_000):
+        v = Decimal("250000.00") if i == 22_000 else Decimal(rng.randrange(100, 10**5)) / 100
+        day = "2024-13-45" if i == 22_000 else f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}"
+        if i != 22_000:
+            truth += v
+        lines.append(f"{day},{'NSEW'[i % 4]},{v}")
+    path = tmp_path / "bad_date.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    omitted = prof["aggregates"]["omitted"]
+    assert prof["rows"] == 24_999
+    assert omitted and omitted[0].startswith("1 row(s) could not be read") and "order_date" in omitted[0]
+    assert _dec(_col(prof, "revenue")["sum"]) == truth, "the total is of the rows read, and says so"
+
+
+def test_a_value_held_by_one_row_is_left_out_of_its_breakdown_and_said(tmp_path):
+    """The canary shape QA used: 20 repeating statuses and one cell seen once."""
+    lines = ["status,amount"]
+    total = Decimal(0)
+    rare_amount = None
+    for i in range(1000):
+        status = "RARE-ONE-7f3a" if i == 700 else f"status-{i % 20:02d}"
+        amount = Decimal(i) + Decimal("0.35")
+        total += amount
+        if i == 700:
+            rare_amount = amount
+        lines.append(f"{status},{amount}")
+    path = tmp_path / "rare.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    entry = _group(prof, "status", "amount")
+    values = [r["value"] for r in entry["rows"]]
+    assert "RARE-ONE-7f3a" not in json.dumps(prof["aggregates"])
+    assert len(values) == 20 and entry["truncated"] is True
+    assert any(why.startswith("by_group status: 1 value(s) found in only one row") for why in prof["aggregates"]["omitted"])
+    listed = sum(_dec(r["sum"]) for r in entry["rows"])
+    assert listed + rare_amount == total == _dec(_col(prof, "amount")["sum"])
+
+
+def test_identifier_and_contact_columns_are_never_group_keys(tmp_path):
+    lines = ["store_id,customer_email,region,amount"]
+    for i in range(400):
+        lines.append(f"{100 + i % 10},person{i % 10}@example.invalid,{'NSEW'[i % 4]},{i}.50")
+    path = tmp_path / "keys.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert {e["group"] for e in prof["aggregates"]["by_group"]} == {"region"}
+    # Their top values are unchanged: that class of raw content was always there.
+    assert len(_col(prof, "customer_email")["top_values"]) == 5
+
+
+def test_column_names_in_reasons_are_clipped(tmp_path):
+    names = [f"amount_{i}_" + "y" * 600 for i in range(12)]
+    lines = ["region," + ",".join(names)]
+    for r in range(100):
+        lines.append("NS"[r % 2] + "," + ",".join(f"{r}.{k}5" for k in range(12)))
+    path = tmp_path / "long.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    beyond = next(w for w in agg["omitted"] if w.startswith("measures beyond the first"))
+    assert beyond.count("…[truncated]") == 4 and len(beyond) < 4 * 260
+    assert _rendered(agg) <= profiler.AGG_MAX_CHARS
+
+
+def test_a_total_a_json_number_cannot_spell_is_flagged(tmp_path):
+    """A DECIMAL sum is carried as a float: past about 15 significant digits
+    its cents are not exact, and QA found nothing said so."""
+    path = tmp_path / "big.csv"
+    path.write_text("amount\n" + "".join("123456789012345.67\n" for _ in range(10)))
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert any(w.startswith("amount: a total has more significant digits") for w in agg["omitted"])
+
+
+def test_median_is_rounded_to_twelve_significant_digits(tmp_path):
+    """(0.1 + 0.2) / 2 is 0.15000000000000002 in double precision; the profile
+    must say 0.15 on every run (QA mutation M15 survived without this)."""
+    path = tmp_path / "m.csv"
+    path.write_text("amount\n" + "0.1\n0.2\n" * 10)
+    col = _col(profiler.profile_tabular(str(path)), "amount")
+    assert repr(col["median"]) == "0.15"
