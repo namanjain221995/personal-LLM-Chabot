@@ -132,7 +132,38 @@ SALESFORCE_ASSISTANT_SYSTEM = (
     "or open another dashboard, and never invent Salesforce numbers. Having "
     "that data does not make anything else off-topic: answer the question "
     "that was asked, in full, and mention the data only when it would "
-    "genuinely help."
+    "genuinely help.\n"
+    # QA, 2026-09-18: "Does the interview record for Priya exist and when was
+    # it last updated?" landed here and answered "I cannot access Salesforce
+    # data" 3 of 3 runs, 2 of 3 also sending the person to check the org
+    # directly — against the sentence above. graph._chat_node now sends a
+    # record question to the SQL engine; this is for the ones it misses.
+    # Measured on that ask, Fast: 4810da0 1 of 3 "cannot access" and 2 of 3
+    # an invented record and date; QA's shorter "say you will look it up"
+    # 2 of 3 "cannot see" and 2 of 3 a "simulated" record; this wording
+    # 0 of 4 of either, 3 of 4 one sentence (1 added a query block).
+    "If they ask what a record in their org says and its values are not in "
+    "this conversation, reply with one sentence saying you will look it up "
+    "and nothing after it: never that you cannot see it, never send them to "
+    "look for it themselves, and never a query, a diagram or a value you "
+    "were not given."
+)
+
+
+#: The Fast small-talk lane's persona. The lane admits only a greeting,
+#: thanks, a farewell, laughter or an emoji (fast_lane.classify_pleasantry is
+#: a fullmatch over a closed lexicon), so none of ASSISTANT_CONDUCT's rules —
+#: recommendations, phishing simulations, disclaimers — can apply to it. It
+#: used to embed the whole ASSISTANT_SYSTEM: 2,645 chars of system prompt for
+#: "hi", and QA measured 'hi' TTFT 0.23 -> 0.27 s when that prompt grew from
+#: 354 chars. The one guarantee a pleasantry can still break is kept in the
+#: exact words ASSISTANT_SYSTEM uses; identity and saved facts are appended
+#: by _lane_messages as before.
+FAST_LANE_SYSTEM = (
+    "You are the TechSara local AI assistant, running entirely on this "
+    "machine. Be helpful, clear, and concise.\n"
+    "You are NOT connected to Salesforce data in this mode — never claim to "
+    "have looked something up in Salesforce or invent CRM numbers."
 )
 
 
@@ -145,7 +176,7 @@ def _lane_messages(message: str, history: Sequence[dict]) -> List[dict]:
     from ..facts import FACTS_HEADER
     from ..identity import identity_line
 
-    system = ASSISTANT_SYSTEM + identity_line()
+    system = FAST_LANE_SYSTEM + identity_line()
     # main.py pins the saved-facts block as a system message; it is the one
     # system block the lane keeps. Recall and document blocks are never
     # assembled for a lane turn, and any other system message is dropped.
