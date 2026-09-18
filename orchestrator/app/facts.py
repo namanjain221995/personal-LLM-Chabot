@@ -27,7 +27,10 @@ Four rules now stand between the model and the table:
      messages are not the person speaking (`own_words`).
   2. A "forget that" may only DELETE (`_FORGET_RE`, db.delete_user_fact); it
      can never add or rewrite, so an erasure request cannot leave a negated
-     copy of the thing behind.
+     copy of the thing behind. And only the PERSON asking deletes anything
+     (`_erasure_requests`, owner rule 2026-09-19): a question about
+     forgetting, a reminder or a third party's "forget" deletes nothing,
+     whatever the extractor proposes.
   3. Only what was stated: a fact may not contain a number or a name the
      message did not contain (`ungrounded_in`), and every row records where
      it came from (`source`, `source_excerpt` — db V40).

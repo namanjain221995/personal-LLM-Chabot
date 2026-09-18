@@ -320,37 +320,90 @@ def _snippet(text: str) -> str:
     return clean
 
 
-#: A sentence that states a choice.
+#: Where a long answer states its choice. The main model writes decision
+#: answers in markdown, and in all six it wrote live (2026-09-19, 6,770-9,664
+#: characters, the decision 5,434-9,413 characters in) the choice sat in one
+#: of two shapes: a heading labelled Recommendation / Verdict / Conclusion,
+#: with the choice in it or on the next line, or a line that opens with a
+#: bold imperative ("**Adopt the Hybrid Model.**"). Plain prose falls back
+#: to a sentence with a decision word in it.
+_DECISION_LABEL_RE = re.compile(
+    r"\b(?:recommend(?:ation|ed)?|verdict|decision|conclusion|bottom\s+line|tl;?dr|"
+    r"in\s+short|final\s+(?:answer|call|choice|pick))\b",
+    re.I,
+)
+_DECISION_LEAD_RE = re.compile(
+    r"^\*\*\s*(?:go\s+with|use|choose|pick|adopt|take|build|ship|"
+    r"hire|stick\s+with|switch\s+to|start\s+with|move\s+to|stay\s+with|sign|lease|keep|"
+    r"launch|buy|migrate\s+to|standardi[sz]e\s+on)\b",
+    re.I,
+)
 _DECISIVE_RE = re.compile(
     r"\b(?:decid(?:e|es|ed|ing)|decision|recommend(?:s|ed|ation)?|verdict|conclusion|"
     r"bottom\s+line|in\s+short|go(?:ing)?\s+with|went\s+with|choose|chose|pick(?:ed)?|"
     r"settled?\s+on|final\s+(?:answer|call|choice|pick)|best\s+(?:choice|option|fit|bet))\b",
     re.I,
 )
-_ANSWER_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]*")
+_CONDITIONAL_RE = re.compile(r"\b(?:if|when|whenever|unless|in\s+case|only\s+for)\b", re.I)
+#: A sentence ends at . ! ? before a space and a capital: not "Next.js",
+#: not "(e.g. a shuttle)".
+_ANSWER_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z*\"'(\[])")
+_ANSWER_RULE_RE = re.compile(r"[-*_=#\s]+")
+_LIST_MARKER_RE = re.compile(r"^(?:[-+]\s+|\*\s+(?!\*)|\d+[.)]\s+)")
+
+
+def _decision_statements(text: str) -> List[str]:
+    """The statements of a long answer that state its choice, in order."""
+    lines = [
+        # "2. **Use …**": the list number is not a sentence of its own
+        _LIST_MARKER_RE.sub("", line.strip())
+        for line in (text or "").splitlines()
+        if line.strip()
+        and not line.strip().startswith("|")  # a table row compares, it does not decide
+        and not _ANSWER_RULE_RE.fullmatch(line.strip())
+    ]
+    marked: List[str] = []
+    for i, line in enumerate(lines):
+        if line.startswith("#") and _DECISION_LABEL_RE.search(line):
+            heading = line.lstrip("#").strip()
+            following = lines[i + 1] if i + 1 < len(lines) and not lines[i + 1].startswith("#") else ""
+            first = _ANSWER_SENTENCE_END_RE.split(following, maxsplit=1)[0] if following else ""
+            marked.append(f"{heading} {first}".strip())
+        elif _DECISION_LEAD_RE.match(line):
+            first = _ANSWER_SENTENCE_END_RE.split(line, maxsplit=1)[0]
+            # "- **Choose GitLab CI** if you need…" is the alternative, not
+            # the choice; two of them crowded out "### Recommendation:
+            # **GitHub Actions**" in a held-out live answer
+            if not _CONDITIONAL_RE.search(first):
+                marked.append(first)
+    if marked:
+        return marked
+    return [
+        sentence
+        for line in lines
+        for sentence in _ANSWER_SENTENCE_END_RE.split(line)
+        if _DECISIVE_RE.search(sentence)
+    ]
 
 
 def _answer_snippet(text: str) -> str:
-    """A paired answer as its opening, the last two sentences of its body
-    that state a choice, and its close.
+    """A paired answer as its opening, the last two statements of its choice,
+    and its close.
 
     Cut to the 240-character snippet, a decision stated later in the answer
     never reached the block: 72.7% of production assistant messages are
     longer than that (median 744 characters), and the main model's own
-    answers to a decision question put the conclusion 2,000-4,500
-    characters in, 0/3 recalled (verifier, 2026-09-18). At most four
-    240-character pieces, so a long answer still costs the block a bounded
-    amount."""
+    answers to a decision question put the choice thousands of characters
+    in (verifier, 2026-09-18: 0/3 recalled; 0/6 in my live set). At most
+    four 240-character pieces, so a long answer still costs the block a
+    bounded amount."""
     clean = " ".join((text or "").split())
     if len(clean) <= 2 * _SNIPPET_CHARS:
         return clean
-    body = clean[_SNIPPET_CHARS:-_SNIPPET_CHARS]
-    decisive = [
-        s.strip()[:_SNIPPET_CHARS]
-        for s in _ANSWER_SENTENCE_RE.findall(body)
-        if _DECISIVE_RE.search(s)
-    ][-2:]
-    return " … ".join([clean[:_SNIPPET_CHARS], *decisive, clean[-_SNIPPET_CHARS:]])
+    head, tail = clean[:_SNIPPET_CHARS], clean[-_SNIPPET_CHARS:]
+    statements = [" ".join(s.split())[:_SNIPPET_CHARS] for s in _decision_statements(text)]
+    statements = [s for s in statements if s and s not in head and s not in tail][-2:]
+    return " … ".join([head, *statements, tail])
 
 
 async def ensure_message_embeddings(user_id: int) -> int:

@@ -492,3 +492,48 @@ def test_more_decision_phrasings_refer_to_the_past(question):
 )
 def test_the_new_phrasings_do_not_open_world_questions(question):
     assert not memory_semantic.refers_to_past_conversation(question)
+
+
+_COMPARISON = (
+    "## Comparison\n\n"
+    "| Criteria | Option A | Option B |\n|---|---|---|\n"
+    "| **Cost** | Low | High (we recommend budgeting for it) |\n"
+    "| **Hiring** | Easy | Hard |\n\n"
+    + "- Consider replication, backups, failover and the hiring pool (e.g. in Pune). " * 12
+    + "\n\n"
+)
+_CLOSE = "\n\n" + "Next steps: plan the migration, set up monitoring and train the team. " * 5
+
+
+@pytest.mark.parametrize(
+    "conclusion,decision",
+    [
+        # the choice on the line after a labelled heading
+        ("### Final Verdict\n**Use SQS FIFO.** It is the simplest option to run.", "**Use SQS FIFO."),
+        # the choice in the heading itself; a dotted name is not a sentence end
+        ("### Final Recommendation: **Next.js (React)**\n\n**Why Next.js?**", "Final Recommendation: **Next.js (React)**"),
+        # a bold imperative straight after a table
+        ("| **Fairness** | Low | **High** |\n\n**Adopt the Hybrid Model.** It fits the cost curve.", "**Adopt the Hybrid Model."),
+        # plain prose
+        ("All things considered, my recommendation is to go with Postgres for the ledger.", "my recommendation is to go with Postgres for the ledger."),
+        # the alternatives listed after the choice are not the choice
+        (
+            "### Recommendation: **GitHub Actions**\n\nIt is closest to the code.\n\n"
+            "- **Choose GitLab CI** if you need built-in compliance reports.\n"
+            "- **Choose CircleCI** if you have more than fifty developers.",
+            "Recommendation: **GitHub Actions**",
+        ),
+        # a numbered bold imperative
+        ("1. **Use SQS FIFO.** It is the simplest option to run.", "**Use SQS FIFO."),
+    ],
+)
+def test_a_long_markdown_answer_keeps_the_statement_of_its_choice(conclusion, decision):
+    """The main model's six live decision answers (6,770-9,664 characters)
+    put the choice 5,434-9,413 characters in, in these shapes; cut to the
+    opening and the close, 0/6 were recalled, and 6/6 with the statements.
+    Table rows compare options and are never taken for the choice."""
+    answer = "Here is a detailed comparison of the options for your team. " * 5 + _COMPARISON + conclusion + _CLOSE
+    snippet = memory_semantic._answer_snippet(answer)
+    assert decision in snippet
+    assert "we recommend budgeting" not in snippet
+    assert len(snippet) <= 4 * memory_semantic._SNIPPET_CHARS + 3 * len(" … ")
