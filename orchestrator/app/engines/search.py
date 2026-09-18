@@ -27,7 +27,7 @@ from .. import llm
 from ..config import settings
 from .. import db, web_index
 from ..core import extract, net, provenance, robots
-from ..freshness import Verdict
+from ..freshness import Freshness, Verdict, classify_offline
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -232,6 +232,51 @@ def _registrable_domain(url: str) -> str:
     if len(parts[-2]) <= 3 and len(parts[-1]) <= 3:
         return ".".join(parts[-3:])
     return ".".join(parts[-2:])
+
+
+# `site:host` as a search operator: a whole token (not the tail of
+# "website:x"), at the start or after a space or "(". A leading "-" makes it
+# an EXCLUSION, which this pattern deliberately does not read as a scope.
+_SITE_OP_RE = re.compile(r"(?:^|(?<=[\s(]))site:(\S+)", re.I)
+
+
+def _site_scope(query: str) -> Tuple[str, ...]:
+    """The hosts a query's `site:` operators confine it to; () when none.
+
+    Measured 2026-09-18 on the production SearXNG: 'site:qdrant.tech
+    documentation performance benchmark 10 million vectors' returned six
+    off-site pages in its top twelve (bing answered the word "documentation";
+    yandex honoured the operator). An engine that ignores the operator cannot
+    be fixed upstream, so the scope is enforced on what comes back.
+    """
+    hosts: List[str] = []
+    for m in _SITE_OP_RE.finditer(query or ""):
+        raw = m.group(1).strip("\"'()[],;")
+        if "://" in raw:
+            try:
+                raw = urlparse(raw).hostname or ""
+            except ValueError:
+                raw = ""
+        host = raw.split("/")[0].split(":")[0].lower().removeprefix("*.").strip(".")
+        host = host.removeprefix("www.")
+        if host:
+            hosts.append(host)
+    return tuple(dict.fromkeys(hosts))
+
+
+def _on_site(url: str, hosts: Sequence[str]) -> bool:
+    """The host itself or any subdomain of it — the search engines' meaning.
+
+    A host-suffix test, not `_registrable_domain` equality: `site:docs.python.org`
+    must not admit bugs.python.org, and `site:gov.in` (a public suffix, whose
+    hosts have no common registrable domain) must admit mea.gov.in."""
+    try:
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
 _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.S)
 
 # Cheap "is this a web question?" heuristic for Auto mode, backed up by a model
@@ -726,6 +771,14 @@ async def _collect_results(
         if results is None:
             failed += 1
             continue
+        # A `site:` query keeps only its site, per QUERY: deep research sends
+        # a scoped rescue query alongside unscoped ones, and one operator
+        # must not empty its neighbours. Filtered before the panel sees it,
+        # so the panel shows what was actually eligible. An empty list is
+        # the honest result and every caller already handles one.
+        scope = _site_scope(q)
+        if scope:
+            results = [r for r in results if _on_site(r.url, scope)]
         per_query.append(results)
         await _emit_query(emit, q, results)
     if degraded is not None:
@@ -944,16 +997,37 @@ def _spawn(coro) -> None:
     task.add_done_callback(_done)
 
 
+#: How old a stored page may be for a REALTIME question (a price, a score, the
+#: weather "right now"). Until 2026-09-18 REALTIME shared the volatile TTL,
+#: WEB_PAGE_FRESH_TTL_S = 3600, with questions like "latest release", so a
+#: quote read 59 minutes earlier answered "right now". Five minutes is a
+#: choice, not a measurement: long enough that a regenerate or an immediate
+#: follow-up reuses the page it just read, short enough that "now" means now.
+#: A module constant rather than a setting: nobody has needed to tune it yet.
+_REALTIME_PAGE_TTL_S = 300
+
+
+def _question_verdict(message: str) -> Optional[Verdict]:
+    """The offline freshness verdict for `message`, the one `_memory_sources`
+    already computes — regex only, microseconds, never a model call. None on
+    any failure: the verdict sharpens the page TTL and must never cost the
+    search."""
+    try:
+        return classify_offline(message, now_year=datetime.now(timezone.utc).year)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
     """How old a stored page may be and still count as fresh for this ask.
 
     With a freshness verdict (app.freshness — the classification every other
     stage of the pipeline already runs, ADR-0001 D2/D6) the decision is the
-    verdict's: a VOLATILE one ("latest release", "current price", anything
-    REALTIME) gets the short TTL, everything else the long one. Re-matching
-    _FRESH_RE here disagreed with that verdict at the edges — "who is",
-    "score", a bare "2026" and "what is the" all trip the regex — so an
-    office-holder question (RECENT, its answer stable for months) threw away
+    verdict's: REALTIME gets `_REALTIME_PAGE_TTL_S`, any other VOLATILE one
+    ("latest release", "current price") the short TTL, everything else the
+    long one. Re-matching _FRESH_RE here disagreed with that verdict at the
+    edges — "who is", "score", a bare "2026" and "what is the" all trip the
+    regex — so an office-holder question (RECENT, its answer stable for months) threw away
     a two-hour-old copy of the page that answered it and paid a network
     fetch with a 3 s connect + 8 s read ceiling for the same text.
 
@@ -962,6 +1036,10 @@ def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
     crawler) gets exactly the TTL it always did.
     """
     if verdict is not None:
+        if verdict.requirement is Freshness.REALTIME:
+            # Never longer than the volatile TTL: an operator who shortened
+            # that one below five minutes meant it for these too.
+            return min(_REALTIME_PAGE_TTL_S, settings.web_page_fresh_ttl_s)
         if verdict.volatile:
             return settings.web_page_fresh_ttl_s
         return settings.web_page_ttl_s
@@ -1614,7 +1692,10 @@ async def research_step(
     sources = _apply_char_tiers(
         _drop_unread_sources(
             await _fetch_sources(
-                results, asked, user_id=user_id, conversation_id=conversation_id
+                results, asked, user_id=user_id, conversation_id=conversation_id,
+                # No caller passed a verdict until 2026-09-18, so a REALTIME
+                # question fell back to `_FRESH_RE` and the 3600 s TTL.
+                verdict=_question_verdict(asked),
             )
         ),
         asked,
@@ -1697,7 +1778,10 @@ async def run_search_engine(
     sources = _apply_char_tiers(
         _drop_unread_sources(
             await _fetch_sources(
-                results, asked, user_id=user_id, conversation_id=conversation_id
+                results, asked, user_id=user_id, conversation_id=conversation_id,
+                # No caller passed a verdict until 2026-09-18, so a REALTIME
+                # question fell back to `_FRESH_RE` and the 3600 s TTL.
+                verdict=_question_verdict(asked),
             )
         ),
         asked,
@@ -1809,7 +1893,8 @@ async def fetch_for_freshness(
 
     try:
         sources = await _fetch_sources(
-            picked, question, user_id=user_id, conversation_id=conversation_id
+            picked, question, user_id=user_id, conversation_id=conversation_id,
+            verdict=_question_verdict(question),
         )
     except Exception:  # noqa: BLE001 — a failed read is a miss, not an error
         return 0
