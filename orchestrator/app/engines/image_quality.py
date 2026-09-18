@@ -186,5 +186,9 @@ def legibility_note(images: Sequence[str]) -> str:
         "put \"?\" where a character is not resolvable, and say the image is "
         "too dark or too blurred to read the rest. Do NOT pick the most "
         "likely digit, letter or word: on this image a confident reading and "
-        "a guess look the same, and the person will act on it."
+        "a guess look the same, and the person will act on it. A number or "
+        "code on such an image may also run on past the characters you can "
+        "make out: never say it is complete, that no characters follow, or "
+        "that every character is legible - give the characters you can read "
+        "and say that more may be there."
     )
