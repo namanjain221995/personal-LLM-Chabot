@@ -352,3 +352,33 @@ def test_the_owners_turn_over_an_uploaded_csv_is_a_file_through_chat(chat_app, w
     assert "table1" not in shown and "figures not in the material" not in shown and "is not available" not in shown, shown
     assert "1 chart could not be drawn from your data" in tokens
     assert any("table1" in r.getMessage() for r in caplog.records)
+
+
+# ------------------------------------------- the report that was never built --
+
+
+#: The `purpose` the composer wrote for "give Big report" in live run fast3
+#: (283 characters). The spec allows 300; an Office core property holds 255,
+#: and python-docx refused it, so the whole DOCX failed: "The DOCX could not
+#: be built: the document writer reported an error."
+LONG_PURPOSE = ("To provide a comprehensive analysis of the customer base using the uploaded dataset (customers-100.csv), "
+                "identifying key trends in subscription dates, geographic distribution, and customer attributes to inform "
+                "strategic decisions regarding retention, acquisition, and resource allocation.")
+
+
+@pytest.mark.parametrize("kind,fmt", [("document", "docx"), ("presentation", "pptx")])
+def test_a_purpose_longer_than_an_office_property_still_builds_the_file(tmp_path, kind, fmt):
+    import zipfile
+
+    from app.artifacts.render import render_version
+    from tests.test_artifact_render_samples import deck, document
+
+    assert 255 < len(LONG_PURPOSE) <= 300
+    spec = document(purpose=LONG_PURPOSE, subtitle="") if kind == "document" else deck(purpose=LONG_PURPOSE, subtitle="")
+    report = render_version(spec, [fmt], str(tmp_path), title_slug="customer-report", version=1)
+    built = [f for f in report.files if f.format == fmt]
+    assert built, report
+    with zipfile.ZipFile(os.path.join(str(tmp_path), built[0].filename)) as z:
+        core = z.read("docProps/core.xml").decode("utf-8")
+    assert LONG_PURPOSE[:200] in core, "the subject is the purpose, cut to what the property holds"
+    assert LONG_PURPOSE not in core
