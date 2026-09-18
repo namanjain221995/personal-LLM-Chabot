@@ -1877,7 +1877,7 @@ def test_the_strict_block_forbids_only_what_was_not_asked():
     its judgement with "The document does not provide market benchmarks ..."
     0 of 8 times answered; the rewritten block answered 7 of 15, and an
     actual residual ("what is the annual fee in this contract and good or
-    bad?", still routed extract) went from 0 of 5 answered to 5 of 5."""
+    bad?", still routed extract) went from 0 of 5 answered to 7 of 8."""
     system = source_use.system_text("what is the invoice total?")
     assert source_use.question_mode("what is the invoice total?") == "extract"
     assert "For this answer do not add advice" not in system

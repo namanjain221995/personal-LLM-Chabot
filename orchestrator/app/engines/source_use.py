@@ -248,8 +248,10 @@ ADVISORY = (
 #:
 #: Measured live, Fast, graded on the first sentence of the judgement half.
 #: A real residual ("what is the annual fee in this contract and good or
-#: bad?", still routed extract): old block 0 of 5 answered, this block 5 of 5
-#: ("**Verdict: Good** / This is a good rate."). The verifier's market
+#: bad?", still routed extract): old block 0 of 5 answered, this block 7 of 8
+#: over two batches ("**Verdict: Good** / This is a good rate."); the miss
+#: opened "This is **not stated in the document**" and listed what it would
+#: need to know. The verifier's market
 #: question FORCED into this block: old 0 of 8, this block 7 of 15 — a
 #: question that needs outside figures is the hard case, and the strict
 #: framing still wins about half the time, which is why the switch and not
@@ -287,9 +289,10 @@ _STRICT_FIELDS = (
 #: industry averages for comparison.", "It is not possible to determine if
 #: this fee is reasonable based on the provided text alone." — and end with a
 #: list of things to go and check: the strict field rules leak into the half
-#: they do not govern. With the rules below: 4 of 5 and 5 of 5; the one miss
-#: opens "Whether 18,000 USD is in line with the market depends entirely on
-#: the scope of services provided, which is not detailed in the excerpt."
+#: they do not govern. With the rules below: 4 of 5 and 5 of 5, then 3 of 3
+#: and 3 of 3 again on the committed code; the one miss opens "Whether
+#: 18,000 USD is in line with the market depends entirely on the scope of
+#: services provided, which is not detailed in the excerpt."
 #: So the rules say which half the strict rules bind, where the verdict goes,
 #: and what a closing referral may be.
 #:
