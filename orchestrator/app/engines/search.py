@@ -11,6 +11,7 @@ Cache (query→sources, TTL) and a per-user rate limit keep it cheap and bounded
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -224,7 +225,13 @@ def _registrable_domain(url: str) -> str:
     # removeprefix, NOT lstrip: lstrip("www.") strips CHARACTERS, so
     # "web.example.com" became "eb.example.com" and the diversity cap grouped
     # unrelated sites (found by review, 2026-08-30).
-    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    try:
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    except ValueError:
+        # 'https://[::1/broken' raises "Invalid IPv6 URL". One malformed URL
+        # from any engine used to abort the whole merge (QA 2026-09-18); a
+        # page with no host has no domain, and the fetch refuses it later.
+        return ""
     parts = host.split(".")
     if len(parts) <= 2:
         return host
@@ -238,43 +245,101 @@ def _registrable_domain(url: str) -> str:
 # "website:x"), at the start or after a space or "(". A leading "-" makes it
 # an EXCLUSION, which this pattern deliberately does not read as a scope.
 _SITE_OP_RE = re.compile(r"(?:^|(?<=[\s(]))site:(\S+)", re.I)
+#: The characters a host or a path prefix can carry. `\w` is Unicode, so
+#: "bücher.de" survives; the "?", "!", "…" or U+200F a person's sentence puts
+#: after the operator does not. QA 2026-09-18: 'does qdrant support 10
+#: million vectors site:qdrant.tech?' scoped to the host "qdrant.tech?", so
+#: the 6 qdrant.tech pages SearXNG returned were dropped with the rest and
+#: the search came back empty.
+_HOST_CHARS_RE = re.compile(r"[\w.-]*")
+_PATH_CHARS_RE = re.compile(r"[\w.~%/-]*")
+#: A `site:` is honoured only in a query the size of one search line.
+#: fetch_for_freshness and rewrite_queries' fallback send the person's WHOLE
+#: message as the query, and a paste arrives inline in it: a pasted
+#: 'cross-check it on site:reddit.com first' confined 6 of 6 Fast candidates
+#: to reddit.com (QA 2026-09-18, against 2 of 8 at 4810da0). A line break, or
+#: more than this many characters, means the text is a message: it is
+#: searched unscoped, exactly as it was before scopes existed. 256 is a
+#: choice, not a measurement: every rewritten query seen live on 2026-09-18
+#: was under 60 characters, and deep research's longer rescue query is
+#: exempt (see `_site_scope`).
+_SITE_SCOPE_MAX_CHARS = 256
+
+
+def _ascii_host(host: str) -> str:
+    """The IDNA (punycode) spelling of `host`, so "bücher.de" and
+    "xn--bcher-kva.de" compare equal whichever side carries which. A label
+    the codec refuses (empty, over 63 characters) keeps its spelling."""
+    if host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return host
 
 
 def _site_scope(query: str) -> Tuple[str, ...]:
-    """The hosts a query's `site:` operators confine it to; () when none.
+    """The scopes a query's `site:` operators confine it to; () when none.
 
-    Measured 2026-09-18 on the production SearXNG: 'site:qdrant.tech
+    Each scope is "host" or "host/path-prefix", the host in its ASCII (IDNA)
+    spelling. Measured 2026-09-18 on the production SearXNG: 'site:qdrant.tech
     documentation performance benchmark 10 million vectors' returned six
     off-site pages in its top twelve (bing answered the word "documentation";
     yandex honoured the operator). An engine that ignores the operator cannot
     be fixed upstream, so the scope is enforced on what comes back.
     """
-    hosts: List[str] = []
-    for m in _SITE_OP_RE.finditer(query or ""):
+    q = query or ""
+    # Deep research's rescue query is `site:{domain} {subquestion}` and the
+    # subquestion has no length cap: an operator that OPENS the query is the
+    # query's own whatever its length.
+    if len(q) > _SITE_SCOPE_MAX_CHARS and q.lstrip()[:5].lower() != "site:":
+        return ()
+    # Every line break str knows (U+2028 and U+0085 too), not only "\n".
+    if len(q.splitlines()) > 1:
+        return ()
+    scopes: List[str] = []
+    for m in _SITE_OP_RE.finditer(q):
         raw = m.group(1).strip("\"'()[],;")
         if "://" in raw:
             try:
-                raw = urlparse(raw).hostname or ""
+                u = urlparse(raw)
+                raw = (u.hostname or "") + (u.path or "")
             except ValueError:
                 raw = ""
-        host = raw.split("/")[0].split(":")[0].lower().removeprefix("*.").strip(".")
-        host = host.removeprefix("www.")
-        if host:
-            hosts.append(host)
-    return tuple(dict.fromkeys(hosts))
+        host, _, path = raw.partition("/")
+        host = host.split(":")[0].lower().removeprefix("*.")
+        host = _HOST_CHARS_RE.match(host).group(0).strip(".").removeprefix("www.")
+        if not host:
+            continue
+        path = _PATH_CHARS_RE.match(path).group(0).lower().rstrip("./").strip("/")
+        host = _ascii_host(host)
+        scopes.append(f"{host}/{path}" if path else host)
+    return tuple(dict.fromkeys(scopes))
 
 
-def _on_site(url: str, hosts: Sequence[str]) -> bool:
-    """The host itself or any subdomain of it — the search engines' meaning.
+def _on_site(url: str, scopes: Sequence[str]) -> bool:
+    """The host itself or any subdomain of it — the search engines' meaning —
+    and, when the scope names a path, that path or anything below it.
 
     A host-suffix test, not `_registrable_domain` equality: `site:docs.python.org`
     must not admit bugs.python.org, and `site:gov.in` (a public suffix, whose
-    hosts have no common registrable domain) must admit mea.gov.in."""
+    hosts have no common registrable domain) must admit mea.gov.in. A path
+    prefix is matched on a segment boundary: /benchmarks admits
+    /benchmarks/single-node, never /benchmarks-old. A URL that does not parse
+    is off-site (fail closed)."""
     try:
-        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        u = urlparse(url)
+        host = _ascii_host((u.hostname or "").lower().removeprefix("www."))
+        path = (u.path or "").lower()
     except ValueError:
         return False
-    return any(host == h or host.endswith("." + h) for h in hosts)
+    for scope in scopes:
+        h, _, p = scope.partition("/")
+        if not (host == h or host.endswith("." + h)):
+            continue
+        if not p or path.rstrip("/") == "/" + p or path.startswith("/" + p + "/"):
+            return True
+    return False
 
 
 _JSON_ARRAY_RE = re.compile(r"\[.*\]", re.S)
@@ -525,7 +590,26 @@ async def rewrite_queries(
     except Exception:
         queries = []
     queries = _strip_unasked_pins(message, history, queries)
+    queries = _keep_asked_site_scope(message, queries)
     return (queries or [message])[:cap]
+
+
+def _keep_asked_site_scope(message: str, queries: List[str]) -> List[str]:
+    """The person's own `site:` rides on every rewritten query that lost it.
+
+    QA 2026-09-18, 3 of 3 live runs: the router rewrote 'site:qdrant.tech how
+    fast is search on 10 million vectors?' into three unscoped queries, so on
+    the ordinary route a typed scope never reached `_collect_results`. The
+    same principle as `_strip_unasked_pins`, the other way round: what the
+    person wrote outranks what the rewriter kept. Only a message
+    `_site_scope` honours (one search-sized line) counts, so an operator
+    inside a pasted document is still not the person's.
+    """
+    scope = _site_scope(message)
+    if not scope:
+        return queries
+    ops = " OR ".join(f"site:{s}" for s in scope)
+    return [q if _site_scope(q) else f"{q} {ops}" for q in queries]
 
 
 #: A token that is nothing but a calendar year.
@@ -1007,45 +1091,75 @@ def _spawn(coro) -> None:
 _REALTIME_PAGE_TTL_S = 300
 
 
+@functools.lru_cache(maxsize=32)
+def _verdict_memo(classify: Callable[..., Verdict], message: str, year: int) -> Verdict:
+    # The classifier is part of the key so a replaced one (a test double, a
+    # hot patch) is never answered from the old one's results.
+    return classify(message, now_year=year)
+
+
 def _question_verdict(message: str) -> Optional[Verdict]:
-    """The offline freshness verdict for `message`, the one `_memory_sources`
-    already computes — regex only, microseconds, never a model call. None on
-    any failure: the verdict sharpens the page TTL and must never cost the
-    search."""
+    """The offline freshness verdict for `message` — regex only, never a
+    model call — computed ONCE per question: the page TTL and
+    `_memory_sources` both need it, and classify_offline's timeless-shape
+    pattern is quadratic on a pathological line (QA 2026-09-18: 619 ms at
+    100 KB, 13.3 s at 400 KB of repeated "what does x"). None on any
+    failure: the verdict sharpens the TTL and must never cost the search."""
     try:
-        return classify_offline(message, now_year=datetime.now(timezone.utc).year)
+        return _verdict_memo(
+            classify_offline, message or "", datetime.now(timezone.utc).year
+        )
     except Exception:  # noqa: BLE001
         return None
+
+
+#: The phrasing `_FRESH_RE` shares with a months-stable office-holder
+#: question ("who is the ceo of ..."), as opposed to a word about time.
+_OFFICE_PHRASING_RE = re.compile(r"\b(?:who is|what is the)\b", re.I)
 
 
 def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
     """How old a stored page may be and still count as fresh for this ask.
 
-    With a freshness verdict (app.freshness — the classification every other
-    stage of the pipeline already runs, ADR-0001 D2/D6) the decision is the
-    verdict's: REALTIME gets `_REALTIME_PAGE_TTL_S`, any other VOLATILE one
-    ("latest release", "current price") the short TTL, everything else the
-    long one. Re-matching _FRESH_RE here disagreed with that verdict at the
-    edges — "who is", "score", a bare "2026" and "what is the" all trip the
-    regex — so an office-holder question (RECENT, its answer stable for months) threw away
-    a two-hour-old copy of the page that answered it and paid a network
-    fetch with a 3 s connect + 8 s read ceiling for the same text.
+    The wording rule decides, as it always has: a question that trips
+    `_FRESH_RE` gets the short TTL, anything else the long one. A freshness
+    verdict (app.freshness, ADR-0001 D2/D6) may only SHORTEN that: REALTIME
+    gets `_REALTIME_PAGE_TTL_S`, any other VOLATILE verdict ("latest
+    release", "current price") the short TTL.
 
-    Without a verdict the regex fallback stands unchanged, so a caller that
-    has not classified the question (deep research's fetch path, the
-    crawler) gets exactly the TTL it always did.
+    It may lengthen it for exactly one shape: an office-holder question whose
+    only freshness words are its own phrasing ("who is", "what is the"). Its
+    answer is stable for months, so the regex made it throw away a two-hour-
+    old copy of the page that answered it and pay a network fetch with a 3 s
+    connect + 8 s read ceiling for the same text. The verdict does not get
+    the last word anywhere else: at a039169 it did, and a RECENT verdict gave
+    24 h to "who won the match today", "news about the air india crash" and
+    "update on the Microsoft layoffs", which 4810da0 held to one hour.
+    Measured 2026-09-18 over 153 questions (the repo's freshness and web test
+    questions plus QA's probes): 55 got a LONGER TTL than 4810da0 at a039169;
+    with this rule 10 do, every one "who is the <office> of X".
+
+    Without a verdict (deep research's fetch path, the crawler) the wording
+    rule is the whole answer, exactly as before.
     """
-    if verdict is not None:
-        if verdict.requirement is Freshness.REALTIME:
-            # Never longer than the volatile TTL: an operator who shortened
-            # that one below five minutes meant it for these too.
-            return min(_REALTIME_PAGE_TTL_S, settings.web_page_fresh_ttl_s)
-        if verdict.volatile:
-            return settings.web_page_fresh_ttl_s
-        return settings.web_page_ttl_s
-    if _FRESH_RE.search(message or ""):
+    wording = (
+        settings.web_page_fresh_ttl_s
+        if _FRESH_RE.search(message or "")
+        else settings.web_page_ttl_s
+    )
+    if verdict is None:
+        return wording
+    if verdict.requirement is Freshness.REALTIME:
+        # Never longer than the volatile TTL: an operator who shortened
+        # that one below five minutes meant it for these too.
+        return min(_REALTIME_PAGE_TTL_S, settings.web_page_fresh_ttl_s)
+    if verdict.volatile:
         return settings.web_page_fresh_ttl_s
-    return settings.web_page_ttl_s
+    if verdict.reason == "lexical:office" and not _FRESH_RE.search(
+        _OFFICE_PHRASING_RE.sub(" ", message or "")
+    ):
+        return settings.web_page_ttl_s
+    return wording
 
 
 async def _stored_pages(
@@ -1463,16 +1577,26 @@ async def _memory_sources(
     """
     if not settings.web_memory_enabled:
         return sources
+    verdict = _question_verdict(message)
+    if verdict is None:
+        return sources
     try:
-        from ..freshness import classify_offline
         from .. import web_memory
 
-        verdict = classify_offline(message, now_year=datetime.now(timezone.utc).year)
         result = await web_memory.retrieve(
             message, level=verdict.requirement, top_k=budget * 2, verdict=verdict
         )
     except Exception:  # noqa: BLE001
         return sources
+    # A REALTIME answer gets no stored passage older than the page TTL. The
+    # passage is labelled with its read DATE only, so the model cannot tell
+    # a two-hour-old quote from this minute's (QA 2026-09-18: a passage read
+    # 2 h earlier was appended to 'NVIDIA stock price right now').
+    max_age = (
+        _page_ttl(message, verdict)
+        if verdict.requirement is Freshness.REALTIME
+        else None
+    )
     have = {_normalize_url(s.url) for s in sources}
     added = 0
     per_domain: dict = {}
@@ -1480,6 +1604,8 @@ async def _memory_sources(
         if added >= budget:
             break
         if not ev.relevant:
+            continue
+        if max_age is not None and ev.age_seconds > max_age:
             continue
         key = _normalize_url(ev.url)
         if not key or key in have:
