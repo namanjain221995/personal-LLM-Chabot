@@ -197,12 +197,16 @@ def test_live_engine_compressed_cue_snaps_back_to_the_speech_it_came_from(monkey
     ]
     segments, _ = _transcribe(monkeypatch, tmp_path, regions=regions, total_s=68.0, engine=lambda i: engine)
     starts = [round(s.start_s, 2) for s in segments]
-    assert starts == [0.31, 15.07, 24.61, 49.48]
+    # 49.57, not 49.48 as on f2e18ea: the compressed cue keeps its 0.09 s end
+    # in the next region (the end side no longer lets a graze go, live clip E
+    # below), and `stitch` starts the next cue there. Known start 50.37 s:
+    # -0.80 s, was -0.89 s.
+    assert starts == [0.31, 15.07, 24.61, 49.57]
     for got, known in zip(starts, [0.50, 15.29, 25.29, 50.37]):
         assert abs(got - known) <= 1.0
-    # The compressed cue now spans the two regions its words fill, and lets
-    # go of the 0.09 s edge of the next one.
-    assert round(segments[2].end_s, 2) == 47.51
+    # The compressed cue now spans the two regions its words fill, up to
+    # where the engine ended it, 0.09 s into the next one.
+    assert round(segments[2].end_s, 2) == 49.57
 
 
 def test_a_cue_that_fits_its_span_is_not_pulled_back_over_uncovered_speech(monkeypatch, tmp_path):
@@ -265,9 +269,12 @@ def test_a_cue_in_known_silence_moves_to_the_next_region(monkeypatch, tmp_path):
     # Was 8.3 (its own 1.3 s length, now on speech) until QA's repair round:
     # a moved cue that keeps its length runs past the next cue's start, and
     # `stitch` then pushed the correctly timed next cue later (7.0 -> 8.6 s
-    # in QA's reproduction). The moved cue now ends where the next one starts.
-    assert got["second thought"].end_s == pytest.approx(7.2)
-    assert got["third thought"].start_s == pytest.approx(7.2)
+    # in QA's reproduction). The moved cue now ends where the next one
+    # starts, but never under a player's minimum cue (0.4 s): at 7.0-7.2 the
+    # SRT writer stretched it to 7.4 over the next cue (QA r2). The next cue
+    # gives up 0.2 s here, never more than 0.4 s.
+    assert got["second thought"].end_s == pytest.approx(7.4)
+    assert got["third thought"].start_s == pytest.approx(7.4)
     # Order stays monotonic and non-overlapping, which players insist on.
     for a, b in zip(segments, segments[1:]):
         assert a.start_s <= a.end_s <= b.start_s <= b.end_s
@@ -675,3 +682,232 @@ def test_snapping_a_long_window_is_not_cues_times_regions():
     took = time.perf_counter() - t0
     assert [(s.start_s, s.end_s) for s in out[:2]] == [(0.0, 1.4), (2.0, 3.4)]
     assert took < 1.0, f"{took:.2f} s"
+
+
+# ------------------------------------------------ QA round 2, the edges --
+#
+# QA's second review (2026-09-18) against f2e18ea. Each names the measured
+# failure it pins; the live replays are the worker whisper's own replies with
+# the regions webrtcvad found on the same clip.
+
+
+def _srt_cues(segments):
+    """(start, end, text) exactly as the downloadable SRT shows them."""
+    def secs(t):
+        return int(t[:2]) * 3600 + int(t[3:5]) * 60 + int(t[6:8]) + int(t[9:12]) / 1000
+
+    out = []
+    for block in art.transcript_srt(segments).strip().split("\n\n"):
+        lines = block.split("\n")
+        a, b = lines[1].split(" --> ")
+        out.append((secs(a), secs(b), " ".join(lines[2:])))
+    return out
+
+
+def test_live_E_a_sentences_last_word_after_a_pause_keeps_its_subtitle(monkeypatch, tmp_path):
+    """LibriSpeech 7127-75947-0011 (LibriVox, public domain): 'remain i implore
+    you the evening is most' [1.4 s pause] 'lovely' (3.90-4.31 s), and another
+    reader 0.08 s later, so 'lovely' opens a LONG region (3.70-14.21). Whisper
+    ended cue 1 at 4.12 s, 0.42 s into that region. f2e18ea let the end go as
+    a graze and cut the cue at 2.81 s: 'lovely' was spoken with no subtitle,
+    3 of 3 live runs ('assert 2.81 >= 4.0'). 4810da0 kept 4.12."""
+    regions = [(0.0, 1.22), (1.36, 2.81), (3.70, 14.21)]
+    said = "Remain, I implore you. The evening is most lovely."
+    nxt = ("He hoped there would be stew for dinner, turnips and carrots and bruised potatoes and fat mutton "
+           "pieces to be ladled out in thick, peppered, flour-fattened sauce.")
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=regions, total_s=70.0, engine=lambda i: [(0.0, 4.12, said), (4.12, 13.92, nxt)]
+    )
+    got = _by_text(segments)
+    assert (got[said].start_s, got[said].end_s) == (0.0, 4.12)
+    assert abs(got[nxt].start_s - 4.39) <= 1.0
+
+
+def test_a_cue_whose_last_word_opens_the_next_region_stays_on_screen(monkeypatch, tmp_path):
+    """'... and the result was' [1.5 s pause] 'remarkable.' with the next
+    sentence straight after it, so the last word opens a long region. The
+    engine ends the cue after the word, 0.5 s into that region. f2e18ea cut
+    it at 5.0 s ('assert 5.0 >= 7.3'); 4810da0 kept 7.5."""
+    said = "we measured it twice and the result was remarkable"
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 15.0)], total_s=15.0,
+        engine=lambda i: [(0.5, 7.5, said), (7.5, 14.8, "so the committee asked for a third measurement")],
+    )
+    assert _by_text(segments)[said].end_s == 7.5
+
+
+def test_an_engine_repeat_inside_a_pause_is_still_dropped(monkeypatch, tmp_path):
+    """Whisper emits 'Thank you.' twice, overlapping in time, in a 2 s pause.
+    `stitch` drops a repeat by its overlap; 4810da0 dropped it. f2e18ea moved
+    both copies to 7.0 s with no length, the overlap was gone, and the SRT
+    said 'Thank you.' twice ('assert 2 == 1')."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 4.8, "we begin with the minutes of the last meeting"),
+            (5.2, 6.0, "Thank you."),
+            (5.3, 6.1, "Thank you."),
+            (7.0, 11.5, "the committee met twice before the vote was called"),
+        ],
+    )
+    assert [s.text for s in segments].count("Thank you.") == 1, [(s.start_s, s.end_s, s.text) for s in segments]
+
+
+def test_an_engine_repeat_moved_onto_a_short_region_is_still_dropped(monkeypatch, tmp_path):
+    """The same repeat when the speech after the pause is a 0.3 s region: both
+    copies move onto it and are no longer than it, so they overlap by less
+    than the seam tolerance. Two cues of one text at one start are one cue."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 7.3), (8.5, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 4.8, "we begin with the minutes of the last meeting"),
+            (5.2, 6.0, "Thank you."),
+            (5.3, 6.1, "Thank you."),
+            (8.5, 11.5, "the committee met twice before the vote was called"),
+        ],
+    )
+    assert [s.text for s in segments].count("Thank you.") == 1, [(s.start_s, s.end_s, s.text) for s in segments]
+
+
+def test_a_cue_moved_out_of_a_pause_keeps_a_readable_span(monkeypatch, tmp_path):
+    """The next cue starts AT the region start. f2e18ea capped the moved cue
+    there: 7.0-7.0 ('assert (7.0 - 7.0) >= 0.4'), which the SRT writer
+    stretched to 7.4 over the next cue. 4810da0 showed it for 1.5 s."""
+    said = "and that is where it ended"
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 4.8, "we begin with the minutes of the last meeting"),
+            (5.3, 6.8, said),
+            (7.0, 11.5, "the committee met twice before the vote was called"),
+        ],
+    )
+    got = _by_text(segments)[said]
+    assert (got.start_s, got.end_s) == (7.0, 7.4)
+    cues = _srt_cues(segments)
+    for (a1, b1, _), (a2, _b2, _) in zip(cues, cues[1:]):
+        assert b1 <= a2 + 1e-9, cues  # f2e18ea: 'assert 7.4 <= (7.0 + 1e-09)'
+
+
+def test_a_short_cue_in_a_regions_padded_tail_and_the_pause_moves_to_its_speech(monkeypatch, tmp_path):
+    """The engine opens 'Right.' where the previous cue ended (4.6 s, 0.4 s
+    into the padded tail of a 5 s region) and ends it in the pause (6.5 s);
+    the word is at 7.0 s. f2e18ea kept the foot as the cue's words, 4.6-5.0:
+    squeezed to 0.4 s and still 2.4 s early ('assert (4.6 >= 6.0 or ...)').
+    The foot is a graze, so the cue lies in the pause and moves out of it."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 4.6, "that was the end of the first part of the reading"),
+            (4.6, 6.5, "Right."),
+            (7.6, 11.8, "now the second part of the reading begins here"),
+        ],
+    )
+    got = _by_text(segments)
+    assert (got["Right."].start_s, got["Right."].end_s) == (7.0, 7.6)
+    assert got["now the second part of the reading begins here"].start_s == 7.6
+
+
+def test_a_cue_opened_in_a_short_replys_padded_tail_starts_on_its_own_speech(monkeypatch, tmp_path):
+    """Interview shape: 'Yes.' is its own 0.9 s padded region (10.0-10.9);
+    whisper times 'Yes.' at 10.1-10.4 and opens the answer where it ended,
+    0.5 s into that region; the answer's words start at 12.5 s. More than
+    half of that short region, so f2e18ea and 4810da0 alike kept it as the
+    answer's first word: 2.1 s early ('assert 10.4 == 12.5 +- 1'). An
+    earlier cue already has its words in that region, so it is a graze."""
+    answer = "we met on the Tuesday and agreed the terms before anyone else arrived"
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 9.0), (10.0, 10.9), (12.5, 20.0)], total_s=20.0,
+        engine=lambda i: [
+            (0.0, 8.8, "and did the committee ever meet the delegation in person"),
+            (10.1, 10.4, "Yes."),
+            (10.4, 19.8, answer),
+        ],
+    )
+    got = _by_text(segments)
+    assert got[answer].start_s == 12.5
+    assert (got["Yes."].start_s, got["Yes."].end_s) == (10.1, 10.4)
+
+
+def test_a_graze_of_the_last_speech_in_the_window_is_still_clamped(monkeypatch, tmp_path):
+    """Nothing after the pause to move to: the cue keeps its foot in the
+    speech and ends where the speech does, as before."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0)], total_s=8.0,
+        engine=lambda i: [(0.0, 4.6, "that was the end of the reading"), (4.6, 6.5, "Right.")],
+    )
+    assert (_by_text(segments)["Right."].start_s, _by_text(segments)["Right."].end_s) == (4.6, 5.0)
+
+
+def test_a_short_cue_inside_long_speech_does_not_move(monkeypatch, tmp_path):
+    """A cue shorter than the edge, wholly inside a region an earlier cue
+    reaches into, is not a graze of anything: it does not leave the region."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (12.0, 20.0)], total_s=20.0,
+        engine=lambda i: [
+            (0.0, 3.0, "and did you sign it"),
+            (3.0, 3.4, "No."),
+            (3.4, 9.8, "I signed it the morning after the vote"),
+            (12.0, 19.5, "and then the committee adjourned"),
+        ],
+    )
+    assert (_by_text(segments)["No."].start_s, _by_text(segments)["No."].end_s) == (3.0, 3.4)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "Known cost, asked for by the brief ('move a segment that falls in known silence to the next region's "
+    "start'): a word the VAD dropped (0.2 s, under its 0.25 s minimum) that the engine timed right is moved "
+    "onto the next speech, 1.2 s late here, and the next cue gives up the 0.4 s minimum cue. Nothing in the "
+    "times tells it apart from a cue the engine opened in the pause (live: 3 of 3 clips)."))
+def test_a_correctly_timed_word_the_vad_dropped_is_not_moved_late(monkeypatch, tmp_path):
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 5.0), (7.0, 12.0)], total_s=12.0,
+        engine=lambda i: [
+            (0.0, 4.8, "did you sign the letter before the meeting"),
+            (5.8, 6.2, "No."),
+            (7.0, 11.5, "I signed it the morning after the vote was called"),
+        ],
+    )
+    assert abs(_by_text(segments)["No."].start_s - 5.8) <= 1.0
+
+
+# ------------------------------------ QA round 2, the constants are pinned --
+#
+# Three changes survived QA's mutation run on f2e18ea: dropping `_merged`,
+# raising `_REGION_EDGE_S` to 1.5 and lowering `_FAST_SPEECH_CHARS_PER_S` to
+# 18. Each test below fails under its mutation.
+
+
+def test_a_real_first_word_a_second_into_a_tail_keeps_the_cue_start(monkeypatch, tmp_path):
+    """1.0 s into the previous speech's tail is more than the engine's own
+    opening slack (0.49 s on the live 70 s clip): that is the cue's words."""
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (11.9, 20.0)], total_s=20.0,
+        engine=lambda i: [(0.0, 8.9, "that was the first part of it"), (9.0, 16.0, "So, what did we find out")],
+    )
+    assert _by_text(segments)["So, what did we find out"].start_s == 9.0
+
+
+def test_an_honest_fast_cue_after_uncovered_speech_is_not_pulled_back(monkeypatch, tmp_path):
+    """208 characters in 10.4 s is 20 a second, a fast but real speaker. After
+    speech with no words (music the VAD took for speech) it stays put: only a
+    stamp short by more than a second at 25 a second is a compressed one."""
+    said = _R2_TAIL
+    span = round(len(said) / 20.0, 2)
+    segments, _ = _transcribe(
+        monkeypatch, tmp_path, regions=[(0.0, 10.0), (11.0, 40.0)], total_s=40.0,
+        engine=lambda i: [(0.0, 9.5, "welcome back to the reading room"), (28.0, 28.0 + span, said)],
+    )
+    assert _by_text(segments)[said].start_s == 28.0
+
+
+def test_hand_built_regions_out_of_order_and_overlapping_snap_like_clean_ones():
+    """A caller's regions need not be sorted or disjoint; the bisects are."""
+    engine = [
+        Segment(0.0, 4.8, "first thought", "en"),
+        Segment(5.3, 6.6, "second thought", "en"),
+        Segment(7.2, 11.5, "third thought", "en"),
+    ]
+    clean = transcribe.snap_to_regions(engine, [(0.0, 5.0), (7.0, 12.0)])
+    assert transcribe.snap_to_regions(engine, [(7.0, 12.0), (2.5, 5.0), (0.0, 3.0)]) == clean
+    assert clean[1].start_s == 7.0

@@ -57,6 +57,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..config import settings
 from . import loops
+from .artifacts import _MIN_CUE_S
 from .types import Segment
 from .vad import SAMPLE_RATE, Window, plan_windows
 
@@ -172,7 +173,15 @@ def stitch(
         for s in segs:
             if not s.text.strip():
                 continue
-            if out and s.start_s < out[-1].end_s - _SEAM_TOLERANCE_S and _norm(s.text) == _norm(out[-1].text):
+            # A repeat overlaps its original in time -- or, once snapping has
+            # moved both out of a pause onto one region start, starts no
+            # later than it: "Thank you." twice at 5.2 and 5.3 s became two
+            # cues at 7.0 s that overlapped by less than the tolerance.
+            if (
+                out
+                and (s.start_s < out[-1].end_s - _SEAM_TOLERANCE_S or s.start_s <= out[-1].start_s)
+                and _norm(s.text) == _norm(out[-1].text)
+            ):
                 continue
             out.append(s)
         prev_window = window
@@ -221,20 +230,31 @@ _STAMP_SHORTFALL_S = 1.0
 _SLOWEST_HONEST_CHARS_PER_S = 10.2
 
 
-def _grazes(region: Tuple[float, float], overlap: float) -> bool:
-    """Does a cue only graze this region at its edge, holding none of its
-    words there? `_REGION_EDGE_S` or less, AND under half of the region.
+def _grazes(region: Tuple[float, float], overlap: float, covered: float) -> bool:
+    """Does a cue's START only graze this region, the tail of the speech
+    before its own, holding none of its words? `_REGION_EDGE_S` or less, AND
+    either under half of the region or in a region an earlier cue already
+    reaches into (`covered`, the end of the cues before it).
 
-    The second condition is the live clip L3 (QA, 2026-09-18): "he has",
-    spoken at 17.54-17.94 s after a 1.2 s pause, was a 0.76 s region of its
-    own, and the engine put it at the end of the previous cue (0.00-17.94).
-    That cue overlaps the short region by 0.50 s: within the edge, but most
-    of the region, and the region is those words. Letting it go ended the cue
-    at 16.61 s and left the words on screen with no subtitle for 2.1 s. The
-    0.49 s the live 70 s clip's cue reached into a 16.6 s region stays a graze.
+    START side only. At the end, the same short foot in the next region is
+    the cue's own last word after a pause: live clip E (QA r2, 2026-09-18),
+    "lovely" at 3.90-4.31 s opened a 10.5 s region, the engine ended the cue
+    at 4.12 s, and letting that 0.42 s go ended the cue at 2.81 s with the
+    word spoken under no subtitle. On 8 live clips the end-side rule fired
+    once, and that once was wrong.
+
+    Half of the region: a short region no earlier cue has words in is this
+    cue's own opening word — "So," alone in a 0.65 s region, which the cue
+    overlaps by 0.45 s, keeps the cue at 12.0 s instead of 13.25 s (QA r1).
+    An earlier cue already in the region: the engine opens a cue where the
+    previous one ended, so what is left of that region is the earlier cue's
+    last word and padding — "Yes." at 10.1-10.4 s in a 0.9 s region, and the
+    answer opened at 10.4 s stayed 2.1 s early, as on 4810da0 (QA r2). The
+    0.49 s the live 70 s clip's cue reached into a 16.6 s region is a graze
+    either way.
     """
     a, b = region
-    return overlap <= _REGION_EDGE_S and overlap < 0.5 * (b - a)
+    return overlap <= _REGION_EDGE_S and (overlap < 0.5 * (b - a) or covered > a)
 
 
 def _merged(regions: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -268,11 +288,14 @@ def snap_to_regions(
     * A cue's start or end in a pause moves to the edge of the speech it
       belongs to. Everything it has INSIDE its regions is kept, so a real
       utterance is never cut shorter than its own span there; only a graze
-      (see `_grazes`) of a neighbouring region's edge is let go.
+      (see `_grazes`) of the previous speech's tail, at the cue's START, is
+      let go. A cue whose start grazes that tail and whose end is in the
+      pause after it lies in that pause.
     * A cue entirely inside a pause moves to the next region's start, with
-      its own length, but never past where the next cue starts: the engine
-      timed that one on speech, and a moved cue pushing it later delayed a
-      correctly timed 7.0 s cue to 8.6 s (QA, 2026-09-18).
+      its own length, but never past where the next cue starts by more than
+      a player's minimum cue: the engine timed that one on speech, and a
+      moved cue pushing it later delayed a correctly timed 7.0 s cue to
+      8.6 s (QA, 2026-09-18).
     * A cue stamped too short to hold its words (see
       `_FAST_SPEECH_CHARS_PER_S`) starts at the first speech no earlier cue
       covers, bounded by `_SLOWEST_HONEST_CHARS_PER_S`. That is where the
@@ -317,26 +340,44 @@ def snap_to_regions(
                 if target < start:
                     start = target
         i = max(0, bisect_right(starts, start) - 1)
-        touched = []
-        for a, b in (regs[n] for n in range(i, len(regs))):
-            if a >= end:
+        touched = []  # (index into regs, overlap)
+        for n in range(i, len(regs)):
+            if regs[n][0] >= end:
                 break
-            overlap = min(end, b) - max(start, a)
+            overlap = min(end, regs[n][1]) - max(start, regs[n][0])
             if overlap > 0:
-                touched.append(((a, b), overlap))
-        while len(touched) > 1 and _grazes(*touched[0]):
-            touched.pop(0)
-        while len(touched) > 1 and _grazes(*touched[-1]):
-            touched.pop()
+                touched.append((n, overlap))
+        # A foot in the tail of the speech before the cue's own is let go when
+        # the cue runs on past it, into later speech or into the pause before
+        # it: then the cue lies in that pause, and moves out of it below.
+        after = None  # the cue's words begin after regs[after]
+        while (
+            touched
+            and touched[0][0] + 1 < len(regs)
+            and regs[touched[0][0]][1] < end
+            and _grazes(regs[touched[0][0]], touched[0][1], covered)
+        ):
+            after = touched.pop(0)[0]
         if touched:
-            start, end = max(start, touched[0][0][0]), min(end, touched[-1][0][1])
+            start, end = max(start, regs[touched[0][0]][0]), min(end, regs[touched[-1][0]][1])
         else:
-            j = bisect_right(starts, start)
-            inside = j > 0 and regs[j - 1][0] <= start <= regs[j - 1][1]
-            if not inside and j < len(regs):
+            if after is not None:
+                j = after + 1
+            else:
+                j = bisect_right(starts, start)
+                if j > 0 and regs[j - 1][0] <= start <= regs[j - 1][1]:
+                    j = len(regs)  # inside speech already: nowhere to move
+            if j < len(regs):
                 a, b = regs[j]
                 nxt = segments[k + 1].start_s if k + 1 < len(segments) else b
-                start, end = a, min(b, a + (end - start), max(a, nxt))
+                # Up to the next cue's start, but never less than a player
+                # shows (`_MIN_CUE_S`): capped at a next cue the engine put AT
+                # the region start, it was 0 s, the SRT stretched it over the
+                # next cue, and an engine repeat moved with it was no longer
+                # seen overlapping its original (QA r2, 2026-09-18). The next
+                # cue gives up at most that 0.4 s, not the moved cue's length.
+                span = max(_MIN_CUE_S, min(end - start, nxt - a))
+                start, end = a, min(b, a + span)
         if out and seg.start_s >= segments[k - 1].start_s:
             start = max(start, out[-1].start_s)
         end = max(end, start)
