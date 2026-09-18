@@ -117,6 +117,7 @@ def rate_ok(user_id: int) -> bool:
 
 def reset_for_tests() -> None:
     _recent.clear()
+    _IN_FLIGHT.clear()
     asr.POOL.reset_for_tests()
     asr.BATCH_POOL.reset_for_tests()
 
@@ -248,11 +249,10 @@ async def transcribe(
             upload_ms=upload_ms,
         )
     )
-    try:
-        done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
-    except asyncio.CancelledError:
-        task.cancel()
-        raise
+    # Held until the engine answers, whatever happens to this request: see
+    # `_hold_until_done`. Never cancelled from here on.
+    _hold_until_done(task)
+    done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
     if done:
         # Finished (or refused) before the heartbeat was due: an ordinary
         # response with its real status line.
@@ -268,25 +268,84 @@ async def _heartbeat_then(task: "asyncio.Future[dict]") -> AsyncIterator[bytes]:
     The status line has already gone out as 200, so a failure from here on is
     carried IN the body as {"detail", "status"} — the same sentence and the
     same status the early path would have sent, which the browser maps the
-    same way. A client that leaves cancels the work.
+    same way. A client that leaves does NOT cancel the work: see
+    `_hold_until_done`.
     """
+    while True:
+        yield _BEAT
+        done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
+        if done:
+            break
     try:
-        while True:
-            yield _BEAT
-            done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
-            if done:
-                break
-        try:
-            payload: dict = task.result()
-        except HTTPException as exc:
-            payload = {"detail": exc.detail, "status": exc.status_code}
-        # The same encoding Starlette's JSONResponse uses for the early path.
-        yield json.dumps(
-            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8")
-    finally:
-        if not task.done():
-            task.cancel()
+        payload: dict = task.result()
+    except HTTPException as exc:
+        payload = {"detail": exc.detail, "status": exc.status_code}
+    except Exception:  # noqa: BLE001
+        # Past the status line an escaped exception would only cut the body
+        # off mid-way; the browser is owed a failure it can read.
+        log.error("ASR transcription failed after the heartbeat started", exc_info=task.exception())
+        payload = {"detail": _GENERIC_FAILURE, "status": 503}
+    # The same encoding Starlette's JSONResponse uses for the early path.
+    yield json.dumps(
+        payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+#: Every transcription in flight, held until the engine answers. asyncio
+#: keeps only a weak reference to a task, so work whose client has gone —
+#: nobody awaits it any more — could be collected mid-flight; this set is
+#: what keeps it (and its pool slot) alive.
+_IN_FLIGHT: "set[asyncio.Future[dict]]" = set()
+
+
+def _hold_until_done(task: "asyncio.Future[dict]") -> None:
+    """Keep the work running if its client goes, and its pool slot taken.
+
+    NOT CANCELLED, on purpose (security review, 2026-09-18). The speech
+    server queues every request on one lock and decodes in an executor that
+    a closed connection cannot stop, so cancelling here freed the dictation
+    pool slot — the only bound on GPU work — while the engine kept decoding.
+    Measured with real sockets: six clients that each hung up 0.4 s after
+    the first heartbeat left a backlog of 6 decodes on a one-slot engine with
+    the pool reading 0, and the next person's 4 s clip waited 7.5 s behind
+    the orphans. Letting the task finish keeps the slot taken for exactly as
+    long as the engine is busy, which is what 4810da0 did by never noticing
+    the hang-up. Registered for EVERY request, not in a `finally`: a client
+    that leaves before the first heartbeat is sent never starts the stream's
+    generator, so its cleanup would never run. The outcome is still recorded
+    (the row and the metric), and the exception, if any, is consumed so an
+    abandoned failure is not logged as unretrieved.
+    """
+    _IN_FLIGHT.add(task)
+
+    def _done(finished: "asyncio.Future[dict]") -> None:
+        _IN_FLIGHT.discard(finished)
+        if not finished.cancelled():
+            finished.exception()
+
+    task.add_done_callback(_done)
+
+
+_GENERIC_FAILURE = "Transcription couldn't be completed. Please try again."
+
+#: Seconds of decoding per second of audio on a BUSY replica: 300 s of audio
+#: took 219.7 s with other clips queued on it (2026-09-18).
+_LOADED_DECODE_S_PER_AUDIO_S = 0.73
+
+
+def _timeout_detail(duration_ms: int) -> str:
+    """The 504's sentence: advice the person can act on.
+
+    "Try a shorter one" helps only when the clip's own length could have used
+    up the budget — when decoding it on a busy replica takes at least half of
+    ASR_TIMEOUT_S (411 s of audio at the 600 s default). A shorter clip that
+    timed out met a stuck or queued engine, and recording less would not have
+    helped; neither does a clip whose length the browser did not report.
+    """
+    decode_s = duration_ms / 1000.0 * _LOADED_DECODE_S_PER_AUDIO_S
+    if duration_ms and decode_s >= settings.asr_timeout_s / 2:
+        return "That recording took too long to transcribe. Try a shorter one."
+    return "The speech engine did not answer in time. Please try again."
 
 
 async def _transcribe_or_refuse(
@@ -321,23 +380,18 @@ async def _transcribe_or_refuse(
             status_code=422, detail="That recording could not be transcribed."
         ) from None
     except asr.ASRTimeout as exc:
-        # BEFORE ASRUnavailable, which it subclasses. Not "try again": the
-        # engine did not fail, the clip outran ASR_TIMEOUT_S, and the same
-        # clip would outrun it again. V19's status vocabulary has no
-        # 'timeout', and the engine did not deliver, so the row says so.
+        # BEFORE ASRUnavailable, which it subclasses. V19's status vocabulary
+        # (a CHECK constraint) has no 'timeout', and the engine did not
+        # deliver, so the row says 'unavailable'; the counter below is what
+        # tells a timeout from an outage on the console's Prometheus half.
         await _record(user_id, duration_ms, None, _since(started), "unavailable")
+        metrics.inc("asr_timeouts_total", "dictations the speech engine did not answer in time")
         log.warning("ASR engine did not answer in time: %s", exc)
-        raise HTTPException(
-            status_code=504,
-            detail="That recording took too long to transcribe. Try a shorter one.",
-        ) from None
+        raise HTTPException(status_code=504, detail=_timeout_detail(duration_ms)) from None
     except asr.ASRUnavailable as exc:
         await _record(user_id, duration_ms, None, _since(started), "unavailable")
         log.warning("ASR engine unavailable: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail="Transcription couldn't be completed. Please try again.",
-        ) from None
+        raise HTTPException(status_code=503, detail=_GENERIC_FAILURE) from None
     except Exception:  # noqa: BLE001
         # The catch-all, and the reason `status = 'error'` exists in V19.
         # Anything the engine client did not anticipate — a 200 whose body is
@@ -347,10 +401,7 @@ async def _transcribe_or_refuse(
         # name. A person holding a microphone gets a sentence instead.
         await _record(user_id, duration_ms, None, _since(started), "error")
         log.exception("ASR transcription failed unexpectedly")
-        raise HTTPException(
-            status_code=503,
-            detail="Transcription couldn't be completed. Please try again.",
-        ) from None
+        raise HTTPException(status_code=503, detail=_GENERIC_FAILURE) from None
 
     total_ms = _since(started)
     await _record(

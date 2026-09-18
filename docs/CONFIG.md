@@ -221,14 +221,23 @@ second per second of the longest allowed clip — clears the loaded rate by
 about 37%, and waiting longer costs nothing now that a timeout is never
 re-sent and the route heartbeats.
 
-**A timeout is not an outage.** Only a connection error or a 5xx moves a
-clip to the other replica. A clip that times out is reported to the person
-as too long to transcribe (504), because the engine still holds it and a
-second replica would decode it in vain.
+**A timeout is not an outage.** Only a connection error, a 5xx, or a
+connect/write/pool timeout (the clip never fully reached an engine) moves a
+clip to the other replica. A read timeout stands the replica down but is not
+re-sent, because the engine still holds the clip and a second replica would
+decode it in vain. The person gets a 504 worded from the clip's length: "Try
+a shorter one" only when decoding it on a busy replica (0.73 s per second of
+audio) needs at least half of `ASR_TIMEOUT_S`; a shorter clip met a stuck or
+queued engine and is asked to try again. The trade-off, accepted: a short
+clip on an engine that accepts connections but never answers now waits the
+full `ASR_TIMEOUT_S` instead of being re-sent after it.
 
 **The wait is visible and survives the proxy.** `/audio/transcribe` answers
 within 15 s of starting work: a streamed `200` that sends a whitespace byte
 every 15 s (leading whitespace is legal JSON) and then the JSON. A failure
 after that point is carried in the body as `{"detail", "status"}`. Refusals
 known before any work (401, 403, 404, 413, 415, 422, 429, a busy 503) keep
-their own status line.
+their own status line. A client that hangs up does not cancel the work: the
+speech server cannot stop a decode it has started, so the dictation slot
+(`ASR_MAX_CONCURRENT` per engine) stays taken until the engine answers — that
+slot is the only bound on how much decoding members can queue.

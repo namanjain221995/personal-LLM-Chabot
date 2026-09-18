@@ -129,7 +129,20 @@ class ASRTimeout(ASRUnavailable):
     was abandoned at 240 s on each replica in turn). A subclass of
     ASRUnavailable so callers that already handle an unavailable engine —
     video analysis, /v1's routing hints — keep working unchanged.
+
+    ONLY A READ TIMEOUT IS ONE. A connect, write or pool timeout means the
+    clip never fully reached an engine, so it is an ordinary ASRUnavailable
+    and the other replica gets the clip.
+
+    `answer` is set when the engine had already answered honestly and only
+    dictation's optional second decode timed out: RoutedProvider stands the
+    replica down and returns that answer instead of a 504 for a clip whose
+    first pass said, correctly, that nothing was said.
     """
+
+    def __init__(self, message: str = "", *, answer: Optional["Transcript"] = None) -> None:
+        super().__init__(message)
+        self.answer = answer
 
 
 class ASRBusy(Exception):
@@ -294,13 +307,12 @@ class VLLMAudioProvider:
                     files={"file": (filename, audio, content_type)},
                     data=data,
                 )
-        except httpx.ConnectTimeout as exc:
-            # No connection, so no engine ever saw the audio: an outage, and
-            # the other replica is the right place for the clip.
-            raise ASRUnavailable(str(exc) or "connect timeout") from exc
-        except httpx.TimeoutException as exc:
-            # The engine took the connection and the clip did not come back
-            # within the budget. Never failed over; see ASRTimeout.
+        except httpx.ReadTimeout as exc:
+            # The whole clip was sent and the answer did not come back within
+            # the budget: the engine has it. Never failed over; see ASRTimeout.
+            # A connect, write or pool timeout falls through to the outage
+            # below — the clip never fully reached an engine, so the other
+            # replica is the right place for it.
             raise ASRTimeout(f"no answer within {self.timeout_s:.0f}s") from exc
         except Exception as exc:  # noqa: BLE001
             raise ASRUnavailable(str(exc)) from exc
@@ -397,16 +409,36 @@ class VLLMAudioProvider:
         """
         first, heard = await self._exchange(audio, filename, content_type)
         if first.text:
-            if speech_is_plausible(first.text, heard.duration_s or 0.0, engine_heard_speech=True):
+            if speech_is_plausible(
+                first.text,
+                heard.duration_s or 0.0,
+                engine_heard_speech=True,
+                no_speech_prob=heard.no_speech_prob,
+            ):
                 return first
             metrics.inc("asr_implausible_reply_total", "dictation replies dropped as invented", result="rejected")
             return dataclasses.replace(first, text="", language=None, language_code=None)
         if not _gated(first, heard):
             return first
-        second, heard_again = await self._exchange(
-            audio, filename, content_type, segments=True, no_speech_check=False
-        )
-        assert isinstance(second, TranscriptSegments)
+        # THE RETRY IS AN OPTIONAL SECOND OPINION: it must never leave a gated
+        # clip worse off than the first pass's honest empty answer. A refusal
+        # (4xx) or a reply this client cannot parse ends in that answer, not
+        # in a 422 or a 503 for a silent clip. An outage (5xx, connection)
+        # still propagates so RoutedProvider fails over; a timeout carries
+        # the first answer so the replica is stood down AND the person gets it.
+        try:
+            second, heard_again = await self._exchange(
+                audio, filename, content_type, segments=True, no_speech_check=False
+            )
+        except ASRTimeout as exc:
+            metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="fail")
+            raise ASRTimeout(str(exc), answer=first) from exc
+        except (ASRRejected, ValueError, TypeError) as exc:
+            metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="fail")
+            log.info("ASR gated retry gave nothing usable (%s); keeping the empty first pass", exc)
+            return first
+        if not isinstance(second, TranscriptSegments):
+            return first
         engine_ms = first.engine_ms + second.engine_ms
         if speech_is_plausible(
             second.text,
@@ -470,7 +502,9 @@ def _number(value: Any) -> Optional[float]:
 # six-talker babble at 0 and -3 dB and under pink noise at 0 dB, one real
 # three-word utterance in 20 s of quiet room noise, and six clips with no
 # speech at all (pink at -20 and -35 dBFS, brown, white, 50 Hz hum with hiss,
-# digital silence). tests/test_asr_long_and_noisy.py carries the table.
+# digital silence) — plus QA's rows: seven real short utterances after a
+# 5-7 s lead-in, and white, fan and pink noise at room level.
+# tests/test_asr_long_and_noisy.py carries the table.
 # ---------------------------------------------------------------------------
 
 #: compose/whisper/server.py's NO_SPEECH_THRESHOLD, which both replicas report
@@ -490,20 +524,46 @@ _RETRY_MIN_SECONDS = 3.0
 _GATED_MIN_WORDS_PER_S = 1.0
 
 #: For text the engine decoded NORMALLY (its gate judged the clip speech),
-#: only the stock-phrase signature is doubted: at most this many words...
-_STOCK_PHRASE_MAX_WORDS = 4
-#: ...from at least this much audio. The phrases Whisper invented from noise
-#: were 1-4 words ("Thank you.", "Thank you for watching!" in this set; "you"
-#: from 30 s of silence earlier; "All right." from 20 s of room noise in the
-#: audit). THE PRICE, measured: a REAL three-word utterance in 20 s of quiet
-#: room is dropped too — Whisper stamped it 0-20 s, exactly like an invented
-#: phrase, so neither the rate nor the segments can tell them apart.
-#: NOT CAUGHT: whole invented sentences. 20 s of pink noise at -20 and -35
-#: dBFS passed the gate (no_speech_prob 0.04) and decoded as 28 and 21 words
-#: of video-outro text, 1.40 and 1.05 words/s — inside the clean-speech range
-#: (1.35-3.35). Nothing on this side separates those without a second decode
-#: of every clip; that belongs to the engine's gate.
+#: one signature is doubted, and only when all three parts of it hold.
+#:
+#: 1. The text is nothing but Whisper's stock phrases — a CLOSED list, not
+#:    "any short reply". The first version dropped every reply of four words
+#:    or fewer from 10 s or more, and QA measured it deleting real dictations
+#:    4810da0 returned verbatim: "He knows them both." (15 s), "The problem
+#:    was solved." (12 s), "no sir certainly not" (11 s). Measured here as
+#:    inventions: "Thank you." (digital silence, dither, room and fan noise
+#:    with the gate off), "Thank you for watching!" (brown noise), "you" (30 s
+#:    of silence), "All right." (20 s of pink room noise, the audit), "Okay."
+#:    (10 s of white noise). "Thanks for watching" and "Bye" are the same
+#:    family, widely reported for Whisper. A sentence-by-sentence match, so
+#:    "Thank you. Thank you." (60 s of dither, measured) is one too.
+_STOCK_PHRASES = frozenset({
+    "you", "thank you", "thank you for watching", "thanks for watching",
+    "all right", "alright", "okay", "ok", "bye",
+})
+#: 2. From at least this much audio. Every invention above came from 10-90 s;
+#:    a person who says "Okay." into a three-second clip is answering.
 _STOCK_PHRASE_MIN_SECONDS = 10.0
+#: 3. The engine was NOT sure somebody spoke. Its no-speech probability on
+#:    real short utterances after a 5-7 s lead-in in a quiet room measured
+#:    0.0003-0.018 (n=7, LibriSpeech); on noise that passed its gate, 0.025-
+#:    0.060 (20 s of pink at -20 and -35 dBFS, five clips), 0.0355 (hum and
+#:    hiss) and 0.1225 (white, which decoded as "Okay."). The audit's "All
+#:    right." came from room-level pink noise; its number was not recorded.
+#:    That is a SMALL labelled set: the line sits between the speech group
+#:    and most of the noise rather than claiming a margin, and a reply the
+#:    engine was surer of than this is always kept, so a real "Thank you."
+#:    said after a pause survives. The price: a stock phrase from a noise
+#:    clip scoring under the line (one pink clip, 0.0251) is kept, as 4810da0
+#:    kept it. Unknown (an engine that does not report it) counts as unsure.
+_CONFIDENT_SPEECH_NSP = 0.03
+#: NOT CAUGHT, and not claimed: inventions that are not stock phrases. 20 s
+#: of pink noise at -20 and -35 dBFS passed the gate (no_speech_prob 0.025-
+#: 0.060, five clips) and decoded as whole video-outro sentences at 1.05-1.40
+#: words/s — inside the clean-speech range (1.35-3.35) — and 20 s of fan
+#: noise as "Stabilization is very good." (0.0355). 4810da0 returned the
+#: same text. Nothing on this side separates those from speech without a
+#: second decode of every clip; that belongs to the engine's gate.
 
 #: Scripts written without spaces between words. Counted by whitespace, a
 #: whole Chinese sentence would be one "word" and always look sparse, so each
@@ -513,6 +573,7 @@ _UNSPACED = re.compile(
     r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"  # kana, CJK
 )
 _WORDISH = re.compile(r"\w", re.UNICODE)
+_SENTENCE_BREAK = re.compile(r"[.,!?;:\u2026\u3002\uff01\uff1f]+")
 
 
 def _speech_units(text: str) -> int:
@@ -548,27 +609,41 @@ def _covered_seconds(segments: Sequence[Dict[str, Any]]) -> float:
     return total
 
 
+def _only_stock_phrases(text: str) -> bool:
+    """Every sentence of `text` is one of Whisper's stock inventions."""
+    parts = [
+        " ".join(re.sub(r"[^\w\s']", " ", part).lower().split())
+        for part in _SENTENCE_BREAK.split(text or "")
+    ]
+    parts = [part for part in parts if part]
+    return bool(parts) and all(part in _STOCK_PHRASES for part in parts)
+
+
 def speech_is_plausible(
     text: str,
     seconds: float,
     segments: Sequence[Dict[str, Any]] = (),
     *,
     engine_heard_speech: bool,
+    no_speech_prob: Optional[float] = None,
 ) -> bool:
     """Whether a dictation transcript is speech rather than Whisper's invention.
 
     `engine_heard_speech` is the engine's prior. True: its silence gate let
-    the clip through and decoded it normally, so only a few words from long
-    audio are doubted. False: the gate called the clip silent and the text
-    comes from the ungated retry, so the words must be as dense as speech —
-    measured over the audio the segments cover, or the whole clip when the
-    reply carries no segments.
+    the clip through and decoded it normally, so the words are kept unless
+    they are nothing but a stock phrase, from a long clip, that the engine
+    was not sure was speech (`no_speech_prob`). False: the gate called the
+    clip silent and the text comes from the ungated retry, so the words must
+    be as dense as speech — measured over the audio the segments cover, or
+    the whole clip when the reply carries no segments.
     """
     units = _speech_units(text)
     if units == 0:
         return False
     if engine_heard_speech:
-        return not (units <= _STOCK_PHRASE_MAX_WORDS and seconds >= _STOCK_PHRASE_MIN_SECONDS)
+        if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
+            return True
+        return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
     covered = _covered_seconds(segments) or seconds
     return units / max(covered, 1.0) >= _GATED_MIN_WORDS_PER_S
 
@@ -739,7 +814,11 @@ class RoutedProvider:
                     # Stood down (it is still decoding this clip, so the next
                     # dictation should not queue behind it) but NOT re-sent:
                     # the other replica would only decode the same doomed
-                    # clip. See ASRTimeout.
+                    # clip. See ASRTimeout. When only dictation's optional
+                    # second decode timed out, the first pass's answer stands.
+                    answer = getattr(exc, "answer", None)
+                    if answer is not None:
+                        return answer
                     raise
             finally:
                 self._active[index] -= 1

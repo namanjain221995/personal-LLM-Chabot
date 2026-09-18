@@ -241,7 +241,8 @@ function isAbort(err: unknown, signal?: AbortSignal): boolean {
  * 403 and 404 are the server saying the feature is not for this account or
  * not on this deployment; both are worth quoting verbatim, because they tell
  * the person what to do. So are the refusals about the recording itself, a
- * busy engine, and a recording that took too long to transcribe (504).
+ * busy engine, and a 504 (the server words it from the clip's length: "Try a
+ * shorter one" for a long clip, "did not answer in time" for a short one).
  * Everything else gets one sentence.
  */
 function failureFor(status: number, detail: unknown): TranscribeFailure {
