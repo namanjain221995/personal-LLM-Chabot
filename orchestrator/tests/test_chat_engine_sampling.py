@@ -183,3 +183,38 @@ def test_the_legacy_temperature_line_is_kept_verbatim():
     import inspect
 
     assert 'temperature = 0.3 if effort in ("think", "max") else 0.6' in inspect.getsource(chat_engine.run_chat_engine)
+
+
+# ---------------------------------------------------------------------------
+# The requested length reaches continuation as a target (backlog 14)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("effort", ["fast", "think"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Produce a 12,000 word employee manual for a recruiting agency.",
+        "Write a 1200-word blog post about remote onboarding.",
+    ],
+)
+def test_the_requested_length_reaches_continuation_as_the_target(recorder, message, effort):
+    """"10,000 words" came back as 24,364 words one run and 5,340 the next:
+    continuation had the budget but never the length that was asked for.
+    The parse is answer_sampling's; the engine only has to hand it on, at
+    every effort."""
+    from app.core import answer_sampling
+
+    wanted = answer_sampling.requested_words(message)
+    assert wanted is not None and wanted >= 1000
+    out = _run_chat(message, mode="assistant", effort=effort)
+    assert out["long"]["target_words"] == wanted
+
+
+def test_an_ask_with_no_length_hands_on_no_target(recorder):
+    from app.core import answer_sampling
+
+    message = "hey, what's a good name for a grey kitten?"
+    assert answer_sampling.requested_words(message) is None
+    out = _run_chat(message, mode="assistant", effort="fast")
+    assert out["long"]["target_words"] is None

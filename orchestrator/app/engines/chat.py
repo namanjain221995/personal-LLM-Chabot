@@ -405,6 +405,10 @@ async def run_chat_engine(
         segment_max_tokens=max_tokens,
         total_max_tokens=total_max_tokens,
         deadline_s=settings.continuation_deadline_s or None,
+        # The length the person asked for, as a target rather than only a
+        # budget: "10,000 words" came back as 24,364 words one run and 5,340
+        # the next (backlog 14). None when the ask names no length.
+        target_words=answer_sampling.requested_words(message),
         **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
     for piece in guard.finish():
