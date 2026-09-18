@@ -706,7 +706,21 @@ async def run_pdf_engine_multi(
 
     signals = source_use.classify(instruction)
     advising = signals.mode == "advise" or signals.wants_advice
-    excerpt = select_relevant(merged, instruction, DOC_CONTEXT_CHARS)
+    if advising:
+        # A decision question's own words rarely name the section that
+        # answers it ("is help Full ??" on a 40-page catalogue): the person's
+        # recent turns carry the subject, and the sections worth reading carry
+        # the figures the verdict turns on (select_relevant, 2026-09-19).
+        said = " ".join(reversed([  # most recent first: keywords() keeps the first ones
+            str(m.get("content") or "")
+            for m in conversation_turns(history, 6)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ]))
+        excerpt = select_relevant(
+            merged, instruction, DOC_CONTEXT_CHARS, context=said, prefer_units=True
+        )
+    else:
+        excerpt = select_relevant(merged, instruction, DOC_CONTEXT_CHARS)
     content: List[dict] = [{"type": "text", "text": header + instruction}]
     if excerpt.strip():
         content.append(

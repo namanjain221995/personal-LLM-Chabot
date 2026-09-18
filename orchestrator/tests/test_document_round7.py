@@ -13,6 +13,7 @@ import time
 import pytest
 
 from app import llm
+from app.core import urls
 from app.engines import document, source_use
 from app.search.base import SearchResult, SearchUnavailableError
 from tests.document_answer_grader import opens_with_refusal
@@ -411,3 +412,49 @@ def test_a_slow_search_cannot_hold_the_answer(engine, monkeypatch):
     text, _ = engine["run"]()
     assert time.monotonic() - started < 2.0
     assert "Web lookup" not in text
+
+
+# ---------------------------------------------------------------------------
+# L5: the excerpt of a long catalogue follows the conversation and the figures
+# ---------------------------------------------------------------------------
+
+
+def _catalogue():
+    """40 sections; only one is about racks, power and cooling, and it shares
+    no word with the owner's question."""
+    sections = []
+    for i in range(40):
+        if i == 31:
+            sections.append(
+                "EdgeRow integrated row. Racks: 2 to 12 per row, 42U, 600 mm wide. "
+                "Cooling: 3 x 15 kW in-row units, 45 kW per row. Power: modular UPS "
+                "10 kVA to 135 kVA. IT load up to 10 kW per rack. " * 3)
+        else:
+            sections.append(
+                f"Product family {i}. Office furniture line {i} with desks, chairs and "
+                f"storage in oak, walnut and grey finishes, delivered flat packed. " * 4)
+    return "\n\n".join(sections)
+
+
+def test_an_advice_excerpt_follows_the_conversation_and_the_figures():
+    """The owner's words ("dgx", "spark", "help", "full") are not in the rack
+    section; his earlier turn ("power and cooling for 20 sparks in racks") is.
+    Before: the section is not selected. After: it is, and a caller that
+    passes neither argument gets the old selection byte for byte."""
+    text = _catalogue()
+    said = "plan is grow to 20 dgx spark next year, need proper racks, power and cooling"
+    plain = urls.select_relevant(text, OWNER_QUESTION, 1500)
+    advised = urls.select_relevant(text, OWNER_QUESTION, 1500, context=said, prefer_units=True)
+    assert "45 kW per row" not in plain
+    assert "45 kW per row" in advised
+    assert urls.select_relevant(text, OWNER_QUESTION, 1500, context="", prefer_units=False) == plain
+
+
+def test_figures_break_a_tie_between_sections_the_words_do_not_separate():
+    """Twelve sections, each naming cooling once; one carries its figures.
+    Without the boost the first section wins the tie (reading order)."""
+    pad = " ".join(["lorem"] * 40)
+    plain = [f"Section {i}. Cooling is described in general terms here. {pad}" for i in range(11)]
+    text = "\n\n".join(plain + [f"Section 11. Cooling units: 4 x 45 kW, 135 kVA UPS. {pad}"])
+    assert "45 kW" not in urls.select_relevant(text, "cooling?", 300)
+    assert "45 kW" in urls.select_relevant(text, "cooling?", 300, prefer_units=True)
