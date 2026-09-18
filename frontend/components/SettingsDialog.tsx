@@ -5,7 +5,8 @@
  * before this, so this dialog establishes the pattern: the ConfirmDialog
  * portal recipe on a wider panel, with a section nav on the left (top on
  * mobile). Sections: Profile (read-only identity), Personalization (theme),
- * Security (change password), Sessions (everywhere you're signed in), Help.
+ * Memory (what the assistant saved about you, B11), Security (change
+ * password), Sessions (everywhere you're signed in), Help.
  *
  * Portalled to <body> — a transformed ancestor would otherwise become the
  * containing block for position:fixed (the bug that hit the ⋯ menu and the
@@ -26,6 +27,7 @@ import {
 import { createPortal } from 'react-dom';
 import type { FetchLike } from '@/lib/auth';
 import type { Account } from './AccountMenu';
+import { MemoryPanel } from './MemoryPanel';
 import { useTheme } from './Providers';
 import { PasswordSection, SessionsSection } from './SecuritySettings';
 import { IconX } from './icons';
@@ -33,6 +35,7 @@ import { IconX } from './icons';
 export type SettingsSection =
   | 'profile'
   | 'personalization'
+  | 'memory'
   | 'security'
   | 'sessions'
   | 'help';
@@ -40,6 +43,7 @@ export type SettingsSection =
 const SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'personalization', label: 'Personalization' },
+  { id: 'memory', label: 'Memory' },
   { id: 'security', label: 'Security' },
   { id: 'sessions', label: 'Sessions' },
   { id: 'help', label: 'Help' },
@@ -138,6 +142,7 @@ export function SettingsDialog({
           <div className="min-w-0 flex-1 overflow-y-auto p-4">
             {section === 'profile' && <ProfileSection account={account} />}
             {section === 'personalization' && <PersonalizationSection />}
+            {section === 'memory' && <MemoryPanel fetchFn={fetchFn} />}
             {section === 'security' && <PasswordSection fetchFn={fetchFn} />}
             {section === 'sessions' && <SessionsSection fetchFn={fetchFn} />}
             {section === 'help' && <HelpSection />}

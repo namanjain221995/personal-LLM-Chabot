@@ -1,13 +1,16 @@
 /**
- * MOCK_MODE=true auth + history backend (V2 counterpart of the §9 chat
- * fixtures): a tiny in-memory implementation of the orchestrator's /auth and
- * /history contracts (V2 §3c) so the FULL v2 UI — login, server history,
- * migration — is demo-able before the real backend exists.
+ * MOCK_MODE=true auth + history + memory backend (V2 counterpart of the §9
+ * chat fixtures): a tiny in-memory implementation of the orchestrator's
+ * /auth, /history (V2 §3c) and /memory/facts contracts so the FULL v2 UI —
+ * login, server history, migration, the memory panel — is demo-able before
+ * the real backend exists.
  *
  * Server-only module (imported by route handlers). State lives for the
  * lifetime of the Node process; that is exactly right for a demo.
  */
 
+import type { MemoryFact } from './memory';
+import type { MemoryProxyDecision } from './memoryRoutes';
 import { buildSnippet, SEARCH_MAX_QUERY } from './searchPalette';
 
 interface MockMessage {
@@ -341,4 +344,82 @@ export async function handleMockHistory(
   }
 
   return json(404, { detail: 'Unknown history endpoint.' });
+}
+
+/* ---------------------------------------------------------------- memory */
+
+/**
+ * Three saved facts, one of each provenance the panel labels (V40 `source`:
+ * 'stated', 'manual', and NULL for a row written before provenance existed),
+ * so every label and the excerpt quote are demo-able. The third is the kind
+ * of row the old extraction rules wrote — a task request, not a fact about
+ * the person — which is what the panel exists to let people remove.
+ */
+function seedMemory(): MemoryFact[] {
+  return [
+    {
+      id: 101,
+      fact: 'Works as a data engineer and mostly writes SQL',
+      source_conversation_id: 'mock-conv-1',
+      source: 'stated',
+      source_excerpt: 'I work as a data engineer, so most of what I write is SQL',
+      created_at: '2026-09-18T09:30:00Z',
+      updated_at: '2026-09-18T09:30:00Z',
+    },
+    {
+      id: 102,
+      fact: 'Prefers answers in metric units',
+      source_conversation_id: null,
+      source: 'manual',
+      source_excerpt: null,
+      created_at: '2026-09-10T12:00:00Z',
+      updated_at: '2026-09-10T12:00:00Z',
+    },
+    {
+      id: 103,
+      fact: 'Wants a cover letter for the Acme analyst role',
+      source_conversation_id: 'mock-conv-0',
+      source: null,
+      source_excerpt: null,
+      created_at: '2026-08-02T08:00:00Z',
+      updated_at: '2026-08-02T08:00:00Z',
+    },
+  ];
+}
+
+const memoryByUser = new Map<string, MemoryFact[]>();
+
+function userMemory(username: string): MemoryFact[] {
+  let facts = memoryByUser.get(username);
+  if (!facts) {
+    facts = seedMemory();
+    memoryByUser.set(username, facts);
+  }
+  return facts;
+}
+
+/**
+ * /memory/facts for an ALREADY-ALLOWLISTED call (the route classifies first,
+ * exactly as it does in live mode), answering in memory_api.py's shapes.
+ */
+export function handleMockMemory(
+  decision: Exclude<MemoryProxyDecision, { kind: 'reject' }>,
+): Response {
+  const user = MOCK_LOCAL_USER;
+  const facts = userMemory(user);
+
+  if (decision.kind === 'list') {
+    return json(200, { facts });
+  }
+  if (decision.kind === 'delete-one') {
+    const id = Number(decision.id);
+    const kept = facts.filter((f) => f.id !== id);
+    if (kept.length === facts.length) {
+      return json(404, { detail: 'fact not found' });
+    }
+    memoryByUser.set(user, kept);
+    return json(200, { deleted: id });
+  }
+  memoryByUser.set(user, []);
+  return json(200, { deleted: facts.length });
 }
