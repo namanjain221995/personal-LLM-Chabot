@@ -458,3 +458,19 @@ def test_figures_break_a_tie_between_sections_the_words_do_not_separate():
     text = "\n\n".join(plain + [f"Section 11. Cooling units: 4 x 45 kW, 135 kVA UPS. {pad}"])
     assert "45 kW" not in urls.select_relevant(text, "cooling?", 300)
     assert "45 kW" in urls.select_relevant(text, "cooling?", 300, prefer_units=True)
+
+
+# ---------------------------------------------------------------------------
+# L6: a damaged PDF is described in the person's terms
+# ---------------------------------------------------------------------------
+
+
+def test_a_damaged_pdf_note_names_no_library():
+    """4e7cf8e: "Could not read x.pdf (Failed to load document (PDFium: Data
+    format error).)." The person can act on what the file is, not on which
+    library failed."""
+    raw = b"%PDF-1.7\n" + bytes(range(256)) * 8
+    doc, err = asyncio.run(document.extract_document("x.pdf", raw, effort="fast"))
+    assert doc is None
+    assert err == "Could not read x.pdf: the file is damaged or is not a PDF."
+    assert "PDFium" not in err and "Failed to load" not in err

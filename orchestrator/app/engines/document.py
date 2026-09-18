@@ -485,8 +485,12 @@ async def extract_document(
         pdf_base64 = base64.b64encode(raw).decode("ascii")
         try:
             pages, total = extract_pdf_pages(pdf_base64)
-        except Exception as exc:  # noqa: BLE001 — a broken PDF is a note, not a 500
-            return None, f"Could not read {label} ({exc})."
+        except Exception:  # noqa: BLE001 — a broken PDF is a note, not a 500
+            # The library's own words ("Failed to load document (PDFium:
+            # Data format error).") went to the person verbatim until
+            # 2026-09-19. What they can act on is what the file IS.
+            log.info("unreadable PDF %s", label, exc_info=True)
+            return None, f"Could not read {label}: the file is damaged or is not a PDF."
         wanted = page_images_wanted(pages, total, effort, question)
         full_text, images, total, ocred, raw_pages = await _extract_pdf(
             pdf_base64, emit, render_pages=wanted
