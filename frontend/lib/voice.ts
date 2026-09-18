@@ -221,6 +221,41 @@ export interface TranscribeFailure {
   error: VoiceError;
 }
 
+const GENERIC_FAILURE = 'Transcription couldn’t be completed. Please try again.';
+
+function isAbort(err: unknown, signal?: AbortSignal): boolean {
+  return (
+    Boolean(signal?.aborted) ||
+    (typeof err === 'object' &&
+      err !== null &&
+      'name' in err &&
+      (err as { name: string }).name === 'AbortError')
+  );
+}
+
+/**
+ * A failed transcription, from its status and the server's sentence. The same
+ * mapping whether the status came on the status line or, after a heartbeat,
+ * in the body.
+ *
+ * 403 and 404 are the server saying the feature is not for this account or
+ * not on this deployment; both are worth quoting verbatim, because they tell
+ * the person what to do. So are the refusals about the recording itself, a
+ * busy engine, and a recording that took too long to transcribe (504).
+ * Everything else gets one sentence.
+ */
+function failureFor(status: number, detail: unknown): TranscribeFailure {
+  const quotable =
+    status === 403 || status === 404 || status === 413 || status === 422 ||
+    status === 429 || status === 503 || status === 504;
+  return {
+    error: {
+      message: (quotable && typeof detail === 'string' && detail) || GENERIC_FAILURE,
+      retryable: status !== 403 && status !== 404,
+    },
+  };
+}
+
 /**
  * Send one recording and get its text back.
  *
@@ -263,53 +298,42 @@ export async function transcribe(
       signal: options.signal,
     });
   } catch (err) {
-    if (
-      typeof err === 'object' &&
-      err !== null &&
-      'name' in err &&
-      (err as { name: string }).name === 'AbortError'
-    ) {
-      // The caller withdrew. Not an error to report.
-      return { error: { message: '', retryable: true } };
+    // The caller withdrew. Not an error to report.
+    if (isAbort(err, options.signal)) return { error: { message: '', retryable: true } };
+    return { error: { message: GENERIC_FAILURE, retryable: true } };
+  }
+
+  // A long transcription arrives as a streamed 200: whitespace heartbeats
+  // (insignificant in JSON, so `json()` reads straight past them) and then the
+  // JSON, over minutes. The read can therefore break mid-way (a proxy restart,
+  // a dropped network), and that has to be a failure the person can retry,
+  // not a rejected promise that leaves the bar on "Transcribing…" forever. It
+  // is also where pressing X now lands most often — during the wait — and
+  // that is still a withdrawal. A body that is not JSON is `null` here.
+  let payload: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = await response.json();
+    if (typeof parsed === 'object' && parsed !== null) {
+      payload = parsed as Record<string, unknown>;
     }
-    return {
-      error: {
-        message: 'Transcription couldn’t be completed. Please try again.',
-        retryable: true,
-      },
-    };
+  } catch (err) {
+    if (isAbort(err, options.signal)) return { error: { message: '', retryable: true } };
+    payload = null;
   }
 
   if (!response.ok) {
-    let detail = '';
-    try {
-      const payload = (await response.json()) as { detail?: unknown };
-      if (typeof payload.detail === 'string') detail = payload.detail;
-    } catch {
-      // Non-JSON body — fall through to the generic sentence.
-    }
-    // 403 and 404 are the server saying the feature is not for this account
-    // or not on this deployment; both are worth quoting verbatim, because
-    // they tell the person what to do. Everything else gets one sentence.
-    const quotable = response.status === 403 || response.status === 404 ||
-      response.status === 413 || response.status === 422 ||
-      response.status === 429 || response.status === 503;
-    return {
-      error: {
-        message:
-          (quotable && detail) ||
-          'Transcription couldn’t be completed. Please try again.',
-        retryable: response.status !== 403 && response.status !== 404,
-      },
-    };
+    return failureFor(response.status, payload?.detail);
+  }
+  if (payload === null) {
+    return { error: { message: GENERIC_FAILURE, retryable: true } };
+  }
+  // A failure after the heartbeat started: the status line was already 200,
+  // so the server carries the real one in the body. It is mapped exactly as
+  // that status would have been, and never read as a (silent) transcript.
+  if (typeof payload.status === 'number' && payload.status >= 400) {
+    return failureFor(payload.status, payload.detail);
   }
 
-  const payload = (await response.json()) as {
-    text?: unknown;
-    language?: unknown;
-    duration_ms?: unknown;
-    processing_ms?: unknown;
-  };
   const text = typeof payload.text === 'string' ? payload.text.trim() : '';
   if (!text) {
     return {

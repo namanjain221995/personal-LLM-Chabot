@@ -26,7 +26,10 @@ by name AND as an ISO code, the clip duration, and `no_speech_prob` — its own
 judgement that there was nothing to transcribe. Whisper is documented to
 hallucinate on silence and, measured here, answers a 30-second silent clip
 with " you"; the engine short-circuits that before the model runs. So this
-client identifies no languages, splits no audio and guesses nothing.
+client identifies no languages, splits no audio and guesses nothing. What it
+does do, for dictation only, is decode a silence-gated clip once more with the
+gate off and keep the words only if they are dense enough to be speech — see
+`VLLMAudioProvider.transcribe` and `speech_is_plausible`.
 
 FORMAT. None is converted here for dictation. The engine decodes with ffmpeg
 on its own side, so the WebM/Opus a browser's MediaRecorder produces is
@@ -36,7 +39,9 @@ PCM it cut itself — see `transcribe_segments` and the BATCH pool.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence
@@ -114,6 +119,19 @@ class ASRUnavailable(Exception):
     """The engine could not be reached, or refused. Retryable."""
 
 
+class ASRTimeout(ASRUnavailable):
+    """The engine HAS the clip and did not answer within ASR_TIMEOUT_S.
+
+    Not retried on another replica. The engine decodes in an executor that a
+    closed request cannot stop, so it is still working on this clip; sending
+    it to the other Spark as well only put a second GPU on a doomed decode
+    while chat slowed on both (2026-09-18: a 595 s clip, 268.3 s of decoding,
+    was abandoned at 240 s on each replica in turn). A subclass of
+    ASRUnavailable so callers that already handle an unavailable engine —
+    video analysis, /v1's routing hints — keep working unchanged.
+    """
+
+
 class ASRBusy(Exception):
     """Every transcription slot is taken and the queue wait ran out."""
 
@@ -149,6 +167,18 @@ class TranscriptSegments(Transcript):
     """
 
     segments: tuple = ()
+
+
+@dataclass(frozen=True)
+class _Heard:
+    """What the engine measured about a clip, beside its transcript: its own
+    judgement that nobody spoke, and the length it decoded. Dictation's retry
+    and plausibility check read these; None from an engine that does not
+    report them. Kept off `Transcript`, whose fields are the public response's
+    contract (tests/test_asr_retired.py)."""
+
+    no_speech_prob: Optional[float]
+    duration_s: Optional[float]
 
 
 class ASRProvider(Protocol):
@@ -216,6 +246,20 @@ class VLLMAudioProvider:
         segments: bool = False,
         no_speech_check: bool = True,
     ) -> Transcript:
+        result, _heard = await self._exchange(
+            audio, filename, content_type, segments=segments, no_speech_check=no_speech_check
+        )
+        return result
+
+    async def _exchange(
+        self,
+        audio: bytes,
+        filename: str,
+        content_type: str,
+        *,
+        segments: bool = False,
+        no_speech_check: bool = True,
+    ) -> "tuple[Transcript, _Heard]":
         """The transcription endpoint — the only one Whisper serves.
 
         The engine's reply carries more than text: the language it identified
@@ -250,6 +294,14 @@ class VLLMAudioProvider:
                     files={"file": (filename, audio, content_type)},
                     data=data,
                 )
+        except httpx.ConnectTimeout as exc:
+            # No connection, so no engine ever saw the audio: an outage, and
+            # the other replica is the right place for the clip.
+            raise ASRUnavailable(str(exc) or "connect timeout") from exc
+        except httpx.TimeoutException as exc:
+            # The engine took the connection and the clip did not come back
+            # within the budget. Never failed over; see ASRTimeout.
+            raise ASRTimeout(f"no answer within {self.timeout_s:.0f}s") from exc
         except Exception as exc:  # noqa: BLE001
             raise ASRUnavailable(str(exc)) from exc
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -269,6 +321,7 @@ class VLLMAudioProvider:
         code = str(body.get("language_code") or "").strip() or None
         if language and not code:
             code = language_code(language)
+        heard = _Heard(_number(body.get("no_speech_prob")), _number(body.get("duration")))
         if segments:
             raw = body.get("segments")
             parsed = tuple(
@@ -296,7 +349,7 @@ class VLLMAudioProvider:
                 engine_ms=elapsed,
                 degraded=False,
                 segments=parsed,
-            )
+            ), heard
         return Transcript(
             text=spoken,
             language=language,
@@ -308,7 +361,7 @@ class VLLMAudioProvider:
             # successful dictation as degraded would make the console read as
             # though the service were permanently limping.
             degraded=False,
-        )
+        ), heard
 
     # -- interface ---------------------------------------------------------
 
@@ -328,8 +381,52 @@ class VLLMAudioProvider:
         `language` is accepted and ignored: the engine is deliberately left to
         detect it, because these users code-switch mid-sentence and forcing
         one language mistranscribes the other.
+
+        NOISY SPEECH GETS ONE MORE DECODE, AND EVERY ANSWER IS CHECKED. The
+        engine's silence gate judges only its no-speech probability, and
+        babble pushes real speech past it: LibriSpeech under six-talker
+        babble at -3 dB scored 0.839 and came back empty, where the same
+        bytes decoded with the gate off gave 112 words — word error rate
+        0.54 against the reference, the rest being the babble, which is an
+        editable draft instead of "Nothing was said". So a clip
+        the gate emptied is decoded ONCE more without it, and what that
+        yields is kept only if `speech_is_plausible` believes it — the gate
+        exists because Whisper invents words from silence ("Thank you." from
+        10 s of digital silence, measured), and a retry that let those
+        through would turn a correct empty draft into a wrong one.
         """
-        return await self._transcriptions(audio, filename, content_type)
+        first, heard = await self._exchange(audio, filename, content_type)
+        if first.text:
+            if speech_is_plausible(first.text, heard.duration_s or 0.0, engine_heard_speech=True):
+                return first
+            metrics.inc("asr_implausible_reply_total", "dictation replies dropped as invented", result="rejected")
+            return dataclasses.replace(first, text="", language=None, language_code=None)
+        if not _gated(first, heard):
+            return first
+        second, heard_again = await self._exchange(
+            audio, filename, content_type, segments=True, no_speech_check=False
+        )
+        assert isinstance(second, TranscriptSegments)
+        engine_ms = first.engine_ms + second.engine_ms
+        if speech_is_plausible(
+            second.text,
+            heard_again.duration_s or heard.duration_s or 0.0,
+            second.segments,
+            engine_heard_speech=False,
+        ):
+            metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="accepted")
+            # A plain Transcript, the shape dictation always returns: the
+            # segments were only the evidence.
+            return Transcript(
+                text=second.text,
+                language=second.language,
+                language_code=second.language_code,
+                provider=second.provider,
+                model=second.model,
+                engine_ms=engine_ms,
+            )
+        metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="rejected")
+        return dataclasses.replace(first, engine_ms=engine_ms)
 
     async def transcribe_segments(
         self,
@@ -356,6 +453,135 @@ class VLLMAudioProvider:
             return response.status_code == 200
         except Exception:  # noqa: BLE001
             return False
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Dictation's second pass and plausibility check (2026-09-18)
+#
+# Every threshold below comes from one labelled set, decoded on the worker
+# replica: ten LibriSpeech test-clean utterances (5-8 s), LibriSpeech under
+# six-talker babble at 0 and -3 dB and under pink noise at 0 dB, one real
+# three-word utterance in 20 s of quiet room noise, and six clips with no
+# speech at all (pink at -20 and -35 dBFS, brown, white, 50 Hz hum with hiss,
+# digital silence). tests/test_asr_long_and_noisy.py carries the table.
+# ---------------------------------------------------------------------------
+
+#: compose/whisper/server.py's NO_SPEECH_THRESHOLD, which both replicas report
+#: on /health as 0.6. An empty reply above it is the gate, not the decoder.
+_ENGINE_NO_SPEECH_THRESHOLD = 0.6
+
+#: A gated clip shorter than this is not decoded again. The engine's own
+#: validation set put its most marginal REAL utterance at three seconds.
+_RETRY_MIN_SECONDS = 3.0
+
+#: Words per second of speech-covered audio a transcript must average when
+#: the engine judged the clip SILENT and the words come only from the
+#: ungated retry. Measured with the gate off: every no-speech clip decoded
+#: at 0.27 words/s or less ("Thank you for watching!" over 15 s of brown
+#: noise, the worst); noisy speech at 2.95 or more; the slowest clean
+#: utterance at 1.35. 1.0 sits ~3.7x above the first and below the rest.
+_GATED_MIN_WORDS_PER_S = 1.0
+
+#: For text the engine decoded NORMALLY (its gate judged the clip speech),
+#: only the stock-phrase signature is doubted: at most this many words...
+_STOCK_PHRASE_MAX_WORDS = 4
+#: ...from at least this much audio. The phrases Whisper invented from noise
+#: were 1-4 words ("Thank you.", "Thank you for watching!" in this set; "you"
+#: from 30 s of silence earlier; "All right." from 20 s of room noise in the
+#: audit). THE PRICE, measured: a REAL three-word utterance in 20 s of quiet
+#: room is dropped too — Whisper stamped it 0-20 s, exactly like an invented
+#: phrase, so neither the rate nor the segments can tell them apart.
+#: NOT CAUGHT: whole invented sentences. 20 s of pink noise at -20 and -35
+#: dBFS passed the gate (no_speech_prob 0.04) and decoded as 28 and 21 words
+#: of video-outro text, 1.40 and 1.05 words/s — inside the clean-speech range
+#: (1.35-3.35). Nothing on this side separates those without a second decode
+#: of every clip; that belongs to the engine's gate.
+_STOCK_PHRASE_MIN_SECONDS = 10.0
+
+#: Scripts written without spaces between words. Counted by whitespace, a
+#: whole Chinese sentence would be one "word" and always look sparse, so each
+#: character in these ranges counts as one unit (a syllable, roughly).
+_UNSPACED = re.compile(
+    r"[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff\u0f00-\u0fff"  # Thai, Lao, Myanmar, Khmer, Tibetan
+    r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]"  # kana, CJK
+)
+_WORDISH = re.compile(r"\w", re.UNICODE)
+
+
+def _speech_units(text: str) -> int:
+    """Words, with each character of an unspaced script counted as one.
+    Punctuation alone (". ." from noise, measured) is zero."""
+    units = 0
+    for token in (text or "").split():
+        unspaced = len(_UNSPACED.findall(token))
+        if unspaced:
+            units += unspaced
+        elif _WORDISH.search(token):
+            units += 1
+    return units
+
+
+def _covered_seconds(segments: Sequence[Dict[str, Any]]) -> float:
+    """Seconds of the clip that segments carrying words span, overlaps merged."""
+    spans = sorted(
+        (float(s.get("start") or 0.0), float(s.get("end") or 0.0))
+        for s in segments or ()
+        if _speech_units(str(s.get("text") or ""))
+    )
+    total, current = 0.0, None
+    for start, end in spans:
+        if current is None or start > current[1]:
+            if current is not None:
+                total += current[1] - current[0]
+            current = [start, max(start, end)]
+        else:
+            current[1] = max(current[1], end)
+    if current is not None:
+        total += current[1] - current[0]
+    return total
+
+
+def speech_is_plausible(
+    text: str,
+    seconds: float,
+    segments: Sequence[Dict[str, Any]] = (),
+    *,
+    engine_heard_speech: bool,
+) -> bool:
+    """Whether a dictation transcript is speech rather than Whisper's invention.
+
+    `engine_heard_speech` is the engine's prior. True: its silence gate let
+    the clip through and decoded it normally, so only a few words from long
+    audio are doubted. False: the gate called the clip silent and the text
+    comes from the ungated retry, so the words must be as dense as speech —
+    measured over the audio the segments cover, or the whole clip when the
+    reply carries no segments.
+    """
+    units = _speech_units(text)
+    if units == 0:
+        return False
+    if engine_heard_speech:
+        return not (units <= _STOCK_PHRASE_MAX_WORDS and seconds >= _STOCK_PHRASE_MIN_SECONDS)
+    covered = _covered_seconds(segments) or seconds
+    return units / max(covered, 1.0) >= _GATED_MIN_WORDS_PER_S
+
+
+def _gated(result: Transcript, heard: _Heard) -> bool:
+    """The engine's silence gate emptied this clip, and it is long enough to
+    be worth one more decode."""
+    return (
+        not result.text
+        and heard.no_speech_prob is not None
+        and heard.no_speech_prob > _ENGINE_NO_SPEECH_THRESHOLD
+        and (heard.duration_s or 0.0) >= _RETRY_MIN_SECONDS
+    )
 
 
 def _detail(response: Any) -> str:
@@ -398,7 +624,9 @@ class RoutedProvider:
     A FAILING ENGINE IS SKIPPED, BRIEFLY. An endpoint that raises
     ASRUnavailable is stood down for `_COOLDOWN_S` and the request is retried
     on another. It is never removed permanently: a node that reboots must
-    rejoin by itself, without anybody editing configuration.
+    rejoin by itself, without anybody editing configuration. The exception is
+    ASRTimeout: that engine is stood down too, but the clip is NOT retried —
+    the engine still has it, and a second replica would decode it in vain.
     """
 
     #: Long enough that a restarting engine is not hammered, short enough that
@@ -482,6 +710,7 @@ class RoutedProvider:
                 raise
             except ASRUnavailable as exc:
                 last = exc
+                timed_out = isinstance(exc, ASRTimeout)
                 # THE STAND-DOWN LENGTHENS WITH CONSECUTIVE FAILURES, and the
                 # reason is a real outage: on 2026-09-10 one node's engine
                 # answered /health for twelve hours while every transcription
@@ -506,6 +735,12 @@ class RoutedProvider:
                     "(consecutive failures: %d)",
                     getattr(engine, "base_url", index), exc, cooldown, self._failures[index],
                 )
+                if timed_out:
+                    # Stood down (it is still decoding this clip, so the next
+                    # dictation should not queue behind it) but NOT re-sent:
+                    # the other replica would only decode the same doomed
+                    # clip. See ASRTimeout.
+                    raise
             finally:
                 self._active[index] -= 1
         raise ASRUnavailable(str(last) if last else "no speech engine answered")

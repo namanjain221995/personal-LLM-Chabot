@@ -264,12 +264,20 @@ class Settings:
         # sent a language at all; see app/asr.transcribe.
         self.asr_language: str = os.environ.get("ASR_LANGUAGE", "auto")
         # A stuck-engine guard, not a budget — but it has to clear the worst
-        # legitimate case. Measured on this hardware: 11 s of audio in 1.24 s,
-        # about 9x realtime. Ten minutes of audio is therefore ~70 s of
-        # decoding, and Whisper's sequential long-form pass is slower per
-        # second than a short clip, so 60 s was too tight for a long
-        # dictation and would have failed it as an engine fault.
-        self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 240.0)
+        # legitimate case, and that is a LONG clip on a BUSY engine. The old
+        # basis (11 s of audio in 1.24 s, ~9x realtime) came from a short
+        # clip. Long-form decoding measured 2026-09-18: 0.45 s per second of
+        # audio on a quiet engine (300 s in 132.8 s, 595 s in 268.3 s), and
+        # 0.73 s per second with other clips queued on the same replica (300 s
+        # in 219.7 s — the engine serialises, and the wait counts). So the
+        # 240 s this used to be failed every dictation over ~530 s even when
+        # quiet, inside the 600 s the composer records, and 360 s would
+        # still fail a 600 s clip under load (~440 s). One second per second
+        # of the longest allowed clip clears the loaded rate by ~37%. Waiting
+        # longer costs nothing it used to: a timeout is never retried on the
+        # other replica (asr.ASRTimeout), and /audio/transcribe heartbeats
+        # while it waits, so no proxy's first-byte limit is met.
+        self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 600.0)
         # Composer dictation, not podcast transcription. Ten minutes is the
         # ceiling; the browser stops recording at it rather than uploading
         # something that will be refused.

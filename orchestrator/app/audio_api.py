@@ -25,14 +25,26 @@ and it is deliberately not enough to reconstruct anything anyone said.
 AUTHORIZATION. A signed-in user, like every other upload route. This is not a
 public transcription service: an open ASR endpoint on a GPU is a free
 denial-of-service against the chat model sharing it.
+
+A LONG CLIP IS ANSWERED WHILE IT DECODES. Whisper's long-form pass took
+268.3 s for 595 s of audio on a quiet replica and 219.7 s for 300 s on a busy
+one (2026-09-18), and Cloudflare gives up on a first byte at 125 s — so a
+route that said nothing until the transcript existed capped public dictation
+at a few minutes of audio while the composer records ten. Work that is not finished after HEARTBEAT_S is answered
+with a streamed 200: one whitespace byte now and every HEARTBEAT_S after
+(leading whitespace is insignificant in JSON), then the JSON itself. Anything
+known before that point keeps its own status line.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import time
-from typing import Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 from . import asr, db, metrics
 from .auth import UserRow, require_user
@@ -63,6 +75,22 @@ ALLOWED_TYPES = {
 #: Below this there is nothing to transcribe — a tap on the button, not
 #: speech. Refused with a message the UI can show, rather than sent to a GPU.
 _MIN_BYTES = 1024
+
+#: Seconds of work before the answer becomes a streamed 200, and between
+#: heartbeat bytes after that. The same cadence /v1's streams keep; far under
+#: Cloudflare's 125 s first-byte limit, and long enough that a short
+#: dictation — the common case, 2-4 s — is still one plain JSON response.
+HEARTBEAT_S = 15.0
+
+_BEAT = b" "
+
+#: `no-transform` is what keeps a compressing hop (Next's own compression,
+#: the Cloudflare edge) from holding the bytes back to find something worth
+#: compressing — a heartbeat that is buffered is not a heartbeat.
+_STREAM_HEADERS = {
+    "cache-control": "no-store, no-transform",
+    "x-accel-buffering": "no",
+}
 
 # --------------------------------------------------------------------------
 # Per-user rate limit.
@@ -164,8 +192,9 @@ async def transcribe(
     language: str = Query("auto"),
     user: UserRow = Depends(require_user),
     _voice: None = Depends(require_voice),
-) -> dict:
-    """Transcribe one recording and return it as editable text."""
+) -> Any:
+    """Transcribe one recording and return it as editable text: a JSON object,
+    or — past HEARTBEAT_S of work — a streamed 200 that ends in one."""
     if not settings.asr_enabled:
         # 404, not 503: a deployment without a speech engine does not have
         # this feature, and the composer hides the button for the same reason.
@@ -208,12 +237,76 @@ async def transcribe(
         )
 
     wanted = (language or "auto").strip() or "auto"
+    task = asyncio.ensure_future(
+        _transcribe_or_refuse(
+            audio,
+            content_type=content_type,
+            language=wanted if wanted != "auto" else settings.asr_language,
+            user_id=user_id,
+            duration_ms=duration_ms,
+            started=started,
+            upload_ms=upload_ms,
+        )
+    )
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    if done:
+        # Finished (or refused) before the heartbeat was due: an ordinary
+        # response with its real status line.
+        return task.result()
+    return StreamingResponse(
+        _heartbeat_then(task), media_type="application/json", headers=_STREAM_HEADERS
+    )
+
+
+async def _heartbeat_then(task: "asyncio.Future[dict]") -> AsyncIterator[bytes]:
+    """Whitespace until the work is done, then its JSON.
+
+    The status line has already gone out as 200, so a failure from here on is
+    carried IN the body as {"detail", "status"} — the same sentence and the
+    same status the early path would have sent, which the browser maps the
+    same way. A client that leaves cancels the work.
+    """
+    try:
+        while True:
+            yield _BEAT
+            done, _pending = await asyncio.wait({task}, timeout=HEARTBEAT_S)
+            if done:
+                break
+        try:
+            payload: dict = task.result()
+        except HTTPException as exc:
+            payload = {"detail": exc.detail, "status": exc.status_code}
+        # The same encoding Starlette's JSONResponse uses for the early path.
+        yield json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _transcribe_or_refuse(
+    audio: bytes,
+    *,
+    content_type: str,
+    language: str,
+    user_id: int,
+    duration_ms: int,
+    started: float,
+    upload_ms: int,
+) -> dict:
+    """The engine call and its bookkeeping: the transcript's JSON, or an
+    HTTPException carrying the status and sentence the person should see."""
     try:
         result = await asr.transcribe(
             audio,
             filename=_FILENAMES.get(content_type, "recording.webm"),
             content_type=content_type or "audio/webm",
-            language=wanted if wanted != "auto" else settings.asr_language,
+            language=language,
         )
     except asr.ASRBusy:
         await _record(user_id, duration_ms, None, _since(started), "busy")
@@ -226,6 +319,17 @@ async def transcribe(
         log.info("ASR refused a clip: %s", exc)
         raise HTTPException(
             status_code=422, detail="That recording could not be transcribed."
+        ) from None
+    except asr.ASRTimeout as exc:
+        # BEFORE ASRUnavailable, which it subclasses. Not "try again": the
+        # engine did not fail, the clip outran ASR_TIMEOUT_S, and the same
+        # clip would outrun it again. V19's status vocabulary has no
+        # 'timeout', and the engine did not deliver, so the row says so.
+        await _record(user_id, duration_ms, None, _since(started), "unavailable")
+        log.warning("ASR engine did not answer in time: %s", exc)
+        raise HTTPException(
+            status_code=504,
+            detail="That recording took too long to transcribe. Try a shorter one.",
         ) from None
     except asr.ASRUnavailable as exc:
         await _record(user_id, duration_ms, None, _since(started), "unavailable")

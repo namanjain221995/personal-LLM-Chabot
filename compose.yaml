@@ -243,7 +243,9 @@ services:
       ASR_MODEL: ${ASR_MODEL:-openai/whisper-large-v3}
       ASR_BACKEND: ${ASR_BACKEND:-whisper}
       ASR_LANGUAGE: ${ASR_LANGUAGE:-auto}
-      ASR_TIMEOUT_S: ${ASR_TIMEOUT_S:-240}
+      # A 600 s clip decodes in ~270 s quiet and ~440 s on a busy replica
+      # (measured 2026-09-18); 240 could not finish it. See app/config.py.
+      ASR_TIMEOUT_S: ${ASR_TIMEOUT_S:-600}
       ASR_MAX_AUDIO_SECONDS: ${ASR_MAX_AUDIO_SECONDS:-600}
       ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
       ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-2}
