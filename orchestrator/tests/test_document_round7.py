@@ -5,13 +5,18 @@ Offline: the model stream, the search provider and the clock are stubs. The
 live bars (B1-B4) are measured in tests/test_live_document_reasoning.py and
 recorded in the commits that change the prompt.
 """
+import asyncio
+import base64
 import re
 import time
 
 import pytest
 
-from app.engines import source_use
+from app import llm
+from app.engines import document, source_use
+from app.search.base import SearchResult, SearchUnavailableError
 from tests.document_answer_grader import opens_with_refusal
+from tests.test_document_reasoning import BROCHURE, OWNER_QUESTION
 from tests import document_judgement_corpus as corpus
 
 
@@ -209,3 +214,200 @@ def test_the_grader_sees_a_verdict_about_the_document_as_a_refusal(answer):
 def test_the_grader_leaves_a_verdict_about_the_product_alone(answer):
     """The subject decides: a verdict about the PRODUCT is an answer."""
     assert not opens_with_refusal(answer), answer
+
+
+# ---------------------------------------------------------------------------
+# L1: one lookup for a named product the document does not describe
+# ---------------------------------------------------------------------------
+
+_SPARK_HISTORY = [
+    {"role": "user", "content": "I have 2 DGX Sparks and plan to grow to 20."},
+    {"role": "assistant", "content": "Noted — a 20-node DGX Spark cluster."},
+]
+
+
+@pytest.mark.parametrize(
+    "question,history,expected",
+    [
+        (OWNER_QUESTION, _SPARK_HISTORY, "DGX Spark"),
+        ("will this rack take my RTX 4090 workstation?", [], "RTX 4090"),
+        ("does this contract satisfy ISO 27001?", [], "ISO 27001"),
+        ("can I cool 4 H100 servers with it?", [], "H100"),
+        ("Two DGX Sparks - is this overkill?", [], "DGX Spark"),
+        # the document describes it: nothing to look up
+        ("is the Vertiv SmartRow good for us?", [], None),
+        # no product: capitals that name a kind of thing, a unit or a team
+        ("IS THIS OK FOR MY SERVER ROOM", [], None),
+        ("We have an AI Team of 5 and 42U racks with 10kW each, is it enough?", [], None),
+        ("is this worth it for us?", [], None),
+    ],
+)
+def test_the_product_to_look_up_is_found_by_rule(question, history, expected):
+    assert document.named_product_to_look_up(question, history, BROCHURE) == expected
+
+
+def test_only_the_persons_own_turns_are_read_for_a_name():
+    """The name leaves the box as a search query, so pinned system blocks and
+    the assistant's own words are never read for one."""
+    history = [
+        {"role": "system", "content": "Saved facts: the user owns an RTX 4090."},
+        {"role": "assistant", "content": "You could also look at a Jetson AGX Orin."},
+        {"role": "user", "content": "thanks"},
+    ]
+    assert document.named_product_to_look_up("is this worth it?", history, BROCHURE) is None
+
+
+def test_the_query_is_focused_on_what_the_document_is_about():
+    assert document.lookup_query("DGX Spark", BROCHURE) == \
+        "DGX Spark power consumption specifications"
+    assert document.lookup_query("ISO 27001", "a services agreement") == "ISO 27001 requirements"
+    assert document.lookup_query("RTX 4090", "a desk catalogue") == "RTX 4090 specifications"
+
+
+class _Rec:
+    def __init__(self):
+        self.events = []
+
+    async def emit(self, kind, data):
+        self.events.append((kind, data))
+
+
+_RESULTS = [
+    SearchResult("World Leader in AI Computing | NVIDIA", "https://www.nvidia.com/en-in/",
+                 "NVIDIA pioneered accelerated computing."),
+    SearchResult("NVIDIA DGX Spark Review - ServeTheHome",
+                 "https://www.servethehome.com/nvidia-dgx-spark-review/4/",
+                 "NVIDIA DGX Spark Power Consumption. The power adapter that comes with "
+                 "the unit is a 240W USB-PD adapter. At idle it drew 40-45W."),
+    SearchResult("Personal AI Supercomputer | NVIDIA DGX Spark",
+                 "https://www.nvidia.com/en-us/products/workstations/dgx-spark/",
+                 "128GB of unified system memory. On your desktop."),
+    SearchResult("Download drivers | NVIDIA", "https://www.nvidia.com/drivers/", ""),
+]
+
+
+@pytest.fixture()
+def engine(monkeypatch):
+    """The document engine with the model and the search engine stubbed."""
+    from app.engines import search
+
+    seen = {"queries": [], "messages": None, "provider": 0}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield "token", "Yes for 20 [1]."
+
+    async def fake_collect(queries, effort="medium", emit=None, **kw):
+        seen["queries"].append(list(queries))
+        return list(_RESULTS)
+
+    def no_provider():
+        seen["provider"] += 1
+        raise AssertionError("web search is off: nothing may reach the provider")
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+    monkeypatch.setattr(search, "_collect_results", fake_collect)
+    monkeypatch.setattr(search, "get_provider", no_provider)
+
+    def run(question=OWNER_QUESTION, history=_SPARK_HISTORY, web_search=True, body=BROCHURE):
+        rec = _Rec()
+        b64 = base64.b64encode(body.encode()).decode()
+        asyncio.run(document.run_pdf_engine_multi(
+            question, [("brochure.pdf", b64)], list(history), rec.emit,
+            effort="fast", web_search=web_search))
+        user = seen["messages"][-1]["content"]
+        text = "\n".join(p["text"] for p in user if p.get("type") == "text")
+        return text, rec.events
+
+    seen["run"] = run
+    return seen
+
+
+def test_web_on_runs_one_focused_lookup_and_cites_it(engine):
+    text, events = engine["run"]()
+    assert engine["queries"] == [["DGX Spark power consumption specifications"]]
+    assert "Web lookup for DGX Spark (NOT from the document)" in text
+    assert re.search(r"searched on \d{4}-\d{2}-\d{2}", text)
+    # only the results about THIS product, the one with figures first
+    assert "[1] NVIDIA DGX Spark Review - ServeTheHome (servethehome.com" in text
+    assert "240W USB-PD adapter" in text
+    assert "[2] Personal AI Supercomputer | NVIDIA DGX Spark" in text
+    assert "World Leader in AI Computing" not in text and "Download drivers" not in text
+    meta = [d for k, d in events if k == "meta"][-1]
+    assert [s["n"] for s in meta["sources"]] == [1, 2]
+    assert meta["sources"][0]["cited"] is True and meta["sources"][1]["cited"] is False
+    assert any(k == "status" and "Looking up DGX Spark" in d["text"] for k, d in events)
+
+
+def test_web_off_makes_no_outbound_call_at_all(engine):
+    """Enforced: with web search off for the turn, the search engine is never
+    called and nothing reaches the provider."""
+    text, events = engine["run"](web_search=False)
+    assert engine["queries"] == [] and engine["provider"] == 0
+    assert "Web lookup" not in text
+    assert "sources" not in [d for k, d in events if k == "meta"][-1]
+
+
+def test_the_default_is_web_off(engine, monkeypatch):
+    """A caller that says nothing about the web gets no web."""
+    rec = _Rec()
+    b64 = base64.b64encode(BROCHURE.encode()).decode()
+    asyncio.run(document.run_pdf_engine_multi(
+        OWNER_QUESTION, [("b.pdf", b64)], list(_SPARK_HISTORY), rec.emit, effort="fast"))
+    assert engine["queries"] == []
+
+
+@pytest.mark.parametrize(
+    "question,history",
+    [
+        # a pure field ask: nothing is being advised
+        ("what is the cooling capacity of the compact configuration?", _SPARK_HISTORY),
+        ("what UPS capacity is included?", _SPARK_HISTORY),
+        # advice, but the only product named is the one the document describes
+        ("is the Vertiv SmartRow worth it for us?", []),
+        # advice with no product named anywhere
+        ("is this worth it for a small office?", []),
+    ],
+)
+def test_no_lookup_when_nothing_calls_for_one(engine, question, history):
+    engine["run"](question=question, history=history)
+    assert engine["queries"] == []
+
+
+def test_a_search_outage_leaves_the_answer_on_the_admission_rule(engine, monkeypatch):
+    from app.engines import search
+
+    async def down(*a, **k):
+        raise SearchUnavailableError("SearXNG error")
+
+    monkeypatch.setattr(search, "_collect_results", down)
+    text, _ = engine["run"]()
+    assert "Web lookup" not in text
+    assert "never invent a figure" in engine["messages"][0]["content"]
+
+
+def test_a_lookup_that_finds_nothing_about_the_product_adds_nothing(engine, monkeypatch):
+    from app.engines import search
+
+    async def unrelated(*a, **k):
+        return [SearchResult("Drivers | NVIDIA", "https://www.nvidia.com/drivers/", "Drivers.")]
+
+    monkeypatch.setattr(search, "_collect_results", unrelated)
+    text, events = engine["run"]()
+    assert "Web lookup" not in text
+    assert "sources" not in [d for k, d in events if k == "meta"][-1]
+
+
+def test_a_slow_search_cannot_hold_the_answer(engine, monkeypatch):
+    from app.engines import search
+
+    async def slow(*a, **k):
+        await asyncio.sleep(5)
+        return list(_RESULTS)
+
+    monkeypatch.setattr(search, "_collect_results", slow)
+    monkeypatch.setattr(document, "LOOKUP_TIMEOUT_S", 0.05)
+    started = time.monotonic()
+    text, _ = engine["run"]()
+    assert time.monotonic() - started < 2.0
+    assert "Web lookup" not in text
