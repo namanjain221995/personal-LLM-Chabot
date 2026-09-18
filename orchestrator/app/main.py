@@ -5591,10 +5591,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # this viewer's published artifacts). The classifier runs at
                 # every effort, only for the band the rules cannot read.
                 from .artifacts import intent_llm as _as3_intent_llm
+                from .artifacts import material_in as _as3_material_in
 
                 _as3_upload_names = [str((r or {}).get("name") or "") for r in (request.pdf_uploads or []) if (r or {}).get("name")]
                 if request.pdf_data and request.pdf_filename:
                     _as3_upload_names.append(str(request.pdf_filename))
+                # B8b: an attached image is one of this turn's uploads too;
+                # the request carries its bytes only, so it is named here.
+                _as3_upload_names.extend(_as3_material_in.image_names(request.images_data))
                 _as3_upload_formats = list(dict.fromkeys(
                     {"xls": "xlsx", "doc": "docx"}.get(n.rsplit(".", 1)[-1].lower(), n.rsplit(".", 1)[-1].lower())
                     for n in _as3_upload_names if "." in n
@@ -5660,11 +5664,51 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # not) be written from this message — see fact_gate above.
             _release_facts(not (artifact_intent is not None and artifact_intent.wants_file))
 
+            # B8b (2026-09-18): an image attached to a file request is the
+            # file's material. The artifact branch sits above the image route,
+            # so the image is read HERE, by the main model, and its text goes
+            # to `gather` like a document's. The rules read "make this table
+            # into an excel file" as an export of the previous answer whenever
+            # one exists; with a photo attached "this" is the photo, so
+            # `image_turn` makes it a create from the upload.
+            _as3_image_read = None
+            _as3_image_refusal = ""
+            if (
+                request.images_data
+                and artifact_intent is not None
+                and artifact_intent.wants_file
+                and not (sf_outcome is not None and sf_outcome.handled)
+            ):
+                from .artifacts import material_in as _as3_img_material
+
+                _as3_img_names = _as3_img_material.image_names(request.images_data)
+                artifact_intent, _as3_img_is_material = _as3_img_material.image_turn(
+                    artifact_intent, text, [n.rsplit(".", 1)[-1] for n in _as3_img_names]
+                )
+                if _as3_img_is_material:
+                    await emit("status", {"text": "Reading the attached image…"})
+                    _as3_image_read = await _as3_img_material.read_images_text(request.images_data, _as3_img_names)
+                    _as3_image_refusal = _as3_img_material.image_refusal(
+                        artifact_intent, _as3_image_read, has_documents=bool(request.pdf_uploads or request.pdf_data)
+                    )
+
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
+            elif _as3_image_refusal:
+                # Nothing in the attached image could be read and it was the
+                # whole material. A file built from the previous answer
+                # instead is the defect this branch exists to stop, so no job
+                # is opened and one sentence, written by code, says why. Like
+                # any file request it is not a fact.
+                if fact_task is not None and not fact_task.done():
+                    fact_task.cancel()
+                memory_state.pop("facts", None)
+                answer = _as3_image_refusal
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "artifact", "effort": request.effort})
             elif artifact_intent is not None and artifact_intent.wants_file:
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
                 # "create a PDF of this", "make a deck for the board", "make
@@ -5708,7 +5752,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     history=history, pdf_uploads=_as3_docs,
                     pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
                     intent=artifact_intent, text=text,
+                    image_texts=_as3_image_read.texts if _as3_image_read is not None else (),
                 )
+                if _as3_image_read is not None:
+                    _as3_gathered.notes.extend(n for n in _as3_image_read.notes if n not in _as3_gathered.notes)
                 _as3_engine_kw: dict = {}
                 _as3_history = list(history)
                 import inspect as _as3_inspect
