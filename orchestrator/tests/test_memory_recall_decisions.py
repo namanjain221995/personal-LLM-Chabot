@@ -525,6 +525,14 @@ _CLOSE = "\n\n" + "Next steps: plan the migration, set up monitoring and train t
         ),
         # a numbered bold imperative
         ("1. **Use SQS FIFO.** It is the simplest option to run.", "**Use SQS FIFO."),
+        # a labelled heading whose next line states the choice in prose
+        (
+            "### Our Recommendation\nPostgres is the right fit for the ledger, given your team. "
+            "It also keeps the reporting stack unchanged.",
+            "Our Recommendation Postgres is the right fit for the ledger, given your team.",
+        ),
+        # a dotted name inside the statement is not where it ends
+        ("**Use Next.js for the console.** It reuses the design system.", "**Use Next.js for the console."),
     ],
 )
 def test_a_long_markdown_answer_keeps_the_statement_of_its_choice(conclusion, decision):
