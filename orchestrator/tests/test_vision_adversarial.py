@@ -662,25 +662,17 @@ def test_clear_numbers_pass_through_untouched(monkeypatch):
 # Probe 7. A superlative is computed by code, not guessed (CONFIRMED)
 # ---------------------------------------------------------------------------
 
-STOCK_JSON = json.dumps(
-    {
-        "tables": [
-            {
-                "columns": ["SKU", "Item", "System qty", "Counted qty", "Delta"],
-                "rows": [
-                    ["AB-1021", "Hex bolt M8", "240", "244", "+4"],
-                    ["BK-3310", "Bracket, steel", "118", "110", "-8"],
-                    ["CL-0907", "Cable clip 10 mm", "500", "500", "0"],
-                    ["CR-2255", "Crate, plastic", "60", "95", "+35"],
-                    ["DR-4480", "Drill bit 6 mm", "75", "71", "-4"],
-                    ["EG-1188", "Edge guard", "32", "32", "0"],
-                    ["EK-7002", "Earth kit", "14", "16", "+2"],
-                    ["EL-5533", "Elbow joint 90", "88", "67", "-21"],
-                ],
-            }
-        ]
-    }
-)
+#: The transcription the live pass returned for the stock-count photo.
+STOCK_TABLE = """| SKU | Item | System qty | Counted qty | Delta |
+|---|---|---|---|---|
+| AB-1021 | Hex bolt M8 | 240 | 244 | +4 |
+| BK-3310 | Bracket, steel | 118 | 110 | -8 |
+| CL-0907 | Cable clip 10 mm | 500 | 500 | 0 |
+| CR-2255 | Crate, plastic | 60 | 95 | +35 |
+| DR-4480 | Drill bit 6 mm | 75 | 71 | -4 |
+| EG-1188 | Edge guard | 32 | 32 | 0 |
+| EK-7002 | Earth kit | 14 | 16 | +2 |
+| EL-5533 | Elbow joint 90 | 88 | 67 | -21 |"""
 STOCK_Q = "Which item has the worst discrepancy between the system count and the counted quantity?"
 
 
@@ -698,7 +690,9 @@ def _user_text(call) -> str:
 def test_a_superlative_question_gets_the_winner_computed_by_code(monkeypatch):
     monkeypatch.setattr(settings, "ocr_enabled", False)
     rec: dict = {}
-    script = [[("token", STOCK_JSON)], [("token", "CR-2255 (+35).")]]
+    # streamed the way the engine streams it: a few characters at a time
+    chunks = [("token", STOCK_TABLE[i:i + 7]) for i in range(0, len(STOCK_TABLE), 7)]
+    script = [chunks, [("token", "CR-2255 (+35).")]]
     monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
     answer, _, _ = _run(STOCK_Q, IMG)
     assert len(rec["calls"]) == 2, "no table was read before the answer"
@@ -706,7 +700,7 @@ def test_a_superlative_question_gets_the_winner_computed_by_code(monkeypatch):
     assert "largest absolute value 35 (CR-2255)" in text, text
     assert "smallest -21 (EL-5533)" in text, text
     # the transcription call never reaches the person
-    assert STOCK_JSON not in answer
+    assert "Hex bolt" not in answer
 
 
 def test_a_question_without_a_superlative_makes_no_extra_call(monkeypatch):
@@ -717,14 +711,81 @@ def test_a_question_without_a_superlative_makes_no_extra_call(monkeypatch):
     assert len(rec["calls"]) == 1
 
 
-def test_an_unusable_transcription_is_silence(monkeypatch):
+@pytest.mark.parametrize(
+    "transcription",
+    [
+        "I see a table but cannot transcribe it.",
+        "NONE",
+        '{"tables": [{"columns": {"labels": ["SKU"], "data": [["AB-1021"]]}}]}',
+        "| a | b |\n| 1 |",
+        "| SKU | Delta |\n|---|---|\n| X | ? |\n| Y | ? |\n| Z | ? |",
+    ],
+)
+def test_an_unusable_transcription_is_silence(monkeypatch, transcription):
+    """Including the JSON shape the live model chose for itself when it was
+    asked for JSON - `columns` as an object - which raised KeyError."""
     monkeypatch.setattr(settings, "ocr_enabled", False)
     rec: dict = {}
-    script = [[("token", "I see a table but cannot transcribe it.")], [("token", "answer")]]
+    script = [[("token", transcription)], [("token", "answer")]]
     monkeypatch.setattr(llm, "stream_chat_events", _scripted_stream(rec, script))
     answer, _, _ = _run(STOCK_Q, IMG)
     assert answer == "answer"
+    assert len(rec["calls"]) == 2
     assert "Computed by the app" not in _user_text(_answer_call(rec))
+
+
+def test_a_list_without_a_header_keeps_its_first_row():
+    """Live, the receipt came back with no header row; the first version
+    made "Flat white | 3.60" the header and left the flat white out."""
+    receipt = "| Flat white | 3.60 |\n| Croissant | 2.85 |\n| Orange juice | 4.20 |\n| Muffin | 3.15 |"
+    (line,) = vision.computed_superlatives(vision._parse_tables(receipt))
+    assert "largest 4.20 (Orange juice)" in line and "smallest 2.85 (Croissant)" in line
+
+
+def test_a_total_is_not_the_largest_item():
+    receipt = (
+        "| Item | Price |\n|---|---|\n| Flat white | 3.60 |\n| Croissant | 2.85 |\n"
+        "| Orange juice | 4.20 |\n| Subtotal | 13.80 |\n| VAT 20% | 2.76 |\n| TOTAL | 16.56 |"
+    )
+    (line,) = vision.computed_superlatives(vision._parse_tables(receipt))
+    assert "largest 4.20 (Orange juice)" in line
+    assert "summary rows left out: Subtotal, VAT 20%, TOTAL" in line
+
+
+def test_numbers_in_different_units_are_not_compared():
+    """"73.4 %" against "4,615" requests a minute: the first version called
+    4,615 the largest value on a metrics panel."""
+    panel = "| CPU | 73.4 % |\n| p95 latency | 182 ms |\n| Requests/min | 4,615 |\n| Error rate | 0.37 % |"
+    assert vision.computed_superlatives(vision._parse_tables(panel)) == []
+
+
+@pytest.mark.parametrize(
+    "cell,value",
+    [("+35", 35.0), ("-21", -21.0), ("\u221221", -21.0), ("1,284.56", 1284.56), ("73.4 %", 73.4),
+     ("EL-5533", None), ("Hex bolt M8", None), ("?", None), ("41 d 6 h", None)],
+)
+def test_a_cell_is_a_number_only_when_it_is_one(cell, value):
+    assert vision._cell_number(cell) == value
+
+
+def test_a_transcription_that_times_out_is_silence(monkeypatch):
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    monkeypatch.setenv("VISION_TABLE_DEADLINE_S", "0.05")
+    rec: dict = {}
+
+    async def fake(messages, *, model_choice="smart", effort="medium", **kwargs):
+        rec.setdefault("calls", []).append({"messages": list(messages), **kwargs})
+        if len(rec["calls"]) == 1:
+            await asyncio.sleep(5)
+            yield ("token", STOCK_TABLE)
+        else:
+            yield ("token", "answer")
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake)
+    started = time.monotonic()
+    answer, _, _ = _run(STOCK_Q, IMG)
+    assert time.monotonic() - started < 2
+    assert answer == "answer"
 
 
 # ---------------------------------------------------------------------------
