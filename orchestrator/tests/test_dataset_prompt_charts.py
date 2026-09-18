@@ -26,8 +26,12 @@ def test_the_dataset_prompt_forbids_charts_of_computed_numbers():
     for named in ("mermaid pie", "xychart", "ASCII plot"):
         assert named in system
     assert "computed or estimated from the data" in system
-    # Exact figures stay allowed exactly where they are real.
-    assert "full_rows" in system.split("CHARTS:")[1]
+    # Exact figures stay allowed exactly where they are real. CONTRACT MOVED
+    # 2026-09-18: that was "where the file's full_rows let you compute them";
+    # the model no longer computes anything (a sum over 200 visible rows was
+    # 165% too high), so the chart rule defers to the NUMBERS rule, which
+    # allows only cells and figures computed by code.
+    assert "only as the NUMBERS rule allows" in system.split("CHARTS:")[1]
     # And the person is told how to get a real chart instead.
     assert "make a bar chart of revenue by region" in system
 
@@ -37,11 +41,14 @@ def test_the_rule_reaches_the_prompt_the_engine_actually_sends():
     messages = dataset.build_messages("Compare revenue by region in a chart", uploads, [])
     system = messages[0]["content"]
     assert "CHARTS:" in system
-    # The honesty rules it qualifies are still there, and so is the file
+    # The numbers rule it qualifies is still there, and so is the file
     # capability line (tests/test_capability_guard.py owns that promise).
-    assert "HONESTY:" in system and "FULL CONTENT:" in system
+    # CONTRACT MOVED 2026-09-18: HONESTY and FULL CONTENT were replaced by the
+    # one NUMBERS rule (quote computed figures, never calculate).
+    assert "NUMBERS:" in system
+    assert "HONESTY:" not in system and "FULL CONTENT:" not in system
     assert CAPABILITY_LINE in system
-    # The rule sits after the honesty block and before the diagram rules, so
+    # The rule sits after the numbers rule and before the diagram rules, so
     # "you may draw a mermaid diagram" is never the last word on charts.
-    assert system.index("HONESTY:") < system.index("CHARTS:")
+    assert system.index("NUMBERS:") < system.index("CHARTS:")
     assert system.index("CHARTS:") < system.index("DIAGRAMS:")
