@@ -51,34 +51,49 @@ export function isUnknownSource(source: string | null | undefined): boolean {
 /** A quote longer than this stops being "short" in a one-line meta row. */
 const EXCERPT_MAX = 140;
 
+let graphemes: Intl.Segmenter | null | undefined;
+
 /**
- * Split into what a reader sees as characters. `String.slice` cuts UTF-16
- * code units, so an emoji straddling the limit became a lone surrogate that
+ * Walk what a reader sees as characters. `String.slice` cuts UTF-16 code
+ * units, so an emoji straddling the limit became a lone surrogate that
  * Chromium painted as a visible U+FFFD (QA, 2026-09-18: "aaaa…a�…"). A
- * grapheme split also keeps a family emoji or a flag whole; code points are
+ * grapheme walk also keeps a family emoji or a flag whole; code points are
  * the fallback where Intl.Segmenter is missing, and never split a surrogate
- * pair either.
+ * pair either. Lazy, so a caller that stops early never segments the rest.
  */
-function characters(text: string): string[] {
-  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
-    const seg = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-    return Array.from(seg.segment(text), (s) => s.segment);
+function characters(text: string): Iterable<string> {
+  if (graphemes === undefined) {
+    graphemes =
+      typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function'
+        ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
+        : null;
   }
-  return Array.from(text);
+  if (!graphemes) return text;
+  const segments = graphemes.segment(text);
+  return (function* () {
+    for (const s of segments) yield s.segment;
+  })();
 }
 
 /**
  * One line of text, at most `max` characters, with "…" where it was cut.
  * Whitespace is collapsed and the ends trimmed; nothing else is rewritten.
+ *
+ * Stops reading at character max+1: segmenting the whole of every 500-char
+ * excerpt on every render was part of why 10,000 rows took 8.7 s to delete
+ * one in Chromium (QA, 2026-09-18).
  */
 export function clipText(text: string, max: number): string {
   const flat = text.replace(/\s+/g, ' ').trim();
   // Cheap exit: a string no longer than `max` code units cannot be longer
   // than `max` characters.
   if (flat.length <= max) return flat;
-  const chars = characters(flat);
-  if (chars.length <= max) return flat;
-  return `${chars.slice(0, max).join('').trimEnd()}…`;
+  const kept: string[] = [];
+  for (const ch of characters(flat)) {
+    if (kept.length === max) return `${kept.join('').trimEnd()}…`;
+    kept.push(ch);
+  }
+  return flat;
 }
 
 /**
@@ -139,10 +154,23 @@ export function isSessionEnded(err: unknown): boolean {
   return err instanceof MemoryRequestError && err.status === 401;
 }
 
+/**
+ * A row the panel can show AND delete. The id must be one the delete route
+ * accepts (lib/memoryRoutes: a positive integer, no sign, fraction or
+ * exponent) and one a JS number holds exactly: 0, -1, 1.5 or a 19-digit id
+ * would render with a delete that can only fail, or that names another row
+ * once rounded. The orchestrator's ids are identity bigints from 1, so this
+ * drops nothing it sends.
+ */
 function isFact(value: unknown): value is MemoryFact {
   if (!value || typeof value !== 'object') return false;
   const v = value as Record<string, unknown>;
-  return typeof v.id === 'number' && typeof v.fact === 'string';
+  return (
+    typeof v.id === 'number' &&
+    Number.isSafeInteger(v.id) &&
+    v.id > 0 &&
+    typeof v.fact === 'string'
+  );
 }
 
 /** GET /api/memory/facts. Throws on a refusal or a network failure. */
@@ -166,16 +194,27 @@ export async function listFacts(
   }));
 }
 
+/** memory_api.delete_fact's 404 detail: the fact is not (or no longer) there. */
+export const FACT_NOT_FOUND = 'fact not found';
+
 /**
- * DELETE /api/memory/facts/{id}. A 404 means the fact is already gone (a
- * second tab, or a clear-all elsewhere), which is the outcome the person
- * asked for, so it resolves rather than throws.
+ * DELETE /api/memory/facts/{id}. The orchestrator's "fact not found" 404
+ * means the fact is already gone (a second tab, or a clear-all elsewhere),
+ * which is the outcome the person asked for, so it resolves rather than
+ * throws. Any other 404 is a refusal: the proxy's own "Unknown memory
+ * endpoint." 404 used to pass as a success, so the row vanished and "Deleted
+ * from memory" showed while the fact stayed saved (QA, 2026-09-18).
  */
 export async function deleteFact(id: number, fetchFn: FetchLike = fetch): Promise<void> {
   const res = await fetchFn(`/api/memory/facts/${encodeURIComponent(String(id))}`, {
     method: 'DELETE',
   });
-  if (!res.ok && res.status !== 404) throw new MemoryRequestError(res.status);
+  if (res.ok) return;
+  if (res.status === 404) {
+    const body = (await res.json().catch(() => null)) as { detail?: unknown } | null;
+    if (body?.detail === FACT_NOT_FOUND) return;
+  }
+  throw new MemoryRequestError(res.status);
 }
 
 /**

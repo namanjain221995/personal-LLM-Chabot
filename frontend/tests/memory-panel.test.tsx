@@ -21,6 +21,7 @@ import {
 } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ArtifactPanel } from '@/components/artifacts/ArtifactPanel';
 import { MemoryDialog, MemoryPanel } from '@/components/MemoryPanel';
 import { MessageRow } from '@/components/MessageRow';
 import { Providers } from '@/components/Providers';
@@ -30,7 +31,9 @@ import { formatDay } from '@/lib/format';
 import {
   CLEAR_ALL_PHRASE,
   clipText,
+  deleteFact,
   excerptQuote,
+  listFacts,
   sourceLabel,
   type MemoryFact,
 } from '@/lib/memory';
@@ -40,6 +43,7 @@ import type { ChatMessage } from '@/lib/types';
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 beforeEach(() => {
   // Loader renders a <video>; jsdom's media element needs a play stub.
@@ -452,10 +456,16 @@ describe('where the panel opens from', () => {
  * lib/searchPalette with an answer streaming, plus a document-level Escape
  * listener like ArtifactPanel's. What they record is what a key pressed in a
  * memory dialog did to the page behind it.
+ *
+ * `documentEscapes` is every Escape that reached the document at all (what a
+ * listener that ignores defaultPrevented, like ActivityPanel's, would act
+ * on); `unansweredDocumentEscapes` is the subset nothing had marked answered
+ * (what ArtifactPanel's listener acts on).
  */
 function pageBehind() {
   const actions: string[] = [];
   const documentEscapes: string[] = [];
+  const unansweredDocumentEscapes: string[] = [];
   function onWindowKey(e: KeyboardEvent) {
     const target = e.target as HTMLElement | null;
     const action = shortcutAction(e, {
@@ -470,13 +480,16 @@ function pageBehind() {
     if (action) actions.push(action);
   }
   function onDocumentKey(e: KeyboardEvent) {
-    if (e.key === 'Escape') documentEscapes.push('artifact-panel-closed');
+    if (e.key !== 'Escape') return;
+    documentEscapes.push('artifact-panel-closed');
+    if (!e.defaultPrevented) unansweredDocumentEscapes.push('artifact-panel-closed');
   }
   window.addEventListener('keydown', onWindowKey);
   document.addEventListener('keydown', onDocumentKey);
   return {
     actions,
     documentEscapes,
+    unansweredDocumentEscapes,
     remove() {
       window.removeEventListener('keydown', onWindowKey);
       document.removeEventListener('keydown', onDocumentKey);
@@ -702,6 +715,11 @@ describe('keys pressed while a memory dialog is open never reach the page behind
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeTruthy();
     expect(behind.actions).toEqual([]);
+    // QA round 2: this Escape also closed the artifact panel behind Settings.
+    // ConfirmDialog (not this change's) closes itself from a DOCUMENT
+    // listener, so the key has to reach the document; what Settings owes the
+    // page is that it arrives already answered.
+    expect(behind.unansweredDocumentEscapes).toEqual([]);
   });
 });
 
@@ -814,5 +832,290 @@ describe('failures are never shown as success (QA round 1)', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toMatch(/session has ended/);
     expect(alert.textContent).not.toMatch(/connection/);
+  });
+});
+
+/* ------------------------------------------- QA round 2 reproductions */
+
+/** Two sessions, so Settings > Sessions shows a "Sign out" that opens a ConfirmDialog. */
+function sessionsServer() {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input) === '/api/auth/sessions') {
+      return json({
+        sessions: [
+          { id: 's1', current: true, created_at: '2026-09-18T09:00:00Z', last_seen_at: '2026-09-18T09:00:00Z', user_agent: null },
+          { id: 's2', current: false, created_at: '2026-09-17T09:00:00Z', last_seen_at: '2026-09-17T09:00:00Z', user_agent: null },
+        ],
+      });
+    }
+    return json({ detail: 'unexpected' }, 599);
+  });
+}
+
+async function openSessionsConfirm(onClose: () => void) {
+  render(
+    <Providers>
+      <SettingsDialog
+        open
+        initialSection="sessions"
+        account={null}
+        onClose={onClose}
+        fetchFn={sessionsServer() as unknown as FetchLike}
+      />
+    </Providers>,
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'Sign out' }));
+  return screen.findByRole('alertdialog');
+}
+
+describe('a nested confirm keeps its keys (QA round 2)', () => {
+  let behind: ReturnType<typeof pageBehind>;
+  beforeEach(() => {
+    behind = pageBehind();
+  });
+  afterEach(() => behind.remove());
+
+  it('row confirm, focus on <body>: Escape closes only the confirm, reaches nothing behind, and focus returns to the row', async () => {
+    const { fn, calls } = fakeServer();
+    render(
+      <Providers>
+        <MemoryDialog open onClose={() => undefined} fetchFn={fn as unknown as FetchLike} />
+      </Providers>,
+    );
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    const trash = screen.getByRole('button', { name: /^Delete “Prefers/ });
+    fireEvent.click(trash);
+    await screen.findByRole('alertdialog', { name: 'Delete this from memory?' });
+
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Memory' })).toBeTruthy();
+    // Not merely marked: the key never reached the document at all.
+    expect(behind.documentEscapes).toEqual([]);
+    expect(behind.actions).toEqual([]);
+    expect(document.activeElement).toBe(trash);
+    expect(calls.filter((c) => c.method === 'DELETE')).toHaveLength(0);
+  });
+
+  it('row confirm, focus on <body>: Tab comes back to the confirm, "/" does nothing behind it', async () => {
+    const { fn } = fakeServer();
+    render(
+      <Providers>
+        <MemoryDialog open onClose={() => undefined} fetchFn={fn as unknown as FetchLike} />
+      </Providers>,
+    );
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    fireEvent.click(screen.getByRole('button', { name: /^Delete “Prefers/ }));
+    const confirm = await screen.findByRole('alertdialog', { name: 'Delete this from memory?' });
+
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: '/' });
+    fireEvent.keyDown(document.body, { key: 'Tab' });
+
+    expect(document.activeElement).toBe(within(confirm).getByRole('button', { name: 'Cancel' }));
+    expect(behind.actions).toEqual([]);
+  });
+
+  it('Tab and Shift+Tab wrap inside the row confirm instead of leaving for the page', async () => {
+    const { fn } = fakeServer();
+    render(
+      <Providers>
+        <MemoryDialog open onClose={() => undefined} fetchFn={fn as unknown as FetchLike} />
+      </Providers>,
+    );
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    fireEvent.click(screen.getByRole('button', { name: /^Delete “Prefers/ }));
+    const confirm = await screen.findByRole('alertdialog', { name: 'Delete this from memory?' });
+    const cancel = within(confirm).getByRole('button', { name: 'Cancel' });
+    const del = within(confirm).getByRole('button', { name: 'Delete' });
+
+    act(() => del.focus());
+    fireEvent.keyDown(del, { key: 'Tab' });
+    expect(document.activeElement).toBe(cancel);
+    fireEvent.keyDown(cancel, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(del);
+    expect(screen.getByRole('alertdialog')).toBe(confirm);
+  });
+
+  it('Settings > Sessions confirm, focus on <body>: Escape closes only the confirm and arrives answered', async () => {
+    const onClose = vi.fn();
+    await openSessionsConfirm(onClose);
+
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(behind.actions).toEqual([]);
+    expect(behind.unansweredDocumentEscapes).toEqual([]);
+  });
+
+  it('Tab wraps inside the Settings > Sessions confirm too', async () => {
+    const confirm = await openSessionsConfirm(vi.fn());
+    const cancel = within(confirm).getByRole('button', { name: 'Cancel' });
+    const buttons = within(confirm).getAllByRole('button');
+    const last = buttons[buttons.length - 1];
+    act(() => last.focus());
+    fireEvent.keyDown(last, { key: 'Tab' });
+    expect(document.activeElement).toBe(cancel);
+  });
+});
+
+describe('the real ArtifactPanel behind a nested confirm (QA round 2)', () => {
+  beforeEach(() => {
+    // A desktop viewport: the panel sits beside the chat, not as a sheet.
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: /\(max-width:\s*(\d+)px\)/.test(query)
+        ? 1440 <= Number(/(\d+)px/.exec(query)![1])
+        : false,
+      media: query,
+      onchange: null,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      dispatchEvent: () => false,
+    }));
+    vi.stubGlobal('fetch', vi.fn(async () => json({ detail: 'x' }, 404)));
+  });
+
+  const artifact = (onClose: () => void) => (
+    <ArtifactPanel
+      artifactId="a3f9c2d1e4b5f6a7b8c9d0e1f2a3b4c5"
+      version={1}
+      originId={null}
+      onClose={onClose}
+    />
+  );
+
+  it('Settings > Memory row confirm, focus on <body>: Escape leaves the artifact panel open', async () => {
+    const onArtifactClose = vi.fn();
+    const onSettingsClose = vi.fn();
+    const { fn } = fakeServer();
+    render(
+      <Providers>
+        {artifact(onArtifactClose)}
+        <SettingsDialog open initialSection="memory" account={null} onClose={onSettingsClose} fetchFn={fn as unknown as FetchLike} />
+      </Providers>,
+    );
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    fireEvent.click(screen.getByRole('button', { name: /^Delete “Works/ }));
+    await screen.findByRole('alertdialog', { name: 'Delete this from memory?' });
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(onSettingsClose).not.toHaveBeenCalled();
+    expect(onArtifactClose).not.toHaveBeenCalled();
+  });
+
+  it('Settings > Sessions confirm, focus on <body>: Escape leaves the artifact panel open', async () => {
+    const onArtifactClose = vi.fn();
+    const onSettingsClose = vi.fn();
+    render(
+      <Providers>
+        {artifact(onArtifactClose)}
+        <SettingsDialog open initialSection="sessions" account={null} onClose={onSettingsClose} fetchFn={sessionsServer() as unknown as FetchLike} />
+      </Providers>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign out' }));
+    await screen.findByRole('alertdialog');
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(onSettingsClose).not.toHaveBeenCalled();
+    expect(onArtifactClose).not.toHaveBeenCalled();
+  });
+
+  it('with no dialog open, Escape still closes the artifact panel (what must not change)', () => {
+    const onArtifactClose = vi.fn();
+    render(<Providers>{artifact(onArtifactClose)}</Providers>);
+    focusFallsToBody();
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(onArtifactClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a delete that did not happen is never shown as one (QA round 2)', () => {
+  it("the proxy's own 404 keeps the row and says it was not deleted", async () => {
+    const { fn } = fakeServer((url, init) =>
+      init.method === 'DELETE'
+        ? json({ message: 'Unknown memory endpoint.' }, 404)
+        : (undefined as unknown as Response),
+    );
+    renderPanel(fn);
+    await waitFor(() => expect(rows()).toHaveLength(3));
+    fireEvent.click(screen.getByRole('button', { name: /^Delete “Works/ }));
+    const confirm = await screen.findByRole('alertdialog');
+    await act(async () => {
+      fireEvent.click(within(confirm).getByRole('button', { name: 'Delete' }));
+    });
+    expect((await screen.findByRole('alert')).textContent).toMatch(/was not deleted/);
+    expect(rows()).toHaveLength(3);
+    expect(screen.queryByText('Deleted from memory')).toBeNull();
+  });
+
+  it("the orchestrator's \"fact not found\" 404 is the outcome asked for, so the row goes", async () => {
+    const fn = vi.fn(async () => json({ detail: 'fact not found' }, 404));
+    await expect(deleteFact(11, fn as unknown as FetchLike)).resolves.toBeUndefined();
+    const other = vi.fn(async () => json({ detail: 'Not Found' }, 404));
+    await expect(deleteFact(11, other as unknown as FetchLike)).rejects.toThrow(/404/);
+    const bodyless = vi.fn(async () => new Response('', { status: 404 }));
+    await expect(deleteFact(11, bodyless as unknown as FetchLike)).rejects.toThrow(/404/);
+  });
+
+  it('a row whose id the delete route cannot address is not listed', async () => {
+    const odd = [0, -1, 1.5, 2 ** 53, 1e21].map((id) => ({ ...FACTS[0], id, fact: `id ${id}` }));
+    const fn = vi.fn(async () => json({ facts: [...odd, { ...FACTS[1], id: 1 }] }));
+    const listed = await listFacts(fn as unknown as FetchLike);
+    expect(listed.map((f) => f.id)).toEqual([1]);
+  });
+});
+
+describe('long lists stay cheap (QA round 2)', () => {
+  /** Count the grapheme segments clipText pulls, through the real segmenter. */
+  function countSegments() {
+    const real = Intl.Segmenter.prototype.segment;
+    const counts = { calls: 0, pulled: 0 };
+    vi.spyOn(Intl.Segmenter.prototype, 'segment').mockImplementation(function (
+      this: Intl.Segmenter,
+      input: string,
+    ) {
+      counts.calls += 1;
+      const segments = real.call(this, input);
+      return {
+        *[Symbol.iterator]() {
+          for (const s of segments) {
+            counts.pulled += 1;
+            yield s;
+          }
+        },
+      } as unknown as Intl.Segments;
+    });
+    return counts;
+  }
+
+  it('clipText stops reading at the cut instead of segmenting the whole text', () => {
+    const counts = countSegments();
+    expect(clipText('a'.repeat(100_000), 10)).toBe(`${'a'.repeat(10)}…`);
+    expect(counts.pulled).toBeLessThanOrEqual(11);
+  });
+
+  it('opening a row confirm re-cuts no row', async () => {
+    const long = Array.from({ length: 40 }, (_, i) => ({
+      ...FACTS[0],
+      id: i + 1,
+      fact: `Fact ${i + 1} ${'x'.repeat(120)}`,
+      source_excerpt: 'y'.repeat(300),
+    }));
+    const fn = vi.fn(async () => json({ facts: long }));
+    renderPanel(fn);
+    await waitFor(() => expect(rows()).toHaveLength(40));
+    const counts = countSegments();
+    fireEvent.click(screen.getByRole('button', { name: /^Delete “Fact 7 x/ }));
+    await screen.findByRole('alertdialog');
+    // One cut, for the confirm's own sentence; every row keeps its text.
+    expect(counts.calls).toBeLessThanOrEqual(1);
   });
 });

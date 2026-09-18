@@ -23,10 +23,13 @@
  *
  * Keys behind a modal: see useModalKeyGuard. ChatApp's window-level
  * shortcuts (Escape stops the answer that is streaming, "/" focuses the
- * composer) must never act behind an open dialog.
+ * composer) and the side panels' document listeners (ArtifactPanel closes on
+ * Escape) must never act behind an open dialog — including one stacked on
+ * top of another.
  */
 
 import {
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -118,9 +121,20 @@ function topModal(): Element | null {
  * window listener (ArtifactPanel and ActivityPanel close on a document
  * Escape too), and it ignores any key whose target is inside a dialog: those
  * are the dialog's own handlers' to decide. For the rest, only the topmost
- * dialog acts. If that is a ConfirmDialog, which owns Escape through its own
- * document listener, Escape is let through to it; every other key is stopped
- * so no global shortcut fires behind the stack.
+ * dialog acts.
+ *
+ * When the dialog on top is not this one's, it is a dialog this code does
+ * not own (Settings > Sessions' ConfirmDialog, which closes on Escape through
+ * its own DOCUMENT listener), so Escape cannot be stopped here without leaving
+ * that dialog open. It is let through but marked answered (preventDefault).
+ * That mark is what ArtifactPanel's listener checks, and it runs BEFORE the
+ * confirm's own listener because it was registered first. Without the mark,
+ * an Escape after a click on the confirm's text closed the artifact panel
+ * behind both dialogs (QA in Chromium, 2026-09-18: chip 3/3, Settings 1/1).
+ * Every other key is stopped, so no page shortcut fires behind the stack.
+ * The memory panel's own row confirm has a guard of its own as well
+ * (MemoryPanel), registered after the host's, which then stops its keys
+ * outright; only a dialog nobody here owns relies on the mark alone.
  */
 export function useModalKeyGuard(
   open: boolean,
@@ -140,7 +154,8 @@ export function useModalKeyGuard(
       const target = e.target instanceof Element ? e.target : null;
       if (target?.closest(MODAL)) return;
       if (topModal() !== panel) {
-        if (e.key !== 'Escape') e.stopPropagation();
+        if (e.key === 'Escape') e.preventDefault();
+        else e.stopPropagation();
         return;
       }
       e.stopPropagation();
@@ -166,21 +181,51 @@ export function useModalKeyGuard(
 /**
  * The React half of the same rule, for a modal panel's onKeyDown. A key whose
  * target is inside the panel stops here, so nothing behind the modal sees it,
- * and the caller handles it. A key that arrives through the React tree from a
- * dialog portalled OUTSIDE the panel (a nested ConfirmDialog) belongs to that
- * dialog: Escape is left for it, and any other key is still stopped so it
- * cannot reach a global shortcut. Returns whether the caller should act.
+ * and the caller handles it. Returns whether the caller should act.
+ *
+ * A key that arrives through the React tree from a dialog portalled OUTSIDE
+ * the panel (a nested ConfirmDialog) belongs to that dialog:
+ * - Escape is left for the dialog's own document listener, but marked
+ *   answered first. React dispatches a portal's keys at <body>, before any
+ *   document listener, so the mark is already set when ArtifactPanel's
+ *   listener reads it. Unmarked, the Settings > Sessions confirm's Escape
+ *   also closed the artifact panel behind Settings (QA, 2026-09-18).
+ * - Tab stays inside that dialog. ConfirmDialog does not trap it, so Tab from
+ *   its last button left the modal stack for the page behind it.
+ * - Anything else is stopped, so it cannot reach a page shortcut.
  */
 export function ownModalKey(
   e: ReactKeyboardEvent<HTMLElement>,
   panel: HTMLElement | null,
 ): boolean {
-  const inside = !!panel && e.target instanceof Node && panel.contains(e.target);
-  if (inside || e.key !== 'Escape') e.stopPropagation();
-  return inside;
+  const target = e.target instanceof Element ? e.target : null;
+  if (panel && target && panel.contains(target)) {
+    e.stopPropagation();
+    return true;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    return false;
+  }
+  e.stopPropagation();
+  const nested = target?.closest<HTMLElement>(MODAL) ?? null;
+  if (nested) trapTab(e, nested);
+  return false;
 }
 
 /* ------------------------------------------------------------ the panel */
+
+const ROW_CONFIRM_TITLE = 'Delete this from memory?';
+
+/**
+ * The row confirm's panel. ConfirmDialog takes no ref, so it is found by the
+ * title this panel gave it; only one row confirm can be open at a time.
+ */
+function rowConfirmPanel(): HTMLElement | null {
+  return document.querySelector<HTMLElement>(
+    `[role="alertdialog"][aria-label="${ROW_CONFIRM_TITLE}"]`,
+  );
+}
 
 /**
  * A 401 is not a connection problem: "check your connection" sent people to
@@ -215,6 +260,7 @@ export function MemoryPanel({
   /** Where focus goes once a row is gone: a fact id, or 'top'. */
   const [focusAfter, setFocusAfter] = useState<number | 'top' | null>(null);
   const deleteButtons = useRef(new Map<number, HTMLButtonElement>());
+  const confirmRef = useRef<HTMLElement | null>(null);
   const topRef = useRef<HTMLDivElement>(null);
   const clearButtonRef = useRef<HTMLButtonElement>(null);
   const headingId = useId();
@@ -314,15 +360,33 @@ export function MemoryPanel({
     clearButtonRef.current?.focus();
   }
 
+  // The row confirm is this panel's own dialog, so its keys are claimed here
+  // like the clear-all dialog's, not left to ConfirmDialog's document
+  // listener. A click on the confirm's text drops focus to <body> (its panel
+  // cannot take focus), and the Escape that followed reached ArtifactPanel's
+  // document listener first: the artifact panel behind both dialogs closed
+  // and the confirm stayed open (QA in Chromium, 2026-09-18: chip 3/3).
+  useEffect(() => {
+    confirmRef.current = pending ? rowConfirmPanel() : null;
+  }, [pending]);
+  useModalKeyGuard(pending !== null, confirmRef, cancelPending);
+
+  const registerButton = useCallback((id: number, el: HTMLButtonElement | null) => {
+    if (el) deleteButtons.current.set(id, el);
+    else deleteButtons.current.delete(id);
+  }, []);
+
   // See the header: an Escape inside a nested dialog is that dialog's, not
   // the host's.
   function onKeyDown(e: ReactKeyboardEvent<HTMLElement>) {
     if (e.key !== 'Escape') return;
     if (pending) {
       e.stopPropagation();
+      e.preventDefault();
       cancelPending();
     } else if (clearOpen) {
       e.stopPropagation();
+      e.preventDefault();
       cancelClear();
     }
   }
@@ -396,11 +460,8 @@ export function MemoryPanel({
                 fact={f}
                 justSaved={justSaved.has(factKey(f.fact))}
                 busy={busy}
-                onDelete={() => setPending(f)}
-                buttonRef={(el) => {
-                  if (el) deleteButtons.current.set(f.id, el);
-                  else deleteButtons.current.delete(f.id);
-                }}
+                onDelete={setPending}
+                registerButton={registerButton}
               />
             ))}
           </ul>
@@ -423,7 +484,7 @@ export function MemoryPanel({
 
       <ConfirmDialog
         open={pending !== null}
-        title="Delete this from memory?"
+        title={ROW_CONFIRM_TITLE}
         body={
           pending
             ? `The assistant will stop using “${shortFact(pending.fact)}” in later chats. This cannot be undone.`
@@ -448,20 +509,32 @@ export function MemoryPanel({
 
 /* ------------------------------------------------------------- one row */
 
-function FactRow({
+/**
+ * Memoised, with only stable props, because every state change in the panel
+ * used to re-render and re-cut every row. At 10,000 rows with 500-character
+ * excerpts that took 3.9 s to open a confirm and 8.7 s to delete one in
+ * Chromium (QA, 2026-09-18). Opening a confirm now renders no row; a delete
+ * re-renders each row twice, for `busy`, and the cut text is kept.
+ */
+const FactRow = memo(function FactRow({
   fact,
   justSaved,
   busy,
   onDelete,
-  buttonRef,
+  registerButton,
 }: {
   fact: MemoryFact;
   justSaved: boolean;
   busy: boolean;
-  onDelete: () => void;
-  buttonRef: (el: HTMLButtonElement | null) => void;
+  onDelete: (fact: MemoryFact) => void;
+  registerButton: (id: number, el: HTMLButtonElement | null) => void;
 }) {
-  const quote = excerptQuote(fact.source_excerpt);
+  const quote = useMemo(() => excerptQuote(fact.source_excerpt), [fact.source_excerpt]);
+  const deleteLabel = useMemo(() => `Delete “${shortFact(fact.fact)}”`, [fact.fact]);
+  const buttonRef = useCallback(
+    (el: HTMLButtonElement | null) => registerButton(fact.id, el),
+    [registerButton, fact.id],
+  );
   const unknown = isUnknownSource(fact.source);
   const when = factShownAt(fact);
   const rewritten =
@@ -511,8 +584,8 @@ function FactRow({
         ref={buttonRef}
         type="button"
         disabled={busy}
-        onClick={onDelete}
-        aria-label={`Delete “${shortFact(fact.fact)}”`}
+        onClick={() => onDelete(fact)}
+        aria-label={deleteLabel}
         title="Delete"
         className="inline-flex shrink-0 items-center justify-center rounded-md p-1.5 text-faint transition-colors duration-ts hover:bg-danger/10 hover:text-danger focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-danger disabled:cursor-not-allowed disabled:opacity-35 max-sm:h-8 max-sm:w-8 [@media(pointer:coarse)]:h-8 [@media(pointer:coarse)]:w-8"
       >
@@ -520,7 +593,7 @@ function FactRow({
       </button>
     </li>
   );
-}
+});
 
 /* --------------------------------------------- the typed clear-all confirm */
 

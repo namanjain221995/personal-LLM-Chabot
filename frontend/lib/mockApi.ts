@@ -9,7 +9,7 @@
  * lifetime of the Node process; that is exactly right for a demo.
  */
 
-import type { MemoryFact } from './memory';
+import { FACT_NOT_FOUND, type MemoryFact } from './memory';
 import type { MemoryProxyDecision } from './memoryRoutes';
 import { buildSnippet, SEARCH_MAX_QUERY } from './searchPalette';
 
@@ -415,7 +415,7 @@ export function handleMockMemory(
     const id = Number(decision.id);
     const kept = facts.filter((f) => f.id !== id);
     if (kept.length === facts.length) {
-      return json(404, { detail: 'fact not found' });
+      return json(404, { detail: FACT_NOT_FOUND });
     }
     memoryByUser.set(user, kept);
     return json(200, { deleted: id });
