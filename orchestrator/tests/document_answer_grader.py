@@ -235,3 +235,63 @@ def source_named_labels(answer: str) -> list[str]:
         if _SOURCE_HEADING_RE.match(text):
             found.append(line.strip())
     return found
+
+
+# ---------------------------------------------------------------------------
+# A STRICT answer shows no working (2026-09-18, round 6).
+#
+# The strict extraction block exists so a field comes back as the page prints
+# it. On the itemised tax-free invoice (two line items, a total, no tax line)
+# the round-5 verifier's live runs padded 2 of 3 answers with why the tax was
+# missing (523 and 251 chars), and one of them stated arithmetic that is FALSE
+# on its own terms: "2 x 1,000.00 + 1 x 4,200.00 = 5,200.00". A wrong sum in
+# an extraction answer is worse than a missing field -- it looks like the
+# document's own figure checked -- and code, not the model, is where numbers
+# are computed. These two graders are the live test's instrument for it.
+# ---------------------------------------------------------------------------
+
+#: A number, an operator and another number ("2 x 1,000.00", "1,000 + 4,200"),
+#: or an equals sign in front of a number ("= 5,200.00"). A hyphen is NOT an
+#: operator here: every date on an invoice ("2026-09-01") has two.
+_COMPUTATION_RE = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s*(?:[x×*+]|times|plus)\s*[$€£₹]?\s*\d"
+    r"|=\s*[$€£₹]?\s*\d",
+    re.I,
+)
+
+_NOT_STATED_RE = re.compile(r"not\s+stated\s+in\s+the\s+document", re.I)
+
+#: A sentence that reasons about an ABSENT field: what the page does not show,
+#: what that suggests, what the value might be. The field's own line ("**Tax
+#: Amount:** not stated in the document") is not one: only what follows the
+#: phrase in its sentence is examined.
+_EXPLAINS_ABSENCE_RE = re.compile(
+    r"\b(?:does|do|did)\s*(?:not|n'?t)\s+(?:\w+\s+){0,2}?(?:mention|contain|cover|provide|"
+    r"include|list|specify|state|show|give|itemi[sz]e|break|separate|indicate|display|have)\b"
+    r"|\bdoesn'?t\b|\bno\s+(?:separate|explicit|specific|distinct|dedicated)\b"
+    r"|\bcannot\s+be\s+(?:determined|confirmed|calculated|established|found)\b"
+    r"|\b(?:not|n'?t)\s+(?:possible|able)\s+to\b|\bunable\s+to\b"
+    r"|\bsuggest(?:s|ing)?\b|\bappears?\s+to\b|\bimpl(?:y|ies|ying)\b"
+    r"|\b(?:likely|presumably|possibly|probably|perhaps)\b"
+    r"|\b(?:may|could)\s+(?:be|have)\b|\bwithout\s+(?:a|any)\b",
+    re.I,
+)
+
+
+def states_a_computation(answer: str) -> list[str]:
+    """Every piece of arithmetic the answer states, verbatim."""
+    return [m.group(0) for m in _COMPUTATION_RE.finditer(answer or "")]
+
+
+def explains_a_missing_field(answer: str) -> list[str]:
+    """Sentences that explain, justify or speculate about a field the answer
+    says is not stated. Empty for "**Tax:** not stated in the document"."""
+    found = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", answer or ""):
+        text = sentence.strip()
+        stated = _NOT_STATED_RE.search(text)
+        if stated:
+            text = text[stated.end():]
+        if _EXPLAINS_ABSENCE_RE.search(text):
+            found.append(sentence.strip())
+    return found

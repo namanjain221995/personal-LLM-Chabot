@@ -272,3 +272,186 @@ FIELD_PAIRS = (
     ("what is the PO number", "the invoice number?"),
     ("what are the payment terms", "is there a late payment penalty?"),
 )
+
+
+# ---------------------------------------------------------------------------
+# ROUND 6 (2026-09-18). Written BEFORE the round-6 detector, the same way as
+# the rows above. The round-5 verifier's blind search found five SHAPES the
+# clause test did not see; the dev rows below carry the verifier's own
+# failing wordings for each shape AND new ones, and the held-out rows use only
+# new wording and were not measured until the detector was finished. Every
+# row still names, in `because`, the words that make it a judgement ask.
+# ---------------------------------------------------------------------------
+
+#: Dev rows, grouped by the shape that hid them.
+ROUND6_TAILS = (
+    # an imperative with a NOUN object (round 5 needed an object pronoun)
+    ("assess the risk", "risk", "assess the risk"),
+    ("evaluate the terms", "verdict", "evaluate the terms"),
+    ("flag any risks", "risk", "flag any risks"),
+    ("highlight any concerns", "caution", "highlight any concerns"),
+    ("assess our exposure", "risk", "assess our exposure"),
+    ("critique the pricing", "opinion", "critique the pricing"),
+    ("size up the deal for us", "verdict", "size up the deal"),
+    ("score the terms out of ten", "opinion", "score the terms"),
+    ("look for anything unfair", "fairness", "anything unfair"),
+    ("comment on the pricing", "opinion", "comment on the pricing"),
+    ("point out the weak spots", "risk", "the weak spots"),
+    ("rate it out of 10", "opinion", "rate it"),
+    ("stress-test the payment schedule", "feasibility", "stress-test"),
+    # a fragment led by a word that is ALSO filler ("okay", "ok")
+    ("okay for us?", "verdict", "okay for us"),
+    ("ok to sign?", "verdict", "ok to sign"),
+    ("okay value?", "market", "okay value"),
+    ("ok by you?", "opinion", "ok by you"),
+    ("so, fair?", "fairness", "fair"),
+    ("well, too high?", "market", "too high"),
+    ("now, safe to accept?", "caution", "safe to accept"),
+    # a modal + the person + a verb the fact lexicon also holds
+    ("would we sign it?", "verdict", "would we sign"),
+    ("would I pay that?", "verdict", "would I pay"),
+    ("could we renew on these terms?", "verdict", "could we renew"),
+    ("might we be charged less elsewhere?", "market", "charged less elsewhere"),
+    ("should we sign it as is?", "verdict", "should we sign"),
+    # a statement of the person's own view, with no question in it
+    ("that seems high to me", "market", "seems high"),
+    ("our CFO thinks it's excessive", "market", "excessive"),
+    ("feels like a lot", "fairness", "a lot"),
+    ("I think we are overpaying", "market", "overpaying"),
+    ("my gut says it's aggressive", "risk", "aggressive"),
+    ("legal reckons it's one-sided", "fairness", "one-sided"),
+    # "is there ..." with the "is there" and the question mark left off
+    ("anything here that would stop you", "caution", "would stop you"),
+    ("any red flags", "caution", "red flags"),
+    ("anything unusual in it", "caution", "unusual"),
+)
+
+#: Held out: new wording only, not measured until the detector was finished.
+ROUND6_HELD_OUT_TAILS = (
+    ("grade the offer", "verdict", "grade the offer"),
+    ("vet the pricing for us", "market", "vet the pricing"),
+    ("poke holes in the terms", "risk", "poke holes"),
+    ("scrutinise the penalties", "risk", "scrutinise the penalties"),
+    ("weigh the fee against the market", "market", "against the market"),
+    ("audit the charges for anything odd", "caution", "anything odd"),
+    ("walk me through the risks", "risk", "the risks"),
+    ("summarise the downsides", "risk", "the downsides"),
+    ("okay to go ahead?", "verdict", "okay to go ahead"),
+    ("ok by industry standards?", "market", "industry standards"),
+    ("okay or not?", "verdict", "okay or not"),
+    ("so, a good price?", "market", "a good price"),
+    ("would we renew it?", "verdict", "would we renew"),
+    ("could I sign it today?", "verdict", "could I sign"),
+    ("might we owe more than that?", "risk", "owe more"),
+    ("would we be paying twice?", "risk", "paying twice"),
+    ("the fee seems a bit rich", "market", "a bit rich"),
+    ("that sounds expensive to me", "market", "expensive"),
+    ("feels like we're overpaying", "market", "overpaying"),
+    ("my CFO believes it's steep", "market", "steep"),
+    ("I reckon it's too high", "market", "too high"),
+    ("the board thinks the notice period is short", "feasibility", "is short"),
+    ("anything we should push back on", "action", "push back"),
+    ("any concerns from your side", "caution", "any concerns"),
+    ("anything that looks off", "caution", "looks off"),
+    ("where are the risks?", "risk", "the risks"),
+    ("how would a buyer see it?", "opinion", "how would a buyer see it"),
+)
+
+#: Follow-ups a document CAN answer, and courtesies that ask nothing. The
+#: first two are the verifier's: beside a field they cost strict extraction
+#: 192 of 1,440 times on the round-5 detector, and "appreciate it" / "love
+#: it" were read as imperatives.
+ROUND6_FACT_FOLLOW_UPS = (
+    "is there a grace period?",
+    "does it renew automatically?",
+    "is it billed monthly?",
+    "is there an auto-renewal?",
+    "does it auto-renew?",
+    "appreciate it",
+    "love it",
+    "thanks so much",
+    "cheers",
+    "much appreciated",
+)
+
+#: Held out, same sitting, not measured until the detector was finished.
+ROUND6_HELD_OUT_FACT_FOLLOW_UPS = (
+    "is there a cure period?",
+    "does the fee renew each year?",
+    "is the deposit refundable?",
+    "is there a cap on the late fee?",
+    "is the price fixed?",
+    "does it roll over automatically?",
+    "is there a notice requirement?",
+    "thank you kindly",
+    "ta",
+    "you're a star",
+    "is it billed in arrears?",
+    "who is it addressed to?",
+)
+
+#: Context a person gives beside a field ask. None of it asks anything, so a
+#: field ask with one of these is still a pure field ask. They measure what a
+#: rule for statements of view costs (the held-out half has the verbs such a
+#: rule would key on: "I think", "I believe", "looks like").
+ROUND6_CONTEXT = (
+    "we got this invoice yesterday",
+    "our accountant needs it by Friday",
+    "this is for the Leeds office",
+    "we're a five-person startup",
+    "I'm reconciling our accounts",
+)
+ROUND6_HELD_OUT_CONTEXT = (
+    "I think this is the final version",
+    "I believe it was sent last week",
+    "it looks like a standard template",
+    "my manager asked me to check",
+    "the supplier sent it this morning",
+)
+
+#: Natural field asks the round-5 verifier found reaching NO strict block at
+#: all. A gap here costs a sentence (they go to neutral), so they are recorded
+#: and measured, not a bar.
+ROUND6_UNREACHED_FIELD_HEADS = (
+    "what's the liability cap",
+    "what is the indemnity limit",
+    "what's the minimum commitment",
+    "how long is the non-compete",
+    "what's the monthly rent in the lease",
+)
+
+#: Written AFTER the view rule's document-identity exemption was fitted to the
+#: held-out context rows above (which therefore no longer measure unseen
+#: wording), and measured once, to estimate what the view rule costs on
+#: context it was not fitted to. Every one has an attitude word and no
+#: judgement of a value.
+ROUND6_FRESH_CONTEXT = (
+    "I think the supplier emailed it on Monday",
+    "it seems to be the signed copy",
+    "I guess this is page two",
+    "looks like it's in USD",
+    "I believe our office manager uploaded it",
+    "I think it covers the Leeds site",
+    "it sounds like they want payment soon",
+    "I feel this is the one legal approved",
+    "I suspect there's a second page",
+    "it looks like an older layout",
+)
+
+#: Written after ROUND6_FRESH_CONTEXT showed the first view rule costing 7 of
+#: those 10, and BEFORE the narrower view rule was designed; not measured
+#: until it was finished. Some are deliberately hard: "the scan is a bit
+#: blurry" and "the second page is missing" are evaluative predicates about
+#: the PAPER, not the value.
+ROUND6_FRESH_CONTEXT_2 = (
+    "I think accounts payable already has a copy",
+    "it seems they changed the address",
+    "I guess the vendor is based in Leeds",
+    "I believe finance forwarded it yesterday",
+    "looks like the scan is a bit blurry",
+    "I suspect this came from their old system",
+    "I think the second page is missing",
+    "it sounds like the PO was raised in June",
+    "I reckon this is the one from March",
+    "my manager thinks it arrived late",
+)
