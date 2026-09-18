@@ -155,9 +155,14 @@ _DURABLE_PREFERENCE_RE = re.compile(
     # Sam"). "Wants" made it a task request, so the name was never saved.
     # The shape must END in a name: listing what may not follow ("back",
     # "tomorrow") let "wants to be called when the build finishes" and "is
-    # asking what the band goes by" in as durable (QA, 2026-09-18).
-    r"|\bto be (?:called|addressed(?: as)?|referred to as)\s+" + _A_NAME +
-    r"|\bgoes by\s+" + _A_NAME +
+    # asking what the band goes by" in as durable (QA, 2026-09-18). And the
+    # one named must be the USER: unanchored, "The user wants the new repo
+    # to be called Atlas" and "…if Priya goes by Pri" were durable too, and
+    # came back as the person's to-do list (security review, 2026-09-18).
+    r"|^the user\s+(?:(?:also|still|now|really)\s+)?"
+    r"(?:wants|prefers|likes|would\s+like|asks|asked|has\s+asked)\s+to\s+be\s+"
+    r"(?:called|addressed(?:\s+as)?|referred\s+to\s+as)\s+" + _A_NAME +
+    r"|^the user\s+(?:(?:also|still|now|usually)\s+)?goes\s+by\s+" + _A_NAME +
     r"|\b(?:address|call|refer to)\s+(?:me|them|him|her|the user)\s+as\s+" + _A_NAME,
     re.I,
 )
@@ -217,31 +222,215 @@ _MATCH_STOPWORDS = frozenset(
 )
 
 
-#: "Forget my employer" shares no word with "The user works at Cognitiv", so
-#: the id-less fallback found nothing and the erasure was a silent no-op
-#: (QA-mem-forget-employer, 2026-09-18). A few profile nouns, only in the
-#: shape that names the person's OWN profile ("my employer", "where I live")
-#: AND ends the request there: "forget my work problems, tell me a joke"
-#: puts a topic aside, and deleted the employer fact when this matched any
-#: "forget my work…" (QA, 2026-09-18).
-_PROFILE_NOUN_RE = re.compile(
-    r"\b(?:forget|erase|un-?remember|remembering|storing|saving|delete|remove|drop|clear)"
-    r"\s+(?:about\s+)?(?:"
-    r"my\s+(?:current\s+|old\s+|home\s+)?"
-    # not "my company's old logo": the noun itself is what is to be forgotten
-    r"(?P<noun>employer|company|job|work(?:place)?|home|address|city|name)\b(?!['’])"
-    r"|(?:where|who)\s+i\s+(?P<verb>work|live)(?:\s+(?:at|for|in))?\b)"
-    r"(?=\s*(?:,?\s*(?:please|now|too|as\s+well)\s*)?(?:[.!?;\n]|$))",
+#: WHO MAY DELETE A FACT (owner rule, 2026-09-19): only the person, by asking
+#: for it. Round 2 took any clause holding "forget" as an erasure and let a
+#: profile noun in it pick the row, and both reviewers then hard-deleted a
+#: profile fact with "Did you forget where I live?", "Don't you dare forget my
+#: employer!" and "How do I make Chrome forget my address?" (none of which
+#: deleted anything at 4810da0). A request is now recognised by its SHAPE: a
+#: sentence that OPENS with the erasure verb, after nothing but "please",
+#: "ok", "can you" and the like, aimed at the person's own memory and ending
+#: there. Questions, reminders, complaints, third parties, quoted or reported
+#: speech and "forget X, tell me Y" all fail that shape. Measured on the 818
+#: messages of tests/test_memory_erasure_requests.py, written before this
+#: code: at 2f702e1 the fallback deleted a fact for 431 of them and a
+#: worst-case extractor's remove ids got through for 579; both are 0 now.
+_ERASE_LEAD = (
+    r"[\s,]*"
+    r"(?:(?:ok(?:ay)?|alright|all\s+right|so|and|also|now|hey|actually|then|oh|btw|"
+    r"by\s+the\s+way|one\s+more\s+thing|last\s+thing|finally|lastly|anyways?)\b[\s,]*)*"
+    r"(?:(?:please|pls|plz|kindly)\b[\s,]*)?"
+    # "can you forget my employer?" asks; "can you ACTUALLY forget …?" wonders
+    r"(?:(?P<ask>(?:can|could|would)\s+you)\s+"
+    r"|i\s+(?:want|need)\s+you\s+to\s+|i(?:['’]d|\s+would)\s+like\s+you\s+to\s+)?"
+    r"(?:(?:please|kindly|just|go\s+ahead\s+and)\s+)*"
+)
+_ERASE_SENTENCE_RE = re.compile(
+    _ERASE_LEAD
+    + r"(?:(?P<forget>forget|erase|un-?remember)\s+(?:about\s+)?"
+    r"|(?:stop|quit)\s+(?P<keep>remembering|storing|saving|keeping)\s+(?:about\s+)?"
+    r"|(?P<delete>delete|remove|drop|clear|wipe|purge)\s+)"
+    r"(?P<object>.*\S)",
     re.I,
 )
-#: …mapped to the SHAPE of the fact that states that attribute of the person.
-#: A bag of the words such a fact is written with ("named", "works",
-#: "based", "working") matched "The user's dog is named Rex", "The user's
-#: wife works at Google" and "The user prefers answers based on primary
-#: sources", and exactly-one-match does not help when the one match is the
-#: wrong fact: QA hard-deleted each of them with an id-less "forget my
-#: name / employer / where I live" (2026-09-18). The subject must be the
-#: user and the verb the attribute.
+
+#: What may follow the thing to be forgotten: a courtesy, a reason ("I
+#: moved"), or a reminder ("…, and don't forget to answer in English").
+#: Anything else — "for now", "in the resume", "tell me a joke" — makes it
+#: a topic set aside or an edit, not an erasure.
+_ERASE_TAIL = (
+    # Possessive (*+, ?+): with backtracking, a clause read lazily up to a
+    # long run of ", please" cost 160-175 ms of event loop on a
+    # 1,150-character message (measured 2026-09-19).
+    r"(?:[\s,]++(?:please|pls|plz|now|too|as\s+well|for\s+good|permanently|completely|"
+    r"entirely|forever|for\s+me|thanks|thank\s+you|thx|ty)\b)*+"
+    r"(?:,?\s+(?:(?:because\s+|since\s+|as\s+)?i(?:\s+have|['’]ve|\s+just)?\s+"
+    r"(?:left|quit|moved(?:\s+out|\s+house)?|resigned|relocated|changed\s+jobs|switched\s+jobs)"
+    r"|(?:that|it|this)(?:['’]s|\s+is)\s+(?:now\s+)?(?:out\s+of\s+date|outdated|wrong|"
+    r"incorrect|old\s+news|not\s+true|no\s+longer\s+true|not\s+right|changed|not\s+the\s+case)"
+    r"|not\s+any\s*more|no\s+longer)\b)?+"
+    r"(?:,?\s+(?:and|but)\s+(?:please\s+)?(?:(?:don['’]?t|do\s+not|never)\s+forget|remember)\b.*)?+"
+    r"(?:[\s,]++(?:please|pls|plz|thanks|thank\s+you|thx|ty)\b)*+"
+    r"[\W_]*+"
+)
+
+#: One profile item the person owns: "my employer", "where I live". Not "my
+#: company's logo" (the possessive) and not "my work" (as often a topic as
+#: a workplace: "forget my work, tell me a joke").
+_PROFILE_ITEM = (
+    r"(?:my\s+(?:current\s+|old\s+|previous\s+|former\s+)?(?:home\s+)?"
+    r"(?:employer|company|job|workplace|address|home|city|name)(?![\w'’])"
+    r"|where\s+i\s+(?:work|live)|who\s+i\s+work\s+for)"
+)
+_PROFILE_LIST = _PROFILE_ITEM + r"(?:(?:\s*,\s*|\s+)(?:(?:and|or)\s+)?" + _PROFILE_ITEM + r")*"
+_PROFILE_NOUN_RE = re.compile(
+    r"\b(?:(?P<noun>employer|company|job|workplace|address|home|city|name)"
+    r"|where\s+i\s+(?P<verb>work|live)|who\s+i\s+(?P<who>work)\s+for)\b",
+    re.I,
+)
+
+#: The objects an erasure verb may take, each tried against the whole rest
+#: of the sentence. `clause` is what names the fact; a form with no clause,
+#: or the bare "my <noun phrase>", lets the extractor's id through but gives
+#: the id-less fallback nothing to match.
+_OBJ_PROFILE_RE = re.compile(
+    r"(?P<clause>" + _PROFILE_LIST + r")"
+    # "forget my employer, Cognitiv": the appositive must also be in the fact
+    r"(?:\s*,\s*(?P<named>(?!(?:please|thanks|thank|thx|i)\b)(?-i:[A-Z])[\w&'’-]*+"
+    r"(?:\s+(?-i:[A-Z])[\w&'’-]*+)*+))?" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_MEMORY_RE = re.compile(
+    r"(?:my|the|that|this|your|these|those|every|all(?:\s+of)?(?:\s+(?:my|your|the))?)\s+"
+    r"(?:saved\s+|stored\s+)?(?:memory|memories|facts?)"
+    r"(?:\s+(?:about|on|regarding|of|that)\s+(?P<clause>.*?\w))?" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_FROM_MEMORY_RE = re.compile(
+    r"(?P<clause>.+?)\s+from\s+(?:your\s+|the\s+|my\s+)?"
+    r"(?:memory|memories|saved\s+(?:facts|memories))" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_KNOWN_RE = re.compile(
+    r"(?:what|everything|anything|whatever|all)\s+(?:that\s+)?you\s+(?:have\s+|['’]ve\s+)?"
+    r"(?:saved|stored|remember|know|noted|kept|learned|learnt|have\s+on\s+file)\s+"
+    r"(?:about|regarding|on)\s+(?P<clause>.*?\w)" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_TOLD_RE = re.compile(
+    r"(?:(?:what|everything|anything|all)\s+(?:that\s+)?)?i\s+(?:ever\s+|just\s+)?"
+    r"(?:told\s+you|said|mentioned|shared|wrote)\s+(?:(?:that|about|regarding|on)\s+)?"
+    r"(?P<clause>.*?\w)" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_THAT_RE = re.compile(
+    r"that\s+(?P<clause>(?:i|my|i['’](?:m|ve|d|ll))\b.*?\w)" + _ERASE_TAIL,
+    re.I,
+)
+_OBJ_MY_RE = re.compile(
+    r"(?:about\s+)?my\s+(?P<np>[\w'’-]+(?:\s+[\w'’-]+){0,2})" + _ERASE_TAIL,
+    re.I,
+)
+#: Which object each verb may take. "Delete my address" is as often an edit
+#: to a document as a request to the memory, so delete/remove/clear only
+#: count when the object names the memory itself.
+_FORGET_OBJECTS = (
+    _OBJ_PROFILE_RE, _OBJ_MEMORY_RE, _OBJ_FROM_MEMORY_RE, _OBJ_KNOWN_RE,
+    _OBJ_TOLD_RE, _OBJ_THAT_RE, _OBJ_MY_RE,
+)
+_DELETE_OBJECTS = (_OBJ_MEMORY_RE, _OBJ_FROM_MEMORY_RE, _OBJ_KNOWN_RE)
+
+#: Words that turn "my <noun phrase>" into something else: "my name ON the
+#: certificate", "my employer IN the resume template".
+_NOT_A_NOUN_PHRASE = frozenset(
+    """in on at for from to of with and or but when while if so the a an this
+    that these those it its as by about into than then until after before
+    since because unless once later""".split()
+)
+
+#: A clause that goes on to ask for something else ("…vegetarian and tell me
+#: the best steakhouse"), that is only for a while ("for tonight", "when we
+#: eat out"), or that means "never mind" ("that I asked", "I said that").
+_CLAUSE_CONTINUES_RE = re.compile(
+    r"[,;:]"
+    r"|\b(?:and|but|so|then|or)\s+(?:then\s+|just\s+|please\s+|also\s+)?"
+    r"(?:tell|give|show|recommend|suggest|find|write|help|list|explain|answer|make|"
+    r"create|plan|book|search|look|let['’]?s|let\s+me|what|how|which|where|who|why|when|"
+    r"can|could|would|will|use|keep|start|do|is|are)\b",
+    re.I,
+)
+_CLAUSE_TEMPORARY_RE = re.compile(
+    r"\b(?:for\s+(?:now|today|tonight|the\s+moment|a\s+(?:second|sec|moment|minute|bit|while)|"
+    r"one\s+(?:second|sec|moment|minute)|this\s+\w+)|just\s+this\s+once|this\s+(?:time|once)|"
+    r"temporarily|when|whenever|if|after|until|once|unless|later)\b",
+    re.I,
+)
+#: …or that points at a document rather than at the memory: "delete what
+#: you know about my employer from the report".
+_CLAUSE_DOCUMENT_RE = re.compile(
+    r"\b(?:in|on|from|into|to)\s+(?:the|this|that|your|my|our|a)\s+(?:[\w-]+\s+){0,2}"
+    r"(?:report|docs?|document|letter|e-?mail|mail|file|draft|resume|résumé|cv|pdf|page|"
+    r"form|slides?|deck|essay|story|answer|reply|response|text|message|notes?|summary|"
+    r"bio|profile|post|invoice|contract|template|code|script|spreadsheet|sheet|table|list|"
+    r"prompt)\b",
+    re.I,
+)
+_NEVER_MIND_RE = re.compile(
+    r"(?:i\s+)?(?:just\s+)?(?:said|asked|mentioned|wrote|typed|sent|told\s+you)?\s*"
+    r"(?:it|that|this|anything|something|everything|so|all\s+(?:that|this|of\s+(?:it|that|this)))?"
+    r"\s*(?:earlier|before|above|previously|just\s+now)?[\W_]*",
+    re.I,
+)
+
+#: A message that takes the request back, or is not in earnest, anywhere in
+#: it: "Please forget my employer. Just kidding!", "forget my employer lol".
+_RETRACTION_RE = re.compile(
+    r"\b(?:just\s+kidding|j/?k|kidding|joking|never\s*mind|nvm|scratch\s+that|"
+    r"ignore\s+(?:that|this|what\s+i\s+(?:just\s+)?said)|"
+    r"(?:actually|wait|no)[\s,]+(?:no[\s,]+)?(?:don['’]?t|do\s+not|keep\s+it|leave\s+it)|"
+    r"keep\s+it|leave\s+it|not\s+really|lol|lmao|rofl|haha+|hehe+)\b|[😂🤣]",
+    re.I,
+)
+
+#: What else a message that deletes may say. "Forget my address. I'll send
+#: it later." and "Forget my employer. Write a generic cover letter." put a
+#: topic aside for a task, sentence by sentence; only a courtesy, a reason
+#: ("I moved.", "That's out of date."), another erasure, or a reminder about
+#: the person ("Don't forget I like spicy food though.") may stand beside a
+#: request that deletes. Any other sentence and nothing is deleted.
+_ERASE_COMPANION_RE = re.compile(
+    r"[\s,]*(?:"
+    r"(?:ok(?:ay)?|thanks?(?:\s+(?:a\s+lot|so\s+much|again|in\s+advance))?|"
+    r"thank\s+you(?:\s+(?:so\s+much|again))?|thx|ty|please|pls|cheers|appreciate\s+it)"
+    r"|(?:because\s+|since\s+)?i(?:['’]ve|\s+have|\s+just)?\s+(?:left|quit|moved|resigned|"
+    r"relocated|retired|changed\s+jobs|switched\s+jobs)\b[^,;]*"
+    r"|(?:that|it|this)(?:['’]s|\s+is)\s+(?:now\s+)?(?:out\s+of\s+date|outdated|wrong|"
+    r"incorrect|old\s+news|not\s+true(?:\s+any\s*more)?|no\s+longer\s+true|not\s+right|"
+    r"private|personal|changed|not\s+the\s+case)"
+    r"|(?:that|it)\s+changed"
+    r"|i\s+(?:don['’]?t|do\s+not)\s+want\s+(?:you\s+to\s+(?:remember|store|save|keep|know)\s+"
+    r"(?:that|it|this)|(?:that|it|this)\s+(?:saved|stored|remembered|kept))(?:\s+any\s*more)?"
+    r"|(?:and\s+|but\s+)?(?:please\s+)?(?:(?:don['’]?t|do\s+not|never)\s+forget|remember)\s+"
+    r"(?:that\s+)?(?:i\b|i['’]|my\b).*"
+    r")[\W_]*",
+    re.I,
+)
+
+#: Quoted material is someone else's words: "She said "forget my address"".
+#: An opening single quote follows a space or the start, so "I'm" is not one.
+_QUOTED_SPAN_RE = re.compile(
+    r"\"[^\"\n]*\"|“[^”\n]*”|‘[^’\n]*’|`[^`\n]*`"
+    r"|(?<![^\s(\[:])'[^'\n]*'(?![^\s.,!?;:)\]])"
+)
+_ERASE_SENTENCE_SPLIT_RE = re.compile(r"[^.!?\n]+")
+_END_PUNCT_RE = re.compile(r"[.!?]*")
+
+#: …and the fact each profile item is stated in. A bag of the words such a
+#: fact is written with ("named", "works", "based") matched "The user's dog
+#: is named Rex", "The user's wife works at Google" and "The user prefers
+#: answers based on primary sources", and exactly-one-match does not help
+#: when the one match is the wrong fact (QA, 2026-09-18). The subject must be
+#: the user and the verb the attribute.
 _PROFILE_FACT_SHAPES = (
     (
         frozenset({"employer", "company", "job", "work", "workplace"}),
@@ -272,11 +461,23 @@ _PROFILE_FACT_SHAPES = (
     ),
 )
 
+#: Words that cannot tell one saved fact from another. Every fact starts
+#: "The user…", and a request is full of "told", "about", "saved".
+_ERASE_STOPWORDS = _MATCH_STOPWORDS | frozenset(
+    """the and for are was were you your yours i'm i've i'd i'll not but has had
+    his her hers its our ours their theirs them they she him who how why any all
+    can will would could should into onto over under some every each user users
+    mine myself one out off too now yet did does doing done got get let may
+    might must shall than then via it's mentioned shared wrote noted kept
+    learned learnt file""".split()
+)
+
 #: A clause: the unit a "forget" and its "don't forget" exception are judged
-#: in. Judged over the whole message, a reminder in the second sentence
-#: ("…Don't forget I like spicy food though") cancelled the erasure in the
-#: first, and the extractor's negated rewrite was written instead (QA,
-#: 2026-09-18).
+#: in, for the one thing that is still judged loosely: whether a message
+#: MENTIONS forgetting, which stops it writing memory. Judged over the whole
+#: message, a reminder in the second sentence ("…Don't forget I like spicy
+#: food though") cancelled the erasure in the first, and the extractor's
+#: negated rewrite was written instead (QA, 2026-09-18).
 _CLAUSE_RE = re.compile(r"[^.!?;,\n]+")
 
 
@@ -450,9 +651,10 @@ def _content_words(text: str) -> set:
 
 
 def _erasure_spans(text: str) -> List[tuple]:
-    """(start, end) of each clause of `text` that asks to forget something:
-    a forget verb, and not a reminder or a confession ("don't forget …",
-    "I always forget …") in the same clause."""
+    """(start, end) of each clause of `text` that mentions forgetting: a
+    forget verb, and not a reminder or a confession ("don't forget …", "I
+    always forget …") in the same clause. Such a message writes no memory;
+    whether it may DELETE any is `_erasure_requests`."""
     return [
         m.span()
         for m in _CLAUSE_RE.finditer(text or "")
@@ -460,52 +662,134 @@ def _erasure_spans(text: str) -> List[tuple]:
     ]
 
 
-def _fact_named_by(text: str, existing: List[dict]) -> Optional[int]:
-    """The id of the ONE saved fact a "forget that" names, or None.
+def _erasure_requests(text: str) -> List[tuple]:
+    """Each thing `text` asks the assistant to forget, as (clause, named,
+    matchable): the words that name the fact, an appositive name the fact
+    must contain ("my employer, Cognitiv"), and whether the id-less
+    fallback may match on the clause at all. [] when the message asks for
+    no deletion — and then nothing may be deleted, whatever the extractor
+    proposes."""
+    body = _QUOTED_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text or "")
+    if _RETRACTION_RE.search(body):
+        return []
+    asks: List[tuple] = []
+    for sentence in _ERASE_SENTENCE_SPLIT_RE.finditer(body):
+        text_ = sentence.group(0)
+        if not re.search(r"\w", text_):
+            continue
+        # "My landlord wrote:\nforget my address": reported, not addressed
+        if body[: sentence.start()].rstrip().endswith(":"):
+            return []
+        ask = _erasure_request(text_, _END_PUNCT_RE.match(body, sentence.end()).group(0))
+        if ask is not None:
+            asks.append(ask)
+        elif not _ERASE_COMPANION_RE.fullmatch(text_):
+            return []
+    return asks
+
+
+def _erasure_request(sentence: str, terminator: str) -> Optional[tuple]:
+    match = _ERASE_SENTENCE_RE.fullmatch(sentence.strip())
+    if match is None:
+        return None
+    # "Forget my address? Never." — only "can you …?" may end in a question mark
+    if "?" in terminator and not match.group("ask"):
+        return None
+    # "Would you forget my name?" is as often "would you ever…?"; with a
+    # "please" it is a request
+    if (match.group("ask") or "").lower().startswith("would") and not re.search(
+        r"\b(?:please|pls|plz|kindly)\b", sentence, re.I
+    ):
+        return None
+    obj = match.group("object")
+    for form in _DELETE_OBJECTS if match.group("delete") else _FORGET_OBJECTS:
+        found = form.fullmatch(obj)
+        if found is None:
+            continue
+        if form is _OBJ_PROFILE_RE:
+            return (found.group("clause"), found.group("named"), True)
+        if form is _OBJ_MY_RE:
+            words = found.group("np").lower().split()
+            if any(w in _NOT_A_NOUN_PHRASE for w in words):
+                return None
+            return (found.group("np"), None, False)
+        clause = (found.group("clause") or "").strip()
+        if clause and (
+            _CLAUSE_CONTINUES_RE.search(clause)
+            or _CLAUSE_TEMPORARY_RE.search(clause)
+            or _CLAUSE_DOCUMENT_RE.search(clause)
+            or _NEVER_MIND_RE.fullmatch(clause)
+        ):
+            return None
+        return (clause, None, True)
+    return None
+
+
+def _asked_for(asks: List[tuple], fact: str) -> bool:
+    """Whether a request lets the extractor delete `fact`. A request that
+    names something ("forget my address, Detective") only reaches a fact
+    that contains the name: role-play addresses someone, and the appositive
+    reading must not hand the extractor every row."""
+    return any(
+        named is None or named.lower() in (fact or "").lower() for _, named, _ in asks
+    )
+
+
+def _stem(word: str) -> str:
+    word = re.sub(r"['’]s$", "", word)
+    for suffix in ("ing", "ed", "es", "s", "e"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+def _erase_words(text: str) -> set:
+    return {
+        _stem(w)
+        for w in re.findall(r"[a-z0-9][a-z0-9'’-]*", (text or "").lower())
+        if len(w) >= 3 and w not in _ERASE_STOPWORDS
+    }
+
+
+def _facts_named(asks: List[tuple], existing: List[dict]) -> List[int]:
+    """The ids of the saved facts the requests name, when the extractor
+    named none.
 
     The model is asked for the id and usually gives one; when it does not,
-    the request is still an erasure, and "forget that I'm vegetarian" points
-    at the row that says vegetarian. Exactly one match, or nothing happens —
-    deleting the wrong memory is worse than deleting none.
-
-    Only the erasure clauses name the fact: in "Forget it, what's the
-    weather in Pune?" the question's "Pune" deleted "The user lives in Pune"
-    (present at 4810da0). A request that names a profile attribute ("forget
-    my name") is matched by the fact's shape alone, so "The user's dog's
-    name is Rex" is not the person's name.
+    "forget that I'm vegetarian" still points at the row that says
+    vegetarian, and "forget my employer" at the row that states where the
+    person works. Each named thing must pin down exactly ONE fact, or
+    nothing is deleted for it — deleting the wrong memory is worse than
+    deleting none. Every word the request names must be in the fact:
+    "forget that my sister moved to Delhi" does not delete "The user's
+    sister lives in Mumbai".
     """
-    spans = _erasure_spans(text)
-    shapes = _profile_shapes(text, spans)
-    if shapes:
-        hits = [
-            f["id"]
-            for f in existing
-            if any(shape.match(" ".join((f["fact"] or "").split())) for shape in shapes)
-        ]
-    else:
-        words: set = set()
-        for start, end in spans:
-            words |= _content_words(text[start:end])
-        hits = (
-            [f["id"] for f in existing if words & _content_words(f["fact"])]
-            if words
-            else []
-        )
-    return hits[0] if len(hits) == 1 else None
-
-
-def _profile_shapes(text: str, spans: List[tuple]) -> list:
-    """The fact shapes of the profile attributes an erasure clause of `text`
-    names ("forget my employer." -> the works-at shape), or []."""
-    shapes: list = []
-    for match in _PROFILE_NOUN_RE.finditer(text or ""):
-        if not any(start <= match.start() < end for start, end in spans):
+    ids: List[int] = []
+    for clause, named, matchable in asks:
+        if not matchable or not clause:
             continue
-        said = (match.group("noun") or match.group("verb") or "").lower()
-        for asked, shape in _PROFILE_FACT_SHAPES:
-            if said in asked and shape not in shapes:
-                shapes.append(shape)
-    return shapes
+        groups: List[List[int]] = []
+        if _OBJ_PROFILE_RE.fullmatch(clause):
+            for noun in _PROFILE_NOUN_RE.finditer(clause):
+                said = (noun.group("noun") or noun.group("verb") or noun.group("who")).lower()
+                for nouns, shape in _PROFILE_FACT_SHAPES:
+                    if said in nouns:
+                        groups.append([
+                            f["id"]
+                            for f in existing
+                            if shape.match(" ".join((f["fact"] or "").split()))
+                            and (not named or named.lower() in (f["fact"] or "").lower())
+                        ])
+        else:
+            words = _erase_words(clause)
+            if words:
+                groups.append(
+                    [f["id"] for f in existing if words <= _erase_words(f["fact"])]
+                )
+        for hits in groups:
+            if len(hits) == 1 and hits[0] not in ids:
+                ids.append(hits[0])
+    return ids
 
 
 async def remember_after_route(
@@ -573,7 +857,12 @@ async def remember_from_message(
     text = own_words(user_text)
     if not text or len(text) < _MESSAGE_MIN_CHARS:
         return []
-    forget_request = bool(_erasure_spans(text))
+    # Two questions, answered separately. Does the message MENTION
+    # forgetting? Then it writes nothing (rule 2). Does the person ASK for
+    # a deletion? Only then may anything be deleted, by the extractor's id
+    # or by the fallback.
+    asks = _erasure_requests(text)
+    forget_request = bool(asks) or bool(_erasure_spans(text))
     try:
         existing = await db.run_in_thread(
             db.list_user_facts, user_id, settings.memory_max_facts
@@ -604,13 +893,14 @@ async def remember_from_message(
         stored: List[dict] = []
         added = 0
         # A delete happens because the PERSON asked for one. The extractor
-        # may point at the row, but an unprompted "remove" on an ordinary
-        # message would let a prompt quietly drop somebody's memory.
-        removals = (
-            [i for i in ops.get("remove", []) if i in by_id]
-            if forget_request
-            else []
-        )
+        # may point at the row, but a "remove" on any other message — an
+        # ordinary one, or "Did you forget my employer?" — would let a prompt
+        # quietly drop somebody's memory.
+        removals = [
+            i
+            for i in ops.get("remove", [])
+            if i in by_id and _asked_for(asks, by_id[i]["fact"])
+        ]
         if forget_request:
             # An erasure request never writes memory. Left to itself the
             # extractor answers "please forget that I'm vegetarian" with a
@@ -618,10 +908,8 @@ async def remember_from_message(
             # thing, kept forever and stated as the person's own words.
             ops["add"] = []
             ops["replace"] = []
-            if not removals:
-                target = _fact_named_by(text, existing)
-                if target is not None:
-                    removals = [target]
+            if asks and not removals:
+                removals = _facts_named(asks, existing)
         for fact_id in removals:
             deleted = await db.run_in_thread(db.delete_user_fact, user_id, fact_id)
             if deleted:

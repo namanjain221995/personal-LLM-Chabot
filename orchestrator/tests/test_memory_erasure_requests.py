@@ -26,6 +26,14 @@ complaints, third parties, quotes, remember requests and negations, plus
 the everyday "forget X, tell me Y" that puts a topic aside, "forget it"
 that means never mind, and delete verbs aimed at a document rather than at
 memory. Each template is expanded over ten ways of naming a profile item.
+
+AFTER THE FIRST DRAFT of the classifier passed all of the above, probing it
+with messages outside the set found one more class: a topic set aside
+across SENTENCES ("Forget my address. I'll send it later."). Those probes
+are in KEEP_ADDED_AFTER_THE_FIRST_DRAFT, and the one pre-written request of
+that shape ("Forget my employer. What's the weather in Pune?") moved from
+ERASE to KEEP: next to another request, a "forget" is not taken as an
+erasure, which is the fail-closed reading the owner asked for.
 """
 from __future__ import annotations
 
@@ -396,6 +404,86 @@ KEEP_WRITTEN = {
 }
 
 
+KEEP_ADDED_AFTER_THE_FIRST_DRAFT = {
+    "set aside across sentences": (
+        "Forget my address. I'll send it later.",
+        "Forget my employer. Write a generic cover letter.",
+        "Forget my name. Use 'the candidate' instead.",
+        "Forget my name. Just call me the candidate.",
+        "Forget my employer. Tell me a joke.",
+        "Forget my address. Let's use the office one.",
+        "Forget my city. We're planning a trip abroad.",
+        "Forget my job. It's the weekend!",
+        "Forget my employer. I don't want to talk about work today.",
+        "Forget my address. It's not relevant here.",
+        "Forget my address!!! It's a secret, don't put it in the letter.",
+        "Forget my job. Forget my boss. Just help me relax.",
+        "Forget my name. Forget my face. Forget everything.",
+        "Please forget my name. I'm writing a story where the hero has no name.",
+        "Forget my employer. What's the weather in Pune?",
+        "Forget my employer. What should I say in the interview?",
+        "Forget my employer. Remember to write the cover letter.",
+        "Forget my employer. Don't forget to write the cover letter.",
+        "Forget where I live. Plan the route from the airport.",
+    ),
+    "not in earnest": (
+        "ok forget my employer lol",
+        "Forget that I'm vegetarian lol",
+        "Forget where I live haha",
+        "Forget my employer 😂",
+        "Forget my name, it's just a test.",
+        "Forget my employer, I was joking.",
+    ),
+    "set aside in one sentence": (
+        "Forget my name for the purposes of this story.",
+        "Forget my employer if you want.",
+        "Please forget my name when you write the email.",
+        "Forget my employer and my address and tell me a joke",
+        "forget my company and focus on the question",
+        "Forget my employer - it's irrelevant to this question.",
+        "Forget my address: use the PO box.",
+        "Forget that I live in Pune when you plan the trip.",
+        "Can you forget my name for a sec?",
+        "Could you forget my address for this reply?",
+        "Forget about my employer, what should I say in the interview?",
+        "Forget about my job for a bit.",
+        "In the next story, forget my name.",
+        "For this answer, forget my employer.",
+        "Forget my employer in your next answer.",
+    ),
+    "role play or instructions": (
+        "Forget my address, Detective.",
+        "Pretend you're my ex. Forget my name.",
+        "You're a detective. Forget my address.",
+        "Translate this. Forget my name.",
+        "Let's play a game: forget my name.",
+        "Write a story where the hero says: forget my name.",
+        "Forget my name in Spanish",
+        "How do you say 'forget my name' in Spanish?",
+        "1. Forget my employer\n2. Tell me a joke",
+        "- forget my employer\n- write the letter",
+        "Delete what you know about my employer from the report.",
+        "Remove the facts about Pune from the essay.",
+        "Forget what I told you about my sister in the email draft",
+    ),
+    "sarcasm or second thoughts": (
+        "Oh sure, forget my employer, like you always do.",
+        "Sure, forget my name too.",
+        "Great, now forget my name too.",
+        "Forget my employer.\n\nBy the way, how's the weather?",
+        "Forget where I live. Or don't, whatever.",
+        "Please forget my name. No wait, keep it.",
+    ),
+    "question about forgetting": (
+        "Would you forget my name?",
+        "Would you delete your memory if I asked?",
+        "Why can't you forget my employer?",
+        "Can't you forget my employer?",
+        "So you forget my employer?",
+    ),
+}
+
+
 def _keep_cases():
     cases = []
     for category, templates in KEEP_TEMPLATES.items():
@@ -405,8 +493,9 @@ def _keep_cases():
                 if message[0].islower() and template.startswith("{o}"):
                     message = message[0].upper() + message[1:]
                 cases.append((category, message))
-    for category, messages in KEEP_WRITTEN.items():
-        cases.extend((category, message) for message in messages)
+    for written in (KEEP_WRITTEN, KEEP_ADDED_AFTER_THE_FIRST_DRAFT):
+        for category, messages in written.items():
+            cases.extend((category, message) for message in messages)
     return cases
 
 
@@ -491,12 +580,18 @@ ERASE = (
     ("Forget my employer and where I live.", (EMPLOYER, HOME), (EMPLOYER, HOME)),
     ("Forget my employer. Also forget where I live.", (EMPLOYER, HOME), (EMPLOYER, HOME)),
     ("Please forget my name and my address.", (NAME, HOME), (NAME, HOME)),
-    ("Forget my employer. What's the weather in Pune?", (EMPLOYER,), (EMPLOYER,)),
     (
         "Please forget that I'm vegetarian. Don't forget I like spicy food though.",
         (VEG,),
         (VEG,),
     ),
+    # Added after the first draft: a courtesy, a reason or a memory noun.
+    ("Forget my address. I moved to Mumbai.", (HOME,), (HOME,)),
+    ("Please forget that I'm vegetarian. That's out of date.", (VEG,), (VEG,)),
+    ("Forget my employer. I don't want that saved.", (EMPLOYER,), (EMPLOYER,)),
+    ("Forget where I live. Thanks!", (HOME,), (HOME,)),
+    ("Delete my memory of Pune.", (HOME,), (HOME,)),
+    ("Clear your memory of my employer.", (EMPLOYER,), (EMPLOYER,)),
     # Honoured when the extractor names the row; the words alone do not.
     ("Forget everything you know about me.", (), (EMPLOYER,)),
     ("Clear my memory.", (), (EMPLOYER,)),
@@ -554,7 +649,10 @@ def test_the_set_is_large_enough():
     assert len(ERASE) >= 50
 
 
-@pytest.mark.parametrize("category", sorted(set(KEEP_TEMPLATES) | set(KEEP_WRITTEN)))
+_CATEGORIES = sorted({category for category, _ in KEEP})
+
+
+@pytest.mark.parametrize("category", _CATEGORIES)
 def test_nothing_is_deleted_without_an_erasure_request_fallback(owner, category):
     """Mode 1: the extractor proposes nothing."""
     wrong = {}
@@ -567,7 +665,7 @@ def test_nothing_is_deleted_without_an_erasure_request_fallback(owner, category)
     assert wrong == {}, f"{len(wrong)} deletions: {wrong}"
 
 
-@pytest.mark.parametrize("category", sorted(set(KEEP_TEMPLATES) | set(KEEP_WRITTEN)))
+@pytest.mark.parametrize("category", _CATEGORIES)
 def test_nothing_is_deleted_without_an_erasure_request_worst_extractor(owner, category):
     """Mode 2: the extractor proposes removing every saved fact."""
     wrong = {}

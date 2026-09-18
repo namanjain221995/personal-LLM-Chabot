@@ -809,3 +809,156 @@ def test_a_suffix_after_an_ungrounded_name_is_left_for_the_grounding_check():
         strip_ungrounded_suffixes("The user works at TechSara Solutions", "I work at TechSara.")
         == "The user works at TechSara"
     )
+
+
+# --- 8. Review round 2, 2026-09-18 -------------------------------------------
+# Both reviewers hard-deleted a profile fact with messages that ask for the
+# opposite, or ask nothing: the round-2 synonym table took any clause holding
+# "forget" as an erasure. None of these deleted anything at 4810da0. The
+# full adversarial set is tests/test_memory_erasure_requests.py; these are
+# the reviewers' own reproductions, verbatim.
+
+_ROUND2_PROFILE = (
+    "The user works at Cognitiv",
+    "The user lives in Pune",
+    "The user's name is Naman",
+    "The user is vegetarian",
+)
+
+
+def _round2_profile(uid):
+    return {f: db.add_user_fact(uid, f, "c1")["id"] for f in _ROUND2_PROFILE}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # security review F1
+        "Don't ever forget where I live.",
+        "Please don't ever forget my employer.",
+        "Do not, ever, forget where I live.",
+        "Never, ever forget my company.",
+        "Don't you dare forget my job!",
+        "Did you forget my employer?",
+        "Did you forget where I live?",
+        "Why did you forget where I work?",
+        "Why do you keep forgetting? Did you forget my company?",
+        # verifier, blocking failure
+        "Did you forget where I work?",
+        "Why would you forget my address?",
+        "How do I make Chrome forget my address?",
+        "How can I make LinkedIn forget my employer?",
+        "How do I get Google Maps to forget my home address?",
+        "Did the app forget my address?",
+        "Don't you dare forget my employer!",
+        # verifier note: deleted the name fact at 4810da0 AND at 2f702e1
+        "Did you forget my name?",
+    ],
+)
+def test_a_question_reminder_or_third_party_deletes_nothing(owner, message):
+    _round2_profile(owner)
+    assert _deleted(_forget(owner, message)) == []
+    assert sorted(_texts(owner)) == sorted(_ROUND2_PROFILE)
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Did you forget my employer?", "Don't ever forget where I live.", "Did you forget my name?"],
+)
+def test_the_extractors_remove_is_ignored_when_nobody_asked(owner, message):
+    """Security review, pre-existing at 4810da0: a remove id the extractor
+    proposes for a QUESTION about forgetting went through. Only a request
+    from the person may delete."""
+    ids = _round2_profile(owner)
+    reply = '{"add": [], "replace": [], "remove": %s}' % sorted(ids.values())
+    assert _deleted(_forget(owner, message, reply)) == []
+    assert sorted(_texts(owner)) == sorted(_ROUND2_PROFILE)
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("Please forget my employer.", "The user works at Cognitiv"),
+        ("Can you forget my employer?", "The user works at Cognitiv"),
+        ("Could you please forget where I live?", "The user lives in Pune"),
+        ("Forget where I live, please.", "The user lives in Pune"),
+        ("Erase my employer.", "The user works at Cognitiv"),
+        ("Stop remembering where I work.", "The user works at Cognitiv"),
+        ("Ok, forget my employer.", "The user works at Cognitiv"),
+        # verifier note: the round-2 clause split dropped the appositive
+        ("Forget my employer, Cognitiv.", "The user works at Cognitiv"),
+    ],
+)
+def test_a_directive_erasure_deletes_exactly_the_named_fact(owner, message, expected):
+    _round2_profile(owner)
+    assert _deleted(_forget(owner, message)) == [expected]
+    assert sorted(_texts(owner)) == sorted(f for f in _ROUND2_PROFILE if f != expected)
+
+
+def test_an_appositive_the_fact_does_not_contain_deletes_nothing(owner):
+    """"Forget my address, Detective." addresses someone; the name after the
+    comma must be in the fact, for the fallback and for the extractor."""
+    ids = _round2_profile(owner)
+    reply = '{"add": [], "replace": [], "remove": %s}' % sorted(ids.values())
+    assert _deleted(_forget(owner, "Forget my address, Detective.", reply)) == []
+    assert _deleted(_forget(owner, "Forget my address, Detective.")) == []
+
+
+def test_the_fallback_never_reaches_another_users_fact(owner):
+    bob = db.create_user("bob", "hash")
+    db.create_conversation(bob, "cb", "Bob")
+    db.add_user_fact(bob, "The user works at Northwind", "cb")
+    carol = db.create_user("carol", "hash")
+    db.create_conversation(carol, "cc", "Carol")
+    asyncio.run(
+        remember_from_message(
+            carol, "Please forget my employer.", "cc", complete=_fake_complete(_NO_OPS)
+        )
+    )
+    assert [f["fact"] for f in db.list_user_facts(bob)] == ["The user works at Northwind"]
+
+
+def test_an_extractor_remove_for_another_users_fact_id_is_ignored(owner):
+    _round2_profile(owner)
+    bob = db.create_user("bob", "hash")
+    db.create_conversation(bob, "cb", "Bob")
+    bobs = db.add_user_fact(bob, "The user works at Northwind", "cb")
+    reply = '{"add": [], "replace": [], "remove": [%d]}' % bobs["id"]
+    _forget(owner, "Please forget my employer.", reply)
+    assert [f["fact"] for f in db.list_user_facts(bob)] == ["The user works at Northwind"]
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "The user wants the new repo to be called Atlas",
+        "The user wants the report to be called Q3 Summary",
+        "The user needs the function to be called ParseInvoice",
+        "The user is asking for the file to be called README",
+        "The user wants to know if Priya goes by Pri",
+    ],
+)
+def test_naming_a_thing_is_not_a_name_preference(fact):
+    """Security review F2: the name-preference shape did not require the
+    USER to be the one named, so a task request became durable."""
+    assert is_durable(fact) is False
+
+
+def test_the_classifier_is_linear_on_a_long_courtesy_tail():
+    """A clause read lazily up to a long run of ", please" backtracked for
+    160-175 ms (measured 2026-09-19) before the tail was made possessive; a
+    message this long runs on the event loop."""
+    import time
+
+    from app.facts import _erasure_requests
+
+    worst = 0.0
+    for text in (
+        "Forget that I x" + ", please" * 140 + " x",
+        "Delete what you know about x" + ", please" * 140 + " x",
+        "Forget that I" + " ," * 560 + "x",
+    ):
+        started = time.perf_counter()
+        _erasure_requests(text)
+        worst = max(worst, time.perf_counter() - started)
+    assert worst < 0.05, worst

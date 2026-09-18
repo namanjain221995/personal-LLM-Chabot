@@ -72,7 +72,26 @@ _PAST_REFERENCE_RE = re.compile(
     # "the last session" alone is also Parliament's; a CHAT is always ours.
     r"|\b(?:in|from)\s+(?:another\s+(?:chat|conversation)|"
     r"(?:the|that|an?)\s+(?:last|previous|earlier|other|old|different)\s+chat)\b"
-    r"|\bour\s+(?:decision|agreement|conclusion)\b",
+    r"|\bour\s+(?:decision|agreement|conclusion)\b"
+    # "Where did we land on the database?", "What database did we land on?",
+    # "Which database are we going with?", "Remind me of the database
+    # decision." — 4 of the 9 decision phrasings the verifier found missed
+    # (2026-09-18). Not a bare "did we land": "Did we land on the moon in
+    # 1969?" is a world question.
+    r"|\bwhere\s+did\s+we\s+(?:finally\s+|ultimately\s+)?land\b"
+    r"|\bdid\s+we\s+(?:finally\s+|ultimately\s+)?land\s+on\W*$"
+    r"|\b(?:are|were)\s+we\s+(?:going|gonna\s+go)\s+with\b"
+    r"|\bremind\s+me\s+(?:of|about)\s+(?:the|our|that)\s+(?:[\w-]+\s+){0,3}"
+    r"(?:decision|choice|conclusion|plan)\b",
+    re.I,
+)
+
+#: A courtesy typed after the question ("what did we decide?\nThanks!").
+#: Read as the question, it hid the question above it.
+_PLEASANTRY_LINE_RE = re.compile(
+    r"\s*(?:thanks?(?:\s+(?:a\s+lot|so\s+much|again|in\s+advance))?|thank\s+you"
+    r"(?:\s+(?:so\s+much|again|in\s+advance))?|thx|ty|tia|cheers|please|pls|"
+    r"appreciate\s+it)[\s.!:)]*",
     re.I,
 )
 
@@ -85,14 +104,19 @@ def refers_to_past_conversation(query: str) -> bool:
     """True when `query` asks about what was said or decided in the person's
     own earlier conversations, not about the world.
 
-    Only the typed question is read: the last non-empty line, at most
-    2,000 characters of it. The composer folds a paste into the message
-    with no marker, so pasted meeting notes saying "we agreed to ship on
-    Friday" opened the gate for the bitcoin question under them, and the
-    whole-text scan cost 1.0-1.9 s of event loop on a 10 MB paste (QA,
-    2026-09-18)."""
+    Only the typed question is read: the last non-empty line that is not a
+    courtesy ("Thanks!"), at most 2,000 characters of it. The composer
+    folds a paste into the message with no marker, so pasted meeting notes
+    saying "we agreed to ship on Friday" opened the gate for the bitcoin
+    question under them, and the whole-text scan cost 1.0-1.9 s of event
+    loop on a 10 MB paste (QA, 2026-09-18)."""
     text = (query or "").rstrip()
-    line = text[text.rfind("\n") + 1 :][-_PAST_REFERENCE_MAX_CHARS:]
+    for _ in range(3):
+        cut = text.rfind("\n")
+        line = text[cut + 1 :][-_PAST_REFERENCE_MAX_CHARS:]
+        if cut < 0 or not _PLEASANTRY_LINE_RE.fullmatch(line):
+            break
+        text = text[:cut].rstrip()
     return bool(_PAST_REFERENCE_RE.search(line))
 
 
@@ -233,8 +257,12 @@ def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict])
 #: patterns do you expect?" -> "Mostly big aggregates." -> "Then go with
 #: ClickHouse." Paired with the clarifying question alone, the decision
 #: was recalled 0/3 live (QA, 2026-09-18). A full answer that ends in an
-#: offer ("…Want me to sketch the schema?") is longer than this.
+#: offer ("…Want me to sketch the schema?") is longer than this — and a
+#: short one ("Go with Postgres. Want me to sketch the schema?") is two
+#: sentences: taken for a question, it dragged the NEXT exchange, a stale
+#: bitcoin price, into the block (verifier, 2026-09-18).
 _CLARIFYING_MAX_CHARS = 300
+_SENTENCE_END_RE = re.compile(r"[.!]\s")
 
 
 def _is_role(row: dict, role: str) -> bool:
@@ -265,6 +293,7 @@ def _answer_index(candidates: List[dict]) -> dict:
             if (
                 reply.endswith("?")
                 and len(reply) <= _CLARIFYING_MAX_CHARS
+                and not _SENTENCE_END_RE.search(reply)
                 and i + 3 < len(rows)
                 and _is_role(rows[i + 2], "user")
                 and _is_role(rows[i + 3], "assistant")
@@ -289,6 +318,39 @@ def _snippet(text: str) -> str:
     if len(clean) > _SNIPPET_CHARS:
         clean = clean[:_SNIPPET_CHARS] + "…"
     return clean
+
+
+#: A sentence that states a choice.
+_DECISIVE_RE = re.compile(
+    r"\b(?:decid(?:e|es|ed|ing)|decision|recommend(?:s|ed|ation)?|verdict|conclusion|"
+    r"bottom\s+line|in\s+short|go(?:ing)?\s+with|went\s+with|choose|chose|pick(?:ed)?|"
+    r"settled?\s+on|final\s+(?:answer|call|choice|pick)|best\s+(?:choice|option|fit|bet))\b",
+    re.I,
+)
+_ANSWER_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]*")
+
+
+def _answer_snippet(text: str) -> str:
+    """A paired answer as its opening, the last two sentences of its body
+    that state a choice, and its close.
+
+    Cut to the 240-character snippet, a decision stated later in the answer
+    never reached the block: 72.7% of production assistant messages are
+    longer than that (median 744 characters), and the main model's own
+    answers to a decision question put the conclusion 2,000-4,500
+    characters in, 0/3 recalled (verifier, 2026-09-18). At most four
+    240-character pieces, so a long answer still costs the block a bounded
+    amount."""
+    clean = " ".join((text or "").split())
+    if len(clean) <= 2 * _SNIPPET_CHARS:
+        return clean
+    body = clean[_SNIPPET_CHARS:-_SNIPPET_CHARS]
+    decisive = [
+        s.strip()[:_SNIPPET_CHARS]
+        for s in _ANSWER_SENTENCE_RE.findall(body)
+        if _DECISIVE_RE.search(s)
+    ][-2:]
+    return " … ".join([clean[:_SNIPPET_CHARS], *decisive, clean[-_SNIPPET_CHARS:]])
 
 
 async def ensure_message_embeddings(user_id: int) -> int:
@@ -452,7 +514,7 @@ async def semantic_hits(
             hits.append(_hit(c, snippet, score))
             units += 1
             for answer in answers.get(c["message_id"], ()):
-                answer_snippet = _snippet(answer["content"])
+                answer_snippet = _answer_snippet(answer["content"])
                 if answer_snippet not in seen_snippets:
                     seen_snippets.add(answer_snippet)
                     hits.append(

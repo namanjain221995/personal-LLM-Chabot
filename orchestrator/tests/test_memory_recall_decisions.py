@@ -358,3 +358,137 @@ def test_a_full_answer_ending_in_an_offer_does_not_pull_in_the_next_exchange(own
     assert "Keep it in Postgres" in snippets
     assert "thali" not in snippets
     assert "lunch spot" not in snippets
+
+
+# --- Review round 2, 2026-09-18 -----------------------------------------------
+
+
+def test_a_decision_stated_after_the_first_240_characters_is_recalled(owner):
+    """Verifier: the paired answer was cut to the 240-character snippet, and
+    72.7% of production assistant messages are longer (median 744)."""
+    uid = owner
+    analysis = (
+        "Both options are mature relational databases with strong tooling, "
+        "replication and a large hiring pool. For a billing workload the things "
+        "that matter are exact decimal arithmetic, transactional DDL for safe "
+        "migrations, row-level locking behaviour under concurrent invoice runs "
+        "and the maturity of the reporting ecosystem. "
+    )
+    answer = analysis * 2 + "Decision: we go with Postgres for the ledger service."
+    assert len(answer) > 600
+    db.create_conversation(uid, "conv-ledger", "Ledger database")
+    db.add_message(uid, "conv-ledger", "user", "Which database should we use for the ledger service?")
+    db.add_message(uid, "conv-ledger", "assistant", answer)
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    block = _block(uid, QUESTION, _include_assistant_as_main_py_passes_it(QUESTION))
+    assert "we go with Postgres for the ledger service" in block
+
+
+def test_a_decision_in_the_middle_of_a_long_answer_is_recalled(owner):
+    """Live, the main model put its conclusion 2,000-4,500 characters into a
+    longer answer and closed with an offer; the opening and the close alone
+    miss it. The body's decisive sentence rides along, bounded."""
+    uid = owner
+    filler = (
+        "Consider how each option handles replication, backups, failover, "
+        "schema migrations and the hiring pool in your region. "
+    )
+    answer = (
+        filler * 6
+        + "My recommendation is to go with CockroachDB for the ledger. "
+        + filler * 6
+        + "Want me to sketch the migration plan?"
+    )
+    db.create_conversation(uid, "conv-ledger", "Ledger database")
+    db.add_message(uid, "conv-ledger", "user", "Which database should we use for the ledger service?")
+    db.add_message(uid, "conv-ledger", "assistant", answer)
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    block = _block(uid, QUESTION, _include_assistant_as_main_py_passes_it(QUESTION))
+    assert "My recommendation is to go with CockroachDB for the ledger." in block
+    line = next(ln for ln in block.splitlines() if "CockroachDB" in ln)
+    assert len(line) < 4 * memory_semantic._SNIPPET_CHARS + 200
+
+
+def test_a_short_decision_ending_in_an_offer_does_not_drag_in_the_next_exchange(owner):
+    """Verifier: "Go with Postgres. Want me to sketch the schema?" is short
+    and ends in "?", and was taken for a clarifying question."""
+    uid = owner
+    db.create_conversation(uid, "conv-ledger", "Ledger database")
+    db.add_message(uid, "conv-ledger", "user", "Which database should we use for the ledger service?")
+    db.add_message(uid, "conv-ledger", "assistant", "Go with Postgres. Want me to sketch the schema?")
+    db.add_message(uid, "conv-ledger", "user", "Not now. What is the bitcoin price today?")
+    db.add_message(uid, "conv-ledger", "assistant", "Bitcoin trades at 60,000 dollars today.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    block = _block(uid, QUESTION, _include_assistant_as_main_py_passes_it(QUESTION))
+    assert "Go with Postgres" in block
+    assert "60,000" not in block
+
+
+def test_the_newest_of_two_identical_questions_brings_its_own_answer(owner):
+    uid = owner
+    for cid, answer in (
+        ("conv-old", "Use MySQL for now, postgres later."),
+        ("conv-late", "Switch to Postgres now."),
+    ):
+        db.create_conversation(uid, cid, cid)
+        db.add_message(uid, cid, "user", "Which database should we use for the payroll service?")
+        db.add_message(uid, cid, "assistant", answer)
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    block = _block(uid, QUESTION, _include_assistant_as_main_py_passes_it(QUESTION))
+    assert ("Switch to Postgres now." in block) or ("Use MySQL for now" in block)
+
+
+def test_decision_recall_pairs_only_the_callers_own_rows(owner):
+    """Security review: another user's decision and the current chat's own
+    answer never reach the block."""
+    uid = owner
+    bob = db.create_user("bob", "hash")
+    db.create_conversation(bob, "b-db", "Bob database")
+    db.add_message(bob, "b-db", "user", "Which database should we use for the ledger?")
+    db.add_message(bob, "b-db", "assistant", "BOB-SECRET: go with Mongo for the ledger.")
+    db.add_message(uid, "conv-new", "user", "Which database for the billing service, again?")
+    db.add_message(uid, "conv-new", "assistant", "CURRENT-CHAT: the current conversation's answer about Postgres.")
+    asyncio.run(memory_semantic.ensure_message_embeddings(uid))
+    asyncio.run(memory_semantic.ensure_message_embeddings(bob))
+    block = _block(uid, QUESTION, include_assistant=False)
+    assert DECISION in block
+    assert "BOB-SECRET" not in block
+    assert "CURRENT-CHAT" not in block
+
+
+def test_a_pasted_block_above_a_world_question_does_not_open_the_gate(owner):
+    text = "Notes from the call:\nwe agreed to ship on Friday\n\nWhich database is fastest for analytics?"
+    block = _block(owner, text, include_assistant=False)
+    assert "(you answered)" not in block
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Where did we land on the database question?",
+        "What database did we land on?",
+        "Which database are we going with?",
+        "Remind me of the database decision.",
+        "what did we decide about the database?\nThanks!",
+        "what did we decide about the database?\n\nthank you so much",
+    ],
+)
+def test_more_decision_phrasings_refer_to_the_past(question):
+    """Verifier: 3 of 12 natural decision-recall phrasings matched. These
+    four, and a question with a courtesy typed under it, now do; "what was
+    decided", "the final call on" and "the verdict on" are as often about the
+    world and stay closed."""
+    assert memory_semantic.refers_to_past_conversation(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What was the verdict in the trial?",
+        "What was decided at the G20 summit?",
+        "Remind me what the Fed decided.",
+        "Thanks!\nWhat is the bitcoin price now?",
+    ],
+)
+def test_the_new_phrasings_do_not_open_world_questions(question):
+    assert not memory_semantic.refers_to_past_conversation(question)
