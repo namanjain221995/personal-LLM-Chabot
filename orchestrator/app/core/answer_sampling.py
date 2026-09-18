@@ -250,12 +250,25 @@ _LONGFORM_INDIC = re.compile(
 )
 #: An explicit size: "2000 words", "३००० शब्दों", "2000 શબ્દોનો", "80 questions".
 #: `\d` matches Devanagari and Gujarati digits too, and int() reads them.
-_SIZE_WORDS = re.compile(r"(\d{2,7})\s*[-\s]?\s*(?:words?|शब्द|શબ્દ)", re.IGNORECASE)
+#: A GROUPED count — "12,000", "5 000", "5 000" — is read first, ASCII
+#: digits only: "Produce a 12,000 word manual" was prose while "12000 word"
+#: was longform (2026-09-18), because `\d{2,7}` cannot cross the comma and
+#: found "000". Indic digits keep exactly the old reading (English-only rule).
+_GROUPED_COUNT = r"[0-9]{1,3}(?:[,   ][0-9]{3})+(?![0-9])"
+_SIZE_WORDS = re.compile(rf"({_GROUPED_COUNT}|\d{{2,7}})\s*[-\s]?\s*(?:words?|शब्द|શબ્દ)", re.IGNORECASE)
 _SIZE_ITEMS = re.compile(
-    r"(\d{2,7})\s+(?:[a-z-]+\s+){0,3}?(?:items|questions|examples|names|ideas|idioms|words|lines|rows|entries|"
+    rf"({_GROUPED_COUNT}|\d{{2,7}})\s+(?:[a-z-]+\s+){{0,3}}?(?:items|questions|examples|names|ideas|idioms|words|lines|rows|entries|"
     r"points|tips|facts|quotes|sentences|paragraphs|pages|steps|recipes|jokes|prompts|titles)\b",
     re.IGNORECASE,
 )
+
+
+def _count(raw: str) -> int:
+    """A size match as a number: a grouped count digits-only, else int(),
+    which also reads Devanagari and Gujarati digits."""
+    if raw.isdigit():
+        return int(raw)
+    return int(re.sub(r"[^0-9]", "", raw))
 #: Target-language mentions for the presence-penalty gate: a Latin-script ask
 #: whose ANSWER is in another script ("translate into Hindi") must not get it.
 _TARGET_LANGUAGE = re.compile(
@@ -266,12 +279,34 @@ _TARGET_LANGUAGE = re.compile(
 )
 
 
+#: A Salesforce RECORD listing: "show my open opportunities", "list the
+#: accounts in Pune". Its answer is rows of records, so it keeps the
+#: structured reading it had when every Salesforce turn was structured.
+_SF_RECORDS = re.compile(
+    r"\b(?:show|list|find|get|fetch|pull|give\s+me|display)\b(?:\s+\S+){0,5}?\s+"
+    r"(?:opportunit(?:y|ies)|accounts?|leads?|contacts?|cases?|records?|deals?|quotes?|tasks?|campaigns?|pipeline)\b",
+    re.IGNORECASE,
+)
+
+
 def shape_for(message: str, *, mode: str = "assistant") -> str:
     """'structured', 'longform' or 'prose' for the length caps and the
     presence-penalty gate. Structured wins over long-form: a 60-row table is
-    both, and the structured reading is the conservative one."""
+    both, and the structured reading is the conservative one.
+
+    Salesforce mode used to be structured on every turn. Since 2026-09-18 it
+    answers ordinary prose too, so it reads shapes the assistant way: small
+    talk is prose (the short shape), a record listing stays structured, and
+    everything else is decided below."""
     if mode == "salesforce":
-        return SHAPE_STRUCTURED
+        from .. import fast_lane
+
+        if fast_lane.classify_pleasantry(message or ""):
+            return SHAPE_PROSE
+        shape = shape_for(message, mode="assistant")
+        if shape == SHAPE_PROSE and _SF_RECORDS.search((message or "")[-_SHAPE_SCAN_CHARS:]):
+            return SHAPE_STRUCTURED
+        return shape
     text = message or ""
     head = text[-_SHAPE_SCAN_CHARS:]
     if _STRUCTURED.search(head):
@@ -288,12 +323,96 @@ def shape_for(message: str, *, mode: str = "assistant") -> str:
     if _LONGFORM_EXTRA.search(head) or _LONGFORM_INDIC.search(head):
         return SHAPE_LONGFORM
     for match in _SIZE_WORDS.finditer(head):
-        if int(match.group(1)) >= 800:
+        if _count(match.group(1)) >= 800:
             return SHAPE_LONGFORM
     for match in _SIZE_ITEMS.finditer(head):
-        if int(match.group(1)) >= 50:
+        if _count(match.group(1)) >= 50:
             return SHAPE_LONGFORM
     return SHAPE_PROSE
+
+
+# ---------------------------------------------------------------------------
+# The length a person asked for
+# ---------------------------------------------------------------------------
+
+#: A count of words: "5,000-word", "3000 words", "1 500 words" is NOT
+#: read — a plain space is also how two counts sit side by side ("5 500-word
+#: essays"), and a misread target makes the answer longer, where a misread
+#: shape above only changes a cap. ASCII digits and English only (2026-09-16).
+_TARGET_RE = re.compile(
+    r"(?<![0-9.,])([0-9]{1,3}(?:[,  ][0-9]{3})+(?![0-9])|[0-9]{2,7})\s*(?:-\s*)?words?\b",
+    re.IGNORECASE,
+)
+#: A request for text: the verb (or marker) must come before the count.
+_PRODUCE_RE = re.compile(
+    r"\b(?:write|writing|draft|compose|produce|generate|create|prepare|craft|pen|author|make|expand|extend|lengthen|"
+    r"rewrite|continue|develop|elaborate|explain|describe|discuss|cover|summari[sz]e|tell\s+me|give\s+me|send\s+me|"
+    r"provide|deliver|build|turn|need|want|(?:i|we)(?:'d|\s+would)\s+like|please|pls|kindly)\b",
+    re.IGNORECASE,
+)
+#: A question ABOUT a length asks for no text of that length.
+_QUESTION_OPENER = re.compile(
+    r"^\W*(?:how|what|what's|whats|why|when|where|which|who|whose|is|are|was|were|does|do|did|should|shall|"
+    r"isn't|aren't|how's)\b",
+    re.IGNORECASE,
+)
+#: A LIMIT is not a target: "under 300 words", "no more than 500 words".
+_LIMIT_BEFORE = re.compile(
+    r"\b(?:under|below|max|maximum|within|less\s+than|fewer\s+than|no\s+more\s+than|not\s+more\s+than|no\s+longer\s+than|"
+    r"shorter\s+than|up\s+to|at\s+most|not\s+(?:to\s+)?exceed(?:ing)?|limit(?:ed)?\s+(?:of|to)|capped\s+at)\s+"
+    r"(?:(?:about|around|roughly|approximately)\s+)?$|[<≤]=?\s*$",
+    re.IGNORECASE,
+)
+_LIMIT_AFTER = re.compile(r"^\s*(?:or\s+(?:less|fewer|under|below)|max(?:imum)?\b|at\s+most|limit\b|cap\b|tops\b)", re.IGNORECASE)
+#: A size PER ITEM: "500 words each", "5 500-word essays", "5 essays of 500 words".
+_PER_ITEM_AFTER = re.compile(r"^\s*(?:each|apiece|per\s+\w+|for\s+each|every)\b", re.IGNORECASE)
+_QUANTITY = r"(?:[0-9]+|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|few|many)"
+_PER_ITEM_BEFORE = re.compile(
+    rf"\b{_QUANTITY}\s+$|\b{_QUANTITY}\s+(?:\w+\s+){{0,2}}?\w+s\s+(?:of|with|at)\s+(?:(?:about|around|roughly|approximately)\s+)?$",
+    re.IGNORECASE,
+)
+#: A count that DESCRIBES text that exists: "rewrite this 5,000-word essay".
+_DESCRIBES_EXISTING = re.compile(
+    r"\b(?:this|the|that|these|those|my|your|our|their|his|her|its|above|attached|following|existing|original|previous)\s+$",
+    re.IGNORECASE,
+)
+#: How much of a long message is read: its opening and its end, where an ask
+#: sits — never the middle of a paste, whose own "2,000-word limit" is not
+#: the person asking for 2,000 words.
+_TARGET_SCAN_CHARS = 1500
+_SENTENCE_END = re.compile(r"[.!?\n]")
+
+
+def requested_words(message: str) -> Optional[int]:
+    """The number of words the message asks the answer to run to, or None.
+
+    A TARGET, approximate or a minimum: "a 5,000-word article", "about 3,000
+    words", "at least 2,000 words", "in 1,500 words". None for a limit ("under
+    300 words"), a size per item ("500 words each"), a count describing text
+    that exists ("this 5,000-word essay"), a question about a length ("how
+    long is a 5,000-word essay?") and a count with no request before it. The
+    largest target wins ("a 3,000-word paper with a 200-word abstract").
+    """
+    text = message or ""
+    if len(text) > 2 * _TARGET_SCAN_CHARS:
+        text = text[:_TARGET_SCAN_CHARS] + "\n" + text[-_TARGET_SCAN_CHARS:]
+    best: Optional[int] = None
+    for m in _TARGET_RE.finditer(text):
+        start = max((b.end() for b in _SENTENCE_END.finditer(text, 0, m.start())), default=0)
+        stop = _SENTENCE_END.search(text, m.end())
+        sentence_head = text[start:m.start()]
+        after = text[m.end(): stop.start() if stop else len(text)]
+        if _QUESTION_OPENER.match(sentence_head):
+            continue
+        if not (_PRODUCE_RE.search(sentence_head) or re.search(r"\b(?:please|pls|kindly)\b", after, re.IGNORECASE)):
+            continue
+        if (_LIMIT_BEFORE.search(sentence_head) or _LIMIT_AFTER.match(after) or _PER_ITEM_AFTER.match(after)
+                or _PER_ITEM_BEFORE.search(sentence_head) or _DESCRIBES_EXISTING.search(sentence_head)):
+            continue
+        n = int(re.sub(r"[^0-9]", "", m.group(1)))
+        if n > 0 and (best is None or n > best):
+            best = n
+    return best
 
 
 def fast_caps(shape: str, *, dense_script: bool = False) -> Tuple[int, int]:

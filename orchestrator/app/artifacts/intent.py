@@ -144,8 +144,15 @@ _DATA_NOUNS = (
     r"(?:sample|dummy|synthetic|test|mock|realistic|fake|random)\s+(?:\w+\s+)?(?:records|rows|data|entries)|"
     r"(?:records|rows)\s+of\s+(?:\w+\s+)?data)"
 )
+#: `word` the FORMAT, never the unit of a count. "Write a 5,000-word article",
+#: "a 5000 word article" and "a 1,500 word blog post" were files (measured
+#: 2026-09-18): the bare noun matched the unit, so an article asked for by
+#: its length opened a Word job. A digit right before it — alone, or with the
+#: hyphen, comma or space of "5,000-word" / "5000 word" — makes it the unit.
+#: "make me a word document" and "a word version" still name the format.
+_WORD_FORMAT = r"(?<![0-9])(?<![0-9][-,\s])(?<![0-9][-,]\s)word"
 _ARTIFACT_NOUNS = (
-    r"(?:pdf|docx|word(?:\s+(?:document|file|doc))?|powerpoint|power ?point|powerpint|pptx?|presentation|slides?|"
+    rf"(?:pdf|docx|{_WORD_FORMAT}(?:\s+(?:document|file|doc))?|powerpoint|power ?point|powerpint|pptx?|presentation|slides?|"
     r"slide ?deck|deck|pitch ?deck|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|work ?book|tracker|document|doc|"
     r"report|sop|standard operating procedure|memo|brief|one[- ]pagers?|one[- ]page|proposal|"
     r"(?<!cheat )(?<!fact )(?<!balance )(?<!time )(?<!score )(?<!answer )sheets?(?!\s*\d)|"
@@ -164,7 +171,7 @@ _ARTIFACT_NOUNS = (
     rf"{_DATA_NOUNS})"
 )
 _FORMAT_WORD = (
-    r"(?:pdf|docx|word|powerpoint|power ?point|powerpint|pptx?|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|"
+    rf"(?:pdf|docx|{_WORD_FORMAT}|powerpoint|power ?point|powerpint|pptx?|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|"
     r"work ?book|slides?|deck|presentation|document|report|csv|cvs|comma[- ]separated(?: values?)?|data ?set|data file)"
 )
 
@@ -192,7 +199,7 @@ _POSITIONAL_CREATE_RE = re.compile(
 #: "another report", "a new deck", "a separate PDF": a new file whatever
 #: the verb — but not "another slide" or "a new section", which are parts.
 _FILE_NOUNS = (
-    r"(?:pdf|docx|word(?:\s+(?:document|file|doc))?|powerpoint|power ?point|pptx?|presentation|slide ?deck|deck|pitch ?deck|"
+    rf"(?:pdf|docx|{_WORD_FORMAT}(?:\s+(?:document|file|doc))?|powerpoint|power ?point|pptx?|presentation|slide ?deck|deck|pitch ?deck|"
     r"excel|xlsx|spread ?sheet|work ?book|tracker|calculator|financial model|document|doc|report|sop|memo|brief|"
     r"one[- ]pagers?|proposal|policy|letter|handout|write[- ]?up|whitepaper|csv|data ?set|data file|file|dashboard)"
 )
@@ -641,6 +648,20 @@ def _is_remark(low: str) -> bool:
     """A statement ABOUT the file with no request in it."""
     return bool(_STATEMENT_RE.match(low)) and not _ASK_CLAUSE_RE.search(low)
 
+
+def _negates_every_file(low: str) -> bool:
+    """`low` (lower-cased, NOT yet clause-blanked) rules out any file and asks
+    for none after saying so. See `_NEGATED_FILE_RE`."""
+    for m in _NEGATED_FILE_RE.finditer(low):
+        head = low[max(0, m.start() - 12):m.start()]
+        if _FIRST_PERSON_NEGATION_RE.search(head + m.group(0)[:24]):
+            continue
+        # The first real negation decides: any later one lies inside `after`
+        # and is blanked there, so one scan of the rest is enough.
+        after = _without_negated_clauses(low[m.end():])
+        return not (_CREATE_RE.search(after) or _AS_FORMAT_RE.search(after) or _NEW_FILE_RE.search(after))
+    return False
+
 #: Chart phrasing that asks for one: a verb, "chart of|with|for", a chart
 #: phrase leading the message, or a data colon.
 _CHART_ASK_RE = re.compile(
@@ -771,12 +792,45 @@ _NEEDS_EDIT_RE = re.compile(
     r"\b(?:needs(?!\s+to\b)|is\s+missing|are\s+missing|should\s+(?:have(?!\s+been\b)|include|show|say|list))\b",
     re.I,
 )
+#: "Write the whole thing out here in this chat", "just answer inline"
+#: (2026-09-18: both were files). Each names the place of the ANSWER, so a
+#: verb of answering or of putting the text down must lead it: "make a PDF
+#: of everything in this chat", "the answer in this chat into a docx" and "a
+#: PDF report with inline citations" still ask for a file.
+_ANSWER_VERB = (
+    r"(?<!the\s)(?<!your\s)(?<!an\s)(?<!my\s)(?<!this\s)(?<!that\s)(?:answer|reply|respond)(?:\s+(?:it|this|that|me))?"
+)
+_PUT_TEXT = (
+    r"(?:write|put|keep|type|give|paste|show|post|send)\s+"
+    r"(?:it|this|that|everything|them|the\s+(?:whole\s+thing|answer|article|essay|text|content))(?:\s+out)?"
+)
+_ANSWER_PLACE = (
+    rf"\b(?:{_ANSWER_VERB}|{_PUT_TEXT})(?:\s+(?:right\s+)?here)?(?:"
+    r"\s+in\s+this\s+chat\b(?!\s+(?:into|as|to)\s+(?:an?\s+|the\s+)?(?:\w+\s+)?"
+    r"(?:pdf|docx?|word|excel|xlsx|csv|sheet|spreadsheet|deck|pptx|presentation|file|document|report)\b)"
+    r"|\s+inline\b(?!\s+(?:citations?|images?|charts?|comments?|code|links?|styles?|footnotes?|references?|tables?|formulas?|equations?))"
+    r"(?!\s+(?:in|into|within|on)\s+(?:the|a|an|this|that|your|my)\s+(?!chat\b|conversation\b|reply\b|answer\b|message\b)))"
+)
 #: The person asked for the answer HERE: "in the chat", "no download",
 #: "just tell me", "in 3 lines", "yahin chat me".
 _CHAT_ONLY_RE = re.compile(
     r"\b(?:(?:here\s+)?in\s+(?:the\s+)?chat|no\s+(?:download|file|files|attachment|pdf|doc)s?|without\s+(?:a\s+)?(?:file|download)|"
     r"(?:don'?t|do\s+not)\s+(?:need|want)\s+(?:a\s+|any\s+)?(?:file|download|document)|just\s+tell\s+me|answer\s+here|"
-    r"in\s+\d+\s+(?:lines?|points?|bullets?|sentences?|words?)|yahi[n]?\s+chat|chat\s+(?:_in_|me|mein|ma)\b|here\s+only)\b",
+    r"in\s+\d+\s+(?:lines?|points?|bullets?|sentences?|words?)|yahi[n]?\s+chat|chat\s+(?:_in_|me|mein|ma)\b|here\s+only)\b"
+    rf"|{_ANSWER_PLACE}",
+    re.I,
+)
+#: A negated creation of ANY file: "do not create a file", "don't generate a
+#: document", "without making an attachment". `_without_negated_clauses`
+#: blanks such a clause so the rest decides — which, after "Write a 10,000-
+#: word document on X. Do not create a file.", is a document request again.
+#: The person ruled out every file, so the turn is chat unless a request
+#: FOLLOWS the negation ("don't create a document, make a deck") or a
+#: first-person negation describes the person ("I can't make a file myself").
+_NEGATED_FILE_RE = re.compile(
+    rf"\b{_NEGATION}\s+(?:{_NEGATION_ADVERBS}\s+)*(?:creat\w*|mak(?:e|es|ing)|generat\w*|produc\w*|build\w*|prepar\w*|export\w*|"
+    r"send\w*|attach\w*|sav(?:e|es|ing)|giv(?:e|es|ing)\s+me)\s+(?:me\s+)?(?:an?\s+|any\s+|the\s+)?"
+    r"(?:(?:separate|new|downloadable|extra|actual)\s+)?(?:files?|documents?|attachments?|downloads?)\b",
     re.I,
 )
 #: ...unless a file is still named as the deliverable ("no pdf, give me a docx").
@@ -1089,7 +1143,7 @@ def decide(
     #    a format named as the source, a how-to, trivia, praise or a request
     #    for code is not a file. First, because "explain how to create a PDF
     #    in Python" has a creation verb.
-    if _CHAT_ONLY_RE.search(low) and not _FILE_DESPITE_RE.search(low):
+    if (_CHAT_ONLY_RE.search(low) or _negates_every_file(raw.lower())) and not _FILE_DESPITE_RE.search(low):
         return made("none", rule="chat-only", instruction="")
     shape = LX.negative_shape(low, uploads)
     if shape is not None:

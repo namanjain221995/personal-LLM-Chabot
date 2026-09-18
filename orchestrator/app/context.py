@@ -57,6 +57,16 @@ def _record_trim(dropped_turns: int, clipped_messages: int) -> None:
 # Never emit a completion shorter than this; below it, trim history instead.
 MIN_OUTPUT_TOKENS = 256
 
+# ...but a request that did NOT fit is trimmed until the answer has real
+# room: min(what was asked for, this, a quarter of the window). Stopping at
+# 256 left a 5.2 MB paste 403 tokens to answer in (2026-09-18). A request
+# that fits untouched is never trimmed to make this room.
+OVERFLOW_ANSWER_ROOM = 32_768
+
+
+def _overflow_room(ceiling: int, window: int) -> int:
+    return max(MIN_OUTPUT_TOKENS, min(int(ceiling), OVERFLOW_ANSWER_ROOM, int(window) // 4))
+
 # Fallback when /tokenize is unavailable. Deliberately pessimistic (real text
 # averages ~4 chars/token) so an estimate errs toward a smaller prompt.
 _CHARS_PER_TOKEN = 3.0
@@ -477,9 +487,11 @@ async def fit_request(
 ) -> Tuple[List[dict], int]:
     """Size one model call so prompt + completion always fit the window.
 
-    Returns (messages, max_tokens). Oldest turns are dropped until at least
-    MIN_OUTPUT_TOKENS of completion room exists; the pinned system block and
-    the current user message are never dropped.
+    Returns (messages, max_tokens). A request with at least MIN_OUTPUT_TOKENS
+    of completion room is returned as it is. One without is trimmed — oldest
+    turns first, then the longest message clipped — until `_overflow_room`
+    exists; the pinned system block and the current user message are never
+    dropped.
     """
     window = await model_window(base_url, model)
     margin = settings.context_safety_margin
@@ -493,10 +505,13 @@ async def fit_request(
 
     dropped = 0
     clipped = 0
+    room = MIN_OUTPUT_TOKENS
     for _ in range(_MAX_FIT_ROUNDS):
         budget = window - prompt_tokens - margin
-        if budget >= MIN_OUTPUT_TOKENS:
+        if budget >= room:
             break
+        # It did not fit: from here on, trim for an answer's room.
+        room = _overflow_room(ceiling, window)
 
         # 1. Prefer dropping whole old turns — they cost nothing to lose.
         trimmed = trim_to_fit(msgs, 1)
@@ -511,7 +526,7 @@ async def fit_request(
             if idx is None:
                 break
             content = msgs[idx]["content"]
-            shed_chars = int((MIN_OUTPUT_TOKENS - budget) * _CHARS_PER_TOKEN) + 1024
+            shed_chars = int((room - budget) * _CHARS_PER_TOKEN) + 1024
             target = len(content) - shed_chars
             if target < _MIN_CLIPPED_CHARS:
                 target = _MIN_CLIPPED_CHARS
