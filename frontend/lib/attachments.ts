@@ -491,6 +491,47 @@ function normaliseMime(mime?: string | null): string {
   return (mime ?? '').split(';')[0].trim().toLowerCase();
 }
 
+/* ---- audio and video: one rail (B12, 2026-09-18) ----
+   The server analyses a file with no video stream end to end — the frames
+   stage skips with "the file has no video stream", the transcript and the
+   summary run (a 36 s speech .m4a finished in 49.7 s, 2026-09-18). What kept a
+   voice memo out was this side: the composer knew no audio at all, so an
+   .m4a fell through to the document fallback and came back as "binary file,
+   not readable as text". Audio therefore travels EXACTLY like a video
+   (purpose=video, the 4 GB cap, the VIDEO_ANALYSIS gate); `audio` only
+   changes what the chip says. */
+const VIDEO_EXTENSIONS = new Set([
+  'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'mpg', 'mpeg', '3gp', 'ogv',
+]);
+const AUDIO_EXTENSIONS = ['mp3', 'm4a', 'wav', 'ogg', 'opus', 'flac', 'aac'];
+const AUDIO_EXTENSION_SET = new Set(AUDIO_EXTENSIONS);
+
+export type MediaKind = 'video' | 'audio';
+
+/**
+ * 'audio' | 'video' for a file the video pipeline should analyse, else null.
+ *
+ * The declared type answers first because it is the only witness for a
+ * nameless file, and a browser recording (`clip.webm`, `audio/webm`) is
+ * audio whatever its container is called. The name answers when the type is
+ * empty, which is what Windows reports for an extension it has no mapping for.
+ */
+export function mediaKindFor(name: string, mime?: string | null): MediaKind | null {
+  const declared = normaliseMime(mime);
+  if (declared.startsWith('audio/')) return 'audio';
+  if (declared.startsWith('video/')) return 'video';
+  const ext = extensionOf(name);
+  if (AUDIO_EXTENSION_SET.has(ext)) return 'audio';
+  if (VIDEO_EXTENSIONS.has(ext)) return 'video';
+  return null;
+}
+
+/** The picker's `accept` entries for the audio/video rail. */
+export const MEDIA_ACCEPT = [
+  'video/*', '.mp4', '.m4v', '.mov', '.webm', '.mkv',
+  'audio/*', ...AUDIO_EXTENSIONS.map((ext) => `.${ext}`),
+].join(',');
+
 /** "report.pdf" → "PDF", "sales.csv" → "CSV", "data.tar.gz" → "TAR.GZ". */
 export function fileBadgeFor(name: string): string {
   const m = /\.(tar\.gz|[a-z0-9]{1,5})$/i.exec(name.trim());

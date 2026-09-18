@@ -39,6 +39,7 @@ import {
   type UploadProgress,
 } from '@/lib/uploadDocument';
 import { formatBytes } from '@/lib/format';
+import { MEDIA_ACCEPT, mediaKindFor } from '@/lib/attachments';
 import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
@@ -264,9 +265,9 @@ const INLINE_DOC_BYTES = 25 * 1024 * 1024;
 const MAX_DATASET_BYTES = 512 * 1024 * 1024;
 // 2026-09-09: a video streams by reference like a big document (chunked past
 // 90 MB); the server's own cap is VIDEO_MAX_UPLOAD_MB. Four hours of 1080p
-// screen recording is well under this.
+// screen recording is well under this. Audio shares it (B12): it is the same
+// upload to the same job.
 const MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024;
-const VIDEO_EXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpg|mpeg|3gp|ogv)$/;
 const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
@@ -320,6 +321,11 @@ function ModeChip({
       <IconX size={11} />
     </button>
   );
+}
+
+/** An audio file on the video rail: same upload and job, its own label. */
+function isAudio(attachment: Pick<Attachment, 'name' | 'file'>): boolean {
+  return mediaKindFor(attachment.name, attachment.file?.type) === 'audio';
 }
 
 function isDatasetName(name: string): boolean {
@@ -784,8 +790,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // 2026-09-09: a video is its own kind — transcribed, read off the
       // screen and summarised on the server — BEFORE the "upload anything"
       // fallback below can swallow it as an unreadable document.
-      const isVideo =
-        !isImage && !isPdf && (file.type.startsWith('video/') || VIDEO_EXT_RE.test(lower));
+      // B12 (2026-09-18): audio is the same kind. It was missing here, so a
+      // voice memo fell to that fallback and was answered as a binary file;
+      // it is claimed now, before the archive and dataset checks run.
+      const isVideo = !isImage && !isPdf && mediaKindFor(file.name, file.type) !== null;
       if (isVideo && !videoAllowed) {
         toast(
           'Video understanding is turned off for your account. Ask an administrator.',
@@ -1066,7 +1074,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 >
                   {attachment.kind === 'video' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-accent/15 text-accent">
-                      <IconPlay size={18} />
+                      {isAudio(attachment) ? <IconMic size={18} /> : <IconPlay size={18} />}
                     </span>
                   ) : attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-danger/15 text-danger">
@@ -1089,7 +1097,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                         {attachment.kind === 'pdf'
                           ? 'PDF'
                           : attachment.kind === 'video'
-                            ? 'VIDEO'
+                            ? isAudio(attachment)
+                              ? 'AUDIO'
+                              : 'VIDEO'
                             : 'DATASET'}
                       </span>
                     )}
@@ -1263,7 +1273,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson,video/*,.mp4,.m4v,.mov,.webm,.mkv"
+                accept={`image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson,${MEDIA_ACCEPT}`}
                 className="sr-only"
                 aria-hidden
                 tabIndex={-1}

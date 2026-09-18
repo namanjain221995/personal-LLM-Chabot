@@ -25,6 +25,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -40,13 +41,20 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/video", tags=["video"])
 
 VIDEO_EXTENSIONS = (".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".mpg", ".mpeg", ".ts", ".3gp", ".ogv", ".wmv", ".flv")
+#: B12 (2026-09-18): audio is the video pipeline with no picture — the frames
+#: stage skips ("the file has no video stream") and the transcript, summary
+#: and index run as for any recording. The composer's list is the same one
+#: (frontend/lib/attachments.ts).
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac", ".aac")
 
 
 def looks_like_video(filename: str, content_type: str = "") -> bool:
+    """True for a file the video pipeline should analyse, audio included."""
     lower = (filename or "").lower()
-    if lower.endswith(VIDEO_EXTENSIONS):
+    if lower.endswith(VIDEO_EXTENSIONS + AUDIO_EXTENSIONS):
         return True
-    return (content_type or "").lower().startswith("video/")
+    declared = (content_type or "").lower()
+    return declared.startswith("video/") or declared.startswith("audio/")
 
 
 async def require_video(request: Request) -> None:
@@ -114,6 +122,21 @@ async def attach_upload(
     }
 
 
+#: B25b (2026-09-18): until this date the vision stage stored "11/12 frames
+#: described by Qwen3-VL-8B-Instruct". The pipeline no longer writes the
+#: name, but finished rows keep their stored text for the life of the bytes,
+#: so the surface drops it on the way out. Only that one sentence shape.
+_DESCRIBED_BY = re.compile(r"^(\d+/\d+ frames described) by \S+$")
+
+
+def _public_detail(stage: str, detail: str) -> str:
+    if stage == "vision":
+        match = _DESCRIBED_BY.match(detail)
+        if match:
+            return match.group(1)
+    return detail
+
+
 def status_payload(row: dict) -> dict:
     """The row as the UI may see it: progress, never engine names."""
     latest = pipeline._latest.get(int(row["id"])) or {}
@@ -125,7 +148,7 @@ def status_payload(row: dict) -> dict:
         if state.get("ms") is not None:
             entry["ms"] = state["ms"]
         if state.get("detail"):
-            entry["detail"] = state["detail"]
+            entry["detail"] = _public_detail(name, str(state["detail"]))
         if latest.get("stage") == name and latest.get("status") == "running":
             entry["status"] = "running"
             entry["percent"] = latest.get("percent")

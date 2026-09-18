@@ -881,7 +881,8 @@ async def _stage_vision(ctx: _Ctx, progress) -> _StageResult:
     if settings.video_captions_enabled and _router_enabled():
         captions = await caption_frames(kept, progress=progress)
         described = sum(1 for c in captions if c)
-        detail = f"{described}/{len(kept)} frames described by {settings.router_model.split('/')[-1]}"
+        # B25b: no model name — the status surface never names one.
+        detail = f"{described}/{len(kept)} frames described"
         if described == 0:
             status = "failed"
             detail = "the vision model described none of the frames"
