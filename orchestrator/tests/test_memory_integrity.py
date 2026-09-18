@@ -311,3 +311,129 @@ def test_a_remove_nobody_asked_for_is_ignored(owner):
         )
     )
     assert _texts(owner) == ["The user is vegetarian"]
+
+
+# --- 5. QA round, 2026-09-18 ------------------------------------------------
+# Two silent, irreversible deletions and one identity overwrite reproduced by
+# QA on the integrated tree. Each test below failed before the fix.
+
+
+@pytest.mark.parametrize(
+    "fact,message",
+    [
+        (
+            "The user always wants unit tests with code",
+            "Don't forget to add the unit tests when you write that module.",
+        ),
+        (
+            "The user's password manager is Bitwarden",
+            "I always forget my password, any tips for remembering it?",
+        ),
+    ],
+)
+def test_ordinary_english_forget_never_deletes_a_memory(owner, fact, message):
+    """A reminder ("forget to …") and a confession ("I always forget …") are
+    not erasure requests. The id-less fallback deletes the one fact whose
+    content words a forget request matches, so a false positive here is a
+    memory lost with no undo."""
+    db.add_user_fact(owner, fact, "c1")
+    asyncio.run(
+        remember_from_message(
+            owner,
+            message,
+            "c1",
+            complete=_fake_complete('{"add": [], "replace": [], "remove": []}'),
+        )
+    )
+    assert _texts(owner) == [fact]
+
+
+def test_a_real_forget_request_still_deletes(owner):
+    saved = db.add_user_fact(owner, "The user lives at 14 Bridge Street", "c1")
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "I want you to forget my address.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": [], "replace": [], "remove": [%d]}' % saved["id"]
+            ),
+        )
+    )
+    assert _texts(owner) == []
+
+
+_SHORT_CV = (
+    "Can you review this profile?\n\n"
+    "NAVEEN R. VELUMALA\n"
+    "AI/ML Engineer | San Francisco, CA | naveen.v@example.invalid\n"
+    "Senior Machine Learning Engineer at Cognitiv, 2021-present.\n"
+    "Built retrieval systems and ranking models."
+)
+
+
+def test_a_short_pasted_cv_is_still_a_document(owner):
+    """Under the length ceiling, so only the layout can say it is a paste:
+    an ALL-CAPS name banner and a line carrying an email address."""
+    assert len(_SHORT_CV) < 300
+    calls = []
+    stored = asyncio.run(
+        remember_from_message(
+            owner,
+            _SHORT_CV,
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user\'s name is Naveen R. Velumala",'
+                ' "The user\'s email is naveen.v@example.invalid"],'
+                ' "replace": []}',
+                calls,
+            ),
+        )
+    )
+    assert stored == []
+    assert _texts(owner) == []
+    assert calls == []
+
+
+def test_a_typed_multi_line_self_disclosure_is_still_remembered(owner):
+    stored = asyncio.run(
+        remember_from_message(
+            owner,
+            "Two things about me:\nI am vegetarian.\nI live in Ahmedabad.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user is vegetarian",'
+                ' "The user lives in Ahmedabad"], "replace": []}'
+            ),
+        )
+    )
+    assert [f["fact"] for f in stored] == [
+        "The user is vegetarian",
+        "The user lives in Ahmedabad",
+    ]
+
+
+def test_a_preference_stated_with_without_is_durable(owner):
+    asyncio.run(
+        remember_from_message(
+            owner,
+            "Please always give me answers without emoji.",
+            "c1",
+            complete=_fake_complete(
+                '{"add": ["The user needs answers without emoji"], "replace": []}'
+            ),
+        )
+    )
+    assert _texts(owner) == ["The user needs answers without emoji"]
+
+
+def test_a_deleted_fact_is_not_announced_as_memory_updated():
+    """The chat's memory chip lists what was SAVED. A deleted row comes back
+    from remember_from_message flagged, and must not ride out as an update
+    carrying the very sentence the person asked to erase."""
+    import inspect
+
+    from app import main
+
+    src = inspect.getsource(main)
+    assert 'f["fact"] for f in saved if not f.get("deleted")' in src

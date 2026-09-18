@@ -100,6 +100,19 @@ _FORGET_RE = re.compile(
     re.I,
 )
 
+#: …but "forget" is also ordinary English, and the id-less fallback below
+#: DELETES the one saved fact whose content words a forget request matches.
+#: QA reproduced two silent, irreversible deletions on 2026-09-18: "Don't
+#: forget to add the unit tests" removed "The user always wants unit tests with
+#: code", and "I always forget my password, any tips?" removed the password
+#: manager fact. A reminder ("forget to …") and a confession ("I always forget
+#: …") are not erasure requests.
+_NOT_A_FORGET_RE = re.compile(
+    r"\bforget\s+to\b"
+    r"|\b(?:i|we)\s+(?:always|often|sometimes|usually|keep|kept|never)?\s*forget\b",
+    re.I,
+)
+
 #: A one-off task request wearing a fact's clothes. 51 of the 132 rows in the
 #: production store matched this shape ("The user is asking about all movie
 #: names in the Spider-Man franchise", "The user wants 200 LeetCode
@@ -125,7 +138,7 @@ _DURABLE_PREFERENCE_RE = re.compile(
     r"\b(?:always|never|prefers?|preference|by default|from now on)\b"
     r"|\b(?:answers?|responses?|replies|explanations?|output|tone|style|"
     r"wording|format|formatting|language|units)\b"
-    r"\s+(?:in|to be|as|with|using|written|formatted)\b",
+    r"\s+(?:in|to be|as|with|without|free of|avoiding|using|written|formatted)\b",
     re.I,
 )
 
@@ -135,6 +148,16 @@ _DURABLE_PREFERENCE_RE = re.compile(
 #: inside them can GROUND one either.
 _FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 _QUOTED_LINE_RE = re.compile(r"^\s*>.*$", re.M)
+
+#: A pasted document announces itself in its layout long before it reaches the
+#: length ceiling: an ALL-CAPS name banner, or a line carrying an email address.
+#: QA stored a 214-character CV paste as the account's name, email and employer
+#: on 2026-09-18 — the same defect as a 4,000-character one, under the ceiling.
+_DOCUMENT_BANNER_RE = re.compile(
+    r"^[A-Z][A-Z][A-Z .'\u2019-]{3,}$"
+    r"|^[^\n]*[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}[^\n]*$",
+    re.M,
+)
 
 #: Grounding: a stored fact may only contain numbers and names the message
 #: itself contains. `_NAME_RE` is deliberately crude — a capitalized word is
@@ -242,7 +265,9 @@ def own_words(text: str) -> Optional[str]:
     self-disclosure can plausibly be, in which case the message is a pasted
     document (a CV, a contract, an email thread) and none of it is a fact
     about the person. The composer folds a paste inline with no marker
-    (frontend/lib/pasted.ts), so length is the only signal there is.
+    (frontend/lib/pasted.ts), so length and layout are the only signals there
+    are: a multi-line message with an ALL-CAPS name banner or an email line is
+    a pasted document whatever its length.
     """
     body = _FENCE_RE.sub(" ", text or "")
     body = _QUOTED_LINE_RE.sub(" ", body)
@@ -250,6 +275,8 @@ def own_words(text: str) -> Optional[str]:
     if not body:
         return None
     if len(body) > settings.memory_self_disclosure_max_chars:
+        return None
+    if "\n" in body and _DOCUMENT_BANNER_RE.search(body):
         return None
     return body
 
@@ -386,7 +413,9 @@ async def remember_from_message(
     text = own_words(user_text)
     if not text or len(text) < _MESSAGE_MIN_CHARS:
         return []
-    forget_request = bool(_FORGET_RE.search(text))
+    forget_request = bool(_FORGET_RE.search(text)) and not _NOT_A_FORGET_RE.search(
+        text
+    )
     try:
         existing = await db.run_in_thread(
             db.list_user_facts, user_id, settings.memory_max_facts

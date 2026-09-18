@@ -4938,8 +4938,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                                 # event loop's callback handler.
                                 return
                             if saved:
+                                # A deleted row comes back flagged; it must not
+                                # ride out as "memory updated" with the very
+                                # sentence the person asked to erase.
                                 memory_state["facts"] = [
-                                    f["fact"] for f in saved
+                                    f["fact"] for f in saved if not f.get("deleted")
                                 ]
 
                         fact_task.add_done_callback(_facts_done)
