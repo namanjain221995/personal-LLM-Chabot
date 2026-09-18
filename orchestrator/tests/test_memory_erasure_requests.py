@@ -474,6 +474,12 @@ KEEP_ADDED_AFTER_THE_FIRST_DRAFT = {
         "Forget where I live. Or don't, whatever.",
         "Please forget my name. No wait, keep it.",
     ),
+    "rhetorical": (
+        "Forget my employer?",
+        "Forget where I live?!",
+        "Forget my name??",
+        "forget my address?",
+    ),
     "question about forgetting": (
         "Would you forget my name?",
         "Would you delete your memory if I asked?",

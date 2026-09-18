@@ -416,12 +416,6 @@ _ERASE_COMPANION_RE = re.compile(
     re.I,
 )
 
-#: Quoted material is someone else's words: "She said "forget my address"".
-#: An opening single quote follows a space or the start, so "I'm" is not one.
-_QUOTED_SPAN_RE = re.compile(
-    r"\"[^\"\n]*\"|“[^”\n]*”|‘[^’\n]*’|`[^`\n]*`"
-    r"|(?<![^\s(\[:])'[^'\n]*'(?![^\s.,!?;:)\]])"
-)
 _ERASE_SENTENCE_SPLIT_RE = re.compile(r"[^.!?\n]+")
 _END_PUNCT_RE = re.compile(r"[.!?]*")
 
@@ -669,7 +663,11 @@ def _erasure_requests(text: str) -> List[tuple]:
     fallback may match on the clause at all. [] when the message asks for
     no deletion — and then nothing may be deleted, whatever the extractor
     proposes."""
-    body = _QUOTED_SPAN_RE.sub(lambda m: " " * len(m.group(0)), text or "")
+    # Quoted and reported speech needs no rule of its own: a sentence that
+    # opens with a quote mark or "She said" is not a request, and one that
+    # a quote or a "My landlord wrote:" line splits off stands beside a
+    # sentence that is neither a request nor a companion.
+    body = text or ""
     if _RETRACTION_RE.search(body):
         return []
     asks: List[tuple] = []
@@ -677,9 +675,6 @@ def _erasure_requests(text: str) -> List[tuple]:
         text_ = sentence.group(0)
         if not re.search(r"\w", text_):
             continue
-        # "My landlord wrote:\nforget my address": reported, not addressed
-        if body[: sentence.start()].rstrip().endswith(":"):
-            return []
         ask = _erasure_request(text_, _END_PUNCT_RE.match(body, sentence.end()).group(0))
         if ask is not None:
             asks.append(ask)
