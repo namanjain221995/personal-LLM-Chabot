@@ -950,3 +950,26 @@ def test_a_report_of_a_photo_is_not_padded_to_the_three_page_data_floor():
     assert C.target_for(_compose_req("make a PDF report of this", uploads_text=WHITEBOARD_MD, sources=[source])).words == 1_500
     # A size the person named is theirs, whatever the material.
     assert C.target_for(_compose_req("make a big PDF report of this", uploads_text=WHITEBOARD_MD)).words == 3_000
+
+
+def test_asking_to_place_the_photo_itself_is_told_it_cannot_be_placed(doc_capture, reader):
+    """The files hold the photo's TEXT; no renderer places a picture. Live
+    2026-09-19, "put this image in a Word doc with a summary": a Word file of
+    the receipt's text and a sentence that said only "Created …" (2 of 2)."""
+    from app.artifacts import requirements as R
+
+    clause = "I can't place an image, logo or letterhead in a file"
+    for words in ("put this image in a Word doc with a summary", "insert the attached photo into a pdf",
+                  "add these pictures to the report"):
+        assert clause in R.unsupported_asks(words), words
+    for words in ("make this table into an excel file", "make an excel file from this photo",
+                  "use this photo to fill the sheet", "summarize this image in a word doc"):
+        assert clause not in R.unsupported_asks(words), words
+
+    composer, _seen = doc_capture
+    calls, state = reader
+    state["reply"] = WHITEBOARD_MD
+    with TestClient(app) as client:
+        final, tokens = _turn(client, composer, "put this image in a Word doc with a summary", conv="img-place", history=[])
+    assert final.get("artifacts") and [c["has_image"] for c in calls] == [True]
+    assert clause in tokens, tokens
