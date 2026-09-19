@@ -50,7 +50,9 @@ earns one more targeted round instead of a confident sentence.
 WHAT IT REUSES. Everything expensive already exists in `engines/search.py`
 and is called directly rather than reimplemented: `_collect_results` (the
 round-robin merge over parallel SearXNG queries, per-domain capped),
-`_rerank_results` (the Qwen3-Reranker cross-encoder), `_fetch_sources`
+`rerank.score` (the Qwen3-Reranker cross-encoder — the client the search
+route's `_rerank_results` wraps; research applies its own floor and caps in
+`_rank_candidates`), `_fetch_sources`
 (SSRF-guarded fetch + readable extraction + the PostgreSQL warm-page store),
 and `_persist_and_index` (write-behind logging and embedding). The pages
 it reads land in the shared corpus; the claims it resolves land in
@@ -71,8 +73,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .. import continuation, db, llm
+from .. import continuation, db, llm, rerank
 from .. import continuity
 from ..continuity import LeaseLost, QueuedForRecovery
 from ..resilience import wait_admitted
@@ -83,6 +86,7 @@ from ..config import settings
 # was costing (C1).
 from ..core import provenance
 from ..core import pasted
+from ..core.org_brief import BUSINESS_TIMEZONE
 from ..core.sf_intel.planner import extract_json_object
 from ..freshness import Freshness, Verdict, classify_offline
 from ..memory_recall import keywords
@@ -90,15 +94,17 @@ from ..search.base import SearchResult, SearchUnavailableError
 from ..web_memory import authority_of
 from . import recent_turns
 from .search import (
+    _RERANK_FLOOR,
     _TIER_A_SOURCES,
     _TIER_B_CHARS,
     _collect_results,
     _fetch_sources,
     _normalize_url,
-    _rerank_results,
     _select_text,
     _spawn,
     _persist_and_index,
+    candidate_budget,
+    domain_cap,
 )
 
 log = logging.getLogger(__name__)
@@ -143,6 +149,48 @@ _REPORT_FLOOR_S = 15.0
 
 def _report_reserve_s(total: float) -> float:
     return min(_REPORT_RESERVE_MAX_S, max(0.0, total) * _REPORT_RESERVE_FRACTION)
+
+
+#: How far past its allowance the report may keep writing, and ONLY while it
+#: is still producing text (B3). The allowance used to be a wall clock:
+#: `asyncio.wait_for(..., report_budget_s())` cut a stream that was mid-sentence
+#: exactly as it cut one that had sent nothing. It now measures IDLE time, and
+#: this is the hard ceiling above it: a run can overrun its budget by at most
+#: one maximal reserve, and `_Admission.frees_in_s` quotes that bound.
+_REPORT_OVERRUN_S = _REPORT_RESERVE_MAX_S
+
+
+@dataclass(frozen=True)
+class _ThinkingOff:
+    """The answer plan the report call carries: thinking OFF, sampling as is.
+
+    `llm.stream_chat_events` reads only `.enable_thinking` and `.sampling`
+    from a plan (continuation forwards it to every segment). The report used
+    to run at the turn's effort, so at Think the model reasoned first over up
+    to 36 sources, and in the audit's two ten-minute runs the 150 s reserve
+    ended before the first answer token: the stored report was the 94-char
+    budget note and nothing else (B3). Everything the report needs is already
+    in the evidence table and the sources; reasoning over them is what the
+    claim, audit and verify passes already did.
+    """
+
+    enable_thinking: bool = False
+
+    @property
+    def sampling(self) -> dict:
+        return {}
+
+
+#: A report word: a run of letters. "[1] [2]" is zero words.
+_WORD_RE = re.compile(r"[^\W\d_]+")
+
+#: Sources the verification round may read PAST DEEP_RESEARCH_MAX_SOURCES
+#: (B23c). The round was gated on `budget_left()`, which is False after a
+#: source_cap stop, so the low-confidence runs — the ones the pass exists
+#: for — never got it. Small on purpose: six more sources at the tail tier
+#: (`_TIER_B_CHARS`, 2,500 characters) add at most ~15,000 characters to
+#: the report prompt.
+_VERIFY_SOURCE_RESERVE = 6
 
 
 #: A citation the model wrote: [1], [12].
@@ -456,6 +504,9 @@ class Claim:
     as_of: Optional[date]
     hint: str  # current | historical | unclear
     iteration: int
+    #: The date after today the extractor gave as the claim's as_of: the
+    #: claim is about the future ("will reach 5 GW by 2031"). None otherwise.
+    forecast_for: Optional[date] = None
 
 
 @dataclass
@@ -481,6 +532,13 @@ class Resolution:
     #: False when no supporting source states `value` in its own words
     #: (`_quote_in`). The report must not present it as an established fact.
     stated_verbatim: bool = True
+    #: [{value, as_of, for, sources}] — predictions for a date after today,
+    #: kept apart from a reported value (B17): neither newer evidence that
+    #: replaces it nor a source that disputes it.
+    forecasts: List[dict] = field(default_factory=list)
+    #: Set when the resolved value itself is such a prediction: only
+    #: forecasts were found for the subquestion.
+    forecast_for: Optional[date] = None
 
     def line(self) -> str:
         head = f"[{self.subq}] {self.question} — {self.status.upper()}"
@@ -507,6 +565,15 @@ class Resolution:
                 + "".join(f"[{n}]" for n in c.get("sources", []))
                 + ")"
             )
+        for f in self.forecasts[:3]:
+            tail += (
+                f' · forecast: "{f["value"]}" (for {f["for"][:4]}'
+                f"{('; made ' + f['as_of']) if f.get('as_of') else ''}; "
+                + "".join(f"[{n}]" for n in f.get("sources", []))
+                + ")"
+            )
+        if self.forecast_for:
+            tail += f" · a FORECAST for {self.forecast_for.year}, not a reported value"
         if not self.stated_verbatim:
             tail += " · NOT STATED VERBATIM by any cited source"
         return head + tail + f" · confidence {self.confidence:.2f}"
@@ -524,6 +591,8 @@ class Resolution:
             "conflicts": list(self.conflicts),
             "confidence": round(self.confidence, 2),
             "stated_verbatim": self.stated_verbatim,
+            "forecasts": list(self.forecasts),
+            "forecast_for": self.forecast_for.isoformat() if self.forecast_for else "",
         }
 
 
@@ -618,6 +687,15 @@ class ResearchState:
     cut_short: List[str] = field(default_factory=list)
     #: Set when the REPORT stream itself was stopped by the budget.
     report_cut_short: bool = False
+    #: Set when the first report call produced no text by its deadline and
+    #: was retried once inside the floor (B3).
+    report_retried: bool = False
+    #: Sources allowed past DEEP_RESEARCH_MAX_SOURCES — the verification
+    #: round's reserve, and zero everywhere else (B23c).
+    source_headroom: int = 0
+    #: Search results the relevance floor turned down, over the whole run.
+    #: A run that read nothing because of it must not blame the provider.
+    off_topic_dropped: int = 0
     #: source.n → folded text + sentence spans, so the verbatim check in
     #: `_resolve` folds each page once per run rather than once per round.
     folded: Dict[int, "_Prepared"] = field(default_factory=dict, repr=False)
@@ -684,6 +762,21 @@ class ResearchState:
         return (
             self.iterations < settings.deep_research_max_iterations
             and len(self.sources) < settings.deep_research_max_sources
+            and self.elapsed < self.gather_budget_s
+        )
+
+    @property
+    def source_limit(self) -> int:
+        """How many sources a round may fill up to right now."""
+        return settings.deep_research_max_sources + self.source_headroom
+
+    def verify_budget_left(self) -> bool:
+        """The verification round's gate: `budget_left()` with the source cap
+        raised by `_VERIFY_SOURCE_RESERVE` (B23c). The iteration cap and the
+        clock still apply."""
+        return (
+            self.iterations < settings.deep_research_max_iterations
+            and len(self.sources) < settings.deep_research_max_sources + _VERIFY_SOURCE_RESERVE
             and self.elapsed < self.gather_budget_s
         )
 
@@ -966,24 +1059,116 @@ def _stale_years(text: str, now_year: int) -> bool:
     return bool(years) and max(years) <= now_year - 3
 
 
+def _site_of(url: str) -> str:
+    """The registrable domain the run-wide site caps count:
+    rocm.docs.amd.com -> amd.com, news.bbc.co.uk -> bbc.co.uk.
+
+    Not `search._registrable_domain`. It treats ANY label of three characters
+    or fewer before a TLD of three or fewer as a two-label public suffix (a
+    rule meant for co.uk), so a vendor with a short name became several
+    sites: measured on 4810da0, rocm.docs.amd.com -> docs.amd.com,
+    community.amd.com -> community.amd.com, developer.ibm.com ->
+    developer.ibm.com, spam1.abc.io -> spam1.abc.io. That let a run that had
+    already read amd.com to its cap follow more amd.com links, and it let any
+    short domain mint a fresh "site" per subdomain, which is what an SEO farm
+    needs to take over a run's sources (QA, 2026-09-18). Here the second-level
+    suffix applies only under a two-letter country TLD, with the
+    second-level labels `provenance.registrable_label` already uses.
+    """
+    labels = [p for p in provenance.domain_of(url).split(".") if p]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if len(labels[-1]) == 2 and labels[-2] in provenance._PUBLIC_SECOND_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _relevance_query(state: ResearchState) -> str:
+    """What the relevance floor scores a page against: the question the PLAN
+    resolved, not the raw message.
+
+    A follow-up sent with Deep Research on ("Tell me more") has no subject of
+    its own; the planner rebuilds it from history into the subquestions.
+    Measured 2026-09-18 on the live reranker, 33 real SearXNG results for the
+    planner's JWST query: "Tell me more" alone kept 0 of 33 (max score
+    0.023), the same message plus the subquestions kept 30 of 33 (QA).
+
+    The person's OWN words, not a paste in the message. The reranker reads
+    the first 600 characters of its query (`rerank.MAX_QUERY_CHARS`), so a
+    pasted document went first and the subquestions never arrived: live on
+    2026-09-19, 40 real SearXNG results for a salary question under a pasted
+    job posting, the floor kept 12 scored against the message and 22 against
+    the question plus the plan.
+    """
+    own = pasted.search_words(state.question).strip()[: rerank.MAX_QUERY_CHARS // 2]
+    parts = [own, *state.subquestions] if own else list(state.subquestions)
+    return "\n".join(parts) if parts else state.question
+
+
 async def _rank_candidates(
-    state: ResearchState, results: List[SearchResult]
+    state: ResearchState, results: List[SearchResult], effort: str = "think"
 ) -> List[SearchResult]:
     """Order search results by topicality × authority × freshness hints.
 
-    The reranker supplies topical order (an authority-blind cross-encoder);
-    the domain's authority prior and the structural source class are added
-    so the official page and the first-party documentation are read before
-    the SEO rewrite of them; and for a time-sensitive question a snippet that
-    only mentions years long past is pushed down — never dropped, because it
-    may be the history the report needs."""
+    The reranker supplies topicality (the cross-encoder's relevance to the
+    question, or engine rank when it is unavailable); the domain's authority
+    prior and the structural source class are added ONCE, here — the search
+    route's `_rerank_results` folds authority into its order as well, which
+    this used to call and then add authority to again — so the official page
+    and the first-party documentation are read before the SEO rewrite of
+    them; and for a time-sensitive question a snippet that only mentions
+    years long past is pushed down — never dropped, because it may be the
+    history the report needs.
+
+    A candidate the reranker scores below `_RERANK_FLOOR` is DROPPED, even
+    when every candidate of the round is below it (B7b). The search route
+    keeps an all-below batch ("never a gate": one pass is all it gets); a
+    research round is not the last word, and reading ten pages about a
+    different subject costs its fetches, its extraction call and a slot in
+    the report's source list. Measured 2026-09-18 on the live reranker: on a
+    four-part question each page answering ONE part scored 0.954-0.998, two
+    unrelated pages 0.0000 — so an all-below round is off-topic, and the
+    auditor's next queries are the way out, not those pages. With no
+    reranker there are no scores and nothing is dropped — and that includes
+    a pool of six or more whose scores all sit within 0.02 of each other,
+    which `rerank.score` reports as degenerate (it cannot tell a unanimous
+    "no" from a broken model), so a uniformly off-topic pool is still read.
+
+    Over-cap sites go to the BACK: at most `domain_cap(effort)` pages per
+    registrable domain lead the order, counting the pages the run has already
+    read from it, and the rest are read only when the round has nothing else
+    (a planner's `site:` query, say). `_collect_results` widens its own per-site cap
+    with the 5x candidate pool (3 -> 15 per site at Think), so without this a
+    single site could fill a round.
+    """
     if not results:
         return []
-    ordered = await _rerank_results(state.question, results, len(results))
-    n = len(ordered)
+    try:
+        relevance: Optional[List[float]] = await rerank.score(
+            _relevance_query(state), [f"{r.title}\n{r.snippet}"[:1000] for r in results]
+        )
+    except rerank.RerankUnavailable:
+        relevance = None
+    if relevance is not None:
+        keep = [i for i in range(len(results)) if relevance[i] >= _RERANK_FLOOR]
+        if len(keep) < len(results):
+            state.off_topic_dropped += len(results) - len(keep)
+            _rlog(
+                state, "rerank floor: %d of %d candidate(s) below %.2f dropped",
+                len(results) - len(keep), len(results), _RERANK_FLOOR,
+            )
+        ordered = [results[i] for i in keep]
+        # The relevance itself, not its rank: the reranker is near-binary
+        # (on-topic pages 0.95-1.0 above), so a rank among on-topic pages is
+        # noise, and a rank term would let that noise outweigh authority.
+        topicals = [relevance[i] for i in keep]
+    else:
+        # No scores: engine rank is the only topical signal there is.
+        ordered = list(results)
+        topicals = [1.0 - (i / float(len(results))) for i in range(len(results))]
     scored: List[Tuple[float, int, SearchResult]] = []
     for i, r in enumerate(ordered):
-        topical = 1.0 - (i / float(max(1, n)))
+        topical = topicals[i]
         auth = authority_of(r.url) / 100.0
         kind = provenance.source_type(r.url)
         type_bonus = 0.15 if kind in provenance.PRIMARY_TYPES else (-0.15 if kind in ("social", "community") else 0.0)
@@ -993,7 +1178,25 @@ async def _rank_candidates(
             state.stale_downranked.append(r.url)
         scored.append((score, i, r))
     scored.sort(key=lambda t: (-t[0], t[1]))
-    return [r for _s, _i, r in scored]
+    cap = domain_cap(effort)
+    # Counted over the WHOLE run, as link following counts: this started at
+    # zero every round, so each round gave the same site `cap` more lead
+    # slots. Live at Fast (cap 2, QA 2026-09-18): doc.rust-lang.org supplied
+    # 6 of 36 sources and postgresql.org 10, all through search rounds.
+    per_site: Dict[str, int] = {}
+    for s in state.sources:
+        site = _site_of(s.url)
+        per_site[site] = per_site.get(site, 0) + 1
+    lead: List[SearchResult] = []
+    back: List[SearchResult] = []
+    for _s, _i, r in scored:
+        site = _site_of(r.url)
+        if per_site.get(site, 0) >= cap:
+            back.append(r)
+            continue
+        per_site[site] = per_site.get(site, 0) + 1
+        lead.append(r)
+    return lead + back
 
 
 # ---------------------------------------------------------------------------
@@ -1061,12 +1264,22 @@ def _link_score(state: ResearchState, src: SourceRecord, link: str, kw: Set[str]
     return score
 
 
-def _candidate_links(state: ResearchState, new_sources: List[SourceRecord], limit: int) -> List[Tuple[str, SourceRecord]]:
+def _candidate_links(
+    state: ResearchState, new_sources: List[SourceRecord], limit: int, effort: str = "think"
+) -> List[Tuple[str, SourceRecord]]:
+    """The best links to open next: at most two per page, and never a site
+    past `domain_cap(effort)` pages across the WHOLE run (B23b).
+
+    The per-page cap alone let one vendor's pages, each linking to two more
+    of its own, fill a run — the audit counted 11 of 36 sources from one
+    vendor — and the entity-host bonus in `_link_score` is exactly what
+    points at the vendor's site. Every page already read from a registrable
+    domain counts, however it was found. Links are extras on top of a
+    round's search results, so the cap is strict here, not deferred.
+    """
     kw = _topic_keywords(state)
     scored: List[Tuple[float, str, SourceRecord]] = []
     for src in new_sources:
-        per_page = 0
-        page_scores: List[Tuple[float, str]] = []
         for link in src.links:
             key = _normalize_url(link)
             if key in state.seen_urls or key == _normalize_url(src.url):
@@ -1074,25 +1287,70 @@ def _candidate_links(state: ResearchState, new_sources: List[SourceRecord], limi
             s = _link_score(state, src, link, kw)
             if s is None or s <= 0:
                 continue
-            page_scores.append((s, link))
-        page_scores.sort(key=lambda t: -t[0])
-        for s, link in page_scores:
-            if per_page >= 2:
-                break
             scored.append((s, link, src))
-            per_page += 1
+    # Stable, so equal scores keep page order and then link order: the same
+    # picks the old per-page-then-global selection made whenever no site cap
+    # binds, since a page's first two links in this order are its top two.
+    # (One difference, on purpose: a link two pages share no longer spends
+    # the second page's slot on a duplicate.)
     scored.sort(key=lambda t: -t[0])
+    cap = domain_cap(effort)
+    per_site: Dict[str, int] = {}
+    for s in state.sources:
+        site = _site_of(s.url)
+        per_site[site] = per_site.get(site, 0) + 1
+    per_page: Dict[int, int] = {}
     out: List[Tuple[str, SourceRecord]] = []
     seen: Set[str] = set()
     for _s, link, src in scored:
         key = _normalize_url(link)
-        if key in seen:
+        if key in seen or per_page.get(src.n, 0) >= 2:
+            continue
+        site = _site_of(link)
+        if per_site.get(site, 0) >= cap:
             continue
         seen.add(key)
+        per_page[src.n] = per_page.get(src.n, 0) + 1
+        per_site[site] = per_site.get(site, 0) + 1
         out.append((link, src))
         if len(out) >= limit:
             break
     return out
+
+
+async def _on_topic_pages(state: ResearchState, fetched: list) -> list:
+    """The followed pages the relevance floor keeps.
+
+    A link has no snippet to score before it is opened (its SearchResult is
+    the bare URL), so the floor search results pass in `_rank_candidates` is
+    applied here, to the page itself, before it takes a source slot. Live at
+    a0a9b6f (QA 2026-09-18), a battery-price run followed links to a uranium
+    price forecast, an 18650 pack calculator and a product page: none was
+    cited, and each spent a slot of the source cap or the verification
+    reserve. Same rules as the search floor: no reranker, or a degenerate
+    one, keeps every page.
+    """
+    if not fetched:
+        return fetched
+    query = _relevance_query(state)
+    try:
+        relevance = await rerank.score(
+            query,
+            [f"{s.title}\n{_select_text(s.text or '', query, 1000)}"[:1000] for s in fetched],
+        )
+    except rerank.RerankUnavailable:
+        return fetched
+    if len(relevance) != len(fetched):
+        return fetched  # not one score per page: no basis to drop any of them
+    kept = [s for s, r in zip(fetched, relevance) if r >= _RERANK_FLOOR]
+    if len(kept) < len(fetched):
+        state.off_topic_dropped += len(fetched) - len(kept)
+        _rlog(
+            state, "rerank floor: %d of %d followed page(s) below %.2f dropped: %s",
+            len(fetched) - len(kept), len(fetched), _RERANK_FLOOR,
+            "; ".join(s.url for s, r in zip(fetched, relevance) if r < _RERANK_FLOOR),
+        )
+    return kept
 
 
 async def _follow_links(
@@ -1104,11 +1362,11 @@ async def _follow_links(
 ) -> List[SourceRecord]:
     """Open the most promising links FROM the pages just read."""
     limit = int(settings.deep_research_links_per_round or 0)
-    room = max(0, settings.deep_research_max_sources - len(state.sources))
+    room = max(0, state.source_limit - len(state.sources))
     limit = min(limit, room)
     if limit <= 0 or not new_sources:
         return []
-    picks = _candidate_links(state, new_sources, limit)
+    picks = _candidate_links(state, new_sources, limit, effort)
     if not picks:
         return []
     results = [SearchResult(title=link, url=link, snippet="") for link, _src in picks]
@@ -1122,6 +1380,7 @@ async def _follow_links(
     except Exception:  # noqa: BLE001
         log.warning("link fetch round failed", exc_info=True)
         return []
+    fetched = await _on_topic_pages(state, fetched)
     by_url = {link: src for link, src in picks}
     added: List[SourceRecord] = []
     for src in fetched:
@@ -1182,7 +1441,13 @@ async def _gather(
     results: List[SearchResult] = []
     for category, group in by_category.items():
         try:
-            found = await _collect_results(group, effort, emit, category)
+            # The candidate POOL, not the fetch budget (B7b): at the budget
+            # the reranker in `_rank_candidates` could only reorder what
+            # engine rank had already chosen. Same kwarg the search route
+            # passes (search.py `candidate_budget`).
+            found = await _collect_results(
+                group, effort, emit, category, candidates=candidate_budget(effort)
+            )
         except SearchUnavailableError:
             # A mid-run outage used to be a bare `continue`: no log, no
             # counter. Search dying after round 1 then looked exactly like a
@@ -1217,13 +1482,19 @@ async def _gather(
         _rlog(state, "round %d: %d results, all already read", state.iterations, len(results))
         return []
 
-    room = max(0, settings.deep_research_max_sources - len(state.sources))
+    room = max(0, state.source_limit - len(state.sources))
     want = min(settings.deep_research_sources_per_iteration, room)
     if want <= 0:
         stats.elapsed_s = time.monotonic() - started
         return []
-    fresh = await _rank_candidates(state, fresh)
+    fresh = await _rank_candidates(state, fresh, effort)
     fresh = fresh[:want]
+    if not fresh:
+        # Every candidate was below the relevance floor: nothing to read. The
+        # queries were run; the auditor writes the next ones.
+        stats.elapsed_s = time.monotonic() - started
+        _rlog(state, "round %d: %d candidate(s), none on topic", state.iterations, len(results))
+        return []
 
     for r in fresh:
         state.seen_urls.add(_normalize_url(r.url))
@@ -1252,12 +1523,15 @@ async def _gather(
     followed = await _follow_links(state, [s for s in added if s.dup_of is None], effort, emit, stats)
     added.extend(followed)
 
-    # Remember the round for the next question, exactly like a plain search.
+    # Remember the round for the next question, exactly like a plain search —
+    # which hands this the READ set, not the pool. It logs the search and
+    # crawl-expands the domains of what it is given, and the pool is now five
+    # times the read set, most of it turned down by the reranker.
     _spawn(
         _persist_and_index(
             state.question,
             queries,
-            results,
+            fresh,
             effort,
             state.user_id,
             state.conversation_id,
@@ -1316,19 +1590,102 @@ async def _gather_bounded(
 # ---------------------------------------------------------------------------
 
 
-def _parse_as_of(value: object) -> Optional[date]:
+def _clock() -> datetime:
+    """Now, in the business timezone (`org_brief.BUSINESS_TIMEZONE`, IST).
+
+    Not the process clock. The production orchestrator container sets no TZ
+    and runs in UTC (QA 2026-09-18: /etc/localtime -> Etc/UTC), so the
+    process's "local" date is YESTERDAY for the person between 00:00 and
+    05:30 IST: the run was stamped with the wrong day, and `_parse_as_of`
+    refused a claim dated the person's today as a future date — measured at
+    00:55 IST on 2026-09-19, `_parse_as_of('2026-09-19')` was None under
+    TZ=UTC. The Salesforce path already reads this zone for the same reason
+    (`org_brief.business_today`). One function, so a test can stop the clock.
+    """
+    try:
+        return datetime.now(ZoneInfo(BUSINESS_TIMEZONE))
+    except ZoneInfoNotFoundError:  # an image without tzdata: the process zone
+        return datetime.now().astimezone()
+
+
+def _today() -> date:
+    """The person's calendar date — the one `_parse_as_of` bounds claims by
+    and `_resolve` ages them against."""
+    return _clock().date()
+
+
+def _stamp(now: datetime) -> str:
+    """'2026-09-19 00:55 IST (2026-09-18 19:25 UTC)': the business-zone date
+    and time, with UTC beside it — the shape of the search route's stamp."""
+    utc = now.astimezone(timezone.utc)
+    return (
+        f"{now.date().isoformat()} {now:%H:%M} {now.tzname() or 'local time'} "
+        f"({utc:%Y-%m-%d %H:%M} UTC)"
+    )
+
+
+def _parse_as_of(value: object, *, allow_future: bool = False) -> Optional[date]:
+    """When a claim held, or None — and None for any date after today (B17),
+    unless `allow_future` asks for the date a forecast names.
+
+    The extractor dates a claim from whatever year its sentence names, so
+    "capacity will reach 5 GW by 2031" arrived as_of 2031-01-01 (measured on
+    4810da0: there was no upper bound). That made a forecast the NEWEST
+    evidence in the run, and `_resolve` ranked it current and filed every
+    real dated claim as superseded history. A date that has not happened yet
+    says when something is predicted, never when it held. Today is the
+    business-zone date (`_today`), the same calendar `_resolve` ages claims
+    against.
+    """
     text = str(value or "").strip()
     if not text:
         return None
     m = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?", text)
     if not m:
         dt = provenance.parse_date(text)
-        return dt.date() if dt else None
-    y, mo, d = m.groups()
-    try:
-        return date(int(y), int(mo or 1), int(d or 1))
-    except ValueError:
+        when = dt.date() if dt else None
+    else:
+        y, mo, d = m.groups()
+        try:
+            when = date(int(y), int(mo or 1), int(d or 1))
+        except ValueError:
+            return None
+    if when is not None and when > _today() and not allow_future:
         return None
+    return when
+
+
+#: A year as a value writes it: 2034, FY2027, the 2030s.
+_YEARISH_RE = re.compile(r"\b(?:fy)?(?:19|20)\d{2}s?\b", re.I)
+
+#: The parts of a value that only say WHEN: a year (2034, FY2027, 2030s), an
+#: ISO date, a quarter or half (Q3, H2), a day beside a month name.
+_WHEN_PART_RE = re.compile(
+    r"\b(?:fy)?(?:19|20)\d{2}s?(?:-\d{1,2}){0,2}\b"
+    r"|\b(?:q[1-4]|h[12])\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?=(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec))"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?\b",
+    re.I,
+)
+
+def _names_a_date(value: str) -> bool:
+    """The value IS a date or a timeline ("2034", "Q3 2027", "First plasma:
+    2034; D-T operations: 2039"): it names a year, and every other number in
+    it is part of a date."""
+    if not _YEARISH_RE.search(value or ""):
+        return False
+    return not re.search(r"\d", _WHEN_PART_RE.sub(" ", value))
+
+
+def _is_forecast(c: Claim) -> bool:
+    """A prediction of a QUANTITY for a date after today: "5 GW by 2031".
+
+    Not a schedule. "First plasma is now planned for 2034" names the future
+    date as its value; it is a statement about the plan, true as of the page
+    that states it, and the live ITER run (QA, 2026-09-18) needs it dated by
+    that page — the 2034 plan from a 2026-09-18 article is the current one,
+    and the older iter.org date is history."""
+    return c.forecast_for is not None and not _names_a_date(c.value)
 
 
 def _claim_time(state: ResearchState, c: Claim) -> Optional[date]:
@@ -1415,15 +1772,18 @@ async def _extract_claims(
         hint = str(item.get("status") or "unclear").lower()
         if hint not in ("current", "historical", "unclear"):
             hint = "unclear"
+        as_of = _parse_as_of(item.get("as_of"))
+        named = None if as_of else _parse_as_of(item.get("as_of"), allow_future=True)
         state.claims.append(
             Claim(
                 subq=subq,
                 text=text[:600],
                 value=" ".join(str(item.get("value") or "").split())[:300],
                 source_n=source_n,
-                as_of=_parse_as_of(item.get("as_of")),
+                as_of=as_of,
                 hint=hint,
                 iteration=state.iterations,
+                forecast_for=named,
             )
         )
         added += 1
@@ -1470,11 +1830,12 @@ def _resolve(state: ResearchState) -> None:
     SUPERSEDED (an earlier value with an earlier date — a change over time)
     or CONFLICTING (a different value of comparable date and authority — a
     real disagreement the report must surface). Claims the source itself
-    presents as history never compete for "current".
+    presents as history never compete for "current", and a forecast competes
+    only when nothing but forecasts was found (B17).
     """
     subqs = state.subquestions or [state.question]
     max_age = state.temporal.max_age_seconds if state.temporal else 14 * 86400
-    today = date.today()
+    today = _today()
     for i, subq in enumerate(subqs, 1):
         claims = [c for c in state.claims if c.subq == i]
         if not claims:
@@ -1522,6 +1883,11 @@ def _resolve(state: ResearchState) -> None:
             times = [t for t in (_claim_time(state, c) for c in cs) if t]
             when = max(times) if times else None
             historical = bool(cs) and all(c.hint == "historical" for c in cs)
+            forecast_for = (
+                max(c.forecast_for for c in cs)
+                if cs and all(_is_forecast(c) for c in cs)
+                else None
+            )
             scored.append(
                 {
                     "key": key, "claims": cs, "support": canonical,
@@ -1529,9 +1895,25 @@ def _resolve(state: ResearchState) -> None:
                     "authority": auth, "primary": primary,
                     "primary_weight": primary_weight, "when": when,
                     "historical": historical, "value": (cs[0].value or cs[0].text)[:200],
+                    "forecast_for": forecast_for,
                 }
             )
         candidates = [g for g in scored if not g["historical"]] or scored
+        # B17. A forecast is dated by the page that makes it (`_claim_time`
+        # falls back to the publication date once its future year is
+        # refused), so an outlook article published after a dated fact was
+        # the NEWEST evidence and won: QA 2026-09-18, "5 GW by 2031" from a
+        # 2026-08-20 article beat "3 GW" as of 2026-07-24 and filed it as
+        # superseded. A prediction does not compete with a reported value at
+        # all — not even when the subquestion asks about the plan too: live,
+        # the real extractor dated "5 GW by 2031" as_of 2031 for "How much
+        # battery storage does the region have, and how much is planned?",
+        # and a rule that let forecasts compete for subquestions naming a
+        # plan made it CURRENT again and filed the measured 3 GW as history.
+        # The forecast is listed beside the value instead, for the writer.
+        present = [g for g in candidates if not g["forecast_for"]]
+        if present:
+            candidates = present
         known = [g["when"] for g in candidates if g["when"]]
         newest = max(known) if known else None
         oldest = min(known) if known else None
@@ -1558,6 +1940,7 @@ def _resolve(state: ResearchState) -> None:
         winner["support"].sort()
         superseded: List[dict] = []
         conflicts: List[dict] = []
+        forecasts: List[dict] = []
         for g in scored:
             if g is winner or g["key"] == winner["key"]:
                 continue
@@ -1567,6 +1950,12 @@ def _resolve(state: ResearchState) -> None:
                 "sources": g["support"],
                 "authority": g["authority"],
             }
+            if g["forecast_for"] and not winner["forecast_for"]:
+                # Neither history nor a dispute: a value predicted for a
+                # different date than the one the subquestion asks about.
+                entry["for"] = g["forecast_for"].isoformat()
+                forecasts.append(entry)
+                continue
             if g["historical"]:
                 superseded.append(entry)
                 continue
@@ -1636,6 +2025,8 @@ def _resolve(state: ResearchState) -> None:
             conflicts=conflicts,
             confidence=confidence,
             stated_verbatim=stated,
+            forecasts=forecasts,
+            forecast_for=winner["forecast_for"],
         )
     for r in state.resolutions.values():
         _rlog(state, "resolution %s", r.line())
@@ -2069,7 +2460,9 @@ def _report_messages(state: ResearchState, history: Sequence[dict]) -> List[dict
         "contradicts what you remember, the source wins — write 'as of "
         "<date>' and cite it. Never let your own memory override newer web "
         "evidence.\n"
-        "7. Use the EVIDENCE STATUS table. State CURRENT facts as current with "
+        "7. Use the EVIDENCE STATUS table as your input — never quote, "
+        "reproduce or paste it, or its labels, into the report. State "
+        "CURRENT facts as current with "
         "their as-of date; present SUPERSEDED values as history ('previously "
         "X until Y', 'changed on Z'), not as errors; present CONFLICTING "
         "values as an open disagreement with both citations; for UNKNOWN say "
@@ -2308,6 +2701,12 @@ async def _persist_claims(state: ResearchState) -> None:
     for res in state.resolutions.values():
         if res.status not in (STATUS_CURRENT, STATUS_CONFLICTING):
             continue
+        if res.forecast_for:
+            # A prediction resolved in place of the present value (only
+            # forecasts were found). Stored as 'current', the shared store
+            # would hand it to every Fast-mode question as the fact (B17).
+            _rlog(state, "claim not persisted (forecast for %d): %r", res.forecast_for.year, res.value[:80])
+            continue
         wanted.append((res.status, res.value, res.as_of, res.confidence, list(res.support)))
         for s in res.superseded[:3]:
             wanted.append(
@@ -2432,6 +2831,30 @@ async def _close_run(
         )
     except Exception:  # noqa: BLE001 — the answer already reached the user
         log.warning("could not close the research run", exc_info=True)
+
+
+def _secs(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds >= 10 else f"{seconds:.1f} s"
+
+
+def _no_report_sentence(state: "ResearchState", allowance_s: float) -> str:
+    """The one sentence a run that wrote no report says instead (B3): what
+    happened, and that the sources it read are still there."""
+    if state.report_retried:
+        when = (
+            f" within its time allowance ({_secs(allowance_s)}, then one "
+            f"{_secs(_REPORT_FLOOR_S)} retry, both with thinking off)"
+        )
+    elif state.report_cut_short:
+        when = f" within its time allowance ({_secs(allowance_s)})"
+    else:
+        when = ""
+    n = len(state.sources)
+    return (
+        f"The research run read {n} source{'s' if n != 1 else ''} but the model "
+        f"returned no report text{when}, so nothing was written in its place; "
+        "the sources it read are listed below."
+    )
 
 
 def _report_stop_note(reason: str) -> str:
@@ -2616,9 +3039,11 @@ class _Admission:
         Truthful only because R8 made `deep_research_timeout_s` a real bound
         rather than an advisory one: every expensive stage is now wrapped by
         what is left of it. The report still gets its floor after the gather
-        budget is spent, so the ceiling on a whole run is the budget plus that
-        floor. Returns 0.0 when nothing is running or no budget is configured
-        — in which case the caller says nothing rather than guessing.
+        budget is spent, and a report still WRITING may run on past its
+        allowance up to `_REPORT_OVERRUN_S` (B3), so the ceiling on a whole
+        run is the budget plus both. Returns 0.0 when nothing is running or no
+        budget is configured — in which case the caller says nothing rather
+        than guessing.
         """
         budget = float(settings.deep_research_timeout_s or 0.0)
         if budget <= 0:
@@ -2630,7 +3055,10 @@ class _Admission:
         )
         if not starts:
             return 0.0
-        return max(0.0, min(starts) + budget + _REPORT_FLOOR_S - time.monotonic())
+        return max(
+            0.0,
+            min(starts) + budget + _REPORT_FLOOR_S + _REPORT_OVERRUN_S - time.monotonic(),
+        )
 
 
 #: The admission state, and the loop it belongs to. `asyncio.Future`s are
@@ -2847,13 +3275,18 @@ async def _run(
     # budget cancelled the queued wait and the run "completed" with an
     # empty report.
     await wait_admitted(what="deep_research", base_url=settings.openai_base_url)
-    now = datetime.now(timezone.utc)
+    # The business-zone date and time, with UTC beside it, from the same clock
+    # `_parse_as_of` and `_resolve` read — one calendar for the whole run.
+    # This was the UTC date (4810da0), then the process-local one; the
+    # production container runs in UTC, so both were yesterday for the
+    # person between 00:00 and 05:30 IST (see `_clock`).
+    now = _clock()
     state = ResearchState(
         research_id=uuid.uuid4().hex,
         conversation_id=conversation_id,
         question=message,
         user_id=user_id,
-        today=now.date().isoformat(),
+        today=_stamp(now),
         now_year=now.year,
     )
     # Offline on purpose: the router model is never consulted mid-run. The
@@ -3049,11 +3482,20 @@ async def _run(
             # search errors are swallowed per round), never via the exception
             # handler below.
             timed_out = bool(state.cut_short)
+            # Blaming the provider was false when the search DID return
+            # results and the relevance floor turned every one of them down
+            # (QA 2026-09-18, the "Tell me more" follow-up before the floor
+            # scored the plan): say which of the two happened.
+            off_topic = state.off_topic_dropped
             await _close_run(
                 run_row, state, "failed", "", [],
                 "the time budget ended the run before any source was read"
                 if timed_out
-                else "no readable sources",
+                else (
+                    f"no on-topic sources ({off_topic} result(s) below the relevance floor)"
+                    if off_topic
+                    else "no readable sources"
+                ),
             )
             text = (
                 "I could not gather any readable sources for this question — "
@@ -3062,9 +3504,15 @@ async def _run(
                     "finished. Nothing was invented to fill the gap. Try "
                     "again, or give research a longer time budget."
                     if timed_out
-                    else "the search provider returned nothing usable. Nothing "
-                    "was invented to fill the gap. Try rephrasing, or ask with "
-                    "Web Search for a single-pass answer."
+                    else (
+                        "the searches returned results, but none of them was "
+                        "about this question. Nothing was invented to fill the "
+                        "gap. Try naming the subject in the question itself."
+                        if off_topic
+                        else "the search provider returned nothing usable. Nothing "
+                        "was invented to fill the gap. Try rephrasing, or ask with "
+                        "Web Search for a single-pass answer."
+                    )
                 )
             )
             await emit("token", {"text": text})
@@ -3100,10 +3548,16 @@ async def _run(
                     sid, "Verifying claims", "not run: the run reached its time budget"
                 )
                 vqueries, low = [], []
-            if ok and low and vqueries and state.budget_left():
+            # `verify_budget_left`, not `budget_left` (B23c): a run that
+            # stopped on source_cap is exactly the thin, low-confidence run
+            # this round exists for, and `budget_left` is False for it by
+            # definition. The round gets a small reserve past the cap; the
+            # clock and the iteration cap still bind.
+            if ok and low and vqueries and state.verify_budget_left():
                 await finish(sid, "Verifying claims", f"{len(low)} claim(s) need more evidence — one more targeted round")
                 state.iterations += 1
                 state.verification_rounds += 1
+                state.source_headroom = _VERIFY_SOURCE_RESERVE
                 label = f"Verifying claims (round {state.iterations})"
                 await emit("status", {"text": f"{label} — {len(vqueries)} queries…"})
                 sid = await step(label)
@@ -3165,14 +3619,29 @@ async def _run(
         # asking a research question wants a book back. The run's own time
         # budget still bounds everything.
         report_run: Optional[continuation.LongResult] = None
+        loop = asyncio.get_running_loop()
+        # B3. The allowance is what the budget leaves the report (at least the
+        # reserve, 150 s at the 600 s default). It used to be a WALL CLOCK:
+        # `asyncio.wait_for` cut a stream that was mid-sentence exactly as it
+        # cut one that had sent nothing, and a report still thinking at 150 s
+        # was stored as the 94-character budget note. It now measures IDLE
+        # time — every word of report text restarts it — under a hard ceiling
+        # of the allowance plus `_REPORT_OVERRUN_S`.
+        allowance = state.report_budget_s()
+        ceiling_at = loop.time() + allowance + _REPORT_OVERRUN_S
 
-        async def _stream_report() -> None:
+        async def _stream_report(on_progress: Callable[[], None]) -> None:
             nonlocal report_run
 
             async def _out(kind: str, delta: str) -> None:
                 await emit(kind, {"text": delta})
                 if kind == "token":
                     parts.append(delta)
+                    # Only report TEXT is progress. The call asks for thinking
+                    # off, so a reasoning delta means the switch was not
+                    # honoured — and a model thinking right up to the ceiling
+                    # is the very failure this deadline exists to end.
+                    on_progress()
 
             async with _LLM_SEM:
                 report_run = await continuation.stream_long_completion(
@@ -3184,26 +3653,137 @@ async def _run(
                         settings.deep_research_report_total_tokens,
                         continuation.budget_for(effort),
                     ),
-                    deadline_s=state.report_budget_s(),
+                    # Checked between segments: no new one past the ceiling.
+                    deadline_s=max(0.0, ceiling_at - loop.time()),
+                    answer_plan=_ThinkingOff(),
                 )
+
+        async def _write(idle_s: float) -> str:
+            """One report call under the idle deadline. '' when it ended by
+            itself; 'idle' when `idle_s` passed without report text; 'ceiling'
+            when the hard ceiling did."""
+
+            def due() -> float:
+                return min(loop.time() + idle_s, ceiling_at)
+
+            def progress() -> None:
+                # A deadline that has already fired is final: rescheduling an
+                # expiring Timeout raises, and a word that arrives in the same
+                # loop pass as the cut must not turn the cut into an error.
+                if not window.expired():
+                    window.reschedule(due())
+
+            try:
+                async with asyncio.timeout_at(due()) as window:
+                    await _stream_report(progress)
+            except TimeoutError:
+                return "ceiling" if loop.time() >= ceiling_at else "idle"
+            return ""
 
         # The one stage the budget may not simply skip — it is the deliverable
         # — but it may not run unbounded either: the only guard underneath it
         # is `llm.py`'s GEN_WALL_CLOCK_S, 1,800 s by default, three times a
         # whole research run (R8). `parts` is appended as each delta arrives,
         # so a stream stopped here keeps every word the user has already seen.
-        try:
-            await asyncio.wait_for(_stream_report(), state.report_budget_s())
-        except asyncio.TimeoutError:
+        cut = await _write(allowance)
+        if cut:
             await _park_if_cut(state, "report")
+        # Only an IDLE cut earns the retry: after the hard ceiling there is no
+        # time left, and "then one 15 s retry" would be a false sentence
+        # (review 2026-09-19).
+        if cut == "idle" and not _WORD_RE.search("".join(parts)):
+            # Not one word by the deadline. Once more, thinking off, with the
+            # floor as its idle allowance — a first word within it, then on
+            # for as long as it keeps writing — under the same ceiling.
+            state.report_retried = True
+            log.warning(
+                "research report produced no text in %.1fs (%s deadline); "
+                "retrying once inside a %.0fs floor",
+                allowance, cut, _REPORT_FLOOR_S,
+            )
+            report_run = None
+            cut = await _write(_REPORT_FLOOR_S)
+            if cut:
+                await _park_if_cut(state, "report")
+        if cut:
             state.report_cut_short = True
             state.cut_short.append("report")
             log.warning(
-                "research report stopped at the run's time budget after "
+                "research report stopped at the run's time budget (%s) after "
                 "%.1fs (%d characters written)",
+                "hard ceiling" if cut == "ceiling" else "no text for the idle allowance",
                 state.elapsed, sum(len(p) for p in parts),
             )
         report = "".join(parts)
+        sources_meta = _sources_meta(state)
+
+        def _research_meta(cited: List[int], invalid: List[int]) -> dict:
+            return {
+                "research_id": state.research_id,
+                "iterations": state.iterations,
+                "queries": state.queries_run,
+                "subquestions": state.subquestions,
+                "sources_found": len(state.sources),
+                "sources_cited": len(cited),
+                "missing": state.missing,
+                "contradictions": state.contradictions,
+                "elapsed_s": round(state.elapsed, 1),
+                "invalid_citations_removed": len(invalid),
+                # 2026-09-03: why it stopped and what it established.
+                "stop_reason": state.stop_reason,
+                "today": state.today,
+                "temporal": state.temporal.requirement.value if state.temporal else "",
+                "rounds": [r.as_meta() for r in state.rounds],
+                "links_followed": state.links_followed,
+                "primary_sources": [s.n for s in state.primary_sources],
+                "duplicates_dropped": len(state.duplicates),
+                "stale_downranked": len(state.stale_downranked),
+                "claims": len(state.claims),
+                "resolutions": [state.resolutions[i].as_meta() for i in sorted(state.resolutions)],
+                "confidence": round(state.confidence, 2),
+                "verification_rounds": state.verification_rounds,
+                # What the run could NOT do, beside what it did.
+                "search_outages": state.search_outages,
+                "evidence_audited": not state.auditor_failed,
+                "report_truncated": state.report_truncated,
+                # R8: the wall-clock budget BOUNDS the run now instead of
+                # advising it, so what it cut belongs on the record.
+                "time_budget_s": round(float(settings.deep_research_timeout_s or 0.0), 1),
+                "stages_cut_short": list(state.cut_short),
+                "report_cut_short": state.report_cut_short,
+                "report_retried": state.report_retried,
+            }
+
+        if not _WORD_RE.search(report):
+            # Never a 'done' run with zero report words (B3): the audit's two
+            # runs were stored as finished with the budget note as their whole
+            # report. Say what happened, keep the sources, close it as failed.
+            text = _no_report_sentence(state, allowance)
+            log.warning(
+                "research report: no report text after %d call(s) — the run "
+                "is closed as failed", 2 if state.report_retried else 1,
+            )
+            await emit("token", {"text": text})
+            open_step = None
+            await emit(
+                "step",
+                {"id": sid, "title": "Writing the report", "status": "failed",
+                 "detail": "the model returned no report text"},
+            )
+            await emit(
+                "meta",
+                {"route": "deep_research", "sources": sources_meta,
+                 "research_run": _research_meta([], [])},
+            )
+            await _close_run(
+                run_row, state, "failed", "", sources_meta,
+                "the model returned no report text"
+                + (" (retried once)" if state.report_retried else ""),
+            )
+            await _persist_claims(state)
+            _spawn(_queue_primary_crawls(state))
+            return text
+
         if state.report_cut_short:
             note = (
                 "\n\n[the run reached its time budget and the report stops "
@@ -3247,47 +3827,12 @@ async def _run(
             f"{len(cited)} of {len(state.sources)} sources cited · stopped: {state.stop_reason.replace('_', ' ')} · confidence {state.confidence:.2f}",
         )
 
-        sources_meta = _sources_meta(state)
-        resolutions_meta = [state.resolutions[i].as_meta() for i in sorted(state.resolutions)]
         await emit(
             "meta",
             {
                 "route": "deep_research",
                 "sources": sources_meta,
-                "research_run": {
-                    "research_id": state.research_id,
-                    "iterations": state.iterations,
-                    "queries": state.queries_run,
-                    "subquestions": state.subquestions,
-                    "sources_found": len(state.sources),
-                    "sources_cited": len(cited),
-                    "missing": state.missing,
-                    "contradictions": state.contradictions,
-                    "elapsed_s": round(state.elapsed, 1),
-                    "invalid_citations_removed": len(invalid),
-                    # 2026-09-03: why it stopped and what it established.
-                    "stop_reason": state.stop_reason,
-                    "today": state.today,
-                    "temporal": state.temporal.requirement.value if state.temporal else "",
-                    "rounds": [r.as_meta() for r in state.rounds],
-                    "links_followed": state.links_followed,
-                    "primary_sources": [s.n for s in state.primary_sources],
-                    "duplicates_dropped": len(state.duplicates),
-                    "stale_downranked": len(state.stale_downranked),
-                    "claims": len(state.claims),
-                    "resolutions": resolutions_meta,
-                    "confidence": round(state.confidence, 2),
-                    "verification_rounds": state.verification_rounds,
-                    # What the run could NOT do, beside what it did.
-                    "search_outages": state.search_outages,
-                    "evidence_audited": not state.auditor_failed,
-                    "report_truncated": state.report_truncated,
-                    # R8: the wall-clock budget BOUNDS the run now instead of
-                    # advising it, so what it cut belongs on the record.
-                    "time_budget_s": round(float(settings.deep_research_timeout_s or 0.0), 1),
-                    "stages_cut_short": list(state.cut_short),
-                    "report_cut_short": state.report_cut_short,
-                },
+                "research_run": _research_meta(cited, invalid),
             },
         )
         await _close_run(run_row, state, "done", report, sources_meta)

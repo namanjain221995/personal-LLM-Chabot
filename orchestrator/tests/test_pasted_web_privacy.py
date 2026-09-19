@@ -306,15 +306,18 @@ def _wire_research(monkeypatch, plan):
             return plan if isinstance(plan, str) else json.dumps(plan)
         return json.dumps({"sufficient": True, "missing": [], "followup_queries": []})
 
-    async def fake_rerank(message, res, target, **kw):
-        return res
+    async def fake_rerank(query, documents, **kw):
+        # No reranker, so `_rank_candidates` keeps engine order - what the
+        # identity fake of `_rerank_results` gave before Deep Research scored
+        # its own candidates (B7b, the relevance floor, merged from its track).
+        raise dr.rerank.RerankUnavailable("offline test")
 
     async def fake_fetch(res, message="", **kw):
         return []
 
     monkeypatch.setattr(dr.llm, "json_completion", fake_json)
     monkeypatch.setattr(dr.llm, "stream_chat_events", _no_stream)
-    monkeypatch.setattr(dr, "_rerank_results", fake_rerank)
+    monkeypatch.setattr(dr.rerank, "score", fake_rerank)
     monkeypatch.setattr(dr, "_fetch_sources", fake_fetch)
     monkeypatch.setattr(dr, "_spawn", lambda coro: coro.close())
     monkeypatch.setattr(dr.db, "create_research_run", lambda *a, **k: 1)

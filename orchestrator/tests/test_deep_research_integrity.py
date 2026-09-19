@@ -132,8 +132,11 @@ def _wire(monkeypatch, *, plan=None, gap=None, report="Report [1].", finish=None
     async def fake_collect(queries, effort="medium", emit=None, categories="", **kw):
         return _results(4)
 
-    async def fake_rerank(message, res, target):
-        return res
+    async def fake_rerank(query, documents, **kw):
+        # No reranker, so `_rank_candidates` keeps engine order — what the
+        # identity fake of `_rerank_results` gave before Deep Research
+        # scored its own candidates (B7b, the relevance floor).
+        raise dr.rerank.RerankUnavailable("offline test")
 
     async def fake_fetch(res, message=""):
         return [
@@ -161,7 +164,7 @@ def _wire(monkeypatch, *, plan=None, gap=None, report="Report [1].", finish=None
     monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
     monkeypatch.setattr(dr.llm, "stream_chat_events", fake_stream)
     monkeypatch.setattr(dr, "_collect_results", fake_collect)
-    monkeypatch.setattr(dr, "_rerank_results", fake_rerank)
+    monkeypatch.setattr(dr.rerank, "score", fake_rerank)
     monkeypatch.setattr(dr, "_fetch_sources", fake_fetch)
     monkeypatch.setattr(dr, "_spawn", lambda coro: coro.close())
     monkeypatch.setattr(dr.db, "create_research_run", lambda *a, **k: 1)
@@ -1059,7 +1062,10 @@ def test_one_person_cannot_take_the_second_slot_as_well(monkeypatch):
     assert "Your own research run is still going" in out_b
     assert "1 run at a time per person" in out_b
     # Truthful, not a bare no: the budget that bounds the other run is quoted.
-    assert "about 10 minutes" in out_b
+    # 14, not 10, since B3 (2026-09-18): a report still WRITING may run past
+    # its allowance up to `_REPORT_OVERRUN_S`, so the bound a refusal quotes
+    # is now budget + floor + overrun = 600 + 15 + 240 s, about 14 minutes.
+    assert "about 14 minutes" in out_b
     assert "Web Search" in out_b
     # The refusal is still a well-formed answer on the wire.
     assert [p for k, p in ev_b if k == "meta"][-1] == {
@@ -1096,7 +1102,10 @@ def test_the_process_ceiling_holds_against_a_third_person(monkeypatch):
 
     out_c = asyncio.run(scenario())
     assert "already running 2 research runs" in out_c
-    assert "The earliest finishes in about 10 minutes" in out_c
+    # 14, not 10, since B3 (2026-09-18): a report still WRITING may run past
+    # its allowance up to `_REPORT_OVERRUN_S`, so the bound a refusal quotes
+    # is now budget + floor + overrun = 600 + 15 + 240 s, about 14 minutes.
+    assert "The earliest finishes in about 14 minutes" in out_c
 
 
 def test_a_queued_request_runs_when_a_slot_frees(monkeypatch):
@@ -1319,8 +1328,11 @@ def _tagged_wire(monkeypatch, claim_rows, closed_rows, run_ids):
             return json.dumps({"verdicts": []})
         return json.dumps({"sufficient": True, "missing": [], "followup_queries": []})
 
-    async def fake_rerank(message, res, target):
-        return res
+    async def fake_rerank(query, documents, **kw):
+        # No reranker, so `_rank_candidates` keeps engine order — what the
+        # identity fake of `_rerank_results` gave before Deep Research
+        # scored its own candidates (B7b, the relevance floor).
+        raise dr.rerank.RerankUnavailable("offline test")
 
     async def fake_fetch(res, message=""):
         tag = _tag_of(message)
@@ -1362,7 +1374,7 @@ def _tagged_wire(monkeypatch, claim_rows, closed_rows, run_ids):
 
     monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
     monkeypatch.setattr(dr.llm, "stream_chat_events", fake_stream)
-    monkeypatch.setattr(dr, "_rerank_results", fake_rerank)
+    monkeypatch.setattr(dr.rerank, "score", fake_rerank)
     monkeypatch.setattr(dr, "_fetch_sources", fake_fetch)
     monkeypatch.setattr(dr, "_spawn", lambda coro: coro.close())
     monkeypatch.setattr(dr.db, "create_research_run", fake_create)
