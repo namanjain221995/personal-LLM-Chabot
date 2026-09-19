@@ -833,3 +833,197 @@ def test_a_clean_long_file_of_any_dialect_reports_no_dropped_rows(tmp_path, shap
     got = profiler.profile_tabular(str(dirty))
     assert got["rows"] == 20_999
     assert got["aggregates"]["omitted"][0].startswith("1 row(s) could not be read"), got["aggregates"]["omitted"]
+
+
+# ---------------------------------------------------------------------------
+# 8. A sheet's row is measured BEFORE it is written, and a spent budget opens
+# no writer for a later sheet.
+# ---------------------------------------------------------------------------
+
+_NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+
+
+def _xcol(i: int) -> str:
+    s, i = "", i + 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _one_string_workbook(path, shared: str, sheets: int, width: int = 60, rows: int = 1) -> None:
+    """`sheets` sheets, each a header row plus `rows` rows whose every one of
+    `width` cells references ONE shared string."""
+    hdr = "".join(f'<c r="{_xcol(i)}1" t="inlineStr"><is><t>c{i}</t></is></c>' for i in range(width))
+    body = "".join(
+        f'<row r="{r}">' + "".join(f'<c r="{_xcol(i)}{r}" t="s"><v>0</v></c>' for i in range(width)) + "</row>"
+        for r in range(2, rows + 2)
+    )
+    sheet = f'<?xml version="1.0" encoding="UTF-8"?><worksheet {_NS}><sheetData><row r="1">{hdr}</row>{body}</sheetData></worksheet>'
+    sst = f'<?xml version="1.0" encoding="UTF-8"?><sst {_NS} count="1" uniqueCount="1"><si><t>{shared}</t></si></sst>'
+    ws_ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"
+    ct = (
+        '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + "".join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="{ws_ct}"/>' for i in range(1, sheets + 1))
+        + '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>'
+    )
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+    )
+    wbx = (
+        f'<?xml version="1.0" encoding="UTF-8"?><workbook {_NS} xmlns:r="{rel}"><sheets>'
+        + "".join(f'<sheet name="S{i}" sheetId="{i}" r:id="rId{i}"/>' for i in range(1, sheets + 1))
+        + "</sheets></workbook>"
+    )
+    wbrels = (
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + "".join(f'<Relationship Id="rId{i}" Type="{rel}/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, sheets + 1))
+        + f'<Relationship Id="rId{sheets + 1}" Type="{rel}/sharedStrings" Target="sharedStrings.xml"/></Relationships>'
+    )
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", ct)
+        z.writestr("_rels/.rels", rels)
+        z.writestr("xl/workbook.xml", wbx)
+        z.writestr("xl/_rels/workbook.xml.rels", wbrels)
+        z.writestr("xl/sharedStrings.xml", sst)
+        for i in range(1, sheets + 1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", sheet)
+
+
+def _big_string(n: int) -> str:
+    rnd = random.Random(7)
+    out, size = [], 0
+    while size < n:
+        seg = "A" * 700 + "".join(rnd.choice("bcdefghij") for _ in range(2))
+        out.append(seg)
+        size += len(seg)
+    return "".join(out)[:n]
+
+
+def _count_written(monkeypatch):
+    written = [0]
+    orig = profiler._CountingWriter.write
+
+    def write(self, text):
+        written[0] += len(text.encode("utf-8"))
+        return orig(self, text)
+
+    monkeypatch.setattr(profiler._CountingWriter, "write", write)
+    return written
+
+
+def _budget_bytes(path) -> int:
+    plan = profiler.archive.check_zip_container(path, label="spreadsheet")
+    return profiler._WorkbookBudget(int(plan.total_uncompressed)).bytes
+
+
+def test_one_row_of_a_big_shared_string_stays_inside_the_byte_budget(tmp_path, monkeypatch):
+    """Security r2: a 34 KB .xlsx whose ONE row has 60 cells referencing one
+    2,000,000-character shared string wrote 120,000,290 bytes against an
+    8,388,608-byte budget at 4b90840 (737 MB RSS; on the worker a 189 KB
+    file of the same shape wrote 1.92 GB at 11 GB RSS in 33.9 s)."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    path = tmp_path / "row.xlsx"
+    _one_string_workbook(path, _big_string(2_000_000), sheets=1)
+    budget = _budget_bytes(path)
+    written = _count_written(monkeypatch)
+    out = profiler.profile_excel(str(path))
+    header = len(",".join(f"c{i}" for i in range(60))) + 1
+    assert written[0] <= budget + header, f"{written[0]:,} bytes written against a {budget:,}-byte budget"
+    assert out["sheets"][0]["note"].startswith("not profiled")
+
+
+def test_a_spent_budget_writes_nothing_more_for_later_sheets(tmp_path, monkeypatch):
+    """Security r2: ten sheets of the same one row; each sheet opened a new
+    writer and wrote one more over-budget row: a 21 KB file wrote
+    1,200,002,900 bytes in 16.6 s (0.13 s on 4810da0)."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    monkeypatch.setattr(profiler, "SHEET_CSV_MIN_BYTES", 256 * 1024)
+    path = tmp_path / "ten.xlsx"
+    _one_string_workbook(path, _big_string(200_000), sheets=10)
+    budget = _budget_bytes(path)
+    written = _count_written(monkeypatch)
+    out = profiler.profile_excel(str(path))
+    header = 10 * (len(",".join(f"c{i}" for i in range(60))) + 1)
+    assert written[0] <= budget + header, f"{written[0]:,} bytes written against a {budget:,}-byte budget"
+    assert all(s.get("note", "").startswith("not profiled") for s in out["sheets"])
+
+
+def test_a_row_within_the_cell_limit_but_over_the_budget_is_not_written(tmp_path, monkeypatch):
+    """The budget check itself, below Excel's 32,767-character cell limit:
+    60 cells of a 30,000-character string are 1.8 MB, over a 256 KB budget.
+    The refused row spends the budget, so sheets 2 and 3 write nothing."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    monkeypatch.setattr(profiler, "SHEET_CSV_MIN_BYTES", 256 * 1024)
+    path = tmp_path / "row.xlsx"
+    _one_string_workbook(path, _big_string(30_000), sheets=3)
+    budget = _budget_bytes(path)
+    written = _count_written(monkeypatch)
+    out = profiler.profile_excel(str(path))
+    header = 3 * (len(",".join(f"c{i}" for i in range(60))) + 1)
+    assert written[0] <= budget + header, f"{written[0]:,} bytes written against a {budget:,}-byte budget"
+    first, *later = out["sheets"]
+    assert first["note"].startswith("not profiled: the workbook expands")
+    assert all(s["note"] == "not profiled: the workbook's earlier sheets used its whole scratch budget" for s in later)
+    assert written[0] == len(",".join(f"c{i}" for i in range(60))) + 1, "only sheet 1's header"
+
+
+def test_opposite_a_normal_long_text_workbook_is_still_profiled(tmp_path, monkeypatch):
+    """Opposite direction: a 2,000-character note repeated in 3 columns of
+    100 rows is ordinary content and must still be profiled like a CSV."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    path = tmp_path / "notes.xlsx"
+    _one_string_workbook(path, "note " * 400, sheets=1, width=3, rows=100)
+    sheet = profiler.profile_excel(str(path))["sheets"][0]
+    assert "note" not in sheet and "aggregates" in sheet and sheet["rows"] == 100
+
+
+def test_a_cell_longer_than_a_spreadsheet_cell_is_refused_even_under_the_budget(tmp_path, monkeypatch):
+    """Excel holds at most 32,767 characters in a cell. One row of 60 cells
+    of a 40,000-character string is 2.4 MB, inside a 1 GB budget, and is
+    still not built into a CSV row (csv.writer holds the whole row in memory
+    first: security r2 measured about 6x the row's size in RSS)."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    monkeypatch.setattr(profiler, "SHEET_CSV_MIN_BYTES", 1 << 30)
+    path = tmp_path / "long_cell.xlsx"
+    _one_string_workbook(path, _big_string(40_000), sheets=1)
+    written = _count_written(monkeypatch)
+    sheet = profiler.profile_excel(str(path))["sheets"][0]
+    assert sheet["note"].startswith("not profiled: a cell holds more than 32,767 characters")
+    assert written[0] <= len(",".join(f"c{i}" for i in range(60))) + 1
+
+
+def test_a_budget_spent_by_quoting_opens_no_writer_for_the_next_sheet(tmp_path, monkeypatch):
+    """A row is measured by its characters before it is written; quoting
+    can double that (every '"' is written twice), so the first sheet can
+    overshoot by one row. Every later sheet then writes NOTHING, not even a
+    header, and says why."""
+    monkeypatch.setenv("PROFILE_SCRATCH_DIR", str(tmp_path / "scratch"))
+    os.makedirs(tmp_path / "scratch")
+    monkeypatch.setattr(profiler, "SHEET_CSV_MIN_BYTES", 256 * 1024)
+    path = tmp_path / "quotes.xlsx"
+    _one_string_workbook(path, "&quot;" * 3_000, sheets=3)  # 3,000 '"' per cell, 60 cells
+    budget = _budget_bytes(path)
+    assert 60 * 3_000 + 60 < budget < 60 * (2 * 3_000 + 2) + 60, "the row fits by characters and not by bytes"
+    calls = []
+    orig = profiler._CountingWriter.write
+
+    def write(self, text):
+        calls.append(len(text.encode("utf-8")))
+        return orig(self, text)
+
+    monkeypatch.setattr(profiler._CountingWriter, "write", write)
+    first, *later = profiler.profile_excel(str(path))["sheets"]
+    assert first["note"].startswith("not profiled: the workbook expands")
+    assert len(calls) == 2, "sheet 1's header and its one row; nothing for sheets 2 and 3"
+    assert all(s["note"] == "not profiled: the workbook's earlier sheets used its whole scratch budget" for s in later)

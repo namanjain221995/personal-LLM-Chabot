@@ -1212,6 +1212,17 @@ SHEET_CSV_MAX_RATIO = 4
 SHEET_CSV_MIN_BYTES = 8 * 1024 * 1024
 # and the WIDTH written is settings.profile_max_columns, the columns a CSV
 # profile describes: DuckDB never parses 16,384 columns.
+#
+# A row is measured BEFORE it is written, and a sheet opens no writer once
+# the budget is spent. Security r2: checked after the write, ONE row of 60
+# cells referencing one 2 MB shared string wrote 120,000,290 bytes against an
+# 8,388,608-byte budget (a 34 KB .xlsx, 1.80 s, 737 MB RSS; a 189 KB one
+# wrote 1.92 GB at 11 GB RSS), and each later sheet opened a new writer and
+# wrote one more such row (10 sheets of a 21 KB file: 1,200,002,900 bytes).
+# csv.writer builds the whole row in memory first, so a cell is also held to
+# what a spreadsheet cell can hold: Excel's limit is 32,767 characters, and a
+# longer one did not come from a spreadsheet.
+SHEET_CELL_MAX_CHARS = 32_767
 
 
 class _WorkbookBudget:
@@ -1275,7 +1286,17 @@ def _profile_sheet(ws, scratch: Optional[str], index: int, budget: _WorkbookBudg
     csv_path: Optional[str] = None
     raw = None
     writer = None
-    if scratch is not None and width:
+    over = f"not profiled: the workbook expands to more text than {SHEET_CSV_MAX_RATIO}x its unpacked size"
+    too_long = (
+        f"not profiled: a cell holds more than {SHEET_CELL_MAX_CHARS:,} characters, more than a spreadsheet cell can"
+    )
+    if scratch is not None and width and (budget.bytes <= 0 or budget.cells <= 0):
+        note = "not profiled: the workbook's earlier sheets used its whole scratch budget"
+    elif scratch is not None and width and max(map(len, shown)) > SHEET_CELL_MAX_CHARS:
+        note = too_long  # the header is a row too
+    elif scratch is not None and width and sum(map(len, shown)) + width > budget.bytes:
+        note, budget.bytes = over, 0
+    elif scratch is not None and width:
         csv_path = os.path.join(scratch, f"sheet-{index + 1}.csv")
         try:
             raw = open(csv_path, "wb")
@@ -1291,10 +1312,14 @@ def _profile_sheet(ws, scratch: Optional[str], index: int, budget: _WorkbookBudg
     # Per column: a datetime with a time of day, and any non-datetime cell.
     stamped = [False] * width
     other = [False] * width
+    # The minimal record names columns as the sample does, clipped: a header
+    # cell can be a shared string of any length, and a refused sheet still
+    # carries its names into the prompt.
+    labels = [clip(n) for n in shown]
     for row in rows_iter:
         counted += 1
         if len(sample) < settings.profile_sample_rows:
-            sample.append({n: clip(v) for n, v in zip(shown, row[:width])})
+            sample.append({n: clip(v) for n, v in zip(labels, row[:width])})
         if writer is None:
             continue
         budget.cells -= width
@@ -1307,30 +1332,45 @@ def _profile_sheet(ws, scratch: Optional[str], index: int, budget: _WorkbookBudg
             # skipped by identity, a gap of 50,000 rows costs 50,000 writes.
             if row is last_blank or all(v is None for v in row[:width]):
                 last_blank = row
+                if len(blank) > budget.bytes:
+                    note, writer, budget.bytes = over, None, 0
+                    continue
                 budget.bytes -= len(blank)
                 raw.write(blank)
             else:
                 cells = tuple(row[:width]) + (None,) * max(0, width - len(row))
+                # str() of a shared string is the same object: no copy yet.
+                texts = [_sheet_cell(v) for v in cells]
+                # Characters are a lower bound on UTF-8 bytes, and a row
+                # also carries width - 1 commas and a newline: a row that
+                # cannot fit is never built into one string.
+                if max(map(len, texts)) > SHEET_CELL_MAX_CHARS:
+                    note, writer = too_long, None
+                    continue
+                if sum(map(len, texts)) + width > budget.bytes:
+                    # The workbook is over its budget: this row is not
+                    # written, and no later sheet opens a writer.
+                    note, writer, budget.bytes = over, None, 0
+                    continue
                 for i, v in enumerate(cells):
                     if isinstance(v, _dt.datetime):
                         if v.time() != _dt.time(0) or v.tzinfo is not None:
                             stamped[i] = True
                     elif v is not None:
                         other[i] = True
-                writer.writerow([_sheet_cell(v) for v in cells])
+                writer.writerow(texts)
         except OSError:
             writer = None
             continue
         if budget.bytes < 0:
-            note = (
-                "not profiled: the workbook expands to more text than "
-                f"{SHEET_CSV_MAX_RATIO}x its unpacked size"
-            )
-            writer = None
+            # Only quoting or multi-byte text can overshoot, by at most one
+            # row of at most width x SHEET_CELL_MAX_CHARS characters, and the
+            # spent budget then stops every later sheet before its header.
+            note, writer = over, None
     minimal: Dict[str, Any] = {
         "name": ws.title,
         "rows": counted,
-        "columns": [{"name": n} for n in shown],
+        "columns": [{"name": n} for n in labels],
         "sample_rows": sample,
     }
     if note:
