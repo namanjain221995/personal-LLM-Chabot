@@ -155,6 +155,18 @@ _DET_RE = re.compile(r"<\|det\|>.*?<\|/det\|>", re.S)
 _TAG_RE = re.compile(r"<\|/?[a-z_]+\|>")
 # Bare bbox payloads like [[123, 45, 678, 90]] left outside det blocks.
 _BBOX_RE = re.compile(r"\[\[\d+(?:,\s*\d+){3}\]\]")
+
+#: The engine's own region types. Of the 1,254 region-shaped line starts in
+#: the 296 answers recorded on 2026-09-18, 1,236 carried one of these (text
+#: 887, title 164, image 75, header 52, table 31, page_number 13, chart 7,
+#: footer 7) and 9 were the model's "result" fused into the first region.
+#: That one stays a type: 6 of the 9 held the image's first line ("result
+#: [0, 0, 999, 540]Tensor Shapes"), and 3 held a self-critique, which stays in
+#: the text rather than risk the 6. The other 9 were the image's own text:
+#: "input [1, 3, 224, 224]", "conv1 [1, 64, 112, 112]" and a bare
+#: "[1, 2, 3, 4]" on a slide or a REPL.
+_LAYOUT_TYPES = ("text", "title", "image", "header", "table", "page_number", "chart", "footer", "result")
+_TYPE_WORD = "(?:%s)" % "|".join(_LAYOUT_TYPES)
 # The format the served model ACTUALLY emits (observed live 2026-08-06):
 # each line starts "type [x, y, x, y]Content" — e.g.
 # "text [31, 306, 212, 347]Vendor: TechSara". Strip the region-type word and
@@ -167,8 +179,21 @@ _BBOX_RE = re.compile(r"\[\[\d+(?:,\s*\d+){3}\]\]")
 # loop for 11.8 s; now 4 ms. The price is that blank lines just above a
 # region line are no longer folded into it. None of the 296 answers recorded
 # this round had one, and this step's output is byte-identical on all 296.
+#
+# The second alternative is the same marker with the wrong number of
+# coordinates and the image's text fused straight behind it (2026-09-19).
+# Live, "OCR" prompt, a scanned 'Matrix rows / [1, 2, 3, 4] / [5, 6, 7, 8]'
+# page on the Files API path, 3 of 3 runs: "result [0, 0, 2558][1, 2, 3, 4]".
+# All 10 such lines in the 593 answers recorded this round are the engine's
+# "result" with 3 numbers. Only an engine type word counts, with at least two
+# numbers and text fused to the bracket, so "image [224, 224, 3]" standing
+# alone as a line, or a heading like "table [3], continued", is left as the
+# image's words. Both alternatives are one pass: content exposed behind a
+# stripped marker is never at a line start for this regex again.
 _LINE_REGION_RE = re.compile(
-    r"^[^\S\n]*(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\]\s*", re.M
+    r"^[^\S\n]*(?:(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\]"
+    r"|" + _TYPE_WORD + r"[^\S\n]*\[\d+(?:,[^\S\n]*\d+){1,7}\](?=\S))\s*",
+    re.M,
 )
 
 
@@ -211,24 +236,22 @@ _PREAMBLE_TOKEN_RE = re.compile(r"\Aovi[ \t]+(?=\S)")
 #: ":\n:\n:\n…"), which is a failed read and must reach `is_degenerate` whole —
 #: stripping it line by line turned such a loop into an `empty` screen.
 _MAX_PREAMBLE_LINES = 2
-#: The start of a line the engine wrote as a region (see `_drop_line_before_layout`).
-#: The type word is the engine's own vocabulary, not "any lower-case word":
-#: of the 1,254 region-shaped line starts in the 296 answers recorded this
-#: round, 1,236 carried one of these (text 887, title 164, image 75, header 52,
-#: table 31, page_number 13, chart 7, footer 7) and 9 were the model's
-#: "result" fused into the first region. That one stays a type: 6 of the 9
-#: held the image's first line ("result [0, 0, 999, 540]Tensor Shapes"), and
-#: 3 held a self-critique, which stays in the text rather than risk the 6.
-#: The other 9 were the image's own text: "input [1, 3, 224, 224]",
-#: "conv1 [1, 64, 112, 112]" and a bare "[1, 2, 3, 4]" on a slide or a REPL.
-#: Taken for layout, such a line drops the real line above it whenever the
-#: engine answers without a preamble ('>>> sorted(xs)' above '[1, 2, 3, 4]',
-#: QA 2026-09-18). A type this list lacks only means a chatter first line is
-#: kept, as it was before this rule existed.
-_LAYOUT_TYPES = ("text", "title", "image", "header", "table", "page_number", "chart", "footer", "result")
+#: A line the engine wrote as a region: the type word and a 4-number box, or
+#: the model card's det-block spelling (see `_drop_line_before_layout`).
+#: Taken for layout, image text such as "input [1, 3, 224, 224]" drops the
+#: real line above it whenever the engine answers without a preamble
+#: ('>>> sorted(xs)' above '[1, 2, 3, 4]', QA 2026-09-18), hence the type
+#: words. A type this list lacks only means a chatter first line is kept, as
+#: it was before this rule existed.
 _LAYOUT_LINE_RE = re.compile(
-    r"[^\S\n]*(?:<\|det\|>|(?:%s)[^\S\n]*\[\d+(?:,\s*\d+){3}\])" % "|".join(_LAYOUT_TYPES)
+    r"[^\S\n]*+(?:<\|det\|>|%s[^\S\n]*+\[\d+(?:,\s*\d+){3}\])" % _TYPE_WORD
 )
+#: A FIRST line that merely opens like a region (a type word and a bracketed
+#: number, however many numbers follow) is still the engine's, and whatever is
+#: fused behind it is the image's text: "result [0, 0, 2558][1, 2, 3, 4]",
+#: live 3 of 3 runs, security review 2026-09-19. Deliberately looser than the
+#: rule that says the LATER lines are layout: this one only ever keeps a line.
+_REGION_START_RE = re.compile(r"[^\S\n]*+(?:<\|det\|>|%s[^\S\n]*+\[\d)" % _TYPE_WORD)
 
 
 def _strip_preamble(text: str) -> str:
@@ -266,6 +289,13 @@ def _drop_line_before_layout(text: str) -> str:
     ONE line, not every line before the first region: in one of the 73 the
     second line was the window title, written without a region.
 
+    A first line that OPENS like a region is kept, even malformed: the only
+    one of 412 dropped first lines in the 593 answers recorded by 2026-09-19
+    that held the image's text was "result [0, 0, 2558][1, 2, 3, 4]" (three
+    numbers, so not a region by the strict rule, with the slide's first row
+    fused behind it; `_REGION_START_RE`). Dropping it cost a Files API page a
+    row of numbers while the read still counted as `ok`.
+
     A region line is recognised in both of the engine's spellings: the bare
     "type [x, y, x, y]" the served model emits today, and the model card's
     "<|det|>type [x, y, x, y]<|/det|>", which is what the same answer looks
@@ -273,7 +303,7 @@ def _drop_line_before_layout(text: str) -> str:
     this runs on the raw answer, before either marker is removed.
     """
     lines = text.strip().split("\n")
-    if len(lines) < 2 or _LAYOUT_LINE_RE.match(lines[0]):
+    if len(lines) < 2 or _REGION_START_RE.match(lines[0]):
         return text
     if any(_LAYOUT_LINE_RE.match(line) for line in lines[1:]):
         return "\n".join(lines[1:])
@@ -297,7 +327,7 @@ def clean_transcript(raw: str) -> str:
     """
     out = _drop_line_before_layout(raw or "")
     first = out.lstrip().split("\n", 1)[0]
-    in_layout = bool(_LAYOUT_LINE_RE.match(first))
+    in_layout = bool(_REGION_START_RE.match(first))
     out = _DET_RE.sub("", out)
     out = _TAG_RE.sub("", out)
     out = _BBOX_RE.sub("", out)

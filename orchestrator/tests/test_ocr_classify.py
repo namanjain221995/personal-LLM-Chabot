@@ -521,3 +521,57 @@ def test_instructions_on_the_image_are_data_not_a_preamble(monkeypatch):
 def test_a_truncated_preamble_only_answer_is_empty(monkeypatch):
     read = _read(monkeypatch, '":"', finish="length")
     assert (read.status, read.text) == ("empty", "")
+
+
+# ================================ review round 2 against 327a5ac (2026-09-19) ==
+#
+# Raw answers marked "live" are verbatim from this deployment's OCR sidecar,
+# recorded by the reviewers (3 of 3 runs each unless noted).
+
+# ---- 1. a first line that opens like a region is the engine's, not chatter --
+
+#: Security review r2, live, the public Files API path: a 'Matrix rows /
+#: [1, 2, 3, 4] / [5, 6, 7, 8]' slide saved as a one-page PDF and rendered
+#: back, prompt "OCR". The engine fused the first row behind a region marker
+#: with three numbers; 327a5ac took the whole line for chatter, returned
+#: '[5, 6, 7, 8]' and still called the read `ok`.
+_MATRIX_FUSED = " result [0, 0, 2558][1, 2, 3, 4]\ntext [55, 456, 300, 530][5, 6, 7, 8]"
+#: Security review r1, live, image route: the same shape on an identity-matrix
+#: slide ('[0, 0, 0]' is the engine's garbled first row, and it is the
+#: image's row as the engine read it).
+_IDENTITY_FUSED = (
+    " result [0, 0, 0][0, 0, 0]\ntext [76, 375, 215, 432][0, 1, 0, 0]\n"
+    "text [76, 478, 215, 536][0, 0, 1, 0]\ntext [76, 583, 215, 639][0, 0, 0, 1]"
+)
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize(
+    "raw, text",
+    [
+        (_MATRIX_FUSED, "[1, 2, 3, 4]\n[5, 6, 7, 8]"),
+        (_IDENTITY_FUSED, "[0, 0, 0]\n[0, 1, 0, 0]\n[0, 0, 1, 0]\n[0, 0, 0, 1]"),
+    ],
+    ids=["matrix-files-live", "identity-image-live"],
+)
+def test_text_fused_behind_a_malformed_region_marker_survives(monkeypatch, raw, text, finish):
+    """Every row stays, and the marker's invented numbers ('2558') do not."""
+    read = _read(monkeypatch, raw, finish=finish)
+    expected = text + ("\n" + _NOTE if finish == "length" else "")
+    assert (read.status, read.text) == ("ok", expected)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Input size\nimage [224, 224, 3]",
+        "Model input\nimage [224, 224, 3] RGB\ndtype uint8",
+        "result [1, 2, 3]",
+        "Contents\ntable [3], continued",
+    ],
+)
+def test_a_bracket_standing_as_text_is_left_alone(raw):
+    """The malformed-marker rule needs two or more numbers and text FUSED to
+    the bracket: a line of the image that merely reads 'image [224, 224, 3]'
+    or 'table [3], continued' is not markup."""
+    assert ocr.clean_transcript(raw) == raw

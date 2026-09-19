@@ -265,6 +265,20 @@ def test_a_page_the_reader_looped_on_with_preamble_tokens_is_degenerate_not_empt
     assert "ovi" not in json.dumps(pages_of(derived))
 
 
+def test_a_scanned_page_keeps_the_row_the_engine_fused_behind_a_malformed_region(tmp_path):
+    """Security review 2026-09-19, live on this path (a 'Matrix rows / [1, 2,
+    3, 4] / [5, 6, 7, 8]' slide as a one-page PDF, prompt "OCR", 3 of 3
+    runs): the engine wrote the first row behind a three-number region
+    marker. 327a5ac dropped the whole line as chatter, so the page's
+    citable text lost a row of numbers and the read still counted as ok."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: " result [0, 0, 2558][1, 2, 3, 4]\ntext [55, 456, 300, 530][5, 6, 7, 8]"}
+    run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert (pages[3]["source"], pages[3]["text"]) == ("ocr", "[1, 2, 3, 4]\n[5, 6, 7, 8]")
+    assert "2558" not in json.dumps(pages), "the marker's numbers are not on the page"
+
+
 def test_the_page_budget_reads_the_first_thin_pages_and_lists_the_rest_as_skipped(tmp_path):
     derived, source = scanned_pdf(tmp_path)
     facts = run_stage(derived, source, budget=2)
