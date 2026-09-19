@@ -34,6 +34,7 @@ from typing import Sequence
 
 from .. import llm
 from ..config import settings
+from ..core import pasted
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
@@ -70,8 +71,21 @@ _FEW_SHOTS = [
     ("rewrite this paragraph to be shorter", {"agent": False, "search": False}),
 ]
 
-# The opening of a request is enough to classify it.
+# What the classifier reads of a long request: its opening AND its end. The
+# opening alone was 2,000 characters of a pasted job description whose ask
+# ("change it in the same way") sat 7,900 characters later (hotfix 1.2, P1);
+# the composer folds a paste in front of what the person typed, so the end is
+# where the ask usually is.
 _INPUT_CAP = 2000
+_CLIP_MARK = "\n[...]\n"
+
+
+def _clip(message: str) -> str:
+    text = message or ""
+    if len(text) <= _INPUT_CAP:
+        return text
+    half = (_INPUT_CAP - len(_CLIP_MARK)) // 2
+    return text[:half] + _CLIP_MARK + text[-half:]
 
 
 @dataclass
@@ -91,7 +105,7 @@ def _messages(message: str, history: Sequence[dict]) -> list:
         *shots,
         # Only the last couple of turns matter for "is this a big task?".
         *[m for m in list(history)[-2:] if m.get("role") != "system"],
-        {"role": "user", "content": (message or "")[:_INPUT_CAP]},
+        {"role": "user", "content": _clip(message)},
     ]
 
 
@@ -132,6 +146,13 @@ async def decide(message: str, history: Sequence[dict], effort: str) -> Plan:
     """
     allowed = allowances(effort)
     if not (allowed["agent"] or allowed["search"]) or not (message or "").strip():
+        return Plan(agent=False, search=False)
+    if pasted.is_transform_ask(message):
+        # A rewrite / reformat / summary of text the person PASTED is one pass
+        # of the chat engine with nothing to look up (hotfix 1.2, P1). Live,
+        # the classifier sent the reported rewrite to the multi-step agent 3
+        # of 3 times, and still 3 of 3 when shown the head and the tail, so
+        # the rule decides it and the classifier is not asked.
         return Plan(agent=False, search=False)
     try:
         raw = await llm.router_chat_completion(
