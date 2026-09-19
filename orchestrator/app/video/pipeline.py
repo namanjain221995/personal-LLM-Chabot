@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -75,7 +76,13 @@ _DONE = "_done"
 #:   3  repetition loops are collapsed out of the transcript (video/loops.py:
 #:      17.9% of a real 2h23m transcript was the decoder repeating itself).
 #:      Scoped: see `_RERUN_FOR` — the engines are not asked again.
-PIPELINE_VERSION = 3
+#:   4  the summary and the artifact titles are written from a neutral name,
+#:      not the stored one (`_shared_name`: the row is shared by every
+#:      uploader of the bytes and its filename is the FIRST uploader's — QA
+#:      measured a second person's overview quoting it, 2026-09-18), and a
+#:      file with no picture is never labelled a screen recording. Scoped:
+#:      only fusion and the artifacts are rebuilt.
+PIPELINE_VERSION = 4
 
 #: WHAT A BUMP INVALIDATES, when that is known precisely. A stale row re-runs
 #: the stages named for every version between its own and this one and keeps
@@ -86,6 +93,9 @@ PIPELINE_VERSION = 3
 #: for a two-hour recording that is forty minutes of two GPUs to fix text.
 _RERUN_FOR: Dict[int, Tuple[str, ...]] = {
     3: ("transcript", "fusion", "index", "artifacts"),
+    # v4 changed what fusion is TOLD (the name) and how its label is read;
+    # the transcript, the screen and the index never saw the filename.
+    4: ("fusion", "artifacts"),
 }
 
 #: The engine's transcript has meant the same thing since this version: a
@@ -157,6 +167,26 @@ _OPTIONAL = {"ocr", "vision", "index"}
 #: The prefix a deferred row's `error` carries; the drain uses it to tell a
 #: row that is waiting for an engine from one that is simply new.
 DEFERRED_MARK = "waiting for the model"
+
+#: An engine's address inside an exception's text: ModelUnavailable says
+#: "model at http://10.100.184.2:8000/v1 unavailable after 780s" (QA,
+#: 2026-09-18), and the stage detail and the row's `error` built from it are
+#: served to the person (/video status, the chat step, "I couldn't analyse
+#: …"). The log line keeps the full text for the operator.
+_ENGINE_ADDRESS = re.compile(
+    r"\b[a-z][a-z0-9+.-]*://\S+"  # any URL
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b",  # a bare IPv4 host[:port]
+    re.I,
+)
+
+
+def public_text(text: str) -> str:
+    """`text` with every engine address replaced — for anything a person reads."""
+    return _ENGINE_ADDRESS.sub("the engine", text or "")
+
+
+def _exc_detail(exc: BaseException, limit: int) -> str:
+    return public_text(f"{type(exc).__name__}: {str(exc)[:limit]}")
 
 
 @dataclass
@@ -393,13 +423,13 @@ class _Runner:
             # the row read 'failed' and nothing ever re-ran it.
             if stage in _OPTIONAL:
                 log.warning("video %s: optional stage %s skipped — %s", content_hash[:12], stage, exc)
-                outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
+                outcome = _StageResult(status="failed", detail=_exc_detail(exc, 400))
             else:
                 log.warning("video %s: stage %s deferred — %s", content_hash[:12], stage, exc)
-                outcome = _StageResult(status="deferred", detail=f"{DEFERRED_MARK}: {str(exc)[:300]}")
+                outcome = _StageResult(status="deferred", detail=f"{DEFERRED_MARK}: {public_text(str(exc)[:300])}")
         except Exception as exc:  # noqa: BLE001 — recorded on the row, never a crash
             log.exception("video %s: stage %s failed", content_hash[:12], stage)
-            outcome = _StageResult(status="failed", detail=f"{type(exc).__name__}: {str(exc)[:400]}")
+            outcome = _StageResult(status="failed", detail=_exc_detail(exc, 400))
         ms = int((time.perf_counter() - stage_started) * 1000)
         stages[stage] = {"status": outcome.status, "ms": ms, "detail": outcome.detail}
         metrics.observe("video_stage_seconds", ms / 1000.0, "wall-clock per pipeline stage", stage=stage)
@@ -649,9 +679,12 @@ async def _stage_probe(ctx: _Ctx, progress) -> _StageResult:
 
     probe = await media.probe(ctx.source, timeout_s=60.0)
     if probe.duration_s > settings.video_max_duration_s:
+        # B12: an audio file rides this rail too, and this sentence reaches
+        # the person ("I couldn't analyse memo.m4a: …").
+        kind = "video" if probe.has_video else "recording"
         return _StageResult(
             "failed",
-            f"the video is {art.fmt_ts(probe.duration_s)} long; the limit is {art.fmt_ts(settings.video_max_duration_s)}",
+            f"the {kind} is {art.fmt_ts(probe.duration_s)} long; the limit is {art.fmt_ts(settings.video_max_duration_s)}",
         )
     summary = probe.summary()
     store.write_json(store.stage_path(ctx.content_hash, "probe.json"), {**summary, "raw": probe.raw})
@@ -881,7 +914,8 @@ async def _stage_vision(ctx: _Ctx, progress) -> _StageResult:
     if settings.video_captions_enabled and _router_enabled():
         captions = await caption_frames(kept, progress=progress)
         described = sum(1 for c in captions if c)
-        detail = f"{described}/{len(kept)} frames described by {settings.router_model.split('/')[-1]}"
+        # B25b: no model name — the status surface never names one.
+        detail = f"{described}/{len(kept)} frames described"
         if described == 0:
             status = "failed"
             detail = "the vision model described none of the frames"
@@ -895,6 +929,27 @@ async def _stage_vision(ctx: _Ctx, progress) -> _StageResult:
     return _StageResult(status, detail)
 
 
+def _shared_name(row: dict) -> str:
+    """The name the SHARED outputs (fusion's prompt, the artifact titles) use.
+
+    A chat-lane row is keyed by the bytes alone, so every person who attaches
+    the same file gets the same row, and the row's `filename` is the FIRST
+    uploader's. QA measured it, 2026-09-18: Bob attached a clip as
+    "memo.m4a" and his overview's "Not covered" discussed what Alice's name
+    for it, "<person> disciplinary hearing.m4a", implied. So those outputs
+    see only the extension. Each person's own name still reaches their own
+    answer through the per-link `display_name`. An api-lane row is keyed by
+    project and hash, so its name is that project's own and is kept.
+    """
+    stored = str(row.get("filename") or "")
+    if row.get("lane") == "api":
+        return stored or "video"
+    ext = os.path.splitext(stored)[1].lower()
+    if not ext[1:].isalnum() or len(ext) > 8:
+        ext = ""
+    return "recording" + ext
+
+
 async def _stage_fusion(ctx: _Ctx, progress) -> _StageResult:
     from .fusion import understand
 
@@ -902,7 +957,7 @@ async def _stage_fusion(ctx: _Ctx, progress) -> _StageResult:
     segments = ctx.load_transcript()
     spans = ctx.load_spans()
     u = await understand(
-        filename=str(ctx.row.get("filename") or "video"),
+        filename=_shared_name(ctx.row),
         duration_s=float(probe.get("duration_s") or 0.0),
         language=ctx.language,
         has_audio=bool(probe.get("has_audio")),
@@ -911,6 +966,13 @@ async def _stage_fusion(ctx: _Ctx, progress) -> _StageResult:
         spans=spans,
         progress=progress,
     )
+    if not probe.get("has_video") and u.content_type == "screen_recording":
+        # No picture, so not a screen recording — the same test the frames
+        # stage skips on. The prompt never says there is no picture, and QA
+        # measured plain speech with no video stream labelled
+        # screen_recording in 7 of 12 fusion passes (2026-09-18), which the
+        # overview printed beside "the file has no video stream".
+        u.content_type = "other"
     store.write_json(store.stage_path(ctx.content_hash, "understanding.json"), u.to_json())
     ctx.understanding = u
     return _StageResult(
@@ -938,7 +1000,7 @@ async def _stage_artifacts(ctx: _Ctx, progress) -> _StageResult:
     spans = ctx.load_spans()
     u = ctx.load_understanding()
     duration = float(probe.get("duration_s") or 0.0)
-    title = str(ctx.row.get("filename") or "video")
+    title = _shared_name(ctx.row)
     out_dir = store.artifacts_dir(ctx.content_hash)
     files = [
         ("transcript_txt", "transcript.txt", "text/plain", art.transcript_txt(segments, title=title)),
