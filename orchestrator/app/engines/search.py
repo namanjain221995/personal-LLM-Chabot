@@ -26,7 +26,7 @@ from . import DIAGRAM_INSTRUCTION, conversation_turns, recent_turns
 from .. import llm
 from ..config import settings
 from .. import db, web_index
-from ..core import extract, net, provenance, robots
+from ..core import extract, net, pasted, provenance, robots
 from ..freshness import Verdict
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
@@ -470,8 +470,18 @@ async def rewrite_queries(
     # into search phrases and sent to SearXNG and the engines behind it — a
     # private term sheet becoming a web query. Only what was said in this
     # conversation is context for a query (security review 2026-09-03).
-    msgs = [{"role": "system", "content": system}, *conversation_turns(history, 4),
-            {"role": "user", "content": message}]
+    #
+    # PASTED TEXT (hotfix 1.2, P6). The same rule for what the person pasted:
+    # a query is built from their OWN words only. The rewriter sees the ask
+    # ("what does this role pay in Pune?"), never the pasted posting it
+    # follows, and an earlier turn's paste is reduced the same way; a query
+    # that still carries a run of pasted text is dropped before it leaves.
+    asked = pasted.own_words(message)
+    if not asked:
+        return []
+    turns = conversation_turns(history, 4)
+    msgs = [{"role": "system", "content": system}, *pasted.own_turns(turns),
+            {"role": "user", "content": asked}]
     try:
         raw = await llm.router_chat_completion(msgs, temperature=0.0, max_tokens=200)
         m = _JSON_ARRAY_RE.search(raw or "")
@@ -479,8 +489,12 @@ async def rewrite_queries(
         queries = [q.strip() for q in queries if isinstance(q, str) and q.strip()]
     except Exception:
         queries = []
-    queries = _strip_unasked_pins(message, history, queries)
-    return (queries or [message])[:cap]
+    queries = _strip_unasked_pins(asked, history, queries)
+    queries = pasted.without_paste(
+        queries, message, *(str(t.get("content") or "") for t in turns if t.get("role") == "user")
+    )
+    fallback = pasted.web_query(message)
+    return (queries or ([fallback] if fallback else []))[:cap]
 
 
 #: A token that is nothing but a calendar year.
@@ -686,6 +700,17 @@ async def _collect_results(
     every existing caller, and every test double, keeps the list return they
     were written against.
     """
+    # THE LAST DOOR (hotfix 1.2, P6). Every web query on every path reaches
+    # the provider through here, so this is where a query carrying a run of
+    # the turn's pasted text is dropped, whoever built it (a planner, an
+    # auditor, a rewriter that copied its context). Counts only in the log:
+    # never the query text.
+    kept = pasted.without_paste(queries)
+    if len(kept) < len(queries):
+        log.info("search: %d of %d queries dropped: they carried pasted text", len(queries) - len(kept), len(queries))
+    queries = kept
+    if not queries:
+        return []
     provider = get_provider()
     failed = 0
 
@@ -1594,6 +1619,7 @@ async def research_step(
     the caller can fall back to answering from model knowledge instead of
     failing the whole step.
     """
+    pasted.mark_turn(question)
     try:
         queries = await rewrite_queries(question, history, effort)
         results = await _collect_results(
@@ -1655,6 +1681,7 @@ async def run_search_engine(
 ) -> str:
     """Full search pipeline with status events, cited streaming, and fallback."""
     await emit("status", {"text": "Searching the web…"})
+    pasted.mark_turn(message)
     degraded: dict = {}
     try:
         queries = await rewrite_queries(message, history, effort)
@@ -1787,8 +1814,14 @@ async def fetch_for_freshness(
     """
     if not settings.search_enabled:
         return 0
+    # The person's own words, never what they pasted (hotfix 1.2, P6): the
+    # reported turn sent a 9,961-character pasted job description here.
+    pasted.mark_turn(question)
+    query = pasted.web_query(question)
+    if not query:
+        return 0
     try:
-        results = await _collect_results([question], effort="fast")
+        results = await _collect_results([query], effort="fast")
     except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal
         return 0
     if not results:
@@ -1837,7 +1870,7 @@ async def fetch_for_freshness(
         db.run_in_thread(
             _log_search_background,
             question,
-            [question],
+            [query],
             picked,
             "fast",
             user_id,

@@ -848,6 +848,12 @@ async def run_agent_engine(
 
     `web` gates internet access the same way: when False, web steps become llm
     steps, so a user who turned web search off never gets a network fetch."""
+    # A web step's query never carries the message's pasted text, whatever
+    # step input the planner wrote (hotfix 1.2, P6; checked in
+    # engines/search.py `_collect_results`).
+    from ..core import pasted
+
+    pasted.mark_turn(message)
     state = await get_agent_graph().ainvoke(
         {
             "message": message,
