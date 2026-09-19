@@ -146,9 +146,11 @@ _TARGET_OVERRUN_CHARS = 2000
 #: not follow (`_has_ended`). The plan's numbers are computed here, never by
 #: the model. The model keeps the section COUNT it is given but not the
 #: words per section: told 7 sections of about 430 words, four live runs
-#: wrote 7-8 sections of 309-379 words (2,358-2,653 words for 3,000). So the
-#: count is sized by the words per section it actually writes.
-_SECTION_WORDS = 340
+#: wrote 7-8 sections of 309-379 words (2,358-2,653 words for 3,000). Sized
+#: at 340 words (9 sections) eight runs gave 2,663-3,806 words, two under
+#: 2,700; at 300 (10 sections) five gave 2,782-3,803, all one segment and
+#: complete, none past the 130% stop.
+_SECTION_WORDS = 300
 _MAX_SECTIONS = 30
 
 _TOKEN = re.compile(r"\S+")

@@ -1278,11 +1278,11 @@ def test_the_first_call_carries_a_section_plan_computed_by_code(model):
     assert first[0] == {"role": "system", "content": "sys"}
     assert first[-1]["role"] == "user"
     assert first[-1]["content"] == ask + "\n\n" + continuation._length_plan(3000)
-    # 3,000 / 340 rounds to 9 sections of about 330 words.
-    assert "about 3,000 words" in first[-1]["content"] and "9 sections of about 330 words" in first[-1]["content"]
+    # 3,000 / 300 is 10 sections of about 300 words.
+    assert "about 3,000 words" in first[-1]["content"] and "10 sections of about 300 words" in first[-1]["content"]
 
 
-@pytest.mark.parametrize("target, sections, per", [(800, 3, 270), (1200, 4, 300), (5000, 15, 330), (10_000, 29, 340),
+@pytest.mark.parametrize("target, sections, per", [(800, 3, 270), (1200, 4, 300), (5000, 17, 290), (10_000, 30, 330),
                                                    (60_000, 30, 2000)])
 def test_the_plan_numbers(target, sections, per):
     plan = continuation._length_plan(target)
