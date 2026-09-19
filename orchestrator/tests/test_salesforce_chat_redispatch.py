@@ -447,3 +447,23 @@ def test_the_check_is_decided_in_bounded_time(org, message, expected):
     value, elapsed = _decide_within(message, 0.5)
     assert value != "overran", f"still deciding after {elapsed:.2f}s on {len(message):,} chars"
     assert value is expected
+
+
+#: Writing and feelings asks the live router already routed to chat (review
+#: 2026-09-19). Before the fix the record check pulled them into SQL: "Help me
+#: word a reply to my boss ..." was answered "the system shows 0 open cases",
+#: and the joke got a sync-worker error. A record question must OPEN as one.
+ROUTER_SAID_CHAT = [
+    "Tell me a joke about a lead record that was last updated in 1999.",
+    "My boss wants to know how many open cases we have. Help me word a reply that says I'll get back to him.",
+    "Can you word a reminder that the status of our open cases is reviewed every Monday?",
+    "My manager asked how many open cases we have. What's a polite way to say I need a day?",
+    "Is it normal to feel anxious when the status of our open cases is bad?",
+    "Help me word a reply to my boss who asked how many open cases we have; I need a day to check.",
+]
+
+
+@pytest.mark.parametrize("message", ROUTER_SAID_CHAT)
+def test_writing_and_feelings_about_records_stay_on_chat(monkeypatch, message):
+    ran = _node(monkeypatch, message)
+    assert [r[0] for r in ran] == ["chat"]

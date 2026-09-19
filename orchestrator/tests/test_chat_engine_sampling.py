@@ -287,15 +287,13 @@ LENGTHS_IN_MATERIAL = [
     "Fix the grammar: 'please write me a 2000 words essay'",
     "Is this prompt good? 'Write a 10,000 word story about dragons.'",
     # The old composer folded pasted blocks IN FRONT of the typed instruction.
-    # KNOWN GAP, left to bk-long-asks' parser: under core/pasted's 300-char
-    # paste floor, with no quote or colon, nothing marks the email as
-    # material, and the first call is told a 5,000-word section plan. The
-    # engine does not narrow short messages itself: "Write a 3,000-word essay
-    # on climate.\n\nMake it persuasive." has the same shape and its count is
-    # the person's.
+    # A paste of any length that is one paragraph is not a "paste" to
+    # core/pasted, so the target came from the whole message and the first call
+    # was told a 5,000-word plan for a two-line summary (review 2026-09-19:
+    # 1 of 2 live runs answered "I cannot generate a 5,000-word report"). The
+    # transform ask's own lines decide the target now.
     pytest.param(
         "Hi Sam, please write a 5,000-word report on Q3 hiring by Friday.\nThanks, Dana\n\nSummarize this in two lines.",
-        marks=pytest.mark.xfail(strict=True, reason="short unmarked paste in front of the ask: bk-long-asks parser"),
         id="short-paste-first",
     ),
 ]

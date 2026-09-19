@@ -488,7 +488,13 @@ def _length_ask(message: str) -> str:
     "Write a 3,000-word report based on these notes:" + notes the count is
     the person's, and pasted.own_words would drop it."""
     turn = pasted.read(message)
-    return message if turn is None else "\n".join(turn.asks)
+    if turn is not None:
+        return "\n".join(turn.asks)
+    # REVIEW PROTOTYPE: a one-paragraph paste is not is_paste(), but the
+    # transform ask at its edge is still the person's only instruction.
+    lines = message.split("\n")
+    asks = [ln for i, ln in enumerate(lines) if pasted._asks_to_transform(ln) and pasted._at_boundary(lines, i)]
+    return "\n".join(asks) if asks and len(lines) > 1 else message
 
 
 async def _run_lane(

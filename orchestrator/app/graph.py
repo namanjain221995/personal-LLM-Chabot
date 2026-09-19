@@ -135,6 +135,16 @@ _REQUEST_LEAD = re.compile(
     re.I,
 )
 _SENTENCE_BREAK = re.compile(r"(?<=[.?!;])\s+")
+#: REVIEW PROTOTYPE: the ask must BE a record question from its first word,
+#: its verb paired with the opener that asks it.
+_QUESTION_SHAPE = re.compile(
+    r"^(?:(?:hi|hey|hello|ok|okay|so|and|also|now|please|pls|kindly|just|quick one|lol|can you|could you|would you)\b[\s,!.:-]*)*"
+    r"(?:(?:does|do|did|is|are)\b[^.?!;]*\bexists?\b"
+    r"|when (?:was|were|did)\b[^.?!;]*\blast (?:updated|modified)\b"
+    r"|what(?:'s|s| is| was) the (?:current |latest )?status of\b"
+    r"|(?:how many|count|show|list)\b)",
+    re.I,
+)
 
 
 #: How much of the chosen line the_ask reads. The quote patterns below
@@ -285,6 +295,8 @@ def is_record_question(message: str) -> bool:
     ask = the_ask(message)
     tokens = list(itertools.islice(_WORD.finditer(ask), _ASK_MAX_WORDS + 1))
     if not tokens or len(tokens) > _ASK_MAX_WORDS:
+        return False
+    if not _QUESTION_SHAPE.match(ask):
         return False
     strong = _STRONG_DATA_VERB.search(ask) is not None
     weak_ends = [m.end() for m in _WEAK_DATA_VERB.finditer(ask)]
