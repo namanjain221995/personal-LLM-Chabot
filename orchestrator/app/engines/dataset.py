@@ -745,8 +745,9 @@ class PlainWords:
 
     A name is left alone when the file itself uses it (a column called
     `aggregates`, a group value "profile"): then it is the person's word.
-    Text is released a line or a sentence at a time, so a name split across
-    two deltas is still seen whole.
+    Text is released a line at a time (a sentence at a time in a long
+    paragraph), so a name split across two deltas is still seen whole, and
+    an answer stopped by its budget can end on its last whole line.
     """
 
     def __init__(self, uploads: Sequence[dict]) -> None:
@@ -773,7 +774,9 @@ class PlainWords:
 
     def feed(self, text: str) -> str:
         self._buf += text
-        cut = max(self._buf.rfind("\n"), self._buf.rfind(". "))
+        cut = self._buf.rfind("\n")
+        if cut < 0 and len(self._buf) > 200:
+            cut = self._buf.rfind(". ")
         if cut < 0 and len(self._buf) > 400:
             cut = self._buf.rfind(" ", 0, len(self._buf) - 80)
         if cut < 0:
@@ -781,8 +784,13 @@ class PlainWords:
         out, self._buf = self._buf[: cut + 1], self._buf[cut + 1:]
         return self._plain(out)
 
-    def finish(self) -> str:
+    def finish(self, whole_lines_only: bool = False) -> str:
+        """The rest. `whole_lines_only` drops an unfinished last line: a
+        budget stop cut "114. Order 100114: " mid-row, above the note that
+        says the line above is where it stopped (2026-09-19)."""
         out, self._buf = self._buf, ""
+        if whole_lines_only and not out.endswith("\n"):
+            return ""
         return self._plain(out)
 
 
@@ -861,7 +869,7 @@ async def run_dataset_engine(
     )
     for piece in guard.finish():
         await _say(words.feed(piece))
-    await _say(words.finish())
+    await _say(words.finish(whole_lines_only=long.truncated))
     await _say(unread_note(uploads, "".join(shown)))
     if long.truncated:
         # Said IN the answer, not only in a UI notice: the stored text is what

@@ -1294,3 +1294,26 @@ def test_a_monthly_question_about_a_group_is_told_that_cross_is_not_computed(tmp
     for question in ("monthly revenue trend", "total revenue by region"):
         assert not any("NOT COMPUTED" in ln for ln in dataset.question_figures(question, [upload])), question
     assert "A NOT COMPUTED line there names a figure" in dataset.build_messages("x", [upload], [])[0]["content"]
+
+
+def test_an_answer_stopped_by_its_budget_ends_on_its_last_whole_line(tmp_path, monkeypatch):
+    """Live, forced 2,500-token total: '114. Order 100114: ' was left cut
+    mid-row above the note saying the line above is where it stopped."""
+    _, upload = profiled_upload(tmp_path, 40, 11)
+    rows = "".join(f"| ORD-{i:05d} | {i}.25 |\n" for i in range(1, 120))
+    text = rows + "| ORD-00120 | 12"
+
+    async def stream(messages, **kwargs):
+        for i in range(0, len(text), 7):
+            yield "token", text[i:i + 7]
+
+    monkeypatch.setattr(llm, "stream_chat_events", stream)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "length")
+    monkeypatch.setattr(llm, "get_usage", lambda: {"completion_tokens": 900, "prompt_tokens": 0})
+    monkeypatch.setattr(settings, "continuation_budget_fast", 900)
+    answer, events = _run_engine(monkeypatch, upload)
+    assert "".join(d["text"] for k, d in events if k == "token") == answer
+    body, note = answer.split("\n\n*This answer stops here", 1)
+    assert "ORD-00120" not in answer, "the unfinished row was shown"
+    assert body.rstrip("\n").splitlines()[-1] == "| ORD-00119 | 119.25 |"
+    assert [d for k, d in events if k == "meta"][-1]["continuation"]["truncated"] is True
