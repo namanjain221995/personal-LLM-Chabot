@@ -461,6 +461,61 @@ def test_the_reranker_scores_the_plan_not_only_the_message(monkeypatch):
     assert seen == ["Tell me more\nWhat explanations exist for the bright early galaxies?"]
 
 
+_PASTED_POSTING = "\n".join(
+    [
+        "Senior Data Engineer - Claims Platform",
+        "Acme Mutual Insurance Private Limited",
+        "Location Pune, hybrid, in office Monday and Wednesday at the Baner campus",
+        "Experience 7 to 10 years",
+        "Employment type full time, permanent",
+        "about acme",
+        "acme mutual settles motor and health claims for 2.3 million policy holders across "
+        "Maharashtra and Karnataka, and every claim passes through the platform this team owns.",
+        "about the role",
+        "you will report to the head of claims data engineering and lead the rebuild of our "
+        "fraud scoring pipeline on the streaming stack we adopted last year.",
+        "requirements",
+        "7+ years building batch and streaming data pipelines in Python and SQL",
+        "hands on experience with Kafka, Flink or Spark Structured Streaming",
+        "has run a dbt project with more than 400 models in production",
+        "benefits",
+        "family health insurance of 6 lakh rupees and a learning budget of 50,000 rupees a year",
+    ]
+)
+
+
+@pytest.mark.parametrize("where", ["search", "links"])
+def test_a_paste_does_not_crowd_the_plan_out_of_the_relevance_query(monkeypatch, where):
+    """A Deep Research message that carries a paste: the floor judges pages
+    against the person's own question and the plan, not the pasted text.
+
+    The reranker reads the first 600 characters of its query
+    (`rerank.MAX_QUERY_CHARS`), so the whole message went first and the
+    subquestions never arrived: live on 2026-09-19, 40 real SearXNG results
+    for a salary question under a pasted job posting, the floor kept 12
+    scored against the message and 22 against the question plus the plan."""
+    question = "What do senior data engineers earn in Pune in 2026, and how does that compare with Bengaluru?"
+    subq = "What is the typical salary range for a senior data engineer in Bengaluru in 2026?"
+    st = _state(question=f"{_PASTED_POSTING}\n\n{question}", subqs=(subq,))
+    seen = []
+
+    async def recording(query, documents, **kw):
+        seen.append(rerank.format_query(query))
+        return [0.9] * len(documents)
+
+    monkeypatch.setattr(rerank, "score", recording)
+    if where == "search":
+        asyncio.run(dr._rank_candidates(st, _results(["https://a.example/x"])))
+    else:
+        page = _Source(n=0, url="https://b.example/pay", title="Pay", text="salaries in Pune")
+        asyncio.run(dr._on_topic_pages(st, [page]))
+    assert len(seen) == 1
+    sent = seen[0]
+    assert question in sent, f"the person's question did not reach the reranker: {sent!r}"
+    assert subq in sent, f"the plan was cut off behind the paste: {sent!r}"
+    assert "Baner campus" not in sent and "Claims Platform" not in sent, f"pasted text scored against: {sent!r}"
+
+
 def test_a_run_whose_results_were_all_off_topic_does_not_blame_the_provider(monkeypatch):
     """The search DID return results; the floor turned every one down. At
     a0a9b6f the person was told "the search provider returned nothing

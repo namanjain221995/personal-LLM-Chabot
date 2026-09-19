@@ -1092,8 +1092,17 @@ def _relevance_query(state: ResearchState) -> str:
     Measured 2026-09-18 on the live reranker, 33 real SearXNG results for the
     planner's JWST query: "Tell me more" alone kept 0 of 33 (max score
     0.023), the same message plus the subquestions kept 30 of 33 (QA).
+
+    The person's OWN words, not a paste in the message. The reranker reads
+    the first 600 characters of its query (`rerank.MAX_QUERY_CHARS`), so a
+    pasted document went first and the subquestions never arrived: live on
+    2026-09-19, 40 real SearXNG results for a salary question under a pasted
+    job posting, the floor kept 12 scored against the message and 22 against
+    the question plus the plan.
     """
-    return "\n".join([state.question, *state.subquestions])
+    own = pasted.search_words(state.question).strip()
+    parts = [own, *state.subquestions] if own else list(state.subquestions)
+    return "\n".join(parts) if parts else state.question
 
 
 async def _rank_candidates(
