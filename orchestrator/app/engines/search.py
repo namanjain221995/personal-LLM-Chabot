@@ -335,6 +335,13 @@ def _scope_of(raw: str) -> str:
             raw = ""
     host, _, path = raw.partition("/")
     host = host.split(":")[0].lower().removeprefix("*.")
+    try:
+        # "。" is an IDNA label separator; a zero-width space maps to nothing.
+        host = idna.uts46_remap(host, std3_rules=False, transitional=False)
+    except (UnicodeError, ValueError):
+        pass
+    # Mapped BEFORE the cut: 'app<U+200B>le.com' was cut to "app", which
+    # admitted every *.app host, and 'apple。com' to "apple".
     host = _HOST_CHARS_RE.match(host).group(0).strip(".").removeprefix("www.")
     if not host:
         return ""
@@ -1332,7 +1339,8 @@ _NOT_A_HOLDER = frozenset(
     recently lately still anymore again yet then soon these those this that
     when while as in on at by with without from to into over under new newly
     next interim acting incoming outgoing former previous ex elect designate
-    rn atm
+    rn atm once last pending week weekend month year monday tuesday
+    wednesday thursday friday saturday sunday recent latest upcoming
     """.split()
 )
 
@@ -1342,7 +1350,11 @@ def _plain_office_question(message: str) -> bool:
     if not m or not _OFFICE.fullmatch(m.group("office")):
         return False
     for word in re.split(r"[\s-]+", m.group("holder").lower()):
-        if re.sub(r"['’]s$", "", word.strip(".'’")) in _NOT_A_HOLDER:
+        word = re.sub(r"['’]s$", "", word.strip(".'’"))
+        # "replacing gelsinger", "reinstated", "elected last week": a verb
+        # form makes the question about a change. A name that ends like one
+        # ("boeing") only loses the dividend, which is 4810da0's hour.
+        if word in _NOT_A_HOLDER or (len(word) > 4 and word.endswith(("ing", "ed"))):
             return False
     return True
 
