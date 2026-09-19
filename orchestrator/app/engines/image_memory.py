@@ -32,10 +32,21 @@ SCOPE IS THE VIEWER AND THE CONVERSATION. `chat`'s conversation key is
 whatever the client sent (`request.conversation_id or scoped_session`), so
 the key here is that value PLUS the viewer's id. Two accounts that happened
 to send the same conversation id — or one that guessed another's — get
-different entries, and image bytes never cross an account.
+different entries, and image bytes never cross an account. A call with no
+viewer stores and recalls nothing (repair round 2): it used to fall back to
+the bare conversation id, so any two callers that forgot the viewer would
+have shared one entry.
+
+WHAT THE CALLER OWES THIS MODULE (hand-off to main.py and history.py, which
+this track does not own): `note_turn` on every turn the word test is not
+asked about (a document, URL, video, agent or research turn), so "that
+chart" after an intervening PDF turn is not taken for the picture; and
+`forget` when a conversation is deleted, so a deleted conversation's photo
+cannot answer the same id again inside the TTL.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -106,11 +117,25 @@ class _Remembered:
 _remembered_images: "OrderedDict[str, _Remembered]" = OrderedDict()
 
 
+#: main.py's conversation key when the client sent no conversation id is
+#: f"u{viewer}-{session_id}", and ChatRequest.session_id defaults to
+#: "default". That key is shared by EVERY such request of the account, so
+#: a photo sent in one of them answered "what else is written in the
+#: photo?" asked in an unrelated one (measured, repair round 3). The
+#: browser always sends a conversation id; a client that sends neither has
+#: not said which conversation it is in, so nothing is remembered for it.
+_SHARED_SESSION = "default"
+
+
 def scope(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> str:
-    """The store's key: the viewer and the conversation, never one alone."""
-    if not conversation_id:
+    """The store's key: the viewer and the conversation, never one alone -
+    '' (nothing stored, nothing recalled) when either is missing, or when
+    the "conversation" is the account's shared default session."""
+    if not conversation_id or user_id is None or str(user_id) == "":
         return ""
-    return f"u{user_id}:{conversation_id}" if user_id is not None else str(conversation_id)
+    if str(conversation_id) == f"u{user_id}-{_SHARED_SESSION}":
+        return ""
+    return f"u{user_id}:{conversation_id}"
 
 
 def remember(
@@ -121,16 +146,67 @@ def remember(
     answer: str = "",
     user_id: "Optional[object]" = None,
 ) -> None:
-    """Keep this turn's images for the rest of the conversation."""
+    """Keep this turn's images for the rest of the conversation.
+
+    main.py calls this inline from the async /chat handler, so nothing slow
+    may run here on the event loop: an image over the budget is downscaled
+    in a worker thread and stored when that finishes (the previous picture
+    is dropped at once - a follow-up in between gets what it got before this
+    module existed). With no running loop (scripts, tests) it runs inline.
+    """
     _sweep_expired()
-    conversation_id = scope(conversation_id, user_id)
-    if not conversation_id or not images:
+    key = scope(conversation_id, user_id)
+    if not key:
         return
+    images = [img for img in (images or []) if (img or "").strip()]
+    if not images:
+        return
+    context = f"{question}\n{answer}".lower()
+    token = object()
+    _latest[key] = token
+    if sum(len(img) for img in images) <= max_chars():
+        _keep(key, token, _fit(images), context)
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _keep(key, token, _fit(images), context)
+        return
+    _remembered_images.pop(key, None)
+    job = loop.run_in_executor(None, _fit, images)
+    job.add_done_callback(lambda done: _keep_when_fitted(key, token, done, context))
+
+
+#: The newest remember() per key. A downscale that finishes after a newer
+#: image turn (or a forget) for the same conversation is thrown away.
+_latest: "dict[str, object]" = {}
+
+
+def _keep_when_fitted(key: str, token: object, done, context: str) -> None:
+    if done.cancelled() or done.exception() is not None:
+        if _latest.get(key) is token:
+            _latest.pop(key, None)
+        return
+    _keep(key, token, done.result(), context)
+
+
+def _keep(key: str, token: object, kept: List[str], context: str) -> None:
+    if _latest.get(key) is not token:
+        return
+    _latest.pop(key, None)
+    if not kept:
+        return
+    _remembered_images[key] = _Remembered(images=kept, context=context)
+    _remembered_images.move_to_end(key)
+    _evict()
+
+
+def _fit(images: Sequence[str]) -> List[str]:
+    """The images that fit the per-conversation budget, in order; one over
+    the budget on its own is kept as a smaller copy."""
     kept: List[str] = []
     budget = max_chars()
     for img in images:
-        if not (img or "").strip():
-            continue
         if len(img) > budget:
             # A single image over the budget used to be dropped whole: a
             # 20 MB photo (27,962,028 characters against 24,000,000) was
@@ -142,13 +218,7 @@ def remember(
                 break
         budget -= len(img)
         kept.append(img)
-    if not kept:
-        return
-    _remembered_images[conversation_id] = _Remembered(
-        images=kept, context=f"{question}\n{answer}".lower()
-    )
-    _remembered_images.move_to_end(conversation_id)
-    _evict()
+    return kept
 
 
 #: Long edges tried, largest first, when an image does not fit the budget.
@@ -156,14 +226,29 @@ def remember(
 #: already looks like.
 _SHRINK_EDGES = (1600, 1024, 768, 512)
 
+#: Pixels this module will decode to make a smaller copy, read from the
+#: header before anything is decoded. The security review measured the
+#: unbounded version on the worker (Pillow 12.3.0): a 13000 x 13000 1-bit
+#: PNG padded to 25.4 M characters blocked for 2,410 ms at +1,567 MiB peak
+#: RSS, and a 9400 x 9400 one - under PIL's own bomb warning - 1,621 ms and
+#: +926 MiB, with five such images allowed per /chat body. 40 MP covers an
+#: 8K screenshot (33.2 MP) and a 600-dpi A4 scan (34.8 MP). A JPEG may be
+#: larger, up to the Files API's ceiling, because `draft` decodes it at a
+#: quarter or an eighth of its size.
+_MAX_DECODE_PIXELS = 40_000_000
+_MAX_JPEG_PIXELS = 89_478_485
+
 
 def _smaller_copy(image: str, budget: int) -> Optional[str]:
     """A downscaled data URL of `image` that fits `budget` characters, or None.
 
     Runs only for an image over the per-conversation budget - one the
-    composer would itself have downscaled. Measured on this box: a 23 MB
-    6000x4000 JPEG became a 1.0 M-character copy in 238 ms (JPEG decodes at
-    reduced scale via `draft`), a 20 MB PNG in 143 ms.
+    composer would itself have downscaled. The picture is decoded ONCE and
+    reduced to 1600 px before any conversion (the first version converted
+    the full-size image to RGB and then copied it at full size for every
+    edge it tried). Measured on this box before the change: a 23 MB
+    6000x4000 JPEG became a 1.0 M-character copy in 238 ms, a 20 MB PNG in
+    143 ms.
     """
     import base64
     import binascii
@@ -176,11 +261,20 @@ def _smaller_copy(image: str, budget: int) -> Optional[str]:
 
         with Image.open(io.BytesIO(payload)) as im:
             photo = (im.format or "").upper() == "JPEG"
+            ceiling = _MAX_JPEG_PIXELS if photo else _MAX_DECODE_PIXELS
+            if im.width * im.height > ceiling:
+                log.debug("oversize image not downscaled: %dx%d is over the ceiling", im.width, im.height)
+                return None
             im.draft("RGB", (_SHRINK_EDGES[0], _SHRINK_EDGES[0]))
-            source = im.convert("RGB")
+            # Resampling needs a real mode: a 1-bit or palette picture
+            # resized as it is would be point-sampled into noise.
+            work = im if im.mode in ("RGB", "RGBA", "L", "LA") else im.convert("L" if im.mode == "1" else "RGB")
+            work.thumbnail((_SHRINK_EDGES[0], _SHRINK_EDGES[0]))
+            source = work.convert("RGB")
         for edge in _SHRINK_EDGES:
-            copy = source.copy()
-            copy.thumbnail((edge, edge))
+            copy = source if edge >= max(source.size) else source.resize(
+                _fit_inside(source.size, edge), Image.Resampling.LANCZOS
+            )
             # PNG for anything that was not already a lossy photo (sharp
             # text stays sharp), JPEG when PNG cannot fit - the frontend's
             # own rule.
@@ -193,8 +287,14 @@ def _smaller_copy(image: str, budget: int) -> Optional[str]:
     except (binascii.Error, Exception) as exc:  # noqa: BLE001 — a cache, never a failed turn
         # Not an image PIL can open, or a decompression bomb: the turn has
         # already been answered, so the only cost is not remembering it.
-        log.debug("oversize image could not be downscaled: %s", exc)
+        log.debug("oversize image could not be downscaled: %s", type(exc).__name__)
     return None
+
+
+def _fit_inside(size: "tuple", edge: int) -> "tuple":
+    w, h = size
+    scale = edge / max(w, h)
+    return max(1, round(w * scale)), max(1, round(h * scale))
 
 
 def _sweep_expired() -> None:
@@ -236,12 +336,27 @@ def recall(conversation_id: Optional[str], user_id: "Optional[object]" = None) -
 
 
 def forget(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
-    _remembered_images.pop(scope(conversation_id, user_id), None)
+    """Drop the conversation's picture now (and any downscale still running
+    for it). history.py's delete should call this; see the module docstring."""
+    key = scope(conversation_id, user_id)
+    _remembered_images.pop(key, None)
+    _latest.pop(key, None)
+
+
+def note_turn(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
+    """Count a turn the word test was not asked about (a document, URL,
+    video, agent or research turn). After it, the picture is no longer the
+    last thing shown, so "that chart" may be the PDF's. main.py should call
+    this wherever it skips `images_for_followup`; see the module docstring."""
+    entry = _remembered_images.get(scope(conversation_id, user_id))
+    if entry is not None:
+        entry.turns_after += 1
 
 
 def clear() -> None:
     """Test hook."""
     _remembered_images.clear()
+    _latest.clear()
 
 
 # --- is this turn about the picture? ---------------------------------------
@@ -259,30 +374,62 @@ def clear() -> None:
 # dataset conversation "What is the total revenue by region?" - and because
 # main.py's image branch sits above the dataset, search, agent and chat
 # branches, every one of them was answered from the stale photo instead of
-# where it went before. A wrong fire costs a wrong answer; a missed one
-# costs only what the conversation had before this module existed (the
-# previous answer is still in the history). So a turn fires only on
-# EVIDENCE that it points at the picture, in four shapes:
+# where it went before. A wrong fire costs a wrong answer (and puts the
+# picture - third-party content that can carry injected text - back in
+# front of the model); a missed one costs only what the conversation had
+# before this module existed (the previous answer is still in the history).
+# So a turn fires only on EVIDENCE that it points at the picture:
 #
-#   (1) it names a picture outright: "the photo", "this screenshot";
+#   (1) it names THE picture: "the photo", "this screenshot", "image 2" -
+#       a pointing word before the noun, and not a topic ("the best photo
+#       editing app", "a screenshot on Ubuntu", "resize images in Python",
+#       "the photos in the PDF" all fired in round 2's reviews);
 #   (2) it points back at a thing the image turn talked about: "the note",
-#       "that chart", "the dashboard" - the noun must appear in the image
-#       turn, or be a thing that is only ever looked at ("the sign") with a
-#       reading verb beside it ("read the sign again"), or be named with a
-#       demonstrative ("that chart") on the turn right after the picture;
-#   (3) it asks again for something the image turn said: "what was the
+#       "the dashboard" - the same word, or its plural (a four-letter prefix
+#       made "the list" match "listed", "the chart" "charge", "the bill"
+#       "billion" and "the form" "format"); or at a thing only ever looked
+#       at ("the sign") with a reading verb ("read the sign again") or as a
+#       place ("the address on the receipt?");
+#   (3) right after the picture, a distal demonstrative ("that chart"), "it"
+#       as the picture ("what's the date on it?", "transcribe it"), or a
+#       question about its lines ("what does the second line say?", "anything
+#       else written on it?"). "This letter" / "this list" is left out: with nothing
+#       attached, "this" points at what the turn itself carries ("Sort this
+#       list alphabetically: banana, apple, cherry");
+#   (4) it asks again for something the image turn said: "what was the
 #       invoice number again?";
-#   (4) it asks about a place IN the picture: "and the total at the
+#   (5) it asks about a place IN the picture: "and the total at the
 #       bottom?" (but not "the bottom OF the ocean").
 #
-# (2)-(4) stand down when the turn names another source ("the PDF", "the
-# dataset", "the sales file", "the email"). Nothing fires for a request to
-# MAKE a picture, or for a figure of speech ("the big picture").
+# Everything stands down when the turn names another source it points at
+# ("the PDF", "the dataset", "the sales file", "the email"); (2)-(5) also
+# when it names one at all, and when the turn carries its own material (a
+# pasted letter after a line break, a list after a colon). A turn longer
+# than a follow-up question is material, decided without reading it (a
+# 10 MB paste took 3.1-4.7 s on the event loop in round 2's review). Nothing
+# fires for a request to MAKE a picture, or for a figure of speech ("the big
+# picture").
 
-#: (1) Words that only ever mean a picture.
+#: A follow-up question about a picture is a sentence or two; a longer turn
+#: is the person's own material. Every on-image follow-up in this module's
+#: tests is under 120 characters.
+_MAX_FOLLOWUP_CHARS = 1000
+
+#: A word that points at one particular thing already in the conversation.
+_POINTER = r"(?:the|this|that|these|those|my|our|your|his|her|their|its|both)"
+
+#: (1) Words that only ever mean a picture...
+_PICTURE_NOUN = (
+    r"(?:images?|photos?|photographs?|pictures?|pics?|screenshots?|screen ?shots?|snapshots?)"
+)
+#: ...named as THE picture, and not as a topic ("photo editing app").
 _NAMES_A_PICTURE = re.compile(
-    r"\b(images?|photos?|photographs?|pictures?|pics?|screenshots?|screen ?shots?|"
-    r"snapshots?)\b",
+    r"\b" + _POINTER + r"\s+(?:[\w'-]+\s+){0,2}?" + _PICTURE_NOUN + r"\b"
+    r"(?!\s+(?:editing|editor|editors|processing|tool|tools|app|apps|application|software|"
+    r"library|libraries|format|formats|file ?types?|size|sizes|quality|recognition|"
+    r"generation|generator|generators|compression|resolution|upload|uploads|limit|limits|"
+    r"gallery|viewer|storage|backup|backups|settings|shortcut|folder|folders)\b)"
+    r"|\b" + _PICTURE_NOUN + r"\s+(?:\d|one|two|three|four|five)\b",
     re.I,
 )
 #: ...except in a figure of speech.
@@ -320,15 +467,12 @@ _BACK_REFERENCE = re.compile(
     re.I,
 )
 _SEEN_RE = re.compile(r"^(" + _SEEN_THINGS + r")$", re.I)
-#: "that chart", "this table": a demonstrative points at what was just
-#: shown. Measured live at Fast (2026-09-18): after a dashboard screenshot
-#: in a dataset conversation, "Which region is smallest in that chart?"
-#: went to the dataset engine, which answered that the profile "does not
-#: show a chart" - the model's answer about the dashboard had never said
-#: the word "chart", so the back-reference test above could not see it.
-_DEMONSTRATIVE = re.compile(
-    r"\b(?:that|this|those|these)\s+(?:[\w'-]+\s+){0,2}?"
-    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b",
+#: A place on a thing that is only ever looked at: "the address on the
+#: receipt?" (4810da0 sent it to the picture; round 1's fix did not). Not
+#: "screen" or "display", which are also a computer's.
+_ON_A_SEEN_THING = re.compile(
+    r"\b(?:on|in|at|from|of)\s+(?:the|that|this|your|my)\s+(?:[\w'-]+\s+){0,2}?"
+    r"(receipts?|signs?|labels?|whiteboard|posters?|sticker|banner|scans?|handwriting|plate)\b",
     re.I,
 )
 _READING_VERB = re.compile(
@@ -337,7 +481,41 @@ _READING_VERB = re.compile(
     re.I,
 )
 
-#: (3) "...again", in a question or with a reading verb.
+#: (3) "that chart": a distal demonstrative points back at what was just
+#: shown. Measured live at Fast (2026-09-18): after a dashboard screenshot
+#: in a dataset conversation, "Which region is smallest in that chart?"
+#: went to the dataset engine, which answered that the profile "does not
+#: show a chart" - the answer about the dashboard never said "chart".
+_DEMONSTRATIVE = re.compile(
+    r"\b(?:that|those)\s+(?:[\w'-]+\s+){0,2}?"
+    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b",
+    re.I,
+)
+#: "Is there anything else written on it?" / "What else does it say?"
+_ELSE_ON_IT = re.compile(
+    r"\b(?:anything|something|what|nothing)\s+else\b[^.?!\n]{0,40}"
+    r"\b(?:written|printed|says?|said|shown|shows?|visible|mentioned|on it|in it)\b"
+    r"|\b(?:written|printed)\s+(?:on|in)\s+(?:it|there)\b"
+    r"|\bdoes\s+it\s+(?:say|show|mention|read|list)\b",
+    re.I,
+)
+
+#: "What's the date on it?", "Can you transcribe it word for word?",
+#: "Translate the whole thing into French." - right after the picture, "it"
+#: and "the whole thing" are the picture (rvq1's natural follow-ups).
+_IT_IS_THE_PICTURE = re.compile(
+    r"\b(?:on|in)\s+it\s*\?"
+    r"|\b(?:transcribe|translate|proofread|read)\s+(?:it|all of it|the whole thing|everything)\b",
+    re.I,
+)
+#: "What does the second line say?" - a line of the picture's text.
+_A_LINE_OF_IT = re.compile(
+    r"\bthe\s+(?:first|second|third|fourth|fifth|last|top|bottom|next|other)\s+"
+    r"(?:line|lines|row|word|words|entry|item|number|name|paragraph)\b",
+    re.I,
+)
+
+#: (4) "...again", in a question or with a reading verb.
 _AGAIN = re.compile(r"\bagain\b", re.I)
 _QUESTION_START = re.compile(
     r"^\s*(what|what's|whats|which|who|whom|whose|where|when|why|how|is|are|was|"
@@ -345,7 +523,7 @@ _QUESTION_START = re.compile(
     re.I,
 )
 
-#: (4) A place in the picture - never "the bottom OF something".
+#: (5) A place in the picture - never "the bottom OF something".
 _PLACE_IN_PICTURE = re.compile(
     r"\b(?:at|in|on|near|along)\s+the\s+(?:very\s+)?(top|bottom|left|right|corner|"
     r"background|foreground|middle|centre|center|edge|margin|header|footer)"
@@ -353,13 +531,29 @@ _PLACE_IN_PICTURE = re.compile(
     re.I,
 )
 
-#: The turn names a source that is not the picture.
-_OTHER_SOURCE = re.compile(
-    r"\b(pdfs?|docx?|documents?|files?|dataset|data ?set|csv|spreadsheets?|excel|"
+#: The turn names a source that is not the picture...
+_OTHER_SOURCE_NOUN = (
+    r"(?:pdfs?|docx?|documents?|files?|dataset|data ?set|csv|spreadsheets?|excel|"
     r"xlsx|sheets?|database|website|web ?page|url|link|videos?|repo|repository|"
-    r"github|e-?mails?|article|report)\b",
-    re.I,
+    r"github|e-?mails?|article|report)"
 )
+_OTHER_SOURCE = re.compile(r"\b" + _OTHER_SOURCE_NOUN + r"\b", re.I)
+#: ...and points at it: "in the PDF", "the sales file", "my report" - not a
+#: format to make ("put the text from this photo into a Word document").
+_POINTS_AT_ANOTHER_SOURCE = re.compile(
+    r"\b" + _POINTER + r"\s+(?:[\w'-]+\s+){0,2}?" + _OTHER_SOURCE_NOUN + r"\b", re.I
+)
+
+
+def _carries_material(text: str) -> bool:
+    """Did the person paste what they are talking about? A line break, or a
+    colon, followed by three or more words that are not a question."""
+    for sep in ("\n", ":"):
+        head, found, rest = text.strip().partition(sep)
+        if found and "?" not in rest and len(rest.split()) >= 3:
+            return True
+    return False
+
 
 #: Short and common words carry no evidence of what a turn is about.
 _STOPWORDS = frozenset(
@@ -382,8 +576,15 @@ def _content_words(text: str) -> List[str]:
 def _stems(text: str) -> set:
     """Four-character prefixes, so "invoice" finds "invoiced" - the audit's
     follow-up asked for an "invoice number" when the answer said
-    "invoiced"."""
+    "invoiced". Used only with "again" (4), where the turn ALSO asks to
+    hear something repeated."""
     return {w[:4] for w in _content_words(text)}
+
+
+def _said(noun: str, words: set) -> bool:
+    """The image turn used this noun, or its plural or singular."""
+    noun = noun.lower()
+    return bool({noun, noun + "s", noun + "es", noun[:-1] if noun.endswith("s") else noun} & words)
 
 
 def _is_a_question(text: str) -> bool:
@@ -391,24 +592,36 @@ def _is_a_question(text: str) -> bool:
 
 
 def _points_at_the_picture(text: str, context: str, *, just_shown: bool = False) -> bool:
-    """The four shapes of evidence above, for one message. `just_shown`:
-    the image turn is the conversation's previous text turn, so "that
-    chart" can only mean the chart in the picture."""
-    if _NAMES_A_PICTURE.search(text) and not _FIGURATIVE.search(text) and not _MAKES_A_PICTURE.search(text):
-        return True
-    if _OTHER_SOURCE.search(text) or _MAKES_A_PICTURE.search(text):
+    """The shapes of evidence above, for one message. `just_shown`: the
+    image turn is the conversation's previous turn, so "that chart" can
+    only mean the chart in the picture."""
+    if len(text) > _MAX_FOLLOWUP_CHARS or not text.strip():
         return False
-    said_before = _stems(context)
+    if _FIGURATIVE.search(text) or _MAKES_A_PICTURE.search(text):
+        return False
+    if _POINTS_AT_ANOTHER_SOURCE.search(text):
+        return False
+    if _NAMES_A_PICTURE.search(text):
+        return True
+    if _OTHER_SOURCE.search(text) or _carries_material(text):
+        return False
+    said_before = set(_content_words(context))
     for match in _BACK_REFERENCE.finditer(text):
-        noun = match.group(1).lower()
-        if noun[:4] in said_before:
+        noun = match.group(1)
+        if _said(noun, said_before):
             return True
         if _SEEN_RE.match(noun) and _READING_VERB.search(text):
             return True
-    if just_shown and _DEMONSTRATIVE.search(text):
+    if _ON_A_SEEN_THING.search(text) and _is_a_question(text):
+        return True
+    if just_shown and (
+        _DEMONSTRATIVE.search(text)
+        or _IT_IS_THE_PICTURE.search(text)
+        or ((_ELSE_ON_IT.search(text) or _A_LINE_OF_IT.search(text)) and _is_a_question(text))
+    ):
         return True
     if _AGAIN.search(text) and (_is_a_question(text) or _READING_VERB.search(text)):
-        if _stems(text) & said_before:
+        if _stems(text) & _stems(context):
             return True
     if _PLACE_IN_PICTURE.search(text) and _is_a_question(text):
         return True
@@ -423,11 +636,10 @@ def is_about_the_image(
     if entry is None or not recall(conversation_id, user_id):
         return False
     text = message or ""
-    if not text.strip():
-        return False
     just_shown = entry.turns_after == 0
     # Every turn main.py asks about counts, fired or not: after one more
     # text turn "that chart" may be a chart the assistant made in between.
+    # (Turns main.py does not ask about are counted by `note_turn`.)
     entry.turns_after += 1
     return _points_at_the_picture(text, entry.context, just_shown=just_shown)
 

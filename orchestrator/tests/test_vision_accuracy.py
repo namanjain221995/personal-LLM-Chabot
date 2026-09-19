@@ -370,18 +370,22 @@ ANSWER1 = (
     "= **3,570 EUR**."
 )
 FOLLOWUP = "What was the invoice number again, and what day was the meeting moved to?"
+#: The signed-in viewer. The store is keyed by viewer AND conversation, and
+#: since repair round 2 a call with no viewer stores and recalls nothing
+#: (tests/test_vision_adversarial.py::test_a_call_without_a_viewer_stores_nothing).
+VIEWER = 7
 
 
 def test_the_image_is_remembered_for_the_conversation_that_sent_it():
-    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
-    assert image_memory.recall("conv-a") == [IMG]
-    assert image_memory.recall("conv-b") == []
-    assert image_memory.recall(None) == []
+    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1, user_id=VIEWER)
+    assert image_memory.recall("conv-a", VIEWER) == [IMG]
+    assert image_memory.recall("conv-b", VIEWER) == []
+    assert image_memory.recall(None, VIEWER) == []
 
 
 def test_the_audit_s_own_followup_is_recognised_as_being_about_the_image():
-    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
-    assert image_memory.images_for_followup("conv-a", FOLLOWUP) == [IMG]
+    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1, user_id=VIEWER)
+    assert image_memory.images_for_followup("conv-a", FOLLOWUP, VIEWER) == [IMG]
 
 
 @pytest.mark.parametrize(
@@ -394,8 +398,8 @@ def test_the_audit_s_own_followup_is_recognised_as_being_about_the_image():
     ],
 )
 def test_ordinary_followups_reach_the_image(message):
-    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
-    assert image_memory.images_for_followup("conv-a", message) == [IMG]
+    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1, user_id=VIEWER)
+    assert image_memory.images_for_followup("conv-a", message, VIEWER) == [IMG]
 
 
 @pytest.mark.parametrize(
@@ -407,12 +411,12 @@ def test_ordinary_followups_reach_the_image(message):
     ],
 )
 def test_an_unrelated_question_does_not_drag_the_image_in(message):
-    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
-    assert image_memory.images_for_followup("conv-a", message) == []
+    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1, user_id=VIEWER)
+    assert image_memory.images_for_followup("conv-a", message, VIEWER) == []
 
 
 def test_a_conversation_that_never_sent_an_image_has_nothing_to_recall():
-    assert image_memory.images_for_followup("conv-z", FOLLOWUP) == []
+    assert image_memory.images_for_followup("conv-z", FOLLOWUP, VIEWER) == []
 
 
 def test_another_account_with_the_same_conversation_id_sees_nothing():
@@ -427,24 +431,24 @@ def test_another_account_with_the_same_conversation_id_sees_nothing():
 
 
 def test_the_memory_expires(monkeypatch):
-    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1)
+    image_memory.remember("conv-a", [IMG], question=TURN1, answer=ANSWER1, user_id=VIEWER)
     monkeypatch.setenv("IMAGE_MEMORY_TTL_S", "0.0001")
     import time
 
     time.sleep(0.01)
-    assert image_memory.recall("conv-a") == []
+    assert image_memory.recall("conv-a", VIEWER) == []
 
 
 def test_the_store_is_bounded_in_conversations_and_in_bytes(monkeypatch):
     monkeypatch.setenv("IMAGE_MEMORY_CONVERSATIONS", "2")
     for name in ("c1", "c2", "c3"):
-        image_memory.remember(name, [IMG])
-    assert image_memory.recall("c1") == []
-    assert image_memory.recall("c3") == [IMG]
+        image_memory.remember(name, [IMG], user_id=VIEWER)
+    assert image_memory.recall("c1", VIEWER) == []
+    assert image_memory.recall("c3", VIEWER) == [IMG]
 
     monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(IMG)))
-    image_memory.remember("c4", [IMG, IMG])
-    assert image_memory.recall("c4") == [IMG]  # the second did not fit
+    image_memory.remember("c4", [IMG, IMG], user_id=VIEWER)
+    assert image_memory.recall("c4", VIEWER) == [IMG]  # the second did not fit
 
 
 def test_the_whole_store_fits_inside_one_budget(monkeypatch):
@@ -453,10 +457,10 @@ def test_the_whole_store_fits_inside_one_budget(monkeypatch):
     monkeypatch.setenv("IMAGE_MEMORY_CONVERSATIONS", "100")
     monkeypatch.setenv("IMAGE_MEMORY_TOTAL_CHARS", str(2 * len(IMG)))
     for name in ("c1", "c2", "c3"):
-        image_memory.remember(name, [IMG])
-    assert image_memory.recall("c1") == []
-    assert image_memory.recall("c2") == [IMG]
-    assert image_memory.recall("c3") == [IMG]
+        image_memory.remember(name, [IMG], user_id=VIEWER)
+    assert image_memory.recall("c1", VIEWER) == []
+    assert image_memory.recall("c2", VIEWER) == [IMG]
+    assert image_memory.recall("c3", VIEWER) == [IMG]
 
 
 # ---------------------------------------------------------------------------

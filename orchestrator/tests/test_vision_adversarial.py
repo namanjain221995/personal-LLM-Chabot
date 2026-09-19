@@ -899,3 +899,431 @@ def test_fast_sends_exactly_what_it_sent_before(monkeypatch):
     (call,) = rec["calls"]
     assert call.get("answer_plan") is None
     assert call["max_tokens"] == vision.vision_max_tokens()
+
+
+# ===========================================================================
+# REPAIR ROUND 2 (2026-09-19): the reviewers' reproductions, each failing on
+# 951b149. Round 1 of review (QA and security) and round 2 (QA and security)
+# found that the fixes above introduced regressions and left gaps; every
+# reproduction below is theirs unless it says otherwise, and each failed on
+# 951b149 before the change that closes it.
+# ===========================================================================
+
+import struct  # noqa: E402
+import threading  # noqa: E402
+import zlib  # noqa: E402
+
+
+def _run_with_deadline(message, images, *, effort="fast", deadline=None):
+    events: list = []
+
+    async def emit(kind, data):
+        events.append((kind, data))
+
+    async def go():
+        coro = vision.run_vision_engine(message, images, [], emit, effort=effort)
+        if deadline is None:
+            return await coro
+        async with asyncio.timeout(deadline):
+            return await coro
+
+    answer = asyncio.run(go())
+    streamed = "".join(d.get("text", "") for k, d in events if k == "token")
+    return answer, streamed, events
+
+
+def _computed_block(rec) -> str:
+    text = _user_text(_answer_call(rec))
+    return text.split("Computed by the app", 1)[1] if "Computed by the app" in text else ""
+
+
+# --- the word test: off-image turns stay where they were -------------------
+
+GENERIC_PICTURE_TOPIC = [
+    "How do I resize images in Python with Pillow?",
+    "What's the best free photo editing app for Linux?",
+    "Is there a keyboard shortcut to take a screenshot on Ubuntu?",
+    "How many pictures can I upload at once?",
+    "Create images for my blog post about hiking",
+]
+#: The person pastes what they mean, right after the picture. The first two
+#: did not fire on 4810da0; 5d22ff7's demonstrative rule made them fire.
+PASTED_MATERIAL = [
+    "Can you fix this letter for me?\n\nDear Sir, I am writing to complain about my order.",
+    "Sort this list alphabetically: banana, apple, cherry",
+    "Proofread this note: Hi team, the offsite is moved to Friday.",
+]
+
+
+@pytest.mark.parametrize("message", GENERIC_PICTURE_TOPIC + PASTED_MATERIAL)
+def test_an_off_image_turn_does_not_fire(message):
+    image_memory.remember("conv", [IMG], question=TURN1, answer=ANSWER1, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+TURN_RCPT = "How much was the service charge on this receipt?"
+ANSWER_RCPT = "The service charge is **4.50 EUR** (12.5% of 36.00)."
+
+OFF_IMAGE_MORE = [
+    ("a photo-app recommendation", TURN1, ANSWER1, "Can you recommend a good photo editing app for Android?"),
+    ("a general image question", TURN1, ANSWER1, "What's the difference between a PNG and a JPEG image?"),
+    ("a screenshot tool", TURN1, ANSWER1, "Thanks. What's the keyboard shortcut to take a screenshot on Windows 11?"),
+    ("'chart' via the stem of 'charge'", TURN_RCPT, ANSWER_RCPT, "Explain the chart you drew earlier in simpler words."),
+    ("a header question about their own doc", TURN1, ANSWER1, "What should I put in the header of my CV?"),
+    ("'the list' via the stem of 'listed'", TURN1, "The items listed are a hotel, a flight and a taxi.", "Add milk to the list."),
+]
+
+
+@pytest.mark.parametrize("label,question,answer,message", OFF_IMAGE_MORE, ids=[r[0] for r in OFF_IMAGE_MORE])
+def test_more_turns_not_about_the_image_do_not_fire(label, question, answer, message):
+    image_memory.remember("conv", [IMG], question=question, answer=answer, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+#: (image turn question, image turn answer, turns since, message)
+OFF_IMAGE_SECURITY = [
+    (TURN1, ANSWER1, 0, "Can you recommend a good photo editing app for Android?"),
+    (TURN1, ANSWER1, 0, "What's the difference between a PNG and a JPEG image?"),
+    (TURN1, ANSWER1, 1, "In the PDF from earlier, what do the photos on page 3 show?"),
+    # four-letter prefix: "billion" -> "bill"
+    (TURN_DASH, ANSWER_DASH.replace("$1.42M", "$1.42 billion"), 1, "Split the bill of 2,400 rupees between 4 people."),
+    # four-letter prefix: "format" -> "form"
+    ("What date is on this ticket?", "The date is printed in the format DD/MM/YYYY: 14/09/2026.", 1,
+     "Where do I download the form for a UK visitor visa?"),
+]
+
+
+@pytest.mark.parametrize(
+    "question,answer,after,message",
+    OFF_IMAGE_SECURITY,
+    ids=["photo-app", "png-vs-jpeg", "pdf-photos", "bill-billion", "form-format"],
+)
+def test_a_turn_not_about_the_picture_is_not_sent_the_picture(question, answer, after, message):
+    image_memory.remember("conv", [IMG], question=question, answer=answer, user_id=1)
+    image_memory._remembered_images[image_memory.scope("conv", 1)].turns_after = after
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+@pytest.mark.parametrize(
+    "question,answer,message",
+    [
+        ("How much did I spend at this restaurant?",
+         "You spent **EUR 86.40** in total, including a 10% service charge of EUR 7.85.",
+         "What's the address on the receipt?"),
+        (TURN1, ANSWER1, "Is there anything else written on it?"),
+    ],
+)
+def test_an_on_image_turn_that_4810da0_answered_from_the_picture_still_is(question, answer, message):
+    """The opposite direction: both reached the picture on 4810da0 and did
+    not on 951b149 - the audit's "I don't see the note" returning."""
+    image_memory.remember("c1", [IMG], question=question, answer=answer, user_id=7)
+    assert image_memory.images_for_followup("c1", message, 7) == [IMG]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "What else is written in the photo?",
+        "Zoom into the screenshot: what's the APAC figure?",
+        "Is there a legend in the image?",
+        "What does the note at the bottom say?",
+        "What's the date on it?",
+        "What does the second line say?",
+        "Can you transcribe it word for word?",
+        "Is the number in image 2 the same?",
+    ],
+)
+def test_explicit_references_still_fire(message):
+    image_memory.remember("conv", [IMG], question=TURN1, answer=ANSWER1, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == [IMG]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "What does the note in the PDF say?",
+        "Summarise the invoice in the attached file.",
+        "What does the note in the PDF say again?",
+        "What does the chart in the PDF show?",
+    ],
+)
+def test_a_turn_naming_another_source_stands_down(message):
+    """Pins the other-source stand-down: deleting it kept all 70 of the
+    builder's tests and test_vision_accuracy.py green (mutation M2). The
+    answer says "note", "invoiced" and "chart", so without the stand-down
+    every one of these is answered from the photo."""
+    image_memory.remember("conv", [IMG], question=TURN1, answer=ANSWER1 + " See the chart.", user_id=1)
+    image_memory.images_for_followup("conv", "ok", 1)  # not the turn right after
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+@pytest.mark.parametrize("message", ["Export the table to Excel.", "Put the table into a spreadsheet."])
+def test_a_back_reference_that_names_another_source_at_all_stands_down(message):
+    """The weaker shapes (a back-reference, a demonstrative, "again", a
+    place) stand down when the turn names another source at all - here as a
+    format to make - so these keep the route they had on 4810da0. A turn
+    that names the picture itself ("put the text from this photo into a
+    Word document") still reaches it."""
+    image_memory.remember("conv", [IMG], question=TURN_DASH, answer=ANSWER_DASH + " The table lists orders.", user_id=1)
+    image_memory.images_for_followup("conv", "ok", 1)  # not the turn right after
+    assert image_memory.images_for_followup("conv", message, 1) == []
+    assert image_memory.images_for_followup(
+        "conv", "Put the text from this photo into a Word document.", 1
+    ) == [IMG]
+
+
+@pytest.mark.parametrize("unit", ["that ", "the ", "at the "])
+def test_a_huge_paste_after_a_picture_is_decided_quickly_and_does_not_fire(unit):
+    """The word test runs synchronously in /chat: a 10 MB paste took 3.1-4.7 s
+    on 951b149 and 1.4 s on 4810da0."""
+    image_memory.remember("c1", [IMG], question=TURN1, answer=ANSWER1, user_id=7)
+    paste = unit * (10_000_000 // len(unit))
+    started = time.perf_counter()
+    fired = image_memory.images_for_followup("c1", paste, 7)
+    took = time.perf_counter() - started
+    assert not fired
+    assert took < 0.5, f"{took:.2f}s to decide a 10 MB paste on the event loop"
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["ما هو الرقم في الصورة؟",
+     "‮otohp eht ni si tahW", "", "   ", "?" * 5000],
+)
+def test_non_english_and_degenerate_turns_do_not_fire(message):
+    image_memory.remember("conv", [IMG], question=TURN1, answer=ANSWER1, user_id=1)
+    assert image_memory.images_for_followup("conv", message, 1) == []
+
+
+def test_note_turn_ends_just_shown():
+    """main.py asks the word test only on turns with no document, video, URL
+    or agent; `note_turn` is how such a turn is counted, so "that chart"
+    after an intervening PDF turn is not taken for the picture (the route
+    half needs main.py to call it - handed to image-into-files)."""
+    image_memory.remember("conv", [IMG], question=TURN_DASH, answer=ANSWER_DASH_LIVE, user_id=1)
+    image_memory.note_turn("conv", 1)
+    assert image_memory.images_for_followup("conv", "Which region is smallest in that chart?", 1) == []
+    # ...and a turn that names the picture still reaches it
+    assert image_memory.images_for_followup("conv", "Which region is smallest in the screenshot?", 1) == [IMG]
+
+
+# --- the word test at the route: the same turn, with and without a picture --
+
+
+def test_a_pasted_letter_right_after_the_picture_routes_as_without_it(engines):
+    msg = PASTED_MATERIAL[0]
+    with TestClient(app) as client:
+        control = _route_of(client, "qa-letter-c", TURN1, ANSWER1, msg, remember=False)
+        engines["vision"].clear()
+        treated = _route_of(client, "qa-letter-t", TURN1, ANSWER1, msg)
+    assert (treated, len(engines["vision"])) == (control, 1)
+
+
+def test_a_document_turn_in_between_ends_just_shown(engines):
+    """image -> PDF -> "What does this table show?": the PDF's table, not the
+    photo's."""
+    pdf = base64.b64encode(b"%PDF-1.4 tiny").decode()
+    msg = "What does this table show?"
+    routes = {}
+    with TestClient(app) as client:
+        for conv, keep in (("qa-pdf-c", False), ("qa-pdf-t", True)):
+            assert _image_turn(client, conv, TURN1).status_code == 200
+            if not keep:
+                image_memory.clear()
+            r = _text_turn(client, conv, "Summarise it", pdf=pdf, pdf_filename="q3.pdf")
+            assert _meta(r).get("route") == "document"
+            engines["vision"].clear()
+            r = _text_turn(client, conv, msg)
+            routes[conv] = (_meta(r).get("route"), len(engines["vision"]))
+    assert routes["qa-pdf-t"] == routes["qa-pdf-c"], routes
+
+
+def test_the_uncovered_off_image_turns_change_route_at_the_route_level(engines):
+    changed = []
+    with TestClient(app) as client:
+        for i, (label, question, answer, message) in enumerate(OFF_IMAGE_MORE):
+            control = _route_of(client, f"more-c-{i}", question, answer, message, remember=False)
+            engines["vision"].clear()
+            treated = _route_of(client, f"more-t-{i}", question, answer, message)
+            if treated != control or len(engines["vision"]) != 1:
+                changed.append((label, control, treated))
+    assert changed == [], changed
+
+
+def test_a_pdf_photo_question_keeps_its_route(engines):
+    """'the photos in the PDF' after an image turn went chat -> vision with
+    the stale photo."""
+    msg = OFF_IMAGE_SECURITY[2][3]
+    routes = {}
+    with TestClient(app) as client:
+        for conv, keep in (("rv-pdfphoto-c", False), ("rv-pdfphoto-t", True)):
+            assert _image_turn(client, conv, TURN1).status_code == 200
+            if not keep:
+                image_memory.clear()
+            engines["vision"].clear()
+            r = _text_turn(client, conv, msg)
+            routes[conv] = (_meta(r).get("route"), len(engines["vision"]))
+    assert routes["rv-pdfphoto-t"] == routes["rv-pdfphoto-c"], routes
+
+
+# --- the store: the viewer is the key, and nothing slow runs on the loop ----
+
+
+def test_a_call_without_a_viewer_stores_nothing():
+    """scope() returned the BARE conversation id for user_id None, contrary
+    to its own docstring: two callers that forgot the viewer shared one
+    entry."""
+    image_memory.remember("c-unscoped", [IMG], question=TURN1, answer=ANSWER1)
+    assert image_memory.recall("c-unscoped") == []
+    assert image_memory._remembered_images == {}
+
+
+def test_the_store_key_carries_the_viewer_even_when_the_conversation_key_does_not():
+    """Behavioural, not a key string: dropping the viewer from scope()
+    (mutation M5) was caught only by `== ["u2:fresh"]`."""
+    image_memory.remember("shared-id", [IMG], question=TURN1, answer=ANSWER1, user_id=1)
+    assert image_memory.recall("shared-id", 2) == []
+    assert image_memory.images_for_followup("shared-id", "What else is written in the photo?", 2) == []
+    assert image_memory.recall("shared-id", 1) == [IMG]
+
+
+def test_scope_keys_never_collide_across_viewers():
+    convs = ["x", "2:x", "u2:x", ":x", "1", "u1-default", "u12:x", "2", "x:u1"]
+    keys: dict = {}
+    for v in (1, 2, 12, 21):
+        for c in convs:
+            k = image_memory.scope(c, v)
+            assert k not in keys or keys[k] == (v, c), (k, keys[k], (v, c))
+            keys[k] = (v, c)
+
+
+def test_the_shared_default_session_is_not_a_conversation(engines, as_user):
+    """Repair round 3. With no conversation id and no session id, main.py's
+    key is f"u{viewer}-default" for EVERY such request of the account, so a
+    photo sent in one reached an unrelated one. A session the client named
+    is still its own conversation (positive control)."""
+    as_user("alice")
+    follow = "What else is written in the photo?"
+    with TestClient(app) as client:
+        assert _image_turn(client, None, TURN1).status_code == 200
+        assert _image_turn(client, None, TURN1, session_id="tab-7").status_code == 200
+        engines["vision"].clear()
+        # another chat of the same account, also sending no ids
+        assert _text_turn(client, None, follow).status_code == 200
+        assert engines["vision"] == [], "a photo crossed into another id-less chat"
+        # the named session keeps its own picture
+        assert _text_turn(client, None, follow, session_id="tab-7").status_code == 200
+        assert [c["images"] for c in engines["vision"]] == [[IMG]]
+
+
+def test_reading_alone_frees_expired_pictures(monkeypatch):
+    """Mutation M1/M3 (the sweep removed from recall) left every test green:
+    the one TTL test above goes through remember()."""
+    for i in range(5):
+        image_memory.remember(f"c{i}", [IMG * 1000], question="q", answer="a", user_id=1)
+    monkeypatch.setenv("IMAGE_MEMORY_TTL_S", "0.001")
+    time.sleep(0.01)
+    assert image_memory.recall("someone-else", 2) == []
+    assert len(image_memory._remembered_images) == 0
+
+
+def _huge_png_b64(w: int, h: int) -> str:
+    """A 1-bit PNG of w x h built with zlib alone: a few KB on the wire."""
+    row = b"\x00" + b"\x00" * ((w + 7) // 8)
+    raw = zlib.compress(row * h, 9)
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 1, 0, 0, 0, 0))
+        + chunk(b"IDAT", raw)
+        + chunk(b"IEND", b"")
+    )
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+def _no_decode_over(monkeypatch, ceiling: int) -> list:
+    """Spy on PIL's decode-and-convert: record every size, and never really
+    decode a bomb here (the head DGX is at its memory ceiling; the real
+    allocation was measured on the worker)."""
+    decoded: list = []
+    real_convert = Image.Image.convert
+    real_load = Image.Image.load
+
+    def convert(self, *a, **k):
+        decoded.append(self.size)
+        if self.size[0] * self.size[1] > ceiling:
+            raise MemoryError("spy: refused to decode on the head")
+        return real_convert(self, *a, **k)
+
+    def load(self):
+        if self.size[0] * self.size[1] > ceiling:
+            decoded.append(self.size)
+            raise MemoryError("spy: refused to decode on the head")
+        return real_load(self)
+
+    monkeypatch.setattr(Image.Image, "convert", convert)
+    monkeypatch.setattr(Image.Image, "load", load)
+    return decoded
+
+
+def test_the_downscale_never_decodes_a_picture_over_the_pixel_ceiling(monkeypatch):
+    """_smaller_copy converted the FULL-resolution image to RGB, then copied
+    it once per edge tried, before any size check: 2,410 ms and +1,567 MiB
+    for one 13000 x 13000 PNG on the worker."""
+    big = _huge_png_b64(12000, 12000)  # 144 M pixels
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(big) - 1))
+    decoded = _no_decode_over(monkeypatch, 89_478_485)
+    image_memory.remember("dos", [big], question="q", answer="a", user_id=1)
+    assert [s for s in decoded if s[0] * s[1] > 89_478_485] == []
+
+
+def test_an_oversize_picture_is_downscaled_off_the_event_loop(monkeypatch):
+    """main.py calls remember() inline in the async /chat handler, so the
+    downscale must not run on the loop's thread."""
+    big = _noisy_png(1400)
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(big) // 3))
+    seen: dict = {}
+    real = image_memory._smaller_copy
+
+    def spy(image, budget):
+        seen["thread"] = threading.get_ident()
+        return real(image, budget)
+
+    monkeypatch.setattr(image_memory, "_smaller_copy", spy)
+
+    async def go():
+        image_memory.remember("conv", [big], question="q", answer="a", user_id=1)
+        during = image_memory.recall("conv", 1)
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if image_memory.recall("conv", 1):
+                break
+        return threading.get_ident(), during, image_memory.recall("conv", 1)
+
+    loop_thread, during, after = asyncio.run(go())
+    assert seen["thread"] != loop_thread, "the downscale ran on the event loop"
+    assert during == [] and len(after) == 1 and len(after[0]) <= len(big) // 3
+
+
+def test_a_newer_picture_or_a_forget_wins_over_a_downscale_still_running(monkeypatch):
+    big = _noisy_png(1400)
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(big) // 3))
+
+    async def go():
+        image_memory.remember("a", [big], question="q", answer="a", user_id=1)
+        image_memory.remember("a", [IMG], question="q2", answer="a2", user_id=1)
+        image_memory.remember("b", [big], question="q", answer="a", user_id=1)
+        image_memory.forget("b", 1)
+        await asyncio.sleep(0)
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if not image_memory._latest:
+                break
+        await asyncio.sleep(0.5)
+        return image_memory.recall("a", 1), image_memory.recall("b", 1)
+
+    a, b = asyncio.run(go())
+    assert a == [IMG] and b == []
