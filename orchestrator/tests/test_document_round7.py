@@ -106,7 +106,7 @@ def test_every_blind_judgement_question_reaches_a_block_that_answers_it():
     answered. The live bar B1 measures the answers."""
     assert len(corpus.R7_JUDGEMENT_QUESTIONS) >= 120
     judged = {
-        "extract": "every such ask is answered",
+        "extract": "that part was asked, so answer it after the fields",
         "advise": "Give a real recommendation",
         "": "STOPPING IS NOT REFUSING TO JUDGE",
     }
@@ -177,6 +177,32 @@ def test_a_verdict_is_about_the_thing_never_the_document():
     for mode in _MODES:
         assert "does not help you" not in source_use.system_for_mode(mode)
         assert "full help" not in source_use.system_for_mode(mode)
+
+
+def test_the_field_block_stops_after_the_fields_unless_more_was_asked():
+    """B2. The first round-7 block framed the judgement as a second rule set
+    ("two sets of rules follow ... every such ask is answered"): on the
+    itemised tax-free invoice, Fast, 13 of 16 answers added a paragraph
+    explaining the missing tax, twice (a3ca8dc, then with its wording
+    tightened). Round 6's shape under the same BASE -- the field rules end in
+    "answer what was asked and stop", the judgement is a conditional part
+    after them -- measured 0 of 16. The shape is what is pinned."""
+    block = source_use.FIELDS
+    stop = block.index("Answer what was asked and stop")
+    judged = block.index("NOTHING THE PERSON ASKED IS FORBIDDEN")
+    assert stop < judged
+    assert "If the question also asks for a judgement" in block[judged:]
+    assert "never refuse it" in block[judged:]
+    assert "Two sets of rules" not in block and "every such ask is answered" not in block
+
+
+def test_a_field_given_as_a_rule_is_stated():
+    """"what is the liability cap - does it protect us enough?" got
+    "Liability Cap: not stated in the document" live for a cap the contract
+    gives as "the fees paid in the 6 months before the claim"."""
+    system = source_use.system_text("what is the liability cap - does it protect us enough?")
+    assert "A field the document gives as a rule or a formula" in system
+    assert "IS stated: quote it" in system
 
 
 def test_a_scale_today_and_a_planned_scale_each_get_a_verdict():

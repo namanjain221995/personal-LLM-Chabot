@@ -187,34 +187,58 @@ ADVISORY = (
 #: permission fill in a contract's governing law with speculation about New
 #: York and England & Wales), "not stated in the document" and never 0.00
 #: (the "**Tax Amount:** 0.00 USD" fabrication), and NO ARITHMETIC IN THE
-#: FIELD LINES (round 6: on the itemised tax-free invoice 4 of 8 answers
-#: padded the missing tax with an explanation and a verifier run stated a
-#: FALSE sum, "2 x 1,000.00 + 1 x 4,200.00 = 5,200.00"; with the rule, 0 of
-#: 16). What changed is the scope: they bind the FIELD lines, and the
-#: judgement rules bind everything else the person asked.
+#: FIELDS (round 6: a verifier run stated a FALSE sum, "2 x 1,000.00 + 1 x
+#: 4,200.00 = 5,200.00").
+#:
+#: THE SHAPE IS MEASURED, NOT JUST THE RULES (2026-09-19). The first round-7
+#: block said "two sets of rules follow" and then "every such ask is
+#: answered": on the itemised tax-free invoice ("I need the total from this
+#: invoice and the tax amount", Fast, 16 runs) 13 of 16 answers added a
+#: paragraph after the fields explaining the missing tax, and one showed the
+#: sum. Tightening its wording did not move it (13 of 16 again). Swapping in
+#: round 6's strict block under the same BASE: 0 of 16. So the block keeps
+#: round 6's shape -- the field rules end in "answer what was asked and
+#: stop", and the judgement is a CONDITIONAL part after them ("if the question
+#: also asks ...") that is never refused, rather than a second rule set the
+#: model reads as licence to add a section: 0 of 16 explanations, 0
+#: computations, and 0 of 8 again on this text. The text is kept exactly as
+#: measured: the same block with its first line reworded and one sentence
+#: added ("Nothing in that part may change, fill in or round a field, and a
+#: field that is not stated stays not stated") explained the tax 6 of 8
+#: times -- every one ending "Therefore, the tax amount is not stated in the
+#: document". "A field the document gives as a rule or a formula IS
+#: stated" is from the same run: "what is the liability cap - does it protect
+#: us enough?" got "Liability Cap: not stated in the document" for a cap the
+#: contract gives as "the fees paid in the 6 months before the claim".
 FIELDS = (
-    "\nTHE QUESTION NAMES FIELDS OF THE DOCUMENT. Two sets of rules follow, and each binds "
-    "only its own part of the answer.\n"
-    "FIELD RULES, for each field asked: return ONLY what is actually in the document "
-    "— the value as written, with a page number where that helps. For a field this "
-    "OVERRIDES the general-knowledge permission above: for a field, the document is the "
-    "only source. Do not fill a missing field from general knowledge, do not infer it from "
-    "the rest of the document, do not estimate it, and do not write 0, 0.00 or \"none\" for "
-    "it; write \"not stated in the document\" — that line is the whole answer for that "
-    "field, with nothing about why it is missing, what the document shows instead or what "
-    "its value might be. NO ARITHMETIC IN THE FIELD LINES: copy every figure exactly as "
-    "printed, with no sum, no equation and no working beside it, not even to show where a "
-    "total comes from.\n"
-    "JUDGEMENT RULES, for anything else the person asked — a judgement, a "
-    "recommendation, a comparison, a decision, a calculation: every such ask is answered, "
-    "after the fields, under its own heading, and never refused. " + _JUDGEMENT_RULES + " "
-    "A calculation you are asked for is yours: show the working and say so. Nothing in the "
-    "second part may change, fill in or round a field in the first part, and a field that "
-    "is not stated stays not stated.\n"
-    "NOTHING UNASKED. Answer what was asked and stop: do not add advice, a recommendation, "
-    "a next step, a caution or an offer of further help that the person did not ask for, "
-    "and do not raise a discrepancy the person did not ask about. Give the answer, not the "
-    "reasoning that found it: no thinking out loud, no self-correction in the answer."
+    "\nTHIS QUESTION ASKS FOR FIELDS OF THE DOCUMENT. Return ONLY what is actually in the "
+    "document for each field asked: the fields, values and figures as written, with page "
+    "numbers where that helps. For those fields this OVERRIDES the general-knowledge "
+    "permission above \u2014 for a field, the document is the only source. Do not fill a "
+    "missing field from general knowledge, do not infer it from the rest of the document, "
+    "do not estimate it, and do not write 0, 0.00 or \"none\" for a field the document "
+    "never gives; write \"not stated in the document\" \u2014 that line is the whole "
+    "answer for that field, with no sentence about why it is missing. It is also the one "
+    "line about the document's silence that the rules above ask for: say nothing more "
+    "about a missing field anywhere in the answer \u2014 not what the document shows "
+    "instead, not why the field is missing, not what its value might be. A field the "
+    "document gives as a rule or a formula (a cap, a notice period, a fee basis) IS "
+    "stated: quote it. NO ARITHMETIC IN THE FIELDS: copy every figure exactly as printed. "
+    "Do not add, multiply or check figures to produce or confirm a field, and write no "
+    "sum, no equation and no working beside the fields, not even to show where a total "
+    "comes from \u2014 for the fields, this overrides the permission above to show your "
+    "arithmetic. Answer what was asked and stop: do not add advice, a recommendation, a "
+    "next step, a caution or an offer of further help that the person did not ask for, "
+    "and do not raise a discrepancy the person did not ask about. Give the fields, not "
+    "the reasoning that found them: no thinking out loud, no self-correction in the "
+    "answer.\n"
+    "NOTHING THE PERSON ASKED IS FORBIDDEN. If the question also asks for a judgement, a "
+    "recommendation, a comparison, a decision or a calculation \u2014 however it is "
+    "phrased, even in a word or two \u2014 that part was asked, so answer it after the "
+    "fields, under its own heading, and never refuse it. " + _JUDGEMENT_RULES + " "
+    "A calculation you are asked for is yours: show the working and say so. A field the "
+    "document does not give is never such a part: it stays \"not stated in the document\", "
+    "with nothing added."
 )
 
 #: Added when the question is neither -- it asks what the document says.

@@ -31,9 +31,9 @@ from tests.document_answer_grader import (cites_document, explains_a_missing_fie
 #: forbade judgement and an extract+advise block beside it; the router chose
 #: between them and missed 10-25% of judgement asks. The assertions that used
 #: to read "EXTRACTION QUESTION" and "ALSO ASKED FOR A JUDGEMENT" read these.
-FIELD_BLOCK = "THE QUESTION NAMES FIELDS OF THE DOCUMENT"
-FIELD_RULES = "FIELD RULES, for each field asked"
-JUDGEMENT_RULES = "JUDGEMENT RULES, for anything else the person asked"
+FIELD_BLOCK = "THIS QUESTION ASKS FOR FIELDS OF THE DOCUMENT"
+FIELD_RULES = "Return ONLY what is actually in the document for each field asked"
+JUDGEMENT_RULES = "NOTHING THE PERSON ASKED IS FORBIDDEN"
 
 
 def _fields_then_judgement(question):
@@ -44,7 +44,8 @@ def _fields_then_judgement(question):
     assert signals.mode == "extract", (question, signals.evidence)
     system = source_use.system_text(question)
     assert system.index(FIELD_RULES) < system.index(JUDGEMENT_RULES), question
-    assert "every such ask is answered" in system and "never refused" in system
+    assert "that part was asked, so answer it after the fields" in system
+    assert "never refuse it" in system
     return signals
 
 #: The owner's question, exactly as he typed it (conversation
@@ -269,7 +270,7 @@ def test_field_questions_stay_strictly_inside_the_document(question):
     assert source_use.question_mode(question) == "extract", question
     system = source_use.system_text(question)
     assert FIELD_BLOCK in system
-    assert "return ONLY what is actually in the document" in system
+    assert "Return ONLY what is actually in the document" in system
     assert "do not add advice" in system
     assert "not stated in the document" in system
     assert "DECISION QUESTION" not in system
@@ -288,7 +289,7 @@ def test_an_explicit_judgement_rides_AFTER_the_fields():
     system = source_use.system_text(q)
     assert "after the fields, under its own heading" in system
     # The advice half may not reach back into the fields.
-    assert "may change, fill in or round a field in the first part" in system
+    assert "A field the document does not give is never such a part" in system
 
 
 @pytest.mark.parametrize(
@@ -1258,7 +1259,8 @@ def test_no_block_the_router_can_choose_forbids_answering_an_ask():
     for mode, block in source_use._BLOCKS.items():
         system = source_use.system_for_mode(mode)
         if mode == "extract":
-            assert "every such ask is answered" in block and "never refused" in block
+            assert "that part was asked, so answer it after the fields" in block
+            assert "never refuse it" in block
         elif mode == "advise":
             assert "Give a real recommendation" in block
         else:
@@ -1824,10 +1826,10 @@ def test_the_verifiers_pair_takes_one_route_without_a_decision_word():
 def test_a_fact_about_a_field_is_still_a_field_ask(question):
     """The other direction: a follow-up the page CAN answer, filler, a
     settled view, a handover verb -- the field block, with nothing that
-    invites a judgement nobody asked for (see NOTHING UNASKED)."""
+    invites a judgement nobody asked for ("Answer what was asked and stop")."""
     signals = source_use.classify(question)
     assert signals.mode == "extract", (question, signals.evidence)
-    assert "NOTHING UNASKED" in source_use.system_text(question)
+    assert "Answer what was asked and stop: do not add advice" in source_use.system_text(question)
 
 
 @pytest.mark.parametrize("follow", ["is it quoted per unit?", "is it per seat?",
@@ -1942,7 +1944,8 @@ def test_the_field_block_forbids_only_what_was_not_asked():
     assert source_use.question_mode("what is the invoice total?") == "extract"
     assert "For this answer do not add advice" not in system
     assert "that the person did not ask for" in system
-    assert "every such ask is answered" in system and "never refused" in system
+    assert "that part was asked, so answer it after the fields" in system
+    assert "never refuse it" in system
     assert "Its FIRST sentence is the verdict" in system
     assert "never a list of things to go and check" in system
 
@@ -1957,9 +1960,11 @@ def test_the_field_block_still_never_invents_a_value():
     assert "for a field, the document is the only source" in system
     assert 'write "not stated in the document"' in system
     assert "that line is the whole answer for that" in system
-    assert "with nothing about why it is missing" in system
-    assert "a field that is not stated stays not stated" in system
+    assert "with no sentence about why it is missing" in system
+    assert 'it stays "not stated in the document", with nothing added' in system
+    assert "A field the document does not give is never such a part" in system
     assert "Answer what was asked and stop" in system
+    assert "Give the fields, not the reasoning that found them" in system
 
 
 def test_both_judgement_blocks_share_one_set_of_rules():
@@ -2032,12 +2037,13 @@ def test_the_field_rules_forbid_working_and_talk_about_a_missing_field():
     q = "I need the total from this invoice and the tax amount"
     assert source_use.question_mode(q) == "extract"
     system = source_use.system_text(q)
-    assert "NO ARITHMETIC IN THE FIELD LINES" in system
+    assert "NO ARITHMETIC IN THE FIELDS" in system
     assert "copy every figure exactly as printed" in system
-    assert "no working beside it, not even to show where a total comes from" in system
-    assert "with nothing about why it is missing, what the document shows instead" in system
+    assert "no working beside the fields, not even to show where a total comes from" in system
+    assert "for the fields, this overrides the permission above to show your arithmetic" in system
+    assert "say nothing more about a missing field anywhere in the answer" in system
     # ... and they bind the field lines only: the judgement may use numbers
-    assert "each binds only its own part of the answer" in system
+    assert "For those fields this OVERRIDES the general-knowledge permission" in system
     assert "A calculation you are asked for is yours: show the working" in system
     # the rule names no failing wording: the model copies what a prompt quotes
     assert "=" not in source_use.FIELDS and " x " not in source_use.FIELDS

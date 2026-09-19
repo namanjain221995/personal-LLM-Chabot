@@ -263,6 +263,8 @@ def test_a_strict_answer_shows_no_working_and_explains_no_missing_field(live, ru
     assert source_use.question_mode(question) == "extract"
     answer = _answer_about(question, ITEMISED_INVOICE_WITHOUT_TAX, "invoice.pdf")
     assert "5,200.00" in answer or "5200.00" in answer, answer
-    assert re.search(r"tax[^\n]{0,60}not stated", answer, re.I), answer
+    # "**Tax Amount**" on its own line, the value on the next, is the same
+    # answer: 2 of 8 correct runs on 2026-09-19 were laid out that way.
+    assert re.search(r"tax[^\n]{0,60}(?:\n[ \t*_]*)?not stated", answer, re.I), answer
     assert not states_a_computation(answer), f"stated a computation:\n{answer}"
     assert not explains_a_missing_field(answer), f"explained a missing field:\n{answer}"
