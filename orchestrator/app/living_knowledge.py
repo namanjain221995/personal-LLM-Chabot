@@ -54,6 +54,19 @@ from .freshness import (
     static_timeless_task,
 )
 from . import web_memory as _web_memory
+
+
+#: A REALTIME answer may come from a stored passage no older than the search
+#: route's own page TTL for such questions (search._REALTIME_PAGE_TTL_S, 300 s).
+#: freshness allows three hours, and the Fast pre-pass answered "USD to INR
+#: exchange rate right now" from a 2.5-hour-old passage (review 2026-09-19).
+REALTIME_MAX_AGE_S = 300
+
+
+def realtime_clamped(verdict: Verdict) -> Verdict:
+    if verdict.requirement is Freshness.REALTIME and verdict.max_age_seconds > REALTIME_MAX_AGE_S:
+        return replace(verdict, max_age_seconds=REALTIME_MAX_AGE_S)
+    return verdict
 from .web_memory import (
     Retrieval,
     _stale_after,
@@ -1014,6 +1027,7 @@ async def prepare(
                 verdict = await classify(question, now_year=now.year, allow_router=True)
         else:
             verdict = await classify(question, now_year=now.year, allow_router=router_on)
+        verdict = realtime_clamped(verdict)
         out.verdict = verdict
         metrics.freshness_classified(verdict.requirement.value, verdict.reason)
 
