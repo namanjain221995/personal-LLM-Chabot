@@ -529,10 +529,27 @@ def _month_breakdowns(con, src: str, date: str, dident: str, kind: str, plans: L
     # and the same file must give the same months on every machine.
     stamp = f"timezone('UTC', {dident})" if kind == "tz" else dident
     sums = ", ".join(p["sum_sql"] for p in plans)
+    # No WHERE: the rows without a date come back as the NULL month, in the
+    # same scan. They are in no month, so the months add up to less than the
+    # column total, and a model adding them up must be told by how much (QA
+    # r1 F3: 100 rows, every 4th date blank, months 3,750.00 against 4,950.00
+    # with omitted=[], while by_group keeps a blank group and reconciles).
+    # Said in omitted, not as a month row: rows stay 'YYYY-MM' by contract.
     found = con.execute(
         f"SELECT strftime(date_trunc('month', {stamp}), '%Y-%m') AS m, COUNT(*), {sums} "
-        f"FROM {src} WHERE {dident} IS NOT NULL GROUP BY 1 ORDER BY 1"
+        f"FROM {src} GROUP BY 1 ORDER BY 1 NULLS LAST"
     ).fetchall()
+    undated = [r for r in found if r[0] is None]
+    found = [r for r in found if r[0] is not None]
+    if undated:
+        _m, n_undated, *rest = undated[0]
+        totals = ", ".join(
+            f"{_label(plan['name'])} {_json_sum(rest[j], plan['mode']) or 0}" for j, plan in enumerate(plans)
+        )
+        omitted.append(
+            f"by_month {_label(date)}: {int(n_undated)} row(s) have no date and are in no month, so the "
+            f"months add up to less than the column totals by: {totals}"
+        )
     kept = found[-AGG_MAX_MONTHS:]  # the most recent months
     for j, plan in enumerate(plans):
         if not plan.get("lossy") and not all(_json_exact(rest[j], plan["mode"]) for _m, _n, *rest in kept):

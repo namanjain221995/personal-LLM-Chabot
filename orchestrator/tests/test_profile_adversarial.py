@@ -546,6 +546,7 @@ def test_zoned_timestamps_are_bucketed_in_utc(tmp_path, monkeypatch):
 # ===========================================================================
 
 import textwrap  # noqa: E402  (kept with the section that needs it)
+from datetime import date, timedelta  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1027,3 +1028,85 @@ def test_a_budget_spent_by_quoting_opens_no_writer_for_the_next_sheet(tmp_path, 
     assert first["note"].startswith("not profiled: the workbook expands")
     assert len(calls) == 2, "sheet 1's header and its one row; nothing for sheets 2 and 3"
     assert all(s["note"] == "not profiled: the workbook's earlier sheets used its whole scratch budget" for s in later)
+
+
+def test_the_dropped_rows_note_comes_first_among_several_reasons(tmp_path):
+    """Mutation M13 (the note appended, not put first) survived every suite
+    because the pinned file had only one reason. Here there are four: a
+    dropped row, a continuous float, a value seen once and a blank date."""
+    rng = random.Random(8)
+    lines = ["order_date,status,reading,revenue"]
+    for i in range(24_000):
+        day = "" if i % 50 == 0 else f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}"
+        status = "ONCE-ONLY" if i == 700 else f"s{i % 9}"
+        revenue = "N/A" if i == 22_000 else f"{rng.randrange(100, 10**6) / 100:.2f}"
+        lines.append(f"{day},{status},{rng.random() * 1000:.9f},{revenue}")
+    path = tmp_path / "many.csv"
+    path.write_text("\n".join(lines) + "\n")
+    omitted = profiler.profile_tabular(str(path))["aggregates"]["omitted"]
+    assert len(omitted) >= 4, omitted
+    assert omitted[0].startswith("1 row(s) could not be read"), omitted
+
+
+# ---------------------------------------------------------------------------
+# 2 / 10. by_month must reconcile with the column total, or say why not.
+# ---------------------------------------------------------------------------
+
+
+def test_monthly_totals_reconcile_or_the_blank_dates_are_said(tmp_path):
+    """QA r2: `AssertionError: months add up to 1912.5, the column to 2525.0,
+    omitted=[]` at 4b90840. by_group keeps a blank group; by_month said
+    nothing."""
+    lines = ["order_date,amount"]
+    total = Decimal(0)
+    for i in range(100):
+        amt = Decimal(i + 1) / 2
+        total += amt
+        day = "" if i % 4 == 0 else (date(2024, 1, 1) + timedelta(days=i)).isoformat()
+        lines.append(f"{day},{amt}")
+    path = tmp_path / "blank_dates.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    agg = prof["aggregates"]
+    assert _dec(_col(prof, "amount")["sum"]) == total
+    months = next(m for m in agg["by_month"] if m["measure"] == "amount")
+    month_total = sum(_dec(r["sum"]) for r in months["rows"])
+    said = any("order_date" in r and ("no date" in r or "blank" in r or "without a date" in r)
+               for r in agg["omitted"])
+    assert month_total == total or said, (
+        f"months add up to {month_total}, the column to {total}, omitted={agg['omitted']}"
+    )
+
+
+def test_the_undated_totals_in_omitted_close_the_gap_to_the_column_sum(tmp_path):
+    """Stronger than 'said': the reason carries each measure's undated total,
+    so months + undated == the column sum, to the cent, for every measure."""
+    lines = ["order_date,amount,qty"]
+    tot_amt, tot_qty, undated_amt, undated_qty = Decimal(0), 0, Decimal(0), 0
+    for i in range(300):
+        amt, qty = Decimal(i * 37 % 1000) / 100 + 1, i % 7
+        tot_amt += amt
+        tot_qty += qty
+        blank = i % 5 == 0
+        if blank:
+            undated_amt += amt
+            undated_qty += qty
+        day = "" if blank else (date(2023, 1, 1) + timedelta(days=i * 3)).isoformat()
+        lines.append(f"{day},{amt},{qty}")
+    path = tmp_path / "undated.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    reason = next(r for r in agg["omitted"] if r.startswith("by_month order_date"))
+    assert reason.startswith("by_month order_date: 60 row(s) have no date"), reason
+    assert f"amount {float(undated_amt)}" in reason and f"qty {undated_qty}" in reason, reason
+    for measure, total, gap in (("amount", tot_amt, undated_amt), ("qty", tot_qty, undated_qty)):
+        months = next(m for m in agg["by_month"] if m["measure"] == measure)
+        assert sum(_dec(r["sum"]) for r in months["rows"]) + gap == total
+        assert sum(r["count"] for r in months["rows"]) == 240
+
+
+def test_opposite_a_file_with_every_date_filled_says_nothing_about_months(tmp_path):
+    lines = ["order_date,amount"] + [f"2024-{1 + i % 12:02d}-10,{i}.50" for i in range(120)]
+    path = tmp_path / "dated.csv"
+    path.write_text("\n".join(lines) + "\n")
+    assert profiler.profile_tabular(str(path))["aggregates"]["omitted"] == []
