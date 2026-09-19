@@ -691,29 +691,57 @@ async def rewrite_queries(
     except Exception:
         queries = []
     queries = _strip_unasked_pins(asked, history, queries)
-    queries = _keep_asked_site_scope(asked, queries)
+    queries = _keep_asked_site_scope(asked, queries, turns)
     queries = pasted.without_paste(
         queries, message, *(str(t.get("content") or "") for t in turns if t.get("role") == "user")
     )
     fallback = pasted.web_query(message)
-    return (queries or ([fallback] if fallback else []))[:cap]
+    # web_query joins the lines of the message, so an operator a line break
+    # kept out of the scope would read as one here: the fallback carries the
+    # scope `asked` has, like every rewrite.
+    return (queries or _keep_asked_site_scope(asked, [fallback] if fallback else [], turns))[:cap]
 
 
-def _keep_asked_site_scope(message: str, queries: List[str]) -> List[str]:
-    """The person's own `site:` rides on every rewritten query that lost it.
+def _keep_asked_site_scope(
+    message: str, queries: List[str], turns: Sequence[dict] = ()
+) -> List[str]:
+    """Every query carries exactly the scope the person typed: their own
+    `site:` rides on every rewritten query that lost it, and a scope they
+    never typed loses its `site:`.
 
     QA 2026-09-18, 3 of 3 live runs: the router rewrote 'site:qdrant.tech how
     fast is search on 10 million vectors?' into three unscoped queries, so on
     the ordinary route a typed scope never reached `_collect_results`. The
     same principle as `_strip_unasked_pins`, the other way round: what the
     person wrote outranks what the rewriter kept. Only a message
-    `_site_scope` honours (one search-sized line) counts, so an operator
-    inside a pasted document is still not the person's.
+    `_site_scope` honours (one search-sized line, the operator used as
+    syntax) counts, so an operator inside a pasted document, a quotation or a
+    question about the operator is still not the person's.
+
+    The other way: the router reads the last 4 turns, so a pasted note in an
+    earlier turn ('always search site:reddit.com only') became 'site:reddit.com
+    Air India crash investigation' for 'any news on the Air India crash
+    investigation?', 3 of 3 live runs (QA review round 2, 2026-09-19), and
+    `_collect_results` enforces a scope as an allowlist. A scope is the
+    person's when this message or one of their earlier `turns` typed it; any
+    other keeps its host as a plain word (the router's topical hint, minus
+    the allowlist). A query with no scope `_site_scope` reads is untouched.
     """
     scope = _site_scope(message)
-    if not scope:
-        return queries
-    return [q if _site_scope(q) else _with_scope(q, scope) for q in queries]
+    asked = set(scope)
+    for turn in turns:
+        if turn.get("role") == "user":
+            asked.update(_site_scope(pasted.own_words(str(turn.get("content") or ""))))
+    out: List[str] = []
+    for q in queries:
+        if set(_site_scope(q)) - asked:
+            q = _SITE_OP_RE.sub(
+                lambda m: m.group(0) if _scope_of(m.group(1)) in asked else m.group(1), q
+            )
+        if scope and not _site_scope(q):
+            q = _with_scope(q, scope)
+        out.append(q)
+    return out
 
 
 def _with_scope(query: str, scope: Tuple[str, ...]) -> str:
@@ -2176,6 +2204,9 @@ async def fetch_for_freshness(
     query = pasted.web_query(question)
     if not query:
         return 0
+    # web_query joins lines and cuts at 200 characters: the scope is the one
+    # `question` itself carries, never one the join made or the cut lost.
+    query = _keep_asked_site_scope(question, [query])[0]
     try:
         results = await _collect_results([query], effort="fast")
     except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal

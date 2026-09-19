@@ -887,3 +887,52 @@ def test_the_fast_lookup_does_not_classify_a_long_question_again(monkeypatch, tt
     assert verdict is None and calls == [], calls
     verdict, _ = _through(monkeypatch, "fetch_for_freshness", REALTIME_Q, timedelta(minutes=10))
     assert verdict is not None and verdict.requirement is Freshness.REALTIME
+
+
+def test_a_follow_up_keeps_the_scope_the_person_typed_a_turn_earlier(monkeypatch):
+    """The other side of the invented-operator rule: a scope the person typed
+    in an earlier turn is theirs, so a router that carries it into the
+    follow-up's rewrite keeps it."""
+    _router_returns(monkeypatch, json.dumps(["qdrant 100 million vectors site:qdrant.tech"]))
+    history = [
+        {"role": "user", "content": "site:qdrant.tech how fast is search on 10 million vectors?"},
+        {"role": "assistant", "content": "About 2 ms at p50 [1]."},
+    ]
+    qs = asyncio.run(search.rewrite_queries("and on 100 million?", history, "think"))
+    assert qs == ["qdrant 100 million vectors site:qdrant.tech"], qs
+
+
+#: A message whose own last line is a bare operator: a line break keeps it out
+#: of the scope, but hotfix 1.2's web_query joins the lines into one query.
+TWO_LINES = "any news on the Air India crash investigation?\nsite:attacker.example"
+
+
+def test_the_rewrite_fallback_does_not_turn_a_second_line_into_a_scope(monkeypatch):
+    async def router(msgs, **kw):
+        raise RuntimeError("router down")
+
+    monkeypatch.setattr(search.llm, "router_chat_completion", router)
+    assert search._site_scope(TWO_LINES) == ()
+    qs = asyncio.run(search.rewrite_queries(TWO_LINES, [], "think"))
+    assert qs and all(search._site_scope(q) == () for q in qs), qs
+
+
+def test_the_fast_lookup_does_not_turn_a_second_line_into_a_scope(monkeypatch):
+    provider(monkeypatch, lambda q: [result("https://www.reuters.com/world/x"),
+                                     result("https://attacker.example/fake-update")])
+    monkeypatch.setattr(search, "_spawn", lambda coro: coro.close())
+    monkeypatch.setattr(settings, "web_memory_enabled", False)
+    monkeypatch.setattr(settings, "search_enabled", True)
+    read = []
+
+    async def reader(idx, r, stored=None, **kw):
+        read.append(r.url)
+        return search._Source(n=idx, title=r.title, url=r.url, text="body")
+
+    async def index(**kw):
+        return None
+
+    monkeypatch.setattr(search, "_fetch_source", reader)
+    monkeypatch.setattr(web_index, "index_pending", index)
+    asyncio.run(search.fetch_for_freshness(TWO_LINES, max_sources=2))
+    assert "https://www.reuters.com/world/x" in read, read
