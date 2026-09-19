@@ -103,7 +103,10 @@ _SYSTEM = (
     "comparing figures that are there is fine. A difference or a share "
     "between things the question names is worked out by code and listed "
     "at the end of the data under FIGURES FOR THIS QUESTION: quote it from "
-    "there. When the figure asked for is not among the computed figures — "
+    "there. A NOTE listed there says what the totals leave out (rows that "
+    "could not be read, rows with no date, a breakdown that is not listed "
+    "and why): whenever you give a figure it touches, say it in one plain "
+    "sentence. When the figure asked for is not among the computed figures — "
     "a total over only some rows, a breakdown by two things at once, a "
     "difference or share that is not listed — say so in one plain sentence "
     "(\"I don't have East's revenue for March worked out\"), give the "
@@ -205,8 +208,25 @@ def _noise_free(value: Any) -> Any:
     return value
 
 
+#: The profile names a left-out breakdown by its internal kind ("by_group
+#: email: not listed, its values look like contact details"), and the model
+#: is told never to say 'by_group' or 'by_month': a reason copied into an
+#: answer must already read as plain words. Only the code-written prefix of
+#: a reason is reworded; the column name after it is the file's own.
+_REASON_KIND = re.compile(r"^by_(group|month) ")
+
+
+def _plain_reason(reason: Any) -> Any:
+    if not isinstance(reason, str):
+        return reason
+    return _REASON_KIND.sub(
+        lambda m: "the breakdown by " if m.group(1) == "group" else "the monthly breakdown by ", reason
+    )
+
+
 def _tidy_figures(node: Any) -> Any:
-    """A profile with its computed figures noise-free and its cells untouched."""
+    """A profile with its computed figures noise-free, its omitted reasons in
+    plain words, and its cells untouched."""
     if isinstance(node, list):
         return [_tidy_figures(v) for v in node]
     if not isinstance(node, dict):
@@ -227,6 +247,8 @@ def _tidy_figures(node: Any) -> Any:
                     else e
                     for e in agg[kind]
                 ]
+        if isinstance(agg.get("omitted"), list):
+            agg["omitted"] = [_plain_reason(r) for r in agg["omitted"]]
         out["aggregates"] = agg
     return out
 
@@ -246,8 +268,13 @@ def _tidy_keys(entry: Any, keys: Sequence[str]) -> Any:
 #: and 6 of 9 answers put one region's figure under another; with labels
 #: first, 0 of 9. Every object is re-ordered here, so the order the model
 #: reads never depends on how the profile was stored.
+#: The same holds for the caveats: the profile writes `rows_not_read` right
+#: after `rows` and `omitted` right after `computed`, so the reasons a total
+#: leaves rows out are read BEFORE the totals; JSONB put rows_not_read last
+#: of all, after every column sum and the sample rows (2026-09-19).
 _LEAD_KEYS = (
     "file", "name", "dtype", "group", "date", "measure", "value", "month",
+    "rows", "rows_not_read", "computed", "omitted",
     "count", "sum", "avg", "median",
 )
 _ROW_LISTS = ("sample_rows", "full_rows")
@@ -385,6 +412,54 @@ def _label(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+#: A question about change over time is a monthly question: "which region
+#: grew fastest" is answered from, and charted as, the months.
+_OVER_TIME_RE = re.compile(
+    r"\b(?:grow(?:s|n|th|ing)?|grew|trends?|trending|over time|increas\w*|decreas\w*|declin\w*)\b", re.I
+)
+
+
+def _asks_months(raw: str, request: str) -> bool:
+    return bool(_MONTHLY_RE.search(request) or _OVER_TIME_RE.search(raw) or _months_named(raw))
+
+
+def _rows_not_read(prof: Dict[str, Any]) -> int:
+    try:
+        return max(0, int(prof.get("rows_not_read") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _caveats(raw: str, request: str, prof: Dict[str, Any], agg: Dict[str, Any]) -> List[str]:
+    """What the totals this question reads leave out, as NOTE lines.
+
+    The profile says it in `rows_not_read` and `omitted`, among dozens of
+    other keys; told nothing more, an answer quoted totals that left rows
+    out without a word. So the caveats that touch THIS question are listed
+    with its figures: rows that could not be read (every total), rows with
+    no date (every month), a breakdown the question names that is not listed.
+    """
+    notes: List[str] = []
+    reasons = [r for r in (agg.get("omitted") or []) if isinstance(r, str)]
+    dropped = _rows_not_read(prof)
+    if dropped:
+        said = next((r for r in reasons if "could not be read" in r), None)
+        notes.append(
+            f"- NOTE: {said}" if said
+            else f"- NOTE: {dropped:,} row(s) could not be read and are left out of every total"
+        )
+    months = _asks_months(raw, request)
+    for reason in reasons:
+        kind = _REASON_KIND.match(reason)
+        if not kind:
+            continue
+        name = reason[kind.end():].split(": ", 1)[0]
+        pat = name_pattern(name)
+        if (kind.group(1) == "month" and months) or (kind.group(1) == "group" and pat and re.search(pat, request)):
+            notes.append(f"- NOTE: {_plain_reason(reason)}")
+    return notes
+
+
 def question_figures(message: str, uploads: Sequence[dict]) -> List[str]:
     """Differences and shares between the things a question names, worked out
     by code from the computed figures, for the end of the data block.
@@ -402,7 +477,10 @@ def question_figures(message: str, uploads: Sequence[dict]) -> List[str]:
     months = _months_named(raw)
     lines: List[str] = []
     for prof, agg, columns, measures, largest in _figure_files(uploads):
+        notes = _caveats(raw, request, prof, agg)
         if not measures:
+            if notes:
+                lines += [f"FILE: {prof.get('file') or ''}", *notes]
             continue
         measure = (named(request, measures) or largest)[0]
         total = _dec(columns[measure].get("sum"))
@@ -459,8 +537,8 @@ def question_figures(message: str, uploads: Sequence[dict]) -> List[str]:
                 except (TypeError, ValueError):
                     pass
                 found.append(line)
-        if found:
-            lines += [f"FILE: {prof.get('file') or ''}", *found]
+        if notes or found:
+            lines += [f"FILE: {prof.get('file') or ''}", *notes, *found]
     if not lines:
         return []
     return ["FIGURES FOR THIS QUESTION (worked out by code from the computed figures, exact):", *lines]
@@ -485,7 +563,7 @@ def chart_offer(message: str, uploads: Sequence[dict]) -> Optional[str]:
     """
     raw = bounded_request(message)
     request = _norm(raw)
-    months_asked = bool(_MONTHLY_RE.search(request)) or bool(_months_named(raw))
+    months_asked = _asks_months(raw, request)
     best = None
     for prof, agg, columns, measures, largest in _figure_files(uploads):
         if not measures:
@@ -678,6 +756,10 @@ async def run_dataset_engine(
     for piece in guard.finish():
         await emit("token", {"text": piece})
     answer = guard.shown
+    unread = unread_note(uploads, answer)
+    if unread:
+        await emit("token", {"text": unread})
+        answer += unread
     if long.truncated:
         # Said IN the answer, not only in a UI notice: the stored text is what
         # the next turn, the transcript and the API read.
@@ -704,6 +786,35 @@ async def run_dataset_engine(
         await answer_guard.record(guard.verdict, effort=effort, route="dataset")
     await emit("meta", meta)
     return answer
+
+
+#: An answer that already says rows were not read needs no note.
+_SAID_UNREAD = re.compile(r"\b(?:could(?:n't| not)(?: be)? read|(?:were|was|are|is) not read|unread(?:able)?)\b", re.I)
+
+
+def unread_note(uploads: Sequence[dict], answer: str) -> str:
+    """The sentence an answer must carry when rows of a file were not read.
+
+    Said by code, not left to the model: every total the answer can quote
+    leaves those rows out, and the person reading "the total revenue is X"
+    has no other way to learn it. Empty when no rows were dropped or the
+    answer already says so.
+    """
+    files = _tabular_files(uploads)
+    unread = [(p.get("file"), _rows_not_read(p)) for p in files]
+    unread = [(name, n) for name, n in unread if n]
+    if not unread or _SAID_UNREAD.search(answer or ""):
+        return ""
+    them = "them" if len(unread) > 1 or unread[0][1] != 1 else "it"
+    if len(files) == 1:
+        n = unread[0][1]
+        where = f"{n:,} row{'s' if n != 1 else ''} of your file"
+    else:
+        where = "; ".join(
+            f"{n:,} row{'s' if n != 1 else ''} of {re.sub(r'[^A-Za-z0-9 ._()-]', '', str(name or 'a file'))[:80]}"
+            for name, n in unread
+        )
+    return f"\n\nNote: {where} could not be read, so every total above leaves {them} out."
 
 
 def stop_note(reason: str) -> str:

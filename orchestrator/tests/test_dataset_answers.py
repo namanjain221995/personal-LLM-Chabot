@@ -1093,3 +1093,109 @@ def test_two_peoples_reports_rendered_in_one_second_never_share_a_file(tmp_path,
     assert got.status_code == 200 and b"ALICEONLY" in got.content
     assert b"BOBONLY" not in got.content, "Alice downloaded Bob's figures"
     assert bob.get(f"/reports/{bob_name}").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 11. The profile contract's caveats reach the answer (dataset-numbers-computed
+#     d2c89d0: rows_not_read, omitted second, undated months, contact columns)
+# ---------------------------------------------------------------------------
+
+
+def _dirty_upload(tmp_path: Path):
+    """22,000 rows, one 'N/A' revenue past the sniff window: the reader drops
+    that row, and the profile says so in rows_not_read and omitted[0]."""
+    lines = ["region,revenue"] + [f"{'NSEW'[i % 4]},{'N/A' if i == 21_000 else f'{i % 50}.25'}" for i in range(22_000)]
+    path = tmp_path / "dirty.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = json.loads(json.dumps(profiler.profile_tabular(str(path)), default=str))
+    assert prof["rows_not_read"] == 1, "premise: the profile track reports the dropped row"
+    return {"filename": path.name, "bytes": path.stat().st_size, "status": "ready",
+            "profile": [_jsonb_order(prof)], "notes": None}
+
+
+def _undated_contact_upload(tmp_path: Path):
+    """Every 5th date blank (rows in no month), and an `owner` column whose
+    values are emails (a breakdown the profile leaves out)."""
+    lines = ["order_date,owner,region,revenue"]
+    for i in range(100):
+        day = "" if i % 5 == 0 else f"2025-{1 + i % 12:02d}-{1 + i % 28:02d}"
+        lines.append(f"{day},rep{i % 4}@example.com,{'NSEW'[i % 4]},{i}.50")
+    path = tmp_path / "undated.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = json.loads(json.dumps(profiler.profile_tabular(str(path)), default=str))
+    reasons = prof["aggregates"]["omitted"]
+    assert any(r.startswith("by_month order_date: 20 row(s) have no date") for r in reasons), reasons
+    assert any(r.startswith("by_group owner:") and "contact details" in r for r in reasons), reasons
+    return {"filename": path.name, "bytes": path.stat().st_size, "status": "ready",
+            "profile": [_jsonb_order(prof)], "notes": None}
+
+
+def test_the_caveats_are_read_before_the_totals_after_a_jsonb_round_trip(tmp_path):
+    """JSONB put rows_not_read after every column sum and the sample rows,
+    and `omitted` wherever its length fell; the profile wrote both first."""
+    upload = _dirty_upload(tmp_path)
+    assert list(upload["profile"][0])[-1] in ("rows_not_read", "columns_total")  # the stored order
+    block = dataset.format_profile([upload])
+    shown = _shown(block)[0]
+    keys = list(shown)
+    assert keys.index("rows") + 1 == keys.index("rows_not_read") < keys.index("columns"), keys
+    assert list(shown["aggregates"])[:2] == ["computed", "omitted"], list(shown["aggregates"])
+    assert block.index('"rows_not_read"') < block.index('"sum"')
+
+
+def test_an_omitted_reason_reaches_the_model_in_plain_words(tmp_path):
+    upload = _undated_contact_upload(tmp_path)
+    block = dataset.format_profile([upload])
+    reasons = _shown(block)[0]["aggregates"]["omitted"]
+    assert reasons and not any("by_group" in r or "by_month" in r for r in reasons), reasons
+    assert any(r.startswith("the breakdown by owner: not listed, its values look like contact details") for r in reasons)
+    assert any(r.startswith("the monthly breakdown by order_date: 20 row(s) have no date") for r in reasons)
+
+
+def test_the_caveats_a_question_touches_are_listed_with_its_figures(tmp_path):
+    dirty = _dirty_upload(tmp_path)
+    notes = [ln for ln in dataset.question_figures("What is the total revenue?", [dirty]) if "NOTE" in ln]
+    assert notes == ["- NOTE: 1 row(s) could not be read under the detected column types "
+                     "(a bad value in revenue) and are left out of every total"], notes
+
+    upload = _undated_contact_upload(tmp_path)
+    monthly = "\n".join(dataset.question_figures("What was the revenue in each month?", [upload]))
+    assert "NOTE: the monthly breakdown by order_date: 20 row(s) have no date" in monthly
+    assert "owner" not in monthly
+    # Growth is a question about the months too.
+    assert "have no date" in "\n".join(dataset.question_figures("Which region grew fastest?", [upload]))
+    by_owner = "\n".join(dataset.question_figures("What is the revenue by owner?", [upload]))
+    assert "NOTE: the breakdown by owner: not listed, its values look like contact details" in by_owner
+    assert "have no date" not in by_owner
+    # A question neither caveat touches gets neither.
+    assert dataset.question_figures("What is the revenue by region?", [upload]) == []
+    # And the rule that says what to do with a NOTE is in the prompt.
+    system = dataset.build_messages("revenue by owner?", [upload], [])[0]["content"]
+    assert "A NOTE listed there says what the totals leave out" in system
+
+
+def test_an_answer_about_a_file_with_unread_rows_says_so(tmp_path, monkeypatch):
+    upload = _dirty_upload(tmp_path)
+
+    def answer_with(text):
+        async def stream(messages, **kwargs):
+            yield "token", text
+
+        monkeypatch.setattr(llm, "stream_chat_events", stream)
+        monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+        return _run_engine(monkeypatch, upload, "total revenue?")
+
+    answer, events = answer_with("The sum of revenue over every order is 538,238.50.")
+    assert answer.endswith("\n\nNote: 1 row of your file could not be read, so every total above leaves it out.")
+    assert "".join(d["text"] for k, d in events if k == "token") == answer
+    # Said once: an answer that already says it gets no second note.
+    said = "The sum of revenue is 538,238.50; 1 row could not be read and is left out."
+    answer, _ = answer_with(said)
+    assert answer == said
+
+
+def test_a_question_about_growth_is_offered_the_monthly_line_chart(tmp_path):
+    _, upload = profiled_upload(tmp_path, 120, 41)
+    for question in ("Which region grew fastest?", "What is the revenue trend by region?"):
+        assert dataset.chart_offer(question, [upload]) == "make a line chart of revenue by month for each region"
+    assert dataset.chart_offer("monthly revenue trend", [upload]) == "make a line chart of revenue by month"
