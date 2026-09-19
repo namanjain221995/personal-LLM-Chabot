@@ -82,6 +82,7 @@ from ..config import settings
 # query-centred `_select_text` — see `_trim_evidence` for what the head slice
 # was costing (C1).
 from ..core import provenance
+from ..core import pasted
 from ..core.sf_intel.planner import extract_json_object
 from ..freshness import Freshness, Verdict, classify_offline
 from ..memory_recall import keywords
@@ -860,10 +861,13 @@ async def _plan(question: str, history: Sequence[dict], effort: str, state: Opti
             e.strip() for e in (data.get("entities") or []) if isinstance(e, str) and e.strip()
         ][:8]
     if not queries:
-        queries = [question]
+        # The person's own words, never a paste in the question (hotfix 1.2,
+        # P6): this fallback used to send the whole message as the query.
+        own = pasted.web_query(question)
+        queries = [own] if own else subs[:1]
     cap = settings.deep_research_max_queries_per_iteration
     queries = queries[:cap]
-    if state is not None:
+    if state is not None and queries:
         queries = _augment_queries(state, queries, cap)
     return subs[:8], queries
 
@@ -2785,6 +2789,9 @@ async def run_deep_research_engine(
     user_id: Optional[int] = None,
 ) -> str:
     """Plan → search → open → extract → follow → assess → verify → report."""
+    # Every query this run builds (plan, audit, verify) passes the paste
+    # check in `_collect_results` against this message (hotfix 1.2, P6).
+    pasted.mark_turn(message)
     key = _admission_key(user_id)
     adm = _admission()
     queued_at = time.monotonic()

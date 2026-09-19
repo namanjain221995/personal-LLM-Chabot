@@ -519,6 +519,17 @@ def hex_to_rgb(colour: str) -> Tuple[int, int, int]:
     return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
 
 
+#: An Office core property holds at most 255 characters and python-docx /
+#: python-pptx raise past it. The spec lets `purpose` reach 300: a
+#: 283-character one failed the whole DOCX of "give Big report" (live run,
+#: hotfix 1.1, 2026-09-19). The file's metadata is cut; its text is not.
+CORE_PROPERTY_MAX = 255
+
+
+def core_property(value: Optional[str]) -> str:
+    return str(value or "")[:CORE_PROPERTY_MAX]
+
+
 __all__ = [
     "PALETTE", "INK", "INK_MUTED", "INK_FAINT", "SURFACE", "SURFACE_2", "BORDER", "ACCENT",
     "ACCENT_STRONG", "ACCENT_SOFT", "NAVY", "BOARDROOM", "SLATE", "PAPER", "TEAL", "DANGER", "WARN", "OK",
@@ -532,5 +543,5 @@ __all__ = [
     "FontChoice", "resolve_font", "pdf_font_stack",
     "uncovered_scripts", "format_cell", "indian_grouping", "CLASSIC_PRIMARY", "CLASSIC_ACCENT", "CLASSIC_INK",
     "CLASSIC_MUTED", "CLASSIC_CAPTION", "CLASSIC_HAIRLINE", "CLASSIC_GRID", "CLASSIC_BAND", "CLASSIC_TOTAL_FILL",
-    "CLASSIC_BODY_FONT", "CLASSIC_HEADING_FONT", "CSS_CLASSIC",
+    "CLASSIC_BODY_FONT", "CLASSIC_HEADING_FONT", "CSS_CLASSIC", "CORE_PROPERTY_MAX", "core_property",
 ]
