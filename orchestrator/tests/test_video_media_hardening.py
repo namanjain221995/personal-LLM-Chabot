@@ -469,6 +469,26 @@ def test_a_mixed_batch_counts_each_state_once():
     assert (summary["ok"], summary["empty"], summary["degenerate"], summary["failed"]) == (1, 1, 1, 1)
 
 
+def test_a_frame_the_model_only_talked_about_is_not_a_frame_with_readable_text():
+    """Live video-path answers ("OCR" prompt) that were counted as readable
+    frames until 2026-09-19: a legible code slide answered with only 'and
+    compare it to the source image.' (security review, 3 of 3 runs), a blank
+    frame answered '[No text detected]', and a photo whose whole answer was
+    a whole-frame region saying there was no text (builder, both runs)."""
+    reads = [
+        ocr.classify(_REAL),
+        ocr.classify(" and compare it to the source image."),
+        ocr.classify(" result\n[No text detected]\nimage [0, 0, 999, 999]"),
+        ocr.classify(
+            " text [0, 0, 999, 999]The image contains no text. The visible element is a solid orange circle"
+            " centered at the bottom center. There is no OCR-able content to extract.\nimage [0, 0, 999, 999]"
+        ),
+    ]
+    assert [r.status for r in reads] == ["ok", "empty", "empty", "empty"]
+    summary = screen._summarise(reads, frames=4, prompt="OCR")
+    assert summary["detail"] == "1/4 frames had readable text"
+
+
 def test_preamble_junk_never_reaches_the_on_screen_text_or_screen_text_txt(monkeypatch, tmp_path):
     from app.video.artifacts import screen_text_txt
 

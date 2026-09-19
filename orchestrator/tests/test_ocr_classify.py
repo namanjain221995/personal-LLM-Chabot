@@ -625,3 +625,245 @@ def test_unclosed_det_openers_are_cleaned_in_linear_time(monkeypatch, raw, finis
         _read(monkeypatch, raw, finish=finish)
         elapsed = time.perf_counter() - started
     assert elapsed < 0.1
+
+# ---- 4. QA review r2 of 327a5ac: where a reading starts --
+
+
+def test_a_plain_answer_keeps_its_first_line_above_an_image_tensor_line():
+    """QA review r2. A plain answer (no regions) whose second line is the
+    slide's 'image [1, 3, 224, 224]': an image region with no text in it
+    says nothing about where a reading starts, so the title stays. (The
+    tensor line itself is removed by the markup rule, as at 4810da0.)"""
+    read = ocr.classify("Model input\nimage [1, 3, 224, 224]\ndtype float32")
+    assert read.status == "ok"
+    assert read.text.split("\n")[0] == "Model input", read.text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["ovi\nimage [306, 219, 691, 786]", " result\nimage [0, 0, 999, 999]", "ovi\nchart [69, 113, 943, 885]"],
+)
+def test_a_picture_region_alone_is_still_an_empty_read(raw):
+    """Live answers for the pictures with no text (39 in the recorded set):
+    the drop rule no longer fires for them, and the preamble rule still
+    empties them."""
+    assert ocr.classify(raw).status == "empty"
+
+
+def test_only_the_engine_s_type_words_make_a_layout_line():
+    """QA review r2: with any lower-case word counted as a region type, the
+    slide's 'input [1, 3, 224, 224]' drops the real first line."""
+    read = ocr.classify("Tensor shapes\ninput [1, 3, 224, 224]\nconv1 [1, 64, 112, 112]\nlogits")
+    assert read.status == "ok"
+    assert read.text.split("\n")[0] == "Tensor shapes", read.text
+
+
+def test_a_region_line_after_two_preamble_lines_is_the_image_s_text(monkeypatch):
+    """QA review r2: 327a5ac protected only the FIRST remaining line; with two
+    chatter lines above the layout, the screenshot's 'output' went as
+    preamble. The preamble is now matched on the raw answer, where a region
+    line still carries its marker."""
+    raw = "ovi\nresult\ntext [24, 95, 144, 193]output\ntext [24, 290, 335, 388]42 rows affected"
+    read = _read(monkeypatch, raw)
+    assert (read.status, read.text) == ("ok", "output\n42 rows affected")
+
+
+# ---- 5. an answer that is only the model talking is not a read --
+
+#: Security review r2, live, prompt "OCR", 3 of 3 runs unless noted. Every one
+#: was `ok` at 327a5ac (and at 4810da0), so it reached the chat evidence block,
+#: the video's readable-frame count and the public Files API as page text.
+_MODEL_TALKING = {
+    # A legible code slide, image, video and Files API paths (9 of 9 calls).
+    "compare-to-source": " and compare it to the source image.",
+    # A terminal screenshot, image and Files API paths (6 of 6 calls).
+    "fenced-no-text": " result is:\n\n```text\n[No text detected]\n```",
+    # A blank gradient page, Files API path: a self-critique, the model's own
+    # "no text" verdict, and a Chinese biology sentence in a whole-frame region.
+    "blank-page-hallucination": (
+        ' result, "A" is incorrect because it hallucinates text where none exists. Therefore, the correct'
+        " OCR output is an empty string.\n\n(No text to output)\n"
+        "text [0, 0, 999, 999](1)基因通过控制 通过控制____,____的合成来控制代谢过程,进而控制生物体的性状。"
+    ),
+    "blank-page-critique": (
+        ' result, "A" is incorrect because it hallucinates text where none exists. Therefore, the correct'
+        " OCR output is an empty string.\n(No text to output)"
+    ),
+    # The same blank page, image and video paths.
+    "no-text-placeholder": " result\n[No text detected]\nimage [0, 0, 999, 999]",
+    # Security review r1, image route, a legible 'Model input' slide.
+    "fused-key": ' result:    "text:    "',
+    # Builder, video path, a photo with no text (both runs).
+    "whole-frame-claim": (
+        " text [0, 0, 999, 999]The image contains no text. The visible element is a solid orange circle"
+        " centered at the bottom center. There is no OCR-able content to extract.\nimage [0, 0, 999, 999]"
+    ),
+    # A region marker with nothing in it (security review r1, video path).
+    "empty-malformed-marker": " result [0, 0, 0]",
+    # QA review r2: short preamble runs under the loop floor.
+    "ovi-x3": "ovi ovi ovi",
+    "ovi-x5": "ovi " * 5,
+    "ovi-x11": "ovi " * 11,
+    "result-x3": "result\nresult\nresult",
+    "result-x7": "result\n" * 7,
+    "output-x5": "output\n" * 5,
+    "ovi-lines-x3": "ovi\n" * 3,
+}
+
+
+@pytest.mark.parametrize("raw", list(_MODEL_TALKING.values()), ids=list(_MODEL_TALKING))
+def test_an_answer_that_is_only_the_model_talking_is_an_empty_read(monkeypatch, raw):
+    assert ocr.classify(raw).status == "empty"
+    read = _read(monkeypatch, raw)
+    assert (read.status, read.text) == ("empty", "")
+
+
+#: Live answers where the same kinds of words stand beside a real reading.
+#: None of them may cost the read, and none of them is cut out of it.
+_TALK_BESIDE_A_READ = [
+    # Builder, "OCR", document path: a revenue slide.
+    (
+        " and non-text figures\n\nTherefore, the corrected OCR output is:\n\n```text\n[No text detected]\n"
+        "text [61, 95, 792, 172]Regional Revenue (USD thousands)\n"
+        "table [80, 234, 920, 830]<table>RegionQ2Q3North1,2401,395</table>",
+        "Therefore, the corrected OCR output is:\n\n```text\n[No text detected]\n"
+        "Regional Revenue (USD thousands)\n<table>RegionQ2Q3North1,2401,395</table>",
+    ),
+    # QA review r1: a terminal screenshot.
+    (
+        " result is:\n\n```text\n[No text detected]\ntext [24, 95, 144, 190]output\n"
+        "text [24, 290, 335, 380]42 rows affected\ntext [27, 478, 464, 573]result cached for 300 s",
+        "```text\n[No text detected]\noutput\n42 rows affected\nresult cached for 300 s",
+    ),
+    # Repair round, video path: a form.
+    (
+        " result: The image contains no text. The horizontal line is a stylistic or background element and"
+        " must be ignored according to the rules.\ntext [48, 120, 140, 192]Name\ntext [374, 128, 388, 180]:\n"
+        "text [618, 116, 817, 202]Jordan Avery",
+        "Name\n:\nJordan Avery",
+    ),
+    # QA review r2, video path: a tensor slide.
+    (
+        " result [No text detected]\ntitle [61, 109, 339, 190]Model input\n"
+        "text [74, 279, 421, 335]image [1, 3, 224, 334]\ntext [74, 380, 284, 436]dtype float32",
+        "Model input\nimage [1, 3, 224, 334]\ndtype float32",
+    ),
+    # Security review r2, video path: the matrix slide.
+    (
+        " result [0, 0, 0, 0][Non-Text]\ntitle [54, 136, 388, 212]Matrix rows\n"
+        "text [55, 332, 300, 406][1, 2, 3, 4]\ntext [55, 456, 300, 531][5, 6, 7, 8]",
+        "[Non-Text]\nMatrix rows\n[1, 2, 3, 4]\n[5, 6, 7, 8]",
+    ),
+    # A screenshot of an OCR tool: its own "No text detected" is kept.
+    ("title [1, 2, 3, 4]Scan status\ntext [5, 6, 7, 8][No text detected]", "Scan status\n[No text detected]"),
+]
+
+
+@pytest.mark.parametrize("raw, text", _TALK_BESIDE_A_READ, ids=["table", "terminal", "form", "tensor", "matrix", "ocr-tool"])
+def test_the_model_s_words_beside_a_real_read_never_cost_the_read(monkeypatch, raw, text):
+    read = _read(monkeypatch, raw)
+    assert (read.status, read.text) == ("ok", text)
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_a_whole_frame_region_is_a_read_unless_the_answer_disowns_it(monkeypatch, finish):
+    """A tight crop can fill the frame. Only the model's own "no text" beside
+    it makes a whole-frame region untrustworthy — and the truncation note,
+    which is ours and says "OCR output", must not count as the model's."""
+    read = _read(monkeypatch, "text [0, 0, 999, 999]SUBMIT ORDER", finish=finish)
+    assert (read.status, read.text) == ("ok", "SUBMIT ORDER" + ("\n" + _NOTE if finish == "length" else ""))
+    read = _read(monkeypatch, "(No text to output)\ntext [0, 0, 999, 999]SUBMIT ORDER", finish=finish)
+    assert read.status == "empty"
+
+
+def test_the_image_route_evidence_block_carries_no_model_talk(monkeypatch):
+    _engine_answering(monkeypatch, [_MODEL_TALKING["compare-to-source"], "result\nSERVER ROOM B"])
+    reads = asyncio.run(ocr.read_images(["A", "B"], prompt="OCR"))
+    block = ocr.evidence_block(reads, "image")
+    assert "source image" not in block
+    assert "--- Image 2 of 2 ---\nSERVER ROOM B" in block and "Image 1 of 2" not in block
+
+
+#: Security review r2: the longest runs the engine can emit (6,000 output
+#: tokens, up to 128 spaces a token), and other shapes that were quadratic in
+#: some earlier version of the cleaner.
+_WS = 768_000
+_HOSTILE = {
+    "colon-spaces-768k": ":" + " " * _WS + "x",
+    "result-spaces-768k": "result" + " " * _WS + "x",
+    "output-tabs-768k": "output" + "\t" * _WS + "x",
+    "ovi-spaces-768k": "ovi" + " " * _WS + "\nSERVER ROOM B",
+    "quote-colon-quote": '"' + " " * 200_000 + ":" + " " * 200_000 + '"' + " " * 200_000 + "x",
+    "tab-line-before-layout": "\t" * 300_000 + "\ntext [1, 2, 3, 4]x",
+    "bracket-comma-newlines": "[1," + "\n" * 200_000 + "x",
+    "type-word-space-lines": ("text" + " " * 120 + "\n") * 3000,
+    "letter-newline-runs": "a" + "\n" * 200_000 + "[1, 2, 3, 4]",
+    "twenty-thousand-regions": "\n".join(f"text [1, {i}, 3, 4]row {i}" for i in range(20_000)),
+    "det-openers": "<|det|>" * 6000,
+    "malformed-markers": "\n".join(f"result [0, 0, {i}][1, 2, 3, 4]" for i in range(20_000)),
+    "whole-frame-regions": "\n".join(f"text [0, 0, 999, 999]row {i}" for i in range(20_000)),
+    "no-text-claims": "[No text detected]\n" * 5000 + "x",
+}
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize("raw", list(_HOSTILE.values()), ids=list(_HOSTILE))
+def test_no_answer_shape_holds_the_event_loop(monkeypatch, raw, finish):
+    _engine_answering(monkeypatch, [raw], finish)
+
+    async def run():
+        gaps = []
+        stop = asyncio.Event()
+
+        async def beat():
+            last = time.perf_counter()
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        heartbeat = asyncio.create_task(beat())
+        await asyncio.sleep(0.03)
+        await ocr.read_images(["A"], prompt="OCR")
+        stop.set()
+        await heartbeat
+        return max(gaps)
+
+    with _no_gc_pause():
+        worst = asyncio.run(run())
+    assert worst < 0.5, f"event loop blocked for {worst:.2f}s"
+
+
+def test_a_preamble_loop_cut_off_at_the_output_limit_is_still_a_failed_read(monkeypatch):
+    """Security review r2: the truncated path appends the note after the
+    loop; the loop must still be degenerate, not emptied."""
+    for loop in ("ovi " * 2000, "result\n" * 500, ":\n" * 500, '":"\n' * 500):
+        assert _read(monkeypatch, loop, finish="length").status == "degenerate", loop[:12]
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize(
+    "raw, text",
+    [
+        ("text [61, 95, 792, 172]No text", "No text"),
+        ("title [54, 136, 388, 212]Ground truth", "Ground truth"),
+        ("text [24, 95, 544, 190][No text detected]", "[No text detected]"),
+        ("title [61, 95, 792, 172]Hallucination rates\ntext [74, 279, 421, 335]The image contains no text.",
+         "Hallucination rates\nThe image contains no text."),
+    ],
+    ids=["no-text", "ground-truth", "tool-placeholder", "slide-about-ocr"],
+)
+def test_a_slide_whose_own_words_sound_like_the_model_keeps_its_read(monkeypatch, raw, text, finish):
+    """Security review r2 asked for both directions pinned: the model's "no
+    text" is not a read, but the same words written by the engine AS a
+    region are the image's, and the read stays ok with them verbatim."""
+    read = _read(monkeypatch, raw, finish=finish)
+    assert (read.status, read.text) == ("ok", text + ("\n" + _NOTE if finish == "length" else ""))
+
+
+@pytest.mark.parametrize("raw", ["No text", "No text detected.", "[No text detected]", "The image contains no text."])
+def test_the_same_words_as_the_whole_plain_answer_are_the_model_s(raw):
+    """The other direction: unwrapped, the whole answer, it is the model
+    saying it found nothing."""
+    assert ocr.classify(raw).status == "empty"

@@ -168,6 +168,7 @@ _BBOX_RE = re.compile(r"\[\[\d+(?:,\s*\d+){3}\]\]")
 #: "[1, 2, 3, 4]" on a slide or a REPL.
 _LAYOUT_TYPES = ("text", "title", "image", "header", "table", "page_number", "chart", "footer", "result")
 _TYPE_WORD = "(?:%s)" % "|".join(_LAYOUT_TYPES)
+
 # The format the served model ACTUALLY emits (observed live 2026-08-06):
 # each line starts "type [x, y, x, y]Content" — e.g.
 # "text [31, 306, 212, 347]Vendor: TechSara". Strip the region-type word and
@@ -212,7 +213,14 @@ _LINE_REGION_RE = re.compile(
 #: "Ovid" or "oviparous" keeps it, and a loop that happens to begin "ovišnje…"
 #: is left whole for `is_degenerate` to judge. "output", "result." and
 #: "result:" joined the list from the 96-read measurement described at
-#: `_drop_line_before_layout`.
+#: `_line_before_layout`; "result is:" and 'result:    "text:    "' (the
+#: whole answer for two legible slides, live 3 of 3 runs, 2026-09-18/19) from
+#: the review rounds.
+#:
+#: Matched on the RAW answer (2026-09-19), where a region line still carries
+#: its marker and so can never pass for a preamble: "text [24, 95, 144,
+#: 193]output" is the word "output" on a screenshot, however many preamble
+#: lines stand above it.
 #:
 #: Every quantifier is possessive (`*+`, `?+`; Python 3.11+). The engine's
 #: answer is untrusted text derived from an uploaded image and this runs on
@@ -221,16 +229,17 @@ _LINE_REGION_RE = re.compile(
 #: ':' plus 1,600 spaces (15 output tokens on this tokenizer) took 4.9 s, and
 #: ':' plus 2,500 spaces held the loop for 38 s. The adjacent classes are
 #: disjoint or may match nothing, so possessive matching accepts exactly the
-#: same lines.
+#: same lines. No `\A`: the patterns are matched at an offset.
 _PREAMBLE_LINE_RE = re.compile(
-    r"""\A[ \t]*+(?:
-        ["'`]*+[ \t]*+:[ \t]*+\d*+[ \t]*+["'`]*+    # ':'  '":"'  ': 3'
-      | (?:result|output)[ \t]*+[.:"'`]?+          # 'result'  "result '"  'result.'  'output'
-      | ovi                                        # 'ovi'
+    r"""[ \t]*+(?:
+        ["'`]*+[ \t]*+:[ \t]*+\d*+[ \t]*+["'`]*+                  # ':'  '":"'  ': 3'
+      | (?:result|output)(?:[ \t.:,"'`]++(?:text|is)?+)*+         # 'result'  "result '"  'result is:'
+      | ovi                                                        # 'ovi'
     )[ \t]*+(?:\n|\Z)""",
     re.X,
 )
-_PREAMBLE_TOKEN_RE = re.compile(r"\Aovi[ \t]+(?=\S)")
+_PREAMBLE_TOKEN_RE = re.compile(r"ovi[ \t]+(?=\S)")
+_SPACE_RE = re.compile(r"\s*+")
 #: The most preamble lines one answer carries. Measured on the 296 raw answers
 #: recorded this round: 40 had one, none had two. One more is allowed; past
 #: that, the leading run is the model LOOPING on a preamble ("ovi ovi ovi …",
@@ -238,7 +247,7 @@ _PREAMBLE_TOKEN_RE = re.compile(r"\Aovi[ \t]+(?=\S)")
 #: stripping it line by line turned such a loop into an `empty` screen.
 _MAX_PREAMBLE_LINES = 2
 #: A line the engine wrote as a region: the type word and a 4-number box, or
-#: the model card's det-block spelling (see `_drop_line_before_layout`).
+#: the model card's det-block spelling (see `_line_before_layout`).
 #: Taken for layout, image text such as "input [1, 3, 224, 224]" drops the
 #: real line above it whenever the engine answers without a preamble
 #: ('>>> sorted(xs)' above '[1, 2, 3, 4]', QA 2026-09-18), hence the type
@@ -247,13 +256,12 @@ _MAX_PREAMBLE_LINES = 2
 _LAYOUT_LINE_RE = re.compile(
     r"[^\S\n]*+(?:<\|det\|>|%s[^\S\n]*+\[\d+(?:,\s*\d+){3}\])" % _TYPE_WORD
 )
-#: A FIRST line that merely opens like a region (a type word and a bracketed
-#: number, however many numbers follow) is still the engine's, and whatever is
-#: fused behind it is the image's text: "result [0, 0, 2558][1, 2, 3, 4]",
-#: live 3 of 3 runs, security review 2026-09-19. Deliberately looser than the
-#: rule that says the LATER lines are layout: this one only ever keeps a line.
+#: A FIRST line that merely opens like a region — a type word and a bracketed
+#: number, however many numbers follow — is still the engine's, and whatever
+#: is fused behind it is the image's text ("result [0, 0, 2558][1, 2, 3, 4]",
+#: live 3 of 3 runs, review 2026-09-19). Deliberately looser than the rule
+#: that says the LATER lines are layout: this one only ever keeps a line.
 _REGION_START_RE = re.compile(r"[^\S\n]*+(?:<\|det\|>|%s[^\S\n]*+\[\d)" % _TYPE_WORD)
-
 
 
 def _strip_det_blocks(text: str) -> str:
@@ -282,25 +290,25 @@ def _strip_det_blocks(text: str) -> str:
     parts.append(text[pos:])
     return "".join(parts)
 
-def _strip_preamble(text: str) -> str:
-    """Drop the model's leading preamble line(s); a no-op on real text.
 
-    At most `_MAX_PREAMBLE_LINES`: a longer run of them is a loop, and the
-    text comes back untouched so that `is_degenerate` sees all of it.
+def _preamble_ends(text: str) -> List[int]:
+    """Where each of the answer's leading preamble items ends, in order.
+
+    Linear: each match starts where the last one ended, so a loop of 3,000
+    "ovi" lines costs one pass, not 3,000 re-slicings of the text.
     """
-    out = text
-    for _ in range(_MAX_PREAMBLE_LINES):
-        match = _PREAMBLE_LINE_RE.match(out) or _PREAMBLE_TOKEN_RE.match(out)
+    ends: List[int] = []
+    pos = _SPACE_RE.match(text).end()
+    while True:
+        match = _PREAMBLE_LINE_RE.match(text, pos) or _PREAMBLE_TOKEN_RE.match(text, pos)
         if not match:
-            return out
-        out = out[match.end():].lstrip()
-    if _PREAMBLE_LINE_RE.match(out) or _PREAMBLE_TOKEN_RE.match(out):
-        return text
-    return out
+            return ends
+        pos = _SPACE_RE.match(text, match.end()).end()
+        ends.append(pos)
 
 
-def _drop_line_before_layout(text: str) -> str:
-    """Drop the first line when it stands OUTSIDE the engine's layout.
+def _line_before_layout(text: str) -> Optional[str]:
+    """The first line when it stands OUTSIDE the engine's layout, else None.
 
     This engine writes what it reads as region lines, "type [x, y, x, y]text",
     and a line without a region can only continue the region above it. So a
@@ -319,10 +327,19 @@ def _drop_line_before_layout(text: str) -> str:
 
     A first line that OPENS like a region is kept, even malformed: the only
     one of 412 dropped first lines in the 593 answers recorded by 2026-09-19
-    that held the image's text was "result [0, 0, 2558][1, 2, 3, 4]" (three
-    numbers, so not a region by the strict rule, with the slide's first row
-    fused behind it; `_REGION_START_RE`). Dropping it cost a Files API page a
-    row of numbers while the read still counted as `ok`.
+    that held the image's text was "result [0, 0, 2558][1, 2, 3, 4]" — three
+    numbers, so not a region by the strict rule, and the slide's first row
+    fused behind it (`_REGION_START_RE`). The other lost first line is
+    unavoidable: a slide whose heading is a lower-case "result" that the
+    engine wrote without a region reads exactly like its "OCR" preamble.
+
+    Only a region with text in it says where the reading starts. A picture
+    region ("image [306, 219, 691, 786]", nothing after it) is the engine
+    marking a figure, and in a plain answer the same shape is the image's
+    own words: "Model input / image [1, 3, 224, 224] / dtype float32" lost
+    its title to it (QA 2026-09-19). In the 593 answers, the 39 drops this
+    condition gives up were all a preamble line in front of a picture region
+    on an image with no text, which the preamble rule removes anyway.
 
     A region line is recognised in both of the engine's spellings: the bare
     "type [x, y, x, y]" the served model emits today, and the model card's
@@ -332,10 +349,162 @@ def _drop_line_before_layout(text: str) -> str:
     """
     lines = text.strip().split("\n")
     if len(lines) < 2 or _REGION_START_RE.match(lines[0]):
-        return text
-    if any(_LAYOUT_LINE_RE.match(line) for line in lines[1:]):
-        return "\n".join(lines[1:])
-    return text
+        return None
+    if any(_region_text(line).strip() for line in lines[1:]):
+        return lines[0]
+    return None
+
+
+def _region_text(line: str) -> str:
+    """The text a region line carries; '' for a line that is not a region."""
+    match = _LAYOUT_LINE_RE.match(line)
+    if not match:
+        return ""
+    rest = line[match.end():]
+    if match.group(0).endswith(_DET_OPEN):
+        close = rest.find(_DET_CLOSE)
+        rest = rest[close + len(_DET_CLOSE):] if close >= 0 else ""
+    return rest
+
+
+# ------------------------------------------------------ what is not a read --
+#
+# Lines the engine writes that are not text on the image. They decide only
+# whether an answer READ anything (`classify`'s `empty`); they are never cut
+# out of an `ok` read, because every one of these shapes also appeared in
+# front of real text: the live answers recorded by 2026-09-19 carry
+# '[No text detected]' above a legible table, a terminal and a tensor slide,
+# 'The image contains no text.' above a form, and 'Therefore, the corrected
+# OCR output is:' above a revenue slide. Cutting them would lose nothing
+# there, but a slide that says "No text detected" or "Ground truth" would
+# lose its line with no signal; deciding `empty` only when NOTHING else is
+# left costs at most that slide, and only when the engine did not write the
+# line as a region (see `_REGION_BODY_RE`).
+
+#: A markdown fence the model wraps its answer in ('```text', '```').
+_FENCE_RE = re.compile(r"```[A-Za-z0-9_+-]*+")
+#: A region marker with nothing in it that the strict rule left behind:
+#: 'result [0, 0, 0]' was the whole answer for a legible matrix slide (live,
+#: security review 2026-09-18).
+_EMPTY_MARKER_RE = re.compile(r"%s[^\S\n]*+\[\d+(?:,[^\S\n]*+\d+){0,7}\]" % _TYPE_WORD)
+#: The model saying there is no text. Recorded live: '[No text detected]',
+#: '(No text to output)', '[Non-Text]', 'The image contains no text. …',
+#: 'result: The image contains only a stylistic horizontal line …'.
+_NO_TEXT_RE = re.compile(
+    r"""(?:(?:result|output)[ \t.:,"'`]*+)?(?:
+        [\[(][ \t]*+non?[- ]?text\b[^\])\n]{0,40}[\])]$
+      | no[ \t]+(?:(?:readable|visible|legible)[ \t]+)?text
+            (?:[ \t]+(?:detected|found|present|to[ \t]+(?:output|extract)))?[ \t]*+\.?$
+      | the[ \t]+(?:image|picture|photo|page|frame|screenshot)[ \t]+(?:contains|has|shows)[ \t]+(?:no|only)\b
+    )""",
+    re.I | re.X,
+)
+#: The model talking about the OCR task instead of reading. Recorded live as
+#: the WHOLE answer or the only lines beside a no-text claim:
+#: 'and compare it to the source image.' (a legible code slide, all three
+#: paths, 3 of 3 runs), 'result, "A" is incorrect because it hallucinates
+#: text where none exists. Therefore, the correct OCR output is an empty
+#: string.' (a blank page on the Files API path), 'The Ground Truth image
+#: displays a single, solid horizontal line. According to Rule 2 …'.
+_META_RE = re.compile(
+    r"\b(?:source[ \t]+image|ground[ \t]+truth|ocr[- ]?(?:output|result)s?|ocr-able|hallucinat\w*"
+    r"|empty[ \t]+string|according[ \t]+to[ \t]+(?:the[ \t]+)?rules?)\b",
+    re.I,
+)
+#: A region whose box is the whole frame. In the 593 answers recorded by
+#: 2026-09-19 a text region covered the whole frame 4 times, all on pictures
+#: with no text, and all 4 beside the model's own claim that there was none:
+#: 'The image contains no text. …' twice, and twice a Chinese biology
+#: sentence under '(No text to output)' on a blank page, which reached the
+#: public Files API as that page's text. Such a region counts as a read only
+#: when the answer does not also disown itself.
+_WHOLE_FRAME_RE = re.compile(
+    r"^[^\S\n]*+[a-z_]{1,12}[^\S\n]*+\[0,[^\S\n]*+0,[^\S\n]*+999,[^\S\n]*+999\]([^\n]*)", re.M
+)
+
+
+#: A line the engine wrote as a region of the image: its box and its text.
+#: Such text is the image's, so a slide that says "No text" or "Ground truth"
+#: in a region keeps its read (security review 2026-09-19 asked for both
+#: directions pinned). Two exceptions, both measured: a whole-frame box (see
+#: `_WHOLE_FRAME_RE`) and the "result" type, which is the model's preamble
+#: fused into a region: " result [0, 0, 0, 0][Non-Text]" on a legible matrix
+#: slide (live, video path).
+_REGION_BODY_RE = re.compile(
+    r"^[^\S\n]*+(?:%s)[^\S\n]*+\[(\d+(?:,[^\S\n]*+\d+){3})\]([^\n]*)"
+    % "|".join(t for t in _LAYOUT_TYPES if t != "result"),
+    re.M,
+)
+_WHOLE_FRAME_BOX = "0,0,999,999"
+
+
+def _strip_markup(text: str):
+    """Remove the engine's layout markup in ONE pass per rule.
+
+    Returns the text, the contents of any whole-frame region (see
+    `_WHOLE_FRAME_RE`) and the text of every other region, which only the
+    markers can tell apart.
+    """
+    out = _strip_det_blocks(text)
+    out = _TAG_RE.sub("", out)
+    out = _BBOX_RE.sub("", out)
+    frame = frozenset(t.strip() for t in _WHOLE_FRAME_RE.findall(out) if t.strip())
+    regioned = frozenset(
+        body.strip()
+        for box, body in _REGION_BODY_RE.findall(out)
+        if body.strip() and "".join(box.split()) != _WHOLE_FRAME_BOX
+    )
+    return _LINE_REGION_RE.sub("", out).strip(), frame, regioned
+
+
+def _disowns(line: str) -> bool:
+    """Is this line the model saying there is no text, or critiquing itself?"""
+    line = line.strip()
+    return bool(_NO_TEXT_RE.match(line) or _META_RE.search(line))
+
+
+def _evidence(text: str, frame, regioned, disowned: bool) -> str:
+    """The lines of a cleaned answer that could be text on the image."""
+    kept: List[str] = []
+    for line in text.split("\n"):
+        line = line.strip()
+        # The truncation note is ours, and it says "OCR output": judged as
+        # the model's words it disowned a whole-frame region read.
+        if not line or line == TRUNCATED_NOTE or _FENCE_RE.fullmatch(line) or _EMPTY_MARKER_RE.fullmatch(line):
+            continue
+        if line not in regioned and _disowns(line):
+            disowned = True
+            continue
+        kept.append(line)
+    if disowned and frame:
+        kept = [line for line in kept if line not in frame]
+    return "\n".join(kept)
+
+
+def _clean(raw: Optional[str]):
+    """The engine's raw answer -> (transcript, the part of it that was read).
+
+    Cleaned ONCE (see `clean_transcript`): the first line outside the layout
+    goes, then up to `_MAX_PREAMBLE_LINES` preamble items, then the markup.
+    A longer preamble run is a loop and stays in the transcript for
+    `is_degenerate`; below the loop floor ('ovi ovi ovi', 'result\\nresult',
+    QA 2026-09-19) it was still reported `ok` with the preamble as the
+    image's text, so the evidence is always judged without it.
+    """
+    out = raw or ""
+    chatter = _line_before_layout(out)
+    if chatter is not None:
+        out = out.strip().split("\n", 1)[1]
+    # The dropped line still speaks for the answer: on a blank page the model
+    # wrote its critique first and "(No text to output)" second (live).
+    disowned = chatter is not None and _disowns(chatter)
+    ends = _preamble_ends(out)
+    lead = ends[-1] if ends else 0
+    cut = lead if len(ends) <= _MAX_PREAMBLE_LINES else 0
+    text, frame, regioned = _strip_markup(out[cut:])
+    if cut != lead:
+        return text, _evidence(*_strip_markup(out[lead:]), disowned)
+    return text, _evidence(text, frame, regioned, disowned)
 
 
 def clean_transcript(raw: str) -> str:
@@ -348,19 +517,8 @@ def clean_transcript(raw: str) -> str:
     exactly like a region. A second pass took it for one, dropped the title
     above it and stripped the line itself (measured live 2026-09-18: a slide
     "Python lists / [1, 2, 3, 4] / [5, 6, 7, 8]" came back `empty`).
-
-    A first line the engine wrote AS a region is text from the image, so the
-    preamble rule does not touch it: "text [24, 95, 144, 193]output" is the
-    word "output" on a screenshot, not the model's "output" preamble.
     """
-    out = _drop_line_before_layout(raw or "")
-    first = out.lstrip().split("\n", 1)[0]
-    in_layout = bool(_REGION_START_RE.match(first))
-    out = _strip_det_blocks(out)
-    out = _TAG_RE.sub("", out)
-    out = _BBOX_RE.sub("", out)
-    out = _LINE_REGION_RE.sub("", out).strip()
-    return out if in_layout else _strip_preamble(out)
+    return _clean(raw)[0]
 
 
 # ------------------------------------------------------------ degeneracy --
@@ -510,13 +668,19 @@ def classify(text: str) -> OcrRead:
     Files API's `ocr_empty_pages` (apifiles/ocr_pages.py), which leaves such a
     page exactly as its text layer left it — and until this change those
     four took '":"' for the image's text.
+
+    It also covers an answer that is nothing but the model's other words
+    (2026-09-19): a no-text claim, a fence, a critique of its own output
+    (see "what is not a read"). The loop check comes first, on the whole
+    transcript, so a loop of such lines is still `degenerate`. The `ok` text
+    is the transcript as cleaned; filler is never cut out of it.
     """
-    body = clean_transcript(text)
+    body, evidence = _clean(text)
     if not body:
         return OcrRead("", "empty")
     if is_degenerate(body):
         return OcrRead(body, "degenerate", "the OCR model repeated itself instead of reading the image")
-    if _content_chars(body) < _MIN_CONTENT_CHARS:
+    if _content_chars(evidence) < _MIN_CONTENT_CHARS:
         return OcrRead("", "empty")
     return OcrRead(body, "ok")
 

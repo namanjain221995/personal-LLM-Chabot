@@ -279,6 +279,31 @@ def test_a_scanned_page_keeps_the_row_the_engine_fused_behind_a_malformed_region
     assert "2558" not in json.dumps(pages), "the marker's numbers are not on the page"
 
 
+def test_a_page_the_model_only_talked_about_keeps_its_text_layer(tmp_path):
+    """Security review 2026-09-19, live answers on this path: for a blank
+    gradient page, a self-critique, "(No text to output)" and a Chinese
+    biology sentence the page does not contain; for a legible code slide,
+    only 'and compare it to the source image.'. Both became citable page
+    text with source 'ocr'."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {
+        3: ' result, "A" is incorrect because it hallucinates text where none exists. Therefore, the correct'
+           " OCR output is an empty string.\n\n(No text to output)\n"
+           "text [0, 0, 999, 999](1)基因通过控制 通过控制____,____的合成来控制代谢过程,进而控制生物体的性状。",
+        5: " and compare it to the source image.",
+        7: " result is:\n\n```text\n[No text detected]\n```",
+    }
+    before = {p["page"]: p for p in pages_of(derived)}
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert pages[3] == before[3] and pages[5] == before[5] and pages[7] == before[7]
+    dumped = json.dumps(pages, ensure_ascii=False)
+    assert "基因" not in dumped and "source image" not in dumped and "No text detected" not in dumped
+    assert facts["ocr_empty_pages"] == 3
+    recorded = ocr_pages.load_recorded(derived)
+    assert {p: recorded[p]["status"] for p in (3, 5, 7)} == {3: "empty", 5: "empty", 7: "empty"}
+
+
 def test_the_page_budget_reads_the_first_thin_pages_and_lists_the_rest_as_skipped(tmp_path):
     derived, source = scanned_pdf(tmp_path)
     facts = run_stage(derived, source, budget=2)
