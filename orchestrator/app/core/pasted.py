@@ -100,6 +100,14 @@ _QUESTION = re.compile(
 )
 
 
+#: The markers the model is told pasted material sits between (hotfix 1.2,
+#: P7). A copy of them INSIDE the material is defused, so a paste cannot
+#: close its own fence and speak as the person.
+OPEN_TAG = "<pasted_text>"
+CLOSE_TAG = "</pasted_text>"
+_TAG_IN_MATERIAL = re.compile(r"<\s*/?\s*pasted_text\s*>", re.I)
+
+
 @dataclass(frozen=True)
 class Pasted:
     """A message read as the person's ask plus the material they pasted."""
@@ -183,6 +191,23 @@ def is_transform_ask(message: str) -> bool:
     """A rewrite / reformat / summarise / translate ask over pasted text: one
     pass of the chat engine, and nothing to look up on the web."""
     return read(message) is not None
+
+
+def fenced(message: str) -> str:
+    """The message as the model should read it: the person's ask in their own
+    words, every pasted block between OPEN_TAG and CLOSE_TAG. Unchanged when
+    it is not a transform ask over pasted text."""
+    pasted = read(message)
+    if pasted is None:
+        return message
+    out = []
+    for kind, text in pasted.parts:
+        if kind == "ask":
+            out.append(text)
+        else:
+            body = _TAG_IN_MATERIAL.sub(lambda m: m.group(0).replace("<", "(").replace(">", ")"), text)
+            out.append(f"{OPEN_TAG}\n{body}\n{CLOSE_TAG}")
+    return "\n\n".join(out)
 
 
 def _question_lines(text: str) -> List[str]:
