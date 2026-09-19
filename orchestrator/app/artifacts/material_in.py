@@ -527,14 +527,22 @@ def wants_conversation_datasets(intent: Optional[I.ArtifactIntent]) -> bool:
     plot in it. `engines/artifact` runs such a turn as an edit; this is the
     same judgement on the material side, and it has to be made here because
     `gather` runs before the parent artifact is picked.
+
+    A CHART IS DRAWN FROM DATA WHATEVER THE TARGET (hotfix 1.1, 2026-09-19).
+    The previous_answer early return ran BEFORE the chart check: when the
+    report came back as a text answer, "also i want Plots on this docs" is
+    create / previous_answer / chart_request, no CSV was read, and every
+    chart in the file became "the table 'customers-100.csv' is not
+    available" (live replay on main @ 4e7cf8e). A previous_answer target
+    with no chart still reads nothing: that file is the answer as written.
     """
     if intent is None:
         return False
+    action = str(getattr(intent, "action", "") or "")
+    if action in ("create", "edit", "convert") and bool(getattr(intent, "chart_request", False)):
+        return True
     if str(getattr(intent, "target", "") or "") == "previous_answer":
         return False
-    action = str(getattr(intent, "action", "") or "")
-    if action == "convert" and bool(getattr(intent, "chart_request", False)):
-        return True
     if action not in ("create", "edit"):
         return False
     return True
