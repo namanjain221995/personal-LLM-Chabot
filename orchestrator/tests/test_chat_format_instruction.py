@@ -128,6 +128,20 @@ def test_a_rewrite_keeps_every_source_item_and_adds_no_fact_of_its_own():
     assert "Never add a detail the source does not state" in text
 
 
+def test_a_rewrite_keeps_each_items_details_and_takes_nothing_from_the_sample():
+    """Hotfix 1.2 follow-up, measured live on this branch (Fast, 3 runs of the
+    reported shape): every item was kept but one run shortened five of them
+    ("Expert Apex, including asynchronous Apex." for "... Queueable, Batch,
+    Schedulable and future methods"); one run copied the sample's "Email
+    your CV to the talent team" into How to Apply; one wrote "a team of 14
+    developers" for "14 people: 9 developers, 2 admins...". Each clause names
+    one of those."""
+    text = FORMAT_INSTRUCTION
+    assert "with all of its details" in text
+    assert "or taking them from the sample" in text
+    assert "keep every number with what it counts" in text
+
+
 # ---------------------------------------------------------------------------
 # 2. A Fast turn does not think
 # ---------------------------------------------------------------------------

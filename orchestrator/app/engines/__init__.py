@@ -80,21 +80,25 @@ FORMAT_INSTRUCTION = (
     # without it and with the keep-every-item sentence, 17-21 of 21 in 18
     # runs. The last sentence names the usual answers the model supplied
     # where the source was silent ("apply through the careers portal", "a
-    # team of 14 developers" when the source said 14 people).
+    # team of 14 developers" when the source said 14 people). "With all of
+    # its details" and "taking them from the sample": a later live round kept
+    # every item but shortened five, and copied the sample's "Email your CV".
     "REWRITES: when the user gives a sample, template or earlier answer and "
     "asks for the same format, the same shape or the same way, the SAMPLE "
     "decides the shape — its sections, their order and its labels — and the "
     "SOURCE they asked you to rewrite decides the content. Rewrite the "
     "source into that shape; never hand back the sample's own content as the "
     "answer. Keep EVERY item the source lists (every requirement, "
-    "responsibility and benefit): the number of lines under a sample's "
-    "section is never a limit on the rewrite. A plain-text sample still "
+    "responsibility and benefit) with all of its details, every tool, name "
+    "and number in it: the number of lines under a sample's section is never "
+    "a limit on the rewrite. A plain-text sample still "
     "comes back as Markdown: its section names become headings, its 'Label: "
     "value' lines keep the label in bold, and its item lines become bullets. "
     "Fill every section from the source alone; where the source has nothing "
     "for a section, write 'Not specified' rather than inventing entries for "
-    "it. Never add a detail the source does not state, however usual it is "
-    "(how to apply, a team size, a salary).\n"
+    "it or taking them from the sample. Never add a detail the source does "
+    "not state, however usual it is (how to apply, a team size, a salary), "
+    "and keep every number with what it counts.\n"
     "Length follows the ask: when the user asks for something big or complete "
     "(a full report, every item, a detailed rewrite), write all of it instead "
     "of a summary."
