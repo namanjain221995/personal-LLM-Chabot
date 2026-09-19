@@ -9,14 +9,16 @@ such content that reaches a prompt:
   * group values  (aggregates.by_group: the values of a column with at most
                    50 distinct values that occur in at least GROUP_MIN_ROWS
                    rows, from a column not named like an identifier or a
-                   contact detail; values truncated)
+                   personal detail and with no value shaped like an email or
+                   a long number; values truncated)
 
 All three go through `clip()`. Everything else is derived statistics: sums,
 averages, counts, months. Group values are NOT the same class as top values:
 top values show the 5 most common, group values list up to 50. QA measured
 the difference on 2026-09-18 (a status seen once at row 4,322, 40 synthetic
 SSNs and emails reaching the prompt), so a value seen in one row, and any
-column named like a key or a contact, is never listed value by value.
+personal column (_personal_name, _personal_value), is never listed value by
+value.
 
 Note what is deliberately ABSENT: min/max VALUES for string columns. Those are
 an arbitrary raw cell from anywhere in the file — the alphabetically first
@@ -344,20 +346,73 @@ def _is_measure(name: Any, dtype: str, nonnull: int, distinct: int, lo: Any, hi:
     return not (nonnull >= 2 and distinct == nonnull)
 
 
-# Names that make a column an identifier or a contact detail. Such a column is
-# never broken down value by value, however few values it has: QA measured a
-# 1,200-row payroll file whose 40 synthetic SSNs and 40 emails ALL reached the
-# prompt through by_group (5 and 9 of them on 4810da0, through the sample and
-# top values). Its top values are unchanged.
-_CONTACT_TOKENS = frozenset({
-    "email", "mail", "address", "addr", "street", "passport", "password",
-    "passwd", "secret", "token", "iban", "ip",
+# A PERSONAL column is never broken down value by value, however few values
+# it has: QA r1 measured a 1,200-row payroll file whose 40 synthetic SSNs and
+# 40 emails ALL reached the prompt through by_group (5 and 9 of them on
+# 4810da0, through the sample and top values). Its top values are unchanged.
+# Personal is a contact detail, a government or financial number, or a
+# credential, by NAME or by VALUE.
+#
+# Names match with digits stripped and, for the longer words, as a prefix or
+# suffix of a token. Security r2: matched as whole tokens, email1, Email2,
+# ssn1 and mobile1 passed the guard and 30 of 30 values of each reached the
+# prompt (WorkEmail, split by camelCase, stayed out).
+#: A token equal to one of these once its digits are stripped (ssn1, ip2).
+#: Short words are not matched inside tokens: "tel" is in hotel, "pin" in spin.
+_PERSONAL_TOKENS = frozenset({
+    "ssn", "sin", "tin", "nin", "pan", "ip", "tel", "fax", "pin", "dob", "cvv",
+    "cvc", "iban", "bic", "swift", "uuid", "guid", "key", "otp", "aadhaar",
+    "aadhar",
 })
+#: A token that starts or ends with one of these (email1, workemail,
+#: phoneno, homephone, mobile2, dateofbirth).
+_PERSONAL_STEMS = (
+    "email", "mail", "phone", "mobile", "passport", "password", "passwd",
+    "secret", "token", "address", "addr", "street", "birth",
+)
+#: Two DIFFERENT words that together name a personal number: national_id,
+#: tax_no, patient_id, card_number, social_security, bank_account,
+#: driver_license. One of them alone (license_type, card_type, tax_rate,
+#: employee_id) is not personal.
+_PERSONAL_PAIRS = (
+    (frozenset({
+        "national", "tax", "voter", "health", "insurance", "medicare", "medicaid",
+        "nhs", "patient", "citizen", "resident", "social", "licence", "license",
+        "card", "routing",
+    }), frozenset({"id", "no", "num", "nbr", "number"})),
+    (frozenset({"social"}), frozenset({"security"})),
+    (frozenset({"credit", "debit"}), frozenset({"card"})),
+    (frozenset({"bank"}), frozenset({"account", "acct"})),
+    (frozenset({"driver", "drivers", "driving"}), frozenset({"licence", "license"})),
+)
+#: Values that look personal whatever the column is called: an email, or a
+#: text with nine or more digits (an SSN has 9, a phone 10-13, a card 13-19,
+#: an IBAN up to 30).
+_EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
+_PERSONAL_DIGITS = 9
+
+
+def _personal_name(name: Any) -> bool:
+    tokens = _name_tokens(name)
+    words = {t.strip("0123456789") for t in tokens}
+    if words & _PERSONAL_TOKENS:
+        return True
+    if any(t.startswith(stem) or t.endswith(stem) for t in tokens for stem in _PERSONAL_STEMS):
+        return True
+    return any(words & first and words & second for first, second in _PERSONAL_PAIRS)
+
+
+def _personal_value(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return bool(_EMAIL_SHAPE.search(text)) or sum(ch.isdigit() for ch in text) >= _PERSONAL_DIGITS
 
 
 def _is_group_key(name: Any) -> bool:
+    if _personal_name(name):
+        return False
     tokens = _name_tokens(name)
-    if set(tokens) & (_KEY_TOKENS | _CONTACT_TOKENS):
+    if {t.strip("0123456789") for t in tokens} & _KEY_TOKENS:
         return False
     return not (tokens and tokens[-1] in _KEY_LAST_TOKENS)
 
@@ -484,11 +539,20 @@ def _ranked(rows: List[tuple]) -> List[tuple]:
     )
 
 
-def _group_breakdowns(con, src: str, group: str, gident: str, plans: List[dict], omitted: List[str]) -> List[dict]:
+def _group_breakdowns(
+    con, src: str, group: str, gident: str, plans: List[dict], omitted: List[str], check_values: bool = True,
+) -> List[dict]:
     sums = ", ".join(f"{p['sum_sql']}, COUNT({p['ident']})" for p in plans)
     found = con.execute(
         f"SELECT {gident}, CAST({gident} AS VARCHAR), COUNT(*), {sums} FROM {src} GROUP BY 1, 2"
     ).fetchall()
+    # A column whose values look like emails or long numbers is a contact or
+    # account column whatever its name ("contact", "owner"): not listed.
+    if check_values and any(_personal_value(text) for v, text, *_rest in found if v is not None):
+        omitted.append(
+            f"by_group {_label(group)}: not listed, its values look like contact details or account numbers"
+        )
+        return []
     # A value held by fewer than GROUP_MIN_ROWS rows is one raw cell from
     # anywhere in the file: it is left out, and the entry says so. The blank
     # group (None) is not content and always stays.
@@ -739,7 +803,9 @@ def _aggregates(
         )
     for g in groups[:AGG_MAX_GROUP_COLUMNS]:
         try:
-            agg["by_group"].extend(_group_breakdowns(con, src, g["name"], g["ident"], plans, omitted))
+            agg["by_group"].extend(
+                _group_breakdowns(con, src, g["name"], g["ident"], plans, omitted, g.get("check_values", True))
+            )
         except Exception as exc:  # noqa: BLE001 — one bad column must not sink the rest
             omitted.append(f"by_group {_label(g['name'])}: could not be computed ({type(exc).__name__})")
     if len(dates) > AGG_MAX_DATE_COLUMNS:
@@ -1147,8 +1213,14 @@ def profile_tabular(
                 and _is_group_key(col["name"])
             ):
                 # A grouping key: few values, and they REPEAT. An all-distinct
-                # column would give one row per group, which is the file.
-                groups.append({"name": col["name"], "ident": ident})
+                # column would give one row per group, which is the file. A
+                # date's or a flag's text is never contact-shaped, and a
+                # timestamp such as 2024-01-15 10:00:00 has twelve digits.
+                groups.append({
+                    "name": col["name"], "ident": ident,
+                    "check_values": _date_kind(col["dtype"]) is None
+                    and (col["dtype"] or "").upper() not in ("BOOLEAN", "TIME"),
+                })
             kind = _date_kind(col["dtype"])
             if kind is not None and nonnull > 0:
                 dates.append({"name": col["name"], "ident": ident, "kind": kind})

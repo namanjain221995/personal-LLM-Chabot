@@ -1110,3 +1110,68 @@ def test_opposite_a_file_with_every_date_filled_says_nothing_about_months(tmp_pa
     path = tmp_path / "dated.csv"
     path.write_text("\n".join(lines) + "\n")
     assert profiler.profile_tabular(str(path))["aggregates"]["omitted"] == []
+
+
+# ---------------------------------------------------------------------------
+# Personal columns: names matched with digits stripped and as prefixes or
+# suffixes, and values shaped like emails or long numbers.
+# ---------------------------------------------------------------------------
+
+
+def test_a_digit_glued_to_a_contact_name_does_not_open_the_column(tmp_path):
+    """Security r2 (#9): the name guard matched whole tokens, so email1,
+    Email2, ssn1 and mobile1 passed it: 30 of 30 values of each reached the
+    prompt at 4b90840 (9, 9, 5 and 5 on 4810da0). WorkEmail stayed at 9."""
+    cols = {
+        "email1": [f"p{i}@example.invalid" for i in range(30)],
+        "Email2": [f"q{i}@example.invalid" for i in range(30)],
+        "ssn1": [f"9{i:02d}-00-{2000 + i}" for i in range(30)],
+        "mobile1": [f"555-01{i:02d}" for i in range(30)],
+        "WorkEmail": [f"w{i}@example.invalid" for i in range(30)],
+    }
+    path = tmp_path / "contacts.csv"
+    lines = [",".join(cols) + ",region,amount"]
+    for r in range(1200):
+        lines.append(",".join(v[r % 30] for v in cols.values()) + f",{'NSEW'[r % 4]},{r % 97}.25")
+    path.write_text("\n".join(lines) + "\n")
+    prompt = _prompt(profiler.profile_tabular(str(path)))
+    cap = settings.profile_top_values + settings.profile_sample_rows
+    for name, values in cols.items():
+        assert sum(v in prompt for v in values) <= cap, name
+
+
+@pytest.mark.parametrize("name, values", [
+    ("passport2", [f"X{i:03d}" for i in range(12)]),  # a personal name, short values
+    ("ssn1", [f"S{i:03d}" for i in range(12)]),  # only the digit split finds "ssn" here
+    ("api_key2", [f"K{i:03d}" for i in range(12)]),
+    ("national_id", [f"N{i:03d}" for i in range(12)]),
+    ("contact", [f"+44 20 7946 {i:04d}" for i in range(12)]),  # an innocent name, phone-shaped values
+    ("owner", [f"o{i}@example.invalid" for i in range(12)]),  # an innocent name, email-shaped values
+    ("card_number", [f"C{i:03d}" for i in range(12)]),
+])
+def test_personal_names_and_contact_shaped_values_are_never_groups(tmp_path, name, values):
+    lines = [f"{name},amount"] + [f"{values[i % 12]},{i}.50" for i in range(360)]
+    path = tmp_path / "p.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert name not in {g["group"] for g in prof["aggregates"]["by_group"]}
+    assert sum(v in json.dumps(prof["aggregates"]) for v in values) == 0
+
+
+@pytest.mark.parametrize("name", ["hotel", "spinner", "keyboard_layout", "region2", "ship_mode"])
+def test_opposite_a_short_personal_word_inside_another_word_does_not_close_the_column(tmp_path, name):
+    """The prefix/suffix match is for the longer words only: 'tel', 'pin',
+    'key' and 'ip' inside hotel, spinner, keyboard and ship are not personal."""
+    lines = [f"{name},amount"] + [f"v{i % 6},{i}.50" for i in range(120)]
+    path = tmp_path / "o.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert name in {g["group"] for g in agg["by_group"]}, agg["omitted"]
+
+
+def test_opposite_timestamps_and_dates_as_groups_are_not_mistaken_for_long_numbers(tmp_path):
+    lines = ["shift_start,amount"] + [f"2024-03-0{1 + i % 5} 10:00:00,{i}.25" for i in range(100)]
+    path = tmp_path / "shifts.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert "shift_start" in {g["group"] for g in agg["by_group"]}, agg["omitted"]
