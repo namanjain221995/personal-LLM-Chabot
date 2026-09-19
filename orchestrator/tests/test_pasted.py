@@ -120,4 +120,29 @@ def test_an_earlier_pasted_turn_is_reduced_to_its_ask():
     # person's heading, so it rides along with the ask; the posting does not.
     assert ASK in out[0]["content"]
     assert "Orbiton" not in out[0]["content"]
-    assert out[1:] == turns[1:]
+    # The assistant turn that answered a paste is its reworded copy (names,
+    # e-mails): it is dropped too (review 2026-09-19, F3). Later turns stay.
+    assert out[1:] == turns[2:]
+
+
+def test_a_typed_multi_line_question_still_has_words_to_search():
+    """Five typed lines, no blank line, ending in the person's own request: the
+    pill-on search used to send nothing (review 2026-09-19, R2)."""
+    typed = "\n".join([
+        "I run a small ML lab and we are choosing hardware this quarter.",
+        "Our budget is about 50,000 US dollars in total, including power work.",
+        "We mostly fine-tune 7B and 13B models, with some 70B inference.",
+        "The room is limited to about 3 kW of power and has no liquid cooling.",
+        "I need the current street prices of the H100 PCIe and the RTX 6000 Blackwell in 2026.",
+    ])
+    assert pasted.search_words(typed).startswith("I need the current street prices")
+    # the same block ending in a line with an e-mail sends nothing
+    assert pasted.search_words(typed + "\nI am at ravi.k@example.invalid") == ""
+
+
+def test_the_rewrite_shaper_keeps_nested_items_and_indented_code():
+    from app.core import rewrite_shape
+
+    shaper = rewrite_shape.Shaper(frozenset())
+    assert shaper._shape_line("  - a nested item") == "  - a nested item"
+    assert shaper._shape_line("    x = compute(y)") == "    x = compute(y)"

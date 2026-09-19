@@ -97,9 +97,10 @@ _ADDRESSED_TO_A_MODEL = re.compile(
 #: the model (`fenced`). Narrower than _ADDRESSED_TO_A_MODEL on purpose - a
 #: line about a human "assistant" is ordinary content and is kept.
 _TO_AN_AI = re.compile(
-    r"\b(?:(?:note|message|instructions?|reminder)\s+(?:to|for)\s+(?:any\s+|every\s+|the\s+|an?\s+)?"
-    r"(?:ai|chatbot|bot|llm|language\s+model|gpt|chatgpt)\b"
-    r"|(?:any|every|dear)\s+(?:ai|llm|chatbot|language\s+model)\b"
+    r"^\W*(?:(?:note|message|instructions?|reminder)\s+(?:to|for)\s+(?:any\s+|every\s+|the\s+|an?\s+)?"
+    r"(?:ai|chatbot|bot|llm|language\s+model|gpt|chatgpt)(?:\s+[\w'’]+){0,8}?\s*[:,-]"
+    r"|\b(?:dear)\s+(?:ai|llm|chatbot|language\s+model)\b"
+    r"|^\W*(?:any|every)\s+(?:ai|llm|chatbot|language\s+model)(?:\s+[\w'’]+){0,8}?\s*[:,-]"
     r"|if\s+you\s+are\s+an?\s+(?:ai|llm|language\s+model|chatbot)\b"
     r"|ignore\s+(?:all\s+|any\s+)?(?:the\s+)?(?:previous|prior|above|earlier)\s+instructions\b)",
     re.I,
@@ -125,6 +126,9 @@ _QUESTION = re.compile(
 OPEN_TAG = "<pasted_text>"
 CLOSE_TAG = "</pasted_text>"
 _TAG_IN_MATERIAL = re.compile(r"<\s*/?\s*pasted_text\s*>", re.I)
+#: An email address or a phone number: never a web query's business when it
+#: came in a paste (reviewer, hotfix 1.2).
+_PII = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\+?\d(?:[\s().-]{0,2}\d){7,}")
 
 
 @dataclass(frozen=True)
@@ -243,11 +247,17 @@ def _question_lines(text: str) -> List[str]:
     """The first and last non-blank lines of a paste, when they read as the
     person's question or request. At most two short lines: anything longer,
     or anything in between, is material."""
-    lines = [ln.strip() for ln in _lines(text) if ln.strip()]
+    raw = _lines(text)
+    idx = [i for i, ln in enumerate(raw) if ln.strip()]
+    # Only a line SET APART from the rest by a blank line is the person's.
+    ends = ([idx[0]] if len(idx) > 1 and not raw[idx[0] + 1].strip() else []) + (
+        [idx[-1]] if len(idx) > 1 and not raw[idx[-1] - 1].strip() else []
+    )
     picked: List[str] = []
-    for ln in (lines[:1] + lines[-1:]) if lines else []:
+    for ln in (raw[i].strip() for i in ends):
         if (
-            len(ln) <= ASK_MAX_CHARS
+            not _PII.search(ln)
+            and len(ln) <= ASK_MAX_CHARS
             and _QUESTION.search(ln)
             and not _ADDRESSED_TO_A_MODEL.search(ln)
             and ln not in picked
@@ -270,11 +280,41 @@ def own_words(message: str) -> str:
     return " ".join(_question_lines(text))
 
 
+#: A line that reads as the person talking, not as a line of a document: it
+#: opens with the first person, a request or a question word, or ends in "?".
+_PERSON_TALKING = re.compile(
+    r"^(?:i|i'?m|i'?d|i'?ve|we|we'?re|we'?d|my|our|please|pls|can\s+you|could\s+you|"
+    r"help\s+me|tell\s+me|what|which|how|why|when|where|who|is|are|should|do|does)\b"
+    r"|\?\s*$",
+    re.I,
+)
+
+
+def search_words(message: str) -> str:
+    """What a web search may use: the person's own words, or - when none can
+    be told apart and the message is one block of lines with no blank line
+    between them, which is how a person TYPES a long question - its last
+    line, unless that line holds an e-mail or phone number. A typed 5-line
+    question ending "I need the current street prices of the H100 PCIe" made
+    no query at all with the pill on (review 2026-09-19, R2)."""
+    words = own_words(message)
+    if words.strip():
+        return words
+    raw = _lines(message or "")
+    idx = [i for i, ln in enumerate(raw) if ln.strip()]
+    if not idx or any(not raw[i].strip() for i in range(idx[0], idx[-1] + 1)):
+        return ""
+    last = raw[idx[-1]].strip()
+    if _PII.search(last) or len(last) > ASK_MAX_CHARS or not _PERSON_TALKING.match(last):
+        return ""
+    return last
+
+
 def web_query(message: str) -> str:
     """A web-search query for this message that carries none of what was
     pasted into it: the person's own words, at most WEB_QUERY_MAX_CHARS, cut
     at a word. "" means there is nothing of theirs to search for."""
-    words = " ".join(own_words(message).split())
+    words = " ".join(search_words(message).split())
     if len(words) <= WEB_QUERY_MAX_CHARS:
         return words
     cut = words[:WEB_QUERY_MAX_CHARS]
@@ -286,9 +326,15 @@ def own_turns(turns: Sequence[dict]) -> List[dict]:
     user turn reduced to the person's own words (an earlier turn's paste would
     otherwise be rewritten into this turn's search phrases)."""
     out: List[dict] = []
+    after_paste = False
     for turn in turns:
         content = turn.get("content")
-        if turn.get("role") == "user" and isinstance(content, str) and is_paste(content):
+        if turn.get("role") == "assistant" and after_paste:
+            # Its answer to a paste is that paste, reworded.
+            after_paste = False
+            continue
+        after_paste = turn.get("role") == "user" and isinstance(content, str) and is_paste(content)
+        if after_paste:
             turn = {**turn, "content": own_words(content)}
         out.append(turn)
     return out
@@ -332,6 +378,13 @@ def carries_paste(query: str, material: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _turn_material: ContextVar[Tuple[str, ...]] = ContextVar("_turn_material", default=())
+_turn_pii: ContextVar[Tuple[str, ...]] = ContextVar("_turn_pii", default=())
+
+
+def _pii_of(message: str) -> Tuple[str, ...]:
+    if not is_paste(message or ""):
+        return ()
+    return tuple(_norm(m) for m in _PII.findall(message))
 
 
 def mark_turn(*messages: str) -> None:
@@ -344,12 +397,19 @@ def mark_turn(*messages: str) -> None:
     )
     if fresh:
         _turn_material.set(known + fresh)
+    pii = tuple(dict.fromkeys(t for x in messages for t in _pii_of(x) if t not in _turn_pii.get()))
+    if pii:
+        _turn_pii.set(_turn_pii.get() + pii)
 
 
 def without_paste(queries: Iterable[str], *messages: str) -> List[str]:
     """`queries` minus every one that carries a run of pasted material from
     this turn or from `messages`."""
     materials = [m for m in _turn_material.get() + tuple(pasted_material(x) for x in messages) if m]
-    if not materials:
+    pii = _turn_pii.get() + tuple(t for x in messages for t in _pii_of(x))
+    if not materials and not pii:
         return list(queries)
-    return [q for q in queries if not any(carries_paste(q, m) for m in materials)]
+    return [
+        q for q in queries
+        if not any(carries_paste(q, m) for m in materials) and not any(t in _norm(q) for t in pii)
+    ]

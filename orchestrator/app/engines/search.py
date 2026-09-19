@@ -476,7 +476,7 @@ async def rewrite_queries(
     # ("what does this role pay in Pune?"), never the pasted posting it
     # follows, and an earlier turn's paste is reduced the same way; a query
     # that still carries a run of pasted text is dropped before it leaves.
-    asked = pasted.own_words(message)
+    asked = pasted.search_words(message)
     if not asked:
         return []
     turns = conversation_turns(history, 4)
@@ -1699,10 +1699,16 @@ async def run_search_engine(
         # already renders (finding S6 — this was invisible in every channel).
         await emit("status", {"text": _degraded_note(degraded)})
     if not results:
-        return await _fallback(
-            message, history, emit,
-            "No web results found — answering from model knowledge.", effort,
+        # A long multi-line message with no line of the person's own could not
+        # be told apart from pasted text, so nothing was searched; saying "no
+        # results" would be false (review 2026-09-19, R2).
+        note = (
+            "I couldn't tell your question apart from the pasted text, so I didn't "
+            "search the web with it. Put your question on its own line to search."
+            if pasted.read(message) is not None and not pasted.search_words(message).strip()
+            else "No web results found — answering from model knowledge."
         )
+        return await _fallback(message, history, emit, note, effort)
 
     # The rewrite already resolved "and its score?" into a query naming the
     # entity; everything downstream used to get the bare phrase back

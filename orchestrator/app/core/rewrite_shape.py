@@ -131,6 +131,10 @@ class Shaper:
     def _shape_line(self, line: str) -> Optional[str]:
         """The line rewritten as a heading or a bold label, or None when it is
         not one (an item candidate, a blank line, or Markdown already)."""
+        # Indented lines (a nested list item, an indented code line) keep their
+        # indentation and are never turned into labels (review 2026-09-19).
+        if line[:1] in (" ", "\t") and line.strip():
+            return line
         s = line.strip()
         m = _HEADING_LABEL.match(s)
         if m and _words(m.group(1)) <= 5:
@@ -139,7 +143,7 @@ class Shaper:
         if m:
             return f"## {m.group(1).strip()}"
         if _MARKDOWN.match(s) or _BOLD_LABEL.match(s):
-            return s
+            return line
         m = _PLAIN_LABEL.match(s)
         if m and _words(m.group(1)) <= 5:
             return f"**{m.group(1).strip()}:** {m.group(2).strip()}"

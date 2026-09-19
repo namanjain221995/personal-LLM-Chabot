@@ -465,6 +465,10 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
             content = message_.get("content")
             if not isinstance(content, str):
                 continue
+            if role == "user":
+                # What the person SAID, never what they pasted (reviewer,
+                # hotfix 1.2): this string becomes a web query.
+                content = pasted.own_words(content)
             picked = [w for w in _content_words(content) if w not in have]
             if picked:
                 return picked
@@ -474,7 +478,9 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
     # what they would have repeated if asked to be explicit. The assistant's
     # answer is the fallback, for "and its score?" where the entity was named
     # only in the reply.
-    extra = _harvest("user") or _harvest("assistant")
+    last_user = next((m for m in reversed(conversation_turns(history, 4)) if m.get("role") == "user"), None)
+    after_paste = bool(last_user) and pasted.is_paste(str(last_user.get("content") or ""))
+    extra = _harvest("user") or ([] if after_paste else _harvest("assistant"))
     if not extra:
         return text
     # Appended PLAIN, not parenthesised. The search path brackets its

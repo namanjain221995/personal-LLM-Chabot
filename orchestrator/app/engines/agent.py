@@ -130,7 +130,9 @@ _PLAN_SYSTEM = (
     "A request for DATA — a list, a count, records, a breakdown — MUST be a "
     "sql or salesforce step. Never plan an llm step whose output would be a "
     "query for the user to run: this platform executes queries itself, and "
-    "an answer telling the user to open Workbench is a failure."
+    "an answer telling the user to open Workbench is a failure.\n"
+    "A web step's input is a search: never copy a person's name, e-mail "
+    "address, phone number or other personal detail from pasted text into it."
 )
 
 # Salesforce OFF: NO Salesforce access. Everything is an "llm" step working from
