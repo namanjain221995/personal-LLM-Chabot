@@ -171,6 +171,42 @@ seven eight nine ten twenty hi hello hey so and or but also plus if when what wh
 was were do does can could would should will have has had got get with for from about
 """.split())
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+.-]*[A-Za-z0-9+]|[A-Za-z0-9]")
+#: A name leaves the box as a search query, so it must never carry a personal
+#: identifier. The round-7 verifier (2026-09-19) sent a PAN, an IBAN, an account
+#: number, an employee id, a passport number and a person's name out as
+#: queries. A run is dropped when one of these words sits just before it, when
+#: it holds an id shape, or when it is a company rather than a product.
+_PERSONAL_CUE_WORDS = frozenset("""
+iban pan account acct id ids number no num employee emp passport ssn aadhaar aadhar policy
+order invoice customer member ref reference card phone mobile tel licence license gstin tin
+roll pin otp password username login email mail guarantor borrower applicant name surname
+""".split())
+_CUE_WINDOW = 3
+_LONG_DIGITS_RE = re.compile(r"\d{5,}")
+_PAN_RE = re.compile(r"^[A-Z]{5}\d{4}[A-Z]$")
+_IBAN_RE = re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$")
+#: "McKenzie", "DeVries", "O'Brien": an inner capital that belongs to a surname.
+_SURNAME_PREFIX_RE = re.compile(r"^(?:Mc|Mac|De|Di|Da|Van|Von|Le|La|Du|O')[A-Z][a-z]+$")
+_COMPANY_SUFFIXES = frozenset(
+    "gmbh ltd inc llc plc ag sa corp co pvt llp limited bv nv oy ab kg srl spa".split()
+)
+
+
+def _carries_personal_data(run: List[str], before: List[str]) -> bool:
+    """Whether a candidate name is, or sits beside, a personal identifier."""
+    if any(w.lower().rstrip(".:") in _PERSONAL_CUE_WORDS for w in before[-_CUE_WINDOW:]):
+        return True
+    standard = run[0].upper() in _STANDARD_BODIES
+    for tok in run:
+        if _PAN_RE.match(tok) or _IBAN_RE.match(tok):
+            return True
+        if _LONG_DIGITS_RE.search(tok) and not standard:
+            return True
+        if tok.lower().rstrip(".") in _COMPANY_SUFFIXES:
+            return True
+    return False
+
+
 #: How much of each text the name finder reads (same bound as the router).
 _NAME_SCAN_CHARS = 2_000
 #: How many of the person's own recent turns may name the product.
@@ -179,6 +215,8 @@ _NAME_TURNS = 3
 
 def _is_model_token(tok: str, shouting: bool) -> bool:
     if _UNIT_TOKEN_RE.match(tok) or tok.upper() in _GENERIC_CAPS:
+        return False
+    if _SURNAME_PREFIX_RE.match(tok):
         return False
     if shouting and tok.isupper() and not any(c.isdigit() for c in tok):
         return False  # a message typed in capitals has no signal in capitals
@@ -191,20 +229,27 @@ def _names_in(text: str) -> List[str]:
     letters = [c for c in text if c.isalpha()]
     shouting = len(letters) > 20 and sum(c.isupper() for c in letters) > 0.6 * len(letters)
     runs: List[List[str]] = []
+    starts: List[int] = []
+    toks: List[str] = []
     prev_end = -2
     for m in _TOKEN_RE.finditer(text):
         tok = m.group(0)
         namey = _NAME_TOKEN_RE.match(tok) or _is_model_token(tok, shouting)
-        joined = runs and text[prev_end:m.start()] == " "
+        joined = runs and runs[-1] and text[prev_end:m.start()] == " "
         if namey and joined:
             runs[-1].append(tok)
         elif namey:
             runs.append([tok])
+            starts.append(len(toks))
         else:
             runs.append([])
+            starts.append(len(toks))
+        toks.append(tok)
         prev_end = m.end()
     names: List[str] = []
-    for run in runs:
+    for run, start in zip(runs, starts):
+        if run and _carries_personal_data(run, toks[max(0, start - _CUE_WINDOW):start]):
+            continue
         while run and (run[0].lower() in _NAME_EDGE_WORDS or run[0].isdigit()):
             run = run[1:]
         while run and run[-1].lower() in _NAME_EDGE_WORDS:
@@ -242,6 +287,20 @@ def _described_in(name: str, document_text: str) -> bool:
     return any(v in doc for v in variants)
 
 
+def _person_names(name: str, person: str) -> bool:
+    """Whether the person's own words hold the name, or the part of it after the
+    brand ("dgx spark" for "NVIDIA DGX Spark"), as whole words in any case. A
+    part must be two words or carry a digit, so "spark" alone never matches."""
+    words = name.split()
+    for k in range(len(words)):
+        part = " ".join(words[k:]).lower()
+        if len(words) - k < 2 and not re.search(r"\d", part):
+            break
+        if re.search(r"(?<![a-z0-9])" + re.escape(part) + r"s?(?![a-z0-9])", person):
+            return True
+    return False
+
+
 def named_product_to_look_up(
     question: str, history: Sequence[dict], document_text: str
 ) -> Optional[str]:
@@ -259,6 +318,21 @@ def named_product_to_look_up(
         for name in _names_in(text):
             if not _described_in(name, document_text):
                 return _singular(name)
+    # People type product names in lower case ("as I have dgx spark ??" was the
+    # owner's own turn), which carries no capital to find. A name the assistant
+    # wrote in its recent turns counts when the person's own words contain it,
+    # in any case; it passes the same personal-data filter.
+    person = " ".join([question] + user_turns).lower()
+    assistant_turns = [
+        str(m.get("content") or "")
+        for m in conversation_turns(history, 2 * _NAME_TURNS)
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str)
+    ][-_NAME_TURNS:]
+    for text in assistant_turns[::-1]:
+        for name in _names_in(text):
+            single = _singular(name)
+            if _person_names(single, person) and not _described_in(single, document_text):
+                return single
     return None
 
 
