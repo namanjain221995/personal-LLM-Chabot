@@ -778,12 +778,16 @@ def _aggregates(
     con, src: str, measures: List[dict], groups: List[dict], dates: List[dict], omitted: List[str],
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
+    # `omitted` right after `computed`: a reader that cuts the rendered
+    # profile (the /v1 file context stops at 24,000 characters) must not keep
+    # "exact" and the totals while losing what qualifies them. QA r2 measured
+    # the dropped-rows reason at offset 34,627 of 36,725, after every total.
     agg: Dict[str, Any] = {
         "computed": "exact",
+        "omitted": omitted,
         "measures": [],
         "by_group": [],
         "by_month": [],
-        "omitted": omitted,
     }
     plans = measures[:AGG_MAX_MEASURES]
     extra = [m["name"] for m in measures[AGG_MAX_MEASURES:]]
@@ -1031,6 +1035,17 @@ class _TextCheck:
         return self._result
 
 
+def _insert_after(d: Dict[str, Any], after: str, key: str, value: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        out[k] = v
+        if k == after:
+            out[key] = value
+    if key not in out:
+        out[key] = value
+    return out
+
+
 def _dropped_reason(dropped: int, where: List[str]) -> str:
     return (
         f"{dropped} row(s) could not be read under the detected column types"
@@ -1231,6 +1246,10 @@ def profile_tabular(
             # First in the list: the cap trims reasons from the end, and this
             # one changes what every total means.
             omitted.insert(0, _dropped_reason(dropped, where))
+            # And next to the row count: the column sums come before the
+            # aggregates, so a cut inside `columns` kept sums that leave these
+            # rows out with nothing in the window saying so (QA r2).
+            out = _insert_after(out, "rows", "rows_not_read", dropped)
         out["aggregates"] = _aggregates(con, src, measures, groups, dates, omitted, agg_max_chars)
 
         sample = con.execute(

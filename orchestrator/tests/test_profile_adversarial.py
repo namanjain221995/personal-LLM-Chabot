@@ -1175,3 +1175,61 @@ def test_opposite_timestamps_and_dates_as_groups_are_not_mistaken_for_long_numbe
     path.write_text("\n".join(lines) + "\n")
     agg = profiler.profile_tabular(str(path))["aggregates"]
     assert "shift_start" in {g["group"] for g in agg["by_group"]}, agg["omitted"]
+
+
+# ---------------------------------------------------------------------------
+# 3. A caveat must not be cut off while the number it qualifies survives: the
+# /v1 file context prints profile.json with indent=1 and cuts it at
+# apifiles.context.PROFILE_MAX_CHARS (24,000).
+# ---------------------------------------------------------------------------
+
+
+def test_a_window_cut_keeps_the_caveats_with_the_totals(tmp_path):
+    """QA r2: at 4b90840 the caveat sat at offset 34,627 of 36,725 while
+    "computed": "exact", the column sums and by_group were inside 24,000."""
+    rng = random.Random(7)
+    path = tmp_path / "sales.csv"
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["order_id", "order_date", "region", "channel", "category", "product", "quantity",
+                    "unit_price", "revenue", "cost", "discount", "customer"])
+        for i in range(40_000):
+            q = rng.randint(1, 20); up = rng.randrange(100, 50000) / 100
+            w.writerow([500000 + i, (date(2020, 1, 1) + timedelta(days=rng.randrange(1826))).isoformat(),
+                        f"R{rng.randrange(8)}", rng.choice(["web", "store", "phone"]), f"cat{rng.randrange(12)}",
+                        f"p{rng.randrange(40):02d}", q, f"{up:.2f}", "N/A" if i == 30_000 else f"{q * up:.2f}",
+                        f"{q * up * 0.6:.2f}", f"{rng.randrange(0, 5000) / 100:.2f}", f"c{rng.randrange(50000)}"])
+    prof = profiler.profile_tabular(str(path), name="table.csv")
+    assert prof["aggregates"]["omitted"][0].startswith("1 row(s) could not be read")
+    window = json.dumps(prof, ensure_ascii=False, indent=1)[:24_000]
+    if '"computed": "exact"' in window:
+        assert "could not be read" in window, "the totals survive the cut and their caveat does not"
+
+
+def test_the_caveat_precedes_the_column_sums_too(tmp_path):
+    """A cut inside `columns` shows column sums and no "computed": "exact":
+    the row count the sums leave out is said before the first column."""
+    lines = ["region,revenue"] + [f"{'NSEW'[i % 4]},{'N/A' if i == 21_000 else f'{i % 50}.25'}" for i in range(22_000)]
+    path = tmp_path / "t.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    text = json.dumps(prof, ensure_ascii=False, indent=1)
+    assert prof["rows_not_read"] == 1
+    assert text.index('"rows_not_read"') < text.index('"columns"')
+
+
+def test_the_caveat_sits_right_after_the_row_count_in_a_sheet_too(tmp_path):
+    """A sheet copies its table profile's keys in order: rows_not_read must
+    follow the sheet's own row count, before its columns."""
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["region", "revenue"])
+    for i in range(22_000):
+        ws.append(["NSEW"[i % 4], "N/A" if i == 21_000 else (i % 50) + 0.25])
+    path = tmp_path / "t.xlsx"
+    wb.save(path)
+    sheet = profiler.profile_excel(str(path))["sheets"][0]
+    keys = list(sheet)
+    assert sheet["rows_not_read"] == 1, sheet.get("aggregates", {}).get("omitted")
+    assert keys.index("rows") < keys.index("rows_not_read") < keys.index("columns")
+    assert list(sheet["aggregates"])[:2] == ["computed", "omitted"]
