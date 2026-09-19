@@ -11,12 +11,13 @@ Cache (query→sources, TTL) and a per-user rate limit keep it cheap and bounded
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import json
 import logging
 import re
+import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1245,11 +1246,44 @@ def _spawn(coro) -> None:
 _REALTIME_PAGE_TTL_S = 300
 
 
-@functools.lru_cache(maxsize=32)
-def _verdict_memo(classify: Callable[..., Verdict], message: str, year: int) -> Verdict:
-    # The classifier is part of the key so a replaced one (a test double, a
-    # hot patch) is never answered from the old one's results.
-    return classify(message, now_year=year)
+class _VerdictMemo:
+    """The last few verdicts, keyed by a SHA-256 of the question, never by
+    the question itself.
+
+    It was an `lru_cache` keyed on the message text, so the last 32 messages,
+    pastes included, stayed alive in the orchestrator after their requests
+    ended and their chats were deleted: 32 messages of 1 MB held 32.7 MB
+    until `cache_clear` (security review round 2, 2026-09-19); nothing on the
+    input path caps a message's size. A verdict carries no user text (its
+    reason is a rule name or a year), so a digest key loses nothing."""
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._items: "OrderedDict[tuple, Verdict]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, classify: Callable[..., Verdict], message: str, year: int) -> Verdict:
+        # The classifier is part of the key so a replaced one (a test double,
+        # a hot patch) is never answered from the old one's results.
+        key = (classify, hashlib.sha256(message.encode("utf-8", "surrogatepass")).digest(), year)
+        with self._lock:
+            hit = self._items.get(key)
+            if hit is not None:
+                self._items.move_to_end(key)
+                return hit
+        verdict = classify(message, now_year=year)
+        with self._lock:
+            self._items[key] = verdict
+            while len(self._items) > self._size:
+                self._items.popitem(last=False)
+        return verdict
+
+    def cache_clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+_verdict_memo = _VerdictMemo(32)
 
 
 def _question_verdict(message: str) -> Optional[Verdict]:
@@ -1260,7 +1294,7 @@ def _question_verdict(message: str) -> Optional[Verdict]:
     100 KB, 13.3 s at 400 KB of repeated "what does x"). None on any
     failure: the verdict sharpens the TTL and must never cost the search."""
     try:
-        return _verdict_memo(
+        return _verdict_memo.get(
             classify_offline, message or "", datetime.now(timezone.utc).year
         )
     except Exception:  # noqa: BLE001
