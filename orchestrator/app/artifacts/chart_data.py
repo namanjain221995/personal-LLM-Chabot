@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import difflib
+import json
 import math
 import re
 import time
@@ -1694,9 +1695,22 @@ def _find_table(table_id: str, tables: Sequence[Any], default: Any = None) -> Tu
     return None, ""
 
 
+def binding_key(binding: Any) -> str:
+    """One binding as a comparable string: the same columns, aggregation and
+    bucket give the same key, whatever defaults the dict left out."""
+    raw = binding.model_dump(mode="json") if hasattr(binding, "model_dump") else binding
+    try:
+        raw = CS.Binding.model_validate(raw).model_dump(mode="json")
+    except Exception:  # noqa: BLE001 — an unreadable binding still has a key
+        pass
+    return json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+
+
 def resolve_chart(chart: Any, tables: Sequence[Any], *, default_table: Any = None, allow_literal: bool = False,
-                  deadline: Optional[float] = None) -> Tuple[Optional[CS.Chart], List[str], str]:
-    """(chart or None, notes, message). None means "draw `message` instead"."""
+                  deadline: Optional[float] = None, accepted: bool = False) -> Tuple[Optional[CS.Chart], List[str], str]:
+    """(chart or None, notes, message). None means "draw `message` instead".
+    `accepted`: an earlier version already drew this binding; a newer "not
+    worth drawing" rule does not take it away in an edit."""
     c = _chart_of(chart)
     if c.data is None:
         if allow_literal:
@@ -1717,7 +1731,7 @@ def resolve_chart(chart: Any, tables: Sequence[Any], *, default_table: Any = Non
     # and one whose tallest bar is two rows is a row of equal bars. Both are
     # pictures of nothing, and both used to be drawn (the owner's "plot" of
     # a customer list). The sentence says WHICH column and why.
-    pointless = chart_choice.not_worth_drawing(c, table, result)
+    pointless = "" if accepted else chart_choice.not_worth_drawing(c, table, result)
     if pointless:
         return None, [f"{c.title or 'a chart'}: {pointless}"], f"The chart was not drawn: {pointless}."
     update: Dict[str, Any] = {
@@ -1977,15 +1991,24 @@ def _sheet_table(sheet: Dict[str, Any]) -> Any:
     return _make_table(id=f"sheet:{name}", title=name, columns=cols, rows=list(sheet.get("rows") or []))
 
 
-def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = False, timeout_s: Optional[float] = None) -> Tuple[Any, List[str]]:
+def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = False, timeout_s: Optional[float] = None,
+                 accepted: Sequence[str] = ()) -> Tuple[Any, List[str]]:
     """Every chart in `spec` resolved against `tables`. Returns (spec, notes).
 
     SYNCHRONOUS AND CPU-BOUND: from async code call resolve_spec_async (a
     worker thread with a deadline). `spec` may be a pydantic spec (envelope
     or body) or its dict; the same type comes back. A chart that cannot be
     computed is replaced: a document block by a note callout, a slide chart
-    by a bullet saying why, a sheet chart is dropped — each with a note."""
+    by a bullet saying why, a sheet chart is dropped — each with a note.
+    `accepted` holds `binding_key`s an earlier version already drew (an
+    edit's parent): those are not refused as not worth drawing."""
     deadline = time.monotonic() + timeout_s if timeout_s else None
+    keep = set(accepted or ())
+
+    def ok(chart: Any) -> bool:
+        data = chart.get("data") if isinstance(chart, dict) else getattr(chart, "data", None)
+        return bool(keep) and data is not None and binding_key(data) in keep
+
     model_cls = type(spec) if hasattr(spec, "model_dump") else None
     data = spec.model_dump(mode="python") if model_cls else _deep_copy(spec)
     body = _dict_body(data)
@@ -1997,7 +2020,7 @@ def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = Fals
     if isinstance(blocks, list):
         for i, blk in enumerate(list(blocks)):
             if isinstance(blk, dict) and blk.get("type") == "chart" and blk.get("chart") is not None:
-                chart, n, msg = _resolve_guarded(blk["chart"], tables, None, allow_literal, deadline)
+                chart, n, msg = _resolve_guarded(blk["chart"], tables, None, allow_literal, deadline, ok(blk["chart"]))
                 notes.extend(n)
                 changed = True
                 if chart is None:
@@ -2008,7 +2031,7 @@ def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = Fals
     if isinstance(slides, list):
         for s in slides:
             if isinstance(s, dict) and s.get("chart") is not None:
-                chart, n, msg = _resolve_guarded(s["chart"], tables, None, allow_literal, deadline)
+                chart, n, msg = _resolve_guarded(s["chart"], tables, None, allow_literal, deadline, ok(s["chart"]))
                 notes.extend(n)
                 changed = True
                 if chart is None:
@@ -2026,7 +2049,7 @@ def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = Fals
             own = _sheet_table(sh)
             kept = []
             for ch in sh["charts"]:
-                chart, n, msg = _resolve_guarded(ch, tables + [own], own, allow_literal, deadline)
+                chart, n, msg = _resolve_guarded(ch, tables + [own], own, allow_literal, deadline, ok(ch))
                 notes.extend(n)
                 changed = True
                 if chart is not None:
@@ -2043,10 +2066,11 @@ def resolve_spec(spec: Any, tables: Sequence[Any], *, allow_literal: bool = Fals
         return model_cls.model_validate(data), notes + legacy_notes
 
 
-def _resolve_guarded(chart: Any, tables: Sequence[Any], default: Any, allow_literal: bool, deadline: Optional[float]) -> Tuple[Optional[CS.Chart], List[str], str]:
+def _resolve_guarded(chart: Any, tables: Sequence[Any], default: Any, allow_literal: bool, deadline: Optional[float],
+                     accepted: bool = False) -> Tuple[Optional[CS.Chart], List[str], str]:
     try:
         _check_deadline(deadline)
-        return resolve_chart(chart, tables, default_table=default, allow_literal=allow_literal, deadline=deadline)
+        return resolve_chart(chart, tables, default_table=default, allow_literal=allow_literal, deadline=deadline, accepted=accepted)
     except ChartDataError as exc:
         return None, [str(exc)], str(exc)
     except Exception as exc:  # a malformed chart dict must not fail the spec

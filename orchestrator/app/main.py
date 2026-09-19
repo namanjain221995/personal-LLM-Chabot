@@ -5635,6 +5635,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     last_turn_is_artifact=_as3_last_is_card,
                     artifact_id=_as3_artifact_id or None,
                     last_deliverable=_as3_shape,
+                    # "give Big report" / "I want plot ??" over an uploaded CSV
+                    # are files made from it, decided by the rules: the Fast
+                    # classifier timed out under load (hotfix 1.1).
+                    has_dataset=dataset_ready,
                 )
                 # --- AS3 intent-capability END ---
             # --- AS3 intent-capability BEGIN ---

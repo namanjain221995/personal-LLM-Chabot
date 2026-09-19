@@ -851,14 +851,25 @@ def _warning_clause(warnings: Sequence[str], *, limit: int = 2) -> str:
     """Up to `limit` warnings in full, then a COUNT of the rest. The slice
     this replaces truncated: four "column not found" warnings were printed
     as two and the person read two thirds of the truth, while the card's
-    `warnings` array carried all four (measured 2026-09-16, J1)."""
-    said = [str(w).strip() for w in warnings if str(w).strip()]
+    `warnings` array carried all four (measured 2026-09-16, J1). Operator
+    notes are not said (T.reader_warnings, hotfix 1.1)."""
+    said = [str(w).strip() for w in T.reader_warnings(warnings) if str(w).strip()]
     if not said:
         return ""
     out = " " + " ".join(f"_{w.rstrip('.')}._" for w in said[:limit])
     if len(said) > limit:
         out += f" _…and {len(said) - limit} more — see the card._"
     return out
+
+
+def _log_operator_notes(ref: T.ArtifactRef, warnings: Sequence[str]) -> None:
+    """The notes `T.reader_warnings` keeps from the person, for operators,
+    once per turn. Each is cut short: a chart title or a figure list is
+    derived from the person's data."""
+    notes = [str(w)[:200] for w in warnings if T.is_operator_note(w)]
+    if notes:
+        log.info("artifact %s v%s: operator notes not shown to the reader: %s", ref.artifact_id, ref.version,
+                 " | ".join(notes[:6]))
 
 
 #: The notes material_in leaves when a file could not be opened at all.
@@ -1195,6 +1206,7 @@ async def run_artifact_engine(
     ref = pipeline.ref_for(row, version_row)
     all_warnings = list(warnings) + [w for w in ref.warnings if w not in warnings] + _cannot_clauses(instruction, all_warnings=warnings)
     ref.warnings = all_warnings
+    _log_operator_notes(ref, all_warnings)
     status = str(row.get("status") or "")
     if status in ("completed", "completed_with_warnings"):
         report = dict(material.transform) if operation == "create" else {}
@@ -1552,9 +1564,21 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
             chart_tables.extend(recovered or [])
         except Exception as exc:  # noqa: BLE001 — the chart refuses as before
             log.info("artifact: parent chart tables not rebuilt: %s", type(exc).__name__)
+    accepted: List[str] = []
+    if parent is not None and _chart_data is not None and hasattr(_chart_data, "binding_key"):
+        # A chart the parent version DREW stays drawn in the edit: a newer
+        # "not worth drawing" rule (names, hotfix 1.1b) must not turn a
+        # section the request did not name into a note.
+        try:
+            from ..artifacts import chart_spec as _CS
+
+            accepted = [_chart_data.binding_key(_CS._get(c, "data")) for _p, c in _CS.iter_chart_slots(parent)
+                        if _CS._get(c, "data") is not None and _CS._get(c, "series")]
+        except Exception as exc:  # noqa: BLE001 — the charts resolve as for a new file
+            log.info("artifact: parent chart bindings unread: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
         try:
-            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, chart_tables)  # type: ignore[attr-defined]
+            spec, notes = await asyncio.to_thread(functools.partial(_chart_data.resolve_spec, spec, chart_tables, accepted=accepted))  # type: ignore[attr-defined]
             for n in notes or []:
                 warn(str(n))
         except Exception as exc:  # noqa: BLE001 — never fails the job
@@ -1726,12 +1750,18 @@ def _edit_sentence(title: str, version: int, changes: Sequence[str], not_applied
     if not_applied:
         bits = [f"{_op_words(n.get('op', ''))} ({n.get('reason', '')})" for n in not_applied[:2]]
         line += " Not applied: " + "; ".join(bits) + "."
-    if unmet:
-        line += " Not confirmed in the file: " + "; ".join(str(u) for u in list(unmet)[:3]) + "."
+    # One plain line: the self-check's evidence ("sections … changed or
+    # disappeared: ['…', '…']") stays on the version row and in the log
+    # (hotfix 1.1b). The same lines ride in `warnings` and are not said twice.
+    whats = list(dict.fromkeys(T.selfcheck_what(u) or str(u) for u in unmet))
+    if whats:
+        line += " Not confirmed in the file: " + "; ".join(whats[:2]) + "."
     if data_only_note:
         note = data_only_note.strip().rstrip(".")
         line += f" {note[0].upper()}{note[1:]}."
-    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")])
+    said_unmet = {str(u) for u in unmet}
+    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")
+                             and str(w) not in said_unmet])
     return line
 
 
@@ -1928,6 +1958,7 @@ async def _run_edit(
     status = str(row.get("status") or "")
     if status in ("completed", "completed_with_warnings"):
         warnings = list(ref.warnings)
+        _log_operator_notes(ref, warnings)
         failed_pending = [w for w in warnings if str(w).startswith("not applied:")]
         said = [c for c in changes if not any(_quoted(c) and _quoted(c) in w for w in failed_pending)]
         not_applied = list(outcome.not_applied) + [{"op": "", "reason": w[len("not applied: "):]} for w in failed_pending]

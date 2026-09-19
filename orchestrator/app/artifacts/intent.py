@@ -1120,6 +1120,68 @@ def _chart_type_change(low: str) -> bool:
     return bool(_CHART_TYPE_RE.search(low)) and bool(_SAME_CHART_RE.search(low)) and not _NEW_CHART_SUBJECT_RE.search(low)
 
 
+#: "report" the VERB after a verb that takes an infinitive: "I want to
+#: report a bug", "we need to report it to the team". `i want` plus the noun
+#: `report` within six words made the first a create on main (4e7cf8e). The
+#: noun keeps its article ("I want a report"), and "convert this to report"
+#: has no infinitive lead, so both are untouched.
+_REPORT_VERB_RE = re.compile(
+    r"\b(?P<lead>(?:want|wants|wanted|wanna|need|needs|needed|like|love|have|has|had|got|going|trying|try|tried|how|able|"
+    r"forgot|forget|remember|wish|plan|planning|hope|hoping|decided|asked|ask|supposed|meant|used)\s+to)\s+report\b",
+    re.I,
+)
+#: THE CONVERSATION HOLDS A DATASET (hotfix 1.1, 2026-09-19). The owner's
+#: turns after uploading customers-100.csv were "I want plot ??" and "give
+#: Big report". The rules read the first as `ambiguous` (the question marks)
+#: and the second as no-request, so both hung on the classifier, which said
+#: none for "give Big report" about 5 times in 6 and flipped between png and
+#: none for the plot — and whose 2.5 s Fast budget ran out under load, which
+#: falls back to these rules in silence. With a dataset in the room these
+#: are requests for a file made FROM it, and the rules say so themselves.
+_DATASET_LEAD = r"^\W*(?:(?:ok|okay|so|and|also|now|then|please|just|hey|hi|sir|bro)\W+)*"
+#: The whole message is a report ask: "give Big report", "full report",
+#: "detailed report please", "I want a big report on this data". Anchored,
+#: so "report a bug" and "as I reported earlier" are never this; and only
+#: an indefinite article, because "give the report" may mean the one made.
+_DATASET_REPORT_RE = re.compile(
+    _DATASET_LEAD
+    + r"(?:(?:give|send|share|provide|make|create|generate|prepare|write|build|get|_give_)\s+(?:me\s+|us\s+)?"
+    r"|(?:i|we)\s+(?:(?:really|just|also|still)\s+)?(?:want|need|would\s+like|'d\s+like|wanna)\s+)?"
+    r"(?:an?\s+|one\s+)?"
+    r"(?:(?:big|bigger|full|detailed|complete|comprehensive|proper|long|longer|large|in[- ]depth|thorough|deep|final|"
+    r"whole|entire|overall|short|quick|brief|summary|data|dataset|analysis|analytical|nice|good|professional|clear)\s+){0,3}"
+    r"report(?:\s+(?:on|of|for|about|from)\s+(?:it|this|that|_this_|the|my|our)(?:\s+(?:data|dataset|file|csv|sheet|table|upload))?)?"
+    r"(?:\s+(?:please|now|too|also|asap))*\W*$",
+    re.I,
+)
+#: A chart ASKED FOR, said with question marks: "I want plot ??", "plot ??",
+#: "show me a graph?". Three openers only — a first-person want/need, a
+#: request verb, or the chart word itself as the verb — and never a copula
+#: after it, so "should I plot this?", "the plot is wrong?" and "I want to
+#: know if the plot is right?" stay with the ambiguous band.
+_DATASET_CHART_ASK_RE = re.compile(
+    _DATASET_LEAD
+    + r"(?:(?:(?:i|we)\s+(?:(?:really|just|also|still|only)\s+)?(?:want|need|would\s+like|'d\s+like|wanna|require)\s+"
+    r"|(?:give|show|make|create|generate|build|prepare|send|draw|get|_give_)\s+(?:me\s+|us\s+)?)"
+    r"(?:(?!(?:know|understand|ask|check|confirm|verify|whether|if|why|how|what|when|where|which)\b)\w+\s+){0,3}?"
+    r"(?:plot|chart|graph|visual|visuali[sz]ation|diagram|histogram)s?\b"
+    r"|(?:plot|chart|graph|visuali[sz]e|draw)s?\b(?!\s+(?:is|are|was|were|looks?|seems?|has|have|does|did)\b))",
+    re.I,
+)
+
+
+def _dataset_ask(low: str, raw: str, chart: bool) -> str:
+    """The rule name when these words ask for a file made from the
+    conversation's dataset, else "". Called only when one exists."""
+    if _DATASET_REPORT_RE.match(low):
+        return "dataset-report"
+    # Without a question mark the create rules below already take a chart
+    # ask; this closes only the band they call ambiguous.
+    if chart and "?" in raw and _DATASET_CHART_ASK_RE.match(low) and not _STORY_PLOT_RE.search(low):
+        return "dataset-chart"
+    return ""
+
+
 def decide(
     text: str,
     *,
@@ -1130,6 +1192,7 @@ def decide(
     last_turn_is_artifact: bool = False,
     artifact_id: Optional[str] = None,
     last_deliverable: Optional[Any] = None,
+    has_dataset: bool = False,
 ) -> ArtifactIntent:
     """Decide from the words alone; nothing here calls a model.
 
@@ -1146,6 +1209,9 @@ def decide(
     (artifacts/deliverable.Deliverable, or the jsonb the version row
     carries), so "make it a bar chart instead" can be read as a change to
     the chart that was just made instead of a second one.
+    `has_dataset`: the conversation holds an uploaded dataset (the chat
+    route's `dataset_ready`), so a bare "give Big report" or "I want plot ??"
+    is a file made from it (`_dataset_ask`).
     """
     # A request for a file is stated in the first sentences; what follows is
     # material. The rules run on a bounded prefix, because a regex with a
@@ -1162,6 +1228,7 @@ def decide(
     # gets — keeps the person's words.
     low = LX.normalize(_without_negated_clauses(raw.lower()))
     low = _without_negated_clauses(_blank_neg_token_clauses(low))
+    low = _REPORT_VERB_RE.sub(r"\g<lead> _report_", low)
     uploads = [str(f).lower().lstrip(".") for f in (upload_formats or ()) if f]
     explicit = F.explicit_formats(low)
     rows = _row_count(_without_negated_clauses(_prose_before_table(original).lower()))
@@ -1460,6 +1527,16 @@ def decide(
         if rule and has_assistant_answer:
             return made("export", reference="previous_answer", rule=rule)
 
+    # 3c. A report or a chart asked of the conversation's DATASET (hotfix
+    #     1.1): decided here so it never depends on the classifier. The
+    #     report is made from the conversation, not from the answer before.
+    if has_dataset:
+        dataset_rule = _dataset_ask(low, raw, chart)
+        if dataset_rule == "dataset-report":
+            return made("create", rule=dataset_rule, target="conversation")
+        if dataset_rule:
+            return made("create", rule=dataset_rule)
+
     # 4. Creation.
     if _TEXT_OBJECT_RE.search(low) and not explicit and not _AS_FORMAT_RE.search(low) and not _FILE_CUE_RE.search(low):
         # "draft an email telling the team the report is delayed".
@@ -1679,5 +1756,5 @@ async def decide_with_hook(
 
 _DECIDE_KWARGS = frozenset({
     "has_artifacts", "artifact_hints", "has_assistant_answer", "upload_formats", "last_turn_is_artifact", "artifact_id",
-    "last_deliverable",
+    "last_deliverable", "has_dataset",
 })
