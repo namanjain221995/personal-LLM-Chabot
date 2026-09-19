@@ -167,8 +167,11 @@ async def _web_sources(instruction: str, history: Sequence[dict], *, effort: str
     if not budget.research or budget.max_sources <= 0:
         return []
     try:
+        from ..core import pasted
         from . import search as search_engine
 
+        # Queries from the person's words only (hotfix 1.2, P6).
+        pasted.mark_turn(instruction)
         if not await asyncio.wait_for(search_engine.should_search(instruction, history), timeout=15.0):
             return []
         queries = await asyncio.wait_for(search_engine.rewrite_queries(instruction, history=history, effort=effort), timeout=20.0)

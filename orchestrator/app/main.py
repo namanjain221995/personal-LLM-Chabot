@@ -4537,6 +4537,21 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # downgraded one. Said once per turn, never as an error.
                 await emit("status", {"text": access_notice})
             history = request.history_messages or memory.history(scoped_session)
+            # What this turn and its earlier user turns PASTED (hotfix 1.2,
+            # P6). Scoped to this task like the notifier above, so every
+            # engine's web query - however deep - is checked against it in
+            # engines/search.py `_collect_results`, and none carries a run of
+            # it to a search provider.
+            from .core import pasted as _pasted
+
+            _pasted.mark_turn(
+                text,
+                *(
+                    m["content"]
+                    for m in history
+                    if m.get("role") == "user" and isinstance(m.get("content"), str)
+                ),
+            )
 
             # THE FAST SMALL-TALK LANE (app/fast_lane.py, 2026-09-14). A
             # closed-lexicon pleasantry at Fast ("hi", "thanks", "bye") skips
