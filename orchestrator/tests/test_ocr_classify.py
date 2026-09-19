@@ -848,11 +848,10 @@ def test_a_preamble_loop_cut_off_at_the_output_limit_is_still_a_failed_read(monk
     [
         ("text [61, 95, 792, 172]No text", "No text"),
         ("title [54, 136, 388, 212]Ground truth", "Ground truth"),
-        ("text [24, 95, 544, 190][No text detected]", "[No text detected]"),
         ("title [61, 95, 792, 172]Hallucination rates\ntext [74, 279, 421, 335]The image contains no text.",
          "Hallucination rates\nThe image contains no text."),
     ],
-    ids=["no-text", "ground-truth", "tool-placeholder", "slide-about-ocr"],
+    ids=["no-text", "ground-truth", "slide-about-ocr"],
 )
 def test_a_slide_whose_own_words_sound_like_the_model_keeps_its_read(monkeypatch, raw, text, finish):
     """Security review r2 asked for both directions pinned: the model's "no
@@ -894,3 +893,35 @@ def test_a_typed_region_marker_is_still_stripped():
     assert ocr.clean_transcript("text [1, 2, 3, 4]Vendor: TechSara\ntable [5, 6, 7, 8]Total 42") == (
         "Vendor: TechSara\nTotal 42"
     )
+
+
+# ---- 7. live check 2026-09-19 (worker sidecar, prompt "OCR", 1 call at a time) --
+
+#: A blank scanned page, image, Files API and video paths: the same answer on
+#: all three, and an `ok` read of "[Non-Text]" once region-written lines were
+#: trusted as the image's. A bracketed no-text token is the model's wherever
+#: it stands; the "No text" a slide shows in plain words keeps its read (above).
+_BLANK_NON_TEXT_LIVE = " text [118, 0, 999, 999][Non-Text]"
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize(
+    "raw", [_BLANK_NON_TEXT_LIVE, "text [24, 95, 544, 190][No text detected]", "title [1, 2, 3, 4](No text to output)"]
+)
+def test_a_bracketed_no_text_token_in_a_region_is_still_not_a_read(monkeypatch, raw, finish):
+    read = _read(monkeypatch, raw, finish=finish)
+    assert (read.status, read.text) == ("empty", "")
+
+
+#: A real screenshot on the video path: the model counted to 100, then looped
+#: on one region until the output limit cut it mid-token.
+_COUNT_THEN_LOOP_LIVE = (
+    ": " + " ".join(f"{i}." for i in range(1, 101)) + "\n"
+    + "header [0, 40, 26, 142][Non-Text]\n" * 59 + "header [0, 40, 26, 142][Non-Text"
+)
+
+
+def test_a_short_loop_cut_at_the_output_limit_is_degenerate_despite_the_note(monkeypatch):
+    read = _read(monkeypatch, _COUNT_THEN_LOOP_LIVE, finish="length")
+    assert read.status == "degenerate"
+    assert read.text.endswith(_NOTE), "the degenerate text keeps the note, as before"

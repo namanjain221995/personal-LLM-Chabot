@@ -396,6 +396,13 @@ _FENCE_RE = re.compile(r"```[A-Za-z0-9_+-]*+")
 #: 'result [0, 0, 0]' was the whole answer for a legible matrix slide (live,
 #: security review 2026-09-18).
 _EMPTY_MARKER_RE = re.compile(r"%s[^\S\n]*+\[\d+(?:,[^\S\n]*+\d+){0,7}\]" % _TYPE_WORD)
+#: The model's bracketed "nothing here" token. Unlike its prose, this is the
+#: model's even when written inside a region: live 2026-09-19, a blank scanned
+#: page came back ' text [118, 0, 999, 999][Non-Text]' on the image, Files
+#: API and video paths alike, and was an `ok` read of "[Non-Text]".
+_PLACEHOLDER_CLAIM_RE = re.compile(
+    r"""(?:(?:result|output)[ \t.:,"'`]*+)?[\[(][ \t]*+non?[- ]?text\b[^\])\n]{0,40}[\])]$""", re.I
+)
 #: The model saying there is no text. Recorded live: '[No text detected]',
 #: '(No text to output)', '[Non-Text]', 'The image contains no text. …',
 #: 'result: The image contains only a stylistic horizontal line …'.
@@ -481,7 +488,7 @@ def _evidence(text: str, frame, regioned, disowned: bool) -> str:
         # the model's words it disowned a whole-frame region read.
         if not line or line == TRUNCATED_NOTE or _FENCE_RE.fullmatch(line) or _EMPTY_MARKER_RE.fullmatch(line):
             continue
-        if line not in regioned and _disowns(line):
+        if _PLACEHOLDER_CLAIM_RE.match(line) or (line not in regioned and _disowns(line)):
             disowned = True
             continue
         kept.append(line)
@@ -663,6 +670,11 @@ def _content_chars(body: str) -> int:
     return alnum + signs
 
 
+def _without_note(body: str) -> str:
+    """The transcript without the truncation note `_ocr_one` appends."""
+    return body[: -len(TRUNCATED_NOTE)].rstrip() if body.endswith(TRUNCATED_NOTE) else body
+
+
 def classify(text: str) -> OcrRead:
     """The engine's RAW answer -> the read it actually is.
 
@@ -687,7 +699,12 @@ def classify(text: str) -> OcrRead:
     body, evidence = _clean(text)
     if not body:
         return OcrRead("", "empty")
-    if is_degenerate(body):
+    # The loop is judged without our truncation note. Live 2026-09-19, video
+    # path, a real screenshot: ': 1. 2. … 100.' and then 60 identical
+    # '[Non-Text]' regions, cut at the output limit. The loop compresses to
+    # 0.04 of its size, but the note's 46 distinct characters lifted the
+    # ratio to 0.10, over the 0.08 threshold, and the frame counted as read.
+    if is_degenerate(_without_note(body)):
         return OcrRead(body, "degenerate", "the OCR model repeated itself instead of reading the image")
     if _content_chars(evidence) < _MIN_CONTENT_CHARS:
         return OcrRead("", "empty")
