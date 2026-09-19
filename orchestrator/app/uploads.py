@@ -325,7 +325,10 @@ async def _finalise_dataset(
     extract_dir = os.path.join(root, "extracted")
     notes: list = []
 
-    try:
+    def _extract_and_profile():
+        # Extraction, the zip-bomb checks and profiling are CPU and disk work:
+        # run on the event loop, a legitimate 100k-row .xlsx held every user's
+        # stream for ~8.5 s (dataset review, 2026-09-19). They run in a thread.
         lower = filename.lower()
         if archive.is_zip_container(raw_path) and not lower.endswith(".xlsx"):
             plan = archive.extract(raw_path, extract_dir)
@@ -344,13 +347,15 @@ async def _finalise_dataset(
             shutil.copy2(raw_path, os.path.join(extract_dir, filename))
             plan = None
 
+        return plan, profiler.profile_directory(extract_dir)
+
+    try:
+        plan, profiles = await asyncio.to_thread(_extract_and_profile)
         if plan is not None:
             for name, why in plan.skipped:
                 notes.append(f"skipped {name}: {why}")
             for name in plan.nested_archives:
                 notes.append(f"nested archive listed but not opened: {name}")
-
-        profiles = profiler.profile_directory(extract_dir)
     except archive.ArchiveError as exc:
         shutil.rmtree(root, ignore_errors=True)
         await db.run_in_thread(
