@@ -149,6 +149,7 @@ def stitch(
 ) -> List[Segment]:
     """Join per-window segments into one timeline, de-duplicating seams."""
     out: List[Segment] = []
+    ends: List[float] = []  # the end of each kept cue's window
     prev_window: Optional[Window] = None
     for window, segments in pieces:
         # By start alone, and stable: two cues at the same start keep the
@@ -170,28 +171,39 @@ def stitch(
                 if head and tail and (head in tail or tail.endswith(head) or head == tail):
                     kept = kept[1:]
             segs = kept
+        first_here = len(out)
         for s in segs:
             if not s.text.strip():
                 continue
-            # A repeat overlaps its original in time -- or, once snapping has
-            # moved both out of a pause onto one region start, starts no
-            # later than it: "Thank you." twice at 5.2 and 5.3 s became two
-            # cues at 7.0 s that overlapped by less than the tolerance.
+            # The engine repeating itself. Inside a snapped window that was
+            # judged on the engine's own times (`_without_engine_repeats`):
+            # snapped times can make two real replies overlap -- a "No." the
+            # VAD missed, moved onto the region where a second "No." begins,
+            # was dropped as its repeat (QA r3). So: across a seam, and in a
+            # window nobody snapped.
             if (
                 out
-                and (s.start_s < out[-1].end_s - _SEAM_TOLERANCE_S or s.start_s <= out[-1].start_s)
+                and (not window.regions or len(out) == first_here)
+                and s.start_s < out[-1].end_s - _SEAM_TOLERANCE_S
                 and _norm(s.text) == _norm(out[-1].text)
             ):
                 continue
             out.append(s)
+            ends.append(window.end_s)
         prev_window = window
     # Monotonic and non-overlapping, which subtitle players insist on.
     fixed: List[Segment] = []
-    for s in out:
-        start = s.start_s
+    for n, s in enumerate(out):
+        start, end = s.start_s, s.end_s
         if fixed and start < fixed[-1].end_s:
             start = fixed[-1].end_s
-        end = max(s.end_s, start)
+            # Pushed off the cue before: keep up to a minimum cue of its own
+            # length, inside its window. Cut to 0 s, the SRT writer stretched
+            # it to `_MIN_CUE_S` over the cue after (QA r2, r3). A run of
+            # short cues after it moves by the same push, no more, and the
+            # first gap or longer cue takes it up.
+            end = max(end, min(start + min(max(0.0, s.end_s - s.start_s), _MIN_CUE_S), ends[n]))
+        end = max(end, start)
         fixed.append(Segment(start, end, s.text, s.language))
     return fixed
 
@@ -230,11 +242,11 @@ _STAMP_SHORTFALL_S = 1.0
 _SLOWEST_HONEST_CHARS_PER_S = 10.2
 
 
-def _grazes(region: Tuple[float, float], overlap: float, covered: float) -> bool:
+def _grazes(region: Tuple[float, float], overlap: float, last_start: Optional[float]) -> bool:
     """Does a cue's START only graze this region, the tail of the speech
     before its own, holding none of its words? `_REGION_EDGE_S` or less, AND
-    either under half of the region or in a region an earlier cue already
-    reaches into (`covered`, the end of the cues before it).
+    either under half of the region or in a region the cue before it BEGAN
+    in (`last_start`).
 
     START side only. At the end, the same short foot in the next region is
     the cue's own last word after a pause: live clip E (QA r2, 2026-09-18),
@@ -246,15 +258,38 @@ def _grazes(region: Tuple[float, float], overlap: float, covered: float) -> bool
     Half of the region: a short region no earlier cue has words in is this
     cue's own opening word — "So," alone in a 0.65 s region, which the cue
     overlaps by 0.45 s, keeps the cue at 12.0 s instead of 13.25 s (QA r1).
-    An earlier cue already in the region: the engine opens a cue where the
-    previous one ended, so what is left of that region is the earlier cue's
-    last word and padding — "Yes." at 10.1-10.4 s in a 0.9 s region, and the
-    answer opened at 10.4 s stayed 2.1 s early, as on 4810da0 (QA r2). The
-    0.49 s the live 70 s clip's cue reached into a 16.6 s region is a graze
-    either way.
+    The cue before began in the region: its words are there, and the engine
+    opens a cue where the previous one ended, so what is left of that region
+    is the earlier cue's last word and padding — "Yes." at 10.1-10.4 s in a
+    0.9 s region, and the answer opened at 10.4 s stayed 2.1 s early, as on
+    4810da0 (QA r2). Merely REACHING into the region is not that: a question
+    whose cue the engine closed 0.1 s into a 0.6 s reply region holds none of
+    the reply, and counting it moved "Yes." 2 s late onto the answer (QA r3).
+    The 0.49 s the live 70 s clip's cue reached into a 16.6 s region is a
+    graze either way.
     """
     a, b = region
-    return overlap <= _REGION_EDGE_S and (overlap < 0.5 * (b - a) or covered > a)
+    return overlap <= _REGION_EDGE_S and (
+        overlap < 0.5 * (b - a) or (last_start is not None and a <= last_start < b)
+    )
+
+
+def _without_engine_repeats(segments: Sequence[Segment]) -> List[Segment]:
+    """The window's cues without empty ones and without the engine's repeats:
+    the same text overlapping the cue before it by more than the seam
+    tolerance, judged on the ENGINE's times -- `stitch`'s rule as it applied
+    before snapping. On snapped times it cannot be judged: two copies of one
+    "Thank you." moved out of a pause stop overlapping, and a real "No." the
+    VAD missed, moved onto the region where a second real "No." begins, starts
+    overlapping it (QA r2 and r3, 2026-09-18)."""
+    kept: List[Segment] = []
+    for s in segments:
+        if not s.text.strip():
+            continue
+        if kept and s.start_s < kept[-1].end_s - _SEAM_TOLERANCE_S and _norm(s.text) == _norm(kept[-1].text):
+            continue
+        kept.append(s)
+    return kept
 
 
 def _merged(regions: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
@@ -290,12 +325,26 @@ def snap_to_regions(
       utterance is never cut shorter than its own span there; only a graze
       (see `_grazes`) of the previous speech's tail, at the cue's START, is
       let go. A cue whose start grazes that tail and whose end is in the
-      pause after it lies in that pause.
+      pause after it lies in that pause -- but only when the engine left the
+      next speech's start without a cue. When the next cue opens at or
+      before it, that speech is the next cue's, and the foot is this cue's
+      own last words: "Thanks." said at 9.4-9.8 s, timed 9.4-10.8 with the
+      next speaker's cue from 10.8, went 2.1 s late onto the next speaker
+      (QA r3). Timed the other way, "Right." 4.6-6.5 with the next cue at
+      7.6, the words are the 7.0-7.6 s no cue holds, and it moves there.
     * A cue entirely inside a pause moves to the next region's start, with
       its own length, but never past where the next cue starts by more than
       a player's minimum cue: the engine timed that one on speech, and a
       moved cue pushing it later delayed a correctly timed 7.0 s cue to
-      8.6 s (QA, 2026-09-18).
+      8.6 s (QA, 2026-09-18). Several cues in one pause share that room,
+      end to end and each at least `_MIN_CUE_S`, so they neither overlap on
+      screen nor push the next cue further; when more are waiting than fit,
+      the earliest are joined into the first cue, their words in order.
+      All moved onto one instant, the second was 0 s long, the SRT writer
+      stretched it over the real cue, and a two-phrase decoder loop stacked
+      about 79 cues there (QA r3). Left in the pause instead, they would
+      start in known silence, which the brief forbids. `stitch` pushes the
+      cue after a moved one off it, keeping up to `_MIN_CUE_S` of its own.
     * A cue stamped too short to hold its words (see
       `_FAST_SPEECH_CHARS_PER_S`) starts at the first speech no earlier cue
       covers, bounded by `_SLOWEST_HONEST_CHARS_PER_S`. That is where the
@@ -315,9 +364,9 @@ def snap_to_regions(
       snapped to the same start with an earlier end: 7 of 3,000 random
       in-order replies put later words first (QA, 2026-09-18).
 
-    Non-overlapping time is `stitch`'s job, afterwards: it also drops an
-    engine repeat by its overlap in time, which forcing it here first would
-    hide from it.
+    The engine's repeats are dropped first, on its own times (see
+    `_without_engine_repeats`); what overlap is left, from cues the engine
+    itself overlapped, is `stitch`'s to resolve.
 
     Bisects rather than scans: this runs on the event loop, and a decoder
     loop of 5 cues a second over a 240 s window is 1,200 cues.
@@ -328,8 +377,43 @@ def snap_to_regions(
         return list(segments)
     regs = _merged(regions)
     starts = [a for a, _ in regs]
+    segments = _without_engine_repeats(segments)
     out: List[Segment] = []
     covered = regs[0][0]  # speech before this instant already has a cue
+    run: List[Tuple[Segment, float, float, bool]] = []  # cues lying in the pause before regs[run_to]
+    run_to = -1
+
+    def emit(seg: Segment, start: float, end: float, in_order: bool) -> None:
+        nonlocal covered
+        if out and in_order:
+            start = max(start, out[-1].start_s)
+        end = max(end, start)
+        out.append(Segment(start, end, seg.text, seg.language))
+        covered = max(covered, end)
+
+    def flush(nxt: float) -> None:
+        # The room is the next region's speech before the next cue's start,
+        # never less than one minimum cue: `fit` cues of `_MIN_CUE_S` or
+        # more. When more are waiting, the earliest share the first slot as
+        # ONE cue, their words in order: n separate cues on screen in the
+        # room of one either overlap there or push the real cue n x 0.4 s.
+        a, b = regs[run_to]
+        room = min(b, max(a, nxt)) - a
+        fit = max(1, min(len(run), int(room / _MIN_CUE_S + 1e-9)))
+        shared = len(run) - fit + 1
+        groups = [run[:shared]] + [[m] for m in run[shared:]]
+        cursor, last = a, a + max(room, _MIN_CUE_S)
+        for n, group in enumerate(groups):
+            head = group[0][0]
+            seg = head if len(group) == 1 else Segment(
+                head.start_s, group[-1][0].end_s, " ".join(m[0].text for m in group), head.language
+            )
+            extent = group[-1][2] - group[0][1]
+            span = max(_MIN_CUE_S, min(extent, last - cursor - (fit - 1 - n) * _MIN_CUE_S))
+            emit(seg, cursor, min(b, cursor + span), group[0][3])
+            cursor = out[-1].end_s
+        run.clear()
+
     for k, seg in enumerate(segments):
         start, end = seg.start_s, max(seg.end_s, seg.start_s)
         chars = len(loops.clean_text(seg.text))
@@ -348,16 +432,21 @@ def snap_to_regions(
             if overlap > 0:
                 touched.append((n, overlap))
         # A foot in the tail of the speech before the cue's own is let go when
-        # the cue runs on past it, into later speech or into the pause before
-        # it: then the cue lies in that pause, and moves out of it below.
+        # the cue runs on past it into later speech, or ends in the pause
+        # before speech the engine left without a cue: then the cue lies in
+        # that pause, and moves out of it below.
+        last_start = regs[run_to][0] if run else (out[-1].start_s if out else None)
+        nxt = segments[k + 1].start_s if k + 1 < len(segments) else float("inf")
         after = None  # the cue's words begin after regs[after]
         while (
             touched
             and touched[0][0] + 1 < len(regs)
             and regs[touched[0][0]][1] < end
-            and _grazes(regs[touched[0][0]], touched[0][1], covered)
+            and _grazes(regs[touched[0][0]], touched[0][1], last_start)
+            and (len(touched) > 1 or nxt > regs[touched[0][0] + 1][0])
         ):
             after = touched.pop(0)[0]
+        to = None  # the region this cue moves to the start of
         if touched:
             start, end = max(start, regs[touched[0][0]][0]), min(end, regs[touched[-1][0]][1])
         else:
@@ -365,24 +454,23 @@ def snap_to_regions(
                 j = after + 1
             else:
                 j = bisect_right(starts, start)
-                if j > 0 and regs[j - 1][0] <= start <= regs[j - 1][1]:
+                # Half-open, like the overlaps above: a cue opening exactly
+                # at a region's end has none of it and lies in the pause,
+                # as one at 4.99 or 5.01 s does (QA r3).
+                if j > 0 and regs[j - 1][0] <= start < regs[j - 1][1]:
                     j = len(regs)  # inside speech already: nowhere to move
             if j < len(regs):
-                a, b = regs[j]
-                nxt = segments[k + 1].start_s if k + 1 < len(segments) else b
-                # Up to the next cue's start, but never less than a player
-                # shows (`_MIN_CUE_S`): capped at a next cue the engine put AT
-                # the region start, it was 0 s, the SRT stretched it over the
-                # next cue, and an engine repeat moved with it was no longer
-                # seen overlapping its original (QA r2, 2026-09-18). The next
-                # cue gives up at most that 0.4 s, not the moved cue's length.
-                span = max(_MIN_CUE_S, min(end - start, nxt - a))
-                start, end = a, min(b, a + span)
-        if out and seg.start_s >= segments[k - 1].start_s:
-            start = max(start, out[-1].start_s)
-        end = max(end, start)
-        out.append(Segment(start, end, seg.text, seg.language))
-        covered = max(covered, end)
+                to = j
+        in_order = k == 0 or seg.start_s >= segments[k - 1].start_s
+        if run and to != run_to:
+            flush(seg.start_s)
+        if to is not None:
+            run.append((seg, start, end, in_order))
+            run_to = to
+            continue
+        emit(seg, start, end, in_order)
+    if run:
+        flush(regs[run_to][1])
     return out
 
 
