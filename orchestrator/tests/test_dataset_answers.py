@@ -1242,6 +1242,11 @@ def test_a_summary_figure_that_is_not_in_the_data_never_reaches_the_pdf(tmp_path
 
     good = f"Across 80 orders from 2025 the sum of revenue is {total}, and West took {west} over 12 months."
     assert summary(good) == good
+    # A day in a date is not a figure (live: "from January 1, 2023, to December 30, 2024").
+    small = _up({"file": "x.csv", "rows": 40, "columns": [{"name": "revenue", "dtype": "DOUBLE", "sum": 1234.5}]})
+    dated = "Orders run from January 1, 2025, to December 29, 2025 (the 29th of Dec.); revenue totals 1,234.50."
+    assert dataset_report.unsupported_figures(dated, [small]) == []
+    assert dataset_report.unsupported_figures("Revenue totals 1,234.50 over 29 regions.", [small]) == ["29"]
     dropped_digit = total.replace(",", "")[:-4] + total[-3:]
     for bad in (f"The total revenue is {dropped_digit}.", "West holds 27.5% of revenue.",
                 f"Revenue totals {total} and averages 1,234,567.89 per order."):

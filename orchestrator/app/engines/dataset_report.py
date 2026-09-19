@@ -722,7 +722,14 @@ _NARRATIVE_CHECKED = "The tables above hold the figures computed by code from th
 #: A number in prose: 1,234,567.89, 1234.5, -12, 12.5%. Dates and times are
 #: removed before this runs.
 _PROSE_NUMBER = re.compile(r"(?<![\w.,])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\w.,])-?\d+(?:\.\d+)?")
-_PROSE_DATE = re.compile(r"\b\d{4}-\d{2}(?:-\d{2})?(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\b|\b\d{1,2}:\d{2}\b")
+_MONTH_WORD = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+#: Dates as prose writes them too: live summaries said "from January 1,
+#: 2023, to December 30, 2024", and the day is not a figure.
+_PROSE_DATE = re.compile(
+    r"\b\d{4}-\d{2}(?:-\d{2})?(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\b|\b\d{1,2}:\d{2}\b"
+    r"|\b" + _MONTH_WORD + r"\s+\d{1,2}(?:st|nd|rd|th)?\b|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?" + _MONTH_WORD,
+    re.I,
+)
 
 
 def _cents(value: Any) -> Optional[Decimal]:
