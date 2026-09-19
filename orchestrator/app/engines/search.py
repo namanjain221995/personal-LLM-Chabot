@@ -28,7 +28,7 @@ from .. import llm
 from ..config import settings
 from .. import db, web_index
 from ..core import extract, net, pasted, provenance, robots
-from ..freshness import Freshness, Verdict, classify_offline
+from ..freshness import _OFFICE, Freshness, Verdict, classify_offline
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -1141,6 +1141,42 @@ def _question_verdict(message: str) -> Optional[Verdict]:
 #: The phrasing `_FRESH_RE` shares with a months-stable office-holder
 #: question ("who is the ceo of ..."), as opposed to a word about time.
 _OFFICE_PHRASING_RE = re.compile(r"\b(?:who is|what is the)\b", re.I)
+#: The whole of a plain office-holder question: "who is the <office> of <up
+#: to five words>", nothing before it and nothing after it but punctuation.
+#: A shape to match, not a list of words to refuse: review round 2
+#: (2026-09-19) found "the new CEO", "the interim ceo", "the acting
+#: president", "the CEO of Intel now", "after pat gelsinger resigned" and
+#: "performing at the concert at 9 pm" ("pm" is an office word) all getting
+#: the 24 h dividend, because none of their words is in `_FRESH_RE`. None of
+#: them fits this shape; `_NOT_A_HOLDER` catches what the shape admits.
+_PLAIN_OFFICE_RE = re.compile(
+    r"^\W*who(?:\s+is|['’]s)\s+the\s+(?P<office>[a-z]+(?:[ -][a-z]+)?)\s+(?:of|at|for)\s+"
+    r"(?P<holder>[\w&.'’-]+(?:\s+[\w&.'’-]+){0,4})[\s?.!]*$",
+    re.I,
+)
+#: Words that make the "of <X>" part a time or a change rather than a name:
+#: "of intel now", "of nepal after yesterday's resignation", "of intel these
+#: days", "of openai following the board reshuffle".
+_NOT_A_HOLDER = frozenset(
+    """
+    after before since until till following amid amidst during post pre now
+    nowadays today tonight yesterday tomorrow currently current presently
+    recently lately still anymore again yet then soon these those this that
+    when while as in on at by with without from to into over under new newly
+    next interim acting incoming outgoing former previous ex elect designate
+    rn atm
+    """.split()
+)
+
+
+def _plain_office_question(message: str) -> bool:
+    m = _PLAIN_OFFICE_RE.match(message or "")
+    if not m or not _OFFICE.fullmatch(m.group("office")):
+        return False
+    for word in re.split(r"[\s-]+", m.group("holder").lower()):
+        if re.sub(r"['’]s$", "", word.strip(".'’")) in _NOT_A_HOLDER:
+            return False
+    return True
 
 
 def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
@@ -1152,17 +1188,18 @@ def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
     gets `_REALTIME_PAGE_TTL_S`, any other VOLATILE verdict ("latest
     release", "current price") the short TTL.
 
-    It may lengthen it for exactly one shape: an office-holder question whose
-    only freshness words are its own phrasing ("who is", "what is the"). Its
-    answer is stable for months, so the regex made it throw away a two-hour-
-    old copy of the page that answered it and pay a network fetch with a 3 s
-    connect + 8 s read ceiling for the same text. The verdict does not get
-    the last word anywhere else: at a039169 it did, and a RECENT verdict gave
-    24 h to "who won the match today", "news about the air india crash" and
-    "update on the Microsoft layoffs", which 4810da0 held to one hour.
-    Measured 2026-09-18 over 153 questions (the repo's freshness and web test
-    questions plus QA's probes): 55 got a LONGER TTL than 4810da0 at a039169;
-    with this rule 10 do, every one "who is the <office> of X".
+    It may lengthen it for exactly one shape: the plain office-holder
+    question, "who is the <office> of <name>" and nothing else
+    (`_PLAIN_OFFICE_RE`). Its answer is stable for months, so the regex made
+    it throw away a two-hour-old copy of the page that answered it and pay a
+    network fetch with a 3 s connect + 8 s read ceiling for the same text.
+    Anything that says the office is changing ("the new CEO", "now", "after
+    ... resigned", "interim", "acting") keeps 4810da0's hour: a copy read
+    before the change names the previous holder, for every user, because the
+    corpus is global. The verdict does not get the last word anywhere else:
+    at a039169 it did, and a RECENT verdict gave 24 h to "who won the match
+    today", "news about the air india crash" and "update on the Microsoft
+    layoffs", which 4810da0 held to one hour.
 
     Without a verdict (deep research's fetch path, the crawler) the wording
     rule is the whole answer, exactly as before.
@@ -1180,8 +1217,10 @@ def _page_ttl(message: str, verdict: Optional[Verdict] = None) -> int:
         return min(_REALTIME_PAGE_TTL_S, settings.web_page_fresh_ttl_s)
     if verdict.volatile:
         return settings.web_page_fresh_ttl_s
-    if verdict.reason == "lexical:office" and not _FRESH_RE.search(
-        _OFFICE_PHRASING_RE.sub(" ", message or "")
+    if (
+        verdict.reason == "lexical:office"
+        and _plain_office_question(message)
+        and not _FRESH_RE.search(_OFFICE_PHRASING_RE.sub(" ", message or ""))
     ):
         return settings.web_page_ttl_s
     return wording

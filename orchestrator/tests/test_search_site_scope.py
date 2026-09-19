@@ -643,3 +643,247 @@ def test_an_operator_after_any_line_break_is_pasted_text_not_a_scope(monkeypatch
     assert search._site_scope(message) == ()
     urls = [r.url for r in asyncio.run(search._collect_results([message], "think"))]
     assert "https://en.wikipedia.org/wiki/Documentation" in urls
+
+
+# ---------------------------------------------------------------------------
+# 4 — QA and security review round 2 repairs (2026-09-19)
+# ---------------------------------------------------------------------------
+
+#: The rewrites the router gave at 4810da0 for two questions ABOUT the
+#: operator (QA review round 2, recorded live with the main model standing in
+#: for the router).
+ABOUT_THE_OPERATOR = {
+    "why does google ignore site:example.com for my queries?": [
+        "why does google ignore site:example.com for my queries",
+        "site: operator not working in google search",
+        "google search site: filter ignored",
+    ],
+    "how do I use site:reddit.com in google search?": [
+        "how to use site: operator in Google search",
+        "Google search site:reddit.com filter examples",
+    ],
+}
+
+#: A pool with the answer pages off the named site, as SearXNG returned it.
+OPERATOR_POOL = [
+    "https://support.google.com/websearch/answer/2466433",
+    "https://example.com/?param=google.com",
+    "https://developers.google.com/search/docs/monitor-debug/search-operators",
+    "https://www.reddit.com/r/Piracy/wiki/megathread/",
+    "https://superuser.com/questions/site-operator",
+]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        *ABOUT_THE_OPERATOR,
+        # The same question with the operator last: the object of "use".
+        "how do I use site:reddit.com?",
+        "can you explain site:example.com",
+        "google keeps ignoring site:example.com",
+        # A one-line quotation of someone else's advice.
+        'Summarise this tweet: "always check site:reddit.com first" and say if it is good advice',
+        'Is this true? "the full report is at site:reddit.com"',
+        # A quotation that ENDS with the operator after a query word, and one
+        # left open: the words are someone else's either way.
+        'Is this true? "full list of winners site:reddit.com"',
+        'Fact-check this: “full list of winners site:reddit.com',
+        "Is this true? 'full list of winners site:reddit.com'",
+        # Asked to AVOID the site, in plain words.
+        "what does the Air India crash report say? please don't rely on site:reddit.com",
+        "latest on the crash, but not from site:reddit.com",
+        "I want the official crash report, not site:reddit.com",
+    ],
+)
+def test_an_operator_the_person_mentions_is_not_a_scope(message):
+    assert search._site_scope(message) == (), message
+
+
+@pytest.mark.parametrize("message", sorted(ABOUT_THE_OPERATOR))
+def test_a_question_about_the_operator_keeps_the_routers_queries(monkeypatch, message):
+    """QA review round 2, live, 3 of 3 runs: the ordinary route's pool for
+    'why does google ignore site:example.com for my queries?' was 58, 67 and
+    58 candidates at 4810da0 (support.google.com, developers.google.com, ...)
+    and 11, 13 and 11 at 3321c20, every one on example.com, because the
+    person's mention was appended to every rewrite as a scope."""
+    rewrites = ABOUT_THE_OPERATOR[message]
+    _router_returns(monkeypatch, json.dumps(rewrites))
+    qs = asyncio.run(search.rewrite_queries(message, [], "think"))
+    assert qs == rewrites, "4810da0 sent the router's queries byte for byte"
+    provider(monkeypatch, lambda q: [result(u) for u in OPERATOR_POOL])
+    urls = [r.url for r in asyncio.run(search._collect_results(qs, "think"))]
+    assert "https://support.google.com/websearch/answer/2466433" in urls, urls
+
+
+@pytest.mark.parametrize(
+    "message, named",
+    [
+        ("why does google ignore site:example.com for my queries?", "example.com"),
+        ("what does the Air India crash report say? please don't rely on site:reddit.com",
+         "reddit.com"),
+    ],
+)
+def test_the_fast_lookup_reads_off_the_site_the_person_only_mentioned(
+    monkeypatch, message, named
+):
+    """The Fast lookup sends the message itself as its one query: 8 candidates
+    with 2 on the named site at 4810da0, 6 with 6 at 3321c20 (live)."""
+    provider(monkeypatch, lambda q: [result(u) for u in OPERATOR_POOL])
+    monkeypatch.setattr(search, "_spawn", lambda coro: coro.close())
+    monkeypatch.setattr(settings, "web_memory_enabled", False)
+    monkeypatch.setattr(settings, "search_enabled", True)
+    read = []
+
+    async def reader(idx, r, stored=None, **kw):
+        read.append(r.url)
+        return search._Source(n=idx, title=r.title, url=r.url, text="body")
+
+    async def index(**kw):
+        return None
+
+    monkeypatch.setattr(search, "_fetch_source", reader)
+    monkeypatch.setattr(web_index, "index_pending", index)
+    asyncio.run(search.fetch_for_freshness(message, max_sources=2))
+    assert read and not all(named in u for u in read), read
+
+
+def test_an_operator_the_rewriter_invented_becomes_a_plain_word(monkeypatch):
+    """QA review round 2, live 3 of 3: a pasted note two turns back made the
+    router write 'site:reddit.com Air India crash investigation'. The host
+    stays as a word (the router's topical hint, as the engines saw it at
+    4810da0 minus the allowlist); only the person's own scope is enforced."""
+    _router_returns(monkeypatch, json.dumps([
+        "site:reddit.com Air India crash investigation",
+        "Air India crash investigation latest news",
+    ]))
+    qs = asyncio.run(search.rewrite_queries(
+        "any news on the Air India crash investigation?", [], "think"))
+    assert qs == [
+        "reddit.com Air India crash investigation",
+        "Air India crash investigation latest news",
+    ], qs
+    assert all(search._site_scope(q) == () for q in qs)
+    # With a typed scope of its own, the person's operator is kept and the
+    # invented one still is not.
+    _router_returns(monkeypatch, json.dumps([
+        "qdrant speed site:reddit.com", "qdrant latency site:qdrant.tech",
+    ]))
+    qs = asyncio.run(search.rewrite_queries(
+        "site:qdrant.tech how fast is search on 10 million vectors?", [], "think"))
+    assert qs == ["qdrant speed reddit.com site:qdrant.tech",
+                  "qdrant latency site:qdrant.tech"], qs
+
+
+def test_the_persons_scope_is_still_read_when_the_rewrite_says_not(monkeypatch):
+    """A trailing operator after a "not" reads as text (the AVOID rule), so
+    the person's operator goes in front of such a rewrite instead."""
+    _router_returns(monkeypatch, json.dumps(["why is qdrant not faster than milvus"]))
+    qs = asyncio.run(search.rewrite_queries(
+        "site:qdrant.tech why is qdrant not faster?", [], "think"))
+    assert [search._site_scope(q) for q in qs] == [("qdrant.tech",)], qs
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # Security review round 2, beside the ten QA listed.
+        "who is the ceo of twitter after musk stepped down",
+        "who is the president of south korea after yesterday's election",
+        "who is the ceo of intel rn",
+        "who is the incoming governor of the RBI",
+        "who is the president-elect of the united states",
+        "who is the ceo of openai following the board reshuffle?",
+    ],
+)
+def test_an_office_question_asked_as_it_changes_keeps_the_hour(ttls, question):
+    assert search._page_ttl(question) == 3600, "fixture must be one 4810da0 held to an hour"
+    verdict = search._question_verdict(question)
+    assert verdict is not None and verdict.reason == "lexical:office", verdict
+    assert search._page_ttl(question, verdict) <= 3600, question
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Who is the CEO of Intel?",
+        "who's the prime minister of the UK",
+        "who is the governor of the RBI",
+        "who is the chief minister of andhra pradesh?",
+        "who is the ceo of bank of america",
+    ],
+)
+def test_a_plain_office_question_keeps_its_dividend(ttls, question):
+    """What must not change from 3321c20: the plain shape the dividend was
+    kept for (test_search_hygiene pins it for 'who is the ceo of acme
+    robotics')."""
+    verdict = search._question_verdict(question)
+    assert search._page_ttl(question, verdict) == 24 * 3600, question
+
+
+def test_the_verdict_memo_holds_no_message_text_at_its_full_size():
+    """Security review round 2: 32 messages of 1 MB left 32.7 MB held after
+    every caller let go; the memo keeps 32 entries, so fill all of them."""
+    import gc
+    import tracemalloc
+
+    search._verdict_memo.cache_clear()
+    para = "The quarterly report describes revenue and the outlook in plain prose. "
+    gc.collect()
+    tracemalloc.start()
+    try:
+        for i in range(32):
+            msg = f"[{i}] latest news on this pasted report: " + para * (256_000 // len(para))
+            assert search._question_verdict(msg) is not None
+            del msg
+        gc.collect()
+        held, _peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        search._verdict_memo.cache_clear()
+    assert held < 2**20, f"{held / 2**20:.1f} MiB of message text outlives 32 turns"
+
+
+def test_the_verdict_memo_still_answers_a_repeat_without_classifying(monkeypatch):
+    calls = []
+
+    def counting(question, *, now_year):
+        calls.append(len(question))
+        return classify_offline(question, now_year=now_year)
+
+    monkeypatch.setattr(search, "classify_offline", counting)
+    search._verdict_memo.cache_clear()
+    first = search._question_verdict("latest vllm release notes")
+    again = search._question_verdict("latest vllm release notes")
+    assert first == again and calls == [len("latest vllm release notes")]
+
+
+def test_an_eszett_scope_goes_upstream_in_its_own_spelling(monkeypatch):
+    """QA review round 2: IDNA 2003 turned site:straße.de into
+    'site:strasse.de', another registrant's domain, on every rewrite."""
+    assert search._site_scope("site:straße.de öffnungszeiten") == ("xn--strae-oqa.de",)
+    assert search._site_scope("site:BÜCHER.de preise") == ("xn--bcher-kva.de",)
+    _router_returns(monkeypatch, json.dumps(["öffnungszeiten"]))
+    qs = asyncio.run(search.rewrite_queries("site:straße.de öffnungszeiten", [], "think"))
+    assert qs == ["öffnungszeiten site:xn--strae-oqa.de"], qs
+
+
+def test_the_fast_lookup_does_not_classify_a_long_question_again(monkeypatch, ttls):
+    """QA round 1 residual, still open after round 2: the Fast lookup's second
+    classify_offline pass ran on the event loop whatever the length (13.3 s
+    on a 400 KB pathological line). Past _FAST_VERDICT_MAX_CHARS it keeps the
+    wording TTL it had at 4810da0; under it the verdict still arrives."""
+    calls = []
+
+    def counting(question, *, now_year):
+        calls.append(len(question))
+        return classify_offline(question, now_year=now_year)
+
+    monkeypatch.setattr(search, "classify_offline", counting)
+    search._verdict_memo.cache_clear()
+    long_q = "what is the NVIDIA stock price right now? " + "what does x " * 1000
+    assert len(long_q) > search._FAST_VERDICT_MAX_CHARS
+    verdict, _ = _through(monkeypatch, "fetch_for_freshness", long_q, timedelta(minutes=10))
+    assert verdict is None and calls == [], calls
+    verdict, _ = _through(monkeypatch, "fetch_for_freshness", REALTIME_Q, timedelta(minutes=10))
+    assert verdict is not None and verdict.requirement is Freshness.REALTIME
