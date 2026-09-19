@@ -349,7 +349,13 @@ _SCALE_VERDICT_RE = re.compile(
     re.I,
 )
 
-_HEADING_ONLY_RE = re.compile(r"^\s*(?:#{1,6}\s|\*\*[^*]+\*\*\s*:?\s*$|__[^_]+__\s*$)")
+#: A heading, or a bullet whose whole text is a bold label ("*   **Current
+#: Scale (2 DGX Sparks):**"): both introduce the lines under them.
+_HEADING_ONLY_RE = re.compile(
+    r"^\s*(?:#{1,6}\s|(?:[-*+]\s+)?\*\*[^*]+\*\*\s*:?\s*$|(?:[-*+]\s+)?__[^_]+__\s*$)"
+)
+#: How many lines under such a heading may carry its verdict.
+_HEADING_REACH = 3
 
 
 def verdict_at_scale(answer: str, count: int, unit: str) -> bool:
@@ -377,9 +383,14 @@ def verdict_at_scale(answer: str, count: int, unit: str) -> bool:
         for sentence in re.split(r"(?<=[.!?])\s+", line):
             if scale_re.search(sentence) and _SCALE_VERDICT_RE.search(scale_re.sub(" ", sentence)):
                 return True
-        if _HEADING_ONLY_RE.match(raw[i]) and i + 1 < len(lines):
-            if _SCALE_VERDICT_RE.search(re.split(r"(?<=[.!?])\s+", lines[i + 1])[0]):
-                return True
+        if _HEADING_ONLY_RE.match(raw[i]):
+            # the lines under it, until one names another count of the unit
+            other = re.compile(rf"\b\d+[- ](?:{unit})\b", re.I)
+            for below in lines[i + 1:i + 1 + _HEADING_REACH]:
+                if other.search(below) and not scale_re.search(below):
+                    break
+                if _SCALE_VERDICT_RE.search(re.split(r"(?<=[.!?])\s+", below)[0]):
+                    return True
     return False
 
 

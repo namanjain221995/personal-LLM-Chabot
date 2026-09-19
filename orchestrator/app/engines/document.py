@@ -348,6 +348,146 @@ async def look_up_named_product(
     return _lookup_block(name, query, picked), sources
 
 
+# ---------------------------------------------------------------------------
+# The person's scale today and the scale they plan (2026-09-19, round 7, L4)
+#
+# The owner runs 2 DGX Sparks and plans 20. With only a general rule in the
+# prompt ("when the conversation gives the person's scale today and a
+# planned scale, give a verdict for EACH"), his turn got a verdict for the 20
+# three times out of three and for the 2 once (a3ca8dc, web on, Fast); on
+# 4e7cf8e, 4 of 22 saved answers judged the 2. The two numbers are in his own
+# turns, so a rule reads them and the turn states them -- the model is not
+# asked to find the numbers, only to judge each one.
+# ---------------------------------------------------------------------------
+
+#: "<count> <thing>": "2 DGX Spark box", "20 dgx spark", "3 nodes", "grow to 20".
+_COUNT_RE = re.compile(r"(?<![\w.,])(\d{1,5})(?![\w.,]\d)((?:\s+[A-Za-z][\w-]*){0,2})")
+#: Said as a plan when one of these sits just before the count.
+_PLAN_WORDS_RE = re.compile(
+    r"\b(?:grow\w*|scal(?:e|es|ing)|expand\w*|increas\w*|reach\w*|plan\w*|target\w*|"
+    r"aim\w*|going|go|add\w*|double|triple|eventually|later|want\w*|up\s+to)\b",
+    re.I,
+)
+#: Said as the present when one of these sits just before the count.
+_NOW_WORDS_RE = re.compile(
+    r"\b(?:have|has|run|runs|running|own|owns|use|using|currently|today|now|got|operate\w*)\b",
+    re.I,
+)
+#: A count of these is a quantity or a time, not the person's units.
+_NOT_A_THING = frozenset("""
+month months year years week weeks day days hour hours minute minutes second seconds percent
+kw w kva va v a gb tb mb mm cm m kg u x times of in for per to by at on and or the a an with
+""".split())
+#: How far before a count its plan or present word may sit.
+_SCALE_LOOKBACK = 30
+
+
+def _thing(words: str) -> Tuple[str, str, str]:
+    """(first word, second word, display) for the words after a count, the
+    words singular and lower case; ("", "", "") when they name no thing."""
+    kept: List[str] = []
+    for w in words.split():
+        if w.lower() in _NOT_A_THING or w.lower() in {"box", "boxes", "unit", "units"}:
+            break
+        kept.append(w)
+    if not kept:
+        return "", "", ""
+    # The second word is part of the name only when it looks like one ("DGX
+    # Spark"); "Sparks today" is the thing and an ordinary word.
+    if len(kept) > 1 and not (_NAME_TOKEN_RE.match(kept[1]) or kept[0].isupper()):
+        kept = kept[:1]
+    display = _singular(" ".join(kept))
+    low = [t.lower().rstrip("s") if len(t) > 3 else t.lower() for t in display.split()]
+    return low[0], (low[1] if len(low) > 1 else ""), display
+
+
+def _same_thing(a: Tuple[str, str, str], b: Tuple[str, str, str]) -> bool:
+    """Same first word, and never two different names after it: "DGX Spark"
+    and "dgx spark" match, "Sparks" and "Sparks" match, "DGX Spark" and "DGX
+    Station" do not."""
+    return a[0] == b[0] and not (a[1] and b[1] and a[1] != b[1])
+
+
+def stated_scales(question: str, history: Sequence[dict]) -> Optional[Tuple[int, int, str]]:
+    """(today, planned, thing) when the person's own words give a count of a
+    thing now and a larger count of the same thing as a plan; else None.
+
+    Only the question and the person's last few turns are read (the assistant
+    restating a plan is not the person's situation), each bounded like the
+    name finder. A bare planned count ("plan to grow to 20") belongs to the
+    thing last counted before it."""
+    user_turns = [
+        str(m.get("content") or "")
+        for m in conversation_turns(history, 2 * _NAME_TURNS)
+        if m.get("role") == "user" and isinstance(m.get("content"), str)
+    ][-_NAME_TURNS:]
+    now: List[Tuple[int, Tuple[str, str, str]]] = []
+    plan: List[Tuple[int, Tuple[str, str, str]]] = []
+    for text in user_turns + [question or ""]:
+        text = text[-_NAME_SCAN_CHARS:]
+        last: Tuple[str, str, str] = ("", "", "")
+        for m in _COUNT_RE.finditer(text):
+            count = int(m.group(1))
+            thing = _thing(m.group(2) or "")
+            before = text[max(0, m.start() - _SCALE_LOOKBACK):m.start()]
+            # the NEARER marker decides: "... grow to 20 racks, we have 2" is now
+            plan_at = max((p.end() for p in _PLAN_WORDS_RE.finditer(before)), default=-1)
+            now_at = max((p.end() for p in _NOW_WORDS_RE.finditer(before)), default=-1)
+            planned = plan_at > now_at
+            if not thing[0]:
+                if not (planned and last[0]):
+                    continue
+                thing = last
+            last = thing
+            if planned:
+                plan.append((count, thing))
+            elif now_at >= 0:
+                now.append((count, thing))
+    for today, thing in now:
+        bigger = [(c, t) for c, t in plan if c > today and _same_thing(thing, t)]
+        if bigger:
+            planned, other = max(bigger, key=lambda ct: ct[0])
+            # the fuller name of the two: "dgx" today, "DGX Sparks" planned
+            name = max((thing[2], other[2]), key=lambda d: len(d.split()))
+            return today, planned, name
+    return None
+
+
+def scale_line(scales: Tuple[int, int, str]) -> str:
+    today, planned, thing = scales
+    return (
+        f"(From this conversation, the person's scale: {today} {thing} today and {planned} "
+        "planned. The question is about both: give a verdict for each scale, with the "
+        "numbers it turns on.)"
+    )
+
+
+def no_source_line(name: str) -> str:
+    """For a named product with no source this turn (web off, or the lookup
+    found nothing about it).
+
+    BASE says "never invent a figure" in general, and the model does not
+    know which figures it is inventing: live at a69534e, Fast, web off, the
+    owner's turn said "a single DGX Spark has a typical power draw of
+    ~300W-400W" 2 of 2 times (its adapter is 240 W). Code knows no source
+    exists, so the turn names the product: with this line, 4 runs are
+    recorded in the commit that added it. Two stronger wordings measured
+    worse, 2 runs each: "not even as an example or an assumption" made both
+    answers reason from a class figure instead ("typical for AI accelerators
+    is often 300W-800W per unit"), and "no figure for the kind of product you
+    think it is" gave one "e.g., 300W-500W" and thinking out loud. The model
+    does not know what the product is; only a lookup fixes that, and this
+    line only keeps the unknown from being stated as fact. The cost is a figure the model
+    does know for an older product (H100, RTX 4090) when web is off; web is
+    on for a turn unless the person or the mode turned it off."""
+    return (
+        f"(No source for {name}'s figures this turn: the document does not describe it and "
+        "no web lookup ran. Your memory of recent products is not reliable, so state no "
+        f"power, size, weight or price for {name}: say in one line that you do not have its "
+        "figures and ask for them, and give the verdict on the figures you do have.)"
+    )
+
+
 #: Words that mean the QUESTION is about what the page looks like, where the
 #: text layer alone cannot answer and the renders earn their tokens.
 _VISUAL_INTENT_RE = re.compile(
@@ -726,18 +866,21 @@ async def run_pdf_engine_multi(
     else:
         excerpt = select_relevant(merged, instruction, DOC_CONTEXT_CHARS)
     content: List[dict] = [{"type": "text", "text": header + instruction}]
+    scales = stated_scales(instruction, history) if advising else None
+    if scales:
+        content.append({"type": "text", "text": "\n\n" + scale_line(scales)})
     if excerpt.strip():
         content.append(
             {"type": "text",
              "text": f"\n\nDocument text (most relevant sections):\n{excerpt}"}
         )
     web_sources: List[dict] = []
-    if advising and web_search:
-        product = named_product_to_look_up(instruction, history, merged)
-        if product:
+    product = named_product_to_look_up(instruction, history, merged) if advising else None
+    if product:
+        block = ""
+        if web_search:
             block, web_sources = await look_up_named_product(product, merged, emit)
-            if block:
-                content.append({"type": "text", "text": "\n\n" + block})
+        content.append({"type": "text", "text": "\n\n" + (block or no_source_line(product))})
     for url in images:
         content.append({"type": "image_url", "image_url": {"url": url}})
     # Images found INSIDE an uploaded archive (data: URLs, already capped by

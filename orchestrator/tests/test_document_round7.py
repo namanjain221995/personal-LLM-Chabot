@@ -351,6 +351,59 @@ def engine(monkeypatch):
     return seen
 
 
+# ---------------------------------------------------------------------------
+# L4: the two scales are read by code and stated in the turn
+# ---------------------------------------------------------------------------
+
+#: The owner's own words, as the live bar B3 replays them.
+_OWNER_HISTORY = [
+    {"role": "user", "content": "hi, we run 2 DGX Spark box in our office for AI work"},
+    {"role": "assistant", "content": "Two DGX Sparks is a solid local setup."},
+    {"role": "user", "content": "fine tune and inference. plan is grow to 20 dgx spark in next "
+     "12 month so thinking proper room for them, power and cooling"},
+    {"role": "assistant", "content": "Going from 2 to 20 Sparks changes the picture."},
+]
+
+
+@pytest.mark.parametrize(
+    "question,history,expected",
+    [
+        (OWNER_QUESTION, _OWNER_HISTORY, (2, 20, "DGX Spark")),
+        (OWNER_QUESTION, _SPARK_HISTORY, (2, 20, "DGX Spark")),
+        ("we have 3 nodes and want to scale to 12 nodes - is this enough?", [], (3, 12, "nodes")),
+        # one scale, or two numbers about different things, or no plan
+        ("we have 2 racks, is this enough?", [], None),
+        ("we have 2 racks and 20 kW of cooling, is this enough?", [], None),
+        ("we have 2 racks and 20 racks at the other site", [], None),
+        ("we have 2 Sparks today and plan 20 Sparks next year", [], (2, 20, "Spark")),
+        ("we have 2 dgx spark, plan 20 DGX Sparks", [], (2, 20, "DGX Spark")),
+        # the nearer word decides: this 2 is today's, not part of the plan
+        ("we plan to grow. We have 2 racks and want 10 racks", [], (2, 10, "racks")),
+        ("we run 2 DGX Spark and plan to add 20 DGX Station", [], None),
+        # the assistant's words are not the person's situation
+        (OWNER_QUESTION, [{"role": "assistant", "content": "You run 2 Sparks and plan 20 Sparks."}],
+         None),
+    ],
+)
+def test_the_two_scales_are_read_from_the_persons_turns(question, history, expected):
+    assert document.stated_scales(question, history) == expected
+
+
+def test_an_advice_turn_states_both_scales_to_the_model(engine):
+    """L4. On a3ca8dc, web on, the owner's turn got a verdict for the 20
+    Sparks 3 of 3 and for the 2 he runs today 1 of 3 -- the rule in the
+    prompt names no numbers. The numbers are in his turns, so code reads
+    them and the turn says them."""
+    text, _ = engine["run"](history=_OWNER_HISTORY, web_search=False)
+    assert "2 DGX Spark today and 20 planned" in text
+    assert "give a verdict for each scale" in text
+
+
+def test_no_scale_line_without_two_scales(engine):
+    text, _ = engine["run"](history=[], web_search=False)
+    assert "give a verdict for each scale" not in text
+
+
 def test_web_on_runs_one_focused_lookup_and_cites_it(engine):
     text, events = engine["run"]()
     assert engine["queries"] == [["DGX Spark power consumption specifications"]]
@@ -424,6 +477,42 @@ def test_a_lookup_that_finds_nothing_about_the_product_adds_nothing(engine, monk
     text, events = engine["run"]()
     assert "Web lookup" not in text
     assert "sources" not in [d for k, d in events if k == "meta"][-1]
+
+
+_NO_SOURCE = "No source for DGX Spark's figures this turn"
+
+
+def test_web_off_tells_the_model_it_has_no_source_for_the_named_product(engine):
+    """L1, web off. BASE already says "never invent a figure" for a product
+    the document does not describe; live at a69534e, Fast, with web off,
+    the owner's turn stated "a single DGX Spark has a typical power draw of
+    ~300W-400W" 2 of 2 times (its adapter is 240 W). Code knows no source
+    exists, so the turn names the product and says so."""
+    text, _ = engine["run"](web_search=False)
+    assert _NO_SOURCE in text
+    assert "state no power, size, weight or price for DGX Spark" in text
+    assert engine["queries"] == [] and engine["provider"] == 0
+
+
+def test_a_lookup_that_found_the_product_needs_no_admission(engine):
+    text, _ = engine["run"]()
+    assert "Web lookup for DGX Spark" in text and _NO_SOURCE not in text
+
+
+def test_a_lookup_that_found_nothing_leaves_the_admission(engine, monkeypatch):
+    from app.engines import search
+
+    async def down(*a, **k):
+        raise SearchUnavailableError("SearXNG error")
+
+    monkeypatch.setattr(search, "_collect_results", down)
+    text, _ = engine["run"]()
+    assert "Web lookup" not in text and _NO_SOURCE in text
+
+
+def test_no_admission_when_no_product_is_named(engine):
+    text, _ = engine["run"](question="is this worth it for us?", history=[], web_search=False)
+    assert _NO_SOURCE not in text
 
 
 def test_a_slow_search_cannot_hold_the_answer(engine, monkeypatch):
@@ -537,6 +626,11 @@ def test_the_scale_grader_sees_a_verdict_for_the_plan_only():
         ("### At 2 Sparks (today)\n**No.** Your desk and room air already cope.", True),
         ("| Scale | Verdict |\n|---|---|\n| 2 DGX Sparks | Not needed |", True),
         ("You have 2 DGX Sparks today.", False),
+        # a bullet label lends the lines under it (a live answer, verbatim)
+        ("*   **Current Scale (2 DGX Sparks):**\n    *   **Requirement:** Minimal.\n"
+         "    *   **Fit:** **Yes.** The SmartRow is massively over-provisioned for 2 units.", True),
+        # ... but not the next scale's verdict
+        ("### 2 DGX Sparks\nSmall.\n### 20 DGX Sparks\n**Yes**, it fits.", False),
         # a density is not the person's scale (a 4e7cf8e answer scored it)
         ("*Recommendation:* Plan for 2 DGX Sparks per rack to stay within 10 kW.", False),
         # thinking out loud is not a verdict (another one did)
