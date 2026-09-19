@@ -109,7 +109,20 @@ _MIN_CLIPPED_CHARS = 2000
 
 # base_url -> max_model_len, learned once per process.
 _window_cache: dict = {}
-_lock = asyncio.Lock()
+#: One lock per event loop. A module-level asyncio.Lock binds to the first loop
+#: that ever WAITS on it, and a later loop that contends it raises "is bound to
+#: a different event loop" - which is what failed PR #79's CI: two generations
+#: resumed at start-up both asked for the window while an earlier test's loop
+#: owned the lock. Production runs one loop, so there it is the same one lock.
+_locks: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _window_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _locks.get(loop)
+    if lock is None:
+        lock = _locks[loop] = asyncio.Lock()
+    return lock
 
 #: One /tokenize client per (event loop, timeout), for the same reason
 #: llm._CLIENTS exists — except this call site was missed by that 2026-09-03
@@ -404,7 +417,7 @@ async def model_window(base_url: str, model: str) -> int:
     cached = _window_cache.get(base_url)
     if cached:
         return cached
-    async with _lock:
+    async with _window_lock():
         cached = _window_cache.get(base_url)
         if cached:
             return cached

@@ -569,17 +569,38 @@ a {
   line-height: var(--ts-lh-chat);
 }
 
+/* 2026-09-19: an h3 at 1em was the body's size, so "### 1. Machine Learning"
+   read as one more bold line and a four-section answer looked like a single
+   flat list (owner's chat a9f05bf2). Every level now steps down from the one
+   above and stays above the paragraph; h4 alone matches the body. */
 .chat-answer .md h1 {
-  font-size: 1.25em;
+  font-size: 1.5em;
 }
 
 .chat-answer .md h2 {
-  font-size: 1.125em;
+  font-size: 1.3em;
 }
 
-.chat-answer .md h3,
+.chat-answer .md h3 {
+  font-size: 1.15em;
+}
+
 .chat-answer .md h4 {
   font-size: 1em;
+}
+
+.chat-answer .md h1,
+.chat-answer .md h2,
+.chat-answer .md h3 {
+  margin-top: 1.5em;
+}
+
+/* A heading belongs to what follows it: a tight gap below, the wide one above. */
+.chat-answer .md h1 + *,
+.chat-answer .md h2 + *,
+.chat-answer .md h3 + *,
+.chat-answer .md h4 + * {
+  margin-top: 0.45em;
 }
 
 .chat-answer .md table {
