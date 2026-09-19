@@ -5871,6 +5871,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         # for documents too (2026-08-29).
                         effort=request.effort,
                         extra_images=list(doc_images) + attached,
+                        # One focused lookup for a product the document does
+                        # not describe, only when this turn may use the web
+                        # (engines/document.py, 2026-09-19).
+                        web_search=bool(search_allowed),
                     )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only
