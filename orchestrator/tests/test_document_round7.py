@@ -636,6 +636,12 @@ def test_the_scale_grader_sees_a_verdict_for_the_plan_only():
         # thinking out loud is not a verdict (another one did)
         ("*   Wait, the user said \"2 DGX Spark box\".", False),
         ("you will need two units (or one large custom build) to handle 20 DGX Sparks.", False),
+        # live answers, 2026-09-19, verbatim: each a verdict for the 2 today
+        ("**Verdict: No.** The Vertiv SmartRow is not a suitable solution for your DGX Spark "
+         "deployment, either at your current scale of 2 or your planned scale of 20.", True),
+        ("For 2 or even 20 DGX Sparks, you do not need a full UPS-integrated row enclosure.", True),
+        ("**Verdict: No.** The Veridane EdgeRow is not suitable for your current 2-unit setup.",
+         True),
     ],
 )
 def test_the_scale_grader_reads_only_verdicts_about_the_count(answer, today):

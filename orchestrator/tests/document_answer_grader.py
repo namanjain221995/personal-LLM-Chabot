@@ -345,7 +345,10 @@ _SCALE_VERDICT_RE = re.compile(
     r"|(?:can|could|will|would)(?:\s+not|n'?t)?\s+(?:handle|fit|cope|cover|hold|support|house)"
     r"|cannot|can'?t|won'?t|not\s+needed|unnecessary|no\s+need|yes|no|ok|okay"
     r"|good|poor|bad|wasteful|premature|justified|makes?\s+sense|worth"
-    r"|recommend\w*|verdict)\b",
+    r"|recommend\w*|verdict|suitable|unsuitable|appropriate|inappropriate"
+    # not bare "right": "right on the edge of the minimum load" is a position
+    r"|(?:right|wrong)\s+(?:choice|fit|size|tool|solution|product|option|call)"
+    r"|mismatch\w*|(?:do|does|did)\s*n[o']?t\s+need|don'?t\s+need|doesn'?t\s+need)\b",
     re.I,
 )
 
@@ -370,9 +373,18 @@ def verdict_at_scale(answer: str, count: int, unit: str) -> bool:
     """
     text = (answer or "").replace("**", "").replace("__", "")
     num = rf"(?:{count}|{_NUMBER_WORDS.get(count, str(count))})"
-    # "2 DGX Sparks per rack" is a density, not the person's scale.
+    # "2 DGX Sparks per rack" is a density, not the person's scale. Besides
+    # "<count> <unit>", three shapes live answers use for the person's scale
+    # (2026-09-19): "your current scale of 2" / "current scale (2 units)",
+    # "for 2 or even 20 DGX Sparks", and "your current 2-unit setup". A bare
+    # "two units" is not one: "you will need two units (or one large custom
+    # build) to handle 20 DGX Sparks" counts enclosures.
+    per = r"(?!\s*(?:per|each|/|in\s+(?:each|every|a))\b)"
     scale_re = re.compile(
-        rf"\b{num}(?:[- ](?:x|×))?[- ](?:{unit})\b(?!\s*(?:per|each|/|in\s+(?:each|every|a))\b)",
+        rf"\b{num}(?:[- ](?:x|×))?[- ](?:{unit})\b{per}"
+        rf"|\bscale\s*(?:of\s+|\(\s*){num}\b"
+        rf"|\b{num}\s+(?:or|and|to)\s+(?:even\s+)?\d+[- ](?:{unit})\b{per}"
+        rf"|\b(?:current|existing|today'?s|your|planned)\s+(?:\w+\s+)?{num}[- ]units?\b",
         re.I,
     )
     lines = [l for l in text.splitlines() if l.strip()]
