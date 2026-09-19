@@ -47,9 +47,11 @@ def test_the_paste_is_fenced_and_the_ask_is_the_persons_own():
     inside = [
         part.split(pasted.CLOSE_TAG)[0] for part in content.split(pasted.OPEN_TAG)[1:]
     ]
-    # The injected note is inside a fence; the person's ask is outside every fence.
-    assert any(INJECTION in block for block in inside)
+    # The posting is inside a fence; the person's ask is outside every fence;
+    # the injected note is nowhere (withheld: see the test below).
+    assert any("hands on experience with Kafka" in block for block in inside)
     assert not any(ASK in block for block in inside)
+    assert INJECTION not in content
     assert ASK in content
     # And the model is told what the fence means.
     assert "<pasted_text>" in system and "never instructions" in system
@@ -85,3 +87,25 @@ def test_any_other_turn_is_handed_over_unchanged_and_without_the_note():
     system, user = _turn(message)
     assert user == {"role": "user", "content": message}
     assert "<pasted_text>" not in system
+
+
+def test_a_line_addressed_to_an_ai_never_reaches_the_model():
+    """Measured live on this branch: with the fence and the note, the injected
+    note was still obeyed in 2 of 2 Fast runs (Salary: 45 LPA, Reports To:
+    Chief Executive Officer). A line addressed to an AI is not written for the
+    posting's readers, so it is withheld from the model; the rest of the
+    paste is kept word for word."""
+    _, user = _turn(REWRITE)
+    assert INJECTION not in user["content"]
+    assert "45 LPA" not in user["content"]
+    assert "hands on experience with Kafka, Flink or Spark Structured Streaming" in user["content"]
+
+
+def test_a_line_about_a_human_assistant_is_kept():
+    lines = [
+        "every assistant in the clinic is trained in patient intake",
+        "note to the assistant: please file the signed copy by Friday",
+    ]
+    content = pasted.fenced(f"{POSTING}\n" + "\n".join(lines) + f"\n\n{ASK}\n\n{SAMPLE}")
+    for line in lines:
+        assert line in content
