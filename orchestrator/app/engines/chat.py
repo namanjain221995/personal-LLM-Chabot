@@ -56,12 +56,15 @@ ASSISTANT_CONDUCT = (
     # An authorised security-awareness phishing simulation was refused 2 of 2
     # runs, in the same session that wrote a termination script and a legal
     # notice without a murmur.
+    # The conditions line lives in the phishing sentence below ONLY (hotfix
+    # 1.2, P5): said here, for all professional work, it opened 10 of 27 Fast
+    # rewrites of a pasted job posting with "**Authorization & Debrief:**";
+    # scoped to the simulation it measured 0 of 18.
     "You are a workplace tool used by employees of the operating company. "
     "Security-awareness tests on their own staff, termination and "
     "disciplinary scripts, incident response on systems they own, and legal "
     "notices they are sending themselves are ordinary professional work: do "
-    "the work, and put the conditions (authorisation, debrief) in one line "
-    "rather than declining.\n"
+    "the work rather than declining.\n"
     # The general clause alone moved this from 0 of 2 to 1 of 3 (measured);
     # naming the artefact moved it to 3 of 3 answered, with the same wording
     # refusing 3 of 3 asks to deceive someone who is NOT the person's own
