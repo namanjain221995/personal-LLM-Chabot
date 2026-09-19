@@ -264,6 +264,45 @@ _PATH_CHARS_RE = re.compile(r"[\w.~%/-]*")
 #: was under 60 characters, and deep research's longer rescue query is
 #: exempt (see `_site_scope`).
 _SITE_SCOPE_MAX_CHARS = 256
+#: One whitespace-separated token that IS an operator: "site:x", "(site:x",
+#: "-site:x" (an exclusion: part of a run of operators, never a scope).
+_SITE_TOKEN_RE = re.compile(r"\(*(-?)site:(\S+)", re.I)
+#: Tokens that join operators into one run: "site:a.com OR site:b.com".
+_SITE_JOINERS = frozenset({"OR", "|", "(", ")"})
+_QUOTE_MARKS = "\"“”„«»"
+#: A word in the sentence before a trailing operator that makes it a site
+#: the person does NOT want searched. Security review round 2 (2026-09-19):
+#: 'what does the Air India crash report say? please don't rely on
+#: site:reddit.com' confined every rewritten query to reddit.com.
+_SCOPE_REFUSED_RE = re.compile(
+    r"n['’]t\b|\b(?:not|no|never|without|except|excluding|exclude[sd]?|"
+    r"avoid\w*|ignor\w*|skip\w*|besides|instead|rather than|other than|"
+    r"anything but|away from)\b",
+    re.I,
+)
+#: The word right before a trailing operator that makes the operator the
+#: OBJECT of a sentence ("how do I use site:reddit.com", "can you explain
+#: site:example.com") rather than a filter after a query ("latest qdrant
+#: release site:qdrant.tech"): closed-class words, and the verbs people put
+#: in front of an operator they are asking ABOUT. Any other word is a query
+#: word. A miss here searches unscoped, as 4810da0 did.
+_OPERATOR_AS_OBJECT = frozenset(
+    """
+    about above across after against along among around as at before behind
+    below beside between beyond by despite during for from in inside into like
+    near of off on onto out over per since than through to toward towards
+    under until unlike up upon via with within without
+    a an the this that these those my your our their its his her any some
+    every each all it them and or but nor so if because while
+    is are was were be been am do does did use uses using used try tried
+    trying search searches searching searched check checks checking explain
+    explains handle handles handled mean means meant visit visiting see open
+    read trust rely prefer include includes including type typed typing
+    enter write add put ignore ignores ignored ignoring show shows find finds
+    get gets say says said post posted share shared mention mentioned cite
+    cited called named block blocks blocked exclude excludes avoid avoids
+    """.split()
+)
 
 
 def _ascii_host(host: str) -> str:
@@ -278,6 +317,68 @@ def _ascii_host(host: str) -> str:
         return host
 
 
+def _scope_of(raw: str) -> str:
+    """'qdrant.tech', 'qdrant.tech/benchmarks' or '' from the text after
+    `site:`, the host in its ASCII (IDNA) spelling."""
+    raw = raw.strip("\"'()[],;")
+    if "://" in raw:
+        try:
+            u = urlparse(raw)
+            raw = (u.hostname or "") + (u.path or "")
+        except ValueError:
+            raw = ""
+    host, _, path = raw.partition("/")
+    host = host.split(":")[0].lower().removeprefix("*.")
+    host = _HOST_CHARS_RE.match(host).group(0).strip(".").removeprefix("www.")
+    if not host:
+        return ""
+    path = _PATH_CHARS_RE.match(path).group(0).lower().rstrip("./").strip("/")
+    host = _ascii_host(host)
+    return f"{host}/{path}" if path else host
+
+
+def _operator_run(q: str) -> List[str]:
+    """The operator tokens a query uses AS SEARCH SYNTAX: the run of
+    operators that opens it, and the run that closes it after a query word.
+
+    An operator anywhere else is text. QA and security review round 2
+    (2026-09-19), live: 'why does google ignore site:example.com for my
+    queries?' read 11 candidates, all on example.com (58 across
+    support.google.com and others at 4810da0), and a quoted forward ('Is this
+    true? "... full proof at site:reddit.com, share ..."') read 8 of 8 from
+    reddit.com. A closing run inside or closing a quotation, after a word
+    that makes it the object of the sentence, or in a sentence that asks to
+    avoid it is text too."""
+    toks = list(re.finditer(r"\S+", q))
+
+    def in_run(tok: str) -> bool:
+        return tok in _SITE_JOINERS or bool(_SITE_TOKEN_RE.match(tok))
+
+    lead = 0
+    while lead < len(toks) and in_run(toks[lead].group()):
+        lead += 1
+    tail = len(toks)
+    while tail > lead and in_run(toks[tail - 1].group()):
+        tail -= 1
+    run = [t.group() for t in toks[:lead]]
+    if lead < tail < len(toks):
+        before = q[: toks[tail].start()]
+        last_word = toks[tail - 1].group().lower().strip("\"'’“”()[],;:")
+        sentence = re.split(r"[.?!;]\s", before)[-1]
+        closes_quote = toks[-1].group().rstrip("?!.,;:\u2026\u200f").endswith(
+            tuple(_QUOTE_MARKS) + ("'", "’")
+        )
+        inside_quote = sum(before.count(c) for c in _QUOTE_MARKS) % 2 == 1
+        if not (
+            closes_quote
+            or inside_quote
+            or last_word in _OPERATOR_AS_OBJECT
+            or _SCOPE_REFUSED_RE.search(sentence)
+        ):
+            run += [t.group() for t in toks[tail:]]
+    return run
+
+
 def _site_scope(query: str) -> Tuple[str, ...]:
     """The scopes a query's `site:` operators confine it to; () when none.
 
@@ -286,7 +387,8 @@ def _site_scope(query: str) -> Tuple[str, ...]:
     documentation performance benchmark 10 million vectors' returned six
     off-site pages in its top twelve (bing answered the word "documentation";
     yandex honoured the operator). An engine that ignores the operator cannot
-    be fixed upstream, so the scope is enforced on what comes back.
+    be fixed upstream, so the scope is enforced on what comes back. Only an
+    operator used as syntax counts (`_operator_run`).
     """
     q = query or ""
     # Deep research's rescue query is `site:{domain} {subquestion}` and the
@@ -298,22 +400,11 @@ def _site_scope(query: str) -> Tuple[str, ...]:
     if len(q.splitlines()) > 1:
         return ()
     scopes: List[str] = []
-    for m in _SITE_OP_RE.finditer(q):
-        raw = m.group(1).strip("\"'()[],;")
-        if "://" in raw:
-            try:
-                u = urlparse(raw)
-                raw = (u.hostname or "") + (u.path or "")
-            except ValueError:
-                raw = ""
-        host, _, path = raw.partition("/")
-        host = host.split(":")[0].lower().removeprefix("*.")
-        host = _HOST_CHARS_RE.match(host).group(0).strip(".").removeprefix("www.")
-        if not host:
-            continue
-        path = _PATH_CHARS_RE.match(path).group(0).lower().rstrip("./").strip("/")
-        host = _ascii_host(host)
-        scopes.append(f"{host}/{path}" if path else host)
+    for tok in _operator_run(q):
+        m = _SITE_TOKEN_RE.match(tok)
+        scope = _scope_of(m.group(2)) if m and not m.group(1) else ""
+        if scope:
+            scopes.append(scope)
     return tuple(dict.fromkeys(scopes))
 
 
@@ -622,8 +713,18 @@ def _keep_asked_site_scope(message: str, queries: List[str]) -> List[str]:
     scope = _site_scope(message)
     if not scope:
         return queries
+    return [q if _site_scope(q) else _with_scope(q, scope) for q in queries]
+
+
+def _with_scope(query: str, scope: Tuple[str, ...]) -> str:
+    """`query` with the operators for `scope` where `_site_scope` reads them:
+    after the query, or before it when the query's own words (a "not", a
+    trailing preposition, an open quotation mark) would make a trailing
+    operator read as text."""
+    q = " ".join(query.split())
     ops = " OR ".join(f"site:{s}" for s in scope)
-    return [q if _site_scope(q) else f"{q} {ops}" for q in queries]
+    after = f"{q} {ops}"
+    return after if _site_scope(after) == scope else f"{ops} {q}"
 
 
 #: A token that is nothing but a calendar year.
