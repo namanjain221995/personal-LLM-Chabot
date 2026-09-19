@@ -1206,3 +1206,55 @@ def test_a_first_segment_that_declines_is_not_touched(model):
     fake = model([(first, "stop"), (prose(900, start=5000), "stop")])
     _, streamed = run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
     assert fake.calls == 2 and streamed.startswith(first)
+
+
+# ===================================================================
+# B6 (live on production, 2026-09-19): "Write a 1,200-word essay ..." at
+# Fast went to the artifact route and came back as a PDF and a DOCX after
+# 72-336 s with nothing streamed. An essay or article with a word count is
+# streamed chat unless the person names a file or format.
+# ===================================================================
+
+
+@pytest.mark.parametrize("text", [
+    "Write a 1,200-word essay on the impact of social media on teenagers.",
+    "Write a 1,200 word essay about the French Revolution",
+    "Please write a 1,200-word essay on AI in healthcare",
+    "Write a 3,000-word article about renewable energy.",
+    # A topic that names reports, documents, decks or downloads is still the
+    # TOPIC: these went to the classifier (or, through a bare "download" or
+    # "printable" cue, straight to a file) instead of the chat.
+    "Write a 1,200-word essay on the role of documents in history.",
+    "Write a 1,200-word essay on why reports matter.",
+    "Write a 3,000-word article about the deck of a ship.",
+    "Write a 2,000-word essay on why people download pirated music.",
+    "Write a 1,000-word story about a kid who wants to download a game.",
+    "Write a 2,000-word blog post about printable planners.",
+    "Write a 1,500-word article on how to download files safely.",
+])
+@pytest.mark.parametrize("ctx", ["none", "ans"])
+def test_a_counted_essay_or_article_is_final_chat(text, ctx):
+    intent = I.decide(text, **CONTEXTS[ctx])
+    assert intent.action == "none", (text, intent.action, intent.rule)
+    assert not I._should_consult(intent, text), (text, intent.rule)
+
+
+@pytest.mark.parametrize("text, fmt", [
+    ("Write a 5,000-word article as a Word file", "docx"),
+    ("Write a 5,000-word article about the Silk Road as a Word file.", "docx"),
+    ("Write a 1,200-word essay on Gandhi as a PDF.", "pdf"),
+    ("Write a 1,200-word essay on Gandhi in a Word document.", "docx"),
+])
+def test_a_counted_essay_with_a_named_format_is_still_a_file(text, fmt):
+    intent = I.decide(text)
+    assert intent.action == "create" and fmt in intent.formats, (text, intent.action, intent.formats)
+
+
+@pytest.mark.parametrize("text", [
+    "Write a 3,000-word article about Rome. Make it downloadable.",
+    "Write a downloadable 1,500-word essay on tea.",
+    "Write a 2,000-word essay on tea, printable version please.",
+    "Write a 1,500-word essay on the history of the printing press and put it on a slide.",
+])
+def test_a_file_cue_about_the_piece_still_makes_a_file(text):
+    assert I.decide(text).action == "create", text

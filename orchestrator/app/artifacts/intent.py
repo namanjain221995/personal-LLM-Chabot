@@ -624,10 +624,18 @@ _NEW_TOPIC_RE = re.compile(
     re.I,
 )
 #: A text deliverable that is NOT a file: "draft an email telling the team
-#: the report is delayed", "write a short paragraph about our policy".
+#: the report is delayed", "write a short paragraph about our policy". A
+#: word count may size it ("write a 1,200-word essay on ..."): without the
+#: count's slot the rule missed, and a topic that named reports or documents
+#: sent the essay to the classifier (B6, live 2026-09-19: "Write a 1,200-word
+#: essay ..." came back as a PDF and a DOCX after 72-336 s, nothing streamed).
+#: `article` is prose too; a file named anywhere still wins (`explicit`,
+#: `_AS_FORMAT_RE`, `_FILE_CUE_RE` at the call site).
+_WORD_COUNT_MOD = r"(?:[0-9][0-9,]*[kK]?\s*[-–—]?\s*words?|[0-9][0-9,]*[kK]?)\s+"
 _TEXT_OBJECT_RE = re.compile(
-    r"^\W*(?:(?:please|just|pls|kindly|ok|okay|now)\s+)*(?:can\s+you\s+|could\s+you\s+)?(?:write|draft|compose|give\s+me|make|create|prepare|(?:i\s+|we\s+)?(?:need|want))\s+(?:me\s+)?(?:an?\s+|the\s+|some\s+)?(?:\w+\s+){0,2}?"
-    r"(?:email|e-mail|mail|message|reply|response|paragraph|poem|story|tweet|post|caption|essay|cover\s+letter|note|list|table|summary|outline|bio|headline|slogan|"
+    r"^\W*(?:(?:please|just|pls|kindly|ok|okay|now)\s+)*(?:can\s+you\s+|could\s+you\s+)?(?:write|draft|compose|give\s+me|make|create|prepare|(?:i\s+|we\s+)?(?:need|want))\s+(?:me\s+)?(?:an?\s+|the\s+|some\s+)?"
+    rf"(?:{_WORD_COUNT_MOD}|\w+\s+){{0,2}}?"
+    r"(?:email|e-mail|mail|message|reply|response|paragraph|poem|story|tweet|post|caption|essay|article|cover\s+letter|note|list|table|summary|outline|bio|headline|slogan|"
     r"tips|ideas|steps|examples|suggestions|points|reasons|questions|advice|pointers|options)s?\b"
     r"(?!\s+(?:document|doc|docx|file|report|pdf|sheet|spreadsheet|deck|presentation|slides|workbook))",
     re.I,
@@ -875,10 +883,17 @@ _NAMED_FILE_RE = re.compile(
 _COUNTED_PIECE_RE = re.compile(rf"\b{_CREATE_VERBS}\b(?:\W+\w+){{0,3}}?\W+[0-9][0-9,]*[kK]?\s*[-–—]?\s*words?\b", re.I)
 #: ...and a file asked for without a format: "downloadable", "I can print",
 #: or put on a slide ("Create a 12-word slogan and put it on a slide" was a
-#: create at 4810da0 only through the count's `word`; QA r1).
+#: create at 4810da0 only through the count's `word`; QA r1). Each cue is
+#: about the PIECE: a bare "download" or "printable" is as often the topic
+#: ("a 2,000-word essay on why people download music", "a blog post about
+#: printable planners" were files through it, 2026-09-19).
 _FILE_CUE_RE = re.compile(
-    r"\b(?:download(?:able|ed)?|printable|print[- ]?out|(?:i|we|you)\s+can\s+(?:download|print)|to\s+(?:download|print)|"
-    r"(?:on|onto)\s+(?:an?|one)\s+(?:\w+\s+)?slides?)\b", re.I)
+    r"\b(?:(?:i|we|you)\s+can\s+(?:download|print|save)|(?:ready|available)\s+(?:to|for)\s+(?:download|print(?:ing)?)|"
+    r"(?:make|have|want|need|get)\s+(?:it|this|them|that)\s+(?:as\s+)?(?:an?\s+)?(?:downloadable|printable)|"
+    r"(?:downloadable|printable|print[- ]?out)\s+(?:version|copy|file|format|link|document|doc)s?|"
+    r"(?:as|in|into)\s+an?\s+(?:downloadable|printable|print[- ]?out)|an?\s+(?:downloadable|printable)\s+[0-9]|"
+    r"(?:put|place|add)\s+(?:it|this|them|that)\s+(?:on|onto)\s+(?:an?|one)\s+(?:\w+\s+)?slides?)\b"
+    r"|[,;:(–—-]\s*(?:downloadable|printable)\b", re.I)
 
 
 def _answer_placed_here(low: str) -> bool:
@@ -1446,7 +1461,7 @@ def decide(
             return made("export", reference="previous_answer", rule=rule)
 
     # 4. Creation.
-    if _TEXT_OBJECT_RE.search(low) and not explicit and not _AS_FORMAT_RE.search(low):
+    if _TEXT_OBJECT_RE.search(low) and not explicit and not _AS_FORMAT_RE.search(low) and not _FILE_CUE_RE.search(low):
         # "draft an email telling the team the report is delayed".
         return made("none", rule="text-object", instruction="")
     as_format = bool(_AS_FORMAT_RE.search(low)) and bool(_ASKING_RE.search(low)) and not _STATEMENT_RE.match(low)
