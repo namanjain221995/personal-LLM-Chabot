@@ -1405,6 +1405,16 @@ def test_the_downscale_never_decodes_a_picture_over_the_pixel_ceiling(monkeypatc
     assert [s for s in decoded if s[0] * s[1] > 89_478_485] == []
 
 
+def test_the_quality_measurement_never_decodes_a_picture_over_the_pixel_ceiling(monkeypatch):
+    """Mine: image_quality.measure ran on the same picture first, on the
+    event loop (847 ms and +353 MiB on the worker), with no ceiling either."""
+    from app.engines import image_quality
+
+    decoded = _no_decode_over(monkeypatch, 89_478_485)
+    assert image_quality.measure(_huge_png_b64(12000, 12000)) is None
+    assert [s for s in decoded if s[0] * s[1] > 89_478_485] == []
+
+
 def test_an_oversize_picture_is_downscaled_off_the_event_loop(monkeypatch):
     """main.py calls remember() inline in the async /chat handler, so the
     downscale must not run on the loop's thread."""
@@ -1452,6 +1462,97 @@ def test_a_newer_picture_or_a_forget_wins_over_a_downscale_still_running(monkeyp
 
     a, b = asyncio.run(go())
     assert a == [IMG] and b == []
+
+
+# --- image_quality: crisp light prints are readable, the smeared sign is not -
+
+
+def light_print(ink=200, paper=250):
+    im = Image.new("L", (1240, 1754), paper)
+    d = ImageDraw.Draw(im)
+    for i, t in enumerate(["INVOICE INV-30418", "Date: 03/09/2026", "Amount due: 1,284.56 EUR", "Pay by: 17/09/2026"]):
+        d.text((120, 200 + i * 44), t, font=_font(_SANS, 22), fill=ink)
+    return _b64(im.convert("RGB"))
+
+
+def pale_whiteboard(ink=175, board=205):
+    import numpy as np
+
+    im = Image.new("L", (1600, 1200), board)
+    d = ImageDraw.Draw(im)
+    for i, t in enumerate(["Sprint 22 plan", "- release 3.9 on Tue 14 Oct", "- budget left: 7,250", "- owner: Priya (ext. 2291)"]):
+        d.text((110, 150 + i * 190), t, font=_font(_SANS, 56), fill=ink)
+    a = np.asarray(im.filter(ImageFilter.GaussianBlur(1.2))).astype(np.float32)
+    a += np.random.default_rng(3).normal(0, 2.0, a.shape)
+    im = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8)).convert("RGB")
+    return _b64(im, "JPEG", quality=90)
+
+
+def dark_sign_smeared_last_digit(digit="1"):
+    """QA's sign: legible words, a dark soft plate, the last digit a smeared
+    blob. Live at Fast without the note (951b149): "ext. 4471" in 5/10."""
+    import numpy as np
+
+    im = Image.new("RGB", (1400, 900), (14, 14, 16))
+    d = ImageDraw.Draw(im)
+    f = _font(_SANS, 52)
+    d.rectangle((150, 260, 1250, 640), fill=(34, 34, 38))
+    d.text((330, 320), "PLANT ROOM 3", font=_font(_SANS_B, 60), fill=(80, 80, 84))
+    d.text((200, 470), "Emergency contact: ext. 447", font=f, fill=(76, 76, 80))
+    blob = Image.new("RGB", (1400, 900), (0, 0, 0))
+    x = 200 + d.textlength("Emergency contact: ext. 447", font=f)
+    ImageDraw.Draw(blob).text((x, 470), digit, font=f, fill=(90, 90, 94))
+    blob = blob.filter(ImageFilter.GaussianBlur(6.5))
+    a = np.maximum(np.asarray(im), np.asarray(blob) * 2.4).clip(0, 255).astype(np.uint8)
+    im = Image.fromarray(a).filter(ImageFilter.GaussianBlur(2.6))
+    arr = np.asarray(im).astype(np.float32) + np.random.default_rng(11).normal(0, 5, (900, 1400, 3))
+    im = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    return _b64(im, "JPEG", quality=75)
+
+
+def one_line_screenshot(w, h, bg, fg, font, size, text="Build 58821 passed in 4m12s"):
+    im = Image.new("RGB", (w, h), bg)
+    ImageDraw.Draw(im).text((40, 40), text, font=_font(font, size), fill=fg)
+    return _b64(im)
+
+
+def small_crop(w, h, size, text, bg, fg):
+    im = Image.new("RGB", (w, h), bg)
+    ImageDraw.Draw(im).text((4, 2), text, font=_font(_SANS, size), fill=fg)
+    return _b64(im)
+
+
+CRISP_BUT_LIGHT_OR_SPARSE = {
+    # 951b149 scored these 8.8 / 9.6 / 8.2 against its threshold of 11
+    "light_print": light_print,
+    "pale_whiteboard": pale_whiteboard,
+    "4K screenshot, one crisp 14 px line": lambda: one_line_screenshot(3840, 2160, "white", (40, 40, 40), _SANS, 14),
+    # guards that already held and must keep holding
+    "composer-sized dark screenshot, one line": lambda: one_line_screenshot(1600, 900, (30, 30, 30), (200, 200, 200), _MONO, 14),
+    "crop 80x24": lambda: small_crop(80, 24, 18, "4471", "white", "black"),
+    "crop 120x32": lambda: small_crop(120, 32, 22, "ext. 4471", "white", "black"),
+    "dark crop 160x32": lambda: small_crop(160, 32, 20, "PIN 5821", (30, 30, 30), (220, 220, 220)),
+    "clear worksheet": clear_worksheet,
+}
+
+
+@pytest.mark.parametrize("name", list(CRISP_BUT_LIGHT_OR_SPARSE))
+def test_a_crisp_light_or_sparse_picture_is_not_declared_unreadable(name):
+    from app.engines import image_quality
+
+    img = CRISP_BUT_LIGHT_OR_SPARSE[name]()
+    q = image_quality.measure(img)
+    assert q is not None and q.hard is False, q
+    assert image_quality.legibility_note([img]) == ""
+
+
+@pytest.mark.parametrize("digit", ["1", "8"])
+def test_a_dark_sign_with_a_smeared_last_digit_gets_the_legibility_note(digit):
+    """4810da0 flagged it (edges 6.6); 951b149 scored 13.26 against 11 and
+    dropped the note, and live at Fast answered "ext. 4471" in 5 of 10."""
+    from app.engines import image_quality
+
+    assert image_quality.legibility_note([dark_sign_smeared_last_digit(digit)]) != ""
 
 
 # --- the computed block: complete, honest, and never the picture's voice ---
