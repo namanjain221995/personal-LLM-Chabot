@@ -559,3 +559,18 @@ def _knowledge_process_state_clear():
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
     _public_sidecars.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _no_finish_reason_from_an_earlier_test():
+    """llm._finish_reason is a ContextVar. A test that sets it outside
+    asyncio.run leaves the value in the main thread's context, and every later
+    asyncio.run copies it: test_continuation.py left "length" behind and the
+    vision table pre-pass - which ignores a transcription cut at its ceiling -
+    silently skipped itself in test_vision_adversarial.py (release-2 CI run,
+    2026-09-19). Each test starts and ends with no finish reason."""
+    from app import llm
+
+    llm._finish_reason.set(None)
+    yield
+    llm._finish_reason.set(None)
