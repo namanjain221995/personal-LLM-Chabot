@@ -199,6 +199,23 @@ def test_the_phishing_carve_out_is_scoped_to_their_own_staff(mode):
 
 
 @pytest.mark.parametrize("mode", ALL_PERSONAS)
+def test_the_authorisation_line_belongs_to_the_phishing_simulation_alone(mode):
+    """Hotfix 1.2, P5. The general clause for ordinary professional work said
+    "do the work, and put the conditions (authorisation, debrief) in one line",
+    and Fast obeyed it on work that has no conditions: 10 of 27 live Fast
+    rewrites of a pasted job posting opened "**Authorization & Debrief:** This
+    is a professional job posting rewrite...". With the conditions named only
+    in the phishing-simulation sentence (the artefact they were written for),
+    the same asks measured 0 preambles in 18 runs, and the phishing clauses
+    pinned above are unchanged."""
+    prompt = system_prompt("Rewrite this job posting in the sample format below.", mode).lower()
+    assert "do the work rather than declining" in prompt
+    assert prompt.count("debrief") == 1
+    sentence = next(s for s in prompt.split(". ") if "debrief" in s)
+    assert "above it" in sentence, "the conditions sit above the simulated email, nowhere else"
+
+
+@pytest.mark.parametrize("mode", ALL_PERSONAS)
 def test_a_refusal_is_one_sentence_and_offers_the_nearest_thing(mode):
     prompt = system_prompt(PHISHING_SIMULATION, mode).lower()
     assert "decline only something genuinely out of bounds" in prompt

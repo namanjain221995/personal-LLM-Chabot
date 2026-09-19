@@ -2581,16 +2581,26 @@ def _apply_chart(w: _Work, op: SetChart) -> str:
 
 
 #: The callout `chart_data.resolve_spec` leaves where a chart could not be
-#: bound. `add_chart` replaces it IN PLACE: that is exactly where the person
-#: expects the picture, and leaving it behind beside a new chart would show
-#: the same failure twice.
+#: bound.
 _CHART_FAILURE_RE = re.compile(r"\b(?:could not be drawn|was not drawn|cannot be drawn|not drawn because)\b", re.I)
 
-#: A section that closes a report. A "Charts" section goes BEFORE it, never
-#: after the conclusion.
+#: The one failure `add_chart` replaces IN PLACE: the chart had no data to
+#: read ("the table 'customers-100.csv' is not available"), and this edit
+#: brings the data, so the callout is a stale error where the person expects
+#: the picture. A refusal on the data's SHAPE ("was not drawn: Company has 80
+#: different values in 100 rows") is still true after the edit and is part of
+#: the section's text: replacing it with an unrelated chart erased two
+#: sections' explanations in the hotfix replay (fast2, 2026-09-19).
+_TABLE_MISSING_RE = re.compile(r"\bthe table\b.{0,160}?\bis not available\b", re.I)
+
+#: A section that closes a report. A "Charts" section goes BEFORE the run of
+#: them that ends the document. Up to three lead words: the composer writes
+#: "Strategic Recommendations and Assumptions" and "Key Takeaways", and the
+#: replay appended the charts after "Assumptions and Limitations" (fast1).
 _CLOSING_SECTION_RE = re.compile(
-    r"^\s*(?:\d+[.)]\s*)?(?:conclusion|conclusions|recommendation|recommendations|next\s+steps?|summary\s+and\s+"
-    r"recommendations?|closing|appendix|appendices|references|sources)\b", re.I)
+    r"^\s*(?:\d+[.)]?\s*)?(?:[A-Za-z&'-]+\s+){0,3}?(?:conclusions?|recommendations?|next\s+steps?|closing|"
+    r"appendix|appendices|references|sources|assumptions?|limitations?|caveats?|disclaimers?|takeaways?|"
+    r"final\s+thoughts)\b", re.I)
 
 
 def chart_failure_text(block: Any) -> str:
@@ -2619,7 +2629,7 @@ def _table_for_chart(op: AddChart, tables_: Sequence[Any]) -> Any:
     return tables_[0]
 
 
-def _charts_for(op: AddChart, table: Any, instruction: str) -> Tuple[List[Any], str]:
+def _charts_for(op: AddChart, table: Any, instruction: str, drawn: Sequence[Any] = ()) -> Tuple[List[Any], str]:
     """(charts, reason it could not) for one add_chart, from ONE table.
 
     A column the person NAMED is never silently swapped for a suggestion: an
@@ -2651,7 +2661,9 @@ def _charts_for(op: AddChart, table: Any, instruction: str) -> Tuple[List[Any], 
             "data": {"table_id": str(getattr(table, "id", "") or ""), "x": columns[idx], "y": ys, "agg": agg},
         })
         return [chart], ""
-    charts, _reasons = CC.suggest_charts(table, instruction=instruction, limit=max(1, int(op.count)))
+    charts, _reasons = CC.suggest_charts(table, instruction=instruction, limit=max(1, int(op.count)), drawn=drawn)
+    if not charts and drawn and CC.suggest_charts(table, instruction=instruction, limit=1)[0]:
+        return [], f"the file already has a chart of every column of {title} worth charting"
     if not charts:
         return [], f"nothing in {title} can be compared in a chart (its columns name rows rather than group them)"
     if op.chart_type and _chart_spec is not None:
@@ -2668,11 +2680,16 @@ def _insert_position(w: _Work, op: AddChart) -> int:
     else before the closing section, else at the end."""
     if op.after is not None:
         return _section_unit(w, op.after)[0] + 1
-    for i, u in enumerate(w.units):
+    # Only the closing run at the END: "Summary and Recommendations" opening
+    # a report is not where its charts go. Never before the preamble (unit 0).
+    pos = len(w.units)
+    while pos > 1:
+        u = w.units[pos - 1]
         head = u["value"][0] if u["value"] and u["value"][0].get("type") == "heading" else None
-        if head is not None and _CLOSING_SECTION_RE.match(str(head.get("text") or "")):
-            return i
-    return len(w.units)
+        if head is None or not _CLOSING_SECTION_RE.match(str(head.get("text") or "")):
+            break
+        pos -= 1
+    return pos
 
 
 def _apply_add_chart(w: _Work, op: AddChart) -> str:
@@ -2686,7 +2703,12 @@ def _apply_add_chart(w: _Work, op: AddChart) -> str:
         return _add_chart_to_sheet(w, op, tables_)
 
     table = _table_for_chart(op, tables_)
-    charts, why = _charts_for(op, table, op.instruction or w.instruction)
+    # The charts the file already draws are not suggested again.
+    drawn = [(u["value"].get("chart") or {}).get("data") if w.kind == "presentation"
+             else b.get("chart", {}).get("data")
+             for u in w.units for b in ([u["value"]] if w.kind == "presentation" else u["value"])
+             if (w.kind == "presentation" or b.get("type") == "chart")]
+    charts, why = _charts_for(op, table, op.instruction or w.instruction, [d for d in drawn if d])
     if not charts:
         raise _NotApplied(why or "the chart could not be bound to the data")
     blocks = [{"type": "chart", "chart": c.model_dump(mode="json", exclude_none=True)} for c in charts]
@@ -2702,13 +2724,14 @@ def _apply_add_chart(w: _Work, op: AddChart) -> str:
             w.touched.add(key)
         return _added_phrase(charts)
 
-    # A failed chart is replaced where it already is.
+    # A chart that failed for want of the table is replaced where it is;
+    # every other block of the file is kept as it was.
     placed = 0
     for u in w.units:
         for i, b in enumerate(list(u["value"])):
             if placed >= len(blocks):
                 break
-            if chart_failure_text(b):
+            if _TABLE_MISSING_RE.search(chart_failure_text(b)):
                 u["value"][i] = blocks[placed]
                 w.touched.add(u["key"])
                 placed += 1
