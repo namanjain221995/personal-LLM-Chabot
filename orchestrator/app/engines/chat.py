@@ -23,7 +23,7 @@ from typing import Awaitable, Callable, List, Sequence
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
 from ..config import settings
-from ..core import answer_sampling, best_of
+from ..core import answer_sampling, best_of, rewrite_shape
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -315,8 +315,9 @@ async def run_chat_engine(
                 await emit(
                     "reasoning", {"text": winner.reasoning[start : start + 1000]}
                 )
-            for start in range(0, len(winner.answer), 200):
-                await emit("token", {"text": winner.answer[start : start + 200]})
+            answer = rewrite_shape.shape(message, winner.answer)
+            for start in range(0, len(answer), 200):
+                await emit("token", {"text": answer[start : start + 200]})
             await emit(
                 "meta",
                 {
@@ -326,7 +327,7 @@ async def run_chat_engine(
                     "best_of_reason": reason,
                 },
             )
-            return winner.answer
+            return answer
 
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
     # call and stays exactly that; the total an answer may run to is decided
@@ -348,11 +349,18 @@ async def run_chat_engine(
 
     # A repetition the person asked for ("write it 50 times") is not a loop.
     guard = answer_guard.AnswerGuard(answer_guard.repetition_allowance(message))
+    # A rewrite into a PASTED SAMPLE's format gets the sample's Markdown
+    # mapping from a rule, not from the model (hotfix 1.2, P3: Fast followed
+    # it in at most 1 of 3 runs). None for every other turn. Ahead of the
+    # guard, so the text that is stored is the text that was streamed.
+    shaper = rewrite_shape.for_message(message)
 
     async def _out(kind: str, text: str) -> None:
         if kind == "reasoning":
             await emit("reasoning", {"text": text})
             return
+        if shaper is not None:
+            text = shaper.feed(text)
         for piece in guard.feed(text):
             await emit("token", {"text": piece})
         if guard.verdict is not None:
@@ -379,6 +387,9 @@ async def run_chat_engine(
         deadline_s=settings.continuation_deadline_s or None,
         **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
+    if shaper is not None and guard.verdict is None:
+        for piece in guard.feed(shaper.finish()):
+            await emit("token", {"text": piece})
     for piece in guard.finish():
         await emit("token", {"text": piece})
 
