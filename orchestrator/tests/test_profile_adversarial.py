@@ -78,6 +78,22 @@ def test_cents_after_the_sniff_window_are_not_summed_as_rounded_integers(tmp_pat
     )
 
 
+def test_a_date_in_a_format_try_cast_does_not_know_is_not_blamed(tmp_path):
+    """The dropped row is counted by a text read, and a column is named when
+    a text cell will not cast to its type. A date the sniffer read as
+    '%m/%d/%Y' fails that cast on EVERY row, so it cannot be the column that
+    lost one row, and the reason names only the column that did."""
+    lines = ["order_date,revenue"]
+    for i in range(22_000):
+        lines.append(f"{1 + i % 12:02d}/{1 + i % 28:02d}/2024,{'N/A' if i == 21_000 else f'{i % 90}.25'}")
+    path = tmp_path / "us_dates.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert _col(prof, "order_date")["dtype"] == "DATE"
+    first = prof["aggregates"]["omitted"][0]
+    assert first.startswith("1 row(s) could not be read") and "revenue" in first and "order_date" not in first, first
+
+
 def test_a_row_the_parser_dropped_is_not_silently_missing_from_an_exact_total(tmp_path):
     """One 'N/A' in an integer column past row 20,000 drops the WHOLE row
     under IGNORE_ERRORS, so every other column's total loses that row too.
@@ -521,3 +537,299 @@ def test_zoned_timestamps_are_bucketed_in_utc(tmp_path, monkeypatch):
         pytest.skip("the CSV sniffer did not type ts as TIMESTAMPTZ")
     months = {r["month"]: r["sum"] for r in agg["by_month"][0]["rows"]}
     assert months == {"2024-01": 11.25}
+
+
+# ===========================================================================
+# Review round 2 (2026-09-19), QA and security lenses on 4b90840. Adopted with
+# their assertions unchanged; each one failed at 4b90840 unless marked as an
+# opposite-direction or by-design pin. Truth computed here with Decimal.
+# ===========================================================================
+
+import textwrap  # noqa: E402  (kept with the section that needs it)
+
+
+# ---------------------------------------------------------------------------
+# 1 / 7. Rows the typed parse rejects must not cost memory or time per row.
+# `store_rejects=true` kept every rejected line in DuckDB's memory (about
+# 1.37 KB of RSS per row) and took a slow per-row path: a 48.8 MB CSV of
+# rejected rows cost 75.7 s and 16,494 MB on the worker.
+#
+# The children report their OWN peak, VmHWM. The reviewers' children read
+# ru_maxrss, which Linux carries across exec from the process that spawned
+# them: measured, a child of an 800 MB parent reported 810 MB with a VmHWM
+# of 9 MB, and inside the full suite (pytest at ~780 MB) the rejected-rows
+# child "peaked" at 781 MB while it peaked at 108 MB run alone.
+# ---------------------------------------------------------------------------
+
+_VMHWM_KB = "int(next(l for l in open('/proc/self/status') if l.startswith('VmHWM')).split()[1])"
+
+_ONE = r'''
+import json, sys, time
+from app.core import profile as p
+t = time.perf_counter(); out = p.profile_tabular(sys.argv[1]); el = time.perf_counter() - t
+print(json.dumps({"s": el, "rss": ''' + _VMHWM_KB + r''', "rows": out.get("rows"),
+                  "omitted": (out.get("aggregates") or {}).get("omitted")}))
+'''
+
+
+def _write_big(path, flip_at, n=300_000, pad=300):
+    rng = random.Random(5)
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["region", "qty", "revenue", "note"])
+        for i in range(n):
+            w.writerow([f"R{i % 5}", str(rng.randint(1, 9)) if i < flip_at else "n/a",
+                        f"{rng.randrange(100, 99999) / 100:.2f}", "x" * pad])
+
+
+def _run(path):
+    env = dict(os.environ)
+    out = subprocess.check_output([sys.executable, "-c", _ONE, str(path)], env=env, text=True)
+    return json.loads(out.strip().splitlines()[-1])
+
+
+def test_rejected_rows_cost_no_more_than_the_same_file_clean(tmp_path):
+    """QA r2: at 4b90840 the dirty file cost 1.42 s / 831 MB against 0.47 s /
+    412 MB clean (`assert 830708 <= (1.5 * 411664)`)."""
+    clean, dirty = tmp_path / "clean.csv", tmp_path / "dirty.csv"
+    _write_big(clean, flip_at=10**9)
+    _write_big(dirty, flip_at=25_000)
+    c = min((_run(clean) for _ in range(3)), key=lambda r: r["s"])
+    d = min((_run(dirty) for _ in range(3)), key=lambda r: r["s"])
+    assert d["rows"] == 25_000 and c["rows"] == 300_000
+    assert d["omitted"] and "275000 row(s) could not be read" in d["omitted"][0], d["omitted"]
+    assert d["rss"] <= 1.5 * c["rss"], (d, c)
+    assert d["s"] <= 2.0 * c["s"] + 0.2, (d, c)
+
+
+_CHILD = textwrap.dedent(
+    """
+    import json, sys
+    from app.core import profile as P
+    prof = P.profile_file(sys.argv[1], name="rej.csv")
+    print(json.dumps({"rss_mb": %s // 1024,
+                      "rows": prof.get("rows"), "omitted": prof.get("aggregates", {}).get("omitted")}))
+    """
+    % _VMHWM_KB
+)
+
+
+def _profile_in_child(path, tmp_path) -> dict:
+    env = {**os.environ, "PROFILE_SCRATCH_DIR": str(tmp_path)}
+    got = subprocess.run(
+        [sys.executable, "-c", _CHILD, str(path)], capture_output=True, text=True, env=env, timeout=600,
+    )
+    assert got.returncode == 0, got.stderr[-2000:]
+    return json.loads(got.stdout.strip().splitlines()[-1])
+
+
+def test_a_csv_of_rejected_rows_costs_no_memory_per_row(tmp_path):
+    """Security r2: 200,000 clean rows sniff `b` as BIGINT; 1,000,000 rows of
+    'x' after them are all rejected. 4810da0: 0.16 s and ~80 MB. 4b90840:
+    2M such rows cost 7.5 s and 2,849 MB."""
+    path = tmp_path / "rej.csv"
+    with open(path, "w") as f:
+        f.write("a,b\n" + "1,2\n" * 200_000 + "1,x\n" * 1_000_000)
+    got = _profile_in_child(path, tmp_path)
+    assert got["rss_mb"] < 600, f"peak RSS {got['rss_mb']} MB for a {os.path.getsize(path):,}-byte CSV"
+
+
+def test_opposite_the_rejected_rows_are_still_disclosed(tmp_path):
+    """Opposite direction: however the drop is counted, the total must still
+    say that rows were left out (QA r1 F2)."""
+    path = tmp_path / "rej.csv"
+    with open(path, "w") as f:
+        f.write("a,b\n" + "1,2\n" * 200_000 + "1,x\n" * 1_000)
+    got = _profile_in_child(path, tmp_path)
+    assert got["rows"] == 200_000
+    assert got["omitted"] and got["omitted"][0].startswith("1000 row(s) could not be read")
+
+
+def test_text_past_the_window_in_a_money_column_is_said(tmp_path):
+    """A DOUBLE column (not an integer one) with 'N/A' after row 20,000."""
+    rng = random.Random(12)
+    lines, truth = ["region,revenue"], Decimal(0)
+    for i in range(30_000):
+        if i == 26_000:
+            lines.append("N,N/A")
+            continue
+        r = Decimal(rng.randrange(100, 10**6)) / 100
+        truth += r
+        lines.append(f"{'NSEW'[i % 4]},{r}")
+    path = tmp_path / "na.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    agg = prof["aggregates"]
+    exact = _dec(_col(prof, "revenue")["sum"]) == truth and prof["rows"] == 30_000
+    said = bool(agg["omitted"]) and "could not be read" in agg["omitted"][0]
+    assert exact or said, (prof["rows"], _col(prof, "revenue")["sum"], agg["omitted"])
+
+
+def test_concurrent_dirty_files_each_report_their_own_dropped_rows(tmp_path):
+    paths = {}
+    for bad in (1, 3, 7):
+        lines = ["region,revenue"]
+        bad_at = {24_000 + 50 * j for j in range(bad)}
+        for i in range(25_000):
+            lines.append(f"{'NSEW'[i % 4]},{'N/A' if i in bad_at else '1.25'}")
+        p = tmp_path / f"dirty{bad}.csv"
+        p.write_text("\n".join(lines) + "\n")
+        paths[bad] = str(p)
+    serial = {k: profiler.profile_tabular(p) for k, p in paths.items()}
+    with cf.ThreadPoolExecutor(3) as ex:
+        par = dict(zip(paths, ex.map(profiler.profile_tabular, paths.values())))
+    for k in paths:
+        assert json.dumps(serial[k], sort_keys=True) == json.dumps(par[k], sort_keys=True)
+        assert _col(serial[k], "revenue")["dtype"] == "DOUBLE"
+        assert serial[k]["rows"] == 25_000 - k
+        assert serial[k]["aggregates"]["omitted"][0].startswith(f"{k} row(s) could not be read")
+
+
+def test_a_malformed_line_past_the_sniff_window_is_said_and_named_nowhere_else(tmp_path):
+    """Without store_rejects the drop is counted by a text read of the same
+    file. A line with an extra field (an unquoted comma in a note, the most
+    common way an export breaks) must be counted too, not only a bad number,
+    and a clean file of the same shape must say nothing."""
+    rng = random.Random(4)
+    lines, truth = ["order_id,note,revenue"], Decimal(0)
+    for i in range(24_000):
+        r = Decimal(rng.randrange(100, 10**6)) / 100
+        if i in (21_000, 23_000):
+            lines.append(f"{i},12 Main St, Springfield,{r}")  # 4 fields: the parser drops it
+            continue
+        truth += r
+        lines.append(f"{i},note {i % 7},{r}")
+    path = tmp_path / "comma.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert prof["rows"] == 23_998
+    assert _dec(_col(prof, "revenue")["sum"]) == truth
+    assert prof["aggregates"]["omitted"][0].startswith("2 row(s) could not be read"), prof["aggregates"]["omitted"]
+    clean = tmp_path / "clean.csv"
+    clean.write_text("\n".join(ln for k, ln in enumerate(lines) if k not in (21_001, 23_001)) + "\n")
+    assert profiler.profile_tabular(str(clean))["aggregates"]["omitted"] == []
+
+
+def test_a_malformed_line_inside_the_sniff_window_is_still_said(tmp_path):
+    """Opposite direction for a short file (read once, no text read): the
+    parse itself records the rejected line, bounded by the file's few lines."""
+    lines = ["order_id,note,revenue"] + [f"{i},note,{i}.25" for i in range(500)]
+    lines[101] = "100,12 Main St, Springfield,100.25"
+    path = tmp_path / "short.csv"
+    path.write_text("\n".join(lines) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    assert prof["rows"] == 499
+    assert prof["aggregates"]["omitted"][0].startswith("1 row(s) could not be read")
+
+
+def test_a_whole_number_column_past_the_window_stays_an_exact_integer(tmp_path):
+    """Opposite direction: 30,000 rows of whole numbers must not be re-typed,
+    flagged or rounded."""
+    rng = random.Random(9)
+    vals = [rng.randrange(1, 10**6) for _ in range(30_000)]
+    path = tmp_path / "ints.csv"
+    path.write_text("order_id,quantity\n" + "\n".join(f"{i},{v}" for i, v in enumerate(vals)) + "\n")
+    prof = profiler.profile_tabular(str(path))
+    q = _col(prof, "quantity")
+    assert q["dtype"] == "BIGINT"
+    assert isinstance(q["sum"], int) and q["sum"] == sum(vals)
+    assert prof["aggregates"]["omitted"] == []
+
+
+def _late_cents_rows(n_whole=25_000, n_cents=600, seed=3):
+    rng = random.Random(seed)
+    rows, truth = [], Decimal(0)
+    for i in range(n_whole + n_cents):
+        r = Decimal(rng.randrange(1, 10**4)) if i < n_whole else Decimal(rng.randrange(100, 10**6)) / 100
+        truth += r
+        rows.append((i + 1, "NSEW"[i % 4], r))
+    return rows, truth
+
+
+def test_late_cents_in_a_sheet_are_summed_to_the_cent(tmp_path):
+    rows, truth = _late_cents_rows()
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["order_id", "region", "revenue"])
+    for oid, reg, r in rows:
+        ws.append([oid, reg, int(r) if r == r.to_integral_value() else float(r)])
+    path = tmp_path / "late.xlsx"
+    wb.save(path)
+    sheet = profiler.profile_excel(str(path))["sheets"][0]
+    assert "note" not in sheet, sheet.get("note")
+    got = _dec(_col(sheet, "revenue")["sum"])
+    assert got == truth, (got, truth, _col(sheet, "revenue")["dtype"], sheet["aggregates"]["omitted"])
+
+
+def test_late_cents_under_a_duplicated_and_quoted_header_are_exact(tmp_path):
+    rows, truth = _late_cents_rows(seed=4)
+    path = tmp_path / "dup.csv"
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(["order_id", 'rev "gross", eur', 'rev "gross", eur'])
+        for oid, _reg, r in rows:
+            w.writerow([oid, r, r])
+    prof = profiler.profile_tabular(str(path))
+    sums = [c.get("sum") for c in prof["columns"][1:3]]
+    assert all(s is not None and _dec(s) == truth for s in sums), (
+        [(c["name"], c["dtype"], c.get("sum")) for c in prof["columns"]], truth, prof["aggregates"]["omitted"]
+    )
+
+
+def test_a_deleted_file_gives_an_error_and_no_totals(tmp_path):
+    p = tmp_path / "gone.csv"
+    p.write_text("region,revenue\nN,1.00\nS,2.00\n")
+    os.remove(p)
+    prof = profiler.profile_tabular(str(p))
+    assert prof.get("error"), prof
+    assert "aggregates" not in prof
+
+
+def _dialect_body(shape: str) -> str:
+    rows = [(i, f"{'NSEW'[i % 4]}", f"{i % 97}.25") for i in range(21_000)]
+    if shape == "semicolon":
+        return "id;region;revenue\n" + "".join(f"{a};{b};{c}\n" for a, b, c in rows)
+    if shape == "tab":
+        return "id\tregion\trevenue\n" + "".join(f"{a}\t{b}\t{c}\n" for a, b, c in rows)
+    body = "id,region,revenue\n" + "".join(f"{a},{b},{c}\n" for a, b, c in rows)
+    if shape == "crlf":
+        return body.replace("\n", "\r\n")
+    if shape == "bom":
+        return "﻿" + body
+    if shape == "no_trailing_newline":
+        return body.rstrip("\n")
+    if shape == "blank_lines":
+        return body.replace("\n20500,", "\n\n\n20500,")
+    if shape == "quoted_newlines":
+        # A quoted cell inside the sniff window, so the sniffer picks '"'. When
+        # the first quote comes after it, the sniffer picks no quote at all and
+        # the typed read really does lose that record (measured: 20,999 rows).
+        body = body.replace("\n3,W,", '\n3,"W",', 1)
+        return body.replace("\n20500,N,", '\n20500,"N\nwith a line break",')
+    if shape == "quoted_header":
+        return body.replace("id,region,revenue", '"id","re, gion","rev ""gross"""', 1)
+    return body
+
+
+@pytest.mark.parametrize("shape", [
+    "plain", "semicolon", "tab", "crlf", "bom", "no_trailing_newline", "blank_lines", "quoted_newlines",
+    "quoted_header",
+])
+def test_a_clean_long_file_of_any_dialect_reports_no_dropped_rows(tmp_path, shape):
+    """The text read counts records under the typed read's own dialect; on a
+    clean file past the sniff window the two counts must agree, or every
+    clean upload of that shape would carry a false 'rows could not be read'.
+    Opposite direction: one 'N/A' in the same file is counted."""
+    path = tmp_path / f"{shape}.csv"
+    path.write_bytes(_dialect_body(shape).encode("utf-8"))
+    prof = profiler.profile_tabular(str(path))
+    assert prof["rows"] == 21_000, prof.get("error")
+    assert not any("could not be" in r for r in prof["aggregates"]["omitted"]), prof["aggregates"]["omitted"]
+    dirty = tmp_path / f"{shape}-dirty.csv"
+    body = _dialect_body(shape)
+    cut = body.index("20700") if shape != "quoted_header" else body.index("\n20700") + 1
+    end = cut + body[cut:].index("25")
+    dirty.write_bytes((body[:end] + "N/A" + body[end + 2:]).encode("utf-8"))
+    got = profiler.profile_tabular(str(dirty))
+    assert got["rows"] == 20_999
+    assert got["aggregates"]["omitted"][0].startswith("1 row(s) could not be read"), got["aggregates"]["omitted"]

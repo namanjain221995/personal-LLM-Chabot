@@ -96,7 +96,7 @@ def _is_csv_source(path: str) -> bool:
     return not path.lower().endswith((".parquet", ".json", ".jsonl", ".ndjson"))
 
 
-def _reader_sql(path: str, *, csv_options: str = "") -> str:
+def _reader_sql(path: str, *, csv_options: str = "", store_rejects: bool = True) -> str:
     lower = path.lower()
     quoted = path.replace("'", "''")
     if lower.endswith(".parquet"):
@@ -104,14 +104,16 @@ def _reader_sql(path: str, *, csv_options: str = "") -> str:
     if lower.endswith((".json", ".jsonl", ".ndjson")):
         return f"read_json_auto('{quoted}')"
     extra = f", {csv_options}" if csv_options else ""
-    # store_rejects records every row IGNORE_ERRORS drops, in the SAME parse
-    # (measured: no cost on a clean 1M-row file, 0.41 s either way). Without
-    # it a row with 'N/A' in a number column past the sniff window vanished
-    # from every total with nothing saying so.
-    return (
-        f"read_csv_auto('{quoted}', SAMPLE_SIZE={_SNIFF_ROWS}, IGNORE_ERRORS=true, "
-        f"store_rejects=true{extra})"
-    )
+    # store_rejects records every row IGNORE_ERRORS drops, in the SAME parse,
+    # so a malformed line no longer vanishes from every total unsaid. It keeps
+    # each rejected line in memory and takes a slow per-row path, so it is
+    # used ONLY for a file of fewer than _SNIFF_ROWS // 2 lines (at most
+    # 10,000 rejects, of a file under _LINES_READ_MAX). Review round 2
+    # measured it on long files, 4810da0 -> 4b90840: 12M rejected rows (a
+    # 48.8 MB CSV, a 24 KB tar.gz), 0.52 s / 134 MB -> 75.7 s / 16,494 MB. A
+    # long file counts its dropped rows with a text read instead (_text_read).
+    rejects = ", store_rejects=true" if store_rejects else ""
+    return f"read_csv_auto('{quoted}', SAMPLE_SIZE={_SNIFF_ROWS}, IGNORE_ERRORS=true{rejects}{extra})"
 
 
 def _types_option(types: Optional[Dict[str, str]]) -> str:
@@ -790,73 +792,168 @@ def _lines_at_least(path: str, n: int) -> bool:
         return False
 
 
-def _fractional_int_columns(path: str, csv_options: str, ints: List[tuple]) -> Optional[Dict[str, int]]:
-    """Whole-number columns that hold fractional values the sniffer never saw.
+def _checkable(dtype: str) -> Optional[str]:
+    """The type a text cell is TRY_CAST to when asking whether the typed
+    parse could have read it, or None for types a CSV never infers."""
+    d = (dtype or "").upper().strip()
+    if d in _INT_TYPES or d in _FLOAT_TYPES or d in ("DATE", "TIME", "BOOLEAN") or d.startswith("TIMESTAMP"):
+        return d
+    if re.fullmatch(r"(DECIMAL|NUMERIC)\(\d+,\s*\d+\)", d):
+        return d
+    return None
 
-    The sniffer types a column from the first _SNIFF_ROWS rows. QA, 2026-09-18:
-    whole-dollar revenue for 25,000 rows and cents after it was typed BIGINT,
-    and DuckDB ROUNDS '2051.01' into a BIGINT without an error, so the sum
-    was 127,559,755 against a true 127,559,748.92 with nothing flagged. The
-    file is read once more, as text, for the integer columns only. It runs on
-    its OWN connection while the typed copy is made (_FractionCheck): on 1M
-    rows x 12 columns it took 0.105 s alone and the pair took 0.235-0.258 s
-    against 0.230-0.253 s for the copy by itself. {name: fractional values},
-    or None when the check could not run.
+
+def _quote_ident(name: Any) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sql_text(value: Any) -> str:
+    text = "" if value is None or value == "(empty)" else str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+#: The text read runs beside the typed copy, so it is kept small: four
+#: threads and a 4 MiB read buffer (the default max_line_size is 2 MiB).
+#: Measured on the worker, 4810da0 -> this, median of 5: an 815 MB CSV of
+#: rejected rows 0.52 s / 748 MB -> 0.57 s / 551 MB; 12.2M rejected short
+#: rows 0.26 s / 124 MB -> 0.33 s / 178 MB. With DuckDB's defaults (every
+#: core, 32 MiB buffers) the pair cost up to 1.73x the memory of 4810da0,
+#: and with two threads 1.62x the time.
+_TEXT_READ_THREADS = 4
+_TEXT_READ_BUFFER = 4 * 1024 * 1024
+
+
+def _text_read(path: str, csv_options: str, names: List[str], ints: List[tuple]) -> Optional[Dict[str, Any]]:
+    """Read a long CSV once more, AS TEXT, to see what the typed parse could
+    not: {"rows": records in the file, "fractional": {int column: values
+    with decimals}, "reader": the text reader's SQL}, or None when the read
+    could not run.
+
+    Two things go wrong past the first _SNIFF_ROWS rows, where the column
+    types are a guess:
+      * QA, 2026-09-18: whole-dollar revenue for 25,000 rows then cents was
+        typed BIGINT, and DuckDB ROUNDS '2051.01' into a BIGINT without an
+        error: 127,559,755 against a true 127,559,748.92, nothing flagged.
+      * a value the type cannot hold ('N/A' in a number column) or a line
+        with an extra field (an unquoted comma) makes IGNORE_ERRORS drop the
+        whole row, from every total.
+    Read as text with null_padding and strict_mode off, every record parses,
+    so COUNT(*) minus the typed row count is the rows dropped, with nothing
+    stored per row (store_rejects kept each one: 16.5 GB for a 48.8 MB
+    file). The typed reader's own projection-free COUNT(*) cannot stand in:
+    measured, it skips a line of the wrong width, and it never casts, so a
+    bad number is counted as read. The dialect is PINNED to what the typed
+    read's sniffer chose (sniff_csv, same options) and the column names are
+    the typed read's: sniffed again with strict_mode off, DuckDB 1.5.5 missed
+    the quote character of a quoted header and split 'rev "gross", eur' in
+    two. A clean file gives equal counts (quoted newlines, CRLF, blank lines,
+    no trailing newline); a line of too many or too few fields is counted.
+
+    Only the count and a cheap fraction test run over every row: a whole
+    number column is cast to DOUBLE only where the text holds a '.', and in a
+    CASE, because DuckDB evaluates both sides of an AND. Measured on 2.2M
+    rows of '1,x': count alone 0.055 s, cast everywhere 0.148 s, contains()
+    AND cast 0.244 s, CASE 0.063 s. Which columns lost rows is asked
+    afterwards, and only when rows were lost (_failed_columns).
+    It runs on its OWN connection while the typed copy is made (_TextCheck).
     """
     quoted = path.replace("'", "''")
-    checks = ", ".join(
-        "count_if(TRY_CAST({q} AS DOUBLE) <> round(TRY_CAST({q} AS DOUBLE)))".format(
-            q='"' + str(c[0]).replace('"', '""') + '"'
-        )
-        for c in ints
-    )
+    extra = f", {csv_options}" if csv_options else ""
     con = _duck()
     try:
-        def run(extra: str):
-            reader = (
-                f"read_csv('{quoted}', SAMPLE_SIZE={_SNIFF_ROWS}, IGNORE_ERRORS=true, "
-                f"all_varchar=true{extra})"
+        con.execute(f"SET threads={_TEXT_READ_THREADS}")
+        delim, quote, escape, new_line, comment, skip, header = con.execute(
+            "SELECT Delimiter, Quote, Escape, NewLineDelimiter, Comment, SkipRows, HasHeader "
+            f"FROM sniff_csv('{quoted}', sample_size={_SNIFF_ROWS}, ignore_errors=true{extra})"
+        ).fetchone()
+        columns = ", ".join(f"{_sql_text(n)}: 'VARCHAR'" for n in names)
+        reader = (
+            f"read_csv('{quoted}', auto_detect=false, delim={_sql_text(delim)}, quote={_sql_text(quote)}, "
+            f"escape={_sql_text(escape)}, new_line={_sql_text(new_line)}, comment={_sql_text(comment)}, "
+            f"skip={int(skip or 0)}, header={'true' if header else 'false'}, columns={{{columns}}}, "
+            f"null_padding=true, strict_mode=false, ignore_errors=true, all_varchar=true, "
+            f"buffer_size={_TEXT_READ_BUFFER})"
+        )
+        exprs = ["COUNT(*)"]
+        exprs += [
+            "count_if(CASE WHEN contains({q}, '.') THEN TRY_CAST({q} AS DOUBLE) <> round(TRY_CAST({q} AS DOUBLE)) "
+            "ELSE false END)".format(
+                q=_quote_ident(c[0])
             )
-            return con.execute(f"SELECT {checks} FROM {reader}").fetchone()
-
-        try:
-            counts = run(f", {csv_options}" if csv_options else "")
-        except Exception:  # noqa: BLE001 — as text the header can be read differently
-            if csv_options:
-                return None
-            try:
-                has_header = con.execute(
-                    f"SELECT HasHeader FROM sniff_csv('{quoted}', sample_size={_SNIFF_ROWS}, "
-                    f"ignore_errors=true)"
-                ).fetchone()[0]
-                counts = run(f", header={'true' if has_header else 'false'}")
-            except Exception:  # noqa: BLE001
-                return None
-        return {str(c[0]): int(k) for c, k in zip(ints, counts) if k}
+            for c in ints
+        ]
+        got = con.execute(f"SELECT {', '.join(exprs)} FROM {reader}").fetchone()
+        return {
+            "rows": int(got[0]),
+            "fractional": {str(c[0]): int(k) for c, k in zip(ints, got[1:]) if k},
+            "reader": reader,
+        }
     finally:
         con.close()
 
 
-class _FractionCheck:
-    """_fractional_int_columns in a thread (DuckDB releases the GIL while it
-    runs a statement), so the re-read overlaps the typed COPY."""
+#: _failed_columns looks at no more than this many rows, twice: the first
+#: rows of the file, and the first rows that fail a cast.
+_FAILED_SAMPLE = 1_000
 
-    def __init__(self, path: str, csv_options: str, ints: List[tuple]) -> None:
-        self._result: Optional[Dict[str, int]] = None
+
+def _failed_columns(con, reader: str, typed: List[tuple]) -> List[str]:
+    """Columns holding a value their detected type cannot read, from a
+    BOUNDED sample: the first _FAILED_SAMPLE rows that fail any cast. Asked
+    only when rows were dropped, so a clean file never pays for it.
+
+    A column whose cast fails on most of the file's FIRST rows is excluded
+    first: those rows were typed by the sniffer, so the failure is the cast,
+    not the data (a date the sniffer read as '%m/%d/%Y' fails TRY_CAST on
+    every row, and would otherwise be blamed for every dropped row)."""
+    fails = [
+        f"({_quote_ident(c[0])} IS NOT NULL AND TRY_CAST({_quote_ident(c[0])} AS {_checkable(c[1])}) IS NULL)"
+        for c in typed
+    ]
+    if not fails:
+        return []
+    counts = ", ".join(f"count_if({f})" for f in fails)
+    head = con.execute(
+        f"SELECT COUNT(*), {counts} FROM (SELECT * FROM {reader} LIMIT {_FAILED_SAMPLE})"
+    ).fetchone()
+    usable = [i for i, k in enumerate(head[1:]) if 2 * int(k) <= int(head[0])]
+    if not usable:
+        return []
+    got = con.execute(
+        f"SELECT {', '.join(f'count_if({fails[i]})' for i in usable)} FROM (SELECT * FROM {reader} "
+        f"WHERE {' OR '.join(fails[i] for i in usable)} LIMIT {_FAILED_SAMPLE})"
+    ).fetchone()
+    return sorted(str(typed[i][0]) for i, k in zip(usable, got) if k)
+
+
+class _TextCheck:
+    """_text_read in a thread (DuckDB releases the GIL while it runs a
+    statement), so the re-read overlaps the typed COPY."""
+
+    def __init__(self, path: str, csv_options: str, names: List[str], ints: List[tuple]) -> None:
+        self._result: Optional[Dict[str, Any]] = None
         self._thread = threading.Thread(
-            target=self._run, args=(path, csv_options, ints), name="profile-sniff-check", daemon=True
+            target=self._run, args=(path, csv_options, names, ints), name="profile-text-check", daemon=True
         )
         self._thread.start()
 
-    def _run(self, path: str, csv_options: str, ints: List[tuple]) -> None:
+    def _run(self, *args: Any) -> None:
         try:
-            self._result = _fractional_int_columns(path, csv_options, ints)
+            self._result = _text_read(*args)
         except Exception:  # noqa: BLE001 — reported as "could not re-check"
             self._result = None
 
-    def result(self) -> Optional[Dict[str, int]]:
+    def result(self) -> Optional[Dict[str, Any]]:
         self._thread.join()
         return self._result
+
+
+def _dropped_reason(dropped: int, where: List[str]) -> str:
+    return (
+        f"{dropped} row(s) could not be read under the detected column types"
+        + (f" (a bad value in {_names(where)})" if where else "")
+        + " and are left out of every total"
+    )
 
 
 def profile_tabular(
@@ -883,12 +980,21 @@ def profile_tabular(
     con = _duck()
     scratch: Optional[str] = None
     omitted: List[str] = []
-    check: Optional[_FractionCheck] = None
+    check: Optional[_TextCheck] = None
+    dropped: Optional[int] = None
+    where: List[str] = []
     try:
         csv_source = _is_csv_source(path)
+        # Past the sniff window a column's type is a guess (_text_read). A
+        # file inside it was sniffed whole (measured: cents at row 18,501 of
+        # 19,500 made the column DOUBLE), so it is parsed once, and its few
+        # rejected lines are recorded by that parse (_reader_sql).
+        long_file = csv_source and _lines_at_least(path, _SNIFF_ROWS // 2)
 
         def bind(column_types: Optional[Dict[str, str]]) -> str:
             opts = _join_options(csv_options, _types_option(column_types)) if csv_source else ""
+            if long_file:
+                return _reader_sql(path, csv_options=opts, store_rejects=False)
             return _reader_sql(path, csv_options=opts) if opts else _reader_sql(path)
 
         src = bind(types)
@@ -896,12 +1002,12 @@ def profile_tabular(
         # sniffer reads a sample, not the file); the columnar copy is used
         # only when it reproduces it exactly.
         described = con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()
-        # Past the sniff window a column's type is a guess (_fractional_int_columns).
-        # A file inside it was sniffed whole (measured: cents at row 18,501
-        # of 19,500 made the column DOUBLE), so it is parsed once, as before.
-        ints = [r for r in described[: settings.profile_max_columns] if _numeric_kind(r[1]) == "int"]
-        if csv_source and ints and _lines_at_least(path, _SNIFF_ROWS // 2):
-            check = _FractionCheck(path, csv_options, ints)
+        if long_file and described:
+            shown = described[: settings.profile_max_columns]
+            check = _TextCheck(
+                path, csv_options, [r[0] for r in described],
+                [r for r in shown if _numeric_kind(r[1]) == "int"],
+            )
         if _parse_once_enabled() and not path.lower().endswith(".parquet"):
             scratch = _scratch_dir()
         floor = _reject_floor(con)
@@ -910,11 +1016,12 @@ def profile_tabular(
         out["rows"] = int(con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0])
 
         if check is not None:
-            fractional = check.result()
-            if fractional is None:
+            text = check.result()
+            fractional = text["fractional"] if text is not None else None
+            if text is None:
                 omitted.append(
-                    f"whole-number columns could not be re-checked past the first {_SNIFF_ROWS} rows, "
-                    f"so a total there may have lost decimals"
+                    f"rows past the first {_SNIFF_ROWS} could not be re-checked, so a total there may "
+                    f"have lost decimals or left out rows the reader could not parse"
                 )
             elif fractional:
                 retyped = {**(types or {}), **{n: "DOUBLE" for n in fractional}}
@@ -930,7 +1037,6 @@ def profile_tabular(
                 if usable:
                     # Read as DOUBLE, exactly what the sniffer picks when it
                     # sees a decimal; money then sums as DECIMAL, to the cent.
-                    floor = _reject_floor(con)
                     copy2 = (
                         _columnar_copy(con, path, described2, scratch, reader=src2, stem="retyped")
                         if scratch is not None else None
@@ -943,6 +1049,16 @@ def profile_tabular(
                             f"{_label(n)}: {k} values have decimals but were read as whole numbers, "
                             f"so its totals are rounded"
                         )
+            if text is not None:
+                dropped = max(0, text["rows"] - out["rows"])
+                if dropped:
+                    try:
+                        where = _failed_columns(
+                            con, text["reader"],
+                            [r for r in described[: settings.profile_max_columns] if _checkable(r[1])],
+                        )
+                    except Exception:  # noqa: BLE001 — the count stands without the names
+                        where = []
 
         columns = [{"name": r[0], "dtype": r[1]} for r in described]
         out["columns_total"] = len(columns)
@@ -1020,15 +1136,12 @@ def profile_tabular(
             if kind is not None and nonnull > 0:
                 dates.append({"name": col["name"], "ident": ident, "kind": kind})
         out["columns"] = columns
-        dropped, where = _dropped_rows(con, floor)
+        if dropped is None:
+            dropped, where = _dropped_rows(con, floor)
         if dropped:
             # First in the list: the cap trims reasons from the end, and this
             # one changes what every total means.
-            omitted.insert(0, (
-                f"{dropped} row(s) could not be read under the detected column types"
-                + (f" (a bad value in {_names(where)})" if where else "")
-                + " and are left out of every total"
-            ))
+            omitted.insert(0, _dropped_reason(dropped, where))
         out["aggregates"] = _aggregates(con, src, measures, groups, dates, omitted, agg_max_chars)
 
         sample = con.execute(
