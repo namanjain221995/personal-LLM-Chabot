@@ -825,7 +825,9 @@ def test_concurrent_runs_keep_their_own_targets(monkeypatch):
     calls = {"A": 0, "B": 0}
 
     async def stream(messages, **kw):
-        key = messages[0]["content"]
+        # The person's message is the key; the first call also carries the
+        # length plan after it (`_length_plan`).
+        key = messages[0]["content"].split("\n")[0]
         text, _ = scripts[key][min(calls[key], len(scripts[key]) - 1)]
         calls[key] += 1
         for i in range(0, len(text), 13):
@@ -1258,3 +1260,76 @@ def test_a_counted_essay_with_a_named_format_is_still_a_file(text, fmt):
 ])
 def test_a_file_cue_about_the_piece_still_makes_a_file(text):
     assert I.decide(text).action == "create", text
+
+
+# ------------------------------------------ the first call's length plan --
+# Live 2026-09-19: with the count only in the person's words, 4 of 15 Fast
+# runs of "Write a 3,000-word article" ended under 2,700 words, one of them
+# already concluded (so no extra segment may follow). The first call now
+# carries a section plan whose numbers this code computed.
+
+
+def test_the_first_call_carries_a_section_plan_computed_by_code(model):
+    ask = "Write a 3,000-word article about tea."
+    fake = model([(prose(2900), "stop")])
+    run(messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": ask}],
+        total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
+    first = fake.prompts[0]
+    assert first[0] == {"role": "system", "content": "sys"}
+    assert first[-1]["role"] == "user"
+    assert first[-1]["content"] == ask + "\n\n" + continuation._length_plan(3000)
+    # 3,000 / 340 rounds to 9 sections of about 330 words.
+    assert "about 3,000 words" in first[-1]["content"] and "9 sections of about 330 words" in first[-1]["content"]
+
+
+@pytest.mark.parametrize("target, sections, per", [(800, 3, 270), (1200, 4, 300), (5000, 15, 330), (10_000, 29, 340),
+                                                   (60_000, 30, 2000)])
+def test_the_plan_numbers(target, sections, per):
+    plan = continuation._length_plan(target)
+    assert f"about {sections} sections of about {per:,} words" in plan and f"about {target:,} words" in plan
+
+
+@pytest.mark.parametrize("target", [None, 0, 799])
+def test_no_target_or_a_short_one_leaves_the_first_call_untouched(model, target):
+    base = [{"role": "system", "content": "sys"}, {"role": "user", "content": "Write about tea."}]
+    fake = model([(prose(100), "stop")])
+    run(messages=[dict(m) for m in base], total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=target)
+    assert fake.prompts[0] == base
+
+
+def test_continuations_are_built_from_the_person_s_own_message(model):
+    """The plan rides on the first call only; each continuation gets the
+    counts (`_WordGauge.note`) on top of the original request, as before."""
+    ask = "Write a 3,000-word article about tea."
+    fake = model([(prose(2000), "length"), (prose(900, start=2000), "stop")])
+    run(messages=[{"role": "user", "content": ask}], total_max_tokens=1_000_000, segment_max_tokens=8000,
+        target_words=3000)
+    assert fake.calls == 2
+    assert fake.prompts[1][0] == {"role": "user", "content": ask}
+
+
+def test_a_multimodal_last_turn_is_sent_as_it_is(model):
+    parts = [{"type": "text", "text": "Write a 3,000-word article about this image."},
+             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    base = [{"role": "user", "content": parts}]
+    fake = model([(prose(2900), "stop")])
+    run(messages=[dict(m) for m in base], total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
+    assert fake.prompts[0] == base
+
+
+@pytest.mark.parametrize("words", [2250, 2400, 2500])
+def test_a_piece_that_stops_at_75_to_83_percent_is_not_extended(model, words):
+    """Live 2026-09-19: stops at 79-83% of 3,000 words, closed by a paragraph
+    under a heading the ending check cannot know ("Legacy and Modern
+    Resonance"), were extended and the extension broke the piece both times.
+    A body with no recognisable ending, like theirs."""
+    fake = model([(prose(words), "stop"), (prose(900, start=words), "stop")])
+    result, streamed = run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
+    assert fake.calls == 1
+    assert (result.stop_reason, result.truncated, count(streamed)) == (continuation.STOP_COMPLETE, False, words)
+
+
+def test_a_piece_under_70_percent_still_gets_the_extension(model):
+    fake = model([(prose(2050), "stop"), (prose(900, start=2050), "stop")])
+    run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
+    assert fake.calls == 2

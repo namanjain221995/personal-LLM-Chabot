@@ -113,7 +113,15 @@ _MAX_PENDING_CHARS = 400
 #: budget, and every reader of a stop reason (the UI's notice, deep
 #: research's report note) already has words for it. `LongResult.note` and
 #: the `target_words`/`words` meta say which budget it was.
-_TARGET_LOW = 0.85
+#: 70%, not the 85% first built: live 2026-09-19 the extension fired on two
+#: of three 3,000-word articles that stopped at 79-83% after writing their
+#: own closing paragraph under a heading `_has_ended` cannot know ("Legacy
+#: and Modern Resonance", "Decline and Legacy"), and both times broke the
+#: piece: a fragment ("of the ancient caravan routes.") glued after the
+#: ending, and new body sections plus a second "Conclusion". That is the
+#: fourth to sixth such break measured. A piece that ends at 80% is short;
+#: one that ends under 70% missed the length.
+_TARGET_LOW = 0.70
 _TARGET_HIGH = 1.30
 #: ...and never below THIS share of it. A reply that stopped under a quarter
 #: of the length asked for was not written as that piece: a clarifying
@@ -131,6 +139,17 @@ _TARGET_MIN_WORDS = 800
 #: Past the high mark with no line break in sight, stop anyway after this
 #: many characters (a paragraph-free wall of text has no better place).
 _TARGET_OVERRUN_CHARS = 2000
+#: THE FIRST CALL IS TOLD THE LENGTH TOO (2026-09-19). With the count only
+#: in the person's words, "Write a 3,000-word article" came back at 2,435-
+#: 3,474 words over 15 live Fast runs, 4 of them under 2,700; the 2,435-word
+#: one had already written its conclusion, where the one extra segment may
+#: not follow (`_has_ended`). The plan's numbers are computed here, never by
+#: the model. The model keeps the section COUNT it is given but not the
+#: words per section: told 7 sections of about 430 words, four live runs
+#: wrote 7-8 sections of 309-379 words (2,358-2,653 words for 3,000). So the
+#: count is sized by the words per section it actually writes.
+_SECTION_WORDS = 340
+_MAX_SECTIONS = 30
 
 _TOKEN = re.compile(r"\S+")
 _ALNUM = re.compile(r"[^\W_]")
@@ -395,6 +414,29 @@ def _repeats_existing(produced: str, candidate: str) -> bool:
     return first in hay and (not second or second in hay)
 
 
+def _length_plan(target: int) -> str:
+    """What the FIRST call is told about a length target, in numbers this
+    code computed (see `_SECTION_WORDS`)."""
+    sections = max(3, min(_MAX_SECTIONS, round(target / _SECTION_WORDS)))
+    per = int(round(target / sections, -1))
+    return (f"Length: about {target:,} words were asked for. Plan about {sections} sections of about {per:,} words "
+            f"each, counting the introduction and the conclusion, and give every section that depth: the piece "
+            f"should reach about {target:,} words before it ends.")
+
+
+def _first_messages(base: Sequence[dict], target: Optional[int]) -> Sequence[dict]:
+    """The first call's prompt: `base` unchanged without a target (the same
+    object, so a caller without one sends what it always sent), else the
+    length plan appended to the person's own message. Only a plain-text last
+    user turn carries it; any other shape is sent as it is."""
+    if target is None or not base:
+        return base
+    last = base[-1]
+    if last.get("role") != "user" or not isinstance(last.get("content"), str):
+        return base
+    return [*base[:-1], {**last, "content": last["content"] + "\n\n" + _length_plan(target)}]
+
+
 def _continuation_messages(
     base: Sequence[dict], produced: str, tail_chars: int, note: str = ""
 ) -> List[dict]:
@@ -480,10 +522,11 @@ async def stream_long_completion(
     so a caller without one sends exactly what it always sent.
 
     `target_words` (answer_sampling.requested_words) is the length the person
-    asked for. A normal stop at 25-85% of it, on a piece that has not reached
+    asked for. A normal stop at 25-70% of it, on a piece that has not reached
     its own conclusion, gets ONE more segment (dropped if it declines); past 130%
     the run stops at the next line break with `STOP_BUDGET` and a `note`
-    saying how long the answer is; every continuation is told the counts.
+    saying how long the answer is; the first call is told a section plan
+    (`_length_plan`) and every continuation the counts.
     None, or a target under `_TARGET_MIN_WORDS`, sends exactly what a call
     without it sends.
     """
@@ -547,7 +590,7 @@ async def stream_long_completion(
         ask = min(segment_cap, max(remaining, settings.continuation_min_segment_tokens))
 
         if index == 0:
-            prompt = base
+            prompt = _first_messages(base, target)
         elif gauge is None:
             prompt = _continuation_messages(base, produced, tail)
         else:
