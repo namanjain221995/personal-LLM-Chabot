@@ -1748,3 +1748,44 @@ def test_the_clock_never_cuts_an_answer_that_has_started(monkeypatch):
     monkeypatch.setattr(llm, "stream_chat_events", fake)
     answer, _, _ = _run_with_deadline("What is this?", IMG, effort="think", deadline=3)
     assert answer == "part one, part two" and len(rec["calls"]) == 1
+
+
+# --- hand-off to main.py and history.py (image-into-files / integrator) -----
+#
+# Both need a call in a file this track does not own; they fail until it is
+# made (the patch that makes it is next to these tests in the hand-off).
+
+
+def test_a_deleted_conversation_does_not_resurface_its_photo(engines, as_user):
+    """DELETE /history/conversations/{id} never called image_memory.forget,
+    so the same account re-sending that id got the deleted photo answered
+    for up to IMAGE_MEMORY_TTL_S (7,200 s)."""
+    as_user("alice")
+    with TestClient(app) as client:
+        assert _image_turn(client, "del-conv-rv", TURN1).status_code == 200
+        r = client.delete("/history/conversations/del-conv-rv")
+        assert r.status_code == 200, r.text
+        engines["vision"].clear()
+        r = _text_turn(client, "del-conv-rv", "What else is written in the photo?")
+        assert r.status_code == 200
+    assert engines["vision"] == [], "a deleted conversation's photo answered a new turn"
+
+
+def test_a_document_turn_in_between_ends_just_shown_for_that_table(engines):
+    """image -> PDF -> "What does that table show?": main.py asks the word
+    test only on turns with no document, so without `note_turn` the photo
+    still counts as the last thing shown and answers the PDF's table."""
+    pdf = base64.b64encode(b"%PDF-1.4 tiny").decode()
+    msg = "What does that table show?"
+    routes = {}
+    with TestClient(app) as client:
+        for conv, keep in (("ho-pdf-c", False), ("ho-pdf-t", True)):
+            assert _image_turn(client, conv, TURN1).status_code == 200
+            if not keep:
+                image_memory.clear()
+            r = _text_turn(client, conv, "Summarise it", pdf=pdf, pdf_filename="q3.pdf")
+            assert _meta(r).get("route") == "document"
+            engines["vision"].clear()
+            r = _text_turn(client, conv, msg)
+            routes[conv] = (_meta(r).get("route"), len(engines["vision"]))
+    assert routes["ho-pdf-t"] == routes["ho-pdf-c"], routes

@@ -595,9 +595,19 @@ _NOT_A_NAME = re.compile(
 )
 
 
+#: A phone-like run of digits: "CALL 0800 555 0199 NOW" is a message, not a name.
+_PHONE_LIKE = re.compile(r"\d[\d\s().-]{5,}\d")
+
+
 def _data_name(text: object, fallback: str) -> str:
     name = " ".join(str(text or "").split())
-    if not name or len(name) > _NAME_MAX or _NOT_A_NAME.search(name):
+    if (
+        not name
+        or len(name) > _NAME_MAX
+        or len(name.split()) > 3
+        or _NOT_A_NAME.search(name)
+        or _PHONE_LIKE.search(name)
+    ):
         return fallback
     return name
 

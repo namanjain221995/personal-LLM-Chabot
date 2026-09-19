@@ -259,7 +259,7 @@ def _smaller_copy(image: str, budget: int) -> Optional[str]:
         payload = base64.b64decode(raw, validate=False)
         from PIL import Image
 
-        with Image.open(io.BytesIO(payload)) as im:
+        with Image.open(io.BytesIO(payload), formats=_IMAGE_FORMATS) as im:
             photo = (im.format or "").upper() == "JPEG"
             ceiling = _MAX_JPEG_PIXELS if photo else _MAX_DECODE_PIXELS
             if im.width * im.height > ceiling:
@@ -456,14 +456,23 @@ _SEEN_THINGS = (
 #: Things that are also words for data or text: they point at the picture
 #: only when the image turn talked about them ("the table" in a dataset
 #: conversation is the dataset's).
+#: Formats a chat picture may be; ICO/CUR decode their embedded PNG inside
+#: Image.open, before the pixel ceiling can run (review 2026-09-19).
+_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF")
 _TALKED_ABOUT_THINGS = (
     "note|notes|invoice|invoices|bill|ticket|table|tables|chart|charts|graph|"
     "graphs|figure|figures|diagram|diagrams|drawing|form|page|map|card|menu|"
     "dashboard|letter|list|board|meter|row|rows|column|columns|legend|axis"
 )
+#: "the best chart TYPE for sign-ups" asks about charts in general, not the
+#: picture (review 2026-09-19: it went chat -> vision after a chart turn).
+_NOT_A_TOPIC = (
+    r"(?!\s+(?:types?|kinds?|formats?|templates?|styles?|tools?|apps?|software|"
+    r"librar(?:y|ies))\b)"
+)
 _BACK_REFERENCE = re.compile(
     r"\b(?:the|that|this|those|these)\s+(?:[\w'-]+\s+){0,2}?"
-    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b",
+    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b" + _NOT_A_TOPIC,
     re.I,
 )
 _SEEN_RE = re.compile(r"^(" + _SEEN_THINGS + r")$", re.I)
@@ -488,7 +497,7 @@ _READING_VERB = re.compile(
 #: show a chart" - the answer about the dashboard never said "chart".
 _DEMONSTRATIVE = re.compile(
     r"\b(?:that|those)\s+(?:[\w'-]+\s+){0,2}?"
-    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b",
+    r"(" + _SEEN_THINGS + "|" + _TALKED_ABOUT_THINGS + r")\b" + _NOT_A_TOPIC,
     re.I,
 )
 #: "Is there anything else written on it?" / "What else does it say?"

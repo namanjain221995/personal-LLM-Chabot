@@ -76,6 +76,14 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 log = logging.getLogger(__name__)
+# Pillow's TIFF plugin logs every short tag value at DEBUG, which can be
+# text from the picture; it never goes below INFO here.
+logging.getLogger("PIL").setLevel(logging.INFO)
+
+#: Formats a chat picture may be. ICO/CUR decode their embedded PNG inside
+#: Image.open, before any size check can run (review 2026-09-19: a 256x256
+#: ICO wrapping a 12000x12000 PNG cost +559 MiB), so they are not opened.
+_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "GIF", "BMP", "TIFF")
 
 _DATA_URL_RE = re.compile(r"^data:image/[\w.+-]+;base64,", re.I)
 
@@ -204,7 +212,7 @@ def measure(image_base64: str) -> Optional[Quality]:
     try:
         from PIL import Image, ImageStat
 
-        with Image.open(io.BytesIO(payload)) as im:
+        with Image.open(io.BytesIO(payload), formats=_IMAGE_FORMATS) as im:
             ceiling = _MAX_JPEG_PIXELS if (im.format or "").upper() == "JPEG" else _MAX_PIXELS
             if im.width * im.height > ceiling:
                 log.debug("image quality not measured: %dx%d is over the ceiling", im.width, im.height)
