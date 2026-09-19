@@ -1246,3 +1246,51 @@ def test_a_summary_figure_that_is_not_in_the_data_never_reaches_the_pdf(tmp_path
     for bad in (f"The total revenue is {dropped_digit}.", "West holds 27.5% of revenue.",
                 f"Revenue totals {total} and averages 1,234,567.89 per order."):
         assert summary(bad) == dataset_report._NARRATIVE_CHECKED, bad
+
+
+# ---------------------------------------------------------------------------
+# 12. The answer never names the data's sections (live 2026-09-19: 2 of 6)
+# ---------------------------------------------------------------------------
+
+
+def test_the_data_s_section_names_never_reach_the_person(tmp_path, monkeypatch):
+    _, upload = profiled_upload(tmp_path, 60, 7)
+    said = ("To see growth I looked at the data. The `by_month` section lists total revenue for all regions "
+            "combined, and the `by_group` section lists revenue per region. Since growth is not pre-computed in "
+            "the provided data profile or the aggregates, I cannot say which grew fastest.\n"
+            "Revenue by region: East 1,000.00.")
+
+    async def stream(messages, **kwargs):
+        for i in range(0, len(said), 3):  # names split across deltas
+            yield "token", said[i:i + 3]
+
+    monkeypatch.setattr(llm, "stream_chat_events", stream)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    answer, events = _run_engine(monkeypatch, upload, "which region grew fastest?")
+    assert "".join(d["text"] for k, d in events if k == "token") == answer
+    for word in ("by_month", "by_group", "aggregates", "profile", "`"):
+        assert word not in answer, (word, answer)
+    assert "The monthly figures lists total revenue" in answer
+    assert "pre-computed in the data or the figures, I cannot" in answer
+    assert answer.endswith("Revenue by region: East 1,000.00.")
+
+
+def test_a_section_name_the_file_itself_uses_is_left_alone():
+    prof = {"file": "p.csv", "rows": 4,
+            "columns": [{"name": "aggregates", "dtype": "BIGINT"},
+                        {"name": "kind", "dtype": "VARCHAR", "top_values": [{"value": "Profile", "count": 3}]}]}
+    words = dataset.PlainWords([_up(prof)])
+    text = words.feed("The sum of aggregates is 10, and the profile rows ") + words.finish()
+    assert text == "The sum of aggregates is 10, and the profile rows "
+    assert dataset.PlainWords([_up({"file": "q.csv", "columns": []})]).finish() == ""
+
+
+def test_a_monthly_question_about_a_group_is_told_that_cross_is_not_computed(tmp_path):
+    _, upload = profiled_upload(tmp_path, 120, 43)
+    want = "- NOT COMPUTED: revenue by month for each region (a breakdown by two things at once)"
+    for question in ("Which region grew fastest?", "What was the East region's revenue in March?",
+                     "monthly revenue by region"):
+        assert want in dataset.question_figures(question, [upload]), question
+    for question in ("monthly revenue trend", "total revenue by region"):
+        assert not any("NOT COMPUTED" in ln for ln in dataset.question_figures(question, [upload])), question
+    assert "A NOT COMPUTED line there names a figure" in dataset.build_messages("x", [upload], [])[0]["content"]

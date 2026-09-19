@@ -106,7 +106,8 @@ _SYSTEM = (
     "there. A NOTE listed there says what the totals leave out (rows that "
     "could not be read, rows with no date, a breakdown that is not listed "
     "and why): whenever you give a figure it touches, say it in one plain "
-    "sentence. When the figure asked for is not among the computed figures — "
+    "sentence. A NOT COMPUTED line there names a figure the question needs "
+    "that is not worked out. When the figure asked for is not among the computed figures — "
     "a total over only some rows, a breakdown by two things at once, a "
     "difference or share that is not listed — say so in one plain sentence "
     "(\"I don't have East's revenue for March worked out\"), give the "
@@ -460,6 +461,31 @@ def _caveats(raw: str, request: str, prof: Dict[str, Any], agg: Dict[str, Any]) 
     return notes
 
 
+def _crossed(raw: str, request: str, agg: Dict[str, Any], measure: Any) -> List[str]:
+    """A NOT COMPUTED line when the question asks for months of a group.
+
+    "Which region grew fastest?" needs revenue by month for each region,
+    and no figure holds it. Left to say so itself, the model explained why
+    in the data's section names ("the `by_month` section lists total revenue
+    for all regions combined") in 2 of 6 answers (2026-09-19); named here, it
+    has the plain sentence to give.
+    """
+    if not _asks_months(raw, request) or not any(
+        isinstance(e, dict) and e.get("rows") for e in agg.get("by_month") or []
+    ):
+        return []
+    for e in agg.get("by_group") or []:
+        if not isinstance(e, dict):
+            continue
+        group = e.get("group")
+        pat = name_pattern(group)
+        if (pat and re.search(pat, request)) or any(
+            isinstance(r, dict) and _value_named(raw, r.get("value")) for r in e.get("rows") or []
+        ):
+            return [f"- NOT COMPUTED: {measure} by month for each {group} (a breakdown by two things at once)"]
+    return []
+
+
 def question_figures(message: str, uploads: Sequence[dict]) -> List[str]:
     """Differences and shares between the things a question names, worked out
     by code from the computed figures, for the end of the data block.
@@ -483,6 +509,7 @@ def question_figures(message: str, uploads: Sequence[dict]) -> List[str]:
                 lines += [f"FILE: {prof.get('file') or ''}", *notes]
             continue
         measure = (named(request, measures) or largest)[0]
+        notes += _crossed(raw, request, agg, measure)
         total = _dec(columns[measure].get("sum"))
         rows_total = prof.get("rows")
         sets: List[Tuple[str, List[Tuple[Any, Decimal, Any]]]] = []
@@ -687,6 +714,78 @@ async def _with_figures(conversation_id: str, uploads: List[dict], emit: Emit) -
     return out
 
 
+# --- the answer is written in the person's words --------------------------
+
+#: The data's own section names, as the model writes them, and what the
+#: person reads instead. Told in two places never to name them, the model
+#: still explained a question it could not answer as "the `by_month` section
+#: lists total revenue for all regions combined ... the `by_group` section"
+#: or "the numbers provided in the profile" in 2 of 6 live answers
+#: (2026-09-19), so the words are replaced in the stream by code.
+_SECTION_WORDS = (
+    ("by_month", "monthly figures"),
+    ("by_group", "group totals"),
+    ("full_rows", "rows"),
+    ("full_content", "rows"),
+    ("sample_rows", "sample rows"),
+    ("top_values", "most common values"),
+    ("rows_not_read", "unread rows"),
+    ("aggregates", "figures"),
+)
+_SECTION_TAIL = r"(?:\s+(?:section|field|key|list|block|entry|entries|array|object|data))?"
+_PROFILE_WORD = re.compile(
+    r"\b(the|this|that|your)\s+(?:(?:provided|uploaded|computed|data|dataset|file)\s+)*profile\b"
+    r"|`profile`(?:\s+(?:section|field|key|block|data))?",
+    re.I,
+)
+
+
+class PlainWords:
+    """Streams text with the data's section names replaced by plain words.
+
+    A name is left alone when the file itself uses it (a column called
+    `aggregates`, a group value "profile"): then it is the person's word.
+    Text is released a line or a sentence at a time, so a name split across
+    two deltas is still seen whole.
+    """
+
+    def __init__(self, uploads: Sequence[dict]) -> None:
+        own = set()
+        for prof in _tabular_files(uploads):
+            for c in prof.get("columns") or []:
+                if isinstance(c, dict):
+                    own.add(str(c.get("name") or "").lower())
+                    own.update(str(v.get("value") or "").lower() for v in c.get("top_values") or [] if isinstance(v, dict))
+        self._rules = [
+            (re.compile(r"`?\b" + word + r"\b`?" + _SECTION_TAIL), plain)
+            for word, plain in _SECTION_WORDS
+            if word not in own
+        ]
+        self._profile = not any("profile" in w for w in own)
+        self._buf = ""
+
+    def _plain(self, text: str) -> str:
+        for rule, plain in self._rules:
+            text = rule.sub(plain, text)
+        if self._profile:
+            text = _PROFILE_WORD.sub(lambda m: f"{m.group(1)} data" if m.group(1) else "the data", text)
+        return text
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        cut = max(self._buf.rfind("\n"), self._buf.rfind(". "))
+        if cut < 0 and len(self._buf) > 400:
+            cut = self._buf.rfind(" ", 0, len(self._buf) - 80)
+        if cut < 0:
+            return ""
+        out, self._buf = self._buf[: cut + 1], self._buf[cut + 1:]
+        return self._plain(out)
+
+    def finish(self) -> str:
+        out, self._buf = self._buf, ""
+        return self._plain(out)
+
+
 async def run_dataset_engine(
     message: str,
     conversation_id: str,
@@ -725,13 +824,20 @@ async def run_dataset_engine(
     from ..core import answer_guard
 
     guard = answer_guard.AnswerGuard(answer_guard.repetition_allowance(message))
+    words = PlainWords(uploads)
+    shown: List[str] = []
+
+    async def _say(text: str) -> None:
+        if text:
+            shown.append(text)
+            await emit("token", {"text": text})
 
     async def _out(kind: str, delta: str) -> None:
         if kind != "token":
             await emit(kind, {"text": delta})
             return
         for piece in guard.feed(delta):
-            await emit("token", {"text": piece})
+            await _say(words.feed(piece))
         if guard.verdict is not None:
             raise continuation.StopGeneration(continuation.STOP_REPETITION)
 
@@ -754,18 +860,14 @@ async def run_dataset_engine(
         deadline_s=settings.continuation_deadline_s or None,
     )
     for piece in guard.finish():
-        await emit("token", {"text": piece})
-    answer = guard.shown
-    unread = unread_note(uploads, answer)
-    if unread:
-        await emit("token", {"text": unread})
-        answer += unread
+        await _say(words.feed(piece))
+    await _say(words.finish())
+    await _say(unread_note(uploads, "".join(shown)))
     if long.truncated:
         # Said IN the answer, not only in a UI notice: the stored text is what
         # the next turn, the transcript and the API read.
-        note = stop_note(long.stop_reason)
-        await emit("token", {"text": note})
-        answer += note
+        await _say(stop_note(long.stop_reason))
+    answer = "".join(shown)
 
     meta = {
         "route": "dataset",
