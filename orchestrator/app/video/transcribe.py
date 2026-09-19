@@ -443,7 +443,15 @@ def snap_to_regions(
             and touched[0][0] + 1 < len(regs)
             and regs[touched[0][0]][1] < end
             and _grazes(regs[touched[0][0]], touched[0][1], last_start)
-            and (len(touched) > 1 or nxt > regs[touched[0][0] + 1][0])
+            and (
+                len(touched) > 1
+                # Ends in the pause: only when earlier cues cover the tail up to
+                # this cue. Speech before it that no cue holds is where its words
+                # are: the live engine stamped late cues at the END of their speech
+                # (G8455 48.16 s words at 50.36 s; H3570 47.54 s at 50.32 s), and
+                # moving them on put them 4.3 s and 4.9 s late (reviewer, 2026-09-19).
+                or (nxt > regs[touched[0][0] + 1][0] and covered >= start - _SEAM_TOLERANCE_S)
+            )
         ):
             after = touched.pop(0)[0]
         to = None  # the region this cue moves to the start of
