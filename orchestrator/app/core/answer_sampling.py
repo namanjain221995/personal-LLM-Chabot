@@ -56,7 +56,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -250,14 +250,22 @@ _LONGFORM_INDIC = re.compile(
 )
 #: An explicit size: "2000 words", "३००० शब्दों", "2000 શબ્દોનો", "80 questions".
 #: `\d` matches Devanagari and Gujarati digits too, and int() reads them.
-#: A GROUPED count — "12,000", "5 000", "5 000" — is read first, ASCII
-#: digits only: "Produce a 12,000 word manual" was prose while "12000 word"
-#: was longform (2026-09-18), because `\d{2,7}` cannot cross the comma and
-#: found "000". Indic digits keep exactly the old reading (English-only rule).
-_GROUPED_COUNT = r"[0-9]{1,3}(?:[,   ][0-9]{3})+(?![0-9])"
-_SIZE_WORDS = re.compile(rf"({_GROUPED_COUNT}|\d{{2,7}})\s*[-\s]?\s*(?:words?|शब्द|શબ્દ)", re.IGNORECASE)
+#: A GROUPED count — "12,000", "5 000" (nbsp), "5 000" (narrow nbsp) — is
+#: read first, ASCII digits only: "Produce a 12,000 word manual" was prose
+#: while "12000 word" was longform (2026-09-18), because `\d{2,7}` cannot
+#: cross the comma and found "000". Indic digits keep exactly the old reading
+#: (English-only rule).
+_GROUPED_COUNT = r"[0-9]{1,3}(?:[,\u00a0\u202f][0-9]{3})+(?![0-9])"
+#: A plain SPACE groups too ("5 000 words"), but it is also how two counts
+#: sit side by side: "Give me 2 500 word essays" is two 500-word essays and
+#: "5 100-word summaries" five of 100 (QA 2026-09-18: read as 2,500 and
+#: 5,100). So a space-grouped count is read only right before the plural
+#: `words`, and as a count of items only when no hyphenated unit follows.
+_SPACED_WORDS = r"[0-9]{1,3}(?: [0-9]{3})+(?=\s*words\b)"
+_SPACED_ITEMS = r"[0-9]{1,3}(?: [0-9]{3})+(?![0-9-])"
+_SIZE_WORDS = re.compile(rf"({_GROUPED_COUNT}|{_SPACED_WORDS}|\d{{2,7}})\s*[-\s]?\s*(?:words?|शब्द|શબ્દ)", re.IGNORECASE)
 _SIZE_ITEMS = re.compile(
-    rf"({_GROUPED_COUNT}|\d{{2,7}})\s+(?:[a-z-]+\s+){{0,3}}?(?:items|questions|examples|names|ideas|idioms|words|lines|rows|entries|"
+    rf"({_GROUPED_COUNT}|{_SPACED_ITEMS}|\d{{2,7}})\s+(?:[a-z-]+\s+){{0,3}}?(?:items|questions|examples|names|ideas|idioms|words|lines|rows|entries|"
     r"points|tips|facts|quotes|sentences|paragraphs|pages|steps|recipes|jokes|prompts|titles)\b",
     re.IGNORECASE,
 )
@@ -340,7 +348,7 @@ def shape_for(message: str, *, mode: str = "assistant") -> str:
 #: essays"), and a misread target makes the answer longer, where a misread
 #: shape above only changes a cap. ASCII digits and English only (2026-09-16).
 _TARGET_RE = re.compile(
-    r"(?<![0-9.,])([0-9]{1,3}(?:[,  ][0-9]{3})+(?![0-9])|[0-9]{2,7})\s*(?:-\s*)?words?\b",
+    r"(?<![0-9.,])([0-9]{1,3}(?:[,\u00a0\u202f][0-9]{3})+(?![0-9])|[0-9]{2,7})\s*(?:-\s*)?words?\b",
     re.IGNORECASE,
 )
 #: A request for text: the verb (or marker) must come before the count.
@@ -356,14 +364,24 @@ _QUESTION_OPENER = re.compile(
     r"isn't|aren't|how's)\b",
     re.IGNORECASE,
 )
-#: A LIMIT is not a target: "under 300 words", "no more than 500 words".
+#: A LIMIT is not a target: "under 300 words", "no more than 500 words",
+#: "keep it to 1,000 words", "not over 1,500 words", "1,500 words or
+#: shorter", "1,200 words at the very most", "a 2,000-word-max essay" (the
+#: last five were targets until QA, 2026-09-18).
 _LIMIT_BEFORE = re.compile(
     r"\b(?:under|below|max|maximum|within|less\s+than|fewer\s+than|no\s+more\s+than|not\s+more\s+than|no\s+longer\s+than|"
-    r"shorter\s+than|up\s+to|at\s+most|not\s+(?:to\s+)?exceed(?:ing)?|limit(?:ed)?\s+(?:of|to)|capped\s+at)\s+"
+    r"shorter\s+than|up\s+to|at\s+most|not\s+(?:to\s+)?exceed(?:ing)?|limit(?:ed)?\s+(?:of|to)|capped\s+at|"
+    r"(?:not|never|no)\s+(?:over|above|beyond|longer\s+than)|"
+    r"keep\s+(?:it|this|that|them|each|the\s+\w+)\s+(?:to|under|below|within)|"
+    r"(?:it|this|that)\s+(?:should|must|shall)\s+not\s+(?:be\s+)?(?:over|exceed|go\s+over))\s+"
     r"(?:(?:about|around|roughly|approximately)\s+)?$|[<≤]=?\s*$",
     re.IGNORECASE,
 )
-_LIMIT_AFTER = re.compile(r"^\s*(?:or\s+(?:less|fewer|under|below)|max(?:imum)?\b|at\s+most|limit\b|cap\b|tops\b)", re.IGNORECASE)
+_LIMIT_AFTER = re.compile(
+    r"^\s*(?:or\s+(?:less|fewer|under|below|shorter|so\s+max)|-?\s*max(?:imum)?\b|at\s+(?:the\s+)?(?:very\s+)?most|"
+    r"limit\b|cap\b|tops\b)",
+    re.IGNORECASE,
+)
 #: A size PER ITEM: "500 words each", "5 500-word essays", "5 essays of 500 words".
 _PER_ITEM_AFTER = re.compile(r"^\s*(?:each|apiece|per\s+\w+|for\s+each|every)\b", re.IGNORECASE)
 _QUANTITY = r"(?:[0-9]+|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|several|multiple|few|many)"
@@ -376,6 +394,133 @@ _DESCRIBES_EXISTING = re.compile(
     r"\b(?:this|the|that|these|those|my|your|our|their|his|her|its|above|attached|following|existing|original|previous)\s+$",
     re.IGNORECASE,
 )
+#: ...or OTHER text the answer works from (QA 2026-09-18: each was the
+#: target): "Summarize a 20,000-word report", "a critique of a 10,000-word
+#: thesis", "an article that references a 10,000-word study", "a paper with
+#: a 200-word abstract", "the entire book is 90,000 words". `in a` is not
+#: here: "explain it in a 1,500-word essay" names the answer.
+_DESCRIBES_SOURCE = re.compile(
+    r"\b(?:summari[sz]\w*|condens\w*|shorten\w*|critiqu\w*|review\w*|analy[sz]\w*|translat\w*|read\w*|respond(?:ing)?\s+to|"
+    r"repl(?:y|ying)\s+to|referenc\w*|cit(?:e|es|ing)|quot(?:e|es|ing)|based\s+on|drawing\s+on|of|from|on|about|for|with|"
+    # "Please proofread a 3,000-word essay I will paste next" (QA r1): a
+    # verb that works ON a text sizes that text, not the answer.
+    r"proof-?read\w*|edit(?:s|ing)?|check\w*|grad(?:e|es|ing)|mark(?:s|ing)?|correct\w*|improv\w*|polish\w*|"
+    r"paraphras\w*|rephras\w*|reword\w*|rewrit\w*|expand\w*)\s+"
+    r"(?:a|an|his|her|their|a\s+whole|an\s+entire)\s+$"
+    r"|\b(?:is|are|was|were|has|had|contains?|runs?|ran|totals?|totalled|spans?)\s+"
+    r"(?:(?:about|around|roughly|approximately|over|nearly|almost|some|just\s+over|just\s+under)\s+)?$"
+    # "Please proofread my essay (4,000 words)": the size of a text named
+    # just before, in brackets (QA r1: read as a 4,000-word target).
+    r"|\b(?:this|that|these|those|my|your|our|their|his|her|its|the\s+attached|the\s+above)\s+(?:[\w-]+\s+){0,3}\(\s*"
+    r"(?:(?:about|around|roughly|approximately|approx\.?|~)\s*)?$",
+    re.IGNORECASE,
+)
+#: THE ANSWER IS NOT THE PIECE (QA r1, 2026-09-18). The count sizes a text
+#: the answer is ABOUT: "Explain how to structure a 10,000-word
+#: dissertation", "Tell me how long it takes to write a 5,000-word essay",
+#: "Give me tips for writing a 3,000-word essay", "I need to write a 5,000-
+#: word essay on Gandhi. Can you suggest a title?", "I am writing a 10,000-
+#: word thesis. What are good sources?". Live, "Give me an outline for a
+#: 10,000-word dissertation" came back at 1,700 words and the extension
+#: appended 3,900 more under the outline. Anywhere in the sentence before
+#: the count.
+_ABOUT_A_PIECE = re.compile(
+    r"\bhow\s+(?:to|do|does|did|can|could|should|would|long|many|much|big)\b"
+    r"|\b(?:for|on|about|with|of|in|to|when|while|before|after)\s+(?:\w+\s+)?"
+    r"(?:writing|drafting|structuring|planning|outlining|formatting|researching|editing|proofreading|grading|marking|"
+    r"reviewing|organi[sz]ing|starting|finishing|preparing|approaching|tackling)\s+(?:a|an|my|your|our|the)\s+$"
+    r"|\b(?:i|we)(?:\s+|(?=['’]))(?:(?:am|are|'m|’m|'re|’re|was|were)\s+(?:currently\s+|now\s+|still\s+)?"
+    r"(?:writing|drafting|working\s+on|preparing|finishing|submitting)"
+    r"|(?:need|have|want|plan|hope|intend|got|am\s+going|'m\s+going|’m\s+going|are\s+going)\s+to\s+"
+    r"(?:write|draft|produce|submit|finish|prepare|complete)"
+    r"|(?:must|will|'ll|’ll|shall|should)\s+(?:be\s+)?(?:write|writing|draft|drafting|submit|submitting)"
+    r"|(?:have\s+been|'ve\s+been|’ve\s+been|was|were|got|am|'m|’m|are|'re|’re)\s+(?:asked|told|assigned|required)\s+to\s+"
+    r"(?:write|draft|produce|submit))\b",
+    re.IGNORECASE,
+)
+#: A REDUCTION's count is a ceiling, not a target: "Summarize a 20,000-word
+#: report into 500 words", "cut this down from 3,000 words to 1,000 words".
+#: A summary that ends short is finished (QA r1: a 550-word summary got an
+#: extension asking for 19,450 more words).
+_REDUCE_RE = re.compile(
+    r"\b(?:summari[sz]\w*|sum\s+(?:it|this|that|them)?\s*up|condens\w*|shorten\w*|cut\s+(?:\w+\s+){0,2}?down|trim\w*|"
+    r"reduc\w*|compress\w*|abridg\w*|boil\w*\s+(?:\w+\s+){0,2}?down|shrink\w*|pare\s+(?:\w+\s+)?down|tl;?dr)\b",
+    re.IGNORECASE,
+)
+#: A LIMIT said as a negated verb: "don't exceed 1,500 words", "don't go
+#: over 1,000 words", "that doesn't exceed 900 words", "in a maximum of
+#: 1,200 words" (QA r1: all four were targets).
+_NEGATED_LIMIT_BEFORE = re.compile(
+    r"\b(?:(?:do|does|must|should|shall|will|can)\s*(?:not|n['’]?t)|don['’]?t|doesn['’]?t|mustn['’]?t|shouldn['’]?t|"
+    r"won['’]?t|never)\s+(?:\w+\s+)?(?:exceed|go\s+(?:over|beyond|past|above)|run\s+(?:over|past|beyond|longer\s+than)|"
+    r"pass|top|be\s+(?:over|above|more\s+than|longer\s+than))\s+(?:(?:about|around|roughly|approximately)\s+)?$"
+    r"|\bmax(?:imum)?\s+(?:of|length\s+of)\s+$"
+    # "a 2,000 word essay, not 5,000 words": the count ruled out.
+    r"|\bnot\s+(?:(?:about|around)\s+)?$",
+    re.IGNORECASE,
+)
+#: A SECOND deliverable after the piece: "Write a 1,000-word essay, then
+#: give me 10 MCQs", "Write a 2,000-word story, then translate it into
+#: Hindi" (QA r1: the target was one piece, and past 130% of it the run is
+#: CUT, dropping the MCQs and the translation). Read in the rest of the
+#: message after the count.
+_MORE_AFTER = re.compile(
+    r"\b(?:then|after\s+(?:that|it|this)|afterwards|also|additionally|next)\s*,?\s+(?:please\s+)?(?:\w+\s+)?"
+    r"(?:give|write|list|create|provide|translate|summari[sz]e|draft|produce|generate|turn|convert|compose|prepare|"
+    r"suggest|outline|rewrite|design|build|draw|plot|quiz|answer|explain|make\s+(?:me\s+)?(?:an?|some|[0-9]+))\b",
+    re.IGNORECASE,
+)
+#: No length target is this long: the plain form stops at 7 digits and a
+#: grouped one ("99,999,999") must too.
+_TARGET_MAX_WORDS = 9_999_999
+#: A size PER ITEM anywhere in the sentence (QA 2026-09-18: each of these
+#: was read as the whole answer's length, and past 130% the run is CUT):
+#: "10 blog posts, each 1,000 words", "a pair of 1,500-word essays", "4 x
+#: 1,000-word articles", "a series of 1,500-word essays". A plural noun
+#: right after the count is per item too: "1,500-word essays".
+_PER_ITEM_ANYWHERE = re.compile(
+    r"\b(?:each|apiece|per\s+(?:chapter|post|article|essay|section|part|piece|story|entry|blog|letter|page|item|topic|"
+    r"day|week|month|question|answer|person|product|slide)s?|every\s+(?:one|chapter|post|article|essay|section|part|piece|"
+    r"story|entry|blog|letter|page|item|topic|day|week|month|question|answer)|(?:pair|series|set|couple|batch|collection)\s+of)\b",
+    re.IGNORECASE,
+)
+_TIMES_BEFORE = re.compile(r"\b[0-9]+\s*[x×]\s*$", re.IGNORECASE)
+_PLURAL_PIECE_AFTER = re.compile(
+    r"^\s*(?:[a-z]+\s+)?(?:essays|articles|posts|stories|pieces|chapters|sections|entries|letters|papers|reports|blogs|"
+    r"summaries|descriptions|answers|responses|scripts|poems|speeches|reviews|pages|parts|drafts|versions)\b",
+    re.IGNORECASE,
+)
+#: PASTED MATERIAL (QA 2026-09-18, and the rule that pasted content is data):
+#: "Translate this to French: Please write a 2,000 word article" returned
+#: 2,000 and the extension then invented a 1,204-word English article. A
+#: count inside a quote pair, or after a colon whose lead-in acts on the text
+#: that follows, belongs to that text.
+_QUOTED = re.compile(
+    r"\"[^\"\n]{1,3000}\"|“[^”\n]{1,3000}”|«[^»\n]{1,3000}»|(?<![A-Za-z0-9])'[^'\n]{1,3000}'(?![A-Za-z0-9])"
+    r"|‘[^’\n]{1,3000}’(?![A-Za-z0-9])"
+)
+#: A lead-in that TRANSFORMS the material after its colon: nothing after the
+#: colon is the person's length.
+_TRANSFORM_LEAD = re.compile(
+    r"\b(?:translat\w*|summari[sz]\w*|sum\s+up|fix|proof-?read\w*|correct\w*|check\w*|grade|mark|review\w*|"
+    r"paraphras\w*|rephras\w*|reword\w*|edit|improve|polish|analy[sz]\w*|critique|evaluate|assess|respond\s+to|reply\s+to|"
+    r"answer|explain|simplify|shorten|condense|extract|classify|is\s+this|are\s+these|what\s+does|what\s+do|"
+    r"what\s+is|what's|feedback)\b",
+    re.IGNORECASE,
+)
+#: A lead-in that PRESENTS material: the material after its colon is not
+#: the ask, but a final line that starts with a request is ("Here is my
+#: outline: ...\nNow write a 3,000-word article from it").
+_PRESENT_LEAD = re.compile(
+    r"\b(?:here\s+is|here's|heres|here\s+are|below\s+is|below\s+are|this\s+is|these\s+are|"
+    r"(?:i|we)\s+(?:have|wrote|got|received|was\s+given|were\s+given)|brief|assignment|prompt|email|message|text)\b",
+    re.IGNORECASE,
+)
+_FINAL_ASK = re.compile(
+    r"^\W*(?:(?:now|then|next|so|and|finally|ok(?:ay)?)\W+)?(?:please\s+|pls\s+|kindly\s+)?"
+    r"(?:write|draft|compose|produce|generate|create|prepare|craft|make|expand|turn|give\s+me|i\s+need|we\s+need)\b",
+    re.IGNORECASE,
+)
 #: How much of a long message is read: its opening and its end, where an ask
 #: sits — never the middle of a paste, whose own "2,000-word limit" is not
 #: the person asking for 2,000 words.
@@ -383,20 +528,60 @@ _TARGET_SCAN_CHARS = 1500
 _SENTENCE_END = re.compile(r"[.!?\n]")
 
 
+def _material_spans(text: str) -> List[Tuple[int, int]]:
+    """The spans of `text` that are material, not the person's ask: quoted
+    passages, and what follows a colon whose lead-in acts on it (see
+    `_TRANSFORM_LEAD`, `_PRESENT_LEAD`). Bounded input (requested_words cut
+    it to 2 x _TARGET_SCAN_CHARS)."""
+    spans = [(q.start(), q.end()) for q in _QUOTED.finditer(text)]
+    for colon in re.finditer(r":(?!//)", text):
+        lead_start = max((b.end() for b in _SENTENCE_END.finditer(text, 0, colon.start())), default=0)
+        lead = text[lead_start:colon.start()]
+        if _TRANSFORM_LEAD.search(lead):
+            spans.append((colon.end(), len(text)))
+            break
+        if _PRESENT_LEAD.search(lead):
+            end = len(text)
+            # The person's ask after the material: its own last line, or a
+            # last sentence that starts with "now"/"then" and a request.
+            nl = text.rstrip().rfind("\n", colon.end())
+            last = max((b.end() for b in _SENTENCE_END.finditer(text.rstrip(), colon.end(), max(colon.end(), len(text.rstrip()) - 1))),
+                       default=-1)
+            if nl >= 0 and _FINAL_ASK.match(text[nl + 1:]):
+                end = nl + 1
+            elif last >= 0 and re.match(r"^\W*(?:now|then|next|finally)\b", text[last:], re.IGNORECASE) \
+                    and _FINAL_ASK.match(text[last:]):
+                end = last
+            spans.append((colon.end(), end))
+            break
+    return spans
+
+
 def requested_words(message: str) -> Optional[int]:
     """The number of words the message asks the answer to run to, or None.
 
     A TARGET, approximate or a minimum: "a 5,000-word article", "about 3,000
     words", "at least 2,000 words", "in 1,500 words". None for a limit ("under
-    300 words"), a size per item ("500 words each"), a count describing text
-    that exists ("this 5,000-word essay"), a question about a length ("how
-    long is a 5,000-word essay?") and a count with no request before it. The
-    largest target wins ("a 3,000-word paper with a 200-word abstract").
+    300 words"), a size per item ("500 words each", "10 posts, each 1,000
+    words", "a pair of 1,500-word essays"), a count describing text that
+    exists or that the answer works from ("this 5,000-word essay", "summarize
+    a 20,000-word report"), a count inside pasted or quoted material, a
+    question about a length ("how long is a 5,000-word essay?"), a piece the
+    answer is about rather than is ("tips for writing a 3,000-word essay"),
+    a reduction ("summarize it into 1,000 words"), a piece followed by a
+    second deliverable ("..., then give me 10 MCQs") and a count with no
+    request before it.
+
+    Two DIFFERENT targets give None ("a 1,000-word essay and a 1,000-word
+    rebuttal" is 2,000 words, "a 2,000-word story and a 1,000-word analysis"
+    3,000): a wrong target cuts the answer at 130% of it, and None keeps the
+    behaviour every answer had before targets existed.
     """
     text = message or ""
     if len(text) > 2 * _TARGET_SCAN_CHARS:
         text = text[:_TARGET_SCAN_CHARS] + "\n" + text[-_TARGET_SCAN_CHARS:]
-    best: Optional[int] = None
+    material: Optional[List[Tuple[int, int]]] = None
+    found: List[Tuple[int, int]] = []
     for m in _TARGET_RE.finditer(text):
         start = max((b.end() for b in _SENTENCE_END.finditer(text, 0, m.start())), default=0)
         stop = _SENTENCE_END.search(text, m.end())
@@ -407,12 +592,25 @@ def requested_words(message: str) -> Optional[int]:
         if not (_PRODUCE_RE.search(sentence_head) or re.search(r"\b(?:please|pls|kindly)\b", after, re.IGNORECASE)):
             continue
         if (_LIMIT_BEFORE.search(sentence_head) or _LIMIT_AFTER.match(after) or _PER_ITEM_AFTER.match(after)
-                or _PER_ITEM_BEFORE.search(sentence_head) or _DESCRIBES_EXISTING.search(sentence_head)):
+                or _PER_ITEM_BEFORE.search(sentence_head) or _DESCRIBES_EXISTING.search(sentence_head)
+                or _DESCRIBES_SOURCE.search(sentence_head) or _TIMES_BEFORE.search(sentence_head)
+                or _PLURAL_PIECE_AFTER.match(after) or _PER_ITEM_ANYWHERE.search(sentence_head)
+                or _PER_ITEM_ANYWHERE.search(after) or _NEGATED_LIMIT_BEFORE.search(sentence_head)
+                or _ABOUT_A_PIECE.search(sentence_head) or _REDUCE_RE.search(sentence_head)
+                or _MORE_AFTER.search(text, m.end())):
+            continue
+        if material is None:
+            material = _material_spans(text)
+        if any(a <= m.start() < b for a, b in material):
             continue
         n = int(re.sub(r"[^0-9]", "", m.group(1)))
-        if n > 0 and (best is None or n > best):
-            best = n
-    return best
+        if 0 < n <= _TARGET_MAX_WORDS:
+            found.append((n, start))
+    # One target, or the same one restated in another sentence ("a 3,000-
+    # word essay. Aim for 3,000 words."). Two in one sentence are two pieces.
+    if not found or len({n for n, _ in found}) != 1 or len({s for _, s in found}) != len(found):
+        return None
+    return found[0][0]
 
 
 def fast_caps(shape: str, *, dense_script: bool = False) -> Tuple[int, int]:
