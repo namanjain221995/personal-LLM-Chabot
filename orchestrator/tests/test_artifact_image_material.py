@@ -823,3 +823,97 @@ def test_extra_cells_the_model_added_are_not_joined_into_one():
     md = "| No | Name | 1 | 2 |\n|---|---|---|---|\n| 1 | Asha | P | A | P | P |\n| 2 | Ravi | P | P |"
     got = asyncio.run(material_in.gather(history=[], image_texts=[("image.jpg", md)], save_documents=False))
     assert got.upload_tables[0].rows == [["1", "Asha", "P", "A"], ["2", "Ravi", "P", "P"]]
+
+
+# -------------------------------------------------- round 3 (2026-09-19) --
+#
+# Live after the dev merge, the owner's two phrasings with a whiteboard or a
+# receipt photo: "put this image in a Word doc with a summary" was a
+# read_source question (the vision route answered "Here is the Word document
+# with the receipt image …" and made no file, 2 of 2), and "make a PDF report
+# of this" after a file card was a convert of that file (the photo was never
+# read; the composer wrote "no specific data was provided", 3 of 4).
+
+#: The earlier turn is a file card, so the rules read a follow-up as a convert.
+CARD_HISTORY = [
+    {"role": "user", "content": "make a pdf of our sprint notes"},
+    {"role": "assistant", "content": "Created **Sprint Notes** as PDF."},
+]
+WHITEBOARD_MD = ("Sprint 14 retro - 16 Sep\nWent well:\n- Login bug fixed in 2 days\nProblems:\n- CI took 45 min per run\n"
+                 "Actions:\n1. Priya: split the CI job by 30 Sep")
+
+
+@pytest.fixture
+def doc_capture():
+    """A stub composer that writes a document, recording what it was handed."""
+    seen: dict = {}
+
+    async def composer(ctx):
+        seen["material"] = dict(ctx.material)
+        seen["operation"] = ctx.operation
+        seen["kind"] = ctx.kind
+        await ctx.progress_stage("intent", "done", "")
+        return S.parse_body("document", {"title": "Sprint 14 retro", "blocks": [{"type": "paragraph", "text": "x"}]})
+
+    return composer, seen
+
+
+@pytest.mark.parametrize("words,history", [
+    ("put this image in a Word doc with a summary", []),
+    ("put this image in a Word doc with a summary", CARD_HISTORY),
+    ("make a PDF report of this", CARD_HISTORY),
+    ("convert this to pdf", CARD_HISTORY),
+])
+def test_the_owners_phrasings_make_the_file_from_the_photo(doc_capture, reader, words, history):
+    composer, seen = doc_capture
+    calls, state = reader
+    state["reply"] = WHITEBOARD_MD
+    with TestClient(app) as client:
+        final, tokens = _turn(client, composer, words, conv="img-owner-" + str(len(history)) + words[:8].replace(" ", ""),
+                              history=history)
+    assert final["route"] == "artifact", tokens
+    assert [c["has_image"] for c in calls] == [True], "the attached photo was read"
+    assert seen["operation"] == "create" and seen["kind"] == "document"
+    assert "Priya: split the CI job by 30 Sep" in (seen["material"].get("uploads_text") or "")
+    assert final.get("artifacts"), "a file was made"
+
+
+@pytest.mark.parametrize("words,rule", [
+    ("also as pdf", "convert-short"),
+    ("convert the report you made to pdf", "convert-artifact-turn"),
+    ("make the previous file a pdf", "convert-artifact-turn"),
+    ("turn that spreadsheet into a pdf", "convert"),
+    ("convert this to pdf", "ui-convert"),
+])
+def test_a_convert_of_a_named_earlier_file_stays_a_convert_and_reads_nothing(words, rule):
+    from app.artifacts import intent as I
+
+    convert = I.ArtifactIntent("convert", formats=["pdf"], target="artifact", reference="latest", rule=rule)
+    assert material_in.image_turn(convert, words, ["jpg"]) == (convert, False)
+
+
+@pytest.mark.parametrize("words", ["make a PDF report of this", "convert this receipt to excel", "put the attached photo in a pdf"])
+def test_a_convert_whose_words_point_at_the_photo_is_made_from_the_photo(words):
+    from app.artifacts import intent as I
+
+    convert = I.ArtifactIntent("convert", formats=["pdf"], target="artifact", reference="latest", reference_hint="notes",
+                               rule="convert-artifact-turn")
+    out, reads = material_in.image_turn(convert, words, ["jpg"])
+    assert reads is True
+    assert (out.action, out.target, out.new_artifact, out.reference, out.reference_hint, out.upload_refs, out.rule) == (
+        "create", "upload", True, "none", "", ["jpg"], "convert-artifact-turn+image")
+
+
+def test_placing_the_attachment_in_a_new_file_is_a_request_not_a_question_about_it():
+    from app.artifacts import intent as I
+    from app.artifacts import lexicon as LX
+
+    for words in ("put this image in a Word doc with a summary", "put a summary of this image in a word doc",
+                  "put the key points of this pdf in a word document"):
+        assert LX.negative_shape(words.lower(), ["jpg"]) is None, words
+        assert I.decide(words, upload_formats=["jpg"]).wants_file, words
+    # A file the words READ stays a question: the article is definite, or
+    # there is no destination at all.
+    for words in ("what does the summary in this pdf say", "summarize this pdf", "what is the total in this pdf",
+                  "tell me what the word doc says"):
+        assert not I.decide(words, upload_formats=["pdf"]).wants_file, words

@@ -434,6 +434,14 @@ _ANSWER_SOURCE_RE = re.compile(
     r"|(?:this|our|the)\s+(?:chat|conversation)(?!\s+(?:screenshot|screen\s*shot|photo|image|picture|pic|snap)s?\b))\b",
     re.I,
 )
+#: Words that name an earlier FILE as the thing converted: "the report you
+#: made", "the previous deck", "that spreadsheet", "the same file".
+_FILE_NOUN = r"(?:file|document|doc|report|deck|presentation|slides|spreadsheet|sheet|workbook|pdf|excel|docx|pptx|xlsx|version|one)"
+_FILE_SOURCE_RE = re.compile(
+    rf"\b(?:(?:the|your|my|our)\s+(?:previous|last|earlier|existing|same|current|old|original)|that)\s+(?:\w+\s+)?{_FILE_NOUN}\b"
+    rf"|\b{_FILE_NOUN}\s+(?:that\s+)?(?:you|we)\s+(?:just\s+)?(?:made|created|built|generated|sent|gave|shared|did|wrote)\b",
+    re.I,
+)
 #: The attachment named by the words: then it is read even when the earlier
 #: answer is named too ("make an excel from this photo and your last answer").
 _NAMES_ATTACHMENT_RE = re.compile(
@@ -486,13 +494,27 @@ def image_turn(intent: Optional[I.ArtifactIntent], text: str, formats: Sequence[
     upload, unless the words name the earlier answer. Then the export stays,
     and the image is read beside the answer only when the words name the
     image too. When the rules themselves chose the upload as the source, it
-    is the source. An edit keeps its target and reads the image; a convert
-    re-renders a stored file and reads nothing."""
-    if intent is None or not intent.wants_file or intent.action == "convert":
+    is the source. An edit keeps its target and reads the image.
+
+    A convert re-renders a stored file and reads nothing, unless the words
+    point at the attachment ("make a PDF report of this") and name no earlier
+    file: after a file card the rules read those words as a convert of that
+    file (`convert-artifact-turn`), and live (2026-09-19) the photo was never
+    read and the composer wrote "no specific data was provided" around the
+    earlier file's title. "also as pdf" names nothing and stays a convert, and
+    so does a convert the UI named (`ui-convert`)."""
+    if intent is None or not intent.wants_file:
         return intent, False
+    words = _NEGATED_SOURCE_RE.sub(" ", text or "")
+    if intent.action == "convert":
+        if (intent.rule.startswith("ui-") or _FILE_SOURCE_RE.search(words) or _ANSWER_SOURCE_RE.search(words)
+                or not (_POINTS_AT_ATTACHMENT_RE.search(words) or _NAMES_ATTACHMENT_RE.search(words))):
+            return intent, False
+        return dataclasses.replace(intent, action="create", target="upload", new_artifact=True, reference="none",
+                                   reference_hint="", upload_refs=[str(f) for f in formats][:5],
+                                   rule=f"{intent.rule}+image"), True
     if intent.action == "edit":
         return intent, True
-    words = _NEGATED_SOURCE_RE.sub(" ", text or "")
     if _ANSWER_SOURCE_RE.search(words) and intent.target != "upload":
         return intent, bool(_NAMES_ATTACHMENT_RE.search(words))
     return dataclasses.replace(intent, action="create", target="upload", new_artifact=True,
