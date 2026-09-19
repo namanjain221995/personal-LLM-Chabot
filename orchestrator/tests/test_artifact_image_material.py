@@ -917,3 +917,36 @@ def test_placing_the_attachment_in_a_new_file_is_a_request_not_a_question_about_
     for words in ("what does the summary in this pdf say", "summarize this pdf", "what is the total in this pdf",
                   "tell me what the word doc says"):
         assert not I.decide(words, upload_formats=["pdf"]).wants_file, words
+
+
+def _compose_req(instruction, *, uploads_text="", tables=(), sources=()):
+    from app.artifacts import compose as C
+
+    material = C.Material(instruction=instruction, uploads_text=uploads_text, tables=list(tables), sources=list(sources))
+    return C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast", operation="create",
+                            instruction=instruction, material=material)
+
+
+def test_a_report_of_a_photo_is_not_padded_to_the_three_page_data_floor():
+    """Live 2026-09-19, "make a PDF report of this" over the whiteboard (about
+    60 words) or a five-item receipt: the 1,500-word data-report floor made
+    7,259-11,117 character files, and the main model, judging each against
+    the photo's text, found 34-106 statements the photo never made in 6 of 6
+    ("a persistent login bug", "digital payment practices in urban India").
+    With no floor for that little material: 804-2,896 characters, 4-37."""
+    from app.artifacts import compose as C
+
+    receipt = C.DataTable(id="upload1", title="image.jpg · table 1", columns=["Item", "Qty", "Amount"],
+                          rows=[["Basmati rice 5kg", "1", "649.00"], ["Toor dal 1kg", "2", "298.00"],
+                                ["Sunflower oil 1L", "3", "477.00"], ["Tea 500g", "1", "285.00"], ["Detergent 2kg", "1", "399.00"]])
+    assert C.target_for(_compose_req("make a PDF report of this", uploads_text=WHITEBOARD_MD)).words == 0
+    assert C.target_for(_compose_req("make a PDF report of this", uploads_text="SHARMA GROCERY\nTOTAL 2213.40",
+                                     tables=[receipt])).words == 0
+    # A dataset still gets its three pages, and so does a report with sources.
+    dataset = C.DataTable(id="upload1", title="customers-100.csv", columns=["Name", "Country", "Spend", "Status"],
+                          rows=[[f"c{i}", "India", str(i), "active"] for i in range(100)])
+    assert C.target_for(_compose_req("make a PDF report of this", tables=[dataset])).words == 1_500
+    source = C.Source(id="s1", title="t", url="https://example.com", text="x")
+    assert C.target_for(_compose_req("make a PDF report of this", uploads_text=WHITEBOARD_MD, sources=[source])).words == 1_500
+    # A size the person named is theirs, whatever the material.
+    assert C.target_for(_compose_req("make a big PDF report of this", uploads_text=WHITEBOARD_MD)).words == 3_000
