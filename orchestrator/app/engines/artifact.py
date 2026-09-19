@@ -1564,9 +1564,21 @@ async def _post_process(spec: Any, tables_: Sequence[Any], warn: Callable[[str],
             chart_tables.extend(recovered or [])
         except Exception as exc:  # noqa: BLE001 — the chart refuses as before
             log.info("artifact: parent chart tables not rebuilt: %s", type(exc).__name__)
+    accepted: List[str] = []
+    if parent is not None and _chart_data is not None and hasattr(_chart_data, "binding_key"):
+        # A chart the parent version DREW stays drawn in the edit: a newer
+        # "not worth drawing" rule (names, hotfix 1.1b) must not turn a
+        # section the request did not name into a note.
+        try:
+            from ..artifacts import chart_spec as _CS
+
+            accepted = [_chart_data.binding_key(_CS._get(c, "data")) for _p, c in _CS.iter_chart_slots(parent)
+                        if _CS._get(c, "data") is not None and _CS._get(c, "series")]
+        except Exception as exc:  # noqa: BLE001 — the charts resolve as for a new file
+            log.info("artifact: parent chart bindings unread: %s", type(exc).__name__)
     if _chart_data is not None and hasattr(_chart_data, "resolve_spec"):
         try:
-            spec, notes = await asyncio.to_thread(_chart_data.resolve_spec, spec, chart_tables)  # type: ignore[attr-defined]
+            spec, notes = await asyncio.to_thread(functools.partial(_chart_data.resolve_spec, spec, chart_tables, accepted=accepted))  # type: ignore[attr-defined]
             for n in notes or []:
                 warn(str(n))
         except Exception as exc:  # noqa: BLE001 — never fails the job

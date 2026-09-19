@@ -2629,7 +2629,7 @@ def _table_for_chart(op: AddChart, tables_: Sequence[Any]) -> Any:
     return tables_[0]
 
 
-def _charts_for(op: AddChart, table: Any, instruction: str) -> Tuple[List[Any], str]:
+def _charts_for(op: AddChart, table: Any, instruction: str, drawn: Sequence[Any] = ()) -> Tuple[List[Any], str]:
     """(charts, reason it could not) for one add_chart, from ONE table.
 
     A column the person NAMED is never silently swapped for a suggestion: an
@@ -2661,7 +2661,9 @@ def _charts_for(op: AddChart, table: Any, instruction: str) -> Tuple[List[Any], 
             "data": {"table_id": str(getattr(table, "id", "") or ""), "x": columns[idx], "y": ys, "agg": agg},
         })
         return [chart], ""
-    charts, _reasons = CC.suggest_charts(table, instruction=instruction, limit=max(1, int(op.count)))
+    charts, _reasons = CC.suggest_charts(table, instruction=instruction, limit=max(1, int(op.count)), drawn=drawn)
+    if not charts and drawn and CC.suggest_charts(table, instruction=instruction, limit=1)[0]:
+        return [], f"the file already has a chart of every column of {title} worth charting"
     if not charts:
         return [], f"nothing in {title} can be compared in a chart (its columns name rows rather than group them)"
     if op.chart_type and _chart_spec is not None:
@@ -2701,7 +2703,12 @@ def _apply_add_chart(w: _Work, op: AddChart) -> str:
         return _add_chart_to_sheet(w, op, tables_)
 
     table = _table_for_chart(op, tables_)
-    charts, why = _charts_for(op, table, op.instruction or w.instruction)
+    # The charts the file already draws are not suggested again.
+    drawn = [(u["value"].get("chart") or {}).get("data") if w.kind == "presentation"
+             else b.get("chart", {}).get("data")
+             for u in w.units for b in ([u["value"]] if w.kind == "presentation" else u["value"])
+             if (w.kind == "presentation" or b.get("type") == "chart")]
+    charts, why = _charts_for(op, table, op.instruction or w.instruction, [d for d in drawn if d])
     if not charts:
         raise _NotApplied(why or "the chart could not be bound to the data")
     blocks = [{"type": "chart", "chart": c.model_dump(mode="json", exclude_none=True)} for c in charts]
