@@ -380,9 +380,43 @@ _TABLE_MISSING_NOTE_RE = re.compile(r"^.+?: the table (?:'[^']*'|\"[^\"]*\") is 
 _FIGURES_NOTE_PREFIX = "figures not in the material"
 
 
+#: Notes about HOW the file was made, read to the owner verbatim in the
+#: hotfix 1.1 replay (2026-09-19): the chart colour map's missed keys ("no
+#: category or series is called '2020', …, so that colour was not used") and
+#: the chooser's type substitution ("a pie shows at most 7 slices, so 83 of
+#: the 89 values … so the data is drawn as a horizontal bar: …"). Nobody asked
+#: for either colour or type; the picture shows what was drawn.
+_COLOUR_MISS_NOTE_RE = re.compile(r"\bso that colou?r was not used\.?$")
+_TYPE_SWAP_NOTE_RE = re.compile(r", so the data is drawn as an? [\w -]{1,40}: ")
+#: compose.LONG_DOCUMENT_NOTE's opening words, and the call count at its end.
+#: "“Big” was read as about 3,000 words" says why the answer took minutes;
+#: "over 9 model calls" is the engine's accounting.
+_LONG_DOCUMENT_PREFIX = "written as a long document"
+_MODEL_CALLS_RE = re.compile(r",?\s*written in [\d,]+ sections? over [\d,]+ model calls?\.?$")
+#: selfcheck._unmet_line / _unconfirmed_line: "not met: <what> — <evidence>".
+#: The evidence is a check's own words (a list repr of section names).
+_SELFCHECK_NOTE_RE = re.compile(r"^not (?:met|confirmed): (?P<what>.+?)(?: — .*)?$", re.S)
+
+
 def is_operator_note(warning: object) -> bool:
     text = str(warning or "").strip()
-    return text.startswith(_FIGURES_NOTE_PREFIX) or bool(_TABLE_MISSING_NOTE_RE.match(text))
+    return (text.startswith(_FIGURES_NOTE_PREFIX) or bool(_TABLE_MISSING_NOTE_RE.match(text))
+            or bool(_COLOUR_MISS_NOTE_RE.search(text)) or bool(_TYPE_SWAP_NOTE_RE.search(text)))
+
+
+def selfcheck_what(line: object) -> str:
+    """The item a self-check line is about, without its evidence, or ""."""
+    m = _SELFCHECK_NOTE_RE.match(str(line or "").strip())
+    return m.group("what").strip() if m else ""
+
+
+def _plain(text: str) -> str:
+    if text.startswith(_LONG_DOCUMENT_PREFIX):
+        return _MODEL_CALLS_RE.sub("", text)
+    what = selfcheck_what(text)
+    if what:
+        return f"not confirmed in the file: {what}"
+    return text
 
 
 def reader_warnings(warnings: Sequence[object]) -> List[str]:
@@ -402,7 +436,9 @@ def reader_warnings(warnings: Sequence[object]) -> List[str]:
             continue
         if is_operator_note(text):
             continue
-        out.append(text)
+        plain = _plain(text.strip())
+        if plain and plain not in out:
+            out.append(plain)
     if missing:
         out.insert(slot, f"{missing} chart{'s' if missing != 1 else ''} could not be drawn from your data")
     return out

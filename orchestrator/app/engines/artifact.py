@@ -1738,12 +1738,18 @@ def _edit_sentence(title: str, version: int, changes: Sequence[str], not_applied
     if not_applied:
         bits = [f"{_op_words(n.get('op', ''))} ({n.get('reason', '')})" for n in not_applied[:2]]
         line += " Not applied: " + "; ".join(bits) + "."
-    if unmet:
-        line += " Not confirmed in the file: " + "; ".join(str(u) for u in list(unmet)[:3]) + "."
+    # One plain line: the self-check's evidence ("sections … changed or
+    # disappeared: ['…', '…']") stays on the version row and in the log
+    # (hotfix 1.1b). The same lines ride in `warnings` and are not said twice.
+    whats = list(dict.fromkeys(T.selfcheck_what(u) or str(u) for u in unmet))
+    if whats:
+        line += " Not confirmed in the file: " + "; ".join(whats[:2]) + "."
     if data_only_note:
         note = data_only_note.strip().rstrip(".")
         line += f" {note[0].upper()}{note[1:]}."
-    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")])
+    said_unmet = {str(u) for u in unmet}
+    line += _warning_clause([w for w in warnings if not _CELL_NOTE_RE.match(str(w)) and not str(w).startswith("not applied:")
+                             and str(w) not in said_unmet])
     return line
 
 
