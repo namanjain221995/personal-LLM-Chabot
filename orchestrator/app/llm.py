@@ -120,6 +120,41 @@ def _record_usage(prompt: int, completion: int) -> None:
     )
 
 
+_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "calls")
+
+
+def usage_since(before: Optional[dict]) -> Optional[dict]:
+    """What THIS context recorded after `before` (an earlier `get_usage()`
+    read in the same context), or None when it recorded nothing.
+
+    For work whose context dies with it — a gathered task, a LangGraph node —
+    so its usage can be carried out and folded into the caller's turn.
+    """
+    now = _usage.get()
+    if not now:
+        return None
+    base = before or {}
+    spent = {k: int(now.get(k) or 0) - int(base.get(k) or 0) for k in _USAGE_KEYS}
+    return spent if spent["calls"] > 0 else None
+
+
+def fold_usage(base: Optional[dict], parts: Sequence[Optional[dict]]) -> None:
+    """Set this context's turn total to `base` plus every reported part.
+
+    SET, not add: whether or not a child's context was a copy, the result is
+    the same total. When no part reported, the total is left as it is — None
+    stays "not measured", never a zero with a call count.
+    """
+    reported = [p for p in parts if p]
+    if not reported:
+        return
+    total = {k: int((base or {}).get(k) or 0) for k in _USAGE_KEYS}
+    for part in reported:
+        for k in _USAGE_KEYS:
+            total[k] += int(part.get(k) or 0)
+    _usage.set(total)
+
+
 # ---------------------------------------------------------------------------
 # FAST NEVER THINKS (owner rule, 2026-09-17).
 #

@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import operator
 import re
-from typing import Awaitable, Callable, List, Literal, Optional, Sequence, Tuple, TypedDict
+from typing import Annotated, Awaitable, Callable, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -526,6 +527,15 @@ async def execute_steps(
     semaphore = asyncio.Semaphore(STEP_CONCURRENCY)
 
     async def run(step: PlanStep) -> dict:
+        # Each step is its own task, in a COPY of the caller's context: the
+        # usage its calls record dies with the task unless it is carried out
+        # on the result (hotfix 1.2, P8).
+        before = llm.get_usage()
+        result = await _run(step)
+        result["usage"] = llm.usage_since(before)
+        return result
+
+    async def _run(step: PlanStep) -> dict:
         async with semaphore:
             await emit("step", {"id": step.id, "title": step.title, "status": "running"})
             try:
@@ -749,9 +759,21 @@ class AgentState(TypedDict, total=False):
     plan: AgentPlan
     results: List[dict]
     answer: str
+    #: The usage every node's calls reported. LangGraph runs each node in a
+    #: COPY of the caller's context, so `llm._usage` recorded inside a node
+    #: never reached the turn: agent turns were stored with NULL tokens
+    #: (hotfix 1.2, P8). Each node returns its own share; the reducer
+    #: collects them and `run_agent_engine` folds them into the turn.
+    usage: Annotated[List[dict], operator.add]
+
+
+def _spent(before: Optional[dict]) -> List[dict]:
+    spent = llm.usage_since(before)
+    return [spent] if spent else []
 
 
 async def _plan_node(state: AgentState) -> dict:
+    before = llm.get_usage()
     plan = await make_plan(
         state["message"],
         state.get("history", []),
@@ -761,10 +783,11 @@ async def _plan_node(state: AgentState) -> dict:
     plan = coerce_allowed(plan, web=state.get("web", True))
     if state.get("web", True) and state.get("web_forced", False):
         plan = ensure_web_step(plan, state["message"])
-    return {"plan": plan}
+    return {"plan": plan, "usage": _spent(before)}
 
 
 async def _execute_node(state: AgentState) -> dict:
+    before = llm.get_usage()
     results = await execute_steps(
         state["plan"],
         state.get("history", []),
@@ -775,10 +798,12 @@ async def _execute_node(state: AgentState) -> dict:
         state.get("user_id"),
         state.get("conversation_id", ""),
     )
-    return {"results": results}
+    steps = [u for u in (r.pop("usage", None) for r in results) if u]
+    return {"results": results, "usage": _spent(before) + steps}
 
 
 async def _synthesize_node(state: AgentState) -> dict:
+    before = llm.get_usage()
     emit = state["emit"]
     results = state.get("results", [])
     # Must happen BEFORE the synthesis prompt is built: the model copies the
@@ -803,7 +828,7 @@ async def _synthesize_node(state: AgentState) -> dict:
 
     # §10: the SINGLE final meta, after the token stream, before done.
     await emit("meta", merge_step_meta(results))
-    return {"answer": "".join(parts)}
+    return {"answer": "".join(parts), "usage": _spent(before)}
 
 
 def build_agent_graph():
@@ -854,6 +879,7 @@ async def run_agent_engine(
     from ..core import pasted
 
     pasted.mark_turn(message)
+    before = llm.get_usage()
     state = await get_agent_graph().ainvoke(
         {
             "message": message,
@@ -867,4 +893,5 @@ async def run_agent_engine(
             "web_forced": web_forced,
         }
     )
+    llm.fold_usage(before, state.get("usage") or [])
     return state.get("answer") or ""
