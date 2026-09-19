@@ -1100,7 +1100,7 @@ def _relevance_query(state: ResearchState) -> str:
     job posting, the floor kept 12 scored against the message and 22 against
     the question plus the plan.
     """
-    own = pasted.search_words(state.question).strip()
+    own = pasted.search_words(state.question).strip()[: rerank.MAX_QUERY_CHARS // 2]
     parts = [own, *state.subquestions] if own else list(state.subquestions)
     return "\n".join(parts) if parts else state.question
 
@@ -3688,7 +3688,10 @@ async def _run(
         cut = await _write(allowance)
         if cut:
             await _park_if_cut(state, "report")
-        if cut and not _WORD_RE.search("".join(parts)):
+        # Only an IDLE cut earns the retry: after the hard ceiling there is no
+        # time left, and "then one 15 s retry" would be a false sentence
+        # (review 2026-09-19).
+        if cut == "idle" and not _WORD_RE.search("".join(parts)):
             # Not one word by the deadline. Once more, thinking off, with the
             # floor as its idle allowance — a first word within it, then on
             # for as long as it keeps writing — under the same ceiling.
