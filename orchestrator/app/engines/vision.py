@@ -128,7 +128,27 @@ def history_turns(history: Sequence[dict], n: Optional[int] = None) -> List[dict
     prompt for no gain, and main.py stores answers as plain text anyway.
     """
     turns = recent_turns(history, n or settings.chat_history_turns)
-    return [m for m in turns if isinstance(m.get("content"), str) and m.get("role")]
+    out = []
+    for m in turns:
+        if not (isinstance(m.get("content"), str) and m.get("role")):
+            continue
+        if m.get("role") == "assistant" and _FILE_CARD_LINE.search(m["content"]):
+            m = {**m, "content": _FILE_CARD_LINE.sub(_file_card_note, m["content"])}
+        out.append(m)
+    return out
+
+
+#: The app's own file-card sentence ("Created **Receipt Summary** as PDF.",
+#: "Updated **Report** v2: ..."). The vision model cannot make files, but it
+#: copied this sentence from the history and told the person "Created **Sharma
+#: Grocery Receipt Summary** as PDF." with no file behind it (image-into-files
+#: review, 2026-09-19). The history keeps THAT a file was made, in words the
+#: model will not mistake for its own reply shape.
+_FILE_CARD_LINE = re.compile(r"^(?:Created|Updated)\s+\*\*(.+?)\*\*[^\n]*$", re.M)
+
+
+def _file_card_note(m: "re.Match") -> str:
+    return f"(Earlier the app made a file here: {m.group(1)}.)"
 
 
 def to_data_url(image_base64: str) -> str:
