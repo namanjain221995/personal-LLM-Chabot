@@ -1317,7 +1317,9 @@ def test_a_multimodal_last_turn_is_sent_as_it_is(model):
     assert fake.prompts[0] == base
 
 
-@pytest.mark.parametrize("words", [2250, 2400, 2500])
+# 2100 is exactly 70% and 2160 is 72% (review 2026-09-19: a 0.75 threshold and
+# "<=" both survived every test before these two rows).
+@pytest.mark.parametrize("words", [2100, 2160, 2250, 2400, 2500])
 def test_a_piece_that_stops_at_75_to_83_percent_is_not_extended(model, words):
     """Live 2026-09-19: stops at 79-83% of 3,000 words, closed by a paragraph
     under a heading the ending check cannot know ("Legacy and Modern

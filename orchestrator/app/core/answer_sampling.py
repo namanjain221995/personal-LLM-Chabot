@@ -485,6 +485,16 @@ _PER_ITEM_ANYWHERE = re.compile(
     re.IGNORECASE,
 )
 _TIMES_BEFORE = re.compile(r"\b[0-9]+\s*[x×]\s*$", re.IGNORECASE)
+#: A DELTA is not the answer's length: "Make it 1,000 words longer", "Expand
+#: the essay above by 1,000 words", "another 2,000 words". The answer is the
+#: piece so far plus N; held to N, a 3,184-word article asked to grow by 1,000
+#: was cut at 1,465 words (reviewer live, 2026-09-19).
+_DELTA_BEFORE = re.compile(r"\b(?:by|another|(?:an?\s+)?(?:extra|additional|further))\s+(?:(?:about|around|roughly|approximately)\s+)?$", re.IGNORECASE)
+_DELTA_AFTER = re.compile(r"^\s*(?:longer|more|extra|additional)\b", re.IGNORECASE)
+#: A deliverable BEFORE the counted piece: "Explain X in detail, then write a
+#: 1,000-word story", "an outline plus a 2,000-word first chapter". The whole
+#: answer is longer than the piece, and the cut is on the whole answer.
+_MORE_BEFORE = re.compile(r"\b(?:then|afterwards|after\s+that|plus|and\s+(?:also\s+)?(?=write|draft|compose|give|produce|create|prepare))\b", re.IGNORECASE)
 _PLURAL_PIECE_AFTER = re.compile(
     r"^\s*(?:[a-z]+\s+)?(?:essays|articles|posts|stories|pieces|chapters|sections|entries|letters|papers|reports|blogs|"
     r"summaries|descriptions|answers|responses|scripts|poems|speeches|reviews|pages|parts|drafts|versions)\b",
@@ -597,7 +607,8 @@ def requested_words(message: str) -> Optional[int]:
                 or _PLURAL_PIECE_AFTER.match(after) or _PER_ITEM_ANYWHERE.search(sentence_head)
                 or _PER_ITEM_ANYWHERE.search(after) or _NEGATED_LIMIT_BEFORE.search(sentence_head)
                 or _ABOUT_A_PIECE.search(sentence_head) or _REDUCE_RE.search(sentence_head)
-                or _MORE_AFTER.search(text, m.end())):
+                or _MORE_AFTER.search(text, m.end()) or _DELTA_BEFORE.search(sentence_head)
+                or _DELTA_AFTER.match(after) or _MORE_BEFORE.search(sentence_head)):
             continue
         if material is None:
             material = _material_spans(text)
