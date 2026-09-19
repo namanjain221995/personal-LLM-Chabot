@@ -1109,8 +1109,6 @@ def not_worth_drawing(chart: CS.Chart, table: Any, computed: Any = None) -> str:
     idx, _ = CD.match_column(b.x, columns)
     if idx is None:
         return ""
-    if names_a_row(columns[idx]):
-        return f"{columns[idx]} names one person or contact per row rather than a group, so counting it compares nothing"
     col = _profile_column(table, idx)
     if col.n_rows < 10 or col.kind == "date":
         # A DATE axis is bucketed before it is counted (one bar per month,
@@ -1120,6 +1118,9 @@ def not_worth_drawing(chart: CS.Chart, table: Any, computed: Any = None) -> str:
     if col.near_unique:
         return (f"{col.name} has {col.n_distinct} different values in {col.n_rows:,} rows, "
                 f"so counting them draws one bar per row")
+    # After the near-unique test, whose numbers say more when they apply.
+    if names_a_row(col.name):
+        return f"{col.name} names one person or contact per row rather than a group, so counting it compares nothing"
     if computed is not None:
         values = [v for s in (getattr(computed, "series", None) or []) for v in (getattr(s, "values", None) or [])]
         top = max(values) if values else 0.0
