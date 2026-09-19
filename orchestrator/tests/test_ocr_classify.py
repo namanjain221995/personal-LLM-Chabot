@@ -867,3 +867,30 @@ def test_the_same_words_as_the_whole_plain_answer_are_the_model_s(raw):
     """The other direction: unwrapped, the whole answer, it is the model
     saying it found nothing."""
     assert ocr.classify(raw).status == "empty"
+
+
+# ---- 6. a bare bracket at a line start is the image's text --
+
+#: Live answers, prompt "OCR" (ocr-truth round 2 and QA probes, 2026-09-18):
+#: in every one the '[…]' line is REPL output or a matrix row on the image.
+_BARE_BRACKET_READS = [
+    (" result\n>>> sorted(xs)\n[1, 2, 3, 4]\n>>> len(xs)\n4", ">>> sorted(xs)\n[1, 2, 3, 4]\n>>> len(xs)\n4"),
+    (" result:\n[1, 2, 3, 4]\n>>> sum(nums)\n10", "[1, 2, 3, 4]\n>>> sum(nums)\n10"),
+    (
+        " result [0, 0, 0]\n[0, 1, 0, 0]\n[0, 0, 1, 0]\n[0, 0, 0, 1]",
+        "result [0, 0, 0]\n[0, 1, 0, 0]\n[0, 0, 1, 0]\n[0, 0, 0, 1]",
+    ),
+    ("xs\n[1, 2, 3, 4]", "xs\n[1, 2, 3, 4]"),
+]
+
+
+@pytest.mark.parametrize("raw, text", _BARE_BRACKET_READS, ids=["repl-shot-live", "repl-list-live", "matrix-live", "word-above"])
+def test_a_bare_bracket_line_is_kept(monkeypatch, raw, text):
+    read = _read(monkeypatch, raw)
+    assert (read.status, read.text) == ("ok", text)
+
+
+def test_a_typed_region_marker_is_still_stripped():
+    assert ocr.clean_transcript("text [1, 2, 3, 4]Vendor: TechSara\ntable [5, 6, 7, 8]Total 42") == (
+        "Vendor: TechSara\nTotal 42"
+    )

@@ -182,6 +182,15 @@ _TYPE_WORD = "(?:%s)" % "|".join(_LAYOUT_TYPES)
 # region line are no longer folded into it. None of the 296 answers recorded
 # this round had one, and this step's output is byte-identical on all 296.
 #
+# The type word is required, and on the same line as its box (2026-09-19).
+# In the 212 distinct live answers recorded by the review rounds, every
+# line that starts with a bare "[a, b, c, d]" is the image's own text, never
+# the engine's markup: REPL output '[1, 2, 3, 4]' (repl_shot, repl_list, on
+# the image, video and document paths) and an identity matrix's rows. With
+# the type optional those lines were stripped whole, and the matrix answer
+# came back `empty`. `\s*` after the type also let "xs" on one line and a
+# bracket on the next read as one region.
+#
 # The second alternative is the same marker with the wrong number of
 # coordinates and the image's text fused straight behind it (2026-09-19).
 # Live, "OCR" prompt, a scanned 'Matrix rows / [1, 2, 3, 4] / [5, 6, 7, 8]'
@@ -193,7 +202,7 @@ _TYPE_WORD = "(?:%s)" % "|".join(_LAYOUT_TYPES)
 # image's words. Both alternatives are one pass: content exposed behind a
 # stripped marker is never at a line start for this regex again.
 _LINE_REGION_RE = re.compile(
-    r"^[^\S\n]*(?:(?:[a-z_]{1,12}\s*)?\[\d+(?:,\s*\d+){3}\]"
+    r"^[^\S\n]*(?:[a-z_]{1,12}[^\S\n]*\[\d+(?:,\s*\d+){3}\]"
     r"|" + _TYPE_WORD + r"[^\S\n]*\[\d+(?:,[^\S\n]*\d+){1,7}\](?=\S))\s*",
     re.M,
 )
