@@ -5,16 +5,23 @@
  * before this, so this dialog establishes the pattern: the ConfirmDialog
  * portal recipe on a wider panel, with a section nav on the left (top on
  * mobile). Sections: Profile (read-only identity), Personalization (theme),
- * Security (change password), Sessions (everywhere you're signed in), Help.
+ * Memory (what the assistant saved about you, B11), Security (change
+ * password), Sessions (everywhere you're signed in), Help.
  *
  * Portalled to <body> — a transformed ancestor would otherwise become the
  * containing block for position:fixed (the bug that hit the ⋯ menu and the
  * diagram viewer). z-[70] matches ConfirmDialog; the session-revoke confirm
  * portals later into <body>, so it still paints above this panel.
  *
- * Escape is handled on the panel, not on document (SearchPalette's pattern):
- * when the nested ConfirmDialog is open its own document-level handler
- * closes it, and this panel — which no longer contains the focus — stays up.
+ * Escape is handled on the panel, not on document (SearchPalette's pattern).
+ * A nested ConfirmDialog portals outside the panel, but React still bubbles
+ * its keys through this component, so the panel acts only on keys whose
+ * target is inside its own DOM (ownModalKey); the confirm's own
+ * document-level handler closes it and this panel stays up. The panel takes
+ * tabIndex -1 and useModalKeyGuard runs while it is open, so a click on
+ * plain text followed by Escape closes Settings instead of reaching ChatApp's
+ * window shortcut and stopping the answer streaming behind it (QA,
+ * 2026-09-18).
  */
 
 import {
@@ -26,6 +33,7 @@ import {
 import { createPortal } from 'react-dom';
 import type { FetchLike } from '@/lib/auth';
 import type { Account } from './AccountMenu';
+import { MemoryPanel, ownModalKey, trapTab, useModalKeyGuard } from './MemoryPanel';
 import { useTheme } from './Providers';
 import { PasswordSection, SessionsSection } from './SecuritySettings';
 import { IconX } from './icons';
@@ -33,6 +41,7 @@ import { IconX } from './icons';
 export type SettingsSection =
   | 'profile'
   | 'personalization'
+  | 'memory'
   | 'security'
   | 'sessions'
   | 'help';
@@ -40,6 +49,7 @@ export type SettingsSection =
 const SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'personalization', label: 'Personalization' },
+  { id: 'memory', label: 'Memory' },
   { id: 'security', label: 'Security' },
   { id: 'sessions', label: 'Sessions' },
   { id: 'help', label: 'Help' },
@@ -64,6 +74,7 @@ export function SettingsDialog({
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) setSection(initialSection);
@@ -75,13 +86,17 @@ export function SettingsDialog({
     if (open) closeRef.current?.focus({ preventScroll: true });
   }, [open]);
 
+  useModalKeyGuard(open, panelRef, onClose);
+
   if (!open || typeof document === 'undefined') return null;
 
   function onPanelKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!ownModalKey(e, panelRef.current)) return;
     if (e.key === 'Escape') {
-      e.stopPropagation();
       onClose();
+      return;
     }
+    trapTab(e, panelRef.current);
   }
 
   return createPortal(
@@ -90,12 +105,14 @@ export function SettingsDialog({
       onClick={onClose}
     >
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onPanelKeyDown}
-        className="palette-panel flex max-h-[85dvh] min-h-[320px] w-full max-w-2xl flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl"
+        className="palette-panel flex max-h-[85dvh] min-h-[320px] w-full max-w-2xl flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl focus:outline-none"
       >
         <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-ink">Settings</h2>
@@ -138,6 +155,7 @@ export function SettingsDialog({
           <div className="min-w-0 flex-1 overflow-y-auto p-4">
             {section === 'profile' && <ProfileSection account={account} />}
             {section === 'personalization' && <PersonalizationSection />}
+            {section === 'memory' && <MemoryPanel fetchFn={fetchFn} />}
             {section === 'security' && <PasswordSection fetchFn={fetchFn} />}
             {section === 'sessions' && <SessionsSection fetchFn={fetchFn} />}
             {section === 'help' && <HelpSection />}
