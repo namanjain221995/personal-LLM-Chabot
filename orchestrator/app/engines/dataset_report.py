@@ -104,7 +104,7 @@ th, td { padding: 1pt 3pt; }
 """
 
 
-def _md_escape(value: Any) -> str:
+def _md_escape(value: Any, limit: int = 60) -> str:
     """Escape a profile value for a Markdown table cell.
 
     Column names and cell values are user file content: a pipe would break the
@@ -121,7 +121,7 @@ def _md_escape(value: Any) -> str:
     and 74 of entities.
     """
     text = "" if value is None else str(value)
-    text = re.sub(r"\s+", " ", text).strip()[:60]
+    text = re.sub(r"\s+", " ", text).strip()[:limit]
     text = text.replace("\\", "\\\\").replace("|", "\\|")
     # BRACKETS ARE ESCAPED. A group value "[Claim your refund](http://evil.
     # example/p)" rendered as a clickable link under the platform's own
@@ -384,7 +384,20 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
     largest = sorted(measures, key=lambda m: abs(_dec(columns[m]["sum"])), reverse=True)
     measure = (named_measures or largest or [None])[0]
 
-    lines: List[str] = [f"### Figures computed from every row ({_fmt_int(prof.get('rows'))} rows)", ""]
+    # ROWS THE READER DROPPED ARE SAID ABOVE THE TOTALS THEY ARE MISSING FROM
+    # (profile contract d2c89d0: rows_not_read). "Computed from every row"
+    # would otherwise head totals that leave those rows out.
+    dropped = _rows_not_read(prof)
+    if dropped:
+        why = next((r for r in agg.get("omitted") or [] if isinstance(r, str) and "could not be read" in r), None)
+        lines: List[str] = [
+            f"### Figures computed from every row that could be read ({_fmt_int(prof.get('rows'))} rows)",
+            "",
+            f"_{_caveat(why) if why else f'{_fmt_int(dropped)} row(s) could not be read and are left out of every total'}._",
+            "",
+        ]
+    else:
+        lines = [f"### Figures computed from every row ({_fmt_int(prof.get('rows'))} rows)", ""]
     if measures:
         lines += ["| Measure | Total | Average | Median |", "| --- | ---: | ---: | ---: |"]
         for m in measures:
@@ -468,6 +481,9 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
             )
         if months.get("truncated"):
             lines += ["", "_Further months are not listed._"]
+        undated = _reason_for(agg, "month", months.get("date"))
+        if undated:
+            lines += ["", f"_{_caveat(undated)}._"]
         lines.append("")
 
     # WHAT WAS ASKED AND IS NOT HERE IS SAID (2026-09-19). "revenue by
@@ -477,7 +493,12 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
     said = _md_escape(measure) if measure is not None else "the figures"
     notes: List[str] = []
     for group in missing:
-        notes.append(f"_A breakdown of {said} by {_md_escape(group)} is not computed for this report._")
+        left_out = _reason_for(agg, "group", group)
+        notes.append(
+            f"_A breakdown of {said} by {_md_escape(group)} is not listed: {_caveat(left_out)}._"
+            if left_out
+            else f"_A breakdown of {said} by {_md_escape(group)} is not computed for this report._"
+        )
     if wants_months and months is None and not any(g in month_groups for g in shown):
         notes.append(f"_Monthly figures were asked for, but none are computed for this file: {_no_months_reason(prof, dates)}._")
     crossed = [g for g in shown if g in explicit and g not in month_groups]
@@ -496,6 +517,31 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
     for note in notes:
         lines += [note, ""]
     return lines, shown
+
+
+def _rows_not_read(prof: Dict[str, Any]) -> int:
+    try:
+        return max(0, int(prof.get("rows_not_read") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _reason_for(agg: Dict[str, Any], kind: str, name: Any) -> Optional[str]:
+    """Why the profile left the `kind` ("group" or "month") breakdown by
+    `name` out or short, in its own words after the column name."""
+    lead = f"by_{kind} {name}: "
+    for reason in agg.get("omitted") or []:
+        if isinstance(reason, str) and reason.startswith(lead):
+            return re.sub(r"^not listed,\s*", "", reason[len(lead):]).rstrip(".")
+    return None
+
+
+def _caveat(value: Any) -> str:
+    """A profile caveat for an italic note: code-written prose around a
+    clipped column name. Cut at a cell's 60 characters it lost the totals it
+    exists to state; its underscores ("order_date") are escaped so they
+    cannot close the italics."""
+    return _md_escape(value, limit=400).replace("*", "\\*").replace("_", "\\_")
 
 
 def _no_months_reason(prof: Dict[str, Any], dates: Sequence[Any]) -> str:
@@ -670,6 +716,65 @@ _NARRATIVE_FALLBACK = (
 )
 
 
+#: Said instead of a summary that states a figure the data does not hold.
+_NARRATIVE_CHECKED = "The tables above hold the figures computed by code from the file."
+
+#: A number in prose: 1,234,567.89, 1234.5, -12, 12.5%. Dates and times are
+#: removed before this runs.
+_PROSE_NUMBER = re.compile(r"(?<![\w.,])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\w.,])-?\d+(?:\.\d+)?")
+_PROSE_DATE = re.compile(r"\b\d{4}-\d{2}(?:-\d{2})?(?:[ T]\d{2}:\d{2}(?::\d{2})?)?\b|\b\d{1,2}:\d{2}\b")
+
+
+def _cents(value: Any) -> Optional[Decimal]:
+    try:
+        return abs(Decimal(str(value).replace(",", ""))).quantize(Decimal("0.01"), ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _known_figures(node: Any, into: set) -> set:
+    """Every number the stored profiles hold, as cents: computed figures,
+    counts, cells, and the numbers inside omitted reasons."""
+    if isinstance(node, dict):
+        for v in node.values():
+            _known_figures(v, into)
+    elif isinstance(node, list):
+        for v in node:
+            _known_figures(v, into)
+    elif isinstance(node, bool):
+        pass
+    elif isinstance(node, (int, float)):
+        c = _cents(node)
+        if c is not None:
+            into.add(c)
+    elif isinstance(node, str):
+        for tok in _PROSE_NUMBER.findall(node):
+            c = _cents(tok)
+            if c is not None:
+                into.add(c)
+    return into
+
+
+def unsupported_figures(text: str, uploads: Sequence[dict]) -> List[str]:
+    """The numbers in `text` that no stored profile holds, to the cent.
+
+    Years and whole numbers up to 12 are left alone: "in 2024", "three
+    things", "12 months" are prose, not figures from the data.
+    """
+    known = _known_figures([u.get("profile") for u in uploads], set())
+    bad = []
+    for tok in _PROSE_NUMBER.findall(_PROSE_DATE.sub(" ", text or "")):
+        value = _cents(tok)
+        if value is None:
+            continue
+        plain = "," not in tok and "." not in tok
+        if plain and (value <= 12 or 1900 <= value <= 2100):
+            continue
+        if value not in known:
+            bad.append(tok)
+    return bad
+
+
 async def _narrative(message: str, uploads: Sequence[dict], model_choice: str) -> str:
     """Profile-grounded prose. Never raises — the facts stand without it."""
     from .dataset import format_profile  # lazy: dataset imports this module
@@ -700,7 +805,19 @@ async def _narrative(message: str, uploads: Sequence[dict], model_choice: str) -
             max_tokens=1200,
             thinking=False,
         )
-        return (text or "").strip() or _NARRATIVE_FALLBACK
+        text = (text or "").strip()
+        if not text:
+            return _NARRATIVE_FALLBACK
+        # THE SUMMARY STATES ONLY FIGURES THE DATA HOLDS. Told never to do
+        # arithmetic, it still wrote "A total of 3745655.34 in revenue" under
+        # a table showing 37,456,555.34 (1 of 8 live reports, 2026-09-18). A
+        # figure no profile holds, to the cent, costs the summary: the
+        # tables carry every figure anyway.
+        wrong = unsupported_figures(text, uploads)
+        if wrong:
+            log.warning("dataset report summary dropped: %d figure(s) not in the data", len(wrong))
+            return _NARRATIVE_CHECKED
+        return text
     except Exception:
         log.warning("dataset report narrative failed", exc_info=True)
         return _NARRATIVE_FALLBACK

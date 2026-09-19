@@ -1199,3 +1199,50 @@ def test_a_question_about_growth_is_offered_the_monthly_line_chart(tmp_path):
     for question in ("Which region grew fastest?", "What is the revenue trend by region?"):
         assert dataset.chart_offer(question, [upload]) == "make a line chart of revenue by month for each region"
     assert dataset.chart_offer("monthly revenue trend", [upload]) == "make a line chart of revenue by month"
+
+
+def test_the_report_says_which_rows_its_totals_leave_out(tmp_path):
+    from app.engines import dataset_report
+
+    md = build_report_markdown("T", [_dirty_upload(tmp_path)], "Summary.", "now", message="pdf of revenue by region")
+    assert "### Figures computed from every row that could be read" in md
+    assert ("_1 row(s) could not be read under the detected column types (a bad value in revenue) "
+            "and are left out of every total._") in md
+    assert md.index("could not be read") < md.index("| revenue |")
+
+    md = build_report_markdown("T", [_undated_contact_upload(tmp_path)], "Summary.", "now",
+                               message="pdf of monthly revenue by owner")
+    month_table = md[md.index("### Total revenue by month"):]
+    assert ("_20 row(s) have no date and are in no month, so the months add up to less than the column "
+            "totals by: revenue 960.0._") in month_table.replace("\\_", "_")
+    assert "_A breakdown of revenue by owner is not listed: its values look like contact details or account numbers._" in md
+    # Clean files say none of it.
+    _, clean = profiled_upload(tmp_path, 60, 3)
+    md = build_report_markdown("T", [clean], "Summary.", "now", message="pdf of monthly revenue by region")
+    assert "could not be read" not in md and "have no date" not in md and "not listed:" not in md
+    assert dataset_report._caveat("a_b *c* [x](y) | z") == "a\\_b \\*c\\* \\[x\\](y) \\| z"
+
+
+def test_a_summary_figure_that_is_not_in_the_data_never_reaches_the_pdf(tmp_path, monkeypatch):
+    """Live 2026-09-18: 'A total of 3745655.34 in revenue' under a table
+    showing 37,456,555.34."""
+    from app.engines import dataset_report
+
+    rows, upload = profiled_upload(tmp_path, 80, 13)
+    t = truth(rows)
+    total = f"{t['revenue_total']:,.2f}"
+    west = f"{t['by_region']['West'][1]:,.2f}"
+
+    def summary(text):
+        async def completion(messages, **kw):
+            return text
+
+        monkeypatch.setattr(llm, "chat_completion", completion)
+        return asyncio.run(dataset_report._narrative("pdf please", [upload], "smart"))
+
+    good = f"Across 80 orders from 2025 the sum of revenue is {total}, and West took {west} over 12 months."
+    assert summary(good) == good
+    dropped_digit = total.replace(",", "")[:-4] + total[-3:]
+    for bad in (f"The total revenue is {dropped_digit}.", "West holds 27.5% of revenue.",
+                f"Revenue totals {total} and averages 1,234,567.89 per order."):
+        assert summary(bad) == dataset_report._NARRATIVE_CHECKED, bad
