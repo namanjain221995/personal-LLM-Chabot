@@ -869,10 +869,12 @@ def test_an_eszett_scope_goes_upstream_in_its_own_spelling(monkeypatch):
 
 
 def test_the_fast_lookup_does_not_classify_a_long_question_again(monkeypatch, ttls):
-    """QA round 1 residual, still open after round 2: the Fast lookup's second
-    classify_offline pass ran on the event loop whatever the length (13.3 s
-    on a 400 KB pathological line). Past _FAST_VERDICT_MAX_CHARS it keeps the
-    wording TTL it had at 4810da0; under it the verdict still arrives."""
+    """QA round 1 residual: the Fast lookup's second classify_offline pass ran
+    on the event loop over the whole message (13.3 s on a 400 KB pathological
+    line). It classifies the person's own words, at most
+    pasted.WEB_QUERY_MAX_CHARS, and the REALTIME verdict still arrives."""
+    from app.core import pasted
+
     calls = []
 
     def counting(question, *, now_year):
@@ -881,11 +883,10 @@ def test_the_fast_lookup_does_not_classify_a_long_question_again(monkeypatch, tt
 
     monkeypatch.setattr(search, "classify_offline", counting)
     search._verdict_memo.cache_clear()
-    long_q = "what is the NVIDIA stock price right now? " + "what does x " * 1000
-    assert len(long_q) > search._FAST_VERDICT_MAX_CHARS
+    long_q = REALTIME_Q + "\n\n" + "\n".join(["what does x " * 50] * 20)
+    assert pasted.web_query(long_q) == REALTIME_Q, "fixture: the question is the person's line"
     verdict, _ = _through(monkeypatch, "fetch_for_freshness", long_q, timedelta(minutes=10))
-    assert verdict is None and calls == [], calls
-    verdict, _ = _through(monkeypatch, "fetch_for_freshness", REALTIME_Q, timedelta(minutes=10))
+    assert calls and max(calls) <= pasted.WEB_QUERY_MAX_CHARS, calls
     assert verdict is not None and verdict.requirement is Freshness.REALTIME
 
 

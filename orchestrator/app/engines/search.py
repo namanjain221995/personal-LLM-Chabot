@@ -2240,12 +2240,12 @@ async def fetch_for_freshness(
     # The person's own words, never what they pasted (hotfix 1.2, P6): the
     # reported turn sent a 9,961-character pasted job description here.
     pasted.mark_turn(question)
-    query = pasted.web_query(question)
-    if not query:
+    words = pasted.web_query(question)
+    if not words:
         return 0
     # web_query joins lines and cuts at 200 characters: the scope is the one
     # `question` itself carries, never one the join made or the cut lost.
-    query = _keep_asked_site_scope(question, [query])[0]
+    query = _keep_asked_site_scope(question, [words])[0]
     try:
         results = await _collect_results([query], effort="fast")
     except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal
@@ -2269,7 +2269,10 @@ async def fetch_for_freshness(
     try:
         sources = await _fetch_sources(
             picked, question, user_id=user_id, conversation_id=conversation_id,
-            verdict=_question_verdict(question),
+            # The person's words, at most WEB_QUERY_MAX_CHARS: the caller has
+            # classified the whole message already, and classify_offline is
+            # quadratic on a pathological line (13.3 s at 400 KB, QA round 1).
+            verdict=_question_verdict(words),
         )
     except Exception:  # noqa: BLE001 — a failed read is a miss, not an error
         return 0
