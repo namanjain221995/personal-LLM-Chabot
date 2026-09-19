@@ -33,6 +33,7 @@
  * was never affected.
  */
 
+import { useEffect, useState } from 'react';
 import { IconStop, IconX } from './icons';
 import { Loader } from './Loader';
 import { LEVEL_BARS } from '@/lib/voice';
@@ -44,6 +45,28 @@ export function formatElapsed(ms: number): string {
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+/**
+ * Milliseconds since `active` last became true; 0 while it is false.
+ *
+ * The transcription wait gets its OWN clock. `elapsedMs` stops at the
+ * recording's length when the recorder closes, and a ten-minute recording
+ * decodes for four to seven minutes more (595 s of audio took 268.3 s on a
+ * quiet replica; 300 s took 219.7 s on a busy one, measured 2026-09-18).
+ * Minutes of a bare "Transcribing…" read as a hang, and a clock frozen at
+ * the recording's length reads as one too.
+ */
+function useWaitClock(active: boolean): number {
+  const [waitedMs, setWaitedMs] = useState(0);
+  useEffect(() => {
+    setWaitedMs(0);
+    if (!active) return;
+    const started = Date.now();
+    const timer = setInterval(() => setWaitedMs(Date.now() - started), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  return waitedMs;
 }
 
 /** Tallest a bar is drawn, at level 1.0. The container must be taller. */
@@ -112,6 +135,7 @@ export function VoiceBar({
 }) {
   const recording = state === 'recording';
   const transcribing = state === 'transcribing';
+  const waitedMs = useWaitClock(transcribing);
   const remaining = Math.max(0, maxMs - elapsedMs);
   // Only in the last thirty seconds. A countdown that is always on turns a
   // two-sentence dictation into a timed exam.
@@ -139,6 +163,11 @@ export function VoiceBar({
         <span className="flex flex-1 items-center justify-center gap-2.5 text-sm text-muted">
           <Loader size={16} />
           Transcribing…
+          {/* aria-hidden: the live region announces the state once (the
+              sr-only sentence below), not a number every second. */}
+          <span aria-hidden="true" className="text-xs tabular-nums">
+            {formatElapsed(waitedMs)}
+          </span>
         </span>
       ) : state === 'requesting' ? (
         <span className="flex flex-1 items-center justify-center gap-2.5 text-sm text-muted">
