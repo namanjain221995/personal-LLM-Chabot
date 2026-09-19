@@ -856,6 +856,26 @@ def _is_id_name(name: str) -> bool:
     return bool(_ID_NAME_RE.match(" ".join(str(name).split())))
 
 
+#: Columns that name ONE row's person or contact, whatever their cardinality
+#: says. The hotfix 1.1 replay's file repeats 25 first names over 100 rows,
+#: so First Name passed as a category and "Records by First Name" was drawn,
+#: by the composer and by "Plots on this docs" alike (2026-09-19): how many
+#: customers are called Linda compares nothing. Narrower than `_ID_NAME_RE`
+#: on purpose — this one REFUSES a chart somebody bound, and rows per
+#: "Product Code" or "Country Code" is a real comparison.
+_ROW_NAMING_RE = re.compile(
+    r"^(?:.*\b)?(?:(?:first|last|middle|given|family|full|nick|maiden|sur|fore)[\s_-]*name|firstname|lastname|"
+    r"e-?mail(?:\s*address)?|(?:phone|mobile|telephone|fax)(?:\s*(?:no\.?|number|\d+))?|web\s*site|homepage|url|"
+    r"id|ids|uuid|guid)$",
+    re.I,
+)
+
+
+def names_a_row(name: str) -> bool:
+    """A person-name part, an e-mail, phone or website, or a row id."""
+    return bool(_ROW_NAMING_RE.match(" ".join(str(name).split())))
+
+
 @dataclass
 class _Col:
     index: int
@@ -917,7 +937,30 @@ def _date_bucket(table: Any, col: _Col) -> str:
     return "year"
 
 
-def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tuple[List[CS.Chart], List[str]]:
+def _drawn_keys(drawn: Sequence[Any]) -> Dict[Tuple[str, Tuple[str, ...]], set]:
+    """(x, y) -> the date buckets already drawn for it, from bindings."""
+    out: Dict[Tuple[str, Tuple[str, ...]], set] = {}
+    for b in drawn or ():
+        get = (lambda k, _b=b: _b.get(k)) if isinstance(b, dict) else (lambda k, _b=b: getattr(_b, k, None))
+        x = " ".join(str(get("x") or "").split()).casefold()
+        if not x:
+            continue
+        ys = tuple(sorted(" ".join(str(v).split()).casefold() for v in (get("y") or [])))
+        out.setdefault((x, ys), set()).add(str(get("date_bucket") or ""))
+    return out
+
+
+def _years_spanned(table: Any, col: "_Col") -> int:
+    from . import chart_data as CD  # lazy
+
+    rows = list(CD._table_attr(table, "rows", []) or [])
+    order = CD.infer_column(table, col.index, sample=SUGGEST_SAMPLE).date_order or "dmy"
+    years = {d.year for d in (CD.to_date(r[col.index] if col.index < len(r) else None, order) for r in _spread(rows, SUGGEST_SAMPLE)) if d is not None}
+    return len(years)
+
+
+def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3,
+                   drawn: Sequence[Any] = ()) -> Tuple[List[CS.Chart], List[str]]:
     """(charts, reasons) — chart BINDINGS this table can honestly carry.
 
     Dates first (how many rows per month / quarter / year, as a line), then
@@ -926,6 +969,11 @@ def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tupl
     address is not a chart. No numbers are computed here — every chart comes
     back with `data` only, and `chart_data.compute` fills it in the job's
     worker thread.
+
+    `drawn` are the bindings the document already draws: a chart it has is
+    not suggested again. A date column it draws per month or quarter can
+    still be drawn per year, as a different reading of the same rows (the
+    replay's "Plots on this docs" re-added the monthly chart the report had).
 
     CPU-bound (one pass per column): call it through `asyncio.to_thread`.
     """
@@ -936,9 +984,13 @@ def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tupl
     charts: List[CS.Chart] = []
     reasons: List[str] = []
     named = top_n_named(instruction)
+    have = _drawn_keys(drawn)
 
     def usable(c: _Col) -> bool:
-        return not _is_id_name(c.name) and c.n_rows > 0
+        return not _is_id_name(c.name) and not names_a_row(c.name) and c.n_rows > 0
+
+    def counted(c: _Col) -> Optional[set]:
+        return have.get((" ".join(c.name.split()).casefold(), ()))
 
     dates = [c for c in cols if c.kind == "date" and usable(c)]
     texts = [c for c in cols if c.kind == "text" and usable(c) and not c.near_unique
@@ -949,6 +1001,14 @@ def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tupl
     for col in dates:
         if len(charts) >= limit:
             break
+        buckets = counted(col)
+        if buckets is not None:
+            if "year" in buckets or _years_spanned(table, col) < 2:
+                continue
+            charts.append(CS.Chart(type="bar", title=f"Records by year of {col.name}"[:120], x_label="Year", y_label="Records",
+                                   data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count", date_bucket="year", sort="x")))
+            reasons.append(f"{col.name} is already drawn over time, so the rows are counted per year")
+            continue
         bucket = _date_bucket(table, col)
         charts.append(CS.Chart(type="line", title=f"Records by {col.name}"[:120], x_label=col.name[:60], y_label="Records",
                                data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count", date_bucket=bucket, sort="x")))
@@ -957,6 +1017,8 @@ def suggest_charts(table: Any, *, instruction: str = "", limit: int = 3) -> Tupl
     for col in texts:
         if len(charts) >= limit:
             break
+        if counted(col) is not None:
+            continue
         top_n = named or (TAIL_TOP_N if col.n_distinct > TAIL_MAX_CATEGORIES else None)
         charts.append(CS.Chart(type=_bar_flavour_for(col), title=f"Records by {col.name}"[:120], x_label=col.name[:60], y_label="Records",
                                data=CS.Binding(table_id=tid, x=col.name, y=[], agg="count", sort="value_desc",
@@ -991,7 +1053,7 @@ def _bar_flavour_for(col: "_Col") -> str:
 def skipped_columns(table: Any) -> List[str]:
     """The columns `suggest_charts` will not chart, for a sentence that has
     to say which ones are missing."""
-    return [c.name for c in _profile(table) if c.kind != "date" and (_is_id_name(c.name) or c.near_unique)]
+    return [c.name for c in _profile(table) if c.kind != "date" and (_is_id_name(c.name) or names_a_row(c.name) or c.near_unique)]
 
 
 def fold_long_tail(chart: CS.Chart, table: Any, instruction: str = "") -> Tuple[Optional[CS.Binding], str]:
@@ -1056,6 +1118,9 @@ def not_worth_drawing(chart: CS.Chart, table: Any, computed: Any = None) -> str:
     if col.near_unique:
         return (f"{col.name} has {col.n_distinct} different values in {col.n_rows:,} rows, "
                 f"so counting them draws one bar per row")
+    # After the near-unique test, whose numbers say more when they apply.
+    if names_a_row(col.name):
+        return f"{col.name} names one person or contact per row rather than a group, so counting it compares nothing"
     if computed is not None:
         values = [v for s in (getattr(computed, "series", None) or []) for v in (getattr(s, "values", None) or [])]
         top = max(values) if values else 0.0
