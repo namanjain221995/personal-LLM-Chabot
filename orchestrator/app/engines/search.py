@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
+import idna  # a dependency of httpx, so installed wherever this runs
+
 from . import DIAGRAM_INSTRUCTION, conversation_turns, recent_turns
 from .. import llm
 from ..config import settings
@@ -307,14 +309,17 @@ _OPERATOR_AS_OBJECT = frozenset(
 
 
 def _ascii_host(host: str) -> str:
-    """The IDNA (punycode) spelling of `host`, so "bücher.de" and
-    "xn--bcher-kva.de" compare equal whichever side carries which. A label
-    the codec refuses (empty, over 63 characters) keeps its spelling."""
+    """The IDNA 2008 (UTS #46, non-transitional) punycode spelling of `host`,
+    so "bücher.de" and "xn--bcher-kva.de" compare equal whichever side carries
+    which. Not Python's "idna" codec: that is IDNA 2003, which maps "ß" to
+    "ss", so site:straße.de admitted strasse.de, a different registrant, and
+    dropped the real xn--strae-oqa.de (QA review round 2, 2026-09-19). A host
+    the IDNA rules refuse keeps its spelling, so it matches only itself."""
     if host.isascii():
         return host
     try:
-        return host.encode("idna").decode("ascii")
-    except UnicodeError:
+        return idna.encode(host, uts46=True).decode("ascii")
+    except (UnicodeError, ValueError):
         return host
 
 
