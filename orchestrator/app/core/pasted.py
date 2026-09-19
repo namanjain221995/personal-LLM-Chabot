@@ -30,6 +30,7 @@ PASTE_RUN_CHARS run of this turn's pasted material is dropped.
 """
 from __future__ import annotations
 
+import functools
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -50,6 +51,13 @@ WEB_QUERY_MAX_CHARS = 200
 #: A query carrying a run of pasted material this long is dropped before it
 #: reaches a search provider (the privacy bar: no 40-character substring).
 PASTE_RUN_CHARS = 40
+#: `read`, `fenced` and `pasted_material` are pure and a turn asks them about
+#: the same message several times (knowledge pre-pass, orchestration, the
+#: shaper, the chat prompt, the turn mark) and about every earlier user turn
+#: again on each later turn. Measured on this box: 0.6 ms for the reported
+#: 10,000-character paste but ~150-175 ms for a 924,000-character one, on the
+#: event loop. A few recent messages are kept (worst case 16 x the message).
+_CACHE_SIZE = 16
 
 _VERBS = (
     r"re-?writ(?:e|es|ing|ten)|rewrote|re-?format(?:s|ted|ting)?|format(?:s|ted|ting)?|"
@@ -168,6 +176,7 @@ def _at_boundary(lines: Sequence[str], i: int) -> bool:
     return not before or not after
 
 
+@functools.lru_cache(maxsize=_CACHE_SIZE)
 def read(message: str) -> Optional[Pasted]:
     """The message as ask + pasted material, or None when it is not a request
     to transform pasted text."""
@@ -204,6 +213,7 @@ def is_transform_ask(message: str) -> bool:
     return read(message) is not None
 
 
+@functools.lru_cache(maxsize=_CACHE_SIZE)
 def fenced(message: str) -> str:
     """The message as the model should read it: the person's ask in their own
     words, every pasted block between OPEN_TAG and CLOSE_TAG. Unchanged when
@@ -250,9 +260,10 @@ def own_words(message: str) -> str:
     """What the PERSON said in a message: the whole message when it is not a
     paste, the ask (or a question at either end) when it is, "" when a paste
     carries no words of theirs that can be told apart."""
-    text = (message or "").strip()
+    text = message or ""
     if not is_paste(text):
-        return text
+        return text.strip()
+    # The message itself, not a stripped copy: `read` is cached by value.
     pasted = read(text)
     if pasted is not None:
         return " ".join(pasted.asks)
@@ -287,6 +298,7 @@ def _norm(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+@functools.lru_cache(maxsize=_CACHE_SIZE)
 def pasted_material(message: str) -> str:
     """The pasted part of a message, normalised for matching ("" if none)."""
     text = message or ""

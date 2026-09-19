@@ -25,6 +25,7 @@ the rest.
 """
 from __future__ import annotations
 
+import functools
 import re
 from typing import FrozenSet, List, Optional
 
@@ -83,6 +84,7 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().strip().rstrip(":").split())
 
 
+@functools.lru_cache(maxsize=pasted._CACHE_SIZE)
 def sample_sections(message: str) -> Optional[FrozenSet[str]]:
     """The pasted sample's section-name lines (normalised), or None when this
     message is not a rewrite into a pasted sample's format."""
