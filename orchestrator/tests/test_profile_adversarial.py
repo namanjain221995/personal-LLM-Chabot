@@ -1233,3 +1233,63 @@ def test_the_caveat_sits_right_after_the_row_count_in_a_sheet_too(tmp_path):
     assert sheet["rows_not_read"] == 1, sheet.get("aggregates", {}).get("omitted")
     assert keys.index("rows") < keys.index("rows_not_read") < keys.index("columns")
     assert list(sheet["aggregates"])[:2] == ["computed", "omitted"]
+
+
+# ---------------------------------------------------------------------------
+# Key-named columns (store_id) are groups when their values repeat.
+# ---------------------------------------------------------------------------
+
+
+def test_revenue_by_store_id_is_computed(tmp_path):
+    """QA r2: `assert 'store_id' in []` at 4b90840. Eight stores, 200 orders.
+    'store_id' is a grouping key a person asks about ('revenue by store');
+    it is not an identifier of a row. Live at 4b90840: per-store figures 0 of
+    24 exact and the ranking wrong 3 of 3."""
+    rng = random.Random(21)
+    lines, truth = ["order_id,store_id,revenue"], {}
+    for i in range(200):
+        s = 101 + rng.randrange(8)
+        r = Decimal(rng.randrange(100, 10**6)) / 100
+        truth[s] = truth.get(s, Decimal(0)) + r
+        lines.append(f"{5000 + i},{s},{r}")
+    path = tmp_path / "stores.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    groups = [g["group"] for g in agg["by_group"]]
+    assert "store_id" in groups, (groups, agg["measures"], agg["omitted"])
+    entry = next(g for g in agg["by_group"] if g["group"] == "store_id")
+    assert {r["value"]: _dec(r["sum"]) for r in entry["rows"]} == truth
+    assert [r["value"] for r in entry["rows"]] == sorted(truth, key=lambda k: -truth[k])
+
+
+@pytest.mark.parametrize("name", ["region_code", "dept_id", "store_no", "product_sku", "branchId"])
+def test_a_repeating_business_key_is_a_group(tmp_path, name):
+    lines = [f"order_id,{name},amount"]
+    for i in range(300):
+        lines.append(f"{9000 + i},K{i % 6},{i}.10")
+    path = tmp_path / "k.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert name in {g["group"] for g in agg["by_group"]}, agg["omitted"]
+
+
+@pytest.mark.parametrize("rows, distinct", [(60, 45), (100, 50), (90, 31)])
+def test_opposite_a_near_unique_key_is_still_not_a_group(tmp_path, rows, distinct):
+    """Keep excluding near-unique identifiers: a key-named column whose values
+    cover fewer than KEY_GROUP_MIN_ROWS_PER_VALUE rows each on average would
+    list the file back, one order number per line."""
+    lines = ["order_no,amount"] + [f"SO-{i % distinct:04d},{i}.50" for i in range(rows)]
+    path = tmp_path / "orders.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert "order_no" not in {g["group"] for g in agg["by_group"]}
+    assert "SO-0001" not in json.dumps(agg)
+
+
+def test_a_key_at_the_repeat_threshold_is_a_group(tmp_path):
+    """The boundary: 30 values over 90 rows is 3 rows per value, a group."""
+    lines = ["order_no,amount"] + [f"SO-{i % 30:04d},{i}.50" for i in range(90)]
+    path = tmp_path / "orders.csv"
+    path.write_text("\n".join(lines) + "\n")
+    agg = profiler.profile_tabular(str(path))["aggregates"]
+    assert "order_no" in {g["group"] for g in agg["by_group"]}, agg["omitted"]

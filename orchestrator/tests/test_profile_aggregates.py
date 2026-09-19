@@ -530,14 +530,25 @@ def test_a_value_held_by_one_row_is_left_out_of_its_breakdown_and_said(tmp_path)
     assert listed + rare_amount == total == _dec(_col(prof, "amount")["sum"])
 
 
-def test_identifier_and_contact_columns_are_never_group_keys(tmp_path):
+def test_contact_columns_are_never_group_keys_and_a_repeating_store_id_is_one(tmp_path):
+    """Contact columns stay out of by_group (QA r1: 40 of 40 synthetic emails
+    reached the prompt). An identifier NAME alone no longer does: at 4b90840
+    this test asserted store_id was excluded too, and QA r2 measured the cost
+    live: 'revenue by store' over 8 store_id values, per-store figures 0 of
+    24 exact and the ranking wrong 3 of 3. A store_id with ten repeating
+    values is a business key, broken down like region, to the cent."""
     lines = ["store_id,customer_email,region,amount"]
+    truth: dict = {}
     for i in range(400):
+        truth[100 + i % 10] = truth.get(100 + i % 10, Decimal(0)) + Decimal(f"{i}.50")
         lines.append(f"{100 + i % 10},person{i % 10}@example.invalid,{'NSEW'[i % 4]},{i}.50")
     path = tmp_path / "keys.csv"
     path.write_text("\n".join(lines) + "\n")
     prof = profiler.profile_tabular(str(path))
-    assert {e["group"] for e in prof["aggregates"]["by_group"]} == {"region"}
+    assert {e["group"] for e in prof["aggregates"]["by_group"]} == {"store_id", "region"}
+    stores = _group(prof, "store_id", "amount")
+    assert {r["value"]: _dec(r["sum"]) for r in stores["rows"]} == truth
+    assert "person" not in json.dumps(prof["aggregates"])
     # Their top values are unchanged: that class of raw content was always there.
     assert len(_col(prof, "customer_email")["top_values"]) == 5
 

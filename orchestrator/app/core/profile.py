@@ -8,9 +8,11 @@ such content that reaches a prompt:
   * top values    (PROFILE_TOP_VALUES, values truncated)
   * group values  (aggregates.by_group: the values of a column with at most
                    50 distinct values that occur in at least GROUP_MIN_ROWS
-                   rows, from a column not named like an identifier or a
-                   personal detail and with no value shaped like an email or
-                   a long number; values truncated)
+                   rows, from a column not named like a personal detail
+                   and with no value shaped like an email or a long number,
+                   and for a key-named column (store_id) only when its values
+                   repeat KEY_GROUP_MIN_ROWS_PER_VALUE times on average;
+                   values truncated)
 
 All three go through `clip()`. Everything else is derived statistics: sums,
 averages, counts, months. Group values are NOT the same class as top values:
@@ -234,8 +236,8 @@ def _columnar_copy(
 #   * count is ROWS in the group (as top values count); sum and avg skip nulls.
 
 #: A column with at most this many distinct values gets top values, and is a
-#: grouping key when its values repeat (and its name is not a key's or a
-#: contact's, see _is_group_key). Group values go through clip() as top
+#: grouping key when its values repeat (and it is not a personal column or a
+#: near-unique key, see _is_group_key). Group values go through clip() as top
 #: values do, but a breakdown lists up to 50 of them where top values list 5.
 TOP_VALUES_MAX_DISTINCT = 50
 #: A group value is listed only when at least this many rows hold it. QA,
@@ -408,13 +410,23 @@ def _personal_value(text: Optional[str]) -> bool:
     return bool(_EMAIL_SHAPE.search(text)) or sum(ch.isdigit() for ch in text) >= _PERSONAL_DIGITS
 
 
-def _is_group_key(name: Any) -> bool:
+#: A column named like a key (store_id, region_code, sku, store_no) is a
+#: grouping key only when each value covers at least this many rows on
+#: average; a near-unique identifier (45 order numbers in 60 rows) would list
+#: the file back. 4b90840 excluded every key-named column, and QA r2 measured
+#: the cost live: "revenue by store" over 8 store_id values in 200 orders,
+#: per-store figures 0 of 24 exact and the ranking wrong 3 of 3.
+KEY_GROUP_MIN_ROWS_PER_VALUE = 3
+
+
+def _is_group_key(name: Any, nonnull: int, distinct: int) -> bool:
     if _personal_name(name):
         return False
     tokens = _name_tokens(name)
-    if {t.strip("0123456789") for t in tokens} & _KEY_TOKENS:
-        return False
-    return not (tokens and tokens[-1] in _KEY_LAST_TOKENS)
+    keyish = bool({t.strip("0123456789") for t in tokens} & _KEY_TOKENS) or bool(
+        tokens and tokens[-1] in _KEY_LAST_TOKENS
+    )
+    return not keyish or nonnull >= KEY_GROUP_MIN_ROWS_PER_VALUE * distinct
 
 
 def _label(name: Any) -> str:
@@ -1225,7 +1237,7 @@ def profile_tabular(
             elif (
                 2 <= col["distinct"] <= TOP_VALUES_MAX_DISTINCT
                 and col["distinct"] < nonnull
-                and _is_group_key(col["name"])
+                and _is_group_key(col["name"], nonnull, col["distinct"])
             ):
                 # A grouping key: few values, and they REPEAT. An all-distinct
                 # column would give one row per group, which is the file. A
