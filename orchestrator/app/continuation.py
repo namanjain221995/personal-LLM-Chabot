@@ -58,7 +58,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import llm
 from .config import settings
@@ -115,6 +115,15 @@ _MAX_PENDING_CHARS = 400
 #: the `target_words`/`words` meta say which budget it was.
 _TARGET_LOW = 0.85
 _TARGET_HIGH = 1.30
+#: ...and never below THIS share of it. A reply that stopped under a quarter
+#: of the length asked for was not written as that piece: a clarifying
+#: question, a refusal, an outline. Live (QA r1, 2026-09-18) an 80-93-word
+#: "which topic do you mean?" (3% of 3,000) was told "It is not finished:
+#: continue it with about 2,900 more words" and the extension appended "I
+#: cannot fulfill this request..."; an outline of 1,248-1,397 words (12-14%
+#: of 10,000) got 3,800-4,200 more words under it. Genuine shortfalls
+#: measured live sat at 82-89%.
+_TARGET_FLOOR = 0.25
 #: Below this a target changes nothing. It is shape_for's long-form
 #: threshold: a short piece that ends early is finished, and a segment
 #: appended after its ending does more harm than the shortfall.
@@ -125,6 +134,55 @@ _TARGET_OVERRUN_CHARS = 2000
 
 _TOKEN = re.compile(r"\S+")
 _ALNUM = re.compile(r"[^\W_]")
+#: A run of three or more backticks opens or closes code (a fence, or an
+#: inline span that crosses lines); an odd count so far means code is open.
+_TICKS_OR_NEWLINE = re.compile(r"`{3,}|\n")
+#: A piece that has ENDED: its last heading closes it, or its last paragraph
+#: opens with a closing phrase. The one extra segment is never granted after
+#: one — live (2026-09-18) it fired twice at 82-83% of the target, both times
+#: after "## Conclusion", and appended new body sections under the ending and
+#: a second conclusion that repeated the first one's sentence verbatim.
+_CLOSING_HEADING = re.compile(
+    r"^\W*(?:\d+[.)]?\s*)?(?:conclusions?|concluding\b|final\s+(?:thoughts|words|reflections?|remarks|notes)|summary\b|"
+    r"in\s+summary|in\s+closing|closing\b|wrap(?:ping)?[- ]?up|(?:key\s+)?takeaways?|epilogue|afterword|the\s+end\b|"
+    r"looking\s+(?:ahead|forward)|recap\b|final\s+word)",
+    re.IGNORECASE,
+)
+_HEADING_LINE = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]+(.+?)[ \t#]*|\*\*([^*\n]{1,120})\*\*[ \t:]*)$", re.MULTILINE)
+_CLOSING_PARAGRAPH = re.compile(
+    r"^\W*(?:in\s+conclusion|to\s+conclude|in\s+summary|in\s+closing|to\s+sum\s+up|to\s+summari[sz]e|all\s+in\s+all|"
+    r"the\s+end\b)",
+    re.IGNORECASE,
+)
+#: How far back the ending is looked for: a conclusion section is rarely
+#: longer, and a heading further back than this is not the last section.
+_ENDING_SCAN_CHARS = 20_000
+
+
+#: The extension answering the length note instead of writing: "I cannot
+#: continue the previous response because the previous response was a
+#: complete..." and "I cannot fulfill the request to generate 19,356 words"
+#: (QA r1 live, 4 runs). Read on the held opening of that segment only.
+_DECLINES = re.compile(
+    r"^\W*(?:i\s+(?:cannot|can\s*not|can['’]t|am\s+unable|am\s+not\s+able|won['’]t|will\s+not|apologi[sz]e)\b"
+    r"|i['’]m\s+(?:sorry|unable|not\s+able)\b|sorry\b|unfortunately\b|as\s+an\s+ai\b"
+    r"|the\s+(?:previous|above|preceding)\s+(?:text|response|piece|article|essay|answer|reply)\s+(?:is|was)\s+(?:already\s+)?complete)",
+    re.IGNORECASE,
+)
+
+
+def _has_ended(text: str) -> bool:
+    """Does `text` end with its own conclusion (see `_CLOSING_HEADING`)?"""
+    tail = text[-_ENDING_SCAN_CHARS:].rstrip()
+    if not tail:
+        return False
+    last = None
+    for last in _HEADING_LINE.finditer(tail):
+        pass
+    if last is not None and _CLOSING_HEADING.match(last.group(1) or last.group(2) or ""):
+        return True
+    paragraph = tail[tail.rfind("\n\n") + 2:] if "\n\n" in tail else tail
+    return bool(_CLOSING_PARAGRAPH.match(paragraph))
 
 CONTINUE_INSTRUCTION = (
     "Continue the text above from exactly where it stops.\n"
@@ -230,12 +288,38 @@ class _WordGauge:
         self.since_over = 0
         self._in_word = False
         self._counted = False
+        #: Inside code opened by a backtick run (the overshoot cut must not
+        #: end in it), and trailing backticks a split delta may continue.
+        self.fence_open = False
+        self._ticks = ""
+
+    @staticmethod
+    def _fence_after(text: str, fence_open: bool, ticks: str) -> Tuple[bool, str, int]:
+        """(code open, backticks carried) after `text`, and the index in
+        `text` just past its first newline at which no code is open (-1 if
+        none). Backticks at the end are carried, not counted, until the run
+        is known to be over."""
+        joined = ticks + text
+        body = joined.rstrip("`")
+        cut = -1
+        for m in _TICKS_OR_NEWLINE.finditer(body):
+            if m.group(0) != "\n":
+                fence_open = not fence_open
+            elif cut < 0 and not fence_open:
+                cut = m.end() - len(ticks)
+        return fence_open, joined[len(body):], cut
+
+    def cut_point(self, text: str) -> int:
+        """Where the overshoot may end inside `text`: just past the first line
+        break outside code, or -1."""
+        return self._fence_after(text, self.fence_open, self._ticks)[2]
 
     def feed(self, text: str) -> None:
         if not text:
             return
         if self.over:
             self.since_over += len(text)
+        self.fence_open, self._ticks, _ = self._fence_after(text, self.fence_open, self._ticks)
         for m in _TOKEN.finditer(text):
             has = _ALNUM.search(m.group(0)) is not None
             if m.start() == 0 and self._in_word:
@@ -396,7 +480,8 @@ async def stream_long_completion(
     so a caller without one sends exactly what it always sent.
 
     `target_words` (answer_sampling.requested_words) is the length the person
-    asked for. A normal stop below 85% of it gets ONE more segment; past 130%
+    asked for. A normal stop at 25-85% of it, on a piece that has not reached
+    its own conclusion, gets ONE more segment (dropped if it declines); past 130%
     the run stops at the next line break with `STOP_BUDGET` and a `note`
     saying how long the answer is; every continuation is told the counts.
     None, or a target under `_TARGET_MIN_WORDS`, sends exactly what a call
@@ -409,6 +494,12 @@ async def stream_long_completion(
     #: whether the NEXT segment is that one (its prompt says so).
     extended = False
     extending = False
+    #: The index of that segment. The answer before it was COMPLETE, so if
+    #: it adds nothing (it repeats, or the call fails before a token) the run
+    #: is reported complete: QA 2026-09-18 saw a finished 1,800-word answer
+    #: reported as "it had begun repeating itself" because the optional
+    #: segment reopened the piece.
+    ext_index = -1
     segment_cap = segment_max_tokens or settings.model_max_output
     total_cap = total_max_tokens or settings.model_max_output
     segments_cap = max_segments or settings.continuation_max_segments
@@ -481,6 +572,8 @@ async def stream_long_completion(
         head_len = 0
         stripped = 0
         repeated = False
+        #: The optional extra segment declined instead of writing (`_DECLINES`).
+        declined = False
         # Text produced but NOT yet emitted: everything after the last
         # whitespace. See 2b in the module docstring — the trailing partial
         # word is held so a continuable segment can drop it.
@@ -494,12 +587,23 @@ async def stream_long_completion(
             emission site always ran."""
             nonlocal produced
             if gauge is not None and gauge.over:
-                cut = text.find("\n")
-                if cut >= 0 or gauge.since_over + len(text) >= _TARGET_OVERRUN_CHARS:
-                    text = text[: cut + 1] if cut >= 0 else text
+                # A line break outside a code fence: a cut inside one left
+                # the fence open and the rest of the page rendered as code
+                # (QA 2026-09-18). Past the overrun bound, the last line break
+                # in sight, and the fence is closed by hand.
+                cut = gauge.cut_point(text)
+                if cut < 0 and gauge.since_over + len(text) >= _TARGET_OVERRUN_CHARS:
+                    cut = text.rfind("\n") + 1 or len(text)
+                if cut >= 0:
+                    text = text[:cut]
                     produced += text
                     gauge.feed(text)
                     await on_delta("token", text)
+                    if gauge.fence_open:
+                        closer = ("" if produced.endswith("\n") else "\n") + "```\n"
+                        produced += closer
+                        gauge.feed(closer)
+                        await on_delta("token", closer)
                     raise StopGeneration(STOP_BUDGET)
             produced += text
             await on_delta("token", text)
@@ -534,7 +638,7 @@ async def stream_long_completion(
 
         async def _release() -> None:
             """Decide the seam on the held opening, then let it go."""
-            nonlocal holding, head, head_len, stripped, repeated
+            nonlocal holding, head, head_len, stripped, repeated, declined
             raw_head = "".join(head)
             head = []
             head_len = 0
@@ -545,7 +649,21 @@ async def stream_long_completion(
             # start a new word, so both sides often supply the space. A
             # leading NEWLINE is left alone — that is a deliberate paragraph
             # break, not an accident of the seam.
-            if produced.endswith((" ", "\n", "\t")):
+            if index == ext_index:
+                # The extra segment follows a piece that ENDED, usually on a
+                # full stop with no whitespace after it: glued on, it read
+                # "connection.The psychological impact" and "Infrastructure.###
+                # Chapter 9", a heading that no longer renders (QA r1 live, 4
+                # of 4 extensions). It is new material, so a paragraph break.
+                body = text.lstrip()
+                if not body:
+                    return
+                if _DECLINES.match(body):
+                    declined = True
+                    return
+                newlines = len(produced) - len(produced.rstrip("\n"))
+                text = "\n" * max(0, 2 - newlines) + body
+            elif produced.endswith((" ", "\n", "\t")):
                 text = text.lstrip(" ")
             if text.strip() and _repeats_existing(produced, text):
                 repeated = True
@@ -581,7 +699,7 @@ async def stream_long_completion(
                     if head_len < _MAX_OVERLAP_CHARS:
                         continue
                     await _release()
-                    if repeated:
+                    if repeated or declined:
                         break
                     continue
                 await _push(delta)
@@ -601,7 +719,10 @@ async def stream_long_completion(
                 if not produced and not pending:
                     raise
                 return _result(STOP_ERROR)
-            stop = STOP_ERROR
+            # The optional extra segment failed before adding a word: the
+            # answer is the complete one it followed (the error stays in
+            # `errors`).
+            stop = STOP_COMPLETE if index == ext_index and len(produced) == seg_chars_before else STOP_ERROR
             break
         finally:
             # Breaking out of an `async for` does NOT close the generator, and
@@ -613,7 +734,7 @@ async def stream_long_completion(
         if halted is None:
             try:
                 # A segment shorter than the hold never reached the release above.
-                if holding and not repeated:
+                if holding and not repeated and not declined:
                     await _release()
 
                 # The held fragment is a real ending only when nothing follows it. If
@@ -636,6 +757,13 @@ async def stream_long_completion(
             stop = halted
             break
 
+        if declined:
+            # Nothing of it was shown: the answer is the complete one before it.
+            log.info("long generation: the length extension (segment %d) declined; kept the complete answer", index)
+            segs.append(Segment(index, 0, None, reason, stripped, time.monotonic() - seg_started))
+            stop = STOP_COMPLETE
+            break
+
         if repeated:
             log.warning(
                 "long generation stopped: segment %d repeats text already written",
@@ -644,7 +772,9 @@ async def stream_long_completion(
             segs.append(
                 Segment(index, 0, None, reason, stripped, time.monotonic() - seg_started)
             )
-            stop = STOP_REPETITION
+            # A repeat is caught before anything of its segment is shown, so
+            # an optional extra segment that repeats leaves the complete answer.
+            stop = STOP_COMPLETE if index == ext_index and len(produced) == seg_chars_before else STOP_REPETITION
             break
 
         seg_tokens_after = _completion_tokens()
@@ -677,10 +807,12 @@ async def stream_long_completion(
             # unless it stopped well short of the length asked for, which
             # earns ONE more segment, told the numbers (`_WordGauge.note`).
             if (gauge is not None and not extended and may_continue and index + 1 < segments_cap
-                    and gauge.words < _TARGET_LOW * gauge.target
+                    and _TARGET_FLOOR * gauge.target <= gauge.words < _TARGET_LOW * gauge.target
                     and total_cap - _used_tokens(measured_start, produced) > settings.continuation_min_segment_tokens
-                    and not (deadline_s is not None and time.monotonic() - started >= deadline_s)):
+                    and not (deadline_s is not None and time.monotonic() - started >= deadline_s)
+                    and not _has_ended(produced)):
                 extended = extending = True
+                ext_index = index + 1
                 continue
             stop = STOP_COMPLETE
             break

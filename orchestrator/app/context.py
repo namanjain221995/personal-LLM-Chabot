@@ -457,6 +457,10 @@ def clip_middle(text: str, max_chars: int) -> str:
     )
 
 
+def _string_chars(messages: Sequence[dict]) -> int:
+    return sum(len(m["content"]) for m in messages if isinstance(m.get("content"), str))
+
+
 def _longest_content_index(messages: Sequence[dict]) -> Optional[int]:
     best, best_len = None, 0
     for i, m in enumerate(messages):
@@ -512,29 +516,50 @@ async def fit_request(
             break
         # It did not fit: from here on, trim for an answer's room.
         room = _overflow_room(ceiling, window)
+        deficit = room - budget
+        # Each old turn's share of the MEASURED count (the estimate scaled to
+        # it), so one round drops as many turns as the deficit needs. One per
+        # round spent all 24 rounds on a conversation of 24+ messages and a
+        # 1.77M-token paste went to a 1M window with max_tokens=1 (QA
+        # 2026-09-18); CHAT_HISTORY_TURNS allows 400.
+        _, rest = _split_pinned(msgs)
+        scale = prompt_tokens / max(1, estimate_messages(msgs))
+        costs = [estimate_messages([m]) * scale for m in rest[:-1]]
 
-        # 1. Prefer dropping whole old turns — they cost nothing to lose.
-        trimmed = trim_to_fit(msgs, 1)
-        if len(trimmed) != len(msgs):
-            msgs = trimmed
-            dropped += 1
+        # 1. Prefer dropping whole old turns — they cost nothing to lose —
+        # when dropping them can make the room.
+        if costs and sum(costs) >= deficit:
+            shed, drop = 0.0, 0
+            while drop < len(costs) and shed < deficit:
+                shed += costs[drop]
+                drop += 1
+            msgs = trim_to_fit(msgs, drop)
+            dropped += drop
         else:
-            # 2. Nothing left to drop: a SINGLE message is bigger than the
-            # window (a large paste, a whole document). Shrink it in place —
-            # otherwise this is the 400 that trimming alone cannot prevent.
+            # 2. Dropping every old turn cannot make the room: a SINGLE
+            # message is bigger than the window (a large paste, a whole
+            # document). The old turns still go first, all of them in this
+            # round, and the longest message is clipped by what is STILL
+            # missing — otherwise this is the 400 that trimming alone cannot
+            # prevent. Clipping it by the whole deficit and keeping the turns
+            # cut an 8k-window paste from 15,689 to 2,000 characters to keep
+            # three old turns (QA r1 repair, measured).
+            # At the prompt's own measured characters per token (never fewer
+            # than the pessimistic estimate's), so one clip is usually enough.
+            chars_per_token = max(_CHARS_PER_TOKEN, _string_chars(msgs) / max(1, prompt_tokens))
+            if costs:
+                msgs = trim_to_fit(msgs, len(costs))
+                dropped += len(costs)
+                deficit -= sum(costs)
             idx = _longest_content_index(msgs)
-            if idx is None:
-                break
-            content = msgs[idx]["content"]
-            shed_chars = int((room - budget) * _CHARS_PER_TOKEN) + 1024
-            target = len(content) - shed_chars
-            if target < _MIN_CLIPPED_CHARS:
-                target = _MIN_CLIPPED_CHARS
-            if target >= len(content):
-                break  # cannot shrink any further
-            msgs = list(msgs)
-            msgs[idx] = {**msgs[idx], "content": clip_middle(content, target)}
-            clipped += 1
+            content = msgs[idx]["content"] if idx is not None else ""
+            target = max(_MIN_CLIPPED_CHARS, len(content) - int(deficit * chars_per_token) - 1024)
+            if target < len(content):
+                msgs = list(msgs)
+                msgs[idx] = {**msgs[idx], "content": clip_middle(content, target)}
+                clipped += 1
+            elif not costs:
+                break  # nothing to drop and nothing left to shrink
 
         _last_count_exact.set(False)
         prompt_tokens, _ = await count_tokens(base_url, model, msgs)
