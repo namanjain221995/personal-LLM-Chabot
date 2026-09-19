@@ -248,7 +248,7 @@ class VLLMAudioProvider:
         import httpx
         from .core.net import shared_ssl_context
 
-        return httpx.AsyncClient(timeout=self.timeout_s, verify=shared_ssl_context())
+        return httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s, connect=_CONNECT_TIMEOUT_S), verify=shared_ssl_context())
 
     async def _transcriptions(
         self,
@@ -291,7 +291,7 @@ class VLLMAudioProvider:
 
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_s, verify=shared_ssl_context()) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s, connect=_CONNECT_TIMEOUT_S), verify=shared_ssl_context()) as client:
                 data = {"model": self.model}
                 if segments:
                     # OpenAI's name for "the shape with timestamped segments";
@@ -537,13 +537,23 @@ _GATED_MIN_WORDS_PER_S = 1.0
 #:    (10 s of white noise). "Thanks for watching" and "Bye" are the same
 #:    family, widely reported for Whisper. A sentence-by-sentence match, so
 #:    "Thank you. Thank you." (60 s of dither, measured) is one too.
+#: How long to wait for a TCP connection to a replica. A replica that drops
+#: connection attempts took 134.9 s to fail (the kernel's SYN retries) before
+#: failing over; 10 s is ample for a LAN replica (review 2026-09-19). Reading the
+#: transcript keeps the full ASR_TIMEOUT_S.
+_CONNECT_TIMEOUT_S = 10.0
+
 _STOCK_PHRASES = frozenset({
     "you", "thank you", "thank you for watching", "thanks for watching",
     "all right", "alright", "okay", "ok", "bye",
 })
-#: 2. From at least this much audio. Every invention above came from 10-90 s;
-#:    a person who says "Okay." into a three-second clip is answering.
-_STOCK_PHRASE_MIN_SECONDS = 10.0
+#: 2. From at least this much audio. A person who says "Okay." into a
+#:    three-second clip is answering. 20 s, not 10 s (review 2026-09-19): live,
+#:    a real "Thank you." said after a 9 s pause scored 0.0385, above the line
+#:    below, and was dropped as noise at 10 s. From 20 s of audio a lone stock
+#:    phrase is still dropped ("All right." from room noise); from 10-20 s it is
+#:    kept, as 4810da0 kept it.
+_STOCK_PHRASE_MIN_SECONDS = 20.0
 #: 3. The engine was NOT sure somebody spoke. Its no-speech probability on
 #:    real short utterances after a 5-7 s lead-in in a quiet room measured
 #:    0.0003-0.018 (n=7, LibriSpeech); on noise that passed its gate, 0.025-
@@ -552,8 +562,7 @@ _STOCK_PHRASE_MIN_SECONDS = 10.0
 #:    right." came from room-level pink noise; its number was not recorded.
 #:    That is a SMALL labelled set: the line sits between the speech group
 #:    and most of the noise rather than claiming a margin, and a reply the
-#:    engine was surer of than this is always kept, so a real "Thank you."
-#:    said after a pause survives. The price: a stock phrase from a noise
+#:    engine was surer of than this is always kept. The price: a stock phrase from a noise
 #:    clip scoring under the line (one pink clip, 0.0251) is kept, as 4810da0
 #:    kept it. Unknown (an engine that does not report it) counts as unsure.
 _CONFIDENT_SPEECH_NSP = 0.03

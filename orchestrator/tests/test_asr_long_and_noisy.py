@@ -615,7 +615,10 @@ GATE_ON_FIRST_PASS = [
     ("qa2: he knows them both 15 s", "He knows them both.", 15.0, 0.0003, True),
     # Inventions that ARE stock phrases, from long noise, engine unsure.
     ("auditor pink room noise 20 s", "All right.", 20.0, 0.0385, False),
-    ("qa: white noise 10 s", "Okay.", 10.0, 0.1225, False),
+    # A KNOWN MISS by choice (review 2026-09-19): under 20 s a lone stock
+    # phrase is kept, as at 4810da0, because a real "Thank you." after a 9 s
+    # pause scored 0.0385 live and was dropped at the old 10 s line.
+    ("qa: white noise 10 s", "Okay.", 10.0, 0.1225, True),
     # A KNOWN MISS, kept as at 4810da0: not a stock phrase (see asr.py).
     ("qa: fan noise 20 s", "Stabilization is very good.", 20.0, 0.0355, True),
 ]
@@ -1076,3 +1079,15 @@ def test_the_real_app_streams_the_first_heartbeat_before_the_engine_answers(monk
     assert start["status"] == 200
     assert len(seen_before_release) >= 2 and all(not c.strip() for c in seen_before_release)
     assert json.loads(b"".join(chunks))["text"] == "done"
+
+
+def test_a_real_thanks_after_a_ten_second_pause_is_kept():
+    """Live 2026-09-19: "Thank you." after a 9 s pause (10.8 s clip) scored
+    no_speech_prob 0.0385 and was dropped as noise."""
+    assert asr.speech_is_plausible("Thank you.", 10.8, engine_heard_speech=True, no_speech_prob=0.0385)
+    # a lone stock phrase from 20 s or more of doubtful audio is still dropped
+    assert not asr.speech_is_plausible("All right.", 24.0, engine_heard_speech=True, no_speech_prob=0.0385)
+
+
+def test_a_dead_replica_fails_the_connect_in_ten_seconds():
+    assert asr._CONNECT_TIMEOUT_S == 10.0
