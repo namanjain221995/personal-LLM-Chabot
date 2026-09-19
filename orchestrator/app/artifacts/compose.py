@@ -416,8 +416,24 @@ def target_for(req: ComposeRequest) -> LengthTarget:
     m = req.material or Material(instruction=req.instruction)
     return _length.parse_size(
         req.instruction or m.instruction, req.kind,
-        has_data=bool(m.tables or m.sources or m.uploads_text),
+        has_data=bool(m.sources) or any(t.source_id != "upload_image" for t in m.tables or ())
+        or _material_words(m) >= DATA_REPORT_MIN_MATERIAL_WORDS,
     )
+
+
+#: How much material the data-report floor (1,500 words, three pages) needs
+#: to be written FROM. Live 2026-09-19, "make a PDF report of this" over a
+#: photo of a whiteboard (about 60 words) or a five-item receipt got the floor,
+#: and each file carried 34-106 statements the photo never made ("a persistent
+#: login bug", "digital payment practices in urban India"), 6 of 6 runs.
+#: The floor was set for a dataset (a 100-row CSV); a fifth of it is the bar.
+DATA_REPORT_MIN_MATERIAL_WORDS = 300
+
+
+def _material_words(m: Material) -> int:
+    """Words of uploaded text plus table cells: what a report is written from."""
+    cells = sum(len(t.rows) * max(1, len(t.columns)) for t in m.tables or ())
+    return cells + len((m.uploads_text or "").split())
 
 
 def _size_line(target: Optional[LengthTarget]) -> str:
