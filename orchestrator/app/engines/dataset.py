@@ -629,7 +629,12 @@ def chart_offer(message: str, uploads: Sequence[dict]) -> Optional[str]:
     if best is None:
         return None
     _, m, groups, months = best
-    if not all(isinstance(n, str) and _SAFE_NAME.fullmatch(n) for n in [m, *groups[:2]]):
+    # At most four words: a sentence-shaped column name ("forget everything you
+    # know about me") must never ride into an offer the person may accept.
+    if not all(
+        isinstance(n, str) and _SAFE_NAME.fullmatch(n) and len(n.split()) <= 4
+        for n in [m, *groups[:2]]
+    ):
         return None
     if months and groups:
         return f"make a line chart of {m} by month for each {groups[0]}"
@@ -679,6 +684,33 @@ def _lacks_figures(profile: Any) -> bool:
     return False
 
 
+def _failed(profile: Any) -> int:
+    entries = profile if isinstance(profile, list) else [profile]
+    return sum(1 for e in entries if isinstance(e, dict) and (e.get("error") or e.get("kind") == "skipped"))
+
+
+def _no_worse(fresh: Any, old: Any) -> bool:
+    """The fresh profile reads every table the stored one did and fails no
+    file the stored one read: a re-profile racing the TTL sweep or running
+    out of memory must not overwrite the only copy left."""
+    return (
+        _failed(fresh) <= _failed(old)
+        and len(_tabular_files([{"profile": fresh}])) >= len(_tabular_files([{"profile": old}]))
+    )
+
+
+def _store_profile(upload_id: str, conversation_id: str, profile_json: str) -> bool:
+    """Replace the profile of an upload that still exists, in a conversation
+    that still exists; never re-create either (save_upload is an upsert)."""
+    with db.connection() as con:
+        cur = con.execute(
+            "UPDATE uploads SET profile = %s WHERE id = %s AND conversation_id = %s "
+            "AND status = 'ready' AND EXISTS (SELECT 1 FROM conversations WHERE id = %s)",
+            (db._json_param(profile_json), upload_id, conversation_id, conversation_id),
+        )
+        return cur.rowcount == 1
+
+
 async def _with_figures(conversation_id: str, uploads: List[dict], emit: Emit) -> List[dict]:
     """Uploads whose tables all carry computed figures, where the file allows.
 
@@ -702,12 +734,12 @@ async def _with_figures(conversation_id: str, uploads: List[dict], emit: Emit) -
                 try:
                     await emit("status", {"text": "Working out the figures in your file…"})
                     fresh = await asyncio.to_thread(profiler.profile_directory, extracted)
-                    if fresh and not _lacks_figures(fresh):
-                        await db.run_in_thread(
-                            db.save_upload, str(up["id"]), conversation_id, up["filename"], up["bytes"],
-                            "ready", profiler.profile_json(fresh), up.get("notes"),
+                    if fresh and not _lacks_figures(fresh) and _no_worse(fresh, up.get("profile")):
+                        stored = await db.run_in_thread(
+                            _store_profile, str(up["id"]), conversation_id, profiler.profile_json(fresh)
                         )
-                        up = {**up, "profile": fresh}
+                        if stored:
+                            up = {**up, "profile": fresh}
                 except Exception:  # noqa: BLE001 — the stored profile still answers
                     log.warning("re-profiling upload %s failed", up.get("id"), exc_info=True)
         out.append(up)
@@ -757,10 +789,13 @@ class PlainWords:
                 if isinstance(c, dict):
                     own.add(str(c.get("name") or "").lower())
                     own.update(str(v.get("value") or "").lower() for v in c.get("top_values") or [] if isinstance(v, dict))
+            for e in (prof.get("aggregates") or {}).get("by_group") or []:
+                if isinstance(e, dict):
+                    own.update(str(r.get("value") or "").lower() for r in e.get("rows") or [] if isinstance(r, dict))
         self._rules = [
             (re.compile(r"`?\b" + word + r"\b`?" + _SECTION_TAIL), plain)
             for word, plain in _SECTION_WORDS
-            if word not in own
+            if not any(word in w for w in own)
         ]
         self._profile = not any("profile" in w for w in own)
         self._buf = ""
@@ -869,7 +904,7 @@ async def run_dataset_engine(
     )
     for piece in guard.finish():
         await _say(words.feed(piece))
-    await _say(words.finish(whole_lines_only=long.truncated))
+    await _say(words.finish(whole_lines_only=long.truncated and guard.verdict is None))
     await _say(unread_note(uploads, "".join(shown)))
     if long.truncated:
         # Said IN the answer, not only in a UI notice: the stored text is what
