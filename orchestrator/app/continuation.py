@@ -122,7 +122,13 @@ _MAX_PENDING_CHARS = 400
 #: fourth to sixth such break measured. A piece that ends at 80% is short;
 #: one that ends under 70% missed the length.
 _TARGET_LOW = 0.70
-_TARGET_HIGH = 1.30
+#: 140%, not the 130% first built: the cut is for a run that keeps going
+#: (10,000 words asked, 24,364 written), and it must sit outside the spread
+#: of a COMPLETE single answer, or it cuts off that answer's own ending.
+#: With the section plan, 24 live Fast runs of "Write a 3,000-word article"
+#: ended naturally at 73-132% of the target; at 130% three of them were cut
+#: just before their conclusion (3,905, 3,935 and 3,962 words).
+_TARGET_HIGH = 1.40
 #: ...and never below THIS share of it. A reply that stopped under a quarter
 #: of the length asked for was not written as that piece: a clarifying
 #: question, a refusal, an outline. Live (QA r1, 2026-09-18) an 80-93-word
@@ -149,7 +155,7 @@ _TARGET_OVERRUN_CHARS = 2000
 #: wrote 7-8 sections of 309-379 words (2,358-2,653 words for 3,000). Sized
 #: at 340 words (9 sections) eight runs gave 2,663-3,806 words, two under
 #: 2,700; at 300 (10 sections) five gave 2,782-3,803, all one segment and
-#: complete, none past the 130% stop.
+#: complete, none past 130% of the target.
 _SECTION_WORDS = 300
 _MAX_SECTIONS = 30
 
@@ -525,7 +531,7 @@ async def stream_long_completion(
 
     `target_words` (answer_sampling.requested_words) is the length the person
     asked for. A normal stop at 25-70% of it, on a piece that has not reached
-    its own conclusion, gets ONE more segment (dropped if it declines); past 130%
+    its own conclusion, gets ONE more segment (dropped if it declines); past 140%
     the run stops at the next line break with `STOP_BUDGET` and a `note`
     saying how long the answer is; the first call is told a section plan
     (`_length_plan`) and every continuation the counts.

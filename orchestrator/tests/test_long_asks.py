@@ -266,14 +266,14 @@ def test_a_normal_stop_near_the_target_is_finished(model):
     assert result.stop_reason == continuation.STOP_COMPLETE
 
 
-def test_past_130_percent_the_run_stops_and_says_how_long_it_is(model):
-    fake = model([(prose(4200), "length"), (prose(2000, start=4200), "stop")])
+def test_past_140_percent_the_run_stops_and_says_how_long_it_is(model):
+    fake = model([(prose(4500), "length"), (prose(2000, start=4500), "stop")])
     result, streamed = run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
     assert fake.calls == 1, "no continuation past the target"
     assert result.stop_reason == continuation.STOP_BUDGET
     assert result.truncated is True
-    # Stopped at the first paragraph break past 3,900 words, never mid-line.
-    assert 3900 <= count(streamed) <= 3940
+    # Stopped at the first paragraph break past 4,200 words, never mid-line.
+    assert 4200 <= count(streamed) <= 4240
     assert streamed.endswith("\n")
     assert result.words == count(streamed)
     meta = result.as_meta()
@@ -286,7 +286,7 @@ def test_the_overrun_is_caught_in_a_later_segment_too(model):
     result, streamed = run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
     assert fake.calls == 2
     assert result.stop_reason == continuation.STOP_BUDGET
-    assert 3900 <= count(streamed) <= 3940
+    assert 4200 <= count(streamed) <= 4240
 
 
 def test_a_short_target_changes_nothing(model):
@@ -1333,3 +1333,14 @@ def test_a_piece_under_70_percent_still_gets_the_extension(model):
     fake = model([(prose(2050), "stop"), (prose(900, start=2050), "stop")])
     run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
     assert fake.calls == 2
+
+
+@pytest.mark.parametrize("words", [3905, 3935, 3962])
+def test_a_complete_answer_at_130_to_132_percent_keeps_its_ending(model, words):
+    """Live 2026-09-19: three complete 3,000-word articles (3,905, 3,935 and
+    3,962 words) were cut at the 130% mark just before their conclusion."""
+    body = prose(words - 12) + "\n\n## Conclusion\n\nThe reef endures because the whole system works.\n"
+    fake = model([(body, "stop")])
+    result, streamed = run(total_max_tokens=1_000_000, segment_max_tokens=8000, target_words=3000)
+    assert fake.calls == 1 and streamed == body
+    assert (result.stop_reason, result.truncated) == (continuation.STOP_COMPLETE, False)
