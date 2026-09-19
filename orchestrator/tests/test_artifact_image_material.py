@@ -936,7 +936,7 @@ def test_a_report_of_a_photo_is_not_padded_to_the_three_page_data_floor():
     With no floor for that little material: 804-2,896 characters, 4-37."""
     from app.artifacts import compose as C
 
-    receipt = C.DataTable(id="upload1", title="image.jpg · table 1", columns=["Item", "Qty", "Amount"],
+    receipt = C.DataTable(id="upload1", title="image.jpg · table 1", columns=["Item", "Qty", "Amount"], source_id="upload_image",
                           rows=[["Basmati rice 5kg", "1", "649.00"], ["Toor dal 1kg", "2", "298.00"],
                                 ["Sunflower oil 1L", "3", "477.00"], ["Tea 500g", "1", "285.00"], ["Detergent 2kg", "1", "399.00"]])
     assert C.target_for(_compose_req("make a PDF report of this", uploads_text=WHITEBOARD_MD)).words == 0

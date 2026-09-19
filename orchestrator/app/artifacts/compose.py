@@ -416,7 +416,8 @@ def target_for(req: ComposeRequest) -> LengthTarget:
     m = req.material or Material(instruction=req.instruction)
     return _length.parse_size(
         req.instruction or m.instruction, req.kind,
-        has_data=bool(m.sources) or _material_words(m) >= DATA_REPORT_MIN_MATERIAL_WORDS,
+        has_data=bool(m.sources) or any(t.source_id != "upload_image" for t in m.tables or ())
+        or _material_words(m) >= DATA_REPORT_MIN_MATERIAL_WORDS,
     )
 
 
