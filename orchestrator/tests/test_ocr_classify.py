@@ -575,3 +575,24 @@ def test_a_bracket_standing_as_text_is_left_alone(raw):
     the bracket: a line of the image that merely reads 'image [224, 224, 3]'
     or 'table [3], continued' is not markup."""
     assert ocr.clean_transcript(raw) == raw
+
+
+# ---- 2. the preamble cap, pinned from both sides (hand weakenings M5, M13) --
+
+
+@pytest.mark.parametrize("n", [12, 13])
+def test_a_short_preamble_loop_at_the_token_floor_is_degenerate(n):
+    """Security review r2 (M5): past `_MAX_PREAMBLE_LINES` the text must go
+    back UNTOUCHED. Handing back what was stripped so far takes 'ovi ' x 12-13
+    under the 12-token run floor, and the loop stops being a loop."""
+    assert ocr.classify("ovi " * n).status == "degenerate"
+
+
+@pytest.mark.parametrize(
+    "raw", ["result\n:\nSERVER ROOM B", "ovi\nresult\nSERVER ROOM B", 'output\n":"\nSERVER ROOM B', '":"\nresult\nSERVER ROOM B']
+)
+def test_two_preamble_lines_both_go(raw):
+    """Security review r2 (M13, `_MAX_PREAMBLE_LINES = 1`): nothing pinned
+    that the SECOND of two preamble lines goes too."""
+    read = ocr.classify(raw)
+    assert (read.status, read.text) == ("ok", "SERVER ROOM B")
