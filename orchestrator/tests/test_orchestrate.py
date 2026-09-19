@@ -200,3 +200,49 @@ def test_high_is_never_weaker_than_medium(monkeypatch):
         med = asyncio.run(orchestrate.decide("q", [], "medium"))
         high = asyncio.run(orchestrate.decide("q", [], "high"))
         assert high.agent >= med.agent and high.search >= med.search
+
+
+# ---------------------------------------------------------------------------
+# Pasted text (hotfix 1.2, P1)
+# ---------------------------------------------------------------------------
+
+#: A long posting pasted as plain lines, the person's one line, a sample: the
+#: reported shape. The ask sits past the classifier's first 2,000 characters.
+_POSTING = "\n".join(
+    f"requirement {i}: builds and runs streaming data pipelines for claims team {i}"
+    for i in range(60)
+)
+_ASK = "this is the requirement, use the sample format below and change it in the same way"
+_SAMPLE = "Job Title: Data Engineer\nCompany: Example Retail Labs\nKey Skills\nPython, SQL"
+_REWRITE = f"{_POSTING}\n\n{_ASK}\n\n{_SAMPLE}"
+
+
+@pytest.mark.parametrize("effort", ["think", "max"])
+def test_a_rewrite_of_pasted_text_is_one_pass_of_the_chat_engine(monkeypatch, effort):
+    """Live, production main 4e7cf8e: Think sent the reported rewrite to the
+    multi-step agent 3 of 3 times (the classifier saw only the posting), and
+    showing it the head and the tail still routed it to the agent 3 of 3. A
+    rewrite of text the person pasted is one pass, so the rule decides it and
+    the classifier is not asked."""
+    assert len(_REWRITE) > orchestrate._INPUT_CAP
+    asked = []
+
+    async def spy(messages, **kwargs):
+        asked.append(messages)
+        return '{"agent": true, "search": true}'
+
+    monkeypatch.setattr(llm, "router_chat_completion", spy)
+    plan = asyncio.run(orchestrate.decide(_REWRITE, [], effort))
+    assert (plan.agent, plan.search) == (False, False)
+    assert asked == []
+
+
+def test_a_long_message_is_read_at_its_head_and_its_tail():
+    """The ask of a long message is usually at the end (the composer folds a
+    paste in front of what the person typed): the classifier must see it."""
+    question = "which of these requirements are hardest to hire for in Pune today?"
+    msgs = orchestrate._messages(f"{_POSTING}\n\n{question}", [])
+    content = msgs[-1]["content"]
+    assert len(content) <= orchestrate._INPUT_CAP
+    assert content.startswith(_POSTING[:200])
+    assert content.endswith(question)
