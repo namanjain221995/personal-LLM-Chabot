@@ -254,6 +254,29 @@ def test_assistant_mode_names_salesforce_mode_and_never_another_dashboard():
     assert "suggest switching Salesforce mode on" not in prompt
 
 
+RECORD_ASK = "Does the interview record for Priya exist and when was it last updated?"
+
+
+def test_a_record_question_on_the_chat_class_is_looked_up_not_refused():
+    """QA, 2026-09-18: this exact ask forced onto the chat class answered "I
+    cannot access Salesforce data" 3 of 3 runs, and 2 of 3 told the person to
+    check "the 'Interview Records' object in your Salesforce org directly".
+    graph._chat_node now dispatches such a question to SQL; the sentence is
+    for the record questions that dispatch misses."""
+    prompt = system_prompt(RECORD_ASK, "salesforce").lower()
+    assert "its values are not in this conversation, reply with one sentence saying you will look it up" in prompt
+    assert "never that you cannot see it" in prompt
+    assert "never send them to look for it themselves" in prompt
+    # Told only to say it would look, the model went on to "simulate" the
+    # lookup and invent the record in 2 of 3 live runs.
+    assert "and nothing after it" in prompt
+    assert "never a query, a diagram or a value you were not given" in prompt
+    # One sentence, added to the measured clauses — none of them reworded.
+    assert "never tell the user you cannot see their salesforce data" in prompt
+    # Assistant mode has no data to look up: its own-data clause stands alone.
+    assert "saying you will look it up" not in system_prompt(RECORD_ASK, "assistant").lower()
+
+
 def test_assistant_mode_still_never_claims_to_have_read_salesforce():
     prompt = system_prompt(OWN_DATA, "assistant")
     assert "NOT connected to Salesforce data in this mode" in prompt

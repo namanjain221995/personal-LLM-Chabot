@@ -439,7 +439,11 @@ def test_the_lane_prompt_is_the_persona_the_facts_and_two_clipped_exchanges():
     messages = chat_engine._messages("hi ??", history, "assistant", lane="greeting")
     system = messages[0]
     assert system["role"] == "system"
-    assert system["content"].startswith(chat_engine.ASSISTANT_SYSTEM)
+    # Was startswith(ASSISTANT_SYSTEM). The contract changed on purpose
+    # (2026-09-18): the lane has its own short persona, because the full
+    # assistant conduct is 2,645 chars of rules no pleasantry can use.
+    # The guarantees it must keep are pinned in the tests below.
+    assert system["content"].startswith(chat_engine.FAST_LANE_SYSTEM)
     assert "Prefers short answers" in system["content"]
     assert "other conversations" not in system["content"]
     assert DIAGRAM_INSTRUCTION not in system["content"] and CODE_INSTRUCTION not in system["content"]
@@ -450,6 +454,44 @@ def test_the_lane_prompt_is_the_persona_the_facts_and_two_clipped_exchanges():
     assert len(messages[1]["content"]) == fast_lane.FAST_LANE_TURN_CHARS
     assert messages[-1] == {"role": "user", "content": "hi ??"}
     assert sum(1 for m in messages if m["role"] == "system") == 1
+
+
+#: The Salesforce guard ASSISTANT_SYSTEM carries, word for word. A lane turn
+#: is assistant mode, where no Salesforce data is connected.
+_LANE_SALESFORCE_GUARD = (
+    "You are NOT connected to Salesforce data in this mode — never claim to "
+    "have looked something up in Salesforce or invent CRM numbers."
+)
+#: 2,645 chars at 4810da0 (the whole ASSISTANT_SYSTEM) for 'hi'.
+_LANE_SYSTEM_BUDGET = 700
+
+
+def test_the_lane_system_prompt_is_short_and_keeps_the_salesforce_guard():
+    """'hi' was answered under 2,645 chars of conduct rules (phishing
+    simulations, recommendations, disclaimers) that no pleasantry can use.
+    The lane gets its own persona, with a real identity line, under 700."""
+    from app.identity import clear_identity, set_identity
+
+    set_identity("Jane Doe", "jane.doe@example.com", "TechSara Solutions")
+    try:
+        system = chat_engine._messages("hi", [], "assistant", lane="greeting")[0]["content"]
+    finally:
+        clear_identity()
+    assert len(system) <= _LANE_SYSTEM_BUDGET, len(system)
+    assert _LANE_SALESFORCE_GUARD in system
+    assert "You are assisting Jane Doe" in system
+    assert chat_engine.ASSISTANT_CONDUCT not in system
+
+
+def test_the_lane_persona_keeps_the_saved_facts_block_within_budget():
+    """The facts block is the one system block the lane keeps; the persona's
+    share of the budget must leave it room."""
+    facts = FACTS_HEADER + "\n- Prefers to be called Sam"
+    history = [{"role": "system", "content": facts}]
+    system = chat_engine._messages("thanks!", history, "assistant", lane="thanks")[0]["content"]
+    assert system.endswith(facts)
+    assert _LANE_SALESFORCE_GUARD in system
+    assert len(system) - len(facts) <= _LANE_SYSTEM_BUDGET
 
 
 def test_the_non_lane_prompt_is_unchanged():
