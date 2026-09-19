@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import random
+import re
 import time
 
 import pytest
@@ -596,3 +598,30 @@ def test_two_preamble_lines_both_go(raw):
     that the SECOND of two preamble lines goes too."""
     read = ocr.classify(raw)
     assert (read.status, read.text) == ("ok", "SERVER ROOM B")
+
+
+# ---- 3. unclosed detection blocks are cleaned in linear time --
+
+#: The regex this replaced, kept here as the specification of what goes.
+_OLD_DET_RE = re.compile(r"<\|det\|>.*?<\|/det\|>", re.S)
+
+
+def test_det_blocks_are_removed_exactly_as_the_old_pattern_removed_them():
+    rnd = random.Random(20260919)
+    pieces = ["<|det|>", "<|/det|>", "a", "\n", " ", "<|det", "|>", "text [1, 2, 3, 4]", "<|", "/det|>"]
+    for _ in range(20_000):
+        s = "".join(rnd.choice(pieces) for _ in range(rnd.randint(0, 14)))
+        assert ocr._strip_det_blocks(s) == _OLD_DET_RE.sub("", s), repr(s)
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+@pytest.mark.parametrize("raw", ["<|det|>" * 6000, "<|det|>x " * 6000], ids=["openers", "openers-with-text"])
+def test_unclosed_det_openers_are_cleaned_in_linear_time(monkeypatch, raw, finish):
+    """Security review r2: every unclosed '<|det|>' rescanned to the end of
+    the answer. 6,000 of them: 687 ms per clean at 327a5ac, and the truncated
+    path cleans twice (1,374 ms)."""
+    with _no_gc_pause():
+        started = time.perf_counter()
+        _read(monkeypatch, raw, finish=finish)
+        elapsed = time.perf_counter() - started
+    assert elapsed < 0.1

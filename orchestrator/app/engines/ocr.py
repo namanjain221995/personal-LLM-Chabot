@@ -150,7 +150,8 @@ def concurrency() -> int:
 
 # Detection blocks are pure layout metadata — "<|det|>type [bbox]<|/det|>"
 # per the model card — so the WHOLE block goes, not just its markers.
-_DET_RE = re.compile(r"<\|det\|>.*?<\|/det\|>", re.S)
+_DET_OPEN = "<|det|>"
+_DET_CLOSE = "<|/det|>"
 # Any other stray control tokens: strip the markers, keep wrapped text.
 _TAG_RE = re.compile(r"<\|/?[a-z_]+\|>")
 # Bare bbox payloads like [[123, 45, 678, 90]] left outside det blocks.
@@ -254,6 +255,33 @@ _LAYOUT_LINE_RE = re.compile(
 _REGION_START_RE = re.compile(r"[^\S\n]*+(?:<\|det\|>|%s[^\S\n]*+\[\d)" % _TYPE_WORD)
 
 
+
+def _strip_det_blocks(text: str) -> str:
+    """Remove every "<|det|>…<|/det|>" block, the shortest from each opener.
+
+    Exactly what `re.sub(r"<\\|det\\|>.*?<\\|/det\\|>", "", text, flags=re.S)`
+    removed, in one pass. The regex was quadratic in unclosed openers: every
+    "<|det|>" with no closer after it rescanned to the end of the text, so
+    6,000 of them took 709 ms per clean (security review 2026-09-19). Here an
+    opener with no closer after it means no later opener has one either, and
+    the scan stops.
+    """
+    if _DET_OPEN not in text:
+        return text
+    parts: List[str] = []
+    pos = 0
+    while True:
+        start = text.find(_DET_OPEN, pos)
+        if start < 0:
+            break
+        end = text.find(_DET_CLOSE, start + len(_DET_OPEN))
+        if end < 0:
+            break
+        parts.append(text[pos:start])
+        pos = end + len(_DET_CLOSE)
+    parts.append(text[pos:])
+    return "".join(parts)
+
 def _strip_preamble(text: str) -> str:
     """Drop the model's leading preamble line(s); a no-op on real text.
 
@@ -328,7 +356,7 @@ def clean_transcript(raw: str) -> str:
     out = _drop_line_before_layout(raw or "")
     first = out.lstrip().split("\n", 1)[0]
     in_layout = bool(_REGION_START_RE.match(first))
-    out = _DET_RE.sub("", out)
+    out = _strip_det_blocks(out)
     out = _TAG_RE.sub("", out)
     out = _BBOX_RE.sub("", out)
     out = _LINE_REGION_RE.sub("", out).strip()
