@@ -42,6 +42,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Sequence
 
 from . import db, metrics
 from .config import settings
+from .core import pasted
 from .freshness import (
     _MAX_AGE,
     Freshness,
@@ -464,6 +465,10 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
             content = message_.get("content")
             if not isinstance(content, str):
                 continue
+            if role == "user":
+                # What the person SAID, never what they pasted (reviewer,
+                # hotfix 1.2): this string becomes a web query.
+                content = pasted.own_words(content)
             picked = [w for w in _content_words(content) if w not in have]
             if picked:
                 return picked
@@ -473,7 +478,9 @@ def resolve_from_history(message: str, history: Sequence[dict]) -> str:
     # what they would have repeated if asked to be explicit. The assistant's
     # answer is the fallback, for "and its score?" where the entity was named
     # only in the reply.
-    extra = _harvest("user") or _harvest("assistant")
+    last_user = next((m for m in reversed(conversation_turns(history, 4)) if m.get("role") == "user"), None)
+    after_paste = bool(last_user) and pasted.is_paste(str(last_user.get("content") or ""))
+    extra = _harvest("user") or ([] if after_paste else _harvest("assistant"))
     if not extra:
         return text
     # Appended PLAIN, not parenthesised. The search path brackets its
@@ -946,6 +953,16 @@ async def prepare(
         metrics.inc("knowledge_pleasantry_total", effort=effort or "")
         _decided(out, "static_model")
         return out
+    if pasted.is_transform_ask(question):
+        # A rewrite / reformat / summary of text the person PASTED (hotfix
+        # 1.2, P6): the answer is made from that text alone, so there is
+        # nothing to look up and nothing stored that bears on it. The
+        # freshness rule read "the head of care technology" inside a pasted
+        # job description as an office-holder question, and the Fast lookup
+        # sent the whole paste to the search provider as its query.
+        out.verdict = Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], "pasted_transform")
+        _decided(out, "static_model")
+        return out
     # A terse follow-up is resolved BEFORE retrieval, freshness classification
     # or any escalation decision — every one of them reads the question, and
     # all of them were reading a phrase with its subject missing.
@@ -1362,12 +1379,17 @@ async def _fast_lookup(
     except Exception:  # noqa: BLE001
         return None
 
+    # The web is asked the person's own words, never what they pasted
+    # (hotfix 1.2, P6); a paste with no words of theirs asks nothing.
+    query = pasted.web_query(question)
+    if not query:
+        return None
     deadline = float(getattr(settings, "freshness_fast_deadline_s", FAST_DEADLINE_S) or FAST_DEADLINE_S)
     sources = int(getattr(settings, "freshness_fast_sources", FAST_SOURCES) or FAST_SOURCES)
     try:
         async with asyncio.timeout(deadline):
             stored = await fetch_for_freshness(
-                question,
+                query,
                 max_queries=FAST_QUERIES,
                 max_sources=sources,
                 user_id=user_id,

@@ -103,9 +103,24 @@ describe('the chat reading size', () => {
   });
 
   it('scales the headings with the body, so an h3 is never smaller than its paragraph', () => {
-    expect(rule('.chat-answer .md h1')).toContain('font-size: 1.25em');
-    expect(rule('.chat-answer .md h2')).toContain('font-size: 1.125em');
-    expect(rule('.chat-answer .md h3,\n.chat-answer .md h4')).toContain('font-size: 1em');
+    expect(rule('.chat-answer .md h1')).toContain('font-size: 1.5em');
+    expect(rule('.chat-answer .md h2')).toContain('font-size: 1.3em');
+    expect(rule('.chat-answer .md h3')).toContain('font-size: 1.15em');
+    expect(rule('.chat-answer .md h4')).toContain('font-size: 1em');
+  });
+
+  it('makes every heading level visibly larger than the next, and an h3 larger than the body', () => {
+    // 2026-09-19, chat a9f05bf2: an h3 at 1em looked exactly like a bold line,
+    // so a four-section answer read as one flat list. Equal sizes fail here.
+    const em = (sel: string) => {
+      const m = /font-size:\s*([\d.]+)em/.exec(rule(sel));
+      return m ? Number(m[1]) : NaN;
+    };
+    const [h1, h2, h3, h4] = ['h1', 'h2', 'h3', 'h4'].map((h) => em(`.chat-answer .md ${h}`));
+    expect(h1).toBeGreaterThan(h2);
+    expect(h2).toBeGreaterThan(h3);
+    expect(h3).toBeGreaterThan(1);
+    expect(h4).toBeGreaterThanOrEqual(1);
   });
 
   it('steps tables and code down from the same size, so they grow on a desktop and stay compact on a phone', () => {

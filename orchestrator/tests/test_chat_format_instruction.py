@@ -111,6 +111,37 @@ def test_the_instruction_names_sample_versus_source_and_not_specified():
     assert "stays plain prose, with no headings" in text
 
 
+def test_a_rewrite_keeps_every_source_item_and_adds_no_fact_of_its_own():
+    """Hotfix 1.2, P2 + P4. The sample decided "its level of detail", so a
+    sample with two "Must Have" lines capped a 21-requirement posting at 8-14
+    of 21 kept (live Fast, production main 4e7cf8e). And sections the source is
+    silent about were filled with the usual answer: "Submit your CV through the
+    company career portal", "lead a team of 14 developers" (the source says 14
+    people, 9 of them developers). The sample now gives the structure and
+    labels only; with that and the keep-every-item sentence the same asks kept
+    17-21 of 21 in 18 runs."""
+    text = FORMAT_INSTRUCTION
+    assert "level of detail" not in text
+    assert "its sections, their order and its labels" in text
+    assert "Keep EVERY item the source lists" in text
+    assert "is never a limit on the rewrite" in text
+    assert "Never add a detail the source does not state" in text
+
+
+def test_a_rewrite_keeps_each_items_details_and_takes_nothing_from_the_sample():
+    """Hotfix 1.2 follow-up, measured live on this branch (Fast, 3 runs of the
+    reported shape): every item was kept but one run shortened five of them
+    ("Expert Apex, including asynchronous Apex." for "... Queueable, Batch,
+    Schedulable and future methods"); one run copied the sample's "Email
+    your CV to the talent team" into How to Apply; one wrote "a team of 14
+    developers" for "14 people: 9 developers, 2 admins...". Each clause names
+    one of those."""
+    text = FORMAT_INSTRUCTION
+    assert "with all of its details" in text
+    assert "or taking them from the sample" in text
+    assert "keep every number with what it counts" in text
+
+
 # ---------------------------------------------------------------------------
 # 2. A Fast turn does not think
 # ---------------------------------------------------------------------------
