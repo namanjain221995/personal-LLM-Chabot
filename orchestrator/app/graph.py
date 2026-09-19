@@ -7,12 +7,17 @@ imported lazily inside the nodes so importing app.graph stays light.
 from __future__ import annotations
 
 import asyncio
+import bisect
+import itertools
+import logging
 import re
-from typing import Awaitable, Callable, List, Optional, TypedDict
+from typing import Awaitable, Callable, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, StateGraph
 
 Emit = Callable[[str, dict], Awaitable[None]]
+
+logger = logging.getLogger(__name__)
 
 
 class ChatState(TypedDict, total=False):
@@ -104,7 +109,102 @@ _HEAD_FOLLOWERS = frozenset(
     "between before after per we i you they there still".split()
 )
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]*")
-_OBJECT_SCAN_LIMIT = 50
+#: Longest ask this check reads, in words. The record questions it exists
+#: for run 7 to 17 words (the ones in tests/test_salesforce_chat_redispatch.py);
+#: a longer ask is a brief or a note, which the router has already judged.
+#: It is also what bounds the work: reading the whole message, the check
+#: measured 10.19 s on 64,000 chars and had not finished 50,424 chars after
+#: 120 s (QA), in a thread that /chat/stop cannot cancel.
+_ASK_MAX_WORDS = 40
+#: Verbs asking for a piece of writing, or for a change to given text. The
+#: SQL engine answers with rows: it cannot write the email, the translation or
+#: the Apex class. QA measured 8 of 8 such asks sent to it once they named a
+#: record ("Write an Apex test class that asserts an Account record exists
+#: after insert.").
+_WORK_VERB = re.compile(
+    r"(?:write|draft|compose|translate|rewrite|rephrase|reword|paraphrase|proofread|edit|fix|correct|"
+    r"polish|tidy|format|reformat|summari[sz]e|condense|shorten|expand|simplify|make|create|generate|"
+    r"turn|convert|improve|review|critique|brainstorm|outline|design|draw|sketch|code|implement|build|"
+    r"prepare|reply|respond|imagine|pretend|describe)\b",
+    re.I,
+)
+#: What may stand in front of a request's verb: "Hi, can you please write".
+_REQUEST_LEAD = re.compile(
+    r"(?:(?:hi|hey|hello|ok|okay|so|and|also|now|please|pls|kindly|just|can|could|would|will|you)\b[\s,!.]*"
+    r"|i (?:need|want|would like|'d like) (?:you )?to\b\s*|help me\b\s*|let's\b\s*)*",
+    re.I,
+)
+_SENTENCE_BREAK = re.compile(r"(?<=[.?!;])\s+")
+
+
+#: How much of the chosen line the_ask reads. The quote patterns below
+#: backtrack within one line, so the line is bounded before they run; a
+#: request is a sentence or two, and the composer has no paste limit.
+_ASK_SCAN_CHARS = 2000
+#: A line that opens like a person asking: a question word, an auxiliary, a
+#: politeness lead, or an imperative. Pasted notes, emails and rulebooks open
+#: with a name or a noun ("Priya said", "Hi team,", "Candidates should").
+_REQUEST_OPENER = re.compile(
+    r"^[\W_]*(?:(?:hi|hey|hello|ok|okay|so|and|also|now)\b[\s,!.]*)*"
+    r"(?:how|what|what's|whats|when|where|which|who|whose|why|is|are|was|were|do|does|did|can|could|"
+    r"would|will|should|has|have|had|may|please|pls|kindly|i need|i want|i would like|i'd like|help|let's|"
+    r"write|draft|compose|translate|rewrite|rephrase|reword|paraphrase|proofread|edit|fix|correct|polish|"
+    r"tidy|format|summari[sz]e|condense|shorten|expand|simplify|explain|describe|make|create|generate|"
+    r"turn|convert|improve|review|give|show|list|tell|find|get|count|check|look|pull|compare|analy[sz]e|"
+    r"suggest|recommend|outline|plan|draw|build|prepare|reply|respond|read|extract)\b",
+    re.IGNORECASE,
+)
+#: Quoted spans are material the person is showing, not asking: a straight
+#: or curly double-quoted span, a curly single-quoted one, a straight single
+#: quote only at word edges ("Priya's" is an apostrophe), and inline code.
+_QUOTED_SPAN = re.compile(
+    r'"[^"]*"|“[^”]*”|‘[^’]*’|(?<![\w\'])\'[^\'\n]*\'(?!\w)|`[^`]*`'
+)
+#: "Summarize this for me: <what they pasted>" — a colon that is followed by
+#: space or ends the line introduces material. "10:30" and "https://" do not.
+_LEAD_COLON = re.compile(r":(?=\s|$)")
+
+
+def the_ask(message: str) -> str:
+    """The person's own request inside a message, without the material they
+    handed over with it.
+
+    The composer folds a paste into the message with no marker, and the old
+    composer put pasted blocks IN FRONT of the typed instruction; so the
+    words a message carries are not all the person's. is_record_question
+    reads only the person's: QA measured 'Summarize this for me:\\n\\nCase
+    00012345: Status of the case updated to Closed ...' going to the SQL
+    engine when it read the whole message. (core/pasted.own_words is the same
+    idea for pastes of 300+ chars; a record question's paste is often a
+    one-line email, so it cannot be the cut here.)
+
+    The ask is ONE line: a single-line message is its own ask; otherwise the
+    first line when it opens like a request, else the last line when that
+    does, else nothing. Within it, quoted spans go, and so does everything
+    from a colon that introduces material. Precision over recall on purpose:
+    an empty ask means "no record question", which is what the chat class
+    decided before it read the message at all.
+    """
+    text = (message or "").strip()
+    if not text:
+        return ""
+    first_break = text.find("\n")
+    if first_break < 0:
+        line = text
+    else:
+        first = text[:first_break].strip()
+        last = text[text.rfind("\n") + 1 :].strip()
+        if _REQUEST_OPENER.match(first[:_ASK_SCAN_CHARS]):
+            line = first
+        elif _REQUEST_OPENER.match(last[:_ASK_SCAN_CHARS]):
+            line = last
+        else:
+            return ""
+    line = _QUOTED_SPAN.sub(" ", line[:_ASK_SCAN_CHARS])
+    lead = _LEAD_COLON.search(line)
+    if lead:
+        line = line[: lead.start()]
+    return " ".join(line.split())
 
 
 def _name_words(api: str, label: str) -> List[List[str]]:
@@ -119,44 +219,91 @@ def _name_words(api: str, label: str) -> List[List[str]]:
     return [n for n in names if n]
 
 
-def is_record_question(message: str) -> bool:
-    """Does this Salesforce-mode message ask for a synced object's records?
+def _synced_objects() -> List[Tuple[str, str]]:
+    """(api, label) of every business object the SQL engine can answer from.
 
-    Pure apart from the cached org dictionary. True only when a data verb
-    governs an object the question names outright (core/sf_dictionary: its
-    whole label or API name, never a word shared with a field or with a setup
-    object's label), the object is the head of its phrase, the question is
-    anchored in this org's rows, and it is not advice. Precision over recall:
-    a record question this misses still gets the assistant, told to say it
-    will look the record up; a general question this caught would be answered
-    by the SQL engine.
+    The org dictionary's objects when one is loaded, otherwise the
+    warehouse's own tables — the list the SQL engine grounds on. Production
+    has no dictionary (QA, 2026-09-18: /data/sf_dictionary.json absent,
+    "objects 0 fields 0"), so reading the dictionary alone, this check never
+    fired there. Only names and labels are read: scoring fields
+    (sf_dictionary.relevant_objects) raised KeyError on an entry without a
+    'label' or 'fields' and cost the person the turn.
     """
-    from . import fast_lane
     from .core import sf_dictionary
     from .core.schema_cache import _is_business_table
 
-    text = message or ""
-    if fast_lane.classify_pleasantry(text):
+    objects = sf_dictionary.load().get("objects")
+    if objects:
+        pairs = [(o.get("api"), o.get("label")) for o in objects.values() if isinstance(o, dict)]
+    else:
+        pairs = [(table, None) for table in _warehouse_tables()]
+    return [(api, str(label or "")) for api, label in pairs if isinstance(api, str) and api and _is_business_table(api)]
+
+
+def _warehouse_tables() -> List[str]:
+    import os
+
+    from .config import settings
+    from .core.schema_cache import schema_cache
+
+    path = settings.duckdb_path
+    if not os.path.exists(path):
+        return []
+    return list(schema_cache.get(path))
+
+
+def _is_work_ask(ask: str) -> bool:
+    """Does a sentence of the ask open with a verb asking for writing work?"""
+    for sentence in _SENTENCE_BREAK.split(ask):
+        sentence = sentence.lstrip(" \t\"'*#>-")
+        lead = _REQUEST_LEAD.match(sentence)
+        if _WORK_VERB.match(sentence, lead.end() if lead else 0):
+            return True
+    return False
+
+
+def is_record_question(message: str) -> bool:
+    """Does this Salesforce-mode message ask for a synced object's records?
+
+    Pure apart from the cached org dictionary (or, without one, the cached
+    warehouse schema). Reads only the person's own ask (engines/chat.the_ask):
+    text they pasted or quoted is data and never chooses the engine. True only
+    when the ask is short, is not a request for writing work or for advice, a
+    data verb governs an object it names outright (the object's whole label or
+    API name), the object is the head of its phrase, and the ask is anchored
+    in this org's rows. Precision over recall: a record question this misses
+    still gets the assistant, told to say it will look the record up; a
+    general question or a piece of writing this caught would be answered by
+    the SQL engine.
+    """
+    from . import fast_lane
+    from .core.sf_dictionary import _stem
+
+    if fast_lane.classify_pleasantry(message or ""):
         return False
-    strong = _STRONG_DATA_VERB.search(text) is not None
-    weak_ends = [m.end() for m in _WEAK_DATA_VERB.finditer(text)]
-    anchored = _ORG_ANCHOR.search(text) is not None
-    if not (strong or weak_ends) or _ADVICE.search(text):
+    ask = the_ask(message)
+    tokens = list(itertools.islice(_WORD.finditer(ask), _ASK_MAX_WORDS + 1))
+    if not tokens or len(tokens) > _ASK_MAX_WORDS:
+        return False
+    strong = _STRONG_DATA_VERB.search(ask) is not None
+    weak_ends = [m.end() for m in _WEAK_DATA_VERB.finditer(ask)]
+    anchored = _ORG_ANCHOR.search(ask) is not None
+    if not (strong or weak_ends) or _ADVICE.search(ask) or _is_work_ask(ask):
         return False
     if not (strong or anchored):
         return False
-    # Not the default four: an org export lists setup objects named after the
-    # same noun (FlowInterview, FlowInterviewLog...), and with enough matching
-    # field labels four of them outrank Interview__c and push it out.
-    objects = [
-        o for o in sf_dictionary.relevant_objects(text, limit=_OBJECT_SCAN_LIMIT) if _is_business_table(o["api"])
-    ]
+    objects = _synced_objects()
     if not objects:
         return False
-    tokens = list(_WORD.finditer(text))
-    stems = [sf_dictionary._stem(t.group(0).lower()) for t in tokens]
-    for obj in objects:
-        for name in _name_words(obj["api"], obj.get("label", "")):
+    stems = [_stem(t.group(0).lower()) for t in tokens]
+    # Computed once per ask, not once per candidate object: per candidate,
+    # a prefix copy per capitalised word and a findall per weak verb made the
+    # check quadratic-to-cubic in the message length (QA, security review).
+    proper = [k for k in range(len(tokens)) if _is_proper_name(ask, tokens, k)]
+    after_weak = [bisect.bisect_left([t.start() for t in tokens], end) for end in weak_ends]
+    for api, label in objects:
+        for name in _name_words(api, label):
             for i in range(len(stems) - len(name) + 1):
                 if stems[i : i + len(name)] != name:
                     continue
@@ -164,29 +311,22 @@ def is_record_question(message: str) -> bool:
                 follower = tokens[last + 1].group(0).lower() if last + 1 < len(tokens) else ""
                 if follower and follower not in _HEAD_FOLLOWERS:
                     continue
-                if strong and (anchored or _proper_name(tokens, text, skip=range(i, last + 1))):
+                if strong and (anchored or any(k < i or k > last for k in proper)):
                     return True
-                if anchored and any(
-                    end <= tokens[i].start() and len(_WORD.findall(text[end : tokens[i].start()])) <= _WEAK_VERB_REACH
-                    for end in weak_ends
-                ):
+                if anchored and any(0 <= i - j <= _WEAK_VERB_REACH for j in after_weak):
                     return True
     return False
 
 
-def _proper_name(tokens, text: str, *, skip) -> bool:
-    """A capitalised word that does not start a sentence: "Priya", "Acme".
-    Only strong verbs accept it as the anchor — "the tasks for Kubernetes"
-    has one too."""
-    for k, tok in enumerate(tokens):
-        word = tok.group(0)
-        if k in skip or k == 0 or not word[0].isupper() or word in ("I", "Salesforce"):
-            continue
-        before = text[: tok.start()].rstrip()
-        if before and before[-1] in ".?!":
-            continue
-        return True
-    return False
+def _is_proper_name(text: str, tokens, k: int) -> bool:
+    """Token k is a capitalised word that does not start a sentence: "Priya",
+    "Acme". Only strong verbs accept it as the anchor — "the tasks for
+    Kubernetes" has one too."""
+    word = tokens[k].group(0)
+    if k == 0 or not word[0].isupper() or word in ("I", "Salesforce"):
+        return False
+    gap = text[tokens[k - 1].end() : tokens[k].start()].rstrip()
+    return not (gap and gap[-1] in ".?!")
 
 
 async def _chat_node(state: ChatState) -> dict:
@@ -195,9 +335,16 @@ async def _chat_node(state: ChatState) -> dict:
     # not chat: QA measured "Does the interview record for Priya exist and
     # when was it last updated?" forced here answering "I cannot access
     # Salesforce data" 3 of 3 runs. It goes to the engine that can look.
-    # Off the event loop: the first call reads the org dictionary from disk
-    # and every call scores its objects in Python.
-    if await asyncio.to_thread(is_record_question, state["message"]):
+    # Off the event loop: the first call reads the org dictionary (or the
+    # warehouse schema) from disk.
+    try:
+        record = await asyncio.to_thread(is_record_question, state["message"])
+    except Exception:  # noqa: BLE001 — the dispatch is an extra; the answer is not
+        # At 4810da0 this node never read the dictionary, so a malformed one
+        # could not cost the person the turn; QA measured it costing it.
+        logger.warning("chat node: record-question check failed, answering on the chat class", exc_info=True)
+        record = False
+    if record:
         from .engines.sql import run_sql_engine
 
         answer = await run_sql_engine(state["message"], state.get("history", []), state["emit"])

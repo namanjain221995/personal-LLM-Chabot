@@ -451,7 +451,7 @@ async def run_chat_engine(
         # The length the person asked for, as a target rather than only a
         # budget: "10,000 words" came back as 24,364 words one run and 5,340
         # the next (backlog 14). None when the ask names no length.
-        target_words=answer_sampling.requested_words(message),
+        target_words=answer_sampling.requested_words(_length_ask(message)),
         **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
     if shaper is not None and guard.verdict is None:
@@ -473,6 +473,22 @@ async def run_chat_engine(
         await answer_guard.record(guard.verdict, effort=effort, route="chat")
     await emit("meta", meta)
     return guard.shown
+
+
+def _length_ask(message: str) -> str:
+    """What requested_words reads for this turn: the message, except a
+    rewrite / summarise / translate ask over pasted text (core/pasted.read),
+    where it is the person's ask lines only.
+
+    requested_words already skips quoted spans and colon-introduced material,
+    but a paste folded in with no marker is neither. QA r1 measured it: a
+    3,010-word rulebook whose first line reads "Candidates should write a
+    1,500-word cover essay" came back as a 1,974-word rewrite, cut by the
+    target it read from the rulebook. Only a transform ask is narrowed: in
+    "Write a 3,000-word report based on these notes:" + notes the count is
+    the person's, and pasted.own_words would drop it."""
+    turn = pasted.read(message)
+    return message if turn is None else "\n".join(turn.asks)
 
 
 async def _run_lane(

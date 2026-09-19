@@ -218,3 +218,130 @@ def test_an_ask_with_no_length_hands_on_no_target(recorder):
     assert answer_sampling.requested_words(message) is None
     out = _run_chat(message, mode="assistant", effort="fast")
     assert out["long"]["target_words"] is None
+
+
+# ---------------------------------------------------------------------------
+# The target is the PERSON's length, never a length inside what they pasted
+# ---------------------------------------------------------------------------
+#
+# QA, review round 1 (2026-09-19): answer_sampling.requested_words read the
+# whole message, pasted and quoted text included. A target works both ways —
+# short of it the answer is continued, past continuation._TARGET_HIGH of it
+# the answer is STOPPED — so a length inside a paste extended a two-line
+# summary (6 of 6 cases, fast and think) and cut a rewrite: a 3,010-word
+# rulebook whose first line reads "Candidates should write a 1,500-word cover
+# essay." came back at 1,974 words with stop_reason 'budget'. Quoted and
+# colon-introduced material is skipped by the parser itself (bk-long-asks,
+# answer_sampling._material_spans); a paste folded in with no marker is
+# narrowed by the engine to the person's ask lines (chat._length_ask).
+
+
+class _Writer:
+    """A stub model: every call streams `text` and stops normally."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.calls: List[list] = []
+
+    async def stream(self, messages, **kwargs):
+        self.calls.append(messages)
+        for line in self.text.splitlines(keepends=True):
+            yield "token", line
+
+    def finish(self):
+        return "stop"
+
+
+def _write(monkeypatch, message: str, text: str, effort: str = "fast"):
+    model = _Writer(text)
+    monkeypatch.setattr(llm, "stream_chat_events", model.stream)
+    monkeypatch.setattr(llm, "get_finish_reason", model.finish)
+    monkeypatch.setattr(llm, "get_usage", lambda: None)
+    monkeypatch.setattr(settings, "extra_high_samples", 1)
+    events: List[tuple] = []
+
+    async def emit(kind, payload):
+        events.append((kind, payload))
+
+    answer = asyncio.run(chat_engine.run_chat_engine(message, [], emit, mode="assistant", effort=effort))
+    meta = [p for k, p in events if k == "meta"][-1]
+    return model.calls, answer, meta
+
+
+def _rules(words: int) -> str:
+    line = "Rule R-{:03d}: staff record every candidate contact in the tracker within one working day.\n"
+    out: List[str] = []
+    count = 0
+    while count < words:
+        out.append(line.format(len(out) + 1))
+        count += len(out[-1].split())
+    return "".join(out)
+
+
+_SUMMARY = "Dana asks Sam for the Q3 hiring report by Friday. It should cover the pilot.\n"
+
+LENGTHS_IN_MATERIAL = [
+    'Summarize this email in two lines:\n\n"Hi Sam, please write a 5,000-word report on Q3 hiring by Friday. Thanks, Dana"',
+    "Summarize this email in two lines:\n\nHi Sam, as discussed, please write a 5,000-word report on the Q3 hiring "
+    "numbers by Friday. Thanks",
+    "Fix the grammar: 'please write me a 2000 words essay'",
+    "Is this prompt good? 'Write a 10,000 word story about dragons.'",
+    # The old composer folded pasted blocks IN FRONT of the typed instruction.
+    # KNOWN GAP, left to bk-long-asks' parser: under core/pasted's 300-char
+    # paste floor, with no quote or colon, nothing marks the email as
+    # material, and the first call is told a 5,000-word section plan. The
+    # engine does not narrow short messages itself: "Write a 3,000-word essay
+    # on climate.\n\nMake it persuasive." has the same shape and its count is
+    # the person's.
+    pytest.param(
+        "Hi Sam, please write a 5,000-word report on Q3 hiring by Friday.\nThanks, Dana\n\nSummarize this in two lines.",
+        marks=pytest.mark.xfail(strict=True, reason="short unmarked paste in front of the ask: bk-long-asks parser"),
+        id="short-paste-first",
+    ),
+]
+
+
+@pytest.mark.parametrize("effort", ["fast", "think"])
+@pytest.mark.parametrize("message", LENGTHS_IN_MATERIAL)
+def test_a_length_inside_pasted_or_quoted_text_is_not_the_target(recorder, message, effort):
+    # The target handed on, not the call count: since bk-long-asks@42cc5af a
+    # reply under 25% of a target is never extended, so a two-line stub would
+    # pass whatever target reached continuation.
+    assert _run_chat(message, mode="assistant", effort=effort)["long"]["target_words"] is None
+
+
+@pytest.mark.parametrize("effort", ["fast", "think"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Rewrite and restructure this rulebook so it reads clearly:\n\n"
+        "Candidates should write a 1,500-word cover essay.\n" + _rules(3000),
+        "Candidates should write a 1,500-word cover essay.\n" + _rules(3000) + "\nRewrite the above so it reads clearly.",
+    ],
+    ids=["instruction-first", "paste-first"],
+)
+def test_a_length_inside_a_pasted_rulebook_does_not_cut_its_rewrite(monkeypatch, message, effort):
+    body = _rules(3000)
+    _calls, answer, meta = _write(monkeypatch, message, body, effort)
+    assert len(answer.split()) == len(body.split())
+    cont = meta.get("continuation") or {}
+    assert not cont.get("truncated") and cont.get("stop_reason") != "budget", cont
+
+
+def test_the_persons_own_length_still_extends_a_short_stop(monkeypatch):
+    # 1,000 of 2,000 words, no ending of its own: between continuation's
+    # _TARGET_FLOOR and _TARGET_LOW, so it gets the one extension segment.
+    calls, _answer, _meta = _write(monkeypatch, "Write a 2,000-word essay about teamwork.", _rules(1000))
+    assert len(calls) == 2
+    assert "2,000 were asked for" in str(calls[1])
+
+
+def test_the_persons_own_length_after_a_pasted_block_is_still_the_target(recorder):
+    message = "Candidates should write a 1,500-word cover essay.\n" + _rules(300) + "\nRewrite the above in about 2,000 words."
+    assert _run_chat(message, mode="assistant", effort="fast")["long"]["target_words"] == 2000
+
+
+def test_the_persons_own_length_still_stops_a_runaway(monkeypatch):
+    _calls, answer, _meta = _write(monkeypatch, "Write a 1,000-word essay about teamwork.", _rules(4000))
+    # bk-long-asks@42cc5af moved the cut from 130% to 140% (its _TARGET_HIGH).
+    assert len(answer.split()) <= continuation._TARGET_HIGH * 1000 + 40
