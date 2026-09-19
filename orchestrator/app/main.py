@@ -5244,6 +5244,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 image_followup_images = image_memory.images_for_followup(
                     conv_key, request.text, viewer
                 )
+            else:
+                # A document, URL, video, agent or research turn still moves
+                # the conversation on: after it, "that table" may be its
+                # table, not the picture's (engines/image_memory.py).
+                from .engines import image_memory
+
+                image_memory.note_turn(conv_key, viewer)
 
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
