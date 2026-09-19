@@ -405,8 +405,13 @@ _ERASE_COMPANION_RE = re.compile(
     r"[\s,]*(?:"
     r"(?:ok(?:ay)?|thanks?(?:\s+(?:a\s+lot|so\s+much|again|in\s+advance))?|"
     r"thank\s+you(?:\s+(?:so\s+much|again))?|thx|ty|please|pls|cheers|appreciate\s+it)"
-    r"|(?:because\s+|since\s+)?i(?:['’]ve|\s+have|\s+just)?\s+(?:left|quit|moved|resigned|"
-    r"relocated|retired|changed\s+jobs|switched\s+jobs)\b[^,;]*"
+    r"|(?:because\s+|since\s+)?i(?:['’]ve|\s+have|\s+just)?\s+(?:left|quit|moved(?:\s+out|\s+house|\s+away)?|"
+    r"resigned|relocated|retired|changed\s+jobs|switched\s+jobs)"
+    # RV3: the reason ends at the verb or names where the person went; "I moved THE PARTY
+    # to the office" / "I left IT in the form" is a task, not a reason.
+    r"(?:\s+(?:(?:to|from|for)\s+)?(?-i:[A-Z])[\w&'’-]*+(?:\s+(?-i:[A-Z])[\w&'’-]*+)*+"
+    r"|\s+(?:the|that|my)\s+(?:company|job|firm|city|country|flat|apartment|house|place)"
+    r"|\s+(?:recently|already|last\s+(?:week|month|year)|(?:a\s+)?(?:few|couple\s+of)\s+(?:days|weeks|months|years)\s+ago))*+"
     r"|(?:that|it|this)(?:['’]s|\s+is)\s+(?:now\s+)?(?:out\s+of\s+date|outdated|wrong|"
     r"incorrect|old\s+news|not\s+true(?:\s+any\s*more)?|no\s+longer\s+true|not\s+right|"
     r"private|personal|changed|not\s+the\s+case)"
@@ -681,7 +686,11 @@ def _erasure_requests(text: str) -> List[tuple]:
         ask = _erasure_request(text_, _END_PUNCT_RE.match(body, sentence.end()).group(0))
         if ask is not None:
             asks.append(ask)
-        elif not _ERASE_COMPANION_RE.fullmatch(text_):
+        elif not _ERASE_COMPANION_RE.fullmatch(text_) or (
+            # RV3: a reminder that sets the thing aside for a task or a later moment
+            _CLAUSE_TEMPORARY_RE.search(text_) or _CLAUSE_DOCUMENT_RE.search(text_)
+            or re.search(r"\bremember\s+(?:that\s+)?i\s+(?:told|said|asked|mentioned|wrote)\b", text_, re.I)
+        ):
             return []
     return asks
 
@@ -729,7 +738,11 @@ def _asked_for(asks: List[tuple], fact: str) -> bool:
     that contains the name: role-play addresses someone, and the appositive
     reading must not hand the extractor every row."""
     return any(
-        named is None or named.lower() in (fact or "").lower() for _, named, _ in asks
+        (named is None or named.lower() in (fact or "").lower())
+        # RV3: a bare "forget my <noun phrase>" reaches only a fact holding every word it
+        # names; "Forget my previous question." / "Forget my job tonight." reach nothing
+        and (matchable or _erase_words(clause) <= _erase_words(fact))
+        for clause, named, matchable in asks
     )
 
 
