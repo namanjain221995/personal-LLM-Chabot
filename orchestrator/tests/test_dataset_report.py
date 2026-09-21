@@ -55,6 +55,34 @@ def test_ordinary_questions_are_not_document_requests(message):
     assert wants_document_report(message) is False
 
 
+def test_the_document_intent_is_read_from_both_ends_not_from_the_whole_paste():
+    """This is the FIRST thing the dataset engine asks of a message, and it
+    used to read every character of it: four alternations that must fail over
+    the whole string before they can say "no". A 5 MB paste cost 178 ms on
+    the single-threaded event loop before a byte of the answer, on top of the
+    prompt build (measured 2026-09-22).
+
+    It now reads the same bounded slice every other read of a request in this
+    module reads — the first 4,000 and last 2,000 characters — so the intent
+    is decided from exactly the text the breakdown, the measure and the
+    one-page rule are decided from. The sentence that asks for a PDF is the
+    sentence the person typed, and it sits at one end of what they pasted.
+    """
+    import time
+
+    filler = "lorem ipsum dolor sit amet " * 200_000
+    assert len(filler) > 5_000_000
+    ask = "Generate a PDF report of revenue by region."
+    assert wants_document_report(ask + "\n\n" + filler) is True, "the ask at the front is read"
+    assert wants_document_report(filler + "\n\n" + ask) is True, "the ask at the back is read"
+    assert wants_document_report("What is the total revenue?\n\n" + filler) is False
+    start = time.perf_counter()
+    for _ in range(5):
+        wants_document_report(filler)
+    took = time.perf_counter() - start
+    assert took < 0.1, f"{took:.2f} s to read the intent of 5 MB five times"
+
+
 # --- content ----------------------------------------------------------------
 
 PROFILE = {

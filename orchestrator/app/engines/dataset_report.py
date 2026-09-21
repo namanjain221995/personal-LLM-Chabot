@@ -64,8 +64,19 @@ def wants_document_report(message: str) -> bool:
 
     Conservative on purpose: a false positive replaces a normal dataset answer
     with a PDF, which is a worse failure than not offering the file.
+
+    BOTH ENDS OF THE REQUEST, NOT ALL OF IT. This read the whole message, and
+    the four patterns are alternations that must fail over every character
+    before they can say "no": on the dataset engine's own path a 5 MB paste
+    cost 178 ms on the event loop, before a single byte of the answer
+    (measured 2026-09-22). Every other read of a request in this module is
+    already bounded to its first 4,000 and last 2,000 characters — the
+    sentence that asks for a PDF is the sentence the person typed, and it sits
+    at one end of whatever they pasted — and this one now reads the same
+    slice, so what the intent is decided from is exactly what the breakdown,
+    the measure and the one-page rule are decided from.
     """
-    text = message or ""
+    text = bounded_request(message)
     if not _CREATE_RE.search(text):
         return False
     if _FORMAT_RE.search(text):

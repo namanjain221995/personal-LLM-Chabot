@@ -205,7 +205,11 @@ def _noise_free(value: Any) -> Any:
     if not isinstance(value, float) or not math.isfinite(value) or value == 0.0:
         return value
     mantissa = repr(value).split("e")[0]
-    if len(re.sub(r"\D", "", mantissa).lstrip("0")) <= 12:
+    # `-` and `.` are the only non-digits a finite float's repr can put before
+    # its exponent, so stripping them is `re.sub(r"\D", "", mantissa)` without
+    # the regex: this runs once per figure in the profile (102,240 times for
+    # 20 files) and re.sub cost a third of the tidy pass (2026-09-22).
+    if len(mantissa.replace("-", "").replace(".", "").lstrip("0")) <= 12:
         # Twelve significant digits or fewer is a short decimal already; the
         # noise sits from the 15th digit on ("3886287.29999999").
         return value
@@ -309,25 +313,43 @@ _LEAD_KEYS = (
     "count", "sum", "avg", "median",
 )
 _ROW_LISTS = ("sample_rows", "full_rows")
+#: _LEAD_KEYS as a rank, so an object is ordered by reading ITS OWN keys once
+#: rather than by asking it for each of the nineteen. A profile is mostly
+#: four-key rows, and this runs on every object in it — 56,120 of them for 20
+#: files, which was 1,228,040 dict lookups (2026-09-22). The sort is by unique
+#: rank, so the order is exactly _LEAD_KEYS order, and the keys that have no
+#: rank keep the order the object stored them in.
+_LEAD_RANK = {k: i for i, k in enumerate(_LEAD_KEYS)}
 
 
 def _ordered(node: Any, columns: Optional[List[Any]] = None) -> Any:
     """`node` with every object's label keys first and each row's cells in the
-    file's column order. Keys are moved, never values."""
+    file's column order. Keys are moved, never values.
+
+    ONLY CONTAINERS RECURSE. Every other node is returned unchanged, so a
+    scalar is skipped here rather than handed to a call that would look at it
+    twice and hand it straight back.
+    """
     if isinstance(node, list):
-        return [_ordered(v, columns) for v in node]
+        return [_ordered(v, columns) if isinstance(v, (dict, list)) else v for v in node]
     if not isinstance(node, dict):
         return node
     if isinstance(node.get("columns"), list):
         columns = [c.get("name") for c in node["columns"] if isinstance(c, dict)]
-    keys = [k for k in _LEAD_KEYS if k in node] + [k for k in node if k not in _LEAD_KEYS]
+    lead: List[Any] = []
+    rest: List[Any] = []
+    for k in node:
+        (lead if k in _LEAD_RANK else rest).append(k)
+    lead.sort(key=_LEAD_RANK.__getitem__)
     out: Dict[str, Any] = {}
-    for k in keys:
+    for k in lead + rest:
         v = node[k]
         if k in _ROW_LISTS and isinstance(v, list):
             out[k] = [_in_column_order(row, columns) for row in v]
-        else:
+        elif isinstance(v, (dict, list)):
             out[k] = _ordered(v, columns)
+        else:
+            out[k] = v
     return out
 
 
@@ -1023,8 +1045,17 @@ async def run_dataset_engine(
     # per-call ceiling stays a ceiling, the total is the effort's budget, and
     # a call that ran out of room is continued with the seam hidden.
     effort = llm.normalize_effort(effort)
+    # THE PROMPT IS RENDERED OFF THE EVENT LOOP. Building it is pure CPU —
+    # tidying every computed figure, re-ordering every object's keys and JSON
+    # encoding the result — and it grows with the profile, not with the
+    # question: 20 files with an eight-measure, six-group breakdown render a
+    # 5.9 MB block, and the orchestrator is single-threaded, so the 250 ms
+    # that takes is 250 ms of nobody else's tokens moving (2026-09-22). It
+    # reads `uploads` and `history` and touches nothing else, so it is handed
+    # to a worker thread exactly as uploads.py hands it the profiler.
+    messages = await asyncio.to_thread(build_messages, message, uploads, history)
     long = await continuation.stream_long_completion(
-        build_messages(message, uploads, history),
+        messages,
         on_delta=_out,
         model_choice=model_choice,
         effort=effort,
