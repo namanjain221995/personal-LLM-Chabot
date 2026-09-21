@@ -251,6 +251,44 @@ def test_the_full_delete_request_is_accepted():
     ) == list(audit_tool.DELETABLE)
 
 
+def test_named_ids_still_need_every_delete_flag():
+    with pytest.raises(SystemExit) as excinfo:
+        audit_tool.check_delete_request(
+            _args(["--dsn", "postgresql://x/y", "--delete", "--ids", "1,2"])
+        )
+    assert "never deletes unattended" in str(excinfo.value)
+
+
+def test_named_ids_are_read_as_ids():
+    assert audit_tool.check_delete_request(
+        _args(
+            [
+                "--dsn", "postgresql://x/y", "--delete", "--yes",
+                "--user", "29", "--backup", "/tmp/b.json", "--ids", "418, 419",
+            ]
+        )
+    ) == {"ids": [418, 419]}
+
+
+def test_ids_and_classes_cannot_both_be_given():
+    with pytest.raises(SystemExit):
+        _args(
+            [
+                "--dsn", "postgresql://x/y", "--delete", "--yes",
+                "--user", "29", "--backup", "/tmp/b.json",
+                "--ids", "418", "--classes", "task_request",
+            ]
+        )
+
+
+def test_an_id_that_is_not_this_users_stops_the_whole_run():
+    """A mistyped id must not quietly delete the ones that did match."""
+    classified = audit_tool.audit([_row(id=418, fact="The user's name is Sam")])
+    with pytest.raises(SystemExit) as excinfo:
+        audit_tool._doomed(classified, {"ids": [418, 999]})
+    assert "no such fact for this user: 999" in str(excinfo.value)
+
+
 # --- 3. against the real table ---------------------------------------------
 
 
@@ -331,6 +369,41 @@ def test_the_delete_backs_up_first_and_touches_one_account_only(store, tmp_path,
     printed = capsys.readouterr().out
     assert "would delete 3 of 4 rows" in printed
     assert "deleted 3 rows" in printed
+
+
+def test_an_unverifiable_row_goes_only_when_the_operator_names_its_id(store, tmp_path):
+    """131 of the 132 production rows predate the provenance columns, so the
+    row that answers "what is my name?" with a stranger's name is
+    `unverifiable` and no class can reach it."""
+    alice, _bob = store
+    stranger = db.add_user_fact(alice, "The user's name is A Stranger", "c9")
+    assert audit_tool.classify(
+        {**stranger, "user_id": alice}
+    ) == audit_tool.UNVERIFIABLE
+
+    # the class run leaves it alone
+    by_class = tmp_path / "by-class.json"
+    audit_tool.main(
+        [
+            "--dsn", settings.app_database_url, "--delete", "--yes",
+            "--user", str(alice), "--backup", str(by_class),
+        ]
+    )
+    assert stranger["id"] in [f["id"] for f in db.list_user_facts(alice)]
+
+    # naming the id removes it, with its own backup
+    by_id = tmp_path / "by-id.json"
+    audit_tool.main(
+        [
+            "--dsn", settings.app_database_url, "--delete", "--yes",
+            "--user", str(alice), "--backup", str(by_id),
+            "--ids", str(stranger["id"]),
+        ]
+    )
+    assert [f["fact"] for f in db.list_user_facts(alice)] == [
+        "The user prefers answers in Hindi"
+    ]
+    assert json.loads(by_id.read_text())[0]["id"] == stranger["id"]
 
 
 def test_the_delete_refuses_to_overwrite_an_earlier_backup(store, tmp_path):

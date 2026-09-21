@@ -7,7 +7,18 @@ ones.
     scripts/memory_audit.py --dsn "$APP_DATABASE_URL" --user 29      # one account
     scripts/memory_audit.py --dsn "$APP_DATABASE_URL" --no-rows      # counts only
     scripts/memory_audit.py --dsn "$APP_DATABASE_URL" --user 29 \\
-        --delete --yes --backup /path/user-29-facts.json
+        --delete --yes --backup /path/user-29-facts.json             # by class
+    scripts/memory_audit.py --dsn "$APP_DATABASE_URL" --user 29 \\
+        --delete --yes --backup /path/user-29-facts.json \\
+        --ids 418,419,420                                            # by id
+
+WHAT THE STORE ACTUALLY HOLDS (read-only run, 2026-09-21): 132 rows across 14
+accounts, and 131 of them were written BEFORE the provenance columns (V40,
+2026-09-18). They have no `source` and no `source_excerpt`, so no rule can
+tell where they came from and they are reported `unverifiable` — including the
+worst row in the store, an account's name taken from a pasted interview
+script. Class-based deletion will not touch those, on purpose. `--ids` is how
+they go: read the audit, read the row, type its id.
 
 WHY THIS EXISTS. Release 1 (2026-09-18) stopped NEW pastes from becoming
 facts, but every row written before it is still read back on every turn under
@@ -26,12 +37,13 @@ or name the message never contained) and `states_profile_attribute` (is this
 row the person's identity?). When those rules change, this tool changes with
 them.
 
-SAFETY. Read-only is the default and the connection says so to PostgreSQL
-(`default_transaction_read_only`), so a bug cannot write. Deleting takes
-three flags that no environment variable can supply — `--delete`, `--yes` and
-`--user` — plus a `--backup` path, and it prints the exact rows first. The
-only statement it ever runs that is not a SELECT is one DELETE against
-`user_facts`, scoped to that one user_id and that explicit list of ids.
+SAFETY. Read-only is the default, and on that path the connection is opened
+READ ONLY, so the server refuses a write even if this tool's SQL stops being
+SELECT-only. Deleting takes three flags that no environment variable can
+supply — `--delete`, `--yes` and `--user` — plus a `--backup` path it refuses
+to overwrite, and it prints the exact rows first. The only statement it ever
+runs that is not a SELECT is one DELETE against `user_facts`, scoped to that
+one user_id and that explicit list of ids.
 
 PRIVACY. Row lines carry the first 80 characters of somebody's saved fact.
 That is the point of the tool for the operator running it, and the reason
@@ -314,10 +326,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="the operator's confirmation; --delete does nothing without it",
     )
     parser.add_argument("--backup", default=None, help="where to write the deleted rows as JSON")
-    parser.add_argument(
+    what = parser.add_mutually_exclusive_group()
+    what.add_argument(
         "--classes",
-        default=",".join(DELETABLE),
-        help="which classes --delete removes (default: %(default)s)",
+        default=None,
+        help="which classes --delete removes (default: %s)" % ",".join(DELETABLE),
+    )
+    what.add_argument(
+        "--ids",
+        default=None,
+        help="the exact fact ids to remove, comma-separated — whatever their "
+        "class, for rows the operator has read in a previous audit",
     )
     return parser
 
@@ -338,13 +357,37 @@ def _delete_classes(raw: str) -> List[str]:
     return chosen
 
 
-def check_delete_request(args) -> List[str]:
+def _delete_ids(raw: str) -> List[int]:
+    ids: List[int] = []
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            ids.append(int(token))
+        except ValueError:
+            raise SystemExit(f"--ids takes fact ids, not {token!r}")
+    if not ids:
+        raise SystemExit("--ids named nothing to delete")
+    return ids
+
+
+def check_delete_request(args):
     """What `--delete` needs before it may touch anything, or SystemExit.
 
     Read-only is the default and stays the default: deletion is never reached
     by an environment variable, a config file or a bare `--delete`. It takes
     the flag, the operator's `--yes`, ONE named account and somewhere to put
     the backup — four things a person types on purpose.
+
+    Returns what to delete: a list of class names, or `{"ids": [...]}` when
+    the operator named the rows themselves. Naming ids is the ONLY way to
+    remove an `unverifiable` row, and it exists because of what the store
+    actually holds: 131 of the 132 production rows were written before the
+    provenance columns (V40, 2026-09-18), so no rule can judge them and the
+    worst row in the store — an account's name, taken from a pasted interview
+    script — is among them. A person reads the audit, reads the row, and
+    types its id.
     """
     if not args.delete:
         return []
@@ -360,12 +403,30 @@ def check_delete_request(args) -> List[str]:
             "refusing to delete: " + ", ".join(missing) + " required. "
             "This tool never deletes unattended."
         )
-    return _delete_classes(args.classes)
+    if args.ids:
+        return {"ids": _delete_ids(args.ids)}
+    return _delete_classes(args.classes or ",".join(DELETABLE))
+
+
+def _doomed(classified: Sequence[dict], wanted) -> List[dict]:
+    """The rows this run would remove. When the operator named ids, EVERY one
+    must be a row of the account they named: an id that is not there is a
+    typo, and the run stops rather than deleting the ones that did match."""
+    if isinstance(wanted, dict):
+        by_id = {row["id"]: row for row in classified}
+        missing = [i for i in wanted["ids"] if i not in by_id]
+        if missing:
+            raise SystemExit(
+                "refusing to delete: no such fact for this user: "
+                + ", ".join(str(i) for i in missing)
+            )
+        return [by_id[i] for i in wanted["ids"]]
+    return [r for r in classified if r["class"] in wanted]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    classes = check_delete_request(args)
+    wanted = check_delete_request(args)
     if not args.dsn:
         raise SystemExit("no database: pass --dsn or set APP_DATABASE_URL")
 
@@ -377,7 +438,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.delete:
             return 0
 
-        doomed = [r for r in classified if r["class"] in classes]
+        doomed = _doomed(classified, wanted)
         print("")
         print(f"would delete {len(doomed)} of {len(classified)} rows for user {args.user}:")
         for row in doomed:
