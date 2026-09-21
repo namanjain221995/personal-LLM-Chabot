@@ -21,10 +21,32 @@ import pytest
 
 from app.engines import source_use
 from app.engines.document import run_pdf_engine_multi
-from tests.document_answer_grader import (cites_document, gives_recommendation,
-                                          opens_with_refusal, referral_only,
-                                          source_named_headings,
-                                          source_named_labels)
+from tests.document_answer_grader import (cites_document, explains_a_missing_field,
+                                          gives_recommendation, opens_with_refusal,
+                                          referral_only, source_named_headings,
+                                          source_named_labels, states_a_computation)
+
+#: The ONE block every field-bearing question gets since round 7 (2026-09-19),
+#: and its two rule sets. Rounds 1-6 had a strict EXTRACTION block that
+#: forbade judgement and an extract+advise block beside it; the router chose
+#: between them and missed 10-25% of judgement asks. The assertions that used
+#: to read "EXTRACTION QUESTION" and "ALSO ASKED FOR A JUDGEMENT" read these.
+FIELD_BLOCK = "THIS QUESTION ASKS FOR FIELDS OF THE DOCUMENT"
+FIELD_RULES = "Return ONLY what is actually in the document for each field asked"
+JUDGEMENT_RULES = "NOTHING THE PERSON ASKED IS FORBIDDEN"
+
+
+def _fields_then_judgement(question):
+    """Round 7's replacement for "mode == extract+advise": the question gets
+    the field block, whose judgement rules answer anything else it asks,
+    after the fields and never refused."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract", (question, signals.evidence)
+    system = source_use.system_text(question)
+    assert system.index(FIELD_RULES) < system.index(JUDGEMENT_RULES), question
+    assert "that part was asked, so answer it after the fields" in system
+    assert "never refuse it" in system
+    return signals
 
 #: The owner's question, exactly as he typed it (conversation
 #: b8b9202e-9966-40c5-8e3c-e3a8c8c881eb, 2026-09-17, Fast mode).
@@ -216,7 +238,7 @@ def test_decision_questions_get_the_advisory_block(question):
     assert "DECISION QUESTION" in system
     assert "clear yes / no / it depends" in system
     assert "never the answer itself" in system  # the vendor referral
-    assert "EXTRACTION QUESTION" not in system
+    assert FIELD_BLOCK not in system
     # Three graded live runs came back "the brochure does not provide full help":
     # a verdict about the PAPER, which is the refusal in a verdict's clothes.
     assert "ABOUT THE THING, NOT THE PAPERWORK" in system
@@ -247,7 +269,7 @@ def test_decision_questions_get_the_advisory_block(question):
 def test_field_questions_stay_strictly_inside_the_document(question):
     assert source_use.question_mode(question) == "extract", question
     system = source_use.system_text(question)
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "Return ONLY what is actually in the document" in system
     assert "do not add advice" in system
     assert "not stated in the document" in system
@@ -258,18 +280,16 @@ def test_an_explicit_judgement_rides_AFTER_the_fields():
     """"...and tell me whether I should renew" asks for both.
 
     The first cut answered it as a pure decision question, which loses the
-    fields. The rule is: extraction wins for the fields, advice may follow
-    after them, clearly separated — so both blocks ride, extraction first.
+    fields. The rule is: the field rules win for the fields, advice follows
+    after them, clearly separated. Since round 7 that is ONE block with two
+    rule sets, fields first, instead of two blocks the router chose between.
     """
     q = "extract the payment terms and tell me whether I should renew"
-    assert source_use.question_mode(q) == "extract+advise"
+    _fields_then_judgement(q)
     system = source_use.system_text(q)
-    assert "EXTRACTION QUESTION" in system
-    assert "ALSO ASKED FOR A JUDGEMENT" in system
-    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
-    assert "Answer in two parts, in this order" in system
+    assert "after the fields, under its own heading" in system
     # The advice half may not reach back into the fields.
-    assert "may change, fill in or round a field in the first part" in system
+    assert "A field the document does not give is never such a part" in system
 
 
 @pytest.mark.parametrize(
@@ -280,7 +300,7 @@ def test_neutral_questions_get_neither_block(question):
     assert source_use.question_mode(question) == ""
     system = source_use.system_text(question)
     assert "DECISION QUESTION" not in system
-    assert "EXTRACTION QUESTION" not in system
+    assert FIELD_BLOCK not in system
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +400,7 @@ def test_an_invoice_upload_never_carries_the_advisory_block(prompt_recorder):
         )
     )
     system = prompt_recorder["messages"][0]["content"]
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "DECISION QUESTION" not in system
 
 
@@ -509,7 +529,7 @@ def test_a_polite_field_ask_is_extraction_not_advice(question):
     """"I need the total" names a FIELD. First person does not make it advice."""
     assert source_use.question_mode(question) == "extract", question
     system = source_use.system_text(question)
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "DECISION QUESTION" not in system
 
 
@@ -527,7 +547,7 @@ def test_contract_fields_are_extraction_not_neutral(question):
     general-knowledge permission then guesses the governing law."""
     assert source_use.question_mode(question) == "extract", question
     system = source_use.system_text(question)
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "DECISION QUESTION" not in system
 
 
@@ -546,7 +566,7 @@ def test_the_extraction_block_overrides_the_general_knowledge_permission():
     [
         OWNER_QUESTION,                                  # advise
         "what is the invoice total?",                    # extract
-        "extract the total and tell me if I should renew",  # extract+advise
+        "extract the total and tell me if I should renew",  # extract, with a judgement
         "summarize this document",                       # neutral
     ],
 )
@@ -581,7 +601,7 @@ def test_a_fully_answered_question_gets_no_unasked_section(question):
     assert "no next steps, no offer of further analysis" in system
     assert "do not pad it with general knowledge" in system
     assert "DECISION QUESTION" not in system
-    assert "EXTRACTION QUESTION" not in system
+    assert FIELD_BLOCK not in system
 
 
 @pytest.mark.parametrize(
@@ -737,7 +757,7 @@ def test_the_misrouted_invoice_turn_builds_a_strict_prompt(prompt_recorder):
         INVOICE_WITHOUT_TAX,
         "invoice.pdf",
     )
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "DECISION QUESTION" not in system
     assert "do not add advice" in system
     assert 'write "not stated in the document"' in system
@@ -751,7 +771,7 @@ def test_the_contract_turn_builds_a_strict_prompt(prompt_recorder):
         CONTRACT,
         "msa.pdf",
     )
-    assert "EXTRACTION QUESTION" in system
+    assert FIELD_BLOCK in system
     assert "DECISION QUESTION" not in system
     assert "OVERRIDES the general-knowledge permission above" in system
 
@@ -769,6 +789,9 @@ def test_the_contract_turn_builds_a_strict_prompt(prompt_recorder):
 # The labels follow the rule the round is built on: strict extraction only on
 # high-precision evidence, and ANY ask for a judgement makes the answer
 # advisory (extract+advise when fields are named too), never extraction alone.
+# Round 7 (2026-09-19) folded extract+advise into "extract": the field block
+# now answers any judgement asked beside its fields, so the eleven "mixed"
+# rows are labelled "extract" and _fields_then_judgement() pins what they get.
 #
 # Covered on purpose: contract and invoice field asks, blunt and polite;
 # decision questions with and without a first-person pronoun; "long term",
@@ -930,17 +953,17 @@ MODE_BATTERY = [
     ('advise', 'is the amount of cooling enough for 20 DGX Sparks?', 'trap-amount-of'),
     ('extract', 'what is the total, in terms of the line items?', 'trap-in-terms-of'),
     ('extract', 'short term this looks fine, but what is the term of the contract?', 'trap-short-term'),
-    ('extract+advise', 'extract the payment terms and tell me whether I should renew', 'mixed'),
-    ('extract+advise', 'what is the annual fee, and do you recommend we sign?', 'mixed'),
-    ('extract+advise', 'give me the total and tell me if it is worth it', 'mixed'),
-    ('extract+advise', 'what is the term and the notice period - should we renew?', 'mixed'),
-    ('extract+advise', 'list the line items and tell me if we are being overcharged', 'mixed'),
-    ('extract+advise', 'what is the total and is it worth it?', 'mixed'),
-    ('extract+advise', 'pull the fees out and tell me whether this is good value', 'mixed'),
-    ('extract+advise', 'who are the parties, and should we sign with them?', 'mixed'),
-    ('extract+advise', 'what is the due date, and do I need to pay early?', 'mixed'),
-    ('extract+advise', 'invoice total please, and is that reasonable for two racks?', 'mixed'),
-    ('extract+advise', 'list the reasons why I should buy this', 'mixed'),
+    ('extract', 'extract the payment terms and tell me whether I should renew', 'mixed'),
+    ('extract', 'what is the annual fee, and do you recommend we sign?', 'mixed'),
+    ('extract', 'give me the total and tell me if it is worth it', 'mixed'),
+    ('extract', 'what is the term and the notice period - should we renew?', 'mixed'),
+    ('extract', 'list the line items and tell me if we are being overcharged', 'mixed'),
+    ('extract', 'what is the total and is it worth it?', 'mixed'),
+    ('extract', 'pull the fees out and tell me whether this is good value', 'mixed'),
+    ('extract', 'who are the parties, and should we sign with them?', 'mixed'),
+    ('extract', 'what is the due date, and do I need to pay early?', 'mixed'),
+    ('extract', 'invoice total please, and is that reasonable for two racks?', 'mixed'),
+    ('extract', 'list the reasons why I should buy this', 'mixed'),
     ('', 'what cooling capacity does this product offer?', 'factual'),
     ('', 'what does clause 11 say?', 'factual'),
     ('', 'what supply water temperature should I run for this unit?', 'factual'),
@@ -987,6 +1010,8 @@ MODE_BATTERY = [
 
 @pytest.mark.parametrize("want,question,group", MODE_BATTERY)
 def test_the_mode_battery_has_no_mismatch(want, question, group):
+    if group == "mixed":
+        _fields_then_judgement(question)
     signals = source_use.classify(question)
     assert signals.mode == want, (
         f"[{group}] {question!r}\n"
@@ -1019,7 +1044,7 @@ def test_the_battery_still_covers_every_group_it_was_built_for():
     for trap in ("trap-long-term", "trap-short-term", "trap-in-terms-of",
                  "trap-total-picture", "trap-whole-party", "trap-amount-of"):
         assert groups[trap] >= 1, f"{trap} dropped out of the battery"
-    for mode in ("extract", "advise", "extract+advise", ""):
+    for mode in ("extract", "advise", ""):
         assert modes[mode] >= 10, f"{mode or 'neutral'}: only {modes[mode]} rows"
 
 
@@ -1050,7 +1075,7 @@ def test_ordinary_english_never_routes_a_decision_to_extraction(question):
     signals = source_use.classify(question)
     assert signals.mode == "advise", (question, signals)
     assert signals.field_score < 2, signals.evidence
-    assert "EXTRACTION QUESTION" not in source_use.system_text(question)
+    assert FIELD_BLOCK not in source_use.system_text(question)
 
 
 @pytest.mark.parametrize(
@@ -1123,7 +1148,7 @@ def test_neutral_never_forbids_a_recommendation():
 )
 def test_the_remaining_field_asks_reach_the_strict_block(question):
     assert source_use.question_mode(question) == "extract", question
-    assert "EXTRACTION QUESTION" in source_use.system_text(question)
+    assert FIELD_BLOCK in source_use.system_text(question)
 
 
 @pytest.mark.parametrize(
@@ -1139,12 +1164,10 @@ def test_the_remaining_field_asks_reach_the_strict_block(question):
 )
 def test_a_decision_signal_beats_a_field_match(question):
     """Rule 2 of the review: a judgement asked for ANYWHERE in the question
-    makes the answer extract+advise, never extraction alone. The fields are
-    still answered first, under the strict rules."""
-    signals = source_use.classify(question)
-    assert signals.mode == "extract+advise", (question, signals)
-    system = source_use.system_text(question)
-    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
+    is answered, never refused. The fields are still answered first, under
+    the field rules."""
+    signals = _fields_then_judgement(question)
+    assert signals.wants_advice, signals.evidence
 
 
 @pytest.mark.parametrize(
@@ -1221,47 +1244,45 @@ def test_help_is_only_a_decision_signal_in_a_frame():
 # ---------------------------------------------------------------------------
 
 
-def test_the_precedence_gives_a_held_signal_back_when_the_fields_win():
-    """The rule, read straight off _apply_precedence with no regex involved.
+def test_no_block_the_router_can_choose_forbids_answering_an_ask():
+    """ROUND 7's invariant, and why the router's misses stopped mattering.
 
-    A narrowing rule may send a question to NEUTRAL, which answers what was
-    asked and still permits a verdict. It may never send one to strict
-    EXTRACTION, whose block says "do not add advice, a recommendation, a next
-    step, a caution or an offer of further help".
-    """
-    def held_only():
-        return source_use._Decision(
-            held=source_use._STRONG,
-            held_why=[("should-inside-a-value-question", "should we")],
-        )
+    Rounds 1-6 pinned this through the router: "a judgement ask may never
+    reach strict EXTRACTION", with a precedence function, held evidence and a
+    clause test to enforce it -- and each blind verifier still found 10-25%
+    of judgement asks that reached it. The strict block is gone. What is
+    asserted now is a property of the three blocks themselves: every one
+    answers a judgement it is asked for, and none bans advice without
+    "that the person did not ask for" in the same sentence. Proved: with the
+    JUDGEMENT RULES sentence removed from FIELDS, the first assertion fails;
+    with the old strict block's unqualified ban put back, the second does."""
+    for mode, block in source_use._BLOCKS.items():
+        system = source_use.system_for_mode(mode)
+        if mode == "extract":
+            assert "that part was asked, so answer it after the fields" in block
+            assert "never refuse it" in block
+        elif mode == "advise":
+            assert "Give a real recommendation" in block
+        else:
+            assert "STOPPING IS NOT REFUSING TO JUDGE" in block
+        for sentence in system.split(". "):
+            if "do not add advice" in sentence.lower():
+                assert "that the person did not ask for" in sentence, (mode, sentence)
+        assert "For this answer do not add advice" not in system
+    assert set(source_use._BLOCKS) == {"extract", "advise", ""}
 
-    below = source_use._apply_precedence(0, held_only())
-    assert below.mode == "", below
-    assert below.held_decision_score == source_use._STRONG
-    assert below.decision_signal_anywhere
 
-    at = source_use._apply_precedence(source_use._FIELD_THRESHOLD, held_only())
-    assert at.mode == "extract+advise", at
-    assert at.held_decision_score == 0, "the held signal is spent, not kept"
-    assert any(
-        kind == "should-restored-beside-a-field-ask" for kind, _ in at.evidence
-    ), at.evidence
-
-
-def test_extraction_alone_is_unreachable_from_any_score_that_carries_a_judgement():
-    """The whole score space, not a sample: 1,000 combinations of the three
-    numbers the precedence sees. Every one that leaves as "extract" carries no
-    judgement evidence at all, held or counted."""
-    seen = {"extract": 0, "extract+advise": 0, "advise": 0, "": 0}
-    for field, score, held in itertools.product(range(10), repeat=3):
-        sig = source_use._apply_precedence(
-            field, source_use._Decision(score=score, held=held)
-        )
-        seen[sig.mode] += 1
-        if sig.mode == "extract":
-            assert not sig.decision_signal_anywhere, (field, score, held, sig)
-    assert seen["extract"], "the search never reached extraction, so it proves nothing"
-    assert seen["extract+advise"], seen
+def test_a_value_question_with_should_beside_a_field_gets_the_field_block():
+    """What the held-evidence machinery existed for, as behaviour. "should"
+    inside a value question is read as asking for a value ("what supply
+    water temperature should I run?" is neutral), and until round 7 that
+    reading, beside a field, sent "what is the invoice total, and should we
+    accept it?" to the strict block (refused 2 of 3 live). The field block
+    now answers the judgement whatever the "should" is taken to mean."""
+    held = source_use.classify("what is the invoice total, and should we accept it?")
+    assert any(k == "should-inside-a-value-question" for k, _ in held.evidence), held.evidence
+    _fields_then_judgement("what is the invoice total, and should we accept it?")
+    assert source_use.question_mode("what supply water temperature should I run?") == ""
 
 
 #: One opener for every word _VALUE_WH_RE names — what / what's / whats / when
@@ -1354,32 +1375,32 @@ def test_every_generated_decision_tail_carries_a_signal_on_its_own():
     """Control 2 for the search: each tail is a judgement ask by itself, so a
     combination that routes to extraction is a signal being DISCARDED and not
     a signal that was never there."""
-    missing = [t for t in _DECISION_TAILS if not source_use.classify(t).decision_signal_anywhere]
+    missing = [t for t in _DECISION_TAILS
+               if not source_use.classify(t).wants_advice
+               and not any(k == "should-inside-a-value-question"
+                           for k, _ in source_use.classify(t).evidence)]
     assert not missing, missing
 
 
-def test_no_generated_combination_routes_to_extraction_alone():
+def test_every_generated_combination_gets_the_fields_and_its_judgement():
     """THE SEARCH. 9,504 questions: every value-wh opener x every field x
     every decision tail x every join.
 
-    Measured on the classifier this test ships with: 0 violations. Measured on
-    the same search against the classifier as it stood before this change:
-    6,336 of 9,504 (66.7%) routed to strict "extract", which is the block that
-    says "do not add advice, a recommendation, a next step, a caution or an
-    offer of further help" — the owner's complaint, reproduced live by QA 3 of
-    3 on a controlled invoice pair.
-
-    It is pinned as a search rather than as rows so that a future edit cannot
-    reintroduce the class by finding a wording nobody thought to write down.
-    """
+    Before round 5, 6,336 of 9,504 (66.7%) routed to the strict block that
+    said "do not add advice, a recommendation, a next step, a caution or an
+    offer of further help" -- the owner's complaint, reproduced live by QA 3
+    of 3 on a controlled invoice pair. Since round 7 every one of them gets
+    the ONE field block, whose judgement rules answer the tail: measured,
+    9,504 of 9,504 "extract" (the no-refusal half is the block invariant,
+    test_no_block_the_router_can_choose_forbids_answering_an_ask)."""
     total = 0
     bad = []
     for question in _generated_questions():
         total += 1
-        if source_use.question_mode(question) == "extract":
+        if source_use.question_mode(question) != "extract":
             bad.append((question, source_use.classify(question).evidence))
     assert total == 9504, total
-    assert not bad, f"{len(bad)} of {total} routed to extraction alone, e.g. {bad[:5]}"
+    assert not bad, f"{len(bad)} of {total} lost the field block, e.g. {bad[:5]}"
 
 
 def test_the_generated_search_covers_both_halves_it_was_built_for():
@@ -1401,10 +1422,8 @@ def test_the_first_word_of_a_question_no_longer_decides_if_it_is_answered():
     phrasing refused the judgement half 3 of 3 ("The document does not provide
     enough information to determine if the invoice should be accepted"), the
     correctly routed one gave a verdict 3 of 3 ("**Yes, accept it.**")."""
-    tell = source_use.classify("tell me the invoice total, and should we accept it?")
-    what = source_use.classify("what is the invoice total, and should we accept it?")
-    assert tell.mode == "extract+advise", tell
-    assert what.mode == "extract+advise", what
+    tell = _fields_then_judgement("tell me the invoice total, and should we accept it?")
+    what = _fields_then_judgement("what is the invoice total, and should we accept it?")
     assert tell.mode == what.mode
 
 
@@ -1423,9 +1442,7 @@ def test_the_first_word_of_a_question_no_longer_decides_if_it_is_answered():
 def test_the_wordings_qa_reproduced_are_answered_in_both_halves(question):
     """Every one of these was verified routing to strict extraction before
     this change; each is a field ask AND a judgement ask."""
-    system = source_use.system_text(question)
-    assert source_use.question_mode(question) == "extract+advise", source_use.classify(question)
-    assert system.index("EXTRACTION QUESTION") < system.index("ALSO ASKED FOR A JUDGEMENT")
+    _fields_then_judgement(question)
 
 
 @pytest.mark.parametrize(
@@ -1445,8 +1462,8 @@ def test_asking_for_an_assessment_is_a_decision_signal(tail):
     """The 2026-09-18 MEDIUM. Alone these are safe — they fall to neutral,
     which permits a judgement — but beside a named field they produced strict
     extraction, and that is the direction this module may not be wrong in."""
-    assert source_use.classify(tail).decision_signal_anywhere, source_use.classify(tail)
-    assert source_use.question_mode(f"what is the invoice total, and {tail}") == "extract+advise"
+    assert source_use.classify(tail).wants_advice, source_use.classify(tail)
+    _fields_then_judgement(f"what is the invoice total, and {tail}")
 
 
 @pytest.mark.parametrize(
@@ -1605,3 +1622,428 @@ def test_the_heading_grader_now_sees_the_source_as_a_bare_subject():
     assert source_named_headings("### 4. Critical Gaps in the Document\n") == []
     assert source_named_headings("### Document Retention\n") == []
 
+
+
+# ---------------------------------------------------------------------------
+# ROUNDS 5 AND 6: judgement asks with NO decision word beside a field ask
+#
+# Round 4's verifier generated 11,475 "field ask + judgement ask" questions and
+# 8,676 took the strict extraction block, which refused the judgement ("I
+# cannot assess its competitiveness based on the provided text"). Rounds 5 and
+# 6 answered with a clause test and then with shapes (an imperative with a noun
+# object, "Okay for us?", "Would we sign it?", "that seems high to me"); each
+# closed what its verifier found, and the next blind verifier found 10-25%
+# more. Round 7 (2026-09-19) removed the strict block instead: every question
+# that names a field gets ONE block whose judgement rules answer whatever else
+# it asks. The clause test, its lexicons and the tests that pinned them are
+# deleted with it; what these tests keep is the BEHAVIOUR they were written
+# for -- every wording below gets the fields AND an answer to its judgement --
+# and the corpora, committed before any detector, still drive it.
+#
+# The vocabulary_off fixture switches the decision vocabulary off: these
+# wordings get the judgement rules because they name a field, not because a
+# decision word was found.
+# ---------------------------------------------------------------------------
+
+from tests import document_judgement_corpus as corpus  # noqa: E402
+
+_ALL_TAILS = corpus.JUDGEMENT_TAILS + corpus.HELD_OUT_TAILS
+_R6_ALL_TAILS = corpus.ROUND6_TAILS + corpus.ROUND6_HELD_OUT_TAILS
+
+
+@pytest.fixture()
+def vocabulary_off(monkeypatch):
+    monkeypatch.setattr(source_use, "_decision_evidence", lambda q: (0, []))
+
+
+def test_the_corpus_tails_are_judgement_asks_by_their_own_wording():
+    """The corpus control: each hand label is checked against the tail's own
+    words, so a label cannot drift away from what it describes."""
+    assert len(corpus.JUDGEMENT_TAILS) >= 80 and len(corpus.HELD_OUT_TAILS) >= 30
+    assert len({t for t, _, _ in _ALL_TAILS}) == len(_ALL_TAILS), "duplicate tail"
+    from collections import Counter
+
+    kinds = Counter(kind for _, kind, _ in _ALL_TAILS)
+    for tail, kind, because in _ALL_TAILS:
+        assert kind in corpus.KINDS, (tail, kind)
+        assert because.lower() in tail.lower(), (tail, because)
+    for kind in corpus.KINDS:
+        assert kinds[kind] >= 3, (kind, kinds[kind])
+
+
+def test_the_round6_rows_are_judgement_asks_by_their_own_wording():
+    assert len(corpus.ROUND6_TAILS) >= 30 and len(corpus.ROUND6_HELD_OUT_TAILS) >= 25
+    every = [t for t, _, _ in _ALL_TAILS + _R6_ALL_TAILS]
+    assert len(set(every)) == len(every), "duplicate tail"
+    for tail, kind, because in _R6_ALL_TAILS:
+        assert kind in corpus.KINDS, (tail, kind)
+        assert because.lower() in tail.lower(), (tail, because)
+
+
+def test_the_decision_vocabulary_is_still_blind_to_most_of_the_corpus():
+    """Why round 7 stopped relying on it. Measured at this commit: most of
+    the hand-written judgement tails carry no decision signal at all, the
+    verifier's own among them -- which is why a router that must SEE the
+    judgement to allow it could never be finished."""
+    tails = _ALL_TAILS + _R6_ALL_TAILS
+    blind = [t for t, _, _ in tails if not source_use.classify(t).wants_advice]
+    assert len(blind) >= len(tails) // 2, (len(blind), len(tails))
+    assert "is that in line with the market?" in blind
+
+
+def test_every_corpus_field_head_reaches_the_field_block_on_its_own():
+    """Control: a combination below cannot pass because its field half quietly
+    failed to register."""
+    wrong = [h for h in corpus.FIELD_HEADS if source_use.question_mode(h + "?") != "extract"]
+    assert not wrong, wrong
+    assert len(corpus.FIELD_HEADS) >= 25 and len(corpus.JOINS) >= 6
+
+
+def test_no_judgement_tail_beside_a_field_loses_the_judgement_rules(vocabulary_off):
+    """THE SEARCH, decision vocabulary OFF: 30 field heads x 175 judgement
+    tails (rounds 5 and 6, dev and held out) x 10 joins x both orders =
+    105,000 questions. Each must get the field block, whose judgement rules
+    answer the tail.
+
+    Before round 7, with its clause test and every shape rule in place, 2,070
+    of the round-5 68,400 and 1,380 of the round-6 36,600 still took the
+    strict block alone; on 4810da0, 55,800 of 68,400. Measured at this
+    commit: 0 of 105,000."""
+    total, lost = 0, []
+    for head, (tail, _, _), join in itertools.product(
+        corpus.FIELD_HEADS, _ALL_TAILS + _R6_ALL_TAILS, corpus.JOINS
+    ):
+        for question in (head + join + tail, tail.rstrip("?") + join + head + "?"):
+            total += 1
+            if source_use.question_mode(question) != "extract":
+                lost.append(question)
+    assert total == 105_000, total
+    assert not lost, f"{len(lost)} lost the field block, e.g. {lost[:5]}"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # round 5: the verifier's live reproduction, and the same ask in other shapes
+        "what is the annual fee in this contract, and is that in line with the market?",
+        "what is the annual fee in this contract and is that in line with the market?",
+        "is that in line with the market? what is the annual fee in this contract",
+        "what is the annual fee in this contract - how does that stack up against the market?",
+        "give me the grand total and tell me if that's in line with the market",
+        "what's the due date, and can we actually meet that?",
+        "what is the notice period; would a lawyer be happy with that?",
+        "list the line items and flag it if that looks unusual",
+        "what is the invoice total, and your thoughts?",
+        "what are the payment terms. is that one-sided?",
+        # round 5: one clause, a field as subject
+        "is the annual fee in this contract in line with the market?",
+        "is the notice period long?",
+        "is the interest rate on late payment steep?",
+        "are the payment terms one-sided?",
+        # round 6, F1: an imperative with any object
+        "what is the annual fee in this contract, and assess the risk",
+        "Extract the payment terms and assess the risk.",
+        "what is the annual fee in this contract but flag any risks",
+        "Highlight any concerns. What is the annual fee in this contract?",
+        "what is the annual fee in this contract, and comment on the pricing",
+        "what is the annual fee in this contract, and rate it out of 10",
+        # round 6, F2: "okay" is the question
+        "what is the annual fee in this contract? Okay for us?",
+        "what is the annual fee in this contract? Ok to sign?",
+        "okay for us, and what is the annual fee in this contract?",
+        # round 6, F3: a modal about the person's own action
+        "what is the annual fee in this contract? Would we sign it?",
+        "what is the invoice total? would I pay that?",
+        # round 6, F7: a statement of view
+        "what is the annual fee in this contract, that seems high to me",
+        "Our CFO thinks it's excessive. What is the annual fee in this contract?",
+        "what is the invoice total - feels like a lot",
+        # round 6: existential, run-on, embedded, why
+        "any red flags, and what is the invoice total?",
+        "Tell me if that's steep What is the annual fee in this contract?",
+        "what is the invoice total, and I wonder if that's steep",
+        "what is the invoice total, and why is the tax amount so high?",
+        # the round-6 verifier's blind residuals (v6-1r-meas), all strict on 899da3d
+        "what is the annual fee in this contract? poke holes in the offer",
+        "what's the notice period, I'm not sure that's fair",
+        "what is the total on this invoice, and help me decide whether to sign",
+        "what's the notice period. our finance lead reckons it's a rip-off",
+        "what is the total on this invoice and deal or no deal",
+        "what is the annual fee in this contract and shall we go ahead",
+    ],
+)
+def test_a_judgement_beside_a_field_gets_the_fields_and_an_answer(vocabulary_off, question):
+    """Every one of these took the strict block alone on some round's code,
+    and the 2026-09-18 live runs show what that cost: "I cannot determine if
+    this is okay" (8 of 8 on "... Okay for us?"). Now each gets the fields and
+    then its judgement, with the decision vocabulary switched off."""
+    _fields_then_judgement(question)
+
+
+def test_the_verifiers_pair_takes_one_route_without_a_decision_word():
+    """The minimal pair, one word different: before round 5 one was refused
+    and the other answered 3 of 3. Both get the same block now, and the
+    market one still carries no decision word -- it does not need one."""
+    market = _fields_then_judgement(
+        "what is the annual fee in this contract, and is that in line with the market?")
+    reasonable = _fields_then_judgement(
+        "what is the annual fee in this contract, and is that reasonable?")
+    assert market.mode == reasonable.mode == "extract"
+    assert not market.wants_advice, market.evidence
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the annual fee, and is it payable in advance?",
+        "what is the invoice total, and does it include VAT?",
+        "what is the due date, and is it a business day?",
+        "what is the notice period, and does it apply to both parties?",
+        "what is the late fee and how is it calculated?",
+        "what is the total, and which clause is it in?",
+        "extract the line items and put them in a table",
+        "what is the total, and can you list the line items?",
+        "is there a PO number on this invoice?",
+        "does the datasheet give a price?",
+        "I need the total from this invoice?",
+        "what is the fee in this contract and in USD?",
+        "summarise the payment terms",
+        "identify the parties to this agreement",
+        "print the line items",
+        "name the parties to the contract",
+        "describe the termination clause",
+        "what is the invoice total, and summarise the line items",
+        "list the line items and put them in a table",
+        "sort the line items by price",
+        "Okay, what is the invoice total?",
+        "ok so what's the due date?",
+        "what is the invoice total? ok",
+        "short term this looks fine, but what is the term of the contract?",
+        "it looks standard, but what is the invoice total?",
+        "what is the notice period, and can we terminate early?",
+    ],
+)
+def test_a_fact_about_a_field_is_still_a_field_ask(question):
+    """The other direction: a follow-up the page CAN answer, filler, a
+    settled view, a handover verb -- the field block, with nothing that
+    invites a judgement nobody asked for ("Answer what was asked and stop")."""
+    signals = source_use.classify(question)
+    assert signals.mode == "extract", (question, signals.evidence)
+    assert "Answer what was asked and stop: do not add advice" in source_use.system_text(question)
+
+
+@pytest.mark.parametrize("follow", ["is it quoted per unit?", "is it per seat?",
+                                    "is that per user?", "is it charged per device?"])
+def test_a_pricing_basis_is_a_field_follow_up_for_every_head(follow):
+    lost = [h for h in corpus.FIELD_HEADS
+            if source_use.question_mode(h + "? " + follow) != "extract"]
+    assert not lost, (follow, lost[:5])
+
+
+@pytest.mark.parametrize("follow", corpus.ROUND6_FACT_FOLLOW_UPS)
+def test_a_fact_follow_up_or_a_courtesy_keeps_every_field_head(follow):
+    lost = []
+    for head, join in itertools.product(corpus.FIELD_HEADS, (", and ", "? ", " - ", ". ")):
+        question = head + join + follow
+        if source_use.question_mode(question) != "extract":
+            lost.append(question)
+    assert not lost, lost[:5]
+
+
+@pytest.mark.parametrize("head", corpus.ROUND6_UNREACHED_FIELD_HEADS)
+def test_the_natural_contract_heads_reach_the_field_block(head):
+    """Five contract fields the lexicon lacked before round 6 ("what's the
+    liability cap", "how long is the non-compete")."""
+    assert source_use.question_mode(head + "?") == "extract", source_use.classify(head + "?")
+
+
+def _pure_field_asks():
+    asks = [h + "?" for h in corpus.FIELD_HEADS + corpus.ROUND6_UNREACHED_FIELD_HEADS]
+    follows = (corpus.FACT_FOLLOW_UPS + corpus.HELD_OUT_FACT_FOLLOW_UPS
+               + corpus.ROUND6_FACT_FOLLOW_UPS + corpus.ROUND6_HELD_OUT_FACT_FOLLOW_UPS)
+    for head, follow, join in itertools.product(corpus.FIELD_HEADS, follows,
+                                                (", and ", "? ", " - ", ". ")):
+        asks.append(head + join + follow)
+    for (a, b), join in itertools.product(corpus.FIELD_PAIRS, corpus.JOINS):
+        asks.append(a + join + b)
+    contexts = (corpus.ROUND6_CONTEXT + corpus.ROUND6_HELD_OUT_CONTEXT
+                + corpus.ROUND6_FRESH_CONTEXT + corpus.ROUND6_FRESH_CONTEXT_2)
+    for head, context, join in itertools.product(corpus.FIELD_HEADS, contexts,
+                                                 (". ", ", ", " - ")):
+        said = context[0].upper() + context[1:]
+        asks += [said + join + head + "?", head + "? " + said + "."]
+    return asks
+
+
+def test_pure_field_asks_keep_the_field_block():
+    """The bar: at least 97% of 12,375 pure field asks (the round-5 set, the
+    round-6 fact follow-ups and courtesies, four sets of context statements)
+    get the field block. Measured at this commit: 12,375 of 12,375."""
+    asks = _pure_field_asks()
+    assert len(asks) == 12_375, len(asks)
+    lost = [q for q in asks if source_use.question_mode(q) != "extract"]
+    kept = len(asks) - len(lost)
+    assert kept >= 0.97 * len(asks), f"{kept}/{len(asks)}; lost e.g. {lost[:8]}"
+
+
+# --- a calculation is not a field -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "what is the sum of the line items?",
+        "add up the line items",
+        "total the line items",
+        "how much do the line items add up to?",
+        "what is the difference between the subtotal and the total?",
+    ],
+)
+def test_a_calculation_beside_a_field_goes_to_neutral(question):
+    """Round 6: the field rules forbid arithmetic in the field lines, so a
+    calculation the person ASKED for goes to NEUTRAL, where BASE says a
+    worked-out figure is yours, with the arithmetic shown. Proved: with
+    _COMPUTE_RE made to match nothing, every row routes "extract"."""
+    signals = source_use.classify(question)
+    assert signals.mode == "", (question, signals.evidence)
+    system = source_use.system_text(question)
+    assert FIELD_BLOCK not in system and "ANSWER THE QUESTION AND STOP" in system
+
+
+def test_how_it_is_calculated_is_still_a_fact_about_the_field():
+    """These ask what the page SAYS about a field. Proved: with the
+    lookarounds on "sum" removed from _COMPUTE_RE, the lump-sum row routes
+    neutral."""
+    for question in ("what is the late fee and how is it calculated?",
+                     "what is the annual fee? is VAT added?",
+                     "what is the annual fee, and is it paid as a lump sum?",
+                     "what are the subtotal and total the invoice shows?"):
+        assert source_use.question_mode(question) == "extract", source_use.classify(question)
+
+
+def test_a_calculation_with_a_judgement_keeps_the_field_block():
+    """A decision word beside a calculation and a field keeps the field
+    block, whose judgement rules cover the calculation ("A calculation you
+    are asked for is yours: show the working and say so")."""
+    q = "add up the line items and tell me if it is worth it"
+    _fields_then_judgement(q)
+    assert "A calculation you are asked for is yours" in source_use.system_text(q)
+    assert source_use.question_mode("add up the line items") == ""
+
+
+# --- the field block no longer turns a misroute into a refusal ---------------
+
+
+def test_the_field_block_forbids_only_what_was_not_asked():
+    """The old strict block said "For this answer do not add advice, a
+    recommendation, a next step, a caution or an offer of further help" with
+    no qualifier; forced into it live, the verifier's market question was
+    answered 0 of 8 times. The field block bans only what the person did not
+    ask for, and says every other ask is answered."""
+    system = source_use.system_text("what is the invoice total?")
+    assert source_use.question_mode("what is the invoice total?") == "extract"
+    assert "For this answer do not add advice" not in system
+    assert "that the person did not ask for" in system
+    assert "that part was asked, so answer it after the fields" in system
+    assert "never refuse it" in system
+    assert "Its FIRST sentence is the verdict" in system
+    assert "never a list of things to go and check" in system
+
+
+def test_the_field_block_still_never_invents_a_value():
+    """What the strict rules exist for, unchanged in force: the "**Tax
+    Amount:** 0.00 USD" fabrication, the governing law filled in from general
+    knowledge."""
+    q = "I need the total from this invoice and the tax amount"
+    system = source_use.system_text(q)
+    assert source_use.question_mode(q) == "extract"
+    assert "for a field, the document is the only source" in system
+    assert 'write "not stated in the document"' in system
+    assert "that line is the whole answer for that" in system
+    assert "with no sentence about why it is missing" in system
+    assert 'it stays "not stated in the document", with nothing added' in system
+    assert "A field the document does not give is never such a part" in system
+    assert "Answer what was asked and stop" in system
+    assert "Give the fields, not the reasoning that found them" in system
+
+
+def test_both_judgement_blocks_share_one_set_of_rules():
+    """A judgement gets the same instruction whichever block it lands in, and
+    the rules quote no failing wording: the model copies what a prompt quotes."""
+    both = source_use.system_text("what is the annual fee, and is that reasonable?")
+    advise = source_use.system_text("is this worth it for us?")
+    assert source_use._JUDGEMENT_RULES in both and source_use._JUDGEMENT_RULES in advise
+    assert both.index(JUDGEMENT_RULES) < both.index(source_use._JUDGEMENT_RULES)
+    for phrase in ("in line with the market", "reasonable?", "competitive",
+                   "does not help", "full help"):
+        assert phrase not in source_use._JUDGEMENT_RULES
+
+
+# --- F6: a strict answer shows no working and explains no missing field -----
+
+#: Real answers from the round-5 verifier's live runs on the itemised tax-free
+#: invoice (INVOICE_WITHOUT_TAX), strict extraction, Fast. The first states a
+#: sum that is false on its own terms (2 x 1,000.00 + 1 x 4,200.00 is
+#: 6,200.00, not 5,200.00).
+_PADDED_WITH_A_FALSE_SUM = (
+    "**Total:** 5,200.00 USD (from the invoice)\n\n**Tax Amount:** Not stated in the "
+    "document\n\nThe invoice lists a total of 5,200.00 USD but does not provide a separate "
+    "line item for tax, nor does it specify a tax rate or amount. The total appears to be "
+    "the sum of the line items (2 x 1,000.00 + 1 x 4,200.00 = 5,200.00), suggesting either "
+    "no tax was applied, tax is included in the unit prices, or the tax amount is zero. "
+    "Without a specific tax line or rate mentioned, the exact tax amount cannot be "
+    "determined from the document."
+)
+_PADDED = (
+    "**Total:** 5,200.00 USD (from the invoice)\n\n**Tax Amount:** Not stated in the "
+    "document. The invoice lists a total of 5,200.00 USD but does not provide a separate "
+    "line item for tax, nor does it specify if tax is included in the line items or the "
+    "total."
+)
+_CLEAN = "**Total:** 5,200.00 USD\n**Tax Amount:** not stated in the document"
+
+
+def test_the_computation_grader_sees_the_false_sum_and_nothing_in_a_clean_answer():
+    assert states_a_computation(_PADDED_WITH_A_FALSE_SUM) == ["2 x 1", "000.00 + 1", "= 5"]
+    assert states_a_computation(_PADDED) == []
+    assert states_a_computation(_CLEAN) == []
+    # a date is not arithmetic, and neither is a field quoted with its unit
+    assert states_a_computation("**Due:** 2026-09-01\n**Rack:** 42U, qty 2") == []
+
+
+def test_the_explanation_grader_sees_padding_and_not_the_field_line():
+    assert len(explains_a_missing_field(_PADDED_WITH_A_FALSE_SUM)) == 3
+    assert explains_a_missing_field(_PADDED) == [
+        "The invoice lists a total of 5,200.00 USD but does not provide a separate line "
+        "item for tax, nor does it specify if tax is included in the line items or the total."
+    ]
+    assert explains_a_missing_field(_CLEAN) == []
+    # a clean contract answer that quotes a clause is not an explanation
+    assert explains_a_missing_field(
+        "**Parties:** Northwind Group Ltd and Acme Racks Ltd\n**Notice:** 90 days written "
+        "notice (Clause 11)") == []
+
+
+def test_the_field_rules_forbid_working_and_talk_about_a_missing_field():
+    """F6. BASE tells every answer to "show the arithmetic" for a figure it
+    worked out and to say the document is silent "in ONE line after" the
+    answer; on the itemised tax-free invoice the strict block obeyed both,
+    live: 4 of 8 answers on 57dcede added a sentence about the missing tax,
+    and a verifier run stated a false sum. The field rules override both for
+    the field lines (round 6: 0 computations, 0 explanations in 16 of 16),
+    and round 7 kept them in the ONE field block, scoped to the field lines,
+    so a judgement or a calculation the person asks for may still work with
+    the numbers. The live test re-measures the behaviour."""
+    q = "I need the total from this invoice and the tax amount"
+    assert source_use.question_mode(q) == "extract"
+    system = source_use.system_text(q)
+    assert "NO ARITHMETIC IN THE FIELDS" in system
+    assert "copy every figure exactly as printed" in system
+    assert "no working beside the fields, not even to show where a total comes from" in system
+    assert "for the fields, this overrides the permission above to show your arithmetic" in system
+    assert "say nothing more about a missing field anywhere in the answer" in system
+    # ... and they bind the field lines only: the judgement may use numbers
+    assert "For those fields this OVERRIDES the general-knowledge permission" in system
+    assert "A calculation you are asked for is yours: show the working" in system
+    # the rule names no failing wording: the model copies what a prompt quotes
+    assert "=" not in source_use.FIELDS and " x " not in source_use.FIELDS

@@ -12,6 +12,14 @@
  * nothing but transport, so there is no way for it to disagree with the gate.
  *
  * NOTHING IS KEPT HERE. The body is a stream that ends when the response does.
+ *
+ * THE ANSWER IS STREAMED TOO (2026-09-18). A long recording decodes for minutes
+ * (595 s of audio took 268.3 s), and the orchestrator keeps the connection
+ * alive with a whitespace byte every 15 s before the JSON. Buffering it here
+ * with `await upstream.text()` held every one of those bytes back until the
+ * transcript existed — the exact silence Cloudflare ends at 125 s. The body is
+ * handed through as it arrives; `no-transform` stops a compressing hop from
+ * collecting it first.
  */
 
 export const runtime = 'nodejs';
@@ -48,10 +56,13 @@ export async function POST(req: Request): Promise<Response> {
       // rather than leaving a GPU transcribing something nobody will read.
       signal: req.signal,
     } as RequestInit & { duplex: 'half' });
-    const body = await upstream.text();
-    return new Response(body, {
+    return new Response(upstream.body, {
       status: upstream.status,
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'no-store, no-transform',
+        'x-accel-buffering': 'no',
+      },
     });
   } catch {
     return Response.json(

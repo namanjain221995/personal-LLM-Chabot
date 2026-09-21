@@ -200,3 +200,44 @@ Operator tools (inside the orchestrator container): `python -m tools.rag_eval`
 watermark reset), `python -m tools.knowledge_admin` (list / quarantine /
 purge shared pages by domain, origin or introducer); on the host,
 `scripts/backup-knowledge.sh` before any change to the stores.
+
+## Dictation (speech to text)
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `ASR_TIMEOUT_S` | `600` | How long the orchestrator waits for one engine to answer one clip. |
+| `ASR_MAX_AUDIO_SECONDS` | `600` | The longest recording accepted; the composer stops recording at it. |
+
+**Measured basis for `ASR_TIMEOUT_S` (2026-09-18, the worker Spark).**
+Whisper's sequential long-form pass took 0.45 s per second of audio on a
+quiet engine (300 s in 132.8 s, 595 s in 268.3 s) and 0.73 s per second with
+other clips queued on the same replica (300 s in 219.7 s; the engine decodes
+one clip at a time and the wait counts). The old default of 240 s therefore
+failed every dictation longer than about 530 s even when quiet, inside the
+600 s the UI allows, and because the timeout was treated as an outage the
+clip was re-sent to the other replica, which could not finish it either.
+360 s would still fail a 600 s clip under load (about 440 s). 600 s — one
+second per second of the longest allowed clip — clears the loaded rate by
+about 37%, and waiting longer costs nothing now that a timeout is never
+re-sent and the route heartbeats.
+
+**A timeout is not an outage.** Only a connection error, a 5xx, or a
+connect/write/pool timeout (the clip never fully reached an engine) moves a
+clip to the other replica. A read timeout stands the replica down but is not
+re-sent, because the engine still holds the clip and a second replica would
+decode it in vain. The person gets a 504 worded from the clip's length: "Try
+a shorter one" only when decoding it on a busy replica (0.73 s per second of
+audio) needs at least half of `ASR_TIMEOUT_S`; a shorter clip met a stuck or
+queued engine and is asked to try again. The trade-off, accepted: a short
+clip on an engine that accepts connections but never answers now waits the
+full `ASR_TIMEOUT_S` instead of being re-sent after it.
+
+**The wait is visible and survives the proxy.** `/audio/transcribe` answers
+within 15 s of starting work: a streamed `200` that sends a whitespace byte
+every 15 s (leading whitespace is legal JSON) and then the JSON. A failure
+after that point is carried in the body as `{"detail", "status"}`. Refusals
+known before any work (401, 403, 404, 413, 415, 422, 429, a busy 503) keep
+their own status line. A client that hangs up does not cancel the work: the
+speech server cannot stop a decode it has started, so the dictation slot
+(`ASR_MAX_CONCURRENT` per engine) stays taken until the engine answers — that
+slot is the only bound on how much decoding members can queue.

@@ -78,8 +78,11 @@ def _wire(monkeypatch, *, plan=None, gap=None, results=None, sources=None, repor
     async def fake_collect(queries, effort="medium", emit=None, categories="", **kw):
         return list(results if results is not None else _results(4))
 
-    async def fake_rerank(message, res, target):
-        return res
+    async def fake_rerank(query, documents, **kw):
+        # No reranker, so `_rank_candidates` keeps engine order — what the
+        # identity fake of `_rerank_results` gave before Deep Research
+        # scored its own candidates (B7b, the relevance floor).
+        raise dr.rerank.RerankUnavailable("offline test")
 
     async def fake_fetch(res, message=""):
         pool = sources if sources is not None else _sources(len(res))
@@ -95,7 +98,7 @@ def _wire(monkeypatch, *, plan=None, gap=None, results=None, sources=None, repor
     monkeypatch.setattr(dr.llm, "json_completion", fake_json_completion)
     monkeypatch.setattr(dr.llm, "stream_chat_events", fake_stream)
     monkeypatch.setattr(dr, "_collect_results", fake_collect)
-    monkeypatch.setattr(dr, "_rerank_results", fake_rerank)
+    monkeypatch.setattr(dr.rerank, "score", fake_rerank)
     monkeypatch.setattr(dr, "_fetch_sources", fake_fetch)
     monkeypatch.setattr(dr, "_spawn", lambda coro: coro.close())
     monkeypatch.setattr(dr.db, "create_research_run", lambda *a, **k: 1)
@@ -432,7 +435,10 @@ def test_a_second_run_from_the_same_person_is_refused_with_a_reason(monkeypatch)
     assert "1 run at a time per person" in out
     # Truthful about WHEN: the wall clock that bounds the other run (R8) is
     # what makes this sentence safe to write.
-    assert "about 10 minutes" in out
+    # 14, not 10, since B3 (2026-09-18): a report still WRITING may run past
+    # its allowance up to `_REPORT_OVERRUN_S`, so the bound a refusal quotes
+    # is now budget + floor + overrun = 600 + 15 + 240 s, about 14 minutes.
+    assert "about 14 minutes" in out
     meta = [p for k, p in events if k == "meta"][-1]
     assert meta["route"] == "deep_research" and meta["sources"] == []
 
@@ -467,7 +473,10 @@ def test_the_process_ceiling_still_holds_against_a_third_person(monkeypatch):
 
     out = asyncio.run(scenario())
     assert "already running 2 research runs" in out
-    assert "The earliest finishes in about 10 minutes" in out
+    # 14, not 10, since B3 (2026-09-18): a report still WRITING may run past
+    # its allowance up to `_REPORT_OVERRUN_S`, so the bound a refusal quotes
+    # is now budget + floor + overrun = 600 + 15 + 240 s, about 14 minutes.
+    assert "The earliest finishes in about 14 minutes" in out
     assert "Web Search" in out
 
 

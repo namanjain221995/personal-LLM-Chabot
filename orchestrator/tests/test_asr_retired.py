@@ -281,12 +281,23 @@ def test_the_pieces_the_next_engine_plugs_into_are_all_still_here():
 
 
 def test_the_transcript_shape_the_response_is_built_from_is_unchanged():
-    """The seven-key public response is assembled from these fields. A change
-    here changes the frontend contract, which was deliberately not touched."""
+    """The public response is assembled from these fields. A change here
+    changes the frontend contract, so the set stays exact.
+
+    `confidence` was added deliberately on 2026-09-21 (audit #24 reframed):
+    the client already computed the engine's no-speech probability and its own
+    plausibility verdict and threw both away, so the composer said "Nothing
+    was said in that recording." for drafts it had emptied itself. It is a
+    closed vocabulary (asr.CONFIDENCE_*), never a sentence and never a
+    number, so it tells a member nothing about the engine."""
     fields = asr.Transcript.__dataclass_fields__
     assert set(fields) == {
         "text", "language", "language_code", "provider", "model",
-        "engine_ms", "degraded",
+        "engine_ms", "degraded", "confidence",
+    }
+    # The three words, and no fourth: the browser maps each one to a line.
+    assert {asr.CONFIDENCE_LOW, asr.CONFIDENCE_UNCLEAR, asr.CONFIDENCE_SILENT} == {
+        "low", "unclear", "silent",
     }
 
 

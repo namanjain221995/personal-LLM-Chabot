@@ -436,8 +436,65 @@ describe('the recorder hook finishing a recording', () => {
       (init.headers as Record<string, string>)['content-type'],
     ).toContain('audio/webm');
 
-    expect(view.onTranscript).toHaveBeenCalledWith('the status');
+    // The second argument is the "check this" line, null when the server was
+    // sure of the draft (2026-09-21; tests/voice-confidence.test.ts).
+    expect(view.onTranscript).toHaveBeenCalledWith('the status', null);
     expect(view.result.current.state).toBe('idle');
+  });
+
+  it('hands back a low-confidence draft AND the line that goes with it', async () => {
+    // The 20 s pink-noise clip, measured 2026-09-21: fourteen invented words
+    // that used to reach the composer as fact. The words still arrive — the
+    // person can read and delete them — and the recorder ends in `idle`, not
+    // `error`, because nothing failed.
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        text: 'the status',
+        language: 'nn',
+        duration_ms: 1200,
+        processing_ms: 310,
+        confidence: 'low',
+      }),
+    );
+    const view = mountRecorder();
+    await record(view, 1200);
+    await act(async () => {
+      view.result.current.stop();
+      await settle();
+    });
+
+    expect(view.onTranscript).toHaveBeenCalledWith(
+      'the status',
+      'That was hard to make out — check the text before you send it.',
+    );
+    expect(view.result.current.state).toBe('idle');
+    expect(view.result.current.error).toBeNull();
+  });
+
+  it('never tells the person a recording was silent when it was not', async () => {
+    // An empty draft whose emptiness the ORCHESTRATOR caused — the words were
+    // dropped as invented, or no second opinion was taken. At 91ac019 every
+    // one of these said "Nothing was said in that recording."
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(200, {
+        text: '',
+        language: null,
+        duration_ms: 1200,
+        processing_ms: 310,
+        confidence: 'unclear',
+      }),
+    );
+    const view = mountRecorder();
+    await record(view, 1200);
+    await act(async () => {
+      view.result.current.stop();
+      await settle();
+    });
+
+    expect(view.onTranscript).not.toHaveBeenCalled();
+    expect(view.result.current.state).toBe('error');
+    expect(view.result.current.error?.message).not.toContain('Nothing was said');
+    expect(view.result.current.error?.retryable).toBe(true);
   });
 
   it('does not transcribe twice when Stop is double-clicked', async () => {

@@ -145,6 +145,28 @@ def test_memory_facts_are_owner_scoped(alice, bob):
     assert bob.delete(f"/memory/facts/{fact_id}").json() == {"deleted": fact_id}
 
 
+def test_clearing_all_memory_deletes_only_the_callers_facts(alice, bob):
+    """B11: DELETE /memory/facts?confirm=all empties the CALLER's memory and
+    nobody else's; without the confirmation it refuses."""
+    bob.post(
+        "/memory/facts",
+        json={"facts": ["Bob prefers green dashboards", "Bob lives in Leeds"]},
+    )
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea", "Alice cycles"]})
+
+    assert alice.delete("/memory/facts").status_code == 422
+    assert alice.delete("/memory/facts?confirm=yes").status_code == 422
+    assert len(alice.get("/memory/facts").json()["facts"]) == 2  # refused means untouched
+
+    assert alice.delete("/memory/facts?confirm=all").json() == {"deleted": 2}
+    assert alice.get("/memory/facts").json()["facts"] == []
+    assert sorted(f["fact"] for f in bob.get("/memory/facts").json()["facts"]) == [
+        "Bob lives in Leeds",
+        "Bob prefers green dashboards",
+    ]
+    assert alice.delete("/memory/facts?confirm=all").json() == {"deleted": 0}
+
+
 # ---------------------------------------------------------------------------
 # Live generations: stop / attach / active
 # ---------------------------------------------------------------------------
@@ -237,3 +259,48 @@ def test_anonymous_chat_is_401(anonymous_mode):
     with TestClient(app) as c:
         resp = c.post("/chat", json={"message": "hi", "mode": "assistant"})
     assert resp.status_code == 401
+
+
+def test_clear_all_signed_out_is_401_and_deletes_nothing(alice, anonymous_mode):
+    """Security review, round 2: signed out, the clear is refused."""
+    from fastapi.testclient import TestClient
+
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea"]})
+    assert TestClient(app).delete("/memory/facts?confirm=all").status_code == 401
+    assert len(alice.get("/memory/facts").json()["facts"]) == 1
+
+
+def test_clear_all_from_a_foreign_origin_is_refused(alice):
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea", "Alice cycles"]})
+    resp = alice.delete("/memory/facts?confirm=all", headers={"Origin": "https://evil.example"})
+    assert resp.status_code == 403
+    assert len(alice.get("/memory/facts").json()["facts"]) == 2
+
+
+@pytest.mark.parametrize(
+    "query", ["", "?confirm=ALL", "?confirm=all%20", "?confirm=1", "?confirm=true", "?Confirm=all"]
+)
+def test_clear_all_needs_the_exact_confirmation(alice, query):
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea"]})
+    assert alice.delete(f"/memory/facts{query}").status_code == 422
+    assert len(alice.get("/memory/facts").json()["facts"]) == 1
+
+
+def test_clear_all_422_does_not_echo_the_query(alice):
+    long = "x" * 64
+    resp = alice.delete(f"/memory/facts?confirm={long}")
+    assert resp.status_code == 422
+    assert long not in resp.text
+
+
+def test_clear_all_keeps_the_callers_conversations(alice, bob):
+    """Verifier, round 2: clearing memory touches facts only."""
+    alice.post("/memory/facts", json={"facts": ["Alice prefers tea", "Alice cycles"]})
+    bob.post("/memory/facts", json={"facts": ["Bob lives in Leeds"]})
+    uid = _uid("alice")
+    db.create_conversation(uid, "alice-chat", "Alice chat")
+    db.add_message(uid, "alice-chat", "user", "Hello there, keep this message.")
+    assert alice.delete("/memory/facts?confirm=all").json() == {"deleted": 2}
+    assert [m["content"] for m in db.list_messages("alice-chat")] == ["Hello there, keep this message."]
+    assert [f["fact"] for f in bob.get("/memory/facts").json()["facts"]] == ["Bob lives in Leeds"]
+    assert bob.delete("/memory/facts?confirm=all").json() == {"deleted": 1}

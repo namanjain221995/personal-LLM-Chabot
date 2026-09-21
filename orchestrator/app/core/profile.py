@@ -1,13 +1,28 @@
 """Tabular profiling (Phase 4).
 
 The model is shown a PROFILE — shape, dtypes, null rates, ranges — never the
-file. Exactly TWO things in a profile are raw data, and they are the only such
-content that reaches a prompt:
+file. Exactly THREE things in a profile are raw data, and they are the only
+such content that reaches a prompt:
 
   * sample rows   (PROFILE_SAMPLE_ROWS, cells truncated)
   * top values    (PROFILE_TOP_VALUES, values truncated)
+  * group values  (aggregates.by_group: the values of a column with at most
+                   50 distinct values that occur in at least GROUP_MIN_ROWS
+                   rows, from a column not named like a personal detail
+                   and with no value shaped like an email or a long number,
+                   and for a key-named column (store_id) only when its values
+                   repeat KEY_GROUP_MIN_ROWS_PER_VALUE times on average;
+                   values truncated. aggregates.by_cross names values too,
+                   but only ones by_group already listed, so it widens
+                   nothing — it adds figures, not content.)
 
-Both go through `clip()`. Everything else is derived statistics.
+All three go through `clip()`. Everything else is derived statistics: sums,
+averages, counts, months. Group values are NOT the same class as top values:
+top values show the 5 most common, group values list up to 50. QA measured
+the difference on 2026-09-18 (a status seen once at row 4,322, 40 synthetic
+SSNs and emails reaching the prompt), so a value seen in one row, and any
+personal column (_personal_name, _personal_value), is never listed value by
+value.
 
 Note what is deliberately ABSENT: min/max VALUES for string columns. Those are
 an arbitrary raw cell from anywhere in the file — the alphabetically first
@@ -20,11 +35,18 @@ Nothing here executes file content: no pickle, no macros, no eval.
 """
 from __future__ import annotations
 
+import csv
+import datetime as _dt
 import json
+import math
 import os
+import re
 import shutil
 import tempfile
-from typing import Any, Dict, List, Optional
+import threading
+from collections import Counter
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import settings
 from . import archive
@@ -72,14 +94,45 @@ def _duck():
     return con
 
 
-def _reader_sql(path: str) -> str:
+#: Rows the CSV type sniffer reads. Types are GUESSED from these rows only.
+_SNIFF_ROWS = 20_000
+
+
+def _is_csv_source(path: str) -> bool:
+    return not path.lower().endswith((".parquet", ".json", ".jsonl", ".ndjson"))
+
+
+def _reader_sql(path: str, *, csv_options: str = "", store_rejects: bool = True) -> str:
     lower = path.lower()
     quoted = path.replace("'", "''")
     if lower.endswith(".parquet"):
         return f"read_parquet('{quoted}')"
     if lower.endswith((".json", ".jsonl", ".ndjson")):
         return f"read_json_auto('{quoted}')"
-    return f"read_csv_auto('{quoted}', SAMPLE_SIZE=20000, IGNORE_ERRORS=true)"
+    extra = f", {csv_options}" if csv_options else ""
+    # store_rejects records every row IGNORE_ERRORS drops, in the SAME parse,
+    # so a malformed line no longer vanishes from every total unsaid. It keeps
+    # each rejected line in memory and takes a slow per-row path, so it is
+    # used ONLY for a file of fewer than _SNIFF_ROWS // 2 lines (at most
+    # 10,000 rejects, of a file under _LINES_READ_MAX). Review round 2
+    # measured it on long files, 4810da0 -> 4b90840: 12M rejected rows (a
+    # 48.8 MB CSV, a 24 KB tar.gz), 0.52 s / 134 MB -> 75.7 s / 16,494 MB. A
+    # long file counts its dropped rows with a text read instead (_text_read).
+    rejects = ", store_rejects=true" if store_rejects else ""
+    return f"read_csv_auto('{quoted}', SAMPLE_SIZE={_SNIFF_ROWS}, IGNORE_ERRORS=true{rejects}{extra})"
+
+
+def _types_option(types: Optional[Dict[str, str]]) -> str:
+    if not types:
+        return ""
+    pairs = ", ".join(
+        "'" + str(n).replace("'", "''") + "': '" + t + "'" for n, t in sorted(types.items())
+    )
+    return f"types={{{pairs}}}"
+
+
+def _join_options(*parts: str) -> str:
+    return ", ".join(p for p in parts if p)
 
 
 def _parse_once_enabled() -> bool:
@@ -98,7 +151,10 @@ def _scratch_dir() -> Optional[str]:
         return None
 
 
-def _columnar_copy(con, path: str, source_columns: List[tuple], scratch: str) -> Optional[str]:
+def _columnar_copy(
+    con, path: str, source_columns: List[tuple], scratch: str, reader: Optional[str] = None,
+    stem: str = "table",
+) -> Optional[str]:
     """Parse a CSV/JSON source ONCE into a scratch Parquet file; the reader
     expression over it, or None to keep reading the source itself.
 
@@ -134,11 +190,12 @@ def _columnar_copy(con, path: str, source_columns: List[tuple], scratch: str) ->
     """
     if path.lower().endswith(".parquet") or not _parse_once_enabled():
         return None
-    target = os.path.join(scratch, "table.parquet")
+    target = os.path.join(scratch, f"{stem}.parquet")
     quoted = target.replace("'", "''")
     copy = f"read_parquet('{quoted}')"
     try:
-        con.execute(f"COPY (SELECT * FROM {_reader_sql(path)}) TO '{quoted}' (FORMAT parquet)")
+        source = reader or _reader_sql(path)
+        con.execute(f"COPY (SELECT * FROM {source}) TO '{quoted}' (FORMAT parquet)")
         copied = con.execute(f"DESCRIBE SELECT * FROM {copy}").fetchall()
     except Exception:  # noqa: BLE001 — the source path reports the real error
         return None
@@ -147,8 +204,1239 @@ def _columnar_copy(con, path: str, source_columns: List[tuple], scratch: str) ->
     return copy
 
 
-def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
-    """Shape, per-column statistics, and a capped sample — no bulk load."""
+# ---------------------------------------------------------------------------
+# Computed aggregates (B2, 2026-09-18)
+# ---------------------------------------------------------------------------
+#
+# The profile used to carry no sum, average or group total, so the model added
+# up `full_rows` itself. Measured live by the audit on 200 rows that were
+# entirely in the prompt: true revenue 1,022,098.02, the model's 2,707,720.92
+# (+165%), every region off by +151% to +206% and ranked wrong. Numbers the
+# model is asked to quote are therefore computed HERE, over every row.
+#
+# out["aggregates"] — the contract the dataset engine codes against:
+#   {"computed": "exact", "measures": [col, ...],
+#    "by_group": [{"group", "measure", "rows": [{"value", "count", "sum", "avg"}], "truncated"}],
+#    "by_month": [{"date", "measure", "rows": [{"month": "YYYY-MM", "count", "sum"}], "truncated"}],
+#    "by_cross": [{"group", "across", "kind": "month"|"group", "measure",
+#                  "rows": [{"value", "cells": [{"month"|"across", "count", "sum"}]}],
+#                  "truncated"}],          # only when `cross` named the pair
+#    "omitted": [reason, ...]}
+#
+# EXACTNESS, stated once:
+#   * integer columns sum as integers (DuckDB HUGEINT): exact.
+#   * DOUBLE columns whose every value is a number of at most 6 decimal places
+#     (to within float noise: a spreadsheet's cached 12.339999999999998 is
+#     12.34) sum as DECIMAL(38,6): exact to the cent and beyond. JSON carries
+#     the sum as a float, which spells the exact decimal up to 15 significant
+#     digits (a total below 10 trillion with cents).
+#   * DOUBLE columns with more decimals than that are measurements, not money:
+#     they sum in double precision (Kahan) rounded to 12 significant digits,
+#     and `omitted` says so.
+#   * avg is the exact sum divided by the non-null count, rounded half-even to
+#     6 decimal places. median and stddev (the SAMPLE deviation, n - 1, as
+#     Excel's STDEV) are double precision rounded to 12 significant digits:
+#     parallel aggregation can move the last bits between runs, and a profile
+#     must be the same every time it is built.
+#   * count is ROWS in the group (as top values count); sum and avg skip nulls.
+
+#: A column with at most this many distinct values gets top values, and is a
+#: grouping key when its values repeat (and it is not a personal column or a
+#: near-unique key, see _is_group_key). Group values go through clip() as top
+#: values do, but a breakdown lists up to 50 of them where top values list 5.
+TOP_VALUES_MAX_DISTINCT = 50
+#: A group value is listed only when at least this many rows hold it. QA,
+#: 2026-09-18: listing every value put a status seen ONCE, at row 4,322 of
+#: 5,000, into the prompt; top values never surface such a cell, because
+#: they show the 5 most common. Values below this are left out, the entry is
+#: marked truncated, and `omitted` says how many there were.
+GROUP_MIN_ROWS = 2
+AGG_MAX_MEASURES = 8
+AGG_MAX_GROUP_COLUMNS = 6
+AGG_MAX_DATE_COLUMNS = 3
+AGG_MAX_MONTHS = 60
+#: THE CROSS IS BOUNDED WHERE IT IS BUILT, not by _cap_aggregates. It is one
+#: measure for every PAIR of values, so 50 regions x 60 months is 3,000 cells
+#: where a one-dimensional breakdown has at most 51 rows — left to the cap it
+#: would either blow the budget or be dropped, and the cross is the one
+#: breakdown the person asked for. Built instead as the top CROSS_MAX_GROUPS
+#: group values by total x the most recent CROSS_MAX_ACROSS months (or the top
+#: CROSS_MAX_ACROSS values of a second grouping column), inside
+#: CROSS_MAX_CELLS figures, with `omitted` saying how many values of each axis
+#: were left out.
+#:
+#: A CELL COSTS ABOUT 120 RENDERED CHARACTERS, measured on the seeded files: a
+#: 60-cell cross took the 3,000-row file's aggregates from 5,537 to 12,773.
+#: CROSS_MAX_CELLS is what keeps one breakdown from eating the whole
+#: 40,000-character block — 96 cells is about 11,500 characters.
+#: MONTHS ARE KEPT BEFORE GROUPS: shrinking the month axis breaks the trend
+#: the cross exists to show, so the group axis gives way first, down to
+#: CROSS_MIN_GROUPS, and only then are columns dropped.
+CROSS_MAX_GROUPS = 12
+CROSS_MAX_ACROSS = 18
+CROSS_MAX_CELLS = 96
+CROSS_MIN_GROUPS = 4
+#: What ONE cross may take of the aggregates budget it is capped against. A
+#: 10-sheet workbook shares AGG_MAX_CHARS across its sheets
+#: (_share_aggregates), and a cross sized for a file on its own left a sheet
+#: nothing at all: measured on a 20,000-row 30-region file at a 12,000
+#: budget, the cross could not fit and the cap dropped every breakdown in the
+#: block, 1,013 characters of nothing but reasons. It is shrunk to this share
+#: instead (_shrink_cross), and dropped only when even a 1 x 1 cross is too
+#: big.
+CROSS_CAP_SHARE = 0.35
+#: Size of the aggregates block AS THE PROMPT RENDERS IT: dataset.format_profile
+#: and the /v1 file context both print profiles with json indent=1, which QA
+#: measured at 1.42x the compact size (38,196 compact -> 54,229 rendered on a
+#: 1M-row file). The size is counted at AGG_RENDER_DEPTH, the nesting of a
+#: sheet's block in the chat prompt (list > workbook > sheets > sheet), the
+#: deepest place a block sits, so every rendering is at most this long.
+#: A WORKBOOK shares one such budget across its sheets (profile_excel).
+#: Over the cap the WIDEST breakdowns go first (_cap_aggregates), each drop
+#: recorded in `omitted`.
+AGG_MAX_CHARS = 40_000
+AGG_RENDER_DEPTH = 4
+#: How many column names one `omitted` reason lists before "and N more".
+_REASON_NAMES = 10
+_EXACT_DECIMALS = 6
+_SIG_DIGITS = 12
+_AVG_STEP = Decimal(1).scaleb(-_EXACT_DECIMALS)
+
+_INT_TYPES = frozenset({
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+    "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT",
+})
+_FLOAT_TYPES = frozenset({"FLOAT", "REAL", "DOUBLE"})
+
+# Name tokens that make a number a KEY, not a quantity to add. Matched as whole
+# tokens (snake_case, camelCase, spaces), so "paid" and "valid" are not "id".
+_KEY_TOKENS = frozenset({
+    "id", "ids", "uuid", "guid", "key", "zip", "zipcode", "postcode", "postal",
+    "pin", "pincode", "phone", "mobile", "tel", "telephone", "fax", "ssn",
+    "code", "sku", "ean", "upc", "isbn", "rowid", "index", "idx",
+})
+_KEY_LAST_TOKENS = frozenset({"no", "num", "nbr", "number"})  # invoice_no, phone number
+_CALENDAR_TOKENS = frozenset({
+    "year", "yr", "fy", "fiscalyear", "month", "quarter", "qtr", "week",
+    "day", "weekday", "hour", "minute", "dow", "doy",
+})
+_COORD_TOKENS = frozenset({"lat", "latitude", "lon", "lng", "longitude"})
+# A name that says money or quantity keeps an all-distinct integer column a
+# measure: twenty salaries in a small file are all different, and still add up.
+_MEASURE_TOKENS = frozenset({
+    "amount", "amt", "revenue", "sales", "sale", "salary", "salaries", "wage",
+    "wages", "pay", "payment", "price", "cost", "costs", "total", "subtotal",
+    "profit", "margin", "income", "expense", "expenses", "spend", "budget",
+    "fee", "fees", "tax", "balance", "value", "qty", "quantity", "units",
+    "volume", "score", "points", "weight", "duration", "hours", "minutes",
+    "count", "gmv", "arr", "mrr", "discount", "commission", "bonus", "net",
+    "gross", "usd", "eur", "inr", "gbp",
+})
+
+
+def _name_tokens(name: Any) -> List[str]:
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name))
+    return [t for t in re.split(r"[^0-9A-Za-z]+", spaced.lower()) if t]
+
+
+def _numeric_kind(dtype: str) -> Optional[str]:
+    d = (dtype or "").upper().strip()
+    if d in _INT_TYPES:
+        return "int"
+    if d.startswith(("DECIMAL", "NUMERIC")):
+        return "decimal"
+    if d in _FLOAT_TYPES:
+        return "float"
+    return None
+
+
+def _date_kind(dtype: str) -> Optional[str]:
+    d = (dtype or "").upper().strip()
+    if d == "DATE":
+        return "date"
+    if d.startswith("TIMESTAMP"):
+        return "tz" if ("TIME ZONE" in d or d == "TIMESTAMPTZ") else "ts"
+    return None
+
+
+def _is_measure(name: Any, dtype: str, nonnull: int, distinct: int, lo: Any, hi: Any) -> bool:
+    """A numeric column worth adding up — not a key, a code, a year or a place."""
+    kind = _numeric_kind(dtype)
+    if kind is None or nonnull <= 0:
+        return False
+    tokens = _name_tokens(name)
+    words = set(tokens)
+    if words & (_KEY_TOKENS | _CALENDAR_TOKENS | _COORD_TOKENS):
+        return False
+    if tokens and tokens[-1] in _KEY_LAST_TOKENS:
+        return False
+    if kind != "int" or words & _MEASURE_TOKENS:
+        return True
+    # A year column by its values (2019..2024 under any name) is a grouping key.
+    if (
+        distinct <= TOP_VALUES_MAX_DISTINCT
+        and isinstance(lo, int) and isinstance(hi, int)
+        and 1900 <= lo and hi <= 2100
+    ):
+        return False
+    # All-distinct integers are a key (order numbers, row numbers).
+    return not (nonnull >= 2 and distinct == nonnull)
+
+
+# A PERSONAL column is never broken down value by value, however few values
+# it has: QA r1 measured a 1,200-row payroll file whose 40 synthetic SSNs and
+# 40 emails ALL reached the prompt through by_group (5 and 9 of them on
+# 4810da0, through the sample and top values). Its top values are unchanged.
+# Personal is a contact detail, a government or financial number, or a
+# credential, by NAME or by VALUE.
+#
+# Names match with digits stripped and, for the longer words, as a prefix or
+# suffix of a token. Security r2: matched as whole tokens, email1, Email2,
+# ssn1 and mobile1 passed the guard and 30 of 30 values of each reached the
+# prompt (WorkEmail, split by camelCase, stayed out).
+#: A token equal to one of these once its digits are stripped (ssn1, ip2).
+#: Short words are not matched inside tokens: "tel" is in hotel, "pin" in spin.
+_PERSONAL_TOKENS = frozenset({
+    "ssn", "sin", "tin", "nin", "pan", "ip", "tel", "fax", "pin", "dob", "cvv",
+    "cvc", "iban", "bic", "swift", "uuid", "guid", "key", "otp", "aadhaar",
+    "aadhar",
+})
+#: A token that starts or ends with one of these (email1, workemail,
+#: phoneno, homephone, mobile2, dateofbirth).
+_PERSONAL_STEMS = (
+    "email", "mail", "phone", "mobile", "passport", "password", "passwd",
+    "secret", "token", "address", "addr", "street", "birth",
+)
+#: Two DIFFERENT words that together name a personal number: national_id,
+#: tax_no, patient_id, card_number, social_security, bank_account,
+#: driver_license. One of them alone (license_type, card_type, tax_rate,
+#: employee_id) is not personal.
+_PERSONAL_PAIRS = (
+    (frozenset({
+        "national", "tax", "voter", "health", "insurance", "medicare", "medicaid",
+        "nhs", "patient", "citizen", "resident", "social", "licence", "license",
+        "card", "routing",
+    }), frozenset({"id", "no", "num", "nbr", "number"})),
+    (frozenset({"social"}), frozenset({"security"})),
+    (frozenset({"credit", "debit"}), frozenset({"card"})),
+    (frozenset({"bank"}), frozenset({"account", "acct"})),
+    (frozenset({"driver", "drivers", "driving"}), frozenset({"licence", "license"})),
+)
+#: Values that look personal whatever the column is called: an email, or a
+#: text with nine or more digits (an SSN has 9, a phone 10-13, a card 13-19,
+#: an IBAN up to 30).
+_EMAIL_SHAPE = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
+_PERSONAL_DIGITS = 9
+
+
+def _personal_name(name: Any) -> bool:
+    tokens = _name_tokens(name)
+    words = {t.strip("0123456789") for t in tokens}
+    if words & _PERSONAL_TOKENS:
+        return True
+    if any(t.startswith(stem) or t.endswith(stem) for t in tokens for stem in _PERSONAL_STEMS):
+        return True
+    return any(words & first and words & second for first, second in _PERSONAL_PAIRS)
+
+
+def _personal_value(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return bool(_EMAIL_SHAPE.search(text)) or sum(ch.isdigit() for ch in text) >= _PERSONAL_DIGITS
+
+
+#: A column named like a key (store_id, region_code, sku, store_no) is a
+#: grouping key only when each value covers at least this many rows on
+#: average; a near-unique identifier (45 order numbers in 60 rows) would list
+#: the file back. 4b90840 excluded every key-named column, and QA r2 measured
+#: the cost live: "revenue by store" over 8 store_id values in 200 orders,
+#: per-store figures 0 of 24 exact and the ranking wrong 3 of 3.
+KEY_GROUP_MIN_ROWS_PER_VALUE = 3
+
+
+def _is_group_key(name: Any, nonnull: int, distinct: int) -> bool:
+    if _personal_name(name):
+        return False
+    tokens = _name_tokens(name)
+    keyish = bool({t.strip("0123456789") for t in tokens} & _KEY_TOKENS) or bool(
+        tokens and tokens[-1] in _KEY_LAST_TOKENS
+    )
+    return not keyish or nonnull >= KEY_GROUP_MIN_ROWS_PER_VALUE * distinct
+
+
+def _label(name: Any) -> str:
+    """A column name inside an `omitted` reason: clipped, so a 6,000-character
+    header cannot make one reason larger than the whole cap."""
+    return str(clip(str(name)))
+
+
+def _names(names: List[Any]) -> str:
+    shown = ", ".join(_label(n) for n in names[:_REASON_NAMES])
+    more = len(names) - _REASON_NAMES
+    return shown + (f" and {more} more" if more > 0 else "")
+
+
+def _sig(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    f = float(value)
+    if not math.isfinite(f):
+        return None
+    return float(f"{f:.{_SIG_DIGITS}g}")
+
+
+def _json_sum(total: Any, mode: str) -> Any:
+    if total is None:
+        return None
+    if mode == "int":
+        return int(total)
+    if mode == "dec":
+        return float(total)  # correctly rounded: spells the exact decimal to 15 digits
+    return _sig(total)
+
+
+def _json_exact(total: Any, mode: str) -> bool:
+    """Whether the JSON number spells the exact total. A DECIMAL sum becomes a
+    float, and a float carries about 15 significant digits: 12345678901234.56
+    survives, 1234567890123456.78 does not."""
+    if total is None or mode != "dec":
+        return True
+    return Decimal(repr(float(total))) == Decimal(total)
+
+
+def _lossy_reason(name: Any) -> str:
+    return (
+        f"{_label(name)}: a total has more significant digits than a JSON number "
+        f"carries exactly (about 15), so it is rounded and its cents are not exact"
+    )
+
+
+def _json_avg(total: Any, n: int, mode: str) -> Optional[float]:
+    if total is None or not n:
+        return None
+    if mode in ("int", "dec"):
+        with localcontext() as ctx:
+            ctx.prec = 80  # a HUGEINT sum has 39 digits; quantize needs room for 6 more
+            mean = (Decimal(total) / Decimal(n)).quantize(_AVG_STEP, rounding=ROUND_HALF_EVEN)
+        return float(mean)
+    return _sig(float(total) / n)
+
+
+def _measure_stats(con, src: str, name: str, ident: str, dtype: str) -> Tuple[Dict[str, Any], Optional[dict], List[str]]:
+    """(column stats, a summing plan for the breakdowns or None, omitted reasons)."""
+    kind = _numeric_kind(dtype)
+    as_double = f"CAST({ident} AS DOUBLE)"
+    if kind == "float":
+        # One scan decides exactness AND computes both candidate sums.
+        exact_ok = (
+            f"bool_and(isfinite({ident}) AND abs({ident}) < 1e30 AND "
+            f"abs({ident} - round({ident}, {_EXACT_DECIMALS})) <= greatest(1e-9, abs({ident}) * 1e-14))"
+        )
+        dec_sum = f"SUM(TRY_CAST({ident} AS DECIMAL(38,{_EXACT_DECIMALS})))"
+        head = f"COUNT({ident}), bool_and(isfinite({ident})), {exact_ok}, {dec_sum}, fsum({ident})"
+    else:
+        head = f"COUNT({ident}), true, true, SUM({ident}), NULL"
+    tail = f"median({as_double}), stddev_samp({as_double}) FILTER (WHERE isfinite({as_double}))"
+    try:
+        n, finite, exact, dsum, fsum, med, sd = con.execute(f"SELECT {head}, {tail} FROM {src}").fetchone()
+    except Exception:  # noqa: BLE001 — a deviation past DOUBLE range: keep the sum
+        n, finite, exact, dsum, fsum, med = con.execute(
+            f"SELECT {head}, median({as_double}) FROM {src}"
+        ).fetchone()
+        sd = None
+    n = int(n or 0)
+    if not finite:
+        return (
+            {"sum": None, "avg": None, "median": None, "stddev": None},
+            None,
+            [f"{_label(name)}: not summed, it holds infinite or NaN values"],
+        )
+    reasons: List[str] = []
+    if kind == "int":
+        mode, total, sum_sql = "int", dsum, f"SUM({ident})"
+    elif kind == "decimal":
+        mode, total, sum_sql = "dec", dsum, f"SUM({ident})"
+    elif exact:
+        mode, total, sum_sql = "dec", dsum, f"SUM(TRY_CAST({ident} AS DECIMAL(38,{_EXACT_DECIMALS})))"
+    else:
+        mode, total, sum_sql = "float", fsum, f"fsum({ident})"
+        reasons.append(
+            f"{_label(name)}: values carry more than {_EXACT_DECIMALS} decimal places, so its totals are "
+            f"double precision rounded to {_SIG_DIGITS} significant digits"
+        )
+    stats = {
+        "sum": _json_sum(total, mode),
+        "avg": _json_avg(total, n, mode),
+        "median": _sig(med),
+        "stddev": _sig(sd),
+    }
+    plan = {"name": name, "ident": ident, "mode": mode, "sum_sql": sum_sql, "lossy": False}
+    if not _json_exact(total, mode):
+        plan["lossy"] = True
+        reasons.append(_lossy_reason(name))
+    return stats, plan, reasons
+
+
+def _ranked(rows: List[tuple]) -> List[tuple]:
+    """Largest total first; ties on row count, then on the value's text
+    exactly as top values break them; the blank group last."""
+    return sorted(
+        rows,
+        key=lambda r: (r[0] is None, r[3] is None, -(r[3] if r[3] is not None else 0), -r[2], r[1] or ""),
+    )
+
+
+def _group_breakdowns(con, src: str, g: dict, plans: List[dict], omitted: List[str]) -> List[dict]:
+    """Every measure broken down by one grouping column.
+
+    Records on `g` what it decided, so a cross over the same column reuses the
+    verdict instead of re-deriving it: `g["listed"]` is the values it is
+    willing to name (those in at least GROUP_MIN_ROWS rows, plus the blank
+    group), and `g["blocked"]` is set when the column's values look personal.
+    """
+    group, gident = g["name"], g["ident"]
+    check_values = g.get("check_values", True)
+    sums = ", ".join(f"{p['sum_sql']}, COUNT({p['ident']})" for p in plans)
+    found = con.execute(
+        f"SELECT {gident}, CAST({gident} AS VARCHAR), COUNT(*), {sums} FROM {src} GROUP BY 1, 2"
+    ).fetchall()
+    # A column whose values look like emails or long numbers is a contact or
+    # account column whatever its name ("contact", "owner"): not listed.
+    if check_values and any(_personal_value(text) for v, text, *_rest in found if v is not None):
+        g["blocked"] = True
+        omitted.append(
+            f"by_group {_label(group)}: not listed, its values look like contact details or account numbers"
+        )
+        return []
+    # A value held by fewer than GROUP_MIN_ROWS rows is one raw cell from
+    # anywhere in the file: it is left out, and the entry says so. The blank
+    # group (None) is not content and always stays.
+    rare = [r for r in found if r[0] is not None and int(r[2]) < GROUP_MIN_ROWS]
+    listed = [r for r in found if r[0] is None or int(r[2]) >= GROUP_MIN_ROWS]
+    g["listed"] = [r[0] for r in listed]
+    if rare:
+        omitted.append(
+            f"by_group {_label(group)}: {len(rare)} value(s) found in only one row are not "
+            f"listed, so its listed groups add up to less than the column totals"
+        )
+    cap = TOP_VALUES_MAX_DISTINCT + 1  # every value, plus the blank group
+    out = []
+    for j, plan in enumerate(plans):
+        per = [(v, text, int(n), rest[2 * j], int(rest[2 * j + 1] or 0)) for v, text, n, *rest in listed]
+        ranked = _ranked(per)
+        if not plan.get("lossy") and not all(_json_exact(r[3], plan["mode"]) for r in ranked[:cap]):
+            plan["lossy"] = True
+            omitted.append(_lossy_reason(plan["name"]))
+        out.append({
+            "group": group,
+            "measure": plan["name"],
+            "rows": [
+                {
+                    "value": clip(v),
+                    "count": n,
+                    "sum": _json_sum(total, plan["mode"]),
+                    "avg": _json_avg(total, nn, plan["mode"]),
+                }
+                for v, _text, n, total, nn in ranked[:cap]
+            ],
+            "truncated": len(ranked) > cap or bool(rare),
+        })
+    return out
+
+
+def _month_breakdowns(con, src: str, date: str, dident: str, kind: str, plans: List[dict], omitted: List[str]) -> List[dict]:
+    # A zoned timestamp is bucketed in UTC: the session zone is the host's,
+    # and the same file must give the same months on every machine.
+    stamp = f"timezone('UTC', {dident})" if kind == "tz" else dident
+    sums = ", ".join(p["sum_sql"] for p in plans)
+    # No WHERE: the rows without a date come back as the NULL month, in the
+    # same scan. They are in no month, so the months add up to less than the
+    # column total, and a model adding them up must be told by how much (QA
+    # r1 F3: 100 rows, every 4th date blank, months 3,750.00 against 4,950.00
+    # with omitted=[], while by_group keeps a blank group and reconciles).
+    # Said in omitted, not as a month row: rows stay 'YYYY-MM' by contract.
+    found = con.execute(
+        f"SELECT strftime(date_trunc('month', {stamp}), '%Y-%m') AS m, COUNT(*), {sums} "
+        f"FROM {src} GROUP BY 1 ORDER BY 1 NULLS LAST"
+    ).fetchall()
+    undated = [r for r in found if r[0] is None]
+    found = [r for r in found if r[0] is not None]
+    if undated:
+        _m, n_undated, *rest = undated[0]
+        totals = ", ".join(
+            f"{_label(plan['name'])} {_json_sum(rest[j], plan['mode']) or 0}" for j, plan in enumerate(plans)
+        )
+        omitted.append(
+            f"by_month {_label(date)}: {int(n_undated)} row(s) have no date and are in no month, so the "
+            f"months add up to less than the column totals by: {totals}"
+        )
+    kept = found[-AGG_MAX_MONTHS:]  # the most recent months
+    for j, plan in enumerate(plans):
+        if not plan.get("lossy") and not all(_json_exact(rest[j], plan["mode"]) for _m, _n, *rest in kept):
+            plan["lossy"] = True
+            omitted.append(_lossy_reason(plan["name"]))
+    return [
+        {
+            "date": date,
+            "measure": plan["name"],
+            "rows": [
+                {"month": m, "count": int(n), "sum": _json_sum(rest[j], plan["mode"])}
+                for m, n, *rest in kept
+            ],
+            "truncated": len(found) > len(kept),
+        }
+        for j, plan in enumerate(plans)
+    ]
+
+
+def _cross_total(sums) -> Any:
+    """Cell sums added up, in the type DuckDB returned them: an int or DECIMAL
+    total stays exact, a float one carries the noise its mode already allows.
+    Used to RANK the axes of a cross, and to say what an axis leaves out."""
+    kept = [s for s in sums if s is not None]
+    if not kept:
+        return None
+    total = kept[0]
+    for v in kept[1:]:
+        total = total + v
+    return total
+
+
+def _cross_axis(cells: List[tuple], at: int) -> List[tuple]:
+    """(value, text, rows, total) per value of one axis of a cross, ranked by
+    _ranked — the order a one-dimensional breakdown uses, so the cross names
+    the same values in the same order."""
+    seen: Dict[Any, List[tuple]] = {}
+    texts: Dict[Any, Any] = {}
+    for r in cells:
+        seen.setdefault(r[at], []).append(r)
+        texts.setdefault(r[at], r[at + 1])
+    return _ranked([
+        (v, texts[v], sum(int(r[4]) for r in rows), _cross_total(r[5] for r in rows))
+        for v, rows in seen.items()
+    ])
+
+
+def _cross_breakdown(
+    con, src: str, group: dict, across: dict, kind: str, plan: dict, omitted: List[str],
+) -> Optional[dict]:
+    """ONE measure broken down by TWO things at once: group x month, or
+    group x group.
+
+    The audit's own headline request — "Generate a PDF report of monthly
+    revenue by region" — asks for exactly this, and nothing computed it:
+    release-2 printed revenue by region and revenue by month side by side and
+    said honestly that the cross was not worked out. It is worked out here,
+    in one GROUP BY, with the measure's own summing plan, so a cell is exact
+    to the cent exactly as a group or a month total is.
+
+    NEITHER AXIS IS NEW RAW CONTENT. Both must already be breakdowns the
+    profile is willing to list: the row axis is a grouping column that passed
+    _is_group_key and the contact-shape check, and only the values
+    _group_breakdowns listed (`g["listed"]`) can label a row, so a value seen
+    in a single row never reaches the prompt through the cross either. A
+    personal-looking column is not a group key, so it can never be an axis.
+
+    The blank group keeps its row, as it does in by_group. A row with no
+    date — or no value for a second grouping column — has no COLUMN to sit
+    under, so it is left out and `omitted` says by how much, the way
+    _month_breakdowns says it for the months.
+    """
+    gident = group["ident"]
+    if kind == "month":
+        # Bucketed in UTC for the same reason _month_breakdowns is: the
+        # session zone is the host's, and one file must give one answer.
+        stamp = f"timezone('UTC', {across['ident']})" if across.get("kind") == "tz" else across["ident"]
+        araw = atext = f"strftime(date_trunc('month', {stamp}), '%Y-%m')"
+        akey = "month"
+    else:
+        araw, atext, akey = across["ident"], f"CAST({across['ident']} AS VARCHAR)", "across"
+    found = con.execute(
+        f"SELECT {gident}, CAST({gident} AS VARCHAR), {araw}, {atext}, COUNT(*), "
+        f"{plan['sum_sql']}, COUNT({plan['ident']}) FROM {src} GROUP BY 1, 2, 3, 4"
+    ).fetchall()
+
+    allowed_g = set(group.get("listed") or [])
+    cells = [r for r in found if r[0] in allowed_g]
+    if kind == "month":
+        gone = [r for r in cells if r[2] is None]
+        cells = [r for r in cells if r[2] is not None]
+    else:
+        allowed_a = set(across.get("listed") or [])
+        gone = [r for r in cells if r[2] not in allowed_a or r[2] is None]
+        cells = [r for r in cells if r[2] in allowed_a and r[2] is not None]
+    if not cells:
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: not computed, no pair of "
+            f"values has rows that both breakdowns list"
+        )
+        return None
+
+    # Which COLUMNS the table has: the most recent months, as by_month keeps
+    # them, or the largest values of a second grouping column, as by_group
+    # ranks them. Both axes are ranked on each value's WHOLE total, including
+    # the cells that will not fit: which months and which groups matter is a
+    # fact about the file, not about how many of them the budget allows.
+    axis_a = _cross_axis(cells, 2)
+    axis_g = _cross_axis(cells, 0)
+    n_g, n_a = min(CROSS_MAX_GROUPS, len(axis_g)), min(CROSS_MAX_ACROSS, len(axis_a))
+    while n_g * n_a > CROSS_MAX_CELLS and n_g > CROSS_MIN_GROUPS:
+        n_g -= 1
+    while n_g * n_a > CROSS_MAX_CELLS and n_a > 1:
+        n_a -= 1
+    kept_across = (
+        sorted(r[0] for r in axis_a)[-n_a:] if kind == "month"
+        else [r[0] for r in axis_a[:n_a]]
+    )
+    across_at = {v: i for i, v in enumerate(kept_across)}
+    kept_groups = [r[0] for r in axis_g[:n_g]]
+
+    per_group: Dict[Any, List[tuple]] = {}
+    for r in cells:
+        per_group.setdefault(r[0], []).append(r)
+
+    out_rows = []
+    lossy = plan.get("lossy")
+    for value in kept_groups:
+        mine = sorted(
+            (r for r in per_group.get(value, ()) if r[2] in across_at), key=lambda r: across_at[r[2]]
+        )
+        if not mine:
+            continue
+        if not lossy and not all(_json_exact(r[5], plan["mode"]) for r in mine):
+            lossy = True
+            omitted.append(_lossy_reason(plan["name"]))
+        out_rows.append({
+            "value": clip(value),
+            "cells": [
+                {
+                    akey: (r[2] if kind == "month" else clip(r[2])),
+                    "count": int(r[4]),
+                    "sum": _json_sum(r[5], plan["mode"]),
+                }
+                for r in mine
+            ],
+        })
+    if lossy:
+        plan["lossy"] = True
+    if not out_rows:
+        return None
+
+    dropped_g = len(axis_g) - len(kept_groups)
+    dropped_a = len(axis_a) - len(kept_across)
+    if dropped_g or dropped_a:
+        parts = []
+        if dropped_g:
+            parts.append(f"{dropped_g} further {_label(group['name'])} value(s)")
+        if dropped_a:
+            parts.append(
+                f"{dropped_a} further month(s)" if kind == "month"
+                else f"{dropped_a} further {_label(across['name'])} value(s)"
+            )
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: "
+            + " and ".join(parts)
+            + " are not listed, so the pairs it holds add up to less than the column totals"
+        )
+    if gone:
+        # A row is left out of the cross when it has no value to sit under:
+        # no date (there is no NULL month, by contract), or a value of the
+        # second column that breakdown will not name (GROUP_MIN_ROWS).
+        n_gone = sum(int(r[4]) for r in gone)
+        total_gone = _cross_total(r[5] for r in gone)
+        why = (
+            "have no date and are under no month" if kind == "month"
+            else f"are under no {_label(across['name'])} value listed here"
+        )
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: {n_gone} row(s) {why}, "
+            f"so the pairs it holds add up to less than the column totals by: "
+            f"{_label(plan['name'])} {_json_sum(total_gone, plan['mode']) or 0}"
+        )
+    return {
+        "group": group["name"],
+        "across": across["name"],
+        "kind": kind,
+        "measure": plan["name"],
+        "rows": out_rows,
+        "truncated": bool(dropped_g or dropped_a),
+    }
+
+
+def _plan_cross(
+    con, src: str, cross: Any, groups: List[dict], dates: List[dict], plans: List[dict],
+    omitted: List[str],
+) -> Optional[dict]:
+    """The requested cross, or None with a reason when an axis cannot carry one.
+
+    `cross` is {"group", "across", "measure"} — the pair the person's request
+    named, chosen by the engine that read the request (engines/dataset_report
+    .cross_request). Nothing here trusts those names: an axis is used only if
+    it is a column this profile ALREADY broke down, which is what keeps a
+    personal-looking column out of a cross.
+    """
+    if not isinstance(cross, dict):
+        return None
+    want_group, want_across = cross.get("group"), cross.get("across")
+    listed_groups = {g["name"]: g for g in groups[:AGG_MAX_GROUP_COLUMNS] if not g.get("blocked")}
+    listed_dates = {d["name"]: d for d in dates[:AGG_MAX_DATE_COLUMNS]}
+    group = listed_groups.get(want_group)
+    across = listed_dates.get(want_across)
+    kind = "month"
+    if across is None:
+        across = listed_groups.get(want_across)
+        kind = "group"
+    if group is None or across is None or group is across:
+        if want_group is not None and want_across is not None:
+            omitted.append(
+                f"by_cross {_label(want_group)} x {_label(want_across)}: not computed, a breakdown by "
+                f"two things at once needs both of them to be broken down on their own first"
+            )
+        return None
+    plan = next((p for p in plans if p["name"] == cross.get("measure")), None) or plans[0]
+    try:
+        return _cross_breakdown(con, src, group, across, kind, plan, omitted)
+    except Exception as exc:  # noqa: BLE001 — the one-dimensional figures still answer
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: could not be computed "
+            f"({type(exc).__name__})"
+        )
+        return None
+
+
+# --- Size, as the prompt renders it ----------------------------------------
+#
+# json.dumps(indent=1) is the pure-Python encoder (the C one only runs without
+# an indent), so a block is never re-rendered per drop. Its rendered length is
+# the compact length (C encoder) plus the whitespace indent=1 adds, which is
+# exact and depends only on the SHAPE: a non-empty container whose line sits
+# at depth d, holding n items, gains n*(d+1) + d + 2 characters over compact
+# (a newline and d+1 spaces per item, a newline and d spaces before the
+# closing bracket, minus the space compact puts after each comma).
+
+
+def _indent_extra(obj: Any, depth: int) -> int:
+    if isinstance(obj, dict):
+        items = list(obj.values())
+    elif isinstance(obj, (list, tuple)):
+        items = list(obj)
+    else:
+        return 0
+    if not items:
+        return 0
+    n = len(items)
+    return n * (depth + 1) + depth + 2 + sum(_indent_extra(v, depth + 1) for v in items)
+
+
+def _rendered_len(obj: Any, depth: int = AGG_RENDER_DEPTH) -> int:
+    """len(the text json.dumps(..., indent=1) prints for obj when its first
+    line sits at `depth`)."""
+    return len(json.dumps(obj, ensure_ascii=False, default=str)) + _indent_extra(obj, depth)
+
+
+def _list_len(items_total: int, n: int, depth: int) -> int:
+    """Rendered length of an n-item list whose line sits at `depth`, from the
+    sum of its items' own rendered lengths (each measured at depth + 1)."""
+    if not n:
+        return 2
+    return items_total + n * (depth + 2) + (n - 1) + depth + 3
+
+
+def _agg_chars(agg: Dict[str, Any]) -> int:
+    return _rendered_len(agg, AGG_RENDER_DEPTH)
+
+
+#: The breakdown lists the cap arbitrates between, and the order it drops
+#: them in. `by_cross` is last on purpose: it is the ONE breakdown the
+#: person's request named, it is already bounded where it is built
+#: (CROSS_MAX_GROUPS x CROSS_MAX_ACROSS), and dropping it would put the
+#: answer back to "that figure is not computed" with the budget spent on
+#: breakdowns nobody asked for.
+_AGG_LISTS = ("by_group", "by_month", "by_cross")
+
+
+def _agg_cells(entry: Any) -> int:
+    """How WIDE a breakdown is, in figures. A cross holds one figure per pair,
+    so its `rows` count understates it by the width of its table."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("rows"), list):
+        return 0
+    rows = entry["rows"]
+    if not any(isinstance(r, dict) and isinstance(r.get("cells"), list) for r in rows):
+        return len(rows)
+    return sum(len(r["cells"]) for r in rows if isinstance(r, dict) and isinstance(r.get("cells"), list))
+
+
+def _drop_order(kind: str, i: int, cells: int) -> tuple:
+    """Sort key: everything but a cross first, widest first; on a tie the
+    later breakdown goes first (the later measure, then the later column), so
+    the order is fixed by the file."""
+    return (kind == "by_cross", -cells, kind == "by_group", -i)
+
+
+def _dropped_reason_cap(kind: str, entry: Dict[str, Any], limit: int) -> str:
+    if kind == "by_cross":
+        return (
+            f"by_cross {_label(entry.get('group'))} x {_label(entry.get('across'))}: the breakdown of "
+            f"{_label(entry.get('measure'))} by both was dropped to keep the aggregates under "
+            f"{limit} characters"
+        )
+    label = entry.get("group") if kind == "by_group" else entry.get("date")
+    return (
+        f"{kind} {_label(label)} x {_label(entry['measure'])}: dropped to keep the aggregates "
+        f"under {limit} characters"
+    )
+
+
+def _shrink_cross(agg: Dict[str, Any], limit: int) -> None:
+    """Cut a cross down to CROSS_CAP_SHARE of `limit`, before any breakdown is
+    dropped, and say what that cut cost.
+
+    A cross is bounded where it is built, but against the budget a FILE gets;
+    a workbook's sheet may be capped against a tenth of that. Shrinking it
+    here keeps the pairs that matter — the largest groups, the most recent
+    months — where dropping the whole entry would leave the question
+    unanswered and the budget spent on breakdowns nobody asked for.
+    """
+    room = int(limit * CROSS_CAP_SHARE)
+    item_depth = AGG_RENDER_DEPTH + 2
+    for entry in agg.get("by_cross") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("rows"), list):
+            continue
+        month = entry.get("kind") == "month"
+        cut_g = cut_a = 0
+        while _rendered_len(entry, item_depth) > room and entry["rows"]:
+            widest = max((len(r["cells"]) for r in entry["rows"]), default=0)
+            if len(entry["rows"]) > CROSS_MIN_GROUPS or widest <= 1:
+                entry["rows"].pop()  # the smallest total: _cross_axis ranked them
+                cut_g += 1
+            else:
+                # The oldest month, or the smallest value of a second group:
+                # cells are written in the axis order the build chose.
+                for r in entry["rows"]:
+                    if len(r["cells"]) > 1:
+                        r["cells"].pop(0 if month else -1)
+                cut_a += 1
+        if cut_g or cut_a:
+            entry["truncated"] = True
+            parts = []
+            if cut_g:
+                parts.append(f"{cut_g} more {_label(entry.get('group'))} value(s)")
+            if cut_a:
+                parts.append(
+                    f"{cut_a} more month(s)" if month
+                    else f"{cut_a} more {_label(entry.get('across'))} value(s)"
+                )
+            agg["omitted"].append(
+                f"by_cross {_label(entry.get('group'))} x {_label(entry.get('across'))}: "
+                + " and ".join(parts)
+                + f" were left out to keep the aggregates under {limit} characters"
+            )
+    agg["by_cross"] = [e for e in agg["by_cross"] if not isinstance(e, dict) or e.get("rows")]
+    if not agg["by_cross"]:
+        del agg["by_cross"]
+
+
+def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
+    """Shrink the block until its rendered size fits `limit` (AGG_MAX_CHARS).
+
+    First the WIDEST breakdowns go: the most FIGURES (groups, months, or the
+    pairs of a cross), not the most characters. Measured on a 1M-row sales
+    file: ranked by characters, the cap dropped revenue-by-month and
+    cost-by-month and kept unit_price- and discount-by-month, because a money
+    total has more digits — the most useful breakdowns went first. Figure
+    count does not depend on the values.
+
+    A CROSS IS DROPPED LAST (_AGG_LISTS): it is the one breakdown the request
+    named, and it is already bounded where it is built.
+
+    Only a pathological file gets further (QA: eight measures with
+    6,000-character headers made the `measures` list alone 48,249 characters
+    against the 40,000 cap). Then `measures` is cut from the end — each
+    measure's totals stay in its own column entry — and last the `omitted`
+    reasons, keeping the first.
+    """
+    limit = AGG_MAX_CHARS if limit is None else limit
+    if _agg_chars(agg) <= limit:
+        return
+    if agg.get("by_cross"):
+        _shrink_cross(agg, limit)
+        if _agg_chars(agg) <= limit:
+            return
+    d = AGG_RENDER_DEPTH
+    item_depth = d + 2  # agg keys sit at d + 1, their list items at d + 2
+    lists = [k for k in _AGG_LISTS if isinstance(agg.get(k), list)]
+    widths = {}
+    order = []
+    for kind in lists:
+        for i, entry in enumerate(agg[kind]):
+            widths[(kind, i)] = _rendered_len(entry, item_depth)
+            order.append((_drop_order(kind, i, _agg_cells(entry)), (kind, i)))
+    order = [key for _rank, key in sorted(order)]
+    # Sizes are tracked arithmetically: the skeleton (everything but the
+    # breakdown lists and the reasons) plus each list rendered from its items'
+    # lengths.
+    empty = {**agg, "omitted": [], **{k: [] for k in lists}}
+    skeleton = _rendered_len(empty, d) - 2 * (len(lists) + 1)
+    kept = {kind: [widths[(kind, i)] for i in range(len(agg[kind]))] for kind in lists}
+    sums = {kind: sum(v) for kind, v in kept.items()}
+    counts = {kind: len(v) for kind, v in kept.items()}
+    notes = [len(json.dumps(r, ensure_ascii=False)) for r in agg["omitted"]]
+    note_sum, note_n = sum(notes), len(notes)
+
+    def size() -> int:
+        return (
+            skeleton
+            + sum(_list_len(sums[k], counts[k], d + 1) for k in lists)
+            + _list_len(note_sum, note_n, d + 1)
+        )
+
+    dropped = set()
+    for key in order:
+        if size() <= limit:
+            break
+        kind, i = key
+        reason = _dropped_reason_cap(kind, agg[kind][i], limit)
+        dropped.add(key)
+        agg["omitted"].append(reason)
+        sums[kind] -= widths[key]
+        counts[kind] -= 1
+        note_sum += len(json.dumps(reason, ensure_ascii=False))
+        note_n += 1
+    for kind in lists:
+        agg[kind] = [e for i, e in enumerate(agg[kind]) if (kind, i) not in dropped]
+    # The arithmetic above is exact for json.dumps' separators; this re-check
+    # keeps the cap a guarantee if that ever changes.
+    while _agg_chars(agg) > limit and any(agg[k] for k in lists):
+        kind, i = min(
+            ((k, i) for k in lists for i in range(len(agg[k]))),
+            key=lambda k: _drop_order(k[0], k[1], _agg_cells(agg[k[0]][k[1]])),
+        )
+        agg["omitted"].append(_dropped_reason_cap(kind, agg[kind].pop(i), limit))
+    if _agg_chars(agg) <= limit:
+        return
+    # Only column NAMES and reasons are left. Cut measures from the end,
+    # keeping room for one reason that says so.
+    note = "{} measures not listed here: their names alone exceed the size cap; each keeps its totals in its column"
+    cut = 0
+    while agg["measures"] and _agg_chars(agg) + len(note) + 16 > limit:
+        agg["measures"].pop()
+        cut += 1
+    if cut:
+        agg["omitted"].insert(0, note.format(cut))
+    popped = 0
+    while _agg_chars(agg) > limit and len(agg["omitted"]) > 1:
+        agg["omitted"].pop()
+        popped += 1
+    if popped:
+        agg["omitted"][-1] = f"{popped + 1} omissions not listed: the column names alone exceed the cap"
+    while _agg_chars(agg) > limit and agg["omitted"]:
+        agg["omitted"].pop()
+
+
+def _aggregates(
+    con, src: str, measures: List[dict], groups: List[dict], dates: List[dict], omitted: List[str],
+    limit: Optional[int] = None, cross: Any = None,
+) -> Dict[str, Any]:
+    # `omitted` right after `computed`: a reader that cuts the rendered
+    # profile (the /v1 file context stops at 24,000 characters) must not keep
+    # "exact" and the totals while losing what qualifies them. QA r2 measured
+    # the dropped-rows reason at offset 34,627 of 36,725, after every total.
+    agg: Dict[str, Any] = {
+        "computed": "exact",
+        "omitted": omitted,
+        "measures": [],
+        "by_group": [],
+        "by_month": [],
+    }
+    plans = measures[:AGG_MAX_MEASURES]
+    extra = [m["name"] for m in measures[AGG_MAX_MEASURES:]]
+    if extra:
+        omitted.append(
+            f"measures beyond the first {AGG_MAX_MEASURES} have column totals but no breakdowns: "
+            + _names(extra)
+        )
+    agg["measures"] = [p["name"] for p in plans]
+    if not plans:
+        _cap_aggregates(agg, limit)
+        return agg
+    if len(groups) > AGG_MAX_GROUP_COLUMNS:
+        omitted.append(
+            f"group columns beyond the first {AGG_MAX_GROUP_COLUMNS} are not broken down: "
+            + _names([g["name"] for g in groups[AGG_MAX_GROUP_COLUMNS:]])
+        )
+    for g in groups[:AGG_MAX_GROUP_COLUMNS]:
+        try:
+            agg["by_group"].extend(_group_breakdowns(con, src, g, plans, omitted))
+        except Exception as exc:  # noqa: BLE001 — one bad column must not sink the rest
+            omitted.append(f"by_group {_label(g['name'])}: could not be computed ({type(exc).__name__})")
+    if len(dates) > AGG_MAX_DATE_COLUMNS:
+        omitted.append(
+            f"date columns beyond the first {AGG_MAX_DATE_COLUMNS} have no monthly totals: "
+            + _names([d["name"] for d in dates[AGG_MAX_DATE_COLUMNS:]])
+        )
+    for d in dates[:AGG_MAX_DATE_COLUMNS]:
+        try:
+            agg["by_month"].extend(_month_breakdowns(con, src, d["name"], d["ident"], d["kind"], plans, omitted))
+        except Exception as exc:  # noqa: BLE001
+            omitted.append(f"by_month {_label(d['name'])}: could not be computed ({type(exc).__name__})")
+    # LAST, because it reuses what the two above decided (which values each
+    # column is willing to name), and FIRST in the block, because it is the
+    # figure the request asked for: the reader meets it before the two
+    # one-dimensional breakdowns it reconciles against.
+    entry = _plan_cross(con, src, cross, groups, dates, plans, omitted)
+    if entry is not None:
+        agg = _insert_after(agg, "measures", "by_cross", [entry])
+    _cap_aggregates(agg, limit)
+    return agg
+
+
+def _reject_floor(con) -> int:
+    """The last reject scan so far (-1 when none): rows dropped by LATER scans
+    are the ones the statistics about to be computed will miss."""
+    try:
+        got = con.execute("SELECT max(scan_id) FROM reject_scans").fetchone()[0]
+    except Exception:  # noqa: BLE001 — no CSV scanned yet: no table
+        return -1
+    return -1 if got is None else int(got)
+
+
+def _dropped_rows(con, floor: int) -> Tuple[int, List[str]]:
+    """(rows IGNORE_ERRORS dropped in the widest scan after `floor`, the
+    columns named in their errors). One scan in the parse-once path; per
+    statement, each scan drops only rows failing in the columns it reads."""
+    try:
+        found = con.execute(
+            "SELECT scan_id, COUNT(DISTINCT line), list(DISTINCT column_name) "
+            f"FROM reject_errors WHERE scan_id > {int(floor)} GROUP BY 1"
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — no CSV scanned: nothing dropped
+        return 0, []
+    if not found:
+        return 0, []
+    _scan, n, cols = max(found, key=lambda r: (r[1], r[0]))
+    return int(n), sorted(str(c) for c in (cols or []) if c is not None)
+
+
+#: _lines_at_least never reads more than this: a 2 GB file of a few very long
+#: lines would otherwise be read whole just to count them.
+_LINES_READ_MAX = 64 * 1024 * 1024
+
+
+def _lines_at_least(path: str, n: int) -> bool:
+    """Whether the file has at least n line breaks, reading no further than
+    that. Rows never outnumber line breaks, so a file with fewer is inside the
+    sniff window and needs no re-check."""
+    seen_n = seen_r = 0
+    try:
+        if os.path.getsize(path) >= _LINES_READ_MAX:
+            return True  # a file this size is re-checked without counting
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    return False
+                seen_n += chunk.count(b"\n")
+                seen_r += chunk.count(b"\r")
+                if max(seen_n, seen_r) >= n:
+                    return True
+    except OSError:
+        return False
+
+
+def _checkable(dtype: str) -> Optional[str]:
+    """The type a text cell is TRY_CAST to when asking whether the typed
+    parse could have read it, or None for types a CSV never infers."""
+    d = (dtype or "").upper().strip()
+    if d in _INT_TYPES or d in _FLOAT_TYPES or d in ("DATE", "TIME", "BOOLEAN") or d.startswith("TIMESTAMP"):
+        return d
+    if re.fullmatch(r"(DECIMAL|NUMERIC)\(\d+,\s*\d+\)", d):
+        return d
+    return None
+
+
+def _quote_ident(name: Any) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sql_text(value: Any) -> str:
+    text = "" if value is None or value == "(empty)" else str(value)
+    return "'" + text.replace("'", "''") + "'"
+
+
+#: The text read runs beside the typed copy, so it is kept small: four
+#: threads and a 4 MiB read buffer (the default max_line_size is 2 MiB).
+#: Measured on the worker, 4810da0 -> this, median of 5: an 815 MB CSV of
+#: rejected rows 0.52 s / 748 MB -> 0.57 s / 551 MB; 12.2M rejected short
+#: rows 0.26 s / 124 MB -> 0.33 s / 178 MB. With DuckDB's defaults (every
+#: core, 32 MiB buffers) the pair cost up to 1.73x the memory of 4810da0,
+#: and with two threads 1.62x the time.
+_TEXT_READ_THREADS = 4
+_TEXT_READ_BUFFER = 4 * 1024 * 1024
+
+
+def _text_read(path: str, csv_options: str, names: List[str], ints: List[tuple]) -> Optional[Dict[str, Any]]:
+    """Read a long CSV once more, AS TEXT, to see what the typed parse could
+    not: {"rows": records in the file, "fractional": {int column: values
+    with decimals}, "reader": the text reader's SQL}, or None when the read
+    could not run.
+
+    Two things go wrong past the first _SNIFF_ROWS rows, where the column
+    types are a guess:
+      * QA, 2026-09-18: whole-dollar revenue for 25,000 rows then cents was
+        typed BIGINT, and DuckDB ROUNDS '2051.01' into a BIGINT without an
+        error: 127,559,755 against a true 127,559,748.92, nothing flagged.
+      * a value the type cannot hold ('N/A' in a number column) or a line
+        with an extra field (an unquoted comma) makes IGNORE_ERRORS drop the
+        whole row, from every total.
+    Read as text with null_padding and strict_mode off, every record parses,
+    so COUNT(*) minus the typed row count is the rows dropped, with nothing
+    stored per row (store_rejects kept each one: 16.5 GB for a 48.8 MB
+    file). The typed reader's own projection-free COUNT(*) cannot stand in:
+    measured, it skips a line of the wrong width, and it never casts, so a
+    bad number is counted as read. The dialect is PINNED to what the typed
+    read's sniffer chose (sniff_csv, same options) and the column names are
+    the typed read's: sniffed again with strict_mode off, DuckDB 1.5.5 missed
+    the quote character of a quoted header and split 'rev "gross", eur' in
+    two. A clean file gives equal counts (quoted newlines, CRLF, blank lines,
+    no trailing newline); a line of too many or too few fields is counted.
+
+    Only the count and a cheap fraction test run over every row: a whole
+    number column is cast to DOUBLE only where the text holds a '.', and in a
+    CASE, because DuckDB evaluates both sides of an AND. Measured on 2.2M
+    rows of '1,x': count alone 0.055 s, cast everywhere 0.148 s, contains()
+    AND cast 0.244 s, CASE 0.063 s. Which columns lost rows is asked
+    afterwards, and only when rows were lost (_failed_columns).
+    It runs on its OWN connection while the typed copy is made (_TextCheck).
+    """
+    quoted = path.replace("'", "''")
+    extra = f", {csv_options}" if csv_options else ""
+    con = _duck()
+    try:
+        con.execute(f"SET threads={_TEXT_READ_THREADS}")
+        delim, quote, escape, new_line, comment, skip, header = con.execute(
+            "SELECT Delimiter, Quote, Escape, NewLineDelimiter, Comment, SkipRows, HasHeader "
+            f"FROM sniff_csv('{quoted}', sample_size={_SNIFF_ROWS}, ignore_errors=true{extra})"
+        ).fetchone()
+        columns = ", ".join(f"{_sql_text(n)}: 'VARCHAR'" for n in names)
+        reader = (
+            f"read_csv('{quoted}', auto_detect=false, delim={_sql_text(delim)}, quote={_sql_text(quote)}, "
+            f"escape={_sql_text(escape)}, new_line={_sql_text(new_line)}, comment={_sql_text(comment)}, "
+            f"skip={int(skip or 0)}, header={'true' if header else 'false'}, columns={{{columns}}}, "
+            f"null_padding=true, strict_mode=false, ignore_errors=true, all_varchar=true, "
+            f"buffer_size={_TEXT_READ_BUFFER})"
+        )
+        exprs = ["COUNT(*)"]
+        exprs += [
+            "count_if(CASE WHEN contains({q}, '.') THEN TRY_CAST({q} AS DOUBLE) <> round(TRY_CAST({q} AS DOUBLE)) "
+            "ELSE false END)".format(
+                q=_quote_ident(c[0])
+            )
+            for c in ints
+        ]
+        got = con.execute(f"SELECT {', '.join(exprs)} FROM {reader}").fetchone()
+        return {
+            "rows": int(got[0]),
+            "fractional": {str(c[0]): int(k) for c, k in zip(ints, got[1:]) if k},
+            "reader": reader,
+        }
+    finally:
+        con.close()
+
+
+#: _failed_columns looks at no more than this many rows, twice: the first
+#: rows of the file, and the first rows that fail a cast.
+_FAILED_SAMPLE = 1_000
+
+
+def _failed_columns(con, reader: str, typed: List[tuple]) -> List[str]:
+    """Columns holding a value their detected type cannot read, from a
+    BOUNDED sample: the first _FAILED_SAMPLE rows that fail any cast. Asked
+    only when rows were dropped, so a clean file never pays for it.
+
+    A column whose cast fails on most of the file's FIRST rows is excluded
+    first: those rows were typed by the sniffer, so the failure is the cast,
+    not the data (a date the sniffer read as '%m/%d/%Y' fails TRY_CAST on
+    every row, and would otherwise be blamed for every dropped row)."""
+    fails = [
+        f"({_quote_ident(c[0])} IS NOT NULL AND TRY_CAST({_quote_ident(c[0])} AS {_checkable(c[1])}) IS NULL)"
+        for c in typed
+    ]
+    if not fails:
+        return []
+    counts = ", ".join(f"count_if({f})" for f in fails)
+    head = con.execute(
+        f"SELECT COUNT(*), {counts} FROM (SELECT * FROM {reader} LIMIT {_FAILED_SAMPLE})"
+    ).fetchone()
+    usable = [i for i, k in enumerate(head[1:]) if 2 * int(k) <= int(head[0])]
+    if not usable:
+        return []
+    got = con.execute(
+        f"SELECT {', '.join(f'count_if({fails[i]})' for i in usable)} FROM (SELECT * FROM {reader} "
+        f"WHERE {' OR '.join(fails[i] for i in usable)} LIMIT {_FAILED_SAMPLE})"
+    ).fetchone()
+    return sorted(str(typed[i][0]) for i, k in zip(usable, got) if k)
+
+
+class _TextCheck:
+    """_text_read in a thread (DuckDB releases the GIL while it runs a
+    statement), so the re-read overlaps the typed COPY."""
+
+    def __init__(self, path: str, csv_options: str, names: List[str], ints: List[tuple]) -> None:
+        self._result: Optional[Dict[str, Any]] = None
+        self._thread = threading.Thread(
+            target=self._run, args=(path, csv_options, names, ints), name="profile-text-check", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self, *args: Any) -> None:
+        try:
+            self._result = _text_read(*args)
+        except Exception:  # noqa: BLE001 — reported as "could not re-check"
+            self._result = None
+
+    def result(self) -> Optional[Dict[str, Any]]:
+        self._thread.join()
+        return self._result
+
+
+def _insert_after(d: Dict[str, Any], after: str, key: str, value: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        out[k] = v
+        if k == after:
+            out[key] = value
+    if key not in out:
+        out[key] = value
+    return out
+
+
+def _dropped_reason(dropped: int, where: List[str]) -> str:
+    return (
+        f"{dropped} row(s) could not be read under the detected column types"
+        + (f" (a bad value in {_names(where)})" if where else "")
+        + " and are left out of every total"
+    )
+
+
+def profile_tabular(
+    path: str,
+    *,
+    name: Optional[str] = None,
+    csv_options: str = "",
+    types: Optional[Dict[str, str]] = None,
+    agg_max_chars: Optional[int] = None,
+    full_chars: Optional[int] = None,
+    cross: Any = None,
+) -> Dict[str, Any]:
+    """Shape, per-column statistics, and a capped sample — no bulk load.
+
+    csv_options / types: only the spreadsheet path passes any (profile_excel).
+    agg_max_chars / full_chars: a workbook's sheets share one budget for
+    their aggregates and their full rows; a file alone gets the full budget.
+    cross: {"group", "across", "measure"} — the ONE two-dimensional
+    breakdown the person's request named, or None (the upload path passes
+    none: a cross belongs to a question, not to a file).
+    """
     rel = name or os.path.basename(path)
     out: Dict[str, Any] = {
         "file": rel,
@@ -157,17 +1445,87 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     }
     con = _duck()
     scratch: Optional[str] = None
+    omitted: List[str] = []
+    check: Optional[_TextCheck] = None
+    dropped: Optional[int] = None
+    where: List[str] = []
     try:
-        src = _reader_sql(path)
+        csv_source = _is_csv_source(path)
+        # Past the sniff window a column's type is a guess (_text_read). A
+        # file inside it was sniffed whole (measured: cents at row 18,501 of
+        # 19,500 made the column DOUBLE), so it is parsed once, and its few
+        # rejected lines are recorded by that parse (_reader_sql).
+        long_file = csv_source and _lines_at_least(path, _SNIFF_ROWS // 2)
+
+        def bind(column_types: Optional[Dict[str, str]]) -> str:
+            opts = _join_options(csv_options, _types_option(column_types)) if csv_source else ""
+            if long_file:
+                return _reader_sql(path, csv_options=opts, store_rejects=False)
+            return _reader_sql(path, csv_options=opts) if opts else _reader_sql(path)
+
+        src = bind(types)
         # The source's own DESCRIBE is the authority on names and types (the
         # sniffer reads a sample, not the file); the columnar copy is used
         # only when it reproduces it exactly.
         described = con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()
+        if long_file and described:
+            shown = described[: settings.profile_max_columns]
+            check = _TextCheck(
+                path, csv_options, [r[0] for r in described],
+                [r for r in shown if _numeric_kind(r[1]) == "int"],
+            )
         if _parse_once_enabled() and not path.lower().endswith(".parquet"):
             scratch = _scratch_dir()
-            if scratch is not None:
-                src = _columnar_copy(con, path, described, scratch) or src
+        floor = _reject_floor(con)
+        if scratch is not None:
+            src = _columnar_copy(con, path, described, scratch, reader=src) or src
         out["rows"] = int(con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0])
+
+        if check is not None:
+            text = check.result()
+            fractional = text["fractional"] if text is not None else None
+            if text is None:
+                omitted.append(
+                    f"rows past the first {_SNIFF_ROWS} could not be re-checked, so a total there may "
+                    f"have lost decimals or left out rows the reader could not parse"
+                )
+            elif fractional:
+                retyped = {**(types or {}), **{n: "DOUBLE" for n in fractional}}
+                try:
+                    src2 = bind(retyped)
+                    described2 = con.execute(f"DESCRIBE SELECT * FROM {src2}").fetchall()
+                    kinds = {r[0]: r[1] for r in described2}
+                    usable = [r[0] for r in described2] == [r[0] for r in described] and all(
+                        kinds.get(n) == "DOUBLE" for n in fractional
+                    )
+                except Exception:  # noqa: BLE001
+                    usable = False
+                if usable:
+                    # Read as DOUBLE, exactly what the sniffer picks when it
+                    # sees a decimal; money then sums as DECIMAL, to the cent.
+                    copy2 = (
+                        _columnar_copy(con, path, described2, scratch, reader=src2, stem="retyped")
+                        if scratch is not None else None
+                    )
+                    src, described = copy2 or src2, described2
+                    out["rows"] = int(con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0])
+                else:
+                    for n, k in sorted(fractional.items()):
+                        omitted.append(
+                            f"{_label(n)}: {k} values have decimals but were read as whole numbers, "
+                            f"so its totals are rounded"
+                        )
+            if text is not None:
+                dropped = max(0, text["rows"] - out["rows"])
+                if dropped:
+                    try:
+                        where = _failed_columns(
+                            con, text["reader"],
+                            [r for r in described[: settings.profile_max_columns] if _checkable(r[1])],
+                        )
+                    except Exception:  # noqa: BLE001 — the count stands without the names
+                        where = []
+
         columns = [{"name": r[0], "dtype": r[1]} for r in described]
         out["columns_total"] = len(columns)
         columns = columns[: settings.profile_max_columns]
@@ -175,8 +1533,12 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
             out["columns_truncated"] = True
 
         rows = out["rows"] or 0
+        measures: List[dict] = []
+        groups: List[dict] = []
+        dates: List[dict] = []
         for col in columns:
             ident = '"' + col["name"].replace('"', '""') + '"'
+            lo = hi = None
             try:
                 nulls, distinct = con.execute(
                     f"SELECT COUNT(*) FILTER (WHERE {ident} IS NULL), "
@@ -202,7 +1564,7 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
                     ).fetchone()
                     col["min"], col["max"] = clip(lo), clip(hi)
                 # Top values are raw data too → capped in count AND length.
-                if 0 < col["distinct"] <= 50:
+                if 0 < col["distinct"] <= TOP_VALUES_MAX_DISTINCT:
                     tops = con.execute(
                         f"SELECT {ident} AS v, COUNT(*) AS n FROM {src} "
                         # Ties broken on the value's text: without it equal
@@ -217,7 +1579,48 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
                     ]
             except Exception:
                 col["stats_unavailable"] = True
+                continue
+            nonnull = rows - int(nulls)
+            if _is_measure(col["name"], col["dtype"], nonnull, col["distinct"], lo, hi):
+                try:
+                    stats, plan, why = _measure_stats(con, src, col["name"], ident, col["dtype"])
+                except Exception as exc:  # noqa: BLE001 — e.g. a HUGEINT sum past 38 digits
+                    stats, plan, why = {}, None, [f"{_label(col['name'])}: totals could not be computed ({type(exc).__name__})"]
+                col.update(stats)
+                omitted.extend(why)
+                if plan is not None:
+                    measures.append(plan)
+            elif (
+                2 <= col["distinct"] <= TOP_VALUES_MAX_DISTINCT
+                and col["distinct"] < nonnull
+                and _is_group_key(col["name"], nonnull, col["distinct"])
+            ):
+                # A grouping key: few values, and they REPEAT. An all-distinct
+                # column would give one row per group, which is the file. A
+                # date's or a flag's text is never contact-shaped, and a
+                # timestamp such as 2024-01-15 10:00:00 has twelve digits.
+                groups.append({
+                    "name": col["name"], "ident": ident,
+                    "check_values": _date_kind(col["dtype"]) is None
+                    and (col["dtype"] or "").upper() not in ("BOOLEAN", "TIME"),
+                })
+            kind = _date_kind(col["dtype"])
+            if kind is not None and nonnull > 0:
+                dates.append({"name": col["name"], "ident": ident, "kind": kind})
         out["columns"] = columns
+        if dropped is None:
+            dropped, where = _dropped_rows(con, floor)
+        if dropped:
+            # First in the list: the cap trims reasons from the end, and this
+            # one changes what every total means.
+            omitted.insert(0, _dropped_reason(dropped, where))
+            # And next to the row count: the column sums come before the
+            # aggregates, so a cut inside `columns` kept sums that leave these
+            # rows out with nothing in the window saying so (QA r2).
+            out = _insert_after(out, "rows", "rows_not_read", dropped)
+        out["aggregates"] = _aggregates(
+            con, src, measures, groups, dates, omitted, agg_max_chars, cross=cross
+        )
 
         sample = con.execute(
             f"SELECT * FROM {src} LIMIT {settings.profile_sample_rows}"
@@ -241,29 +1644,307 @@ def profile_tabular(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
                 {n: clip(v) for n, v in zip(names, row[: len(names)])}
                 for row in all_rows
             ]
-            if len(json.dumps(full, default=str)) <= settings.profile_full_chars:
+            budget = settings.profile_full_chars if full_chars is None else full_chars
+            if len(json.dumps(full, default=str)) <= budget:
                 out["full_rows"] = full
                 out["full_content"] = True
     except Exception as exc:
         out["error"] = f"could not be read as a table: {type(exc).__name__}"
     finally:
+        if check is not None:
+            check.result()  # its connection reads the file: never outlive the call
         con.close()
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
     return out
 
 
-def profile_excel(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
+# The scratch CSV is written by us, so the reader is told its dialect; only
+# the column TYPES are sniffed, exactly as for an uploaded CSV. Row 1 is the
+# header by the spreadsheet contract (it always was: the old profile named
+# columns from it), so a sheet of all-text columns keeps its names.
+_SHEET_CSV_OPTIONS = "HEADER=true, DELIM=',', QUOTE='\"', ESCAPE='\"'"
+
+#: Keys of a table profile that describe the scratch file, not the sheet.
+_SHEET_DROPPED_KEYS = frozenset({"file", "bytes", "kind", "rows"})
+
+# --- What one workbook may cost -------------------------------------------
+#
+# A few kilobytes of .xlsx can describe far more work than they hold, and
+# every cap in core/archive.py passes (it bounds the ZIP, not the sheet):
+#   * one 32,000-character shared string referenced by every cell: a
+#     29,591-byte file wrote a 64,002,030-byte scratch CSV; 65,803 bytes
+#     wrote 640 MB, took 6.49 s (0.10 s on 4810da0) and peaked at 1.8 GB RSS;
+#   * a <dimension> of A1:XFD50000 with one data row: openpyxl yields 50,000
+#     rows of 16,384 empty cells, the writer padded each, and a 4,843-byte
+#     file ran past 1,200 s at 18 GB RSS (0.0 s and 31 MB on 4810da0).
+# The chat upload profiles ON its event loop (uploads.py _finalise_dataset),
+# so this is a stall for every user. Three bounds, one budget per WORKBOOK:
+#: cells written to scratch CSVs (a row costs its written width, blank or not)
+SHEET_MAX_CELLS = 20_000_000
+#: bytes written to scratch CSVs: SHEET_CSV_MAX_RATIO x the workbook's
+#: uncompressed size, at least SHEET_CSV_MIN_BYTES, at most the ceiling an
+#: uploaded zip of CSVs faces (settings.archive_max_uncompressed_mb). New
+#: work stays within a constant factor of the XML openpyxl already parses.
+SHEET_CSV_MAX_RATIO = 4
+SHEET_CSV_MIN_BYTES = 8 * 1024 * 1024
+# and the WIDTH written is settings.profile_max_columns, the columns a CSV
+# profile describes: DuckDB never parses 16,384 columns.
+#
+# A row is measured BEFORE it is written, and a sheet opens no writer once
+# the budget is spent. Security r2: checked after the write, ONE row of 60
+# cells referencing one 2 MB shared string wrote 120,000,290 bytes against an
+# 8,388,608-byte budget (a 34 KB .xlsx, 1.80 s, 737 MB RSS; a 189 KB one
+# wrote 1.92 GB at 11 GB RSS), and each later sheet opened a new writer and
+# wrote one more such row (10 sheets of a 21 KB file: 1,200,002,900 bytes).
+# csv.writer builds the whole row in memory first, so a cell is also held to
+# what a spreadsheet cell can hold: Excel's limit is 32,767 characters, and a
+# longer one did not come from a spreadsheet.
+SHEET_CELL_MAX_CHARS = 32_767
+
+
+class _WorkbookBudget:
+    def __init__(self, unpacked: int) -> None:
+        ceiling = settings.archive_max_uncompressed_mb * 1024 * 1024
+        self.cells = SHEET_MAX_CELLS
+        self.bytes = min(ceiling, max(SHEET_CSV_MIN_BYTES, SHEET_CSV_MAX_RATIO * unpacked))
+        self.full_chars = settings.profile_full_chars
+
+
+class _CountingWriter:
+    """What csv.writer writes to: encodes each row once and counts its bytes
+    against the workbook budget."""
+
+    def __init__(self, raw, budget: _WorkbookBudget) -> None:
+        self.raw = raw
+        self.budget = budget
+
+    def write(self, text: str) -> None:
+        data = text.encode("utf-8")
+        self.budget.bytes -= len(data)
+        self.raw.write(data)
+
+
+def _sheet_cell(value: Any) -> str:
+    """One cell as a CSV field an uploaded CSV of the same data would hold."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, _dt.datetime):
+        # A spreadsheet has no DATE type: a date is a datetime at midnight.
+        # Written as a date, it profiles as the DATE a CSV export would give.
+        if value.tzinfo is None and value.time() == _dt.time(0):
+            return value.date().isoformat()
+        return value.isoformat(sep=" ")
+    if isinstance(value, (_dt.date, _dt.time)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return repr(value)  # shortest text that reads back as the same double
+    return str(value)
+
+
+def _profile_sheet(
+    ws, scratch: Optional[str], index: int, budget: _WorkbookBudget, cross: Any = None,
+) -> Dict[str, Any]:
+    """Stream one worksheet into a scratch CSV and profile it like a CSV.
+
+    Falls back to the old minimal record (names, count, five sample rows)
+    when there is no scratch space, the sheet has no header, the write fails
+    (a sandbox RLIMIT_FSIZE raises EFBIG), the workbook's budget runs out
+    (then `note` says which) or the CSV cannot be read.
+    """
+    rows_iter = ws.iter_rows(values_only=True)
+    header = next(rows_iter, None) or ()
+    names = [str(h) if h is not None else f"column_{i + 1}" for i, h in enumerate(header)]
+    shown = names[: settings.profile_max_columns]
+    width = len(shown)  # the columns written; the header may be wider
+    sample: List[Dict[str, Any]] = []
+    counted = 0
+    note: Optional[str] = None
+
+    csv_path: Optional[str] = None
+    raw = None
+    writer = None
+    over = f"not profiled: the workbook expands to more text than {SHEET_CSV_MAX_RATIO}x its unpacked size"
+    too_long = (
+        f"not profiled: a cell holds more than {SHEET_CELL_MAX_CHARS:,} characters, more than a spreadsheet cell can"
+    )
+    if scratch is not None and width and (budget.bytes <= 0 or budget.cells <= 0):
+        note = "not profiled: the workbook's earlier sheets used its whole scratch budget"
+    elif scratch is not None and width and max(map(len, shown)) > SHEET_CELL_MAX_CHARS:
+        note = too_long  # the header is a row too
+    elif scratch is not None and width and sum(map(len, shown)) + width > budget.bytes:
+        note, budget.bytes = over, 0
+    elif scratch is not None and width:
+        csv_path = os.path.join(scratch, f"sheet-{index + 1}.csv")
+        try:
+            raw = open(csv_path, "wb")
+            out_fh = _CountingWriter(raw, budget)
+            writer = csv.writer(out_fh, lineterminator="\n")
+            writer.writerow(shown)
+        except OSError:
+            writer = None
+    # Written by hand: csv quotes a lone empty field as "", which a text
+    # column would read as an empty string, not a blank.
+    blank = ("," * (width - 1) + "\n").encode("utf-8")
+    last_blank: Any = None
+    # Per column: a datetime with a time of day, and any non-datetime cell.
+    stamped = [False] * width
+    other = [False] * width
+    # The minimal record names columns as the sample does, clipped: a header
+    # cell can be a shared string of any length, and a refused sheet still
+    # carries its names into the prompt.
+    labels = [clip(n) for n in shown]
+    for row in rows_iter:
+        counted += 1
+        if len(sample) < settings.profile_sample_rows:
+            sample.append({n: clip(v) for n, v in zip(labels, row[:width])})
+        if writer is None:
+            continue
+        budget.cells -= width
+        if budget.cells < 0:
+            note = f"not profiled: the workbook holds more than {SHEET_MAX_CELLS:,} cells"
+            writer = None
+            continue
+        try:
+            # openpyxl yields ONE shared tuple for every missing row number:
+            # skipped by identity, a gap of 50,000 rows costs 50,000 writes.
+            if row is last_blank or all(v is None for v in row[:width]):
+                last_blank = row
+                if len(blank) > budget.bytes:
+                    note, writer, budget.bytes = over, None, 0
+                    continue
+                budget.bytes -= len(blank)
+                raw.write(blank)
+            else:
+                cells = tuple(row[:width]) + (None,) * max(0, width - len(row))
+                # str() of a shared string is the same object: no copy yet.
+                texts = [_sheet_cell(v) for v in cells]
+                # Characters are a lower bound on UTF-8 bytes, and a row
+                # also carries width - 1 commas and a newline: a row that
+                # cannot fit is never built into one string.
+                if max(map(len, texts)) > SHEET_CELL_MAX_CHARS:
+                    note, writer = too_long, None
+                    continue
+                if sum(map(len, texts)) + width > budget.bytes:
+                    # The workbook is over its budget: this row is not
+                    # written, and no later sheet opens a writer.
+                    note, writer, budget.bytes = over, None, 0
+                    continue
+                for i, v in enumerate(cells):
+                    if isinstance(v, _dt.datetime):
+                        if v.time() != _dt.time(0) or v.tzinfo is not None:
+                            stamped[i] = True
+                    elif v is not None:
+                        other[i] = True
+                writer.writerow(texts)
+        except OSError:
+            writer = None
+            continue
+        if budget.bytes < 0:
+            # Only quoting or multi-byte text can overshoot, by at most one
+            # row of at most width x SHEET_CELL_MAX_CHARS characters, and the
+            # spent budget then stops every later sheet before its header.
+            note, writer = over, None
+    minimal: Dict[str, Any] = {
+        "name": ws.title,
+        "rows": counted,
+        "columns": [{"name": n} for n in labels],
+        "sample_rows": sample,
+    }
+    if note:
+        minimal["note"] = note
+    if raw is not None:
+        try:
+            raw.close()
+        except OSError:
+            writer = None
+    if writer is None or csv_path is None:
+        if csv_path is not None and os.path.exists(csv_path):
+            os.remove(csv_path)
+        return minimal
+
+    # Midnight cells were written as dates and the rest as timestamps, so a
+    # column holding both reads as TEXT unless it is declared: declare it,
+    # but only when every filled cell really was a datetime.
+    seen = Counter(shown)
+    forced = {
+        shown[i]: "TIMESTAMP" for i in range(width)
+        if stamped[i] and not other[i] and seen[shown[i]] == 1
+    }
+    try:
+        prof = profile_tabular(
+            csv_path,
+            name=str(ws.title),
+            csv_options=_SHEET_CSV_OPTIONS,
+            types=forced,
+            full_chars=max(0, budget.full_chars),
+            # Offered to every sheet: a sheet without both named columns
+            # computes no cross, so the pair lands on the sheet that holds it.
+            cross=cross,
+        )
+    finally:
+        os.remove(csv_path)
+    if prof.get("error"):
+        return minimal
+    sheet: Dict[str, Any] = {"name": ws.title, "rows": counted}
+    sheet.update({k: v for k, v in prof.items() if k not in _SHEET_DROPPED_KEYS})
+    if len(names) > width:
+        # As for a CSV wider than PROFILE_MAX_COLUMNS: the first columns are
+        # described, and a table with columns cut never ships in full.
+        sheet["columns_total"] = len(names)
+        sheet["columns_truncated"] = True
+        sheet.pop("full_rows", None)
+        sheet.pop("full_content", None)
+    if "full_rows" in sheet:
+        budget.full_chars -= len(json.dumps(sheet["full_rows"], default=str))
+    if prof.get("rows") != counted:
+        # The CSV reader skipped rows it could not parse under the sniffed
+        # types (IGNORE_ERRORS, as for any CSV): the statistics cover these.
+        sheet["rows_profiled"] = prof.get("rows")
+    return sheet
+
+
+def _share_aggregates(sheets: List[Dict[str, Any]]) -> None:
+    """One AGG_MAX_CHARS for the whole workbook, shared out by water-filling:
+    a sheet that needs less than an equal share keeps all of it, the rest is
+    split among the larger ones. QA measured the per-sheet cap on a 3-sheet x
+    1,000-row workbook: its chat prompt block grew from 7,037 characters on
+    4810da0 to 163,562, and the /v1 context cut sheets 2 and 3 off."""
+    blocks = [s["aggregates"] for s in sheets if isinstance(s.get("aggregates"), dict)]
+    sizes = [_agg_chars(b) for b in blocks]
+    if sum(sizes) <= AGG_MAX_CHARS:
+        return
+    left = AGG_MAX_CHARS
+    order = sorted(range(len(blocks)), key=lambda i: (sizes[i], i))
+    for k, i in enumerate(order):
+        share = left // (len(order) - k)
+        allowed = min(sizes[i], share)
+        if sizes[i] > allowed:
+            _cap_aggregates(blocks[i], allowed)
+        left -= min(_agg_chars(blocks[i]), allowed)
+
+
+def profile_excel(path: str, *, name: Optional[str] = None, cross: Any = None) -> Dict[str, Any]:
     """Profile an .xlsx — AFTER the zip-container caps have been applied.
 
     An .xlsx is a ZIP. Handing one straight to openpyxl would walk around
     every bomb cap in core/archive.py, so the caller must have run
     `archive.check_zip_container` first; this asserts it rather than trusting.
+
+    Each sheet (the first 10) is profiled LIKE A CSV (B15, 2026-09-18): the
+    old profile carried only names, a row count and five sample rows, so the
+    same 50 rows were answerable uploaded as .csv and refused as .xlsx. A
+    sheet now carries everything a table profile does — types, nulls, ranges,
+    top values, computed aggregates, full rows when small — under its name
+    and openpyxl's row count. The workbook is ONE file: its sheets share one
+    cell, byte, full-rows and aggregates budget.
     """
     rel = name or os.path.basename(path)
     # Belt and braces: re-run the container caps here so no future caller can
     # reach openpyxl without them (raises ArchiveError on a bomb).
-    archive.check_zip_container(path, label="spreadsheet")
+    plan = archive.check_zip_container(path, label="spreadsheet")
 
     from openpyxl import load_workbook
 
@@ -273,38 +1954,23 @@ def profile_excel(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
         "kind": "spreadsheet",
         "sheets": [],
     }
+    budget = _WorkbookBudget(int(getattr(plan, "total_uncompressed", 0) or 0))
     # read_only streams rows; data_only avoids evaluating anything.
     wb = load_workbook(path, read_only=True, data_only=True)
+    scratch: Optional[str] = None
     try:
-        for ws in wb.worksheets[:10]:
-            rows_iter = ws.iter_rows(values_only=True)
-            header = next(rows_iter, None) or ()
-            names = [
-                str(h) if h is not None else f"column_{i + 1}"
-                for i, h in enumerate(header)
-            ][: settings.profile_max_columns]
-            sample: List[Dict[str, Any]] = []
-            counted = 0
-            for row in rows_iter:
-                counted += 1
-                if len(sample) < settings.profile_sample_rows:
-                    sample.append(
-                        {n: clip(v) for n, v in zip(names, row[: len(names)])}
-                    )
-            out["sheets"].append(
-                {
-                    "name": ws.title,
-                    "rows": counted,
-                    "columns": [{"name": n} for n in names],
-                    "sample_rows": sample,
-                }
-            )
+        scratch = _scratch_dir()
+        for index, ws in enumerate(wb.worksheets[:10]):
+            out["sheets"].append(_profile_sheet(ws, scratch, index, budget, cross))
     finally:
         wb.close()
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+    _share_aggregates(out["sheets"])
     return out
 
 
-def profile_file(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
+def profile_file(path: str, *, name: Optional[str] = None, cross: Any = None) -> Dict[str, Any]:
     """Profile one file, choosing a reader by extension AND magic bytes."""
     rel = name or os.path.basename(path)
     lower = rel.lower()
@@ -314,11 +1980,11 @@ def profile_file(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     if any(lower.endswith(s) for s in EXCEL_SUFFIXES):
         if not archive.is_zip_container(path):
             return {"file": rel, "kind": "skipped", "reason": "not a real .xlsx"}
-        return profile_excel(path, name=rel)
+        return profile_excel(path, name=rel, cross=cross)
     if any(lower.endswith(s) for s in TABULAR_SUFFIXES) or archive.sniff_format(
         path
     ) == "parquet":
-        return profile_tabular(path, name=rel)
+        return profile_tabular(path, name=rel, cross=cross)
     return {
         "file": rel,
         "kind": "other",

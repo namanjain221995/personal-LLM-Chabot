@@ -210,15 +210,99 @@ export function canTransition(from: VoiceState, to: VoiceState): boolean {
   return TRANSITIONS[from].includes(to);
 }
 
+/**
+ * How sure the server is of a draft. A closed vocabulary — the orchestrator
+ * sends one of these words or null, and the wording below is ours.
+ * `app/asr.py` decides it from the engine's own no-speech probability and its
+ * plausibility check, both of which used to be computed and thrown away.
+ */
+export type Confidence = 'low' | 'unclear' | 'silent';
+
 export interface TranscriptionResult {
   text: string;
   language: string | null;
   durationMs: number | null;
   processingMs: number | null;
+  /**
+   * One short line to show BESIDE the transcript, or null. Never a reason to
+   * withhold the text: the words still go into the composer, because a draft
+   * a person can edit beats a warning they cannot act on.
+   */
+  notice: string | null;
+}
+
+/**
+ * What a person is told when a transcript comes back with nothing in it.
+ *
+ * SILENCE IS A CLAIM, and until 2026-09-21 it was made for every empty draft
+ * — including the ones the orchestrator emptied itself after deciding the
+ * engine had invented them, and the ones where a second opinion was never
+ * taken. Measured on this fleet the same day: 20 s of pink noise decodes as
+ * fourteen words, and a gated clip is only re-decoded when it is between 3
+ * and 120 seconds long. "Nothing was said" now needs the server to have
+ * measured exactly that.
+ */
+const EMPTY_MESSAGES: Record<Confidence | 'unknown', string> = {
+  silent: 'Nothing was said in that recording.',
+  unclear: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+  low: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+  unknown: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+};
+
+/**
+ * And what they are told when there IS a draft but it may be invented.
+ *
+ * One line, shown once, next to text that is already in the composer. Not a
+ * dialog and not a block: the person can read the words and decide, which is
+ * something no threshold here can do for them.
+ */
+const LOW_CONFIDENCE_NOTICE =
+  'That was hard to make out — check the text before you send it.';
+
+function confidenceOf(value: unknown): Confidence | null {
+  return value === 'low' || value === 'unclear' || value === 'silent'
+    ? value
+    : null;
 }
 
 export interface TranscribeFailure {
   error: VoiceError;
+}
+
+const GENERIC_FAILURE = 'Transcription couldn’t be completed. Please try again.';
+
+function isAbort(err: unknown, signal?: AbortSignal): boolean {
+  return (
+    Boolean(signal?.aborted) ||
+    (typeof err === 'object' &&
+      err !== null &&
+      'name' in err &&
+      (err as { name: string }).name === 'AbortError')
+  );
+}
+
+/**
+ * A failed transcription, from its status and the server's sentence. The same
+ * mapping whether the status came on the status line or, after a heartbeat,
+ * in the body.
+ *
+ * 403 and 404 are the server saying the feature is not for this account or
+ * not on this deployment; both are worth quoting verbatim, because they tell
+ * the person what to do. So are the refusals about the recording itself, a
+ * busy engine, and a 504 (the server words it from the clip's length: "Try a
+ * shorter one" for a long clip, "did not answer in time" for a short one).
+ * Everything else gets one sentence.
+ */
+function failureFor(status: number, detail: unknown): TranscribeFailure {
+  const quotable =
+    status === 403 || status === 404 || status === 413 || status === 422 ||
+    status === 429 || status === 503 || status === 504;
+  return {
+    error: {
+      message: (quotable && typeof detail === 'string' && detail) || GENERIC_FAILURE,
+      retryable: status !== 403 && status !== 404,
+    },
+  };
 }
 
 /**
@@ -263,58 +347,48 @@ export async function transcribe(
       signal: options.signal,
     });
   } catch (err) {
-    if (
-      typeof err === 'object' &&
-      err !== null &&
-      'name' in err &&
-      (err as { name: string }).name === 'AbortError'
-    ) {
-      // The caller withdrew. Not an error to report.
-      return { error: { message: '', retryable: true } };
+    // The caller withdrew. Not an error to report.
+    if (isAbort(err, options.signal)) return { error: { message: '', retryable: true } };
+    return { error: { message: GENERIC_FAILURE, retryable: true } };
+  }
+
+  // A long transcription arrives as a streamed 200: whitespace heartbeats
+  // (insignificant in JSON, so `json()` reads straight past them) and then the
+  // JSON, over minutes. The read can therefore break mid-way (a proxy restart,
+  // a dropped network), and that has to be a failure the person can retry,
+  // not a rejected promise that leaves the bar on "Transcribing…" forever. It
+  // is also where pressing X now lands most often — during the wait — and
+  // that is still a withdrawal. A body that is not JSON is `null` here.
+  let payload: Record<string, unknown> | null = null;
+  try {
+    const parsed: unknown = await response.json();
+    if (typeof parsed === 'object' && parsed !== null) {
+      payload = parsed as Record<string, unknown>;
     }
-    return {
-      error: {
-        message: 'Transcription couldn’t be completed. Please try again.',
-        retryable: true,
-      },
-    };
+  } catch (err) {
+    if (isAbort(err, options.signal)) return { error: { message: '', retryable: true } };
+    payload = null;
   }
 
   if (!response.ok) {
-    let detail = '';
-    try {
-      const payload = (await response.json()) as { detail?: unknown };
-      if (typeof payload.detail === 'string') detail = payload.detail;
-    } catch {
-      // Non-JSON body — fall through to the generic sentence.
-    }
-    // 403 and 404 are the server saying the feature is not for this account
-    // or not on this deployment; both are worth quoting verbatim, because
-    // they tell the person what to do. Everything else gets one sentence.
-    const quotable = response.status === 403 || response.status === 404 ||
-      response.status === 413 || response.status === 422 ||
-      response.status === 429 || response.status === 503;
-    return {
-      error: {
-        message:
-          (quotable && detail) ||
-          'Transcription couldn’t be completed. Please try again.',
-        retryable: response.status !== 403 && response.status !== 404,
-      },
-    };
+    return failureFor(response.status, payload?.detail);
+  }
+  if (payload === null) {
+    return { error: { message: GENERIC_FAILURE, retryable: true } };
+  }
+  // A failure after the heartbeat started: the status line was already 200,
+  // so the server carries the real one in the body. It is mapped exactly as
+  // that status would have been, and never read as a (silent) transcript.
+  if (typeof payload.status === 'number' && payload.status >= 400) {
+    return failureFor(payload.status, payload.detail);
   }
 
-  const payload = (await response.json()) as {
-    text?: unknown;
-    language?: unknown;
-    duration_ms?: unknown;
-    processing_ms?: unknown;
-  };
   const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+  const confidence = confidenceOf(payload.confidence);
   if (!text) {
     return {
       error: {
-        message: 'Nothing was said in that recording.',
+        message: EMPTY_MESSAGES[confidence ?? 'unknown'],
         retryable: true,
       },
     };
@@ -326,6 +400,7 @@ export async function transcribe(
       typeof payload.duration_ms === 'number' ? payload.duration_ms : null,
     processingMs:
       typeof payload.processing_ms === 'number' ? payload.processing_ms : null,
+    notice: confidence === 'low' ? LOW_CONFIDENCE_NOTICE : null,
   };
 }
 

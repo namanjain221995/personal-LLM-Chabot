@@ -596,6 +596,25 @@ def test_every_scenario_has_a_baseline_fixture_holding_its_seeded_context_and_no
         assert_markers(name, (GOLDEN_DIR / f"{name}.messages.json").read_text(encoding="utf-8"))
 
 
+def test_the_manifest_records_the_bytes_of_every_fixture():
+    """MANIFEST.json is the record of what was captured, and it sat stale from
+    2026-09-13 to 2026-09-18: all 12 messages hashes described fixtures four
+    recaptures old, because the check above skips the manifest. A recapture
+    now updates it in the same commit, or this fails."""
+    import hashlib
+
+    manifest = json.loads((GOLDEN_DIR / "MANIFEST.json").read_text(encoding="utf-8"))
+    present = {p.name for p in GOLDEN_DIR.glob("*.json") if p.name != "MANIFEST.json"}
+    assert set(manifest["sha256"]) == present
+    stale = sorted(
+        name
+        for name, digest in manifest["sha256"].items()
+        if hashlib.sha256((GOLDEN_DIR / name).read_bytes()).hexdigest() != digest
+    )
+    assert stale == []
+    assert set(manifest["scenarios"]) == set(SCENARIOS)
+
+
 @pytest.mark.parametrize("concurrent_reads", ["false", "true"])
 @pytest.mark.parametrize("scenario", list(SCENARIOS))
 def test_the_engine_is_handed_the_pre_change_prompt_byte_for_byte_with_the_reads_concurrent_or_not(

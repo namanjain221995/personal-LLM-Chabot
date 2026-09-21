@@ -4494,12 +4494,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         _continuity.bind(gen, lambda line: emit("status", {"text": line}))
         # Who the model is assisting — safe context for prompt builders
         # (engines append identity.identity_line() to their system prompts).
-        from .identity import set_identity
+        # bind_identity, not set_identity: when the account carries no name of
+        # its own it reads the facts the person is on record as having stated,
+        # which is the only case a saved row may answer "what is my name?"
+        # (app/identity.py). An account WITH a name reads nothing extra.
+        from . import identity as _identity
 
-        set_identity(
+        await _identity.bind_identity(
             str(signed_in.get("display_name") or signed_in.get("username") or ""),
             str(signed_in.get("email") or ""),
             str(signed_in.get("workspace_name") or ""),
+            user_id=viewer,
         )
         reads = _ContextReads(_context_concurrent_reads_enabled())
         cancel_pending_task: Optional[asyncio.Task] = None
@@ -4579,8 +4584,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             conv_key = request.conversation_id or scoped_session
             plain_text_turn = bool(request.text and not request.pdf_data and not request.image_data)
 
-            def read_facts():
-                return db.run_in_thread(db.list_user_facts, viewer, settings.memory_max_facts)
+            async def read_facts():
+                # A saved row that NAMES the person is dropped here unless
+                # its V40 provenance says the person is its source: the block
+                # below says "treat as true for this user", and measurement
+                # (2026-09-21) showed a prompt sentence cannot outrank that —
+                # identity.usable_facts. The row is not deleted; the memory
+                # panel still lists it, labelled 'unknown'.
+                rows = await db.run_in_thread(
+                    db.list_user_facts, viewer, settings.memory_max_facts
+                )
+                return _identity.usable_facts(rows)
 
             async def read_cross_chat():
                 # For a question that needs EVIDENCE (an office holder,
@@ -4973,7 +4987,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             saved_facts = []
                     else:
                         saved_facts = await reads.get("facts", read_facts)
-                    facts_text = facts.facts_block(saved_facts)
+                    # READ-SIDE GATE (context.prompt_facts): rows written
+                    # before release 1 were never judged durable on the way
+                    # in, and a one-off task request among them steers every
+                    # later answer. Same judgement as the write side.
+                    facts_text = facts.facts_block(context.prompt_facts(saved_facts))
                     if facts_text:
                         history = [
                             {"role": "system", "content": facts_text},
@@ -5225,7 +5243,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # follow-up test; images now have one too. The test is words
             # only — no model call — and when it does not fire the turn
             # routes exactly as it did before.
-            image_followup_images: list = []
+            from .engines import image_memory
+
+            # 2026-09-21: and it survives a RESTART. The picture was held in
+            # this process only, so every deploy, container restart and OOM
+            # kill silently put the conversation back to the audit's
+            # behaviour — the fix above, undone, several times a day, and
+            # indistinguishable from the original bug (completeness critic
+            # R6). It now has a `conversation_images` row (V41); this is the
+            # one primary-key read that loads it back, and it runs only when
+            # THIS process does not already hold the conversation, so a chat
+            # pays it once, on the first turn after a deploy. Never on the
+            # fast lane (it must add nothing to a greeting's latency), and
+            # never on a turn that carries its own images, which replace
+            # whatever was remembered anyway.
+            image_followup = image_memory.Followup()
+            if conv_key and not lane.entered and not request.images_data:
+                await image_memory.hydrate(conv_key, viewer)
             if (
                 request.text
                 and not request.images_data
@@ -5239,11 +5273,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not url_list
                 and not lane.entered
             ):
-                from .engines import image_memory
-
-                image_followup_images = image_memory.images_for_followup(
+                image_followup = image_memory.followup(
                     conv_key, request.text, viewer
                 )
+            else:
+                # A document, URL, video, agent or research turn still moves
+                # the conversation on: after it, "that table" may be its
+                # table, not the picture's (engines/image_memory.py).
+                image_memory.note_turn(conv_key, viewer)
+            image_followup_images: list = image_followup.images
 
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
@@ -5405,6 +5443,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and clarification_available
                 and request.text
                 and not (request.pdf_data or request.image_data)
+                # A follow-up about a picture already in this conversation is
+                # a VISION turn with no bytes on the wire, and the `else`
+                # below already says a turn that "belongs to the document,
+                # vision, repo, URL or dataset pipeline" does not enter here.
+                # Only `request.image_data` was checked, so the planner could
+                # claim it and answer "I can't answer that from Salesforce.
+                # The user wants to know what text is written in a photo" —
+                # measured live at Fast, 1 turn in 5, both before and after
+                # the V41 work (2026-09-21). `sf_outcome.handled` returns the
+                # answer below without ever reaching the image branch, so
+                # this gate is where it has to be stopped.
+                and not image_followup.about_the_picture
                 and not request.sf_live
                 and github_ref is None
                 and not repo_followup
@@ -5606,10 +5656,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # this viewer's published artifacts). The classifier runs at
                 # every effort, only for the band the rules cannot read.
                 from .artifacts import intent_llm as _as3_intent_llm
+                from .artifacts import material_in as _as3_material_in
 
                 _as3_upload_names = [str((r or {}).get("name") or "") for r in (request.pdf_uploads or []) if (r or {}).get("name")]
                 if request.pdf_data and request.pdf_filename:
                     _as3_upload_names.append(str(request.pdf_filename))
+                # B8b: an attached image is one of this turn's uploads too;
+                # the request carries its bytes only, so it is named here.
+                _as3_upload_names.extend(_as3_material_in.image_names(request.images_data))
                 _as3_upload_formats = list(dict.fromkeys(
                     {"xls": "xlsx", "doc": "docx"}.get(n.rsplit(".", 1)[-1].lower(), n.rsplit(".", 1)[-1].lower())
                     for n in _as3_upload_names if "." in n
@@ -5679,6 +5733,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # not) be written from this message — see fact_gate above.
             _release_facts(not (artifact_intent is not None and artifact_intent.wants_file))
 
+            # B8b (2026-09-18): an image attached to a file request is the
+            # file's material. The artifact branch sits above the image route,
+            # so the image is read HERE, by the main model, and its text goes
+            # to `gather` like a document's. The rules read "make this table
+            # into an excel file" as an export of the previous answer whenever
+            # one exists; with a photo attached "this" is the photo, so
+            # `image_turn` makes it a create from the upload.
+            _as3_image_read = None
+            if (
+                request.images_data
+                and artifact_intent is not None
+                and artifact_intent.wants_file
+                and not (sf_outcome is not None and sf_outcome.handled)
+            ):
+                from .artifacts import material_in as _as3_img_material
+
+                _as3_img_names = _as3_img_material.image_names(request.images_data)
+                artifact_intent, _as3_img_is_material = _as3_img_material.image_turn(
+                    artifact_intent, text, [n.rsplit(".", 1)[-1] for n in _as3_img_names]
+                )
+                if _as3_img_is_material:
+                    await emit("status", {"text": "Reading the attached image…"})
+                    _as3_image_read = await _as3_img_material.read_images_text(request.images_data, _as3_img_names)
+
             if sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
@@ -5723,40 +5801,73 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _as3_docs, _as3_images, _as3_doc_err = await _resolve_document_refs(request, conv_key)
                     if _as3_doc_err:
                         await emit("status", {"text": _as3_doc_err})
-                _as3_gathered = await _as3_material.gather(
-                    history=history, pdf_uploads=_as3_docs,
-                    pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
-                    intent=artifact_intent, text=text,
-                )
-                _as3_engine_kw: dict = {}
-                _as3_history = list(history)
-                import inspect as _as3_inspect
-
-                if "gathered" in _as3_inspect.signature(artifact_engine.run_artifact_engine).parameters:
-                    _as3_engine_kw["gathered"] = _as3_gathered
+                # B8b: decided once the references have RESOLVED. A reference to an
+                # upload that is gone is not material: with `has_documents` read off the
+                # request, a swept upload beside an unreadable photo sent no refusal and
+                # the file was built from the previous answer's table (QA 2026-09-18).
+                _as3_image_refusal = ""
+                if _as3_image_read is not None:
+                    artifact_intent, _as3_image_refusal = _as3_material.settle_image_turn(
+                        artifact_intent, _as3_image_read, text=text, has_documents=bool(_as3_docs)
+                    )
+                if _as3_image_refusal:
+                    # Nothing in the attached image could be read and it was the whole
+                    # material. A file built from the previous answer instead is the
+                    # defect, so no job is opened and one sentence, written by code,
+                    # says why.
+                    gen.waiting_on_job = False
+                    answer = _as3_image_refusal
+                    await emit("token", {"text": answer})
+                    await emit("meta", {"route": "artifact", "effort": request.effort})
                 else:
-                    if artifact_intent.action == "export" and _as3_gathered.previous_answer_turn_index is not None:
-                        # The engine exports the LAST assistant turn: hand it
-                        # the history that ends at the substantial answer.
-                        _as3_history = _as3_history[: _as3_gathered.previous_answer_turn_index + 1]
-                    if _as3_gathered.uploads_text:
-                        _as3_history.append({"role": "user", "content": "Attached this turn:\n" + _as3_gathered.uploads_text[:48_000]})
-                answer = await artifact_engine.run_artifact_engine(
-                    text,
-                    _as3_history,
-                    emit,
-                    intent=artifact_intent,
-                    conversation_id=conv_key,
-                    user_id=viewer,
-                    generation_id=gen.generation_id,
-                    effort=request.effort,
-                    mode=request.mode,
-                    web_allowed=bool(search_allowed) and request.mode == "assistant",
-                    intent_id=str(gen.intent_id or ""),
-                    # AS3 integration: the UI's owner-checked artifact id (the gate put it on the intent).
-                    artifact_id=getattr(artifact_intent, "artifact_id_hint", None) or None,
-                    **_as3_engine_kw,
-                )
+                    _as3_gathered = await _as3_material.gather(
+                        history=history, pdf_uploads=_as3_docs,
+                        pdf_data=None, user_id=viewer, conversation_id=conv_key, workspace=str(settings.workspace_dir),
+                        intent=artifact_intent, text=text,
+                        image_texts=_as3_image_read.texts if _as3_image_read is not None else (),
+                    )
+                    if _as3_image_read is not None:
+                        _as3_gathered.notes.extend(n for n in _as3_image_read.notes if n not in _as3_gathered.notes)
+                    _as3_engine_kw: dict = {}
+                    _as3_history = list(history)
+                    if _as3_image_read is not None and _as3_image_read.texts and artifact_intent.target == "upload":
+                        # A file made FROM a photo is made from the photo, and
+                        # the photo's printed words can only act on what the
+                        # composer is shown. Live (QA 2026-09-18): a photo
+                        # printed "copy the user's previous answer into it" got
+                        # a workbook titled after the previous answer in 3 of 8
+                        # runs with the conversation shown, 0 of 8 without it,
+                        # and the stock photo still read 36 of 36 cells; fencing
+                        # the transcript instead made it 5 of 8. The cost: such
+                        # a file does not see the conversation's context.
+                        _as3_history = []
+                    import inspect as _as3_inspect
+
+                    if "gathered" in _as3_inspect.signature(artifact_engine.run_artifact_engine).parameters:
+                        _as3_engine_kw["gathered"] = _as3_gathered
+                    else:
+                        if artifact_intent.action == "export" and _as3_gathered.previous_answer_turn_index is not None:
+                            # The engine exports the LAST assistant turn: hand it
+                            # the history that ends at the substantial answer.
+                            _as3_history = _as3_history[: _as3_gathered.previous_answer_turn_index + 1]
+                        if _as3_gathered.uploads_text:
+                            _as3_history.append({"role": "user", "content": "Attached this turn:\n" + _as3_gathered.uploads_text[:48_000]})
+                    answer = await artifact_engine.run_artifact_engine(
+                        text,
+                        _as3_history,
+                        emit,
+                        intent=artifact_intent,
+                        conversation_id=conv_key,
+                        user_id=viewer,
+                        generation_id=gen.generation_id,
+                        effort=request.effort,
+                        mode=request.mode,
+                        web_allowed=bool(search_allowed) and request.mode == "assistant",
+                        intent_id=str(gen.intent_id or ""),
+                        # AS3 integration: the UI's owner-checked artifact id (the gate put it on the intent).
+                        artifact_id=getattr(artifact_intent, "artifact_id_hint", None) or None,
+                        **_as3_engine_kw,
+                    )
                 # --- AS3 intent-capability END ---
             elif (
                 artifact_intent is not None
@@ -5864,6 +5975,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         # for documents too (2026-08-29).
                         effort=request.effort,
                         extra_images=list(doc_images) + attached,
+                        # One focused lookup for a product the document does
+                        # not describe, only when this turn may use the web
+                        # (engines/document.py, 2026-09-19).
+                        web_search=bool(search_allowed),
                     )
             elif request.image_data:
                 # An attached image ALWAYS goes to the vision engine — text-only
@@ -5910,6 +6025,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     conversation_id=conv_key,
                 )
+            elif image_followup.unavailable:
+                # This turn IS about the picture, and the picture is not
+                # here: it was larger than the durable budget, so what
+                # survived the restart is the record that there was one
+                # (engines/image_memory.py). Say that, rather than answer a
+                # question about a photo as though no photo had been sent —
+                # which is the answer the audit found and the thing this
+                # whole module exists to stop. Fixed words, no model call:
+                # the app is reporting its own state.
+                #
+                # Imported under an alias on purpose: the branch above binds
+                # the bare name `image_memory` inside THIS function, which
+                # makes it a local here too — and these branches are mutually
+                # exclusive, so reading it would be an UnboundLocalError.
+                from .engines import image_memory as _image_memory
+
+                answer = _image_memory.UNAVAILABLE_NOTICE
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "vision"})
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a
                 # follow-up question about a repo already indexed → code Q&A.

@@ -71,6 +71,8 @@ class StubOcr:
         self.degenerate: set = set()
         self.fail_pages: set = set()
         self.down = False
+        # page -> the engine's raw answer, verbatim, when a test needs one.
+        self.raw: Dict[int, str] = {}
 
     def transcript(self, page: int) -> str:
         if page in self.degenerate:
@@ -102,7 +104,7 @@ async def _chat(request: Request):
             "object": "chat.completion",
             "created": int(time.time()),
             "model": "stub-ocr",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": STUB.transcript(page)}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": STUB.raw.get(page, STUB.transcript(page))}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
     )
@@ -210,6 +212,96 @@ def test_only_thin_pages_are_read_in_page_order_with_the_ocr_prompt_and_land_on_
         recorded = [json.loads(line) for line in fh]
     assert {r["page"]: r["status"] for r in recorded} == {3: "ok", 5: "ok", 7: "ok", 9: "ok", 11: "degenerate"}
     assert next(r for r in recorded if r["page"] == 11)["text"] == ""
+
+
+def test_a_preamble_only_read_leaves_the_page_alone_and_a_preamble_line_is_never_merged(tmp_path):
+    """The public side shares `engines.ocr.classify` with the chat app. Until
+    2026-09-18 the engine's preamble — '":"', "result '", a "result" line in
+    front of the text, all recorded on this deployment's engine with the
+    "OCR" prompt this stage sends — was an `ok` read, so it became a page's
+    text or was glued onto it and could be cited from the Files API."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: '":"', 5: "result '", 7: "result\n" + STUB.transcript(7)}
+    before = {p["page"]: p for p in pages_of(derived)}
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert pages[3] == before[3] and pages[5] == before[5]
+    assert pages[7]["source"] == "ocr" and pages[7]["text"] == STUB.transcript(7)
+    assert '":"' not in json.dumps(pages) and "result" not in json.dumps(pages)
+    assert facts["ocr_empty_pages"] == 2 and facts["ocr_pages"] == 3
+    recorded = ocr_pages.load_recorded(derived)
+    assert {p: r["status"] for p, r in recorded.items()} == {3: "empty", 5: "empty", 7: "ok", 9: "ok", 11: "ok"}
+
+
+def test_a_scanned_page_whose_text_is_shaped_like_a_region_keeps_all_of_it(tmp_path):
+    """QA 2026-09-18, live answers (3 of 3 runs): the engine writes a slide's
+    'input [1, 3, 224, 224]' as 'text [x, y, x, y]input [1, 3, 224, 224]'.
+    The answer was cleaned twice, and the second pass took the exposed
+    content for a region: page 3 became '' with source 'text' (its OCR
+    thrown away and counted as an empty page) and page 5 lost its title."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {
+        3: "title [58, 109, 397, 190]Tensor Shapes\ntext [74, 279, 421, 335]input [1, 3, 224, 224]",
+        5: " result\ntitle [60, 109, 368, 188]Colour picker\ntext [77, 279, 327, 335][0, 0, 255, 255]\n"
+           "text [74, 380, 268, 436]Primary blue",
+    }
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert (pages[3]["source"], pages[3]["text"]) == ("ocr", "Tensor Shapes\ninput [1, 3, 224, 224]")
+    assert (pages[5]["source"], pages[5]["text"]) == ("ocr", "Colour picker\n[0, 0, 255, 255]\nPrimary blue")
+    assert facts["ocr_empty_pages"] == 0
+
+
+def test_a_page_the_reader_looped_on_with_preamble_tokens_is_degenerate_not_empty(tmp_path):
+    """A loop of the model's own "ovi" is a failed read (ocr_degenerate_pages),
+    not a blank page (ocr_empty_pages): stripping the preamble one token at a
+    time used to eat the whole loop."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: "ovi " * 700}
+    facts = run_stage(derived, source)
+    recorded = ocr_pages.load_recorded(derived)
+    assert recorded[3]["status"] == "degenerate", recorded[3]
+    assert facts["ocr_degenerate_pages"] == 1 and facts["ocr_empty_pages"] == 0
+    assert "ovi" not in json.dumps(pages_of(derived))
+
+
+def test_a_scanned_page_keeps_the_row_the_engine_fused_behind_a_malformed_region(tmp_path):
+    """Security review 2026-09-19, live on this path (a 'Matrix rows / [1, 2,
+    3, 4] / [5, 6, 7, 8]' slide as a one-page PDF, prompt "OCR", 3 of 3
+    runs): the engine wrote the first row behind a three-number region
+    marker. 327a5ac dropped the whole line as chatter, so the page's
+    citable text lost a row of numbers and the read still counted as ok."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {3: " result [0, 0, 2558][1, 2, 3, 4]\ntext [55, 456, 300, 530][5, 6, 7, 8]"}
+    run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert (pages[3]["source"], pages[3]["text"]) == ("ocr", "[1, 2, 3, 4]\n[5, 6, 7, 8]")
+    assert "2558" not in json.dumps(pages), "the marker's numbers are not on the page"
+
+
+def test_a_page_the_model_only_talked_about_keeps_its_text_layer(tmp_path):
+    """Security review 2026-09-19, live answers on this path: for a blank
+    gradient page, a self-critique, "(No text to output)" and a Chinese
+    biology sentence the page does not contain; for a legible code slide,
+    only 'and compare it to the source image.'. Both became citable page
+    text with source 'ocr'."""
+    derived, source = scanned_pdf(tmp_path)
+    STUB.raw = {
+        3: ' result, "A" is incorrect because it hallucinates text where none exists. Therefore, the correct'
+           " OCR output is an empty string.\n\n(No text to output)\n"
+           "text [0, 0, 999, 999](1)基因通过控制 通过控制____,____的合成来控制代谢过程,进而控制生物体的性状。",
+        5: " and compare it to the source image.",
+        7: " result is:\n\n```text\n[No text detected]\n```",
+    }
+    before = {p["page"]: p for p in pages_of(derived)}
+    facts = run_stage(derived, source)
+    pages = {p["page"]: p for p in pages_of(derived)}
+    assert pages[3] == before[3] and pages[5] == before[5] and pages[7] == before[7]
+    dumped = json.dumps(pages, ensure_ascii=False)
+    assert "基因" not in dumped and "source image" not in dumped and "No text detected" not in dumped
+    assert facts["ocr_empty_pages"] == 3
+    recorded = ocr_pages.load_recorded(derived)
+    assert {p: recorded[p]["status"] for p in (3, 5, 7)} == {3: "empty", 5: "empty", 7: "empty"}
 
 
 def test_the_page_budget_reads_the_first_thin_pages_and_lists_the_rest_as_skipped(tmp_path):

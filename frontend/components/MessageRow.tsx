@@ -18,6 +18,7 @@ import { parseClarification } from '@/lib/clarification';
 import { ClarificationRecord } from './ClarificationCard';
 import { Loader } from './Loader';
 import { LiveStatus } from './LiveStatus';
+import { MemoryDialog } from './MemoryPanel';
 import { ReasoningStar } from './ReasoningStar';
 import { SalesforceSourceLine } from './SalesforceSourceLine';
 import {
@@ -495,6 +496,14 @@ function MessageRowImpl({
 }) {
   // Hooks live above the user-bubble early return (rules of hooks).
   const [activityOpen, setActivityOpen] = useState(false);
+  // B11: the "Memory updated" chip opens the memory panel. Focus goes back to
+  // the chip on close, so a keyboard user lands where they left.
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const memoryChipRef = useRef<HTMLButtonElement>(null);
+  const closeMemory = useCallback(() => {
+    setMemoryOpen(false);
+    memoryChipRef.current?.focus({ preventScroll: true });
+  }, []);
   /**
    * The answer as it is DISPLAYED: [n] markers removed (the numbered sources
    * live in the ActivityPanel; the stored content keeps them).
@@ -1225,13 +1234,27 @@ function MessageRowImpl({
               </p>
             )}
 
+          {/* B11: a button, not a label — until 2026-09-18 it opened nothing,
+              so a person told their memory changed had no way to see what
+              was saved or to delete it. */}
           {(message.meta?.memory_updated?.length ?? 0) > 0 && (
-            <p
-              className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted"
-              title={message.meta!.memory_updated!.join('\n')}
-            >
-              Memory updated
-            </p>
+            <>
+              <button
+                ref={memoryChipRef}
+                type="button"
+                aria-haspopup="dialog"
+                onClick={() => setMemoryOpen(true)}
+                className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                title={message.meta!.memory_updated!.join('\n')}
+              >
+                Memory updated
+              </button>
+              <MemoryDialog
+                open={memoryOpen}
+                onClose={closeMemory}
+                highlight={message.meta!.memory_updated}
+              />
+            </>
           )}
 
           {message.status === 'stopped' && (
