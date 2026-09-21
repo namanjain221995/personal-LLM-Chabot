@@ -6107,32 +6107,86 @@ def get_sf_conversation_state(conversation_id: str) -> Optional[dict]:
 # --- Cross-chat memory (V6): user facts + message embeddings -----------------
 
 
+#: The V40 `source` values that put the PERSON behind a saved fact: 'stated'
+#: (facts.remember_from_message read it out of their own message) and
+#: 'manual' (they typed it into the memory panel). Anything else — above all
+#: NULL, which is every row written before V40 — has an origin nobody can
+#: name, and the 2026-09-16 rows that made the assistant call its owner by a
+#: pasted interview candidate's name are exactly that shape.
+TRUSTED_FACT_SOURCES = ("stated", "manual")
+
+#: What the memory panel shows when `source` is NULL. A separate constant so
+#: the API, the identity line and the panel all say the same word.
+UNKNOWN_FACT_ORIGIN = "unknown"
+
+
+def fact_source_is_trusted(source: Optional[str]) -> bool:
+    """True when a fact's V40 provenance names the person as its source."""
+    return (source or "").strip().lower() in TRUSTED_FACT_SOURCES
+
+
+def fact_origin(source: Optional[str]) -> str:
+    """The provenance label a client can key on: 'stated', 'manual' or
+    'unknown' (the row predates V40, or was written by a caller that could
+    not say where it came from)."""
+    value = (source or "").strip().lower()
+    return value if value in TRUSTED_FACT_SOURCES else UNKNOWN_FACT_ORIGIN
+
+
+def _fact_row(r) -> dict:
+    return {
+        "id": int(r["id"]),
+        "fact": r["fact"],
+        "source_conversation_id": r["source_conversation_id"],
+        "source": r["source"],
+        "source_excerpt": r["source_excerpt"],
+        # Derived, not stored: one judgement of the V40 columns, so the
+        # memory panel and the identity line cannot disagree about which
+        # rows the person is answerable for.
+        "origin": fact_origin(r["source"]),
+        "trusted": fact_source_is_trusted(r["source"]),
+        "created_at": _iso(r["created_at"]),
+        "updated_at": _iso(r["updated_at"]),
+    }
+
+
+_FACT_COLUMNS = (
+    "SELECT id, fact, source_conversation_id, source, source_excerpt,"
+    "       created_at, updated_at"
+    "  FROM user_facts WHERE user_id = %s"
+)
+
+
 def list_user_facts(user_id: int, limit: int = 500) -> List[dict]:
     """The user's durable facts, most recently updated first.
 
     `source` / `source_excerpt` (V40) say where each row came from; both are
-    None for a row written before that migration.
+    None for a row written before that migration, and `origin` / `trusted`
+    are that provenance judged once, here.
     """
     with read_connection() as con:
         rows = con.execute(
-            "SELECT id, fact, source_conversation_id, source, source_excerpt,"
-            "       created_at, updated_at"
-            "  FROM user_facts WHERE user_id = %s"
-            " ORDER BY updated_at DESC, id DESC LIMIT %s",
+            _FACT_COLUMNS + " ORDER BY updated_at DESC, id DESC LIMIT %s",
             (user_id, limit),
         ).fetchall()
-    return [
-        {
-            "id": int(r["id"]),
-            "fact": r["fact"],
-            "source_conversation_id": r["source_conversation_id"],
-            "source": r["source"],
-            "source_excerpt": r["source_excerpt"],
-            "created_at": _iso(r["created_at"]),
-            "updated_at": _iso(r["updated_at"]),
-        }
-        for r in rows
-    ]
+    return [_fact_row(r) for r in rows]
+
+
+def trusted_user_facts(user_id: int, limit: int = 50) -> List[dict]:
+    """Only the facts whose V40 provenance names the person as their source.
+
+    The filter is in the SQL, not in the caller: a row with a NULL `source`
+    must never reach the code that decides what to call somebody, and a
+    forgotten `if` in one caller is how that happens.
+    """
+    with read_connection() as con:
+        rows = con.execute(
+            _FACT_COLUMNS
+            + "   AND lower(source) = ANY(%s)"
+            " ORDER BY updated_at DESC, id DESC LIMIT %s",
+            (user_id, list(TRUSTED_FACT_SOURCES), limit),
+        ).fetchall()
+    return [_fact_row(r) for r in rows]
 
 
 def add_user_fact(
@@ -6181,6 +6235,8 @@ def add_user_fact(
         "source_conversation_id": source_conversation_id,
         "source": source,
         "source_excerpt": excerpt,
+        "origin": fact_origin(source),
+        "trusted": fact_source_is_trusted(source),
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
@@ -6217,6 +6273,8 @@ def update_user_fact(
         "fact": fact,
         "source": row["source"],
         "source_excerpt": row["source_excerpt"],
+        "origin": fact_origin(row["source"]),
+        "trusted": fact_source_is_trusted(row["source"]),
         "updated_at": now.isoformat(),
     }
 
