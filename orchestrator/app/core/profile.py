@@ -12,7 +12,9 @@ such content that reaches a prompt:
                    and with no value shaped like an email or a long number,
                    and for a key-named column (store_id) only when its values
                    repeat KEY_GROUP_MIN_ROWS_PER_VALUE times on average;
-                   values truncated)
+                   values truncated. aggregates.by_cross names values too,
+                   but only ones by_group already listed, so it widens
+                   nothing — it adds figures, not content.)
 
 All three go through `clip()`. Everything else is derived statistics: sums,
 averages, counts, months. Group values are NOT the same class as top values:
@@ -216,6 +218,9 @@ def _columnar_copy(
 #   {"computed": "exact", "measures": [col, ...],
 #    "by_group": [{"group", "measure", "rows": [{"value", "count", "sum", "avg"}], "truncated"}],
 #    "by_month": [{"date", "measure", "rows": [{"month": "YYYY-MM", "count", "sum"}], "truncated"}],
+#    "by_cross": [{"group", "across", "kind": "month"|"group", "measure",
+#                  "rows": [{"value", "cells": [{"month"|"across", "count", "sum"}]}],
+#                  "truncated"}],          # only when `cross` named the pair
 #    "omitted": [reason, ...]}
 #
 # EXACTNESS, stated once:
@@ -250,6 +255,36 @@ AGG_MAX_MEASURES = 8
 AGG_MAX_GROUP_COLUMNS = 6
 AGG_MAX_DATE_COLUMNS = 3
 AGG_MAX_MONTHS = 60
+#: THE CROSS IS BOUNDED WHERE IT IS BUILT, not by _cap_aggregates. It is one
+#: measure for every PAIR of values, so 50 regions x 60 months is 3,000 cells
+#: where a one-dimensional breakdown has at most 51 rows — left to the cap it
+#: would either blow the budget or be dropped, and the cross is the one
+#: breakdown the person asked for. Built instead as the top CROSS_MAX_GROUPS
+#: group values by total x the most recent CROSS_MAX_ACROSS months (or the top
+#: CROSS_MAX_ACROSS values of a second grouping column), inside
+#: CROSS_MAX_CELLS figures, with `omitted` saying how many values of each axis
+#: were left out.
+#:
+#: A CELL COSTS ABOUT 120 RENDERED CHARACTERS, measured on the seeded files: a
+#: 60-cell cross took the 3,000-row file's aggregates from 5,537 to 12,773.
+#: CROSS_MAX_CELLS is what keeps one breakdown from eating the whole
+#: 40,000-character block — 96 cells is about 11,500 characters.
+#: MONTHS ARE KEPT BEFORE GROUPS: shrinking the month axis breaks the trend
+#: the cross exists to show, so the group axis gives way first, down to
+#: CROSS_MIN_GROUPS, and only then are columns dropped.
+CROSS_MAX_GROUPS = 12
+CROSS_MAX_ACROSS = 18
+CROSS_MAX_CELLS = 96
+CROSS_MIN_GROUPS = 4
+#: What ONE cross may take of the aggregates budget it is capped against. A
+#: 10-sheet workbook shares AGG_MAX_CHARS across its sheets
+#: (_share_aggregates), and a cross sized for a file on its own left a sheet
+#: nothing at all: measured on a 20,000-row 30-region file at a 12,000
+#: budget, the cross could not fit and the cap dropped every breakdown in the
+#: block, 1,013 characters of nothing but reasons. It is shrunk to this share
+#: instead (_shrink_cross), and dropped only when even a 1 x 1 cross is too
+#: big.
+CROSS_CAP_SHARE = 0.35
 #: Size of the aggregates block AS THE PROMPT RENDERS IT: dataset.format_profile
 #: and the /v1 file context both print profiles with json indent=1, which QA
 #: measured at 1.42x the compact size (38,196 compact -> 54,229 rendered on a
@@ -551,9 +586,16 @@ def _ranked(rows: List[tuple]) -> List[tuple]:
     )
 
 
-def _group_breakdowns(
-    con, src: str, group: str, gident: str, plans: List[dict], omitted: List[str], check_values: bool = True,
-) -> List[dict]:
+def _group_breakdowns(con, src: str, g: dict, plans: List[dict], omitted: List[str]) -> List[dict]:
+    """Every measure broken down by one grouping column.
+
+    Records on `g` what it decided, so a cross over the same column reuses the
+    verdict instead of re-deriving it: `g["listed"]` is the values it is
+    willing to name (those in at least GROUP_MIN_ROWS rows, plus the blank
+    group), and `g["blocked"]` is set when the column's values look personal.
+    """
+    group, gident = g["name"], g["ident"]
+    check_values = g.get("check_values", True)
     sums = ", ".join(f"{p['sum_sql']}, COUNT({p['ident']})" for p in plans)
     found = con.execute(
         f"SELECT {gident}, CAST({gident} AS VARCHAR), COUNT(*), {sums} FROM {src} GROUP BY 1, 2"
@@ -561,6 +603,7 @@ def _group_breakdowns(
     # A column whose values look like emails or long numbers is a contact or
     # account column whatever its name ("contact", "owner"): not listed.
     if check_values and any(_personal_value(text) for v, text, *_rest in found if v is not None):
+        g["blocked"] = True
         omitted.append(
             f"by_group {_label(group)}: not listed, its values look like contact details or account numbers"
         )
@@ -570,6 +613,7 @@ def _group_breakdowns(
     # group (None) is not content and always stays.
     rare = [r for r in found if r[0] is not None and int(r[2]) < GROUP_MIN_ROWS]
     listed = [r for r in found if r[0] is None or int(r[2]) >= GROUP_MIN_ROWS]
+    g["listed"] = [r[0] for r in listed]
     if rare:
         omitted.append(
             f"by_group {_label(group)}: {len(rare)} value(s) found in only one row are not "
@@ -645,6 +689,221 @@ def _month_breakdowns(con, src: str, date: str, dident: str, kind: str, plans: L
     ]
 
 
+def _cross_total(sums) -> Any:
+    """Cell sums added up, in the type DuckDB returned them: an int or DECIMAL
+    total stays exact, a float one carries the noise its mode already allows.
+    Used to RANK the axes of a cross, and to say what an axis leaves out."""
+    kept = [s for s in sums if s is not None]
+    if not kept:
+        return None
+    total = kept[0]
+    for v in kept[1:]:
+        total = total + v
+    return total
+
+
+def _cross_axis(cells: List[tuple], at: int) -> List[tuple]:
+    """(value, text, rows, total) per value of one axis of a cross, ranked by
+    _ranked — the order a one-dimensional breakdown uses, so the cross names
+    the same values in the same order."""
+    seen: Dict[Any, List[tuple]] = {}
+    texts: Dict[Any, Any] = {}
+    for r in cells:
+        seen.setdefault(r[at], []).append(r)
+        texts.setdefault(r[at], r[at + 1])
+    return _ranked([
+        (v, texts[v], sum(int(r[4]) for r in rows), _cross_total(r[5] for r in rows))
+        for v, rows in seen.items()
+    ])
+
+
+def _cross_breakdown(
+    con, src: str, group: dict, across: dict, kind: str, plan: dict, omitted: List[str],
+) -> Optional[dict]:
+    """ONE measure broken down by TWO things at once: group x month, or
+    group x group.
+
+    The audit's own headline request — "Generate a PDF report of monthly
+    revenue by region" — asks for exactly this, and nothing computed it:
+    release-2 printed revenue by region and revenue by month side by side and
+    said honestly that the cross was not worked out. It is worked out here,
+    in one GROUP BY, with the measure's own summing plan, so a cell is exact
+    to the cent exactly as a group or a month total is.
+
+    NEITHER AXIS IS NEW RAW CONTENT. Both must already be breakdowns the
+    profile is willing to list: the row axis is a grouping column that passed
+    _is_group_key and the contact-shape check, and only the values
+    _group_breakdowns listed (`g["listed"]`) can label a row, so a value seen
+    in a single row never reaches the prompt through the cross either. A
+    personal-looking column is not a group key, so it can never be an axis.
+
+    The blank group keeps its row, as it does in by_group. A row with no
+    date — or no value for a second grouping column — has no COLUMN to sit
+    under, so it is left out and `omitted` says by how much, the way
+    _month_breakdowns says it for the months.
+    """
+    gident = group["ident"]
+    if kind == "month":
+        # Bucketed in UTC for the same reason _month_breakdowns is: the
+        # session zone is the host's, and one file must give one answer.
+        stamp = f"timezone('UTC', {across['ident']})" if across.get("kind") == "tz" else across["ident"]
+        araw = atext = f"strftime(date_trunc('month', {stamp}), '%Y-%m')"
+        akey = "month"
+    else:
+        araw, atext, akey = across["ident"], f"CAST({across['ident']} AS VARCHAR)", "across"
+    found = con.execute(
+        f"SELECT {gident}, CAST({gident} AS VARCHAR), {araw}, {atext}, COUNT(*), "
+        f"{plan['sum_sql']}, COUNT({plan['ident']}) FROM {src} GROUP BY 1, 2, 3, 4"
+    ).fetchall()
+
+    allowed_g = set(group.get("listed") or [])
+    cells = [r for r in found if r[0] in allowed_g]
+    if kind == "month":
+        gone = [r for r in cells if r[2] is None]
+        cells = [r for r in cells if r[2] is not None]
+    else:
+        allowed_a = set(across.get("listed") or [])
+        gone = [r for r in cells if r[2] not in allowed_a or r[2] is None]
+        cells = [r for r in cells if r[2] in allowed_a and r[2] is not None]
+    if not cells:
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: not computed, no pair of "
+            f"values has rows that both breakdowns list"
+        )
+        return None
+
+    # Which COLUMNS the table has: the most recent months, as by_month keeps
+    # them, or the largest values of a second grouping column, as by_group
+    # ranks them. Both axes are ranked on each value's WHOLE total, including
+    # the cells that will not fit: which months and which groups matter is a
+    # fact about the file, not about how many of them the budget allows.
+    axis_a = _cross_axis(cells, 2)
+    axis_g = _cross_axis(cells, 0)
+    n_g, n_a = min(CROSS_MAX_GROUPS, len(axis_g)), min(CROSS_MAX_ACROSS, len(axis_a))
+    while n_g * n_a > CROSS_MAX_CELLS and n_g > CROSS_MIN_GROUPS:
+        n_g -= 1
+    while n_g * n_a > CROSS_MAX_CELLS and n_a > 1:
+        n_a -= 1
+    kept_across = (
+        sorted(r[0] for r in axis_a)[-n_a:] if kind == "month"
+        else [r[0] for r in axis_a[:n_a]]
+    )
+    across_at = {v: i for i, v in enumerate(kept_across)}
+    kept_groups = [r[0] for r in axis_g[:n_g]]
+
+    per_group: Dict[Any, List[tuple]] = {}
+    for r in cells:
+        per_group.setdefault(r[0], []).append(r)
+
+    out_rows = []
+    lossy = plan.get("lossy")
+    for value in kept_groups:
+        mine = sorted(
+            (r for r in per_group.get(value, ()) if r[2] in across_at), key=lambda r: across_at[r[2]]
+        )
+        if not mine:
+            continue
+        if not lossy and not all(_json_exact(r[5], plan["mode"]) for r in mine):
+            lossy = True
+            omitted.append(_lossy_reason(plan["name"]))
+        out_rows.append({
+            "value": clip(value),
+            "cells": [
+                {
+                    akey: (r[2] if kind == "month" else clip(r[2])),
+                    "count": int(r[4]),
+                    "sum": _json_sum(r[5], plan["mode"]),
+                }
+                for r in mine
+            ],
+        })
+    if lossy:
+        plan["lossy"] = True
+    if not out_rows:
+        return None
+
+    dropped_g = len(axis_g) - len(kept_groups)
+    dropped_a = len(axis_a) - len(kept_across)
+    if dropped_g or dropped_a:
+        parts = []
+        if dropped_g:
+            parts.append(f"{dropped_g} further {_label(group['name'])} value(s)")
+        if dropped_a:
+            parts.append(
+                f"{dropped_a} further month(s)" if kind == "month"
+                else f"{dropped_a} further {_label(across['name'])} value(s)"
+            )
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: "
+            + " and ".join(parts)
+            + " are not listed, so the pairs it holds add up to less than the column totals"
+        )
+    if gone:
+        # A row is left out of the cross when it has no value to sit under:
+        # no date (there is no NULL month, by contract), or a value of the
+        # second column that breakdown will not name (GROUP_MIN_ROWS).
+        n_gone = sum(int(r[4]) for r in gone)
+        total_gone = _cross_total(r[5] for r in gone)
+        why = (
+            "have no date and are under no month" if kind == "month"
+            else f"are under no {_label(across['name'])} value listed here"
+        )
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: {n_gone} row(s) {why}, "
+            f"so the pairs it holds add up to less than the column totals by: "
+            f"{_label(plan['name'])} {_json_sum(total_gone, plan['mode']) or 0}"
+        )
+    return {
+        "group": group["name"],
+        "across": across["name"],
+        "kind": kind,
+        "measure": plan["name"],
+        "rows": out_rows,
+        "truncated": bool(dropped_g or dropped_a),
+    }
+
+
+def _plan_cross(
+    con, src: str, cross: Any, groups: List[dict], dates: List[dict], plans: List[dict],
+    omitted: List[str],
+) -> Optional[dict]:
+    """The requested cross, or None with a reason when an axis cannot carry one.
+
+    `cross` is {"group", "across", "measure"} — the pair the person's request
+    named, chosen by the engine that read the request (engines/dataset_report
+    .cross_request). Nothing here trusts those names: an axis is used only if
+    it is a column this profile ALREADY broke down, which is what keeps a
+    personal-looking column out of a cross.
+    """
+    if not isinstance(cross, dict):
+        return None
+    want_group, want_across = cross.get("group"), cross.get("across")
+    listed_groups = {g["name"]: g for g in groups[:AGG_MAX_GROUP_COLUMNS] if not g.get("blocked")}
+    listed_dates = {d["name"]: d for d in dates[:AGG_MAX_DATE_COLUMNS]}
+    group = listed_groups.get(want_group)
+    across = listed_dates.get(want_across)
+    kind = "month"
+    if across is None:
+        across = listed_groups.get(want_across)
+        kind = "group"
+    if group is None or across is None or group is across:
+        if want_group is not None and want_across is not None:
+            omitted.append(
+                f"by_cross {_label(want_group)} x {_label(want_across)}: not computed, a breakdown by "
+                f"two things at once needs both of them to be broken down on their own first"
+            )
+        return None
+    plan = next((p for p in plans if p["name"] == cross.get("measure")), None) or plans[0]
+    try:
+        return _cross_breakdown(con, src, group, across, kind, plan, omitted)
+    except Exception as exc:  # noqa: BLE001 — the one-dimensional figures still answer
+        omitted.append(
+            f"by_cross {_label(group['name'])} x {_label(across['name'])}: could not be computed "
+            f"({type(exc).__name__})"
+        )
+        return None
+
+
 # --- Size, as the prompt renders it ----------------------------------------
 #
 # json.dumps(indent=1) is the pure-Python encoder (the C one only runs without
@@ -687,14 +946,108 @@ def _agg_chars(agg: Dict[str, Any]) -> int:
     return _rendered_len(agg, AGG_RENDER_DEPTH)
 
 
+#: The breakdown lists the cap arbitrates between, and the order it drops
+#: them in. `by_cross` is last on purpose: it is the ONE breakdown the
+#: person's request named, it is already bounded where it is built
+#: (CROSS_MAX_GROUPS x CROSS_MAX_ACROSS), and dropping it would put the
+#: answer back to "that figure is not computed" with the budget spent on
+#: breakdowns nobody asked for.
+_AGG_LISTS = ("by_group", "by_month", "by_cross")
+
+
+def _agg_cells(entry: Any) -> int:
+    """How WIDE a breakdown is, in figures. A cross holds one figure per pair,
+    so its `rows` count understates it by the width of its table."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("rows"), list):
+        return 0
+    rows = entry["rows"]
+    if not any(isinstance(r, dict) and isinstance(r.get("cells"), list) for r in rows):
+        return len(rows)
+    return sum(len(r["cells"]) for r in rows if isinstance(r, dict) and isinstance(r.get("cells"), list))
+
+
+def _drop_order(kind: str, i: int, cells: int) -> tuple:
+    """Sort key: everything but a cross first, widest first; on a tie the
+    later breakdown goes first (the later measure, then the later column), so
+    the order is fixed by the file."""
+    return (kind == "by_cross", -cells, kind == "by_group", -i)
+
+
+def _dropped_reason_cap(kind: str, entry: Dict[str, Any], limit: int) -> str:
+    if kind == "by_cross":
+        return (
+            f"by_cross {_label(entry.get('group'))} x {_label(entry.get('across'))}: the breakdown of "
+            f"{_label(entry.get('measure'))} by both was dropped to keep the aggregates under "
+            f"{limit} characters"
+        )
+    label = entry.get("group") if kind == "by_group" else entry.get("date")
+    return (
+        f"{kind} {_label(label)} x {_label(entry['measure'])}: dropped to keep the aggregates "
+        f"under {limit} characters"
+    )
+
+
+def _shrink_cross(agg: Dict[str, Any], limit: int) -> None:
+    """Cut a cross down to CROSS_CAP_SHARE of `limit`, before any breakdown is
+    dropped, and say what that cut cost.
+
+    A cross is bounded where it is built, but against the budget a FILE gets;
+    a workbook's sheet may be capped against a tenth of that. Shrinking it
+    here keeps the pairs that matter — the largest groups, the most recent
+    months — where dropping the whole entry would leave the question
+    unanswered and the budget spent on breakdowns nobody asked for.
+    """
+    room = int(limit * CROSS_CAP_SHARE)
+    item_depth = AGG_RENDER_DEPTH + 2
+    for entry in agg.get("by_cross") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("rows"), list):
+            continue
+        month = entry.get("kind") == "month"
+        cut_g = cut_a = 0
+        while _rendered_len(entry, item_depth) > room and entry["rows"]:
+            widest = max((len(r["cells"]) for r in entry["rows"]), default=0)
+            if len(entry["rows"]) > CROSS_MIN_GROUPS or widest <= 1:
+                entry["rows"].pop()  # the smallest total: _cross_axis ranked them
+                cut_g += 1
+            else:
+                # The oldest month, or the smallest value of a second group:
+                # cells are written in the axis order the build chose.
+                for r in entry["rows"]:
+                    if len(r["cells"]) > 1:
+                        r["cells"].pop(0 if month else -1)
+                cut_a += 1
+        if cut_g or cut_a:
+            entry["truncated"] = True
+            parts = []
+            if cut_g:
+                parts.append(f"{cut_g} more {_label(entry.get('group'))} value(s)")
+            if cut_a:
+                parts.append(
+                    f"{cut_a} more month(s)" if month
+                    else f"{cut_a} more {_label(entry.get('across'))} value(s)"
+                )
+            agg["omitted"].append(
+                f"by_cross {_label(entry.get('group'))} x {_label(entry.get('across'))}: "
+                + " and ".join(parts)
+                + f" were left out to keep the aggregates under {limit} characters"
+            )
+    agg["by_cross"] = [e for e in agg["by_cross"] if not isinstance(e, dict) or e.get("rows")]
+    if not agg["by_cross"]:
+        del agg["by_cross"]
+
+
 def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
     """Shrink the block until its rendered size fits `limit` (AGG_MAX_CHARS).
 
-    First the WIDEST breakdowns go: the most ROWS (groups or months), not the
-    most characters. Measured on a 1M-row sales file: ranked by characters,
-    the cap dropped revenue-by-month and cost-by-month and kept unit_price-
-    and discount-by-month, because a money total has more digits — the most
-    useful breakdowns went first. Row count does not depend on the values.
+    First the WIDEST breakdowns go: the most FIGURES (groups, months, or the
+    pairs of a cross), not the most characters. Measured on a 1M-row sales
+    file: ranked by characters, the cap dropped revenue-by-month and
+    cost-by-month and kept unit_price- and discount-by-month, because a money
+    total has more digits — the most useful breakdowns went first. Figure
+    count does not depend on the values.
+
+    A CROSS IS DROPPED LAST (_AGG_LISTS): it is the one breakdown the request
+    named, and it is already bounded where it is built.
 
     Only a pathological file gets further (QA: eight measures with
     6,000-character headers made the `measures` list alone 48,249 characters
@@ -705,21 +1058,26 @@ def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
     limit = AGG_MAX_CHARS if limit is None else limit
     if _agg_chars(agg) <= limit:
         return
+    if agg.get("by_cross"):
+        _shrink_cross(agg, limit)
+        if _agg_chars(agg) <= limit:
+            return
     d = AGG_RENDER_DEPTH
     item_depth = d + 2  # agg keys sit at d + 1, their list items at d + 2
+    lists = [k for k in _AGG_LISTS if isinstance(agg.get(k), list)]
     widths = {}
-    rows = {}
-    for kind in ("by_group", "by_month"):
+    order = []
+    for kind in lists:
         for i, entry in enumerate(agg[kind]):
             widths[(kind, i)] = _rendered_len(entry, item_depth)
-            rows[(kind, i)] = len(entry["rows"])
-    # Most rows first; on a tie the later breakdown goes first (the later
-    # measure, then the later column), so the order is fixed by the file.
-    order = sorted(rows, key=lambda k: (-rows[k], k[0] == "by_group", -k[1]))
-    # Sizes are tracked arithmetically: the skeleton (everything but the three
-    # lists) plus each list rendered from its items' lengths.
-    skeleton = _rendered_len({**agg, "by_group": [], "by_month": [], "omitted": []}, d) - 6
-    kept = {kind: [widths[(kind, i)] for i in range(len(agg[kind]))] for kind in ("by_group", "by_month")}
+            order.append((_drop_order(kind, i, _agg_cells(entry)), (kind, i)))
+    order = [key for _rank, key in sorted(order)]
+    # Sizes are tracked arithmetically: the skeleton (everything but the
+    # breakdown lists and the reasons) plus each list rendered from its items'
+    # lengths.
+    empty = {**agg, "omitted": [], **{k: [] for k in lists}}
+    skeleton = _rendered_len(empty, d) - 2 * (len(lists) + 1)
+    kept = {kind: [widths[(kind, i)] for i in range(len(agg[kind]))] for kind in lists}
     sums = {kind: sum(v) for kind, v in kept.items()}
     counts = {kind: len(v) for kind, v in kept.items()}
     notes = [len(json.dumps(r, ensure_ascii=False)) for r in agg["omitted"]]
@@ -728,8 +1086,7 @@ def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
     def size() -> int:
         return (
             skeleton
-            + _list_len(sums["by_group"], counts["by_group"], d + 1)
-            + _list_len(sums["by_month"], counts["by_month"], d + 1)
+            + sum(_list_len(sums[k], counts[k], d + 1) for k in lists)
             + _list_len(note_sum, note_n, d + 1)
         )
 
@@ -738,33 +1095,23 @@ def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
         if size() <= limit:
             break
         kind, i = key
-        entry = agg[kind][i]
-        label = entry.get("group") if kind == "by_group" else entry.get("date")
-        reason = (
-            f"{kind} {_label(label)} x {_label(entry['measure'])}: dropped to keep the aggregates "
-            f"under {limit} characters"
-        )
+        reason = _dropped_reason_cap(kind, agg[kind][i], limit)
         dropped.add(key)
         agg["omitted"].append(reason)
         sums[kind] -= widths[key]
         counts[kind] -= 1
         note_sum += len(json.dumps(reason, ensure_ascii=False))
         note_n += 1
-    for kind in ("by_group", "by_month"):
+    for kind in lists:
         agg[kind] = [e for i, e in enumerate(agg[kind]) if (kind, i) not in dropped]
     # The arithmetic above is exact for json.dumps' separators; this re-check
     # keeps the cap a guarantee if that ever changes.
-    while _agg_chars(agg) > limit and (agg["by_group"] or agg["by_month"]):
+    while _agg_chars(agg) > limit and any(agg[k] for k in lists):
         kind, i = min(
-            ((k, i) for k in ("by_group", "by_month") for i in range(len(agg[k]))),
-            key=lambda k: (-len(agg[k[0]][k[1]]["rows"]), k[0] == "by_group", -k[1]),
+            ((k, i) for k in lists for i in range(len(agg[k]))),
+            key=lambda k: _drop_order(k[0], k[1], _agg_cells(agg[k[0]][k[1]])),
         )
-        entry = agg[kind].pop(i)
-        label = entry.get("group") if kind == "by_group" else entry.get("date")
-        agg["omitted"].append(
-            f"{kind} {_label(label)} x {_label(entry['measure'])}: dropped to keep the aggregates "
-            f"under {limit} characters"
-        )
+        agg["omitted"].append(_dropped_reason_cap(kind, agg[kind].pop(i), limit))
     if _agg_chars(agg) <= limit:
         return
     # Only column NAMES and reasons are left. Cut measures from the end,
@@ -788,7 +1135,7 @@ def _cap_aggregates(agg: Dict[str, Any], limit: Optional[int] = None) -> None:
 
 def _aggregates(
     con, src: str, measures: List[dict], groups: List[dict], dates: List[dict], omitted: List[str],
-    limit: Optional[int] = None,
+    limit: Optional[int] = None, cross: Any = None,
 ) -> Dict[str, Any]:
     # `omitted` right after `computed`: a reader that cuts the rendered
     # profile (the /v1 file context stops at 24,000 characters) must not keep
@@ -819,9 +1166,7 @@ def _aggregates(
         )
     for g in groups[:AGG_MAX_GROUP_COLUMNS]:
         try:
-            agg["by_group"].extend(
-                _group_breakdowns(con, src, g["name"], g["ident"], plans, omitted, g.get("check_values", True))
-            )
+            agg["by_group"].extend(_group_breakdowns(con, src, g, plans, omitted))
         except Exception as exc:  # noqa: BLE001 — one bad column must not sink the rest
             omitted.append(f"by_group {_label(g['name'])}: could not be computed ({type(exc).__name__})")
     if len(dates) > AGG_MAX_DATE_COLUMNS:
@@ -834,6 +1179,13 @@ def _aggregates(
             agg["by_month"].extend(_month_breakdowns(con, src, d["name"], d["ident"], d["kind"], plans, omitted))
         except Exception as exc:  # noqa: BLE001
             omitted.append(f"by_month {_label(d['name'])}: could not be computed ({type(exc).__name__})")
+    # LAST, because it reuses what the two above decided (which values each
+    # column is willing to name), and FIRST in the block, because it is the
+    # figure the request asked for: the reader meets it before the two
+    # one-dimensional breakdowns it reconciles against.
+    entry = _plan_cross(con, src, cross, groups, dates, plans, omitted)
+    if entry is not None:
+        agg = _insert_after(agg, "measures", "by_cross", [entry])
     _cap_aggregates(agg, limit)
     return agg
 
@@ -1074,12 +1426,16 @@ def profile_tabular(
     types: Optional[Dict[str, str]] = None,
     agg_max_chars: Optional[int] = None,
     full_chars: Optional[int] = None,
+    cross: Any = None,
 ) -> Dict[str, Any]:
     """Shape, per-column statistics, and a capped sample — no bulk load.
 
     csv_options / types: only the spreadsheet path passes any (profile_excel).
     agg_max_chars / full_chars: a workbook's sheets share one budget for
     their aggregates and their full rows; a file alone gets the full budget.
+    cross: {"group", "across", "measure"} — the ONE two-dimensional
+    breakdown the person's request named, or None (the upload path passes
+    none: a cross belongs to a question, not to a file).
     """
     rel = name or os.path.basename(path)
     out: Dict[str, Any] = {
@@ -1262,7 +1618,9 @@ def profile_tabular(
             # aggregates, so a cut inside `columns` kept sums that leave these
             # rows out with nothing in the window saying so (QA r2).
             out = _insert_after(out, "rows", "rows_not_read", dropped)
-        out["aggregates"] = _aggregates(con, src, measures, groups, dates, omitted, agg_max_chars)
+        out["aggregates"] = _aggregates(
+            con, src, measures, groups, dates, omitted, agg_max_chars, cross=cross
+        )
 
         sample = con.execute(
             f"SELECT * FROM {src} LIMIT {settings.profile_sample_rows}"
@@ -1386,7 +1744,9 @@ def _sheet_cell(value: Any) -> str:
     return str(value)
 
 
-def _profile_sheet(ws, scratch: Optional[str], index: int, budget: _WorkbookBudget) -> Dict[str, Any]:
+def _profile_sheet(
+    ws, scratch: Optional[str], index: int, budget: _WorkbookBudget, cross: Any = None,
+) -> Dict[str, Any]:
     """Stream one worksheet into a scratch CSV and profile it like a CSV.
 
     Falls back to the old minimal record (names, count, five sample rows)
@@ -1520,6 +1880,9 @@ def _profile_sheet(ws, scratch: Optional[str], index: int, budget: _WorkbookBudg
             csv_options=_SHEET_CSV_OPTIONS,
             types=forced,
             full_chars=max(0, budget.full_chars),
+            # Offered to every sheet: a sheet without both named columns
+            # computes no cross, so the pair lands on the sheet that holds it.
+            cross=cross,
         )
     finally:
         os.remove(csv_path)
@@ -1563,7 +1926,7 @@ def _share_aggregates(sheets: List[Dict[str, Any]]) -> None:
         left -= min(_agg_chars(blocks[i]), allowed)
 
 
-def profile_excel(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
+def profile_excel(path: str, *, name: Optional[str] = None, cross: Any = None) -> Dict[str, Any]:
     """Profile an .xlsx — AFTER the zip-container caps have been applied.
 
     An .xlsx is a ZIP. Handing one straight to openpyxl would walk around
@@ -1598,7 +1961,7 @@ def profile_excel(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     try:
         scratch = _scratch_dir()
         for index, ws in enumerate(wb.worksheets[:10]):
-            out["sheets"].append(_profile_sheet(ws, scratch, index, budget))
+            out["sheets"].append(_profile_sheet(ws, scratch, index, budget, cross))
     finally:
         wb.close()
         if scratch is not None:
@@ -1607,7 +1970,7 @@ def profile_excel(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     return out
 
 
-def profile_file(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
+def profile_file(path: str, *, name: Optional[str] = None, cross: Any = None) -> Dict[str, Any]:
     """Profile one file, choosing a reader by extension AND magic bytes."""
     rel = name or os.path.basename(path)
     lower = rel.lower()
@@ -1617,11 +1980,11 @@ def profile_file(path: str, *, name: Optional[str] = None) -> Dict[str, Any]:
     if any(lower.endswith(s) for s in EXCEL_SUFFIXES):
         if not archive.is_zip_container(path):
             return {"file": rel, "kind": "skipped", "reason": "not a real .xlsx"}
-        return profile_excel(path, name=rel)
+        return profile_excel(path, name=rel, cross=cross)
     if any(lower.endswith(s) for s in TABULAR_SUFFIXES) or archive.sniff_format(
         path
     ) == "parquet":
-        return profile_tabular(path, name=rel)
+        return profile_tabular(path, name=rel, cross=cross)
     return {
         "file": rel,
         "kind": "other",

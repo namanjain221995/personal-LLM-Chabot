@@ -363,6 +363,64 @@ def asked_breakdowns(text: str, names: Sequence[Any]) -> List[Any]:
 MAX_BREAKDOWNS = 2
 
 
+def _figure_names(prof: Dict[str, Any]) -> Optional[tuple]:
+    """(columns, measures, group names, date names) of a profile that carries
+    computed figures, or None."""
+    agg = prof.get("aggregates")
+    if not isinstance(agg, dict) or not agg.get("computed"):
+        return None
+    columns = {c.get("name"): c for c in (prof.get("columns") or []) if isinstance(c, dict)}
+    measures = [m for m in (agg.get("measures") or []) if _dec((columns.get(m) or {}).get("sum")) is not None]
+    groups = list(dict.fromkeys(
+        g.get("group") for g in (agg.get("by_group") or []) if isinstance(g, dict) and g.get("rows")
+    ))
+    dates = list(dict.fromkeys(
+        g.get("date") for g in (agg.get("by_month") or []) if isinstance(g, dict) and g.get("rows")
+    ))
+    return columns, measures, groups, dates
+
+
+def cross_request(prof: Dict[str, Any], request: str) -> Optional[Dict[str, Any]]:
+    """The ONE two-dimensional breakdown a request asks a file for, or None.
+
+    THE AUDIT'S HEADLINE REQUEST. "Generate a PDF report of monthly revenue by
+    region" names both a grouping column and the months, and until now nothing
+    computed that pair: the report printed revenue by region and revenue by
+    month and said honestly that the cross was not worked out (completeness
+    critic R5, 2026-09-21). Named here, it is computed in DuckDB over every
+    row (core/profile._cross_breakdown).
+
+    Only a column the profile ALREADY broke down can be an axis, so a
+    personal-looking column — which is never a group key — can never become
+    one through a request. `request` is request_text(message).
+    """
+    found = _figure_names(prof)
+    if not found:
+        return None
+    columns, measures, groups, dates = found
+    if not measures or not groups:
+        return None
+    # The same candidate list _computed_section asks: any column but a
+    # measure or a date, plus group names a truncated column list left out.
+    candidates = [n for n in columns if n not in measures and n not in dates]
+    candidates += [g for g in groups if g not in columns]
+    asked = [n for n in asked_breakdowns(request, candidates) if n in groups]
+    if not asked:
+        return None
+    measure = (named(request, measures) or sorted(
+        measures, key=lambda m: abs(_dec(columns[m]["sum"])), reverse=True
+    ))[0]
+    if _MONTHLY_RE.search(request) and dates:
+        across = (named(request, dates) or dates)[0]
+    elif len(asked) >= 2:
+        across = asked[1]
+    else:
+        return None
+    if across == asked[0]:
+        return None
+    return {"group": asked[0], "across": across, "measure": measure}
+
+
 def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], List[Any]]:
     """Each measure's total and mean, then the breakdowns the request asks for.
 
@@ -507,21 +565,130 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
     if wants_months and months is None and not any(g in month_groups for g in shown):
         notes.append(f"_Monthly figures were asked for, but none are computed for this file: {_no_months_reason(prof, dates)}._")
     crossed = [g for g in shown if g in explicit and g not in month_groups]
-    if months is not None and crossed:
-        # "monthly revenue by region" asks for a cross the aggregates do not
-        # hold; the two breakdowns are shown, and the gap is said.
+    cross = _cross_entry(agg)
+    if cross is not None:
+        lines += _cross_table(cross, columns, agg)
+    elif months is not None and crossed:
+        # "monthly revenue by region" asks for a cross; when none was computed
+        # the two breakdowns are shown and the gap is said.
         notes.append(
             f"_A breakdown of {_md_escape(months.get('measure'))} by {_md_escape(crossed[0])} for each "
-            "month is not computed for this report; the two breakdowns above are._"
+            f"month is not computed for this report{_cross_why(agg)}; the two breakdowns above are._"
         )
     elif len(shown) > 1 and shown[0] in explicit:
         notes.append(
             f"_A breakdown of {said} by {_md_escape(shown[0])} and {_md_escape(shown[1])} together is "
-            "not computed for this report; the two breakdowns above are._"
+            f"not computed for this report{_cross_why(agg)}; the two breakdowns above are._"
         )
     for note in notes:
         lines += [note, ""]
     return lines, shown
+
+
+#: WHAT ONE A4 COLUMN OF THE PDF HOLDS. _PAGE_CSS never reaches the PDF
+#: (sanitise_for_render strips it), so the template's own print CSS lays the
+#: page out and a money column is about a sixth of the text width. Measured
+#: 2026-09-21: a 5-region x 8-month table rendered three columns off the right
+#: edge of the page, "2024-1" and "186,4" cut mid-cell. A cross is split into
+#: as many tables as it takes instead, so no figure is lost to the margin.
+REPORT_CROSS_COLUMNS = 5
+#: Rows per table. Eighteen months of a monthly report still fit the page.
+REPORT_CROSS_ROWS = 18
+
+
+def _cross_entry(agg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The computed cross, or None. A profile holds at most one and it was
+    computed FOR this request (core/profile._plan_cross), so there is nothing
+    to match here."""
+    for e in agg.get("by_cross") or []:
+        if isinstance(e, dict) and e.get("rows"):
+            return e
+    return None
+
+
+def _cross_why(agg: Dict[str, Any]) -> str:
+    """Why no cross was computed, in the profile's own words, or ''."""
+    for reason in agg.get("omitted") or []:
+        if isinstance(reason, str) and reason.startswith("by_cross "):
+            return f" ({_caveat(reason.split(': ', 1)[-1].rstrip('.'))})"
+    return ""
+
+
+def _cross_grid(entry: Dict[str, Any]) -> Tuple[List[Any], List[Any], Dict[tuple, Any], bool]:
+    """(row labels, column labels, cell by (row label, column label), whether
+    the rows are the second axis) for the cross.
+
+    THE LONGER AXIS GOES DOWN THE PAGE. A page has far more room downwards
+    than across, and it is usually the second axis — eighteen months — that
+    is long, while the first is a handful of regions.
+    """
+    key = "month" if entry.get("kind") == "month" else "across"
+    groups: List[Any] = []
+    across: List[Any] = []
+    cells: Dict[tuple, Any] = {}
+    for r in entry["rows"]:
+        if not isinstance(r, dict) or not isinstance(r.get("cells"), list):
+            continue
+        groups.append(r.get("value"))
+        for c in r["cells"]:
+            if not isinstance(c, dict):
+                continue
+            if c.get(key) not in across:
+                across.append(c.get(key))
+            cells[(r.get("value"), c.get(key))] = c
+    if key == "month":
+        across = sorted(across)  # oldest first: a report reads a year forwards
+    if len(across) >= len(groups):
+        return across, groups, {(a, g): c for (g, a), c in cells.items()}, True
+    return groups, across, cells, False
+
+
+def _cross_table(entry: Dict[str, Any], columns: Dict[Any, Any], agg: Dict[str, Any]) -> List[str]:
+    """The cross as a matrix, split into as many tables as the page needs.
+
+    Every cell is a figure computed in DuckDB over every row — nothing here
+    adds anything up. A pair with no rows is an empty cell, not a zero: the
+    file says nothing about it.
+    """
+    group, across, measure = entry.get("group"), entry.get("across"), entry.get("measure")
+    whole = _whole((columns.get(measure) or {}).get("dtype"))
+    month = entry.get("kind") == "month"
+    down, along, cells, down_is_across = _cross_grid(entry)
+    second = "Month" if month else _md_escape(across)
+    corner = second if down_is_across else _md_escape(group)
+
+    lines = [
+        f"### Total {_md_escape(measure)} by {_md_escape(group)} for each "
+        f"{'month' if month else _md_escape(across)}",
+        "",
+    ]
+    kept = down[:REPORT_CROSS_ROWS]
+    chunks = [along[i:i + REPORT_CROSS_COLUMNS] for i in range(0, len(along), REPORT_CROSS_COLUMNS)]
+    for chunk in chunks:
+        if len(chunks) > 1:
+            lines += [f"_{_md_escape(chunk[0])} to {_md_escape(chunk[-1])}:_", ""]
+        lines += [
+            f"| {corner} | " + " | ".join(_md_escape(h) for h in chunk) + " |",
+            "| --- |" + " ---: |" * len(chunk),
+        ]
+        for label in kept:
+            row = [
+                _fmt_figure(cells[(label, head)].get("sum"), whole) if (label, head) in cells else "—"
+                for head in chunk
+            ]
+            lines.append(f"| {_md_escape(label)} | " + " | ".join(row) + " |")
+        lines.append("")
+    note = []
+    if len(down) > len(kept):
+        what = "month(s)" if (month and down_is_across) else f"{_md_escape(corner)} value(s)"
+        note.append(f"_{len(down) - len(kept)} further {what} are not shown in this table._")
+    lead = f"by_cross {group} x {across}: "
+    for reason in agg.get("omitted") or []:
+        if isinstance(reason, str) and reason.startswith(lead):
+            note.append(f"_{_caveat(reason[len(lead):].rstrip('.'))}._")
+    if note:
+        lines += [" ".join(note), ""]
+    return lines
 
 
 def _rows_not_read(prof: Dict[str, Any]) -> int:
@@ -788,6 +955,21 @@ def unsupported_figures(text: str, uploads: Sequence[dict]) -> List[str]:
     return bad
 
 
+def _plain_words(text: str, uploads: Sequence[dict]) -> str:
+    """The summary with the data's own field names replaced by plain words.
+
+    The chat answer has run through PlainWords since 2026-09-19; the report's
+    summary never did, and the same model wrote the same leak into a PDF: "a
+    revenue discrepancy of 575900.39 in the monthly aggregates" (live,
+    2026-09-21), under a prompt that already forbids the word. A PDF is the
+    copy that gets forwarded, so it gets the same guard.
+    """
+    from .dataset import PlainWords  # lazy: dataset imports this module
+
+    words = PlainWords(uploads)
+    return (words.feed(text + "\n") + words.finish()).rstrip("\n")
+
+
 async def _narrative(message: str, uploads: Sequence[dict], model_choice: str) -> str:
     """Profile-grounded prose. Never raises — the facts stand without it."""
     from .dataset import format_profile  # lazy: dataset imports this module
@@ -830,7 +1012,7 @@ async def _narrative(message: str, uploads: Sequence[dict], model_choice: str) -
         if wrong:
             log.warning("dataset report summary dropped: %d figure(s) not in the data", len(wrong))
             return _NARRATIVE_CHECKED
-        return text
+        return _plain_words(text, uploads)
     except Exception:
         log.warning("dataset report narrative failed", exc_info=True)
         return _NARRATIVE_FALLBACK
