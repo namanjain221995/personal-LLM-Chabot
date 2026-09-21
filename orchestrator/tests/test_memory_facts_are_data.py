@@ -114,6 +114,9 @@ def test_the_facts_block_is_labelled_as_background_not_orders():
     # The assistant is not the person the facts describe (the interview rows
     # made it answer "My name is Aa m a n i Nand e n d l a", 2 of 3 runs).
     assert "never speak as if you were them" in header
+    # A stored value is quoted, not reconstructed: greeting the spaced-out
+    # name, the model invented "Aam Nandendala" and "Aamanda Nandendl".
+    assert "quote a name or a number from it exactly" in header
 
 
 def test_the_longer_label_costs_the_person_no_saved_facts():
