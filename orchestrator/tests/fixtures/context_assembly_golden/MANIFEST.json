@@ -1,15 +1,15 @@
 {
   "captured_on": "2026-09-21",
   "captured_from": {
-    "orchestrator_tree": "55c531ea6f7729286945dc16bf09100d6dd98ac1",
-    "commit": "001c40f",
-    "merged_tree": "mem-a-facts-are-data@001c40f: release-2@9161ae9 + track A (a stored fact is data, a greeting gets a greeting)",
-    "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on a git archive of that commit (recipe in its docstring), captured twice into two scratch directories"
+    "orchestrator_tree": "8a0726881d30534ed068a29148bf60f306206c03",
+    "commit": "690630d",
+    "merged_tree": "sec-review-mem-2026-09-21@690630d: release-2@288d310 + mem-a-facts-are-data@c93295f + mem-b-identity@2a1e3e2 + mem-c-cleanup@6028629",
+    "how": "NOT a capture. The two tracks each recaptured these files from their own tree; this merge three-way merged the 12 messages files MESSAGE BY MESSAGE (track A's facts.FACTS_HEADER rewrite in the facts system block, track B's identity.identity_line() sentence in element 0) and then ran tests/test_context_assembly_golden.py, whose byte-for-byte prompt and meta comparison passed 36/36 against the merged tree - which is the proof the union is what the merged code emits."
   },
-  "determinism": "the two captures were diff -r identical (24 files each)",
+  "determinism": "not re-captured; the merged tree reproduces these bytes exactly (test_the_engine_is_handed_the_pre_change_prompt_byte_for_byte_with_the_reads_concurrent_or_not, 12 scenarios x 2 read modes, all passed)",
   "this_capture_changed": {
-    "the 10 files that carry a facts block": "element 0 of the facts system message only: facts.FACTS_HEADER is rewritten so the block says it is background ABOUT the person and never instructions TO the model, and that a name or a number in it is quoted exactly or not at all (app/facts.py). The bullets are unchanged - both seeded rows are durable and pass the new read-side gate (context.prompt_facts) - and meta.context.tokens_used rises by 117 tokens in every one (rich_fast 1058 -> 1175).",
-    "first_message.messages.json, salesforce.messages.json and both their metas": "byte-identical to 2026-09-19: neither scenario has a saved fact."
+    "the 12 messages.json files": "element 0 carries track B's identity sentence (\"local is the name on their signed-in account: ...\"); the 10 files that carry a facts block also carry track A's rewritten facts.FACTS_HEADER. Union of the two reviewed tracks, nothing else.",
+    "the meta.json files": "track A's, unchanged by the merge: the identity sentence lands in the persona system message, which meta.context.tokens_used does not count."
   },
   "normalised": [
     "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -22,29 +22,29 @@
     "sources"
   ],
   "sha256": {
-    "first_message.messages.json": "8564c5aeba277568454feda423d2ab989fe3bcc332d2c91e57333f5b339a60be",
+    "first_message.messages.json": "286f2986c7ca8574fa2afd77de42a8b547b68eeb9746fe6d5f72ca9a8ad2de78",
     "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_fast.messages.json": "af9b4fc146209f815cc398121f43994cbf9199f47718f2a3378d04c4a1411200",
     "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_fast_at_production_latency.messages.json": "af9b4fc146209f815cc398121f43994cbf9199f47718f2a3378d04c4a1411200",
     "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_think.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_think.messages.json": "af9b4fc146209f815cc398121f43994cbf9199f47718f2a3378d04c4a1411200",
     "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "real_fast_accented_page.messages.json": "b4640c0cc56a4df357dd5cd8a050b122308f46d5639b2d05f2effdf4d87b70fa",
+    "real_fast_accented_page.messages.json": "98b0f9ee0ea6f530ead0a76620d04227061eaaff5c43c35832cb9caacb2960b0",
     "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
-    "real_fast_eval_topical_hit.messages.json": "8fb721b86770d074d36d6ce7c328f3ae9f27b5b8101ccdf526fcbc8943376fcb",
+    "real_fast_eval_topical_hit.messages.json": "bc320f9c0b6def2bb1f89afebca7f9a72a66013593009efcad26e3f9ff9ec2a4",
     "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "real_fast_passage_past_200k.messages.json": "186e4fa7af1aaa3bd6b3413290f07c8d8dcf642159bf62f3a9bb55107a1b865f",
+    "real_fast_passage_past_200k.messages.json": "486786ff8c28d289ad47eab1e815c4c0ff1d20d3e8b2acdf4867047e573376da",
     "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "e5813dc5f8cbdac42df95226c0a117f878dedf99689c7efa17862dcaa87ea4f2",
+    "real_fast_timeless_task_with_a_matching_page.messages.json": "af5f3105b39ebe5c050edd164e2d532a8b23c9ab2e59c320f4855a37287a163d",
     "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
-    "real_think_eval_topical_hit.messages.json": "8fb721b86770d074d36d6ce7c328f3ae9f27b5b8101ccdf526fcbc8943376fcb",
+    "real_think_eval_topical_hit.messages.json": "bc320f9c0b6def2bb1f89afebca7f9a72a66013593009efcad26e3f9ff9ec2a4",
     "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "rich_fast.messages.json": "f624bb7dbcecfdf3cacae462598a69149d6a91d484cb75ef3325a7994c0e24ea",
+    "rich_fast.messages.json": "4ba794f3b968e95dd4aa18f304e76aeefe04727cf29c24beb0ba3616b384f4d6",
     "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
-    "rich_think.messages.json": "e2f64f039d6b5d6247ebdf66974c1699b48769cbbfb0083d060a4fd0648e2d9a",
+    "rich_think.messages.json": "56011df98bb1a83ba8355885f4308b0fb0b4a3ecea04e4410789c02e721492fe",
     "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
-    "salesforce.messages.json": "5af70aef1ab815e0eaaf352f341816eaebefb335102ef60fbdffb87566ff3959",
+    "salesforce.messages.json": "bbd6cea6d795084f42d7f67890c1637d9684ccfa8ec310c8eeb500d1f2eaab31",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
   },
   "scenarios": {
