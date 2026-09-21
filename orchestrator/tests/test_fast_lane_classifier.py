@@ -483,6 +483,52 @@ def test_the_lane_system_prompt_is_short_and_keeps_the_salesforce_guard():
     assert chat_engine.ASSISTANT_CONDUCT not in system
 
 
+#: The lane's identity line is the ONLY part of its system prompt that grows
+#: with user data, and `identity._NAME_MAX_CHARS` already caps a name at 80.
+#: 2026-09-21: the full identity line reached 280 chars when an account gained
+#: a settable display name, and the lane prompt went to 862 against the budget
+#: above. The constants moved into FAST_LANE_SYSTEM and the lane now takes
+#: `identity_line(short=True)`, so the growth is bounded here rather than
+#: watched.
+_LANE_IDENTITY_BUDGET = 101  # "\n" + "You are assisting " + 80 + "."
+
+
+@pytest.mark.parametrize(
+    "display_name, email",
+    [
+        ("Jane Doe", "jane.doe@example.com"),
+        ("W" * 200, "w@example.com"),  # cut to _NAME_MAX_CHARS before it is quoted
+        ("", "test1@gmail.com"),  # a login handle is never greeted as a name
+        ("", ""),
+    ],
+)
+def test_the_lane_identity_line_cannot_grow_with_user_data(display_name, email):
+    from app.identity import clear_identity, identity_line, set_identity
+
+    set_identity(display_name, email, "TechSara Solutions")
+    try:
+        line = identity_line(short=True)
+        full = identity_line()
+    finally:
+        clear_identity()
+    assert len(line) <= _LANE_IDENTITY_BUDGET, len(line)
+    # The lane's copy is shorter, and the non-lane prompt keeps the long one.
+    assert len(line) < len(full)
+    # A login handle is not a name: "test1@gmail.com" must not reach the lane.
+    if not display_name:
+        assert "test1" not in line and "@" not in line
+
+
+def test_the_lane_persona_carries_the_naming_rule_the_identity_line_dropped():
+    """The rule costs the same for every account, so it belongs in the
+    constant. Without it the short identity line would be a weaker line, not
+    just a shorter one."""
+    persona = chat_engine.FAST_LANE_SYSTEM
+    assert "spelled exactly as written" in persona
+    assert "naming somebody else is not about them" in persona
+    assert "never reveal information about other workspace members" in persona
+
+
 def test_the_lane_persona_keeps_the_saved_facts_block_within_budget():
     """The facts block is the one system block the lane keeps; the persona's
     share of the budget must leave it room."""

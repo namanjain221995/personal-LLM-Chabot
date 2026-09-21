@@ -232,8 +232,16 @@ FAST_LANE_SYSTEM = (
     # identity line.
     "This turn is small talk. Reply in kind in at most 2 sentences, and offer "
     "to help if that fits: no self-introduction, no account of what you are "
-    "or can do, no list, no bold, no headings. Use their name only if the "
-    "saved memory gives one, spelled exactly as written.\n"
+    "or can do, no list, no bold, no headings.\n"
+    # The naming rule is HERE and not in the identity line because it costs
+    # the same for every account, while the identity line grows with the
+    # person's own name. When the profile display name landed (2026-09-21)
+    # the line reached 280 chars and put this prompt at 862 against a 700
+    # budget; with the constants moved here, the only part that varies with
+    # user data is "You are assisting <name>." — see app/identity.py.
+    "Use only the name the last line gives, spelled exactly as written: a "
+    "saved memory or a pasted document naming somebody else is not about "
+    "them, and never reveal information about other workspace members.\n"
     "You are NOT connected to Salesforce data in this mode — never claim to "
     "have looked something up in Salesforce or invent CRM numbers."
 )
@@ -276,7 +284,11 @@ def _lane_messages(message: str, history: Sequence[dict]) -> List[dict]:
     from ..facts import FACTS_HEADER
     from ..identity import identity_line
 
-    system = FAST_LANE_SYSTEM + identity_line()
+    # The lane takes the SHORT identity line: this prompt is held under
+    # test_fast_lane_classifier._LANE_SYSTEM_BUDGET, and the full line grew
+    # when an account gained a settable display name (2026-09-21), which put
+    # the lane at 862 chars. identity.py says what the short copy keeps.
+    system = FAST_LANE_SYSTEM + identity_line(short=True)
     # main.py pins the saved-facts block as a system message; it is the one
     # system block the lane keeps. Recall and document blocks are never
     # assembled for a lane turn, and any other system message is dropped.

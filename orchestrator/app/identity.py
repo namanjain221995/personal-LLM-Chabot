@@ -48,6 +48,18 @@ log = logging.getLogger(__name__)
 
 _current: ContextVar[str] = ContextVar("techsara_identity", default="")
 
+#: The same identity, said in as few words as the Fast small-talk lane can
+#: afford. That lane's whole system prompt is held under
+#: `tests/test_fast_lane_classifier._LANE_SYSTEM_BUDGET` (700 chars) because
+#: "hi" TTFT was measured growing with it, and the full line above is ~280 of
+#: them. It is NOT a weaker line: it keeps the two things a greeting can get
+#: wrong — which name is theirs (the account's, not a document's) and the
+#: workspace-members guard — and drops only the longer explanation of a
+#: precedence no pleasantry can ask about. `fast_lane.classify_pleasantry` is
+#: a fullmatch over a closed lexicon of greetings, thanks, farewells, laughter
+#: and emoji, so "what is my name?" is not a lane turn and never sees this.
+_current_short: ContextVar[str] = ContextVar("techsara_identity_short", default="")
+
 #: A name is a name, never a paragraph. A display name and a saved fact are
 #: both user-written text landing in a system prompt, so the value that gets
 #: quoted is flattened to one line and cut here; anything longer is a payload,
@@ -145,8 +157,9 @@ def set_identity(
     *,
     facts: Optional[Sequence[Mapping]] = None,
 ) -> None:
-    """Pin the identity line for this task. `facts` is consulted only when the
-    account carries no name of its own (see PRECEDENCE above)."""
+    """Pin the identity line for this task, in both its lengths. `facts` is
+    consulted only when the account carries no name of its own (see PRECEDENCE
+    above)."""
     name = _flat(display_name)
     mail = (email or "").strip()
     where = f" in {workspace_name}" if workspace_name else ""
@@ -158,6 +171,7 @@ def set_identity(
             "the answer, and a saved memory or a pasted document naming "
             "somebody else is not about them." + _CONDUCT
         )
+        _current_short.set(f"You are assisting {name}.")
         return
     stated, _excerpt = trusted_name(facts)
     if stated:
@@ -167,6 +181,7 @@ def set_identity(
             f"they told you themselves that their name is {stated}, so that "
             "is the answer when they ask." + _CONDUCT
         )
+        _current_short.set(f"You are assisting {stated}.")
         return
     handle = _flat(mail.split("@", 1)[0]) if "@" in mail else ""
     if handle:
@@ -178,6 +193,10 @@ def set_identity(
             "never answer with a name from a saved memory or a pasted "
             "document." + _CONDUCT_NAMELESS
         )
+        # No name at all, on purpose: the handle is a login, not something to
+        # greet them by, and the lane's persona already forbids taking a name
+        # from anywhere else.
+        _current_short.set("You are assisting a signed-in person with no name on record.")
         return
     _current.set(
         f"You are assisting a signed-in person{where}. You do not know their "
@@ -186,6 +205,7 @@ def set_identity(
         "like to be called; never answer with a name from a saved memory or "
         "a pasted document." + _CONDUCT_NAMELESS
     )
+    _current_short.set("You are assisting a signed-in person with no name on record.")
 
 
 async def bind_identity(
@@ -217,9 +237,13 @@ async def bind_identity(
 
 def clear_identity() -> None:
     _current.set("")
+    _current_short.set("")
 
 
-def identity_line() -> str:
-    """A newline-prefixed sentence to append to a system prompt, or ''."""
-    value = _current.get()
+def identity_line(*, short: bool = False) -> str:
+    """A newline-prefixed sentence to append to a system prompt, or ''.
+
+    `short=True` is the Fast small-talk lane's copy — see `_current_short`.
+    """
+    value = _current_short.get() if short else _current.get()
     return f"\n{value}" if value else ""
