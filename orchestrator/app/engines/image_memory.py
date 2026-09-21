@@ -15,18 +15,66 @@ an image was ever there; and `vision.history_turns` drops multimodal entries
 on purpose. Documents already survive a turn (`_resolve_document_refs`) and
 videos have both a pinned block and a follow-up test — images had neither.
 
-WHAT THIS IS. The bytes of the conversation's most recent image turn, held in
-this process, with a TTL, a per-conversation byte budget and a cap on how
-many conversations are remembered at once. It is a cache, not a record: a
-restart loses it and the next turn behaves exactly as it did before this
-module existed. Nothing is written to disk and nothing is written to the
-database, so no image outlives the conversation that produced it.
+WHAT THIS IS. The bytes of the conversation's most recent image turn, with a
+TTL, a per-conversation byte budget and a cap on how many conversations are
+remembered at once — held in this process AND, since 2026-09-21, in one
+`conversation_images` row (V41) so that a restart does not undo it.
+
+IT USED TO BE A CACHE ONLY, AND THAT WAS THE DEFECT (completeness critic R6,
+2026-09-21). This docstring said, of the process dict: "a restart loses it
+and the next turn behaves exactly as it did before this module existed."
+Every deploy, container restart and OOM kill therefore silently reverted the
+fix for every conversation in flight, and what the person saw was the
+original reported bug, word for word. Auto-deploy fires on every push to
+main, so that was a daily event.
+
+WHY THE BYTES AND NOT A DESCRIPTION. The obvious cheaper record is the one
+video and documents keep: pin the transcript, not the material. It is the
+right answer for them because text is what a video and a PDF ARE. It is the
+wrong answer here for three measured reasons.
+  * The follow-up route hands the remembered bytes to the vision engine
+    (`main.py`, the `elif image_followup.images:` branch). A description
+    answers "what does the third line say?" and cannot answer "what colour
+    is the logo?", "how many people are in it?" or "is the stamp legible?".
+    Swapping pixels for prose would have narrowed a working feature.
+  * There is no description to store at Fast. `vision.run_vision_engine`
+    skips the OCR pass below Think deliberately (measured 3.3 s of the 4.0 s
+    to the first visible token). Storing one would mean a SECOND, speculative
+    model pass on every single upload, to serve the minority of image turns
+    that ever get a follow-up — and the live check this fix was measured on
+    is a Fast turn.
+  * A description is not cheaper in the sense that matters. It is still
+    derived user content in the database, under the same TTL and the same
+    deletion rules; it is only smaller. The honest way to spend less is the
+    durable byte budget below, which keeps a picture the person's own
+    browser already capped at 1600 px.
+
+WHAT IS STORED, AND WHAT IS NOT. The row holds what the follow-up needs and
+nothing else: the fitted image data URLs, the lowercased question+answer the
+word test compares against, the turns-since counter, and `created_at`. No
+filename, no upload id, no model output beyond the answer text that is
+already in `messages`. It is a new copy of the person's picture, so it is
+bounded (IMAGE_MEMORY_DB_CHARS), scoped by primary key to one viewer and one
+conversation, deleted with the chat and with the account, and swept at the
+TTL.
+
+WHEN THE BYTES ARE GONE, SAY SO (the critic's option (b), kept as the
+residual). A picture too large for the durable budget still writes its ROW,
+so a later process knows a picture was there even though it cannot show it.
+`followup()` then reports `unavailable`, and main.py answers "that picture is
+no longer attached, please send it again" instead of answering as though
+nothing had ever been attached. Note that (b) could never have been built
+WITHOUT this row: a fresh process cannot tell "no picture was ever sent" from
+"the picture is gone".
 
 THE TTL RELEASES MEMORY, NOT ONLY RECALL (adversarial QA, 2026-09-18). An
 expired entry used to be dropped only when ITS conversation asked again, so
 the bytes stayed: 70 conversations, TTL passed, one more image -> 47 entries
 and 62,666,884 characters still held. Every read and write now sweeps the
-expired entries first (at most 64 of them, microseconds).
+expired entries first (at most 64 of them, microseconds). The same rule
+applies to the row: `hydrate` refuses and deletes an expired one on sight,
+and `db.prune_conversation_images` runs on a bounded cadence from both the
+read and the write path, so the TTL bounds STORAGE too.
 
 SCOPE IS THE VIEWER AND THE CONVERSATION. `chat`'s conversation key is
 whatever the client sent (`request.conversation_id or scoped_session`), so
@@ -37,12 +85,14 @@ viewer stores and recalls nothing (repair round 2): it used to fall back to
 the bare conversation id, so any two callers that forgot the viewer would
 have shared one entry.
 
-WHAT THE CALLER OWES THIS MODULE (hand-off to main.py and history.py, which
-this track does not own): `note_turn` on every turn the word test is not
-asked about (a document, URL, video, agent or research turn), so "that
-chart" after an intervening PDF turn is not taken for the picture; and
-`forget` when a conversation is deleted, so a deleted conversation's photo
-cannot answer the same id again inside the TTL.
+WHAT THE CALLER OWES THIS MODULE (hand-off to main.py and history.py):
+`hydrate` (awaited — it reads the database) before the word test, so a
+process that has just started can still see the conversation's picture;
+`note_turn` on every turn the word test is not asked about (a document, URL,
+video, agent or research turn), so "that chart" after an intervening PDF turn
+is not taken for the picture; and `forget` when a conversation is deleted, so
+a deleted conversation's photo cannot answer the same id again inside the
+TTL.
 """
 from __future__ import annotations
 
@@ -97,6 +147,53 @@ def max_total_chars() -> int:
     return int(_env_number("IMAGE_MEMORY_TOTAL_CHARS", 64_000_000))
 
 
+def max_db_chars() -> int:
+    """Base64 characters written to `conversation_images` per conversation.
+
+    Smaller than the in-process budget on purpose: RAM eviction and DISK
+    retention are different problems. This is a new copy of the person's
+    picture, so the durable one is the one a browser already produces —
+    `MAX_IMAGE_EDGE` in frontend/lib/images.ts is 1600 px, and five such
+    uploads (the per-turn maximum) are comfortably under 8 M characters
+    (~6 MB). A picture above this budget is stored as the same 1600 px copy
+    `_smaller_copy` already makes for the in-process budget; when even that
+    cannot be produced the ROW is still written with no images, and the
+    follow-up says the picture is no longer attached rather than pretending
+    there never was one.
+    """
+    return int(_env_number("IMAGE_MEMORY_DB_CHARS", 8_000_000))
+
+
+def durable_enabled() -> bool:
+    """Is the V41 row written and read at all?
+
+    An env flag and not a settings field for the same reason the numbers
+    above are: nobody on this programme owns config.py. Off is the old
+    process-only cache, which is what the tests of the word test want and
+    what a deployment with no database (scripts, the bare engine harness)
+    gets for free — every durable call already fails soft.
+    """
+    raw = (os.environ.get("IMAGE_MEMORY_DURABLE") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def prune_interval_s() -> float:
+    """How often ONE process will sweep expired rows. The sweep is a range
+    delete on an index; running it on every turn would still be a statement
+    per turn for nothing, and running it never is how a TTL stops releasing
+    storage."""
+    return _env_number("IMAGE_MEMORY_PRUNE_INTERVAL_S", 60.0)
+
+
+#: What the person is told when this conversation's picture is past what the
+#: durable budget could hold. Fixed words, no model call: the app is
+#: reporting its own state, and a model asked to report it would embroider.
+UNAVAILABLE_NOTICE = (
+    "That picture is no longer attached to this conversation, so I can't read "
+    "it again. Please send it once more and ask your question with it."
+)
+
+
 @dataclass
 class _Remembered:
     images: List[str]
@@ -138,6 +235,273 @@ def scope(conversation_id: Optional[str], user_id: "Optional[object]" = None) ->
     return f"u{user_id}:{conversation_id}"
 
 
+# --- the durable half (V41 `conversation_images`) --------------------------
+#
+# Everything below fails soft, by design. This module answers a follow-up
+# question a little better than the app did before it existed; a database
+# that is slow, missing or mid-migration must cost exactly that improvement
+# and never a turn. So every durable call is wrapped, logs at debug and
+# returns, and the process cache carries on alone — which is precisely the
+# behaviour this file had until 2026-09-21.
+
+
+def _durable_identity(
+    conversation_id: "Optional[str]", user_id: "Optional[object]"
+) -> "Optional[tuple]":
+    """(user_id as int, conversation_id) for the row, or None.
+
+    The same rule as `scope`, plus the one the FOREIGN KEY adds: the row
+    hangs off `users(id)`, so a viewer that is not an integer id (a script, a
+    test using a label) has a process cache and no row. `scope` is still what
+    keys the process dict — the two must agree on whether this call has an
+    identity at all, which is why this starts from `scope`.
+    """
+    if not scope(conversation_id, user_id):
+        return None
+    try:
+        return int(user_id), str(conversation_id)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+#: The newest durable write per key, so a write that reaches its thread after
+#: a NEWER image turn's write cannot put the older picture back. Same shape
+#: and same reason as `_latest` for the process cache.
+_durable_latest: "dict[str, object]" = {}
+
+#: `time.monotonic()` of this process's last expired-row sweep.
+_last_prune: float = 0.0
+
+
+def _db():
+    """The database module, imported here and not at module import: `app.db`
+    opens a connection pool and the engines are imported by tooling that has
+    no database at all."""
+    from .. import db
+
+    return db
+
+
+#: ONE thread, for every durable write this module makes.
+#:
+#: Not the default executor, and not one thread per call: these writes have to
+#: happen IN ORDER. main.py's `note_turn` runs on an image turn just before
+#: `remember` replaces the entry, and `forget` can arrive from the delete
+#: route while a write for the same conversation is still queued. On a shared
+#: pool those land in whatever order threads are scheduled, and the two
+#: outcomes are a picture whose turns-since counter says it is already stale,
+#: and — the one that matters — a deleted conversation's photo written back
+#: after the delete. A single worker makes the queue FIFO, and it also caps
+#: what this module can take from the connection pool at one connection.
+_writer = None
+
+
+def _writer_pool():
+    global _writer
+    if _writer is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-memory")
+    return _writer
+
+
+def _run_durable(fn, *args) -> None:
+    """Queue a durable write on the writer thread; wait for it off the loop.
+
+    The /chat handler calls `remember`, `note_turn` and `followup` inline from
+    `async def`, and psycopg is synchronous: a commit on the loop is a commit
+    every other in-flight SSE stream waits for. So with a running loop this
+    returns at once and the write happens behind the turn.
+
+    With no running loop — history.py's sync delete route, scripts, tests —
+    it waits, which keeps both guarantees that callers rely on: after
+    `forget(...)` returns the row is gone, and after `remember(...)` returns
+    the row is there.
+
+    Never called FROM the writer thread (that would wait on a queue only this
+    thread can drain): `hydrate` reads through `asyncio.to_thread`, not here.
+    """
+    future = _writer_pool().submit(fn, *args)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        future.result()
+
+
+def _prune_expired_rows() -> None:
+    """Sweep rows past the TTL, at most once every `prune_interval_s`.
+
+    Called from the write path and from `hydrate`, so any activity at all
+    releases the storage of conversations that have gone quiet. Rate-limited
+    because otherwise it is one DELETE statement per turn to find nothing.
+    """
+    global _last_prune
+    now = time.monotonic()
+    if now - _last_prune < prune_interval_s():
+        return
+    _last_prune = now
+    try:
+        gone = _db().prune_conversation_images(ttl_s())
+        if gone:
+            log.debug("image memory: pruned %d expired picture row(s)", gone)
+    except Exception as exc:  # noqa: BLE001 — never a failed turn
+        log.debug("image memory: prune failed: %s", type(exc).__name__)
+
+
+def _persist(ident: "Optional[tuple]", kept: List[str], context: str) -> None:
+    """Write this turn's picture to its row (see `_persist_now`)."""
+    if ident is None or not durable_enabled():
+        return
+    key = f"u{ident[0]}:{ident[1]}"
+    token = object()
+    _durable_latest[key] = token
+    _run_durable(_persist_now, ident, kept, context, key, token)
+
+
+def _persist_now(
+    ident: tuple, kept: List[str], context: str, key: str, token: object
+) -> None:
+    """The durable write itself, in a worker thread.
+
+    `kept` already fits the in-process budget; the durable budget is smaller
+    (see `max_db_chars`), so a picture above it is reduced HERE, in this
+    thread, by the same `_smaller_copy` the in-process budget uses — measured
+    143-238 ms, which is why it may not happen on the loop.
+
+    A picture that cannot be reduced at all writes the row with NO images
+    rather than no row: that is what lets a later process say "the picture is
+    no longer attached" instead of answering as if none had been sent.
+    """
+    if _durable_latest.get(key) is not token:
+        return  # a newer image turn for this conversation already won
+    try:
+        stored = kept if sum(map(len, kept)) <= max_db_chars() else _fit(kept, max_db_chars())
+        _db().save_conversation_image(ident[0], ident[1], stored, context)
+        if not stored:
+            log.info(
+                "image memory: picture too large for the durable budget; the "
+                "next turn will ask for it again"
+            )
+    except Exception as exc:  # noqa: BLE001 — never a failed turn
+        log.debug("image memory: could not store the picture: %s", type(exc).__name__)
+    finally:
+        if _durable_latest.get(key) is token:
+            _durable_latest.pop(key, None)
+        _prune_expired_rows()
+
+
+def _forget_durable(ident: "Optional[tuple]") -> None:
+    """Delete the row, and cancel a write for it that has not run yet.
+
+    The cancellation is the half that matters: without it, a `remember`
+    queued microseconds before a conversation was deleted would write the
+    photo back AFTER the delete, and the next process would hydrate a
+    deleted conversation's picture.
+    """
+    if ident is None or not durable_enabled():
+        return
+    _durable_latest.pop(f"u{ident[0]}:{ident[1]}", None)
+
+    def _write() -> None:
+        try:
+            _db().delete_conversation_image(ident[0], ident[1])
+        except Exception as exc:  # noqa: BLE001
+            log.debug("image memory: could not forget the picture: %s", type(exc).__name__)
+
+    _run_durable(_write)
+
+
+def _note_durable_turn(ident: "Optional[tuple]", turns_after: int) -> None:
+    """Persist the 0 -> non-zero step of the turns-since counter.
+
+    ONLY that step. The counter feeds one decision — `just_shown`, which asks
+    whether the picture is still the last thing the chat was shown — and
+    every value above zero answers it the same way, so writing each later
+    turn would be a statement per turn that changes nothing. Without this
+    step, a restart would hand a hydrated entry `turns_after = 0` and "that
+    chart" would fire ten turns after the photo, which is the wrong-fire the
+    2026-09-18 adversarial round spent itself on.
+    """
+    if ident is None or not durable_enabled():
+        return
+
+    def _write() -> None:
+        try:
+            _db().touch_conversation_image_turns(ident[0], ident[1], turns_after)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("image memory: could not count the turn: %s", type(exc).__name__)
+
+    _run_durable(_write)
+
+
+def _hydrate_read(ident: tuple) -> "Optional[dict]":
+    """The row, or None — the DATABASE half of `hydrate`, in a worker thread.
+
+    Reads and deletes only; `_remembered_images` is never touched from here.
+    The store is mutated by `remember` and `_keep` on the event loop, and a
+    second writer in a thread would race them: `_evict`'s read-modify-write
+    loop and `move_to_end` on a key another thread has just dropped are a
+    KeyError out of a live turn, for a cache.
+    """
+    try:
+        row = _db().get_conversation_image(ident[0], ident[1])
+    except Exception as exc:  # noqa: BLE001
+        log.debug("image memory: could not read the picture: %s", type(exc).__name__)
+        return None
+    finally:
+        _prune_expired_rows()
+    if row is None:
+        return None
+    if row["age_s"] > ttl_s():
+        # Expired: never served, and gone now. The TTL is measured from
+        # `created_at` by the database, because a monotonic clock does not
+        # survive the restart this row exists for.
+        _forget_durable(ident)
+        return None
+    return row
+
+
+async def hydrate(
+    conversation_id: "Optional[str]", user_id: "Optional[object]" = None
+) -> None:
+    """Load this conversation's picture back into the process, if it has one.
+
+    main.py awaits this before the word test. It is one primary-key read and
+    it happens only when this process does not already hold the conversation,
+    so a chat that stays on one orchestrator pays it once — on the first turn
+    after a deploy, which is exactly the turn that used to lose the picture.
+
+    Deliberately NOT folded into `recall`: `recall` is called from inside the
+    word test and from `images_for_followup`, both synchronous and both on
+    the event loop, and a database read belongs on neither.
+    """
+    if not durable_enabled():
+        return
+    _sweep_expired()
+    key = scope(conversation_id, user_id)
+    if not key or key in _remembered_images:
+        return
+    ident = _durable_identity(conversation_id, user_id)
+    if ident is None:
+        return
+    row = await asyncio.to_thread(_hydrate_read, ident)
+    if row is None or key in _remembered_images:
+        # `key in ...` again: an image turn for this conversation may have
+        # landed while the read was in flight, and it is the newer picture.
+        return
+    _remembered_images[key] = _Remembered(
+        images=list(row["images"]),
+        context=row["context"],
+        # The age the DATABASE measured, translated into this process's
+        # monotonic clock, so `_sweep_expired` and `recall` keep working on
+        # a hydrated entry exactly as on a local one.
+        at=time.monotonic() - row["age_s"],
+        turns_after=row["turns_after"],
+    )
+    _remembered_images.move_to_end(key)
+    _evict()
+
+
 def remember(
     conversation_id: Optional[str],
     images: Sequence[str],
@@ -153,6 +517,11 @@ def remember(
     in a worker thread and stored when that finishes (the previous picture
     is dropped at once - a follow-up in between gets what it got before this
     module existed). With no running loop (scripts, tests) it runs inline.
+
+    The durable row (V41) is written from `_keep`, in a worker thread too:
+    the process cache is what the NEXT request in this process reads, and it
+    is written first and synchronously, so nothing waits on the database to
+    get the behaviour this module already had.
     """
     _sweep_expired()
     key = scope(conversation_id, user_id)
@@ -162,19 +531,26 @@ def remember(
     if not images:
         return
     context = f"{question}\n{answer}".lower()
+    ident = _durable_identity(conversation_id, user_id)
     token = object()
     _latest[key] = token
     if sum(len(img) for img in images) <= max_chars():
-        _keep(key, token, _fit(images), context)
+        _keep(key, token, _fit(images), context, ident)
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        _keep(key, token, _fit(images), context)
+        _keep(key, token, _fit(images), context, ident)
         return
     _remembered_images.pop(key, None)
+    # BOTH halves drop the previous picture at once, not just this process's.
+    # Otherwise, for the 143-238 ms the downscale takes, the conversation
+    # holds no picture here and its OLD one in the database — and a restart
+    # inside that window would hydrate the picture the person has just
+    # replaced. The new row lands behind this delete (one writer thread).
+    _forget_durable(ident)
     job = loop.run_in_executor(None, _fit, images)
-    job.add_done_callback(lambda done: _keep_when_fitted(key, token, done, context))
+    job.add_done_callback(lambda done: _keep_when_fitted(key, token, done, context, ident))
 
 
 #: The newest remember() per key. A downscale that finishes after a newer
@@ -182,15 +558,23 @@ def remember(
 _latest: "dict[str, object]" = {}
 
 
-def _keep_when_fitted(key: str, token: object, done, context: str) -> None:
+def _keep_when_fitted(
+    key: str, token: object, done, context: str, ident: "Optional[tuple]" = None
+) -> None:
     if done.cancelled() or done.exception() is not None:
         if _latest.get(key) is token:
             _latest.pop(key, None)
         return
-    _keep(key, token, done.result(), context)
+    _keep(key, token, done.result(), context, ident)
 
 
-def _keep(key: str, token: object, kept: List[str], context: str) -> None:
+def _keep(
+    key: str,
+    token: object,
+    kept: List[str],
+    context: str,
+    ident: "Optional[tuple]" = None,
+) -> None:
     if _latest.get(key) is not token:
         return
     _latest.pop(key, None)
@@ -199,13 +583,18 @@ def _keep(key: str, token: object, kept: List[str], context: str) -> None:
     _remembered_images[key] = _Remembered(images=kept, context=context)
     _remembered_images.move_to_end(key)
     _evict()
+    _persist(ident, kept, context)
 
 
-def _fit(images: Sequence[str]) -> List[str]:
-    """The images that fit the per-conversation budget, in order; one over
-    the budget on its own is kept as a smaller copy."""
+def _fit(images: Sequence[str], budget: "Optional[int]" = None) -> List[str]:
+    """The images that fit a byte budget, in order; one over the budget on
+    its own is kept as a smaller copy.
+
+    `budget` defaults to the per-conversation process budget; the durable
+    write passes the smaller `max_db_chars()` (see `_persist_now`).
+    """
     kept: List[str] = []
-    budget = max_chars()
+    budget = max_chars() if budget is None else budget
     for img in images:
         if len(img) > budget:
             # A single image over the budget used to be dropped whole: a
@@ -306,7 +695,13 @@ def _sweep_expired() -> None:
 
 
 def _evict() -> None:
-    """Drop the least recently used conversations until the store fits."""
+    """Drop the least recently used conversations until the store fits.
+
+    This process's memory bound only: the ROW stays, and `hydrate` brings an
+    evicted conversation's picture back on its next turn. Eviction is this
+    process saying it cannot hold everything at once, not the conversation
+    saying it is finished with its photo — that is `forget` and the TTL.
+    """
     limit = max_conversations()
     budget = max_total_chars()
     while len(_remembered_images) > limit:
@@ -336,11 +731,14 @@ def recall(conversation_id: Optional[str], user_id: "Optional[object]" = None) -
 
 
 def forget(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
-    """Drop the conversation's picture now (and any downscale still running
-    for it). history.py's delete should call this; see the module docstring."""
+    """Drop the conversation's picture now — both halves (and any downscale
+    still running for it). history.py's delete calls this; see the module
+    docstring. The row goes too, or deleting a chat would only hide its photo
+    until the next restart hydrated it back."""
     key = scope(conversation_id, user_id)
     _remembered_images.pop(key, None)
     _latest.pop(key, None)
+    _forget_durable(_durable_identity(conversation_id, user_id))
 
 
 def note_turn(conversation_id: Optional[str], user_id: "Optional[object]" = None) -> None:
@@ -349,14 +747,33 @@ def note_turn(conversation_id: Optional[str], user_id: "Optional[object]" = None
     last thing shown, so "that chart" may be the PDF's. main.py should call
     this wherever it skips `images_for_followup`; see the module docstring."""
     entry = _remembered_images.get(scope(conversation_id, user_id))
-    if entry is not None:
-        entry.turns_after += 1
+    if entry is None:
+        return
+    entry.turns_after += 1
+    if entry.turns_after == 1:
+        _note_durable_turn(_durable_identity(conversation_id, user_id), 1)
 
 
 def clear() -> None:
-    """Test hook."""
+    """Test hook: forget every picture, in BOTH halves.
+
+    Still means "nothing was ever remembered", because that is what the
+    tests of the word test use it for — and since V41 that has to reach the
+    rows as well, or a cleared test would hydrate the previous one's photo.
+
+    A RESTART is a different event and has no hook: it is the two dicts below
+    being empty and the rows still there, which is what
+    tests/test_image_memory_restart.py reproduces directly.
+    """
     _remembered_images.clear()
     _latest.clear()
+    _durable_latest.clear()
+    if not durable_enabled():
+        return
+    try:
+        _db().prune_conversation_images(0.0)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("image memory: could not clear the rows: %s", type(exc).__name__)
 
 
 # --- is this turn about the picture? ---------------------------------------
@@ -374,7 +791,12 @@ def clear() -> None:
 # dataset conversation "What is the total revenue by region?" - and because
 # main.py's image branch sits above the dataset, search, agent and chat
 # branches, every one of them was answered from the stale photo instead of
-# where it went before. A wrong fire costs a wrong answer (and puts the
+# where it went before. (It does NOT sit above everything: Salesforce
+# Intelligence Mode and Artifact Studio are decided before the chain and can
+# return without reaching it. The Salesforce gate now excludes a turn this
+# module claims - `Followup.about_the_picture`, 2026-09-21 - because
+# `sf_outcome.handled` answers straight away.) A wrong fire costs a wrong
+# answer (and puts the
 # picture - third-party content that can carry injected text - back in
 # front of the model); a missed one costs only what the conversation had
 # before this module existed (the previous answer is still in the history).
@@ -637,26 +1059,69 @@ def _points_at_the_picture(text: str, context: str, *, just_shown: bool = False)
     return False
 
 
-def is_about_the_image(
+@dataclass
+class Followup:
+    """What a text-only turn should do about the conversation's picture.
+
+    Three outcomes, and main.py needs all three kept apart:
+      * `images` — this turn is about the picture and here it is;
+      * `unavailable` — this turn is about the picture and the picture is
+        gone (it was over the durable budget, so only its row survived the
+        restart). The turn is answered by saying so, which is the critic's
+        option (b) and the only case left where it applies;
+      * neither — this turn is not about a picture at all, and routes exactly
+        as it did before this module existed.
+    """
+
+    images: List[str] = field(default_factory=list)
+    unavailable: bool = False
+
+    @property
+    def about_the_picture(self) -> bool:
+        """The word test fired: this turn belongs to the image route, whether
+        or not the bytes are still there. What every gate ABOVE the answer
+        chain has to check, so that a turn about a photo is not claimed by
+        something that cannot see one."""
+        return bool(self.images) or self.unavailable
+
+
+def followup(
     conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
-) -> bool:
-    """Should this text-only turn be answered with the remembered image?"""
-    entry = _remembered_images.get(scope(conversation_id, user_id))
-    if entry is None or not recall(conversation_id, user_id):
-        return False
+) -> Followup:
+    """The picture this text-only turn should be answered with, if any.
+
+    `hydrate` must have been awaited first for a conversation this process
+    has not seen; everything here is in-memory and safe on the event loop.
+    """
+    key = scope(conversation_id, user_id)
+    entry = _remembered_images.get(key)
+    if entry is None:
+        return Followup()
+    images = recall(conversation_id, user_id)
+    if key not in _remembered_images:
+        return Followup()  # recall found it expired and dropped it
     text = message or ""
     just_shown = entry.turns_after == 0
     # Every turn main.py asks about counts, fired or not: after one more
     # text turn "that chart" may be a chart the assistant made in between.
     # (Turns main.py does not ask about are counted by `note_turn`.)
     entry.turns_after += 1
-    return _points_at_the_picture(text, entry.context, just_shown=just_shown)
+    if entry.turns_after == 1:
+        _note_durable_turn(_durable_identity(conversation_id, user_id), 1)
+    if not _points_at_the_picture(text, entry.context, just_shown=just_shown):
+        return Followup()
+    return Followup(images=images, unavailable=not images)
+
+
+def is_about_the_image(
+    conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
+) -> bool:
+    """Should this text-only turn be answered with the remembered image?"""
+    return bool(followup(conversation_id, message, user_id).images)
 
 
 def images_for_followup(
     conversation_id: Optional[str], message: str, user_id: "Optional[object]" = None
 ) -> List[str]:
     """The remembered images when this turn is about them, else []."""
-    if not is_about_the_image(conversation_id, message, user_id):
-        return []
-    return recall(conversation_id, user_id)
+    return followup(conversation_id, message, user_id).images

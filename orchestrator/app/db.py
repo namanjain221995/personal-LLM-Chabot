@@ -2816,6 +2816,62 @@ ALTER TABLE user_facts
 """
 
 
+_MIGRATION_V41 = """
+-- V41 (2026-09-21): the picture a conversation was shown, so a RESTART does
+-- not undo "an image is remembered for the next turn". Idempotent DDL only:
+-- a new table and one index, no backfill.
+--
+-- WHY. `engines/image_memory.py` held the image turn's bytes in the
+-- orchestrator PROCESS with a TTL, and said so in its own docstring: "a
+-- restart loses it and the next turn behaves exactly as it did before this
+-- module existed". Every deploy, container restart and OOM kill therefore
+-- reverted the fix for every conversation in flight, and the person saw the
+-- ORIGINAL reported bug — "I don't see the note you're referring to ...
+-- please upload it here" about a photo they sent one turn ago (audit
+-- 2026-09-17, completeness critic R6 2026-09-21). Auto-deploy fires on every
+-- push to main, so this was a daily occurrence, not a rare one.
+--
+-- WHY THE BYTES AND NOT A TRANSCRIPT. Videos pin a summary and documents pin
+-- page text because text is what those attachments ARE. A photograph's
+-- content is its pixels: the follow-up route hands the bytes to the vision
+-- engine, so a transcript would answer "what does the third line say?" and
+-- not "what colour is the logo?". And there is no transcript to store at
+-- Fast — `vision.run_vision_engine` skips the OCR pass below Think on
+-- purpose (measured 3.3 s of a 4.0 s first token), so a transcript-backed
+-- memory would need a second, speculative model pass on every upload to
+-- serve the minority of turns that get a follow-up.
+--
+-- SCOPE IS THE PRIMARY KEY. (user_id, conversation_id), never the
+-- conversation alone: `chat`'s conversation key is whatever the client sent,
+-- so two accounts can hold the same id and one account can guess another's.
+-- The read is by the full key, so image bytes cannot cross an account. The
+-- users FK cascades, so a deleted ACCOUNT takes its pictures with it;
+-- `history.delete_conversation` -> `image_memory.forget` deletes the row for
+-- a deleted CHAT, and the table is in `_SIDE_TABLES` as well.
+--
+-- RETENTION. `created_at` carries the same TTL the process cache has always
+-- had (IMAGE_MEMORY_TTL_S, 2 h): a row past it is never served and is
+-- deleted on sight, and image_memory prunes expired rows on a bounded
+-- cadence, so the TTL releases STORAGE and not only recall. `images` is
+-- text[] rather than jsonb deliberately — these are multi-megabyte base64
+-- strings and nothing ever queries inside them, so JSON validation and
+-- escaping on every write would be paid for nothing.
+CREATE TABLE IF NOT EXISTS conversation_images (
+    user_id         integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id text        NOT NULL,
+    images          text[]      NOT NULL DEFAULT '{}',
+    context         text        NOT NULL DEFAULT '',
+    turns_after     integer     NOT NULL DEFAULT 0,
+    created_at      timestamptz NOT NULL,
+    PRIMARY KEY (user_id, conversation_id)
+);
+
+-- The retention sweep's only query: everything older than the TTL.
+CREATE INDEX IF NOT EXISTS idx_conversation_images_created
+    ON conversation_images (created_at);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -2857,6 +2913,7 @@ _MIGRATIONS: tuple = (
     (38, _MIGRATION_V38),
     (39, _MIGRATION_V39),
     (40, _MIGRATION_V40),
+    (41, _MIGRATION_V41),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -3629,6 +3686,16 @@ _SIDE_TABLES = (
     # V29: a conversation's upload sessions and send intents are its own.
     "upload_sessions",
     "chat_requests",
+    # V41: the picture this conversation was shown. `image_memory.forget`
+    # already deletes it by (user, conversation) when a chat is deleted;
+    # listed here too because that call is one line in one route and a photo
+    # still answering questions in a conversation the person deleted is the
+    # whole reason `forget` exists. This loop matches on the conversation id
+    # alone, so it can also drop a DIFFERENT account's row for a client-sent
+    # id that happens to collide. That is their own picture forgotten early,
+    # never anyone's picture disclosed, and early is the safe direction for a
+    # cache — image_memory.forget stays the scoped delete.
+    "conversation_images",
     # V31 artifacts, artifact_versions and artifact_jobs are DELIBERATELY
     # absent, for the reason report_files is: they are the person's
     # deliverables, addressed by id from GET /artifacts without their
@@ -5027,6 +5094,122 @@ def clear_summary(conversation_id: str) -> None:
             "DELETE FROM conversation_chunks WHERE conversation_id = %s",
             (conversation_id,),
         )
+
+
+# ---------------------------------------------------------------------------
+# V41: the picture a conversation was shown (engines/image_memory.py)
+# ---------------------------------------------------------------------------
+#
+# Every accessor here takes the viewer AND the conversation and puts both in
+# the WHERE clause. That is not defensive habit: `chat`'s conversation key is
+# whatever the client sent, so the conversation id alone is not an identity.
+# There is deliberately no "by conversation id" read.
+
+
+def save_conversation_image(
+    user_id: int,
+    conversation_id: str,
+    images: Sequence[str],
+    context: str,
+    *,
+    turns_after: int = 0,
+) -> None:
+    """Replace this viewer's remembered picture for this conversation.
+
+    The whole row is replaced, never merged: a new image turn supersedes the
+    last one, exactly as the in-process store does, so a conversation holds
+    one picture and its budget is the budget of one turn.
+
+    `created_at` is the SERVER's `now()`, not this process's clock, because
+    `get_conversation_image` measures the row's age with the server's `now()`
+    too. Mixing the two is how a 17 ms skew between an orchestrator and its
+    database (measured against the worker-hosted test server, 2026-09-18)
+    turns into a picture that is already expired the instant it is written.
+    """
+    with connection() as con:
+        con.execute(
+            "INSERT INTO conversation_images "
+            "(user_id, conversation_id, images, context, turns_after, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, now()) "
+            "ON CONFLICT (user_id, conversation_id) DO UPDATE SET "
+            "images = excluded.images, context = excluded.context, "
+            "turns_after = excluded.turns_after, created_at = excluded.created_at",
+            (
+                user_id,
+                conversation_id,
+                list(images),
+                _text(context) or "",
+                int(turns_after),
+            ),
+        )
+
+
+def get_conversation_image(user_id: int, conversation_id: str) -> Optional[dict]:
+    """The viewer's remembered picture for this conversation, or None.
+
+    `age_s` is computed by the DATABASE, not by the reader: the TTL has to
+    hold across a restart and across the two orchestrator ranks, and neither
+    of those shares a monotonic clock with the process that wrote the row.
+    """
+    with read_connection() as con:
+        row = con.execute(
+            "SELECT images, context, turns_after, "
+            "EXTRACT(EPOCH FROM (now() - created_at)) AS age_s "
+            "FROM conversation_images WHERE user_id = %s AND conversation_id = %s",
+            (user_id, conversation_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "images": list(row["images"] or []),
+        "context": row["context"] or "",
+        "turns_after": int(row["turns_after"] or 0),
+        "age_s": float(row["age_s"] or 0.0),
+    }
+
+
+def touch_conversation_image_turns(
+    user_id: int, conversation_id: str, turns_after: int
+) -> None:
+    """Record that the picture is no longer the last thing the chat was shown.
+
+    Only the 0 -> non-zero step is ever written (see `image_memory.note_turn`):
+    the counter feeds one decision, `just_shown`, and every value above zero
+    decides it the same way. `created_at` is untouched, so counting turns can
+    never extend the TTL.
+    """
+    with connection() as con:
+        con.execute(
+            "UPDATE conversation_images SET turns_after = %s "
+            "WHERE user_id = %s AND conversation_id = %s",
+            (int(turns_after), user_id, conversation_id),
+        )
+
+
+def delete_conversation_image(user_id: int, conversation_id: str) -> None:
+    """Forget this viewer's picture for this conversation, now."""
+    with connection() as con:
+        con.execute(
+            "DELETE FROM conversation_images "
+            "WHERE user_id = %s AND conversation_id = %s",
+            (user_id, conversation_id),
+        )
+
+
+def prune_conversation_images(ttl_s: float) -> int:
+    """Delete every remembered picture past the TTL; returns how many went.
+
+    The TTL has to release STORAGE and not only recall — the same bug the
+    in-process sweep was fixed for on 2026-09-18, one layer down. Indexed on
+    `created_at`, so this is a range delete and not a scan.
+    """
+    with connection() as con:
+        cur = con.execute(
+            "DELETE FROM conversation_images "
+            "WHERE created_at < now() - make_interval(secs => %s)",
+            (float(max(0.0, ttl_s)),),
+        )
+        return int(cur.rowcount or 0)
 
 
 def add_conversation_chunks(conversation_id: str, chunks: List[dict]) -> None:
