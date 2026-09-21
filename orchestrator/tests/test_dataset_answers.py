@@ -970,6 +970,49 @@ def test_a_pasted_megabyte_does_not_stall_the_event_loop():
     assert "### Total m3 by g2" in md and "### Total m3 by g4" in md
 
 
+def test_the_prompt_is_rendered_off_the_event_loop(monkeypatch):
+    """Rendering the profile block is the engine's one unbounded CPU cost.
+
+    It grows with the DATA, not with the question — tidying every computed
+    figure, re-ordering every object's keys and JSON-encoding the result, 5.9
+    MB of it for 20 files with an eight-measure, six-group breakdown
+    (2026-09-22) — and there is no slice of it that can be skipped, because
+    the block IS the answer's evidence. The orchestrator is single-threaded,
+    so a quarter of a second spent here is a quarter of a second of every
+    other user's answer not moving, which is exactly the shape of this
+    platform's worst latency defect. It therefore runs in a worker thread.
+
+    Asserted structurally, not with a stopwatch: a stopwatch on a shared CI
+    runner measures the runner.
+    """
+    import threading
+
+    upload = _up({"file": "f.csv", "rows": 1, "columns_total": 1,
+                  "columns": [{"name": "revenue", "dtype": "DOUBLE", "sum": 1.5, "avg": 1.5}]})
+    monkeypatch.setattr(db, "get_uploads", lambda _conv: [upload])
+    real = dataset.build_messages
+    on_main: List[bool] = []
+
+    def spy(*args, **kwargs):
+        on_main.append(threading.current_thread() is threading.main_thread())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dataset, "build_messages", spy)
+
+    async def stream(messages, **kwargs):
+        yield "token", "ok"
+
+    monkeypatch.setattr(llm, "stream_chat_events", stream)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+
+    async def emit(kind, data):
+        pass
+
+    answer = asyncio.run(dataset.run_dataset_engine("total revenue?", "c-off-loop", [], emit, effort="fast"))
+    assert answer == "ok", "the answer is unchanged by where its prompt was built"
+    assert on_main == [False], f"build_messages ran on the event loop thread: {on_main}"
+
+
 def test_a_spreadsheet_upload_gets_its_computed_figures(tmp_path):
     """profile_excel stores {kind, sheets: [...]}; each sheet carries what a
     CSV's profile does (the dataset-numbers-computed contract)."""
