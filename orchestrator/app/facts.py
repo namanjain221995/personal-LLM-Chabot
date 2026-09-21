@@ -544,6 +544,10 @@ _ERASE_STOPWORDS = _MATCH_STOPWORDS | frozenset(
     learned learnt file""".split()
 )
 
+#: One name per `_PROFILE_FACT_SHAPES` group, in the same order, so a caller
+#: can say WHICH part of the profile a fact states (`states_profile_attribute`).
+_PROFILE_ATTRIBUTES = ("employer", "home", "name")
+
 #: A clause: the unit a "forget" and its "don't forget" exception are judged
 #: in, for the one thing that is still judged loosely: whether a message
 #: MENTIONS forgetting, which stops it writing memory. Judged over the whole
@@ -551,6 +555,24 @@ _ERASE_STOPWORDS = _MATCH_STOPWORDS | frozenset(
 #: food though") cancelled the erasure in the first, and the extractor's
 #: negated rewrite was written instead (QA, 2026-09-18).
 _CLAUSE_RE = re.compile(r"[^.!?;,\n]+")
+
+
+def states_profile_attribute(fact: str) -> Optional[str]:
+    """Which part of the person's own profile `fact` states — "employer",
+    "home" or "name" — or None.
+
+    The same shapes the id-less erasure fallback matches a "forget my
+    employer" against (`_PROFILE_FACT_SHAPES`), named so the clean-up tool
+    (scripts/memory_audit.py) can tell an IDENTITY row from an ordinary one
+    without reaching into this module's privates. An identity row taken from
+    a document is the worst row in the store: it is the one that answers
+    "what is my name?" with somebody else's.
+    """
+    text = " ".join((fact or "").split())
+    for label, (_nouns, shape) in zip(_PROFILE_ATTRIBUTES, _PROFILE_FACT_SHAPES):
+        if shape.match(text):
+            return label
+    return None
 
 
 def facts_block(facts: List[dict]) -> Optional[str]:
