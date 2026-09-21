@@ -101,6 +101,32 @@ export function clearAccountCache(): void {
 }
 
 /**
+ * Fold a new display name into an account, and into the module-level cache
+ * when it is the same account.
+ *
+ * The cache write is the point. The sidebar row, the menu header and the
+ * settings panel all render one Account object, and `fetchAccount` answers
+ * from the cache for the life of the page — so a rename that only updated
+ * component state would come back as the old name the next time anything
+ * re-read the identity. Pure apart from that write, so the caller can use the
+ * returned object as its own next state.
+ */
+export function withDisplayName(
+  account: Account | null,
+  name: string,
+): Account | null {
+  if (!account) return null;
+  const next: Account = {
+    ...account,
+    user: account.user ? { ...account.user, name } : null,
+  };
+  if (cachedAccount && cachedAccount.user?.id === account.user?.id) {
+    cachedAccount = next;
+  }
+  return next;
+}
+
+/**
  * GET /api/auth/me, cached module-level for the life of the page. Concurrent
  * callers share one request; a failure resolves null and is retried on the
  * next call rather than cached.
@@ -536,6 +562,9 @@ export function AccountMenu({ fetchFn = fetch, navigate }: AccountMenuProps) {
         initialSection={settingsSection ?? 'profile'}
         account={account}
         fetchFn={fetchFn}
+        // The row behind the dialog is the same identity, so a rename shows
+        // up there the moment it is accepted — including the avatar initial.
+        onAccountChange={setAccount}
         onClose={() => {
           setSettingsSection(null);
           triggerRef.current?.focus();
