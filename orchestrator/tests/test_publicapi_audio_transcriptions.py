@@ -174,7 +174,13 @@ def test_public_windows_go_to_the_replica_dictation_reaches_for_last(api, fleet,
     assert fleet["asr-worker"].calls and not fleet["asr-head"].calls
 
 
-def test_audio_longer_than_the_old_five_minute_limit_is_transcribed_in_windows_of_at_most_ninety_seconds(api, fleet, speech_dir, platform):
+def test_audio_longer_than_the_old_five_minute_limit_is_transcribed_in_windows_of_at_most_ninety_seconds(
+    api, fleet, speech_dir, platform, monkeypatch
+):
+    # WINDOWS, counted as clips: the language guard re-reads a sampled
+    # window's speech regions as further clips, so its sample is switched off
+    # for this count and measured in tests/test_publicapi_audio_language.py.
+    monkeypatch.setenv("PUBLIC_API_ASR_LANGUAGE_PROBE_WINDOWS", "0")
     script, audio = speech(speech_dir, 400)
 
     response = _post(api, audio)
@@ -186,6 +192,7 @@ def test_audio_longer_than_the_old_five_minute_limit_is_transcribed_in_windows_o
     assert len(sent) >= 5 and max(call["seconds"] for call in sent) <= 93.0
     row = usage_events("v1_audio_transcriptions")[0]
     assert row["meta"]["audio_seconds"] == 400 and row["meta"]["windows"] == len(sent)
+    assert row["meta"]["engine_calls"] == len(sent)
 
 
 def test_the_upload_streams_to_disk_and_is_never_spooled_by_starlette_or_left_behind(api, fleet, speech_dir, monkeypatch):

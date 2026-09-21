@@ -404,6 +404,11 @@ def test_a_decoder_loop_inside_a_window_is_collapsed_out_of_the_transcript(world
 def test_a_retry_after_five_windows_sends_only_the_windows_that_never_finished(world, speech_dir, monkeypatch):
     script, path = speech(speech_dir, 1200)
     monkeypatch.setenv("PUBLIC_API_ASR_UNAVAILABLE_GRACE_S", "0")
+    # This test counts WINDOWS by counting clips, so the language guard's
+    # re-reads are switched off rather than mixed into the count: the guard's
+    # own behaviour on a retry is measured in
+    # tests/test_publicapi_audio_language.py.
+    monkeypatch.setenv("PUBLIC_API_ASR_LANGUAGE_PROBE_WINDOWS", "0")
     del world.order[1:]
     head = world.fleet["asr-head"]
     head.fail_status, head.fail_after_calls = 503, 5
@@ -469,6 +474,10 @@ def test_a_rising_cuda_failure_count_fails_the_window_over_even_while_ready(worl
 def test_a_window_silent_on_a_ready_replica_is_resent_once_to_the_other_and_a_second_silence_fails_retry_safe(world, speech_dir, monkeypatch):
     script, path = speech(speech_dir, 600, seed=3)
     monkeypatch.setenv("PUBLIC_API_ASR_WINDOW_SILENCE_S", "0.4")
+    # `hang_calls` picks the replica's Nth call, so the sequence of clips has
+    # to be the windows and nothing else; the language guard's re-reads are
+    # switched off here and exercised in tests/test_publicapi_audio_language.py.
+    monkeypatch.setenv("PUBLIC_API_ASR_LANGUAGE_PROBE_WINDOWS", "0")
     head, worker = world.fleet["asr-head"], world.fleet["asr-worker"]
     head.hang_calls = {2}
     _, result = run(transcribe_path(world.jobs, path))
@@ -598,7 +607,11 @@ def test_a_second_start_joins_the_running_job_and_a_finished_job_is_attached_fro
         return spec, result, calls, attached, again
 
     spec, result, calls, attached, again = run(scenario())
-    assert calls == result.report["windows"], "the joined start sent nothing of its own"
+    # Every clip the fleet was sent was one THIS job's dispatcher sent: its
+    # windows, plus whatever the language guard re-read. A second job would
+    # show up as fleet calls the job never counted.
+    assert calls == result.report["dispatch"]["engine_calls"], "the joined start sent nothing of its own"
+    assert calls >= result.report["windows"] >= 1
     assert attached is not None and attached.state == "done" and attached.result.text == result.text
     assert again.state == "done" and again.result.text == result.text
     assert windows_sent(world.fleet) == calls
