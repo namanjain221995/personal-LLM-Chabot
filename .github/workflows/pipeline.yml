@@ -353,7 +353,23 @@ jobs:
     # requirements, then the whole orchestrator suite against a real Postgres.
     # 60, not 45 (owner-approved 2026-09-15): with ~8,400 tests the suite runs
     # 31-45 min on the hosted runners and was being cancelled at 98%.
-    timeout-minutes: 60
+    #
+    # 90, not 60 (2026-09-21, release 2): the suite is 13,733 tests now, and it
+    # was cancelled again — at 79%, after 1h0m16s, with nothing failing:
+    #     ##[error]The operation was canceled.
+    # It takes 57m15s on the DGX head, which is faster than a hosted runner, so
+    # 60 was already the wrong number before this release added its tests. A
+    # cancelled job reports as a FAILURE with no failing test in the log, which
+    # reads like a broken build and is not one.
+    #
+    # THE REAL FIX IS SHARDING, and it is deliberately not done here. Splitting
+    # this suite means one database per shard (conftest TRUNCATEs every table
+    # before every test, so shards cannot share one) and either a new plugin
+    # dependency or a hand-rolled file split. A hand-rolled split that silently
+    # drops a file is a GREEN run that tested less than it claims, which is a
+    # worse failure than a slow one. Whoever does it must land the guard with
+    # it: assert that every tests/test_*.py appears in exactly one shard.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
