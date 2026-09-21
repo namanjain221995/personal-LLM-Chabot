@@ -31,6 +31,18 @@ does do, for dictation only, is decode a silence-gated clip once more with the
 gate off and keep the words only if they are dense enough to be speech — see
 `VLLMAudioProvider.transcribe` and `speech_is_plausible`.
 
+TWO DECODES, ONE WALL CLOCK, AND A BOUND ON THE SECOND (2026-09-21). That
+optional retry is a whole extra decode of the clip, and it used to have no
+upper length bound and a fresh ASR_TIMEOUT_S of its own, so one noisy
+ten-minute dictation could hold a Spark for twenty minutes. It is now skipped
+above `_RETRY_MAX_SECONDS` of audio, and both decodes share the ONE deadline
+`transcribe` opens.
+
+AND THE NUMBERS ARE NOT THROWN AWAY. `no_speech_prob` and the plausibility
+verdict decide a `confidence` word on every dictation (CONFIDENCE_*), which
+the composer turns into one short line — so an empty draft is never called
+silence unless silence is what was measured.
+
 FORMAT. None is converted here for dictation. The engine decodes with ffmpeg
 on its own side, so the WebM/Opus a browser's MediaRecorder produces is
 understood natively. Video analysis (app/video) is the one caller that sends
@@ -153,6 +165,24 @@ class ASRRejected(Exception):
     """The audio itself is the problem — too long, unreadable, empty."""
 
 
+#: How sure this client is of a draft, in a CLOSED vocabulary the composer
+#: turns into one short sentence. The engine's `no_speech_prob` and this
+#: file's plausibility verdict were both computed and then thrown away until
+#: 2026-09-21, so the composer said "Nothing was said in that recording." for
+#: every empty draft — including the ones this client emptied itself, and the
+#: ones where a second opinion was never taken. Measured on this fleet the
+#: same day, one request per clip: 20 s of pink noise at -25 dBFS came back
+#: as FOURTEEN invented words with no caution of any kind.
+#:
+#:   None        the engine decoded the clip and was sure somebody spoke.
+#:   "low"       there IS a draft and it may be invented — check it.
+#:   "unclear"   the draft is empty and silence is NOT established.
+#:   "silent"    the draft is empty and nobody spoke.
+CONFIDENCE_LOW = "low"
+CONFIDENCE_UNCLEAR = "unclear"
+CONFIDENCE_SILENT = "silent"
+
+
 @dataclass(frozen=True)
 class Transcript:
     """One finished transcription. `language` is None when nobody identified it."""
@@ -167,6 +197,11 @@ class Transcript:
     engine_ms: int
     #: True when the primary path failed and the fallback answered.
     degraded: bool = False
+    #: One of the CONFIDENCE_* words above, or None when there is nothing to
+    #: say. Set by `VLLMAudioProvider.transcribe` — dictation's path — and
+    #: left None by `transcribe_segments`, whose caller (video analysis) runs
+    #: its own voice-activity detection and has no composer to tell.
+    confidence: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -272,8 +307,14 @@ class VLLMAudioProvider:
         *,
         segments: bool = False,
         no_speech_check: bool = True,
+        timeout_s: Optional[float] = None,
     ) -> "tuple[Transcript, _Heard]":
         """The transcription endpoint — the only one Whisper serves.
+
+        `timeout_s` is how long to wait for THIS exchange, and it defaults to
+        the engine's own ASR_TIMEOUT_S. Dictation passes a smaller number for
+        its second decode: the pair shares ONE wall clock rather than taking
+        ASR_TIMEOUT_S each (`transcribe`).
 
         The engine's reply carries more than text: the language it identified
         by NAME and as an ISO code, the clip's duration, and `no_speech_prob`
@@ -289,9 +330,10 @@ class VLLMAudioProvider:
         import httpx
         from .core.net import shared_ssl_context
 
+        budget = self.timeout_s if timeout_s is None else float(timeout_s)
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_s, connect=_CONNECT_TIMEOUT_S), verify=shared_ssl_context()) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(budget, connect=min(_CONNECT_TIMEOUT_S, budget)), verify=shared_ssl_context()) as client:
                 data = {"model": self.model}
                 if segments:
                     # OpenAI's name for "the shape with timestamped segments";
@@ -313,7 +355,7 @@ class VLLMAudioProvider:
             # A connect, write or pool timeout falls through to the outage
             # below — the clip never fully reached an engine, so the other
             # replica is the right place for it.
-            raise ASRTimeout(f"no answer within {self.timeout_s:.0f}s") from exc
+            raise ASRTimeout(f"no answer within {budget:.0f}s") from exc
         except Exception as exc:  # noqa: BLE001
             raise ASRUnavailable(str(exc)) from exc
         elapsed = int((time.perf_counter() - started) * 1000)
@@ -406,7 +448,24 @@ class VLLMAudioProvider:
         exists because Whisper invents words from silence ("Thank you." from
         10 s of digital silence, measured), and a retry that let those
         through would turn a correct empty draft into a wrong one.
+
+        ONE WALL CLOCK FOR BOTH DECODES (2026-09-21). Until this change each
+        exchange carried its own ASR_TIMEOUT_S, so a clip the gate emptied
+        could hold a replica for 2 x 600 s — twenty minutes of one Spark for a
+        recording the engine had already called silent. Whisper decodes one
+        clip at a time and the chat model is tensor-parallel across both
+        Sparks, so that window degrades chat for everybody. The deadline below
+        is the SAME 600 s that already clears the worst legitimate single
+        decode (600 s of audio at the loaded 0.73 s/s = 438 s) by ~37%; the
+        second decode spends what the first one left of it, and is skipped
+        outright when the clip cannot finish in that (`_retry_affordable`).
+
+        AND THE ANSWER CARRIES WHAT WE KNOW ABOUT IT. Every return below sets
+        `confidence` — see the CONFIDENCE_* vocabulary — so the composer can
+        say "check this" or "the recording was not clear" instead of claiming
+        silence it did not measure.
         """
+        deadline = time.monotonic() + self.timeout_s
         first, heard = await self._exchange(audio, filename, content_type)
         if first.text:
             if speech_is_plausible(
@@ -415,11 +474,42 @@ class VLLMAudioProvider:
                 engine_heard_speech=True,
                 no_speech_prob=heard.no_speech_prob,
             ):
-                return first
+                return dataclasses.replace(
+                    first,
+                    confidence=_reply_confidence(
+                        first.text, heard.duration_s or 0.0, heard.no_speech_prob
+                    ),
+                )
             metrics.inc("asr_implausible_reply_total", "dictation replies dropped as invented", result="rejected")
-            return dataclasses.replace(first, text="", language=None, language_code=None)
+            # The engine heard something and this client judged it invented.
+            # Whatever was on that clip, "nothing was said" is not what was
+            # measured, so the empty draft goes back as UNCLEAR.
+            return dataclasses.replace(
+                first, text="", language=None, language_code=None,
+                confidence=CONFIDENCE_UNCLEAR,
+            )
         if not _gated(first, heard):
-            return first
+            if _gate_emptied(first, heard) and (heard.duration_s or 0.0) > _RETRY_MAX_SECONDS:
+                # Counted, because a bound nobody can see is a bound nobody
+                # can revisit: this is how often a long recording loses its
+                # second opinion to `_RETRY_MAX_SECONDS`.
+                metrics.inc(
+                    "asr_gated_retry_too_long_total",
+                    "silence-gated dictations too long to decode a second time",
+                )
+            return dataclasses.replace(
+                first, confidence=_silence_confidence(first, heard)
+            )
+        remaining = deadline - time.monotonic()
+        if not _retry_affordable(heard.duration_s or 0.0, remaining):
+            # The first pass used the dictation's wall clock up. Starting a
+            # decode that cannot finish inside it would take a GPU for a
+            # transcript nobody will ever receive.
+            metrics.inc(
+                "asr_gated_retry_skipped_total",
+                "silence-gated dictations whose second decode did not fit the wall clock",
+            )
+            return dataclasses.replace(first, confidence=CONFIDENCE_UNCLEAR)
         # THE RETRY IS AN OPTIONAL SECOND OPINION: it must never leave a gated
         # clip worse off than the first pass's honest empty answer. A refusal
         # (4xx) or a reply this client cannot parse ends in that answer, not
@@ -428,17 +518,20 @@ class VLLMAudioProvider:
         # the first answer so the replica is stood down AND the person gets it.
         try:
             second, heard_again = await self._exchange(
-                audio, filename, content_type, segments=True, no_speech_check=False
+                audio, filename, content_type,
+                segments=True, no_speech_check=False, timeout_s=remaining,
             )
         except ASRTimeout as exc:
             metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="fail")
-            raise ASRTimeout(str(exc), answer=first) from exc
+            raise ASRTimeout(
+                str(exc), answer=dataclasses.replace(first, confidence=CONFIDENCE_UNCLEAR)
+            ) from exc
         except (ASRRejected, ValueError, TypeError) as exc:
             metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="fail")
             log.info("ASR gated retry gave nothing usable (%s); keeping the empty first pass", exc)
-            return first
+            return dataclasses.replace(first, confidence=CONFIDENCE_UNCLEAR)
         if not isinstance(second, TranscriptSegments):
-            return first
+            return dataclasses.replace(first, confidence=CONFIDENCE_UNCLEAR)
         engine_ms = first.engine_ms + second.engine_ms
         if speech_is_plausible(
             second.text,
@@ -448,7 +541,9 @@ class VLLMAudioProvider:
         ):
             metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="accepted")
             # A plain Transcript, the shape dictation always returns: the
-            # segments were only the evidence.
+            # segments were only the evidence. ALWAYS low confidence: the
+            # engine's own gate called this clip silent and these words exist
+            # only because we asked a second time with the gate off.
             return Transcript(
                 text=second.text,
                 language=second.language,
@@ -456,9 +551,14 @@ class VLLMAudioProvider:
                 provider=second.provider,
                 model=second.model,
                 engine_ms=engine_ms,
+                confidence=CONFIDENCE_LOW,
             )
         metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="rejected")
-        return dataclasses.replace(first, engine_ms=engine_ms)
+        # Asked twice, nothing plausible either time: this is the one empty
+        # draft we may honestly call silence.
+        return dataclasses.replace(
+            first, engine_ms=engine_ms, confidence=CONFIDENCE_SILENT
+        )
 
     async def transcribe_segments(
         self,
@@ -514,6 +614,33 @@ _ENGINE_NO_SPEECH_THRESHOLD = 0.6
 #: A gated clip shorter than this is not decoded again. The engine's own
 #: validation set put its most marginal REAL utterance at three seconds.
 _RETRY_MIN_SECONDS = 3.0
+
+#: Seconds of DECODING per second of audio, measured on this fleet 2026-09-18
+#: and recorded beside ASR_TIMEOUT_S in config.py (the comment at :266-279):
+#: 0.45 s/s on a quiet replica (300 s of audio in 132.8 s, 595 s in 268.3 s)
+#: and 0.73 s/s with other clips queued on the same replica (300 s in 219.7 s
+#: — whisper serialises, and the wait counts). Every bound below is sized
+#: from the LOADED rate, because the clip that costs the most is the one that
+#: arrives while the fleet is already busy. app/audio_api.py reads the same
+#: constant for the sentence it puts on a 504; there is one copy of the
+#: number, here.
+QUIET_DECODE_S_PER_AUDIO_S = 0.45
+LOADED_DECODE_S_PER_AUDIO_S = 0.73
+
+#: And a gated clip LONGER than this is not decoded again either (2026-09-21).
+#: The retry costs a WHOLE second decode of the clip, and it had no upper
+#: bound at all: at the loaded rate above, the 600 s the composer records is
+#: 438 s of one Spark — spent on a recording the engine has already said was
+#: silent, on top of the first pass. Two minutes of audio costs 87.6 s loaded
+#: (54.0 s quiet), which is what an OPTIONAL second opinion may take.
+#:
+#: Two minutes and not less: every retry the labelled set above accepted was
+#: an utterance of 5-8 s under babble, the longest clip in it is 30 s, and
+#: nothing measured needs two minutes of audio to be recognised as speech.
+#: Past it the first pass's empty answer stands and the person is told the
+#: recording was UNCLEAR rather than silent — which is the truth, because
+#: nobody asked twice.
+_RETRY_MAX_SECONDS = 120.0
 
 #: Words per second of speech-covered audio a transcript must average when
 #: the engine judged the clip SILENT and the words come only from the
@@ -657,15 +784,101 @@ def speech_is_plausible(
     return units / max(covered, 1.0) >= _GATED_MIN_WORDS_PER_S
 
 
-def _gated(result: Transcript, heard: _Heard) -> bool:
-    """The engine's silence gate emptied this clip, and it is long enough to
-    be worth one more decode."""
+def _gate_emptied(result: Transcript, heard: _Heard) -> bool:
+    """The engine's SILENCE GATE is why this clip came back empty.
+
+    compose/whisper/server.py short-circuits before the model runs when the
+    no-speech probability of the first thirty seconds clears its threshold, so
+    an empty reply above that line is the gate's answer and not the decoder's.
+    """
     return (
         not result.text
         and heard.no_speech_prob is not None
         and heard.no_speech_prob > _ENGINE_NO_SPEECH_THRESHOLD
-        and (heard.duration_s or 0.0) >= _RETRY_MIN_SECONDS
     )
+
+
+def _gated(result: Transcript, heard: _Heard) -> bool:
+    """The engine's silence gate emptied this clip, and it is long enough —
+    and short enough — to be worth one more decode. See `_RETRY_MIN_SECONDS`
+    and `_RETRY_MAX_SECONDS` for both ends and what they were measured from."""
+    duration = heard.duration_s or 0.0
+    return (
+        _gate_emptied(result, heard)
+        and _RETRY_MIN_SECONDS <= duration <= _RETRY_MAX_SECONDS
+    )
+
+
+def _retry_affordable(duration_s: float, remaining_s: float) -> bool:
+    """Whether the second decode can finish in what is left of the dictation's
+    one wall clock.
+
+    Estimated at the LOADED rate: a replica that is already decoding somebody
+    else's clip is exactly when this optional decode is most expensive, and
+    guessing the quiet rate would start decodes that end as a 504 having spent
+    the GPU anyway.
+    """
+    return remaining_s > 0.0 and duration_s * LOADED_DECODE_S_PER_AUDIO_S <= remaining_s
+
+
+def _silence_confidence(result: Transcript, heard: _Heard) -> str:
+    """Why an EMPTY draft is empty, claiming no more than was measured.
+
+    Only one case earns the word "silent" without a second decode: the gate
+    fired on a clip shorter than the most marginal real utterance in the
+    engine's own validation set (`_RETRY_MIN_SECONDS`, 3 s). Everything else
+    — a clip the decoder itself returned empty, a gated clip whose second
+    opinion was refused or did not fit the wall clock — is UNCLEAR, because
+    babble is measured to push real speech past that gate (the LibriSpeech
+    row in the block above: 0.839, empty, 112 words with the gate off).
+    """
+    if (
+        _gate_emptied(result, heard)
+        # An engine that reported no duration has not told us whether this
+        # was a two-second tap or ten minutes, and the 3 s line is the whole
+        # reason the short case may be believed unasked.
+        and heard.duration_s is not None
+        and heard.duration_s < _RETRY_MIN_SECONDS
+    ):
+        return CONFIDENCE_SILENT
+    return CONFIDENCE_UNCLEAR
+
+
+def _reply_confidence(
+    text: str, seconds: float, no_speech_prob: Optional[float]
+) -> Optional[str]:
+    """Whether a transcript the engine decoded NORMALLY is worth a caution.
+
+    BOTH of this file's already-measured lines have to agree, and no third
+    number is introduced. The engine must have been unsure (`no_speech_prob`
+    at or above `_CONFIDENT_SPEECH_NSP`, the line below which every real
+    utterance in the labelled set sits and above which noise decoded as whole
+    sentences), AND the words must be as sparse as the things noise produces
+    (`_GATED_MIN_WORDS_PER_S`).
+
+    Measured on this fleet 2026-09-21, one request per clip, with the same
+    real recording behind the speech rows:
+
+        clip                      no_speech_prob   words/s   cautioned
+        8 s clean speech                  0.0088      2.13   no
+        8 s of the same, 26 dB down       0.0238      2.13   no
+        30 s clean dictation              0.1034      2.17   no
+        20 s pink noise at -25 dBFS       0.0352      0.70   YES (14 words)
+
+    The probability alone would have cautioned that 30-second dictation, and
+    a caution on ordinary speech is how a warning stops being read. Sparse
+    alone would caution a real one-word answer. Together they caught the
+    noise clip and left all three speech clips alone.
+
+    An engine that reports no probability gets no opinion: unknown is not
+    evidence, and a caution on every dictation is noise.
+    """
+    if no_speech_prob is None or no_speech_prob < _CONFIDENT_SPEECH_NSP:
+        return None
+    units = _speech_units(text)
+    if units and units / max(seconds, 1.0) < _GATED_MIN_WORDS_PER_S:
+        return CONFIDENCE_LOW
+    return None
 
 
 def _detail(response: Any) -> str:
@@ -1016,6 +1229,14 @@ async def transcribe(
         "identified languages",
         language=result.language or "unknown",
     )
+    if result.confidence == CONFIDENCE_LOW:
+        # Counted in ONE place for both ways a draft earns a caution — a
+        # sparse reply the engine was unsure of, and words that exist only
+        # because the gated clip was decoded a second time.
+        metrics.inc(
+            "asr_low_confidence_total",
+            "dictations returned with a caution the composer shows",
+        )
     return result
 
 

@@ -210,11 +210,59 @@ export function canTransition(from: VoiceState, to: VoiceState): boolean {
   return TRANSITIONS[from].includes(to);
 }
 
+/**
+ * How sure the server is of a draft. A closed vocabulary — the orchestrator
+ * sends one of these words or null, and the wording below is ours.
+ * `app/asr.py` decides it from the engine's own no-speech probability and its
+ * plausibility check, both of which used to be computed and thrown away.
+ */
+export type Confidence = 'low' | 'unclear' | 'silent';
+
 export interface TranscriptionResult {
   text: string;
   language: string | null;
   durationMs: number | null;
   processingMs: number | null;
+  /**
+   * One short line to show BESIDE the transcript, or null. Never a reason to
+   * withhold the text: the words still go into the composer, because a draft
+   * a person can edit beats a warning they cannot act on.
+   */
+  notice: string | null;
+}
+
+/**
+ * What a person is told when a transcript comes back with nothing in it.
+ *
+ * SILENCE IS A CLAIM, and until 2026-09-21 it was made for every empty draft
+ * — including the ones the orchestrator emptied itself after deciding the
+ * engine had invented them, and the ones where a second opinion was never
+ * taken. Measured on this fleet the same day: 20 s of pink noise decodes as
+ * fourteen words, and a gated clip is only re-decoded when it is between 3
+ * and 120 seconds long. "Nothing was said" now needs the server to have
+ * measured exactly that.
+ */
+const EMPTY_MESSAGES: Record<Confidence | 'unknown', string> = {
+  silent: 'Nothing was said in that recording.',
+  unclear: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+  low: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+  unknown: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+};
+
+/**
+ * And what they are told when there IS a draft but it may be invented.
+ *
+ * One line, shown once, next to text that is already in the composer. Not a
+ * dialog and not a block: the person can read the words and decide, which is
+ * something no threshold here can do for them.
+ */
+const LOW_CONFIDENCE_NOTICE =
+  'That was hard to make out — check the text before you send it.';
+
+function confidenceOf(value: unknown): Confidence | null {
+  return value === 'low' || value === 'unclear' || value === 'silent'
+    ? value
+    : null;
 }
 
 export interface TranscribeFailure {
@@ -336,10 +384,11 @@ export async function transcribe(
   }
 
   const text = typeof payload.text === 'string' ? payload.text.trim() : '';
+  const confidence = confidenceOf(payload.confidence);
   if (!text) {
     return {
       error: {
-        message: 'Nothing was said in that recording.',
+        message: EMPTY_MESSAGES[confidence ?? 'unknown'],
         retryable: true,
       },
     };
@@ -351,6 +400,7 @@ export async function transcribe(
       typeof payload.duration_ms === 'number' ? payload.duration_ms : null,
     processingMs:
       typeof payload.processing_ms === 'number' ? payload.processing_ms : null,
+    notice: confidence === 'low' ? LOW_CONFIDENCE_NOTICE : null,
   };
 }
 

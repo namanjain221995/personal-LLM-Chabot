@@ -484,7 +484,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const videoAllowed = features?.video_analysis !== false;
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
-      onTranscript: (transcript) => {
+      onTranscript: (transcript, notice) => {
         setText((prev) => {
           const next = mergeTranscript(prev, transcript);
           onDraftChange?.(next);
@@ -493,6 +493,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // Same handoff `prefill` uses: the textarea is controlled, so the
         // caret has to move after the new text has actually landed.
         caretToEnd.current = true;
+        // A draft the server was not sure of still goes in — the words are
+        // editable and a person can judge them — with one line beside it.
+        // `info`, not `error`: nothing failed, and the same toast surface
+        // every other composer message uses, so it is never a dialog and
+        // never blocks the send.
+        if (notice) toast(notice, 'info');
       },
     });
     const voiceActive =

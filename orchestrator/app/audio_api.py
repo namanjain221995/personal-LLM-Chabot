@@ -34,6 +34,15 @@ at a few minutes of audio while the composer records ten. Work that is not finis
 with a streamed 200: one whitespace byte now and every HEARTBEAT_S after
 (leading whitespace is insignificant in JSON), then the JSON itself. Anything
 known before that point keeps its own status line.
+
+AND THAT WAIT IS BOUNDED. The heartbeat is what makes a long wait survivable,
+not a licence for an unbounded one: one dictation is ONE ASR_TIMEOUT_S of
+engine time for both of its decodes together (app/asr.VLLMAudioProvider
+.transcribe), so the wall clock this route serves is bounded by the same
+number the engine client times out on — never the other way round. The
+cancellation rule is unchanged and deliberate: the deadline belongs to the
+engine call, because cancelling HERE would free the pool slot while the
+engine kept decoding (see `_hold_until_done`).
 """
 from __future__ import annotations
 
@@ -328,10 +337,6 @@ def _hold_until_done(task: "asyncio.Future[dict]") -> None:
 
 _GENERIC_FAILURE = "Transcription couldn't be completed. Please try again."
 
-#: Seconds of decoding per second of audio on a BUSY replica: 300 s of audio
-#: took 219.7 s with other clips queued on it (2026-09-18).
-_LOADED_DECODE_S_PER_AUDIO_S = 0.73
-
 
 def _timeout_detail(duration_ms: int) -> str:
     """The 504's sentence: advice the person can act on.
@@ -341,8 +346,12 @@ def _timeout_detail(duration_ms: int) -> str:
     ASR_TIMEOUT_S (411 s of audio at the 600 s default). A shorter clip that
     timed out met a stuck or queued engine, and recording less would not have
     helped; neither does a clip whose length the browser did not report.
+
+    The rate is `asr.LOADED_DECODE_S_PER_AUDIO_S` — the same measurement the
+    engine client sizes its own bounds from, kept in one place so this
+    sentence and the deadline that produces it can never disagree.
     """
-    decode_s = duration_ms / 1000.0 * _LOADED_DECODE_S_PER_AUDIO_S
+    decode_s = duration_ms / 1000.0 * asr.LOADED_DECODE_S_PER_AUDIO_S
     if duration_ms and decode_s >= settings.asr_timeout_s / 2:
         return "That recording took too long to transcribe. Try a shorter one."
     return "The speech engine did not answer in time. Please try again."
@@ -410,6 +419,12 @@ async def _transcribe_or_refuse(
 
     # No model name, no engine URL, no provider — a member has no reason to
     # learn the platform's internals from a dictation box.
+    #
+    # `confidence` is the one field that is about the ANSWER rather than the
+    # clock: one of asr.CONFIDENCE_* or null. It is a closed vocabulary, not a
+    # sentence, because the wording belongs to the browser — and it names no
+    # engine, no threshold and no probability, so it stays as free of
+    # reconnaissance as the rest of this reply.
     return {
         "text": result.text,
         "language": result.language,
@@ -418,6 +433,7 @@ async def _transcribe_or_refuse(
         "processing_ms": total_ms,
         "upload_ms": upload_ms,
         "engine_ms": result.engine_ms,
+        "confidence": result.confidence,
     }
 
 

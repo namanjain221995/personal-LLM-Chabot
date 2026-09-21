@@ -153,6 +153,9 @@ describe('reading a transcription that arrived behind a heartbeat', () => {
       language: 'English',
       durationMs: 300_000,
       processingMs: 141_000,
+      // No `confidence` in this body, so nothing is said about the draft
+      // (2026-09-21). tests/voice-confidence.test.ts owns that field.
+      notice: null,
     });
   });
 
