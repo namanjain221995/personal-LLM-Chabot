@@ -250,7 +250,7 @@ cases:
       conciseness: 0.15
 - id: SF-OBJ-005
   review_status: approved
-  category: object_metadatadone
+  category: object_metadata
   difficulty: basic
   question: What is the purpose of Job_Requirement__c?
   request:
