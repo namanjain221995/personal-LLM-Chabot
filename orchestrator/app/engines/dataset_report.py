@@ -462,7 +462,18 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
                 f"| {_md_escape(r.get('value'))} | {_fmt_int(r.get('count'))} "
                 f"| {_fmt_figure(r.get('sum'), whole)} | {_fmt_mean(r.get('avg'))} |"
             )
-        if entry.get("truncated"):
+        # THE ROWS ABOVE, RECONCILED AGAINST THE TOTAL ABOVE THEM. The old
+        # "_Further values are not listed._" is kept for a truncated list
+        # whose figures do agree, and is replaced by the arithmetic when they
+        # do not — a reader must never be able to add the column up and get a
+        # different answer from the same page (2026-09-21).
+        note = _reconciliation(
+            entry["rows"], _dec((columns.get(m) or {}).get("sum")) if m in measures else None,
+            prof.get("rows"), m, whole, _reason_for(agg, "group", group),
+        )
+        if note:
+            lines += ["", note]
+        elif entry.get("truncated"):
             lines += ["", "_Further values are not listed._"]
         lines.append("")
 
@@ -484,7 +495,20 @@ def _computed_section(prof: Dict[str, Any], request: str) -> Tuple[List[str], Li
                 f"| {_md_escape(r.get('month'))} | {_fmt_int(r.get('count'))} "
                 f"| {_fmt_figure(r.get('sum'), whole)} |"
             )
-        if months.get("truncated"):
+        # Same reconciliation: the months a file holds are capped at
+        # AGG_MAX_MONTHS and its undated rows are in no month at all, so the
+        # monthly rows add up to less than the Total above them too. The
+        # undated sentence below already carries the WHY for the commonest
+        # cause and is left exactly where it was, so `reason` is None here —
+        # this line supplies the one thing it does not: what the months
+        # listed actually add up to.
+        note = _reconciliation(
+            months["rows"], _dec((columns.get(m) or {}).get("sum")) if m in measures else None,
+            prof.get("rows"), m, whole, None,
+        )
+        if note:
+            lines += ["", note]
+        elif months.get("truncated"):
             lines += ["", "_Further months are not listed._"]
         undated = _reason_for(agg, "month", months.get("date"))
         if undated:
@@ -557,6 +581,79 @@ def _no_months_reason(prof: Dict[str, Any], dates: Sequence[Any]) -> str:
         if isinstance(c, dict)
     )
     return "it has no column of dates" if not has_dates and not dates else "its dates could not be grouped by month"
+
+
+#: A difference below this fraction of the headline total is the profile's own
+#: rounding, not a missing row. profile.py sums a money column as
+#: DECIMAL(38,6) and a measurement column to 12 significant digits, so a real
+#: gap — one dropped group value — is orders of magnitude larger than this.
+_RECONCILE_RELATIVE = Decimal("1e-9")
+
+
+def _reconciliation(
+    rows: Sequence[Any], total: Optional[Decimal], file_rows: Any, measure: Any, whole: bool, reason: Optional[str]
+) -> Optional[str]:
+    """One plain sentence when the rows RENDERED ABOVE do not add up to the
+    headline Total, computed here from those very rows.
+
+    THE DEFECT THIS CLOSES (2026-09-21). "Figures computed from every row"
+    prints `revenue 1,022,098.02`, and the breakdown under it lists the group
+    values the profile kept — which is not all of them: a value held by fewer
+    than GROUP_MIN_ROWS rows is dropped, the list is capped at
+    TOP_VALUES_MAX_DISTINCT, and a lossy DOUBLE sum rounds. The rows then add
+    up to 1,009,021.02, and the only thing between the two totals was
+    "_Further values are not listed._", which is printed only when the profile
+    set `truncated` and never says that the figures disagree or by how much. A
+    reader who added the column up got a different answer from the same page.
+
+    The profile DOES carry a reason for the commonest cause (`omitted`), and
+    the dataset chat engine relays it (engines/dataset.py _caveats); the
+    report dropped it. But a relayed reason is not the mechanism either: it
+    names a cause, not a figure, and it is absent for the other causes. The
+    gap is arithmetic over numbers this module already holds, so it is
+    computed rather than described — and the profile's reason is appended
+    when there is one, because "why" is worth having next to "how much".
+
+    Returns None when the rows do add up, or when a row carries no sum to
+    add (nothing is claimed about figures that were never computed).
+    """
+    if total is None:
+        return None
+    listed = Decimal(0)
+    for row in rows:
+        value = _dec(row.get("sum")) if isinstance(row, dict) else None
+        if value is None:
+            return None
+        listed += value
+    gap = total - listed
+    counted: Optional[int] = 0
+    for row in rows:
+        try:
+            counted += int(row.get("count"))  # type: ignore[union-attr, operator]
+        except (AttributeError, TypeError, ValueError):
+            counted = None
+            break
+    whole_rows = _dec(file_rows)
+    if abs(gap) <= abs(total) * _RECONCILE_RELATIVE:
+        # The figures agree. Say so only when the ROW counts do not — a group
+        # value dropped from a file whose rows sum to nothing still leaves the
+        # reader counting 198 rows in a table headed "every row (200 rows)".
+        if counted is None or whole_rows is None or Decimal(counted) == whole_rows:
+            return None
+        return (
+            f"_These rows cover {_fmt_int(counted)} of the {_fmt_int(file_rows)} rows above; "
+            f"their {_caveat(measure)} still adds up to the total._"
+        )
+    direction = "less" if gap > 0 else "more"
+    said = (
+        f"_These rows add up to {_fmt_figure(listed, whole)}, {_fmt_figure(abs(gap), whole)} {direction} than "
+        f"the {_fmt_figure(total, whole)} total {_caveat(measure)} above"
+    )
+    if counted is not None and whole_rows is not None and Decimal(counted) != whole_rows:
+        said += f", and cover {_fmt_int(counted)} of its {_fmt_int(file_rows)} rows"
+    if reason:
+        said += f": {_caveat(reason)}"
+    return said + "._"
 
 
 def _pick(entries: Sequence[dict], key: str, value: Any, measure: Any, largest: Sequence[str]) -> Optional[dict]:
