@@ -33,6 +33,16 @@ class FactsIn(BaseModel):
 
 @router.get("/facts")
 def list_facts(user: UserRow = Depends(require_user)) -> dict:
+    """Every saved fact, each one carrying where it came from.
+
+    Per row: `source` / `source_excerpt` are the V40 columns — how the row
+    was written and a fragment of the words behind it — and `origin`
+    ('stated', 'manual', 'unknown') plus `trusted` are that provenance judged
+    by db.fact_origin, the same judgement the identity line makes. A row
+    written before V40 comes back origin 'unknown', trusted false and no
+    excerpt: that is the honest answer, and it is the shape of the rows a
+    pasted interview prompt left behind on 2026-09-16.
+    """
     facts = db.list_user_facts(int(user["id"]), settings.memory_max_facts)
     return {"facts": facts}
 

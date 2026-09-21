@@ -4494,12 +4494,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         _continuity.bind(gen, lambda line: emit("status", {"text": line}))
         # Who the model is assisting — safe context for prompt builders
         # (engines append identity.identity_line() to their system prompts).
-        from .identity import set_identity
+        # bind_identity, not set_identity: when the account carries no name of
+        # its own it reads the facts the person is on record as having stated,
+        # which is the only case a saved row may answer "what is my name?"
+        # (app/identity.py). An account WITH a name reads nothing extra.
+        from . import identity as _identity
 
-        set_identity(
+        await _identity.bind_identity(
             str(signed_in.get("display_name") or signed_in.get("username") or ""),
             str(signed_in.get("email") or ""),
             str(signed_in.get("workspace_name") or ""),
+            user_id=viewer,
         )
         reads = _ContextReads(_context_concurrent_reads_enabled())
         cancel_pending_task: Optional[asyncio.Task] = None
