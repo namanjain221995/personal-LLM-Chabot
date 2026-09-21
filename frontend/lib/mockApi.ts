@@ -59,6 +59,15 @@ const MOCK_ME = {
   local: true,
 };
 
+/**
+ * Mirrors orchestrator `authn/display_name.MAX_LENGTH`, so MOCK_MODE can show
+ * the too-long refusal. Only the two rules a person meets by accident are
+ * mocked; the punctuation allowlist and the prompt-instruction refusal live
+ * on the server alone, because duplicating them here would give two places to
+ * disagree about what a name is.
+ */
+const MOCK_NAME_MAX_LENGTH = 64;
+
 /** The mock's session is the cookie's PRESENCE — mirrors the middleware. */
 function hasMockSession(req: Request): boolean {
   return /(?:^|;\s*)ts_session=/.test(req.headers.get('cookie') ?? '');
@@ -108,6 +117,28 @@ export async function handleMockAuth(
   if (endpoint === 'logout' && req.method === 'POST') {
     // Safe when signed out, like the real endpoint.
     return json(200, { ok: true }, MOCK_SESSION_CLEAR);
+  }
+
+  if (endpoint === 'profile' && req.method === 'PATCH') {
+    if (!hasMockSession(req)) return json(401, { detail: 'Sign in required.' });
+    let body: { display_name?: unknown } = {};
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      return json(422, { detail: 'Body must be JSON.' });
+    }
+    const name =
+      typeof body.display_name === 'string' ? body.display_name.trim() : '';
+    if (!name) return json(422, { detail: 'Enter a name.' });
+    if (name.length > MOCK_NAME_MAX_LENGTH) {
+      return json(422, {
+        detail: `A name can be at most ${MOCK_NAME_MAX_LENGTH} characters.`,
+      });
+    }
+    // The mock's identity is process state, so the rename survives the next
+    // GET /auth/me exactly as the database makes it survive in production.
+    MOCK_ME.user.name = name;
+    return json(200, { display_name: name, user: { ...MOCK_ME.user } });
   }
 
   return json(404, { detail: 'Unknown auth endpoint.' });
