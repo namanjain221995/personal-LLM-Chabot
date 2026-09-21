@@ -14,12 +14,16 @@ Release 1 stopped NEW pastes becoming facts (facts.own_words, the
 document-banner rule, the transient-task-request filter). These rows predate
 it, so the judgement the write side already makes is applied again on the
 READ side (context.prompt_facts), the block says what it is, and the
-small-talk lane's persona says what a greeting is answered with.
+small-talk lane's persona says what small talk is answered with.
+
+Out of this track's scope, and still true: "The user's name is
+Aa m a n i Nand e n d l a" is a DATA row, not an instruction, so it survives
+the gate and the name question still answers with it. Repairing or deleting
+that row belongs to the write-side track and the memory panel.
 """
 from __future__ import annotations
 
 import json
-from collections import Counter
 
 import pytest
 from fastapi.testclient import TestClient
