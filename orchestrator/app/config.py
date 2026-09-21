@@ -373,8 +373,46 @@ class Settings:
         # 15 s at the price of a few more calls (the engine's own receptive
         # field is 30 s, so seams are no worse than its internal ones).
         self.video_asr_window_s: float = _float("VIDEO_ASR_WINDOW_S", 90.0)
-        self.video_asr_max_gap_s: float = _float("VIDEO_ASR_MAX_GAP_S", 2.0)
+        # The longest pause a clip may swallow. NOT a language guard — see
+        # `video_asr_language_guard`, which is. Two measurements set it
+        # (2026-09-21, this engine, `webrtcvad` regions after the detector's
+        # 0.2 s padding): within-sentence pauses in continuous narration ran
+        # 0.29-0.89 s, while the pauses between paragraphs on the live
+        # LibriVox clips ran 1.67-2.00 s. 1.2 s sits in the empty band
+        # between them, so an ordinary breath stays inside one clip and a
+        # paragraph-length pause ends it. 2.0 s landed ON the second cluster
+        # (1.97, 2.00, 2.00): the plan flipped between one window and two on
+        # a hundredth of a second. The audit's 0.8 s is ruled out by the same
+        # measurement — it splits a 0.89 s within-sentence pause, and it does
+        # NOT split the reproduction's Hindi-to-English turn, which measures
+        # 0.80 s. Each region boundary is already >= 0.5 s of real silence
+        # (`vad.regions_from_flags`), so this only decides which of those
+        # boundaries a clip may cross.
+        self.video_asr_max_gap_s: float = _float("VIDEO_ASR_MAX_GAP_S", 1.2)
         self.video_asr_overlap_s: float = _float("VIDEO_ASR_OVERLAP_S", 3.0)
+        # ONE CLIP IS DECODED IN ONE LANGUAGE. Measured on this engine
+        # 2026-09-21: a 33.6 s clip holding 30 s of English and then one
+        # Hindi sentence came back entirely in English, and the Hindi
+        # sentence for "this is pork, not cow's meat" was rendered "This is
+        # a mouse's flesh, not a cow's flesh" — a fluent English sentence
+        # that says something else. The same clip's regions decoded
+        # separately came back Hindi
+        # and English, each correct. The engine's per-segment language label
+        # cannot see this: every cue of the mixed clip was labelled `en`,
+        # including the Hindi one. So the orchestrator re-decodes a window's
+        # speech regions as separate clips and keeps those when a region's
+        # own language contradicts the window's.
+        self.video_asr_language_guard: bool = _bool("VIDEO_ASR_LANGUAGE_GUARD", True)
+        # How many windows the guard checks before it has evidence either
+        # way. Checking every window with a pause in it would add a clip per
+        # window (~+33 % of the stage) to every monolingual recording, so the
+        # guard samples this many spread across the recording and escalates
+        # to every one of them the moment any evidence of a second language
+        # appears — either a sample that contradicts its window, or two
+        # windows of the first pass reporting different languages.
+        self.video_asr_language_probe_windows: int = _int(
+            "VIDEO_ASR_LANGUAGE_PROBE_WINDOWS", 4
+        )
         # Clips in flight at once. Two = one per Spark: the speech router
         # hands each clip to the engine with the fewest in flight, so both
         # nodes decode side by side. A person dictating meanwhile may wait

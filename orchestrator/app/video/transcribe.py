@@ -27,6 +27,14 @@ utterance into a short stamp seconds late (21.8 s on a live clip,
 2026-09-18). Each window carries the VAD regions it covers, and
 `snap_to_regions` holds its cues to them before the seams are stitched.
 
+LANGUAGE. A clip is decoded in ONE language, chosen from its opening and
+applied to all of it, so a window that joins a Hindi turn to an English one
+comes back entirely in English — and the Hindi is not transcribed badly, it
+is rewritten into a fluent English sentence that says something else.
+`language_guard` re-reads the speech regions of the windows where that can
+have happened and keeps the per-region transcripts when one contradicts its
+window. It has the measurement.
+
 LOOPS. After stitching, `loops.collapse` removes what the decoder repeated
 rather than heard — a phrase cycling inside one cue, or one cue emitted
 dozens of times over a few seconds. 17.9% of a real 2h23m transcript was
@@ -482,6 +490,190 @@ def snap_to_regions(
     return out
 
 
+# --------------------------------------------------------- language guard --
+
+#: A region has to be at least this long before its own language label may
+#: contradict the window's. A clip of a few hundred milliseconds is where the
+#: engine invents (the module docstring's "Thank you."), and an invented cue
+#: comes with an invented language: letting a 0.6 s region overrule a whole
+#: window would trade a rare mistranslation for a common one. The regions
+#: this rejects are still re-read and still kept when the window IS repaired
+#: — they simply do not get a vote.
+_LANGUAGE_MIN_REGION_S = 1.0
+
+
+def _spread(items: Sequence[int], n: int) -> List[int]:
+    """Up to `n` of `items`, spread evenly over the list rather than taken
+    from the front: a person who switches language forty minutes into a
+    lecture is invisible to a sample of the first four windows."""
+    if n <= 0 or not items:
+        return []
+    if len(items) <= n:
+        return list(items)
+    step = len(items) / n
+    return [items[min(len(items) - 1, int(k * step + step / 2))] for k in range(n)]
+
+
+def _segments_in_video_time(result, *, offset_s: float, regions) -> List[Segment]:
+    """One clip's reply -> segments in video time, held to `regions`."""
+    return snap_to_regions(
+        [
+            Segment(
+                start_s=offset_s + float(s.get("start", 0.0)),
+                end_s=offset_s + float(s.get("end", 0.0)),
+                text=str(s.get("text") or "").strip(),
+                language=(str(s.get("language")) if s.get("language") else result.language_code),
+            )
+            for s in (result.segments or [])
+        ],
+        regions,
+    )
+
+
+async def language_guard(
+    windows: Sequence[Window],
+    results: Dict[int, List[Segment]],
+    languages: Dict[int, Optional[str]],
+    *,
+    decode: Callable[[int, float, float], Awaitable[Optional[object]]],
+    probe_windows: int,
+) -> dict:
+    """Re-read the windows whose transcript could be in the wrong language.
+
+    THE DEFECT THIS EXISTS FOR (measured on this engine, 2026-09-21). A clip
+    is decoded in ONE language, chosen from its opening and applied to every
+    second of it. A 33.6 s clip holding 30 s of English and then one Hindi
+    sentence came back entirely in English, and the Hindi sentence for "this
+    is pork, not cow's meat" was rendered "This is a mouse's flesh, not a
+    cow's flesh": not a bad transcription, a fluent English sentence that
+    says something else, and it goes on to the summary, the chapter titles
+    and the subtitles the person downloads. Sent as its own clip, the same
+    speech came back in its own script and said what was said. This is not
+    the engine's `translate` task — compose/whisper/server.py forces
+    `transcribe` — it is one language decision stretched over two languages.
+
+    WHY THE ENGINE'S OWN LABELS CANNOT FIND IT. Every cue of that mixed clip
+    was labelled `en`, the Hindi one included. The window's label is the
+    forced decision, so the only second opinion available is a second decode
+    of a smaller piece of audio.
+
+    WHY THE PAUSE LENGTH CANNOT FIND IT EITHER. In the reproduction the
+    Hindi-to-English turn is a 0.80 s pause after the detector's padding,
+    while within-sentence pauses in one speaker's narration measured
+    0.29-0.89 s: a turn change hides behind a shorter pause than a breath.
+    No value of `max_gap_s` separates them, which is why this is a guard and
+    not a threshold.
+
+    WHAT IT COSTS. Checking a window means re-reading its speech region by
+    region — about what the window cost the first time, since the audio is
+    the same and only the per-clip overhead is new. Doing that to every
+    window would roughly double the stage, so: a window is AT RISK when it
+    holds more than one speech region, `probe_windows` of them spread over
+    the recording are checked, and the check escalates to every at-risk
+    window the moment there is evidence of a second language — a checked
+    window contradicting itself, or two windows of the first pass reporting
+    different languages, which is free. On an 80-window recording a sample
+    of four is a few per cent; on a recording of four windows it is most of
+    a second pass, which on a recording that short is a few seconds.
+
+    EVERY REGION, not a likely one. The first cut of this guard re-read only
+    the region furthest from the clip's opening, on the reasoning that the
+    engine judges the language on the opening. The reproduction refutes it:
+    a clip that OPENS with the Hindi sentence was decoded in English
+    anyway. The engine's choice is not the opening's language, so no region
+    is the safe one to skip.
+
+    A window is repaired only when a region long enough to be trusted
+    (`_LANGUAGE_MIN_REGION_S`) comes back in a different language from the
+    window's. Then its per-region transcripts replace the window's, region by
+    region, and a region the engine refused keeps the first pass's words
+    rather than losing them.
+    """
+    at_risk = [
+        i
+        for i in sorted(results)
+        if len(windows[i].regions) >= 2 and languages.get(i) and results[i]
+    ]
+    report = {
+        "at_risk": len(at_risk),
+        "windows_checked": 0,
+        "clips": 0,
+        "windows_repaired": 0,
+    }
+    if not at_risk:
+        return report
+    escalated = len({lang for lang in languages.values() if lang}) > 1
+
+    async def check(i: int) -> bool:
+        regs = windows[i].regions
+        decoded: Dict[int, Tuple[List[Segment], Optional[str]]] = {}
+
+        async def read(k: int) -> None:
+            a, b = regs[k]
+            result = await decode(i, a, b)
+            report["clips"] += 1
+            if result is None:
+                return
+            decoded[k] = (
+                _segments_in_video_time(result, offset_s=a, regions=(regs[k],)),
+                result.language_code or None,
+            )
+
+        def contradicts() -> bool:
+            return any(
+                lang
+                and lang != languages[i]
+                and segs
+                and regs[k][1] - regs[k][0] >= _LANGUAGE_MIN_REGION_S
+                for k, (segs, lang) in decoded.items()
+            )
+
+        for k in range(len(regs)):
+            await read(k)
+        if not contradicts():
+            return False
+        repaired: List[Segment] = []
+        carried: set = set()  # pass-1 cues already kept, by position
+        for k, (a, b) in enumerate(regs):
+            if k in decoded:
+                repaired.extend(decoded[k][0])
+                continue
+            # The engine refused this region on its own. Its words are still
+            # in the first pass, possibly in the wrong language; dropping
+            # them would answer a mistranslation with a hole. Once each: one
+            # sentence spoken across a pause is a cue in two regions, and
+            # `stitch` does not de-duplicate inside a window that was snapped.
+            for n, seg in enumerate(results[i]):
+                if n not in carried and seg.start_s < b and seg.end_s > a:
+                    carried.add(n)
+                    repaired.append(seg)
+        if not repaired:
+            return False
+        log.info(
+            "language guard: window %d (%.1f-%.1fs) was decoded as %s but holds %s; "
+            "keeping the per-region transcripts",
+            i,
+            windows[i].start_s,
+            windows[i].end_s,
+            languages[i],
+            ", ".join(sorted({lang for _s, lang in decoded.values() if lang})),
+        )
+        results[i] = repaired
+        report["windows_repaired"] += 1
+        return True
+
+    sample = list(at_risk) if escalated else _spread(at_risk, probe_windows)
+    checked = set(sample)
+    found = await asyncio.gather(*(check(i) for i in sample))
+    if any(found) and not escalated:
+        rest = [i for i in at_risk if i not in checked]
+        if rest:
+            await asyncio.gather(*(check(i) for i in rest))
+            checked.update(rest)
+    report["windows_checked"] = len(checked)
+    return report
+
+
 def dominant_language(segments: Sequence[Segment]) -> Optional[str]:
     """The language most of the speech is in, weighted by duration."""
     weight: Dict[str, float] = {}
@@ -575,6 +767,9 @@ async def transcribe_audio(
     width = max(1, int(settings.video_asr_concurrency))
     gate = asyncio.Semaphore(width)
     results: Dict[int, List[Segment]] = {}
+    #: The language the engine chose for each window's clip. One decision per
+    #: clip, so this is what `language_guard` checks a region against.
+    languages: Dict[int, Optional[str]] = {}
     tally = {"engine_ms": 0, "failures": 0, "paced_s": 0.0, "done_s": 0.0, "in_flight": 0, "retries": 0}
     threshold = max(3, len(windows) // 4)
 
@@ -648,20 +843,32 @@ async def transcribe_audio(
             tally["engine_ms"] += int(result.engine_ms or 0)
             # The engine's times are in-clip and not anchored to the speech;
             # the window's own VAD regions are (see `snap_to_regions`).
-            results[i] = snap_to_regions(
-                [
-                    Segment(
-                        start_s=window.start_s + float(s.get("start", 0.0)),
-                        end_s=window.start_s + float(s.get("end", 0.0)),
-                        text=str(s.get("text") or "").strip(),
-                        language=(str(s.get("language")) if s.get("language") else result.language_code),
-                    )
-                    for s in (result.segments or [])
-                ],
-                window.regions,
+            results[i] = _segments_in_video_time(
+                result, offset_s=window.start_s, regions=window.regions
             )
+            languages[i] = result.language_code or None
             tally["done_s"] += window.duration_s
             await _say()
+
+    async def region_clip(i: int, a_s: float, b_s: float):
+        """One speech region of window `i` as its own clip, for the language
+        guard. Paced and gated like any other clip: a second read is more
+        work for the same two Sparks. An engine that refuses this region is
+        not a failed video — the guard keeps the first pass's words for it."""
+        async with gate:
+            tally["paced_s"] += await _pipe.pace()
+            a, b = int(a_s * SAMPLE_RATE), int(b_s * SAMPLE_RATE)
+            clip = await asyncio.to_thread(wav_bytes, pcm[a:b])
+            try:
+                result = await send(i, clip)
+            except (asr.ASRRejected, asr.ASRBusy, asr.ASRUnavailable) as exc:
+                log.warning(
+                    "language guard: window %d region %.1f-%.1fs could not be re-read: %s",
+                    i, a_s, b_s, exc,
+                )
+                return None
+            tally["engine_ms"] += int(result.engine_ms or 0)
+            return result
 
     # FAIL FAST, LEAVING NOTHING BEHIND. `gather` propagates the first error
     # and leaves every other clip running to the end of the recording, each
@@ -686,6 +893,19 @@ async def transcribe_audio(
     if fatal is not None:
         await _cancel_all(pending)
         raise fatal
+    # AND NOW THE LANGUAGE. Everything above trusted one language decision per
+    # clip; `language_guard` re-reads the windows where that decision could
+    # have covered two languages, and replaces the ones it did. It runs before
+    # the seams are stitched because it replaces a window's cues wholesale.
+    guard = {"at_risk": 0, "windows_checked": 0, "clips": 0, "windows_repaired": 0}
+    if settings.video_asr_language_guard and results:
+        guard = await language_guard(
+            windows,
+            results,
+            languages,
+            decode=region_clip,
+            probe_windows=int(settings.video_asr_language_probe_windows),
+        )
     # Stitching wants the windows in time order, whichever finished first.
     pieces: List[Tuple[Window, List[Segment]]] = [(windows[i], results[i]) for i in sorted(results)]
     engine_ms, failures, paced_s = tally["engine_ms"], tally["failures"], tally["paced_s"]
@@ -715,6 +935,7 @@ async def transcribe_audio(
         "segments": len(segments),
         "chars": sum(len(s.text) for s in segments),
         "loops": loop_report,
+        "language_guard": guard,
         "wall_s": round(time.perf_counter() - started, 2),
     }
     return segments, language, report
