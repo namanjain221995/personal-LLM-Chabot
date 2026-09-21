@@ -27,7 +27,6 @@ import pytest
 from app import db, identity
 
 
-
 def set_identity(*args, **kwargs):
     return identity.set_identity(*args, **kwargs)
 
@@ -50,6 +49,7 @@ def name_from_fact(fact: str) -> str:
 
 def trusted_name(facts):
     return identity.trusted_name(facts)
+
 
 #: A name fact with NO provenance: the exact shape of the 2026-09-16 rows.
 STRANGER_NO_PROVENANCE = {
