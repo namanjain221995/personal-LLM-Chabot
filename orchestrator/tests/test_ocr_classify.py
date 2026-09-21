@@ -450,20 +450,21 @@ def test_the_image_route_evidence_block_carries_no_preamble(monkeypatch):
     _engine_answering(monkeypatch, ["result\nSERVER ROOM B", '":"'])
     reads = asyncio.run(ocr.read_images(["A", "B"], prompt="OCR"))
     block = ocr.evidence_block(reads, "image")
-    assert "--- Image 1 of 2 ---\nSERVER ROOM B" in block
+    assert "--- Image 1 of 2 ---\n<ocr_transcript>\nSERVER ROOM B" in block
     assert "Image 2 of 2" not in block, "a preamble-only read is not evidence"
     assert "result" not in block.split("---", 1)[1]
 
 
 def test_ocr_images_keeps_its_contract_and_drops_the_junk(monkeypatch):
-    """`ocr_images` (the document route's view) still forwards a degenerate
-    read's text — document.py is frozen this round and that contract is its
-    own — but a preamble-only read is now empty, so it arrives as ''."""
+    """`ocr_images` (the document route's view) gives back an `ok` read's text
+    and '' for anything else. A preamble-only read is empty; a LOOP is not a
+    read either (2026-09-21): it used to be forwarded verbatim and document.py
+    appended it to the page, so a 60-line repetition arrived as page text."""
     _engine_answering(monkeypatch, ['":"', "ovi\nInvoice 42", "nije " * 400])
     texts = asyncio.run(ocr.ocr_images(["A", "B", "C"]))
     assert texts[0] == ""
     assert texts[1] == "Invoice 42"
-    assert texts[2].startswith("nije nije"), "unchanged: degenerate text is still forwarded here"
+    assert texts[2] == "", "a loop is not page text"
 
 
 # ------------------------------------------------ boundaries (QA 2026-09-18) --
@@ -781,7 +782,8 @@ def test_the_image_route_evidence_block_carries_no_model_talk(monkeypatch):
     reads = asyncio.run(ocr.read_images(["A", "B"], prompt="OCR"))
     block = ocr.evidence_block(reads, "image")
     assert "source image" not in block
-    assert "--- Image 2 of 2 ---\nSERVER ROOM B" in block and "Image 1 of 2" not in block
+    assert "--- Image 2 of 2 ---\n<ocr_transcript>\nSERVER ROOM B" in block
+    assert "Image 1 of 2" not in block
 
 
 #: Security review r2: the longest runs the engine can emit (6,000 output
