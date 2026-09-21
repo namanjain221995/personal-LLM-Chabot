@@ -107,7 +107,8 @@ _sites("context", _DB,
        "get_conversation_videos", "get_conversation_crawl_sites",
        "get_repo", "get_repo_keys", "save_repo", "replace_repo_chunks",
        "search_repo_chunks")
-_sites("facts", _DB, "list_user_facts", "add_user_fact", "update_user_fact", "delete_user_fact")
+_sites("facts", _DB, "list_user_facts", "trusted_user_facts", "add_user_fact",
+       "update_user_fact", "delete_user_fact")
 _sites("recall", _DB,
        "recall_conversations", "search_conversations", "fetch_message_embeddings",
        "messages_missing_embeddings", "store_message_embeddings")
