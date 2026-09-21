@@ -104,6 +104,11 @@ _APP_TABLES = (
     # and conversations, but naming them keeps a truncation explicit.
     "upload_sessions",
     "chat_requests",
+    # V41 (2026-09-21): the picture a conversation was shown. It cascades
+    # from users, but a row that survived into the next test would hand that
+    # test a photo it never sent — and the tests of the word test are
+    # precisely about which turns do and do not reach one.
+    "conversation_images",
     "video_analyses",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.
@@ -559,3 +564,18 @@ def _knowledge_process_state_clear():
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
     _public_sidecars.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _no_finish_reason_from_an_earlier_test():
+    """llm._finish_reason is a ContextVar. A test that sets it outside
+    asyncio.run leaves the value in the main thread's context, and every later
+    asyncio.run copies it: test_continuation.py left "length" behind and the
+    vision table pre-pass - which ignores a transcription cut at its ceiling -
+    silently skipped itself in test_vision_adversarial.py (release-2 CI run,
+    2026-09-19). Each test starts and ends with no finish reason."""
+    from app import llm
+
+    llm._finish_reason.set(None)
+    yield
+    llm._finish_reason.set(None)

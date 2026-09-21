@@ -39,6 +39,7 @@ import {
   type UploadProgress,
 } from '@/lib/uploadDocument';
 import { formatBytes } from '@/lib/format';
+import { MEDIA_ACCEPT, mediaKindFor } from '@/lib/attachments';
 import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
@@ -264,9 +265,9 @@ const INLINE_DOC_BYTES = 25 * 1024 * 1024;
 const MAX_DATASET_BYTES = 512 * 1024 * 1024;
 // 2026-09-09: a video streams by reference like a big document (chunked past
 // 90 MB); the server's own cap is VIDEO_MAX_UPLOAD_MB. Four hours of 1080p
-// screen recording is well under this.
+// screen recording is well under this. Audio shares it (B12): it is the same
+// upload to the same job.
 const MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024;
-const VIDEO_EXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|mpg|mpeg|3gp|ogv)$/;
 const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
@@ -320,6 +321,11 @@ function ModeChip({
       <IconX size={11} />
     </button>
   );
+}
+
+/** An audio file on the video rail: same upload and job, its own label. */
+function isAudio(attachment: Pick<Attachment, 'name' | 'file'>): boolean {
+  return mediaKindFor(attachment.name, attachment.file?.type) === 'audio';
 }
 
 function isDatasetName(name: string): boolean {
@@ -421,6 +427,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     /** Highlighted row of the slash-command picker while it is showing. */
     const [commandIndex, setCommandIndex] = useState(0);
     const [attachments, setAttachments] = useState<Attachment[]>([]);
+    /**
+     * The chips as the NEXT render will see them, for the MAX_DOCS ruling.
+     * One pick of six files calls appendDocument six times before React has
+     * run a single setAttachments updater, so neither `attachments` nor a
+     * flag set inside the updater can say "that was the sixth" in time: the
+     * toast never showed and the sixth file vanished (QA, 2026-09-18).
+     * appendDocument advances this synchronously; the effect below re-syncs
+     * it with every committed change (removals, datasets, inline reads).
+     */
+    const acceptedRef = useRef<Attachment[]>([]);
+    useEffect(() => {
+      acceptedRef.current = attachments;
+    }, [attachments]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
     /**
@@ -465,7 +484,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const videoAllowed = features?.video_analysis !== false;
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
-      onTranscript: (transcript) => {
+      onTranscript: (transcript, notice) => {
         setText((prev) => {
           const next = mergeTranscript(prev, transcript);
           onDraftChange?.(next);
@@ -474,6 +493,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // Same handoff `prefill` uses: the textarea is controlled, so the
         // caret has to move after the new text has actually landed.
         caretToEnd.current = true;
+        // A draft the server was not sure of still goes in — the words are
+        // editable and a person can judge them — with one line beside it.
+        // `info`, not `error`: nothing failed, and the same toast surface
+        // every other composer message uses, so it is never a dialog and
+        // never blocks the send.
+        if (notice) toast(notice, 'info');
       },
     });
     const voiceActive =
@@ -596,6 +621,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       onSend(trimmed, outgoing, options);
       setText('');
       onDraftChange?.(''); // the draft is gone — drop it from the meter
+      acceptedRef.current = [];
       setAttachments([]);
       // The uploads belong to the send now: its promises are already held by
       // the caller, and nothing here may abort them any more.
@@ -736,6 +762,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         delete next[clientId];
         return next;
       });
+      acceptedRef.current = acceptedRef.current.filter((a) => a.clientId !== clientId);
       setAttachments((prev) => prev.filter((a) => a.clientId !== clientId));
     }
 
@@ -752,16 +779,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
 
     /** Documents stack to MAX_DOCS and displace images/datasets (2026-09-02). */
     function appendDocument(att: Attachment) {
-      let refused = false;
+      const streamed = (list: Attachment[]) =>
+        list.filter((a) => a.kind === 'pdf' || a.kind === 'video').length;
+      const accepted = acceptedRef.current.filter((a) => a.kind !== 'dataset');
+      if (streamed(accepted) >= MAX_DOCS) {
+        toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
+        return;
+      }
+      acceptedRef.current = [...accepted, att];
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
-        if (kept.filter((a) => a.kind === 'pdf' || a.kind === 'video').length >= MAX_DOCS) {
-          refused = true;
-          return prev;
-        }
+        if (streamed(kept) >= MAX_DOCS) return prev; // raced past the cap
         return [...kept, att];
       });
-      if (refused) toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
     }
 
     function handleFile(file: File) {
@@ -784,8 +814,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // 2026-09-09: a video is its own kind — transcribed, read off the
       // screen and summarised on the server — BEFORE the "upload anything"
       // fallback below can swallow it as an unreadable document.
-      const isVideo =
-        !isImage && !isPdf && (file.type.startsWith('video/') || VIDEO_EXT_RE.test(lower));
+      // B12 (2026-09-18): audio is the same kind. It was missing here, so a
+      // voice memo fell to that fallback and was answered as a binary file;
+      // it is claimed now, before the archive and dataset checks run.
+      const isVideo = !isImage && !isPdf && mediaKindFor(file.name, file.type) !== null;
       if (isVideo && !videoAllowed) {
         toast(
           'Video understanding is turned off for your account. Ask an administrator.',
@@ -850,18 +882,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // Never read a 512 MB archive into memory: keep the File handle and
         // stream it to /api/upload when the message is sent. A dataset (like
         // a PDF) stands alone — it replaces whatever was attached.
-        setAttachments([
-          {
-            clientId: newClientId(),
-            attachment_id: newAttachmentId(),
-            name: file.name,
-            bytes: file.size,
-            kind: 'dataset',
-            dataUrl: '',
-            base64: '',
-            file,
-          },
-        ]);
+        const dataset: Attachment = {
+          clientId: newClientId(),
+          attachment_id: newAttachmentId(),
+          name: file.name,
+          bytes: file.size,
+          kind: 'dataset',
+          dataUrl: '',
+          base64: '',
+          file,
+        };
+        acceptedRef.current = [dataset];
+        setAttachments([dataset]);
         return;
       }
       if (isPdf && file.size > INLINE_DOC_BYTES) {
@@ -1066,7 +1098,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 >
                   {attachment.kind === 'video' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-accent/15 text-accent">
-                      <IconPlay size={18} />
+                      {isAudio(attachment) ? <IconMic size={18} /> : <IconPlay size={18} />}
                     </span>
                   ) : attachment.kind === 'pdf' || attachment.kind === 'dataset' ? (
                     <span className="grid h-10 w-10 shrink-0 place-items-center rounded-md bg-danger/15 text-danger">
@@ -1089,7 +1121,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                         {attachment.kind === 'pdf'
                           ? 'PDF'
                           : attachment.kind === 'video'
-                            ? 'VIDEO'
+                            ? isAudio(attachment)
+                              ? 'AUDIO'
+                              : 'VIDEO'
                             : 'DATASET'}
                       </span>
                     )}
@@ -1263,7 +1297,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept="image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson,video/*,.mp4,.m4v,.mov,.webm,.mkv"
+                accept={`image/*,application/pdf,.pdf,.docx,.txt,.md,.zip,.tar,.tar.gz,.tgz,.csv,.tsv,.parquet,.xlsx,.json,.jsonl,.ndjson,${MEDIA_ACCEPT}`}
                 className="sr-only"
                 aria-hidden
                 tabIndex={-1}

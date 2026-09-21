@@ -427,6 +427,90 @@ def test_a_degenerate_frame_is_unread_and_its_text_never_reaches_the_evidence(mo
     assert "unreadable" in result.summary["detail"]
 
 
+#: What the "OCR" prompt returned for two perfectly legible slides in the
+#: speech-video audit (2026-09-17): the model's preamble, and nothing else.
+_PREAMBLE_ONLY = ('":"', "result '")
+
+
+def test_a_preamble_only_read_is_not_counted_as_a_frame_with_readable_text():
+    """The audit's video reported "4/4 frames had readable text" when two of
+    the four frames had been read; the other two were '":"' and "result '"."""
+    reads = [
+        ocr.classify(_REAL),
+        ocr.classify(_PREAMBLE_ONLY[0]),
+        ocr.classify("Agenda\n1. Pricing for the Meryton launch"),
+        ocr.classify(_PREAMBLE_ONLY[1]),
+    ]
+    summary = screen._summarise(reads, frames=4, prompt="OCR")
+    assert summary["detail"] == "2/4 frames had readable text"
+    assert (summary["ok"], summary["empty"], summary["unread"]) == (2, 2, 0)
+
+
+def test_a_reader_that_looped_on_its_preamble_is_unavailable_not_a_blank_screen():
+    """QA 2026-09-18: 'ovi ' x 700 was stripped one "ovi" at a time down to
+    nothing, so both frames were `empty` and the stage said "ok" — a loop
+    cached as two blank screens."""
+    reads = [ocr.classify("ovi " * 700), ocr.classify(":\n" * 400)]
+    summary = screen._summarise(reads, frames=2, prompt="OCR")
+    assert summary["status"] == "unavailable"
+    assert (summary["degenerate"], summary["empty"]) == (2, 0)
+
+
+def test_a_mixed_batch_counts_each_state_once():
+    reads = [
+        ocr.classify("Weekly Planning Meeting"),
+        ocr.classify('":"'),
+        ocr.classify("nije " * 400),
+        ocr.OcrRead("", "failed", "APITimeoutError: x"),
+    ]
+    summary = screen._summarise(reads, frames=4, prompt="OCR")
+    assert summary["detail"] == "1/4 frames had readable text · 1 unreadable (the reader looped) · 1 not read"
+    assert summary["status"] == "partial"
+    assert (summary["ok"], summary["empty"], summary["degenerate"], summary["failed"]) == (1, 1, 1, 1)
+
+
+def test_a_frame_the_model_only_talked_about_is_not_a_frame_with_readable_text():
+    """Live video-path answers ("OCR" prompt) that were counted as readable
+    frames until 2026-09-19: a legible code slide answered with only 'and
+    compare it to the source image.' (security review, 3 of 3 runs), a blank
+    frame answered '[No text detected]', and a photo whose whole answer was
+    a whole-frame region saying there was no text (builder, both runs)."""
+    reads = [
+        ocr.classify(_REAL),
+        ocr.classify(" and compare it to the source image."),
+        ocr.classify(" result\n[No text detected]\nimage [0, 0, 999, 999]"),
+        ocr.classify(
+            " text [0, 0, 999, 999]The image contains no text. The visible element is a solid orange circle"
+            " centered at the bottom center. There is no OCR-able content to extract.\nimage [0, 0, 999, 999]"
+        ),
+    ]
+    assert [r.status for r in reads] == ["ok", "empty", "empty", "empty"]
+    summary = screen._summarise(reads, frames=4, prompt="OCR")
+    assert summary["detail"] == "1/4 frames had readable text"
+
+
+def test_preamble_junk_never_reaches_the_on_screen_text_or_screen_text_txt(monkeypatch, tmp_path):
+    from app.video.artifacts import screen_text_txt
+
+    monkeypatch.setattr(settings, "ocr_enabled", True)
+    monkeypatch.setattr(settings, "video_ocr_enabled", True)
+    monkeypatch.setattr(settings, "video_ocr_concurrency", 4)
+    raws = [_REAL, _PREAMBLE_ONLY[0], "result\nSERVER ROOM B", _PREAMBLE_ONLY[1]]
+
+    async def engine(images, **kwargs):
+        return [ocr.classify(raw) for raw in raws[: len(images)]]
+
+    monkeypatch.setattr(ocr, "read_images", engine)
+    frames = _frames(tmp_path, 4)
+    result = asyncio.run(screen.read_frames(frames, progress=_quiet))
+    assert [r.status for r in result.reads] == ["ok", "empty", "ok", "empty"]
+    assert result.texts == [_REAL, "", "SERVER ROOM B", ""]
+    assert result.summary["detail"] == "2/4 frames had readable text"
+    txt = screen_text_txt(screen.build_spans(frames, result.texts, [None] * 4))
+    assert '":"' not in txt and "result" not in txt
+    assert "SERVER ROOM B" in txt and "Weekly Planning Meeting" in txt
+
+
 def test_the_video_ocr_prompt_is_the_one_that_works_and_can_be_overridden(monkeypatch, tmp_path):
     """Measured 2026-09-11 against the live engine: 'document parsing' looped
     on four of six real frames; 'OCR' read all six."""

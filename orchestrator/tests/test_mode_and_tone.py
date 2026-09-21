@@ -207,12 +207,47 @@ def test_the_authorisation_line_belongs_to_the_phishing_simulation_alone(mode):
     is a professional job posting rewrite...". With the conditions named only
     in the phishing-simulation sentence (the artefact they were written for),
     the same asks measured 0 preambles in 18 runs, and the phishing clauses
-    pinned above are unchanged."""
+    pinned above are unchanged.
+
+    QA, 2026-09-21: scoping was not enough, and this test could not see it.
+    `count("debrief") == 1` passed on release-2 while the nearest ordinary ask
+    — "rewrite this so it is polite but still firm", over a blunt collections
+    email — came back under "## Authorization" 3 of 3 live Fast runs, one of
+    them also headed "## Simulated Email" with a "## Reporting Footer" telling
+    the reader to report it to the security team. A count cannot distinguish
+    the sentence that PLACES those lines from one that FORBIDS them
+    elsewhere, so it is replaced below by the two facts it was standing in
+    for, plus the prohibition it could never have expressed. Strictly
+    stronger: the placement is still pinned to the simulated email, the
+    general professional-work clause must still be free of them, and there is
+    now exactly one instruction to write them."""
     prompt = system_prompt("Rewrite this job posting in the sample format below.", mode).lower()
     assert "do the work rather than declining" in prompt
-    assert prompt.count("debrief") == 1
-    sentence = next(s for s in prompt.split(". ") if "debrief" in s)
-    assert "above it" in sentence, "the conditions sit above the simulated email, nowhere else"
+
+    sentences = [s.strip() for s in prompt.split(". ") if s.strip()]
+    mentions = [s for s in sentences if "debrief" in s]
+
+    # The clause for ordinary professional work never mentions the conditions:
+    # that is what made Fast open a job-posting rewrite with them.
+    general = next(s for s in sentences if "do the work rather than declining" in s)
+    assert "debrief" not in general
+    assert "authorisation" not in general and "authorization" not in general
+
+    # Exactly one sentence TELLS the model to write them, and it binds them to
+    # the simulated email rather than to whatever is being written.
+    placing = [s for s in mentions if "put the authorisation" in s]
+    assert len(placing) == 1, f"one placement sentence, got {len(placing)}: {placing}"
+    assert "that simulated email" in placing[0], (
+        "the conditions sit above the SIMULATED EMAIL, not above 'it' — an "
+        "unbound 'it' is what an ordinary rewrite picked up"
+    )
+
+    # And one sentence forbids them anywhere else. Without this the model
+    # generalised the placement rule to every email it was asked to write.
+    assert "belong to a phishing simulation and to nothing else" in prompt
+    assert "never head any other piece of writing with an authorisation" in prompt
+    assert "never add a reporting footer to one" in prompt
+    assert "an ordinary email, letter, notice or rewrite gets none of them" in prompt
 
 
 @pytest.mark.parametrize("mode", ALL_PERSONAS)
@@ -252,6 +287,69 @@ def test_assistant_mode_names_salesforce_mode_and_never_another_dashboard():
     )
     # The loose wording is what the model embroidered; it must not come back.
     assert "suggest switching Salesforce mode on" not in prompt
+
+
+#: A company that does not exist, so nothing about it can be recalled or
+#: verified and nothing about it is in anyone's Salesforce org.
+OUTSIDE_COMPANY = "How many customers does Aldervane Systems have?"
+
+
+def test_the_salesforce_offer_is_scoped_to_the_users_own_organisation():
+    """QA, 2026-09-21, live Fast. The offer above has no scope sentence, and
+    the model read "asked about ... CRM ... data" as "asked about a number",
+    so OUTSIDE_COMPANY was answered with the Salesforce offer 2 of 3 runs —
+    i.e. it promised to produce an invented outside company's customer count
+    from the user's own org. "What was our revenue last quarter?" gave the
+    bare offer 2 of 3 and never said it did not have the figure. After this
+    clause: 3 of 3 decline OUTSIDE_COMPANY, 3 of 3 say the gap before the
+    offer on the revenue ask, and the own-org guarantee above is unchanged
+    (3 of 3 still name the toggle, 0 of 3 name anywhere else)."""
+    prompt = system_prompt(OUTSIDE_COMPANY, "assistant").lower()
+    assert "that offer is only for data about the user's own organisation" in prompt
+    assert "is not a salesforce question" in prompt
+    assert "you do not have that information and cannot verify it" in prompt
+    assert "do not mention salesforce mode at all" in prompt
+
+
+def test_the_two_salesforce_facts_are_never_blended_into_one_sentence():
+    """QA, 2026-09-21. "You are NOT connected to Salesforce data in this mode"
+    and "you can pull those numbers once they turn the mode on" are both true,
+    and the model resolved the tension by negating the first verb of the
+    second: "I cannot pull those numbers from your Salesforce data as soon as
+    you turn Salesforce mode on in the composer, because this platform holds a
+    synced copy of that org" — a sentence that states nothing. Measured 1 of 3
+    on the genuine own-org ask and 1 of 3 on OUTSIDE_COMPANY; 0 of 6 after."""
+    prompt = system_prompt(OWN_DATA, "assistant").lower()
+    assert "both of those facts hold at once and must never be blended" in prompt
+    assert "say the gap first, then the offer" in prompt
+    # The broken sentence is quoted in the prompt so it cannot be produced.
+    assert (
+        'never "i cannot pull those numbers as soon as you turn salesforce mode on"'
+        in prompt
+    )
+
+
+RECORD_ASK = "Does the interview record for Priya exist and when was it last updated?"
+
+
+def test_a_record_question_on_the_chat_class_is_looked_up_not_refused():
+    """QA, 2026-09-18: this exact ask forced onto the chat class answered "I
+    cannot access Salesforce data" 3 of 3 runs, and 2 of 3 told the person to
+    check "the 'Interview Records' object in your Salesforce org directly".
+    graph._chat_node now dispatches such a question to SQL; the sentence is
+    for the record questions that dispatch misses."""
+    prompt = system_prompt(RECORD_ASK, "salesforce").lower()
+    assert "its values are not in this conversation, reply with one sentence saying you will look it up" in prompt
+    assert "never that you cannot see it" in prompt
+    assert "never send them to look for it themselves" in prompt
+    # Told only to say it would look, the model went on to "simulate" the
+    # lookup and invent the record in 2 of 3 live runs.
+    assert "and nothing after it" in prompt
+    assert "never a query, a diagram or a value you were not given" in prompt
+    # One sentence, added to the measured clauses — none of them reworded.
+    assert "never tell the user you cannot see their salesforce data" in prompt
+    # Assistant mode has no data to look up: its own-data clause stands alone.
+    assert "saying you will look it up" not in system_prompt(RECORD_ASK, "assistant").lower()
 
 
 def test_assistant_mode_still_never_claims_to_have_read_salesforce():

@@ -29,7 +29,8 @@ guess costs a slightly worse cut, never a lost word.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from bisect import bisect_right
+from dataclasses import dataclass, field, replace
 from typing import List, Sequence, Tuple
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,14 @@ class Window:
     #: True when this window's opening overlaps the previous one's tail
     #: (a continuous-speech split); the stitcher de-duplicates that seam.
     overlaps_previous: bool = False
+    #: The speech regions inside this window, clipped to it, in time order.
+    #: `transcribe.snap_to_regions` holds the engine's cue times to them:
+    #: whisper opens a cue where the previous one ended, so without them a
+    #: cue after a pause started IN the pause (-2.28 s, measured 2026-09-18).
+    #: Empty for a window nobody ran the detector for (the public API's
+    #: fixed windows) — nothing is snapped then. Not part of the window's
+    #: identity or repr: a window IS the stretch of audio it sends.
+    regions: Tuple[Tuple[float, float], ...] = field(default=(), compare=False, repr=False)
 
     @property
     def duration_s(self) -> float:
@@ -235,7 +244,26 @@ def windows_from_regions(
                 merged[-1] = Window(prev.start_s, w.end_s, prev.overlaps_previous)
                 continue
         merged.append(w)
-    return merged
+    return [replace(w, regions=_regions_within(regions, w.start_s, w.end_s)) for w in merged]
+
+
+def _regions_within(
+    regions: Sequence[Tuple[float, float]], start_s: float, end_s: float
+) -> Tuple[Tuple[float, float], ...]:
+    """The sorted, non-overlapping `regions` that overlap [start_s, end_s],
+    clipped to it. A bisect, because a four-hour lecture has thousands of
+    regions and hundreds of windows — and an index walk after it, not
+    `regions[i:]`, which copied the rest of the list for every window: 1.5 s
+    for 40,000 one-region windows (QA, 2026-09-18). An islice would still
+    step through the first `i`."""
+    i = max(0, bisect_right(regions, (start_s, float("inf"))) - 1)
+    out: List[Tuple[float, float]] = []
+    for a, b in (regions[k] for k in range(i, len(regions))):
+        if a >= end_s:
+            break
+        if b > start_s:
+            out.append((max(a, start_s), min(b, end_s)))
+    return tuple(out)
 
 
 def plan_windows(

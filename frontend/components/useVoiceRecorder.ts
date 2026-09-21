@@ -49,8 +49,14 @@ export function useVoiceRecorder({
   onTranscript,
   maxMs = 10 * 60 * 1000,
 }: {
-  /** Called once, with the text, when a recording transcribes successfully. */
-  onTranscript: (text: string) => void;
+  /**
+   * Called once, with the text, when a recording transcribes successfully.
+   *
+   * `notice` is one short line to show beside the draft when the server was
+   * not sure of it (lib/voice.ts), or null. It never withholds the text: a
+   * draft a person can edit beats a warning they cannot act on.
+   */
+  onTranscript: (text: string, notice: string | null) => void;
   /** Hard ceiling; the recorder stops itself rather than being refused later. */
   maxMs?: number;
 }): VoiceRecorder {
@@ -183,7 +189,7 @@ export function useVoiceRecorder({
         return;
       }
       move('idle');
-      onTranscript(result.text);
+      onTranscript(result.text, result.notice);
     },
     [move, onTranscript],
   );

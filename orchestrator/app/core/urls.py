@@ -94,17 +94,55 @@ def chunk_text(text: str, chunk_chars: int = 1600, overlap: int = 200) -> List[s
     return [c for c in chunks if c]
 
 
-def select_relevant(text: str, query: str, max_chars: int) -> str:
+#: A figure with a unit — the numbers an advisory answer turns on (power,
+#: cooling, space, weight). Case-sensitive on purpose: "W" and "U" are units,
+#: "w" and "u" are letters.
+_UNIT_FIGURE_RE = re.compile(
+    r"\b\d[\d,.]*\s?(?:kW|MW|kVA|VA|W|BTU(?:/h)?|racks?|U|mm|kg|A|V)\b"
+)
+#: How much a chunk's figures may add to its score: enough to break a tie
+#: between chunks the words do not separate, never enough to outrank a chunk
+#: that shares the person's own words.
+_UNIT_BOOST_CAP = 3
+#: How many keywords the conversation may add (see select_relevant).
+_CONTEXT_KEYWORDS = 24
+
+
+def select_relevant(
+    text: str,
+    query: str,
+    max_chars: int,
+    *,
+    context: str = "",
+    prefer_units: bool = False,
+) -> str:
     """Return up to `max_chars` of `text` most relevant to `query`.
 
     Small texts pass through. Larger ones are chunked and scored by keyword
     overlap with the query; the top chunks (in original order) are joined until
     the budget is filled — so the model sees the pertinent parts of a long page.
+
+    `context` and `prefer_units` are for a DECISION question (2026-09-19). "as
+    I have dgx spark ?? is help Full ??" shares no word with a 40-page
+    catalogue's rack section: the subject ("power and cooling for 20 Sparks")
+    is in the person's earlier turns, and the sections worth reading carry
+    figures with units. `context`'s keywords join the query's (up to
+    _CONTEXT_KEYWORDS of them: at 12, "power" and "cooling" were cut off the
+    end of the owner's turn); with `prefer_units`, each figure with a unit
+    adds a point, capped at _UNIT_BOOST_CAP per chunk. Both default off, so
+    every other caller gets exactly the selection it always had.
+
+    Measured on QA's 40-page catalogue (74,804 chars, 48,000-char budget),
+    the owner's question and turns, lines of the three rack-row pages in the
+    excerpt: question alone 0/13, 13/13, 6/11; with 12 context keywords
+    13/13, 0/13, 5/11; with 24 and the unit boost 13/13, 13/13, 11/11.
     """
     if len(text) <= max_chars:
         return text
     kws = set(keywords(query, max_keywords=12))
-    if not kws:
+    if context:
+        kws |= set(keywords(context, max_keywords=_CONTEXT_KEYWORDS))
+    if not kws and not prefer_units:
         return text[:max_chars]
     # Chunk smaller than the budget so the relevant chunk is kept whole rather
     # than sliced through the middle.
@@ -115,6 +153,8 @@ def select_relevant(text: str, query: str, max_chars: int) -> str:
     for i, c in enumerate(chunks):
         low = c.lower()
         score = sum(low.count(k) for k in kws)
+        if prefer_units:
+            score += min(len(_UNIT_FIGURE_RE.findall(c)), _UNIT_BOOST_CAP)
         scored.append((score, i, c))
     # keep the highest-scoring chunks, then restore reading order
     scored.sort(key=lambda t: t[0], reverse=True)

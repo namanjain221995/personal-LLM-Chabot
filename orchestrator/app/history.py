@@ -640,6 +640,15 @@ def delete_conversation(
 ) -> dict:
     if not db.delete_conversation(int(user["id"]), conversation_id):
         raise _not_found()
+    # The photo the conversation was shown is held for the TTL, in this
+    # process AND in a `conversation_images` row since V41
+    # (engines/image_memory.py); without this the same id, sent again by the
+    # same account, was answered from the deleted photo. `forget` clears both
+    # halves — the row above all, since that is the half a restart would
+    # otherwise hand back.
+    from .engines import image_memory
+
+    image_memory.forget(conversation_id, int(user["id"]))
     return {"ok": True}
 
 

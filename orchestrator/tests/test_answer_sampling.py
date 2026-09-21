@@ -171,7 +171,13 @@ def test_the_legacy_profile_placed_changes_nothing_but_temperature():
         ("export this to CSV please", "assistant", "structured"),
         ("draw a mermaid flowchart of login", "assistant", "structured"),
         ("draw a diagram of the pipeline", "assistant", "structured"),
-        ("hello", "salesforce", "structured"),
+        # Was "structured": every Salesforce turn was. Changed deliberately
+        # 2026-09-18 — Salesforce mode answers ordinary prose now, so small
+        # talk takes the short prose shape and other turns are read the
+        # assistant way (a record listing stays structured; test_long_asks.py).
+        ("hello", "salesforce", "prose"),
+        ("list my open opportunities", "salesforce", "structured"),
+        ("explain what a lead conversion does", "salesforce", "prose"),
         ("write a python function that parses dates", "assistant", "longform"),
         ("fix this:\n```py\nprint(1\n```", "assistant", "longform"),
         ("give me a detailed report on solar", "assistant", "longform"),

@@ -11,10 +11,11 @@ import hashlib
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .. import db
 from ..config import settings
+from . import display_name as display_names
 from . import invites, passwords, proxy_trust, sessions, store
 from .principal import (
     Principal,
@@ -250,6 +251,64 @@ async def me(request: Request, response: Response) -> dict:
         sessions.clear_cookie(probe, request=request)
         headers = {"set-cookie": probe.headers["set-cookie"]}
     raise HTTPException(status_code=401, detail=body, headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# Profile — the one thing a person may change about their own account
+# ---------------------------------------------------------------------------
+
+
+class ProfileUpdateRequest(BaseModel):
+    """`extra="forbid"` is load-bearing, not tidiness.
+
+    The only account this route can touch is the caller's, because the user id
+    comes from the session cookie and appears nowhere else. Forbidding extras
+    is what makes that explicit rather than implicit: a caller that tries
+    `{"display_name": "x", "user_id": 30}` gets a 422 naming the field it may
+    not send, instead of a 200 that silently ignored it and left them unsure
+    whose name they just changed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Four times `display_names.MAX_LENGTH`: pydantic bounds the absurd, and
+    #: the validator owns the message for anything a person could plausibly
+    #: have typed — including a name that is merely too long.
+    display_name: str = Field(max_length=4 * display_names.MAX_LENGTH)
+
+
+@router.patch("/profile")
+async def update_profile(body: ProfileUpdateRequest, request: Request) -> dict:
+    """Set the caller's own display name. 422 with a sentence to show, or the
+    new value.
+
+    This is the field `app/identity.py` puts in every chat system prompt, so
+    the value is validated as prompt input (authn/display_name.py), not merely
+    as a string. The next turn picks it up with no extra work: the principal
+    is rebuilt from `users` on every request, and `main._chat_worker` reads
+    the name off that principal when it calls `set_identity`.
+    """
+    principal = await require_principal(request)
+    try:
+        name = display_names.validate_display_name(body.display_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def work() -> None:
+        if store.get_user(principal.user_id) is None:  # pragma: no cover
+            raise HTTPException(status_code=401, detail="Sign in required.")
+        store.set_credentials(principal.user_id, display_name=name)
+        # The new value is recorded: an identity-change entry that does not
+        # say what the identity became cannot answer the question it exists
+        # for. A chosen display name is already visible to every admin on the
+        # Members page, so this adds no exposure.
+        audit(principal, request, "display_name_changed", meta={"display_name": name})
+
+    await db.run_in_thread(work)
+    return {
+        "display_name": name,
+        "user": {"id": principal.user_id, "name": name, "email": principal.email},
+    }
 
 
 class PasswordChangeRequest(BaseModel):

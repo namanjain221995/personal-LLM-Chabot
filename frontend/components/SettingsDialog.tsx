@@ -4,35 +4,48 @@
  * User settings surface (enterprise auth retrofit) — no settings UI existed
  * before this, so this dialog establishes the pattern: the ConfirmDialog
  * portal recipe on a wider panel, with a section nav on the left (top on
- * mobile). Sections: Profile (read-only identity), Personalization (theme),
- * Security (change password), Sessions (everywhere you're signed in), Help.
+ * mobile). Sections: Profile (identity — the display name is editable here
+ * since 2026-09-21, everything else is the admin's), Personalization (theme),
+ * Memory (what the assistant saved about you, B11), Security (change
+ * password), Sessions (everywhere you're signed in), Help.
  *
  * Portalled to <body> — a transformed ancestor would otherwise become the
  * containing block for position:fixed (the bug that hit the ⋯ menu and the
  * diagram viewer). z-[70] matches ConfirmDialog; the session-revoke confirm
  * portals later into <body>, so it still paints above this panel.
  *
- * Escape is handled on the panel, not on document (SearchPalette's pattern):
- * when the nested ConfirmDialog is open its own document-level handler
- * closes it, and this panel — which no longer contains the focus — stays up.
+ * Escape is handled on the panel, not on document (SearchPalette's pattern).
+ * A nested ConfirmDialog portals outside the panel, but React still bubbles
+ * its keys through this component, so the panel acts only on keys whose
+ * target is inside its own DOM (ownModalKey); the confirm's own
+ * document-level handler closes it and this panel stays up. The panel takes
+ * tabIndex -1 and useModalKeyGuard runs while it is open, so a click on
+ * plain text followed by Escape closes Settings instead of reaching ChatApp's
+ * window shortcut and stopping the answer streaming behind it (QA,
+ * 2026-09-18).
  */
 
 import {
   useEffect,
+  useId,
   useRef,
   useState,
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
 import type { FetchLike } from '@/lib/auth';
-import type { Account } from './AccountMenu';
-import { useTheme } from './Providers';
+import { withDisplayName, type Account } from './AccountMenu';
+import { Loader } from './Loader';
+import { MemoryPanel, ownModalKey, trapTab, useModalKeyGuard } from './MemoryPanel';
+import { useTheme, useToast } from './Providers';
 import { PasswordSection, SessionsSection } from './SecuritySettings';
-import { IconX } from './icons';
+import { IconAlert, IconX } from './icons';
 
 export type SettingsSection =
   | 'profile'
   | 'personalization'
+  | 'memory'
   | 'security'
   | 'sessions'
   | 'help';
@@ -40,6 +53,7 @@ export type SettingsSection =
 const SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: 'profile', label: 'Profile' },
   { id: 'personalization', label: 'Personalization' },
+  { id: 'memory', label: 'Memory' },
   { id: 'security', label: 'Security' },
   { id: 'sessions', label: 'Sessions' },
   { id: 'help', label: 'Help' },
@@ -53,6 +67,12 @@ interface SettingsDialogProps {
   onClose: () => void;
   /** Injectable for tests — same idiom as lib/auth.fetchMe. */
   fetchFn?: FetchLike;
+  /**
+   * The identity changed in here (Profile → Your name). The owner of the
+   * Account object re-renders with it, so the sidebar row behind the dialog
+   * shows the new name immediately.
+   */
+  onAccountChange?: (account: Account | null) => void;
 }
 
 export function SettingsDialog({
@@ -61,9 +81,11 @@ export function SettingsDialog({
   account,
   onClose,
   fetchFn,
+  onAccountChange,
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) setSection(initialSection);
@@ -75,13 +97,17 @@ export function SettingsDialog({
     if (open) closeRef.current?.focus({ preventScroll: true });
   }, [open]);
 
+  useModalKeyGuard(open, panelRef, onClose);
+
   if (!open || typeof document === 'undefined') return null;
 
   function onPanelKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!ownModalKey(e, panelRef.current)) return;
     if (e.key === 'Escape') {
-      e.stopPropagation();
       onClose();
+      return;
     }
+    trapTab(e, panelRef.current);
   }
 
   return createPortal(
@@ -90,12 +116,14 @@ export function SettingsDialog({
       onClick={onClose}
     >
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-label="Settings"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={onPanelKeyDown}
-        className="palette-panel flex max-h-[85dvh] min-h-[320px] w-full max-w-2xl flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl"
+        className="palette-panel flex max-h-[85dvh] min-h-[320px] w-full max-w-2xl flex-col overflow-hidden rounded-ts border border-border bg-surface shadow-2xl focus:outline-none"
       >
         <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-3">
           <h2 className="text-sm font-semibold text-ink">Settings</h2>
@@ -136,8 +164,15 @@ export function SettingsDialog({
           </nav>
 
           <div className="min-w-0 flex-1 overflow-y-auto p-4">
-            {section === 'profile' && <ProfileSection account={account} />}
+            {section === 'profile' && (
+              <ProfileSection
+                account={account}
+                fetchFn={fetchFn}
+                onAccountChange={onAccountChange}
+              />
+            )}
             {section === 'personalization' && <PersonalizationSection />}
+            {section === 'memory' && <MemoryPanel fetchFn={fetchFn} />}
             {section === 'security' && <PasswordSection fetchFn={fetchFn} />}
             {section === 'sessions' && <SessionsSection fetchFn={fetchFn} />}
             {section === 'help' && <HelpSection />}
@@ -166,9 +201,104 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function ProfileSection({ account }: { account: Account | null }) {
+/**
+ * Mirrors orchestrator `authn/display_name.MAX_LENGTH` (422 above it), the
+ * same courtesy `MIN_PASSWORD_LENGTH` pays in SecuritySettings. The server
+ * stays the authority: it also refuses control characters, prompt punctuation
+ * and instruction-shaped prose, and its sentence is what gets shown.
+ */
+const MAX_NAME_LENGTH = 64;
+
+/**
+ * What the server will count. It trims, then collapses runs of horizontal
+ * whitespace to one space — so counting the raw string here would refuse a
+ * name the server would have accepted, which is the one way a client-side
+ * length check can be worse than no check at all.
+ */
+function normalizeName(value: string): string {
+  return value.trim().replace(/[\t  ]+/g, ' ');
+}
+
+function ProfileSection({
+  account,
+  fetchFn = fetch,
+  onAccountChange,
+}: {
+  account: Account | null;
+  fetchFn?: FetchLike;
+  onAccountChange?: (account: Account | null) => void;
+}) {
+  const { toast } = useToast();
+  const fieldId = useId();
+  const errorId = `${fieldId}-error`;
+  const hintId = `${fieldId}-hint`;
+
   const name = account?.user?.name ?? account?.username ?? '—';
   const initial = name.trim().charAt(0).toUpperCase() || '?';
+  const editable = Boolean(account?.user);
+
+  // Seeded once per opening: the dialog unmounts when it closes, so there is
+  // no stale draft to reconcile and — the part that matters — a refused save
+  // leaves the text the person typed in place for them to fix.
+  const [draft, setDraft] = useState(name === '—' ? '' : name);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const candidate = normalizeName(draft);
+  const dirty = candidate !== name && candidate.length > 0;
+
+  async function save(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (busy || !dirty || !account) return;
+    if (candidate.length > MAX_NAME_LENGTH) {
+      setError(`A name can be at most ${MAX_NAME_LENGTH} characters.`);
+      return;
+    }
+    setError(null);
+    setBusy(true);
+
+    // Optimistic: the row behind the dialog, the avatar and the header all
+    // change now. `rollBack` is what we do if the server disagrees — not a
+    // re-fetch, which would race with whatever else is on the page. It goes
+    // back through withDisplayName rather than handing the old object over,
+    // because the optimistic write also updated the module-level identity
+    // cache and only another write can undo that one.
+    const previous = account;
+    const rollBack = () => onAccountChange?.(withDisplayName(previous, name));
+    onAccountChange?.(withDisplayName(account, candidate));
+    try {
+      const res = await fetchFn('/api/auth/profile', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ display_name: draft }),
+      });
+      if (res.ok) {
+        // The server cleans (NFC, whitespace), so the name it returns is the
+        // one to show — not the one we guessed.
+        const body = (await res.json()) as { display_name?: unknown };
+        const saved =
+          typeof body.display_name === 'string' && body.display_name
+            ? body.display_name
+            : candidate;
+        onAccountChange?.(withDisplayName(previous, saved));
+        setDraft(saved);
+        toast('Name updated');
+        return;
+      }
+      rollBack();
+      if (res.status === 401) {
+        setError('Your session ended. Sign in again to change your name.');
+        return;
+      }
+      setError((await readProfileDetail(res)) ?? 'Could not save the name.');
+    } catch {
+      rollBack();
+      setError('Network error — the name was not saved.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section aria-label="Profile">
       <h3 className="text-sm font-semibold text-ink">Profile</h3>
@@ -186,17 +316,88 @@ function ProfileSection({ account }: { account: Account | null }) {
           )}
         </div>
       </div>
+
+      {editable ? (
+        <form onSubmit={save} className="mt-5 max-w-sm">
+          <label htmlFor={fieldId} className="mb-1 block text-xs font-medium text-muted">
+            Your name
+          </label>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+            <input
+              id={fieldId}
+              value={draft}
+              onChange={(e) => {
+                setDraft(e.target.value);
+                if (error) setError(null);
+              }}
+              onKeyDown={(e) => {
+                // Escape reverts the edit instead of closing Settings —
+                // losing a half-typed name to a key meant to undo it would
+                // be the opposite of what the key says. With nothing to
+                // revert it bubbles and the dialog closes as usual.
+                if (e.key === 'Escape' && draft !== name) {
+                  e.stopPropagation();
+                  setDraft(name);
+                  setError(null);
+                }
+              }}
+              disabled={busy}
+              autoComplete="name"
+              spellCheck={false}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={error ? errorId : hintId}
+              className="w-full flex-1 rounded-lg border border-border bg-bg px-3 py-2 text-sm text-ink placeholder:text-faint focus:border-accent/60 focus:outline-none disabled:opacity-60"
+            />
+            <button
+              type="submit"
+              disabled={busy || !dirty}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-md bg-accent-strong px-4 py-2 text-sm font-medium text-white transition-all duration-ts hover:brightness-110 focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-35"
+            >
+              {busy && <Loader size={16} />}
+              Save
+            </button>
+          </div>
+          {error ? (
+            <p
+              id={errorId}
+              role="alert"
+              className="mt-2 flex items-start gap-1.5 text-sm text-danger"
+            >
+              <IconAlert size={14} className="mt-0.5 shrink-0" />
+              {error}
+            </p>
+          ) : (
+            <p id={hintId} className="mt-2 text-xs text-faint">
+              This is what TechSara calls you in chat.
+            </p>
+          )}
+        </form>
+      ) : (
+        <div className="mt-5">
+          <Field label="Name" value={name} />
+        </div>
+      )}
+
       <div className="mt-5 space-y-3">
-        <Field label="Name" value={name} />
         <Field label="Email" value={account?.user?.email ?? '—'} />
         <Field label="Workspace" value={account?.workspace?.name ?? '—'} />
         <Field label="Role" value={roleLabel(account?.workspace?.role)} />
       </div>
       <p className="mt-5 text-xs text-faint">
-        Name and email are managed by your workspace admin.
+        Email, workspace and role are managed by your workspace admin.
       </p>
     </section>
   );
+}
+
+/** The server's own sentence, when it sent one. */
+async function readProfileDetail(res: Response): Promise<string | null> {
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    return typeof body.detail === 'string' ? body.detail : null;
+  } catch {
+    return null;
+  }
 }
 
 /* -------------------------------------------------------- personalization */

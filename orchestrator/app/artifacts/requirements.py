@@ -1004,7 +1004,12 @@ _CANNOT: Tuple[Tuple[str, str], ...] = (
     (r"\btracked?\s+changes\b|\bredlines?\b|\bsuggesting\s+mode\b|\bcomment\s+bubbles?\b",
      "tracked changes can't be turned on in the files I make"),
     (r"\b(?:add|insert|put|place|include|use|with|using)\s+(?:(?:our|the|company|corporate|my|a|an|some|client'?s?)\s+){0,2}"
-     r"(?:letterhead|logos?|watermarks?|brand\s+images?|images?|photos?|pictures?|screenshots?|icons?)\b",
+     r"(?:letterhead|logos?|watermarks?|brand\s+images?|images?|photos?|pictures?|screenshots?|icons?)\b"
+     # "put THIS image in a Word doc with a summary" (live 2026-09-19, 2 of 2):
+     # the file held the photo's text, and the sentence said only "Created …".
+     # Placement verbs only: "use this photo" may mean its data.
+     r"|\b(?:add|insert|put|place|include|embed|paste)\s+(?:(?:this|these|that|those|the|attached|uploaded)\s+){1,2}"
+     r"(?:images?|photos?|pictures?|screenshots?|scans?|logos?)\b",
      "I can't place an image, logo or letterhead in a file"),
     (r"\bprint\s+(?:\w+\s+){0,2}?(?:cop(?:y|ies)|pages?|it|this|them|out)\b|\bsend\s+(?:it|this)\s+to\s+the\s+printer\b",
      "I can't print — you can download the PDF and print it"),

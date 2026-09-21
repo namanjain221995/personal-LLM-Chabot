@@ -439,7 +439,11 @@ def test_the_lane_prompt_is_the_persona_the_facts_and_two_clipped_exchanges():
     messages = chat_engine._messages("hi ??", history, "assistant", lane="greeting")
     system = messages[0]
     assert system["role"] == "system"
-    assert system["content"].startswith(chat_engine.ASSISTANT_SYSTEM)
+    # Was startswith(ASSISTANT_SYSTEM). The contract changed on purpose
+    # (2026-09-18): the lane has its own short persona, because the full
+    # assistant conduct is 2,645 chars of rules no pleasantry can use.
+    # The guarantees it must keep are pinned in the tests below.
+    assert system["content"].startswith(chat_engine.FAST_LANE_SYSTEM)
     assert "Prefers short answers" in system["content"]
     assert "other conversations" not in system["content"]
     assert DIAGRAM_INSTRUCTION not in system["content"] and CODE_INSTRUCTION not in system["content"]
@@ -450,6 +454,90 @@ def test_the_lane_prompt_is_the_persona_the_facts_and_two_clipped_exchanges():
     assert len(messages[1]["content"]) == fast_lane.FAST_LANE_TURN_CHARS
     assert messages[-1] == {"role": "user", "content": "hi ??"}
     assert sum(1 for m in messages if m["role"] == "system") == 1
+
+
+#: The Salesforce guard ASSISTANT_SYSTEM carries, word for word. A lane turn
+#: is assistant mode, where no Salesforce data is connected.
+_LANE_SALESFORCE_GUARD = (
+    "You are NOT connected to Salesforce data in this mode — never claim to "
+    "have looked something up in Salesforce or invent CRM numbers."
+)
+#: 2,645 chars at 4810da0 (the whole ASSISTANT_SYSTEM) for 'hi'.
+_LANE_SYSTEM_BUDGET = 700
+
+
+def test_the_lane_system_prompt_is_short_and_keeps_the_salesforce_guard():
+    """'hi' was answered under 2,645 chars of conduct rules (phishing
+    simulations, recommendations, disclaimers) that no pleasantry can use.
+    The lane gets its own persona, with a real identity line, under 700."""
+    from app.identity import clear_identity, set_identity
+
+    set_identity("Jane Doe", "jane.doe@example.com", "TechSara Solutions")
+    try:
+        system = chat_engine._messages("hi", [], "assistant", lane="greeting")[0]["content"]
+    finally:
+        clear_identity()
+    assert len(system) <= _LANE_SYSTEM_BUDGET, len(system)
+    assert _LANE_SALESFORCE_GUARD in system
+    assert "You are assisting Jane Doe" in system
+    assert chat_engine.ASSISTANT_CONDUCT not in system
+
+
+#: The lane's identity line is the ONLY part of its system prompt that grows
+#: with user data, and `identity._NAME_MAX_CHARS` already caps a name at 80.
+#: 2026-09-21: the full identity line reached 280 chars when an account gained
+#: a settable display name, and the lane prompt went to 862 against the budget
+#: above. The constants moved into FAST_LANE_SYSTEM and the lane now takes
+#: `identity_line(short=True)`, so the growth is bounded here rather than
+#: watched.
+_LANE_IDENTITY_BUDGET = 101  # "\n" + "You are assisting " + 80 + "."
+
+
+@pytest.mark.parametrize(
+    "display_name, email",
+    [
+        ("Jane Doe", "jane.doe@example.com"),
+        ("W" * 200, "w@example.com"),  # cut to _NAME_MAX_CHARS before it is quoted
+        ("", "test1@gmail.com"),  # a login handle is never greeted as a name
+        ("", ""),
+    ],
+)
+def test_the_lane_identity_line_cannot_grow_with_user_data(display_name, email):
+    from app.identity import clear_identity, identity_line, set_identity
+
+    set_identity(display_name, email, "TechSara Solutions")
+    try:
+        line = identity_line(short=True)
+        full = identity_line()
+    finally:
+        clear_identity()
+    assert len(line) <= _LANE_IDENTITY_BUDGET, len(line)
+    # The lane's copy is shorter, and the non-lane prompt keeps the long one.
+    assert len(line) < len(full)
+    # A login handle is not a name: "test1@gmail.com" must not reach the lane.
+    if not display_name:
+        assert "test1" not in line and "@" not in line
+
+
+def test_the_lane_persona_carries_the_naming_rule_the_identity_line_dropped():
+    """The rule costs the same for every account, so it belongs in the
+    constant. Without it the short identity line would be a weaker line, not
+    just a shorter one."""
+    persona = chat_engine.FAST_LANE_SYSTEM
+    assert "spelled exactly as written" in persona
+    assert "naming somebody else is not about them" in persona
+    assert "never reveal information about other workspace members" in persona
+
+
+def test_the_lane_persona_keeps_the_saved_facts_block_within_budget():
+    """The facts block is the one system block the lane keeps; the persona's
+    share of the budget must leave it room."""
+    facts = FACTS_HEADER + "\n- Prefers to be called Sam"
+    history = [{"role": "system", "content": facts}]
+    system = chat_engine._messages("thanks!", history, "assistant", lane="thanks")[0]["content"]
+    assert system.endswith(facts)
+    assert _LANE_SALESFORCE_GUARD in system
+    assert len(system) - len(facts) <= _LANE_SYSTEM_BUDGET
 
 
 def test_the_non_lane_prompt_is_unchanged():

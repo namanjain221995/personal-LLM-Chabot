@@ -166,7 +166,15 @@ def test_full_rows_reach_the_prompt_for_small_files(small_csv):
     prompt = json.dumps(messages)
     assert "full_rows" in prompt
     assert "person19" in prompt  # the LAST row is present, not just a sample
-    assert "FULL CONTENT" in prompt  # the system rule that permits computing
+    # CONTRACT MOVED 2026-09-18 (audit, backlog 2): this asserted "FULL
+    # CONTENT", the rule that let the model "compute sums, group-bys ... from
+    # full_rows, exactly" — and its sum over 200 visible rows came back 165%
+    # too high. The rows still ship (a single cell may be quoted, every row
+    # listed), but the rule now forbids computing from them: figures are
+    # quoted from the aggregates the profile computed.
+    assert "FULL CONTENT" not in prompt
+    assert "NUMBERS: you never perform arithmetic." in prompt
+    assert "not even over rows you can see" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +258,18 @@ def test_profile_is_wrapped_in_a_delimited_data_block():
 
 def test_system_prompt_forbids_inventing_aggregates():
     messages = dataset.build_messages("total revenue?", [], [])
-    assert "CANNOT compute new aggregates" in messages[0]["content"]
-    assert "Never invent numbers" in messages[0]["content"]
+    # CONTRACT MOVED 2026-09-18 (audit, backlog 2 and 18): from "you CANNOT
+    # compute new aggregates ... Never invent numbers" (a refusal that named
+    # `full_rows` and sent people to Excel) to "quote precomputed aggregates":
+    # the model never performs arithmetic, every number is a cell or a
+    # computed count/min/max/sum/avg/median, and it says which.
+    system = messages[0]["content"]
+    assert "NUMBERS: you never perform arithmetic." in system
+    assert (
+        "Every number you state is either a single cell copied from a row, or "
+        "a count, min, max, sum, avg or median copied from the computed figures"
+    ) in system
+    assert "When the figure asked for is not among the computed figures" in system
 
 
 # ---------------------------------------------------------------------------

@@ -1,64 +1,138 @@
 {
-  "captured_on": "2026-09-13",
-  "captured_from": {
-    "orchestrator_tree": "aefd714251b3fa135e7db7baf548651324abf8ab",
-    "commits_with_that_tree": [
+ "captured_on": "2026-09-21",
+ "captured_from": {
+  "commit": "fix-answer-self-consistency, branched from release-2 at 2fbdd6d",
+  "orchestrator_tree_captured_from": "13b5c78a8c3665c095ef4d4da5571eba18d728e2 plus this branch's chat.py change",
+  "merged_tree": "release-2 (2fbdd6d) with the answer-self-consistency change only: one sentence added to engines/chat.py ASSISTANT_CONDUCT, and the deterministic reconciliation in engines/dataset_report.py, which reaches no prompt",
+  "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on this worktree, twice into two scratch directories"
+ },
+ "determinism": "the two captures were diff -r identical",
+ "this_capture_changed": {
+  "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE added line and nothing removed: the sentence that scopes the COMMIT rule away from a figure that has to be worked out — \"That is about a CHOICE, not about a figure. A total, a time, a count or a does-it-fit answer has to be worked out before it can be stated: put it after the rows, steps or table it comes from, and copy it from them. Never open with a figure you have not worked out yet.\" It sits immediately after the COMMIT paragraph it narrows, in ASSISTANT_SYSTEM and SALESFORCE_ASSISTANT_SYSTEM; the Fast small-talk lane and the Salesforce small-talk reply do not carry it.",
+  "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
+  "why": "the sweep's self-contradicting answers (a headline figure the body then contradicts) were measured live at Fast, thinking off: 20 of 54 runs flagged before, 4 of 54 after, with no length blow-up. The measurement and the two rejected longer variants are recorded in ASSISTANT_CONDUCT beside the sentence."
+ },
+ "normalised": [
+  "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
+  "meta.generation_id, meta.trace_id, meta.request_id are generated per turn and are not pinned"
+ ],
+ "pinned_meta_keys": [
+  "context",
+  "route",
+  "knowledge",
+  "sources"
+ ],
+ "sha256": {
+  "first_message.messages.json": "e2123d0af96238ec973d46395a693be2545b83ed69ff7737036464d0eaa70947",
+  "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
+  "living_knowledge_topical_fast.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+  "living_knowledge_topical_fast_at_production_latency.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+  "living_knowledge_topical_think.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+  "real_fast_accented_page.messages.json": "c55aa4236ab8a076dd03b03d1545724758dd95e4bc13e02808cc4147aefa07a4",
+  "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
+  "real_fast_eval_topical_hit.messages.json": "d16a89f12df2f31e7c74bcd4a4b78b4797237aa65708db44c453dfa45fe4bc13",
+  "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
+  "real_fast_passage_past_200k.messages.json": "f1247ba891e003ea90e1775f3360433547aa6d48349ceb662a339ec504def6dc",
+  "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
+  "real_fast_timeless_task_with_a_matching_page.messages.json": "24a214c1671b962a6b43a14b35196348004f246490cb429fa02f32622f64d463",
+  "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
+  "real_think_eval_topical_hit.messages.json": "d16a89f12df2f31e7c74bcd4a4b78b4797237aa65708db44c453dfa45fe4bc13",
+  "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
+  "rich_fast.messages.json": "63ba0a45f30e68a29756c20667231b1721c1c31c48db97c77415ff3509faee0a",
+  "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
+  "rich_think.messages.json": "c0c201b3a4c89353cd8fad51c560a58bc9963dc49821b6a50c35426f0c9ec6e9",
+  "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
+  "salesforce.messages.json": "c837f0b3dae066b03c13c45fde8e3eccc15bbdf78d085d9844b0536e3f3e7445",
+  "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
+ },
+ "scenarios": {
+  "rich_fast": "assistant, Fast, every context block seeded (facts, cross-chat recall, stored page, document, summary, in-conversation recall)",
+  "rich_think": "assistant, Think, same conversation",
+  "first_message": "assistant, Fast, a new conversation's first message",
+  "salesforce": "salesforce mode routed to chat, keyword recall",
+  "living_knowledge_topical_fast": "rich conversation + living_knowledge ON, stubbed STATIC retrieval returning a topical hit after 50 ms; pins the grounding block appended to the system prompt and meta.knowledge/sources",
+  "living_knowledge_topical_fast_at_production_latency": "the same, retrieval after 0.72 s (production static retrieval p50); the baseline waited and grounded",
+  "living_knowledge_topical_think": "the same at Think (no Fast budget), 50 ms",
+  "real_fast_eval_topical_hit": "assistant, Fast, REAL web_memory.retrieve + topical gate + pre-check over the web_eval pages, dense stand-in after 0.72 s, router STATIC after 0.2 s (added 2026-09-13, second prover pass)",
+  "real_think_eval_topical_hit": "the same at Think",
+  "real_fast_accented_page": "Fast, real retrieval: 'explain crème brûlée caramelising' (the first pre-check rejected it: search_tsv keeps 'crème', the gate's _WORD splits it)",
+  "real_fast_passage_past_200k": "Fast, real retrieval: the answer sits past search_tsv's 200,000-char cap in a 205k-char page",
+  "real_fast_timeless_task_with_a_matching_page": "Fast, real retrieval: a timeless task whose page is a topical hit (the router is asked with the shipped default; FRESHNESS_FAST_SKIP_ROUTER, opt-in since 2026-09-14, would skip it)"
+ },
+ "earlier_captures": [
+  {
+   "2026-09-13": {
+    "captured_from": {
+     "orchestrator_tree": "aefd714251b3fa135e7db7baf548651324abf8ab",
+     "commits_with_that_tree": [
       "02b509f",
       "82265d5"
-    ],
-    "how": "git archive of the pre-change tree + tests/fixtures/context_assembly_golden/capture_from_baseline.py (recipe in its docstring)"
+     ],
+     "how": "git archive of the pre-change tree + tests/fixtures/context_assembly_golden/capture_from_baseline.py (recipe in its docstring)"
+    },
+    "cross_check": "rich_fast, rich_think, first_message and salesforce equal the performance prover's independent HEAD capture (scratchpad/prove/golden_out/head) in prompt bytes and meta.context/route",
+    "real_scenarios_captured": "2026-09-13 by the closing engineer from git archive HEAD (tree aefd714), twice into scratch cap1/cap2, diff -r empty; the 14 earlier files recaptured byte-identical"
+   },
+   "2026-09-18": {
+    "captured_from": {
+     "orchestrator_tree": "f95c6991bfdc0d556de8e8d8f4a81fc98372ba85",
+     "merged_tree": "4810da0 + bk-chat-prompt@6f39831 + the 13 other release-2 track branches, merged in a detached scratch worktree (tree ab1f9f2)",
+     "track_branches": [
+      "bk-audio-upload@a769028",
+      "bk-dataset-answers@523d781",
+      "bk-dataset-numbers-computed@9045dbf",
+      "bk-deep-research-report-and-sources@a0a9b6f",
+      "bk-dictation-long-and-noisy@e047858",
+      "bk-image-into-files@5a6c6c5",
+      "bk-long-asks@b13f07a",
+      "bk-memory-panel@b2b2b33",
+      "bk-memory-recall-and-facts@2f702e1",
+      "bk-ocr-truth@74dbeb7",
+      "bk-video-cue-timing@0451163",
+      "bk-vision-adversarial-qa@951b149",
+      "bk-web-search-scope@a039169"
+     ],
+     "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on that merged tree (recipe in its docstring), captured twice into two scratch directories"
+    },
+    "determinism": "the two captures were diff -r identical (24 files each); the capture from bk-chat-prompt alone was byte-identical to the merged one, so no other track moves these prompts",
+    "this_capture_changed": {
+     "salesforce.messages.json": "element 0 (the system message) only: SALESFORCE_ASSISTANT_SYSTEM gains the record-lookup sentence (engines/chat.py). Elements 1-2 and every other file byte-identical to 4810da0."
+    }
+   },
+   "2026-09-19": {
+    "captured_from": {
+     "orchestrator_tree": "caf3560826b557e40b82e32a0e36308a49487cad",
+     "commit": "91c6dbe8e89da397f51d8591487552f0eea3d1da",
+     "merged_tree": "bk-chat-prompt@91c6dbe: origin/dev@cda7f53 (hotfixes 1.1 + 1.2) + bk-long-asks@42cc5af + this track, via git archive of the commit",
+     "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on a git archive of that commit (recipe in its docstring), captured twice into two scratch directories"
+    },
+    "determinism": "the two captures were diff -r identical (24 files each), and byte-identical to the fixtures checked in with the dev merge",
+    "this_capture_changed": {
+     "salesforce.messages.json": "against origin/dev: element 0 (the system message) only, one added line: SALESFORCE_ASSISTANT_SYSTEM's record-lookup sentence (engines/chat.py). Every other file is byte-identical to origin/dev, whose hotfix 1.2 moved all 12 messages files (FORMAT_INSTRUCTION, conduct preamble)."
+    }
+   },
+   "between": "recaptured 2026-09-16 (6097a1e), 2026-09-17 (8e5ea78) and 2026-09-18 (24af0a0, f64efd2) without this file being updated; its sha256 table was stale for all 12 messages files until this capture, which is why tests/test_context_assembly_golden.py now checks it"
   },
-  "determinism": "captured twice on the baseline into separate directories (diff -r empty), and again after every change to the test module: the existing files stayed byte-identical",
-  "cross_check": "rich_fast, rich_think, first_message and salesforce equal the performance prover's independent HEAD capture (scratchpad/prove/golden_out/head) in prompt bytes and meta.context/route",
-  "normalised": [
-    "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
-    "meta.generation_id, meta.trace_id, meta.request_id are generated per turn and are not pinned"
-  ],
-  "pinned_meta_keys": [
-    "context",
-    "route",
-    "knowledge",
-    "sources"
-  ],
-  "sha256": {
-    "first_message.messages.json": "2947be58c7feb639ad93b2843c0e457ee2b3e3d9c0b6c77e0962652ecd667b74",
-    "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "b6e39d01730a7d796092d2e9ee4a7bb610d83b8cbb01d7e24d7b3b36500b51c8",
-    "living_knowledge_topical_fast.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "b6e39d01730a7d796092d2e9ee4a7bb610d83b8cbb01d7e24d7b3b36500b51c8",
-    "living_knowledge_topical_fast_at_production_latency.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "living_knowledge_topical_think.messages.json": "b6e39d01730a7d796092d2e9ee4a7bb610d83b8cbb01d7e24d7b3b36500b51c8",
-    "living_knowledge_topical_think.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "real_fast_accented_page.messages.json": "66993bb5811ddd581d6c2ddfdc6efed9bccf1bcb6b26542b77596ac83e1977a1",
-    "real_fast_accented_page.meta.json": "49d79fbbec98885ce063b63783b4944ffda23620507dfecbdaf9c640afa59144",
-    "real_fast_eval_topical_hit.messages.json": "015331d95603e4b6ec9e5c328a0def6001c4163e5baeded7cf760257ef268946",
-    "real_fast_eval_topical_hit.meta.json": "5068e66440b5c5e56a1dc53b9c54c9f46b0cda86830a242c23f2cffc83310c35",
-    "real_fast_passage_past_200k.messages.json": "f52e4e99a9048134b1d39a072f139f69afc7e1a4aa0dd81fa9712945bb700099",
-    "real_fast_passage_past_200k.meta.json": "c6c03bc3a5df490592e1d0a84e7df5b2d188f79f61b3922c4d193f384b63f40f",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "750b03cc16aecdecb51c8bb774f61b6dd8edd11cee3b2ea544666620a0cd98b5",
-    "real_fast_timeless_task_with_a_matching_page.meta.json": "1c61c304f13e948cb938ed184dde9652deaab8027a2706cbb942f4a19279446b",
-    "real_think_eval_topical_hit.messages.json": "015331d95603e4b6ec9e5c328a0def6001c4163e5baeded7cf760257ef268946",
-    "real_think_eval_topical_hit.meta.json": "5068e66440b5c5e56a1dc53b9c54c9f46b0cda86830a242c23f2cffc83310c35",
-    "rich_fast.messages.json": "2ab989d2b489bfd292126f1657f603fc568e49915590c311364ee50470397544",
-    "rich_fast.meta.json": "a31eaf9b9b15b3e4a4cdb9eebf77b8fbe982eaaf40eab34d8da492bfc929f4b0",
-    "rich_think.messages.json": "270af739cd661087c0bf237a9a6151f8b1d5de8b971d3c9ab5230d7ee929061b",
-    "rich_think.meta.json": "7b74dd7005aaef8636ba20e84532ac049ae3121930d5fe96131fe1d454293dba",
-    "salesforce.messages.json": "33c1a2010045e15348fd269134f49aeef74021887975656474fe254883abfade",
-    "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
+  {
+   "captured_on": "2026-09-21",
+   "orchestrator_tree": "8a0726881d30534ed068a29148bf60f306206c03",
+   "commit": "690630d",
+   "merged_tree": "sec-review-mem-2026-09-21@690630d: release-2@288d310 + mem-a-facts-are-data@c93295f + mem-b-identity@2a1e3e2 + mem-c-cleanup@6028629",
+   "how": "NOT a capture. The two tracks each recaptured these files from their own tree; this merge three-way merged the 12 messages files MESSAGE BY MESSAGE (track A's facts.FACTS_HEADER rewrite in the facts system block, track B's identity.identity_line() sentence in element 0) and then ran tests/test_context_assembly_golden.py, whose byte-for-byte prompt and meta comparison passed 36/36 against the merged tree - which is the proof the union is what the merged code emits."
   },
-  "scenarios": {
-    "rich_fast": "assistant, Fast, every context block seeded (facts, cross-chat recall, stored page, document, summary, in-conversation recall)",
-    "rich_think": "assistant, Think, same conversation",
-    "first_message": "assistant, Fast, a new conversation's first message",
-    "salesforce": "salesforce mode routed to chat, keyword recall",
-    "living_knowledge_topical_fast": "rich conversation + living_knowledge ON, stubbed STATIC retrieval returning a topical hit after 50 ms; pins the grounding block appended to the system prompt and meta.knowledge/sources",
-    "living_knowledge_topical_fast_at_production_latency": "the same, retrieval after 0.72 s (production static retrieval p50); the baseline waited and grounded",
-    "living_knowledge_topical_think": "the same at Think (no Fast budget), 50 ms",
-    "real_fast_eval_topical_hit": "assistant, Fast, REAL web_memory.retrieve + topical gate + pre-check over the web_eval pages, dense stand-in after 0.72 s, router STATIC after 0.2 s (added 2026-09-13, second prover pass)",
-    "real_think_eval_topical_hit": "the same at Think",
-    "real_fast_accented_page": "Fast, real retrieval: 'explain crème brûlée caramelising' (the first pre-check rejected it: search_tsv keeps 'crème', the gate's _WORD splits it)",
-    "real_fast_passage_past_200k": "Fast, real retrieval: the answer sits past search_tsv's 200,000-char cap in a 205k-char page",
-    "real_fast_timeless_task_with_a_matching_page": "Fast, real retrieval: a timeless task whose page is a topical hit (the router is asked with the shipped default; FRESHNESS_FAST_SKIP_ROUTER, opt-in since 2026-09-14, would skip it)"
-  },
-  "real_scenarios_captured": "2026-09-13 by the closing engineer from git archive HEAD (tree aefd714), twice into scratch cap1/cap2, diff -r empty; the 14 earlier files recaptured byte-identical"
+  {
+   "captured_on": "2026-09-21",
+   "captured_from": {
+    "commit": "release-2 at the memory-and-greeting merge",
+    "merged_tree": "release-2 with every track plus aq-answer-quality and the memory/greeting track (facts-are-data, identity, clean-up)",
+    "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice into two scratch directories"
+   },
+   "this_capture_changed": {
+    "all 12 *.messages.json": "element 0 (the system message) only: it now carries both the memory track's clauses and the answer-quality clauses - the authorisation, debrief and reporting-footer lines are bound to the simulated email, and the Salesforce offer is scoped to the person's own organisation"
+   }
+  }
+ ]
 }

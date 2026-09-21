@@ -595,7 +595,15 @@ def _clause_shape(clause: str, uploads: Sequence[str]) -> Optional[NegativeShape
             rf"|(?:pdf|docx|word|excel|xlsx|csv|pptx|file|document)(?:\s+(?:file|format|version))?\s+_in_\s+(?:_give_|_convert_|\S+\s+_give_)|_convert_"
             # "make a styled Excel summary from the uploaded CSV": a new file.
             rf"|{_B}(?:make|create|generate|build|prepare|produce|give\s+me|send\s+me)\s+(?:me\s+)?an?\s+(?:\S+\s+){{0,2}}?"
-            rf"(?:pdf|docx|word|excel|xlsx|csv|pptx|powerpoint|presentation|deck|slides|report|document|spreadsheet|sheet|workbook|charts?|graph)",
+            rf"(?:pdf|docx|word|excel|xlsx|csv|pptx|powerpoint|presentation|deck|slides|report|document|spreadsheet|sheet|workbook|charts?|graph)"
+            # "put this image in a Word doc with a summary": a file named with
+            # an indefinite article after "in/into/on" is a NEW destination, not
+            # the thing read. With a photo attached this was read_source, and
+            # the vision route answered "Here is the Word document …" with no
+            # file (live, 2026-09-19, 2 of 2 runs).
+            rf"|{_B}(?:put|place|insert|paste|add|include|copy|type|write|summari[sz]e)\s+(?:\S+\s+){{0,6}}?"
+            rf"(?:in|into|inside|on|onto|to)\s+an?\s+(?:\S+\s+)?"
+            rf"(?:pdf|docx|doc|word|excel|xlsx|csv|pptx|powerpoint|presentation|deck|slides|document|spreadsheet|workbook){_E}",
             clause,
         )
         if source_named and not dest:

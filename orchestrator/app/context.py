@@ -20,6 +20,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import re
 import struct
 import weakref
 from collections import OrderedDict
@@ -56,6 +57,16 @@ def _record_trim(dropped_turns: int, clipped_messages: int) -> None:
 
 # Never emit a completion shorter than this; below it, trim history instead.
 MIN_OUTPUT_TOKENS = 256
+
+# ...but a request that did NOT fit is trimmed until the answer has real
+# room: min(what was asked for, this, a quarter of the window). Stopping at
+# 256 left a 5.2 MB paste 403 tokens to answer in (2026-09-18). A request
+# that fits untouched is never trimmed to make this room.
+OVERFLOW_ANSWER_ROOM = 32_768
+
+
+def _overflow_room(ceiling: int, window: int) -> int:
+    return max(MIN_OUTPUT_TOKENS, min(int(ceiling), OVERFLOW_ANSWER_ROOM, int(window) // 4))
 
 # Fallback when /tokenize is unavailable. Deliberately pessimistic (real text
 # averages ~4 chars/token) so an estimate errs toward a smaller prompt.
@@ -460,6 +471,10 @@ def clip_middle(text: str, max_chars: int) -> str:
     )
 
 
+def _string_chars(messages: Sequence[dict]) -> int:
+    return sum(len(m["content"]) for m in messages if isinstance(m.get("content"), str))
+
+
 def _longest_content_index(messages: Sequence[dict]) -> Optional[int]:
     best, best_len = None, 0
     for i, m in enumerate(messages):
@@ -490,9 +505,11 @@ async def fit_request(
 ) -> Tuple[List[dict], int]:
     """Size one model call so prompt + completion always fit the window.
 
-    Returns (messages, max_tokens). Oldest turns are dropped until at least
-    MIN_OUTPUT_TOKENS of completion room exists; the pinned system block and
-    the current user message are never dropped.
+    Returns (messages, max_tokens). A request with at least MIN_OUTPUT_TOKENS
+    of completion room is returned as it is. One without is trimmed — oldest
+    turns first, then the longest message clipped — until `_overflow_room`
+    exists; the pinned system block and the current user message are never
+    dropped.
     """
     window = await model_window(base_url, model)
     margin = settings.context_safety_margin
@@ -506,33 +523,57 @@ async def fit_request(
 
     dropped = 0
     clipped = 0
+    room = MIN_OUTPUT_TOKENS
     for _ in range(_MAX_FIT_ROUNDS):
         budget = window - prompt_tokens - margin
-        if budget >= MIN_OUTPUT_TOKENS:
+        if budget >= room:
             break
+        # It did not fit: from here on, trim for an answer's room.
+        room = _overflow_room(ceiling, window)
+        deficit = room - budget
+        # Each old turn's share of the MEASURED count (the estimate scaled to
+        # it), so one round drops as many turns as the deficit needs. One per
+        # round spent all 24 rounds on a conversation of 24+ messages and a
+        # 1.77M-token paste went to a 1M window with max_tokens=1 (QA
+        # 2026-09-18); CHAT_HISTORY_TURNS allows 400.
+        _, rest = _split_pinned(msgs)
+        scale = prompt_tokens / max(1, estimate_messages(msgs))
+        costs = [estimate_messages([m]) * scale for m in rest[:-1]]
 
-        # 1. Prefer dropping whole old turns — they cost nothing to lose.
-        trimmed = trim_to_fit(msgs, 1)
-        if len(trimmed) != len(msgs):
-            msgs = trimmed
-            dropped += 1
+        # 1. Prefer dropping whole old turns — they cost nothing to lose —
+        # when dropping them can make the room.
+        if costs and sum(costs) >= deficit:
+            shed, drop = 0.0, 0
+            while drop < len(costs) and shed < deficit:
+                shed += costs[drop]
+                drop += 1
+            msgs = trim_to_fit(msgs, drop)
+            dropped += drop
         else:
-            # 2. Nothing left to drop: a SINGLE message is bigger than the
-            # window (a large paste, a whole document). Shrink it in place —
-            # otherwise this is the 400 that trimming alone cannot prevent.
+            # 2. Dropping every old turn cannot make the room: a SINGLE
+            # message is bigger than the window (a large paste, a whole
+            # document). The old turns still go first, all of them in this
+            # round, and the longest message is clipped by what is STILL
+            # missing — otherwise this is the 400 that trimming alone cannot
+            # prevent. Clipping it by the whole deficit and keeping the turns
+            # cut an 8k-window paste from 15,689 to 2,000 characters to keep
+            # three old turns (QA r1 repair, measured).
+            # At the prompt's own measured characters per token (never fewer
+            # than the pessimistic estimate's), so one clip is usually enough.
+            chars_per_token = max(_CHARS_PER_TOKEN, _string_chars(msgs) / max(1, prompt_tokens))
+            if costs:
+                msgs = trim_to_fit(msgs, len(costs))
+                dropped += len(costs)
+                deficit -= sum(costs)
             idx = _longest_content_index(msgs)
-            if idx is None:
-                break
-            content = msgs[idx]["content"]
-            shed_chars = int((MIN_OUTPUT_TOKENS - budget) * _CHARS_PER_TOKEN) + 1024
-            target = len(content) - shed_chars
-            if target < _MIN_CLIPPED_CHARS:
-                target = _MIN_CLIPPED_CHARS
-            if target >= len(content):
-                break  # cannot shrink any further
-            msgs = list(msgs)
-            msgs[idx] = {**msgs[idx], "content": clip_middle(content, target)}
-            clipped += 1
+            content = msgs[idx]["content"] if idx is not None else ""
+            target = max(_MIN_CLIPPED_CHARS, len(content) - int(deficit * chars_per_token) - 1024)
+            if target < len(content):
+                msgs = list(msgs)
+                msgs[idx] = {**msgs[idx], "content": clip_middle(content, target)}
+                clipped += 1
+            elif not costs:
+                break  # nothing to drop and nothing left to shrink
 
         _last_count_exact.set(False)
         prompt_tokens, _ = await count_tokens(base_url, model, msgs)
@@ -558,3 +599,53 @@ async def fit_request(
     # Never negative, never above what the caller asked for.
     max_tokens = max(1, min(ceiling, budget))
     return msgs, max_tokens
+
+
+# --------------------------------------------------------------------------
+# What may enter the prompt from the person's saved memory
+# --------------------------------------------------------------------------
+
+#: A row that speaks about ONE occasion — "the first answer", "this reply",
+#: "the next round" — rather than about answers as a rule. Such a row cannot
+#: still be true on the next turn, so it is not durable however it is phrased.
+#: It needs its own test because the write side's preference clause rescues
+#: it: "The user wants the first answer to be a professional
+#: self-introduction (~150-180 words)" reads as "answer … to be", the shape
+#: of "answers to be short", and that one row is what produced the owner's
+#: 164-word greeting (2026-09-21).
+_ONE_OCCASION_RE = re.compile(
+    r"\b(?:the\s+(?:first|next|last|final|second|third)|this|that)\s+"
+    r"(?:answer|reply|response|message|round|question|introduction)\b",
+    re.I,
+)
+
+
+def prompt_facts(rows: Optional[Sequence[Any]]) -> List[Any]:
+    """The saved-memory rows that may be shown to the model, in order.
+
+    A row is dropped when it is a one-off task request rather than something
+    durable about the person. That judgement already runs when a fact is
+    WRITTEN (facts.is_durable, release 1) — it is run again here because rows
+    written before release 1 were never judged at all, and they are still
+    read on every turn. The owner's account holds 13 written on 2026-09-16
+    out of a pasted interview-simulation prompt ("The user is asking for the
+    interview to begin with a self-introduction"), and with them in the block
+    "hi ??" came back as a 164-word first-person candidate self-introduction,
+    3 of 3 live runs at Fast (2026-09-21).
+
+    Deliberately the SAME function as the write side, called through the
+    module so the two can never drift apart, plus the one shape only a stored
+    row shows (_ONE_OCCASION_RE). A genuine standing preference ("answers in
+    Hindi", "layman terms") is durable and stays.
+    """
+    from . import facts
+
+    kept: List[Any] = []
+    for row in rows or ():
+        text = row.get("fact") if isinstance(row, dict) else row
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if not facts.is_durable(text) or _ONE_OCCASION_RE.search(text):
+            continue
+        kept.append(row)
+    return kept
