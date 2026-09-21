@@ -48,21 +48,48 @@ ASSISTANT_CONDUCT = (
     "answer a request for one recommendation with a list of options. If the "
     "person tells you to stop hedging, still give the reason — one name and a "
     "price with nothing behind it is not an answer either.\n"
-    # NOT FIXED HERE, and the attempts are recorded so the next person does
-    # not repeat them (QA, 2026-09-21). At Fast, thinking off, this clause
-    # makes the model name a figure it has not worked out yet and then argue
-    # with itself in front of the person: 7 of 114 answers carried visible
-    # self-correction and 2 more left a wrong headline standing ("The third
-    # deploy finishes at **10:07**." then "Wait, let me re-evaluate the queue
-    # logic carefully"; "The total revenue including 18% GST is **80,000**."
-    # above a breakdown totalling 79,945). Two prompt variants were measured
-    # over the same 27 arithmetic/reasoning runs and NEITHER earned its place:
-    # "do the working FIRST, then the result" scored 22/27 against a 20/27
-    # baseline but tripled the longest answer (631 -> 1,743 words) and still
-    # left 3 self-corrections; "finish the working before the first sentence"
-    # scored 17/27 with 5. Both sit inside the noise of 3 runs a question. The
-    # defect is real and needs a mechanism, not wording — most likely a
-    # bounded thinking pass for arithmetic asks, or a check on the answer.
+    # THE CLAUSE ABOVE IS THE PRESSURE THAT CAUSES THE NEXT ONE (2026-09-21).
+    # At Fast, thinking off, "name one answer in the first sentence" makes the
+    # model state a figure it has not worked out yet and then argue with
+    # itself in front of the person: 7 of 114 answers in the sweep carried
+    # visible self-correction and 2 more left a wrong headline standing ("The
+    # third deploy finishes at **10:07**." then "Wait, let me re-evaluate the
+    # queue logic carefully"; "The total revenue including 18% GST is
+    # **80,000**." above a breakdown totalling 79,945).
+    #
+    # Two earlier variants were measured and NEITHER earned its place: "do the
+    # working FIRST, then the result" scored 22/27 against a 20/27 baseline
+    # but tripled the longest answer (631 -> 1,743 words) and still left 3
+    # self-corrections; "finish the working before the first sentence" scored
+    # 17/27 with 5. Both ADDED a rule beside the COMMIT clause and left the
+    # pressure in place, and both asked for more narration, which is where the
+    # length went.
+    #
+    # The sentence below does the opposite: it SCOPES the clause above, which
+    # is about a choice, away from a figure that has to be computed, and says
+    # where the figure comes from. Measured live (Qwen3.6-35B-A3B-NVFP4, Fast,
+    # thinking off, 9 arithmetic/verdict asks x 3 runs a round, scored by a
+    # deterministic text check for a total row that does not sum, a headline
+    # figure in no cell, a visible self-correction and a reversed verdict):
+    # baseline 20 of 54 flagged over two rounds, this wording 8 of 81 over
+    # three (4, 3, 1 per round; the third round ran the committed source, the
+    # first two a spliced copy of the same bytes). No length blow-up: mean
+    # 147/163/152 words against the baseline's 153/177, and the longest answer
+    # FELL from 533 to 337. Two longer variants measured worse for the extra
+    # words: adding "never leave two different values standing / never show a
+    # correction" gave 3 of 27 and did not stop a single self-correction, and
+    # adding "never let one stand once your own working disagrees with it"
+    # gave 5 of 27 at 188 mean words.
+    #
+    # WHAT THIS DOES NOT FIX: the VERDICT flip. "No, it does not fit." above
+    # working that ends "Yes, it fits." survived all three wordings at about
+    # 1 of 3 runs, including the one that names a verdict explicitly. That
+    # shape needs a mechanism, not wording, and any mechanism must stay out of
+    # Fast's way — Fast never thinks (see run_chat_engine).
+    "That is about a CHOICE, not about a figure. A total, a time, a count or "
+    "a does-it-fit answer has to be worked out before it can be stated: put "
+    "it after the rows, steps or table it comes from, and copy it from them. "
+    "Never open with a figure you have not worked out yet.\n"
     # 6 of 26 answers carried an "I am an AI / consult a professional" block
     # and 2 led with it, in front of a genuinely good answer.
     "Never open with a disclaimer or an \"as an AI\" line, and never announce "

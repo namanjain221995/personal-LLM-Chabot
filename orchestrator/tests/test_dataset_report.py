@@ -200,3 +200,160 @@ def test_unreadable_upload_does_not_crash_the_report():
     bad = {"filename": "x.bin", "profile": [{"file": "x.bin", "error": "not a table"}]}
     md = build_report_markdown("T", [bad], "", "now")
     assert "No readable tabular data" in md
+
+
+# --- the totals reconcile (self-consistency, 2026-09-21) ---------------------
+#
+# "Figures computed from every row" prints the column total; the breakdown
+# under it lists only the group values the profile kept. Before this block the
+# two figures could disagree on the same page with nothing but an occasional
+# "_Further values are not listed._" between them — the summary line saying one
+# total and the table below summing to another, which is the shape the
+# answer-quality sweep recorded. Both numbers are ours, so the gap is
+# arithmetic, not a sentence we hope a model will write.
+
+def _sales_profile(rows_by_region, *, column_sum, file_rows, omitted=(), months=None, truncated=True):
+    return {
+        "file": "sales-2025.csv",
+        "bytes": 90000,
+        "kind": "table",
+        "rows": file_rows,
+        "columns_total": 3,
+        "columns": [
+            {"name": "region", "dtype": "VARCHAR", "null_pct": 0.0, "distinct": 5},
+            {"name": "order_date", "dtype": "DATE", "null_pct": 0.0, "distinct": 90},
+            {"name": "revenue", "dtype": "DOUBLE", "null_pct": 0.0, "distinct": 198,
+             "min": 120.5, "max": 19000.0, "sum": column_sum, "avg": 5110.49, "median": 4980.0},
+        ],
+        "aggregates": {
+            "computed": "exact",
+            "measures": ["revenue"],
+            "by_group": [{"group": "region", "measure": "revenue", "truncated": truncated,
+                          "rows": list(rows_by_region)}],
+            "by_month": list(months or []),
+            "omitted": list(omitted),
+        },
+    }
+
+
+def _report(prof, message="Create a PDF report of revenue by region"):
+    return build_report_markdown(
+        "Sales report", [{"filename": "sales-2025.csv", "bytes": 90000, "profile": [prof]}],
+        "", "2026-09-21 10:00", message=message,
+    )
+
+
+SHORT_ROWS = [
+    {"value": "North", "count": 70, "sum": 380120.00, "avg": 5430.29},
+    {"value": "South", "count": 68, "sum": 341900.55, "avg": 5027.95},
+    {"value": "East", "count": 60, "sum": 287000.47, "avg": 4783.34},
+]
+
+
+def test_a_breakdown_that_does_not_add_up_to_the_total_says_so_with_both_figures():
+    """The measures table says 1,022,098.02 and these rows add up to
+    1,009,021.02. The report must state the gap, in figures, under the rows."""
+    md = _report(_sales_profile(SHORT_ROWS, column_sum=1022098.02, file_rows=200))
+    assert "| revenue | 1,022,098.02 |" in md
+    assert "These rows add up to 1,009,021.02, 13,077.00 less than the 1,022,098.02 total revenue above" in md
+    assert "cover 198 of its 200 rows" in md
+    # The vague line it replaces must not also be printed.
+    assert "_Further values are not listed._" not in md
+
+
+def test_the_profile_s_own_reason_for_the_gap_is_carried_into_the_report():
+    """The dataset chat engine relays `omitted`; the report dropped it. The
+    figure says how much is missing, the reason says why."""
+    md = _report(_sales_profile(
+        SHORT_ROWS, column_sum=1022098.02, file_rows=200,
+        omitted=["by_group region: 2 value(s) found in only one row are not listed, so its "
+                 "listed groups add up to less than the column totals"],
+    ))
+    assert "2 value(s) found in only one row are not listed" in md
+
+
+def test_a_breakdown_that_adds_up_is_left_exactly_as_it_was():
+    """No note on a report whose figures agree: the mechanism must be silent
+    when there is nothing to reconcile."""
+    rows = [
+        {"value": "North", "count": 70, "sum": 380120.00, "avg": 5430.29},
+        {"value": "South", "count": 68, "sum": 341900.55, "avg": 5027.95},
+        {"value": "East", "count": 62, "sum": 300077.47, "avg": 4839.96},
+    ]
+    md = _report(_sales_profile(rows, column_sum=1022098.02, file_rows=200, truncated=False))
+    assert "| revenue | 1,022,098.02 |" in md
+    assert "These rows add up to" not in md
+    assert "These rows cover" not in md
+
+
+def test_float_noise_in_a_double_sum_is_not_reported_as_a_gap():
+    """A DOUBLE column's sum comes back as 1,022,098.0200000001. That is the
+    last bits of a double, not a missing row."""
+    rows = [
+        {"value": "North", "count": 100, "sum": 511049.01, "avg": 5110.49},
+        {"value": "South", "count": 100, "sum": 511049.01, "avg": 5110.49},
+    ]
+    md = _report(_sales_profile(rows, column_sum=1022098.0200000001, file_rows=200, truncated=False))
+    assert "These rows add up to" not in md
+
+
+def test_rows_that_are_short_while_the_figures_agree_are_still_said():
+    """A dropped group whose revenue is zero leaves the totals equal and the
+    row counts apart — a reader counting 190 rows under a heading that says
+    200 is the same contradiction in the other column."""
+    rows = [
+        {"value": "North", "count": 95, "sum": 511049.01, "avg": 5379.46},
+        {"value": "South", "count": 95, "sum": 511049.01, "avg": 5379.46},
+    ]
+    md = _report(_sales_profile(rows, column_sum=1022098.02, file_rows=200))
+    assert "These rows cover 190 of the 200 rows above" in md
+    assert "still adds up to the total" in md
+
+
+def test_a_breakdown_row_with_no_computed_sum_claims_nothing():
+    """Nothing is asserted about figures that were never computed."""
+    rows = [
+        {"value": "North", "count": 70, "sum": 380120.00, "avg": 5430.29},
+        {"value": "South", "count": 68, "sum": None, "avg": None},
+    ]
+    md = _report(_sales_profile(rows, column_sum=1022098.02, file_rows=200))
+    assert "These rows add up to" not in md
+    # the old line is still the honest thing to say for a truncated list
+    assert "_Further values are not listed._" in md
+
+
+def test_monthly_rows_are_reconciled_against_the_column_total():
+    """Undated rows are in no month and AGG_MAX_MONTHS caps the list, so the
+    months add up to less than the Total above them."""
+    months = [{"date": "order_date", "measure": "revenue", "truncated": True, "rows": [
+        {"month": "2025-01", "count": 60, "sum": 300000.00},
+        {"month": "2025-02", "count": 60, "sum": 320000.00},
+        {"month": "2025-03", "count": 60, "sum": 340000.00},
+    ]}]
+    prof = _sales_profile(SHORT_ROWS, column_sum=1022098.02, file_rows=200, months=months)
+    md = _report(prof, message="Create a PDF report of monthly revenue")
+    assert "### Total revenue by month" in md
+    assert "These rows add up to 960,000.00, 62,098.02 less than the 1,022,098.02 total revenue above" in md
+    assert "_Further months are not listed._" not in md
+
+
+def test_a_breakdown_larger_than_the_total_is_reported_in_its_own_direction():
+    """A lossy DOUBLE sum can round the other way. The sentence must not
+    claim rows are missing when there are more, not fewer."""
+    rows = [
+        {"value": "North", "count": 100, "sum": 600000.00, "avg": 6000.0},
+        {"value": "South", "count": 100, "sum": 500000.00, "avg": 5000.0},
+    ]
+    md = _report(_sales_profile(rows, column_sum=1022098.02, file_rows=200, truncated=False))
+    assert "77,901.98 more than the 1,022,098.02 total revenue above" in md
+
+
+def test_a_measure_name_with_an_underscore_cannot_close_the_italics():
+    """The sentence is an italic note and the measure name is the file's own
+    text: `order_total` would otherwise open an emphasis run inside it."""
+    prof = _sales_profile(SHORT_ROWS, column_sum=1022098.02, file_rows=200)
+    prof["columns"][2]["name"] = "order_total"
+    prof["aggregates"]["measures"] = ["order_total"]
+    prof["aggregates"]["by_group"][0]["measure"] = "order_total"
+    md = _report(prof, message="Create a PDF report of order_total by region")
+    assert "total order\\_total above" in md
