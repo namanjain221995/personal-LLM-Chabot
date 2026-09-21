@@ -4973,7 +4973,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             saved_facts = []
                     else:
                         saved_facts = await reads.get("facts", read_facts)
-                    facts_text = facts.facts_block(saved_facts)
+                    # READ-SIDE GATE (context.prompt_facts): rows written
+                    # before release 1 were never judged durable on the way
+                    # in, and a one-off task request among them steers every
+                    # later answer. Same judgement as the write side.
+                    facts_text = facts.facts_block(context.prompt_facts(saved_facts))
                     if facts_text:
                         history = [
                             {"role": "system", "content": facts_text},

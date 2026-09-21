@@ -20,6 +20,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import re
 import struct
 import weakref
 from collections import OrderedDict
@@ -598,3 +599,53 @@ async def fit_request(
     # Never negative, never above what the caller asked for.
     max_tokens = max(1, min(ceiling, budget))
     return msgs, max_tokens
+
+
+# --------------------------------------------------------------------------
+# What may enter the prompt from the person's saved memory
+# --------------------------------------------------------------------------
+
+#: A row that speaks about ONE occasion — "the first answer", "this reply",
+#: "the next round" — rather than about answers as a rule. Such a row cannot
+#: still be true on the next turn, so it is not durable however it is phrased.
+#: It needs its own test because the write side's preference clause rescues
+#: it: "The user wants the first answer to be a professional
+#: self-introduction (~150-180 words)" reads as "answer … to be", the shape
+#: of "answers to be short", and that one row is what produced the owner's
+#: 164-word greeting (2026-09-21).
+_ONE_OCCASION_RE = re.compile(
+    r"\b(?:the\s+(?:first|next|last|final|second|third)|this|that)\s+"
+    r"(?:answer|reply|response|message|round|question|introduction)\b",
+    re.I,
+)
+
+
+def prompt_facts(rows: Optional[Sequence[Any]]) -> List[Any]:
+    """The saved-memory rows that may be shown to the model, in order.
+
+    A row is dropped when it is a one-off task request rather than something
+    durable about the person. That judgement already runs when a fact is
+    WRITTEN (facts.is_durable, release 1) — it is run again here because rows
+    written before release 1 were never judged at all, and they are still
+    read on every turn. The owner's account holds 13 written on 2026-09-16
+    out of a pasted interview-simulation prompt ("The user is asking for the
+    interview to begin with a self-introduction"), and with them in the block
+    "hi ??" came back as a 164-word first-person candidate self-introduction,
+    3 of 3 live runs at Fast (2026-09-21).
+
+    Deliberately the SAME function as the write side, called through the
+    module so the two can never drift apart, plus the one shape only a stored
+    row shows (_ONE_OCCASION_RE). A genuine standing preference ("answers in
+    Hindi", "layman terms") is durable and stays.
+    """
+    from . import facts
+
+    kept: List[Any] = []
+    for row in rows or ():
+        text = row.get("fact") if isinstance(row, dict) else row
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if not facts.is_durable(text) or _ONE_OCCASION_RE.search(text):
+            continue
+        kept.append(row)
+    return kept

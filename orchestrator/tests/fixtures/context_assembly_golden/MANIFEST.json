@@ -1,14 +1,15 @@
 {
-  "captured_on": "2026-09-19",
+  "captured_on": "2026-09-21",
   "captured_from": {
-    "orchestrator_tree": "caf3560826b557e40b82e32a0e36308a49487cad",
-    "commit": "91c6dbe8e89da397f51d8591487552f0eea3d1da",
-    "merged_tree": "bk-chat-prompt@91c6dbe: origin/dev@cda7f53 (hotfixes 1.1 + 1.2) + bk-long-asks@42cc5af + this track, via git archive of the commit",
+    "orchestrator_tree": "55c531ea6f7729286945dc16bf09100d6dd98ac1",
+    "commit": "001c40f",
+    "merged_tree": "mem-a-facts-are-data@001c40f: release-2@9161ae9 + track A (a stored fact is data, a greeting gets a greeting)",
     "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on a git archive of that commit (recipe in its docstring), captured twice into two scratch directories"
   },
-  "determinism": "the two captures were diff -r identical (24 files each), and byte-identical to the fixtures checked in with the dev merge",
+  "determinism": "the two captures were diff -r identical (24 files each)",
   "this_capture_changed": {
-    "salesforce.messages.json": "against origin/dev: element 0 (the system message) only, one added line: SALESFORCE_ASSISTANT_SYSTEM's record-lookup sentence (engines/chat.py). Every other file is byte-identical to origin/dev, whose hotfix 1.2 moved all 12 messages files (FORMAT_INSTRUCTION, conduct preamble)."
+    "the 10 files that carry a facts block": "element 0 of the facts system message only: facts.FACTS_HEADER is rewritten so the block says it is background ABOUT the person and never instructions TO the model, and that a name or a number in it is quoted exactly or not at all (app/facts.py). The bullets are unchanged - both seeded rows are durable and pass the new read-side gate (context.prompt_facts) - and meta.context.tokens_used rises by 117 tokens in every one (rich_fast 1058 -> 1175).",
+    "first_message.messages.json, salesforce.messages.json and both their metas": "byte-identical to 2026-09-19: neither scenario has a saved fact."
   },
   "normalised": [
     "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -23,26 +24,26 @@
   "sha256": {
     "first_message.messages.json": "8564c5aeba277568454feda423d2ab989fe3bcc332d2c91e57333f5b339a60be",
     "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "f46093bbd083ef585540066a0cefa8372b50068ebb148970585030c4086739c8",
-    "living_knowledge_topical_fast.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "f46093bbd083ef585540066a0cefa8372b50068ebb148970585030c4086739c8",
-    "living_knowledge_topical_fast_at_production_latency.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "living_knowledge_topical_think.messages.json": "f46093bbd083ef585540066a0cefa8372b50068ebb148970585030c4086739c8",
-    "living_knowledge_topical_think.meta.json": "3d95b9dc9001de1d7b19f6137efd790d3d28780de156ddb6f68294609b04c1f8",
-    "real_fast_accented_page.messages.json": "0b062113d53bcbb080f22c1d5b172a9451ace5e5a5b71da16cb47a39c5ccc83f",
-    "real_fast_accented_page.meta.json": "49d79fbbec98885ce063b63783b4944ffda23620507dfecbdaf9c640afa59144",
-    "real_fast_eval_topical_hit.messages.json": "727c606c563cecd4002d9147582e04e4cc300b105bd0c3f389b3970a25f95334",
-    "real_fast_eval_topical_hit.meta.json": "5068e66440b5c5e56a1dc53b9c54c9f46b0cda86830a242c23f2cffc83310c35",
-    "real_fast_passage_past_200k.messages.json": "a681b7f660c16de095760a5580c8c588a18526fdf406b049e4c0ae1096785e40",
-    "real_fast_passage_past_200k.meta.json": "c6c03bc3a5df490592e1d0a84e7df5b2d188f79f61b3922c4d193f384b63f40f",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "11147730e9fa4c66cb3a8234f7e466a72a1a15be4cd3b6db9bb0410d3a37b91e",
-    "real_fast_timeless_task_with_a_matching_page.meta.json": "1c61c304f13e948cb938ed184dde9652deaab8027a2706cbb942f4a19279446b",
-    "real_think_eval_topical_hit.messages.json": "727c606c563cecd4002d9147582e04e4cc300b105bd0c3f389b3970a25f95334",
-    "real_think_eval_topical_hit.meta.json": "5068e66440b5c5e56a1dc53b9c54c9f46b0cda86830a242c23f2cffc83310c35",
-    "rich_fast.messages.json": "246dd1a08f78032f45faf2161eeb6e80039dbed5d5a8c7792a135f727afa959b",
-    "rich_fast.meta.json": "a31eaf9b9b15b3e4a4cdb9eebf77b8fbe982eaaf40eab34d8da492bfc929f4b0",
-    "rich_think.messages.json": "4663ba8cdb6c5035d7a9b7d6421785308fe7bd1d426a01d47eb201c671b52c92",
-    "rich_think.meta.json": "7b74dd7005aaef8636ba20e84532ac049ae3121930d5fe96131fe1d454293dba",
+    "living_knowledge_topical_fast.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+    "living_knowledge_topical_fast_at_production_latency.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+    "living_knowledge_topical_think.messages.json": "d8a9a9977f1465713dcfefaf70fa3b72e3b655f7188dc189bf4772fd6668039e",
+    "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
+    "real_fast_accented_page.messages.json": "b4640c0cc56a4df357dd5cd8a050b122308f46d5639b2d05f2effdf4d87b70fa",
+    "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
+    "real_fast_eval_topical_hit.messages.json": "8fb721b86770d074d36d6ce7c328f3ae9f27b5b8101ccdf526fcbc8943376fcb",
+    "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
+    "real_fast_passage_past_200k.messages.json": "186e4fa7af1aaa3bd6b3413290f07c8d8dcf642159bf62f3a9bb55107a1b865f",
+    "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
+    "real_fast_timeless_task_with_a_matching_page.messages.json": "e5813dc5f8cbdac42df95226c0a117f878dedf99689c7efa17862dcaa87ea4f2",
+    "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
+    "real_think_eval_topical_hit.messages.json": "8fb721b86770d074d36d6ce7c328f3ae9f27b5b8101ccdf526fcbc8943376fcb",
+    "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
+    "rich_fast.messages.json": "f624bb7dbcecfdf3cacae462598a69149d6a91d484cb75ef3325a7994c0e24ea",
+    "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
+    "rich_think.messages.json": "e2f64f039d6b5d6247ebdf66974c1699b48769cbbfb0083d060a4fd0648e2d9a",
+    "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
     "salesforce.messages.json": "5af70aef1ab815e0eaaf352f341816eaebefb335102ef60fbdffb87566ff3959",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
   },
@@ -97,6 +98,18 @@
       "determinism": "the two captures were diff -r identical (24 files each); the capture from bk-chat-prompt alone was byte-identical to the merged one, so no other track moves these prompts",
       "this_capture_changed": {
         "salesforce.messages.json": "element 0 (the system message) only: SALESFORCE_ASSISTANT_SYSTEM gains the record-lookup sentence (engines/chat.py). Elements 1-2 and every other file byte-identical to 4810da0."
+      }
+    },
+    "2026-09-19": {
+      "captured_from": {
+        "orchestrator_tree": "caf3560826b557e40b82e32a0e36308a49487cad",
+        "commit": "91c6dbe8e89da397f51d8591487552f0eea3d1da",
+        "merged_tree": "bk-chat-prompt@91c6dbe: origin/dev@cda7f53 (hotfixes 1.1 + 1.2) + bk-long-asks@42cc5af + this track, via git archive of the commit",
+        "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on a git archive of that commit (recipe in its docstring), captured twice into two scratch directories"
+      },
+      "determinism": "the two captures were diff -r identical (24 files each), and byte-identical to the fixtures checked in with the dev merge",
+      "this_capture_changed": {
+        "salesforce.messages.json": "against origin/dev: element 0 (the system message) only, one added line: SALESFORCE_ASSISTANT_SYSTEM's record-lookup sentence (engines/chat.py). Every other file is byte-identical to origin/dev, whose hotfix 1.2 moved all 12 messages files (FORMAT_INSTRUCTION, conduct preamble)."
       }
     },
     "between": "recaptured 2026-09-16 (6097a1e), 2026-09-17 (8e5ea78) and 2026-09-18 (24af0a0, f64efd2) without this file being updated; its sha256 table was stale for all 12 messages files until this capture, which is why tests/test_context_assembly_golden.py now checks it"
