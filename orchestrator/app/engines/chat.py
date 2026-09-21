@@ -170,11 +170,13 @@ FAST_LANE_SYSTEM = (
     # 164/167/164-word first-person self-introduction with 4-5 bolded runs,
     # 3 of 3 live at Fast (2026-09-21). The shape rule is here rather than in
     # the facts label because it must hold with no saved memory at all.
-    "This turn is small talk — a greeting, thanks, a farewell or laughter. "
-    "Reply in kind in at most 2 sentences, and offer to help if that fits. "
-    "No self-introduction, no account of what you are or what you can do, no "
-    "list, no bold text, no headings. Use their name only if the saved "
-    "memory below gives one, spelled exactly as it is written there.\n"
+    # …and it fits the 700-char lane budget the latency work set
+    # (tests/test_fast_lane_classifier._LANE_SYSTEM_BUDGET): 679 with the
+    # identity line.
+    "This turn is small talk. Reply in kind in at most 2 sentences, and offer "
+    "to help if that fits: no self-introduction, no account of what you are "
+    "or can do, no list, no bold, no headings. Use their name only if the "
+    "saved memory gives one, spelled exactly as written.\n"
     "You are NOT connected to Salesforce data in this mode — never claim to "
     "have looked something up in Salesforce or invent CRM numbers."
 )
