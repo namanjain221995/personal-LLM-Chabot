@@ -502,7 +502,10 @@ def facts_block(facts: List[dict]) -> Optional[str]:
     if not facts:
         return None
     lines = [FACTS_HEADER]
-    used = len(FACTS_HEADER)
+    # The cap bounds the SAVED FACTS, not the label above them: counting the
+    # header against it meant the 2026-09-21 rewrite (155 -> 512 chars) would
+    # silently drop the last rows of a full store.
+    used = 0
     for f in facts:
         line = f"- {f['fact']}"
         if used + len(line) > _BLOCK_MAX_CHARS:

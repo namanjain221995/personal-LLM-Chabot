@@ -116,6 +116,15 @@ def test_the_facts_block_is_labelled_as_background_not_orders():
     assert "never speak as if you were them" in header
 
 
+def test_the_longer_label_costs_the_person_no_saved_facts():
+    """The block cap bounds the facts, not the label: a store full of short
+    rows keeps exactly as many of them as it did under the 155-char header."""
+    rows = [{"id": i, "fact": f"Prefers option {i:03d} for the weekly report"} for i in range(200)]
+    kept = facts_block(rows).split("\n")[1:]
+    assert len(kept) == 142, len(kept)  # 6000 chars / 42 per bullet
+    assert kept[-1] == "- Prefers option 141 for the weekly report"
+
+
 def test_a_language_preference_is_still_honoured_by_the_label():
     """The one standing preference the label must NOT neutralise."""
     assert "language preference" in FACTS_HEADER.lower()
