@@ -23,7 +23,7 @@ from typing import Awaitable, Callable, List, Sequence
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
 from ..config import settings
-from ..core import answer_sampling, best_of, pasted, rewrite_shape
+from ..core import answer_sampling, best_of, pasted, rewrite_coverage, rewrite_shape
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -260,6 +260,30 @@ PASTED_TEXT_NOTE = (
 )
 
 
+#: Only on a turn that is a rewrite of a pasted source with countable items
+#: (platform audit #13, core/rewrite_coverage.py). `{items}` is COUNTED by
+#: that module: the model is never asked to work out how many it was given.
+#:
+#: FORMAT_INSTRUCTION already says "keep EVERY item the source lists" — but
+#: inside the REWRITES paragraph, which opens "when the user gives a sample,
+#: template or earlier answer and asks for the same format". A plain "rewrite
+#: the rules below" has no sample, so on release-2 nothing in the shipped
+#: prompt asked for completeness on it. Measured live, Fast, on a real
+#: 120,000-character document of 647 listed items: 44 of 523 measurable items
+#: carried over without this clause, 463 of 523 with it.
+COVER_SOURCE_NOTE = (
+    "\n\nCOVER THE WHOLE SOURCE: the pasted text holds {items} listed items. "
+    "This is a rewrite, not a summary: work through the source in order and "
+    "carry EVERY one of those {items} items into the answer, with its own "
+    "details, names and numbers. Never write \"and so on\", \"the remaining "
+    "items follow the same pattern\", \"(continues)\" or a closing summary in "
+    "place of items you have not written out. If you cannot write them all, "
+    "write as many as you can in order and end with one line saying which "
+    "item number you stopped at — never present a partial rewrite as the "
+    "finished one."
+)
+
+
 def _fence_turns(turns: Sequence[dict]) -> tuple:
     """User turns that are asks over pasted text, fenced; and whether any was."""
     out: List[dict] = []
@@ -366,6 +390,11 @@ def _messages(
     content = pasted.fenced(message)
     if fenced_history or content != message:
         system = system + PASTED_TEXT_NOTE
+    # COMPLETENESS, on this turn only: a rewrite of a pasted source with
+    # countable items, and nothing else, pays for COVER_SOURCE_NOTE.
+    source = rewrite_coverage.source_of(message)
+    if source is not None:
+        system = system + COVER_SOURCE_NOTE.format(items=source.items)
     return (
         [{"role": "system", "content": system}]
         + turns
@@ -462,15 +491,14 @@ async def run_chat_engine(
             answer = rewrite_shape.shape(message, winner.answer)
             for start in range(0, len(answer), 200):
                 await emit("token", {"text": answer[start : start + 200]})
-            await emit(
-                "meta",
-                {
-                    "route": "chat",
-                    "best_of": settings.extra_high_samples,
-                    "best_of_winner": winner.index,
-                    "best_of_reason": reason,
-                },
-            )
+            meta = {
+                "route": "chat",
+                "best_of": settings.extra_high_samples,
+                "best_of_winner": winner.index,
+                "best_of_reason": reason,
+            }
+            answer = await _say_what_was_left_out(message, answer, emit, meta)
+            await emit("meta", meta)
             return answer
 
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
@@ -552,8 +580,33 @@ async def run_chat_engine(
     if guard.verdict is not None:
         meta["loop_guard"] = guard.verdict.as_meta()
         await answer_guard.record(guard.verdict, effort=effort, route="chat")
+    answer = await _say_what_was_left_out(message, guard.shown, emit, meta)
     await emit("meta", meta)
-    return guard.shown
+    return answer
+
+
+async def _say_what_was_left_out(message: str, answer: str, emit: Emit, meta: dict) -> str:
+    """The truthful ending (platform audit #13): what a rewrite measurably
+    failed to carry over from the pasted source, said in the answer itself.
+
+    The run that produces this ends `stop_reason=complete, truncated=false` —
+    the model DID stop of its own accord, and nothing in the stream knows the
+    source was left half-covered. So the check is against the source, after
+    the fact: core/rewrite_coverage.py counts the items whose own distinctive
+    word never reached the answer and writes the sentence from that count.
+    The note is emitted as ordinary answer text AND returned, so the stored
+    message carries it too — a reload must not show a "finished" rewrite.
+
+    Only a countable rewrite over pasted text is measured at all, and the
+    source's anchors are already cached from `_messages` on this same turn;
+    what is left is one tokenisation of the answer.
+    """
+    short = rewrite_coverage.shortfall(message, answer)
+    if short is None:
+        return answer
+    await emit("token", {"text": short.note})
+    meta["coverage"] = short.as_meta()
+    return answer + short.note
 
 
 def _length_ask(message: str) -> str:
