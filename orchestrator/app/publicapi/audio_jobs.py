@@ -38,19 +38,40 @@ strangers' traffic:
      CONTINUOUS unavailability. No window is ever skipped: a gap in a
      transcript is a silent lie, so a window that cannot be transcribed fails
      the job instead.
-  6. CACHE. Every finished window is written to a content-addressed cache
+  6. LANGUAGE. A clip is decoded in ONE language, so a window that joins a
+     Hindi turn to an English one comes back entirely in English — and the
+     Hindi is not transcribed badly, it is rewritten as fluent English.
+     `LanguageGuard` re-reads such a window's speech regions as separate
+     clips and keeps those when a region contradicts its window. The rule
+     and the measurement belong to `video.transcribe.language_guard`, which
+     is imported, not copied; what is this endpoint's own is WHICH windows
+     are checked and WHAT the checking may cost (below).
+  7. CACHE. Every finished window is written to a content-addressed cache
      keyed by sha256(project, model, language, sha256 of the exact clip
      bytes), kept PUBLIC_API_ASR_CACHE_TTL_S (24 h). A retry after a failure,
      a deploy or a disconnect re-sends only the windows that never finished.
      The project is in the key so identical audio in another project is never
-     answered from this one's cache (no cross-tenant presence signal).
-  7. STITCH. Window offsets added; overlap seams de-duplicated WORD BY WORD
+     answered from this one's cache (no cross-tenant presence signal). A
+     guard's region clips are cached the same way, so a retry reproduces a
+     repair without paying for it twice.
+  8. STITCH. Window offsets added; overlap seams de-duplicated WORD BY WORD
      (below); `video.loops.collapse` removes decoder loops; a 2-cue holdback
      (plus every cue the next overlap may still trim) so streamed deltas are
      never retracted.
-  8. OUTPUT. Events for a stream (`transcript.text.delta`, `…done`, `: ping`,
+  9. OUTPUT. Events for a stream (`transcript.text.delta`, `…done`, `: ping`,
      `: queued`), or one result for a committed JSON body. Usage seconds are
      ceil(decoded samples / 16,000).
+
+THE LANGUAGE GUARD ON A STREAMING JOB. The video analyser decodes every
+window first and guards afterwards; this endpoint dispatches one window at a
+time and emits `transcript.text.delta` as each finishes, and a delta is never
+retracted (CONTRACT §10). So the check happens between a window's reply and
+its deltas, and the two consequences are stated rather than hidden: the
+sample of windows to check is chosen from the PLAN (every window's speech
+regions are known before the first clip is sent), and an escalation — the
+guard finding a second language — can only reach windows not yet emitted.
+Evidence that costs nothing still arrives from the first pass: two windows
+reporting different languages escalates without any re-reading at all.
 
 WHY THE SEAM IS DE-DUPLICATED BY WORDS, NOT SEGMENTS (measured 2026-09-13 on
 the decodable synthetic speech of tests/publicapi_fake_whisper.py, 20 minutes,
@@ -114,9 +135,16 @@ from typing import (
 
 import httpx
 
-from ..config import _float, _int, settings
+from ..config import _bool, _float, _int, settings
 from ..video import loops
-from ..video.transcribe import wav_bytes
+
+# The language guard's RULE lives in the video module and is imported, not
+# copied: one measurement (2026-09-21), one definition of "a region long
+# enough to contradict its window", one place to fix. `_spread` is its
+# sampler — private to that module, borrowed here so both paths sample a
+# recording the same way.
+from ..video.transcribe import _spread as spread_over_recording
+from ..video.transcribe import language_guard, wav_bytes
 from ..video.types import Segment
 from ..video.vad import SAMPLE_RATE, Window, plan_windows
 from . import capacity, errors
@@ -230,6 +258,13 @@ def _setting_float(name: str, default: float) -> float:
     return float(_float(name, float(default)))
 
 
+def _setting_bool(name: str, default: bool) -> bool:
+    value = getattr(settings, name.lower(), None)
+    if value is not None:
+        return bool(value)
+    return bool(_bool(name, bool(default)))
+
+
 def _setting_str(name: str, default: str) -> str:
     value = getattr(settings, name.lower(), None)
     if isinstance(value, str) and value.strip():
@@ -257,8 +292,87 @@ def overlap_s() -> float:
 
 
 def max_gap_s() -> float:
-    """PUBLIC_API_ASR_MAX_GAP_S (2): the longest pause kept inside one window."""
+    """PUBLIC_API_ASR_MAX_GAP_S (2): the longest pause kept inside one window.
+
+    WHY 2.0 HERE AND 1.2 ON THE VIDEO PATH (decided 2026-09-21, with the
+    numbers). The video analyser lowered VIDEO_ASR_MAX_GAP_S to 1.2 so that
+    an ordinary breath (measured 0.29-0.89 s) stays inside one clip while a
+    paragraph pause (1.67-2.00 s) ends it, and to move off the 1.97-2.00 s
+    cluster its plan was flipping on. That buys CUE TIMING, which matters
+    there because `snap_to_regions` holds each cue to the speech in its own
+    window. This endpoint does not snap: its seams are resolved word by word
+    (see the module docstring), and a window boundary is not free — it is one
+    more clip, and whisper pads every clip to its 30 s receptive field.
+
+    Measured on this box, `webrtcvad`, the same planner: 10 minutes of speech
+    plans 14 windows at 2.0 and 18 at 1.2 (+29 %); 20 minutes, 28 and 37
+    (+32 %). The OVERLAPPING seams — the only place the word aligner can drop
+    or duplicate a word — were identical either way (3 and 5), so the extra
+    cuts buy this endpoint nothing there. And they do not shrink the language
+    guard's surface either: the windows holding more than one speech region,
+    the ones the guard has to check, were 8 and 18 at BOTH gaps.
+
+    So the public path keeps 2.0: the mixed-language defect is closed by
+    `LanguageGuard`, which is what it needed, and strangers' traffic does not
+    pay 30 % more engine calls on the two Sparks chat shares for a cue-timing
+    improvement this endpoint does not use. Note also that this value is part
+    of `JobSpec.key()`: changing it strands every stored result.
+    """
     return max(0.0, _setting_float("PUBLIC_API_ASR_MAX_GAP_S", 2.0))
+
+
+def language_guard_enabled() -> bool:
+    """PUBLIC_API_ASR_LANGUAGE_GUARD (true): re-read a window that holds more
+    than one speech region when it may have been decoded in one language while
+    holding two. Default and meaning are VIDEO_ASR_LANGUAGE_GUARD's; the knob
+    is separate because this endpoint carries strangers' traffic and an
+    operator must be able to stand the extra clips down here alone."""
+    return _setting_bool("PUBLIC_API_ASR_LANGUAGE_GUARD", True)
+
+
+def language_probe_windows() -> int:
+    """PUBLIC_API_ASR_LANGUAGE_PROBE_WINDOWS (4): how many at-risk windows are
+    checked before there is evidence either way, spread over the recording.
+    VIDEO_ASR_LANGUAGE_PROBE_WINDOWS's default: the cost of a probe is the same
+    engine on the same audio."""
+    return max(0, _setting_int("PUBLIC_API_ASR_LANGUAGE_PROBE_WINDOWS", 4))
+
+
+#: Re-reading a window region by region costs MORE engine time than the window
+#: itself did, because whisper pads every clip to its 30 s receptive field, so
+#: six short regions are six paddings. Measured live on this deployment
+#: 2026-09-21, a 31.4 s window of six speech regions: 12.46 s of wall for the
+#: window, 18.63 s for its six regions — 1.50x. The guard's budget allows this
+#: multiple of what the job's OWN first pass spent, so the yardstick is the
+#: engine as it is behaving today: at 3.0 an engine that has become twice as
+#: slow since the first pass still finishes the check, and only one that has
+#: stopped answering runs the budget out.
+LANGUAGE_GUARD_WORK_FACTOR = 3.0
+
+
+def language_guard_budget_s(first_pass_s: float) -> float:
+    """The wall clock one job's language guard may spend on the engine.
+
+    A budget that GROWS WITH THE WORK, the shape `file_inputs.count_read_budget_s`
+    already uses here: `LANGUAGE_GUARD_WORK_FACTOR` times what this job's own
+    first pass spent, plus PUBLIC_API_ASR_LANGUAGE_GUARD_BUDGET_S (60) as a
+    base. The base is what a retry gets: its windows come from the cache, so
+    it has no first pass to measure, and without it a resumed job could never
+    re-read a region whose clip was not cached.
+
+    WHY A BUDGET AT ALL. A window that cannot be transcribed fails the job —
+    a gap in a transcript is a silent lie. A REGION that cannot be re-read is
+    not that: the words are already in the transcript, possibly in the wrong
+    language, and the guard keeps them. So a probe must never inherit a
+    window's patience: `WhisperDispatcher.transcribe` waits out a silent
+    replica for PUBLIC_API_ASR_WINDOW_SILENCE_S (1800) and an unreachable
+    fleet for PUBLIC_API_ASR_UNAVAILABLE_GRACE_S (1800), and a second opinion
+    is not worth an hour of a caller's job. When this budget is spent the
+    guard stops, the report says so, and the job finishes with the first
+    pass rather than quietly running long.
+    """
+    base = max(0.0, _setting_float("PUBLIC_API_ASR_LANGUAGE_GUARD_BUDGET_S", 60.0))
+    return base + LANGUAGE_GUARD_WORK_FACTOR * max(0.0, float(first_pass_s))
 
 
 def decode_concurrency() -> int:
@@ -821,6 +935,156 @@ class Stitcher:
 
 def _norm_cue(cue: _Cue) -> str:
     return " ".join(w.lower() for w in cue.words)
+
+
+# -------------------------------------------------------- language guard --
+
+
+@dataclass(frozen=True)
+class _RegionReply:
+    """The two fields `video.transcribe.language_guard` reads off one decode.
+    The video path hands it an `asr.TranscriptSegments`; here the same two
+    fields come off a slimmed engine reply."""
+
+    segments: Tuple[Mapping[str, Any], ...]
+    language_code: Optional[str]
+
+
+class LanguageGuard:
+    """Which windows get a second opinion on their language, and what it may cost.
+
+    THE DEFECT (measured on this deployment's whisper, 2026-09-21, through
+    this endpoint's own job path). A clip is decoded in ONE language, chosen
+    once and applied to all of it. A 31.4 s window holding six speech regions
+    — five English sentences and one Hindi one — came back entirely in
+    English, and the Hindi sentence was rendered "This is a pig's flesh, not a
+    cow's flesh": English words where Hindi was spoken, from an engine whose
+    task is pinned to `transcribe`. Every cue of that window was labelled
+    `en`, the Hindi one included, so the engine's own label cannot find it.
+    The same region sent as its own clip came back `hi`, in Devanagari.
+
+    WHAT IS BORROWED AND WHAT IS OWNED HERE. The repair itself —
+    re-read every speech region of a window, and keep the per-region
+    transcripts when a region of at least a second contradicts its window,
+    keeping the first pass's words for a region the engine refuses — is
+    `video.transcribe.language_guard`, called once per window with that
+    window's own result. This class owns only the two questions that are
+    different on a streaming job: WHICH windows are worth checking, and WHEN
+    to stop.
+
+    WHICH. A window is at risk when it holds more than one speech region,
+    which is known from the PLAN before any clip is sent. `probe_windows` of
+    them, spread over the recording (the same sampler the video path uses),
+    are checked; the check escalates to every later at-risk window on any
+    evidence of a second language — a checked window that contradicts itself,
+    or simply two windows of the first pass reporting different languages,
+    which costs nothing. A monolingual recording therefore pays for the
+    sample and nothing else.
+
+    WHEN TO STOP. Deltas are emitted as each window finishes and are never
+    retracted, so escalation reaches only windows not yet sent — stated in
+    the module docstring rather than worked around. And the probes run under
+    `language_guard_budget_s`: when that is spent the guard stops checking,
+    `report["budget_spent"]` records it, and the job finishes on its first
+    pass instead of running long in silence.
+    """
+
+    def __init__(self, windows: Sequence[Window], *, probe_windows: int) -> None:
+        self.windows = list(windows)
+        at_risk = [i for i, w in enumerate(self.windows) if len(w.regions) >= 2]
+        self.sample = set(spread_over_recording(at_risk, int(probe_windows)))
+        self.escalated = False
+        self.spent_s = 0.0
+        self._languages: set = set()
+        self.report: Dict[str, Any] = {
+            "at_risk": len(at_risk),
+            "sampled": len(self.sample),
+            "windows_checked": 0,
+            "windows_repaired": 0,
+            "clips": 0,
+            "regions_refused": 0,
+            "budget_spent": False,
+            "escalated": False,
+            "engine_ms": 0,
+            "spent_ms": 0,
+        }
+
+    def note_language(self, language: Optional[str]) -> None:
+        """The language a window's first pass reported. Two different ones in
+        one recording is evidence of a second language that cost nothing to
+        find, so it escalates the check to every later at-risk window."""
+        if not language:
+            return
+        self._languages.add(str(language))
+        if len(self._languages) > 1 and not self.escalated:
+            self.escalated = True
+            self.report["escalated"] = True
+
+    def wanted(self, index: int) -> bool:
+        return len(self.windows[index].regions) >= 2 and (self.escalated or index in self.sample)
+
+    def budget_left_s(self, first_pass_s: float) -> float:
+        return language_guard_budget_s(first_pass_s) - self.spent_s
+
+    async def check(
+        self,
+        index: int,
+        reply: Dict[str, Any],
+        *,
+        decode: Callable[[int, float, float], Awaitable[Optional[_RegionReply]]],
+    ) -> bool:
+        """Re-read window `index` and, if a region contradicts it, replace
+        `reply["segments"]` in place with the per-region transcripts.
+
+        The window's segments go to `language_guard` in RECORDING time with
+        the engine's own cue times — not snapped: this endpoint resolves its
+        seams word by word and must keep the times the aligner was measured
+        on. What comes back for a REPAIRED region is held to that region, as
+        on the video path, because the region's clip began there.
+        """
+        window = self.windows[index]
+        language = reply.get("language")
+        segments = [
+            Segment(
+                start_s=window.start_s + float(s.get("start") or 0.0),
+                end_s=window.start_s + max(float(s.get("start") or 0.0), float(s.get("end") or 0.0)),
+                text=str(s.get("text") or ""),
+                language=(str(s["language"]) if s.get("language") else (str(language) if language else None)),
+            )
+            for s in reply["segments"]
+        ]
+        results: Dict[int, List[Segment]] = {index: segments}
+        found = await language_guard(
+            self.windows,
+            results,
+            {index: (str(language) if language else None)},
+            decode=decode,
+            # One window per call: this class has already decided that THIS
+            # window is the one to check, so the helper's own sampling has a
+            # single candidate and does exactly that one.
+            probe_windows=1,
+        )
+        self.report["clips"] += int(found.get("clips", 0))
+        self.report["windows_checked"] += int(found.get("windows_checked", 0))
+        self.report["spent_ms"] = int(self.spent_s * 1000)
+        if not int(found.get("windows_repaired", 0)):
+            return False
+        reply["segments"] = [
+            {
+                "start": max(0.0, s.start_s - window.start_s),
+                "end": max(0.0, s.end_s - window.start_s),
+                "text": s.text,
+                "language": s.language,
+            }
+            for s in results[index]
+            if s.text.strip()
+        ]
+        reply["language"] = _dominant_language(results[index]) or language
+        self.report["windows_repaired"] += 1
+        if not self.escalated:
+            self.escalated = True
+            self.report["escalated"] = True
+        return True
 
 
 # -------------------------------------------------------------- decoding --
@@ -1980,6 +2244,94 @@ class AudioJobs:
                 segments.extend(new)
                 job.publish(JobEvent("delta", {"delta": delta, "cues": len(new)}))
 
+            # ONE CLIP IS DECODED IN ONE LANGUAGE (see `LanguageGuard`). A
+            # caller who NAMED a language gets no guard: the engine was told
+            # which language to use, every re-read would be told the same, and
+            # there is no second opinion left to ask for.
+            guard = (
+                LanguageGuard(windows, probe_windows=language_probe_windows())
+                if language_guard_enabled() and not job.spec.language
+                else None
+            )
+            #: What the first pass spent on the engine, which is the yardstick
+            #: the guard's budget grows with. Only real engine calls count: a
+            #: window served from the cache bought no measurement of how fast
+            #: the engine is right now.
+            first_pass_s = [0.0]
+
+            async def region_decode(index: int, a_s: float, b_s: float) -> Optional[_RegionReply]:
+                """One speech region of window `index` as its own clip.
+
+                Cached like any other clip, and the CACHE IS READ BEFORE THE
+                BUDGET: a resumed job whose region clips are already on disk
+                reproduces the repair for nothing, which is what keeps a retry
+                identical to the run it resumes.
+
+                An engine that refuses this region, or that does not answer
+                inside the budget, returns None: the first pass's words for
+                the region are still in the transcript, and answering a
+                mistranslation with a failed job would be worse than the
+                mistranslation. `asyncio.timeout` (not `wait_for`: CI runs
+                3.11) so a cancellation of the job itself still propagates.
+                """
+                assert guard is not None
+                a = int(round(a_s * SAMPLE_RATE))
+                b = int(round(b_s * SAMPLE_RATE))
+                clip, clip_sha = await on_worker(_clip_and_hash, pcm, a, b)
+                key = WindowCache.key(
+                    project_id=job.project_id,
+                    clip_sha256=clip_sha,
+                    language=job.spec.language,
+                    model=self.model(),
+                )
+                reply = await on_worker(cache.get, key)
+                if reply is None:
+                    left = guard.budget_left_s(first_pass_s[0])
+                    if left <= 0:
+                        if not guard.report["budget_spent"]:
+                            guard.report["budget_spent"] = True
+                            log.warning(
+                                "language guard: budget spent after %.1fs; window %d region "
+                                "%.1f-%.1fs keeps its first pass",
+                                guard.spent_s, index, a_s, b_s,
+                            )
+                        return None
+                    started = time.monotonic()
+                    try:
+                        async with asyncio.timeout(left):
+                            raw = await dispatcher.transcribe(
+                                clip, language=job.spec.language, index=index, on_wait=on_wait
+                            )
+                    except (asyncio.TimeoutError, EngineFailure) as exc:
+                        guard.spent_s += time.monotonic() - started
+                        guard.report["regions_refused"] += 1
+                        if isinstance(exc, asyncio.TimeoutError):
+                            guard.report["budget_spent"] = True
+                        log.info(
+                            "language guard: window %d region %.1f-%.1fs was not re-read (%s); "
+                            "keeping the first pass",
+                            index, a_s, b_s, exc.reason if isinstance(exc, EngineFailure) else "budget spent",
+                        )
+                        return None
+                    finally:
+                        del clip
+                    guard.spent_s += time.monotonic() - started
+                    if isinstance(raw.get("processing_ms"), (int, float)):
+                        guard.report["engine_ms"] += int(raw["processing_ms"])
+                    reply = _slim_reply(raw)
+                    await on_worker(cache.put, key, reply)
+                if not reply["segments"]:
+                    # NO WORDS IS NOT AN ANSWER HERE. A re-read that comes back
+                    # empty cannot contradict anything, and `language_guard`
+                    # would put its (empty) transcript into a repaired window
+                    # in place of the words the first pass DID find there. Sent
+                    # back as "no reply", the same helper carries the first
+                    # pass's words for the region instead — a gap in a
+                    # transcript is a silent lie (step 5 of the module).
+                    guard.report["regions_refused"] += 1
+                    return None
+                return _RegionReply(tuple(reply["segments"]), reply.get("language"))
+
             await progress({"stage": "transcribing", "percent": 0.0, "windows_total": len(windows), "windows_done": 0}, force=True)
             for index, window in enumerate(windows):
                 a = int(round(window.start_s * SAMPLE_RATE))
@@ -1991,13 +2343,24 @@ class AudioJobs:
                 )
                 reply = await on_worker(cache.get, key)
                 if reply is None:
-                    raw = await dispatcher.transcribe(clip, language=job.spec.language, index=index, on_wait=on_wait)
+                    started = time.monotonic()
+                    try:
+                        raw = await dispatcher.transcribe(clip, language=job.spec.language, index=index, on_wait=on_wait)
+                    finally:
+                        first_pass_s[0] += time.monotonic() - started
                     engine_ms += int(raw.get("processing_ms") or 0) if isinstance(raw.get("processing_ms"), (int, float)) else 0
                     reply = _slim_reply(raw)
                     await on_worker(cache.put, key, reply)
                 else:
                     cached += 1
                 del clip
+                # The guard runs BEFORE the deltas, because a delta is never
+                # retracted; the cache above holds the FIRST pass, so a retry
+                # re-derives the same repair from the same cached region clips.
+                if guard is not None:
+                    guard.note_language(reply.get("language"))
+                    if guard.wanted(index):
+                        await guard.check(index, reply, decode=region_decode)
                 for segment in reply["segments"]:
                     if not segment.get("language"):
                         segment["language"] = reply.get("language")
@@ -2021,6 +2384,11 @@ class AudioJobs:
                     "engine_ms": engine_ms,
                     "stitch": dict(stitcher.report),
                     "dispatch": dict(dispatcher.stats),
+                    "language_guard": (
+                        {**guard.report, "spent_ms": int(guard.spent_s * 1000)}
+                        if guard is not None
+                        else {"skipped": "language_pinned" if job.spec.language else "off"}
+                    ),
                 }
             )
             return TranscriptResult(
@@ -2156,6 +2524,7 @@ __all__ = [
     "Follower",
     "JobEvent",
     "JobSpec",
+    "LanguageGuard",
     "Stitcher",
     "TranscriptResult",
     "WhisperDispatcher",
