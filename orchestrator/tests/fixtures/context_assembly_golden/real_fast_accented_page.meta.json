@@ -1,9 +1,9 @@
 {
   "context": {
-    "fraction": 0.001,
+    "fraction": 0.0011,
     "reserved_output": 8192,
     "summarized_turns": 2,
-    "tokens_used": 1026,
+    "tokens_used": 1054,
     "usable_budget": 991296,
     "window": 1000000
   },
