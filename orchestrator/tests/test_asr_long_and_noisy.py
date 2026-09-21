@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time as _real_time
 from pathlib import Path
 
 import httpx
@@ -79,10 +80,18 @@ class _Wire:
     def __init__(self, monkeypatch) -> None:
         self.requests: list[tuple[str, dict]] = []
         self.scripts: dict[str, list] = {}
+        #: The READ timeout each client was built with, in order. One
+        #: dictation's two decodes share one wall clock, so these are the
+        #: numbers that say whether the second one got what the first left or
+        #: a fresh ASR_TIMEOUT_S of its own (2026-09-21).
+        self.read_timeouts: list[float] = []
         transport = httpx.MockTransport(self._handle)
         real = httpx.AsyncClient
 
         def fake(*args, **kwargs):
+            timeout = kwargs.get("timeout")
+            if timeout is not None and getattr(timeout, "read", None) is not None:
+                self.read_timeouts.append(float(timeout.read))
             kwargs["transport"] = transport
             return real(*args, **kwargs)
 
@@ -105,9 +114,18 @@ class _Wire:
         return [host for host, _ in self.requests]
 
 
-def _engine(host: str) -> asr.VLLMAudioProvider:
+def _engine(host: str, timeout_s: float = 600.0) -> asr.VLLMAudioProvider:
+    """A real client over the fake socket, with PRODUCTION's timeout.
+
+    600 s, not the 5 s this used to pass: since 2026-09-21 the two decodes of
+    one dictation share that one wall clock, and a second decode is skipped
+    when the clip cannot finish in what is left of it. A toy timeout made
+    every gated retry in this file unaffordable, which is a property of the
+    fixture and not of the code under test. Nothing here waits — the
+    transport answers immediately — so the number costs no test time.
+    """
     return asr.VLLMAudioProvider(
-        base_url=f"http://{host}:30007/v1", model=MODEL, name="whisper", timeout_s=5.0
+        base_url=f"http://{host}:30007/v1", model=MODEL, name="whisper", timeout_s=timeout_s
     )
 
 
@@ -1091,3 +1109,325 @@ def test_a_real_thanks_after_a_ten_second_pause_is_kept():
 
 def test_a_dead_replica_fails_the_connect_in_ten_seconds():
     assert asr._CONNECT_TIMEOUT_S == 10.0
+
+
+# ---------------------------------------------------------------------------
+# 5. The GPU a single dictation may take (R7, 2026-09-21)
+#
+# Measured on the production worker replica, one call at a time, before a line
+# changed: noisy600.wav — ten minutes whose first thirty seconds are pink
+# noise at -22 dBFS, so the engine's gate (which judges the first thirty
+# seconds only) empties it — cost ONE Spark 233.09 s of decoding, and the two
+# exchanges carried 600 s of read timeout EACH: 1200 s of licence for one
+# person's microphone. Whisper decodes one clip at a time and the chat model
+# is tensor-parallel across both Sparks, so that window is chat slowing down
+# for everybody (config.py: 71 tok/s -> ~24 on either node while the speech
+# engine is saturated).
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """`asr`'s view of `time`, with a scripted monotonic clock.
+
+    The dictation's wall clock is the thing under test, so it has to be
+    deterministic: a real one makes the remaining budget a race with the test
+    machine. Substituted as the MODULE asr reads, never by patching
+    `time.monotonic` itself — asyncio's event loop calls that too, and it
+    would eat the ticks meant for the code under test (it did).
+    """
+
+    def __init__(self, *ticks: float) -> None:
+        self._ticks = list(ticks)
+
+    def monotonic(self) -> float:
+        return self._ticks.pop(0) if len(self._ticks) > 1 else self._ticks[0]
+
+    def perf_counter(self) -> float:
+        return _real_time.perf_counter()
+
+
+def _clock(monkeypatch, *ticks: float) -> _Clock:
+    clock = _Clock(*ticks)
+    monkeypatch.setattr(asr, "time", clock)
+    return clock
+
+
+def test_both_decodes_of_one_dictation_share_one_wall_clock(monkeypatch):
+    """The second decode gets what the first one LEFT, not a fresh
+    ASR_TIMEOUT_S. Before this change the pair carried 2 x timeout_s, which is
+    the 600 + 600 = 1200 s measured on the real clip above."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=60.0)), (200, DENSE)]
+    engine = _engine("w")
+    # The deadline opens at t=1000 and the first decode takes 120 s of it.
+    _clock(monkeypatch, 1000.0, 1120.0)
+
+    assert _dictate(engine).text == _DENSE_TEXT
+    assert wire.read_timeouts == [600.0, 480.0]
+    # Spent plus still allowed is ONE timeout, which is the whole point.
+    assert 120.0 + wire.read_timeouts[1] == engine.timeout_s
+
+
+def test_a_second_decode_never_gets_a_whole_fresh_timeout(monkeypatch):
+    """The R7 bound restated: however little the first decode left, the
+    second one is held to it. At 91ac019 this was 600.0 both times."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=90.0)), (200, DENSE)]
+    engine = _engine("w")
+    _clock(monkeypatch, 5000.0, 5300.0)
+
+    _dictate(engine)
+
+    assert len(wire.read_timeouts) == 2
+    assert wire.read_timeouts[1] == 300.0
+    assert wire.read_timeouts[1] < engine.timeout_s
+
+
+def test_a_ten_minute_clip_the_gate_emptied_is_not_decoded_a_second_time(monkeypatch):
+    """The measured case. 600 s of audio is 438 s of one Spark at the loaded
+    rate (232.4 s observed on a quiet replica), spent on a recording the
+    engine has already said was silent. The retry is an OPTIONAL second
+    opinion and it does not get to cost that."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=600.0)), (200, DENSE)]
+
+    result = _dictate(_engine("w"))
+
+    assert len(wire.requests) == 1
+    assert result.text == ""
+    # And the person is NOT told the room was silent: nobody asked twice.
+    assert result.confidence == asr.CONFIDENCE_UNCLEAR
+
+
+@pytest.mark.parametrize(
+    "duration, decoded_again",
+    [(119.9, True), (120.0, True), (120.1, False), (300.0, False)],
+)
+def test_the_second_opinion_stops_at_two_minutes_of_audio(monkeypatch, duration, decoded_again):
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=duration)), (200, DENSE)]
+
+    _dictate(_engine("w"))
+
+    assert len(wire.requests) == (2 if decoded_again else 1)
+
+
+def test_the_retry_is_skipped_when_the_first_decode_spent_the_wall_clock(monkeypatch):
+    """A retry that cannot finish inside the deadline would take a GPU for a
+    transcript nobody ever receives. 60 s of audio needs 43.8 s at the loaded
+    rate and 10 s of the 600 s budget is left."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=60.0)), (200, DENSE)]
+    _clock(monkeypatch, 1000.0, 1590.0)
+
+    result = _dictate(_engine("w"))
+
+
+    assert len(wire.requests) == 1
+    assert result.confidence == asr.CONFIDENCE_UNCLEAR
+
+
+def test_the_decode_rate_the_bounds_are_sized_from_is_the_measured_one():
+    """0.45 s/s quiet and 0.73 s/s loaded, recorded beside ASR_TIMEOUT_S in
+    config.py. ONE copy of each number: audio_api words its 504 from the same
+    constant, and a second copy could drift away from the deadline it
+    explains."""
+    assert asr.QUIET_DECODE_S_PER_AUDIO_S == 0.45
+    assert asr.LOADED_DECODE_S_PER_AUDIO_S == 0.73
+    assert audio_api.asr.LOADED_DECODE_S_PER_AUDIO_S is asr.LOADED_DECODE_S_PER_AUDIO_S
+    # The bound is what that rate makes of two minutes of audio.
+    assert asr._RETRY_MAX_SECONDS * asr.LOADED_DECODE_S_PER_AUDIO_S < 90.0
+
+
+def test_the_heartbeat_still_beats_far_inside_the_wall_clock_it_serves(monkeypatch):
+    """The SSE invariant, restated for a bounded wait: the stream must beat at
+    least every 15 s, and no request timeout may be shorter than the wall
+    clock it serves. One dictation is now bounded by ONE ASR_TIMEOUT_S, and
+    that is still many heartbeats long."""
+    from app.config import Settings
+
+    monkeypatch.delenv("ASR_TIMEOUT_S", raising=False)
+    fresh = Settings()
+    assert audio_api.HEARTBEAT_S <= 15.0
+    assert fresh.asr_timeout_s > audio_api.HEARTBEAT_S * 10
+    # The whole dictation, both decodes together, fits in the timeout the
+    # route is sized against — it is not the pair's SUM any more.
+    assert fresh.asr_timeout_s >= fresh.asr_max_audio_seconds * asr.LOADED_DECODE_S_PER_AUDIO_S
+
+
+# ---------------------------------------------------------------------------
+# 6. Confidence reaches the person (audit #24 reframed, 2026-09-21)
+#
+# The language selector was refused: forcing a language mistranscribes the
+# code-switching majority. What the client already knew and threw away was
+# CONFIDENCE — the engine's no_speech_prob and this file's own plausibility
+# verdict. Measured on the production worker replica 2026-09-21, one request
+# per clip, the speech rows cut from one real recording:
+#
+#   clip                            no_speech_prob   words   words/s
+#   8 s clean speech                        0.0088      17      2.13
+#   8 s of the same, 26 dB down             0.0238      17      2.13
+#   30 s clean dictation                    0.1034      65      2.17
+#   20 s pink noise at -25 dBFS             0.0352      14      0.70
+#   20 s digital silence                    0.7082       0         -
+#
+# The noise clip is the finding: fourteen invented words, in "Nynorsk", went
+# into the composer with nothing said about them. The silence clip is the
+# other one: it was correct, and it is the ONLY one of the five a person may
+# honestly be told was silent.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label, nsp, words, seconds, expected",
+    [
+        ("clean speech", 0.0088, 17, 8.0, None),
+        ("quiet speech", 0.0238, 17, 8.0, None),
+        ("clean 30 s dictation", 0.1034, 65, 30.0, None),
+        ("pink noise at -25 dBFS", 0.0352, 14, 20.0, "low"),
+    ],
+)
+def test_the_measured_confidence_set_is_classified_as_measured(
+    label, nsp, words, seconds, expected
+):
+    """Both lines must agree, and both are already in the file. The
+    probability ALONE would caution the real 30-second dictation (0.1034);
+    sparseness alone would caution a real one-word answer."""
+    assert asr._reply_confidence(_words(words), seconds, nsp) == expected
+
+
+def test_an_engine_that_reports_no_probability_gets_no_opinion():
+    """Unknown is not evidence, and a caution on every dictation is how a
+    caution stops being read."""
+    assert asr._reply_confidence(_words(3), 20.0, None) is None
+
+
+def test_a_noise_clip_that_passed_the_gate_reaches_the_composer_with_a_caution(monkeypatch):
+    """The 20 s pink-noise clip, end to end through the real client. Its words
+    are NOT deleted — 4810da0 kept them and nothing here can tell them from a
+    short real answer — but they no longer arrive as a fact."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, {
+        "text": "Og så skal vi se på det her", "language": "nynorsk",
+        "language_code": "nn", "duration": 20.0, "no_speech_prob": 0.0352,
+    })]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text
+    assert result.confidence == asr.CONFIDENCE_LOW
+    assert len(wire.requests) == 1
+
+
+def test_a_clean_dictation_carries_no_caution(monkeypatch):
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(SPEECH_REPLY, no_speech_prob=0.0088))]
+
+    assert _dictate(_engine("w")).confidence is None
+
+
+def test_only_measured_silence_is_reported_as_silence(monkeypatch):
+    """A clip the gate emptied, too short for the second opinion to be worth
+    taking (the engine's own validation set puts its most marginal REAL
+    utterance at 3 s). This is the one empty draft "nothing was said" fits
+    without a second decode."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, duration=2.4, no_speech_prob=0.708))]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_SILENT
+
+
+def test_silence_confirmed_by_a_second_decode_is_still_silence(monkeypatch):
+    """Asked twice, nothing plausible either time."""
+    wire = _Wire(monkeypatch)
+    invented = {"text": "Thank you.", "language": "english", "language_code": "en",
+                "duration": 10.0, "no_speech_prob": 0.0,
+                "segments": [{"id": 0, "start": 0.0, "end": 10.0, "text": "Thank you."}]}
+    wire.scripts["w"] = [(200, dict(GATED, duration=10.0, no_speech_prob=0.708)), (200, invented)]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_SILENT
+    assert len(wire.requests) == 2
+
+
+def test_words_this_client_deleted_are_never_reported_as_silence(monkeypatch):
+    """The auditor's clip: 20 s of room noise decoded as "All right." and was
+    dropped as invented. The engine HEARD something — telling the person
+    nobody spoke is a claim nothing measured."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, {"text": "All right.", "language": "english",
+                                "language_code": "en", "duration": 20.0,
+                                "no_speech_prob": 0.0385})]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_UNCLEAR
+
+
+def test_an_empty_answer_the_gate_did_not_give_is_unclear_not_silent(monkeypatch):
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, dict(GATED, no_speech_prob=0.21))]
+
+    assert _dictate(_engine("w")).confidence == asr.CONFIDENCE_UNCLEAR
+
+
+def test_words_that_exist_only_because_of_the_retry_are_low_confidence(monkeypatch):
+    """The engine's own gate called this clip silent; these words exist
+    because we asked a second time with the gate off. They are a draft worth
+    having (LibriSpeech under babble: 112 words at word error rate 0.54) and
+    they are never a fact."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, GATED), (200, DENSE)]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == _DENSE_TEXT
+    assert result.confidence == asr.CONFIDENCE_LOW
+
+
+def test_a_retry_that_timed_out_returns_the_first_answer_as_unclear(monkeypatch):
+    """The replica is stood down and the first pass's answer stands — but it
+    stands as UNCLEAR: the second opinion never arrived."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["slow"] = [(200, dict(GATED, duration=20.0)), httpx.ReadTimeout]
+    wire.scripts["spare"] = [(200, SPEECH_REPLY)]
+    router = asr.RoutedProvider([_engine("slow"), _engine("spare")])
+
+    result = _dictate(router)
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_UNCLEAR
+    assert wire.hosts == ["slow", "slow"]
+
+
+def test_video_windows_carry_no_confidence(monkeypatch):
+    """Video analysis runs its own voice-activity detection and has no
+    composer to tell; the field stays None on that path."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, DENSE)]
+
+    result = asyncio.run(
+        _engine("w").transcribe_segments(WEBM, filename="w.wav", content_type="audio/wav")
+    )
+    assert result.confidence is None
+
+
+def test_a_gated_reply_without_a_duration_is_unclear_not_silent(monkeypatch):
+    """An engine that reports no duration has not said whether this was a
+    two-second tap or ten minutes, and the 3 s line is the whole reason a
+    short gated clip may be believed without a second decode."""
+    wire = _Wire(monkeypatch)
+    wire.scripts["w"] = [(200, {"text": "", "language": None, "language_code": None,
+                                "no_speech_prob": 0.8387})]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_UNCLEAR
+    assert len(wire.requests) == 1

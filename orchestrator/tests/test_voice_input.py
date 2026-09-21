@@ -791,7 +791,12 @@ def test_a_transcript_never_tells_a_member_what_hardware_answered(
         "processing_ms",
         "upload_ms",
         "engine_ms",
+        # One of asr.CONFIDENCE_* or null (2026-09-21). A closed vocabulary,
+        # not a probability and not a threshold: the browser owns the wording
+        # and a member still learns nothing about the engine from it.
+        "confidence",
     }
+    assert response.json()["confidence"] in {None, "low", "unclear", "silent"}
 
 
 # ---------------------------------------------------------------------------
