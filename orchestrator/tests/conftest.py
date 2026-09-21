@@ -104,6 +104,11 @@ _APP_TABLES = (
     # and conversations, but naming them keeps a truncation explicit.
     "upload_sessions",
     "chat_requests",
+    # V41 (2026-09-21): the picture a conversation was shown. It cascades
+    # from users, but a row that survived into the next test would hand that
+    # test a photo it never sent — and the tests of the word test are
+    # precisely about which turns do and do not reach one.
+    "conversation_images",
     "video_analyses",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.

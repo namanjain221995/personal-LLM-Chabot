@@ -5225,7 +5225,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # follow-up test; images now have one too. The test is words
             # only — no model call — and when it does not fire the turn
             # routes exactly as it did before.
-            image_followup_images: list = []
+            from .engines import image_memory
+
+            # 2026-09-21: and it survives a RESTART. The picture was held in
+            # this process only, so every deploy, container restart and OOM
+            # kill silently put the conversation back to the audit's
+            # behaviour — the fix above, undone, several times a day, and
+            # indistinguishable from the original bug (completeness critic
+            # R6). It now has a `conversation_images` row (V41); this is the
+            # one primary-key read that loads it back, and it runs only when
+            # THIS process does not already hold the conversation, so a chat
+            # pays it once, on the first turn after a deploy. Never on the
+            # fast lane (it must add nothing to a greeting's latency), and
+            # never on a turn that carries its own images, which replace
+            # whatever was remembered anyway.
+            image_followup = image_memory.Followup()
+            if conv_key and not lane.entered and not request.images_data:
+                await image_memory.hydrate(conv_key, viewer)
             if (
                 request.text
                 and not request.images_data
@@ -5239,18 +5255,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not url_list
                 and not lane.entered
             ):
-                from .engines import image_memory
-
-                image_followup_images = image_memory.images_for_followup(
+                image_followup = image_memory.followup(
                     conv_key, request.text, viewer
                 )
             else:
                 # A document, URL, video, agent or research turn still moves
                 # the conversation on: after it, "that table" may be its
                 # table, not the picture's (engines/image_memory.py).
-                from .engines import image_memory
-
                 image_memory.note_turn(conv_key, viewer)
+            image_followup_images: list = image_followup.images
 
             # Phase A/B: assemble THIS session's context — rolling summary +
             # retrieved folded chunks + recent turns — compacting first if the
@@ -5412,6 +5425,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and clarification_available
                 and request.text
                 and not (request.pdf_data or request.image_data)
+                # A follow-up about a picture already in this conversation is
+                # a VISION turn with no bytes on the wire, and the `else`
+                # below already says a turn that "belongs to the document,
+                # vision, repo, URL or dataset pipeline" does not enter here.
+                # Only `request.image_data` was checked, so the planner could
+                # claim it and answer "I can't answer that from Salesforce.
+                # The user wants to know what text is written in a photo" —
+                # measured live at Fast, 1 turn in 5, both before and after
+                # the V41 work (2026-09-21). `sf_outcome.handled` returns the
+                # answer below without ever reaching the image branch, so
+                # this gate is where it has to be stopped.
+                and not image_followup.about_the_picture
                 and not request.sf_live
                 and github_ref is None
                 and not repo_followup
@@ -5982,6 +6007,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     conversation_id=conv_key,
                 )
+            elif image_followup.unavailable:
+                # This turn IS about the picture, and the picture is not
+                # here: it was larger than the durable budget, so what
+                # survived the restart is the record that there was one
+                # (engines/image_memory.py). Say that, rather than answer a
+                # question about a photo as though no photo had been sent —
+                # which is the answer the audit found and the thing this
+                # whole module exists to stop. Fixed words, no model call:
+                # the app is reporting its own state.
+                #
+                # Imported under an alias on purpose: the branch above binds
+                # the bare name `image_memory` inside THIS function, which
+                # makes it a local here too — and these branches are mutually
+                # exclusive, so reading it would be an UnboundLocalError.
+                from .engines import image_memory as _image_memory
+
+                answer = _image_memory.UNAVAILABLE_NOTICE
+                await emit("token", {"text": answer})
+                await emit("meta", {"route": "vision"})
             elif github_ref is not None or repo_followup:
                 # Phase 3: a GitHub repo URL → clone/index/overview; or a
                 # follow-up question about a repo already indexed → code Q&A.
