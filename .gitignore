@@ -16,6 +16,8 @@ secrets/
 *.p12
 .session_secret
 .runtime/
+brain/packs
+brain/sources
 
 # ---------------------------------------------------------------------------
 # Data and generated artifacts
