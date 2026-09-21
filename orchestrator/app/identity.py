@@ -113,6 +113,31 @@ def trusted_name(facts: Optional[Iterable[Mapping]]) -> Tuple[str, str]:
     return "", ""
 
 
+def usable_facts(facts: Iterable[Mapping]) -> list:
+    """The saved facts a prompt may state as true of THIS person.
+
+    A row that NAMES them is kept only when its V40 provenance says they are
+    its source; every other row passes through untouched, and nothing is
+    deleted — the dropped row stays in the store and in the memory panel,
+    labelled 'unknown', where the person can see it and remove it.
+
+    This is a code rule because the prompt could not be one. Measured
+    2026-09-21 against the live engine, Fast, one call at a time: with an
+    unprovenanced "The user's name is <stranger>" in the saved-facts block,
+    "what is my name?" came back as the stranger 3 of 3 runs even though the
+    identity line above it named the account holder and said the account
+    wins. The block tells the model to "treat as true for this user"; a
+    sentence does not outrank a fact it has been told is true.
+    """
+    return [f for f in facts or () if not _unprovenanced_name(f)]
+
+
+def _unprovenanced_name(fact: Mapping) -> bool:
+    if fact_source_is_trusted(fact.get("source")):
+        return False
+    return bool(name_from_fact(str(fact.get("fact") or "")))
+
+
 def set_identity(
     display_name: str,
     email: str,

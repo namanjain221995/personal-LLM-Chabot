@@ -311,3 +311,68 @@ def test_memory_facts_route_shows_where_each_fact_came_from(client):
     assert typed["origin"] == "manual"
     assert typed["trusted"] is True
     assert "source_excerpt" in typed
+
+
+# --- what a prompt may state as true of the person --------------------------
+
+
+def test_usable_facts_drops_a_name_nobody_can_vouch_for():
+    """The rule the prompt could not carry. Measured 2026-09-21 against the
+    live engine, Fast, one call at a time: with this row in the block,
+    "what is my name?" answered with the stranger 3/3 even though the
+    identity line above it named the account holder."""
+    kept = identity.usable_facts(
+        [STRANGER_NO_PROVENANCE, {"fact": "The user prefers Hindi", "source": None}]
+    )
+    assert [f["fact"] for f in kept] == ["The user prefers Hindi"]
+
+
+def test_usable_facts_keeps_a_name_the_person_gave():
+    kept = identity.usable_facts([OWN_WORDS])
+    assert [f["fact"] for f in kept] == [OWN_WORDS["fact"]]
+
+
+def test_usable_facts_touches_nothing_else():
+    """Only a NAME is judged: an unprovenanced preference is still the
+    person's memory, and this is not a memory-cleaning pass."""
+    rows = [
+        {"fact": "The user works at TechSara", "source": None},
+        {"fact": "The user wants all keywords bolded", "source": None},
+        {"fact": "Sahil Patel is the CEO of TechSara", "source": None},
+    ]
+    assert identity.usable_facts(rows) == rows
+
+
+def test_usable_facts_handles_an_empty_read():
+    assert identity.usable_facts([]) == []
+    assert identity.usable_facts(None) == []
+
+
+# --- end to end: the prompt main.py actually builds --------------------------
+
+# The Fast lane's route test already stubs every network boundary and keeps
+# the engine-bound prompts; reusing its fixture proves the RULE reaches the
+# real read (main.read_facts), not just the pure function.
+from tests.test_fast_lane_route import _send, wired  # noqa: E402,F401
+
+
+def test_an_unprovenanced_name_never_reaches_the_prompt(wired):
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.facts import FACTS_HEADER
+    from tests.conftest import _materialize_test_user
+
+    uid = int(_materialize_test_user("local")["id"])
+    db.add_user_fact(uid, "The user's name is Priya Shah")  # source NULL
+    db.add_user_fact(uid, "The user's name is Sam", source="stated")
+    db.add_user_fact(uid, "The user prefers answers in Hindi")  # source NULL
+    with TestClient(main.app) as client:
+        _send(client, "identity-conv", [{"role": "user", "content": "good morning"}])
+    (prompt,) = wired["prompts"]
+    system = prompt[0]["content"]
+    assert FACTS_HEADER in system
+    assert "Priya Shah" not in system
+    # the person's own name, and an unprovenanced NON-name, both survive
+    assert "The user's name is Sam" in system
+    assert "The user prefers answers in Hindi" in system

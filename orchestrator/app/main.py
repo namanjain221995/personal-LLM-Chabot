@@ -4584,8 +4584,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             conv_key = request.conversation_id or scoped_session
             plain_text_turn = bool(request.text and not request.pdf_data and not request.image_data)
 
-            def read_facts():
-                return db.run_in_thread(db.list_user_facts, viewer, settings.memory_max_facts)
+            async def read_facts():
+                # A saved row that NAMES the person is dropped here unless
+                # its V40 provenance says the person is its source: the block
+                # below says "treat as true for this user", and measurement
+                # (2026-09-21) showed a prompt sentence cannot outrank that —
+                # identity.usable_facts. The row is not deleted; the memory
+                # panel still lists it, labelled 'unknown'.
+                rows = await db.run_in_thread(
+                    db.list_user_facts, viewer, settings.memory_max_facts
+                )
+                return _identity.usable_facts(rows)
 
             async def read_cross_chat():
                 # For a question that needs EVIDENCE (an office holder,
