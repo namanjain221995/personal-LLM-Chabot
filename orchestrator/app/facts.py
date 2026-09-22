@@ -939,6 +939,15 @@ def _facts_named(asks: List[tuple], existing: List[dict]) -> List[int]:
     return ids
 
 
+#: How long the extractor may wait for the answer's first token before it
+#: gives up waiting and runs anyway (see `after` below). It is a SAFETY
+#: bound, not a schedule: every path out of the chat worker resolves the
+#: future in its `finally`, so this only fires if a future path forgets to.
+#: Losing a person's saved memory because a wait never ended would be a far
+#: worse defect than the GPU contention the wait exists to avoid.
+FIRST_TOKEN_WAIT_MAX_S = 20.0
+
+
 async def remember_after_route(
     gate: "asyncio.Future[bool]",
     user_id: int,
@@ -947,8 +956,10 @@ async def remember_after_route(
     *,
     attachments: bool = False,
     complete=None,
+    after: "Optional[asyncio.Future]" = None,
 ) -> List[dict]:
-    """`remember_from_message`, held until the turn knows its route.
+    """`remember_from_message`, held until the turn knows its route — and
+    then until the answer has started.
 
     The chat turn starts extraction the moment it has the message, before
     it knows whether the message is a request for a FILE. A request for a
@@ -958,12 +969,40 @@ async def remember_after_route(
     `user_facts` table (CONTRACT-2 §8). Cancelling the task is not enough:
     the extractor's first awaits are thread hops and it often FINISHES
     before the artifact intent is decided. The turn therefore resolves
-    `gate` once the route is known — True to extract as before (still
-    concurrent with the answer, which starts after the same decision),
-    False to do nothing — and every path out of the turn resolves it, so
-    the task never waits forever."""
+    `gate` once the route is known — True to extract as before, False to do
+    nothing — and every path out of the turn resolves it, so the task never
+    waits forever.
+
+    `after` is the second gate, and it is the whole point of this function
+    now. The extractor calls the ROUTER model, which is resident on the
+    same head Spark as rank 0 of the TP=2 main model, so while it runs the
+    answer's PREFILL is fighting it for that GPU. Measured 2026-09-22,
+    idle-gated, on the owner's own shapes: an ordinary question's time to
+    first token was 674.2 ms with the extractor racing and 403.7 ms with it
+    switched off; a question over three stored PDFs, 1,729.7 ms against
+    966.6 ms. The same body replayed straight at vLLM seconds later took
+    224 ms against the turn's 480 ms, and the effect reproduces with no
+    orchestrator in the picture at all (225.7 ms alone, 485.8 ms with one
+    router completion started 5 ms earlier, 4 of 4 runs).
+
+    Waiting for the first token moves that contention off the prefill and
+    onto the decode, which is where there is room for it: extraction is one
+    router round trip of roughly 900 ms and an answer decodes for seconds,
+    so the facts still land — and the `memory_updated` chip still lights —
+    well before the turn ends. Nothing about WHAT is extracted changes."""
     if not await gate:
         return []
+    if after is not None and not after.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(after), FIRST_TOKEN_WAIT_MAX_S)
+        except asyncio.TimeoutError:
+            log.warning(
+                "facts: the answer's first token did not arrive in %.0fs; "
+                "extracting anyway rather than losing the memory",
+                FIRST_TOKEN_WAIT_MAX_S,
+            )
+        except Exception:  # pragma: no cover - a cancelled turn, nothing to wait for
+            pass
     return await remember_from_message(
         user_id,
         user_text,

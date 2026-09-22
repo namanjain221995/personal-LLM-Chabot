@@ -196,6 +196,12 @@ async def lifespan(_app: FastAPI):
         )
 
     video_pipeline.set_busy_probe(_chat_is_busy)
+    # The web knowledge worker paces against the same probe: its embedding
+    # drain is the other batch on this box with nobody waiting on it, and the
+    # query embedding on a chat turn's retrieval path shares the sidecar with
+    # it. `start()` above only creates the task, which sleeps 45 s before its
+    # first cycle, so installing the probe here is well ahead of any drain.
+    web_worker.set_busy_probe(_chat_is_busy)
     # Artifact Studio (2026-09-11): documents, decks and workbooks made in
     # chat run as durable jobs with the same lease/heartbeat/requeue shape as
     # video analyses. The composer — the one model-facing piece — is
@@ -4253,6 +4259,25 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     def _release_facts(extract: bool) -> None:
         if not fact_gate.done():
             fact_gate.set_result(bool(extract))
+
+    # The extractor's SECOND gate: the answer's first token. The extractor
+    # calls the router model, which shares the head Spark with rank 0 of the
+    # TP=2 main model, so running it during the answer's prefill costs the
+    # person 270 ms on an ordinary question and 763 ms on one over three
+    # stored PDFs (measured 2026-09-22, idle-gated; facts.remember_after_route
+    # carries the full figures). Resolved at the first token below, and again
+    # in the worker's `finally` so a turn that emits none — an artifact turn,
+    # an error, a cancel — never leaves the extractor waiting.
+    answer_started: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+    # How long the final meta may wait for an extraction still in flight, so a
+    # short answer keeps its "memory updated" chip. One router round trip is
+    # roughly 900 ms; this is that with headroom, and it is spent only when
+    # the answer finished first.
+    _FACT_CHIP_WAIT_S = 2.0
+
+    def _release_answer_started() -> None:
+        if not answer_started.done():
+            answer_started.set_result(None)
     # Salesforce Intelligence Mode extras (assumptions, resolved scope, the
     # final phase) merged into whichever engine's meta ends up being emitted.
     salesforce_state: dict = {}
@@ -4353,6 +4378,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 data["context"] = dict(context_state)
             if orchestration_state:
                 data["auto"] = dict(orchestration_state)
+            # The chip, and the one thing the first-token gate costs it.
+            # Extraction used to start at route time and had the whole
+            # prefill AND decode to finish in; it now starts at the first
+            # token, so on a SHORT answer the turn can reach its meta while
+            # the extractor is still in flight and the person loses the
+            # "memory updated" chip for a fact that is about to be saved
+            # anyway. A bounded wait here buys it back. It delays only the
+            # final meta event — every answer token is already on screen —
+            # and on a long answer the task is finished and this costs
+            # nothing. The facts persist either way; this is about the chip.
+            if (
+                fact_task is not None
+                and not fact_task.done()
+                and not memory_state.get("facts")
+            ):
+                try:
+                    await asyncio.wait_for(asyncio.shield(fact_task), _FACT_CHIP_WAIT_S)
+                    # `_facts_done` fills memory_state from a done-callback,
+                    # which the loop runs on its next pass, not at await.
+                    await asyncio.sleep(0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:  # pragma: no cover - the task's own failure
+                    pass
             if memory_state.get("facts"):
                 data["memory_updated"] = list(memory_state["facts"])
             # Merged rather than overwritten: the engine that answered owns
@@ -4437,6 +4486,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             from time import perf_counter as _pc
 
             _timing["first_token"] = _pc() - _timing["started"]
+            # The answer is out of prefill and into decode: fact extraction
+            # may have the router now without costing this person their
+            # first token.
+            _release_answer_started()
         if _timing.get("first_visible") is None and event in ("token", "reasoning", "status"):
             # chat_first_visible_seconds (plan item 1, 2026-09-13): the first
             # thing a person can READ — an answer token, a reasoning token,
@@ -4953,6 +5006,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                                     or request.image
                                     or request.image_base64
                                 ),
+                                after=answer_started,
                             )
                         )
                         _background_tasks.add(fact_task)
@@ -6595,6 +6649,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # cancel) still lets the message be remembered, as it always
             # was; only a decided artifact turn says no.
             _release_facts(True)
+            # ... and a turn that emitted no answer token at all still lets
+            # the extractor run rather than sit on its second gate.
+            _release_answer_started()
             # V29: the row's terminal status — cancelled, failed, or
             # interrupted when the loop is tearing this process down.
             await ending.step(_settle_chat_request(gen))

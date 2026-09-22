@@ -22,6 +22,7 @@ under a per-conversation lock, they cannot double-fold or race each other.
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -248,6 +249,10 @@ async def compact(
             boundary = min(boundary, max(0, len(turns) - 1))
             if boundary <= covers:
                 return None
+            # The stored summary and fold boundary are about to move, so the
+            # transcript the next turn assembles is not the one that was
+            # measured.
+            _forget_after_turn(conversation_id)
             return await _fold(conversation_id, turns, covers, boundary, existing)
         except Exception:
             import logging
@@ -283,8 +288,105 @@ def should_compact(budget: Budget, threshold: float) -> bool:
 _BOUND_SLACK_TOKENS = 64
 
 
+#: The exact prompt size the BACKGROUND pass measured at the end of a turn,
+#: keyed by conversation: `digest of the message list it counted -> that
+#: count`. See `_carried_bound` for why it is kept and what it is allowed to
+#: decide. Bounded and ordinary data (no event-loop affinity), evicted least
+#: recently used first.
+_after_turn: "OrderedDict[str, Tuple[bytes, int, str]]" = OrderedDict()
+_AFTER_TURN_MAX = 512
+
+
+def _digest(messages: Sequence[dict]) -> bytes:
+    """A fingerprint of a message list, for proving it has not changed.
+
+    Roles and contents only, length-prefixed so no two different lists can
+    render to the same bytes. Cryptographic because the contents are the
+    user's own text: a collision must not be reachable by writing a message.
+    """
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=16)
+    for m in messages:
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if not isinstance(content, str):
+            return b""  # multimodal: never fingerprinted, never carried
+        h.update(f"{len(role)}:{role}:{len(content)}:".encode())
+        h.update(content.encode("utf-8", "surrogatepass"))
+    return h.digest()
+
+
+def _remember_after_turn(
+    conversation_id: str, candidate: Sequence[dict], used: int, base_url: str
+) -> None:
+    """Keep an EXACT count only.
+
+    `context.count_tokens` falls back to the character estimate when
+    /tokenize cannot be reached, and that estimate divides ASCII by three —
+    it is not an upper bound on anything. Carrying one forward would let a
+    prompt past the cap look as though it had been proved under it.
+    """
+    if not context._last_count_exact.get():
+        _after_turn.pop(conversation_id, None)
+        return
+    fingerprint = _digest(candidate)
+    if not fingerprint:
+        _after_turn.pop(conversation_id, None)
+        return
+    _after_turn[conversation_id] = (fingerprint, int(used), base_url)
+    _after_turn.move_to_end(conversation_id)
+    while len(_after_turn) > _AFTER_TURN_MAX:
+        _after_turn.popitem(last=False)
+
+
+def _forget_after_turn(conversation_id: str) -> None:
+    _after_turn.pop(conversation_id, None)
+
+
+def _carried_bound(
+    conversation_id: str,
+    base_candidate: Sequence[dict],
+    tail: Sequence[dict],
+    base_url: str,
+) -> Optional[int]:
+    """An EXACT-count-backed upper bound on this turn's prompt, or None.
+
+    WHY (2026-09-21). The byte bound above is sound but loose: real English
+    costs the Qwen tokenizer ~4-6 bytes a token, so a 6,900-token
+    conversation already bounds at 40,872 and trips the 40,000-token cap.
+    Every turn from there to the cap therefore ran an exact /tokenize IN
+    FRONT OF THE FIRST TOKEN to re-learn a number that could not fire
+    compaction — measured on this box at 104.6 ms for a 39,089-token thread.
+
+    The count is not new work, though: `maybe_background_compact` already
+    measured the very same transcript EXACTLY after the previous turn, off
+    the critical path. `base_candidate` is the list this turn assembled from
+    the same stored history, summary and fold boundary; when its fingerprint
+    matches the one that was counted, that count IS its exact size, and this
+    turn adds only `tail` (the retrieved block and the new user message),
+    which the byte bound covers. Anything else — a first turn, a fold, an
+    edited message, a changed system block, a restarted process — does not
+    match and counts exactly, as before.
+    """
+    found = _after_turn.get(conversation_id)
+    if not found:
+        return None
+    fingerprint, used, seen_base_url = found
+    if seen_base_url != base_url:
+        return None  # a different engine, a different tokenizer
+    if _digest(base_candidate) != fingerprint:
+        return None
+    _after_turn.move_to_end(conversation_id)
+    return used + context.upper_bound_messages(tail) + _BOUND_SLACK_TOKENS
+
+
 def _certainly_no_compaction(
-    probe: Sequence[dict], *, base_url: str, requested_max_tokens: Optional[int]
+    probe: Sequence[dict],
+    *,
+    base_url: str,
+    requested_max_tokens: Optional[int],
+    carried_bound: Optional[int] = None,
 ) -> bool:
     """True when NO exact count of `probe` could make `should_compact` fire.
 
@@ -293,6 +395,10 @@ def _certainly_no_compaction(
     count cannot exceed it. Only plain-text prompts qualify (an image part
     is sized by a header heuristic, not a bound), and only once the serving
     window is known — the first turn of a process always counts.
+
+    `carried_bound` is the tighter bound `_carried_bound` builds out of the
+    previous turn's exact count. Both are upper bounds on the same prompt, so
+    the smaller one decides.
     """
     window = context._window_cache.get(base_url)
     if not window:
@@ -300,6 +406,8 @@ def _certainly_no_compaction(
     if any(not isinstance(m.get("content"), str) for m in probe):
         return False
     bound = context.upper_bound_messages(probe) + _BOUND_SLACK_TOKENS
+    if carried_bound is not None:
+        bound = min(bound, carried_bound)
     cap = int(settings.context_compact_max_tokens or 0)
     if cap > 0 and bound > cap:
         return False
@@ -388,10 +496,27 @@ async def prepare_deferred(
     covers = row["covers_through"] if row else 0
 
     candidate = assemble(history, summary, covers, retrieved)
-    probe = list(candidate) + [{"role": "user", "content": current_text}]
+    current = {"role": "user", "content": current_text}
+    probe = list(candidate) + [current]
+
+    carried = None
+    if defer_measure:
+        # The background pass measured `assemble(history, summary, covers)`
+        # — no retrieved block, no current message — so the fingerprint is
+        # taken of exactly that list, and what this turn adds on top is the
+        # `tail` the byte bound covers.
+        tail = [current]
+        if retrieved and retrieved.strip():
+            tail.insert(0, {"role": "system", "content": retrieved})
+        carried = _carried_bound(
+            conversation_id, assemble(history, summary, covers), tail, base_url
+        )
 
     if defer_measure and _certainly_no_compaction(
-        probe, base_url=base_url, requested_max_tokens=requested_max_tokens
+        probe,
+        base_url=base_url,
+        requested_max_tokens=requested_max_tokens,
+        carried_bound=carried,
     ):
         summarized = covers if summary else 0
         # Taken now, as `prepare` does before returning: the notice belongs
@@ -497,7 +622,14 @@ async def maybe_background_compact(
             requested_max_tokens=requested_max_tokens,
         )
         if not should_compact(budget, settings.context_bg_compact_threshold):
+            # Nothing to fold: this transcript is settled, and its EXACT size
+            # is now known. The next turn reuses it instead of asking the
+            # engine the same question in front of the user (`_carried_bound`).
+            _remember_after_turn(conversation_id, candidate, budget.used, base_url)
             return None
+        # About to fold: whatever was remembered describes a transcript the
+        # next turn will not assemble.
+        _forget_after_turn(conversation_id)
         result = await compact(conversation_id, history)
         if result:
             _pending_notice[conversation_id] = {
@@ -506,4 +638,5 @@ async def maybe_background_compact(
             }
         return result
     except Exception:
+        _forget_after_turn(conversation_id)
         return None

@@ -81,6 +81,25 @@ import { SIDECARS_NO_TIMEOUT_LIVE } from '@/content/docs/pages/sidecarsLive';
 import type { DocPage, DocSection } from '@/content/docs';
 import { FILES_API_PUBLISHED } from '@/content/docs/pages/files';
 
+/* WHY A LONGER TIMEOUT HERE, AND ONLY HERE.
+ *
+ * Vitest's default is 5 s. The slowest single case in this file is 1,221 ms on
+ * an idle DGX head, so nothing here is near that bound on its own. It is the
+ * PARALLEL run that tips it over: `npm test` puts 181 files on the machine at
+ * once, and on a 2-vCPU hosted runner these docs pages tests are the ones that
+ * lose the race. Measured across four full runs on 2026-09-22: two of them
+ * failed here, every failure `Error: Test timed out in 5000ms`, never an
+ * assertion, and all of them pass 3/3 in isolation. Timed solo against the
+ * branch base the cost was unchanged, so nothing in the code under test got
+ * slower -- the machine got busier.
+ *
+ * Twenty seconds is roughly twenty times the measured cost and still a hard
+ * stop for a real hang. This follows the precedent set for the same reason in
+ * tests/streaming-render-cost.test.tsx (2026-09-11).
+ */
+vi.setConfig({ testTimeout: 20_000 });
+
+
 afterEach(cleanup);
 
 /**

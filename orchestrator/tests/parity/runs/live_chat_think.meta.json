@@ -1,0 +1,16 @@
+{
+  "effort": "think",
+  "thinking": true,
+  "wall_clock_s": 54.22,
+  "finish_reason": "stop",
+  "usage": {
+    "prompt_tokens": 1880,
+    "total_tokens": 7465,
+    "completion_tokens": 5585,
+    "prompt_tokens_details": null,
+    "completion_tokens_details": {
+      "reasoning_tokens": 2584
+    }
+  },
+  "system_chars": 7704
+}

@@ -299,9 +299,14 @@ class HostGuardWriterTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _fake_nft(self, exit_code, stderr=""):
+    def _fake_nft(self, exit_code, stderr="", stdout=""):
         fake = self.dir / "nft"
-        fake.write_text(f"#!/bin/sh\nprintf '%s\\n' {json.dumps(stderr)} >&2\nexit {exit_code}\n")
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' {json.dumps(stdout)}\n"
+            f"printf '%s\\n' {json.dumps(stderr)} >&2\n"
+            f"exit {exit_code}\n"
+        )
         fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         return fake
 
@@ -360,6 +365,29 @@ class HostGuardWriterTests(unittest.TestCase):
         finally:
             locked.chmod(0o755)
         self.assertEqual(v['techsara_host_guard_check_ok{source="state_file"}'], "0")
+
+    def test_the_degraded_fallback_is_reported_as_a_missing_table_under_nft(self):
+        # The boot unit loads the fallback under the same table name when the
+        # full apply fails. It closes the office LAN and the tailnet and
+        # nothing else, so "the guard is in place" would be a lie.
+        degraded = 'table inet techsara_guard {\n  chain input {\n    counter packets 0 bytes 0 accept comment "DEGRADED fallback: no catch-all drop, only the office LAN and the tailnet are closed"\n  }\n}'
+        _, v = self._run(HOST_GUARD_SOURCE="nft", HOST_GUARD_NFT=str(self._fake_nft(0, stdout=degraded)))
+        self.assertEqual(v['techsara_host_guard_table_present{source="nft"}'], "0")
+        self.assertEqual(v['techsara_host_guard_check_ok{source="nft"}'], "1")
+
+    def test_the_degraded_fallback_is_reported_as_a_missing_table_under_the_state_file(self):
+        state = self.dir / "state"
+        state.write_text("GUARD_ROLE=head\nGUARD_MODE=degraded\nGUARD_APPLIED_AT=2026-09-22T04:10:00Z\n")
+        _, v = self._run(HOST_GUARD_SOURCE="state_file", HOST_GUARD_STATE_FILE=str(state))
+        self.assertEqual(v['techsara_host_guard_table_present{source="state_file"}'], "0")
+        self.assertEqual(v['techsara_host_guard_check_ok{source="state_file"}'], "1")
+
+    def test_a_full_apply_recorded_in_the_state_file_is_present(self):
+        state = self.dir / "state"
+        state.write_text("GUARD_ROLE=head\nGUARD_MODE=full\nGUARD_APPLIED_AT=2026-09-22T04:10:00Z\n")
+        _, v = self._run(HOST_GUARD_SOURCE="state_file", HOST_GUARD_STATE_FILE=str(state))
+        self.assertEqual(v['techsara_host_guard_table_present{source="state_file"}'], "1")
+        self.assertEqual(v['techsara_host_guard_check_ok{source="state_file"}'], "1")
 
     def test_the_file_is_valid_exposition_with_help_and_type_and_no_temp_file_is_left(self):
         text, v = self._run(HOST_GUARD_SOURCE="nft", HOST_GUARD_NFT=str(self._fake_nft(0)))
