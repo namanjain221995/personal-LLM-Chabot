@@ -806,6 +806,191 @@ def test_prepare_deferred_counts_first_whenever_the_bound_cannot_rule_compaction
 
 
 # ---------------------------------------------------------------------------
+# A settled thread is not re-counted in front of the next answer
+# ---------------------------------------------------------------------------
+#
+# The byte bound is sound but loose: real English costs the tokenizer ~4-6
+# bytes a token, so a thread far below CONTEXT_COMPACT_MAX_TOKENS already
+# bounds above it and every turn ran an exact /tokenize before the first
+# token. `maybe_background_compact` had already counted that same transcript
+# exactly, off the critical path.
+
+
+def _long_thread(chars: int = 60_000) -> list:
+    """A thread whose BYTE bound is over the 40,000-token cap while its exact
+    count (four characters a token, `_counting`) is a quarter of it."""
+    block = "The northern region renewed its subscription this quarter. " * 25
+    turns: list = []
+    while sum(len(m["content"]) for m in turns) < chars:
+        n = len(turns) // 2
+        turns.append({"role": "user", "content": f"Question {n}. {block}"})
+        turns.append({"role": "assistant", "content": f"Answer {n}. {block}"})
+    return turns
+
+
+def _no_carried_state(monkeypatch):
+    """No count carried in from another test. Tolerates a tree without the
+    carry at all, so the tests below fail on what they assert rather than on
+    a missing name."""
+    from collections import OrderedDict
+
+    if hasattr(compaction, "_after_turn"):
+        monkeypatch.setattr(compaction, "_after_turn", OrderedDict())
+
+
+def _exact_counting(calls: list, window: int = 1_000_000):
+    """`_counting`, and it reports itself EXACT as the real /tokenize path does."""
+    inner = _counting(calls, window)
+
+    async def count(base_url, model, messages):
+        result = await inner(base_url, model, messages)
+        context._last_count_exact.set(True)
+        return result
+
+    return count
+
+
+def test_a_settled_thread_is_not_recounted_in_front_of_the_next_answer(monkeypatch):
+    uid = _local_user()
+    db.create_conversation(uid, "carry-1", "d")
+    _no_carried_state(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(context, "count_tokens", _exact_counting(calls))
+    monkeypatch.setitem(context._window_cache, "http://x/v1", 1_000_000)
+    history = _long_thread()
+    # The premise: the byte bound alone cannot clear the cap, so before this
+    # change the turn below had to count exactly, first.
+    assert (
+        context.upper_bound_messages(history) > settings.context_compact_max_tokens
+    ), "fixture must be past the cap by BYTES"
+
+    async def scenario():
+        # End of the previous turn: nothing to fold, and the exact size is
+        # now known.
+        assert (
+            await compaction.maybe_background_compact(
+                "carry-1", history, base_url="http://x/v1", model="m"
+            )
+            is None
+        )
+        counted_in_the_background = list(calls)
+        calls.clear()
+
+        got_history, info, pending = await compaction.prepare_deferred(
+            "carry-1", history, "and the southern region?",
+            base_url="http://x/v1", model="m",
+        )
+        assert counted_in_the_background, "the background pass did count exactly"
+        assert calls == [], "no count ran in front of the prompt"
+        assert info is None and pending is not None
+        settled = await pending
+
+        # ...and what the model is handed, and what the meter reports, are
+        # exactly what the counting path produces.
+        calls.clear()
+        expected_history, expected_info = await compaction.prepare(
+            "carry-1", history, "and the southern region?",
+            base_url="http://x/v1", model="m",
+        )
+        assert got_history == expected_history
+        assert settled == expected_info
+
+    asyncio.run(scenario())
+
+
+def test_an_estimated_count_is_never_carried(monkeypatch):
+    """/tokenize unreachable: `count_tokens` returns the CHARACTER estimate,
+    which divides ASCII by three and bounds nothing. Carrying one would let a
+    prompt past the cap look as though it had been proved under it."""
+    uid = _local_user()
+    db.create_conversation(uid, "carry-4", "d")
+    _no_carried_state(monkeypatch)
+    calls: list = []
+    counter = _exact_counting(calls)
+
+    async def unreachable(base_url, model, messages):
+        count, window = await counter(base_url, model, messages)
+        context._last_count_exact.set(False)  # as the except branch does
+        return count, window
+
+    monkeypatch.setattr(context, "count_tokens", unreachable)
+    monkeypatch.setitem(context._window_cache, "http://x/v1", 1_000_000)
+    history = _long_thread()
+
+    async def scenario():
+        await compaction.maybe_background_compact(
+            "carry-4", history, base_url="http://x/v1", model="m"
+        )
+        assert compaction._after_turn.get("carry-4") is None
+        calls.clear()
+        return await compaction.prepare_deferred(
+            "carry-4", history, "next", base_url="http://x/v1", model="m"
+        )
+
+    _history, info, pending = asyncio.run(scenario())
+    assert pending is None and info is not None
+    assert calls, "an estimate proves nothing; the turn counts"
+
+
+@pytest.mark.parametrize("change", ["one_more_turn", "an_edited_message", "another_engine"])
+def test_a_transcript_that_moved_since_it_was_counted_is_counted_again(monkeypatch, change):
+    uid = _local_user()
+    db.create_conversation(uid, "carry-2", "d")
+    _no_carried_state(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(context, "count_tokens", _exact_counting(calls))
+    monkeypatch.setitem(context._window_cache, "http://x/v1", 1_000_000)
+    monkeypatch.setitem(context._window_cache, "http://y/v1", 1_000_000)
+    history = _long_thread()
+
+    async def scenario():
+        await compaction.maybe_background_compact(
+            "carry-2", history, base_url="http://x/v1", model="m"
+        )
+        calls.clear()
+        base_url = "http://x/v1"
+        moved = list(history)
+        if change == "one_more_turn":
+            moved = moved + [{"role": "user", "content": "one more thing"}]
+        elif change == "an_edited_message":
+            moved = [{**moved[0], "content": moved[0]["content"] + "!"}] + moved[1:]
+        else:
+            base_url = "http://y/v1"
+        return await compaction.prepare_deferred(
+            "carry-2", moved, "next", base_url=base_url, model="m"
+        )
+
+    _history, info, pending = asyncio.run(scenario())
+    assert pending is None and info is not None
+    assert calls, "a transcript that is not the one that was counted counts again"
+
+
+def test_folding_drops_the_carried_count(monkeypatch):
+    uid = _local_user()
+    db.create_conversation(uid, "carry-3", "d")
+    _no_carried_state(monkeypatch)
+    calls: list = []
+    monkeypatch.setattr(context, "count_tokens", _exact_counting(calls))
+    monkeypatch.setitem(context._window_cache, "http://x/v1", 1_000_000)
+    history = _long_thread()
+
+    async def scenario():
+        await compaction.maybe_background_compact(
+            "carry-3", history, base_url="http://x/v1", model="m"
+        )
+        assert compaction._after_turn.get("carry-3"), "settled: the count is kept"
+        # A later turn folds: the transcript the next turn assembles is a
+        # summary plus a tail, not the list that was counted.
+        monkeypatch.setattr(settings, "context_compact_max_tokens", 1)
+        await compaction.maybe_background_compact(
+            "carry-3", history, base_url="http://x/v1", model="m"
+        )
+        assert compaction._after_turn.get("carry-3") is None
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
 # One query embedding per question per turn
 # ---------------------------------------------------------------------------
 
