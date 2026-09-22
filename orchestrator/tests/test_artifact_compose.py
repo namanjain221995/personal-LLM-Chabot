@@ -16,6 +16,7 @@ from app import llm
 from app.artifacts import compose as C
 from app.artifacts import spec as S
 from app.artifacts import types as T
+from tests.test_artifact_length import OWNER_PROMPT
 
 
 def _doc_json(**over):
@@ -1004,3 +1005,223 @@ def test_revise_section_rewrites_only_the_named_section(monkeypatch):
     assert len(seen) == 1 and set(seen[0]["properties"]) == {"blocks"}, "the schema is the section's block list only"
     same = asyncio.run(C.revise_section(req, parent, "Budget", ["x"]))
     assert same is parent
+
+
+# ------------------------------- a numbered list of requirements IS a list --
+#
+# The owner's request of 2026-09-22 named fifteen sections under a line
+# reading "Requirements:" and `requested_sections` returned []. Three
+# independent reasons, each of them enough on its own: neither older trigger
+# fires on that wording (no "sections:", no include/contain/cover/with);
+# `_LIST_SPLIT_RE` cannot split a space-separated numbered run and the
+# 300-character bound on the older triggers is shorter than the list; and
+# `take()` discarded every phrase containing a digit, so "1. Executive
+# Summary" was ineligible even if it had been split out.
+
+FIFTEEN_SECTIONS = [
+    "Executive Summary", "Architecture Overview", "Hardware Layer", "AI Inference Layer",
+    "Backend Architecture", "Frontend Architecture", "Database Architecture", "RAG Pipeline",
+    "Authentication and Authorization", "Security", "Monitoring", "Scaling Strategy",
+    "Failure Recovery", "Performance Optimization", "Conclusion",
+]
+
+
+def test_a_numbered_list_under_requirements_names_the_sections_it_numbers():
+    assert C.requested_sections(OWNER_PROMPT) == FIFTEEN_SECTIONS
+
+    # The item is NOT split on "and": item 9 is one section, not two.
+    assert "Authentication and Authorization" in C.requested_sections(OWNER_PROMPT)
+
+    # The other heading words, and the bulleted form over real newlines.
+    bulleted = "Write the handbook.\nSections:\n- Purpose\n- Scope\n- Roles\n- Escalation\nKeep it factual."
+    assert C.requested_sections(bulleted) == ["Purpose", "Scope", "Roles", "Escalation"]
+    assert C.requested_sections("Outline: 1) Problem 2) Options 3) Decision") == ["Problem", "Options", "Decision"]
+
+    # The list stops where the list stops: the sentence AFTER it is prose.
+    assert "Use professional Markdown" not in " ".join(C.requested_sections(OWNER_PROMPT))
+    # A heading with no marked list under it still names nothing.
+    assert C.requested_sections("Requirements: it has to be accurate and it has to be quick.") == []
+    # "Context:" is not a section heading — those dashes are the brief.
+    assert C.requested_sections("Context: - 10 DGX systems - Redis caching - 300 users") == []
+
+
+def test_requested_sections_reads_only_the_first_four_thousand_characters():
+    """The prefix slice, asserted directly so it cannot be removed
+    silently: section names live in the request, the megabyte pasted
+    behind one is material."""
+    assert C._SECTION_SCAN_CHARS == 4_000
+    tail = "Sections: 1. Alpha 2. Beta 3. Gamma"
+    assert C.requested_sections(tail) == ["Alpha", "Beta", "Gamma"]
+    assert C.requested_sections(("x " * 2_100) + tail) == [], "past the slice, nothing is read"
+    assert C.requested_sections(("x " * 1_000) + tail) == ["Alpha", "Beta", "Gamma"]
+
+
+def test_requested_sections_is_bounded_on_a_megabyte_of_pasted_text():
+    """Composer paste is inline: there is no chip and no size limit
+    anywhere on the input path, and `requested_sections` runs
+    synchronously on the orchestrator's single event loop. This repository
+    has already stalled that loop twice on exactly this shape (b13c406,
+    and the Fast-mode CPU-bound pre-pass before it).
+
+    MEASURED, so the claim is not bigger than the fact: on the tree before
+    the list triggers landed these three blobs took 0.04 s, 0.08 s and
+    0.14 s, so this is a GUARD and not the repair of a live hang. It is a
+    guard with teeth, though: the third blob repeats the trigger word, and
+    the new list machinery scans a bounded block per trigger — without the
+    prefix slice, 90,000 triggers would scan 108 MB and hold the loop for
+    seconds."""
+    import time
+
+    def bounded(blob, why):
+        started = time.perf_counter()
+        C.requested_sections(blob)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.25, f"{why}: {elapsed:.3f}s on {len(blob):,} characters"
+
+    # Adversarial: no sentence terminator, thousands of ordinals, no
+    # trigger word — the input that makes an unanchored scan quadratic.
+    blob = ("1) " + ("a" * 40) + " ") * 24_000
+    assert len(blob) > 1_000_000, len(blob)
+    assert C.requested_sections(blob) == []
+    bounded(blob, "ordinals, no trigger")
+    # The same megabyte with the trigger armed, so the list machinery runs.
+    bounded("Requirements: " + blob, "ordinals, trigger armed")
+    # The trigger itself repeated: one bounded block scan each, 90,000 of them.
+    bounded("sections: a " * 90_000, "the trigger repeated")
+
+
+def test_the_section_cap_already_fits_fifteen_named_sections_at_every_effort():
+    """A PIN, not a fix: `caps_for` yields 17 sections at fast, think AND
+    max the moment `requested_sections` works. It is here so nobody raises
+    EFFORT_BUDGETS to solve a parsing bug."""
+    target = C.target_for(C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
+                                           instruction=OWNER_PROMPT, material=C.Material(instruction=OWNER_PROMPT)))
+    assert C.caps_for(T.EFFORT_BUDGETS["fast"], target, FIFTEEN_SECTIONS) == (17, 12)
+    for effort in ("fast", "think", "max"):
+        # 15 named + 2, at every effort: the requested list is a FLOOR on
+        # the cap, so the effort's own max_sections never enters into it.
+        assert C.caps_for(T.EFFORT_BUDGETS[effort], target, FIFTEEN_SECTIONS)[0] == 17, effort
+
+
+def test_the_prompt_names_every_requested_section_and_the_callout_kinds():
+    """What the owner read on his card was our own budget warning. What
+    the MODEL read was "at most 8 top-level sections" — the integer, never
+    the fifteen names behind it."""
+    instruction = OWNER_PROMPT
+    req = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
+                           instruction=instruction, material=C.Material(instruction=instruction))
+    requested = C.requested_sections(instruction)
+    system = C._material_messages(req, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(req),
+                                  requested=requested)[0]["content"]
+    for name in FIFTEEN_SECTIONS:
+        assert name in system, name
+    assert "at most 8 top-level sections" not in system
+    assert "at most 17 top-level sections" in system
+    assert "sub-heading" in system
+    assert '"warning"' in system and '"note"' in system
+
+    # A request that names no sections is untouched: same prompt as before.
+    plain = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
+                             instruction="write a note about the price change",
+                             material=C.Material(instruction="write a note about the price change"))
+    quiet = C._material_messages(plain, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(plain))[0]["content"]
+    assert "Be concise and concrete." in quiet and "in this order" not in quiet
+
+
+def test_a_draft_that_headed_every_requested_section_at_level_two_is_promoted_in_code():
+    """The live counterfactual put the TITLE at level 1 and all fifteen
+    requested sections at level 2. `_tidy_document` drops the title
+    repeat, which left the draft with zero level-1 headings — and
+    `_enforce_caps`, which counts only `level == 1`, cannot see a document
+    like that at all. Code promotes; no model call."""
+    raw = {"title": "Enterprise Local AI Platform", "template_id": "generic", "blocks":
+           [{"type": "heading", "level": 1, "text": "Enterprise Local AI Platform"}]}
+    for name in FIFTEEN_SECTIONS:
+        raw["blocks"].append({"type": "heading", "level": 2, "text": name})
+        raw["blocks"].append({"type": "paragraph", "text": f"What {name} covers."})
+    req = C.ComposeRequest(kind="document", formats=["docx"], template_id="generic", effort="fast")
+
+    C._tidy_document(raw, req, requested=FIFTEEN_SECTIONS)
+    levels = [b["level"] for b in raw["blocks"] if b["type"] == "heading"]
+    assert levels == [1] * 15, f"fifteen top-level sections, got {levels}"
+    assert [b["text"] for b in raw["blocks"] if b["type"] == "heading"] == FIFTEEN_SECTIONS
+
+    # Relative structure is kept: a sub-heading under a promoted section
+    # stays a sub-heading.
+    nested = {"title": "T", "template_id": "generic", "blocks": [
+        {"type": "heading", "level": 2, "text": "Executive Summary"},
+        {"type": "heading", "level": 3, "text": "Scope"},
+        {"type": "paragraph", "text": "x"},
+        {"type": "heading", "level": 2, "text": "Conclusion"},
+    ]}
+    C._tidy_document(nested, req, requested=["Executive Summary", "Conclusion"])
+    assert [(b["level"], b["text"]) for b in nested["blocks"] if b["type"] == "heading"] == [
+        (1, "Executive Summary"), (2, "Scope"), (1, "Conclusion")]
+
+    # A draft that already has top-level headings is not touched, and
+    # neither is one whose level-2 headings are not the sections asked for.
+    fine = {"title": "T", "template_id": "generic", "blocks": [
+        {"type": "heading", "level": 1, "text": "Executive Summary"},
+        {"type": "heading", "level": 2, "text": "Scope"}]}
+    C._tidy_document(fine, req, requested=["Executive Summary"])
+    assert [b["level"] for b in fine["blocks"]] == [1, 2]
+
+    stranger = {"title": "T", "template_id": "generic", "blocks": [
+        {"type": "heading", "level": 2, "text": "Appendix"},
+        {"type": "heading", "level": 2, "text": "Glossary"}]}
+    C._tidy_document(stranger, req, requested=FIFTEEN_SECTIONS)
+    assert [b["level"] for b in stranger["blocks"]] == [2, 2], "nothing here is a section that was asked for"
+
+
+def test_a_scoped_section_call_is_told_a_section_has_parts(monkeypatch):
+    """The sectioned writer's per-section prompt described a section as a
+    level-1 heading and prose and stopped there, while the whole-document
+    prompt asked for sub-headings — so a fifteen-section report written
+    section by section came back with 0 of 15 sections carrying one."""
+    seen = []
+    seen_user = []
+
+    async def fake(messages, **kw):
+        seen.append(messages[0]["content"])
+        seen_user.append(messages[-1]["content"])
+        return json.dumps({"blocks": [{"type": "heading", "level": 1, "text": "Hardware Layer"},
+                                      {"type": "paragraph", "text": "Ten nodes."}]})
+
+    monkeypatch.setattr(llm, "json_completion", fake)
+    req = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="think",
+                           instruction=OWNER_PROMPT, material=C.Material(instruction=OWNER_PROMPT))
+    asyncio.run(C._write_one_section(
+        req, T.EFFORT_BUDGETS["think"], C.target_for(req),
+        {"title": "T", "sections": []}, {"heading": "Hardware Layer", "purpose": "the nodes", "elements": ["paragraphs"]},
+        written=[], words=400, position=(3, 15)))
+    prompt = seen[0]
+    assert "LEVEL 2" in prompt and "head each part at LEVEL 2" in prompt
+    assert "plus level-2 sub-headings" in seen_user[0], "the elements line is the list the model writes to"
+    assert '"warning"' in prompt and '"note"' in prompt and "numbered block" in prompt
+    # The fifteen NAMES stay out of a call that writes one section.
+    assert "Scaling Strategy" not in prompt.split("YOU ARE WRITING ONE SECTION")[1]
+
+
+def test_a_correction_the_model_cannot_write_keeps_the_draft_instead_of_failing_the_job(monkeypatch):
+    """Live at Max, 2026-09-22: a fifteen-section report written section
+    by section came back from its review with five musts, the one
+    whole-document correction call did not return JSON, and the WHOLE JOB
+    failed — a complete document that had cost sixteen model calls thrown
+    away because the pass meant to polish it could not run."""
+    instruction = "Create a PDF report on the pricing change. Include an executive summary, risks and the roadmap."
+    draft = _doc_json(blocks=[b for h in ("Executive Summary", "Risks", "Roadmap") for b in (
+        {"type": "heading", "level": 1, "text": h},
+        {"type": "paragraph", "text": f"What {h} says about the $59 price.", "sources": ["s1"]})])
+    model = _Model([
+        {"title": "T", "audience": "a", "purpose": "p", "sections": [], "needs_current_facts": False, "assumptions": []},
+        draft,
+        {"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more", "severity": "must"}]},
+        "not json at all",          # the correction call
+        "still not json",           # its one repair
+    ])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("think", instruction=instruction,
+                                        material=C.Material(instruction=instruction,
+                                                            sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
+    assert [b.text for b in result.spec.body.blocks if b.type == "heading"] == ["Executive Summary", "Risks", "Roadmap"]
+    assert any("could not be written and was not applied" in w for w in result.warnings), result.warnings

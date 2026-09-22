@@ -85,3 +85,49 @@ def test_shrink_asked_reads_only_a_request_that_wants_less():
     assert L.shrink_asked("keep it short") is True
     assert L.shrink_asked("a big report, not a summary") is False
     assert L.shrink_asked("a short report of at least 6 pages") is False, "a number is a size the person chose"
+
+
+# ------------------------------------------------ a section name is not a size --
+
+#: The owner's request of 2026-09-22 (conversation
+#: dcf76e20-0cf5-4c9a-ae2b-a64b0f6cbbc4), verbatim, en dash and all. It is
+#: the fixture for this round because every defect it found is a defect
+#: about READING IT, and the two other artifact-size suites import it from
+#: here so there is exactly one copy.
+OWNER_PROMPT = (
+    "Create a professional technical report titled:\n"
+    "\"Enterprise Local AI Platform – Technical Overview\"\n"
+    "Context: - 10 NVIDIA DGX Spark systems - Qwen model served using vLLM - PostgreSQL database - "
+    "FastAPI backend - Next.js frontend - Redis caching - RAG document search - Web search - "
+    "Speech-to-text - Text-to-speech - 300 enterprise users\n"
+    "Requirements: 1. Executive Summary 2. Architecture Overview 3. Hardware Layer 4. AI Inference Layer "
+    "5. Backend Architecture 6. Frontend Architecture 7. Database Architecture 8. RAG Pipeline "
+    "9. Authentication and Authorization 10. Security 11. Monitoring 12. Scaling Strategy "
+    "13. Failure Recovery 14. Performance Optimization 15. Conclusion\n"
+    "Use professional Markdown. Use headings, subheadings, tables, bullet points, numbered steps, bold text, "
+    "code blocks, warnings, notes, and recommendations where appropriate. Do not skip any section. "
+    "Do not repeat information unnecessarily."
+)
+
+
+def test_a_section_called_executive_summary_is_not_a_request_for_a_short_file():
+    """The owner asked for a fifteen-section technical report and got four
+    pages. `_SHRINK_RE` carried a bare `summary` alternative, it matched
+    the SECTION NAME "1. Executive Summary" at offset 363 of his request,
+    and the shrink branch returns before the data-report floor is even
+    considered — so the request read as "the person asked for less"."""
+    assert "Executive Summary" in OWNER_PROMPT
+    target = L.parse_size(OWNER_PROMPT, "document")
+    assert target.explicit is False, f"nothing in this request named a size, got {target.phrase!r}"
+    assert target.words == 0, "and with no data behind it there is nothing to write 1,500 words FROM"
+    assert L.shrink_asked(OWNER_PROMPT) is False
+    # With material behind it the floor applies again, which the shrink
+    # branch's early return had been skipping.
+    assert L.parse_size(OWNER_PROMPT, "document", has_data=True).words == L.DATA_REPORT_FLOOR == 1_500
+
+    # The guard is a lookbehind on three qualifiers, not a removal: every
+    # other "summary" still asks for less.
+    for text in ("a management summary of the incident", "the technical summary, please"):
+        assert L.parse_size(text, "document").explicit is False, text
+    for text in ("summarise the release", "give me a summary", "a summary of the csv"):
+        assert L.shrink_asked(text) is True, text
