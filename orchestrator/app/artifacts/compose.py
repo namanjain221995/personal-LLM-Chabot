@@ -71,6 +71,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 from pydantic import ValidationError
 
 from .. import llm
+from ..core import pasted
 from ..core.sf_intel.planner import extract_json_object
 from . import length as _length
 from . import spec as S
@@ -555,11 +556,29 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
         f"{tone} Limits: at most {max_sections} top-level sections, "
         f"{max_slides} slides, {budget.max_sheets} sheets. "
         f"Set template_id to \"{req.template_id}\"."
-        + _requested_line(requested)
         + (f" Author: {req.author}." if req.author else "") + (f" Date: {req.date}." if req.date else "")
     )
     system += _language_line(req.instruction or m.instruction)
-    user = "\n\n".join(parts + [f"Request: {req.instruction or m.instruction}"])
+    # THE SECTION NAMES TRAVEL IN THE USER MESSAGE, NOT THE SYSTEM ONE.
+    #
+    # They are the person's own words, lifted verbatim out of their request —
+    # and a request routinely contains a pasted third-party document, so those
+    # words are untrusted text. Every other scrap of untrusted text in this
+    # composer already travels in the user role: notes, the conversation, the
+    # previous answer, uploaded material, tables, sources and the request
+    # itself are all joined into `user` below, and the system message is
+    # entirely code-controlled. Appending the names to `system` broke that
+    # boundary, putting up to twenty attacker-shaped phrases in the same
+    # message as _ROLE's "You never invent statistics, names, dates or
+    # quotations", framed as an instruction the document must obey.
+    #
+    # Nothing in the feature depends on the role: the model reads both
+    # messages, and the names are a requirement about the document, which is
+    # what the user message is for. Pinned by
+    # test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
+    user = "\n\n".join(
+        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested)]
+    )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -789,6 +808,34 @@ _SECTION_SCAN_CHARS = 4_000
 #: neither older trigger fires on that wording, the run is space-separated
 #: so `_LIST_SPLIT_RE` cannot split it, and `take()` discards any phrase
 #: carrying a digit, so "1. Executive Summary" was ineligible anyway.
+#: A pasted document's own table of contents is NOT the sections this request
+#: named. `_LIST_HEADING_RE` matches "Contents:", "Sections:" and "Outline:" —
+#: exactly the words a third-party document puts above its own list — so a
+#: request that pastes a thirty-heading report and asks for a one-page summary
+#: was read as a request for thirty sections, and the document was SIZED from
+#: them (`target_for` turns each name into WORDS_PER_SECTION words). The
+#: platform already marks pasted material: `app/core/pasted.fenced` wraps it in
+#: <pasted_text>...</pasted_text> so the model can be told it is material and
+#: never instructions. The scan reads only what is OUTSIDE those fences — the
+#: person's own words — which is the same line the rest of the platform draws.
+#: An unclosed opening fence swallows the rest of the message on purpose: text
+#: after "here is what they sent:" with no close is not the person speaking
+#: either.
+_PASTED_BLOCK_RE = re.compile(
+    re.escape(pasted.OPEN_TAG) + r".*?(?:" + re.escape(pasted.CLOSE_TAG) + r"|\Z)",
+    re.I | re.S,
+)
+
+
+def _own_words(instruction: str) -> str:
+    """The request with every fenced paste removed. Pure, and bounded: the
+    pattern is anchored on two literals with one lazy span between them, so
+    the scan stays linear whatever is pasted in."""
+    if not instruction or pasted.OPEN_TAG.lower() not in instruction.lower():
+        return instruction
+    return _PASTED_BLOCK_RE.sub(" ", instruction)
+
+
 _LIST_HEADING_RE = re.compile(r"\b(?:requirements?|sections?|structure|contents|outline|include)\s*:", re.I)
 
 #: How much of the text after such a heading is read as its list. Long
@@ -968,7 +1015,7 @@ def requested_sections(instruction: str) -> List[str]:
     slice is the FIRST thing that happens — before the join that copies
     the string, before the style-clause pass, before any pattern runs.
     """
-    head = (instruction or "")[:_SECTION_SCAN_CHARS]
+    head = _own_words(instruction or "")[:_SECTION_SCAN_CHARS]
     raw = strip_style_clauses(head)
     text = " ".join(raw.split())
     if not text:

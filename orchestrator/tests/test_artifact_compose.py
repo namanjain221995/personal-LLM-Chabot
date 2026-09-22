@@ -1106,26 +1106,38 @@ def test_the_section_cap_already_fits_fifteen_named_sections_at_every_effort():
 def test_the_prompt_names_every_requested_section_and_the_callout_kinds():
     """What the owner read on his card was our own budget warning. What
     the MODEL read was "at most 8 top-level sections" — the integer, never
-    the fifteen names behind it."""
+    the fifteen names behind it.
+
+    WHICH MESSAGE CARRIES WHAT (security review, 2026-09-22). The names are
+    the person's own text and a request routinely carries a pasted document,
+    so they travel in the USER message with the rest of the untrusted input;
+    the cap is an integer this code computed, so it stays in the system
+    message. Both still reach the model. The boundary itself is pinned by
+    test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
+    """
     instruction = OWNER_PROMPT
     req = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
                            instruction=instruction, material=C.Material(instruction=instruction))
     requested = C.requested_sections(instruction)
-    system = C._material_messages(req, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(req),
-                                  requested=requested)[0]["content"]
+    messages = C._material_messages(req, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(req),
+                                    requested=requested)
+    system = messages[0]["content"]
+    user = "\n".join(m["content"] for m in messages if m["role"] == "user")
     for name in FIFTEEN_SECTIONS:
-        assert name in system, name
+        assert name in user, name
+        assert name not in system, f"{name} reached the system message"
     assert "at most 8 top-level sections" not in system
     assert "at most 17 top-level sections" in system
-    assert "sub-heading" in system
-    assert '"warning"' in system and '"note"' in system
+    assert "sub-heading" in user
+    assert '"warning"' in user and '"note"' in user
 
     # A request that names no sections is untouched: same prompt as before.
     plain = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
                              instruction="write a note about the price change",
                              material=C.Material(instruction="write a note about the price change"))
-    quiet = C._material_messages(plain, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(plain))[0]["content"]
-    assert "Be concise and concrete." in quiet and "in this order" not in quiet
+    quiet_msgs = C._material_messages(plain, budget=T.EFFORT_BUDGETS["fast"], target=C.target_for(plain))
+    quiet = "\n".join(m["content"] for m in quiet_msgs)
+    assert "Be concise and concrete." in quiet_msgs[0]["content"] and "in this order" not in quiet
 
 
 def test_a_draft_that_headed_every_requested_section_at_level_two_is_promoted_in_code():
