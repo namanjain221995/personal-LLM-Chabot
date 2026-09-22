@@ -110,6 +110,18 @@ class ComposeOverlayValidationTests(unittest.TestCase):
         discovery = patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery())
         discovery.start()
         self.addCleanup(discovery.stop)
+        # `_compose_config` hands Compose this process's environment, and
+        # Compose ranks the process environment ABOVE every --env-file.  An
+        # operator who exports TECHSARA_MODEL_CACHE in their shell therefore
+        # overrides the temporary cache root the launcher just generated, and
+        # every model bind renders as that one developer's directory --
+        # failing the bind-source invariant on their box while passing in CI,
+        # which exports nothing.  The cache these tests reason about is always
+        # the one `_compose_config` creates; the shell's is never an input.
+        cache = patch.dict(os.environ, {}, clear=False)
+        cache.start()
+        self.addCleanup(cache.stop)
+        os.environ.pop("TECHSARA_MODEL_CACHE", None)
 
     def _render(
         self,
