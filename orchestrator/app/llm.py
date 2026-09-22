@@ -412,12 +412,19 @@ async def _fit(
     if _is_primary(base_url) and not _breaker.main_allows():
         await wait_admitted(what=what, base_url=base_url, recovery_s=recovery_s)
     if continuation:
+        # A continuation is never sized send-first: it goes to
+        # `_fit_continuation`, which does its own arithmetic and starts no
+        # count of its own. `context.fit_request` is not reached.
         return await _fit_continuation(
             messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
         )
-    return await context.fit_request(
-        messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
-    )
+    # THIS is the call site that settles a count left running, inside
+    # `_settling` below — so sizing here may hand the request to the wire
+    # before the count comes back. Nowhere else may.
+    with context.settles_pending_count():
+        return await context.fit_request(
+            messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
+        )
 
 
 class ContinuationRoomExhausted(RuntimeError):
@@ -675,6 +682,39 @@ async def _open_stream(client, request: dict, **send: Any):
                 type(exc).__name__, exc, _USAGE_RETRY_S,
             )
         return opened
+
+
+@contextlib.asynccontextmanager
+async def _settling(sized: Sequence[dict], base_url: str):
+    """Settle the exact prompt count `_fit` may have left running.
+
+    `context.fit_request` returns before its /tokenize answers whenever a
+    bound already proves the request fits (context.py, "Sending while the
+    exact count is still in flight"), so the body reaches the engine a round
+    trip earlier. Wrap the DISPATCH in this: on the way out the count is
+    awaited and written back into this task's context, so `_measured`, the
+    meter and the admission lanes see exactly what they see on the blocking
+    path; on any other exit — a refusal, a Stop, a cancelled turn — it is
+    dropped, so nothing this request started outlives it.
+
+    A no-op when nothing is pending: every slow-path call, every non-vLLM
+    endpoint, and every test that replaces `context.fit_request` with a
+    passthrough.
+
+    FOR NON-STREAMING CALLS ONLY. A streamed call must not settle between
+    `_open_stream` returning and `_consume` taking the stream: a Stop landing
+    on that await would strand an open stream holding an admission lane. The
+    two streaming sites settle INSIDE `_consume` instead, with a synchronous
+    `cancel_pending_count` guarding the dispatch (no await, so nothing can
+    land in the gap).
+    """
+    try:
+        yield
+    except BaseException:
+        context.cancel_pending_count()
+        raise
+    else:
+        await context.settle_pending_count(sized, base_url)
 
 
 @contextlib.asynccontextmanager
@@ -968,7 +1008,8 @@ async def chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await _primary_send(client, request, what="chat_completion", base_url=settings.openai_base_url)
+    async with _settling(sized, settings.openai_base_url):
+        resp = await _primary_send(client, request, what="chat_completion", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
@@ -1022,11 +1063,12 @@ async def chat_completion_with_reasoning(
         # The hang guard for the non-streaming collector: a candidate stuck
         # in a repetition loop dies at the wall clock instead of holding the
         # whole best-of-N gather hostage.
-        resp = await _asyncio.wait_for(
-            _primary_send(client, request, what="chat_completion_with_reasoning",
-                          base_url=settings.openai_base_url),
-            timeout=settings.gen_wall_clock_s,
-        )
+        async with _settling(sized, settings.openai_base_url):
+            resp = await _asyncio.wait_for(
+                _primary_send(client, request, what="chat_completion_with_reasoning",
+                              base_url=settings.openai_base_url),
+                timeout=settings.gen_wall_clock_s,
+            )
     except _asyncio.TimeoutError:
         log.error(
             "GENERATION WALL CLOCK EXCEEDED (non-streaming collector): "
@@ -1076,7 +1118,18 @@ async def stream_chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    async with _consume(await _open_stream(client, request)) as stream:
+    dispatched = False
+    try:
+        opened = await _open_stream(client, request)
+        dispatched = True
+    finally:
+        # Synchronous, so nothing can be cancelled between the dispatch and
+        # the stream being taken below.
+        if not dispatched:
+            context.cancel_pending_count()
+    async with _consume(opened) as stream:
+        # Settled with the stream already held: a Stop here closes it.
+        await context.settle_pending_count(sized, settings.openai_base_url)
         async for chunk in stream:
             _capture_usage(chunk)
             _capture_finish(chunk)
@@ -1520,22 +1573,33 @@ async def stream_chat_events(
     # answer. Applies in BOTH modes.
     started = _generation_clock()
     reset_finish_reason()
+    dispatched = False
     try:
-        opened = await _open_stream(client, request, **send)
-    except _bad_request_error() as exc:
-        if not (continue_final_message and _continuation_estimated.get() and _is_size_refusal(exc)):
-            raise
-        # ONLY AN EXACT COUNT MAY END A RUN (_fit_continuation): the max_tokens
-        # guessed without a count was refused, so ask once more with none and
-        # let the engine size the answer to the room it really has. A prompt
-        # that has no room is refused again, and that refusal propagates.
-        log.warning("continuation refused at max_tokens=%s without an exact count (%s); retrying with the "
-                    "engine sizing it", request.get("max_tokens"), type(exc).__name__)
-        request = dict(request)
-        request["max_tokens"] = None
-        budget = None
-        opened = await _open_stream(client, request, **send)
+        try:
+            opened = await _open_stream(client, request, **send)
+        except _bad_request_error() as exc:
+            if not (continue_final_message and _continuation_estimated.get() and _is_size_refusal(exc)):
+                raise
+            # ONLY AN EXACT COUNT MAY END A RUN (_fit_continuation): the
+            # max_tokens guessed without a count was refused, so ask once more
+            # with none and let the engine size the answer to the room it
+            # really has. A prompt with no room is refused again, and that
+            # refusal propagates.
+            log.warning("continuation refused at max_tokens=%s without an exact count (%s); retrying with the "
+                        "engine sizing it", request.get("max_tokens"), type(exc).__name__)
+            request = dict(request)
+            request["max_tokens"] = None
+            budget = None
+            opened = await _open_stream(client, request, **send)
+        dispatched = True
+    finally:
+        # Synchronous, so nothing can be cancelled between the dispatch and
+        # the stream being taken below.
+        if not dispatched:
+            context.cancel_pending_count()
     async with _consume(opened) as stream:
+        # Settled with the stream already held: a Stop here closes it.
+        await context.settle_pending_count(sized, base_url)
         async for chunk in stream:
             engine_state.note_chunk()
             _capture_finish(chunk)
@@ -1769,7 +1833,8 @@ async def chat_with_tools(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await _primary_send(client, request, what="chat_with_tools", base_url=settings.openai_base_url)
+    async with _settling(sized, settings.openai_base_url):
+        resp = await _primary_send(client, request, what="chat_with_tools", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     message = resp.choices[0].message
@@ -1836,35 +1901,40 @@ async def json_completion(
     if extra_body is not None:
         base["extra_body"] = extra_body
 
-    if json_schema is not None:
-        guided = dict(base)
-        guided["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "schema": json_schema,
-                "strict": False,
-            },
-        }
-        try:
-            resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
-            _capture_usage(resp)
-            _note_truncation(resp, schema_name, budget)
-            return resp.choices[0].message.content or ""
-        except _bad_request_error() as exc:
-            # A 400 is the documented "this backend has no guided decoding"
-            # shape and the ONLY one that should downgrade. This used to
-            # catch every exception, so during an engine outage each call
-            # logged a misleading "guided JSON unavailable" and immediately
-            # re-sent an unconstrained request into the same dead port.
-            log.info(
-                "guided JSON unavailable on this backend (%s: %s); retrying "
-                "unconstrained",
-                type(exc).__name__,
-                str(exc)[:160],
-            )
+    # ONE settlement for BOTH sends. The guided-JSON downgrade is a caught
+    # 400, not a failed turn: the request did reach the engine, so its count
+    # is still owed to the lanes and the meter. Settling inside the `try`
+    # would have cancelled it on the way to the re-send.
+    async with _settling(sized, settings.openai_base_url):
+        if json_schema is not None:
+            guided = dict(base)
+            guided["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": json_schema,
+                    "strict": False,
+                },
+            }
+            try:
+                resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
+                _capture_usage(resp)
+                _note_truncation(resp, schema_name, budget)
+                return resp.choices[0].message.content or ""
+            except _bad_request_error() as exc:
+                # A 400 is the documented "this backend has no guided decoding"
+                # shape and the ONLY one that should downgrade. This used to
+                # catch every exception, so during an engine outage each call
+                # logged a misleading "guided JSON unavailable" and immediately
+                # re-sent an unconstrained request into the same dead port.
+                log.info(
+                    "guided JSON unavailable on this backend (%s: %s); retrying "
+                    "unconstrained",
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
 
-    resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
+        resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
     # Until 2026-09-13 neither json_completion branch recorded usage (F045):
     # every Deep Research step, sf_intel plan, artifact compose and video
     # fusion spent main-model tokens the ledger and the per-key quotas never
@@ -1939,11 +2009,12 @@ async def router_chat_completion(
         request["extra_body"] = extra_body
     # A sidecar: on an interactive turn it gets one attempt and the caller's
     # fallback (every caller has one); a job with a recovery window waits.
-    resp = await resilient(
-        lambda: client.chat.completions.create(**request),
-        what="router_chat_completion", base_url=settings.router_base_url,
-        recovery_s=sidecar_recovery_s(),
-    )
+    async with _settling(sized, settings.router_base_url):
+        resp = await resilient(
+            lambda: client.chat.completions.create(**request),
+            what="router_chat_completion", base_url=settings.router_base_url,
+            recovery_s=sidecar_recovery_s(),
+        )
     return resp.choices[0].message.content or ""
 
 
