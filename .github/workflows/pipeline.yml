@@ -322,6 +322,45 @@ jobs:
             python .github/workflows/scripts/unittest_gate.py \
               --label "launcher" --start launcher/tests --min-tests 450
 
+      # The monitoring deliverable ships 35 offline tests
+      # (monitoring/developer-api/tests) that NOTHING in this file discovered:
+      # only launcher/tests and .github/workflows/scripts/tests were gated, so
+      # a dashboard panel querying an undeclared metric, an alert without a
+      # runbook, a metric contract out of step with the rules, or a host-guard
+      # writer that reported "missing" when it merely could not look, all
+      # reached main green. They need no Prometheus, no Grafana, no container
+      # and no root, and the whole suite runs in under a second.
+      #
+      # It runs HERE, as a step of the launcher job, rather than in a job of
+      # its own -- the same argument the shard check in `orchestrator` makes:
+      # a separate job would be one more `needs:` edge that can SKIP, and a
+      # skipped upstream job is exactly the shape `ci-ok` exists to refuse. As
+      # a step inside a job the gate already requires, its failure is an
+      # ordinary red. The launcher job is the right host because this suite,
+      # like the launcher's, is offline and standard-library-shaped, and the
+      # 3.11/3.12 matrix then proves it on both interpreters for free.
+      #
+      # PyYAML is NOT in the standard library and setup-python does not bring
+      # it. Without it seven of the 35 tests -- every AlertRuleTests case and
+      # the contract cross-check in MetricStatusTests -- skip themselves, and
+      # the run prints `OK (skipped=7)` in green. Installing it explicitly
+      # (same pin as the policy job's YAML step) is what makes those seven run;
+      # the floor below is what makes their absence RED instead of green,
+      # because unittest_gate.py counts tests that executed, not tests that
+      # were collected.
+      #
+      # The floor is 33 against the 35 that execute today: close enough that
+      # any class dropping out of discovery fails the job, with just enough
+      # slack that it is not edited every time a test is added. Lower it in
+      # the same commit if tests are ever deliberately deleted.
+      - name: The monitoring deliverable's tests have a gate too
+        run: |
+          python -m pip install -q "PyYAML>=6"
+          python .github/workflows/scripts/unittest_gate.py \
+            --label "monitoring" \
+            --start monitoring/developer-api/tests \
+            --min-tests 33
+
   orchestrator:
     # SHARDED (2026-09-22). The job ID stays `orchestrator`, which is what
     # `ci-ok` names in `needs:` and passes to ci_gate.py --require. A MATRIX
