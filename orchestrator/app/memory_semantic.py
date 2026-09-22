@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
-from . import db, llm
+from . import db, llm, metrics
 from .config import settings
 from .memory_recall import format_recall_block, keywords
 from .recall import cosine_many, pack_vector
@@ -236,6 +236,53 @@ def _load_candidates(
         while len(_candidate_cache) > _CANDIDATE_CACHE_MAX:
             _candidate_cache.popitem(last=False)
     return rows
+
+
+def _cached_candidates_nonempty(
+    user_id: int, model_id: str, exclude_conversation_id: Optional[str], limit: int
+) -> bool:
+    """True when THIS module's own in-process candidate cache already holds a
+    non-empty, unexpired entry for exactly the key `_load_candidates` will read.
+
+    A pure local dict lookup — no database, no sidecar, no change anywhere
+    else. It is the gate on starting the query embedding early (see
+    `semantic_hits`), and it is deliberately conservative: it answers the one
+    question that decides whether HEAD would have embedded at all, because
+    `semantic_hits` returns before it ever embeds when the candidate list
+    comes back empty. A miss means HEAD's order stands.
+
+    It does NOT check the fingerprint (that is a database round trip, which is
+    the very wait being overlapped), so a "yes" can still be followed by an
+    invalidated refetch that returns nothing. That residual is counted as
+    `cross_chat_speculative_embed_wasted_total` and the embedding is
+    cancelled; a cancelled caller releases its EMBED_MAX_INFLIGHT slot at
+    once, exactly as an abandoned flight does on HEAD (llm.py:2167-2175).
+    """
+    ttl = float(getattr(settings, "cross_chat_embeddings_cache_s", CROSS_CHAT_EMBEDDINGS_CACHE_S))
+    if ttl <= 0:
+        return False
+    key = (user_id, model_id, exclude_conversation_id or "", int(limit))
+    now = time.monotonic()
+    with _candidate_lock:
+        hit = _candidate_cache.get(key)
+        if hit is None:
+            return False
+        stamp, _fingerprint, rows = hit
+        return bool(rows) and (now - stamp) < ttl
+
+
+async def _discard(task: "asyncio.Task") -> None:
+    """Cancel a sibling task and WAIT for it, so no path leaves one running.
+
+    `asyncio.wait` is used rather than `await task` so that an outer
+    cancellation arriving here still propagates (it is this coroutine that is
+    being cancelled, not the child), and the child's exception is retrieved so
+    it is never reported as "never retrieved".
+    """
+    task.cancel()
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()
 
 
 def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict]) -> List[tuple]:
@@ -526,17 +573,76 @@ async def semantic_hits(
     ):
         return []
     try:
-        candidates = await db.run_in_thread(
-            _load_candidates,
-            user_id,
-            settings.embed_model,
-            exclude_conversation_id,
-            _CANDIDATE_LIMIT,
-        )
+        # THE ONE READ THE TURN WAITS FOR (2026-09-22). Eleven of the twelve
+        # `_ContextReads` collect in 0.00-0.02 ms; this one cost 8.2 ms on an
+        # empty conversation and 51.9 ms p50 on a compacted 40-turn thread.
+        # Nothing below shrinks what is read, drops a hit or changes a vector:
+        # the only change is that work which was already going to happen, and
+        # which does not depend on the step before it, now happens beside it.
+        #
+        # THE EMBEDDING, ONLY WHEN IT IS CERTAIN. `semantic_hits` returns
+        # before it embeds anything when the candidate list is empty (below),
+        # so on a new or single-conversation account HEAD spends NO embedding
+        # at all. Speculating there would put avoidable load on an embedding
+        # sidecar shared with every other user, and llm.py:2125-2130 records
+        # what abandoned flights did to EMBED_MAX_INFLIGHT ("the next question
+        # failed 'busy' after 1.0 s"). So the query embedding starts beside the
+        # candidate load ONLY when this module's own in-process cache already
+        # holds a non-empty, unexpired entry for this key — i.e. only when
+        # HEAD would certainly have embedded too. The work is moved, never
+        # created.
+        embed_task: Optional[asyncio.Task] = None
+        if _cached_candidates_nonempty(
+            user_id, settings.embed_model, exclude_conversation_id, _CANDIDATE_LIMIT
+        ):
+            embed_task = asyncio.ensure_future(llm.embed_query(query))
+        try:
+            candidates = await db.run_in_thread(
+                _load_candidates,
+                user_id,
+                settings.embed_model,
+                exclude_conversation_id,
+                _CANDIDATE_LIMIT,
+            )
+        except BaseException:
+            # The load failed, or the turn was cancelled (a newer message
+            # replaced it). The embedding is cancelled and the turn is
+            # degraded either way, on HEAD as here, so this is NOT counted as
+            # a wrong guess: the counter below has to keep exactly one
+            # meaning, or nobody can read it.
+            if embed_task is not None:
+                await _discard(embed_task)
+            raise
         if not candidates:
+            if embed_task is not None:
+                # THE GATE WAS WRONG, and this counter counts only that: the
+                # cache said this key had rows, the fingerprint disagreed and
+                # the refetch came back empty, so HEAD would have embedded
+                # nothing and this turn embedded once. It is the only case in
+                # which this branch does work HEAD does not. Measured zero
+                # over 200 turns across five account shapes (2026-09-22); if
+                # it is ever non-zero in production, the speculation goes.
+                metrics.inc(
+                    "cross_chat_speculative_embed_wasted_total",
+                    "query embeddings started beside the candidate load on a "
+                    "cache entry the fingerprint then invalidated to nothing",
+                )
+                await _discard(embed_task)
             return []
-        query_vec = await llm.embed_query(query)
+        if embed_task is not None:
+            query_vec = await embed_task
+        else:
+            query_vec = await llm.embed_query(query)
         scored = await db.run_in_thread(_rank_candidates, query, query_vec, candidates)
+        # `_answer_index` is a pure function of `candidates` too, so it COULD
+        # run beside the ranking. Measured, it earns nothing: over three paired
+        # passes on a 2,000-row account (2026-09-22; no main-model call is
+        # involved, load average 6.6-7.0) the serial pair cost
+        # rank 1.20-1.38 ms plus answers 0.55-0.58 ms, and running them side by
+        # side cost rank 1.79-1.96 ms and answers 1.13-1.26 ms — the same wall
+        # clock, because each leg then waits on the other for a worker. It also
+        # holds a second slot of a bounded pool in front of a Postgres server
+        # that has run out of connection slots before. So it stays serial.
         answers = await db.run_in_thread(_answer_index, candidates) if pair_answers else {}
         score_of = {c["message_id"]: s for s, c in scored} if pair_answers else {}
         hits: List[dict] = []
