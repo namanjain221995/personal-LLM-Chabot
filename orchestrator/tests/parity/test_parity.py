@@ -13,9 +13,10 @@ The split is deliberate and it is about incentives. `shard_tests.py`
 discovers `test_*.py` at any depth under `orchestrator/tests`, so everything
 here runs in a CI shard on every push. A test file that is permanently red
 because today's product is not good enough yet is a pipeline that the first
-person under deadline pressure repairs by lowering the bar. So nothing in
-this file can be made green by softening a floor. Three guards do that
-work, and they catch DIFFERENT things:
+person under deadline pressure repairs by lowering the bar. So no floor can
+be softened here without a failure that names it. Three guards do that work,
+and they catch DIFFERENT things -- none of them is a superset of the others,
+and the last block of this docstring lists what all three miss:
 
   * `test_every_floor_still_has_its_pinned_value` compares every floor in
     checklist.py against `FLOOR_VALUES` below, a mapping of floor name to
@@ -82,6 +83,18 @@ added to fix was a docstring that claimed more than its test delivered.
     to the coverage guard alike. Two such literals already had to be lifted
     out into `HEADINGS_MIN` and `RECOMMENDATION_MENTIONS_MIN` when this
     harness landed. Keep floors in checklist.py.
+  * IT PINS NUMBERS, NOT THE CHECKLIST'S NAMED CONTENT, and that is an open
+    hole of exactly the same shape. `REQUIRED_SECTIONS` (the 15 sections),
+    `REQUIRED_TITLE` and `CONTEXT_ITEMS` (the 12 items `CONTEXT_ITEMS_MIN`
+    counts out of) are not pinned by anything in this directory. Measured,
+    not assumed: deleting "Monitoring" from `REQUIRED_SECTIONS` -- one of the
+    15 sections the request names, the whole `sections_present` check for
+    that section gone -- leaves all 56 tests in here green, and so does
+    dropping "text-to-speech" from `CONTEXT_ITEMS`. Softening the checklist
+    by deleting a requirement is easier today than softening it by moving a
+    floor. Closing that needs a content pin next to `FLOOR_VALUES`; it was
+    deliberately left out of the commit that added the value pin rather than
+    done in passing, because re-freezing the five baselines is part of it.
 
 REGENERATING `calibration/reference_counts.json`. It is the reference's
 observed counts and nothing else -- integers and one ratio, no prose, because
