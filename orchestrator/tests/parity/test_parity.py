@@ -14,17 +14,74 @@ discovers `test_*.py` at any depth under `orchestrator/tests`, so everything
 here runs in a CI shard on every push. A test file that is permanently red
 because today's product is not good enough yet is a pipeline that the first
 person under deadline pressure repairs by lowering the bar. So nothing in
-this file can be made green by softening a floor:
+this file can be made green by softening a floor. Three guards do that
+work, and they catch DIFFERENT things:
 
-  * every floor is asserted to be at or below what the calibration reference
-    actually achieved, so a floor RAISED past the reference fails here and
-    the failure names it;
+  * `test_every_floor_still_has_its_pinned_value` compares every floor in
+    checklist.py against `FLOOR_VALUES` below, a mapping of floor name to
+    value written out in this file. Move any floor by any amount in either
+    direction and this fails, and the failure names the floor and what it
+    moved from and to. This is the guard that catches a floor being softened
+    QUIETLY; the last block of this docstring says what it does not do.
+  * `test_every_floor_is_below_the_reference` asserts no floor sits above
+    what the calibration reference achieved, so a floor RAISED past the
+    reference fails here and the failure names it.
   * every frozen baseline is pinned to its EXACT score and its EXACT
-    per-check pass/fail vector, so a floor moved in EITHER direction fails
-    here and the failure names the check that moved.
+    per-check pass/fail vector. This catches what the value pin cannot: a
+    change in score.py's LOGIC -- a parser that starts counting a block
+    differently, a check whose comparison flips -- with every floor value
+    left exactly where it is.
 
-An exact pin is strictly stronger than a floor. A floor lowered to rescue a
-build leaves a floor-based test green; it cannot leave these green.
+WHAT THE BASELINE PIN DOES NOT CATCH, AND WHY THE VALUE PIN EXISTS
+
+An exact-score pin on five recordings is NOT a general floor guard, and the
+first version of this file said it was. A recording's vector only changes
+when a floor CROSSES that recording's observed count. Between two
+recordings' counts there is a gap, and a floor moved anywhere inside its gap
+leaves all five vectors identical and this whole directory green.
+
+Measured on the commit that added this pin, by setting each floor to every
+value in turn and re-deriving all five baseline vectors plus the calibration
+guards: 16 of the 17 floors had such a gap.
+
+    SECTION_WORD_FLOOR            100   free anywhere in    76 .. 102
+    TOTAL_WORDS_MIN             2,000   free anywhere in 1,725 .. 2,007
+    HEADINGS_MIN                   15   free anywhere in     0 .. 16
+    SECTIONS_WITH_SUBHEADING_MIN    8   free anywhere in     1 .. 13
+    BULLET_LISTS_MIN                3   free anywhere in     0 .. 10
+    TOTAL_WORDS_MAX             8,000   free from 2,475 upward, no ceiling
+    DIAGRAM_ROLED_NODES_MIN         1   free from 0 upward, no ceiling
+
+RECOMMENDATION_MENTIONS_MIN was the only floor with a recording on each side
+of it. HEADINGS_MIN could have gone to 0 -- the check deleted in all but
+name -- with every test here still green. That gap is what a later track
+could have used to turn a red build green, and closing it is what
+`FLOOR_VALUES` is for.
+
+`test_moving_any_floor_off_its_pinned_value_fails_the_value_pin` is the test
+of that test: it walks every floor, moves it by the smallest step that
+changes it, and asserts the value pin fails and names it. Of those 34
+single-step moves, 26 are invisible to the baseline pin and the calibration
+guards put together.
+
+WHAT THE VALUE PIN STILL DOES NOT DO, said plainly, because the thing it was
+added to fix was a docstring that claimed more than its test delivered.
+
+  * It does not make a floor unchangeable. Edit checklist.py AND `FLOOR_VALUES`
+    in one commit and the suite is green again -- by design, because a floor
+    must be changeable. What it buys is that the change cannot be quiet: it
+    is two edits, in a file called a pin, and the failure text asks for the
+    reason in the changelog before it goes green.
+  * It does not check that the changelog line was written. Nothing here can:
+    a test cannot tell a considered floor change from an unconsidered one.
+    `test_the_floor_pin_changelog_is_not_empty` only keeps the list alive.
+    This one is on the reviewer, which is why the procedure is in the failure
+    message rather than only in this docstring.
+  * It sees only floors that live in checklist.py. A comparison hard-coded as
+    a literal inside score.py is invisible to it, to the calibration guard and
+    to the coverage guard alike. Two such literals already had to be lifted
+    out into `HEADINGS_MIN` and `RECOMMENDATION_MENTIONS_MIN` when this
+    harness landed. Keep floors in checklist.py.
 
 REGENERATING `calibration/reference_counts.json`. It is the reference's
 observed counts and nothing else -- integers and one ratio, no prose, because
@@ -161,6 +218,191 @@ def _observe(md: str) -> dict:
 
 def _fixture() -> dict:
     return json.loads(CALIBRATION.read_text(encoding="utf-8"))["observed"]
+
+
+# ------------------------------------------------------ the floor VALUES --
+#
+# The pin that actually stops a floor being softened. Everything else in
+# this file is indirect: the calibration guard only bounds a floor from
+# ABOVE, and the baseline pin only notices a floor that crosses one of five
+# recordings' observed counts. This one compares the number to the number.
+
+#: Every edit to `FLOOR_VALUES`, newest first: date, floor, old -> new, and
+#: the reason. A floor that moved without a line here moved without a reason,
+#: and a reviewer reading the diff sees the missing line.
+FLOOR_PIN_CHANGELOG = [
+    "2026-09-23 -- pin created. No floor moved: these are the values the "
+    "harness entered the repository with at 41e7a7b. The pin was added "
+    "because the baseline recordings alone left 16 of the 17 floors free to "
+    "move inside a gap (HEADINGS_MIN could have reached 0) with this whole "
+    "directory green.",
+]
+
+#: FLOOR NAME -> ITS VALUE, every floor in checklist.py, written out.
+#:
+#: Written out rather than derived, because a pin derived from the thing it
+#: pins is not a pin. `test_every_floor_still_has_its_pinned_value` asserts
+#: this mapping equals the live checklist attributes, and
+#: `test_every_floor_in_the_checklist_is_pinned_by_value` asserts a floor
+#: added to checklist.py cannot stay out of this mapping.
+FLOOR_VALUES = {
+    "SECTION_WORD_FLOOR": 100,
+    "TOTAL_WORDS_MIN": 2_000,
+    "TOTAL_WORDS_MAX": 8_000,
+    "HEADINGS_MIN": 15,
+    "SECTIONS_WITH_SUBHEADING_MIN": 8,
+    "TABLES_MIN": 3,
+    "CODE_BLOCKS_MIN": 3,
+    "CALLOUTS_MIN": 2,
+    "WARNINGS_MIN": 1,
+    "BULLET_LISTS_MIN": 3,
+    "NUMBERED_LISTS_MIN": 1,
+    "BOLD_RUNS_MIN": 10,
+    "RECOMMENDATION_MENTIONS_MIN": 3,
+    "REPEAT_SHINGLE_OVERLAP": 0.60,
+    "CONTEXT_ITEMS_MIN": 10,
+    "DIAGRAMS_MIN": 1,
+    "DIAGRAM_ROLED_NODES_MIN": 1,
+}
+
+#: What to do about it, quoted in the failure so nobody has to find this file
+#: to learn the procedure.
+MOVED_A_FLOOR = (
+    "change the pin in the same commit with a one-line reason in this file's "
+    "CHANGELOG list, and re-record the five baselines if a recording's "
+    "pass/fail changes")
+
+#: The smallest step that changes a floor, used by the test of the test.
+#: One for a count; one hundredth for the single ratio, because +/- 1 on a
+#: ratio is a mutation nobody could make by accident and would prove less.
+FLOOR_STEP = {"REPEAT_SHINGLE_OVERLAP": 0.01}
+
+_ABSENT = object()
+
+
+def _floor_moves() -> list:
+    """Every floor whose live value is not the pinned one. The pin's engine."""
+    moves = []
+    for name, want in sorted(FLOOR_VALUES.items()):
+        live = getattr(K, name, _ABSENT)
+        if live is _ABSENT:
+            moves.append(
+                f"{name} is pinned at {want!r} but no longer exists in "
+                "checklist.py")
+        elif type(live) is not type(want):
+            # `WARNINGS_MIN = True` compares equal to 1 and would slip past a
+            # bare `!=`. It scores the same today; it is still a floor that
+            # changed without a reason, and the next edit to it is unreadable.
+            moves.append(
+                f"{name} moved {want!r} -> {live!r} "
+                f"({type(want).__name__} -> {type(live).__name__})")
+        elif live != want:
+            moves.append(f"{name} moved {want!r} -> {live!r}")
+    return moves
+
+
+def test_every_floor_still_has_its_pinned_value():
+    """The direct pin: floor by floor, the number against the number.
+
+    This is the test a later track hits when it softens a floor to turn its
+    own build green, and unlike the baseline pin it does not care whether any
+    recording happened to sit on the far side of the move.
+
+    It stops a SILENT change, not a change. Moving a floor deliberately means
+    editing checklist.py and this pin together, and the failure says so.
+    """
+    moves = _floor_moves()
+    assert not moves, (
+        f"{len(moves)} checklist floor(s) no longer match the values pinned "
+        f"in FLOOR_VALUES: " + "; ".join(moves) + ". If the move is "
+        f"deliberate, {MOVED_A_FLOOR}."
+    )
+
+
+def test_every_floor_in_the_checklist_is_pinned_by_value():
+    """A floor added to checklist.py and not to the pin is an unpinned floor.
+
+    Deliberately broader than `test_every_floor_in_the_checklist_is_calibrated`,
+    which looks only at `*_MIN` and `*_FLOOR` integers: that rule does not see
+    `TOTAL_WORDS_MAX` or the `REPEAT_SHINGLE_OVERLAP` ratio, and both of them
+    decide whether an answer passes. Every upper-case number in checklist.py
+    is a floor for this purpose.
+    """
+    declared = {
+        name for name in vars(K)
+        if name.isupper()
+        and isinstance(vars(K)[name], (int, float))
+        and not isinstance(vars(K)[name], bool)
+    }
+    assert declared == set(FLOOR_VALUES), (
+        "checklist.py's floors and FLOOR_VALUES disagree, so a floor is "
+        "moving unwatched. Not pinned: "
+        f"{sorted(declared - set(FLOOR_VALUES))}; pinned but no longer "
+        f"declared: {sorted(set(FLOOR_VALUES) - declared)}. "
+        f"To change a floor, {MOVED_A_FLOOR}."
+    )
+
+
+def test_the_floor_pin_changelog_is_not_empty():
+    """A pin with no changelog is a pin whose procedure nobody wrote down."""
+    assert FLOOR_PIN_CHANGELOG and all(
+        isinstance(line, str) and line.strip() for line in FLOOR_PIN_CHANGELOG)
+
+
+@pytest.mark.parametrize("direction", ("down", "up"))
+@pytest.mark.parametrize("floor", sorted(FLOOR_VALUES))
+def test_moving_any_floor_off_its_pinned_value_fails_the_value_pin(
+        floor, direction, monkeypatch):
+    """The test of the test, over EVERY floor, in BOTH directions.
+
+    This is the verifier's sweep, kept as a test. It is the claim the module
+    docstring makes, made checkable: the value pin is not selective, it does
+    not depend on any recording, and its failure names the floor.
+
+    Measured when this was written: of these same 34 single-step mutations,
+    26 are INVISIBLE to the five-recording pin and the calibration guards put
+    together -- including SECTION_WORD_FLOOR 100 -> 99, HEADINGS_MIN 15 -> 14
+    and TOTAL_WORDS_MIN 2,000 -> 1,999. That is the whole reason this pin
+    exists, and it is why this test asserts against the VALUE pin rather than
+    against the suite as a whole.
+    """
+    step = FLOOR_STEP.get(floor, 1)
+    want = FLOOR_VALUES[floor]
+    moved = round(want - step, 4) if direction == "down" else round(want + step, 4)
+    assert moved != want, f"the step for {floor} does not change it"
+    monkeypatch.setattr(K, floor, moved)
+
+    with pytest.raises(AssertionError) as caught:
+        test_every_floor_still_has_its_pinned_value()
+
+    message = str(caught.value)
+    assert floor in message, (
+        f"moving {floor} {want} -> {moved} fails the pin but the failure does "
+        f"not name the floor, so the reader cannot act on it: {message}")
+    assert f"{want!r} -> {moved!r}" in message, (
+        f"the failure for {floor} does not say what it moved from and to: "
+        f"{message}")
+    assert MOVED_A_FLOOR in message, (
+        f"the failure for {floor} does not tell the reader what to do about "
+        f"it: {message}")
+
+
+def test_a_floor_deleted_from_the_checklist_fails_the_value_pin(monkeypatch):
+    """Deleting a floor is the other way to stop it failing a build."""
+    monkeypatch.delattr(K, "HEADINGS_MIN")
+    with pytest.raises(AssertionError) as caught:
+        test_every_floor_still_has_its_pinned_value()
+    assert "HEADINGS_MIN" in str(caught.value)
+    assert "no longer exists" in str(caught.value)
+
+
+def test_a_floor_added_to_the_checklist_fails_the_coverage_pin(monkeypatch):
+    """And adding one without pinning it is how the pin rots."""
+    monkeypatch.setattr(K, "A_BRAND_NEW_MIN", 7, raising=False)
+    with pytest.raises(AssertionError) as caught:
+        test_every_floor_in_the_checklist_is_pinned_by_value()
+    assert "A_BRAND_NEW_MIN" in str(caught.value)
+
 
 
 # ----------------------------------------------------- calibration guards --
@@ -385,13 +627,26 @@ def _baseline_names() -> list:
 
 @pytest.mark.parametrize("name", _baseline_names())
 def test_a_frozen_baseline_still_scores_exactly_what_it_scored(name):
-    """An EXACT pin, not a floor, and that is the whole point.
+    """An EXACT pin on five recordings. It catches SCORER DRIFT.
 
-    A floor can be moved down to rescue a failing build and every
-    floor-based test stays green. Move any floor in either direction and
-    this fails, and the failure names the check that moved and what it moved
-    from. These five numbers -- 10, 10, 11, 12, 14 -- are the proof that the
-    harness came into the repository without being softened.
+    What it catches, and catches better than anything else here: score.py's
+    LOGIC changing underneath fixed floors. A parser that starts counting a
+    nested table, a warning regex that widens, a comparison that flips from
+    `>=` to `>` -- every floor still at its pinned value, and one of these
+    five vectors moves. `FLOOR_VALUES` cannot see any of that.
+
+    What it does NOT catch, and what this docstring claimed it did until the
+    value pin was added: a floor move in general. A recording's vector only
+    changes when a floor crosses THAT recording's observed count, so between
+    two recordings' counts every floor has a gap it can be moved inside with
+    this test green -- 26 values wide for SECTION_WORD_FLOOR, 282 for
+    TOTAL_WORDS_MIN, and all the way down to 0 for HEADINGS_MIN. The module
+    docstring has the measured table. Floor VALUES are pinned by
+    `test_every_floor_still_has_its_pinned_value`; that is the guard against
+    softening, and this one is not a substitute for it.
+
+    The five numbers -- 10, 10, 11, 12, 14 -- are the proof that the harness
+    came into the repository without the SCORER being softened.
     """
     assert name != NO_BASELINES, (
         f"{BASELINES} could not be read, so no baseline is pinned at all and "

@@ -108,11 +108,17 @@ count **and** the exact per-check pass/fail vector.
 `words` is a prose count: headings, code fences and diagram fences are
 excluded. By `wc -w` the reference is 3,419.
 
-An exact pin is strictly stronger than a floor. A floor lowered to rescue a
-failing build leaves a floor-based test green; it cannot leave these green,
-and the failure names the check that moved and what it moved from. Those five
-numbers — 10, 10, 11, 12, 14 — are the proof this harness entered the
-repository without being softened.
+These five numbers are pinned EXACTLY, which is what catches the scorer's
+logic drifting while every floor stands still. It is **not** what catches a
+floor being softened: a recording's vector only moves when a floor crosses
+that recording's own count, so each floor has a gap between two recordings it
+can be moved inside with this whole directory green — measured at 26 values
+wide for `SECTION_WORD_FLOOR`, 282 for `TOTAL_WORDS_MIN`, and unbounded below
+for `HEADINGS_MIN`. Floor **values** are therefore pinned by name and value in
+`test_parity.py` (`FLOOR_VALUES`), and moving any one of them by a single step
+fails that pin and names the floor. Those five numbers — 10, 10, 11, 12, 14 —
+are the proof this harness entered the repository without the scorer being
+softened.
 
 ## What the baseline says
 
@@ -241,7 +247,7 @@ a recording nobody declared fails too.
 | `checklist.py` | the 17 prompt checks + 2 extras, each with its clause, and every floor with the measurement that justifies it |
 | `normalise.py` | DocumentSpec → the Markdown it is equivalent to, plus the two block shapes and the role vocabulary |
 | `score.py` | the Markdown parser and the checks; reports what it OBSERVED, not just pass/fail |
-| `test_parity.py` | the calibration guards and the exact-score pins |
+| `test_parity.py` | the floor-VALUE pin (`FLOOR_VALUES`, with its changelog), the calibration guards, and the exact-score pins on the recordings |
 | `test_parity_gate.py` | `PARITY_MIN` applied to the candidates |
 | `calibration/reference_counts.json` | the reference's observed counts, derived; the reference itself is not here |
 | `runs/` | the frozen baselines, each pinned by name |

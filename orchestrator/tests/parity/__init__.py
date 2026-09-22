@@ -29,8 +29,9 @@ THE TWO TEST FILES ARE A DELIBERATE SPLIT.
 ``.github/workflows/scripts/shard_tests.py`` discovers by ``rglob`` at any
 depth, so everything here named ``test_*.py`` runs in a CI shard. A file that
 is permanently red is a pipeline the first person under deadline pressure
-fixes by lowering the floor. So the baselines are pinned by EXACT score --
-which is a stronger anti-softening guard than a floor, because moving a floor
-in EITHER direction fails it and the failure names the check -- and only the
+fixes by lowering the floor. So every floor's VALUE is pinned by name in
+``test_parity.py`` -- move one in either direction and the failure names it --
+and the baselines are pinned by EXACT score on top of that, which is what
+catches the scorer's LOGIC drifting while the floors stand still. Only the
 candidate runs, which do not exist yet, are measured against ``PARITY_MIN``.
 """
