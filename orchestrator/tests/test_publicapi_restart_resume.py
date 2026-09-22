@@ -54,6 +54,23 @@ def _text(records):
     return "".join(r[2]["delta"] for r in records if r[1] == "response.output_text.delta")
 
 
+class _SteppedClock:
+    """Stands in for the `time` module inside `durable`: `monotonic()` moves
+    only when the test moves it, everything else is the real module."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 def _append(owner, response_id, seqs, text="x"):
     return durable_store.append(owner, {
         response_id: [(s, "response.output_text.delta", {"delta": text, "_t": 1}) for s in seqs]
@@ -413,35 +430,41 @@ def test_background_resumes_are_staggered_oldest_first_after_continuity(monkeypa
         ids.append(row["id"])
     claims = []
     real_claim = durable_store.claim
+    # The dispatcher compares `time.monotonic()` against its own last claim.
+    # Reading the same stepped clock here, a claim is recorded at the instant
+    # the dispatcher measured, not after a thread hop and a database round
+    # trip on a busy host, so the gaps are the stagger and nothing else.
+    clock = _SteppedClock()
+    tick = 1 / 16  # binary-exact: the sums carry no float noise
 
     def recording_claim(response_id, owner, **kwargs):
         claimed = real_claim(response_id, owner, **kwargs)
         if claimed is not None:
-            claims.append((response_id, time.monotonic()))
+            claims.append((response_id, clock.monotonic()))
         return claimed
 
     monkeypatch.setattr(durable_store, "claim", recording_claim)
 
     async def scenario():
         continuity = asyncio.Event()
-        b = _runtime(tmp_path, "B")
-        b._started_at = time.monotonic()
+        b = _runtime(tmp_path, "B")  # configured first: its liveness clock stays real
+        monkeypatch.setattr(durable, "time", clock)
+        b._started_at = clock.monotonic()
         b.continuity_done = continuity
         before = await b.dispatch_once()
         continuity.set()
-        started = time.monotonic()
-        while len(claims) < 3 and time.monotonic() - started < 5:
+        while len(claims) < 3 and clock.monotonic() < 5:
             await b.dispatch_once()
-            await asyncio.sleep(0.02)
-        for run in list(b.runs.values()):
-            await asyncio.wait_for(run.done.wait(), 5)
+            for run in list(b.runs.values()):
+                await asyncio.wait_for(run.done.wait(), 5)
+            clock.advance(tick)
         return before
 
     before = asyncio.run(scenario())
     assert before == 0  # nothing before chat's continuity sweep (or the stagger)
     assert [rid for rid, _ in claims] == ids  # oldest enqueued first
     gaps = [b - a for (_, a), (_, b) in zip(claims, claims[1:])]
-    assert all(gap >= 0.28 for gap in gaps)
+    assert all(0.3 <= gap < 0.3 + tick for gap in gaps), gaps  # one per stagger, at the first tick after it
     assert all(durable_store.get_run(rid)["status"] == "completed" for rid in ids)
 
 
