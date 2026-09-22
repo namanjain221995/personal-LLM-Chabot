@@ -319,6 +319,181 @@ print(max(versions) if versions else "")
 PY
 }
 
+# ------------------------------------------------ the reversibility verdict
+# "Can this deploy be undone?" asked ONCE, while the answer is still knowable,
+# and then consulted later instead of re-derived.
+#
+# WHY THIS EXISTS. deploy.sh's schema_gate() answers "may this code start on
+# this database" by reading the LIVE schema version. That read goes to /health
+# first and to `docker exec <pg> psql` second, and when it cannot be made the
+# gate says "proceeding WITHOUT the compatibility check" and returns 0. On the
+# FORWARD path that is a considered trade. On the ROLLBACK path it was a
+# fail-open at exactly the wrong moment: the rollback is consulted only after
+# the health gate failed or `techsara up` failed, which is precisely when
+# /health is down and the compose project may be mid-recreate, so BOTH reads
+# can fail together. The gate then returned 0 and older code was started on a
+# newer schema - the outcome the rollback gate exists to prevent.
+#
+# The fix is not a better read at rollback time. There is no better read at
+# rollback time; the box is broken by definition. The fix is to take the
+# reading BEFORE anything is touched, while /health still answers, write the
+# verdict down, and make the rollback consult THAT - refusing when it is
+# missing rather than proceeding.
+#
+# Everything below is a PURE FUNCTION of its arguments: no docker, no curl, no
+# git, no filesystem. That is what makes the decision unit-testable
+# (.github/workflows/scripts/tests/test_rollback_reversibility.py drives these
+# by sourcing this file), and a decision nobody can test is a decision nobody
+# should trust with an unattended rollback at 3 a.m.
+
+#: A non-negative decimal integer and nothing else. Each argument is checked
+#: SEPARATELY: concatenating them first would let an empty value hide behind a
+#: neighbour's digits ("" + "41" + "40" is all digits and means nothing).
+_dr_is_uint() { case "${1-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+#: One `key=value` token out of a verdict line. A bash loop rather than sed or
+#: awk so the KEY is never interpolated into another language's pattern, and
+#: with globbing off for the split so a `*` in a tampered file cannot expand
+#: into a directory listing.
+_dr_verdict_field() {  # _dr_verdict_field LINE KEY -> the value, or 1
+  local line="${1-}" key="${2-}" token rc=1
+  local -                     # restores shell options on return (bash 4.4+)
+  set -f
+  for token in $line; do
+    case "$token" in
+      "$key"=*) printf '%s\n' "${token#*=}"; rc=0; break ;;
+    esac
+  done
+  return "$rc"
+}
+
+# The forward computation, taken while the stack is still healthy.
+#
+#   dr_reversibility_verdict PREVIOUS TARGET LIVE
+#
+# PREVIOUS  the highest migration the currently-live COMMIT's code knows
+# TARGET    the highest migration the commit being deployed knows
+# LIVE      the migration version the database has APPLIED, right now
+#
+# The database after this deploy will hold max(LIVE, TARGET): migrations only
+# go forward, `init_schema` applies what is missing, and nothing removes any.
+# So the rollback is honest exactly when PREVIOUS knows at least that much.
+#
+# Prints ONE line of `key=value` tokens and returns 0; prints nothing and
+# returns 1 when any input is not a non-negative integer, which is the caller's
+# signal that no verdict could be formed (and therefore that the rollback must
+# refuse rather than assume).
+dr_reversibility_verdict() {
+  local previous="${1-}" target="${2-}" live="${3-}" after verdict range='-'
+  _dr_is_uint "$previous" && _dr_is_uint "$target" && _dr_is_uint "$live" || return 1
+  if [ "$target" -ge "$live" ]; then after="$target"; else after="$live"; fi
+  if [ "$previous" -ge "$after" ]; then
+    verdict=reversible
+  else
+    verdict=forward-only
+    range="V$((previous + 1))..V$after"
+  fi
+  printf 'verdict=%s previous=%s target=%s live_at_decision=%s after=%s range=%s\n' \
+    "$verdict" "$previous" "$target" "$live" "$after" "$range"
+}
+
+# The same verdict as one English sentence, derived FROM the verdict line so
+# the sentence and the gate can never disagree. This is what the deploy log and
+# the run summary say out loud, because "V41 > V40" is a fact an operator can
+# act on and "schema gate passed" is not.
+dr_reversibility_sentence() {  # dr_reversibility_sentence VERDICT_LINE
+  local line="${1-}" verdict previous after
+  verdict="$(_dr_verdict_field "$line" verdict)" || {
+    printf 'no reversibility verdict was recorded, so an automatic rollback will REFUSE rather than guess.\n'
+    return 1
+  }
+  previous="$(_dr_verdict_field "$line" previous)" || previous='?'
+  after="$(_dr_verdict_field "$line" after)" || after='?'
+  case "$verdict" in
+    reversible)
+      printf 'V%s code knows V%s, which is where the database will be after this deploy, so a failed health gate CAN be rolled back automatically.\n' \
+        "$previous" "$after" ;;
+    forward-only)
+      printf 'V%s > V%s, so a failed health gate CANNOT be rolled back automatically - the database will have applied V%s and V%s code cannot start on it.\n' \
+        "$after" "$previous" "$after" "$previous" ;;
+    *)
+      printf 'the recorded reversibility verdict (%s) is not one this script understands, so an automatic rollback will REFUSE.\n' "$verdict"
+      return 1 ;;
+  esac
+}
+
+# The rollback-time decision. FAIL-CLOSED: every path that is not a proof that
+# the rollback is safe is a refusal.
+#
+#   dr_rollback_is_reversible VERDICT_LINE LIVE_NOW
+#
+# VERDICT_LINE  what dr_reversibility_verdict printed before the deploy began,
+#               read back from the release record (or empty, if none was ever
+#               written - which is itself a refusal).
+# LIVE_NOW      the live schema version read at THIS moment, or empty when it
+#               cannot be read. Empty is a REFUSAL, not a shrug: an unreadable
+#               database is the state this gate was fooled by.
+#
+# Prints one line naming the decision and its reason. Returns 0 to proceed, 1
+# to refuse.
+dr_rollback_is_reversible() {
+  local line="${1-}" live_now="${2-}" verdict previous range
+  # Nothing at all (no release record, or a record written before this gate
+  # existed) is a different failure from "something, but not a verdict", and an
+  # operator reading the log at 3 a.m. should not have to guess which happened.
+  if [ -z "${line//[[:space:]]/}" ]; then
+    printf 'refuse reason=no-recorded-verdict\n'; return 1
+  fi
+  verdict="$(_dr_verdict_field "$line" verdict)" || verdict=''
+  previous="$(_dr_verdict_field "$line" previous)" || previous=''
+  case "$verdict" in
+    reversible | forward-only) : ;;
+    *) printf 'refuse reason=unparseable-verdict\n'; return 1 ;;
+  esac
+  _dr_is_uint "$previous" || { printf 'refuse reason=unparseable-verdict\n'; return 1; }
+  # THE case this whole helper exists for. /health is down and psql did not
+  # answer, which is the normal state when a rollback is being considered.
+  if ! _dr_is_uint "$live_now"; then
+    printf 'refuse reason=live-schema-unreadable previous=%s\n' "$previous"; return 1
+  fi
+  # THE COMPARISON THAT DECIDES, and it is against the FRESH reading, not
+  # against the verdict's own prediction.
+  #
+  # The verdict was taken before the deploy ran and says what the database
+  # WOULD hold once the target's migrations applied. Whether they applied is
+  # exactly what live_now answers, and the two cases differ:
+  #
+  #   * the HEALTH GATE failed. `techsara up` succeeded, the orchestrator
+  #     started, init_schema ran: live_now is the target's version, it is
+  #     above PREVIOUS, and the rollback is refused. This is the case the
+  #     forward-only verdict predicted.
+  #   * `techsara up` FAILED - a build error, a container that would not
+  #     start. Nothing migrated anything, live_now is still where it was, and
+  #     rolling back to PREVIOUS is both safe and the right thing to do.
+  #     Refusing it on the verdict alone would make the automatic rollback
+  #     useless on most releases, because db.py went V13 -> V41 in 22 days
+  #     and nearly every release therefore carries a forward-only verdict.
+  #
+  # Fail-closed is about the UNKNOWN (handled above), not about refusing what
+  # a good reading says is fine.
+  if [ "$previous" -lt "$live_now" ]; then
+    if [ "$verdict" = forward-only ]; then
+      range="$(_dr_verdict_field "$line" range)" || range='-'
+      printf 'refuse reason=forward-only previous=%s live=%s range=%s\n' "$previous" "$live_now" "$range"
+    else
+      # The verdict said reversible and the database moved anyway: something
+      # other than this deploy migrated it. The fresh reading wins.
+      printf 'refuse reason=database-moved-past-previous previous=%s live=%s\n' "$previous" "$live_now"
+    fi
+    return 1
+  fi
+  if [ "$verdict" = forward-only ]; then
+    printf 'proceed previous=%s live=%s note=the-targets-migrations-did-not-apply\n' "$previous" "$live_now"
+    return 0
+  fi
+  printf 'proceed previous=%s live=%s\n' "$previous" "$live_now"
+}
+
 # ------------------------------------------------------------------ env reads
 # A single value from the merged --env-file chain, via the launcher's canonical
 # parser. Never echoes anything but the one key asked for, and callers only ask

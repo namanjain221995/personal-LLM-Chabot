@@ -1169,6 +1169,10 @@ jobs:
     runs-on: [self-hosted, dgx-spark]
     permissions:
       contents: read
+      # READ ONLY, and for exactly one thing: the freshness step below asks
+      # this run's own job list when `CI passed` finished, so it can refuse a
+      # rollout that has been queued for days. Nothing here can write.
+      actions: read
     # Add required reviewers and a deployment-branch policy to this environment
     # in repo settings to turn every production deploy into an approval gate.
     environment: production
@@ -1185,6 +1189,12 @@ jobs:
     outputs:
       was_full: ${{ steps.rollout.outputs.was_full }}
       started_at: ${{ steps.rollout.outputs.started_at }}
+      # The release directory this rollout actually produced, so `verify` can
+      # run scripts/deploy-smoke.sh against THESE files. Not a glob over
+      # .runtime/releases: a hand-run deploy at the same moment would leave a
+      # newer directory there and the glob would smoke-test the wrong release.
+      manifest: ${{ steps.rollout.outputs.manifest }}
+      record: ${{ steps.rollout.outputs.record }}
     env:
       # The production checkout, NOT the runner workspace: that is where
       # .env, .runtime/ and the model cache live.
@@ -1209,6 +1219,28 @@ jobs:
       # every such deploy silently left the owner's own working directory on
       # a detached HEAD. The dispatch input still overrides it.
       DEPLOY_BRANCH: ${{ inputs.branch || github.ref_name }}
+      # ------------------------------------------------ THE LOCK ARITHMETIC
+      # scripts/deploy.sh is DESIGNED to wait: dr_lock_acquire defaults to
+      # 1800 s for the deploy lock and engine_lock_acquire to 1200 s for the
+      # engine recovery lock. That is 50 minutes of legitimate waiting inside
+      # a job whose timeout-minutes is 45. When the ceiling wins, GitHub
+      # cancels wherever the step happens to be - and if that is inside
+      # `techsara up`, the result is a partially recreated stack with no
+      # health gate and no rollback, which is the one outcome this whole file
+      # is arranged to prevent.
+      #
+      # 900 + 600 = 25 minutes of waiting inside 45, leaving 20 for the
+      # rollout itself (the measured rolling deploy is about 150 s).
+      #
+      # BEHAVIOUR CHANGE, stated plainly: a hand-run deploy that holds the
+      # lock for more than 15 minutes now makes this job FAIL instead of
+      # queueing behind it. That is the intended trade - a diagnosable
+      # failure an operator re-runs beats a SIGTERM landing inside
+      # `techsara up` - but the long wait was chosen deliberately, so it is
+      # worth seeing the sentence. The SCRIPT's own defaults are untouched,
+      # so a hand-run deploy still waits the full 30 + 20 minutes.
+      DEPLOY_LOCK_WAIT: "900"
+      ENGINE_LOCK_WAIT: "600"
     steps:
       # Check out the commit being deployed, so the deploy SCRIPT is the one
       # that commit ships. Running it out of the production checkout is a
@@ -1216,6 +1248,65 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
+
+      # ---------------------------------------------------------- FRESHNESS
+      # The first thing this job does after materialising its own workspace,
+      # and before anything on the BOX is read or touched.
+      #
+      # A deploy job is a QUEUED job, and the gap between "CI passed went
+      # green" and "the rollout started" is not bounded by anything in this
+      # file. Measured here: a gate green at 2026-09-19T07:33:29Z rolled out
+      # at 2026-09-21T14:11:26Z - 2d 6h 37m 57s later, unattended, because
+      # the self-hosted runner had wedged after a DNS blip and the run sat
+      # queued until it came back. The two normal hand-offs measured on the
+      # same repository are 12 s and 10m46s, so the 90-minute default window
+      # sits well above the normal case and far below the pathological one.
+      #
+      # THE INTERACTION WITH `concurrency:`, because they look like the same
+      # guard and are not. `{group: deploy-dgx-spark, cancel-in-progress:
+      # false}` means a newer deploy REPLACES a pending one, so two rollouts
+      # cannot land out of order. That is ORDERING. A single queued deploy
+      # with nothing behind it is never superseded, waits as long as the
+      # runner is away, and then runs: this guard is about stale TIME.
+      #
+      # Everything reaches the script through `env:` or through a file, never
+      # interpolated into this `run:` body (workflow_policy.py P6). The API
+      # read is best-effort by design: a 403 or no network leaves the file
+      # unusable and the script falls back to the commit timestamp, naming
+      # which source it used. With neither, it REFUSES - the age of a release
+      # is not something to assume.
+      - name: Freshness - is this still the release, and is it still recent?
+        env:
+          DEPLOY_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_BRANCH: ${{ github.ref_name }}
+          # Always present on a push, absent on a dispatch. Older than the
+          # gate's completion by roughly the length of CI, so an age measured
+          # from it errs towards refusing - the safe direction.
+          FALLBACK_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+          GH_API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The tip of the release branch, asked of the REMOTE rather than of
+          # this workspace: the workspace is pinned to github.sha and cannot
+          # know that main has moved on since.
+          origin_tip="$(git ls-remote --exit-code origin "refs/heads/${RELEASE_BRANCH}" \
+                        | awk 'NR == 1 { print $1 }')" || origin_tip=""
+
+          # When `CI passed` finished, from this run's own job list. Written
+          # to a FILE and parsed by the gate script, so the network call stays
+          # out of the thing that decides and every way it can go wrong is a
+          # unit test rather than an untested branch on the release path.
+          jobs_file="${RUNNER_TEMP}/ci-jobs.json"
+          curl -fsS -m 20 \
+            -H "Authorization: Bearer ${GH_API_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+            -o "$jobs_file" || rm -f "$jobs_file"
+
+          ORIGIN_TIP="$origin_tip" GATE_JOBS_FILE="$jobs_file" \
+            python3 .github/workflows/scripts/deploy_freshness.py
 
       # ---------------------------------------------------------- PREFLIGHT
       # Everything that can say "not today" BEFORE a container is touched.
@@ -1279,6 +1370,13 @@ jobs:
       # ------------------------------------------------------------ ROLLOUT
       - name: Deploy and health-gate
         id: rollout
+        env:
+          # apply() writes `key=value` here for whoever ran it: the release
+          # manifest and the pre-deploy record this rollout produced. `verify`
+          # smoke-tests against exactly these, and the alternative - globbing
+          # .runtime/releases for the newest directory - picks the wrong
+          # release whenever a hand-run deploy is in flight beside this one.
+          DEPLOY_RESULT_FILE: ${{ runner.temp }}/deploy-result.env
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
@@ -1302,6 +1400,24 @@ jobs:
           export DEPLOY_BRANCH
           echo "checkout will land on: ${DEPLOY_BRANCH:-<detached HEAD>}"
           "$GITHUB_WORKSPACE/scripts/deploy.sh" --ref "$DEPLOY_REF" $FLAGS
+
+          # Hand the release paths across the job boundary. GITHUB_ENV does
+          # not cross one; job outputs do, and was_full/started_at above are
+          # the precedent. Only the two known keys are copied, and only when
+          # the value is an absolute path made of characters a path is made
+          # of - so nothing this file could contain can become workflow
+          # syntax, whatever wrote it.
+          if [ -f "$DEPLOY_RESULT_FILE" ]; then
+            while IFS='=' read -r key value; do
+              case "$key" in manifest | record) ;; *) continue ;; esac
+              case "$value" in /*) ;; *) continue ;; esac
+              case "$value" in *[!A-Za-z0-9/._-]*) continue ;; esac
+              printf '%s=%s\n' "$key" "$value" >> "$GITHUB_OUTPUT"
+              echo "published $key=$value"
+            done < "$DEPLOY_RESULT_FILE"
+          else
+            echo "no $DEPLOY_RESULT_FILE was written; verify will smoke-test in its degraded mode"
+          fi
 
       - name: The box is serving the commit we asked for
         run: |
@@ -1348,11 +1464,68 @@ jobs:
           newest="$(find .runtime/logs -maxdepth 1 -name 'deploy-*.log' -printf '%T@ %p\n' 2>/dev/null \
                     | sort -rn | head -1 | cut -d' ' -f2-)"
           if [ -n "$newest" ]; then
+            # CAN THIS RELEASE BE UNDONE? deploy.sh answers that at its
+            # forward gate, before it touches anything, and the answer belongs
+            # where a human will see it rather than only in a log on the box.
+            # db.py went V13 -> V41 in 22 days, so this reads CANNOT on most
+            # releases - which is the point, and it is now a statement about a
+            # gate that actually refuses (scripts/lib/deploy-common.sh,
+            # dr_rollback_is_reversible) rather than a narration of one that
+            # returned 0 when it could not read the database.
+            # A pipeline's exit status is its LAST command's, so `grep ... |
+            # sed ... || fallback` never reaches the fallback: sed succeeds on
+            # empty input. Each section is captured first and its emptiness
+            # tested, which is the difference between "no verdict was
+            # recorded" and a heading with nothing under it.
+            reversibility="$(grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+reversibility:' "$newest" \
+                             | sed -E 's/^[0-9:]+[[:space:]]+reversibility: /- /' || true)"
+            drain="$(grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+drain:' "$newest" \
+                     | sed -E 's/^[0-9:]+[[:space:]]+drain: /- /' || true)"
             {
-              echo "### Deploy log — last 40 lines of \`$(basename "$newest")\`"
+              echo "### Reversibility"
+              echo ""
+              if [ -n "$reversibility" ]; then
+                printf '%s\n' "$reversibility"
+              else
+                echo "_the deploy log recorded no reversibility verdict_"
+              fi
+              echo ""
+              echo "### Drain"
+              echo ""
+              if [ -n "$drain" ]; then
+                printf '%s\n' "$drain"
+              else
+                echo "_the deploy log recorded no drain outcome_"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            # THE LOG TAIL IS FILTERED, and this is a real finding rather than
+            # tidiness. `tail -n 40` of a two-node deploy log ends inside
+            # scripts/cluster-status.sh's output, which names the worker's
+            # RoCE fabric addresses - and this step publishes it into the run
+            # summary of a PUBLIC repository, on every successful deploy.
+            #
+            # The filter is an ALLOW list first: only lines deploy.sh and its
+            # helpers wrote themselves, which all carry a HH:MM:SS prefix from
+            # say()/dr_say(). Measured over the 2026-09-22 deploy log, that
+            # selection contains zero addresses while keeping every line that
+            # says what the deploy did. The sed after it is a second layer for
+            # anything a future helper might print. The unfiltered log stays
+            # on the box, where it is not published.
+            narrated="$(grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2} ' "$newest" \
+                        | tail -n 40 \
+                        | sed -E 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address redacted>/g' || true)"
+            {
+              echo "### Deploy log — last 40 narrated lines of \`$(basename "$newest")\`"
               echo '```'
-              tail -n 40 "$newest"
+              if [ -n "$narrated" ]; then
+                printf '%s\n' "$narrated"
+              else
+                echo "(the deploy log has no narrated lines)"
+              fi
               echo '```'
+              echo "_Sub-command output (\`techsara up\`, cluster status) is in the full"
+              echo "log on the box: it can name cluster fabric addresses and this summary is public._"
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "_no deploy log was written under .runtime/logs_" >> "$GITHUB_STEP_SUMMARY"
@@ -1525,6 +1698,73 @@ jobs:
           fi
           echo "- main model: **preserved** — running since \`${started_iso}\` (${uptime_min} min), older than this rollout" >> "$GITHUB_STEP_SUMMARY"
 
+      # ------------------------------------------------- POST-ROLLOUT INVARIANTS
+      # scripts/deploy-smoke.sh was written for this and, until now, had no
+      # caller at all: `grep -rn deploy-smoke` found only its own header. Four
+      # questions nothing else in this job asks, each of which a green /health
+      # answers wrongly:
+      #
+      #   DIGEST      the containers are running the PROMOTED image ids. A
+      #               healthy container running last week's image is healthy
+      #               and wrong.
+      #   SCHEMA      the running orchestrator's CODE version equals the
+      #               version the database has APPLIED. Old code on a newer
+      #               schema passes /health - app_db is reachable, which is
+      #               all that check tests - and then fails on the one route
+      #               that touches the column it has never heard of.
+      #   NOT LOOPING no container in the project is in the `restarting`
+      #               state. Deliberately that and not a RestartCount
+      #               threshold: lifetime RestartCount is the launcher
+      #               foot-gun that once disabled three healthy services.
+      #   MODEL CLOCK the main model container did not restart, asserted
+      #               against the pre-deploy record rather than observed.
+      #
+      # WITHOUT --with-model, on purpose. The step above already does a real
+      # completion and asserts vllm:generation_tokens_total advanced; a second
+      # generation costs BOTH nodes, because the main model is tensor-parallel
+      # across the head and the worker.
+      #
+      # The paths come from `deploy` as job outputs. If they are missing the
+      # script still runs in its documented degraded mode (tags instead of
+      # promoted ids, and no model-clock baseline) and says so - a path that
+      # was not published must not be able to fail an otherwise good deploy,
+      # and the model-clock property is independently asserted above.
+      - name: Post-rollout invariants (promoted images, code vs schema, no restart loop)
+        if: ${{ !cancelled() }}
+        env:
+          SMOKE_MANIFEST: ${{ needs.deploy.outputs.manifest }}
+          SMOKE_RECORD: ${{ needs.deploy.outputs.record }}
+        run: |
+          set -euo pipefail
+          args=()
+          degraded=""
+          if [ -n "${SMOKE_MANIFEST:-}" ]; then
+            args+=(--manifest "$SMOKE_MANIFEST")
+          else
+            degraded="the deploy published no manifest path, so DIGEST compared tags rather than promoted image ids"
+          fi
+          if [ -n "${SMOKE_RECORD:-}" ]; then
+            args+=(--baseline "$SMOKE_RECORD")
+          else
+            degraded="${degraded:+$degraded; }no pre-deploy record path, so MODEL CLOCK could only observe"
+          fi
+          smoke="$RUNNER_TEMP/deploy-smoke.log"
+          rc=0
+          "$GITHUB_WORKSPACE/scripts/deploy-smoke.sh" "${args[@]}" >"$smoke" 2>&1 || rc=$?
+          cat "$smoke"
+          {
+            echo ""
+            echo "### Post-rollout invariants"
+            echo '```'
+            cat "$smoke"
+            echo '```'
+            if [ -n "$degraded" ]; then
+              echo ""
+              echo "> **degraded:** $degraded"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
       # THE EXPOSURE ASSERTION (audit F065 / N023, CI half). The raw vLLM API
       # has no authentication, so the question is "can it be reached from
       # outside the cluster?", and this step answers it by BEHAVIOUR.
@@ -1592,6 +1832,53 @@ jobs:
         run: |
           set -u
           cd "$TECHSARA_DEPLOY_ROOT" || exit 0
+
+          # ------------------------------------------- /health, NAMES ONLY
+          # This used to be `curl .../health 2>&1 | head -60` piped straight
+          # into the run summary. orchestrator/app/health.py builds a failing
+          # check's detail as
+          #     {"status": "error", "detail": f"HTTP {resp.status_code} from {url}"}
+          # where `url` is settings.ocr_base_url / settings.rerank_base_url,
+          # and on this cluster those engines are addressed across the fabric.
+          # This job runs ONLY when deploy or verify failed - which is exactly
+          # when those detail strings are populated - and this repository is
+          # PUBLIC.
+          #
+          # So: check NAMES and their STATUSES, nothing else. `detail` is
+          # never read. The full payload stays in a file on the runner, which
+          # is not published. `verify` already holds this standard one job
+          # earlier, where the engine_bind.py step says "this log is public,
+          # so no address, hostname or ssh target is ever printed".
+          health_raw="${RUNNER_TEMP:-/tmp}/recovery-health.json"
+          health_table="${RUNNER_TEMP:-/tmp}/recovery-health.txt"
+          if curl -fsS -m 15 -o "$health_raw" http://127.0.0.1:8080/health 2>/dev/null; then
+            python3 - "$health_raw" >"$health_table" 2>&1 <<'PY'
+          import json
+          import sys
+
+          try:
+              doc = json.load(open(sys.argv[1], encoding="utf-8"))
+          except Exception as exc:                       # noqa: BLE001
+              print(f"/health answered, but the payload did not parse: {type(exc).__name__}")
+              raise SystemExit(0)
+          if not isinstance(doc, dict):
+              print("/health answered with something that is not an object")
+              raise SystemExit(0)
+          print("status: %s" % doc.get("status", "?"))
+          checks = doc.get("checks")
+          if not isinstance(checks, dict):
+              print("checks: <absent or not an object>")
+              raise SystemExit(0)
+          for name in sorted(checks):
+              entry = checks[name] if isinstance(checks[name], dict) else {}
+              # NAME and STATUS. `detail` is deliberately not read: it carries
+              # the address of whatever the check could not reach.
+              print("  %-18s %s" % (name, entry.get("status", "?")))
+          PY
+          else
+            printf '%s\n' "the orchestrator did not answer /health on the loopback port" >"$health_table"
+          fi
+
           {
             echo "## Deploy/verify failed — diagnostics"
             echo ""
@@ -1603,15 +1890,31 @@ jobs:
             docker ps -a --filter label=com.docker.compose.project=sf-local-ai \
               --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}' 2>&1 | head -40
             echo '```'
-            echo "### Orchestrator /health"
-            echo '```json'
-            curl -fsS -m 15 http://127.0.0.1:8080/health 2>&1 | head -60
+            echo "### Orchestrator /health (check names and statuses only)"
             echo '```'
+            cat "$health_table"
+            echo '```'
+            echo "_A failing check's \`detail\` names the engine it could not reach, and on"
+            echo "this cluster that is a fabric address. It is in \`$health_raw\` on the"
+            echo "runner and deliberately not here._"
             echo "### Last deploy log"
             echo '```'
             newest="$(find .runtime/logs -maxdepth 1 -name 'deploy-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
-            if [ -n "$newest" ]; then tail -80 "$newest"; else echo "no deploy log"; fi
+            if [ -n "$newest" ]; then
+              # Same allow-list as the deploy job's summary: only the lines
+              # deploy.sh and its helpers narrated (HH:MM:SS prefix), then an
+              # IPv4 redaction as a second layer. Sub-command output -
+              # `techsara up`, scripts/cluster-status.sh - can name the
+              # worker's fabric addresses, and this summary is public.
+              grep -E '^[0-9]{2}:[0-9]{2}:[0-9]{2} ' "$newest" \
+                | tail -80 \
+                | sed -E 's/\b([0-9]{1,3}\.){3}[0-9]{1,3}\b/<address redacted>/g' \
+                || echo "(the deploy log has no narrated lines)"
+            else
+              echo "no deploy log"
+            fi
             echo '```'
+            echo "_The unfiltered log is on the box at \`$TECHSARA_DEPLOY_ROOT/.runtime/logs/\`._"
             echo "### What deploy.sh already did"
             if [ "${{ needs.deploy.result }}" = "failure" ]; then
               echo "The deploy script's own health gate failed, so it ALREADY attempted a"
