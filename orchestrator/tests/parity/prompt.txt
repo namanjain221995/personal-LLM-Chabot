@@ -1,0 +1,5 @@
+Create a professional technical report titled:
+"Enterprise Local AI Platform – Technical Overview"
+Context: - 10 NVIDIA DGX Spark systems - Qwen model served using vLLM - PostgreSQL database - FastAPI backend - Next.js frontend - Redis caching - RAG document search - Web search - Speech-to-text - Text-to-speech - 300 enterprise users
+Requirements: 1. Executive Summary 2. Architecture Overview 3. Hardware Layer 4. AI Inference Layer 5. Backend Architecture 6. Frontend Architecture 7. Database Architecture 8. RAG Pipeline 9. Authentication and Authorization 10. Security 11. Monitoring 12. Scaling Strategy 13. Failure Recovery 14. Performance Optimization 15. Conclusion
+Use professional Markdown. Use headings, subheadings, tables, bullet points, numbered steps, bold text, code blocks, warnings, notes, and recommendations where appropriate. Do not skip any section. Do not repeat information unnecessarily.

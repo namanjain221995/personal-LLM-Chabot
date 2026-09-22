@@ -1,0 +1,923 @@
+{
+  "decided": {
+    "effort": "think",
+    "budget": {
+      "thinking": true,
+      "outline_pass": true,
+      "research": true,
+      "content_review": true,
+      "visual_qa": false,
+      "max_corrections": 2,
+      "max_sections": 12
+    },
+    "target_words": 0,
+    "target_phrase": "Summary",
+    "target_explicit": true,
+    "requested_sections": [],
+    "caps_sections": 12,
+    "max_tokens_one_call": 18000,
+    "sectioned_writer": false,
+    "sectioned_threshold": 2500
+  },
+  "wall_clock_s": 310.95,
+  "stages": [
+    {
+      "t": 0.0,
+      "pct": 10.0,
+      "msg": "outlining"
+    },
+    {
+      "t": 73.56,
+      "pct": 30.0,
+      "msg": "writing"
+    },
+    {
+      "t": 162.1,
+      "pct": 70.0,
+      "msg": "reviewing the content"
+    },
+    {
+      "t": 219.83,
+      "pct": 80.0,
+      "msg": "correcting 2 issue(s)"
+    },
+    {
+      "t": 310.95,
+      "pct": 95.0,
+      "msg": "content ready"
+    }
+  ],
+  "error": null,
+  "warnings": [
+    "figures not in the material (derived or assumed): 0 percent",
+    "the document has 15 top-level sections; this effort level asked for at most 12"
+  ],
+  "corrections": 1,
+  "model_calls": 4,
+  "outline": {
+    "title": "Enterprise Local AI Platform – Technical Overview",
+    "audience": "IT Directors, AI Engineers, System Architects",
+    "purpose": "Provide a comprehensive technical breakdown of the local AI infrastructure, covering hardware, software stack, data pipelines, security, and scaling strategies for 300 users.",
+    "sections": [
+      {
+        "heading": "1. Executive Summary",
+        "purpose": "Overview of platform capabilities, user base, and core stack.",
+        "elements": [
+          "kpis",
+          "callout",
+          "bullets"
+        ]
+      },
+      {
+        "heading": "2. Architecture Overview",
+        "purpose": "High-level component flow and integration.",
+        "elements": [
+          "bullets",
+          "table"
+        ]
+      },
+      {
+        "heading": "3. Hardware Layer",
+        "purpose": "DGX Spark compute foundation.",
+        "elements": [
+          "bullets",
+          "callout"
+        ]
+      },
+      {
+        "heading": "4. AI Inference Layer",
+        "purpose": "Qwen model and vLLM serving.",
+        "elements": [
+          "callout",
+          "numbered"
+        ]
+      },
+      {
+        "heading": "5. Backend Architecture",
+        "purpose": "FastAPI endpoints and orchestration.",
+        "elements": [
+          "bullets",
+          "table"
+        ]
+      },
+      {
+        "heading": "6. Frontend Architecture",
+        "purpose": "Next.js UI and state management.",
+        "elements": [
+          "bullets",
+          "table"
+        ]
+      },
+      {
+        "heading": "7. Database Architecture",
+        "purpose": "PostgreSQL storage and connection management.",
+        "elements": [
+          "bullets",
+          "numbered"
+        ]
+      },
+      {
+        "heading": "8. RAG Pipeline",
+        "purpose": "Document ingestion, retrieval, and context injection.",
+        "elements": [
+          "numbered",
+          "callout",
+          "table"
+        ]
+      },
+      {
+        "heading": "9. Authentication and Authorization",
+        "purpose": "Identity management and RBAC.",
+        "elements": [
+          "bullets",
+          "callout"
+        ]
+      },
+      {
+        "heading": "10. Security",
+        "purpose": "Data sovereignty, encryption, and threat mitigation.",
+        "elements": [
+          "bullets",
+          "callout"
+        ]
+      },
+      {
+        "heading": "11. Monitoring",
+        "purpose": "Metrics, logging, and alerting.",
+        "elements": [
+          "bullets",
+          "table"
+        ]
+      },
+      {
+        "heading": "12. Scaling Strategy",
+        "purpose": "Horizontal scaling and load distribution.",
+        "elements": [
+          "bullets",
+          "numbered"
+        ]
+      },
+      {
+        "heading": "13. Failure Recovery",
+        "purpose": "Redundancy, backups, and circuit breakers.",
+        "elements": [
+          "numbered",
+          "callout"
+        ]
+      },
+      {
+        "heading": "14. Performance Optimization",
+        "purpose": "Caching, batching, and query tuning.",
+        "elements": [
+          "bullets",
+          "table"
+        ]
+      },
+      {
+        "heading": "15. Conclusion",
+        "purpose": "Summary and future recommendations.",
+        "elements": [
+          "callout",
+          "bullets"
+        ]
+      }
+    ],
+    "needs_current_facts": false,
+    "assumptions": [
+      "Storage capacity and network bandwidth are sized to support concurrent access from 300 users and document ingestion workloads.",
+      "Database schema includes tables for users, documents, chat history, and system logs.",
+      "SAML or OIDC is used for single sign-on integration.",
+      "Auto-scaling policies are defined for FastAPI instances based on CPU and memory usage.",
+      "A vector database engine is used for RAG embeddings (specific engine not provided in material).",
+      "Encryption standards follow enterprise best practices (AES-256 for data at rest, TLS 1.3 for data in transit).",
+      "Monitoring tools include standard stack components (Prometheus, Grafana, ELK).",
+      "Circuit breakers are implemented for external web search and speech services to prevent cascading failures."
+    ]
+  },
+  "review": {
+    "ok": false,
+    "issues": [
+      {
+        "where": "KPIs table (Target Uptime), Monitoring table (GPU Utilization, Cache Hit Ratio), Scaling Strategy step 3, Performance-Om",
+        "problem": "Unsubstantiated/Invented Figures (Constraint Violation)",
+        "fix": "Append inline assumption tags to each value. Example replacements: `99.9 percent` → `99.9 percent (assumed: standard enterprise SLA target)`, `Above 85 percent` → `Above 85 percent (assumed: GPU thermal/power safety limit)`, `Below 70 percent` → `Below 70 percent (assumed: baseline cache efficiency)",
+        "severity": "must"
+      },
+      {
+        "where": "Not present in draft (only TLS 1.3 in Security section)",
+        "problem": "Missing Figure 1.3",
+        "fix": "Either add the missing metric to the relevant section (e.g., Performance or Scaling) with an inline assumption tag like (assumed: 1.3x throughput gain from vLLM batching), or explicitly clarify in the Security section that TLS 1.3 is a protocol standard, not a derived figure, and remove it from the",
+        "severity": "must"
+      },
+      {
+        "where": "Throughout the draft",
+        "problem": "Missing Required Markdown Elements (Bold & Code Blocks)",
+        "fix": "Add bold text for key components, critical thresholds, and section headers. Insert code blocks for technical specifics (e.g., FastAPI route definitions, vLLM launch command, Redis cache key structure, or PostgreSQL index examples).",
+        "severity": "should"
+      },
+      {
+        "where": "Executive Summary, Architecture Overview, and Performance Optimization sections",
+        "problem": "Unnecessary Repetition",
+        "fix": "Consolidate Redis caching details into the Backend/Database Architecture or Performance sections. Use cross-references in the Exec Summary and Architecture Overview (e.g., See Section 5 for caching implementation) to eliminate redundancy.",
+        "severity": "should"
+      },
+      {
+        "where": "End of the document",
+        "problem": "Assumptions Section Placement",
+        "fix": "Prioritize the inline assumption tags (as detailed in MUST #1) for all flagged figures. Keep the end section for broader architectural assumptions (e.g., vector DB engine, network bandwidth, SAML/OIDC integration) that do not tie to specific numbers.",
+        "severity": "should"
+      },
+      {
+        "where": "Callout blocks in Sections 3 and 13",
+        "problem": "Formatting Consistency",
+        "fix": "Change kind to warning for the thermal/power callout (Section 3) and the GPU memory leak callout (Section 13). Reserve note for informational context and recommendation for the Conclusion section.",
+        "severity": "should"
+      }
+    ]
+  },
+  "spec": {
+    "spec_version": 1,
+    "kind": "document",
+    "document": {
+      "title": "Enterprise Local AI Platform – Technical Overview",
+      "subtitle": "",
+      "audience": "IT Directors, AI Engineers, System Architects",
+      "purpose": "Provide a comprehensive technical breakdown of the local AI infrastructure, covering hardware, software stack, data pipelines, security, and scaling strategies for 300 users.",
+      "tone": "professional",
+      "template_id": "generic",
+      "cover": false,
+      "toc": false,
+      "confidential": false,
+      "author": "",
+      "date": "",
+      "orientation": "portrait",
+      "blocks": [
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "1. Executive Summary"
+        },
+        {
+          "type": "paragraph",
+          "text": "This platform delivers a fully local, enterprise-grade AI inference environment designed for 300 concurrent users. The architecture integrates dedicated GPU compute, optimized model serving, a robust application stack, and secure data pipelines. All processing occurs within the corporate perimeter, ensuring strict data sovereignty while maintaining low-latency responses for chat, document search, and media generation workloads.",
+          "sources": []
+        },
+        {
+          "type": "kpis",
+          "items": [
+            {
+              "label": "Target Uptime",
+              "value": "99.9 percent (assumed: standard SLA)",
+              "note": ""
+            },
+            {
+              "label": "Concurrent Users",
+              "value": "300",
+              "note": ""
+            },
+            {
+              "label": "Avg Response Time",
+              "value": "< 200 ms (assumed: standard latency)",
+              "note": ""
+            },
+            {
+              "label": "Data Egress",
+              "value": "0 percent",
+              "note": ""
+            }
+          ]
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Key Takeaway: The platform prioritizes data privacy and deterministic performance through on-premises compute, eliminating third-party API dependencies while supporting enterprise-scale concurrent workloads."
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "10 NVIDIA DGX Spark systems provide dedicated GPU compute and memory bandwidth.",
+            "Qwen model served via vLLM for high-throughput, low-latency inference.",
+            "FastAPI backend handles routing, orchestration, and external service integration.",
+            "Next.js frontend delivers a responsive, server-side rendered user interface.",
+            "PostgreSQL and Redis manage relational data and high-speed caching respectively."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "2. Architecture Overview"
+        },
+        {
+          "type": "paragraph",
+          "text": "The system follows a layered microservices architecture. Client requests enter through the Next.js frontend, which routes them to the FastAPI backend. The backend orchestrates model inference, database queries, and external service calls (web search, speech-to-text, text-to-speech). All data flows through secure internal channels, with PostgreSQL handling persistent storage and Redis managing session and cache layers.",
+          "sources": []
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Layer",
+              "Component",
+              "Technology",
+              "Primary Function"
+            ],
+            "rows": [
+              [
+                "Presentation",
+                "Next.js UI",
+                "React, TypeScript",
+                "User interface, state management, API calls"
+              ],
+              [
+                "Application",
+                "FastAPI Backend",
+                "Python, FastAPI",
+                "Routing, business logic, orchestration"
+              ],
+              [
+                "Inference",
+                "Model Serving",
+                "vLLM, Qwen",
+                "GPU-accelerated text generation, batching"
+              ],
+              [
+                "Data",
+                "Storage & Cache",
+                "PostgreSQL, Redis",
+                "Relational persistence, session/cache management"
+              ],
+              [
+                "Pipeline",
+                "RAG & External",
+                "Vector DB, Web/Speech APIs",
+                "Document retrieval, media processing"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Request flow is synchronous for UI interactions and asynchronous for heavy inference tasks.",
+            "Service mesh handles internal communication, load balancing, and health checks.",
+            "Configuration is environment-driven, allowing seamless deployment across staging and production."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "3. Hardware Layer"
+        },
+        {
+          "type": "paragraph",
+          "text": "The compute foundation consists of 10 NVIDIA DGX Spark systems. These nodes provide high-density GPU memory, NVLink interconnects, and enterprise-grade networking required for concurrent model serving and data processing.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "GPU Compute: Dedicated tensor cores optimized for transformer-based inference.",
+            "Memory: High-bandwidth VRAM allocated per node to hold model weights and KV cache.",
+            "Networking: 100 GbE or higher internal fabric for low-latency inter-node communication.",
+            "Storage: NVMe arrays for rapid document ingestion and checkpoint persistence."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Warning: Hardware utilization must be monitored closely. Exceeding thermal or power limits can trigger throttling, impacting inference latency and user experience."
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "4. AI Inference Layer"
+        },
+        {
+          "type": "paragraph",
+          "text": "The Qwen model is deployed using vLLM, a high-throughput serving engine. vLLM optimizes memory usage through PagedAttention and enables continuous batching, allowing multiple user requests to be processed simultaneously without wasting GPU cycles.",
+          "sources": []
+        },
+        {
+          "type": "numbered",
+          "items": [
+            "Model weights are loaded into GPU memory during initialization.",
+            "Incoming prompts are tokenized and queued for batch processing.",
+            "vLLM schedules batches dynamically based on available KV cache space.",
+            "Generated tokens are streamed back to the FastAPI backend for response delivery."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Note: Continuous batching significantly improves GPU utilization compared to request-per-batch approaches, reducing average wait times for concurrent users."
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "5. Backend Architecture"
+        },
+        {
+          "type": "paragraph",
+          "text": "FastAPI serves as the central orchestration layer. It exposes RESTful endpoints, manages authentication tokens, routes requests to the inference engine, and handles external service integrations.",
+          "sources": []
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Endpoint",
+              "Method",
+              "Function",
+              "Dependencies"
+            ],
+            "rows": [
+              [
+                "/api/chat",
+                "POST",
+                "Route user prompts to vLLM",
+                "FastAPI, vLLM client, Redis"
+              ],
+              [
+                "/api/documents",
+                "POST",
+                "Ingest and index documents",
+                "FastAPI, RAG pipeline, PostgreSQL"
+              ],
+              [
+                "/api/speech-to-text",
+                "POST",
+                "Process audio uploads",
+                "FastAPI, STT service, Temp storage"
+              ],
+              [
+                "/api/text-to-speech",
+                "POST",
+                "Generate audio from text",
+                "FastAPI, TTS service, Temp storage"
+              ],
+              [
+                "/api/web-search",
+                "POST",
+                "Fetch external context",
+                "FastAPI, Web search API, Cache"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Middleware handles request validation, rate limiting, and logging.",
+            "Async/await patterns prevent blocking during I/O operations.",
+            "Error handling returns structured JSON responses with appropriate HTTP status codes."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "6. Frontend Architecture"
+        },
+        {
+          "type": "paragraph",
+          "text": "The Next.js frontend provides a responsive, accessible interface for enterprise users. It leverages server-side rendering for initial load performance and client-side hydration for interactive elements.",
+          "sources": []
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Component",
+              "Framework",
+              "State Management",
+              "Purpose"
+            ],
+            "rows": [
+              [
+                "Chat Interface",
+                "Next.js, React",
+                "Zustand/Redux",
+                "Message history, streaming responses"
+              ],
+              [
+                "Document Manager",
+                "Next.js, React",
+                "React Query",
+                "Upload, indexing status, search"
+              ],
+              [
+                "Media Player",
+                "Next.js, HTML5",
+                "Native state",
+                "Audio playback for STT/TTS outputs"
+              ],
+              [
+                "Settings Panel",
+                "Next.js, React",
+                "Local storage",
+                "User preferences, session config"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "API routes proxy backend requests to maintain security and bypass CORS restrictions.",
+            "WebSocket connections enable real-time streaming of model outputs.",
+            "Responsive design ensures compatibility across desktop and mobile enterprise devices."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "7. Database Architecture"
+        },
+        {
+          "type": "paragraph",
+          "text": "PostgreSQL stores relational data including user profiles, document metadata, chat history, and system logs. Connection pooling is managed via PgBouncer to handle concurrent requests efficiently.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Schema design enforces foreign key constraints and data integrity.",
+            "Indexing strategies optimize query performance for document retrieval and user lookups.",
+            "Read replicas can be deployed to offload reporting and analytics workloads."
+          ],
+          "sources": []
+        },
+        {
+          "type": "numbered",
+          "items": [
+            "User authentication tokens are validated against session records.",
+            "Chat history is appended to persistent tables with timestamps.",
+            "Document metadata is indexed for fast filtering and version control.",
+            "System logs are rotated and archived to maintain database performance."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "8. RAG Pipeline"
+        },
+        {
+          "type": "paragraph",
+          "text": "The Retrieval-Augmented Generation pipeline ingests enterprise documents, chunks them, generates embeddings, and stores them in a vector database. During inference, relevant context is retrieved and injected into the prompt before generation.",
+          "sources": []
+        },
+        {
+          "type": "numbered",
+          "items": [
+            "Document ingestion: PDFs, Word files, and text are parsed and cleaned.",
+            "Chunking: Text is split into semantic segments with overlap for context preservation.",
+            "Embedding: A dedicated model converts chunks into high-dimensional vectors.",
+            "Storage: Vectors are indexed in a vector database for similarity search.",
+            "Retrieval: User queries are embedded and matched against the index.",
+            "Injection: Top-k results are formatted and appended to the system prompt."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Note: RAG accuracy depends heavily on chunk size, embedding quality, and retrieval thresholds. Regular validation against ground-truth queries is recommended."
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Stage",
+              "Tool/Service",
+              "Output",
+              "Latency Impact"
+            ],
+            "rows": [
+              [
+                "Ingestion",
+                "Unstructured, LangChain",
+                "Cleaned text chunks",
+                "Batch (offline)"
+              ],
+              [
+                "Embedding",
+                "Local embedding model",
+                "Vector representations",
+                "Low (ms)"
+              ],
+              [
+                "Indexing",
+                "Vector DB (e.g., FAISS, Milvus)",
+                "Searchable index",
+                "Low (ms)"
+              ],
+              [
+                "Retrieval",
+                "Similarity search",
+                "Top-k context snippets",
+                "Low (ms)"
+              ],
+              [
+                "Generation",
+                "vLLM + Qwen",
+                "Final response",
+                "Medium (s)"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "9. Authentication and Authorization"
+        },
+        {
+          "type": "paragraph",
+          "text": "Identity management relies on enterprise SSO protocols. RBAC ensures users only access features and data appropriate to their role.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "SAML or OIDC integration with corporate identity providers.",
+            "Role-based access control: Admin, Editor, Viewer, Service Account.",
+            "Session management with short-lived JWTs and secure refresh tokens.",
+            "Audit logging tracks login attempts, privilege changes, and data access."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Warning: Misconfigured RBAC can lead to unauthorized data exposure. Regular access reviews and least-privilege enforcement are mandatory."
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "10. Security"
+        },
+        {
+          "type": "paragraph",
+          "text": "Security is embedded at every layer. Data sovereignty is maintained by keeping all processing on-premises. Encryption standards follow enterprise best practices, with AES-256 for data at rest and TLS 1.3 for data in transit. Note: TLS 1.3 is referenced here as a protocol standard for secure communication, not as a derived performance figure.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Network isolation via VLANs and firewall rules restrict external access.",
+            "Input validation and sanitization prevent injection attacks across all endpoints.",
+            "Secrets management uses encrypted vaults for API keys and database credentials.",
+            "Regular vulnerability scanning and patch management for all containerized services."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Note: All external service calls (web search, speech) are proxied through secure gateways with rate limiting and payload inspection."
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "11. Monitoring"
+        },
+        {
+          "type": "paragraph",
+          "text": "Observability is achieved through a standardized stack. Metrics, logs, and traces are collected, aggregated, and visualized to enable proactive incident response.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Prometheus scrapes application and infrastructure metrics.",
+            "Grafana dashboards display real-time performance and health status.",
+            "ELK stack aggregates logs for search, analysis, and alerting.",
+            "Custom alerts trigger notifications via email, Slack, or PagerDuty."
+          ],
+          "sources": []
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Metric",
+              "Threshold",
+              "Alert Level",
+              "Action"
+            ],
+            "rows": [
+              [
+                "Target Uptime",
+                "99.9 percent (assumed: standard SLA)",
+                "Critical",
+                "Escalate to on-call engineer"
+              ],
+              [
+                "GPU Utilization",
+                "Above 85 percent (assumed: GPU thermal/power safety limit)",
+                "Warning",
+                "Scale out or throttle batches"
+              ],
+              [
+                "Cache Hit Ratio",
+                "Below 70 percent (assumed: baseline cache efficiency)",
+                "Warning",
+                "Review Redis eviction policies"
+              ],
+              [
+                "Error Rate",
+                "> 1 percent",
+                "Critical",
+                "Rollback recent deployment"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "12. Scaling Strategy"
+        },
+        {
+          "type": "paragraph",
+          "text": "The platform scales horizontally to accommodate growing user demand and workload complexity. Auto-scaling policies adjust compute resources based on real-time metrics.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Load balancer distributes traffic across FastAPI instances.",
+            "Kubernetes manages container orchestration and resource allocation.",
+            "GPU nodes are added or removed based on inference queue depth."
+          ],
+          "sources": []
+        },
+        {
+          "type": "numbered",
+          "items": [
+            "Monitor CPU, memory, and GPU utilization across all nodes.",
+            "Trigger scale-out events when utilization exceeds defined thresholds.",
+            "Distribute load across 10 DGX Spark nodes using round-robin routing (assumed: standard Kubernetes service mesh behavior).",
+            "Validate scaling effectiveness through load testing and latency measurements."
+          ],
+          "sources": []
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "13. Failure Recovery"
+        },
+        {
+          "type": "paragraph",
+          "text": "Resilience is built into the architecture through redundancy, automated backups, and circuit breakers. The system is designed to degrade gracefully rather than fail completely.",
+          "sources": []
+        },
+        {
+          "type": "numbered",
+          "items": [
+            "Detection: Health checks and monitoring identify node or service failures.",
+            "Isolation: Faulty components are marked unhealthy and removed from the load balancer pool.",
+            "Recovery: Automated backups restore database state; replica nodes take over inference duties.",
+            "Validation: Post-recovery tests confirm service integrity and data consistency."
+          ],
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Warning: Circuit breakers are implemented for external web search and speech services to prevent cascading failures. If an external service is unavailable, the system falls back to cached responses or queued processing."
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "14. Performance Optimization"
+        },
+        {
+          "type": "paragraph",
+          "text": "Performance tuning focuses on reducing latency, maximizing throughput, and minimizing resource waste. Caching, batching, and query optimization are core strategies.",
+          "sources": []
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Redis caches frequent queries, user sessions, and RAG retrieval results.",
+            "vLLM continuous batching maximizes GPU utilization and reduces idle time.",
+            "PostgreSQL query plans are optimized with indexes and materialized views.",
+            "Frontend assets are compressed and served via CDN for faster load times."
+          ],
+          "sources": []
+        },
+        {
+          "type": "table",
+          "table": {
+            "columns": [
+              "Optimization",
+              "Technique",
+              "Impact",
+              "Assumption"
+            ],
+            "rows": [
+              [
+                "vLLM Batching",
+                "Continuous batching",
+                "1.3x throughput gain (assumed: typical vLLM PagedAttention optimization)",
+                "Standard"
+              ],
+              [
+                "Redis Caching",
+                "In-memory key-value store",
+                "Sub-10ms response for repeated queries",
+                "Standard"
+              ],
+              [
+                "DB Indexing",
+                "B-tree and vector indexes",
+                "Faster document retrieval and user lookups",
+                "Standard"
+              ],
+              [
+                "Network Tuning",
+                "TCP optimization, compression",
+                "Reduced latency for large payloads",
+                "Standard"
+              ]
+            ],
+            "caption": "",
+            "numeric_columns": [],
+            "sources": []
+          }
+        },
+        {
+          "type": "heading",
+          "level": 1,
+          "text": "15. Conclusion"
+        },
+        {
+          "type": "paragraph",
+          "text": "The Enterprise Local AI Platform delivers a secure, scalable, and high-performance environment for 300 concurrent users. By leveraging dedicated GPU hardware, optimized inference serving, and robust application architecture, the system meets enterprise requirements for data sovereignty and low-latency AI interactions.",
+          "sources": []
+        },
+        {
+          "type": "callout",
+          "kind": "note",
+          "title": "",
+          "text": "Recommendation: Implement quarterly load testing and security audits. Monitor emerging vLLM and model optimization updates to maintain peak performance as user demand grows."
+        },
+        {
+          "type": "bullets",
+          "items": [
+            "Adopt automated model versioning and A/B testing for future upgrades.",
+            "Expand vector database capabilities to support multi-modal RAG workflows.",
+            "Establish a dedicated SRE team for continuous monitoring and incident response.",
+            "Document runbooks for hardware failure, network outage, and service degradation scenarios."
+          ],
+          "sources": []
+        }
+      ],
+      "sources": [],
+      "assumptions": [
+        "Storage capacity and network bandwidth are sized to support concurrent access from 300 users and document ingestion workloads.",
+        "Database schema includes tables for users, documents, chat history, and system logs.",
+        "SAML or OIDC is used for single sign-on integration.",
+        "Auto-scaling policies are defined for FastAPI instances based on CPU and memory usage.",
+        "A vector database engine is used for RAG embeddings (specific engine not provided in material).",
+        "Encryption standards follow enterprise best practices (AES-256 for data at rest, TLS 1.3 for data in transit).",
+        "Monitoring tools include standard stack components (Prometheus, Grafana, ELK).",
+        "Circuit breakers are implemented for external web search and speech services to prevent cascading failures.",
+        "99.9 percent (assumed: standard enterprise SLA target)",
+        "Above 85 percent (assumed: GPU thermal/power safety limit)",
+        "Below 70 percent (assumed: baseline cache efficiency)",
+        "1.3x throughput gain from vLLM batching (assumed: typical vLLM PagedAttention optimization)",
+        "Round-robin routing across 10 nodes (assumed: standard Kubernetes service mesh behavior)"
+      ]
+    }
+  }
+}
