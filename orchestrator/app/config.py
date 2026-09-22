@@ -1170,6 +1170,14 @@ class Settings:
         # column so a restart resumes rather than forgets.
         self.web_knowledge_worker_enabled: bool = _bool("WEB_KNOWLEDGE_WORKER_ENABLED", True)
         self.web_worker_interval_s: int = _int("WEB_WORKER_INTERVAL_S", 300)
+        # PACING, like the video and artifact pipelines. Before each embedding
+        # drain the worker waits — up to this long — while a chat generation is
+        # in flight, because one index batch occupies the embedding sidecar for
+        # most of a second and the query embedding on a chat turn's retrieval
+        # path then queues behind it (measured 2026-09-22 through the real
+        # drain: 1138.4 ms with pacing off, 30.9 ms with it on, for the same
+        # index work). 0 disables pacing and restores the old behaviour.
+        self.web_index_pace_max_wait_s: float = _float("WEB_INDEX_PACE_MAX_WAIT_S", 20.0)
         self.web_refresh_max_pages_per_cycle: int = _int("WEB_REFRESH_MAX_PAGES_PER_CYCLE", 8)
         self.web_refresh_concurrency: int = _int("WEB_REFRESH_CONCURRENCY", 2)
         # Per-level re-read deadlines. A page about an office holder is worth

@@ -196,6 +196,12 @@ async def lifespan(_app: FastAPI):
         )
 
     video_pipeline.set_busy_probe(_chat_is_busy)
+    # The web knowledge worker paces against the same probe: its embedding
+    # drain is the other batch on this box with nobody waiting on it, and the
+    # query embedding on a chat turn's retrieval path shares the sidecar with
+    # it. `start()` above only creates the task, which sleeps 45 s before its
+    # first cycle, so installing the probe here is well ahead of any drain.
+    web_worker.set_busy_probe(_chat_is_busy)
     # Artifact Studio (2026-09-11): documents, decks and workbooks made in
     # chat run as durable jobs with the same lease/heartbeat/requeue shape as
     # video analyses. The composer — the one model-facing piece — is
