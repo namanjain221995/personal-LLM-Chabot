@@ -124,6 +124,32 @@
   --ts-chart-4: #6d5ae6;
   --ts-chart-5: #c0566b;
 
+  /* Mermaid diagram roles — a CLOSED four-name vocabulary (service, store,
+     model, external) shared verbatim with the orchestrator. A diagram names a
+     ROLE, never a colour: role names are a vocabulary we can validate, hex
+     values are not, which is why the block strips author colour directives
+     rather than trusting them.
+
+     The FILL is a tint that carries the hue (ΔL* 8.0-10.6 from the #1e1e1e
+     card, against the 0.88 the old config actually painted); the STROKE
+     carries the separation at 3.21-4.58:1, which is why the contrast floor
+     sits on the stroke. Ink on fill is 10.5-11.4:1. Worst all-pairs CVD
+     stroke separation 42.9 (protan/deutan/tritan).
+
+     Three of the four hues are already repo tokens: --ts-engine-report blue,
+     --ts-engine-sql amber, --ts-engine-agent violet. Deliberately no teal and
+     no green — tests/accent-palette.test.ts fails any hex in the green band,
+     and teal is the Records engine identity. */
+  --ts-diagram-ink: #ececec;
+  --ts-diagram-service-fill: #22303f;
+  --ts-diagram-service-stroke: #2f6fb2;
+  --ts-diagram-store-fill: #40321e;
+  --ts-diagram-store-stroke: #b7791f;
+  --ts-diagram-model-fill: #362c4e;
+  --ts-diagram-model-stroke: #8b5cf6;
+  --ts-diagram-external-fill: #462934;
+  --ts-diagram-external-stroke: #d55181;
+
   /* type scale (§9): 13 / 14 / 16 / 20 / 28 */
   --ts-fs-xs: 13px;
   --ts-fs-sm: 14px;
@@ -267,6 +293,21 @@ html.light,
   --ts-sql-str: #197a4b;
   --ts-sql-num: #8a5a14;
   --ts-sql-com: #5b6b7f;
+
+  /* Diagram roles on paper. Light was never given a palette at all — it ran
+     mermaid's stock theme on our grey card (#ececff nodes at 1.06:1,
+     mediumpurple borders, highlighter-yellow clusters) and nobody reported it
+     because the owner works in dark mode. Ink on fill 13.6-14.9:1, stroke on
+     the #f4f4f4 card 3.31-6.46:1, worst CVD stroke separation 50.4. */
+  --ts-diagram-ink: #0d0d0d;
+  --ts-diagram-service-fill: #d4dfe9;
+  --ts-diagram-service-stroke: #2f6fb2;
+  --ts-diagram-store-fill: #eae0d2;
+  --ts-diagram-store-stroke: #b7791f;
+  --ts-diagram-model-fill: #ded3f0;
+  --ts-diagram-model-stroke: #6d28d9;
+  --ts-diagram-external-fill: #e7d6d9;
+  --ts-diagram-external-stroke: #a33a4d;
 }
 /* Sign-in pages wear the LOGO's colour, not the product accent.
    public/techsara-mark.png is deep indigo #1a2480 (sampled: hue 235deg,
@@ -879,11 +920,16 @@ a {
 
 /* ------------------------------------------------- mermaid diagram host */
 
+/* The INLINE block sizes its own SVG in real pixels (MermaidBlock's sizing
+   effect + lib/mermaidTheme.diagramScale), so there is deliberately no
+   `max-width: 100%` here: that rule is what shrank a wide diagram to the
+   column and took its labels down to 6 px beside 17 px answer text. The
+   block scrolls sideways instead, and the fullscreen viewer is the overview.
+   `margin: 0 auto` only centres a diagram narrower than the column. */
 .mermaid-host svg {
-  max-width: 100%;
-  height: auto;
   display: block;
   margin: 0 auto;
+  height: auto;
 }
 
 /* Fullscreen viewer: the wrapper is sized to natural-size x zoom, and the

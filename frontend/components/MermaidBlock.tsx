@@ -13,6 +13,16 @@
  * The fullscreen viewer is portalled to <body>: a transformed ancestor would
  * otherwise become the containing block for position:fixed and both mis-place
  * it and paint it behind the thread (the bug that hit the ⋯ menu).
+ *
+ * COLOUR and SIZE both live in lib/mermaidTheme.ts, which carries the reasons:
+ * `theme: 'base'` (the packaged themes silently discard our themeVariables),
+ * the four-name role palette read from `--ts-diagram-*`, the source sanitiser
+ * that enforces the colour ban in code rather than by asking, and the zoom
+ * floor. This file only applies them.
+ *
+ * The inline block is sized in real layout pixels, never with a CSS
+ * transform: a transformed ancestor becomes the containing block for
+ * position:fixed, which is the same trap the fullscreen viewer records above.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -27,6 +37,12 @@ import {
   prepareSvgForExport,
   svgNaturalSize,
 } from '@/lib/mermaid';
+import {
+  diagramScale,
+  mermaidTheme,
+  prepareDiagramSource,
+  smallestLabelPx,
+} from '@/lib/mermaidTheme';
 import { CopyButton } from './CopyButton';
 import { useTheme } from './Providers';
 import {
@@ -45,62 +61,19 @@ type View = 'preview' | 'code';
 let mermaidPromise: Promise<typeof import('mermaid').default> | null = null;
 let renderSeq = 0;
 
-/** Load + configure mermaid once per theme. */
+/**
+ * Load mermaid and apply the theme for `mode`.
+ *
+ * `mermaid.initialize` is GLOBAL, so there is exactly one config per theme and
+ * never one per block: four diagrams in one answer with four configs would
+ * race, and the last one to initialize would paint all four.
+ */
 async function getMermaid(dark: boolean) {
   if (!mermaidPromise) {
     mermaidPromise = import('mermaid').then((m) => m.default);
   }
   const mermaid = await mermaidPromise;
-  mermaid.initialize({
-    startOnLoad: false,
-    // securityLevel 'strict' sanitizes labels — the diagram source comes from
-    // model output, so it is never trusted with raw HTML.
-    securityLevel: 'strict',
-    // Without this, a syntax error makes mermaid APPEND a big red "Syntax
-    // error in text" bomb element to <body> — one per failed attempt, piling
-    // up under the app. We render our own quiet error state instead.
-    suppressErrorRendering: true,
-    theme: dark ? 'dark' : 'default',
-    fontFamily: "'IBM Plex Sans', system-ui, sans-serif",
-    // htmlLabels:false makes mermaid draw labels as native SVG <text> instead
-    // of <foreignObject> HTML. foreignObject TAINTS a canvas, which breaks
-    // "download PNG" with "Tainted canvases may not be exported".
-    htmlLabels: false,
-    flowchart: { htmlLabels: false, useMaxWidth: true },
-    class: { htmlLabels: false },
-    // Full contrast set — mermaid's dark defaults produce magenta nodes and
-    // low-contrast text on our pure-black theme.
-    themeVariables: dark
-      ? {
-          background: '#1e1e1e',
-          primaryColor: '#2f2f2f',
-          primaryTextColor: '#ececec',
-          primaryBorderColor: '#6b6b6b',
-          secondaryColor: '#26303c',
-          secondaryTextColor: '#ececec',
-          secondaryBorderColor: '#4b5563',
-          tertiaryColor: '#232323',
-          tertiaryTextColor: '#ececec',
-          tertiaryBorderColor: '#4a4a4a',
-          lineColor: '#a3a3a3',
-          textColor: '#ececec',
-          titleColor: '#ececec',
-          nodeTextColor: '#ececec',
-          clusterBkg: '#161616',
-          clusterBorder: '#3f3f3f',
-          edgeLabelBackground: '#111111',
-          noteBkgColor: '#3a3a2e',
-          noteTextColor: '#ececec',
-          actorBkg: '#2f2f2f',
-          actorTextColor: '#ececec',
-          actorBorder: '#6b6b6b',
-          labelBoxBkgColor: '#2f2f2f',
-          labelTextColor: '#ececec',
-          signalColor: '#a3a3a3',
-          signalTextColor: '#ececec',
-        }
-      : { background: '#ffffff' },
-  });
+  mermaid.initialize(mermaidTheme(dark ? 'dark' : 'light'));
   return mermaid;
 }
 
@@ -113,12 +86,28 @@ export function MermaidBlock({ code }: { code: string }) {
   const [userPicked, setUserPicked] = useState(false);
   const [full, setFull] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [overflows, setOverflows] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
   const fullRef = useRef<HTMLDivElement>(null);
+
+  /**
+   * What is actually drawn: the model's source with every colour-bearing
+   * directive stripped and our four role classDefs appended.
+   *
+   * The Code tab and the copy button read this same string, so what a person
+   * copies is what they were shown — copying a `style A fill:#ff0000` that
+   * was never painted would be a lie about the diagram.
+   */
+  const source = prepareDiagramSource(code, dark ? 'dark' : 'light');
 
   // Render (or re-render on theme change) once the source looks complete.
   useEffect(() => {
     let cancelled = false;
+    // The streaming guard judges the MODEL's own output, never the prepared
+    // source: `prepareDiagramSource` appends four classDef lines, and
+    // `looksRenderable` only asks for a known head plus one body line, so a
+    // still-streaming `flowchart LR` with nothing under it yet would look
+    // finished and be rendered as an empty diagram.
     if (!looksRenderable(code)) {
       setSvg('');
       return;
@@ -127,7 +116,7 @@ export function MermaidBlock({ code }: { code: string }) {
       try {
         const mermaid = await getMermaid(dark);
         const id = `mmd-${(renderSeq += 1)}`;
-        const { svg: out } = await mermaid.render(id, code);
+        const { svg: out } = await mermaid.render(id, source);
         if (!cancelled) {
           setSvg(out);
           setError('');
@@ -142,7 +131,73 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => {
       cancelled = true;
     };
-  }, [code, dark]);
+  }, [code, source, dark]);
+
+  /**
+   * Size the inline SVG in real layout pixels.
+   *
+   * mermaid's `useMaxWidth` is off, so the SVG arrives at its natural size and
+   * this decides how much of it to show. `diagramScale` fits the column when
+   * that keeps labels at or above 12 px and otherwise stops at the floor and
+   * lets the block scroll sideways — measured, the shipped policy rendered the
+   * architecture diagram's smallest label at 6.0 px beside 17 px answer text,
+   * and at 2.3 px on a phone.
+   *
+   * Width and height are set as ATTRIBUTES, not as a CSS transform: a
+   * transformed ancestor becomes the containing block for position:fixed, and
+   * the fullscreen viewer above records what that costs.
+   */
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !svg) return;
+    const natural = svgNaturalSize(svg);
+
+    /**
+     * Re-query the live <svg> on EVERY pass rather than capturing it once.
+     *
+     * The host is filled with dangerouslySetInnerHTML, so React owns those
+     * child nodes and may replace them on a later commit. Measured: holding
+     * the node from the first pass left this effect sizing a DETACHED element
+     * (isConnected false) while the diagram on screen kept its natural width —
+     * the architecture diagram rendered at 1773 px in a 668 px column with the
+     * scale correctly computed as 0.75 and applied to nothing.
+     *
+     * Re-querying also makes the ResizeObserver self-healing: a commit that
+     * rewrites the host changes its height, which fires the observer, which
+     * sizes whatever is actually in the DOM now.
+     */
+    const apply = () => {
+      const el = host.querySelector('svg');
+      if (!el) return;
+      const style = window.getComputedStyle(host);
+      const pad =
+        (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+      const hostWidth = host.clientWidth - pad;
+      const scale = diagramScale({
+        hostWidth,
+        naturalWidth: natural?.width ?? 0,
+        // Measured from the element in the DOM right now: a replaced node has
+        // never been sized, so its labels are still at their natural size.
+        smallestLabelPx: smallestLabelPx(el),
+      });
+      if (natural) {
+        const w = Math.round(natural.width * scale);
+        const h = Math.round(natural.height * scale);
+        el.setAttribute('width', String(w));
+        el.setAttribute('height', String(h));
+        el.style.width = `${w}px`;
+        el.style.height = `${h}px`;
+        el.style.maxWidth = 'none';
+      }
+      setOverflows(host.scrollWidth > host.clientWidth + 1);
+    };
+
+    apply();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(apply);
+    ro.observe(host);
+    return () => ro.disconnect();
+  }, [svg]);
 
   // A diagram that renders flips to preview unless the user chose otherwise.
   useEffect(() => {
@@ -202,7 +257,7 @@ export function MermaidBlock({ code }: { code: string }) {
               if (!png) return reject(new Error('export failed'));
               // The anchor MUST be in the document for Chromium to honour the
               // click, and the object URL must outlive the download start.
-              save(png, diagramFileName(code, 'png'));
+              save(png, diagramFileName(source, 'png'));
               resolve();
             }, 'image/png');
           } catch (err) {
@@ -217,11 +272,11 @@ export function MermaidBlock({ code }: { code: string }) {
       // PNG rasterization can fail (tainted canvas, blocked image). Always
       // give the user a file: the SVG is vector, opens anywhere, and never
       // taints anything.
-      save(blob, diagramFileName(code, 'svg'));
+      save(blob, diagramFileName(source, 'svg'));
     } finally {
       URL.revokeObjectURL(url);
     }
-  }, [code, dark, full]);
+  }, [source, dark, full]);
 
   const pick = (v: View) => {
     setUserPicked(true);
@@ -288,7 +343,7 @@ export function MermaidBlock({ code }: { code: string }) {
       >
         <IconDownload size={15} />
       </button>
-      <CopyButton text={code} label="Copy diagram source" />
+      <CopyButton text={source} label="Copy diagram source" />
     </>
   );
 
@@ -304,12 +359,23 @@ export function MermaidBlock({ code }: { code: string }) {
         </div>
 
         {view === 'preview' && svg ? (
-          <div
-            ref={hostRef}
-            className="mermaid-host max-h-[480px] overflow-auto bg-surface p-4"
-            // mermaid output is sanitized by securityLevel: 'strict'
-            dangerouslySetInnerHTML={{ __html: svg }}
-          />
+          <>
+            {/* No max-height: the 480 px cap made a tall diagram scroll INSIDE
+                the answer, a scroll area within a scroll area. The block grows
+                to the diagram's height and scrolls sideways instead. */}
+            <div
+              ref={hostRef}
+              className="mermaid-host overflow-x-auto overflow-y-hidden bg-surface p-4"
+              // mermaid output is sanitized by securityLevel: 'strict'
+              dangerouslySetInnerHTML={{ __html: svg }}
+            />
+            {overflows && (
+              <p className="border-t border-border px-3 py-1.5 text-[11px] text-faint">
+                This diagram is wider than the column — scroll it sideways, or
+                open it fullscreen.
+              </p>
+            )}
+          </>
         ) : (
           <div>
             {!svg && !error && (
@@ -323,7 +389,7 @@ export function MermaidBlock({ code }: { code: string }) {
               </p>
             )}
             <pre tabIndex={0}>
-              <code>{code}</code>
+              <code>{source}</code>
             </pre>
           </div>
         )}
