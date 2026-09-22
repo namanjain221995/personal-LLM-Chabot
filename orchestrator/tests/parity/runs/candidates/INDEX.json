@@ -8,5 +8,22 @@
     "note": "what this recording is evidence of",
     "samples": "how many live runs this recording came from. One sample is evidence about one sample: the chat route at Think was measured at 14, 12 and 14 over three runs of an unchanged system, moving on `tables` and `recommendations` alone. See README.md, 'Run-to-run spread'."
   },
-  "candidates": []
+  "candidates": [
+    {
+      "file": "chat_max_loop_1.md",
+      "track": "max-loop",
+      "route": "chat",
+      "effort": "max",
+      "note": "core/max_loop.py: plan (thinking off) -> streamed draft -> contract.check (0 model calls) -> critique -> guarded revision. Two model calls, first character at 42.1 s, 86.9 s wall. Same prompt on dev's best-of-N: 12/17, 1,436 words, first character at 80.3 s, 4 model calls. The critique did not run: the router is only reachable inside the compose network, so contract.extract degraded to its rule half, nothing was left undecided, and the critic was correctly skipped.",
+      "samples": 1
+    },
+    {
+      "file": "chat_max_loop_2.md",
+      "track": "max-loop",
+      "route": "chat",
+      "effort": "max",
+      "note": "A SECOND live run of the same build, minutes apart, because one sample is evidence about one sample. First character at 45.4 s, 96.1 s wall, two model calls. No revision: the one unmet requirement was a per-section gap an append cannot honestly fix, so it was reported in the step detail and left to the next draft.",
+      "samples": 1
+    }
+  ]
 }
