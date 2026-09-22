@@ -106,9 +106,9 @@ class HardwareValueTests(unittest.TestCase):
 class CachePathTests(unittest.TestCase):
     """The cache decision must come from this test's inputs, never the shell.
 
-    ``choose_cache_path`` falls back with ``env = env or os.environ``, and an
-    EMPTY dict is falsy -- so the ``{}`` the default-path test passes to mean
-    "nothing in the environment" silently becomes *this process's* environment.
+    ``choose_cache_path`` used to fall back with ``env = env or os.environ``, and
+    an EMPTY dict is falsy -- so the ``{}`` the default-path test passes to mean
+    "nothing in the environment" silently became *this process's* environment.
     A developer box that exports ``TECHSARA_MODEL_CACHE`` (or any other key the
     function consults) therefore answered those assertions from the operator's
     shell while CI, which exports none of them, answered from the platform
@@ -166,6 +166,24 @@ class CachePathTests(unittest.TestCase):
                     "techsara_cli.hardware.platform.system", return_value=system
                 ), patch("techsara_cli.hardware.Path.home", return_value=fake_home):
                     self.assertEqual(choose_cache_path(fake_home / "project", {}), expected.resolve())
+
+    def test_an_empty_environment_never_reads_the_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_home = Path(temporary) / "home"
+            cases = {
+                "Darwin": fake_home / "Library" / "Caches" / "TechSara" / "models",
+                "Linux": fake_home / ".cache" / "techsara" / "models",
+                "Windows": fake_home / "AppData" / "Local" / "TechSara" / "models",
+            }
+            for system, expected in cases.items():
+                with self.subTest(system=system), patch.dict(
+                    os.environ, {"TECHSARA_MODEL_CACHE": "/tmp/leak-from-shell"}
+                ), patch("techsara_cli.hardware.platform.system", return_value=system), patch(
+                    "techsara_cli.hardware.Path.home", return_value=fake_home
+                ):
+                    selected = choose_cache_path(fake_home / "project", {})
+                    self.assertNotEqual(selected, Path("/tmp/leak-from-shell").resolve())
+                    self.assertEqual(selected, expected.resolve())
 
 
 class MacDetectionTests(unittest.TestCase):
