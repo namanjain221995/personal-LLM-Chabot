@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +104,34 @@ class HardwareValueTests(unittest.TestCase):
 
 
 class CachePathTests(unittest.TestCase):
+    """The cache decision must come from this test's inputs, never the shell.
+
+    ``choose_cache_path`` falls back with ``env = env or os.environ``, and an
+    EMPTY dict is falsy -- so the ``{}`` the default-path test passes to mean
+    "nothing in the environment" silently becomes *this process's* environment.
+    A developer box that exports ``TECHSARA_MODEL_CACHE`` (or any other key the
+    function consults) therefore answered those assertions from the operator's
+    shell while CI, which exports none of them, answered from the platform
+    default.  Removing exactly the keys the function reads, and restoring them
+    afterwards, makes both boxes give the same answer.
+    """
+
+    #: Every environment key ``choose_cache_path`` consults, in the order it
+    #: consults them.  Keep in step with ``techsara_cli.hardware``.
+    CACHE_ENVIRONMENT_KEYS = (
+        "TECHSARA_MODEL_CACHE",
+        "VLLM_MODELS_DIR",
+        "LOCALAPPDATA",
+        "XDG_CACHE_HOME",
+    )
+
+    def setUp(self) -> None:
+        guard = patch.dict(os.environ, {}, clear=False)
+        guard.start()
+        self.addCleanup(guard.stop)
+        for key in self.CACHE_ENVIRONMENT_KEYS:
+            os.environ.pop(key, None)
+
     def test_explicit_cache_override_has_highest_precedence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
