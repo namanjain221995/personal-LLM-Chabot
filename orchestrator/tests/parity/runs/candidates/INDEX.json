@@ -1,0 +1,12 @@
+{
+  "_comment": "Candidate recordings the programme's tracks are expected to produce. Each track ADDS its entry in the same commit as the recording it declares; test_every_declared_candidate_is_present then fails, naming the track, if a recording ever goes missing. Empty is the honest state before any track lands: test_parity_gate.py passes while printing that it measured nothing, which is visibly different from a skip.",
+  "_fields": {
+    "file": "the recording, relative to runs/candidates/ (.md for a chat answer, .json for a composer result)",
+    "track": "the track that owes it",
+    "route": "chat | file",
+    "effort": "fast | think | max",
+    "note": "what this recording is evidence of",
+    "samples": "how many live runs this recording came from. One sample is evidence about one sample: the chat route at Think was measured at 14, 12 and 14 over three runs of an unchanged system, moving on `tables` and `recommendations` alone. See README.md, 'Run-to-run spread'."
+  },
+  "candidates": []
+}
