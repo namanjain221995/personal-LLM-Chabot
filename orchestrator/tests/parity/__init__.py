@@ -31,7 +31,10 @@ depth, so everything here named ``test_*.py`` runs in a CI shard. A file that
 is permanently red is a pipeline the first person under deadline pressure
 fixes by lowering the floor. So every floor's VALUE is pinned by name in
 ``test_parity.py`` -- move one in either direction and the failure names it --
-and the baselines are pinned by EXACT score on top of that, which is what
-catches the scorer's LOGIC drifting while the floors stand still. Only the
-candidate runs, which do not exist yet, are measured against ``PARITY_MIN``.
+and so is every WORD of the checklist: the 15 section names in order, the
+title and the 12 context items, because deleting a requirement is otherwise
+an easier way to soften the bar than moving a floor. The baselines are pinned
+by EXACT score on top of both, which is what catches the scorer's LOGIC
+drifting while the checklist stands still. Only the candidate runs, which do
+not exist yet, are measured against ``PARITY_MIN``.
 """

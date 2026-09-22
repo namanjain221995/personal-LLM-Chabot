@@ -13,10 +13,11 @@ The split is deliberate and it is about incentives. `shard_tests.py`
 discovers `test_*.py` at any depth under `orchestrator/tests`, so everything
 here runs in a CI shard on every push. A test file that is permanently red
 because today's product is not good enough yet is a pipeline that the first
-person under deadline pressure repairs by lowering the bar. So no floor can
-be softened here without a failure that names it. Three guards do that work,
-and they catch DIFFERENT things -- none of them is a superset of the others,
-and the last block of this docstring lists what all three miss:
+person under deadline pressure repairs by lowering the bar. So neither a
+floor nor a requirement can be softened here without a failure that names it.
+Four guards do that work, and they catch DIFFERENT things -- none of them is
+a superset of the others, and the last block of this docstring lists what all
+four miss:
 
   * `test_every_floor_still_has_its_pinned_value` compares every floor in
     checklist.py against `FLOOR_VALUES` below, a mapping of floor name to
@@ -24,6 +25,11 @@ and the last block of this docstring lists what all three miss:
     direction and this fails, and the failure names the floor and what it
     moved from and to. This is the guard that catches a floor being softened
     QUIETLY; the last block of this docstring says what it does not do.
+  * `test_every_named_thing_in_the_checklist_still_matches_its_pin` does the
+    same job for the checklist's WORDS, against `CHECKLIST_CONTENT`: the 15
+    section names IN ORDER, the title, and the 12 context items. Delete a
+    section, rename one, swap two, drop a context item, or turn the title's
+    en dash into a hyphen, and this fails naming the item.
   * `test_every_floor_is_below_the_reference` asserts no floor sits above
     what the calibration reference achieved, so a floor RAISED past the
     reference fails here and the failure names it.
@@ -65,17 +71,17 @@ changes it, and asserts the value pin fails and names it. Of those 34
 single-step moves, 26 are invisible to the baseline pin and the calibration
 guards put together.
 
-WHAT THE VALUE PIN STILL DOES NOT DO, said plainly, because the thing it was
+WHAT THE TWO PINS STILL DO NOT DO, said plainly, because the thing they were
 added to fix was a docstring that claimed more than its test delivered.
 
-  * It does not make a floor unchangeable. Edit checklist.py AND `FLOOR_VALUES`
-    in one commit and the suite is green again -- by design, because a floor
-    must be changeable. What it buys is that the change cannot be quiet: it
-    is two edits, in a file called a pin, and the failure text asks for the
-    reason in the changelog before it goes green.
-  * It does not check that the changelog line was written. Nothing here can:
-    a test cannot tell a considered floor change from an unconsidered one.
-    `test_the_floor_pin_changelog_is_not_empty` only keeps the list alive.
+  * They do not make a floor or a requirement unchangeable. Edit checklist.py
+    AND the pin in one commit and the suite is green again -- by design,
+    because both must be changeable. What they buy is that the change cannot
+    be quiet: it is two edits, in a mapping called a pin, and the failure
+    text asks for the reason in the changelog before it goes green.
+  * They do not check that the changelog line was written. Nothing here can:
+    a test cannot tell a considered change from an unconsidered one.
+    `test_the_pin_changelog_is_not_empty` only keeps the list alive.
     This one is on the reviewer, which is why the procedure is in the failure
     message rather than only in this docstring.
   * It sees only floors that live in checklist.py. A comparison hard-coded as
@@ -83,18 +89,25 @@ added to fix was a docstring that claimed more than its test delivered.
     to the coverage guard alike. Two such literals already had to be lifted
     out into `HEADINGS_MIN` and `RECOMMENDATION_MENTIONS_MIN` when this
     harness landed. Keep floors in checklist.py.
-  * IT PINS NUMBERS, NOT THE CHECKLIST'S NAMED CONTENT, and that is an open
-    hole of exactly the same shape. `REQUIRED_SECTIONS` (the 15 sections),
-    `REQUIRED_TITLE` and `CONTEXT_ITEMS` (the 12 items `CONTEXT_ITEMS_MIN`
-    counts out of) are not pinned by anything in this directory. Measured,
-    not assumed: deleting "Monitoring" from `REQUIRED_SECTIONS` -- one of the
-    15 sections the request names, the whole `sections_present` check for
-    that section gone -- leaves all 56 tests in here green, and so does
-    dropping "text-to-speech" from `CONTEXT_ITEMS`. Softening the checklist
-    by deleting a requirement is easier today than softening it by moving a
-    floor. Closing that needs a content pin next to `FLOOR_VALUES`; it was
-    deliberately left out of the commit that added the value pin rather than
-    done in passing, because re-freezing the five baselines is part of it.
+  * `FLOOR_VALUES` pins numbers and nothing else. The words are pinned by
+    `CHECKLIST_CONTENT`, a SEPARATE mapping, because the two fail for
+    different reasons and their recovery differs: a floor can move without
+    any recording noticing, while a section name or a context item changes
+    what the recordings OBSERVE, so a content change usually forces a
+    re-record and a floor change usually does not. Worth keeping the
+    measurement that justified adding it: on b91e684, with the value pin
+    already in place, deleting "Monitoring" from `REQUIRED_SECTIONS` left
+    `pytest tests/parity` at "56 passed", and so did dropping
+    "text-to-speech" from `CONTEXT_ITEMS` and replacing the title's en dash
+    with a hyphen. Softening the checklist by DELETING a requirement was
+    easier than softening it by moving a floor.
+  * The content sweep's 57 cases are not 57 new catches. Deleting any of the
+    15 sections, deleting any of the 12 context items and the title change
+    were invisible before; renaming and swapping were already caught, but
+    only INDIRECTLY -- by the five recordings' vectors moving -- and the
+    failure named a check (`sections_in_order`) rather than the section. They
+    are swept anyway so the guarantee stops depending on which recordings
+    happen to be frozen.
 
 REGENERATING `calibration/reference_counts.json`. It is the reference's
 observed counts and nothing else -- integers and one ratio, no prose, because
@@ -240,11 +253,20 @@ def _fixture() -> dict:
 # ABOVE, and the baseline pin only notices a floor that crosses one of five
 # recordings' observed counts. This one compares the number to the number.
 
-#: Every edit to `FLOOR_VALUES`, newest first: date, floor, old -> new, and
-#: the reason. A floor that moved without a line here moved without a reason,
-#: and a reviewer reading the diff sees the missing line.
-FLOOR_PIN_CHANGELOG = [
-    "2026-09-23 -- pin created. No floor moved: these are the values the "
+#: Every edit to `FLOOR_VALUES` or `CHECKLIST_CONTENT`, newest first: date,
+#: what changed, old -> new, and the reason. A floor or a requirement that
+#: moved without a line here moved without a reason, and a reviewer reading
+#: the diff sees the missing line. One list serves both pins, which is why it
+#: is not named after either of them.
+PIN_CHANGELOG = [
+    "2026-09-23 -- CHECKLIST_CONTENT added, pinning the checklist's WORDS: "
+    "the 15 REQUIRED_SECTIONS in order, REQUIRED_TITLE and the 12 "
+    "CONTEXT_ITEMS. Nothing changed value; they are pinned exactly as they "
+    "stood at b91e684, so no recording's verdict moves and no re-record is "
+    "due. Added because deleting 'Monitoring' from REQUIRED_SECTIONS left "
+    "all 56 tests green: softening the checklist by deleting a requirement "
+    "was easier than softening it by moving a floor.",
+    "2026-09-23 -- FLOOR_VALUES created. No floor moved: these are the values the "
     "harness entered the repository with at 41e7a7b. The pin was added "
     "because the baseline recordings alone left 16 of the 17 floors free to "
     "move inside a gap (HEADINGS_MIN could have reached 0) with this whole "
@@ -356,10 +378,10 @@ def test_every_floor_in_the_checklist_is_pinned_by_value():
     )
 
 
-def test_the_floor_pin_changelog_is_not_empty():
+def test_the_pin_changelog_is_not_empty():
     """A pin with no changelog is a pin whose procedure nobody wrote down."""
-    assert FLOOR_PIN_CHANGELOG and all(
-        isinstance(line, str) and line.strip() for line in FLOOR_PIN_CHANGELOG)
+    assert PIN_CHANGELOG and all(
+        isinstance(line, str) and line.strip() for line in PIN_CHANGELOG)
 
 
 @pytest.mark.parametrize("direction", ("down", "up"))
@@ -415,6 +437,274 @@ def test_a_floor_added_to_the_checklist_fails_the_coverage_pin(monkeypatch):
     with pytest.raises(AssertionError) as caught:
         test_every_floor_in_the_checklist_is_pinned_by_value()
     assert "A_BRAND_NEW_MIN" in str(caught.value)
+
+
+
+# ---------------------------------------------------- the checklist WORDS --
+#
+# FLOOR_VALUES pins every number in checklist.py. This pins every name. The
+# two holes are the same shape: measured on b91e684, before this block
+# existed, deleting "Monitoring" from REQUIRED_SECTIONS -- one of the 15
+# sections the owner's request names -- left all 56 tests in here green, and
+# so did deleting a CONTEXT_ITEM and replacing the title's en dash with a
+# hyphen. Softening the checklist by deleting a requirement was easier than
+# softening it by moving a floor.
+
+#: NAME -> ITS CONTENT, written out, for every named thing in checklist.py.
+#:
+#: ORDER IS PART OF THE PIN. `sections_in_order` scores the 15 sections in
+#: the sequence the request numbered them, so REQUIRED_SECTIONS is pinned as
+#: an ordered tuple and a swap of two adjacent entries is a failure, not a
+#: reshuffle of an unordered set.
+#:
+#: The title carries an EN DASH (U+2013), and it is pinned as the escape
+#: `\u2013` rather than as the literal character on purpose: in most fonts an
+#: en dash and a hyphen-minus are one or two pixels apart, so a literal here
+#: would let the one substitution checklist.py's own comment warns about pass
+#: a reviewer's eye. The escape cannot.
+CHECKLIST_CONTENT = {
+    "REQUIRED_SECTIONS": (
+        "Executive Summary",
+        "Architecture Overview",
+        "Hardware Layer",
+        "AI Inference Layer",
+        "Backend Architecture",
+        "Frontend Architecture",
+        "Database Architecture",
+        "RAG Pipeline",
+        "Authentication and Authorization",
+        "Security",
+        "Monitoring",
+        "Scaling Strategy",
+        "Failure Recovery",
+        "Performance Optimization",
+        "Conclusion",
+    ),
+    "REQUIRED_TITLE": "Enterprise Local AI Platform \u2013 Technical Overview",
+    "CONTEXT_ITEMS": (
+        "DGX Spark", "Qwen", "vLLM", "PostgreSQL", "FastAPI",
+        "Next.js", "Redis", "RAG", "web search", "speech-to-text",
+        "text-to-speech", "300",
+    ),
+}
+
+#: The content procedure, quoted in the failure. It differs from
+#: `MOVED_A_FLOOR` in one way that matters: a floor can move without any
+#: recording noticing, but a section name, its position or a context item
+#: changes what `sections_present`, `sections_in_order` and `context_used`
+#: OBSERVE, so a re-record is the normal case here rather than the exception.
+CHANGED_THE_CHECKLIST = (
+    "change the pin in the same commit with a one-line reason in this file's "
+    "CHANGELOG list, and re-record the five baselines: renaming, reordering "
+    "or dropping one of these changes what the recordings score, so their "
+    "pass/fail will move")
+
+
+def _named_changes() -> list:
+    """Every pinned name whose live content differs. The content pin's engine.
+
+    Reports ADDED, REMOVED and REORDERED separately, because they are three
+    different mistakes: a dropped section is a requirement deleted, an added
+    one is a requirement invented, and a reordered pair is `sections_in_order`
+    quietly grading a different sequence.
+    """
+    out = []
+    for name, want in CHECKLIST_CONTENT.items():
+        live = getattr(K, name, _ABSENT)
+        if live is _ABSENT:
+            out.append(f"{name} is pinned but no longer exists in checklist.py")
+            continue
+        if isinstance(want, str):
+            if not isinstance(live, str):
+                out.append(f"{name} is no longer a string: {type(live).__name__}")
+            elif live != want:
+                out.append(f"{name} changed {want!r} -> {live!r}")
+            continue
+        if not isinstance(live, (list, tuple)):
+            # A set would keep every name and silently destroy the order that
+            # `sections_in_order` grades on.
+            out.append(
+                f"{name} is no longer an ordered sequence: {type(live).__name__}")
+            continue
+        live = tuple(live)
+        if live == want:
+            continue
+        if len(live) != len(want):
+            out.append(f"{name}: {len(want)} entries -> {len(live)}")
+        removed = [v for v in want if v not in live]
+        added = [v for v in live if v not in want]
+        if removed:
+            out.append(f"{name}: REMOVED " + ", ".join(repr(v) for v in removed))
+        if added:
+            out.append(f"{name}: ADDED " + ", ".join(repr(v) for v in added))
+        moved = [(i, w, g) for i, (w, g) in enumerate(zip(want, live)) if w != g]
+        if moved and not removed and not added:
+            out.append(
+                f"{name}: REORDERED -- "
+                + "; ".join(f"index {i} was {w!r}, is now {g!r}"
+                            for i, w, g in moved[:6]))
+        elif moved:
+            i, w, g = moved[0]
+            out.append(f"{name}: first position that differs is index {i}, "
+                       f"was {w!r}, is now {g!r}")
+    return out
+
+
+def test_every_named_thing_in_the_checklist_still_matches_its_pin():
+    """The content pin: name by name, word by word, order included.
+
+    The analogue of `test_every_floor_still_has_its_pinned_value` for the
+    checklist's words. Like that one it stops a SILENT change, not a change.
+    """
+    changes = _named_changes()
+    assert not changes, (
+        f"{len(changes)} change(s) to the checklist's named content, which no "
+        f"floor and no recording is guaranteed to notice: "
+        + "; ".join(changes) + f". If the change is deliberate, "
+        f"{CHANGED_THE_CHECKLIST}."
+    )
+
+
+def test_every_named_thing_in_the_checklist_is_pinned_by_content():
+    """A name added to checklist.py and not to the pin is an unpinned name.
+
+    The rule is every upper-case constant that is a string, or a sequence of
+    strings. `CHECKS` and `CHECKS_BY_ID` are deliberately NOT in that set and
+    are NOT unguarded: a check added, removed or moved between the `prompt`
+    and `extra` groups changes the check-id vocabulary or the scored total,
+    and `test_a_frozen_baseline_still_scores_exactly_what_it_scored` asserts
+    both against every one of the five recordings. Saying so here so the
+    exclusion is a decision on the record rather than a gap nobody noticed.
+    """
+    declared = {
+        name for name, value in vars(K).items()
+        if name.isupper() and (
+            isinstance(value, str)
+            or (isinstance(value, (list, tuple))
+                and all(isinstance(v, str) for v in value)))
+    }
+    assert declared == set(CHECKLIST_CONTENT), (
+        "checklist.py's named content and CHECKLIST_CONTENT disagree, so a "
+        "requirement is moving unwatched. Not pinned: "
+        f"{sorted(declared - set(CHECKLIST_CONTENT))}; pinned but no longer "
+        f"declared: {sorted(set(CHECKLIST_CONTENT) - declared)}. "
+        f"To change the checklist, {CHANGED_THE_CHECKLIST}."
+    )
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _content_mutations() -> list:
+    """(id, attribute, mutated value, the strings the failure must name).
+
+    One case per way a requirement can be softened, generated from the pin so
+    that a section added to the checklist is automatically swept too.
+    """
+    cases = []
+    secs = CHECKLIST_CONTENT["REQUIRED_SECTIONS"]
+    for i, s in enumerate(secs):
+        cases.append((f"delete-section-{_slug(s)}", "REQUIRED_SECTIONS",
+                      secs[:i] + secs[i + 1:], (s,)))
+        cases.append((f"rename-section-{_slug(s)}", "REQUIRED_SECTIONS",
+                      secs[:i] + ("Renamed Section",) + secs[i + 1:],
+                      (s, "Renamed Section")))
+    for i in range(len(secs) - 1):
+        cases.append((f"swap-sections-{i}-{i + 1}", "REQUIRED_SECTIONS",
+                      secs[:i] + (secs[i + 1], secs[i]) + secs[i + 2:],
+                      (secs[i], secs[i + 1])))
+    items = CHECKLIST_CONTENT["CONTEXT_ITEMS"]
+    for i, c in enumerate(items):
+        cases.append((f"delete-context-item-{_slug(c)}", "CONTEXT_ITEMS",
+                      items[:i] + items[i + 1:], (c,)))
+    title = CHECKLIST_CONTENT["REQUIRED_TITLE"]
+    hyphened = title.replace("\u2013", "-")
+    cases.append(("retitle-en-dash-to-hyphen", "REQUIRED_TITLE", hyphened,
+                  (title, hyphened)))
+    return cases
+
+
+CONTENT_MUTATIONS = _content_mutations()
+
+
+@pytest.mark.parametrize(
+    "attr,mutated,must_name",
+    [c[1:] for c in CONTENT_MUTATIONS],
+    ids=[c[0] for c in CONTENT_MUTATIONS])
+def test_softening_the_checklist_fails_the_content_pin(
+        attr, mutated, must_name, monkeypatch):
+    """The test of the test: every way to soften a requirement, swept.
+
+    Deleting each of the 15 sections, renaming each of them, swapping each
+    adjacent pair, deleting each of the 12 context items, and replacing the
+    title's en dash with a hyphen. Every case must fail the content pin and
+    every case must NAME the item, because a failure that says only "the
+    checklist changed" sends the reader back to the diff.
+
+    Measured on b91e684, before the pin existed: the 15 deletions, the 12
+    context-item deletions and the title change all left `pytest tests/parity`
+    at "56 passed" -- they are the coverage this adds. The renames and swaps
+    were already caught, but only INDIRECTLY, by the five recordings' vectors
+    moving, and the failure named a check (`sections_in_order`) rather than
+    the section. They are swept here so the guarantee no longer depends on
+    which recordings happen to be frozen.
+    """
+    # Compared against the PIN, never against the live attribute. If it were
+    # the live one, then the moment checklist.py genuinely differs from the
+    # pin -- which is the moment the pin is meant to be failing, loudly, once
+    # -- every one of these 57 cases would fail as well and bury it.
+    pinned = CHECKLIST_CONTENT[attr]
+    unchanged = (pinned == mutated if isinstance(mutated, str)
+                 else tuple(pinned) == tuple(mutated))
+    assert not unchanged, f"the mutation for {attr} does not change the pin"
+    monkeypatch.setattr(K, attr, mutated)
+
+    with pytest.raises(AssertionError) as caught:
+        test_every_named_thing_in_the_checklist_still_matches_its_pin()
+
+    message = str(caught.value)
+    assert attr in message, f"the failure does not name {attr}: {message}"
+    for token in must_name:
+        assert repr(token) in message or token in message, (
+            f"the failure does not name {token!r}, so the reader cannot see "
+            f"which requirement moved: {message}")
+    assert CHANGED_THE_CHECKLIST in message, (
+        f"the failure does not tell the reader what to do about it: {message}")
+
+
+def test_emptying_a_checklist_list_fails_the_content_pin(monkeypatch):
+    """The blunt version of softening: delete the requirement list outright."""
+    monkeypatch.setattr(K, "REQUIRED_SECTIONS", [])
+    with pytest.raises(AssertionError) as caught:
+        test_every_named_thing_in_the_checklist_still_matches_its_pin()
+    assert "15 entries -> 0" in str(caught.value)
+    assert "Executive Summary" in str(caught.value)
+
+
+def test_a_name_added_to_the_checklist_fails_the_content_coverage_pin(monkeypatch):
+    """A new requirement list that nobody pinned is a requirement nobody guards."""
+    monkeypatch.setattr(K, "REQUIRED_APPENDICES", ["Glossary"], raising=False)
+    with pytest.raises(AssertionError) as caught:
+        test_every_named_thing_in_the_checklist_is_pinned_by_content()
+    assert "REQUIRED_APPENDICES" in str(caught.value)
+    assert CHANGED_THE_CHECKLIST in str(caught.value)
+
+
+def test_a_name_removed_from_the_checklist_fails_the_content_pin(monkeypatch):
+    """And deleting the list outright is caught as a deletion, by name."""
+    monkeypatch.delattr(K, "CONTEXT_ITEMS")
+    with pytest.raises(AssertionError) as caught:
+        test_every_named_thing_in_the_checklist_still_matches_its_pin()
+    assert "CONTEXT_ITEMS is pinned but no longer exists" in str(caught.value)
+
+
+def test_turning_the_sections_into_a_set_fails_the_content_pin(monkeypatch):
+    """A set keeps every name and destroys the order sections_in_order grades."""
+    monkeypatch.setattr(K, "REQUIRED_SECTIONS", set(K.REQUIRED_SECTIONS))
+    with pytest.raises(AssertionError) as caught:
+        test_every_named_thing_in_the_checklist_still_matches_its_pin()
+    assert "no longer an ordered sequence" in str(caught.value)
 
 
 
