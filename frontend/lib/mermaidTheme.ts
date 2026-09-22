@@ -36,6 +36,8 @@
  * already the Records engine identity.
  */
 
+import { withoutPreamble } from './mermaid';
+
 /**
  * The closed role vocabulary. Four names, shared verbatim with the
  * orchestrator so a diagram that validates there has a classDef here.
@@ -95,6 +97,10 @@ const CHROME: Record<
     noteBkg: string;
     noteBorder: string;
     altRow: string;
+    /** quadrantChart's four background regions — tints, not series colours. */
+    quadrant: readonly [string, string, string, string];
+    /** journey's smiley face, which mermaid otherwise hard-codes to cornsilk. */
+    faceFill: string;
   }
 > = {
   dark: {
@@ -110,6 +116,8 @@ const CHROME: Record<
     noteBkg: '#3a3a2e',
     noteBorder: '#6b6b52',
     altRow: '#252a2e',
+    quadrant: ['#1f2d3d', '#453625', '#53404e', '#674f47'],
+    faceFill: '#33383d',
   },
   light: {
     surface: '#f4f4f4',
@@ -124,7 +132,101 @@ const CHROME: Record<
     noteBkg: '#f6efd6',
     noteBorder: '#c9bd8e',
     altRow: '#eceff2',
+    quadrant: ['#d1e3f9', '#e0ceb9', '#d1baca', '#c6aaa1'],
+    faceFill: '#dbe0e4',
   },
+};
+
+// ------------------------------------------------------ the categorical set
+
+/**
+ * How many categorical slots mermaid asks for. `pie1…pie12` and
+ * `cScale0…cScale11` are both twelve; git branches are the first eight.
+ */
+export const CATEGORICAL_SLOTS = 12;
+
+/**
+ * The categorical palette — what a pie slice, a timeline section, a gitGraph
+ * branch, a mindmap branch, a journey section and an xychart series are
+ * painted with.
+ *
+ * WHY THIS EXISTS AT ALL
+ * ----------------------
+ * mermaid's `base` theme DERIVES every categorical family from `primaryColor`
+ * (theme-base's `updateColors`: `cScale0 = primaryColor`, `cScale3…11 =
+ * adjust(primaryColor, {h: 30…330})`, then a flat `darken(…, 75)` in dark
+ * mode; `pie1 = primaryColor`, `git0 = primaryColor`, `quadrant1Fill =
+ * primaryColor`). Our `primaryColor` is the grey node fill `#33383d`, so
+ * rotating its hue produces twelve greys. Measured in Chromium 11.17 on the
+ * dark card, before this palette existed:
+ *
+ *   pie       slices rgb(51,56,61) rgb(34,48,63) rgb(25,28,31) rgb(2,3,3)
+ *             — ΔL* 3.89 from the #1e1e1e card, 1.08:1, worst pair ΔL* 0.77
+ *   timeline  every section rgb(0,0,0) — one fill for all three
+ *   mindmap   rgb(0,0,0)
+ *   quadrant  four fills 5 rgb units apart, worst pair ΔL* 2.19
+ *   xychart   BOTH series rgb(255,244,221) — mermaid's stock cream, which on
+ *             the light card is ΔL* 0.30 and 1.01:1
+ *
+ * A categorical family cannot be derived from a neutral; it has to be stated.
+ *
+ * THE SHAPE: SIX HUE FAMILIES, TWO LIGHTNESS STEPS
+ * ------------------------------------------------
+ * Twelve distinct hues are not available here. `tests/accent-palette.test.ts`
+ * bans the whole green/teal/aqua arc outside chartTheme.ts, and at the
+ * lightness a mark needs to clear 3:1 on the card the yellow end turns olive,
+ * which reads green to a person even where the test allows it. The usable arc
+ * measures 215° (OKLCH hue 250→106 through 0), so the set is six families at
+ * ~36° with two lightness steps each: slots 1-6 are six different hues, slots
+ * 7-12 the second step of the same six in the same order. A chat pie has 3-8
+ * slices, a timeline 3-6 sections and a gitGraph 2-5 branches, so the traffic
+ * lands in the first six at full hue separation and degrades to a second step
+ * of a hue you already know rather than to a colour nobody can name.
+ *
+ * Four of the six hues are the product's own, read off the tokens already in
+ * globals.css: blue (`--ts-chart-2` / the service outline), amber
+ * (`--ts-chart-3` / store), violet (`--ts-chart-4` / model) and rose
+ * (`--ts-chart-5` / external). Two more fill the widest gaps.
+ *
+ * THE BAND
+ * --------
+ * mermaid paints a pie's percentage ON the slice with ONE colour for every
+ * slice (`pieSectionTextColor`), so a single ink has to clear AA 4.5:1 on all
+ * twelve. That is what sets the lightness band, not taste: OKLCH L 0.600-0.665
+ * on the dark card (near-black ink) and 0.465-0.565 on the light card (white
+ * ink), both inside the data-viz band and both ≥ 3:1 against the card.
+ *
+ * Validated with the dataviz skill's own validator in both modes; the numbers
+ * and the measured render are in the commit message.
+ *
+ * As with the roles, globals.css owns the values (`--ts-diagram-cat-*`) and
+ * these literals are the SSR/test fallback.
+ */
+const CATEGORICAL_FALLBACK: Record<ThemeMode, readonly string[]> = {
+  // slots 1-6: blue, gold, magenta, orange, violet, rose
+  // slots 7-12: the second lightness step of the same six, same order
+  dark: [
+    '#3596f8', '#ca8200', '#bc51a6', '#d05320', '#776de0', '#e75f7c',
+    '#1981e1', '#b07000', '#d265bb', '#e76838', '#8981f7', '#d04a69',
+  ],
+  light: [
+    '#0076d5', '#a36700', '#8f257d', '#993200', '#5343b3', '#c43e5f',
+    '#005aa4', '#7c4e00', '#b0469b', '#c44810', '#6d62d4', '#a11943',
+  ],
+};
+
+/**
+ * The one ink every categorical fill carries.
+ *
+ * Near-black on the dark card and white on the light one, because the fills
+ * themselves are inverted between the modes: on a dark card a categorical
+ * mark has to be LIGHT to clear 3:1, and light marks take dark text. This is
+ * the same direction mermaid's own dark theme takes (`scaleLabelColor:
+ * 'black'` when `darkMode`), for the same reason.
+ */
+const CATEGORICAL_INK: Record<ThemeMode, string> = {
+  dark: '#0d0d0d',
+  light: '#ffffff',
 };
 
 // ------------------------------------------------------------ token reading
@@ -190,6 +292,105 @@ export function resolveRolePaints(
   return out;
 }
 
+/**
+ * The twelve categorical fills for `mode`, resolved from `--ts-diagram-cat-N`.
+ *
+ * Safe during SSR and in tests, same as `resolveRolePaints`.
+ */
+export function resolveCategorical(
+  mode: ThemeMode,
+  root?: Element | null,
+): string[] {
+  const fallback = CATEGORICAL_FALLBACK[mode] ?? CATEGORICAL_FALLBACK.dark;
+  const style = rootStyle(root);
+  return fallback.map((fb, i) =>
+    readToken(style, `--ts-diagram-cat-${i + 1}`, fb),
+  );
+}
+
+/** The ink that sits ON a categorical fill, for `mode`. */
+export function categoricalInk(
+  mode: ThemeMode,
+  root?: Element | null,
+): string {
+  return readToken(
+    rootStyle(root),
+    '--ts-diagram-cat-ink',
+    CATEGORICAL_INK[mode] ?? CATEGORICAL_INK.dark,
+  );
+}
+
+/**
+ * Every mermaid theme variable that carries a CATEGORICAL colour, stated.
+ *
+ * Each family below was read out of mermaid 11.17's `theme-base` (the `base`
+ * theme is `Theme` / `getThemeVariables` in dist/mermaid.js), because every
+ * one of them derives from `primaryColor` when we leave it alone:
+ *
+ *   cScale0…11        timeline sections, mindmap branches, journey sections,
+ *                     treemap tiles. `cScaleN = primaryColor` rotated, then
+ *                     flat-darkened by 75 in dark mode — which is how three
+ *                     timeline sections all arrived as rgb(0,0,0).
+ *   cScaleLabel0…11   the text ON those fills; defaults to `labelTextColor`.
+ *   cScaleInv0…11     `invert(cScaleN)`, used for mindmap edges (`lineColorN`)
+ *                     and section outlines. Inverting a mid-tone fill gives a
+ *                     complementary colour nobody chose, so it is stated as
+ *                     the theme's own line colour instead.
+ *   pie1…12           pie slices. NOTE the 1-based index, unlike every other
+ *                     family here.
+ *   git0…7            gitGraph branches; gitInv/gitBranchLabel are their inks.
+ *   fillType0…7       journey/requirement section fills.
+ *   venn1…8           venn set fills.
+ *   quadrant1…4Fill   quadrant BACKGROUNDS — see below, they are not series.
+ *   xyChart.plotColorPalette  a comma-separated string, not a set of keys, and
+ *                     it defaults to mermaid's stock cream list, which is why
+ *                     both xychart series painted rgb(255,244,221).
+ *
+ * `theme-base.calculate` applies our overrides, runs `updateColors`, then
+ * applies them AGAIN — so a key mermaid assigns unconditionally (`pieN =
+ * cScaleN`) still ends up with our value. Setting both is deliberate, not
+ * redundant: it makes the result independent of that re-apply.
+ *
+ * The quadrant fills are the one family that must NOT be a series colour: they
+ * are the four background regions of the plot, with the point marks and the
+ * labels drawn on top. They are stated as four tints of the first four hues,
+ * mixed most of the way to the card so they read as background and still step
+ * apart from it and from each other.
+ */
+function categoricalVariables(
+  mode: ThemeMode,
+  c: (typeof CHROME)[ThemeMode],
+  root?: Element | null,
+): Record<string, string> {
+  const cat = resolveCategorical(mode, root);
+  const ink = categoricalInk(mode, root);
+  const out: Record<string, string> = {};
+  for (let i = 0; i < CATEGORICAL_SLOTS; i += 1) {
+    const fill = cat[i] ?? cat[i % cat.length];
+    out[`cScale${i}`] = fill;
+    out[`cScaleLabel${i}`] = ink;
+    out[`cScaleInv${i}`] = c.line;
+    out[`pie${i + 1}`] = fill;
+  }
+  for (let i = 0; i < 8; i += 1) {
+    const fill = cat[i] ?? cat[i % cat.length];
+    out[`git${i}`] = fill;
+    out[`gitInv${i}`] = ink;
+    out[`gitBranchLabel${i}`] = ink;
+    out[`fillType${i}`] = fill;
+    out[`venn${i + 1}`] = fill;
+  }
+  // journey actors. `actor0…5` ARE theme variables, but the journey renderer
+  // leaves `.actor-N` unfilled when they are unset and falls back to its own
+  // hard-coded list — measured on the light card: rgb(0,255,255) cyan,
+  // rgb(124,252,0) lawngreen and rgb(143,188,143) darkseagreen, three colours
+  // the product has decided against, sitting in the middle of a chat answer.
+  for (let i = 0; i < 6; i += 1) {
+    out[`actor${i}`] = cat[i] ?? cat[i % cat.length];
+  }
+  return out;
+}
+
 // --------------------------------------------------------------- the config
 
 /**
@@ -227,6 +428,8 @@ export const SECURE_KEYS = [
 export function mermaidTheme(mode: ThemeMode, root?: Element | null) {
   const c = CHROME[mode] ?? CHROME.dark;
   const roles = resolveRolePaints(mode, root);
+  const cat = resolveCategorical(mode, root);
+  const catInk = categoricalInk(mode, root);
   return {
     startOnLoad: false,
     securityLevel: 'strict' as const,
@@ -309,6 +512,81 @@ export function mermaidTheme(mode: ThemeMode, root?: Element | null) {
       // misc ink
       errorBkgColor: c.nodeFill,
       errorTextColor: c.ink,
+
+      // ------------------------------------------------ categorical families
+      // Twelve stated fills plus their inks; see `categoricalVariables` for
+      // what mermaid derives from `primaryColor` when these are left alone.
+      ...categoricalVariables(mode, c, root),
+
+      // pie chrome. `pieOpacity` defaults to 0.7, which washes every slice
+      // back toward the card and undoes a validated palette; the slices are
+      // separated by a hairline in the CARD colour instead of mermaid's
+      // default literal 'black', which is invisible on our dark card and a
+      // hard rule on the light one.
+      pieOpacity: '1',
+      pieStrokeColor: c.surface,
+      pieOuterStrokeColor: c.surface,
+      pieSectionTextColor: catInk,
+      pieTitleTextColor: c.ink,
+      pieLegendTextColor: c.ink,
+
+      // gitGraph chrome: the commit and tag labels sit on OUR surfaces, not
+      // on a branch colour, so they take the theme ink rather than catInk.
+      commitLabelColor: c.ink,
+      commitLabelBackground: c.nodeFill,
+      tagLabelColor: c.ink,
+      tagLabelBackground: c.nodeFill,
+      tagLabelBorder: c.nodeBorder,
+      branchLabelColor: catInk,
+      // mermaid ships these at 10px, and a gitGraph is not scaled up (the
+      // block never scales UP — see `diagramScale`), so 10px is what reaches
+      // the screen: measured at 10.0 px beside 17 px answer text. The track's
+      // own floor is 12.
+      commitLabelFontSize: '12px',
+      tagLabelFontSize: '12px',
+
+      // journey: the smiley face defaults to a hard-coded cornsilk #FFF8DC,
+      // which is ΔL* 1.27 from the light card — a face you cannot see.
+      faceColor: c.faceFill,
+
+      // quadrantChart: the four fills are BACKGROUND REGIONS with the points
+      // and the axis labels drawn on top, so they are tints rather than
+      // series colours. The point takes the first categorical fill, which is
+      // what makes a plotted item findable on them.
+      quadrant1Fill: c.quadrant[0],
+      quadrant2Fill: c.quadrant[1],
+      quadrant3Fill: c.quadrant[2],
+      quadrant4Fill: c.quadrant[3],
+      quadrant1TextFill: c.ink,
+      quadrant2TextFill: c.ink,
+      quadrant3TextFill: c.ink,
+      quadrant4TextFill: c.ink,
+      quadrantPointFill: cat[0],
+      quadrantPointTextFill: c.ink,
+      quadrantXAxisTextFill: c.ink,
+      quadrantYAxisTextFill: c.ink,
+      quadrantTitleFill: c.ink,
+      quadrantInternalBorderStrokeFill: c.nodeBorder,
+      quadrantExternalBorderStrokeFill: c.nodeBorder,
+
+      // xychart is a nested OBJECT, and its series colours are one
+      // comma-separated string. Left alone it keeps mermaid's stock cream
+      // list, which is how both series arrived as rgb(255,244,221).
+      xyChart: {
+        backgroundColor: c.surface,
+        titleColor: c.ink,
+        dataLabelColor: c.ink,
+        legendTextColor: c.ink,
+        xAxisTitleColor: c.ink,
+        xAxisLabelColor: c.inkMuted,
+        xAxisTickColor: c.line,
+        xAxisLineColor: c.line,
+        yAxisTitleColor: c.ink,
+        yAxisLabelColor: c.inkMuted,
+        yAxisTickColor: c.line,
+        yAxisLineColor: c.line,
+        plotColorPalette: cat.slice(0, 8).join(','),
+      },
     },
   };
 }
@@ -326,7 +604,9 @@ const CLASSDEF_HEADS = ['flowchart', 'graph', 'statediagram', 'classdiagram'];
 
 /** The head token of a diagram source, lowercased (`flowchart lr` -> `flowchart`). */
 export function diagramHead(code: string): string {
-  const first = (code || '')
+  // Past the preamble: a `---\nconfig: …\n---` block would otherwise be read
+  // as the head, and a flowchart carrying one would get no role classDefs.
+  const first = withoutPreamble(code)
     .split('\n')
     .map((l) => l.trim())
     .find((l) => l && !l.startsWith('%%'));
@@ -352,31 +632,138 @@ export function roleClassDefs(
 
 // -------------------------------------------------------------- the sanitiser
 
+/** The statement keywords that can carry a colour. Matched per STATEMENT. */
+const COLOUR_DIRECTIVE = /^\s*(classDef|style|linkStyle|click)\b/i;
+
+/**
+ * Split ONE line into mermaid statements on `;`.
+ *
+ * `;` is a statement separator in the flowchart grammar, which is the whole
+ * reason a line-anchored filter was not enforcement: measured on this branch,
+ * `C-->D; style A fill:#ff0000,stroke:#00ff00` painted rgb(255,0,0) on a
+ * rgb(0,255,0) outline in BOTH themes, because the line does not START with
+ * `style`.
+ *
+ * A `;` inside a LABEL must not split, so the scan tracks mermaid's label
+ * delimiters: `"…"`, `[…]`, `(…)`, `{…}` and the `|…|` of an edge label.
+ *
+ * Two deliberate details:
+ *
+ *  - only `"` opens a string, never `'`. An apostrophe is ordinary prose
+ *    ("Don't"), and treating it as a delimiter would leave the rest of the
+ *    line "inside a string" — which is exactly how a trailing `; style …`
+ *    would slip back through. mermaid spells a literal double quote `#quot;`.
+ *  - a delimiter that does not BALANCE on the line is not treated as a
+ *    delimiter at all — `"`, `[]`, `()`, `{}` and `|` alike. An unbalanced
+ *    opener would otherwise swallow the rest of the line and re-open the hole
+ *    this function exists to close (measured: `A["unclosed --> B; style A
+ *    fill:#ff0000` kept its `style` while `[` was trusted). Ignoring it costs
+ *    nothing, because a source with unbalanced delimiters does not parse.
+ *
+ * `%%` starts a comment that runs to end of line, so everything after it is
+ * inert and is kept verbatim rather than split.
+ */
+function splitStatements(line: string): string[] {
+  const balanced = (open: string, close = open) =>
+    open === close
+      ? (line.split(open).length - 1) % 2 === 0
+      : line.split(open).length === line.split(close).length;
+  const quotes = balanced('"');
+  const pipes = balanced('|');
+  const squares = balanced('[', ']');
+  const parens = balanced('(', ')');
+  const braces = balanced('{', '}');
+  const out: string[] = [];
+  let buf = '';
+  let inQuote = false;
+  let square = 0;
+  let paren = 0;
+  let brace = 0;
+  let inPipe = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (inQuote) {
+      buf += ch;
+      if (ch === '"') inQuote = false;
+      continue;
+    }
+    if (ch === '%' && line[i + 1] === '%' && !square && !paren && !brace) {
+      // A comment: inert to mermaid, so it is never split or stripped.
+      buf += line.slice(i);
+      break;
+    }
+    if (ch === '"' && quotes) {
+      inQuote = true;
+      buf += ch;
+      continue;
+    }
+    if (ch === '[' && squares) square += 1;
+    else if (ch === ']' && squares) square = Math.max(0, square - 1);
+    else if (ch === '(' && parens) paren += 1;
+    else if (ch === ')' && parens) paren = Math.max(0, paren - 1);
+    else if (ch === '{' && braces) brace += 1;
+    else if (ch === '}' && braces) brace = Math.max(0, brace - 1);
+    else if (ch === '|' && pipes) inPipe = !inPipe;
+    else if (ch === ';' && !square && !paren && !brace && !inPipe) {
+      out.push(buf);
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  out.push(buf);
+  return out;
+}
+
 /**
  * Strip every colour-bearing directive from a model-authored diagram.
  *
- * Enforced in CODE, not by asking. Both failure modes were measured against
- * the shipped block: a `%%{init: {'theme':'default'}}%%` painted mermaid's
- * light lavender inside the dark chat, and an author `style A fill:#ff0000`
- * survived even with our own classDef appended after it (inline style wins,
- * which is also why fighting it with CSS `!important` is the wrong tool — it
- * would then beat OUR theme in the fullscreen viewer and the PNG export).
+ * Enforced in CODE, not by asking — and enforced per STATEMENT, not per line.
+ * Three failure modes were measured against the shipped block, and the third
+ * against this branch's own first attempt:
  *
- * What is removed: `%%{init …}%%` directives, and any `classDef`, `style`,
- * `linkStyle` or `click` STATEMENT. What survives untouched: `A:::role`,
- * `class A,B role`, and a `classDiagram`'s own `class Foo { … }` blocks —
- * none of which carries a colour.
+ *  1. `%%{init: {'theme':'default'}}%%` painted mermaid's light lavender
+ *     inside the dark chat.
+ *  2. an author `style A fill:#ff0000` survived even with our own classDef
+ *     appended after it — inline style wins, which is also why fighting it
+ *     with CSS `!important` is the wrong tool: `!important` would then beat
+ *     OUR theme in the fullscreen viewer and the PNG export.
+ *  3. `C-->D; style A fill:#ff0000,stroke:#00ff00` rode a SEMICOLON past the
+ *     line-anchored filter and rendered red-on-green in both themes. `;` is a
+ *     statement separator in the flowchart grammar, so "the line starts with
+ *     style" was never the right question.
  *
- * The matches are anchored to the start of a line so a node label that merely
- * contains the word ("A[style guide]") is left alone.
+ * What is removed: `%%{ … }%%` directives wherever they appear, including the
+ * multi-line form, and any `classDef`, `style`, `linkStyle` or `click`
+ * STATEMENT — whether it opens its line or follows a `;`.
+ *
+ * What survives untouched: `A:::role`, `class A,B role`, and a
+ * `classDiagram`'s own `class Foo { … }` blocks. None of those carries a
+ * colour: they NAME something, and the four names that mean anything are the
+ * closed role vocabulary. An application that names a class nobody defined —
+ * `class A mine`, once its `classDef mine` has been stripped — is inert, and
+ * paints the default node (measured, both themes).
+ *
+ * A statement is only rewritten when something was actually dropped from its
+ * line, so ordinary sources reach the Code tab byte-for-byte unchanged.
  */
 export function sanitizeDiagramSource(code: string): string {
   if (!code) return '';
-  // `%%{ … }%%` directives, including multi-line ones.
+  // `%%{ … }%%` directives, including multi-line ones. Run before the
+  // statement split so a directive that itself contains `;` cannot confuse it.
   let out = code.replace(/%%\{[\s\S]*?\}%%/g, '');
+  // An unterminated `%%{init: …` is a comment to mermaid rather than a
+  // directive, but it must not reach the Code tab looking like one.
+  out = out.replace(/%%\{[^\n]*/g, '');
   out = out
     .split('\n')
-    .filter((line) => !/^\s*(classDef|style|linkStyle|click)\b/i.test(line))
+    .map((line) => {
+      const parts = splitStatements(line);
+      if (!parts.some((p) => COLOUR_DIRECTIVE.test(p))) return line;
+      const kept = parts.filter((p) => p.trim() && !COLOUR_DIRECTIVE.test(p));
+      return kept.join(';');
+    })
+    .filter((line, i, all) => !(line === '' && all[i - 1] === ''))
     .join('\n');
   return out.replace(/^\s*\n/, '').replace(/\n{3,}/g, '\n\n');
 }

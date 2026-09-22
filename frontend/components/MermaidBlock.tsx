@@ -16,9 +16,11 @@
  *
  * COLOUR and SIZE both live in lib/mermaidTheme.ts, which carries the reasons:
  * `theme: 'base'` (the packaged themes silently discard our themeVariables),
- * the four-name role palette read from `--ts-diagram-*`, the source sanitiser
- * that enforces the colour ban in code rather than by asking, and the zoom
- * floor. This file only applies them.
+ * the four-name role palette read from `--ts-diagram-*`, the twelve-slot
+ * categorical palette that pie/timeline/gitGraph/mindmap/xychart paint from,
+ * the source sanitiser that enforces the colour ban PER STATEMENT (a
+ * line-anchored one was not enforcement: `C-->D; style A fill:#ff0000` walked
+ * straight past it), and the zoom floor. This file only applies them.
  *
  * The inline block is sized in real layout pixels, never with a CSS
  * transform: a transformed ancestor becomes the containing block for

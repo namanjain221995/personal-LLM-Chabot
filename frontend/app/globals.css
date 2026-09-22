@@ -150,6 +150,40 @@
   --ts-diagram-external-fill: #462934;
   --ts-diagram-external-stroke: #d55181;
 
+  /* Diagram CATEGORICAL slots. A role says what a node IS; these say only
+     "a different one" — pie slices, timeline and journey sections, mindmap
+     and gitGraph branches, xychart series. mermaid's base theme derives all
+     of them from primaryColor, which here is the grey node fill, so left
+     alone a pie came out four near-blacks and a timeline came out rgb(0,0,0).
+
+     Six hue families (blue, gold, magenta, orange, violet, rose) x two
+     lightness steps: 1-6 are the six hues, 7-12 their second step in the
+     same order. Twelve distinct hues do not exist inside the repo's colour
+     ban — the green/teal/aqua arc is out, and at the lightness a mark needs
+     to clear 3:1 on the card the yellow end turns olive — so the usable arc
+     is 215deg and the set spends it on six.
+
+     Validated with the data-viz validator against the real card, both modes,
+     ALL CHECKS PASS: worst adjacent CVD dE 15.8 dark / 12.3 light, worst
+     adjacent normal dE 18.0 / 16.9, every slot >= 3:1 on the card (3.86 /
+     4.19 worst) and >= 4.5:1 against --ts-diagram-cat-ink (4.50 / 4.61).
+     On the ALL-PAIRS list the first three still pass in both modes; the
+     first six do not (normal dE 10.9 / 12.5) and lean on the direct labels
+     every one of these diagram types already draws. */
+  --ts-diagram-cat-ink: #0d0d0d;
+  --ts-diagram-cat-1: #3596f8;
+  --ts-diagram-cat-2: #ca8200;
+  --ts-diagram-cat-3: #bc51a6;
+  --ts-diagram-cat-4: #d05320;
+  --ts-diagram-cat-5: #776de0;
+  --ts-diagram-cat-6: #e75f7c;
+  --ts-diagram-cat-7: #1981e1;
+  --ts-diagram-cat-8: #b07000;
+  --ts-diagram-cat-9: #d265bb;
+  --ts-diagram-cat-10: #e76838;
+  --ts-diagram-cat-11: #8981f7;
+  --ts-diagram-cat-12: #d04a69;
+
   /* type scale (§9): 13 / 14 / 16 / 20 / 28 */
   --ts-fs-xs: 13px;
   --ts-fs-sm: 14px;
@@ -308,6 +342,24 @@ html.light,
   --ts-diagram-model-stroke: #6d28d9;
   --ts-diagram-external-fill: #e7d6d9;
   --ts-diagram-external-stroke: #a33a4d;
+
+  /* The same six hues stepped for paper, in the same slot order, so the theme
+     toggle never re-orders a diagram's colours. The ink inverts with them:
+     on the dark card a categorical mark has to be LIGHT to clear 3:1 and
+     takes dark text; on paper it has to be DARK and takes white. */
+  --ts-diagram-cat-ink: #ffffff;
+  --ts-diagram-cat-1: #0076d5;
+  --ts-diagram-cat-2: #a36700;
+  --ts-diagram-cat-3: #8f257d;
+  --ts-diagram-cat-4: #993200;
+  --ts-diagram-cat-5: #5343b3;
+  --ts-diagram-cat-6: #c43e5f;
+  --ts-diagram-cat-7: #005aa4;
+  --ts-diagram-cat-8: #7c4e00;
+  --ts-diagram-cat-9: #b0469b;
+  --ts-diagram-cat-10: #c44810;
+  --ts-diagram-cat-11: #6d62d4;
+  --ts-diagram-cat-12: #a11943;
 }
 /* Sign-in pages wear the LOGO's colour, not the product accent.
    public/techsara-mark.png is deep indigo #1a2480 (sampled: hue 235deg,
