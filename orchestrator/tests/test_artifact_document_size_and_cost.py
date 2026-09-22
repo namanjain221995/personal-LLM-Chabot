@@ -29,6 +29,8 @@ from app.artifacts import length as L
 from app.artifacts import pipeline as P
 from app.artifacts import spec as S
 from app.artifacts import types as T
+from tests.test_artifact_compose import FIFTEEN_SECTIONS
+from tests.test_artifact_length import OWNER_PROMPT
 
 
 class _Model:
@@ -259,3 +261,104 @@ def test_a_pipeline_that_cannot_pace_is_not_a_failed_job(monkeypatch):
         C.compose_sectioned(req, T.EFFORT_BUDGETS["fast"], C.target_for(req),
                             say=lambda *a, **k: asyncio.sleep(0)))
     assert calls == 3 and not any("waited" in w for w in warnings)
+
+
+# ----------- 2026-09-22: a size CODE derived is not a size the person named --
+#
+# A request that names fifteen sections has named a size, and code now
+# derives one (15 x length.WORDS_PER_SECTION = 6,000 words). That number
+# crosses SECTIONED_WRITER_WORDS, so without a guard the owner's Fast
+# request would have bought the sectioned writer: an outline plus one call
+# per section, roughly sixteen calls and minutes of an engine that is also
+# answering live chat. A size the PERSON named still buys that path at any
+# effort; a size code derived buys it only where an outline pass already
+# exists, which is Think and Max.
+
+
+def test_fifteen_named_sections_derive_a_size_without_claiming_the_person_named_one():
+    req = _req(OWNER_PROMPT)
+    target = C.target_for(req)
+    assert target.words == 15 * L.WORDS_PER_SECTION == 6_000
+    assert target.explicit is False, "code's judgement, like DATA_REPORT_FLOOR — not the person's words"
+    assert target.phrase == "the 15 sections the request named"
+    assert L.sections_for(target.words) == 15, "400 is sections_for's own constant, inverted"
+
+    # Under the floor of six names nothing changes: every section-naming
+    # case in this suite before today named three to five.
+    small = _req("Create a report including an executive summary, risks and a roadmap")
+    assert C.target_for(small).words == 0
+
+    # An edit still has no size target at all.
+    assert C.target_for(_req(OWNER_PROMPT, operation="edit")).words == 0
+
+
+def test_fast_writes_the_owners_fifteen_section_report_in_exactly_one_model_call(monkeypatch):
+    """The two cost guards, together, on the request that needs them.
+    Without them this is the sectioned writer: one outline call plus one
+    call per section, and then a short-draft correction on top."""
+    model = _Model([_doc(FIFTEEN_SECTIONS, 60)])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req(OWNER_PROMPT)))
+    assert model.calls == ["artifact_document"], model.calls
+    assert result.model_calls == 1
+    assert _headings(result.spec) == FIFTEEN_SECTIONS
+    assert not any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
+    # And the card no longer carries our own budget warning.
+    assert not any("top-level sections" in w and "at most" in w for w in result.warnings), result.warnings
+    assert C._enforce_caps(result.spec, T.EFFORT_BUDGETS["fast"], FIFTEEN_SECTIONS,
+                           target=C.target_for(_req(OWNER_PROMPT))) == []
+
+
+def test_a_size_the_person_named_still_buys_the_sectioned_writer_at_fast(monkeypatch):
+    """The guard is on the DERIVED target only. "A big report" is still
+    3,000 words, still over SECTIONED_WRITER_WORDS, still sectioned at
+    Fast — exactly as it was before this change."""
+    model = _Model([_outline(["One", "Two", "Three"])] + [_section(h, 1_100) for h in ("One", "Two", "Three")])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req("give me a big report on the customers file", tables=[_table()])))
+    assert any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
+
+
+def test_think_may_spend_the_sectioned_writer_on_a_derived_size(monkeypatch):
+    """Think and Max already pay for an outline pass, so a derived size
+    buys them the sectioned writer; Fast does not have one and does not."""
+    model = _Model([_outline(FIFTEEN_SECTIONS)] + [_section(h, 400) for h in FIFTEEN_SECTIONS]
+                   + [{"ok": True, "issues": []}])
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req(OWNER_PROMPT, effort="think")))
+    assert any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
+    assert len(_headings(result.spec)) == 15
+
+
+def test_a_correction_cannot_halve_a_sectioned_draft_a_derived_size_bought(monkeypatch):
+    """B-1's floor, for the path this release opened. A target derived
+    from the sections a request names buys the sectioned writer at Think,
+    so a Think document can now be the work of eight calls with
+    `explicit=False` — and the CORRECTION_KEEP_FRACTION floor read
+    `target.explicit` alone, which would have let one review correction
+    replace all eight."""
+    seven = ["Overview", "Architecture", "Security", "Monitoring", "Scaling", "Recovery", "Conclusion"]
+    instruction = "Write the platform report.\nRequirements:\n" + "\n".join(
+        f"{i}. {name}" for i, name in enumerate(seven, 1))
+    req = _req(instruction, effort="think")
+    target = C.target_for(req)
+    assert len(C.requested_sections(instruction)) == 7 and target.words == 2_800 > C.SECTIONED_WRITER_WORDS
+    assert target.explicit is False
+
+    model = _Model(
+        [_outline(seven)]
+        + [_section(h, 800) for h in seven]
+        + [{"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more", "severity": "must"}]}]
+        # A correction `_worse()` alone would ACCEPT: 4,000 words of the
+        # draft's 5,600 (71%) across 12 blocks of its 21, over both of
+        # `_gutted`'s halves — and three of the seven sections gone.
+        + [_doc(seven[:4], 1_000)]
+    )
+    monkeypatch.setattr(llm, "json_completion", model)
+    result = asyncio.run(C.compose(_req(instruction, effort="think")))
+    assert _headings(result.spec) == seven, "the eight-call draft must survive the one-call correction"
+    cut = next((w for w in result.warnings if "would have cut the document" in w), None)
+    assert cut is not None, result.warnings
+    assert "5,609 words to 4,006" in cut and "was not applied" in cut, cut
+    # And the sentence does not tell the person they asked for 2,800 words.
+    assert "words that were asked for" not in cut and "2,800 words this document was sized at" in cut, cut

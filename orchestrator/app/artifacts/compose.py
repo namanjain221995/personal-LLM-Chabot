@@ -71,6 +71,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 from pydantic import ValidationError
 
 from .. import llm
+from ..core import pasted
 from ..core.sf_intel.planner import extract_json_object
 from . import length as _length
 from . import spec as S
@@ -405,6 +406,14 @@ def caps_for(budget: Any, target: Optional[LengthTarget] = None, requested: Sequ
     return sections, min(slides, T.MAX_SLIDES)
 
 
+#: How many sections a request must NAME before the composer derives a
+#: size from them. Every section-naming case in the suite before
+#: 2026-09-22 named three to five; a table of contents of six or more is a
+#: report, and nothing smaller changes size. The floor is what bounds the
+#: blast radius of the rule below.
+DERIVED_TARGET_MIN_SECTIONS = 6
+
+
 def target_for(req: ComposeRequest) -> LengthTarget:
     """How big this request asked its file to be. Reads the request's own
     words, and — for the data-report floor only — whether the material has
@@ -414,11 +423,29 @@ def target_for(req: ComposeRequest) -> LengthTarget:
     if req.operation == "edit":
         return LengthTarget()
     m = req.material or Material(instruction=req.instruction)
-    return _length.parse_size(
-        req.instruction or m.instruction, req.kind,
+    instruction = req.instruction or m.instruction
+    target = _length.parse_size(
+        instruction, req.kind,
         has_data=bool(m.sources) or any(t.source_id != "upload_image" for t in m.tables or ())
         or _material_words(m) >= DATA_REPORT_MIN_MATERIAL_WORDS,
     )
+    # A REQUEST THAT NAMES ITS SECTIONS HAS NAMED A SIZE (owner report,
+    # 2026-09-22). Fifteen numbered sections and "do not skip any section"
+    # is an ask for a report, but no size WORD appears in it, so the
+    # composer sized it at nothing and wrote 1,081 words across fifteen
+    # headings — thirteen of them under a hundred words each. The number
+    # comes from `length.sections_for` read backwards: that function gives
+    # one section per WORDS_PER_SECTION, so N sections are N of them.
+    # `explicit=False` is deliberate and follows the DATA_REPORT_FLOOR
+    # precedent — it is code's judgement, not the person's words, and the
+    # two cost guards below depend on knowing the difference.
+    if req.kind == "document" and not target.explicit and not _length.shrink_asked(instruction):
+        names = requested_sections(instruction)
+        words = min(len(names) * _length.WORDS_PER_SECTION, _length.MAX_WORDS)
+        if len(names) >= DERIVED_TARGET_MIN_SECTIONS and words > target.words:
+            return LengthTarget(words=words, slides=target.slides,
+                                phrase=f"the {len(names)} sections the request named", explicit=False)
+    return target
 
 
 #: How much material the data-report floor (1,500 words, three pages) needs
@@ -443,6 +470,38 @@ def _size_line(target: Optional[LengthTarget]) -> str:
         return ""
     return (f"Write about {target.words:,} words: every section several paragraphs, with a table or a chart "
             "wherever the data supports one. Do not stop early and do not summarise what you have already written.")
+
+
+def _requested_line(requested: Sequence[str]) -> str:
+    """The sections the person named, in their words and their order.
+
+    Until 2026-09-22 they reached the model only as the integer inside
+    "at most N top-level sections" — and on the owner's fifteen-section
+    request that integer was Fast's eight, a cap his own request
+    contradicts fifteen times over. The names themselves were never in the
+    prompt at all, and neither was the fact that he had numbered them.
+
+    The second half maps his words to the vocabulary the schema already
+    has: "warnings, notes" is a `Callout` with `kind` "warning" or "note",
+    which the model will not reach for unless it is told. Sub-headings are
+    named too: the prompt asks for them and every recorded run produced
+    none.
+    """
+    if not requested:
+        return ""
+    names = "; ".join(str(n).strip() for n in requested if str(n).strip())
+    if not names:
+        return ""
+    return (
+        f" The request names these {len(requested)} sections and the document must carry every one of them, "
+        f"in this order, none skipped, none merged into another, none renamed: {names}. Each of them is a "
+        "heading at LEVEL 1; the parts inside a section are sub-headings at LEVEL 2, and a section of several "
+        "hundred words needs two or three of them. Write real prose under every heading rather than a heading "
+        "followed by a single line. Use the block the request's own words ask for: a bullets block for an "
+        "enumeration, a numbered block for a sequence of steps, a table where things are compared, a callout "
+        "with kind \"warning\" and a title for a caution or a risk, a callout with kind \"note\" and a title "
+        "for an aside or a note, and recommendations written as recommendations where the request asks for them."
+    )
 
 
 def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: Optional[LengthTarget] = None,
@@ -500,7 +559,26 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
         + (f" Author: {req.author}." if req.author else "") + (f" Date: {req.date}." if req.date else "")
     )
     system += _language_line(req.instruction or m.instruction)
-    user = "\n\n".join(parts + [f"Request: {req.instruction or m.instruction}"])
+    # THE SECTION NAMES TRAVEL IN THE USER MESSAGE, NOT THE SYSTEM ONE.
+    #
+    # They are the person's own words, lifted verbatim out of their request —
+    # and a request routinely contains a pasted third-party document, so those
+    # words are untrusted text. Every other scrap of untrusted text in this
+    # composer already travels in the user role: notes, the conversation, the
+    # previous answer, uploaded material, tables, sources and the request
+    # itself are all joined into `user` below, and the system message is
+    # entirely code-controlled. Appending the names to `system` broke that
+    # boundary, putting up to twenty attacker-shaped phrases in the same
+    # message as _ROLE's "You never invent statistics, names, dates or
+    # quotations", framed as an instruction the document must obey.
+    #
+    # Nothing in the feature depends on the role: the model reads both
+    # messages, and the names are a requirement about the document, which is
+    # what the user message is for. Pinned by
+    # test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
+    user = "\n\n".join(
+        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested)]
+    )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -712,6 +790,74 @@ def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Seque
 # to the draft's headings by word overlap; a missing one costs exactly one
 # correction, naming the sections, at every effort (CONTRACT-2 §11).
 
+#: How much of the request the section scan reads. THE BOUND IS PART OF
+#: THE FEATURE, not a follow-up. `requested_sections` runs synchronously
+#: on the orchestrator's single event loop over the person's whole
+#: message; composer paste is inline, with no chip and no size limit
+#: anywhere on the input path, so "the person's message" is routinely a
+#: pasted document. This repository has already stalled that loop twice on
+#: exactly this shape — b13c406 ("a multi-megabyte question never holds
+#: the event loop") and the Fast-mode CPU-bound pre-pass before it. A
+#: table of contents lives in the first few sentences of a request; the
+#: megabyte behind one is material, and material is read elsewhere.
+_SECTION_SCAN_CHARS = 4_000
+
+#: The THIRD trigger: a heading that introduces the list of sections. The
+#: owner's request of 2026-09-22 named fifteen sections under a line
+#: reading "Requirements:" and this function returned none of them —
+#: neither older trigger fires on that wording, the run is space-separated
+#: so `_LIST_SPLIT_RE` cannot split it, and `take()` discards any phrase
+#: carrying a digit, so "1. Executive Summary" was ineligible anyway.
+#: A pasted document's own table of contents is NOT the sections this request
+#: named. `_LIST_HEADING_RE` matches "Contents:", "Sections:" and "Outline:" —
+#: exactly the words a third-party document puts above its own list — so a
+#: request that pastes a thirty-heading report and asks for a one-page summary
+#: was read as a request for thirty sections, and the document was SIZED from
+#: them (`target_for` turns each name into WORDS_PER_SECTION words). The
+#: platform already marks pasted material: `app/core/pasted.fenced` wraps it in
+#: <pasted_text>...</pasted_text> so the model can be told it is material and
+#: never instructions. The scan reads only what is OUTSIDE those fences — the
+#: person's own words — which is the same line the rest of the platform draws.
+#: An unclosed opening fence swallows the rest of the message on purpose: text
+#: after "here is what they sent:" with no close is not the person speaking
+#: either.
+_PASTED_BLOCK_RE = re.compile(
+    re.escape(pasted.OPEN_TAG) + r".*?(?:" + re.escape(pasted.CLOSE_TAG) + r"|\Z)",
+    re.I | re.S,
+)
+
+
+def _own_words(instruction: str) -> str:
+    """The request with every fenced paste removed. Pure, and bounded: the
+    pattern is anchored on two literals with one lazy span between them, so
+    the scan stays linear whatever is pasted in."""
+    if not instruction or pasted.OPEN_TAG.lower() not in instruction.lower():
+        return instruction
+    return _PASTED_BLOCK_RE.sub(" ", instruction)
+
+
+_LIST_HEADING_RE = re.compile(r"\b(?:requirements?|sections?|structure|contents|outline|include)\s*:", re.I)
+
+#: How much of the text after such a heading is read as its list. Long
+#: enough for twenty numbered names, short enough that a heading in a
+#: pasted document cannot pull the rest of the paste into the scan.
+_LIST_BLOCK_CHARS = 1_200
+
+#: A list item's marker: an ordinal or a bullet, at the start of the block
+#: or after whitespace. Anchored on a literal, bounded, and with no nested
+#: quantifier, so the scan stays linear whatever is pasted into it.
+_LIST_MARKER_RE = re.compile(r"(?:\A|(?<=\s))(?:\(?\d{1,2}[.)]|[-*\u2022])[ \t]+")
+#: The same marker at the head of a line: what continues a multi-line list.
+_LIST_LINE_RE = re.compile(r"[ \t]*(?:\(?\d{1,2}[.)]|[-*\u2022])[ \t]+")
+#: Where one item stops when no next marker does it: a clause or sentence
+#: end. "15. Conclusion" must not swallow the sentence after the list.
+_ITEM_END_RE = re.compile(r"[.;:!?\n]")
+
+#: The ordinal a numbered item carries, stripped BEFORE the digit filter
+#: runs — otherwise every item of a numbered list is "a phrase with a
+#: digit in it" and none of them is a section.
+_LEAD_ORDINAL_RE = re.compile(r"^\(?\d{1,2}[.)]\s*")
+
 _SECTIONS_COLON_RE = re.compile(r"\bsections?\s*:\s*(?P<list>[^.;!?\n]{3,300})", re.I)
 _SECTION_LIST_RE = re.compile(
     r"\b(?P<verb>includ(?:e|es|ing)|contain(?:s|ing)?|cover(?:s|ing)?|with)\s+"
@@ -817,36 +963,75 @@ def _content_words(text: str) -> set:
 
 def _section_phrase(raw: str) -> str:
     text = " ".join(raw.split()).strip(" -–—:'\"")
+    text = _LEAD_ORDINAL_RE.sub("", text)
     text = _LEAD_WORDS_RE.sub("", text)
     text = _TRAIL_WORDS_RE.sub("", text)
     return text.strip()
 
 
+def _list_block(text: str, start: int) -> str:
+    """The list under a heading: the rest of the heading's line, plus the
+    following lines while each one still opens with a list marker. Bounded
+    twice over — by `_LIST_BLOCK_CHARS` and by the first line that is not
+    a list item — so the sentence after the list stays prose."""
+    block = text[start: start + _LIST_BLOCK_CHARS]
+    lines = block.split("\n")
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if not _LIST_LINE_RE.match(line):
+            break
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _list_items(block: str) -> List[str]:
+    """One phrase per marked item, in the order the list numbered them.
+    An item runs from its marker to the next marker, or to the first
+    clause end, whichever comes first. Items are NOT split on "and":
+    "Authentication and Authorization" is one section (item 9 of the
+    owner's fifteen), not two."""
+    marks = list(_LIST_MARKER_RE.finditer(block))
+    items: List[str] = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(block)
+        chunk = block[m.end():end]
+        stop = _ITEM_END_RE.search(chunk)
+        items.append(chunk[: stop.start()] if stop else chunk)
+    return items
+
+
 def requested_sections(instruction: str) -> List[str]:
     """The sections a request names — "include A, B, C and D", "covering
-    A and B", "sections: A, B" — as short phrases, in order, deduplicated.
-    A phrase is a section only when it is one to five words with no digit
-    and at least one content word that does not name a file part (rows,
-    logo, PDF, chart …); "with" needs a list of two or more, because "with
-    a total row" describes the table, not a chapter. Empty when the
-    request names none."""
-    text = " ".join(strip_style_clauses(instruction or "").split())
+    A and B", "sections: A, B", and a numbered or bulleted list under a
+    heading such as "Requirements:" — as short phrases, in order,
+    deduplicated. A phrase is a section only when it is one to five words
+    with no digit (its ordinal having been stripped first) and at least
+    one content word that does not name a file part (rows, logo, PDF,
+    chart …); "with" needs a list of two or more, because "with a total
+    row" describes the table, not a chapter. Empty when the request names
+    none.
+
+    Only the first `_SECTION_SCAN_CHARS` characters are read, and the
+    slice is the FIRST thing that happens — before the join that copies
+    the string, before the style-clause pass, before any pattern runs.
+    """
+    head = _own_words(instruction or "")[:_SECTION_SCAN_CHARS]
+    raw = strip_style_clauses(head)
+    text = " ".join(raw.split())
     if not text:
         return []
     found: List[str] = []
     seen: set = set()
 
-    def take(raw_list: str, minimum: int) -> None:
-        phrases = [_section_phrase(x) for x in _LIST_SPLIT_RE.split(raw_list) if x and x.strip()]
-        keep: List[str] = []
-        for ph in phrases:
-            words = ph.split()
-            if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph) or re.search(r"\d\s*pt\b", ph, re.I):
-                continue
-            content = _content_words(ph)
-            if not content or content <= {_stem(w) for w in _NOT_SECTION_WORDS}:
-                continue
-            keep.append(ph)
+    def eligible(ph: str) -> bool:
+        words = ph.split()
+        if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph) or re.search(r"\d\s*pt\b", ph, re.I):
+            return False
+        content = _content_words(ph)
+        return bool(content) and not content <= {_stem(w) for w in _NOT_SECTION_WORDS}
+
+    def add(phrases: Sequence[str], minimum: int) -> None:
+        keep = [ph for ph in phrases if eligible(ph)]
         if len(keep) < minimum:
             return
         for ph in keep:
@@ -855,11 +1040,25 @@ def requested_sections(instruction: str) -> List[str]:
                 seen.add(key)
                 found.append(ph)
 
+    def take(raw_list: str, minimum: int) -> None:
+        add([_section_phrase(x) for x in _LIST_SPLIT_RE.split(raw_list) if x and x.strip()], minimum)
+
+    # The marked list under a heading goes FIRST: it is the most explicit
+    # statement of the sections a request can make, and its order is the
+    # order the person numbered. It reads `raw`, with the newlines still
+    # in it, because a newline is what tells a list item from the sentence
+    # after the list. Two items minimum — one stray dash is not a table of
+    # contents, and a single-item "sections: X" is already read below.
+    for m in _LIST_HEADING_RE.finditer(raw):
+        add([_section_phrase(x) for x in _list_items(_list_block(raw, m.end()))], 2)
+
     for m in _SECTIONS_COLON_RE.finditer(text):
         take(m.group("list"), 1)
     for m in _SECTION_LIST_RE.finditer(text):
         take(m.group("list"), 2 if m.group("verb").lower() == "with" else 1)
-    return found[:12]
+    # 20, not 12: `_OUTLINE_SCHEMA`'s own `sections.maxItems` is 20, and a
+    # request that numbers fifteen sections is not a request for twelve.
+    return found[:20]
 
 
 def _missing_sections(spec: S.ArtifactSpec, requested: Sequence[str]) -> List[str]:
@@ -1047,6 +1246,20 @@ async def _write_one_section(
         "Write it in full — several paragraphs of real prose, plus a list, a table or a chart where the material "
         "supports one. Never write another section's content, never repeat a section already written, and write a "
         "closing summary only if this is the last section."
+        # A SECTION HAS PARTS, and until 2026-09-22 nothing here said so:
+        # the whole-document prompt asks for sub-headings and this one did
+        # not, so a fifteen-section report written section by section came
+        # back with fifteen headings and not one sub-heading (measured,
+        # Think, file route: 0 of 15). The vocabulary sentence is the same
+        # one the whole-document prompt carries, said once per section
+        # instead of once per document — the fifteen section NAMES are
+        # deliberately not repeated here, because this call writes one.
+        " Break the section into its parts and head each part at LEVEL 2 under your level-1 heading — two or "
+        "three of them, unless the section really is one single idea. Use the "
+        "block the request's own words ask for: a bullets block for an enumeration, a numbered block for a "
+        "sequence of steps, a table where things are compared, a callout with kind \"warning\" and a title for a "
+        "caution or a risk, a callout with kind \"note\" and a title for an aside, and a recommendation written "
+        "plainly as a recommendation where the request asks for them."
     )
     parts = [
         "OUTLINE OF THE WHOLE FILE (context — write only your own section):\n"
@@ -1054,7 +1267,13 @@ async def _write_one_section(
         ("Sections already written, which you must not repeat: " + "; ".join(written)) if written
         else "This is the first section of the file.",
         f"WRITE SECTION {index} OF {total}: “{heading}”. What it is for: {str(item.get('purpose') or '').strip()}. "
-        f"Elements to use: {', '.join(str(e) for e in (item.get('elements') or []) if e) or 'paragraphs'}. "
+        # The outline's `elements` list is a CLOSED enum with no heading in
+        # it, and the model follows it literally: fifteen scoped calls
+        # produced fifteen headings and no sub-heading at all, twice
+        # measured. Sub-headings are named here, beside the elements,
+        # because the list the model reads is the list it writes to.
+        f"Elements to use: {', '.join(str(e) for e in (item.get('elements') or []) if e) or 'paragraphs'}, "
+        "plus level-2 sub-headings for this section's parts. "
         f"Write about {words:,} words in this section.",
     ]
     if current:
@@ -1207,8 +1426,18 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     target = target_for(req)
 
     outline_json: Optional[dict] = None
+    # THE SECTIONED WRITER IS BOUGHT BY THE PERSON, NOT BY CODE. A target
+    # code DERIVED from the number of sections a request names crosses
+    # SECTIONED_WRITER_WORDS at fifteen sections (15 x 400 = 6,000), and
+    # at Fast that is an outline call plus one call per section — roughly
+    # sixteen calls and minutes of an engine that is also answering live
+    # chat, for a request whose words named no size at all. A size the
+    # PERSON named still buys this path at any effort; a size code derived
+    # buys it only where an outline pass is already budgeted, which is
+    # Think and Max.
     sectioned = (req.kind == "document" and req.operation != "edit"
-                 and target.words > SECTIONED_WRITER_WORDS)
+                 and target.words > SECTIONED_WRITER_WORDS
+                 and (target.explicit or budget.outline_pass))
     ran_out_of_time = False
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
@@ -1246,13 +1475,30 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         validated, then HELD AGAINST THE DRAFT IT CORRECTS. A correction that
         returns a fraction of the content is not applied — the Think brief
         of the 2026-09-11 e2e run came back from its review as one KPI row
-        on an empty page. Shrinking is allowed only when it was asked for."""
+        on an empty page. Shrinking is allowed only when it was asked for.
+
+        A correction the model could not produce AT ALL is the same
+        answer: keep the draft and say so. Live at Max on 2026-09-22, a
+        fifteen-section report written section by section came back from
+        its review with five musts, and the one whole-document correction
+        call that followed did not return JSON — which failed the entire
+        job and threw away a complete 6,000-word document that had cost
+        sixteen calls. A correction is an improvement attempt; losing the
+        work it was meant to improve is not one of its outcomes."""
         nonlocal spec, calls, corrections
         await say(pct, detail)
-        raw = await _compose_once(req, budget, outline_json=outline_json, extra=extra, target=target, requested=requested)
-        calls += 1
-        corrections += 1
-        candidate, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json, target=target, requested=requested)
+        try:
+            raw = await _compose_once(req, budget, outline_json=outline_json, extra=extra, target=target, requested=requested)
+            calls += 1
+            corrections += 1
+            candidate, repaired, notes = await _validate_or_repair(req, budget, raw, outline_json, target=target, requested=requested)
+        except ComposeError as exc:
+            calls += 1
+            corrections += 1
+            result_warnings.append(f"a correction ({detail}) could not be written and was not applied; "
+                                   "the draft before it is what you see")
+            log.info("artifact compose: a correction (%s) failed: %s; kept the draft", detail, exc)
+            return
         calls += repaired
         result_warnings.extend(n for n in notes if n not in result_warnings)
         why = _worse(spec, candidate, allow_shrink=allow_shrink)
@@ -1260,7 +1506,15 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         # to any report over tables, which is code's own judgement and comes
         # from a single call with no sectioned draft to protect (verifier,
         # 2026-09-18). The floor is for a length the PERSON named.
-        if not why and target.explicit and target.words and not allow_shrink:
+        #
+        # `or sectioned` since 2026-09-22, and it is the same rule read
+        # literally rather than a new one: the clause that follows says
+        # "the draft it replaces may be the work of nine", and the reason
+        # a derived target was excluded was that it "comes from a single
+        # call with no sectioned draft to protect". A target derived from
+        # the sections a request names CAN buy the sectioned writer, at
+        # Think and Max, so from today there is a draft to protect.
+        if not why and (target.explicit or sectioned) and target.words and not allow_shrink:
             # A correction is ONE call over the whole file; the draft it
             # replaces may be the work of nine. _worse() only refuses a
             # correction that keeps less than HALF, so a 47% cut passed:
@@ -1273,7 +1527,8 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             after_words = len(S.text_of(candidate).split())
             if before_words >= 40 and after_words < before_words * CORRECTION_KEEP_FRACTION:
                 why = (f"would have cut the document from {before_words:,} words to {after_words:,}, "
-                       f"against the {target.words:,} words that were asked for")
+                       + (f"against the {target.words:,} words that were asked for" if target.explicit
+                          else f"against the {target.words:,} words this document was sized at"))
         if why:
             result_warnings.append(f"a correction {why} and was not applied; the draft before it is what you see")
             log.info("artifact compose: a correction (%s) %s; kept the draft", detail, why)
@@ -1332,7 +1587,13 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # sections, and a writer that ran out of time is not asked for more.
     if target.words and req.kind == "document" and req.operation != "edit":
         words = len(S.text_of(spec).split())
-        if words < target.words * SHORT_DRAFT_FRACTION and not sectioned and not ran_out_of_time:
+        # `target.explicit`, the same distinction CORRECTION_KEEP_FRACTION
+        # makes a few lines above: a whole extra whole-document call is
+        # the person's to buy by naming a size, not code's to spend on a
+        # number it derived. The measured counterfactual came in at 3,785
+        # of a derived 6,000 = 63%, only just over the 60% line.
+        if (words < target.words * SHORT_DRAFT_FRACTION and target.explicit
+                and not sectioned and not ran_out_of_time):
             await correct(
                 65.0, "writing the document out in full",
                 f"Your draft is about {words:,} words; the request asked for about {target.words:,}. "
@@ -1343,7 +1604,15 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             )
             words = len(S.text_of(spec).split())
         if words < target.words * SHORT_DRAFT_FRACTION:
-            result_warnings.append(f"the document is about {words:,} words against the {target.words:,} asked for")
+            # "asked for" only when the person DID ask. A target code
+            # derived is code's judgement, and the owner's whole complaint
+            # of 2026-09-22 was that the one sentence he read on the card
+            # was our own budget arithmetic quoted back at him as if it
+            # were his request.
+            result_warnings.append(
+                f"the document is about {words:,} words against the {target.words:,} asked for"
+                if target.explicit else
+                f"the document is about {words:,} words; {target.phrase} suggested about {target.words:,}")
 
     # Figures the material never gave. Named on the version at every effort;
     # handed to the reviewer where there is one.
@@ -1461,11 +1730,55 @@ def _pin_template(raw: dict, req: ComposeRequest) -> None:
         raw["template_id"] = req.template_id
 
 
-def _tidy_document(raw: dict, req: ComposeRequest) -> None:
+#: How much of the requested list the level-2 headings must cover before
+#: code promotes them. A draft whose own headings are mostly the sections
+#: that were asked for is a draft that used the wrong level; one that
+#: shares a heading or two with the list is a different document.
+PROMOTE_COVERAGE = 0.6
+
+
+def _promote_headings(blocks: List[Any], requested: Sequence[str]) -> None:
+    """A draft that headed every requested section at level 2 has its
+    heading levels shifted up by one. Code, not a model call.
+
+    In the live counterfactual of 2026-09-22 the model put the TITLE at
+    level 1 and all fifteen requested sections at level 2. `_tidy_document`
+    drops the title repeat — correctly, the renderer prints it — and the
+    draft is then a document with ZERO level-1 headings, which
+    `_enforce_caps` (it counts only `level == 1`) cannot see at all and
+    which reads as one flat body. Shifting every heading up by one keeps
+    the draft's own relative structure exactly: a sub-heading under a
+    promoted section is still a sub-heading.
+    """
+    if not requested:
+        return
+    headings = [b for b in blocks if isinstance(b, dict) and b.get("type") == "heading"]
+    if not headings or any(int(b.get("level") or 1) == 1 for b in headings):
+        return
+    tops = [_content_words(str(b.get("text") or "")) for b in headings if int(b.get("level") or 1) == 2]
+    if not tops:
+        return
+    covered = 0
+    for phrase in requested:
+        words = _content_words(phrase)
+        # 0.6 is `_missing_sections`' own overlap rule (CONTRACT-2 §11):
+        # a heading covers a phrase when it holds 60% of its content
+        # words. The same rule decides here what a section IS.
+        if words and any(len(words & h) / len(words) >= 0.6 for h in tops):
+            covered += 1
+    if covered < max(1, round(len(requested) * PROMOTE_COVERAGE)):
+        return
+    for b in headings:
+        b["level"] = max(1, int(b.get("level") or 1) - 1)
+
+
+def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()) -> None:
     """AS3 (e), code not model: a document's first heading that repeats
-    its title is dropped (the renderer already prints the title block), and
-    every table's `numeric_columns` is inferred from its cells — a column
-    is numeric when all its non-blank cells parse as numbers. Mutates."""
+    its title is dropped (the renderer already prints the title block),
+    the heading levels are shifted up when a draft headed every requested
+    section at level 2, and every table's `numeric_columns` is inferred
+    from its cells — a column is numeric when all its non-blank cells
+    parse as numbers. Mutates."""
     if req.kind != "document" or not isinstance(raw, dict) or not isinstance(raw.get("blocks"), list):
         return
     blocks = raw["blocks"]
@@ -1474,6 +1787,7 @@ def _tidy_document(raw: dict, req: ComposeRequest) -> None:
     if (first is not None and first.get("type") == "heading" and title and len(blocks) > 1
             and " ".join(str(first.get("text") or "").split()).casefold() == title and int(first.get("level") or 1) == 1):
         blocks.pop(0)
+    _promote_headings(blocks, requested)
     for b in blocks:
         t = b.get("table") if isinstance(b, dict) and b.get("type") == "table" else None
         if not isinstance(t, dict) or not isinstance(t.get("columns"), list) or not isinstance(t.get("rows"), list):
@@ -1832,7 +2146,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     code-made rows are filled (CONTRACT-2 §4), so the Sheet that validates
     is the one that renders."""
     notes = _reconcile_sources(raw, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(raw, req)
+    _tidy_document(raw, req, requested)
     _pin_template(raw, req)
     # In a thread: a 10,000-row generator or copy is CPU the event loop
     # must not spend (#11); the fill mutates `raw` and `notes` in place.
@@ -1853,7 +2167,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         target=target, requested=requested,
     )
     notes = _reconcile_sources(fixed, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(fixed, req)
+    _tidy_document(fixed, req, requested)
     _pin_template(fixed, req)
     problems = await asyncio.to_thread(_fill_code_made_rows, fixed, req, notes)
     if problems:
