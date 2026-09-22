@@ -1119,6 +1119,136 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
+  # LANE B. BOX EVIDENCE, gathered AT THE SAME TIME as the test evidence.
+  #
+  # This is the node that turns the graph from a line into two converging
+  # pipes. Lane A asks "does this tree work?" on hosted runners; this asks
+  # "can this machine be deployed to?" on the box, while lane A is still
+  # running, and the two meet at `deploy`.
+  #
+  # Until now the first thing that looked at the box was `deploy` itself,
+  # after the full ~31-minute CI had passed. So every box-state refusal cost
+  # a CI run before it was even asked. Measured on recorded runs: one burned
+  # ~55 minutes of CI before a 3m53s deploy failure that had nothing to do
+  # with the code; another's `verify` reported non-cluster addresses ACCEPTING
+  # a connection to the unauthenticated engine port, a fact that was already
+  # true before the run started. Two of the three most recent main-run
+  # failures were box state, not code.
+  #
+  # ------------------------------------------------------------- THE GATING
+  # `needs: [policy, security]`, and NOT `needs: [policy]`.
+  #
+  # gitleaks-over-full-history lives in the `security` job (its step is
+  # "Secret scan (full git history)"), not in `policy`. `policy` runs YAML
+  # validity, actionlint, workflow_policy P1-P8, ruff, `bash -n` over every
+  # *.sh, the gate-script suite, the schema_parity invariants and the rollback
+  # rehearsal. Today the first job to reach the box is `deploy`, which needs
+  # `ci-ok`, which needs BOTH — so gating on `policy` alone would put a
+  # self-hosted job ahead of the secret scan for the first time in this
+  # repository's history. Both are hosted, neither builds nor waits on a
+  # service, so readiness still starts long before the 18-28 minute
+  # orchestrator shards finish, and that is where the hour this job saves
+  # actually is.
+  #
+  # THIS IS A MITIGATION, NOT A CURE. Neither `policy` nor `security` is a
+  # code review. Anyone who can push to main can still cause this commit's
+  # box_readiness.py — plus everything it subprocesses — to run on the
+  # production box. Only branch protection closes that, and at the time of
+  # writing `gh api repos/{owner}/{repo}/branches/main/protection` returns
+  # 404 "Branch not protected", `rulesets` returns `[]`, and the `production`
+  # environment has `"protection_rules": []` with `"can_admins_bypass": true`.
+  # "The script is read-only" is NOT the argument: read-only is a property of
+  # the intended code, not of whatever a commit contains.
+  #
+  # -------------------------------------------------------- THE CONCURRENCY
+  # PER COMMIT, and deliberately NOT the release path's `deploy-dgx-spark`.
+  # GitHub holds at most one running and one PENDING entry per group, and a
+  # newly queued entry cancels the pending one; `cancel-in-progress: false`
+  # protects only the in-progress entry. If readiness shared the release
+  # path's group, a concurrent or scheduled job could cancel a PENDING
+  # `box-readiness`; `needs.box-readiness.result` would then be `cancelled`,
+  # the deploy's `if:` would be false, and the deploy would be SKIPPED with no
+  # reason given — the exact failure class that once cost three green pushes
+  # to main. A per-sha group cannot evict anything and cannot be evicted.
+  #
+  # The property the shared group was meant to buy — never run during a
+  # rollout — is delivered by two things that actually hold, and both are
+  # STATED INVARIANTS:
+  #   (a) there is ONE self-hosted runner on the head and it runs one job at a
+  #       time, so jobs on the box serialise physically;
+  #   (b) the deploy-lock probe REFUSES when the flock is held.
+  # If a second runner is ever added on the head, this job must take a read
+  # lock or rejoin `deploy-dgx-spark`.
+  #
+  # ------------------------------------------------ WHAT IT DOES NOT CLAIM
+  # It is a PRE-check taken minutes before the deploy, not a guarantee held at
+  # deploy time. The deploy root is a working tree several sessions write to
+  # and a lock can be taken in the gap. scripts/deploy.sh's own preflight
+  # still runs and stays authoritative; nobody may remove a check from it on
+  # the strength of this job.
+  #
+  # It is deliberately NOT in `ci-ok`'s `needs:` or in ci_gate.py --require.
+  # It is self-hosted, so it skips on every pull_request, and ci_gate.py
+  # counts a skipped dependency as a failure — it would turn every PR red.
+  # P4 exists to keep self-hosted jobs out of the PR-facing gate. When this
+  # job refuses it goes RED on its own, with the reason in its own log, which
+  # is the opposite of a silent skip.
+  # ==========================================================================
+  box-readiness:
+    name: Box readiness
+    needs: [policy, security]
+    if: >-
+      needs.policy.result == 'success' &&
+      needs.security.result == 'success' &&
+      github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, dgx-spark]
+    permissions:
+      contents: read
+    # Seven reads. Measured on the box on 2026-09-23: 10.0s wall clock on a
+    # healthy head. The ceiling is the sum of the per-probe subprocess
+    # timeouts (405s) plus the checkout, so even a box where every probe hangs
+    # finishes inside it.
+    timeout-minutes: 8
+    concurrency:
+      group: box-readiness-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      # The production checkout, not the runner workspace: .env, .runtime/ and
+      # the model cache live there. Same value the deploy job uses.
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+    steps:
+      # The probe scripts come from a checkout of the commit being deployed,
+      # the same way `deploy` and `verify` run theirs. The production checkout
+      # is by definition still on the OLD commit, and a gate that is missing
+      # there must not be a gate that silently does not run.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+
+      # STRICTLY READ-ONLY, and it never takes the deploy lock — it observes
+      # whether the lock is free, which is a different act. Every probe fails
+      # closed: a probe that cannot be performed, that raises, or that times
+      # out is a refusal, never a shrug. Every refusal prints the exact
+      # command a human runs to clear it.
+      #
+      # Probe 6 is a REAL completion, never /health: a wedged vLLM engine
+      # served a green /health for five and a half hours on this box while
+      # generating nothing. One tiny generation, thinking off, <= 8 tokens —
+      # the main model is TP=2 across both nodes, so it costs both of them and
+      # it runs beside live chat.
+      #
+      # Nothing that is not on an allowlist reaches stdout. This repository is
+      # public, its run summaries are world-readable, and the deploy root's
+      # .runtime/generated.env holds TECHSARA_SECRET_ENV — the pointer to the
+      # real secrets file — among 220 keys. See box_probes.py.
+      - name: Is this box in a state to be deployed to?
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/box_readiness.py \
+            --deploy-root "$TECHSARA_DEPLOY_ROOT" \
+            --ref "$GITHUB_SHA"
+
+  # ==========================================================================
   # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
   #
   # Everything below runs on [self-hosted, dgx-spark] — the production box.
@@ -1134,7 +1264,11 @@ jobs:
   # ==========================================================================
   deploy:
     name: Deploy to production (rolling, model-preserving)
-    needs: ci-ok
+    # BOTH pipes must arrive: the hosted test evidence (`ci-ok`) and the box
+    # evidence (`box-readiness`). `needs` is what makes the skip happen; the
+    # explicit conjunct in `if:` below is what makes the guard auditable,
+    # which is the convention this file already states for `verify`.
+    needs: [ci-ok, box-readiness]
     # A push to main DEPLOYS (2026-09-08, at the owner's request): merging any
     # branch into main is the release action, so it should not also need a
     # second manual step that is easy to forget.
@@ -1159,6 +1293,7 @@ jobs:
     # rollout accepts the result — otherwise this rolls itself back.
     if: >-
       needs.ci-ok.result == 'success' &&
+      needs.box-readiness.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (
         (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
