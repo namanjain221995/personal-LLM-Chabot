@@ -58,6 +58,24 @@ _FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r")
 #: A URL a citation may carry. http(s) only; no data:, file:, javascript:.
 _URL_RE = re.compile(r"^https?://[^\s<>\"']{1,2000}$", re.IGNORECASE)
 
+#: A code fence's info string. It becomes a CSS class and a DOCX style name,
+#: so it is an allowlist and not a length limit: anything outside it is
+#: dropped to empty rather than escaped and carried.
+_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9+#._-]{0,20}$")
+
+#: A diagram node id. It is only ever used to match edges to nodes inside one
+#: diagram — it never reaches a filename, a class or a selector.
+_NODE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,39}$")
+
+#: What a diagram node IS. The list is closed and shared: it is the same
+#: vocabulary render/diagrams.DIAGRAM_ROLES paints and the same one the chat
+#: prompt teaches, and a test pins the three together. Four is not a rounding:
+#: the dataviz validator finds no five-slot subset of this repository's eight
+#: chart colours that separates under `--pairs all`, which is the check a
+#: diagram needs because its LAYOUT decides which colours end up touching.
+DiagramRole = Literal["service", "store", "model", "external"]
+DIAGRAM_ROLES: Tuple[str, ...] = DiagramRole.__args__  # type: ignore[attr-defined]
+
 _SOURCE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 
 
@@ -208,6 +226,91 @@ class ChartBlock(_Strict):
     chart: Chart
 
 
+# A fenced code block. `language` is a LABEL, never anything executable, and
+# it reaches a CSS class name and a DOCX style name, so it is validated
+# against a closed pattern here and anything else becomes empty. `text` is
+# model-authored, or lifted verbatim out of an uploaded Markdown file, so
+# every renderer escapes it (render/html.py's `e()`); nothing here is markup.
+# The docstring is one line on purpose: a class docstring becomes the JSON
+# schema's `description` and is paid for in prefill on every composition.
+class Code(_Strict):
+    """A fenced code block, kept verbatim and shown monospaced."""
+
+    type: Literal["code"] = "code"
+    language: str = Field(default="", max_length=20)
+    text: str = Field(min_length=1, max_length=6000)
+    caption: str = Field(default="", max_length=300)
+
+    @field_validator("language")
+    @classmethod
+    def _language_shape(cls, v: str) -> str:
+        return v if _LANGUAGE_RE.match(v or "") else ""
+
+
+# `kind` is what the node IS, and it is what the renderer colours by — never
+# the node's depth in the graph, and never anything inferred from the words
+# in its label.
+class DiagramNode(_Strict):
+    """One box: an id, a short label, and what the box is."""
+
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    kind: DiagramRole = "service"
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _NODE_ID_RE.match(v):
+            raise ValueError("a node id must start with a letter and hold letters, digits, _ or -")
+        return v
+
+
+class DiagramEdge(_Strict):
+    source: str = Field(min_length=1, max_length=40)
+    target: str = Field(min_length=1, max_length=40)
+    label: str = Field(default="", max_length=24)
+    style: Literal["solid", "dashed"] = "solid"
+
+
+# A node-and-edge picture, DECLARED rather than drawn. The model never writes
+# mermaid, DOT or any other source a renderer would have to interpret: it
+# names nodes, edges and roles, and render/diagrams.py lays them out and
+# draws them with matplotlib. There is no colour field and there never will
+# be one — `DiagramNode.kind` selects from a validated four-colour set, so a
+# model cannot pick an unreadable pair and cannot smuggle a style directive
+# in as a colour. The caps are legibility, not storage: past about two dozen
+# boxes a diagram on a page stops being read and starts being decoration.
+class Diagram(_Strict):
+    """A flow diagram: boxes, arrows between them, and what each box is.
+    Code draws and colours it, so there is no colour or style field."""
+
+    title: str = Field(default="", max_length=120)
+    direction: Literal["TD", "LR"] = "TD"
+    nodes: List[DiagramNode] = Field(min_length=2, max_length=24)
+    edges: List[DiagramEdge] = Field(default_factory=list, max_length=40)
+    caption: str = Field(default="", max_length=300)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "Diagram":
+        ids = [n.id for n in self.nodes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two nodes share an id")
+        known = set(ids)
+        kept = [e for e in self.edges if e.source in known and e.target in known]
+        if len(kept) != len(self.edges):
+            # A dangling edge is dropped rather than refused: the rest of the
+            # picture is still true, and a refusal would lose the whole
+            # figure. Assigned the way Slide._shape assigns, not through
+            # object.__setattr__ — this model is not frozen.
+            self.edges = kept
+        return self
+
+
+class DiagramBlock(_Strict):
+    type: Literal["diagram"] = "diagram"
+    diagram: Diagram
+
+
 class Callout(_Strict):
     type: Literal["callout"] = "callout"
     kind: Literal["note", "tip", "warning", "quote"] = "note"
@@ -230,7 +333,9 @@ class PageBreak(_Strict):
     type: Literal["page_break"] = "page_break"
 
 
-DocumentBlock = Union[Heading, Paragraph, Bullets, Numbered, TableBlock, ChartBlock, Callout, KPIRow, PageBreak]
+DocumentBlock = Union[
+    Heading, Paragraph, Bullets, Numbered, TableBlock, ChartBlock, Code, DiagramBlock, Callout, KPIRow, PageBreak,
+]
 
 
 class DocumentSpec(_Strict):
@@ -990,8 +1095,20 @@ def validation_summary(exc: ValidationError, limit: int = 12) -> str:
 
 
 def text_of(spec: ArtifactSpec) -> str:
-    """Every piece of prose in the spec, joined — for the placeholder scan,
-    the content review and the length check. No structure, no formatting."""
+    """Every piece of PROSE in the spec, joined — for the placeholder scan,
+    the content review and the length check. No structure, no formatting.
+
+    A `Code` block and a `Diagram`'s labels are deliberately NOT prose here,
+    and the omission is a decision rather than an oversight. The placeholder
+    scan would read a snippet's `TODO` comment or `YOUR_API_KEY` as an
+    unfinished document; `unsupported_figures` would read a version number
+    or a port in a snippet as a figure the material never gave; and the
+    length check would let a page of pasted code stand in for the writing
+    the person asked for. The parity eval draws the same line — its word
+    count excludes code and diagram fences. The prose CEILING
+    (`DocumentSpec._shape`) does count `Code.text`, because that one is
+    about how much text a renderer is asked to carry.
+    """
     parts: List[str] = [spec.title]
     body = spec.body
     if isinstance(body, DocumentSpec):
@@ -1222,6 +1339,7 @@ def unsupported_figures(spec: ArtifactSpec, material_text: str) -> List[str]:
 __all__ = [
     "SPEC_VERSION", "ArtifactSpec", "DocumentSpec", "PresentationSpec", "WorkbookSpec",
     "Heading", "Paragraph", "Bullets", "Numbered", "TableBlock", "ChartBlock", "Callout",
+    "Code", "Diagram", "DiagramBlock", "DiagramNode", "DiagramEdge", "DiagramRole", "DIAGRAM_ROLES",
     "KPI", "KPIRow", "PageBreak", "Slide", "Sheet", "Column", "Total", "Table", "Chart",
     "Series", "Citation", "Generator", "GenColumn", "OnlyWhen", "Derived", "TextPool", "Rewrite",
     "Highlight", "SheetStyle", "ColumnFormat", "schema_for", "parse_body", "load", "validation_summary",

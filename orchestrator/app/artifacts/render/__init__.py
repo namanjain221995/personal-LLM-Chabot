@@ -288,6 +288,42 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
                 raise _safe("chart", f"chart {ordinal} ({chart.title or chart.type}) could not be drawn") from exc
             report.chart_files.append(name)
 
+        # 1b. Diagrams: a second asset loop beside the charts one, writing
+        # `diagram-<n>.png` into the SAME directory under the same naming
+        # rule — so the picture rides the path that already exists. pdf.py's
+        # fetcher allows a bare `.png` from the assets directory and needs no
+        # change, and the DOCX embeds the file from disk. The name is
+        # appended to `chart_files`, which is what the pipeline passes to
+        # `store.publish(scratch=...)`: an embedded picture is scratch and is
+        # removed with the chart PNGs rather than left in the published
+        # version. It is timed as part of "charts" rather than under a key of its
+        # own, because `timings` keys are the FORMAT keys the pipeline reads
+        # for artifact_render_seconds{format} plus "charts" and "preview",
+        # and a new key is a change to that contract.
+        from . import diagrams as DG
+
+        spec_diagrams = H.spec_diagrams(spec)
+        doc_body = spec.body if isinstance(spec.body, S.DocumentSpec) else None
+        landscape = bool(spec_diagrams) and doc_body is not None and H.document_orientation(doc_body, ST.resolve(spec)) == "landscape"
+        box = DG.LANDSCAPE_BOX_IN if landscape else DG.PORTRAIT_BOX_IN
+        for ordinal, diagram in enumerate(spec_diagrams, start=1):
+            name = H.diagram_filename(ordinal)
+            try:
+                layout = DG.render_diagram_png(diagram, out / name, box_in=box)
+            except ImportError as exc:
+                raise RenderError("dependency_unavailable", "The chart library is not installed on this server.") from exc
+            except Exception as exc:
+                log.exception("diagram %d failed", ordinal)
+                raise _safe("diagram", f"diagram {ordinal} ({diagram.title or 'untitled'}) could not be drawn") from exc
+            report.chart_files.append(name)
+            if not layout.fits:
+                # Said plainly rather than shipped as an unreadable picture.
+                report.warnings.append(
+                    f"The diagram “{diagram.title or 'untitled'}” has more in it than fits one page at a readable "
+                    f"size, so its labels print at about {layout.effective_pt:.0f} pt. Splitting it into two diagrams, or "
+                    "turning the page landscape, would make it readable."
+                )
+
     # 2. Formats, then 3. preview.pdf. `paths` is keyed role:format:slug
     # (CONTRACT-2 §11) and `entries` remembers, per key, the role, format,
     # title and sheet the FileRef needs; the order is the requested order.

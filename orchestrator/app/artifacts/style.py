@@ -1402,7 +1402,7 @@ def _spec_outline(body: Any) -> Dict[str, Any]:
     from . import spec as S  # lazy: spec imports this module
 
     out: Dict[str, Any] = {"kind": None, "headings": [], "tables": 0, "columns": set(), "sheets": {}, "slides": 0, "charts": 0,
-                           "has": set()}
+                           "diagrams": 0, "code_blocks": 0, "has": set()}
     if isinstance(body, S.DocumentSpec):
         out["kind"] = "document"
         out["has"].update({"title", "paragraph", "header_footer", "caption"})
@@ -1417,6 +1417,22 @@ def _spec_outline(body: Any) -> Dict[str, Any]:
                 out["max_cols"] = max(out.get("max_cols", 0), len(b.table.columns))
             elif isinstance(b, S.ChartBlock):
                 out["charts"] += 1
+            elif isinstance(b, S.DiagramBlock):
+                # This dispatch DROPS what it does not know, silently: a
+                # block type added to the schema and not here contributes
+                # nothing to `has`, and every per-element rule that could
+                # have targeted it is thrown away with no error. A diagram
+                # is a figure with a caption, so it is the caption rules it
+                # brings in; there is no diagram target kind, because
+                # TargetKind is the model-facing vocabulary and a picture
+                # has no runs to style.
+                out["diagrams"] += 1
+                out["has"].add("caption")
+            elif isinstance(b, S.Code):
+                # Likewise for a code block: its body is a paragraph of
+                # monospaced text and it may carry a caption.
+                out["code_blocks"] += 1
+                out["has"].update({"paragraph", "caption"})
             elif isinstance(b, S.KPIRow):
                 out["has"].update({"kpi_value", "kpi_label"})
             elif isinstance(b, S.Callout):

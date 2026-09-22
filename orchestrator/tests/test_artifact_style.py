@@ -365,7 +365,17 @@ def test_csv_with_styling_also_delivers_a_styled_xlsx(tmp_path):
 #: 2026-09-16: +1826 for the six advanced chart types (their names in the
 #: `type` enum and the bullet chart's `target` column). The number is pinned
 #: so that anything ELSE creeping into guided decoding is caught here.
-BASE_SCHEMA_LENGTHS = {"document": 14972, "presentation": 12872, "workbook": 21356}
+#: 2026-09-22 (feat/document-vocabulary): document +2547 for the two block
+#: types that make a code block and a drawn diagram possible in a file —
+#: Code, DiagramBlock, Diagram, DiagramNode, DiagramEdge. This IS the
+#: mechanism: the composer learns that a diagram exists from this schema and
+#: from nothing else (app/artifacts/compose.py never imports the chat
+#: prompt's DIAGRAM_INSTRUCTION), so the cost is the feature. Measured on
+#: the pinned engine: 4,673 → 5,463 tokens, +790 per document composition,
+#: on the artifact path only — no chat effort pays it. Class docstrings
+#: become schema `description`, so the reasoning for these models lives in
+#: comments above them rather than in their docstrings.
+BASE_SCHEMA_LENGTHS = {"document": 17519, "presentation": 12872, "workbook": 21356}
 
 
 @pytest.mark.parametrize("kind", sorted(BASE_SCHEMA_LENGTHS))

@@ -105,25 +105,51 @@ FORMAT_INSTRUCTION = (
 )
 
 # Diagrams: the UI renders ```mermaid blocks as real, zoomable, downloadable
-# diagrams. The instruction is deliberately conservative — an earlier, more
-# eager version made the model decorate ordinary answers with diagrams and
-# invent giant, syntax-error-prone graphs with unreadable custom colors.
+# diagrams, and the document renderer now draws the same source as a coloured
+# figure inside a .docx and a .pdf (artifacts/render/diagrams.py). The
+# instruction stays deliberately conservative — an earlier, more eager version
+# made the model decorate ordinary answers with diagrams and invent giant,
+# syntax-error-prone graphs with unreadable custom colors.
+#
+# THE ONE CHANGE, 2026-09-22, AND WHY IT IS THE ONLY ONE. This string is
+# concatenated at ELEVEN call sites (chat.py x2, rag.py, repo.py x2, agent.py,
+# url.py x2, dataset.py, document.py, search.py), on the chat path, at EVERY
+# effort, with no gate — so a byte added here is a byte of prefill on every
+# Fast turn in nine engines. The one-diagram cap, the "ordinary questions get
+# none" rule and the ~20-node legibility cap are therefore all kept exactly as
+# they were; the three-diagram allowance for a DOCUMENT lives on the artifact
+# path, which never imports this string. What the ban on style/classDef
+# becomes is a ROLE: the model names what a node is from a closed list and the
+# renderers pick the colour, which is what makes a coloured diagram possible
+# without letting a model choose an unreadable pair. Measured: the string was
+# 1,082 bytes before this edit and is 1,082 bytes after it, and
+# tests/test_diagram_instruction_budget.py fails if it grows. (+8 tokens per
+# prompt on the pinned tokenizer, 30,832 -> 30,928 across the twelve golden
+# fixtures: about 0.8 ms of prefill.)
+#
+# THE CHAT UI IS UNAFFECTED, CHECKED RATHER THAN ASSUMED. `A["x"]:::role`
+# reaches the browser's mermaid, which has no `classDef` for these names.
+# mermaid 11.17.0 `setClass` (dist/chunks/mermaid.core/chunk-RHFEMEQ7.mjs:423)
+# only pushes the name onto the node's class list; it never looks the class
+# up and never raises, so an undefined class is a CSS class nothing styles.
+# The chat diagram keeps exactly the theme MermaidBlock gives it today.
 DIAGRAM_INSTRUCTION = (
-    "\n\nDIAGRAMS: the interface renders ```mermaid code blocks as real "
-    "diagrams the user can zoom and download. Include one ONLY when the user "
+    "\n\nDIAGRAMS: the interface renders ```mermaid blocks as diagrams the "
+    "user can zoom and download. Include one ONLY when the user "
     "explicitly asks for a diagram/flowchart/visualization, or when you are "
     "explaining something genuinely complex (a system architecture, a "
     "multi-step process, entity relationships) where a picture is clearly "
-    "easier to understand than prose. Ordinary questions, short answers and "
-    "conversation must NOT contain a diagram. When you do draw one, follow "
+    "easier to follow than prose. Ordinary questions, short answers and "
+    "conversation must NOT contain a diagram. When you do, follow "
     "ALL of these rules: at most ONE diagram per answer; keep it SMALL "
-    "(under ~20 nodes — summarize, don't enumerate); prefer `flowchart TD` or "
+    "(under ~20 nodes — summarize, don't enumerate); use `flowchart TD` or "
     "`flowchart LR`; one statement per line; every label in double quotes "
-    '(e.g. A["Login page"]) and short, with no parentheses, brackets, pipes '
-    "or markdown inside labels; NEVER use style, classDef, linkStyle, click "
-    "or %%{init}%% directives — the app applies its own theme and custom "
-    "colors break dark mode. Never draw ASCII-art boxes. Right after the "
-    "diagram, add one or two plain, simple sentences explaining what it "
+    "and short, with no parentheses, brackets, pipes or markdown in labels; "
+    "give each node a role with ::: — service, store, model or external "
+    '(A["API"]:::service) — and NEVER a colour, hex, style, classDef, '
+    "linkStyle, click or %%{init}%% directive: the app colours the roles. "
+    "Never draw ASCII-art boxes. Right after the "
+    "diagram, add one or two plain sentences saying what it "
     "shows so a non-technical reader can follow it."
 )
 

@@ -1,16 +1,17 @@
 {
- "captured_on": "2026-09-21",
+ "captured_on": "2026-09-22",
  "captured_from": {
-  "commit": "fix-answer-self-consistency, branched from release-2 at 2fbdd6d",
-  "orchestrator_tree_captured_from": "13b5c78a8c3665c095ef4d4da5571eba18d728e2 plus this branch's chat.py change",
-  "merged_tree": "release-2 (2fbdd6d) with the answer-self-consistency change only: one sentence added to engines/chat.py ASSISTANT_CONDUCT, and the deterministic reconciliation in engines/dataset_report.py, which reaches no prompt",
+  "commit": "feat/document-vocabulary, branched from dev at 593af55",
+  "orchestrator_tree_captured_from": "this branch's tree, whose prompt change is the reason for the recapture",
+  "merged_tree": "dev (593af55) plus the document-vocabulary change only: the DIAGRAM_INSTRUCTION clause in app/engines/__init__.py, and the artifact schema/renderer work, which reaches no chat prompt",
   "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> pytest tests/fixtures/context_assembly_golden/capture_from_baseline.py on this worktree, twice into two scratch directories"
  },
  "determinism": "the two captures were diff -r identical",
  "this_capture_changed": {
-  "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE added line and nothing removed: the sentence that scopes the COMMIT rule away from a figure that has to be worked out — \"That is about a CHOICE, not about a figure. A total, a time, a count or a does-it-fit answer has to be worked out before it can be stated: put it after the rows, steps or table it comes from, and copy it from them. Never open with a figure you have not worked out yet.\" It sits immediately after the COMMIT paragraph it narrows, in ASSISTANT_SYSTEM and SALESFORCE_ASSISTANT_SYSTEM; the Fast small-talk lane and the Salesforce small-talk reply do not carry it.",
+  "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE line: the DIAGRAMS paragraph. The ban on 'style, classDef, linkStyle, click or %%{init}%% directives - the app applies its own theme and custom colors break dark mode' became a ROLE clause: 'give each node a role with ::: - service, store, model or external (A[\"API\"]:::service) - and NEVER a colour, hex, style, classDef, linkStyle, click or %%{init}%% directive: the app colours the roles.' The one-diagram cap, the 'ordinary questions get none' rule, the ~20-node legibility cap and the explain-it-after rule are unchanged.",
   "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
-  "why": "the sweep's self-contradicting answers (a headline figure the body then contradicts) were measured live at Fast, thinking off: 20 of 54 runs flagged before, 4 of 54 after, with no length blow-up. The measurement and the two rejected longer variants are recorded in ASSISTANT_CONDUCT beside the sentence."
+  "why": "a diagram can now be drawn into a .docx and a .pdf (app/artifacts/render/diagrams.py), and colour comes from a node's declared ROLE out of a closed four-name list rather than from anything the model writes - so the prompt teaches the role names instead of forbidding colour outright.",
+  "size": "the string was 1,082 bytes before this edit and is 1,082 bytes after it. It is concatenated at eleven chat call sites at every effort, so growth is a Fast-path cost; tests/test_diagram_instruction_budget.py holds the ceiling."
  },
  "normalised": [
   "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -23,29 +24,29 @@
   "sources"
  ],
  "sha256": {
-  "first_message.messages.json": "e2123d0af96238ec973d46395a693be2545b83ed69ff7737036464d0eaa70947",
+  "first_message.messages.json": "2eb39bc75878eeb3daa5d8db7e36ab830dc77775a6ca15422824a162d09cd2fc",
   "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-  "living_knowledge_topical_fast.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_fast.messages.json": "a428ee20dc0133ec69bacd8a7ac12b4017dd52dcad4a13dac209595b73d1637b",
   "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-  "living_knowledge_topical_fast_at_production_latency.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_fast_at_production_latency.messages.json": "a428ee20dc0133ec69bacd8a7ac12b4017dd52dcad4a13dac209595b73d1637b",
   "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-  "living_knowledge_topical_think.messages.json": "9fcbe8b63642a464b71c7cca943c539555356de32304deca888453990fdafe37",
+  "living_knowledge_topical_think.messages.json": "a428ee20dc0133ec69bacd8a7ac12b4017dd52dcad4a13dac209595b73d1637b",
   "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-  "real_fast_accented_page.messages.json": "c55aa4236ab8a076dd03b03d1545724758dd95e4bc13e02808cc4147aefa07a4",
+  "real_fast_accented_page.messages.json": "30da62830dc7acb7b076c7ad3221d4d7020301bfcb4818c394fce3246628aed0",
   "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
-  "real_fast_eval_topical_hit.messages.json": "d16a89f12df2f31e7c74bcd4a4b78b4797237aa65708db44c453dfa45fe4bc13",
+  "real_fast_eval_topical_hit.messages.json": "e02db74e115f05a86e64e85f84bf3e0a80e6efd5d9c6a3997ff7ae90af68e130",
   "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-  "real_fast_passage_past_200k.messages.json": "f1247ba891e003ea90e1775f3360433547aa6d48349ceb662a339ec504def6dc",
+  "real_fast_passage_past_200k.messages.json": "bc91ad339bb9687b32e0577601e560d299167eac56f5848935ab59160b8289b9",
   "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
-  "real_fast_timeless_task_with_a_matching_page.messages.json": "24a214c1671b962a6b43a14b35196348004f246490cb429fa02f32622f64d463",
+  "real_fast_timeless_task_with_a_matching_page.messages.json": "34e78581ddc13f0121a3d1b907ede23baf3802cc9d37df5b0747152d2ea826e3",
   "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
-  "real_think_eval_topical_hit.messages.json": "d16a89f12df2f31e7c74bcd4a4b78b4797237aa65708db44c453dfa45fe4bc13",
+  "real_think_eval_topical_hit.messages.json": "e02db74e115f05a86e64e85f84bf3e0a80e6efd5d9c6a3997ff7ae90af68e130",
   "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-  "rich_fast.messages.json": "63ba0a45f30e68a29756c20667231b1721c1c31c48db97c77415ff3509faee0a",
+  "rich_fast.messages.json": "db493133049ab112ede735c9b6144991e423eefd3d6b16319e55bb3ae132b2a7",
   "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
-  "rich_think.messages.json": "c0c201b3a4c89353cd8fad51c560a58bc9963dc49821b6a50c35426f0c9ec6e9",
+  "rich_think.messages.json": "102b99b4cda8b45af19035a3a3e356b477d0cf4ac40d02b232d01a0baf509793",
   "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
-  "salesforce.messages.json": "c837f0b3dae066b03c13c45fde8e3eccc15bbdf78d085d9844b0536e3f3e7445",
+  "salesforce.messages.json": "d22e4c2ce17f3c9ad7c071c0c70e8c0306634aab798d3036d936734af36d793e",
   "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
  },
  "scenarios": {

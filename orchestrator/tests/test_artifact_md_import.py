@@ -111,7 +111,18 @@ def test_the_40k_audit_export_is_faithful_in_the_produced_docx(tmp_path, monkeyp
     assert "tracker.example.net" not in rels and "<script>" not in body
     assert re.findall(r'TargetMode="External"', rels) == []
     assert doc.title == "Internal Controls Audit Report — FY2026"
-    assert any("mermaid" in n for n in notes)
+    # The two fences: the SQL one is a real code block and the mermaid one is
+    # a drawn diagram. Both used to be note callouts — the mermaid one read
+    # "Diagram omitted" — which is the defect this release closes.
+    codes = [b for b in doc.blocks if isinstance(b, S.Code)]
+    assert [c.language for c in codes] == ["sql"]
+    assert "SELECT user_id FROM access_review WHERE stale;" in codes[0].text
+    diagrams = [b for b in doc.blocks if isinstance(b, S.DiagramBlock)]
+    assert len(diagrams) == 1 and [n.id for n in diagrams[0].diagram.nodes] == ["A", "B"]
+    assert not any("Diagram omitted" in getattr(b, "title", "") for b in doc.blocks)
+    assert notes == [] or not any("mermaid" in n for n in notes)
+    with zipfile.ZipFile(produced) as z2:
+        assert [n for n in z2.namelist() if n.startswith("word/media/")], "the diagram reached the file"
 
 
 def test_the_export_html_never_carries_unsafe_urls_or_remote_images(tmp_path):
@@ -304,3 +315,75 @@ def test_verifier_docx_numbers_and_merged_cells_import_faithfully(tmp_path):
     table = next(b.table for b in doc.blocks if isinstance(b, S.TableBlock))
     assert table.columns == ["c00", "c01", "c02"]
     assert table.rows[0] == ["merged", None, "c12"], "cells after a merged cell stay under their own heading"
+
+
+# ---------------------------------------------- fences, after 2026-09-22 --
+
+
+def test_a_mermaid_fence_becomes_a_drawn_diagram_not_an_apology():
+    """`md_import.py:330` used to turn every ```mermaid fence into a callout
+    reading "Diagram omitted". The source is still never executed and never
+    fetched — it is read by a regular expression over a closed grammar — but
+    when it reads, the document now gets the picture."""
+    doc, notes = md_import.markdown_to_document(
+        "# Title\n\nBefore.\n\n```mermaid\n"
+        'flowchart LR\n  A["Browser"]:::external --> B["API"]:::service\n  B --> C["Postgres"]:::store\n'
+        "```\n\nAfter.\n"
+    )
+    blocks = [b for b in doc.blocks if isinstance(b, S.DiagramBlock)]
+    assert len(blocks) == 1
+    d = blocks[0].diagram
+    assert d.direction == "LR"
+    assert [(n.id, n.kind) for n in d.nodes] == [("A", "external"), ("B", "service"), ("C", "store")]
+    assert not any(isinstance(b, S.Callout) and "Diagram" in (b.title or "") for b in doc.blocks)
+
+
+def test_a_mermaid_fence_that_cannot_be_read_keeps_the_old_callout():
+    """A source with a `classDef` in it is refused WHOLE, and the fallback is
+    exactly what every fence used to get. A half-understood graph is never
+    drawn."""
+    doc, notes = md_import.markdown_to_document(
+        "# Title\n\n```mermaid\nflowchart TD\n  A[\"a\"] --> B[\"b\"]\n  classDef x fill:#f00\n```\n"
+    )
+    assert not [b for b in doc.blocks if isinstance(b, S.DiagramBlock)]
+    callouts = [b for b in doc.blocks if isinstance(b, S.Callout)]
+    assert any("Diagram omitted" == (c.title or "") for c in callouts)
+    assert any("could not be read" in n for n in notes)
+
+
+def test_a_code_fence_keeps_its_text_verbatim_as_a_code_block():
+    body = "def f(x):\n    return x * 2   # keeps its indentation\n"
+    doc, _ = md_import.markdown_to_document(f"# T\n\n```python\n{body}```\n")
+    codes = [b for b in doc.blocks if isinstance(b, S.Code)]
+    assert len(codes) == 1
+    assert codes[0].language == "python"
+    assert codes[0].text == body.rstrip("\n")
+    assert "    return x * 2" in codes[0].text, "leading whitespace survives"
+
+
+def test_an_info_string_is_cut_to_its_safe_token_before_it_becomes_a_class():
+    """Two gates, and the test proves BOTH. `_FENCE_RE` reads only `[\\w+-]*`
+    off the fence line, so `x" onload="` arrives as `x`; `spec.Code` then
+    re-checks it against a closed pattern, so anything that got past the
+    first gate is dropped to empty rather than escaped and kept."""
+    from app.artifacts.render import html as H
+
+    doc, _ = md_import.markdown_to_document('# T\n\n```x" onload="\nprint(1)\n```\n')
+    codes = [b for b in doc.blocks if isinstance(b, S.Code)]
+    assert len(codes) == 1 and codes[0].language == "x"
+    assert codes[0].text == "print(1)"
+    page = H.document_html(doc)
+    assert 'onload=' not in page and 'class="lang-x"' in page
+    assert S.Code(language='x" onload="', text="print(1)").language == ""
+
+
+def test_a_code_block_over_the_ceiling_is_split_at_line_boundaries():
+    """`_split_text` cuts prose at sentences and words, which would break a
+    statement in half. Code is split at newlines instead, so every chunk is
+    still a sequence of whole lines."""
+    body = "\n".join(f"line_{i} = {i} * 2  # a comment long enough to matter here" for i in range(200))
+    doc, _ = md_import.markdown_to_document(f"# T\n\n```python\n{body}\n```\n")
+    codes = [b for b in doc.blocks if isinstance(b, S.Code)]
+    assert len(codes) > 1, "the sample is over the 6,000-character ceiling"
+    assert all(line.startswith("line_") for c in codes for line in c.text.split("\n"))
+    assert "".join(c.text.replace("\n", "") for c in codes) == body.replace("\n", "")
