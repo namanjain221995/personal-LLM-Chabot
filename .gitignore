@@ -18,6 +18,13 @@ secrets/
 .runtime/
 brain/packs
 brain/sources
+# Salesforce DX metadata mirror (105 MB). NEVER commit: its customMetadata
+# records carry live credentials (an AWS key pair, flow token secrets).
+brain/Salesforce-Org-Data-main/Prod Org Data/
+# Generated build artifacts: `graphrag index` / `catalog` / `graphdb` / `cards`.
+brain/Salesforce-Org-Data-main/graph.jsonl
+brain/Salesforce-Org-Data-main/salesforce-vault/
+brain/knowledge/
 
 # ---------------------------------------------------------------------------
 # Data and generated artifacts
