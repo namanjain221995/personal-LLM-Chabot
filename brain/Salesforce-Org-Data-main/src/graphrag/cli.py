@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 
 from .cards import CardError, build_cards
 from .catalog import CatalogError, build_catalog, write_catalog
+from .embed import DEFAULT_ENDPOINT, DEFAULT_MODEL, EmbedError, build_vectors
 from .graph import build_graph, read_graph, write_graph
+from .lexicon import LexiconError, build_lexicon
+from .resolver import Bundle, ResolverError
 from .graphdb import GraphDbError, build_graphdb
 from .obsidian import export_obsidian
 from .queries import (
@@ -64,6 +68,41 @@ def main(argv: list[str] | None = None) -> int:
     cards.add_argument("--catalog", required=True)
     cards.add_argument("--graph-db", required=True, dest="graph_db")
     cards.add_argument("--output", required=True)
+    lexicon = subparsers.add_parser(
+        "lexicon", help="map business vocabulary to catalog components"
+    )
+    lexicon.add_argument("--catalog", required=True)
+    lexicon.add_argument("--output", required=True)
+    lexicon.add_argument("--packs", help="brain/packs directory (optional)")
+    lexicon.add_argument("--curated", help="curated.yaml (optional)")
+    lexicon.add_argument("--org-schema", dest="org_schema",
+                         help="org-schema.json, for standard-object labels (optional)")
+    discover = subparsers.add_parser(
+        "discover", help="rank the components a question is about"
+    )
+    discover.add_argument("--bundle", required=True)
+    discover.add_argument("--query", required=True)
+    discover.add_argument("--limit", type=int, default=10)
+    discover.add_argument("--semantic", action="store_true",
+                          help="also score by meaning (needs `graphrag embed`)")
+    discover.add_argument("--rerank", action="store_true",
+                          help="reorder the shortlist with the cross-encoder")
+    describe = subparsers.add_parser(
+        "describe", help="full detail for one component"
+    )
+    describe.add_argument("--bundle", required=True)
+    describe.add_argument("--name", required=True)
+    describe.add_argument("--text", action="store_true",
+                          help="print the detail card instead of JSON")
+    embed = subparsers.add_parser(
+        "embed", help="embed the embeddable fact cards for semantic search"
+    )
+    embed.add_argument("--cards", required=True)
+    embed.add_argument("--output", required=True)
+    embed.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
+    embed.add_argument("--model", default=DEFAULT_MODEL)
+    embed.add_argument("--batch-size", type=int, default=32, dest="batch_size")
+    embed.add_argument("--limit", type=int)
     obsidian = subparsers.add_parser("export-obsidian", help="export a graph as an Obsidian vault")
     obsidian.add_argument("--graph", required=True)
     obsidian.add_argument("--output", required=True)
@@ -137,6 +176,41 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
         print(json.dumps(stats.as_dict(), indent=2, sort_keys=True))
         print(f"wrote {stats.total} cards to {args.output}")
+    elif args.command == "lexicon":
+        try:
+            stats = build_lexicon(args.catalog, args.output, args.packs,
+                                  args.curated, args.org_schema)
+        except (OSError, UnicodeError, LexiconError, ValueError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(stats.as_dict(), indent=2, sort_keys=True))
+        print(f"wrote {stats.total} entries to {args.output}")
+    elif args.command == "discover":
+        try:
+            with Bundle(args.bundle) as bundle:
+                result = bundle.discover_schema(args.query, args.limit,
+                                                semantic=args.semantic,
+                                                rerank=args.rerank)
+        except (OSError, ResolverError, sqlite3.Error) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result.as_dict(), indent=2))
+    elif args.command == "describe":
+        try:
+            with Bundle(args.bundle) as bundle:
+                result = bundle.describe_object(args.name)
+        except (OSError, ResolverError, sqlite3.Error) as exc:
+            parser.error(str(exc))
+        if args.text and result.get("detail"):
+            print(result["detail"])
+        else:
+            print(json.dumps(result, indent=2))
+    elif args.command == "embed":
+        try:
+            stats = build_vectors(args.cards, args.output,
+                                  endpoint=args.endpoint, model=args.model,
+                                  batch_size=args.batch_size, limit=args.limit)
+        except (OSError, EmbedError, ValueError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(stats.as_dict(), indent=2, sort_keys=True))
     elif args.command == "export-obsidian":
         try:
             graph = read_graph(args.graph)

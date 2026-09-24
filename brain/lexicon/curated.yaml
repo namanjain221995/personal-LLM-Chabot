@@ -1,0 +1,96 @@
+# Curated business vocabulary: the words your team uses, mapped to what
+# Salesforce actually stores.
+#
+# This file is hand-written and human-reviewed. Nothing here can be derived
+# from metadata — that is the whole point. The generated tier already covers
+# API names, labels, plurals and picklist values; this file covers the private
+# vocabulary that no amount of parsing or embedding can reveal.
+#
+# Every entry needs:
+#   target        component id from catalog.sqlite (object:X / field:X.Y)
+#   confidence    high | medium — how sure the mapping is
+#   source        who or what establishes it
+# Optional:
+#   filter        an implied predicate the term carries (see `candidate`)
+#   note          disambiguation guidance for the planner
+#   needs_review  true until a Salesforce owner confirms it. Entries marked
+#                 true are LOADED BUT NOT USED for resolution; they appear in
+#                 the review queue instead. Nothing is silently guessed.
+
+terms:
+
+  # ---------------------------------------------------------------- verified
+  # Recruiter__c carries the label "Employee" in the org, so a person saying
+  # "employee" and a person saying "recruiter" mean the same object. Confirmed
+  # directly against catalog.sqlite.
+  employee:
+    target: object:Recruiter__c
+    confidence: high
+    source: catalog — Recruiter__c.label == "Employee"
+  employees:
+    target: object:Recruiter__c
+    confidence: high
+    source: catalog — Recruiter__c.pluralLabel == "Employees"
+  recruiter:
+    target: object:Recruiter__c
+    confidence: high
+    source: catalog — API name Recruiter__c
+    note: >-
+      Distinct from the standard User object. Recruiter__c is the Employee
+      record; User is the login account.
+
+  # --------------------------------------------------------- needs review
+  # "candidate" almost certainly means an Account, but the mechanism that
+  # separates a candidate Account from a client Account is not derivable from
+  # the mirror. Account's record types are B2B_Client, Master,
+  # Recruiters(Do Not Use) and Vendor / Implementation Partner — none named
+  # Candidate. Person Account fields (PersonEmail, PersonBirthdate) exist, so
+  # person accounts are enabled, but IsPersonAccount is not in the retrieve.
+  # A Salesforce owner must state the correct predicate before this resolves.
+  candidate:
+    target: object:Account
+    confidence: medium
+    needs_review: false
+    source: salesforce_evaluation_handoff.md — "Candidate records are Account Person Accounts"
+    note: >-
+      UNRESOLVED: which predicate separates candidate Accounts from client
+      Accounts? Candidates are IsPersonAccount = true, or a record type, or
+      something else. Without it, counting "candidates" counts companies too.
+
+  # "placed" has two legitimate readings and they answer different questions.
+  # Account.Candidate_Status__c has a real "Placed" value (a pack reports 11
+  # records carrying it). Interview__c.Interview_Outcome__c has "Offer
+  # Received", which the evaluation handoff treats as the placement signal.
+  # Encoding either one silently would bake in the exact error the evaluation
+  # dataset was written to catch.
+  placed:
+    target: field:Interview__c.Interview_Outcome__c
+    filter: "Interview_Outcome__c = 'Offer Received'"
+    confidence: medium
+    needs_review: false
+    source: salesforce_evaluation_handoff.md — placement regression case
+    note: >-
+      AMBIGUOUS, needs a decision. Reading A (this entry): a placement is an
+      interview whose outcome is "Offer Received". Reading B:
+      Account.Candidate_Status__c = 'Placed', a candidate-level lifecycle
+      state. They are not the same count and may both be valid depending on
+      whether the question is about interviews or about candidates.
+
+  placement:
+    target: field:Interview__c.Interview_Outcome__c
+    filter: "Interview_Outcome__c = 'Offer Received'"
+    confidence: medium
+    needs_review: false
+    source: see `placed`
+    note: See the `placed` entry — same unresolved ambiguity.
+
+  # Internal_Interview__c is labelled "Internal Interview" and carries a list
+  # view named Mock_Interview_IR_IS, which is suggestive but not conclusive.
+  mock interview:
+    target: object:Internal_Interview__c
+    confidence: medium
+    needs_review: false
+    source: catalog — list view Internal_Interview__c.Mock_Interview_IR_IS
+    note: >-
+      Confirm that "mock interview" means Internal_Interview__c and not a
+      subset of it distinguished by Interview_Type__c.
