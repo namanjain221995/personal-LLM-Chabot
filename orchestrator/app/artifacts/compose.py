@@ -1327,6 +1327,7 @@ def _ordinal_run_items(text: str) -> List[str]:
             break
     if len(run) < _ORDINAL_RUN_MIN:
         return []
+    one_line = "\n" not in text
     items: List[str] = []
     ran_over = False
     for i, m in enumerate(run):
@@ -1335,8 +1336,19 @@ def _ordinal_run_items(text: str) -> List[str]:
         stop = _ITEM_END_RE.search(chunk)
         items.append(chunk[: stop.start()] if stop else chunk)
         if i + 1 == len(run):
-            ran_over = stop is not None and stop.group(0) != "\n"
+            ran_over = one_line or (stop is not None and stop.group(0) != "\n")
     # ONLY A LAST ITEM THAT ACTUALLY RAN OVER IS TRIMMED (QA r1, new_defect 1).
+    # Two shapes, and the list itself says which one it is:
+    #   * a ONE-LINE list has no newline anywhere, so its last item has nothing
+    #     to end it and always ran over - including when it runs to the end of
+    #     the message with no punctuation at all ("… 4. Conclusion and then some
+    #     trailing prose about the file", which loses the heading entirely if it
+    #     is not trimmed);
+    #   * a MULTI-LINE list bounds each item with its own line, so its last item
+    #     ran over only when something OTHER than a newline ended it - a
+    #     sentence end on the same line ("3. Conclusion Use professional
+    #     Markdown."). A last item ended by a newline, or by the end of the
+    #     message, is already correct and must be left alone.
     # `_trim_runover` exists for the ONE-LINE list, whose last item has no
     # newline to end it. A newline-delimited list's last item is already
     # correctly bounded by `_ITEM_END_RE`, so applying the instruction-verb cut
@@ -1360,6 +1372,7 @@ def _list_items(block: str) -> List[str]:
     "Authentication and Authorization" is one section (item 9 of the
     owner's fifteen), not two."""
     marks = list(_LIST_MARKER_RE.finditer(block))
+    one_line = "\n" not in block
     items: List[str] = []
     ran_over = False
     for i, m in enumerate(marks):
@@ -1368,7 +1381,7 @@ def _list_items(block: str) -> List[str]:
         stop = _ITEM_END_RE.search(chunk)
         items.append(chunk[: stop.start()] if stop else chunk)
         if i + 1 == len(marks):
-            ran_over = stop is not None and stop.group(0) != "\n"
+            ran_over = one_line or (stop is not None and stop.group(0) != "\n")
     # THE LAST ITEM OF A ONE-LINE LIST RUNS INTO THE SENTENCE AFTER IT.
     # Measured on the owner's own instruction of 2026-09-22, which is a
     # single line with no newline anywhere in it: "15. Conclusion Use
@@ -1384,6 +1397,17 @@ def _list_items(block: str) -> List[str]:
     # six-word last one; where the siblings really are long, nothing is cut.
     #
     # ONLY A LAST ITEM THAT ACTUALLY RAN OVER IS TRIMMED (QA r1, new_defect 1).
+    # Two shapes, and the list itself says which one it is:
+    #   * a ONE-LINE list has no newline anywhere, so its last item has nothing
+    #     to end it and always ran over - including when it runs to the end of
+    #     the message with no punctuation at all ("… 4. Conclusion and then some
+    #     trailing prose about the file", which loses the heading entirely if it
+    #     is not trimmed);
+    #   * a MULTI-LINE list bounds each item with its own line, so its last item
+    #     ran over only when something OTHER than a newline ended it - a
+    #     sentence end on the same line ("3. Conclusion Use professional
+    #     Markdown."). A last item ended by a newline, or by the end of the
+    #     message, is already correct and must be left alone.
     # `_trim_runover` exists for the ONE-LINE list, whose last item has no
     # newline to end it. A newline-delimited list's last item is already
     # correctly bounded by `_ITEM_END_RE`, so applying the instruction-verb cut

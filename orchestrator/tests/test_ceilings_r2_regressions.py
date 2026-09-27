@@ -80,6 +80,33 @@ def test_a_multiline_list_whose_last_line_carries_an_instruction_is_still_cut():
         "Executive Summary", "Data Model", "Conclusion"]
 
 
+def test_a_one_line_runover_with_no_punctuation_at_all_is_still_cut():
+    """The case the smallest fix got wrong, found by sweeping it (r2).
+
+    Keying the trim on "the terminator was not a newline" skips a one-line list
+    whose last item runs to the END of the message with no punctuation: the
+    terminator is None, so nothing was trimmed, and the whole runover phrase
+    then failed the one-to-eight-word filter and the section was dropped
+    ENTIRELY - a missing heading instead of a wrong one. A one-line list has no
+    newline anywhere, so its last item never had anything to end it; that, not
+    the terminator, is what the trim keys on now.
+    """
+    text = ("Requirements: 1. Executive Summary 2. Data Model 3. Threat Scope "
+            "4. Conclusion and then some trailing prose about the file")
+    assert C.requested_sections(text) == [
+        "Executive Summary", "Data Model", "Threat Scope", "Conclusion and"]
+
+
+def test_a_newline_list_whose_last_heading_ends_the_message_is_left_alone():
+    """The end of the message bounds a multi-line list's last item, so the
+    sibling backstop must not reach it even though the terminator is None."""
+    text = "Requirements:\n1. Intro\n2. Scope\n3. Security\n4. Acceptable Use Policy"
+    assert C._list_items(
+        "1. Intro\n2. Scope\n3. Security\n4. Acceptable Use Policy"
+    )[-1].strip() == "Acceptable Use Policy"
+    assert C.requested_sections(text)[-1] == "Acceptable Use Policy"
+
+
 # ---------------------------------------------------------------------------
 # 2 — a row count in a DOCUMENT request does not switch the derived size off
 # ---------------------------------------------------------------------------
