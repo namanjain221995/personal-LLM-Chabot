@@ -23,7 +23,7 @@ from typing import Awaitable, Callable, List, Sequence
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
 from ..config import settings
-from ..core import answer_sampling, best_of, pasted, rewrite_coverage, rewrite_shape
+from ..core import answer_sampling, best_of, contract, max_loop, pasted, rewrite_coverage, rewrite_shape
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -490,6 +490,80 @@ async def run_chat_engine(
         # An operator who set CONTINUATION_BUDGET_FAST lower still wins.
         total_max_tokens = min(answer_plan.total_max_tokens, total_max_tokens)
     # --- effort_policy (answer quality) end ---
+
+    # MAX IS A LOOP (core/max_loop.py), AND ONLY MAX. Plan, draft, a check
+    # code does, a fenced critique, one guarded revision, each one a step
+    # card the person watches. Everything in this branch is gated on
+    # `effort == "max"`: the critique and the revision are extra model
+    # calls, and Fast's budget is the owner's line.
+    #
+    # THE SHAPE DECIDES, not the effort alone. best-of-N is genuinely the
+    # better shape for a SHORT ask, whose whole candidate fits inside the
+    # judge's 4,000-character window, so it is kept and routed to below;
+    # the loop takes the asks that name sections or elements, which is
+    # precisely where a 4,000-character judge was reading a seventh of each
+    # candidate. `extract_rules` is pure Python and costs nothing, so the
+    # routing decision itself never buys a model call.
+    # `settings.max_loop_enabled` IS THE KILL SWITCH IT SAYS IT IS. config.py
+    # has documented it since this loop landed — "Off = Max keeps best-of-N" —
+    # and nothing read it, so an operator with a Max turn misbehaving in
+    # production had no way to turn it off short of a deploy. It is read here,
+    # ahead of the extraction, so `MAX_LOOP_ENABLED=false` costs nothing at all
+    # and falls through to exactly the best-of-N branch below.
+    if effort == "max" and model_choice == "smart" and settings.max_loop_enabled:
+        rules = contract.extract_rules(message)
+        if max_loop.wants_loop(rules):
+            from ..core import answer_guard as _answer_guard
+
+            loop_guard = _answer_guard.AnswerGuard(_answer_guard.repetition_allowance(message))
+            loop_shaper = rewrite_shape.for_message(message)
+
+            async def _loop_out(kind: str, text: str) -> None:
+                if kind == "reasoning":
+                    await emit("reasoning", {"text": text})
+                    return
+                if loop_shaper is not None:
+                    text = loop_shaper.feed(text)
+                for piece in loop_guard.feed(text):
+                    await emit("token", {"text": piece})
+                if loop_guard.verdict is not None:
+                    raise continuation.StopGeneration(continuation.STOP_REPETITION)
+
+            meta = {"route": "chat"}
+            # busy=None on purpose: the busy probe answers "is a person
+            # waiting on a chat answer", and on this path the person waiting
+            # IS this turn. The 8-second timeout inside extract() is what
+            # bounds a wedged router here, and a wedged router degrades to
+            # the rule extractor rather than stalling the turn.
+            full = await contract.extract(message, effort=effort, busy=None)
+            await max_loop.run(
+                message,
+                history,
+                _messages(message, history, mode, grounding),
+                emit,
+                mode=mode,
+                model_choice=model_choice,
+                grounding=grounding,
+                contract=full,
+                on_delta=_loop_out,
+                temperature=temperature,
+                segment_max_tokens=max_tokens,
+                total_max_tokens=total_max_tokens,
+                deadline_s=settings.continuation_deadline_s or None,
+                target_words=answer_sampling.requested_words(_length_ask(message)),
+                meta=meta,
+            )
+            if loop_shaper is not None and loop_guard.verdict is None:
+                for piece in loop_guard.feed(loop_shaper.finish()):
+                    await emit("token", {"text": piece})
+            for piece in loop_guard.finish():
+                await emit("token", {"text": piece})
+            if loop_guard.verdict is not None:
+                meta["loop_guard"] = loop_guard.verdict.as_meta()
+                await _answer_guard.record(loop_guard.verdict, effort=effort, route="chat")
+            answer = await _say_what_was_left_out(message, loop_guard.shown, emit, meta)
+            await emit("meta", meta)
+            return answer
 
     # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
     # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
