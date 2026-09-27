@@ -23,11 +23,15 @@ retired by anything here.
 
 WHAT IT REFUSES TO DO
 ---------------------
-It is READ-ONLY. It never takes the deploy lock, never restarts a container,
-never touches the engine. Its FIRST probe asks whether a rollout is in flight,
-and if one is it records `deferred`, exits 0 and touches nothing: a monitor
-yields to a release, it does not compete with it and it does not report a
-rollout as a fault.
+It is READ-ONLY apart from ONE write: the node-exporter textfile that carries
+its verdict. It never takes the deploy lock, never restarts a container, never
+touches the engine. That one write happens on every run that actually OBSERVED
+the box -- clean or faulty alike -- because rewriting the file is the only
+thing that turns a previous run's fault back off again.
+
+Its FIRST probe asks whether a rollout is in flight, and if one is it records
+`deferred`, exits 0 and touches nothing: a monitor yields to a release, it does
+not compete with it and it does not report a rollout as a fault.
 
 THE PROBES ARE NOT IMPLEMENTED HERE
 -----------------------------------
@@ -60,8 +64,14 @@ MAIL, and a red scheduled run mails. So when this watch finds a real fault it
 hands the fault to Prometheus -- which owns alerting -- and stays green. That
 is only honest if the handover actually happened, so:
 
-    verdict `ok`                                          -> GREEN
-    verdict `deferred` (a rollout is in flight)           -> GREEN, nothing probed
+    verdict `ok`                                          -> GREEN, and the
+                                                             textfile is
+                                                             REWRITTEN so a
+                                                             cleared fault
+                                                             clears
+    verdict `deferred` (a rollout is in flight)           -> GREEN, nothing
+                                                             probed, nothing
+                                                             written
     a fault verdict, AND the textfile was written, AND a
       Prometheus readback shows the metric present with a
       FRESH timestamp                                     -> GREEN, verdict carried
@@ -69,6 +79,10 @@ is only honest if the handover actually happened, so:
       missing, the write failed, or the metric is absent
       or stale on readback                                -> RED
     a probe could not be PERFORMED                        -> RED
+
+A clean run does NOT do the readback: the readback buys the right to be green
+OVER A FAULT, and `ok` has no fault to justify. It writes, reports whether the
+write landed, and stays green either way -- a healthy box must never mail.
 
 The readback is what makes the green honest. Without it, "wrote a file" is
 indistinguishable from "wrote a file nobody reads" -- and on this box today
@@ -162,11 +176,32 @@ FAULT_FOR_PROBE: dict[str, str] = {
 #: as a verdict.
 SEVERITY: dict[str, int] = {"ok": 0, "degraded": 1, "wedged": 2, "exposed": 3, "unavailable": 4}
 
-#: Verdicts that need no channel, because there is nothing to hand over.
+#: Verdicts that may be green whatever the channel does, because they hand
+#: nothing over. `ok` is still WRITTEN (see REPORTED_VERDICTS) -- it just does
+#: not have to prove the write was read back before it is allowed to be green.
 NO_CHANNEL_NEEDED = frozenset({"ok", "deferred"})
 
 #: Verdicts that are handed to Prometheus and may therefore be green.
 FAULT_VERDICTS = frozenset({"exposed", "wedged", "degraded"})
+
+#: Verdicts the textfile is WRITTEN for: the run observed the box and reached a
+#: conclusion about it.
+#:
+#: `ok` is in here, and that is the fix for a defect that made this metric
+#: useless. The file is one series per verdict and it is replaced wholesale, so
+#: the only thing that turns `verdict{verdict="exposed"} 1` back into 0 -- and
+#: the only thing that moves `check_timestamp_seconds` forward -- is a LATER run
+#: writing the file. While `ok` wrote nothing, the first fault latched for good:
+#: the Prometheus alert fired forever after the box had been fixed, nothing but
+#: a root `rm` cleared it, and every run stayed green while it did.
+#:
+#: `deferred` and `unavailable` are deliberately ABSENT. Both mean this run did
+#: not observe the box -- a rollout held the deploy lock, or a probe could not be
+#: performed -- and a run that measured nothing must not zero another run's fault
+#: or advance the freshness timestamp. Their silence leaves the last real reading
+#: in place and lets the age of `check_timestamp_seconds` say "the watch has not
+#: looked lately", which is a different statement from "the box is well".
+REPORTED_VERDICTS = frozenset({"ok"}) | FAULT_VERDICTS
 
 METRIC_PREFIX = "techsara_production_truth"
 READBACK_EXPR = f"{METRIC_PREFIX}_check_timestamp_seconds"
@@ -452,12 +487,44 @@ def deploy_lock_state(lock_path: pathlib.Path) -> str:
 # -------------------------------------------------------------------- the sink
 
 
+#: The check timestamp's resolution, in ONE place, because two numbers have to
+#: agree exactly: the value `render_textfile` writes into the file, and the
+#: `written_at` that `readback` compares Prometheus's scraped sample against.
+#: They did not agree. The file carried `{now:.0f}` while `written_at` carried
+#: the unrounded `time.time()`, so at every instant whose fraction rounded DOWN
+#: the written value was strictly less than the value it was checked against,
+#: and a Prometheus that had scraped this run's own file instantly was reported
+#: "present but STALE" -- a RED run on half of all wall-clock instants, which on
+#: a schedule means a mailed alert saying the monitor is broken while the box is
+#: fine. Quantise BEFORE the number is used anywhere.
+TIMESTAMP_SPEC = ".0f"
+
+
+def quantise_timestamp(now: float) -> float:
+    """`now` as the textfile will carry it: exactly what a scraper reads back."""
+    return float(format(now, TIMESTAMP_SPEC))
+
+
+def format_timestamp(now: float) -> str:
+    """The only place the check timestamp is turned into text."""
+    return format(now, TIMESTAMP_SPEC)
+
+
 def render_textfile(verdict: str, now: float, reasons: list[str]) -> str:
     """The node-exporter textfile, in the shape host_guard_textfile.sh uses.
 
     One series per verdict rather than a verdict label on a single series, so
     a verdict that STOPS being reported leaves its old value at 0 instead of
     leaving a stale 1 behind for the alert to read.
+
+    That argument only holds while the file is REWRITTEN on a clean run too: a
+    series nobody rewrites keeps its last value, it does not decay to zero. See
+    `refresh_channel` -- `ok` writes this file exactly as a fault does, and that
+    is what lets a cleared fault clear.
+
+    `now` is expected to be quantised already (`quantise_timestamp`), and the
+    timestamp goes out through `format_timestamp`, so the number written here
+    and the number `readback` compares cannot drift apart.
     """
     lines = [
         f"# HELP {METRIC_PREFIX}_verdict 1 for the verdict this watch reached, 0 for the others.",
@@ -474,7 +541,7 @@ def render_textfile(verdict: str, now: float, reasons: list[str]) -> str:
         f"{METRIC_PREFIX}_faults {len(reasons)}",
         f"# HELP {READBACK_EXPR} Unix time of the last watch run.",
         f"# TYPE {READBACK_EXPR} gauge",
-        f"{READBACK_EXPR} {now:.0f}",
+        f"{READBACK_EXPR} {format_timestamp(now)}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -603,7 +670,10 @@ def use_channel(
     scrape_interval: int,
     deadline_seconds: int,
 ) -> Channel:
-    now = runtime.now()
+    # Quantised BEFORE it is used, so `written_at` below is the very number the
+    # file carries. Passing the raw clock here is the rounding defect described
+    # at TIMESTAMP_SPEC: it made a perfect scrape look stale half the time.
+    now = quantise_timestamp(runtime.now())
     try:
         runtime.write_textfile(textfile_dir, render_textfile(verdict, now, reasons))
     except ChannelError as exc:
@@ -615,6 +685,47 @@ def use_channel(
         written_at=now,
         scrape_interval=scrape_interval,
         deadline_seconds=deadline_seconds,
+    )
+
+
+def refresh_channel(
+    runtime: Runtime,
+    *,
+    verdict: str,
+    reasons: list[str],
+    textfile_dir: pathlib.Path,
+) -> Channel:
+    """Write the textfile for a verdict that has nothing to hand over.
+
+    A clean run MUST still write -- see REPORTED_VERDICTS for why: skip it and
+    the first fault latches in Prometheus for good.
+
+    No readback, and `required=False`. The readback buys the right to be green
+    OVER A FAULT and there is no fault here to justify; spending the Prometheus
+    deadline on every healthy tick would hold the production box's single runner
+    for nothing. A refusal is REPORTED and the run stays green, because `ok`
+    must never mail -- the staleness of `check_timestamp_seconds` is what says
+    the write is not landing, and that belongs to Prometheus like every other
+    alert this job hands over.
+    """
+    now = quantise_timestamp(runtime.now())
+    try:
+        runtime.write_textfile(textfile_dir, render_textfile(verdict, now, reasons))
+    except ChannelError as exc:
+        return Channel(required=False, ok=False, detail=f"not required, and the refresh FAILED: {exc}")
+    except OSError as exc:
+        return Channel(
+            required=False,
+            ok=False,
+            detail=(
+                "not required, and the refresh FAILED: the textfile write failed "
+                f"({type(exc).__name__})"
+            ),
+        )
+    return Channel(
+        required=False,
+        ok=True,
+        detail="not required (nothing to hand over); the textfile was refreshed",
     )
 
 
@@ -805,8 +916,13 @@ def main(argv: list[str] | None = None, runtime: Runtime | None = None) -> int:
         report.row("verdict", verdict)
 
         # ------------------------------------------------------------- the channel
-        if verdict in NO_CHANNEL_NEEDED:
-            channel = Channel(required=False, ok=True, detail="not required (nothing to hand over)")
+        if verdict not in REPORTED_VERDICTS:
+            # `unavailable` only -- a `deferred` run has already returned. This
+            # run did not observe the box, so it writes NOTHING: zeroing a
+            # previous run's fault on the strength of a reading that was never
+            # taken is the mistake REPORTED_VERDICTS exists to prevent. Red
+            # whatever the channel would have done.
+            channel = Channel(required=False, ok=False, detail="not consulted (the verdict is unavailable)")
         elif verdict in FAULT_VERDICTS:
             if args.dry_run:
                 channel = predict_channel(runtime, textfile_dir=textfile_dir)
@@ -819,11 +935,20 @@ def main(argv: list[str] | None = None, runtime: Runtime | None = None) -> int:
                     scrape_interval=args.scrape_interval_seconds,
                     deadline_seconds=args.readback_deadline_seconds,
                 )
-        else:  # unavailable: red whatever the channel does
-            channel = Channel(required=False, ok=False, detail="not consulted (the verdict is unavailable)")
+        else:
+            # `ok`: WRITTEN, but not proven. The file is refreshed so a cleared
+            # fault clears, and the run is green whatever the sink says.
+            if args.dry_run:
+                channel = dataclasses.replace(
+                    predict_channel(runtime, textfile_dir=textfile_dir), required=False
+                )
+            else:
+                channel = refresh_channel(
+                    runtime, verdict=verdict, reasons=reasons, textfile_dir=textfile_dir
+                )
         report.row("channel", channel.detail)
 
-        if verdict == "ok":
+        if verdict in NO_CHANNEL_NEEDED:
             green = True
         elif verdict in FAULT_VERDICTS:
             # THE DELIBERATE EXCEPTION, and the only one. A fault is green only

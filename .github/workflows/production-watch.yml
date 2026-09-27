@@ -86,8 +86,13 @@
 # writes the verdict as a node-exporter textfile and then READS IT BACK out of
 # Prometheus before it is allowed to be green:
 #
-#     verdict `ok`                                      -> GREEN
-#     verdict `deferred` (a rollout is in flight)       -> GREEN, nothing probed
+#     verdict `ok`                                      -> GREEN, and the
+#                                                          textfile is
+#                                                          REWRITTEN so a
+#                                                          cleared fault clears
+#     verdict `deferred` (a rollout is in flight)       -> GREEN, nothing
+#                                                          probed, nothing
+#                                                          written
 #     a fault verdict, the textfile was written, AND a
 #       Prometheus readback shows the metric present
 #       with a FRESH timestamp                          -> GREEN, verdict carried
@@ -98,6 +103,22 @@
 #
 # The readback is what makes the green honest: without it, "wrote a file" is
 # indistinguishable from "wrote a file nobody reads".
+#
+# A CLEAN run writes that file too, and does NOT read it back. The metric is one
+# series per verdict and the file is replaced whole, so the only thing that turns
+# `verdict{verdict="exposed"} 1` back into 0 -- and the only thing that moves the
+# check timestamp forward -- is a LATER run rewriting it. A watch whose clean
+# runs wrote nothing would latch its first fault in Prometheus for good: the
+# alert would fire forever after the box had been fixed, only a root `rm` would
+# clear it, and every run would stay green while it did. The readback itself
+# stays fault-only -- it buys the right to be green OVER A FAULT, and a clean run
+# has no fault to justify, so it must never spend the Prometheus deadline or turn
+# a healthy box red.
+#
+# A run that OBSERVED NOTHING writes nothing: `deferred` (a rollout held the
+# deploy lock) and a probe that could not be performed both leave the file
+# exactly as it was, because zeroing a fault on the strength of a reading that
+# was never taken would clear a live alert.
 name: Production watch
 
 # NO `schedule:` HERE. It arrives in its own one-line commit once the

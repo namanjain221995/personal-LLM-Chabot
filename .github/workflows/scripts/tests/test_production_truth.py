@@ -82,6 +82,37 @@ class Recorder:
             raise self.error
 
 
+def scraped_timestamp(text: str) -> float:
+    """The check timestamp as a SCRAPER reads it: out of the file's own text.
+
+    The green-channel tests used to hand the readback `(clock(), clock())` --
+    the raw clock, never the number `render_textfile` actually writes. That is
+    what hid the rounding defect fixed in the same commit as this helper: the
+    file carries whole seconds while `written_at` carried the fraction too, and
+    `readback` compares one against the other.
+    """
+    for line in text.splitlines():
+        if line.startswith(f"{pt.READBACK_EXPR} "):
+            return float(line.split()[-1])
+    raise AssertionError(f"{pt.READBACK_EXPR} is not in the textfile at all")
+
+
+def perfect_prometheus(writer: Recorder):
+    """The most favourable scrape that can physically exist.
+
+    It returns, with no delay at all, exactly the value this run's own write
+    put in the file. A red verdict under this fake is the script's own
+    arithmetic, never a slow, stale or broken Prometheus.
+    """
+
+    def samples(clock):
+        if not writer.calls:
+            return []
+        return [(clock(), scraped_timestamp(writer.calls[-1][1]))]
+
+    return samples
+
+
 def make_runtime(
     *,
     probes=None,
@@ -95,7 +126,7 @@ def make_runtime(
 ) -> tuple[pt.Runtime, Clock, Recorder, dict]:
     clock = clock or Clock()
     writer = writer or Recorder()
-    seen: dict = {"imported": [], "slept": []}
+    seen: dict = {"imported": [], "slept": [], "queried": []}
 
     def import_module(name: str):
         seen["imported"].append(name)
@@ -104,6 +135,7 @@ def make_runtime(
         return probes if probes is not None else fake_probes()
 
     def query(expr: str):
+        seen["queried"].append(expr)
         if query_error is not None:
             raise query_error
         if samples is None:
@@ -137,7 +169,16 @@ def run(runtime, argv=None) -> tuple[int, str]:
 # ------------------------------------------------------------- the happy answer
 
 
-class AClearBoxIsGreenAndHandsOverNothing(unittest.TestCase):
+class AClearBoxIsGreenAndRefreshesTheMetric(unittest.TestCase):
+    """A clean run hands nothing OVER, but it does still WRITE.
+
+    The class was `AClearBoxIsGreenAndHandsOverNothing`, which was accurate
+    about the channel and wrong about the file. `ok` needs no readback and no
+    proof of receipt -- it has no fault to justify -- and it must still rewrite
+    the textfile, because a series nobody rewrites keeps its last value and the
+    previous run's fault would stay at 1 in Prometheus for good.
+    """
+
     def test_all_probes_clean_is_green_with_verdict_ok(self):
         runtime, _, writer, _ = make_runtime()
         code, text = run(runtime)
@@ -146,10 +187,79 @@ class AClearBoxIsGreenAndHandsOverNothing(unittest.TestCase):
         self.assertRegex(text, r"verdict\s+ok")
         self.assertRegex(text, r"result\s+GREEN")
 
-    def test_a_clean_run_writes_no_textfile_at_all(self):
+    def test_a_clean_run_REFRESHES_the_textfile_so_a_cleared_fault_CLEARS(self):
+        # THIS TEST WAS `test_a_clean_run_writes_no_textfile_at_all`, and what
+        # it pinned was a defect, not a property. Because `ok` wrote nothing,
+        # after any fault the textfile kept `verdict{verdict="exposed"} 1` and
+        # a frozen check timestamp FOREVER: the Prometheus alert this job hands
+        # its faults to could never clear once the box had been fixed, only a
+        # root `rm` would clear it, and every run stayed green while it did.
+        # `render_textfile`'s own docstring justifies one series per verdict by
+        # "a verdict that STOPS being reported leaves its old value at 0
+        # instead of leaving a stale 1 behind" -- which is true only if the
+        # file is REWRITTEN. This is that rewrite.
+        writer = Recorder()
+        clock = Clock(1_700_000_000.0)
+        faulty, _, _, _ = make_runtime(
+            probes=_exposed_probes(),
+            writer=writer,
+            samples=perfect_prometheus(writer),
+            clock=clock,
+        )
+        code, text = run(faulty)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertEqual(len(writer.calls), 1, text)
+        first = writer.calls[-1][1]
+        self.assertIn('techsara_production_truth_verdict{verdict="exposed"} 1', first)
+
+        clock.advance(3600.0)  # an hour later, the box has been fixed
+        clean, _, _, _ = make_runtime(writer=writer, samples=perfect_prometheus(writer), clock=clock)
+        code, text = run(clean)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertRegex(text, r"verdict\s+ok")
+        self.assertRegex(text, r"result\s+GREEN")
+        self.assertEqual(len(writer.calls), 2, "a clean run must rewrite the file, not skip it")
+        second = writer.calls[-1][1]
+        self.assertIn('techsara_production_truth_verdict{verdict="exposed"} 0', second)
+        self.assertIn('techsara_production_truth_verdict{verdict="ok"} 1', second)
+        self.assertGreater(
+            scraped_timestamp(second),
+            scraped_timestamp(first),
+            "the check timestamp must advance, or a staleness alert fires on a healthy box",
+        )
+
+    def test_a_clean_run_is_green_even_when_the_refresh_fails(self):
+        # The channel requirement stays FAULT-ONLY. `ok` hands nothing over, so
+        # a sink that refuses the write must not turn a healthy box into a RED
+        # run: a red scheduled run mails, and the owner's standing instruction
+        # is no alert mail. The refusal is reported instead.
+        writer = Recorder(error=pt.ChannelError("the node-exporter textfile directory does not exist"))
+        runtime, _, _, _ = make_runtime(writer=writer)
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertRegex(text, r"verdict\s+ok")
+        self.assertRegex(text, r"result\s+GREEN")
+        self.assertIn("does not exist", text, "a failed refresh is still reported")
+
+    def test_a_clean_run_does_not_spend_the_readback_deadline(self):
+        # `ok` writes, and stops. The readback buys the right to be green OVER
+        # A FAULT and there is no fault here to justify; waiting out the
+        # Prometheus deadline on every healthy tick would hold the production
+        # box's single runner for nothing.
+        runtime, _, writer, seen = make_runtime()
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertEqual(len(writer.calls), 1)
+        self.assertEqual(seen["queried"], [], "a clean run asks Prometheus nothing")
+        self.assertEqual(seen["slept"], [])
+
+    def test_a_clean_dry_run_still_writes_nothing(self):
         runtime, _, writer, _ = make_runtime()
-        run(runtime)
-        self.assertEqual(writer.calls, [], "a clean verdict has nothing to hand over")
+        code, text = run(runtime, ARGS + ["--dry-run"])
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertRegex(text, r"result\s+GREEN")
+        self.assertIn("predicted", text)
+        self.assertEqual(writer.calls, [], "--dry-run writes nothing, ever")
 
 
 # ------------------------------------------- the channel rules: the B4 fix
@@ -250,6 +360,136 @@ class AFaultIsGreenOnlyWhenSomebodyReceivesIt(unittest.TestCase):
         runtime, _, _, _ = make_runtime(probes=_exposed_probes(), writer=writer)
         _, text = run(runtime)
         self.assertIn("A verdict nobody receives is not a verdict", text)
+
+
+class TheReadbackComparesTheNumberThatWasWritten(unittest.TestCase):
+    """A PERFECT Prometheus must never produce a red run. It used to, half the time.
+
+    `render_textfile` writes the check timestamp as WHOLE SECONDS, and
+    `readback` refuses a sample whose value is below the timestamp this run
+    says it wrote. `use_channel` passed the raw `time.time()` float, fraction
+    and all, so at every instant whose fraction was below .5 the number in the
+    file was strictly SMALLER than the number it was compared against: a
+    Prometheus that had scraped this run's own file instantly was declared
+    "present but STALE", the run went RED, and a real engine exposure was
+    reported as a broken monitor -- on the schedule this job promises will not
+    mail. That is 50% of wall-clock instants.
+
+    These tests drive the green channel through `render_textfile`, which is the
+    file a scraper actually reads, instead of through the raw clock.
+    """
+
+    FRACTIONS = (0.0, 0.2, 0.37, 0.499, 0.5, 0.6, 0.83, 0.999)
+
+    def _run_at(self, fraction: float):
+        writer = Recorder()
+        clock = Clock(1_700_000_000.0 + fraction)
+        runtime, _, _, _ = make_runtime(
+            probes=_exposed_probes(),
+            writer=writer,
+            samples=perfect_prometheus(writer),
+            clock=clock,
+        )
+        code, text = run(runtime)
+        return code, text, writer
+
+    def test_a_perfect_scrape_is_green_at_every_fraction_of_a_second(self):
+        for fraction in self.FRACTIONS:
+            with self.subTest(fraction=fraction):
+                code, text, writer = self._run_at(fraction)
+                self.assertNotIn("STALE", text, "the scrape returned this run's OWN written value")
+                self.assertRegex(text, r"result\s+GREEN")
+                self.assertEqual(code, pt.EXIT_OK, text)
+                self.assertEqual(len(writer.calls), 1)
+
+    def test_the_value_in_the_file_is_the_value_the_readback_compares(self):
+        # The coupling itself, not only its effect: whatever resolution the
+        # timestamp is rendered at, the number the file carries must survive
+        # being parsed back as a float. Change `render_textfile`'s format
+        # without changing `quantise_timestamp` and this fails.
+        for fraction in self.FRACTIONS:
+            with self.subTest(fraction=fraction):
+                now = pt.quantise_timestamp(1_700_000_000.0 + fraction)
+                self.assertEqual(scraped_timestamp(pt.render_textfile("exposed", now, [])), now)
+
+    def test_a_genuinely_older_sample_is_still_STALE(self):
+        # The fix must not blunt the check it repairs. A value a whole second
+        # below this run's write is a PREVIOUS run's file, and stays red.
+        writer = Recorder()
+        clock = Clock(1_700_000_000.37)
+        runtime, _, _, _ = make_runtime(
+            probes=_exposed_probes(),
+            writer=writer,
+            samples=lambda c: [(c(), pt.quantise_timestamp(c()) - 1.0)],
+            clock=clock,
+        )
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertIn("STALE", text)
+
+
+# ------------------------------- a run that measured nothing clears nothing
+
+
+class ARunThatObservedNothingClearsNothing(unittest.TestCase):
+    """`deferred` and `unavailable` write NOTHING, and that is deliberate.
+
+    Writing on those two would zero `verdict{verdict="exposed"}` on the
+    strength of a run that never looked at the box -- a rollout holding the
+    deploy lock, or a probe that could not be performed, would silently clear a
+    live exposure alert. Their silence leaves the last real reading in place
+    and lets the freshness of `check_timestamp_seconds` say "the watch has not
+    looked lately", which is a different statement from "the box is well".
+    """
+
+    def _leave_a_fault_in_the_file(self, writer, clock):
+        runtime, _, _, _ = make_runtime(
+            probes=_exposed_probes(),
+            writer=writer,
+            samples=perfect_prometheus(writer),
+            clock=clock,
+        )
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertIn('techsara_production_truth_verdict{verdict="exposed"} 1', writer.calls[-1][1])
+
+    def test_a_deferred_run_does_not_clear_a_previous_runs_fault(self):
+        writer = Recorder()
+        clock = Clock(1_700_000_000.0)
+        self._leave_a_fault_in_the_file(writer, clock)
+        clock.advance(1800.0)
+        deferred, _, _, _ = make_runtime(lock="held", writer=writer, clock=clock)
+        code, text = run(deferred)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertRegex(text, r"verdict\s+deferred")
+        self.assertEqual(len(writer.calls), 1, "a rollout must not clear an exposure alert")
+        self.assertIn('techsara_production_truth_verdict{verdict="exposed"} 1', writer.calls[-1][1])
+
+    def test_an_unavailable_run_does_not_clear_a_previous_runs_fault(self):
+        writer = Recorder()
+        clock = Clock(1_700_000_000.0)
+        self._leave_a_fault_in_the_file(writer, clock)
+        clock.advance(1800.0)
+        blind, _, _, _ = make_runtime(
+            probes=fake_probes(
+                probe_container_states={"ok": False, "performed": False, "detail": "docker unreachable"}
+            ),
+            writer=writer,
+            clock=clock,
+        )
+        code, text = run(blind)
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertRegex(text, r"verdict\s+unavailable")
+        self.assertEqual(len(writer.calls), 1, "an unmeasured box must not clear an exposure alert")
+        self.assertIn('techsara_production_truth_verdict{verdict="exposed"} 1', writer.calls[-1][1])
+
+    def test_the_written_verdicts_are_exactly_the_observed_ones(self):
+        self.assertEqual(pt.REPORTED_VERDICTS, frozenset({"ok"}) | pt.FAULT_VERDICTS)
+        self.assertNotIn("deferred", pt.REPORTED_VERDICTS)
+        self.assertNotIn("unavailable", pt.REPORTED_VERDICTS)
+        # `ok` is written, but is green whatever the sink does.
+        self.assertIn("ok", pt.NO_CHANNEL_NEEDED)
+        self.assertIn("ok", pt.REPORTED_VERDICTS)
 
 
 # --------------------------------------------------------------- wedged engines
