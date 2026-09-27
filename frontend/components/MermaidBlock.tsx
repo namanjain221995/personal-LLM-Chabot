@@ -289,8 +289,20 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => document.removeEventListener('keydown', onKey);
   }, [full]);
 
-  /** What the Code tab shows and the copy button copies: what was drawn. */
-  const shown = drawn || source;
+  /**
+   * What the Code tab shows and the copy button copies: what was drawn.
+   *
+   * On a REFUSAL nothing was drawn and `source` is not a fallback — it is the
+   * half-stripped residue, which is nobody's text. Measured on the commit
+   * before this one: for `%%{init: {"themeCSS": "a}%% …"}}%%` the Code tab held
+   * ` .node rect { fill: #ff0000 !important }"}}%%` with the author's first
+   * line half-eaten, and for a label containing `}%%` it held a two-line
+   * `flowchart LR\n  A["` that no one wrote. The notice under it says "Showing
+   * the source.", the copy button hands that string on, and it names the
+   * downloaded file. A refusal is the one place this component promises the
+   * SOURCE instead of a picture, so it has to be the author's.
+   */
+  const shown = drawn || (refusal ? code : source);
 
   const downloadPng = useCallback(async () => {
     const host = (full ? fullRef.current : hostRef.current) ?? hostRef.current;

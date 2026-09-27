@@ -23,7 +23,7 @@
  * Chromium 153.0.8010.36 against mermaid 11.17.0 with an esbuild bundle of
  * this component; those numbers are in DIAG-35's header.
  */
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 /** Every source mermaid was asked to render, in order, across a test. */
@@ -95,6 +95,41 @@ describe('DIAG-36 · the block hands mermaid the guarded source', () => {
     );
     const shown = screen.getByRole('code').textContent ?? '';
     expect(shown).not.toContain('classDef service');
+  });
+
+  /**
+   * DIAG-36f — a refusal says "Showing the source", so it has to BE the source.
+   *
+   * `prepareDiagramSource` on a refused source is the half-stripped residue:
+   * the balanced directive strip stopped at the inner `}%%`, so the author's
+   * first line is half eaten. Measured on the commit before this one, the Code
+   * tab for the source below held
+   * ` .node rect { fill: #ff0000 !important }"}}%%\nflowchart TD\n  SVC…` —
+   * text nobody wrote, under a notice promising the source, feeding the copy
+   * button and naming the downloaded file.
+   */
+  it('DIAG-36f · a refusal shows the AUTHOR\'s source, not the residue', async () => {
+    const src =
+      '%%{init: {"themeCSS": "a}%% .node rect { fill: #ff0000 !important }"}}%%\n' + FLOW;
+    render(<MermaidBlock code={src} />);
+    await waitFor(() =>
+      expect(screen.getByText(/This diagram was not drawn/)).toBeTruthy(),
+    );
+    expect(screen.getByRole('code').textContent).toBe(src);
+    expect(attempts).toEqual([]);
+  });
+
+  it('DIAG-36g · a drawn diagram still shows what was DRAWN, not the input', async () => {
+    // The refusal branch must not leak into the ordinary path: what a person
+    // copies from a diagram that rendered is still the string mermaid drew.
+    const src = '---\ntitle: Kept\n---\n' + FLOW + '\n  style SVC fill:#ff0000';
+    render(<MermaidBlock code={src} />);
+    await waitFor(() => expect(attempts.length).toBe(1));
+    // A diagram that renders flips to preview, so ask for the source tab.
+    fireEvent.click(screen.getByLabelText('Show diagram source'));
+    const shown = await waitFor(() => screen.getByRole('code').textContent ?? '');
+    expect(shown).toBe(attempts[0]);
+    expect(shown).not.toContain('#ff0000');
   });
 
   it('DIAG-36e · an ordinary diagram is unaffected by any of this', async () => {

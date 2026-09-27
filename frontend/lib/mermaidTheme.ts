@@ -749,6 +749,14 @@ export function roleClassDefs(
 const FRONTMATTER_RE = /^([^\S\n\r]*)-{3}\s*[\n\r](.*?)[\n\r]\1-{3}\s*[\n\r]+/s;
 
 /**
+ * How many times a preamble may PROMOTE before the source is refused.
+ *
+ * Shared by the guard's own loop and by the sanitise fixed point below, so the
+ * two cannot disagree about where "too much preamble" starts.
+ */
+const MAX_PREAMBLE_PASSES = 64;
+
+/**
  * The ONE thing a frontmatter block may carry: a caption.
  *
  * This is a positive allowlist and it is deliberately the narrowest one that
@@ -868,7 +876,8 @@ export function guardDiagramSource(code: string): GuardedSource {
    * pass strictly shortens `out`, so the bound guards a future edit rather than
    * any source seen here.
    */
-  for (let pass = 0; pass < 64; pass += 1) {
+  let passes = 0;
+  for (; passes < MAX_PREAMBLE_PASSES; passes += 1) {
     const before = out;
     // `%%{ … }%%` directives, including multi-line ones. Run before the
     // statement split so a directive that itself contains `;` cannot confuse
@@ -877,12 +886,33 @@ export function guardDiagramSource(code: string): GuardedSource {
     // An unterminated `%%{init: …` is a comment to mermaid rather than a
     // directive, but it must not reach the Code tab looking like one.
     out = out.replace(/%%\{[^\n]*/g, '');
-    if (/\}%%/.test(out)) {
+    // ...and only when a directive was actually OPENED. `}%%` on its own is
+    // not a directive to mermaid — its `directiveRegex` needs the `%%{` — so a
+    // label that merely contains the three characters is an ordinary diagram.
+    // Measured: `flowchart LR\n  A["50}%% done"] --> B[Next]` drew two nodes
+    // in theme colours before this refusal existed, and without the `%%\{`
+    // half of this test it is refused with a notice naming a construct its
+    // author never wrote. The attack shape still has its opening `%%{`.
+    if (/\}%%/.test(out) && /%%\{/.test(code)) {
       return { code: out, refusal: 'it carries a malformed %%{…}%% directive' };
     }
     // The leading blank lines `sanitizeDiagramSource` trims at the end anyway.
     // Trimming them HERE is what makes case 2 visible instead of smuggled.
-    out = out.replace(/^(?:[ \t]*\n)+/, '');
+    //
+    // `[^\S\n\r]` and not `[ \t]`: the trim at the end of
+    // `sanitizeDiagramSource` is `/^\s*\n/`, so ANY whitespace-only line it
+    // would delete has to be a line this one deletes too. The difference is
+    // one character class and it was a complete bypass — a single U+00A0,
+    // U+FEFF, \f, \v, U+2028/9, U+1680, U+2000-200A, U+202F, U+205F or U+3000
+    // line above a `config:` block hid the block from `FRONTMATTER_RE` (whose
+    // `([^\S\n\r]*)` indent cannot span a newline), the sanitiser then deleted
+    // the line, and the string handed to `mermaid.render` BEGAN with the live
+    // block. Measured on the commit before this one: `\u00a0\n---\nconfig:\n
+    // c4:\n    width: 400\n    personFontSize: 40\n---\nC4Context …` moved
+    // c4.width 216 -> 400 and personFontSize 14 -> 40 and redrew the diagram
+    // at 700x1041 px with 40 px type; with this class it is byte-identical to
+    // the same source without the preamble line.
+    out = out.replace(/^(?:[^\S\n\r]*\n)+/, '');
     const fm = FRONTMATTER_RE.exec(out);
     if (!fm) break;
     const indent = fm[1];
@@ -899,12 +929,36 @@ export function guardDiagramSource(code: string): GuardedSource {
     }
     if (out === before) break;
   }
+  /**
+   * EXHAUSTING the bound is a refusal, not a pass-through.
+   *
+   * Every pass above strictly shortens `out`, so no source reaches this line
+   * by accident — but a source CAN reach it on purpose. Measured on the commit
+   * before this one: 65 stacked `config:` blocks left block 65 live at the head
+   * of the returned code (0.1 ms), and the only thing that kept mermaid away
+   * was `looksRenderable` reading `---` as the head and declining to render at
+   * all — a permanent "Rendering the diagram…" with no message to the reader,
+   * and a hole the moment anything teaches `looksRenderable` to look past a
+   * preamble it did not strip. Such a source is not a diagram either way:
+   * mermaid reads only the FIRST block, so blocks 2..65 are body and a parse
+   * error. Refusing costs nothing and says so out loud.
+   */
+  if (passes >= MAX_PREAMBLE_PASSES && FRONTMATTER_RE.test(head + out)) {
+    return { code: head + out, refusal: 'it stacks more preamble blocks than we will strip' };
+  }
   return { code: head + out, refusal: '' };
 }
 
-/** Why this source may not be rendered at all, or `''`. */
+/**
+ * Why this source may not be rendered at all, or `''`.
+ *
+ * This asks the FIXED POINT (`guardedSanitize`), not the guard's single pass:
+ * the string the renderer is handed is `prepareDiagramSource`'s, so the refusal
+ * has to be the one that string earns. Asking the guard alone would let a
+ * refusal the statement pass exposes go unreported and the residue be drawn.
+ */
 export function diagramRefusal(code: string): string {
-  return guardDiagramSource(code).refusal;
+  return guardedSanitize(code).refusal;
 }
 
 // -------------------------------------------------------------- the sanitiser
@@ -1030,10 +1084,136 @@ function splitStatements(line: string): string[] {
  * A statement is only rewritten when something was actually dropped from its
  * line, so ordinary sources reach the Code tab byte-for-byte unchanged.
  */
-export function sanitizeDiagramSource(code: string): string {
-  if (!code) return '';
-  let out = guardDiagramSource(code).code;
-  out = out
+/**
+ * The colour words mermaid's `box` statement accepts, as `CSS.supports` judges
+ * them: every CSS named colour, plus the keywords that are legal `color`
+ * values. Closed by the CSS spec, and DRIFT IS COSMETIC — a colour missing from
+ * here survives as a word in the box's title, never as its fill, because
+ * `transparent` is written into the segment mermaid reads as the colour either
+ * way. `#rrggbb` is absent on purpose: mermaid does not accept a hex colour on
+ * a `box` at all ("#hex codes are not supported for now because of the way the
+ * char # is handled" — its own comment).
+ */
+const BOX_COLOUR_WORDS = [
+  'aliceblue', 'antiquewhite', 'aqua', 'aquamarine', 'azure', 'beige', 'bisque',
+  'black', 'blanchedalmond', 'blue', 'blueviolet', 'brown', 'burlywood',
+  'cadetblue', 'chartreuse', 'chocolate', 'coral', 'cornflowerblue', 'cornsilk',
+  'crimson', 'cyan', 'darkblue', 'darkcyan', 'darkgoldenrod', 'darkgray',
+  'darkgreen', 'darkgrey', 'darkkhaki', 'darkmagenta', 'darkolivegreen',
+  'darkorange', 'darkorchid', 'darkred', 'darksalmon', 'darkseagreen',
+  'darkslateblue', 'darkslategray', 'darkslategrey', 'darkturquoise',
+  'darkviolet', 'deeppink', 'deepskyblue', 'dimgray', 'dimgrey', 'dodgerblue',
+  'firebrick', 'floralwhite', 'forestgreen', 'fuchsia', 'gainsboro',
+  'ghostwhite', 'gold', 'goldenrod', 'gray', 'green', 'greenyellow', 'grey',
+  'honeydew', 'hotpink', 'indianred', 'indigo', 'ivory', 'khaki', 'lavender',
+  'lavenderblush', 'lawngreen', 'lemonchiffon', 'lightblue', 'lightcoral',
+  'lightcyan', 'lightgoldenrodyellow', 'lightgray', 'lightgreen', 'lightgrey',
+  'lightpink', 'lightsalmon', 'lightseagreen', 'lightskyblue', 'lightslategray',
+  'lightslategrey', 'lightsteelblue', 'lightyellow', 'lime', 'limegreen',
+  'linen', 'magenta', 'maroon', 'mediumaquamarine', 'mediumblue',
+  'mediumorchid', 'mediumpurple', 'mediumseagreen', 'mediumslateblue',
+  'mediumspringgreen', 'mediumturquoise', 'mediumvioletred', 'midnightblue',
+  'mintcream', 'mistyrose', 'moccasin', 'navajowhite', 'navy', 'oldlace',
+  'olive', 'olivedrab', 'orange', 'orangered', 'orchid', 'palegoldenrod',
+  'palegreen', 'paleturquoise', 'palevioletred', 'papayawhip', 'peachpuff',
+  'peru', 'pink', 'plum', 'powderblue', 'purple', 'rebeccapurple', 'red',
+  'rosybrown', 'royalblue', 'saddlebrown', 'salmon', 'sandybrown', 'seagreen',
+  'seashell', 'sienna', 'silver', 'skyblue', 'slateblue', 'slategray',
+  'slategrey', 'snow', 'springgreen', 'steelblue', 'tan', 'teal', 'thistle',
+  'tomato', 'turquoise', 'violet', 'wheat', 'white', 'whitesmoke', 'yellow',
+  'yellowgreen',
+  'transparent', 'currentcolor', 'inherit', 'initial', 'unset', 'revert',
+  'revert-layer',
+];
+
+/** A leading `box` colour: a colour function, or one of the words above. */
+const BOX_COLOUR = new RegExp(
+  '^(?:(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color|color-mix)\\s*\\([^)]*\\)' +
+    `|(?:${BOX_COLOUR_WORDS.join('|')}))(?![\\w-])[ \\t]*`,
+  'i',
+);
+
+/**
+ * The colour statements that are NOT `classDef`/`style`/`linkStyle`/`click`.
+ *
+ * `COLOUR_DIRECTIVE` is a flowchart-family vocabulary, and three other diagram
+ * types the app renders carry a paint channel of their own. None of these is a
+ * regression of this branch — all three painted identically on the commit
+ * before it — but this branch IS the colour ban, and measured today in Chromium
+ * 153.0.8010.36 / mermaid 11.17.0 each one put the attacker's literal colour on
+ * screen in a chat answer:
+ *
+ *  - `C4Context … UpdateElementStyle(p, $bgColor="#ff0000", $fontColor="#00ff00",
+ *    $borderColor="#ff00ff")` drew node `mmd-1-p` at computed fill
+ *    rgb(255, 0, 0). `UpdateRelStyle` does the same to an arrow, and
+ *    `UpdateLayoutConfig` re-lays the diagram out. All three are presentation
+ *    only: a C4 diagram draws its full graph without them, so the whole
+ *    statement goes.
+ *  - `sequenceDiagram … box rgb(255,0,0) Hot path` emitted
+ *    `<rect … fill="rgb(255,0,0)">` behind the actors. `box` is STRUCTURAL —
+ *    it groups actors and is closed by `end` — so the statement has to survive
+ *    with its colour replaced. `transparent` is not a guess: mermaid's own
+ *    `parseBoxData` matches `^((?:rgba?|hsla?)\s*\(.*\)|\w*)(.*)$`, tests the
+ *    first segment with `CSS.supports('color', …)` and falls back to
+ *    `transparent` when it fails, so an uncoloured box IS a transparent box.
+ *    Writing `transparent` into that first segment is what makes this rule
+ *    FAIL CLOSED: whatever follows is the title to mermaid, so a colour this
+ *    code did not recognise can only end up as TEXT in a label, never as paint.
+ *    The recognised token is then dropped so the label does not read
+ *    "rgb(255,0,0) Hot path", and `BOX_COLOUR_WORDS` being incomplete costs a
+ *    stray word in a title and nothing else.
+ *  - `quadrantChart … "A": [0.7, 0.8] radius: 20, color: #ff0000,
+ *    stroke-color: #00ff00, stroke-width: 6px` emitted
+ *    `<circle … fill="#ff0000" stroke="#00ff00" stroke-width="6px">`. The
+ *    coordinates are the data and the clause after `]` is the paint, so the
+ *    clause goes and the point stays where the author put it. A `:::name` is
+ *    kept: it is inert once its `classDef` has been stripped, exactly as in the
+ *    flowchart family.
+ *
+ * Each rule is gated on the diagram's own HEAD, which is narrower than a
+ * line-anchored keyword on purpose and for the reason `CLASS_STATEMENT` gives:
+ * outside its own grammar `box` is an ordinary flowchart node id
+ * (`box[Label] --> other`) and deleting or rewriting it would delete the
+ * author's graph.
+ */
+function stripTypedColourStatements(code: string): string {
+  const head = diagramHead(code);
+  if (head.startsWith('c4')) {
+    return code
+      .split('\n')
+      .filter((line) => !/^\s*Update(?:ElementStyle|RelStyle|LayoutConfig)\s*\(/i.test(line))
+      .join('\n');
+  }
+  if (head.startsWith('sequencediagram')) {
+    return code
+      .split('\n')
+      .map((line) => {
+        const box = /^(\s*box)[ \t]+(.*)$/.exec(line);
+        if (!box) return line;
+        // Drop the leading token only when it IS a colour. mermaid sets the
+        // title to the WHOLE string when the first word is not one, so eating
+        // it unconditionally would delete a word of `box Hot path`.
+        const title = box[2].replace(BOX_COLOUR, '');
+        return `${box[1]} transparent${title ? ` ${title}` : ''}`;
+      })
+      .join('\n');
+  }
+  if (head.startsWith('quadrantchart')) {
+    return code
+      .split('\n')
+      .map((line) => {
+        const point = /^(\s*(?:"[^"\n]*"|[^:\n]+?)\s*:\s*\[[^\]\n]*\])(.*)$/.exec(line);
+        if (!point) return line;
+        const role = /^\s*(:::[\w-]+)\s*$/.exec(point[2]);
+        return role ? `${point[1]}${role[1]}` : point[1];
+      })
+      .join('\n');
+  }
+  return code;
+}
+
+function stripColourStatements(code: string): string {
+  return code
     .split('\n')
     .map((line) => {
       const parts = splitStatements(line);
@@ -1042,8 +1222,70 @@ export function sanitizeDiagramSource(code: string): string {
       return kept.join(';');
     })
     .filter((line, i, all) => !(line === '' && all[i - 1] === ''))
-    .join('\n');
-  return out.replace(/^\s*\n/, '').replace(/\n{3,}/g, '\n\n');
+    .join('\n')
+    .replace(/^\s*\n/, '');
+}
+
+/**
+ * The guard and the statement pass, alternated TO A FIXED POINT.
+ *
+ * The guard's own loop already handles a preamble promoted by removing the
+ * preamble above it. This loop handles the other direction, which the guard
+ * cannot see because it runs first: THE STATEMENT PASS ALSO PROMOTES.
+ *
+ *     classDef zz fill:#fff
+ *     ---
+ *     config:
+ *       themeCSS: |
+ *         .node rect { fill: #ff0000 !important }
+ *     ---
+ *     flowchart TD
+ *       SVC[Gateway]:::service --> PLAIN[Plain node]
+ *
+ * `FRONTMATTER_RE` is anchored at `^`, so with a statement on line 1 the guard
+ * sees no frontmatter at all and returns the text unchanged. The statement pass
+ * then empties line 1, the trim deletes it, and the block lands at column 0 —
+ * live. Measured on the commit before this one with mermaid 11.17.0's own
+ * `frontMatterRegex`: mermaid read `config: [themeCSS]`, and for the `c4:`
+ * variant `config: [c4]`, out of the string the app handed it. A leading
+ * `click`, `style` or `linkStyle` line does the same, and so does a `classDef`
+ * followed by a whitespace-only line.
+ *
+ * Nothing but `looksRenderable` stopped those: it read `classdef` as the head,
+ * found no diagram type and never called `mermaid.render`, so the reader got a
+ * permanent "Rendering the diagram…" and no message (rendered=false, err=null,
+ * measured both commits). That is an accident of a check written for streaming,
+ * and the engineer's own plan to teach `looksRenderable` to share this guard
+ * would have ARMED every one of them.
+ *
+ * So: guard, strip, guard again, until the text stops changing. Each round
+ * either deletes something or terminates, and exhausting the bound is a
+ * refusal for the same reason it is inside the guard.
+ */
+function guardedSanitize(code: string): GuardedSource {
+  if (!code) return { code: '', refusal: '' };
+  let out = code;
+  for (let pass = 0; pass < MAX_PREAMBLE_PASSES; pass += 1) {
+    const guarded = guardDiagramSource(out);
+    if (guarded.refusal) return guarded;
+    const next = stripTypedColourStatements(stripColourStatements(guarded.code));
+    if (next === out) return { code: next, refusal: '' };
+    out = next;
+  }
+  const guarded = guardDiagramSource(out);
+  if (guarded.refusal) return guarded;
+  if (FRONTMATTER_RE.test(guarded.code)) {
+    return {
+      code: guarded.code,
+      refusal: 'it stacks more preamble blocks than we will strip',
+    };
+  }
+  return { code: guarded.code, refusal: '' };
+}
+
+export function sanitizeDiagramSource(code: string): string {
+  if (!code) return '';
+  return guardedSanitize(code).code.replace(/\n{3,}/g, '\n\n');
 }
 
 /** The characters a role name is made of, after `:::`. */
