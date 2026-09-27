@@ -1127,7 +1127,19 @@ class TheDocsDoNotCiteAControlThisRepositoryLacks(unittest.TestCase):
     def test_the_withdrawn_sentence_stays_withdrawn_while_no_rule_exists(self):
         # assertFalse over a membership test, not assertNotIn: the haystack is
         # the whole script, and a failure message carrying it is unreadable.
-        source = self.SOURCE.read_text(encoding="utf-8")
+        #
+        # COLLAPSED WHITESPACE, and that single call is what makes this guard
+        # able to see anything at all. Both needles are SENTENCES, and every
+        # sentence in that file lives inside a wrapped docstring: the withdrawn
+        # claim sat in the pre-r3 source as `...belongs to Prometheus like every
+        # other\n    alert this job hands over.`, so `WITHDRAWN in source` over
+        # the raw text was False against the exact source it exists to detect
+        # (measured 2026-09-28: raw membership False, collapsed True). The guard
+        # passed either way; the mutation that appeared to prove it -- reverting
+        # this docstring wholesale -- fired on the assertIn below instead,
+        # because that revert also deletes the absent() paragraph. Collapsing
+        # makes the needle independent of where the line happens to wrap.
+        source = " ".join(self.SOURCE.read_text(encoding="utf-8").split())
         if self.rule_exists():
             self.assertFalse(
                 "finds no Prometheus rule" in source,
