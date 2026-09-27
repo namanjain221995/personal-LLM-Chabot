@@ -967,6 +967,64 @@ _STORY_PLOT_RE = re.compile(
     re.I,
 )
 _QUESTION_ABOUT_RE = re.compile(r"^\W*(?:what|which|why|how|who|where|when|is|are|does|do|did|was|were)\b", re.I)
+#: The MODAL interrogative openers `_QUESTION_ABOUT_RE` does not hold:
+#: "would a new report help here?", "should we prepare a separate brief for
+#: legal?". Together the two cover the shapes that ask WHETHER to build
+#: something (W2, 2026-09-27).
+#: `\b` alone would fire on the "can" of "can't": the apostrophe is a
+#: non-word character, so "can't you just give it in docs? provide a dox
+#: file" -- a real production request (test_artifact_intent_labelled
+#: PRODUCTION_SHAPES) -- read as a question and lost its docx. A NEGATED
+#: auxiliary is a request, and `_REQUEST_OF_YOU_RE` below takes it.
+_MODAL_QUESTION_RE = re.compile(
+    r"^\W*(?:would|should|shall|could|can|will|may|might|must|am|have|has|had|if|whether)\b(?![\u2019'])", re.I)
+#: The turn is addressed to the assistant AS A REQUEST. Narrower than
+#: `_POLITE_RE`, whose `you` is optional: "would a new report help here?"
+#: matches `_POLITE_RE` on its bare "would" and is not a request, so the
+#: question guard below cannot use `_POLITE_RE` as its escape hatch
+#: (measured 2026-09-27).
+_REQUEST_OF_YOU_RE = re.compile(
+    r"^\W*(?:please|pls|kindly)\b"
+    r"|^\W*(?:can|could|would|will|may|might)\s+(?:you|u)\b"
+    # The exasperated form, which is the owner's own tone: "can't you just
+    # give it in docs?", "won't you send the pdf".
+    r"|^\W*(?:can|could|would|wo|do|does|did|is|are|ai)n[\u2019']?t\s+(?:you|u)\b"
+    r"|^\W*(?:can|could|may)\s+(?:i|we)\s+(?:get|have|please)\b"
+    r"|^\W*(?:i|we)\s+(?:need|want|would\s+like|'?d\s+like)\b",
+    re.I,
+)
+#: The message OPENS with a creation or hand-over verb, so it is an order
+#: however it is punctuated: "OK Make sheet for Me ??", "give me a pdf of
+#: this?". This is the request marker the step-4 question guard needs: a
+#: named FORMAT is not one, and using `explicit` as the marker let "did you
+#: make a new sheet?" build a workbook in a FRESH conversation (W2b,
+#: 2026-09-27).
+_IMPERATIVE_CREATE_RE = re.compile(
+    r"^\W*(?:(?:please|pls|kindly|just|also|and|then|now|ok|okay|hey|hi|so)\W+)*"
+    r"(?:make|create|generate|build|write|draft|prepare|produce|compile|assemble|put\s+together|design|develop|"
+    r"give|send|get|export|convert|save|download|turn|put|format|wrap|render|print|share|provide|deliver|hand|"
+    r"_give_|_convert_)\b",
+    re.I,
+)
+
+
+def _question_not_a_request(low: str, *, raw: str = "") -> bool:
+    """The turn ASKS about making a file instead of ordering one.
+
+    A question mark, an interrogative opener, and nothing that addresses the
+    assistant as a request. Step 4's creation gate has had this test since
+    the "Would a report help here?" case; step 2b (`create-first-clause`)
+    did not, so an existing artifact REMOVED a guard rather than adding
+    context -- the five W2 questions were `none` in a fresh conversation and
+    `create` the moment a file was in the room (measured 2026-09-27).
+
+    `raw` is the person's own words, which is where the decisive sites look
+    for the question mark; `_export_shape` has only the normalised text and
+    already looked for it there, so it passes none.
+    """
+    if "?" not in (raw or low) or _REQUEST_OF_YOU_RE.match(low) or _IMPERATIVE_CREATE_RE.match(low):
+        return False
+    return bool(_QUESTION_ABOUT_RE.match(low) or _MODAL_QUESTION_RE.match(low))
 #: The upload named as the source: "the pdf I uploaded", "from the attached
 #: sheet", "this file" (AS3 (h)).
 _UPLOAD_SOURCE_RE = re.compile(
@@ -1090,8 +1148,12 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
         return None
     # Verifier 2026-09-15: a WH-question about the file's content is not a
     # hand-over ("my boss said pdf bana do, so what should go in it?", "docs me
-    # kya likhna chahiye").
-    if ("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low):
+    # kya likhna chahiye"). Nor is any other question that is not addressed
+    # as a request: "is it normal to create a second excel for this?" named a
+    # format and a reference and came back as a CONVERSION of the artifact
+    # (W2b, 2026-09-27) once the create paths above stopped taking it.
+    if ("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low) \
+            or _question_not_a_request(low):
         return None
     ref = bool(_BARE_REF_RE.search(low))
     # "I need to know the page count of this PDF": a question, whatever the verb.
@@ -1482,7 +1544,10 @@ def decide(
         # 2b. A new file, said first: "Create a professional PDF report on
         #     X. Make it visually professional." is a create, not an edit
         #     of the last artifact (CONTRACT-2 §5; discovery C2).
-        if _positional_create(low) and not no_file:
+        #     A QUESTION about whether to build one is not an order
+        #     (`_question_not_a_request`): step 4 below has always tested
+        #     this and this branch did not (W2, 2026-09-27).
+        if _positional_create(low) and not no_file and not _question_not_a_request(low, raw=raw):
             return made("create", rule="create-first-clause")
         # 2c. A pronoun follow-up after an ANSWER (not a file card) exports
         #     that answer even when files exist in the conversation.
@@ -1613,9 +1678,15 @@ def decide(
     counted = (bool(explicit or _FILE_CUE_RE.search(low)) and bool(_COUNTED_PIECE_RE.search(low))
                and not _QUESTION_ABOUT_RE.match(low))
     if _CREATE_RE.search(low) or as_format or _BEST_OR_ALL_RE.search(low) or sov or chart_ask or noun_first or counted:
-        if "?" in raw and not _POLITE_RE.match(low) and not explicit and not sov:
+        if "?" in raw and not _POLITE_RE.match(low) and not sov \
+                and not (explicit and not _question_not_a_request(low, raw=raw)):
             # "Would a report help here?" — a creation verb, a document noun,
             # a question, no format: the one shape the rules cannot read.
+            # A named FORMAT used to switch this guard off on its own, so
+            # "did you make a new sheet?" and "what happens if I generate
+            # another workbook?" built one in a FRESH conversation (W2b,
+            # 2026-09-27). The format may still carry a request — "pdf of
+            # this?" — but only when the turn is addressed as one.
             return made("none", rule="ambiguous", ambiguous=True)
         return made("create", rule="create-chart" if chart_ask and not (_CREATE_RE.search(low) or as_format or sov) else
                     ("create-postposition" if sov and not _CREATE_RE.search(low) else "create"))

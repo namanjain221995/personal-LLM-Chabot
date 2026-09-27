@@ -156,9 +156,12 @@ W2_QUESTIONS = [
 
 
 @pytest.mark.parametrize("text", W2_QUESTIONS)
-@pytest.mark.xfail(strict=True, reason="W2: step 2b create-first-clause has no question guard (intent.py:1427)")
 def test_a_question_about_making_a_file_does_not_make_one(text: str) -> None:
-    """Asking whether to build something is not asking for it."""
+    """Asking whether to build something is not asking for it.
+
+    FIXED 2026-09-27: step 2b now runs `_question_not_a_request`, the test
+    step 4 always had. All five decided create under PC before the fix and
+    none (`ambiguous`, or `no-request` for the "would" opener) after it."""
     assert I.decide(text, **PC).action != "create"
 
 
@@ -179,10 +182,15 @@ W2B_QUESTIONS = [
 
 
 @pytest.mark.parametrize("text", W2B_QUESTIONS)
-@pytest.mark.xfail(strict=True, reason="W2b: the step-4 question guard is skipped when a format is named (intent.py:1559 `and not explicit`)")
 @pytest.mark.parametrize("ctx", [P0, PC], ids=["fresh", "card-last"])
 def test_a_question_that_names_a_format_does_not_make_a_file(text: str, ctx: dict) -> None:
-    """A question about the past, or a hypothetical, is not an order."""
+    """A question about the past, or a hypothetical, is not an order.
+
+    FIXED 2026-09-27: a named format no longer defeats step 4's question
+    guard on its own -- a request marker has to be there too -- and
+    `_export_shape` declines the same shape, which is where the third of
+    these went (convert-artifact-turn) once the create paths let go. All six
+    made a file before the fix and none after."""
     assert I.decide(text, **ctx).wants_file is False
 
 
