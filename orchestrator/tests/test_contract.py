@@ -615,24 +615,93 @@ def test_the_production_document_fails_the_three_counted_checks():
     assert depth.status == contract.FAIL
     assert "29 paragraphs over 15 sections" in depth.observed
 
-    assert len(report.failed_musts()) == 6
-    assert report.detail() == "15 of 15 sections; 6 requirements not yet met"
+    # SEVEN, NOT SIX, SINCE fix/document-vocabulary-r2. The seventh is
+    # "2 code blocks": that branch adds `class Code` to spec.DocumentBlock, so
+    # `_spec_block_types()` reads "code" off the union, `_spec_vocabulary()`
+    # gains "code_block", and the item below stops being `unsupported` and
+    # becomes a real count — which is exactly what the comment on
+    # `_SPEC_BLOCK_ELEMENTS` says will happen "with no edit here". Measured on
+    # this tree: failed_musts() is 7 and the seventh label is "2 code blocks".
+    assert len(report.failed_musts()) == 7
+    assert [r.label for r in report.failed_musts()][-2:] == ["2 warning callouts", "2 recommendations"]
+    assert "2 code blocks" in [r.label for r in report.failed_musts()]
+    assert report.detail() == "15 of 15 sections; 7 requirements not yet met"
 
 
-def test_a_code_block_is_unsupported_in_a_document_spec_not_failed():
-    """The document schema's block union has no code block and no inline
-    markup, so "use code blocks" is UNSUPPORTED — said once and plainly,
-    never failed on every revision until the budget runs out. The day
-    document-vocabulary adds the block, `_spec_vocabulary` sees it and the
-    same item becomes a real check with no edit here."""
+def test_the_day_came_a_code_block_is_counted_while_bold_is_still_unsupported():
+    """THE DAY THIS FILE PREDICTED ARRIVED, 2026-09-27, and it needed no edit
+    to contract.py. This test used to assert `code_block` was UNSUPPORTED,
+    under a docstring saying "the day document-vocabulary adds the block,
+    `_spec_vocabulary` sees it and the same item becomes a real check with no
+    edit here". fix/document-vocabulary-r2 adds `class Code` (and
+    `DiagramBlock`) to `spec.DocumentBlock`, so that day is today and the
+    prediction held: `_spec_block_types()` reads "code" off the union,
+    `_spec_vocabulary()` maps it to "code_block", and the item is counted.
+
+    `bold` stays UNSUPPORTED, which is what keeps this test honest: a
+    DocumentSpec block carries text, not inline markup, and no branch changed
+    that. So the two verdicts are decided by the MEDIUM, one element at a
+    time, and not by a flag.
+
+    WHAT THIS DOES NOT COST, measured on this tree rather than assumed. A
+    failed MUST is not a model call. `app/core/max_loop.py:350` is the only
+    production caller of `contract.check`, and it passes `result.text`, a
+    Markdown string — so `read_spec` and the `document_spec` medium are
+    reached by tests and not by the Max loop, and `code_block` was never
+    `unsupported` in Markdown to begin with (`MARKDOWN_VOCABULARY` is every
+    element). When a document path does adopt the check, `max_loop.
+    _APPENDABLE_ELEMENTS` already lists "code_block" and `_is_appendable`
+    only asks for one when `count_of("code_block") == 0`, so a document short
+    of the floor is never padded — and the writer is already commissioned
+    for them: `requirements_brief` carries "fenced code blocks" whenever the
+    person asked for them, independent of the medium.
+    """
     c = contract.extract_rules(OWNER_PROMPT)
     report = contract.check(c, PRODUCTION_DOCUMENT)
     results = {i.target: r for i, r in zip(c.items, report.results) if i.kind == "element"}
-    assert results["code_block"].status == contract.UNSUPPORTED
+    assert "code_block" in report.observed.vocabulary
+    assert results["code_block"].status == contract.FAIL
+    assert results["code_block"].observed == "0 found"
+    # Still unsupported, and for the reason it always was.
     assert results["bold"].status == contract.UNSUPPORTED
-    assert "code_block" not in report.observed.vocabulary
+    assert "bold" not in report.observed.vocabulary
     # An unsupported item is DECIDED: it is never handed to the critic.
     assert all(r.status != contract.UNSUPPORTED for r in report.undecided())
+    # The writer is told to produce them, so the count is a check it can meet.
+    assert "fenced code blocks" in contract.requirements_brief(c)
+
+
+def test_the_vocabulary_follows_the_schema_rather_than_a_list_in_this_module():
+    """The guard on the derivation itself, because that is what made the
+    change above free. `_spec_block_types()` reads the `type` literals off
+    `spec.DocumentBlock`; if someone replaces it with a hand-written set, this
+    fails instead of the count drifting quietly a release later.
+
+    `diagram` is here as the control: fix/document-vocabulary-r2 adds
+    `DiagramBlock` in the same commit as `Code`, and it moves NO element,
+    because `_SPEC_BLOCK_ELEMENTS` has no entry for it — a diagram is not one
+    of the elements a prompt asks for by name. So the +1 in failed_musts() is
+    the code block alone, measured, and not "the schema grew".
+    """
+    from app.artifacts import spec as S
+
+    blocks = contract._spec_block_types()
+    literals = {
+        value
+        for member in S.DocumentBlock.__args__  # type: ignore[attr-defined]
+        for value in member.model_fields["type"].annotation.__args__
+        if isinstance(value, str)
+    }
+    assert blocks == literals
+    assert {"code", "diagram"} <= blocks
+
+    vocabulary = contract._spec_vocabulary()
+    assert "code_block" in vocabulary
+    assert not any(e == "diagram" for e in vocabulary)
+    # Removing `Code` from the union would put the element back out of reach,
+    # which is the property the derivation exists for.
+    assert contract._SPEC_BLOCK_ELEMENTS["code"] == ("code_block",)
+    assert "diagram" not in contract._SPEC_BLOCK_ELEMENTS
 
 
 def test_the_same_document_as_markdown_can_carry_a_code_block():
