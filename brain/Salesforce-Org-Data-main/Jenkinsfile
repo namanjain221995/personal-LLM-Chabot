@@ -1,0 +1,109 @@
+// salesforce-org-backup — automated READ-ONLY metadata snapshot of the Techsara prod org.
+//
+// This pipeline only ever runs: sf org login / org display / project generate manifest /
+// project retrieve start. It must NEVER deploy to or otherwise modify the production org.
+//
+// One-time Jenkins setup (see docs/architecture.md for full detail):
+//   1. Credentials:
+//      - 'sf-prod-backup-auth-url'  (Secret text)  = result.sfdxAuthUrl from
+//        `sf org display --target-org Techsara --verbose --json`
+//      - 'github-backup-push' (Username with password) = GitHub username + fine-grained PAT
+//        with Contents read/write on Techsara-Solutions/Salesforce-Org-Data
+//   2. Pipeline job named 'salesforce-org-backup', "Pipeline script from SCM",
+//      repo https://github.com/Techsara-Solutions/Salesforce-Org-Data.git, branch main,
+//      script path 'Jenkinsfile'. Git plugin: full clone (no shallow), fetch tags.
+//   3. Agent with sf CLI v2+, git, and bash (Git Bash if Windows). Update the label below.
+//
+// Trigger from the prod-deploy pipeline (deployment repo), inside post { success { } }:
+//   build job: 'salesforce-org-backup',
+//         parameters: [string(name: 'FEATURE_NAME', value: env.FEATURE_NAME ?: env.BRANCH_NAME ?: '')],
+//         wait: false, propagate: false
+
+pipeline {
+  agent { label 'sf-cli' }   // TODO: set to your agent label (needs sf CLI + git + bash)
+
+  options {
+    disableConcurrentBuilds()            // serialize deploy-triggered + cron + manual runs
+    timeout(time: 60, unit: 'MINUTES')   // retrieve is ~5-10 min; leaves retry headroom
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '120'))
+  }
+
+  parameters {
+    string(name: 'FEATURE_NAME', defaultValue: '',
+           description: 'Feature just deployed (used in the deploy/<date>-<feature> tag)')
+    choice(name: 'RUN_TYPE', choices: ['auto', 'deploy', 'weekly', 'manual'],
+           description: 'auto = detect from build cause (cron -> weekly, upstream -> deploy, human -> manual)')
+    booleanParam(name: 'ALLOW_MASS_DELETION', defaultValue: false,
+           description: 'Override the >200-files-deleted safety guard (only after manual review)')
+  }
+
+  triggers { cron('H 2 * * 0') }         // weekly snapshot + rotation, Sundays ~02:00
+
+  environment {
+    HUSKY = '0'                          // never run repo hooks from CI
+    SF_DISABLE_TELEMETRY = 'true'
+    SF_AUTOUPDATE_DISABLE = 'true'
+    ORG_ALIAS = 'Techsara-CI'
+    // NEVER add deploy credentials or deploy steps here. Prod is READ-ONLY for automation.
+  }
+
+  stages {
+    stage('Resolve run type') {
+      steps {
+        script {
+          def causes = currentBuild.getBuildCauses().toString()
+          env.RESOLVED_RUN_TYPE = (params.RUN_TYPE != 'auto') ? params.RUN_TYPE
+            : causes.contains('TimerTrigger')  ? 'weekly'
+            : causes.contains('UpstreamCause') ? 'deploy'
+            : 'manual'
+          echo "Run type: ${env.RESOLVED_RUN_TYPE}, feature: '${params.FEATURE_NAME}'"
+        }
+      }
+    }
+
+    stage('Authenticate (read-only)') {
+      steps {
+        withCredentials([string(credentialsId: 'sf-prod-backup-auth-url', variable: 'SF_AUTH_URL')]) {
+          sh 'printf "%s" "$SF_AUTH_URL" | sf org login sfdx-url --sfdx-url-stdin --alias "$ORG_ALIAS"'
+        }
+      }
+    }
+
+    stage('Snapshot') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'github-backup-push',
+                          usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+          sh '''
+            export RUN_TYPE="$RESOLVED_RUN_TYPE"
+            export FEATURE_NAME="${FEATURE_NAME:-}"
+            export ALLOW_MASS_DELETION="${ALLOW_MASS_DELETION:-false}"
+            bash "Prod Org Data/scripts/backup/snapshot.sh"
+          '''
+        }
+      }
+    }
+
+    stage('Rotate week branches') {
+      when { expression { env.RESOLVED_RUN_TYPE == 'weekly' } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'github-backup-push',
+                          usernameVariable: 'GIT_USER', passwordVariable: 'GIT_TOKEN')]) {
+          sh 'bash "Prod Org Data/scripts/backup/rotate-weeks.sh"'
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'sf org logout --target-org "$ORG_ALIAS" --no-prompt || true'   // no refresh token left on agent
+      archiveArtifacts artifacts: 'Prod Org Data/retrieve-log.json', allowEmptyArchive: true
+    }
+    failure {
+      // TODO: wire your notification channel (email / Slack / Teams). Example:
+      // mail to: 'team@techsarasolutions.com', subject: "Org backup FAILED: ${env.BUILD_URL}"
+      echo "NOTIFY: org backup failed — ${env.BUILD_URL}"
+    }
+  }
+}
