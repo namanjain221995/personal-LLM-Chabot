@@ -18,12 +18,12 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable, List, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
 from ..config import settings
-from ..core import answer_sampling, best_of, pasted, rewrite_coverage, rewrite_shape
+from ..core import answer_sampling, best_of, contract, max_loop, pasted, rewrite_coverage, rewrite_shape
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -429,6 +429,46 @@ def _messages(
     )
 
 
+def _effort_degraded(
+    reason: str,
+    detail: str,
+    *,
+    delivered: str = "single_generation",
+    also: Sequence[dict] = (),
+) -> dict:
+    """meta.effort_degraded — "you chose Max and this is not Max".
+
+    A downgrade the code cannot avoid has to be VISIBLE; silence is the
+    defect. Same shape and same job as meta.search_degraded
+    (engines/search.py): `reason` is the machine key, `detail` the one human
+    line, and it rides on the answer's metadata so the stored turn carries it
+    through a reload rather than living only in a log.
+
+    `delivered` names what the person actually got, because "not Max" has
+    more than one shape: no comparison at all ("single_generation"), or a
+    comparison over fewer drafts than were asked for ("best_of_2").
+
+    `also` carries FURTHER downgrades on the same turn, each one a
+    {"reason", "detail"} pair. A Max turn can lose more than one thing at
+    once — the loop switched off AND two of three drafts failing are two
+    facts — and reporting one of them while dropping the other would be the
+    same silence this key exists to end. The list is omitted entirely when
+    there is only one, so a turn with a single downgrade keeps exactly the
+    four keys it always had.
+    """
+    out = {
+        "asked": "max",
+        "delivered": delivered,
+        "reason": reason,
+        "detail": detail,
+    }
+    if also:
+        out["also"] = [
+            {"reason": a["reason"], "detail": a["detail"]} for a in also
+        ]
+    return out
+
+
 async def run_chat_engine(
     message: str,
     history: Sequence[dict],
@@ -491,16 +531,143 @@ async def run_chat_engine(
         total_max_tokens = min(answer_plan.total_max_tokens, total_max_tokens)
     # --- effort_policy (answer quality) end ---
 
+    # MAX IS A LOOP (core/max_loop.py), AND ONLY MAX. Plan, draft, a check
+    # code does, a fenced critique, one guarded revision, each one a step
+    # card the person watches. Everything in this branch is gated on
+    # `effort == "max"`: the critique and the revision are extra model
+    # calls, and Fast's budget is the owner's line.
+    #
+    # THE SHAPE DECIDES, not the effort alone. best-of-N is genuinely the
+    # better shape for a SHORT ask, whose whole candidate fits inside the
+    # judge's 4,000-character window, so it is kept and routed to below;
+    # the loop takes the asks that name sections or elements, which is
+    # precisely where a 4,000-character judge was reading a seventh of each
+    # candidate. `extract_rules` is pure Python and costs nothing, so the
+    # routing decision itself never buys a model call.
+    # `settings.max_loop_enabled` IS THE KILL SWITCH IT SAYS IT IS. config.py
+    # has documented it since this loop landed — "Off = Max keeps best-of-N" —
+    # and nothing read it, so an operator with a Max turn misbehaving in
+    # production had no way to turn it off short of a deploy. It is read here,
+    # ahead of the extraction, so switching it off falls through to exactly the
+    # best-of-N branch below at the price of one pure-Python `extract_rules`
+    # and not one model call. Measured today on the owner's own four-section
+    # report prompt: 0.61 ms, mean of 2,000 runs, on a box at load average
+    # 34.89 — against a Max turn that is three to five model calls long.
+    #
+    # EFFORT DECIDES EFFORT, ON BOTH MAX GATES (2026-09-27). This gate also
+    # required `model_choice == "smart"`. The best-of-N gate below drops that
+    # clause for a reason that holds here word for word —
+    # llm.resolve_model_choice returns the main model for EVERY choice, so the
+    # clause selected nothing and only took Max away from a client holding the
+    # legacy `model: "fast"` preference — and keeping it HERE while dropping it
+    # THERE was worse than either. Measured on the two branches merged, before
+    # this line changed: wants_loop True, max_loop_enabled True,
+    # extra_high_samples 3, and then
+    #   model_choice='smart' -> max_loop path: True,  best_of_N: False
+    #   model_choice='fast'  -> max_loop path: False, best_of_N: True
+    # — a sectioned ask routed into the very shape the paragraph above calls
+    # wrong for it, silently. The two gates now split on `effort` and their own
+    # feature switch and nothing else; tests/test_max_gate_parity.py fails if
+    # they diverge again.
+    #
+    # `loop_degraded` is the other half of that silence. A Max turn that could
+    # not TAKE the loop is now named in the answer's metadata, exactly as a Max
+    # turn that could not get its drafts is. Exactly one cause survives the fix
+    # above — the operator's kill switch — and it counts only for an ask the
+    # loop was the shape for: a short ask loses nothing, because best-of-N is
+    # genuinely the better shape for it.
+    loop_degraded: Optional[dict] = None
+    if effort == "max" and settings.max_loop_enabled:
+        rules = contract.extract_rules(message)
+        if max_loop.wants_loop(rules):
+            from ..core import answer_guard as _answer_guard
+
+            loop_guard = _answer_guard.AnswerGuard(_answer_guard.repetition_allowance(message))
+            loop_shaper = rewrite_shape.for_message(message)
+
+            async def _loop_out(kind: str, text: str) -> None:
+                if kind == "reasoning":
+                    await emit("reasoning", {"text": text})
+                    return
+                if loop_shaper is not None:
+                    text = loop_shaper.feed(text)
+                for piece in loop_guard.feed(text):
+                    await emit("token", {"text": piece})
+                if loop_guard.verdict is not None:
+                    raise continuation.StopGeneration(continuation.STOP_REPETITION)
+
+            meta = {"route": "chat"}
+            # busy=None on purpose: the busy probe answers "is a person
+            # waiting on a chat answer", and on this path the person waiting
+            # IS this turn. The 8-second timeout inside extract() is what
+            # bounds a wedged router here, and a wedged router degrades to
+            # the rule extractor rather than stalling the turn.
+            full = await contract.extract(message, effort=effort, busy=None)
+            await max_loop.run(
+                message,
+                history,
+                _messages(message, history, mode, grounding),
+                emit,
+                mode=mode,
+                model_choice=model_choice,
+                grounding=grounding,
+                contract=full,
+                on_delta=_loop_out,
+                temperature=temperature,
+                segment_max_tokens=max_tokens,
+                total_max_tokens=total_max_tokens,
+                deadline_s=settings.continuation_deadline_s or None,
+                target_words=answer_sampling.requested_words(_length_ask(message)),
+                meta=meta,
+            )
+            if loop_shaper is not None and loop_guard.verdict is None:
+                for piece in loop_guard.feed(loop_shaper.finish()):
+                    await emit("token", {"text": piece})
+            for piece in loop_guard.finish():
+                await emit("token", {"text": piece})
+            if loop_guard.verdict is not None:
+                meta["loop_guard"] = loop_guard.verdict.as_meta()
+                await _answer_guard.record(loop_guard.verdict, effort=effort, route="chat")
+            answer = await _say_what_was_left_out(message, loop_guard.shown, emit, meta)
+            await emit("meta", meta)
+            return answer
+    elif effort == "max" and max_loop.wants_loop(contract.extract_rules(message)):
+        # MAX_LOOP_ENABLED=false with an ask the loop is for. The kill switch
+        # is an operator's choice and best-of-N below is still a real answer,
+        # so this is not an error — but the person chose Max on an ask that
+        # names sections, and what they get is the 4,000-character judge the
+        # loop exists to keep away from exactly that ask. Stamped onto
+        # whichever metadata the fall-through produces, below.
+        loop_degraded = {
+            "reason": "max_loop_disabled",
+            "detail": (
+                "the Max loop is off on this deployment "
+                "(MAX_LOOP_ENABLED=false), so this ask was answered without "
+                "the plan, the check and the revision it is shaped for"
+            ),
+        }
+
     # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
     # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
     # the winner's thinking + answer stream to the UI (core/best_of.py).
     # Zero usable candidates falls through to the ordinary single stream —
     # best-of-N must never make extra_high worse than high.
-    if (
-        effort == "max"
-        and model_choice == "smart"
-        and settings.extra_high_samples > 1
-    ):
+    #
+    # EFFORT DECIDES EFFORT (2026-09-27). This gate also required
+    # `model_choice == "smart"`, which guarded nothing real: the candidates
+    # come from best_of.generate_candidates → llm.chat_completion_with_reasoning,
+    # which is main-model-only and reads the level from `effort` alone, and
+    # llm.resolve_model_choice serves those same weights for EVERY choice.
+    # What the clause did do was take the whole Max feature away from a client
+    # sending the legacy `model: "fast"` — a value frontend/lib/prefs.ts still
+    # keeps when it loads a stored preference, that today's effort picker can
+    # neither produce nor clear, and that ChatRequest.model still accepts.
+    # Measured on origin/dev (4164bb8) today, model="fast" + effort="max":
+    # 0 candidates generated, thinking off, meta {"route": "chat"} — the person
+    # paid for Max and was told nothing. `degraded` below is that silence's fix:
+    # anything Max asked for and did not get is named in the answer's metadata.
+    degraded: Optional[dict] = None
+    if effort == "max" and settings.extra_high_samples > 1:
         prompt = _messages(message, history, mode, grounding)
         candidates = await best_of.generate_candidates(
             prompt,
@@ -518,15 +685,76 @@ async def run_chat_engine(
             answer = rewrite_shape.shape(message, winner.answer)
             for start in range(0, len(answer), 200):
                 await emit("token", {"text": answer[start : start + 200]})
+            # ASKED vs COMPARED. `best_of` is the N the operator configured
+            # and asked for; it is NOT how many drafts the judge got to see.
+            # A candidate that fails comes back unusable rather than fatal
+            # (core/best_of.generate_candidates), and select_best judges only
+            # the usable ones — down to "only one candidate produced an
+            # answer", which is no comparison at all. Reporting the asked
+            # count alone made that case claim a best-of-3 it never ran
+            # (2026-09-27): the same silence as the two branches below, one
+            # `if` earlier, so it is named the same way.
+            compared = sum(1 for c in candidates if c.usable)
             meta = {
                 "route": "chat",
                 "best_of": settings.extra_high_samples,
+                "best_of_compared": compared,
                 "best_of_winner": winner.index,
                 "best_of_reason": reason,
             }
+            if compared < settings.extra_high_samples:
+                failed = settings.extra_high_samples - compared
+                meta["effort_degraded"] = _effort_degraded(
+                    "candidates_partially_failed",
+                    f"{failed} of {settings.extra_high_samples} Max drafts "
+                    + (
+                        "failed; the one that survived was used without a "
+                        "comparison"
+                        if compared == 1
+                        else f"failed; the best of {compared} was kept"
+                    ),
+                    delivered=(
+                        "single_generation"
+                        if compared == 1
+                        else f"best_of_{compared}"
+                    ),
+                    also=(loop_degraded,) if loop_degraded else (),
+                )
+            elif loop_degraded is not None:
+                # Every draft the operator asked for was compared, so
+                # best-of-N ran exactly as configured — and this ask was still
+                # the loop's shape, and the loop was off. `delivered` names
+                # what really ran; the reason names what it replaced.
+                meta["effort_degraded"] = _effort_degraded(
+                    loop_degraded["reason"],
+                    loop_degraded["detail"],
+                    delivered=f"best_of_{compared}",
+                )
             answer = await _say_what_was_left_out(message, answer, emit, meta)
             await emit("meta", meta)
             return answer
+        # Every candidate failed. The single stream below is still the right
+        # answer — best-of-N may never make Max WORSE than Think — but N
+        # drafts were asked for and one was delivered, so it is recorded.
+        degraded = _effort_degraded(
+            "candidates_failed",
+            f"all {settings.extra_high_samples} Max drafts failed; "
+            "answered with a single generation",
+            also=(loop_degraded,) if loop_degraded else (),
+        )
+    elif effort == "max":
+        # EXTRA_HIGH_SAMPLES <= 1: the operator has best-of-N switched off, so
+        # Max is Think with a longer leash. A deployment choice, not a bug —
+        # but not what the picker promises either ("drafts several answers in
+        # parallel, keeps the best"), so the person is told rather than left
+        # to assume they got it.
+        degraded = _effort_degraded(
+            "best_of_disabled",
+            "best-of-N is off on this deployment "
+            f"(EXTRA_HIGH_SAMPLES={settings.extra_high_samples}); "
+            "answered with a single generation",
+            also=(loop_degraded,) if loop_degraded else (),
+        )
 
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
     # call and stays exactly that; the total an answer may run to is decided
@@ -602,6 +830,8 @@ async def run_chat_engine(
     # so through it (stop_reason "repetition": "This answer stops here: it had
     # begun repeating itself.").
     meta = {"route": "chat"}
+    if degraded is not None:
+        meta["effort_degraded"] = degraded
     if long.segment_count > 1 or long.truncated:
         meta["continuation"] = long.as_meta()
     if guard.verdict is not None:

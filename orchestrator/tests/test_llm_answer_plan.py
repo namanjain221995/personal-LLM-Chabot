@@ -104,6 +104,35 @@ def test_a_routed_thinking_plan_places_keys_and_skips_the_floor(world):
     assert "seed" not in sent
 
 
+def test_a_thinking_plan_is_honoured_at_a_legacy_model_value(world):
+    """GUARD (2026-09-27). `thinking_on = bool(plan_thinking) and
+    model_choice == "smart"` was a second copy of the veto `wants_thinking`
+    carried: a plan that DECIDES thinking was overruled by a legacy weights
+    value that resolves to the same model. Restore the clause and this sends
+    enable_thinking false with the plan asking for true."""
+    plan = SimpleNamespace(sampling=answer_sampling.routed_thinking_sampling(), enable_thinking=True)
+    sent = _sent(world, model_choice="fast", effort="fast", temperature=0.6, max_tokens=1024 + 8000,
+                 answer_plan=plan)
+    assert sent["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
+    # Byte-identical to the same plan at "smart": the choice changes nothing.
+    assert sent == _sent(world, model_choice="smart", effort="fast", temperature=0.6,
+                         max_tokens=1024 + 8000, answer_plan=plan)
+
+
+def test_a_fast_turn_still_never_thinks_whatever_a_plan_asks(world, monkeypatch):
+    """The safety net the guard above leans on: `llm.fast_turn()` is the last
+    word, so removing the model-value veto did not let a Fast turn think."""
+    llm.mark_fast_turn(True)
+    try:
+        plan = SimpleNamespace(sampling=answer_sampling.routed_thinking_sampling(), enable_thinking=True)
+        for choice in ("smart", "fast"):
+            sent = _sent(world, model_choice=choice, effort="fast", temperature=0.6,
+                         max_tokens=1024 + 8000, answer_plan=plan)
+            assert sent["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}, choice
+    finally:
+        llm.mark_fast_turn(False)
+
+
 def test_client_budget_mode_does_not_apply_to_a_plan(world, monkeypatch):
     monkeypatch.setattr(settings, "thinking_budget_mode", "client")
     plan = SimpleNamespace(sampling=answer_sampling.routed_thinking_sampling(), enable_thinking=True)
@@ -143,10 +172,15 @@ def test_enable_thinking_false_turns_off_think_effort(world):
     assert sent["max_tokens"] == 500 and sent["temperature"] == 0.3
 
 
-def test_enable_thinking_true_never_applies_to_the_fast_model_choice(world):
+def test_a_legacy_model_choice_does_not_veto_a_plan_that_asks_to_think(world):
+    """This asserted the opposite until 2026-09-27 ("never applies to the fast
+    model choice"), which is where `thinking_on = bool(plan_thinking) and
+    model_choice == "smart"` came from. The choice resolves to the same
+    weights, so it decides nothing about thinking; `fast_turn()` does, and
+    the test below proves it still does."""
     plan = SimpleNamespace(sampling={}, enable_thinking=True)
     sent = _sent(world, model_choice="fast", effort="fast", temperature=0.6, max_tokens=500, answer_plan=plan)
-    assert sent["extra_body"] == _NO_THINK
+    assert sent["extra_body"] == _THINK
 
 
 def test_a_strict_backend_gets_no_vllm_extensions(world, monkeypatch):

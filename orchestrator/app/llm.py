@@ -1135,15 +1135,31 @@ def assert_answer_engine(base_url: str) -> None:
 
 
 def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
-    """Should this call run the model's reasoning pass?
+    """Should this call run the model's reasoning pass? EFFORT decides, alone.
 
     One set of weights now serves both picker choices, so "Fast" is not a
     smaller model — it is the SAME model with thinking switched off. That is
     what actually makes it fast: the reasoning pass, not the parameter count,
     is where the seconds go. Effort "low" means the same thing.
+
+    `model_choice` names WEIGHTS and `resolve_model_choice` is the one place
+    that reads it. It is not an effort dial, and until 2026-09-27 this
+    function made it one: it returned False for every choice but "smart", so
+    a client holding the legacy `model: "fast"` preference and choosing Max
+    was served thinking-off — and, through the best-of-N gate in
+    engines/chat.py, no best-of-N either — on the SAME weights "smart" gets.
+    Measured on origin/dev (4164bb8) today with the real engine functions:
+    model="fast", effort="max" produced 0 candidates, wants_thinking False and
+    meta {"route": "chat"}. The choice selects nothing, so it may not veto the
+    level the person chose; `chat_completion_with_reasoning` — best-of-N's own
+    call — has always hardcoded wants_thinking("smart", effort) for exactly
+    this reason.
+
+    The parameter stays: every caller passes it positionally, and it is where
+    the weights axis would be read from if a choice ever splits again. Should
+    that happen, it belongs in `resolve_model_choice`, not here.
     """
-    if model_choice != "smart":
-        return False
+    del model_choice  # weights, not effort — see above
     # Fast answers directly; Think and Max reason first.
     return normalize_effort(effort) in ("think", "max")
 
@@ -1400,7 +1416,12 @@ async def stream_chat_events(
     thinking_on = wants_thinking(model_choice, effort)
     plan_thinking = getattr(answer_plan, "enable_thinking", None) if answer_plan is not None else None
     if plan_thinking is not None:
-        thinking_on = bool(plan_thinking) and model_choice == "smart"
+        # `and model_choice == "smart"` stood here until 2026-09-27: the same
+        # entanglement `wants_thinking` carried, one line further on. A plan
+        # that DECIDES thinking is decided by the caller's plan, not by a
+        # legacy weights value that resolves to the same model. `fast_turn()`
+        # below remains the last word, so a Fast turn still never thinks.
+        thinking_on = bool(plan_thinking)
     # Only a plan that DECIDES thinking sizes the call itself; a sampling-only
     # plan must not disturb a thinking decision made elsewhere.
     plan_sizes_call = plan_thinking is not None
