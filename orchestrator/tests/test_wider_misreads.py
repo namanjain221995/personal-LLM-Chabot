@@ -10,19 +10,23 @@ sweep AROUND it: five further shapes that `intent.decide` reads as something
 the person did not say, each measured on origin/dev 1f80aa3a2b, each with
 the contrast case that shows the rules get the neighbouring shape right.
 
-HOW TO READ A CASE. Every defect below is stated as two tests:
+ALL FIVE ARE FIXED, on the five commits after 8acbcd2 (2026-09-27), and this
+file is now the regression guard rather than the reproduction. It was written
+the other way round: every defect carried an `xfail(strict=True)` test
+asserting what the person asked for, next to a plain test pinning the
+CONTRAST — the same words in a context, or with the one synonym, where the
+rules already did the right thing. The 49 xfails are gone because the fixes
+turned them into passes; nothing was deleted, nothing was softened, and no
+assertion was reversed. Each fixed test's docstring says what it measured
+before and after. Several gained assertions rather than losing them, and the
+W4 drift measurement — which asserted the drift as a fact and therefore had
+to go — was replaced by the anti-drift guard it argued for.
 
-  * a `xfail(strict=True)` test asserting what the person asked for. It
-    xfails on origin/dev — that IS the reproduction. When the fix lands it
-    XPASSes, which `strict=True` turns into a failure, so the marker has to
-    be deleted in the same commit as the fix. Nothing here is skipped and no
-    assertion is softened: the wrong answer is never asserted as correct.
-  * a plain test pinning the CONTRAST — the same words in the context, or
-    with the one synonym, where the rules already do the right thing. Those
-    pass today. They are the regression guard on the working side, and they
-    are why each finding is a defect rather than a shape nobody taught.
+HOW TO READ A CASE. What the person asked for, then the CONTRAST that bounds
+it: the neighbouring shape that already worked, or the same words with no
+format, which must not move.
 
-THE FIVE, most harmful first.
+THE FIVE, most harmful first. Each heading states what it did BEFORE the fix.
 
 W1  A REFUSAL MAKES THE FILE. "I don't want another file" -> create. The
     negation guards (`_NEGATED_CLAUSE_RE` line 301, `_NEGATED_FORMAT_RE`
@@ -209,9 +213,11 @@ def _pasted_rows(n: int) -> str:
     return "\n".join(f"EMP{i:04d}\tTeam {i % 7}\tEngineer\t{50000 + i}\tActive" for i in range(1, n + 1))
 
 
-#: The ask people type after their data. 40 rows (~1.5 kB) is a file today;
-#: 120 rows (~4.4 kB) is not, because `_clean(text)[:4000]` has already cut
-#: the sentence off. Nothing is logged and no metric counts it.
+#: The ask people type after their data. BEFORE the fix, 40 rows (~1.5 kB)
+#: was a file and 120 rows (~4.4 kB) was not, because `_clean(text)[:4000]`
+#: had already cut the sentence off; nothing was logged and no metric
+#: counted it. `_decide_window` reads the tail as well, at the same total
+#: scanned length.
 @pytest.mark.parametrize("rows", [120, 400, 10_000])
 def test_an_ask_after_a_pasted_table_is_still_a_request(rows: int) -> None:
     """Paste the data, then ask. The ask must survive the paste.

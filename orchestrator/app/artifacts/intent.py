@@ -1111,6 +1111,8 @@ def _question_not_a_request(low: str, *, raw: str = "") -> bool:
     if "?" not in (raw or low) or _REQUEST_OF_YOU_RE.match(low) or _IMPERATIVE_CREATE_RE.match(low):
         return False
     return bool(_QUESTION_ABOUT_RE.match(low) or _MODAL_QUESTION_RE.match(low))
+
+
 #: The upload named as the source: "the pdf I uploaded", "from the attached
 #: sheet", "this file" (AS3 (h)).
 _UPLOAD_SOURCE_RE = re.compile(
