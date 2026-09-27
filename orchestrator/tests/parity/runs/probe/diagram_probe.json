@@ -1,0 +1,16 @@
+{
+  "explicit_diagram": {
+    "mermaid": true,
+    "colour_directive": false,
+    "nodes": 1,
+    "wall_s": 21.5,
+    "chars": 760
+  },
+  "explicit_coloured": {
+    "mermaid": true,
+    "colour_directive": false,
+    "nodes": 10,
+    "wall_s": 34.5,
+    "chars": 785
+  }
+}
