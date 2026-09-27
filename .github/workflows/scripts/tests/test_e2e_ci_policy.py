@@ -440,9 +440,9 @@ class EverySixthPublicModelIsReallyConfigured(unittest.TestCase):
     """The defect the first local run of this stage found, pinned.
 
     app/publicapi/registry.py WITHDRAWS a public model whose engine shares an
-    address with the main engine -- `_router_configured` (:721),
-    `_ocr_configured` (:769), `_embed_configured` (:807) and
-    `_rerank_configured` (:845) all end in
+    address with the main engine -- `_router_configured` (registry.py:716, the
+    test at :723), `_ocr_configured` (:762, :769), `_embed_configured` (:802,
+    :807) and `_rerank_configured` (:838, :846) all refuse on
     `not _same_address(url, openai_base_url)`. That guard is correct: a profile
     pointing a sidecar at the main engine would publish the main model a second
     time, around its breaker and its admission lanes.
