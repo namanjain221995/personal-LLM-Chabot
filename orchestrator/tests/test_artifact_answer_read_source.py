@@ -841,3 +841,272 @@ def test_the_first_arm_of_the_sov_shape_carries_no_file_reference():
     norm = "kitna _in_ hai"
     assert I._Q_SOV_RE.search(norm) is not None, norm
     assert I._Q_SOV_OUR_FILE_RE.search(norm) is None, norm
+
+
+# ---------------------------------------------------------------------------
+# ROUND 4 (2026-09-28). The round-3 pointer was measured through POST /chat
+# against the four defects it was written for, and passed all of them; what it
+# was NOT measured against was the word order Gujarati and Hindi speakers
+# actually type, and the two nouns that name a file with no determiner in front
+# of them. Both holes are the same mistake in two places — a rule read on a view
+# from which the evidence has already been removed — and both were invisible to
+# the corpus score, the 77 authored chart rows and the whole of these two files.
+
+
+def test_the_file_words_that_cannot_name_our_file_alone_are_a_computed_difference():
+    """`_Q_OUR_FILE_NOUN` is the file words MINUS the ones that name any file at
+    all, and it is COMPUTED from the same list rather than restated, for the
+    reason `_Q_CONTENT_ONLY_NOUN` already gives: a hand-copied list is a claim
+    about another list that nothing checks.
+
+    This pins WHICH words are held back and which are left, so that adding a
+    word to `_Q_FILE_WORD_WORDS` is a decision about both."""
+    from app.artifacts import intent as I
+
+    # Every word held back is really one of the file words (a typo here would
+    # silently hold back nothing at all).
+    assert set(I._Q_NOT_OURS_ALONE_WORDS) <= set(I._Q_FILE_WORD_WORDS), (
+        sorted(set(I._Q_NOT_OURS_ALONE_WORDS) - set(I._Q_FILE_WORD_WORDS)))
+    assert I._Q_OUR_FILE_NOUN == I._alt(
+        w for w in I._Q_FILE_WORD_WORDS if w not in I._Q_NOT_OURS_ALONE_WORDS)
+    # What is LEFT is the vocabulary of a thing this platform MADE.
+    assert [w for w in I._Q_FILE_WORD_WORDS if w not in I._Q_NOT_OURS_ALONE_WORDS] == [
+        "work ?books?", "spread ?sheets?", "sheets?", "trackers?", "reports?",
+        "decks?", "presentations?", "outputs?", "deliverables?", "versions?"]
+    # …and the two kinds held back: a bare FORMAT and a bare CONTAINER.
+    for held in ("csv", "excel", "pdfs?", "xlsx", "ppt", "files?", "documents?", "docs?"):
+        assert held in I._Q_NOT_OURS_ALONE_WORDS, held
+
+
+#: A BARE FORMAT OR CONTAINER WORD IN SOV ORDER IS NOT A POINTER. Round 3's SOV
+#: pointer ORed the whole of `_Q_FILE_WORD` into an arm that has no determiner in
+#: front of it, and a bare `csv`/`excel`/`pdf`/`file`/`doc` is what the person's
+#: OWN upload is called. Ten turns that reached the dataset engine on 153bb8c2
+#: were answered "**Workflow Tracker** (v1) is a workbook with 1 sheet: `Tasks`"
+#: on 780bdea2; the whole turns are in tests/test_artifact_question_route.py.
+HELD_OUT_A_BARE_FORMAT_WORD_IN_SOV_ORDER_IS_NOT_A_POINTER = (
+    "csv me total spend kitna hai ??",
+    "csv me kitne rows hai ??",
+    "csv me kitne columns hai ??",
+    "csv me kya data hai ??",
+    "excel me kitne rows hai ??",
+    "csv में कितने rows हैं ?",
+    "csv ma ketla rows che ??",
+    "pdf me kitne pages hai ??",
+    "file me kitne rows hai ??",
+    "doc me kitne pages hai ??",
+    "document me kitne pages hai ??",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_BARE_FORMAT_WORD_IN_SOV_ORDER_IS_NOT_A_POINTER)
+def test_a_bare_format_or_container_word_in_sov_order_is_not_a_pointer(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_BARE_FORMAT_WORD_IN_SOV_ORDER_IS_NOT_A_POINTER)
+def test_the_same_turns_are_still_questions_about_a_file(text):
+    """The fix is about WHOSE file, and must not quietly stop the gate from
+    seeing a question at all: with no dataset in the room there is no other file
+    these can be about, and every one of them keeps its read-back."""
+    decided = _intent_that_asks_about(text)
+    assert decided.answer_about_artifact is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=False) is True, (text, decided.rule)
+
+
+#: THE DETERMINER IS WHAT MAKES A FORMAT WORD OURS, and it is the arm that keeps
+#: the residual this module already records for "what is in the csv?". Gujarati's
+#: `આ` is rewritten to `_this_` by the lexicon, so "આ csv ma ketla rows che ??"
+#: IS "this csv" and takes the same arm and the same decision.
+HELD_OUT_A_FORMAT_WORD_WITH_A_DETERMINER_IS_STILL_THE_RESIDUAL = (
+    "what is in the csv?",
+    "how many rows does the csv have?",
+    "આ csv ma ketla rows che ??",
+    "is csv me kitne rows hai ??",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_FORMAT_WORD_WITH_A_DETERMINER_IS_STILL_THE_RESIDUAL)
+def test_a_determiner_in_front_of_a_format_word_keeps_the_stated_residual(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_this_token_in_the_determiner_arm_is_load_bearing():
+    """THE ARM ROUND 3 ADDED AND DID NOT GUARD (verifier, 2026-09-28): `_this_`
+    was put into `_Q_OUR_FILE`'s determiner arm so "is data sheet me kya hai ??"
+    — which the lexicon writes "_this_ data sheet _in_ kya hai" — still reaches
+    the file word past the bare-demonstrative lookahead, and nothing failed when
+    the arm was removed. It fails here now.
+
+    The lookahead on the FIRST arm is what makes the second one necessary: after
+    `_this_` comes `data`, a noun a dataset owns, so the bare-demonstrative arm
+    stands down and only "a determiner, up to two words, a file word" is left to
+    see the `sheet`."""
+    import re
+
+    from app.artifacts import intent as I
+
+    without = re.compile(
+        rf"(?:(?:it|this|that|these|those|them|_this_)\b(?!\s+{I._Q_CONTENT_ONLY_NOUN}\b)"
+        rf"|(?:the|this|that|these|those|my|our|your)\s+(?:\w+\s+){{0,2}}?{I._Q_FILE_WORD}\b"
+        rf"|(?:slide|page|sheet|tab|section|column|row)\s+\d+\b)", re.I)
+    for norm in ("_this_ data sheet _in_ kya hai", "_this_ data sheet me su che"):
+        assert without.search(norm) is None, norm
+        assert I._Q_OUR_FILE_RE.search(norm) is not None, norm
+    # …and the whole turn, through the gate.
+    for text in ("is data sheet me kya hai ??", "આ data sheet ma su che ??"):
+        decided = _intent_that_asks_about(text, has_dataset=True)
+        assert decided.names_our_file is True, (text, decided.rule)
+
+
+#: N1 IN VERB-FINAL WORD ORDER. Round 3 closed "don't make a file, just tell me
+#: X" for English, where the verb precedes its object and X survives the
+#: subtraction. In the order Gujarati and Hindi speakers type, the object stands
+#: INSIDE the two-word gap `_Q_TELL_ONLY_RE` allows before the speech verb —
+#: "fakt kul spend kaho", "bas countries bata do" — so the phrase took the
+#: subject away with it, nothing was left, and the refusal was read as a pointer.
+#: Measured through POST /chat on 153bb8c2, on the round-2 candidate AND on
+#: 780bdea2: all six answered "**Workflow Tracker** (v1) is a workbook with 1
+#: sheet: `Tasks`".
+HELD_OUT_A_REFUSAL_THAT_NAMES_ITS_SUBJECT_LAST = (
+    "navi file na banavo, fakt kul spend kaho",
+    "file mat banao bas countries bata do",
+    "file mat banao sirf countries bata do",
+    "nayi file mat banao khali total spend batao",
+    "navi file na banavo fakt average spend kaho",
+    "file na banavo, bas spend samjavo",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_REFUSAL_THAT_NAMES_ITS_SUBJECT_LAST)
+def test_a_refusal_that_names_its_subject_last_is_not_a_pointer(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+def test_the_words_between_the_intensifier_and_the_speech_verb_are_kept():
+    """The mechanism, not only its effect. `_Q_TELL_ONLY_RE` names its gap and
+    `_names_nothing_but_the_ask` puts it back, so what the person said between
+    "fakt"/"bas" and the speech verb still has to pass the filler test."""
+    from app.artifacts import intent as I
+
+    assert "told_gap" in I._Q_TELL_ONLY_RE.groupindex, I._Q_TELL_ONLY_RE.groupindex
+    m = I._Q_TELL_ONLY_RE.search("fakt kul spend _read_")
+    assert m is not None and m.group("told_gap").split() == ["kul", "spend"], m
+    # The subject survives the subtraction …
+    assert I._names_nothing_but_the_ask("new file _neg_ , fakt kul spend _read_") is False
+    assert I._names_nothing_but_the_ask("file _neg_ bas countries _read_") is False
+    # … and a gap that names nothing does not become one. An ADVERB between
+    # "just" and the verb is the English shape of the same slot, and the turn it
+    # belongs to had its read-back before this change.
+    assert I._names_nothing_but_the_ask("dont create a file , just quickly tell me") is True
+    assert I._names_nothing_but_the_ask("file _neg_ bas _read_") is True
+
+
+@pytest.mark.parametrize("text", (
+    "dont create a file, just quickly tell me",
+    "file mat banao bas bata do",
+    "please dont make a new file, just briefly tell me",
+))
+def test_a_refusal_whose_gap_holds_only_an_adverb_still_points_at_our_file(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_ask_that_names_nothing_is_bounded_by_the_length_of_the_text():
+    """NOT A DEFECT WHEN IT WAS FOUND, BOUNDED SO IT CANNOT BECOME ONE (verifier,
+    2026-09-28). `_names_nothing_but_the_ask` runs three regex substitutions over
+    the WHOLE turn, which costs 24.8 ms on a 108,000-character normalised refusal
+    against 330-380 us for a short one, and nothing bounded the text it scans. A
+    pasted refusal is a realistic shape.
+
+    The bound is also the right answer: a message that long names plenty besides
+    the ask. The proof is behavioural rather than a stopwatch — the text here is
+    PURE FILLER, which the subtraction would otherwise reduce to nothing and call
+    a pointer, so the short-circuit is the only thing that can return False."""
+    from app.artifacts import intent as I
+
+    filler = "please just tell me only , ok "   # 30 characters, whole words
+    assert len(filler) == 30 and I._Q_NOTHING_BUT_THE_ASK_MAX_CHARS == 400
+    assert I._names_nothing_but_the_ask(filler * 3) is True
+    huge = filler * 4000
+    assert len(huge) > 100_000, len(huge)
+    assert I._names_nothing_but_the_ask(huge) is False, len(huge)
+    # The boundary itself, so the constant cannot drift without a failure. The
+    # same words on either side of it: 390 characters and 420 characters.
+    assert I._names_nothing_but_the_ask(filler * 13) is True, len(filler * 13)
+    assert I._names_nothing_but_the_ask(filler * 14) is False, len(filler * 14)
+
+
+#: THE SOV SHAPE WITH A BARE FILE WORD. `_Q_SOV_RE`'s second arm read a
+#: DETERMINER and a file word (`_Q_THIS_FILE`) or a content noun, so a question
+#: that names our file in its own words and carries neither — "tracker me kya hai
+#: ??" — was not a question about a file at all and the whole turn went to the
+#: dataset engine. The English "what is in the tracker?" is
+#: `_Q_FILE_CONTENTS_RE`'s, because `in` is a containment word there.
+HELD_OUT_THE_SOV_SHAPE_WITH_A_BARE_FILE_WORD = (
+    "tracker me kya hai ??",
+    "workbook me kitni sheets hai ??",
+    "work book me kya hai ??",
+    "deck me kitne slides hai ??",
+    "deliverable me kya hai ??",
+    "spreadsheet me kitne rows hai ??",
+    "document me kya hai ??",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THE_SOV_SHAPE_WITH_A_BARE_FILE_WORD)
+def test_the_sov_shape_reads_a_bare_file_word_as_a_question(text):
+    decided = _intent_that_asks_about(text)
+    assert decided.answer_about_artifact is True, (text, decided.rule)
+    assert decided.action == "none", (text, decided.action, decided.rule)
+
+
+@pytest.mark.parametrize("text", (
+    "tracker me kya hai ??",
+    "workbook me kitni sheets hai ??",
+    "deck me kitne slides hai ??",
+    "deliverable me kya hai ??",
+    "spreadsheet me kitne rows hai ??",
+))
+def test_a_file_word_of_our_own_in_sov_order_points_at_our_file(text):
+    """The other half: these name a thing this platform MADE, so they keep the
+    read-back with a dataset in the room. Nobody calls the CSV they just
+    uploaded a tracker or a deliverable."""
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_postposition_is_not_a_containment_word():
+    """WHY THE SHAPE AND NOT `_Q_INSIDE`. The obvious fix for "tracker me kya hai
+    ??" is to call `_in_` a containment word, and it is wrong: `_in_` is what the
+    normaliser writes for every CONVERSION — "pdf me convert karo" becomes "pdf
+    _in_ _convert_" — so `_Q_INSIDE_RE` would be true for turns that ask for
+    work, and it guards two more shapes in `_artifact_question_kind`."""
+    from app.artifacts import intent as I
+    from app.artifacts import lexicon as LX
+
+    assert I._Q_INSIDE_RE.search("pdf _in_ _convert_") is None
+    assert "_in_" in LX.normalize("pdf me convert karo"), LX.normalize("pdf me convert karo")
+    assert I._Q_SOV_RE.search("tracker _in_ kya hai") is not None
+    assert I._Q_SOV_RE.search("pdf _in_ _convert_") is None
+
+
+def test_the_feminine_question_word_is_read_like_the_masculine():
+    """`kitni` is the feminine of `kitna`, and Gujarati's `ketli` was in the
+    question words without it, so "workbook me KITNI sheets hai ??" was not a
+    question and "workbook me KITNE sheets hai ??" was — the same question, one
+    inflection apart."""
+    from app.artifacts import intent as I
+
+    for text in ("workbook me kitni sheets hai ??", "sheet me kitni rows hai ??",
+                 "is sheet me kitni sheets hai ??"):
+        decided = _intent_that_asks_about(text)
+        assert decided.answer_about_artifact is True, (text, decided.rule)

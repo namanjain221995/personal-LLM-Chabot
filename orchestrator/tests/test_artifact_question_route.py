@@ -436,3 +436,193 @@ def test_an_incidental_crawl_instruction_in_a_paste_is_not_a_crawl():
         # whole-site walk nobody asked for did not claim it.
         assert final.get("route") == "artifact", (final, tokens[:300])
         assert "Workflow Tracker" in tokens, tokens[:300]
+
+
+# ---------------------------------------------------------------------------
+# ROUND 4 (2026-09-28). Two whole classes of turn the round-3 fix got wrong,
+# both measured here through POST /chat with customers.csv and a workbook in ONE
+# conversation, because unit assertions passed on two candidates while the
+# product was broken:
+#
+# D1  a BARE FORMAT OR CONTAINER WORD is what the person's own upload is called.
+#     The new SOV pointer ORed the whole file-word list into an arm with no
+#     determiner in front of it, so "csv me total spend kitna hai ??" — a
+#     question about customers.csv — was answered "**Workflow Tracker** (v1) is
+#     a workbook with 1 sheet: `Tasks`". Ten turns, and not one guard, corpus
+#     row or score moved, which is why the round-3 report did not see it.
+# D2  N1 CLOSED ENGLISH WORD ORDER ONLY. "navi file na banavo, fakt kul spend
+#     kaho" names its own subject, and Gujarati and Hindi put it before the verb,
+#     inside the gap the ask-to-be-told phrase subtracted whole.
+#
+# And the reverse direction, which the round-3 report claimed as a win for one
+# word out of six: a question that names our file in its OWN words reached the
+# dataset engine, because the postposition was never written for `tracker`,
+# `work book`, `deck` or `deliverable` and because the SOV shape wanted a
+# determiner the turn does not have.
+
+D1_A_BARE_FORMAT_WORD_IS_THEIR_UPLOAD = (
+    "csv me total spend kitna hai ??",
+    "csv me kitne rows hai ??",
+    "csv me kitne columns hai ??",
+    "csv me kya data hai ??",
+    "excel me kitne rows hai ??",
+    "csv में कितने rows हैं ?",
+    "csv ma ketla rows che ??",
+    "pdf me kitne pages hai ??",
+    "file me kitne rows hai ??",
+    "doc me kitne pages hai ??",
+)
+D2_A_REFUSAL_THAT_NAMES_ITS_SUBJECT_LAST = (
+    "navi file na banavo, fakt kul spend kaho",
+    "file mat banao bas countries bata do",
+    "file mat banao sirf countries bata do",
+    "nayi file mat banao khali total spend batao",
+    "navi file na banavo fakt average spend kaho",
+    "file na banavo, bas spend samjavo",
+)
+
+
+@pytest.mark.parametrize("question", [
+    *D1_A_BARE_FORMAT_WORD_IS_THEIR_UPLOAD,
+    *D2_A_REFUSAL_THAT_NAMES_ITS_SUBJECT_LAST,
+])
+def test_a_question_in_verb_final_order_reaches_the_dataset_engine(question):
+    """The whole turn: `meta.route` must be the engine that has the rows, the
+    reply must not be the workbook sentence, and nothing may be built."""
+    conv = "art-r4-" + hashlib.md5(question.encode()).hexdigest()[:10]
+    with TestClient(app) as client:
+        before = _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, question)
+        assert "artifact_answer" not in final, (question, final, tokens[:300])
+        assert "Workflow Tracker" not in tokens, (question, tokens[:300])
+        assert final.get("route") == "dataset", (question, final, tokens[:300])
+    rows = adb.list_artifacts(_owner_id(), conv)
+    assert len(rows) == 1 and str(rows[0]["id"]) == str(before[0]["id"]), (rows, before)
+
+
+R4_OUR_FILE_IN_ITS_OWN_WORDS = (
+    "tracker me kya hai ??",
+    "workbook me kitni sheets hai ??",
+    "work book me kya hai ??",
+    "deck me kitne slides hai ??",
+    "deliverable me kya hai ??",
+    "spreadsheet me kitne rows hai ??",
+)
+
+
+@pytest.mark.parametrize("question", R4_OUR_FILE_IN_ITS_OWN_WORDS)
+def test_a_question_that_names_our_file_in_its_own_words_keeps_the_read_back(question):
+    """THE OTHER DIRECTION, and the reason D1's fix is a NARROWER word list and
+    not a narrower pointer: nobody calls the CSV they just uploaded a tracker, a
+    deck or a deliverable, so these keep the read-back with a dataset in the
+    room. Every one of them reached the dataset engine on 780bdea2."""
+    conv = "art-r4-ours-" + hashlib.md5(question.encode()).hexdigest()[:8]
+    with TestClient(app) as client:
+        made = _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, question)
+        answered = final.get("artifact_answer") or {}
+        assert answered, (question, final, tokens[:300])
+        assert str(answered.get("artifact_id")) == str(made[0]["id"]), (answered, made)
+        assert "Workflow Tracker" in tokens, tokens[:300]
+        assert "artifacts" not in final, final
+
+
+@pytest.mark.parametrize("question", (
+    "dont create a file, just quickly tell me",
+    "file mat banao bas bata do",
+))
+def test_a_refusal_whose_gap_holds_no_subject_keeps_the_read_back(question):
+    """THE COST OF D2's FIX, paid for and pinned. The words between "just"/"bas"
+    and the speech verb are kept rather than subtracted, so a turn whose gap
+    holds an ADVERB — the English shape of that slot — must not read as a turn
+    that named a subject. `_Q_NO_SUBJECT_FILLER_RE` carries the manner adverbs
+    for exactly this."""
+    conv = "art-r4-adv-" + hashlib.md5(question.encode()).hexdigest()[:8]
+    with TestClient(app) as client:
+        _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, question)
+        assert final.get("route") == "artifact", (question, final, tokens[:300])
+        assert "Workflow Tracker" in tokens, tokens[:300]
+
+
+#: THE SAME QUESTION IN TWO LANGUAGES, round 4. The verifier read the Hinglish
+#: demonstrative as word-order-fragile in a way English is not; measured, it is
+#: not — English gives the SAME verdict for both members of each pair. What the
+#: pair asserts is the contract this module already states: not "Hindi works" but
+#: "Hindi and English agree".
+R4_SAME_QUESTION_TWO_LANGUAGES = (
+    ("isme kya data hai ??", "what data is in it ??"),
+    ("isme kitna total spend hai ??", "what is the total spend in it ??"),
+    ("tracker me kya hai ??", "what is in the tracker ??"),
+    ("workbook me kitni sheets hai ??", "how many sheets are in the workbook ??"),
+    ("csv me kitne rows hai ??", "how many rows are in the csv i uploaded ??"),
+    ("file mat banao bas countries bata do", "dont make a file, just tell me the countries"),
+)
+
+
+@pytest.mark.parametrize("indic,english", R4_SAME_QUESTION_TWO_LANGUAGES,
+                         ids=[e[:40] for _i, e in R4_SAME_QUESTION_TWO_LANGUAGES])
+def test_the_round_four_pairs_take_the_same_route_in_both_languages(indic, english):
+    routes = {}
+    for label, question in (("indic", indic), ("english", english)):
+        conv = "art-r4-lang-" + label + "-" + hashlib.md5(question.encode()).hexdigest()[:8]
+        with TestClient(app) as client:
+            _make_artifact(client, conv, conv)
+            _add_dataset(conv)
+            final, tokens = _answer_turn(client, conv, question)
+            routes[label] = (final.get("route"), "Workflow Tracker" in tokens)
+    assert routes["indic"] == routes["english"], routes
+
+
+def test_a_determiner_in_front_of_a_bare_format_word_is_the_stated_residual():
+    """WHERE D1's FIX STOPS, measured and recorded. "આ csv ma ketla rows che ??"
+    is "THIS csv": the lexicon rewrites `આ` to `_this_`, so the turn takes
+    `_Q_OUR_FILE`'s DETERMINER arm, which admits the whole file-word list — and
+    must, because it is the arm that keeps "what is in the csv?" answering.
+
+    That is the residual tests/test_artifact_answer_read_source.py already
+    records: this platform publishes CSV artifacts, so "this csv" names either
+    file and no words rule separates them. It is the ONE turn of the ten that
+    does not return to the dataset engine, and it is the same decision the repo
+    already took for English, not a new one."""
+    question = "આ csv ma ketla rows che ??"
+    conv = "art-r4-residual"
+    with TestClient(app) as client:
+        _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, question)
+        assert final.get("route") == "artifact", (final, tokens[:300])
+        assert "Workflow Tracker" in tokens, tokens[:300]
+        # …and its English twin takes the same route, which is the point.
+        conv_en = "art-r4-residual-en"
+        _make_artifact(client, conv_en, conv_en)
+        _add_dataset(conv_en)
+        final_en, tokens_en = _answer_turn(client, conv_en, "how many rows are in this csv ??")
+        assert final_en.get("route") == "artifact", (final_en, tokens_en[:300])
+
+
+def test_output_is_the_one_file_word_the_postposition_list_cannot_take():
+    """THE KNOWN COST of closing the reverse direction, stated rather than
+    discovered. `outputs?` is a file word, but "output me" cannot be disambiguated
+    by the noun: "output me a summary" is an English imperative with the PRONOUN,
+    and lexicon.py's postposition list is a list of nouns after which `me` is
+    certainly the postposition. So "output me kya hai ??" still reaches the
+    dataset engine, and closing it needs the turn's LANGUAGE at the normaliser
+    (lexicon.language_of), not another word in the list."""
+    conv = "art-r4-output"
+    with TestClient(app) as client:
+        _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, "output me kya hai ??")
+        assert final.get("route") == "dataset", (final, tokens[:300])
+        # The English form is not affected: it has a determiner and a
+        # containment word, so it keeps its read-back.
+        conv_en = "art-r4-output-en"
+        _make_artifact(client, conv_en, conv_en)
+        _add_dataset(conv_en)
+        final_en, tokens_en = _answer_turn(client, conv_en, "what is in the output ??")
+        assert final_en.get("route") == "artifact", (final_en, tokens_en[:300])
+        assert "Workflow Tracker" in tokens_en, tokens_en[:300]

@@ -1312,6 +1312,35 @@ def _alt(words) -> str:
 
 _Q_CONTENT_NOUN = _alt(_Q_CONTENT_NOUN_WORDS)
 _Q_FILE_WORD = _alt(_Q_FILE_WORD_WORDS)
+#: The file words that CANNOT name our own file with no determiner in front of
+#: them, COMPUTED as the difference below (2026-09-28, round 4). Two kinds:
+#:
+#:   * a bare FORMAT name — `csv`, `excel`, `pdf`, `xlsx`, `ppt` — is what the
+#:     person's OWN upload is called, and this platform publishes those formats
+#:     too (artifacts/formats.py), so the word names either file;
+#:   * a bare GENERIC CONTAINER — `file`, `document`, `doc`, `attachment` — names
+#:     any file at all, and `attachments?` is the vocabulary
+#:     `_Q_THEIR_UPLOAD_RE` uses to say a file is THEIRS.
+#:
+#: `_Q_OUR_FILE`'s determiner arm already requires the|this|that|my|our|your in
+#: front of a file word for exactly this reason. The SOV pointer below has NO
+#: determiner in its bare arm, so it needs the narrower set: measured through
+#: POST /chat with customers.csv and a workbook in one conversation, the bare
+#: `_Q_FILE_WORD` there answered "csv me total spend kitna hai ??", "excel me
+#: kitne rows hai ??", "csv में कितने rows हैं ?", "csv ma ketla rows che ??",
+#: "pdf me kitne pages hai ??", "file me kitne rows hai ??" and "doc me kitne
+#: pages hai ??" with "**Workflow Tracker** (v1) is a workbook with 1 sheet:
+#: `Tasks`" — a description of a workbook nobody asked about.
+#:
+#: What is LEFT is the vocabulary of a thing this platform MADE: `work ?books?`,
+#: `spread ?sheets?`, `sheets?`, `trackers?`, `reports?`, `decks?`,
+#: `presentations?`, `outputs?`, `deliverables?`, `versions?`. Nobody calls the
+#: CSV they just uploaded a tracker or a deliverable.
+_Q_NOT_OURS_ALONE_WORDS = (
+    "files?", "documents?", "docs?", "pdfs?", "docx", "xlsx", "xls", "excel", "csv",
+    "pptx", "powerpoint", "ppt", "attachments?",
+)
+_Q_OUR_FILE_NOUN = _alt(w for w in _Q_FILE_WORD_WORDS if w not in _Q_NOT_OURS_ALONE_WORDS)
 #: The content nouns a DATASET owns just as much as a file this platform made —
 #: the content nouns MINUS the file words, COMPUTED (2026-09-28). A noun that is
 #: also a file word (`sheets?` is the only one today) still points at our file,
@@ -1347,7 +1376,10 @@ _Q_INSIDE = (
 #: the workbook). The guards are lookarounds instead, and the shapes below
 #: must NOT wrap `_Q_WH` in `\b`.
 _Q_WH_ANY = (
-    r"(?<!\w)(?:what'?s?|how\s+many|how\s+much|kya|kaya|kitne|kitna|ketla|ketli|su|shu"
+    # `kitni` is the feminine of `kitna`, and Gujarati's `ketli` was here
+    # without it: "workbook me KITNI sheets hai ??" was not a question at all
+    # while "workbook me KITNE sheets hai ??" was (measured 2026-09-28).
+    r"(?<!\w)(?:what'?s?|how\s+many|how\s+much|kya|kaya|kitne|kitna|kitni|ketla|ketli|su|shu"
     r"|क्या|कितन\w*|શું|કેટલ\w*)(?!\w)"
 )
 #: `where`, `which` and `why` open a question at the START of a clause and
@@ -1409,8 +1441,16 @@ _Q_OUR_FILE_RE = re.compile(rf"\b{_Q_OUR_FILE}", re.I)
 #: "credit note में क्या है ?" — normalised "credit note _in_ kya hai" — matched
 #: through the `it` inside "credit" and pointed a question about the person's
 #: own credit note at our workbook.
+#:
+#: THE BARE ARM CARRIES NO DETERMINER, so it reads `_Q_OUR_FILE_NOUN` and not
+#: `_Q_FILE_WORD` (2026-09-28, round 4): a bare format name or a bare generic
+#: container is what the person's own upload is called, and this arm was
+#: answering ten measured questions about an uploaded CSV with a description of
+#: a workbook. The determiner arm inside `_Q_OUR_FILE` still admits the whole
+#: file-word list, which is why "what is in the csv?" stays the stated residual
+#: that tests/test_artifact_answer_read_source.py pins.
 _Q_SOV_OUR_FILE_RE = re.compile(
-    rf"\b(?:{_Q_OUR_FILE}|{_Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b",
+    rf"\b(?:{_Q_OUR_FILE}|{_Q_OUR_FILE_NOUN})(?:\W+\w+){{0,4}}?\W+_in_\b",
     re.I,
 )
 #: …and THEIR file, named as their own: "the csv i uploaded", "the attachment",
@@ -1474,9 +1514,21 @@ def _q_wh_content(clause: str, marked: bool) -> bool:
 #: becomes "_this_ sheet _in_ kya hai", where the question word can be
 #: anywhere. `_in_` is written only for me/mein/में/માં, so this shape
 #: cannot fire on an English turn.
+#:
+#: A BARE FILE WORD counts (2026-09-28, round 4). The second arm read
+#: `_Q_THIS_FILE` — which needs a determiner — or a content noun, so "tracker me
+#: kya hai ??", "deliverable me kya hai ??" and "document me kya hai ??" were
+#: not questions about a file AT ALL: they carry no determiner and no content
+#: noun, and the whole turn reached the dataset engine although the person had
+#: just been shown the file card. The English "what is in the tracker?" is
+#: `_Q_FILE_CONTENTS_RE`'s, because `in` is a containment word there; `_in_` is
+#: not in `_Q_INSIDE` and must not be (every `pdf me convert karo` writes one),
+#: so the SOV shape names the case itself. WHOSE file it is stays
+#: `_Q_SOV_OUR_FILE_RE`'s question, and a bare format word there is still the
+#: person's own upload.
 _Q_SOV_RE = re.compile(
     rf"{_Q_WH}(?:\W+\w+){{0,6}}?\W+_in_\b"
-    rf"|(?:{_Q_THIS_FILE}|{_Q_CONTENT_NOUN})(?:\W+\w+){{0,4}}?\W+_in_\b(?:\W+\w+){{0,4}}?\W+{_Q_WH}",
+    rf"|(?:{_Q_THIS_FILE}|{_Q_CONTENT_NOUN}|{_Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b(?:\W+\w+){{0,4}}?\W+{_Q_WH}",
     re.I,
 )
 #: A question about WHAT WAS DONE: "what did you put in the second sheet",
@@ -1576,8 +1628,17 @@ _Q_NOT_CONTENTS_RE = re.compile(
 )
 #: "just tell me", "tell me only", "i want to know", "sirf bata do": the
 #: person asks to be TOLD, and for nothing else.
+#:
+#: `told_gap` NAMES the words between the intensifier and the speech verb,
+#: because `_names_nothing_but_the_ask` has to put them back (2026-09-28, round
+#: 4). In English the verb comes before its object, so "just tell me the total
+#: spend" leaves the subject standing after the phrase; in VERB-FINAL Hinglish
+#: and Gujlish the object sits INSIDE the gap — "fakt kul spend kaho", "bas
+#: countries bata do" — and subtracting the phrase whole subtracted the subject
+#: with it, which is why six measured refusals that plainly name their own
+#: subject went on pointing at our workbook.
 _Q_TELL_ONLY_RE = re.compile(
-    r"\b(?:just|only|simply|sirf|faqt|fakt|khali|bas)\s+(?:\w+\s+){0,2}?(?:tell|say|show|explain|answer|_read_)\b"
+    r"\b(?:just|only|simply|sirf|faqt|fakt|khali|bas)\s+(?P<told_gap>(?:\w+\s+){0,2}?)(?:tell|say|show|explain|answer|_read_)\b"
     r"|\b(?:tell|explain|show)\s+(?:me|us)\s+(?:only|just)\b"
     r"|\b(?:i|we)\s+(?:just\s+|only\s+|really\s+)?(?:want|need|would\s+like|wanna)\s+to\s+know\b"
     r"|\b(?:i|we)\s+(?:only|just)\s+(?:want|need)\b"
@@ -1620,14 +1681,30 @@ _Q_REFUSE_CREATE_RE = re.compile(
 #: takes ("a new one", "anything", "a file"). Whatever survives this AND the
 #: three phrase patterns above is a subject the person named for themselves.
 #: `d` is in it because the transcript's own turn ends "Not create d??".
+#: The MANNER ADVERBS are here because `_Q_TELL_ONLY_RE`'s gap is kept rather
+#: than subtracted (2026-09-28, round 4): in English the two words that may
+#: stand between "just" and the speech verb are an adverb — "just quickly tell
+#: me" — and an adverb names no subject, so keeping the gap must not turn one
+#: into a subject and cost the read-back the turn had before.
 _Q_NO_SUBJECT_FILLER_RE = re.compile(
     r"\b(?:i|we|me|us|my|our|you|your|it|its|this|that|just|only|simply|sirf|fakt|faqt|khali|bas|"
     r"please|pls|kindly|ok|okay|no|nope|yes|ya|and|but|so|now|then|also|first|na|hey|hi|sir|bro|yaar|"
     r"bhai|said|want|wanted|need|needed|wanna|would|like|to|know|d|"
+    r"quick|quickly|brief|briefly|short|shortly|fast|straight|plainly|honestly|directly|"
     r"a|an|the|any|another|new|other|second|extra|more|one|ones|anything|something|thing|files?)\b"
     r"|\W+",
     re.I,
 )
+#: THE LONGEST MESSAGE that can be nothing but the ask to be told. The ask and
+#: the refusal are short phrases — the longest real one measured is 84
+#: characters ("please tell me only, do not make a new file - what is the
+#: average spend per country?", which names a subject and is not this) — and a
+#: message longer than this names plenty besides them, so it is not a pointer
+#: whatever the subtraction would say. It is a BOUND, not a heuristic: a pasted
+#: refusal is a realistic shape and `_names_nothing_but_the_ask` runs three
+#: regex substitutions over the whole text, which cost 24.8 ms on a 108,000-
+#: character turn against 330-380 us for a short one (measured 2026-09-28).
+_Q_NOTHING_BUT_THE_ASK_MAX_CHARS = 400
 
 
 def _names_nothing_but_the_ask(text: str) -> bool:
@@ -1659,8 +1736,21 @@ def _names_nothing_but_the_ask(text: str) -> bool:
     whole of "sirf bata do nayi file mat banao - total spend kitna hai" reduces
     to a single space there, which is how a first attempt at this rule passed a
     turn that names a total straight through.
+
+    WORD ORDER (2026-09-28, round 4). The subtraction has to KEEP the words
+    `_Q_TELL_ONLY_RE` allows between the intensifier and the speech verb. In
+    English the verb precedes its object, so "just tell me the total spend"
+    leaves "total spend" standing; in the verb-final order Gujarati and Hindi
+    speakers type, those words ARE the object — "fakt kul spend _read_", "bas
+    countries _read_" — and subtracting the phrase whole left nothing, so six
+    measured refusals that name their own subject were read as pointers and
+    answered "**Workflow Tracker** (v1) is a workbook with 1 sheet: `Tasks`".
+    `_Q_NO_SUBJECT_FILLER_RE` still decides whether what is put back names
+    anything, which is what keeps "just quickly tell me" a pointer.
     """
-    rest = _Q_TELL_ONLY_RE.sub(" ", text)
+    if len(text) > _Q_NOTHING_BUT_THE_ASK_MAX_CHARS:
+        return False
+    rest = _Q_TELL_ONLY_RE.sub(lambda m: " %s " % (m.group("told_gap") or ""), text)
     rest = _Q_REFUSE_CREATE_RE.sub(" ", rest)
     rest = _Q_TELL_RE.sub(" ", rest)
     return not _Q_NO_SUBJECT_FILLER_RE.sub(" ", rest).strip()
