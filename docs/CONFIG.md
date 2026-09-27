@@ -155,6 +155,30 @@ Stop reasons (`meta.research_run.stop_reason`, and the `research[…] assess:` l
 | `OCR_VISION_DEADLINE_S` / `OCR_VISION_MAX_TOKENS` | `10.0` / `1500` | The image route's OCR pass is time-boxed and capped; past the deadline the answer proceeds from the pixels. PDF scans keep the full budget. |
 | `DOCUMENT_PREWARM_ENABLED` / `DOCUMENT_PREWARM_MAX_MB` | `true` / `64` | Extract a document at upload time so the send reads a cache. |
 
+### How much stored material a prompt carries (2026-09-27)
+
+These replaced bare literals — an inline `6000` for a stored page and an
+inline `8000` for an uploaded document — that decided how much of the
+person's own material the model could see for the rest of a conversation.
+They are derived from the served window, so they follow it.
+
+| Env var | Default | What it governs |
+|---|---|---|
+| `DOCUMENT_CONTEXT_WINDOW_FRACTION` | `0.10` | The share of the served context window one prompt may spend on stored material. `DOCUMENT_CONTEXT_CHARS` is derived from it. |
+| `DOCUMENT_CONTEXT_CHARS` | derived | Characters of stored material one prompt may carry, **shared between the items, not spent on each**. `0` (the default) means "derive it from the fraction above". |
+| `CONTEXT_COMPACT_WINDOW_FRACTION` | `0.5` | The share of the served window the rolling history summary may occupy before compaction fires. This, not a code change, is the knob to turn DOWN if a large prefill is costing TTFT. |
+
+**The budget is a total, not a per-item allowance.** `/chat` pins
+question-relevant excerpts of every page and every document from earlier in
+the conversation onto every later turn, and `db.get_documents` selects them
+with no `LIMIT`. Applying the budget per item therefore multiplied it by the
+number of uploads, with nothing naming a ceiling; `main._shared_context_chars`
+divides it instead, with a floor of 48,000 characters — what the upload turn
+itself passes for a single document — so a conversation with many uploads
+never starves any one of them. `context.fit_request` remains the physical
+backstop, but its trim is generic: which document loses text is arbitrary,
+which is why the total has to be bounded before it gets there.
+
 ## The knowledge "brain" (ADR-0001, 2026-09-03)
 
 Full rationale in `docs/07-brain/`. Every knob below has a sensible default;
