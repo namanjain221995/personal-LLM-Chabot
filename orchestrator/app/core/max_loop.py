@@ -393,8 +393,28 @@ async def run(
             result.refused = refusal
             await steps.failed(f"kept the draft: {refusal}")
             return result.text
-        for start in range(0, len(addition), 400):
-            await sink("token", addition[start : start + 400])
+        # THE GUARD CAN FIRE ON THE REVISION'S OWN TEXT, AND IT MUST NOT COST
+        # THE PERSON THEIR ANSWER. `sink` is the engine's delta sink, and it
+        # raises continuation.StopGeneration when the loop guard's verdict
+        # lands (engines/chat._loop_out). On every other path that exception
+        # is raised INSIDE stream_long_completion, which catches it and ends
+        # the stream cleanly. Here the revision is buffered and the sink is
+        # called directly, so nothing was catching it: it escaped `run`,
+        # escaped run_chat_engine, and reached main.py's terminal error
+        # handler, which turned a finished answer into a failed generation and
+        # an `error` frame. Measured on this branch before this block, with a
+        # revision that repeats one sentence forty times.
+        #
+        # The draft is already the answer. What the guard held back is held
+        # back, the step says so, and the engine's own post-loop path still
+        # reports the verdict on the meta.
+        try:
+            for start in range(0, len(addition), 400):
+                await sink("token", addition[start : start + 400])
+        except continuation.StopGeneration:
+            result.text = "".join(pieces)
+            await steps.failed("the revision began repeating itself; it stops there")
+            return result.text
         result.text = "".join(pieces)
         result.revised = True
         await steps.done(

@@ -510,6 +510,87 @@ def test_fast_and_think_make_exactly_the_calls_they_made_before(effort, monkeypa
     assert answer == THIN_DRAFT
 
 
+#: One sentence, repeated. `answer_guard.AnswerGuard` fires on the second copy.
+_CYCLE = (
+    "The platform runs entirely on local hardware and keeps every byte of data "
+    "inside the building. "
+)
+
+
+def test_the_documented_kill_switch_really_turns_the_loop_off(monkeypatch):
+    """config.py has promised `MAX_LOOP_ENABLED=false` -> "Max keeps
+    best-of-N" since this loop landed, and nothing read the setting: there was
+    no way to turn the loop off short of a deploy. Off, a Max turn of exactly
+    the loop's own shape takes best-of-N and makes no phase call."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "max_loop_enabled", False)
+    _answer, events, recorded = _run_chat(OWNER_PROMPT, "max", monkeypatch)
+    assert recorded.names == ["best_of", "judge"]
+    assert [k for k, _ in events if k == "step"] == []
+
+
+def test_a_looping_revision_does_not_cost_the_person_their_answer(monkeypatch):
+    """THE GUARD FIRES ON THE REVISION, AND THE TURN STILL ENDS AS AN ANSWER.
+
+    engines/chat._loop_out raises continuation.StopGeneration when the loop
+    guard's verdict lands. On every other path that happens INSIDE
+    stream_long_completion, which catches it; the revision is buffered and
+    calls the sink directly, so before this was fixed the exception escaped
+    max_loop.run, escaped run_chat_engine, and reached main.py's terminal
+    error handler — the person got an `error` frame instead of the report they
+    had just watched being written.
+    """
+    recorded = _Calls()
+
+    async def fake_plan(messages, **kwargs):
+        recorded.add("plan")
+        return "a plan"
+
+    async def fake_json(messages, **kwargs):
+        recorded.add("critique")
+        return json.dumps({"findings": []})
+
+    async def fake_router(messages, **kwargs):
+        recorded.add("proposer")
+        return json.dumps({"items": []})
+
+    async def fake_stream(messages, *, on_delta, **kwargs):
+        revise = any("STILL MISSING" in str(m.get("content")) for m in messages)
+        recorded.add("revise" if revise else "draft")
+        text = ("\n\n## Appendix\n\n" + _CYCLE * 40) if revise else THIN_DRAFT
+        try:
+            await on_delta("token", text)
+        except continuation.StopGeneration:
+            # What stream_long_completion does with it on the draft path.
+            pass
+        return continuation.LongResult(text=text, stop_reason="complete")
+
+    monkeypatch.setattr(llm, "chat_completion", fake_plan)
+    monkeypatch.setattr(llm, "json_completion", fake_json)
+    monkeypatch.setattr(llm, "router_chat_completion", fake_router)
+    monkeypatch.setattr(continuation, "stream_long_completion", fake_stream)
+
+    events = []
+
+    async def emit(kind, data):
+        events.append((kind, dict(data)))
+
+    answer = asyncio.run(
+        chat_engine.run_chat_engine(
+            OWNER_PROMPT, [], emit, mode="assistant", model_choice="smart", effort="max"
+        )
+    )
+    assert answer.startswith(THIN_DRAFT), "the draft is the answer and it is returned"
+    meta = [d for k, d in events if k == "meta"][-1]
+    # The turn says what happened, in both places a person can see it.
+    assert meta["loop_guard"]["signal"]
+    revise_step = [s for s in meta["steps"] if s["title"] == max_loop.STEP_REVISE]
+    assert revise_step and revise_step[-1]["status"] == "failed"
+    assert "repeating" in revise_step[-1]["detail"]
+    assert meta["max_loop"]["revised"] is False
+
+
 def test_a_max_turn_of_the_wrong_shape_still_gets_best_of_n(monkeypatch):
     """best-of-N is not deleted: it is genuinely the better shape for a
     short ask, whose whole candidate fits inside the judge's 4,000

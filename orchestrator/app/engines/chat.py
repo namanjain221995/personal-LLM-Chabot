@@ -504,7 +504,13 @@ async def run_chat_engine(
     # precisely where a 4,000-character judge was reading a seventh of each
     # candidate. `extract_rules` is pure Python and costs nothing, so the
     # routing decision itself never buys a model call.
-    if effort == "max" and model_choice == "smart":
+    # `settings.max_loop_enabled` IS THE KILL SWITCH IT SAYS IT IS. config.py
+    # has documented it since this loop landed — "Off = Max keeps best-of-N" —
+    # and nothing read it, so an operator with a Max turn misbehaving in
+    # production had no way to turn it off short of a deploy. It is read here,
+    # ahead of the extraction, so `MAX_LOOP_ENABLED=false` costs nothing at all
+    # and falls through to exactly the best-of-N branch below.
+    if effort == "max" and model_choice == "smart" and settings.max_loop_enabled:
         rules = contract.extract_rules(message)
         if max_loop.wants_loop(rules):
             from ..core import answer_guard as _answer_guard
