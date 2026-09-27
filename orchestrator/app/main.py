@@ -5685,6 +5685,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # setting (has_artifacts=True) and found no file request.
                 and not lane.entered
             ):
+                from .artifacts import describe as _as3_describe
                 from .artifacts import intent as artifact_intent_rules
                 from .engines import artifact as artifact_engine_mod
 
@@ -5816,7 +5817,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
-            elif artifact_intent is not None and artifact_intent.wants_file:
+            elif artifact_intent is not None and (
+                artifact_intent.wants_file
+                # ...OR ASKS ABOUT A FILE THIS PLATFORM ALREADY MADE. A question
+                # ("what does this sheet have?") wants no file and `wants_file` is
+                # False for it, but the answer comes from that artifact's stored
+                # spec, which only the artifact engine can reach; it returns before
+                # any job is accepted, so no version is written. The verdict is the
+                # intent gate's, read (never decided) by artifacts/describe. The
+                # live intent is read here on purpose: when a later step re-decides
+                # the turn (an attached image becoming the material), the engine's
+                # own branch reads the same object and the two agree.
+                or _as3_describe.is_artifact_question(artifact_intent)
+            ):
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
                 # "create a PDF of this", "make a deck for the board", "make
                 # slide 4 shorter", "also as Word" — is answered with one.
