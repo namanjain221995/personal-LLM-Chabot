@@ -204,9 +204,31 @@ _ARTIFACT_NOUNS = (
     r"calculator|financial model|budget\s+(?:calculator|tracker|planner|sheet|spread ?sheet|template|model|workbook)|"
     rf"{_DATA_NOUNS})"
 )
+#: `sheets?` and `doc` are the words the OWNER types, and they were the two
+#: `formats.explicit_formats` mapped ("sheet" -> xlsx, "doc" -> docx) while
+#: this constant did not, so every rule built on it was blind to them:
+#: `_AS_FORMAT_RE`, `_CONVERT_RE`, `_NEGATED_FORMAT_RE`, `_ABOUT_FORMAT_RE`,
+#: `_FORMAT_ONLY_RE`, `_FORMAT_OF_REF_RE`, `_MAKE_IT_FORMAT_RE`,
+#: `_NAMED_FILE_RE`, `_FORMAT_LIST_OBJECT_RE`, `_FUNCTION_WORDS_RE`. The
+#: worst of it was an exclusion being built: "make it a pdf, not a sheet"
+#: returned ['pdf', 'xlsx'] where "not a spreadsheet" returned ['pdf'] (W4,
+#: measured 2026-09-27). `tests/test_wider_misreads.py` now fails if the two
+#: vocabularies diverge again.
+#:
+#: The `sheets?` lookbehinds are the UNION of the two guards that already
+#: existed for the same word -- `_ARTIFACT_NOUNS` above (cheat, fact,
+#: balance, time, score, answer) and `formats._ALIAS["xlsx"]` (cheat, fact,
+#: term, style, rate, balance, time) -- so "cheat sheet", "balance sheet"
+#: and "style sheet" are not formats, and `(?!\s*\d)` keeps "sheet 2" a
+#: PART of a workbook rather than a format.
+_SHEET_FORMAT = (
+    r"(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )(?<!score )(?<!answer )"
+    r"sheets?(?!\s*\d)"
+)
 _FORMAT_WORD = (
     rf"(?:pdf|docx|{_WORD_FORMAT}|powerpoint|power ?point|powerpint|pptx?|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|"
-    r"work ?book|slides?|deck|presentation|document|report|csv|cvs|comma[- ]separated(?: values?)?|data ?set|data file)"
+    rf"work ?book|slides?|deck|presentation|document|doc|report|csv|cvs|comma[- ]separated(?: values?)?|data ?set|data file|"
+    rf"{_SHEET_FORMAT})"
 )
 
 #: A creation verb, then an artifact noun within six words. The noun alone
@@ -269,7 +291,11 @@ _GAP_WORD = r"(?:(?!the\s|this\s|that\s|these\s|those\s|my\s|our\s|your\s|his\s|
 _AS_FORMAT_RE = re.compile(
     rf"\bas\s+(?:an?\s+|the\s+|one\s+|two\s+|three\s+|\d+\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
     rf"|\b(?:in|into|to)\s+(?:an?\s+|one\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
-    rf"|\b(?:{_FORMAT_WORD}|sheet)(?:\s+(?:file|format|version|copy|doc))?\s+_in_\b{LX.DEST_AFTER}"
+    # `|sheet` stood here by hand, in ONE of these four alternatives, while
+    # the other three could not see the word: that half-closed patch is what
+    # `_FORMAT_WORD` now carries for all of them, with the lookbehind guard
+    # the hand patch did not have (W4, 2026-09-27).
+    rf"|\b{_FORMAT_WORD}(?:\s+(?:file|format|version|copy|doc))?\s+_in_\b{LX.DEST_AFTER}"
     # "put it in a 2000 word doc" (normalised to "docx"): the count's `word`
     # stopped being the format (2026-09-18), so the doc it sizes is named here.
     r"|\b(?:as|in|into)\s+(?:an?\s+)?[0-9][0-9,]*[kK]?\s*[-–—]?\s*word\s+(?:docx|docs?|documents?|files?)\b",

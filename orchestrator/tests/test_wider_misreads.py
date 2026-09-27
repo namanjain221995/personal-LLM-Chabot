@@ -258,22 +258,85 @@ def test_a_swallowed_ask_at_least_reaches_the_classifier(rows: int) -> None:
 
 
 # ----------------------------------------------------------------------- W4 --
-@pytest.mark.parametrize("word,fmt", [("sheet", "xlsx"), ("sheets", "xlsx"), ("doc", "docx")])
-def test_the_format_vocabularies_have_drifted(word: str, fmt: str) -> None:
-    """The measurement behind W4, asserted as itself: `formats` knows these
-    three words and `intent._FORMAT_WORD` does not. This test passes today
-    and is the evidence; the two below are the consequences."""
+#: The SINGULAR format words `formats.explicit_formats` reads on their own.
+#: `sheet`, `sheets` and `doc` were the three `intent._FORMAT_WORD` did not
+#: hold, which is W4; the rest were already in both.
+FORMAT_VOCABULARY = [
+    ("pdf", "pdf"),
+    ("docx", "docx"), ("doc", "docx"),
+    ("xlsx", "xlsx"), ("xls", "xlsx"), ("excel", "xlsx"), ("exel", "xlsx"),
+    ("spreadsheet", "xlsx"), ("workbook", "xlsx"), ("sheet", "xlsx"), ("sheets", "xlsx"),
+    ("pptx", "pptx"), ("ppt", "pptx"), ("powerpoint", "pptx"), ("slides", "pptx"),
+    ("csv", "csv"), ("dataset", "csv"), ("data set", "csv"),
+]
+
+
+@pytest.mark.parametrize("word,fmt", FORMAT_VOCABULARY)
+def test_the_two_format_vocabularies_agree(word: str, fmt: str) -> None:
+    """THE ANTI-DRIFT GUARD, which is what W4 was.
+
+    `formats.explicit_formats` decides which files get MADE;
+    `intent._FORMAT_WORD` decides which rules can SEE a format at all. When
+    they disagree the gate acts on a format policy it cannot read: measured
+    2026-09-27, `explicit_formats('sheet')` was ['xlsx'] while
+    `_FORMAT_WORD` did not match 'sheet', so "make it a pdf, not a sheet"
+    returned ['pdf', 'xlsx'] and built the very thing that was ruled out.
+    A word added to one side from here on has to be added to the other, or
+    this fails."""
     import re
 
-    assert F.explicit_formats(word) == [fmt]
+    assert F.explicit_formats(word) == [fmt], "formats no longer reads this word"
+    assert re.compile(I._FORMAT_WORD, re.I).fullmatch(word) is not None, (
+        f"intent._FORMAT_WORD cannot see {word!r}, which formats maps to {fmt}")
+
+
+#: WHAT THIS FIX DID NOT CLOSE, measured 2026-09-27 and pinned so the next
+#: person has to face it deliberately rather than discover it as a bug.
+#: These words still diverge, in both directions. They are outside W4 (which
+#: is `sheet`/`sheets`/`doc`) and each would move a different family of
+#: turns, so none of them is a one-line follow-on.
+KNOWN_DIVERGENCES = [
+    # formats reads the PLURAL, `_FORMAT_WORD` reads only the singular.
+    ("pdfs", ["pdf"]), ("docs", ["docx"]), ("spreadsheets", ["xlsx"]),
+    ("workbooks", ["xlsx"]), ("csvs", ["csv"]),
+    # ...and the other direction: `formats._ALIAS["xlsx"]` guards `sheet`
+    # with cheat/fact/term/style/rate/balance/time and NOT with score or
+    # answer, so it reads these two as workbooks while the gate does not.
+    ("score sheet", ["xlsx"]), ("answer sheet", ["xlsx"]),
+]
+
+
+@pytest.mark.parametrize("word,fmts", KNOWN_DIVERGENCES)
+def test_the_remaining_divergences_are_the_known_ones(word: str, fmts: list) -> None:
+    """See `KNOWN_DIVERGENCES`. Both halves are asserted, so closing one of
+    these fails here and the person closing it has to say so."""
+    import re
+
+    assert F.explicit_formats(word) == fmts
     assert re.compile(I._FORMAT_WORD, re.I).fullmatch(word) is None
 
 
-@pytest.mark.xfail(strict=True, reason="W4: _NEGATED_FORMAT_RE is built on _FORMAT_WORD, which has no `sheet` (intent.py:172/309)")
+@pytest.mark.parametrize("phrase", [
+    "cheat sheet", "balance sheet", "term sheet", "style sheet", "rate sheet",
+    "time sheet", "fact sheet", "sheet 2",
+])
+def test_the_compound_sheets_are_still_not_formats(phrase: str) -> None:
+    """THE BOUND on the `sheet` half of W4: the lookbehinds `_ARTIFACT_NOUNS`
+    and `formats._ALIAS["xlsx"]` already carried, taken as their union, so
+    widening `_FORMAT_WORD` cannot turn "balance sheet" into a workbook, and
+    the digit veto keeps "sheet 2" a PART of a workbook."""
+    import re
+
+    assert F.explicit_formats(phrase) == []
+    assert re.compile(rf"\b{I._FORMAT_WORD}\b", re.I).search(phrase) is None
+
+
 def test_a_format_ruled_out_as_a_sheet_is_not_produced() -> None:
     """"not a sheet" must remove the workbook exactly as "not a
-    spreadsheet" does. Measured: formats ['pdf', 'xlsx'] — the person is
-    handed the very thing they excluded."""
+    spreadsheet" does. Measured before the fix: formats ['pdf', 'xlsx'] --
+    the person is handed the very thing they excluded. FIXED 2026-09-27 by
+    `sheets?` joining `_FORMAT_WORD`, which `_NEGATED_FORMAT_RE` is built
+    on."""
     assert I.decide("make it a pdf, not a sheet", **PA).formats == ["pdf"]
 
 
@@ -282,7 +345,6 @@ def test_the_same_exclusion_spelled_spreadsheet_is_already_honoured() -> None:
     assert I.decide("make it a pdf, not a spreadsheet", **PA).formats == ["pdf"]
 
 
-@pytest.mark.xfail(strict=True, reason="W4: `sheet` is not in _FORMAT_WORD, so _AS_FORMAT_RE sees no destination (intent.py:172/238)")
 def test_an_elliptical_handover_to_a_sheet_is_a_request() -> None:
     """"all of that as a sheet" names a destination. Measured: no-request."""
     assert I.decide("all of that as a sheet", **PA).wants_file is True
@@ -293,11 +355,19 @@ def test_the_same_handover_to_a_spreadsheet_is_already_a_request() -> None:
     assert I.decide("all of that as a spreadsheet", **PA).wants_file is True
 
 
-@pytest.mark.xfail(strict=True, reason="W4: `doc` is not in _FORMAT_WORD, so the docx is lost and the answer is not the source (intent.py:172)")
 def test_a_handover_to_a_doc_keeps_its_format_and_its_source() -> None:
-    """"give me a doc of this" must export the answer as a docx. Measured:
-    action=create with formats=[] — the format is dropped, the reference to
-    the answer is dropped, and the model is asked to invent the content."""
+    """"give me a doc of this" must export the answer as a docx. Measured
+    before the fix: action=create with formats=[] -- the format is dropped,
+    the reference to the answer is dropped, and the model is asked to invent
+    the content.
+
+    This one needed BOTH vocabularies moved. `_FORMAT_WORD` learning `doc`
+    fixes the shape; the format itself comes from
+    `formats.explicit_formats`, and `lexicon.normalize` mapped a bare `doc`
+    to `docx` only at the end of a turn or after in/as/into/to, so
+    `explicit_formats("a doc of this")` was [] while
+    `explicit_formats("doc")` was ['docx']. An indefinite article before
+    `doc` now names the deliverable there too."""
     got = I.decide("give me a doc of this", **PA)
     assert got.formats == ["docx"]
     assert got.action == "export"

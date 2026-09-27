@@ -252,6 +252,13 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     # "docs me" — never "the docs say" or "google docs".
     (re.compile(rf"(?<!google )(?<!google  ){_B}docs?{_E}(?=\s*(?:file|format|version|copy|_in_)\b)"), " docx "),
     (re.compile(rf"{_B}(in|as|into|to)\s+docs?{_E}"), r" \1 docx "),
+    # "give me a doc of this", "a doc for the board": an INDEFINITE article
+    # makes it the deliverable. "the docs for the API" keeps its article and
+    # stays documentation. Without this the word named no format mid-sentence
+    # -- explicit_formats("doc") was ['docx'] but explicit_formats("a doc of
+    # this") was [] -- so the gate read a hand-over with no format at all and
+    # asked the model to invent the content (W4, measured 2026-09-27).
+    (re.compile(rf"{_B}(an?)\s+docs?{_E}(?=\s+(?:of|for){_E})"), r" \1 docx "),
     # "excel me do", "पीडीएफ में दो": a bare "give" after a destination.
     (re.compile(rf"_in_\s+(?:do|दो|दें|de|dijiye){_E}"), " _in_ _give_ "),
     _word(r"ek", "a"),
