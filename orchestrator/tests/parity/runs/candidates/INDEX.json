@@ -14,7 +14,7 @@
       "track": "max-loop",
       "route": "chat",
       "effort": "max",
-      "note": "core/max_loop.py: plan (thinking off) -> streamed draft -> contract.check (0 model calls) -> critique -> guarded revision. Two model calls, first character at 42.1 s, 86.9 s wall. Same prompt on dev's best-of-N: 12/17, 1,436 words, first character at 80.3 s, 4 model calls. The critique did not run: the router is only reachable inside the compose network, so contract.extract degraded to its rule half, nothing was left undecided, and the critic was correctly skipped.",
+      "note": "CORRECTED. The note this entry carried named five phases — \"plan -> streamed draft -> contract.check -> critique -> guarded revision\" — for a run in which THREE of them happened, and gave the reason only at the end. What ran: plan (thinking off), streamed draft, contract.check (0 model calls). Two model calls, first character at 42.1 s, 86.9 s wall, 17/17. The critique did not run because the router was unreachable from the host (its base URL defaults to the compose service name), so contract.extract degraded to its rule half. The revision did not run either. Neither is stated as a capability by this recording. See chat_max_loop_3.md for a run with the router reachable.",
       "samples": 1
     },
     {
@@ -22,7 +22,15 @@
       "track": "max-loop",
       "route": "chat",
       "effort": "max",
-      "note": "A SECOND live run of the same build, minutes apart, because one sample is evidence about one sample. First character at 45.4 s, 96.1 s wall, two model calls. No revision: the one unmet requirement was a per-section gap an append cannot honestly fix, so it was reported in the step detail and left to the next draft.",
+      "note": "CORRECTED. A second live run of the same build, minutes apart. First character at 45.4 s, 96.1 s wall, two model calls, 17/17. Three phases again — plan, draft, check — and for the same reason. \"No revision: the one unmet requirement was a per-section gap an append cannot honestly fix\" stands and is the guard working. The original note also compared this against \"dev's best-of-N: 12/17 ... 4 model calls\": that was ONE run of dev, not a frozen baseline, and this harness's own README records a 14/12/14 spread over three runs of an unchanged system. The comparison that is safe to make is against the frozen chat-route Think baseline, live_chat_think.md at 14/17.",
+      "samples": 1
+    },
+    {
+      "file": "chat_max_loop_3.md",
+      "track": "max-loop",
+      "route": "chat",
+      "effort": "max",
+      "note": "The owner's exact prompt, on this branch AFTER origin/dev (1f80aa3) was merged and the commission gate, the title gate, the fenced brief, the loop-guard catch and the kill switch went in, with the ROUTER REACHABLE so the model half of contract.extract really ran. 17/17. 4,076 prose words, 15 sections, 31 headings, 8 tables, 5 code fences, 11 callouts, 41 bold runs. 108.8 s wall, first character at 42.2 s. Per phase, from the step frames: extract 1 router call; plan 7.0 s, 1 call, thinking off; draft 97.0 s streaming, 1 call; check 0.0 s and 0 calls, \"15 of 15 sections; everything asked for is present\". THE CRITIQUE WAS CORRECTLY SKIPPED AND THAT IS THE DESIGN, not the router being unreachable this time: the proposer returned 15 items, every one matched a rule item and merged as `both`, so check() decided every requirement and nothing was left for a model to be asked about. The critique is reached when a request carries a requirement no counter can express — measured separately, live, on a one-page proposal (\"persuasive\", \"under 800 words\", \"avoid jargon\", \"no unfulfillable promises\"): 5 open points, critique 3.7 s, thinking off, 3 model calls, 38.9 s wall. That run is not declared here because it answers a different prompt and this checklist is the owner's.",
       "samples": 1
     }
   ]
