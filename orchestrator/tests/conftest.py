@@ -579,3 +579,26 @@ def _no_finish_reason_from_an_earlier_test():
     llm._finish_reason.set(None)
     yield
     llm._finish_reason.set(None)
+
+
+@pytest.fixture(autouse=True)
+def _artifact_intent_cooldown_clear():
+    """The intent classifier's timeout cool-down is process state too
+    (app/artifacts/intent_llm.py: `_timeouts_in_a_row`, `_cooldown_until`).
+
+    Measured 2026-09-27: `tests/test_artifact_intent.py`'s
+    test_as3_classifier_times_out_at_fast_and_the_rules_answer_stands times out
+    twice on purpose, which opens the cool-down for COOLDOWN_S; a probe in the
+    next file pytest collected read `cooldown_remaining=29.85
+    timeouts_in_a_row=2` and its classify() returned None without a call. A
+    cool-down that outlives the test that earned it makes the next file's
+    classifier skip itself in silence — the same silence this gate's logging
+    was added to remove — so every test starts and ends with it forgotten.
+    The saturation probe is module state of the same kind and goes with it."""
+    from app.artifacts import intent_llm as _intent_llm
+
+    _intent_llm.reset_state()
+    _intent_llm.set_saturation_probe(None)
+    yield
+    _intent_llm.reset_state()
+    _intent_llm.set_saturation_probe(None)
