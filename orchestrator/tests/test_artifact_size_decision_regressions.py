@@ -178,12 +178,50 @@ def test_a_correction_that_removes_a_placeholder_is_still_applied():
 
 
 def test_the_card_names_the_sections_the_file_actually_has():
-    """A plan of 100 sections is cut to 40 and says so — and the next sentence
-    on the same card says the file was "written in 100 sections"."""
-    model = Model(_plan([(f"S{i}", 100) for i in range(100)]))
+    """A plan of 100 sections is cut and says so — and the next sentence on
+    the same card said the file was "written in 100 sections".
+
+    THE PLAN'S PER-SECTION NUMBER IS 600 AND NOT 100 (review, 2026-09-28).
+    At 100 words a section the r2 bound cuts the plan to eight sections and
+    8 x 100 = 800 words is under `SECTIONED_WRITER_WORDS` (2,500), so the
+    sectioned writer is never reached, no LONG_DOCUMENT_NOTE is emitted, and
+    the `if note is None: return` this test used to carry made it VACUOUS on
+    the fixed tree: reverting `written_sections = _top_headings_in(raw)` to
+    the plan's length left the whole file at 44 passed. Measured directly on
+    c9768bbe: "LONG_DOCUMENT_NOTE present? False", warnings were only the
+    two clamp lines, 0 scoped writes, 3 model calls. 600 a section keeps the
+    decided size (8 x 600 = 4,800) over the threshold, so the note exists
+    and the assertion is real; the early exit is gone."""
+    model = Model(_plan([(f"S{i}", 600) for i in range(100)]))
     llm.json_completion = model
     result = asyncio.run(C.compose(_req("Write a report on migrating our monolith.")))
     note = next((w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE)), None)
-    if note is None:
-        return  # this tree never reaches the sectioned writer for this request
-    assert "written in 40 sections" in note, note
+    assert note is not None, (
+        f"the sectioned writer was not reached, so this case pins nothing: {result.warnings}")
+    assert "written in 8 sections" in note, note
+
+
+def test_the_card_names_the_file_and_not_the_plan_at_think():
+    """The same rule where the two numbers are furthest apart and the
+    sectioned writer is certainly reached: 20 planned sections x 600 words at
+    Think, which `size_bounds` bounds to 12 sections / 8,100 words. The file
+    has 12 top-level headings; the plan still lists 20. Reverting
+    compose.py's `written_sections = _top_headings_in(raw) or 1` to
+    `len((outline_json or {}).get("sections") or [])` makes this say 20."""
+    model = Model(_plan([(f"S{i}", 600) for i in range(1, 21)]))
+    llm.json_completion = model
+    result = asyncio.run(C.compose(_req("Write a report on migrating our monolith.", effort="think")))
+    note = next((w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE)), None)
+    assert note is not None, f"the sectioned writer was not reached: {result.warnings}"
+    assert "written in 12 sections" in note, note
+
+
+def test_the_derived_section_target_names_its_own_provenance():
+    """`target_for`'s sections-times-WORDS_PER_SECTION target is code reading
+    the person's shape, so its `source` is SOURCE_DERIVED — the same constant
+    the data-report floor next door sets. It was SOURCE_NONE, and `_size_was`
+    reached the right sentence only by falling through its last branch."""
+    target = C.target_for(_req(OWNER15))
+    assert target.words == 15 * L.WORDS_PER_SECTION and not target.explicit, target
+    assert target.source == L.SOURCE_DERIVED, (
+        f"source={target.source!r}, so nothing in the provenance model says who decided this size")

@@ -69,6 +69,7 @@ from ..artifacts import types as T
 from ..artifacts import db as adb
 from ..artifacts import intent as intent_rules
 from ..artifacts.intent import ArtifactIntent
+from ..core import pasted as _pasted
 
 log = logging.getLogger(__name__)
 
@@ -207,6 +208,55 @@ def _decision_text(text: str) -> str:
     (#8). intent.decide builds `instruction` the same way; this is for an
     intent that reached the engine with more than that."""
     return " ".join((text or "").split())[:intent_rules._DECIDE_CHARS]
+
+
+def _own_instruction(raw_text: str) -> str:
+    """The request as the SIZE and COST reads must see it: the person's own
+    words, with every pasted third-party block between
+    `pasted.OPEN_TAG`/`CLOSE_TAG`, whitespace-collapsed and cut like
+    `_decision_text` so it is the same view of the same message.
+
+    Built HERE because this is the last place that still has the message's
+    line breaks: `pasted.read` tells the ask from the material by line, and
+    `_decision_text` collapses them. `compose._own_words` strips the fences
+    again on the other side, and an unclosed fence (the cut landed inside a
+    paste) swallows the rest on purpose — text after an opening fence is not
+    the person speaking either.
+
+    THE PERSON'S WORDS GO FIRST, so the `_DECIDE_CHARS` cut can only ever
+    eat into the material. The reported paste (hotfix 1.2) is ~10,000
+    characters with the ask AFTER it, and fencing in message order put that
+    ask past the 4,000-character cut: `_own_words` then saw an unclosed
+    opening fence, swallowed everything, and a size the person really had
+    typed was lost. Repeating the ask costs nothing downstream — the two
+    readers of this string are `length.parse_size`, which takes the largest
+    candidate, and `requested_sections`, which deduplicates.
+
+    Unchanged for a message with no paste, and unchanged when the platform
+    cannot tell the ask from the material: `pasted.fenced` returns the
+    message as it was, so every read falls back to exactly what it saw
+    before this existed. `Material.pasted_ask` is what covers that case.
+
+    See `compose.Material.own_instruction` for what this closes.
+    """
+    raw = raw_text or ""
+    fenced = _pasted.fenced(raw)
+    if fenced == raw:
+        return _decision_text(raw)
+    own = _pasted.own_words(raw).strip()
+    return _decision_text(f"{own}\n\n{fenced}" if own else fenced)
+
+
+def _pasted_ask(raw_text: str) -> bool:
+    """Does this turn carry pasted material the platform could NOT tell apart
+    from the person's ask? `pasted.read` segments a TRANSFORM ask ("turn this
+    into", "make this into", "summarise this") and nothing else, so
+    "Write a report on this." over a pasted document comes back unfenced.
+
+    `compose.Material.pasted_ask` says what the composer does with it.
+    """
+    raw = raw_text or ""
+    return _pasted.is_paste(raw) and _pasted.fenced(raw) == raw
 
 
 def _utf8_len(text: str) -> int:
@@ -377,6 +427,8 @@ def _material_dict(m: C.Material) -> dict:
         tables_out[0]["transform"] = dict(m.transform)
     return {
         "history_text": m.history_text,
+        "own_instruction": m.own_instruction,
+        "pasted_ask": bool(m.pasted_ask),
         "previous_answer": m.previous_answer,
         "uploads_text": m.uploads_text,
         "sources": [s.__dict__ for s in m.sources],
@@ -403,6 +455,8 @@ def _material_from_dict(d: dict) -> C.Material:
         transform = first["transform"] if first else {}
     return C.Material(
         instruction="",
+        own_instruction=str(d.get("own_instruction") or ""),
+        pasted_ask=bool(d.get("pasted_ask")),
         history_text=str(d.get("history_text") or ""),
         previous_answer=str(d.get("previous_answer") or ""),
         uploads_text=str(d.get("uploads_text") or ""),
@@ -1095,7 +1149,9 @@ async def run_artifact_engine(
         data_only_note = str(getattr(decision, "data_only_note", "") or "")
 
     # 3. Material.
-    material = C.Material(instruction=instruction, history_text=C.material_from_history(history))
+    material = C.Material(instruction=instruction, own_instruction=_own_instruction(raw_text),
+                          pasted_ask=_pasted_ask(raw_text),
+                          history_text=C.material_from_history(history))
     material.notes.append(f"Today is {_dt.date.today().strftime('%d %B %Y')}.")
     material.notes.append("Mode: Salesforce workspace" if mode == "salesforce" else "Mode: assistant")
     import_payload: Optional[dict] = None
@@ -1923,7 +1979,9 @@ async def _run_edit(
         return await say(_no_change_sentence(title, outcome.not_applied))
 
     # 2. Accept — the child spec rides in the payload.
-    material = C.Material(instruction=instruction, history_text=C.material_from_history(history))
+    material = C.Material(instruction=instruction, own_instruction=_own_instruction(raw_text),
+                          pasted_ask=_pasted_ask(raw_text),
+                          history_text=C.material_from_history(history))
     material.notes.append(f"Today is {_dt.date.today().strftime('%d %B %Y')}.")
     material.notes.append("Mode: Salesforce workspace" if mode == "salesforce" else "Mode: assistant")
     if gathered is not None:

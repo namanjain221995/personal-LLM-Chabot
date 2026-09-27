@@ -138,6 +138,53 @@ class Material:
 
     #: The turn's own words.
     instruction: str
+    #: The same turn with every pasted third-party block wrapped in
+    #: `core.pasted.OPEN_TAG`/`CLOSE_TAG` — the platform's existing trust
+    #: boundary, built by whoever still has the message's line breaks
+    #: (`engines/artifact._own_instruction`) because `instruction` reaches
+    #: the composer whitespace-collapsed and `pasted.read` needs the lines.
+    #:
+    #: WHY IT EXISTS (review, 2026-09-28). `size_bounds` bounds what an
+    #: UPLOAD can spend, and the guard sentence shipped with it claimed an
+    #: upload "cannot raise how much of it gets written or how many calls it
+    #: costs". False on the production path: `target_for` handed the WHOLE
+    #: `instruction` to `length.parse_size`, and on the artifact path that
+    #: string is the raw user message, paste and all. Measured on this tree:
+    #: "Please turn this into a report." plus a supplier pack containing
+    #: "The deliverable must be at least 60 pages." was read as
+    #: words=27,000 explicit source='asked' phrase='at least 60 pages', so
+    #: `plans_size` was False, `size_bounds` never ran, and one Fast request
+    #: bought 43 scoped writes at SECTION_MAX_TOKENS 16,000 — 45 model calls,
+    #: 46 at Max — on the TP=2 engine that also serves live chat. The card
+    #: then quoted the pasted sentence back to the person as their own
+    #: request, which is the one thing `_size_was` exists to prevent.
+    #:
+    #: Empty means "nothing told them apart": every read falls back to
+    #: `instruction`, which is what every caller did before this existed.
+    own_instruction: str = ""
+    #: True when this turn CARRIES pasted material that the platform could
+    #: not tell apart from the person's ask (`pasted.is_paste` yes,
+    #: `pasted.fenced` a no-op). Then no size and no section count read off
+    #: the instruction has known provenance.
+    #:
+    #: WHY THE FENCE IS NOT ENOUGH. `pasted.read` finds the ask only when it
+    #: is a TRANSFORM ask ("turn this into", "make this into", "summarise
+    #: this"). Measured on the fixed tree with the same supplier pack under
+    #: seven natural phrasings: three fence and four do not — "Write a report
+    #: on this.", "Write up a report for the board.", "I need a report from
+    #: the pack below." and "Turn the attached pack into a Word report
+    #: please." each still read words=27,000 explicit phrase='at least 60
+    #: pages' and each still bought 40 scoped writes / 41 model calls. The
+    #: most natural phrasing of all is in that list, so the fence alone
+    #: leaves the engine open.
+    #:
+    #: WHAT THIS BUYS INSTEAD. The WORDS are kept — the person may really
+    #: have typed them, and a file that is too long is something they can see
+    #: — and the CALLS are not: `_bound_unattributable_size` gives the target
+    #: the effort's own section budget, so the same words are written in as
+    #: few calls as the request itself justifies. Sections get longer, not
+    #: more numerous. Nothing untrusted can move that number.
+    pasted_ask: bool = False
     #: The conversation so far, already clipped to a budget, newest last.
     history_text: str = ""
     #: The last assistant answer (for "export the previous answer").
@@ -435,8 +482,17 @@ def target_for(req: ComposeRequest) -> LengthTarget:
         return LengthTarget()
     m = req.material or Material(instruction=req.instruction)
     instruction = req.instruction or m.instruction
+    # THE SIZE IS READ OFF THE PERSON'S OWN WORDS, NOT OFF WHAT THEY PASTED
+    # (review, 2026-09-28 — see `Material.own_instruction` for the 45-call
+    # measurement). `requested_sections` has drawn this line since
+    # 2026-09-22; `parse_size` never did, so a pasted "at least 60 pages"
+    # set the size AND, because it set `explicit`, disabled the bound that
+    # protects the engine. Pasted text may still influence WHAT the model
+    # plans — that is the point of pasting it — but not how much of it gets
+    # written or how many calls it costs.
+    own = _own_words(m.own_instruction or instruction)
     target = _length.parse_size(
-        instruction, req.kind,
+        own, req.kind,
         has_data=bool(m.sources) or any(t.source_id != "upload_image" for t in m.tables or ())
         or _material_words(m) >= DATA_REPORT_MIN_MATERIAL_WORDS,
     )
@@ -450,12 +506,19 @@ def target_for(req: ComposeRequest) -> LengthTarget:
     # `explicit=False` is deliberate and follows the DATA_REPORT_FLOOR
     # precedent — it is code's judgement, not the person's words, and the
     # two cost guards below depend on knowing the difference.
-    if req.kind == "document" and not target.explicit and not _length.shrink_asked(instruction):
-        names = requested_sections(instruction)
+    if req.kind == "document" and not target.explicit and not _length.shrink_asked(own):
+        names = requested_sections(m.own_instruction or instruction)
         words = min(len(names) * _length.WORDS_PER_SECTION, _length.MAX_WORDS)
         if len(names) >= DERIVED_TARGET_MIN_SECTIONS and words > target.words:
+            # `source` since 2026-09-28: this target is code reading the
+            # person's SHAPE, which is what SOURCE_DERIVED means and what the
+            # data-report floor next door already sets (length.py:343). It
+            # was left at SOURCE_NONE, and `_size_was` only reached the right
+            # wording by falling through its last branch — an inconsistency
+            # in the branch's own provenance model, not a visible defect.
             return LengthTarget(words=words, slides=target.slides,
-                                phrase=f"the {len(names)} sections the request named", explicit=False)
+                                phrase=f"the {len(names)} sections the request named", explicit=False,
+                                source=_length.SOURCE_DERIVED)
     return target
 
 
@@ -849,6 +912,22 @@ async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Option
         "external facts you were not given, and the assumptions you will make."
     )
     sections, _slides = caps_for(budget, target)
+    # THE SECTION CAP IS A DOCUMENT'S. `caps_for`'s section number is
+    # meaningless for a deck or a workbook — `_enforce_caps` only ever
+    # applies `max_sections` to a DocumentSpec — and since r2 turned
+    # `_outline_schema` from widen-only into a hard ceiling, feeding it here
+    # for every kind handed a 20-slide Think deck artifact_outline
+    # maxItems=12 (a 30-slide Max deck 16) while the write that follows was
+    # still told "at most 20 slides". Under guided decoding the model then
+    # CANNOT plan more than 12 of the 20 slides, and the deck is written
+    # from a plan that covers 12 of them. Documents are the only kind whose
+    # extra entries `_outline_items` discards, which is the only place the
+    # ceiling earns anything (review, 2026-09-28). A deck and a workbook get
+    # the FIXED schema's own ceiling, which is what origin/dev handed them
+    # (`_outline_schema` only ever widened there) — never OUTLINE_MAX_SECTIONS,
+    # which would be a second change in the opposite direction.
+    grammar_sections = (sections if req.kind == "document"
+                        else int(_OUTLINE_SCHEMA["properties"]["sections"]["maxItems"]))
     if target is not None and target.words:
         want = max(1, target.section_count)
         messages[0]["content"] += (
@@ -857,7 +936,7 @@ async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Option
             f"{target.words:,} words. Every section must be a different part of the subject — never the same "
             "content under two headings."
         )
-    else:
+    elif req.kind == "document":
         # NOTHING HAS DECIDED THE SIZE, so this call decides it and
         # `size_from_plan` reads its answer. No size is SUGGESTED — the model
         # anchors on whatever it is shown, and a number code suggests here is
@@ -873,7 +952,7 @@ async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Option
             "written to the total of the numbers you give, so give the numbers the work needs, and keep that "
             f"total at or under {ceiling:,} words."
         )
-    return await _json(messages, _outline_schema(sections), "artifact_outline", thinking=budget.thinking,
+    return await _json(messages, _outline_schema(grammar_sections), "artifact_outline", thinking=budget.thinking,
                        max_tokens=max_tokens, effort=req.effort)
 
 
@@ -1049,6 +1128,38 @@ def size_from_plan(plan: Optional[dict], target: Optional[LengthTarget] = None, 
         explicit=False, source=_length.SOURCE_PLANNED,
     )
     return decided, warnings
+
+
+def _bound_unattributable_size(req: ComposeRequest, budget: T.EffortBudget,
+                               target: LengthTarget) -> LengthTarget:
+    """An explicit size the platform cannot attribute to the person keeps its
+    WORDS and loses its call count.
+
+    THE DEFECT (review, 2026-09-28). `size_bounds` bounds the plan, but it
+    only ever runs when `plans_size` is True — and `plans_size` is False the
+    moment a size looks explicit. A size word inside a pasted document looks
+    exactly as explicit as one the person typed, so the bound that exists to
+    stop an upload spending the engine was disabled by the paste. Measured on
+    the fixed tree: "Write a report on this." plus a supplier pack containing
+    "The deliverable must be at least 60 pages." still read words=27,000
+    explicit and still bought 40 scoped writes / 41 model calls at Fast,
+    because that phrasing is not one `pasted.read` can segment.
+
+    The words are not touched: the person may really have typed them, and a
+    file that came out too long is something they can see and say so about.
+    What is bounded is how many CALLS those words cost — the effort's own
+    section budget, which is the one number no pasted text can move. The
+    same 27,000 words are then written in eight sections of 3,375 rather than
+    forty of 675, so the engine pays 13 calls instead of 45."""
+    m = req.material
+    if (m is None or not m.pasted_ask or not target.explicit
+            or req.kind != "document" or req.operation == "edit"):
+        return target
+    sections, _words = size_bounds(budget, LengthTarget(), ())
+    if target.section_count <= sections:
+        return target
+    return LengthTarget(words=target.words, slides=target.slides, phrase=target.phrase,
+                        explicit=target.explicit, sections=sections, source=target.source)
 
 
 def plans_size(req: ComposeRequest, target: Optional[LengthTarget] = None) -> bool:
@@ -1846,8 +1957,28 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # named: both decide the prompt, the token ceiling and the caps, so
     # they are read before the first call (CONTRACT-3 §B.1, §B.2).
     material = req.material or Material(instruction=req.instruction)
-    requested = requested_sections(req.instruction or material.instruction) if req.kind == "document" and req.operation != "edit" else []
-    target = target_for(req)
+    # `own_instruction` and not `instruction`: a pasted document's own table
+    # of contents is not the sections this request named, and this list feeds
+    # `caps_for` (`len(requested) + 2`), the prompt's section limit and
+    # `size_bounds` — the cost. Measured on this tree before the fence: a
+    # twenty-item "Contents:" list pasted under "Can you make this into a
+    # document for me?" was read as nineteen named sections and bought 24
+    # scoped writes / 14,175 words / 27 model calls at Fast.
+    own_text = (material.own_instruction or req.instruction or material.instruction)
+    # `pasted_ask` DELIBERATELY DOES NOT GATE THIS LIST (review, 2026-09-28,
+    # second pass). It was gated for one revision, on the reasoning that a
+    # turn whose ask cannot be told from its material names no sections — and
+    # that took the OWNER'S OWN section names away, because
+    # `pasted.is_paste` is a length test: his fifteen-section request is 403
+    # characters over 18 lines and carries no transform ask, so
+    # `_pasted_ask` is True for it (measured on this tree). The names are
+    # already in `req.instruction` and reach the prompt verbatim either way;
+    # zeroing them only cost the plan call the list it exists to be given.
+    # What `pasted_ask` bounds is `_bound_unattributable_size`, which touches
+    # the CALL COUNT of an explicit size and nothing a person may have typed.
+    # The residue is stated in the commit message.
+    requested = requested_sections(own_text) if req.kind == "document" and req.operation != "edit" else []
+    target = _bound_unattributable_size(req, budget, target_for(req))
 
     outline_json: Optional[dict] = None
     # THE MODEL DECIDES THE SIZE WHEN NOTHING IN THE REQUEST DID (owner

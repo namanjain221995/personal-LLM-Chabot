@@ -293,6 +293,12 @@ def _material(data: Optional[dict]) -> dict:
     data = dict(data or {})
     return {
         "history_text": str(data.get("history_text") or ""),
+        # The person's own words with their pasted material fenced: the size
+        # and the cost are read off THIS and not off `instruction`, so a key
+        # missing here means a requeued job sizes itself from the paste again
+        # (review, 2026-09-28 — see compose.Material.own_instruction).
+        "own_instruction": str(data.get("own_instruction") or ""),
+        "pasted_ask": bool(data.get("pasted_ask")),
         "previous_answer": str(data.get("previous_answer") or ""),
         "sources": list(data.get("sources") or []),
         "tables": list(data.get("tables") or []),
