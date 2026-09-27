@@ -102,6 +102,11 @@ def _result_seen(metrics, result: str) -> bool:
     return f'result="{result}"' in metrics.render()
 
 
+def schema_actions() -> list:
+    """The enum the model is actually constrained to, not the tuple beside it."""
+    return IL.SCHEMA["properties"]["action"]["enum"]
+
+
 # ------------------------------------------------- a word for the question --
 
 
@@ -110,7 +115,7 @@ def test_the_classifier_has_a_word_for_a_question_about_the_file(clean):
     classifier can now say so, and the verdict says it is not a file."""
     assert IL.ANSWER_ACTION == "answer_artifact"
     assert IL.ANSWER_ACTION in IL.ACTIONS
-    assert IL.ANSWER_ACTION in SCHEMA_ACTIONS()
+    assert IL.ANSWER_ACTION in schema_actions()
 
     v = asyncio.run(IL.classify("Ok What This sheet have ??", last_turn_is_artifact=True, has_artifacts=True,
                                 artifact_titles=["TechSara AI Engineering Workflow Tracker"],
@@ -120,10 +125,6 @@ def test_the_classifier_has_a_word_for_a_question_about_the_file(clean):
     assert v.answer_about_artifact is True
     assert v.wants_file is False, "an answer verdict must never read as a request for a file"
     assert _result_seen(clean, "accepted_answer")
-
-
-def SCHEMA_ACTIONS():
-    return IL.SCHEMA["properties"]["action"]["enum"]
 
 
 def test_an_answer_verdict_carries_no_format_and_points_at_the_artifact(clean):
