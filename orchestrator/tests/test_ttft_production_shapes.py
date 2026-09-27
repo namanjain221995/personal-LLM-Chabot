@@ -2,13 +2,34 @@
 
 WHY THIS FILE EXISTS. The Fast-mode time-to-first-token work needed a seeded
 account that costs what a production account costs before the engine is even
-asked: `context_assembly_seconds` reads 167 ms on real traffic where the small
-seeded shapes read 13-23 ms. This file is the definition of that account —
+asked, because every cost in this shape is paid per turn and the small seeded
+shapes pay almost none of it. This file is the definition of that account —
 shape 7, 'heavy': saved facts at the MEMORY_MAX_FACTS ceiling (including
-non-ASCII ones that reach the rendered facts block), ten stored documents, a
-thread far longer than the compaction window and already compacted, and eight
-earlier conversations whose messages are embedded so cross-chat recall has a
-corpus to search.
+non-ASCII ones that survive the read-side durability gate and reach the
+rendered facts block), ten stored documents, a thread far longer than the
+compaction window and already compacted, and eight earlier conversations whose
+messages are embedded so cross-chat recall has a corpus to search.
+
+WITHDRAWN: an earlier version of this paragraph justified the shape with
+"`context_assembly_seconds` reads 167 ms on real traffic where the small seeded
+shapes read 13-23 ms". Neither figure is reproducible — the harness that
+produced them lived in a cleared session scratch directory — and neither
+appears anywhere else in the repository, so both are withdrawn rather than
+left to be quoted as measured. What IS measurable is the metric itself, on the
+head node's Prometheus (127.0.0.1:9090). Recorded 2026-09-27 over its whole
+retained window — 15d retention, oldest `context_assembly_seconds_count` sample
+13.5 days old, `sum(increase(..._count[30d]))` = 464 —
+
+    sum(increase(context_assembly_seconds_sum[30d]))
+      / sum(increase(context_assembly_seconds_count[30d]))   0.437 s
+    the same, by (effort)            fast 0.474 s, think 0.007 s, max 0.005 s
+    histogram_quantile(0.5,  sum by (le) (increase(..._bucket[30d])))  0.081 s
+    histogram_quantile(0.95, sum by (le) (increase(..._bucket[30d])))  0.466 s
+
+The two quantiles are bucket-interpolated and the counts are `increase()`
+extrapolations, so read them as the order of magnitude they are. Like the two
+constants below, this is a recorded observation and not an assertion — the
+suite cannot reach Prometheus, so no test here checks it.
 
 THIS FILE STANDS ALONE. The measuring harness that consumed the builder lived
 in a session scratch directory that has since been cleared, and nothing in the
@@ -35,6 +56,20 @@ shape the app folds 232 of 240 messages and the shape folded 224, so every
 measurement carried eight extra verbatim messages (+1,760 chars) that
 production would not have sent.
 
+THE FACTS BLOCK IS THE APP'S RENDER PATH, NOT `facts_block(stored)`. Production
+builds the saved-facts system message as
+`facts.facts_block(context.prompt_facts(saved_facts))` (`app/main.py`), so the
+read-side durability gate runs on every turn between the stored rows and the
+prompt. This file used to render `facts.facts_block(stored)` and skip that gate,
+which let the shape carry a row production would never show: measured on this
+shape 2026-09-27, `context.prompt_facts` kept 199 of the 200 stored rows, and
+the one it dropped — "The user asks for Ελληνικά headings…", rejected because
+`facts._TRANSIENT_FACT_RE` matches a leading "the user asks" — was one of the
+ten non-ASCII probes. The test path showed 10 of 10 probes in the block and the
+app path 9 of 10. The probe is now worded durably and the test renders through
+`context.prompt_facts`, so the shape is measured through the call production
+makes.
+
 ONLY THE APP'S PUBLIC WRITERS. `build_heavy_account` calls
 `db.create_conversation`, `db.add_user_fact`, `db.save_document`,
 `db.add_message`, `db.save_summary`, `recall.index_folded` and
@@ -50,12 +85,27 @@ SYNTHETIC DATA ONLY. Every fact, document, message and conversation below is
 invented: an imaginary maintenance rulebook for an imaginary site. No
 production chat content, no real person, no real address.
 
-KNOWN LIMIT, NOT FIXED. `build_heavy_account` is idempotent by check-then-
-create around `db.create_conversation`, which is not atomic: two builders
-running concurrently on one account can still both see the conversation
-missing and race into the `conversations_pkey` UniqueViolation the builder's
-docstring describes. Every caller so far is sequential, so this has never
-fired; closing it would need a writer the app does not expose.
+KNOWN LIMITS, NOT FIXED. Three, all deliberate:
+
+* `build_heavy_account` is idempotent by check-then-create around
+  `db.create_conversation`, which is not atomic: two builders running
+  concurrently on one account can still both see the conversation missing and
+  race into the `conversations_pkey` UniqueViolation the builder's docstring
+  describes. Every caller so far is sequential, so this has never fired;
+  closing it would need a writer the app does not expose.
+* the shape models the turn where the saved facts ARRIVE. In Fast mode
+  `app/main.py` waits only `fast_lane.FAST_LANE_FACTS_WAIT_S` for the facts
+  read and sends NO facts block at all on timeout, so the cheapest Fast turn is
+  a shape this file does not build. Anything measured here is the cost when the
+  read wins the race, which is the expensive case and the one a saved-facts cap
+  would be judged on.
+* NON_ASCII_FACTS carries no right-to-left text and no decomposed character —
+  checked 2026-09-27, no character of any entry is in U+0590..U+08FF, every
+  entry is already NFC and none contains a combining mark. Bidirectional
+  rendering and NFD input are therefore uncovered seams. What the ten probes do
+  cover is byte width (excess over character count 1, 1, 1, 2, 4, 4, 6, 6, 8
+  bytes) across CJK, Latin, Cyrillic and Greek, which is what the refused
+  byte-counting cap broke on.
 """
 from __future__ import annotations
 
@@ -63,10 +113,12 @@ import ast
 import asyncio
 import hashlib
 import inspect
+import re
+from pathlib import Path
 
 import pytest
 
-from app import compaction, db, facts, llm, memory_semantic, recall
+from app import compaction, context, db, facts, llm, memory_semantic, recall
 from app.config import settings
 
 # ---------------------------------------------------------------------------
@@ -107,6 +159,17 @@ PRODUCTION_MEMORY_MAX_FACTS_AS_OBSERVED = 200
 #: `facts.facts_block` stops at `_BLOCK_MAX_CHARS`, so the OLDEST facts are
 #: precisely the ones that never reach the prompt. Written first, as they were,
 #: all ten were dropped: the shape carried them in the database only.
+#:
+#: EVERY ENTRY MUST BE DURABLE. Production renders
+#: `facts.facts_block(context.prompt_facts(saved_facts))`, so a fact that
+#: `facts.is_durable` rejects is dropped on every turn however it is stored.
+#: The Greek probe read "The user ASKS FOR Ελληνικά headings to stay
+#: untranslated in the appendix." and was dropped for exactly that reason —
+#: `facts._TRANSIENT_FACT_RE` matches a leading "the user asks" — so keep these
+#: phrased as standing preferences ("keeps", "prefers", "always", "never") and
+#: never as a request. `test_every_shape_fact_survives_the_read_side_gate` is
+#: the guard: it fails if any entry here, or any generated fact, stops
+#: surviving the gate.
 NON_ASCII_FACTS = [
     "The user reads the 日本語 edition of the operations handbook, not the English one.",
     "The user prefers dates written as 2026年9月22日 in internal summaries.",
@@ -116,7 +179,7 @@ NON_ASCII_FACTS = [
     "The user keeps the Ærø site's checklists in Danish and never translates them.",
     "The user signs off internal notes with «ок» when a draft is approved.",
     "The user's glossary renders the unit as μs, never as us or microseconds.",
-    "The user asks for Ελληνικά headings to stay untranslated in the appendix.",
+    "The user keeps Ελληνικά headings untranslated in the appendix.",
     "The user's archive path contains ünïcödé characters and must not be escaped.",
 ]
 
@@ -620,8 +683,53 @@ def test_the_facts_reach_the_ceiling_and_keep_their_non_ascii(ceiling):
         assert any(probe in f for f in facts_list), (
             f"{probe!r} must survive a ceiling of {ceiling}"
         )
-    if ceiling >= 2:
-        assert any(len(f.encode("utf-8")) > len(f) + 4 for f in facts_list)
+    # Unconditional: it holds at ceiling 1 too, because entry 0 is the 日本語
+    # probe and three 3-byte characters are 6 bytes wider than they are long.
+    # Measured 2026-09-27, widest utf-8 excess per ceiling: 1 -> 6, 2 -> 6,
+    # 9/10/11/200 -> 8.
+    assert any(len(f.encode("utf-8")) > len(f) + 4 for f in facts_list), (
+        "no fact in this shape is wider in utf-8 bytes than in characters, so "
+        "a byte-counting cap would measure nothing this shape exists to catch"
+    )
+
+
+@pytest.mark.parametrize("ceiling", [1, 2, 9, 10, 11, 200])
+def test_every_shape_fact_survives_the_read_side_gate(ceiling):
+    """No row of this shape may be one production would drop on every turn.
+
+    Production renders `facts.facts_block(context.prompt_facts(saved_facts))`
+    (`app/main.py`), so `context.prompt_facts` sits between the store and the
+    prompt on every turn and a row it rejects is stored cost that is never
+    prompt cost. This ran as a pure function — no database, no builder — so it
+    fails on the CONSTANTS, where the defect lives, rather than only in the
+    end-to-end test.
+
+    It catches the defect this file shipped with: the Greek probe read "The
+    user asks for Ελληνικά headings…", which `facts._TRANSIENT_FACT_RE` rejects
+    as a one-off request, so `prompt_facts` kept 199 of 200 rows and the
+    rendered block carried 9 of the 10 non-ASCII probes, not 10.
+    """
+    shape_facts = heavy_facts(ceiling)
+    kept = [
+        row["fact"] for row in context.prompt_facts([{"fact": f} for f in shape_facts])
+    ]
+    assert kept == shape_facts, (
+        f"{len(shape_facts) - len(kept)} of {len(shape_facts)} facts at ceiling "
+        f"{ceiling} are dropped by context.prompt_facts on every turn, so the "
+        "shape stores rows the prompt never carries: "
+        f"{[f for f in shape_facts if f not in set(kept)]}"
+    )
+    # Named separately from the generated bulk: these ten are the shape's whole
+    # reason to exist, and a ceiling above 10 must keep every one of them.
+    non_ascii_kept = [
+        row["fact"]
+        for row in context.prompt_facts([{"fact": f} for f in NON_ASCII_FACTS])
+    ]
+    assert non_ascii_kept == NON_ASCII_FACTS, (
+        "the read-side gate drops non-ASCII probes: "
+        f"{[f for f in NON_ASCII_FACTS if f not in set(non_ascii_kept)]}; word "
+        "them as standing preferences, never as requests"
+    )
 
 
 def test_the_hardest_probes_lead_the_non_ascii_list():
@@ -824,11 +932,22 @@ def test_the_heavy_account_writes_the_rows_it_claims(as_user, stub_embeddings):
 def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings):
     """Stored is not the same as sent, and only sent is measurable.
 
-    On the unfixed shape this failed 10/10: the facts were written first, so
-    `db.list_user_facts` (updated_at DESC) put them last and
-    `facts.facts_block` stopped at `_BLOCK_MAX_CHARS` after 56 of 200 rows.
-    The prompt the harness measured, and the prompt a byte-counting saved-facts
-    cap would have been tested against, contained no non-ASCII fact at all.
+    TWO THINGS STAND BETWEEN A STORED ROW AND THE PROMPT, and this test has to
+    go through both, because production does:
+
+        facts.facts_block(context.prompt_facts(saved_facts))   app/main.py
+
+    1. `context.prompt_facts`, the read-side durability gate, runs every turn.
+       Measured on this shape 2026-09-27, it kept 199 of 200 rows; the one it
+       dropped was a non-ASCII probe worded as a request, so rendering
+       `facts.facts_block(stored)` here showed 10 of 10 probes while the prompt
+       production builds showed 9 of 10. This test called the un-gated form
+       until then, which is why the defect was invisible.
+    2. `facts._BLOCK_MAX_CHARS`. On the unfixed shape that alone failed 10/10:
+       the facts were written first, so `db.list_user_facts` (updated_at DESC)
+       put them last and the block stopped after 56 of 200 rows. The prompt the
+       harness measured, and the prompt a byte-counting saved-facts cap would
+       have been tested against, contained no non-ASCII fact at all.
     """
     user = as_user("ttft_heavy_block")
     user_id = int(user["id"])
@@ -839,18 +958,30 @@ def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings)
 
     ceiling = int(settings.memory_max_facts)
     stored = db.list_user_facts(user_id, ceiling)
-    block = facts.facts_block(stored)
+    # Gate first, exactly as production does. Asserting the gate keeps
+    # everything separately from asserting the block renders everything keeps
+    # the two failure modes distinguishable in the message.
+    kept = context.prompt_facts(stored)
+    dropped = [
+        row["fact"] for row in stored if row["fact"] not in {r["fact"] for r in kept}
+    ]
+    assert dropped == [], (
+        f"{len(dropped)} of {len(stored)} stored facts are dropped by "
+        "context.prompt_facts on EVERY turn, so the shape stores rows the "
+        f"prompt never carries: {dropped}"
+    )
+    block = facts.facts_block(kept)
     assert block is not None
     missing = [f for f in NON_ASCII_FACTS if f not in block]
     assert missing == [], (
         f"{len(missing)} of {len(NON_ASCII_FACTS)} non-ASCII facts never reach "
         f"the prompt: facts_block renders {len(block.splitlines()) - 1} of "
-        f"{len(stored)} rows within {facts._BLOCK_MAX_CHARS} characters, "
+        f"{len(kept)} gated rows within {facts._BLOCK_MAX_CHARS} characters, "
         "oldest first out"
     )
     # The block is genuinely capped — otherwise this test would pass for the
     # uninteresting reason that everything fits.
-    assert len(block.splitlines()) - 1 < len(stored), (
+    assert len(block.splitlines()) - 1 < len(kept), (
         "the cap no longer bites on this shape, so it no longer proves the "
         "ordering; raise MEMORY_MAX_FACTS in the shape or re-read the cap"
     )
@@ -865,6 +996,92 @@ def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings)
     assert [f["fact"] for f in identity_facts] == list(reversed(NON_ASCII_FACTS)), (
         "the newest trusted facts must be the non-ASCII probes, newest first"
     )
+
+
+#: How `app/main.py` builds the saved-facts system message, as a pattern rather
+#: than a literal so renaming the variable does not trip the guard below.
+PRODUCTION_FACTS_BLOCK_CALL = re.compile(
+    r"facts\.facts_block\(\s*context\.prompt_facts\("
+)
+
+
+def test_the_rendered_prompt_test_uses_the_call_production_makes():
+    """The one guard the durability guard cannot give.
+
+    Once every fact of the shape is durable, `facts.facts_block(stored)` and
+    `facts.facts_block(context.prompt_facts(stored))` return the same string —
+    measured 2026-09-27 on this shape, both 6,696 chars / 6,736 utf-8 bytes /
+    60 of 200 rows. So dropping the gate out of the end-to-end test again would
+    pass every other test in this file, and the shape would only start lying
+    later, the next time a fact is worded as a request. This test is what makes
+    that edit fail now instead.
+
+    It pins the path from BOTH ends, because either end can move:
+
+    * the app's end — `app/main.py` must still build the block as
+      `facts.facts_block(context.prompt_facts(...))`. If production stops
+      gating, or gates somewhere else, the shape's claim to render "the call
+      production makes" is stale and this is where a reader is told.
+    * the test's end — walked as an AST, not searched as text, for the reason
+      `test_the_public_writer_guard_rejects_evasions` gives: a text check is
+      walked past with string surgery.
+    """
+    main_py = Path(__file__).resolve().parents[1] / "app" / "main.py"
+    assert main_py.is_file(), (
+        f"{main_py} is not where this guard expects the app to be, so the guard "
+        "cannot check that the shape still renders the block production renders"
+    )
+    main_source = main_py.read_text(encoding="utf-8")
+    assert PRODUCTION_FACTS_BLOCK_CALL.search(main_source), (
+        f"{main_py} no longer builds the saved-facts block as "
+        "facts.facts_block(context.prompt_facts(...)). The shape below renders "
+        "through context.prompt_facts because production did; re-read the new "
+        "call and change both, or the shape measures a prompt production does "
+        "not send"
+    )
+
+    tree = ast.parse(inspect.getsource(test_the_non_ascii_facts_reach_the_rendered_prompt))
+    # Names bound from a `context.prompt_facts(...)` call, so the gated rows can
+    # travel through a local without defeating the check.
+    gated: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        callee = node.value.func
+        if (
+            isinstance(callee, ast.Attribute)
+            and callee.attr == "prompt_facts"
+            and isinstance(callee.value, ast.Name)
+            and callee.value.id == "context"
+        ):
+            gated.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    assert gated, (
+        "the end-to-end test no longer calls context.prompt_facts, so it renders "
+        "a block production never sends: production applies that gate on every "
+        "turn and it dropped 1 of this shape's 200 rows when the defect shipped"
+    )
+
+    rendered = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "facts_block"
+    ]
+    assert rendered, "the end-to-end test no longer renders facts.facts_block"
+    for call in rendered:
+        assert len(call.args) == 1, "facts_block takes the rows as one argument"
+        arg = call.args[0]
+        ok = (isinstance(arg, ast.Name) and arg.id in gated) or (
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Attribute)
+            and arg.func.attr == "prompt_facts"
+        )
+        assert ok, (
+            "facts.facts_block must be rendered over rows that went through "
+            f"context.prompt_facts (gated names: {sorted(gated)}); rendering the "
+            "stored rows skips the gate production runs on every turn"
+        )
 
 
 def test_a_second_run_reuses_the_account_and_builds_its_own_conversation(
