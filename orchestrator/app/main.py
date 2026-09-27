@@ -2969,6 +2969,101 @@ def _asks_about_an_attachment(
     return _t3_visuals.asks_about_attachment_content(text)
 
 
+#: The question ATTRIBUTES the file to this assistant ("the report you made",
+#: "how big is the pdf you generated?"), so it is about the artifact whatever
+#: else the conversation holds. It vetoes `_NAMES_AN_UPLOAD_RE` and nothing
+#: else. Measured 2026-09-27 on held-out neighbours: without it "what's on
+#: page 3 of the report you made?" was diverted to the chat engine by `page 3`,
+#: and a PDF this platform produced HAS pages.
+_NAMES_OUR_OWN_FILE_RE = _re.compile(
+    r"\byou\s+(?:just\s+)?(?:made|created|generated|produced|built|wrote|saved)\b"
+    r"|\b(?:you'?ve|you\s+have)\s+(?:just\s+)?(?:made|created|generated|produced|built|written|saved)\b",
+    _re.I,
+)
+#: A question that names a file the PERSON put in the conversation: "the
+#: attachment", "the pdf I sent", "on page 2", "at 2:10". NARROW on purpose —
+#: see `_carries_a_file_to_read`. Measured 2026-09-27: 0 hits over all 119
+#: turns of the programme's intent corpus, and 0 over 22 held-out questions
+#: about a file this platform made, so it cannot cost the read-back class.
+_NAMES_AN_UPLOAD_RE = _re.compile(
+    r"\b(?:the|that|this|my)\s+(?:attach(?:ment|ed)|upload(?:ed)?)\b"
+    r"|\b(?:i|we)\s+(?:just\s+)?(?:sent|uploaded|shared|attached)\b"
+    r"|\b(?:attach(?:ed|ment)|upload(?:ed)?)\s+"
+    r"(?:file|pdf|doc|document|image|photo|picture|scan|screenshot)\b"
+    r"|\bpage\s+\d+\b|\bat\s+\d{1,2}:\d{2}\b",
+    _re.I,
+)
+
+
+def _carries_a_file_to_read(
+    text: str,
+    request: "ChatRequest",
+    video_followup: bool,
+    image_followup: bool = False,
+    stored_documents: bool = False,
+) -> bool:
+    """Does this turn hold a file of the PERSON'S OWN for another route to read?
+
+    WHY IT EXISTS (verifier, 2026-09-27). The artifact read-back branch below
+    claims a turn the intent gate called a question, and it sits ABOVE the
+    video route, the document route and the two image routes — the same place
+    in the same elif chain where `_asks_about_an_attachment` was needed on
+    2026-09-16. Claimed unconditionally, "what does the chart in that photo
+    say?", "what does that image contain?" and "what does the map on page 2
+    show?" were answered from a stored WORKBOOK's spec.json and the photo was
+    never opened.
+
+    THE FIRST SIX ARE CODE, NOT WORDS. A turn that carries a video, a
+    document or an image has a file and a route below that opens it; and
+    `image_followup`/`video_followup` are themselves the words test —
+    `image_memory.followup` and `video_engine.is_about_video` have already read
+    this turn's text and produced the bytes. Measured 2026-09-27 with a photo
+    remembered, `image_memory.followup` fires on 0 of the 49 labelled artifact
+    questions, so this half costs the read-back nothing at all.
+
+    A DOCUMENT FROM AN EARLIER TURN TAKES THE WORDS, and they have to be
+    narrow. That document has no route of its own — it rides as a pinned
+    system block on every later turn — so nothing but the words can say which
+    file the question is about. `visuals.asks_about_attachment_content` is the
+    obvious candidate and is the WRONG one: measured 2026-09-27 it is True for
+    13 of those 49 turns (q03 "what is in this sheet", q11 "what did you put
+    in the second sheet ??", q15 "summarise the tracker you made", q17 "list
+    the headings in the document", q19, q20, q24, q25, q28, q40, q42, q45,
+    q49), because "is this a question about a file's contents?" is exactly
+    what an artifact question is. Using it would take a quarter of the class
+    away in the commonest flow there is — upload a PDF, make a file from it,
+    ask about the file. `_NAMES_AN_UPLOAD_RE` asks the narrower question the
+    residual sentences answer and those 13 do not: does the question name the
+    upload as the person's own, or a page or timestamp inside it.
+
+    KNOWN RESIDUAL, decided rather than left open (the programme asked which
+    way this would go). "what does this document say?" with a PDF uploaded
+    earlier still reaches the read-back: no words rule can separate it from
+    q17 "list the headings in the document", which is a labelled artifact
+    question about a DOCUMENT artifact, and the only test that catches both
+    costs those 13. The mitigation is already in the reply — the deterministic
+    read-back opens with the artifact's own title and kind ("**Quarterly Audit
+    Report** (v1) is a document with …"), so the person can see which file was
+    read and say so. Widening this needs the picked artifact's KIND at this
+    line, which the route does not have until the engine picks it.
+    """
+    if (
+        request.video_uploads
+        or video_followup
+        or request.pdf_uploads
+        or request.pdf_data
+        or request.image_data
+        or image_followup
+    ):
+        return True
+    if not stored_documents:
+        return False
+    text = (text or "")[:600]
+    if _NAMES_OUR_OWN_FILE_RE.search(text):
+        return False
+    return bool(_NAMES_AN_UPLOAD_RE.search(text))
+
+
 _MAX_VIDEO_REFS = 3
 
 
@@ -5215,6 +5310,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # excerpts ride as a pinned system block on EVERY later turn, so
             # "what did that PDF say about X?" works ten turns later, in any
             # mode, whatever engine answers.
+            # Bound unconditionally: the artifact route below reads it to
+            # decide whether a question is about an uploaded document or about
+            # a file this platform made, and the guard on this block does not
+            # cover every turn that reaches there.
+            stored_docs: list = []
             if request.text and not request.pdf_data and not request.image_data and not lane.entered:
                 from .core.urls import select_relevant as _doc_select
 
@@ -5685,6 +5785,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # setting (has_artifacts=True) and found no file request.
                 and not lane.entered
             ):
+                from .artifacts import describe as _as3_describe
                 from .artifacts import intent as artifact_intent_rules
                 from .engines import artifact as artifact_engine_mod
 
@@ -5816,7 +5917,35 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
-            elif artifact_intent is not None and artifact_intent.wants_file:
+            elif artifact_intent is not None and (
+                artifact_intent.wants_file
+                # ...OR ASKS ABOUT A FILE THIS PLATFORM ALREADY MADE. A question
+                # ("what does this sheet have?") wants no file and `wants_file` is
+                # False for it, but the answer comes from that artifact's stored
+                # spec, which only the artifact engine can reach; it returns before
+                # any job is accepted, so no version is written. The verdict is the
+                # intent gate's, read (never decided) by artifacts/describe. The
+                # live intent is read here on purpose: when a later step re-decides
+                # the turn (an attached image becoming the material), the engine's
+                # own branch reads the same object and the two agree.
+                #
+                # ...AND ONLY WHEN THERE IS NOTHING OF THE PERSON'S OWN TO READ.
+                # This branch sits above the video route (below), the document
+                # route and the two image routes, exactly where the visual
+                # refusal needed `_asks_about_an_attachment` on 2026-09-16: a
+                # question about a photo, a PDF page or a video must be answered
+                # by the engine that can OPEN it, never from the spec of a
+                # workbook we made. `wants_file` is False for such a turn, so
+                # main.py's own image read above is skipped too and the file
+                # would never be opened at all.
+                or _as3_describe.answers_from_spec(
+                    artifact_intent,
+                    has_read_source=_carries_a_file_to_read(
+                        text, request, video_followup, bool(image_followup_images),
+                        stored_documents=bool(stored_docs),
+                    ),
+                )
+            ):
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
                 # "create a PDF of this", "make a deck for the board", "make
                 # slide 4 shorter", "also as Word" — is answered with one.

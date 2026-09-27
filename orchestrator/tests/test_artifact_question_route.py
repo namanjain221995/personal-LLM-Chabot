@@ -116,8 +116,28 @@ def test_the_question_after_a_workbook_opens_no_second_job(question, intent_id):
         assert second.status_code == 200
         events = _parse_sse(second.text)
         final = [d for k, d in events if k == "meta"][-1]
-        assert final["route"] != "artifact", final
+        # THE META CONTRACT, settled 2026-09-27 where this branch met
+        # fix/answer-from-the-spec-r2. `route` names the ENGINE that handled the
+        # turn, NOT whether a file came out of it: origin/dev's
+        # engines/artifact.py already emits `{"route": "artifact"}` on seven
+        # paths that produce nothing — the unmakeable-conversion refusal, the
+        # which-file question, the bad-format refusal, the oversized paste, the
+        # no-table-for-a-chart refusal. The key that means "a file was made" is
+        # `artifacts`, and the read-back path never sets it.
+        #
+        # So this asserts what the docstring above says — no file, no job — and
+        # is strictly STRONGER than the `final["route"] != "artifact"` it
+        # replaces: that only said "some other engine took it", which a turn
+        # that silently answered nothing would also satisfy. This says the turn
+        # was ANSWERED, from the artifact that ALREADY EXISTS, at the version it
+        # already had, without a model call. A future change that answers from a
+        # newly built artifact keeps `route != "artifact"` false and fails here.
         assert "artifacts" not in final, final
+        answered = final.get("artifact_answer") or {}
+        assert answered, final
+        assert str(answered.get("artifact_id")) == str(after_create[0]["id"]), (answered, after_create)
+        assert int(answered.get("version") or 0) == 1, answered
+        assert answered.get("grounded") is True, answered
         tokens = "".join(d["text"] for k, d in events if k == "token")
         assert not tokens.startswith(("Created ", "Updated ", "Converted ")), tokens[:120]
 
