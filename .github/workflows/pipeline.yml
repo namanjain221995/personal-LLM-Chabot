@@ -1162,7 +1162,7 @@ jobs:
   #
   # WHAT IS MEASURED NOW, and what is still not (2026-09-27, local run of this
   # exact stack on the aarch64 box; `docker compose` untouched, own Postgres):
-  #   * `node --test e2e/ci/tests/`      0.2 s (34 cases)
+  #   * `node --test e2e/ci/tests/`      0.2 s (41 cases)
   #   * `stack.sh up`                    9.4-10.0 s over three runs — stub
   #     engine ready after 1 s, orchestrator after 4 s WITH every migration run
   #     to schema V41 against an empty database (the database was dropped and
@@ -1173,6 +1173,34 @@ jobs:
   # average was between 1.0 and 9.1 across the three runs. Peak container
   # memory with the stack up and the suite finished: orchestrator 301 MiB,
   # frontend 85 MiB, stub engine 9 MiB, Postgres 67 MiB.
+  #
+  # RE-MEASURED 2026-09-28, load average beside each (same box, own Postgres on
+  # a fixed port; nothing on the GPUs was touched):
+  #   * `node --test e2e/ci/tests/`                     41 pass 0 fail, 0.20 s (load 1.65)
+  #   * `node --test e2e/platform/tests/`               18 pass 0 fail, 2.50 s (load 4.86)
+  #     — needs `npm ci` in e2e/platform first (83 packages) or it dies with
+  #     "Cannot find module 'puppeteer-core'" and looks like a branch defect
+  #   * test_e2e_ci_policy.py                           65 tests OK, 1.0 s (load 5.0)
+  #   * unittest_gate.py --min-tests 95                 246 executed, 0 skipped, of 246 (load 7.2)
+  #   * workflow_policy.py --default-branch main        OK (P1-P8) (load 7.2)
+  #   * ruff_gate.py, shard_tests.py --of 3 --check     clean; 141/142/142 (load 9.0)
+  #   * pinned actionlint + this repo's conf            exit 0, no output (load 10.6)
+  # Three probe and predicate behaviours were measured directly rather than
+  # argued from the source, because each one had been argued wrongly before:
+  #   * Node 20 `fetch` has NO default timeout. Against a socket that accepts the
+  #     connection and never answers, engine_healthy's old body was still running
+  #     when an external `timeout 20` killed it; with AbortSignal.timeout(10000)
+  #     it rejected at 10.0 s. wait_for only checks its deadline BETWEEN probes,
+  #     so that one probe would have hung the job to the 60-minute ceiling.
+  #   * The playground wait in `--chat-mode live`: in a fixture of
+  #     Playground.tsx:505-528 in headless Chrome, the OLD predicate resolved
+  #     after 3 ms — on the first token — whether or not the generation ever
+  #     finished; the repaired one resolves at 2504 ms when it really finishes and
+  #     rejects at the deadline when it does not. Live mode is still not RUN
+  #     anywhere (this job is `--chat-mode stub`), so that path stays labelled.
+  #   * bash 5.2.21: a failing AND-list as the last command in a LOOP body does
+  #     not exit under `set -e`; as the last command of a FUNCTION it does. The
+  #     comment in the collect step below used to state the loop case backwards.
   #
   # STILL UNMEASURED, and it must stay labelled: the two IMAGE BUILDS on a
   # 4-vCPU hosted runner (cache hits on every local attempt — 2.9 s and 0.3 s
@@ -1328,8 +1356,14 @@ jobs:
           # exits 0, and the two asserts below never run. Measured today
           # 2026-09-27 on this branch with a heredoc whose only statements
           # print and then `exit 7`: without -i nothing printed and rc was 0,
-          # with -i the line printed and rc was 7. e2e/ci/stack.sh:195 carries
-          # the same -i for the same reason, and
+          # with -i the line printed and rc was 7. e2e/ci/stack.sh:295 carries
+          # the same -i for the same reason. That number has now gone stale TWICE
+          # -- it said 195, which was right until up() grew ~89 lines above it,
+          # and 284, which was right until engine_healthy grew a comment -- so
+          # test_the_line_citations_in_this_job_still_point_at_what_they_name
+          # resolves every `<file>:<line>` in this job against the line's content
+          # and fails when it drifts. Fix the number, do not delete the citation.
+          # And
           # test_e2e_ci_policy.py::TheStepsThatRunAProgramInsideTheContainer
           # fails if any docker exec in this job feeds a heredoc without it.
           docker exec -i techsara-e2e-ci-orchestrator python3 - <<'PY'
@@ -1441,16 +1475,39 @@ jobs:
           # returns before doing the work when a named file cannot be read,
           # because `actions/upload-artifact` below runs on `if: failure()` and
           # would have uploaded the untouched report.
-          # `if`, not `[ -s "$f" ] && …`: under `set -e` a failing AND-list as
-          # the last command in a loop body ends the step, and a missing file
-          # here is the normal case, not an error.
-          secret_args=()
-          for f in "$RUNNER_TEMP/e2e-admin.pw" "$RUNNER_TEMP/e2e-member.pw" \
-                   "$RUNNER_TEMP/e2e-ci-session.key" "$RUNNER_TEMP/e2e-ci-pepper.key"; do
+          # `if`, not `[ -s "$f" ] && …` -- for READABILITY, not because `set -e`
+          # requires it here. Measured in bash 5.2.21 on 2026-09-28: a failing
+          # AND-list as the last command in a LOOP body does NOT exit
+          # (`for f in /nope1 /nope2; do [ -s "$f" ] && echo have; done; echo
+          # after` prints `after`, rc 0); it DOES exit as the last command of a
+          # FUNCTION (rc 1, nothing after it runs). The earlier version of this
+          # comment stated the loop case wrongly, and e2e/ci/stack.sh:492's
+          # `[ -s "$STACK_ID_FILE" ] && token=...` sits mid-function where the
+          # rule really does bite, so the distinction is worth getting right.
+          #
+          # AND THE TWO ACCOUNT PASSWORDS ARE PASSED UNCONDITIONALLY (2026-09-28).
+          # The `[ -s ]` pre-filter re-opened the very fail-open redact.js was
+          # changed to close: a file that is missing is simply not in the rule
+          # set, and the step stays GREEN with that literal unredacted, while
+          # redact.js's "report it, apply every other rule, still exit non-zero"
+          # only fires for a path it is actually GIVEN. The two passwords are
+          # written by `openssl rand -hex 24` in this job's own "Per-run
+          # credentials, generated here and stored nowhere" step above -- cited by
+          # CONTENT, not by line number: a citation into the
+          # same file is the one kind guaranteed to rot, and the `-i` citation in
+          # the capacity step has already gone stale twice from edits above it.
+          # They are written before the stack starts, so if they are missing here
+          # something has gone wrong and the artifact must not be uploaded as if
+          # it were clean -- let redact.js do the refusing. The session key and
+          # the pepper are generated by stack.sh inside `up`, so a run that never
+          # got that far legitimately has neither: those two keep the test.
+          secret_args=(--secrets-file "$RUNNER_TEMP/e2e-admin.pw"
+                       --secrets-file "$RUNNER_TEMP/e2e-member.pw")
+          for f in "$RUNNER_TEMP/e2e-ci-session.key" "$RUNNER_TEMP/e2e-ci-pepper.key"; do
             if [ -s "$f" ]; then
               secret_args+=(--secrets-file "$f")
             else
-              echo "redact: no $f on this runner; its literal value is not in the rule set"
+              echo "redact: no $f on this runner; stack.sh generates it in \`up\`, so this run never reached it"
             fi
           done
           node e2e/ci/redact.js "${secret_args[@]+"${secret_args[@]}"}" "$E2E_OUT"

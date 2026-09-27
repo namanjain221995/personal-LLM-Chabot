@@ -178,7 +178,17 @@ up() {
   # third-party key -- into .runtime/e2e.env on a box several sessions share.
   # That is the exact fail-open the allowlist exists to close, and it earned
   # nothing: E2E_EXTRA_ENV_FILE is already the reviewed way to add one variable.
-  ENV_ALLOWLIST="OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED}"
+  #
+  # NO TRAILING BRACE. Removing the `${E2E_ENV_ALLOWLIST:-` wrapper above left
+  # its closing `}` inside the pattern, which made the last alternative
+  # `[A-Z0-9_]+_ENABLED}` -- grep then wanted a literal `}` before the `=`, so
+  # `RERANK_ENABLED=true` did NOT match and `RERANK_ENABLED}=true` did. Measured
+  # 2026-09-28 on a 26-name sample: 3 variables matched instead of 26, i.e.
+  # EVERY `*_ENABLED` flag was dropped, and three of them then fell back to an
+  # app default that disagrees with production (ASR_ENABLED, SEARCH_ENABLED and
+  # VIDEO_ANALYSIS_ENABLED are all `_bool(..., False)` at config.py:223, :951
+  # and :325). test_the_enabled_flags_are_really_matched runs the regex.
+  ENV_ALLOWLIST="OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED"
   # An empty match is a hard error rather than an empty file: `grep` exiting 1
   # under `set -o pipefail` would otherwise take the whole script down with no
   # explanation, and a silently empty engine contract would start a stack that
@@ -212,7 +222,16 @@ up() {
   if [ -n "${E2E_EXTRA_ENV_FILE:-}" ]; then
     [ -r "$E2E_EXTRA_ENV_FILE" ] || die "E2E_EXTRA_ENV_FILE is set but not readable: $E2E_EXTRA_ENV_FILE"
     say "adding the extra environment from $E2E_EXTRA_ENV_FILE"
-    grep -E '^[A-Z][A-Z0-9_]*=' "$E2E_EXTRA_ENV_FILE" >> "$ROOT/.runtime/e2e.env"
+    # SAME PROTECTION AS THE ALLOWLIST GREP ABOVE (2026-09-28). `grep` exits 1
+    # when nothing matches, and under `set -euo pipefail` that ends up() mid-way
+    # with NO message at all: measured, an extra env file holding only comments
+    # aborted the function after "adding the extra environment from ..." and
+    # before the container was created, rc 1, nothing printed. An operator who
+    # named a file deliberately gets told it contributed nothing, rather than
+    # watching `up` die silently.
+    if ! grep -E '^[A-Z][A-Z0-9_]*=' "$E2E_EXTRA_ENV_FILE" >> "$ROOT/.runtime/e2e.env"; then
+      die "E2E_EXTRA_ENV_FILE ($E2E_EXTRA_ENV_FILE) has no KEY=VALUE line; remove it or fix it"
+    fi
   fi
 
   docker rm -f "$ORCH" "$FRONT" >/dev/null 2>&1 || true

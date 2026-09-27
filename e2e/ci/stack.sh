@@ -263,8 +263,19 @@ wait_for() { # wait_for <label> <seconds> <command...>
   done
 }
 
+# EVERY PROBE wait_for IS GIVEN MUST BOUND ITSELF (2026-09-28). The deadline
+# above is only checked BETWEEN probes, so one probe that never returns hangs
+# the loop past the budget and the job dies on `timeout-minutes: 60` instead of
+# printing `docker logs` -- the same failure the deadline was written to fix.
+# Node 20's `fetch` has NO default timeout: measured against a socket that
+# accepts the connection and never answers, the old body (no signal) was still
+# running when an external `timeout 20` killed it, while
+# `AbortSignal.timeout(10000)` rejected at 10 s on the nose. `timeout 15` on the
+# `docker exec` bounds the client too, in case the daemon is the thing wedged.
+# test_every_probe_bounds_itself checks this for every command wait_for is
+# handed, not only the curl ones.
 engine_healthy() {
-  docker exec "$ENGINE" node -e "fetch('http://127.0.0.1:${ENGINE_PORT}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  timeout 15 docker exec "$ENGINE" node -e "fetch('http://127.0.0.1:${ENGINE_PORT}/health', { signal: AbortSignal.timeout(10000) }).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 }
 
 orch_healthy() { curl -fsS -m 15 "http://127.0.0.1:${ORCH_PORT}/health" >/dev/null; }
@@ -320,8 +331,50 @@ seed_account() { # seed_account <username> <role> <password-file>
     | docker exec -i "$ORCH" python3 -c "$(cat "$HERE/seed.py")" "$name" "$role"
 }
 
+# WHICH DATABASE THIS IS ABOUT TO MIGRATE (2026-09-28). ci.env points the stack
+# at `host.docker.internal:5432`, which is right on a hosted runner: that is the
+# job's own `services: postgres`, and nothing else is there. On the PRODUCTION BOX
+# -- where the header above says this script is in fact run while it is being
+# developed -- the same address is the host gateway, and 127.0.0.1:5432 there is
+# `sf-local-ai-postgres-1`, the production database. The orchestrator runs its
+# migrations the moment it boots.
+#
+# And the address cannot be redirected from the environment: load_ci_env does
+# `export "$key=$value"` unconditionally, so ci.env WINS. Measured 2026-09-28:
+# with STACK_PG_HOST=127.0.0.1 STACK_PG_PORT=55813 exported before the call, the
+# values afterwards were still host.docker.internal and 5432. That is deliberate
+# for the ENGINE addresses -- repointing one of those is a production-reaching
+# change and must be an edit to a reviewed file -- so the fix here is not to make
+# ci.env overridable. It is to make the operator say, outside Actions, which
+# database they are about to run migrations against.
+#
+# Inside Actions nothing changes. What saves the box today is only that the `test`
+# role and the `techsara_e2e_ci_test` database do not exist in production, so the
+# connection is refused; that is luck, not a control.
+confirm_database() {
+  local address="${STACK_PG_HOST}:${STACK_PG_PORT}/${STACK_PG_DB}"
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    say "database $address (on the runner: this job's own services: postgres)"
+    return 0
+  fi
+  if [ "${STACK_PG_CONFIRM:-}" = "$address" ]; then
+    say "database $address, confirmed by STACK_PG_CONFIRM"
+    return 0
+  fi
+  die "refusing to start outside Actions without confirming the database.
+  This stack would run the orchestrator's migrations against
+      $address
+  and on this box host.docker.internal is the HOST GATEWAY, so that is whatever
+  holds 127.0.0.1:${STACK_PG_PORT} here -- production's postgres, if it is up.
+  ci.env cannot be overridden from the environment (load_ci_env exports over it),
+  so if that is not the database you meant, point a throwaway Postgres at
+  127.0.0.1:${STACK_PG_PORT} or edit ci.env in a branch. To proceed deliberately:
+      STACK_PG_CONFIRM='$address' bash e2e/ci/stack.sh up"
+}
+
 up() {
   guard_names
+  confirm_database
   command -v docker >/dev/null || die "docker is not on PATH"
   command -v openssl >/dev/null || die "openssl is not on PATH"
   # Here, not at top level: `down` and `logs` use no image tag, and the job's

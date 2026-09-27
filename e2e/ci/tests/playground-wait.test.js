@@ -106,3 +106,40 @@ test('the playground waits for the intercepted execute call before asserting on 
   // A wait with no ceiling would hang the check instead of failing it.
   assert.match(body.slice(wait - 200, wait), /Date\.now\(\) \+ 20_000/);
 });
+
+test('the live-mode wait says WHY it expired, because nothing runs that path', () => {
+  // WHAT THE REPAIR COSTS IN `--chat-mode live`, measured 2026-09-28 in a
+  // fixture of Playground.tsx:505-528 driven in headless Chrome (live mode needs
+  // a real model on the GPUs, so the sequence was reproduced; timeout scaled
+  // 170 s -> 6 s):
+  //
+  //   generation still running at the deadline  old RESOLVED after 3 ms (first
+  //                                             token), new REJECTED at the
+  //                                             deadline
+  //   generation finishes inside the deadline   old RESOLVED after 2 ms (first
+  //                                             token), new RESOLVED after
+  //                                             2504 ms (when it finished)
+  //
+  // The repair is right -- the old wait asserted nothing in live mode -- but it
+  // turns a long live answer into a failure, and pipeline.yml runs
+  // `--chat-mode stub` while e2e/platform/README.md lists live as not exercised.
+  // So the ONE path this change alters is the one path nobody has run, and its
+  // failure has to name the state rather than a millisecond count. This is NOT a
+  // licence to widen the timeout or to drop the `!running` half.
+  const body = playgroundCheck();
+  assert.ok(
+    /!running\)/.test(body),
+    'the wait no longer requires the generation to have STOPPED; it would pass on the first token again',
+  );
+  assert.match(
+    body,
+    /STILL GENERATING/,
+    'the live-mode timeout no longer reports that the generation was still running, so the first person '
+      + 'to run `--chat-mode live` gets a bare millisecond count',
+  );
+  assert.match(
+    body,
+    /never rendered any output/,
+    'the live-mode timeout no longer distinguishes "still generating" from "nothing ever arrived"',
+  );
+});
