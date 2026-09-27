@@ -221,9 +221,25 @@ _ARTIFACT_NOUNS = (
 #: term, style, rate, balance, time) -- so "cheat sheet", "balance sheet"
 #: and "style sheet" are not formats, and `(?!\s*\d)` keeps "sheet 2" a
 #: PART of a workbook rather than a format.
+#:
+#: `(?<!google )` IS THE QA FIX OF 2026-09-27, and it is the guard lexicon.py
+#: had already written for the same word one line over: `(?<!google )docs?`,
+#: because "google docs" names a PLACE and not a deliverable. Adding `sheets?`
+#: here without it made "google sheets" a destination format, and the create
+#: and convert paths acted on it. Measured on this branch against origin/dev
+#: 1f80aa3a2b, `decide()` rules only: "can you open the sheet in google
+#: sheets?" went none/no-request -> create/['xlsx'] under P0 and PA, "open the
+#: sheet in google sheets" went none/no-request -> convert/['xlsx'] under PC,
+#: and once the W2c fix above stopped the question guard from masking it, "is
+#: it possible to open the sheet in google sheets?" went none/no-request ->
+#: create/['xlsx'] under P0 and export/['xlsx'] under PA. None of the three
+#: asks for a file; all three name where the data already lives.
+#: "google slides" has the same shape and is NOT fixed here: `slides?` is a
+#: format word on origin/dev too, so 'is it possible to open this in google
+#: slides?' exports there as well -- pre-existing, and outside this branch.
 _SHEET_FORMAT = (
     r"(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )(?<!score )(?<!answer )"
-    r"sheets?(?!\s*\d)"
+    r"(?<!google )sheets?(?!\s*\d)"
 )
 _FORMAT_WORD = (
     rf"(?:pdf|docx|{_WORD_FORMAT}|powerpoint|power ?point|powerpint|pptx?|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|"
@@ -1064,19 +1080,87 @@ _QUESTION_ABOUT_RE = re.compile(r"^\W*(?:what|which|why|how|who|where|when|is|ar
 #: auxiliary is a request, and `_REQUEST_OF_YOU_RE` below takes it.
 _MODAL_QUESTION_RE = re.compile(
     r"^\W*(?:would|should|shall|could|can|will|may|might|must|am|have|has|had|if|whether)\b(?![\u2019'])", re.I)
+#: The AVAILABILITY nouns of an indirect request: "do you have the
+#: BANDWIDTH to also make a deck?". Asking whether the assistant is free to
+#: do the thing is the politest way there is of asking for the thing, and it
+#: is not a question about whether the thing is a good idea.
+_CAPACITY_NOUNS = (r"(?:bandwidth|time|capacity|capabilit(?:y|ies)|abilit(?:y|ies)|resources?|room|cycles|"
+                   r"headroom|energy)")
 #: The turn is addressed to the assistant AS A REQUEST. Narrower than
 #: `_POLITE_RE`, whose `you` is optional: "would a new report help here?"
 #: matches `_POLITE_RE` on its bare "would" and is not a request, so the
 #: question guard below cannot use `_POLITE_RE` as its escape hatch
 #: (measured 2026-09-27).
+#:
+#: THE INDIRECT FORMS BELOW ARE THE QA FIX OF 2026-09-27. The W2 guard is
+#: right that a question about building is not an order, but it read every
+#: INDIRECT request as one of those, and an indirect request is the shape a
+#: polite person uses: measured on this branch before the fix, `decide('do
+#: you have the bandwidth to also make a deck?', PC)` was
+#: `none`/`ambiguous` where origin/dev and fix/question-not-edit-r2 both
+#: produced the deck -- and it is case 38 of that branch's own 48-case
+#: `HELD_OUT_STILL_A_FILE` list, which this file's W2c section now carries.
+#: Five further phrasings went the same way ("do you have time to ...",
+#: "do you have the capacity to build a one-pager?", "is it possible to
+#: also make a deck?", "is there any way you can make a deck?", "do you
+#: think you could make a deck?"), one lost an EXPORT ("would it be
+#: possible to get a pdf of this?": export/export-followup-handover on
+#: origin/dev, none/no-request here), and with a FORMAT named the loss
+#: reached a fresh conversation too ("do you have the bandwidth to make a
+#: pdf?": create/['pdf'] on origin/dev under P0, PA, PC and PF;
+#: none/ambiguous on all four here).
+#:
+#: EVERY ALTERNATIVE BELOW WAS ABLATED ONE AT A TIME AND KEPT ONLY IF IT
+#: MOVED A ROW. "would you mind making a deck of this?", "do you mind making
+#: a deck?" and "are you able to make a deck?" are NOT here: they produce no
+#: file on origin/dev either (no-request, and `about-format` for the third,
+#: with or without the question mark), so a marker for them would have been
+#: unreachable. They are a separate pre-existing gap, marked
+#: xfail(strict=True) in tests/test_wider_misreads.py rather than asserted as
+#: correct.
+#:
+#: WHY THIS AND NOT "a build verb plus a deliverable noun makes a file",
+#: which is the rule the obvious reading suggests: every W2/W2b question
+#: carries both ("did you make a new SHEET?", "do you want me to write a
+#: MEMO?", "is it normal to create a second EXCEL for this?"), so that rule
+#: reverses the fix it sits next to. What separates the two families is WHO
+#: is being asked to act and WHEN: these frames put the work to the
+#: assistant, in the present. PAST tense stays out on purpose -- `did` is
+#: absent from the availability form below, because "did you have time to
+#: make the deck?" asks about the past, exactly as W2b's "did you make a new
+#: sheet?" does. So is the NORM question: "is it POSSIBLE to ..." is a
+#: request, "is it NORMAL/usual to create a second excel for this?" is W2b
+#: and must not match, which is why the adjective is named and not a class.
 _REQUEST_OF_YOU_RE = re.compile(
     r"^\W*(?:please|pls|kindly)\b"
     r"|^\W*(?:can|could|would|will|may|might)\s+(?:you|u)\b"
     # The exasperated form, which is the owner's own tone: "can't you just
     # give it in docs?", "won't you send the pdf".
     r"|^\W*(?:can|could|would|wo|do|does|did|is|are|ai)n[\u2019']?t\s+(?:you|u)\b"
-    r"|^\W*(?:can|could|may)\s+(?:i|we)\s+(?:get|have|please)\b"
-    r"|^\W*(?:i|we)\s+(?:need|want|would\s+like|'?d\s+like)\b",
+    # "can I download this as a file?", "may I download the answer as a
+    # file?". The verb used to be a closed three (get|have|please), so every
+    # other verb of RECEIVING read as a question about building: measured on
+    # this branch before the fix, "can I download this as a file?" (item v16
+    # of tests/fixtures/artifact_intent_set.py, gold `convert` under PA) went
+    # from `export`/`export-followup` on origin/dev to `create`/`create` --
+    # a brand-new invented document in place of the answer the person had
+    # just read -- and "may I download the answer as a file?" produced
+    # nothing at all. First person asking to be given something is a
+    # request whatever the verb; it still has to carry a file signal
+    # downstream to produce one, because this pattern only declines to VETO.
+    r"|^\W*(?:can|could|may)\s+(?:i|we)\b"
+    r"|^\W*(?:i|we)\s+(?:need|want|would\s+like|'?d\s+like)\b"
+    # The availability question, present tense only (see above).
+    rf"|^\W*(?:do|does|would|will)\s+(?:you|u)\s+(?:still\s+)?(?:have|got)\s+"
+    rf"(?:the\s+|any\s+|enough\s+|some\s+)?{_CAPACITY_NOUNS}\b"
+    # "do you think you could make a deck?"
+    r"|^\W*(?:do|does|would)\s+(?:you|u)\s+(?:think|reckon|suppose)\s+(?:you|u)\s+"
+    r"(?:could|can|would|might|may)\b"
+    # "is there any way you can make a deck?", "any chance you could ...?"
+    r"|^\W*is\s+there\s+(?:any\s+|some\s+|a\s+)?(?:way|chance|possibility)\b"
+    # "is it possible to also make a deck?", "would it be possible to get a
+    # pdf of this?" -- `possible` and its synonyms of FEASIBILITY only.
+    r"|^\W*(?:is|would)\s+it\s+(?:be\s+)?(?:possible|feasible|doable)\b",
     re.I,
 )
 #: The message OPENS with a creation or hand-over verb, so it is an order

@@ -205,6 +205,215 @@ def test_the_same_question_without_a_new_noun_is_already_correct(text: str) -> N
     assert I.decide(text, **PC).wants_file is False
 
 
+# ---------------------------------------------------------------------- W2c --
+# W2c IS THE COST OF W2 AND W2b, FOUND BY QA ON 2026-09-27 AND FIXED IN THE
+# SAME PASS. The two guards above are right that a question about building is
+# not an order; widened, they also refused every INDIRECT request, which is
+# the shape a polite person uses. Measured on this branch before the fix,
+# with `create`/`create-first-clause` on origin/dev 1f80aa3a2b in each case:
+#
+#   PC  'do you have the bandwidth to also make a deck?'   none / ambiguous
+#   PC  'do you have time to also make a deck?'            none / ambiguous
+#   PC  'do you have the capacity to build a one-pager?'   none / ambiguous
+#   PC  'do you think you could make a deck?'              none / ambiguous
+#   PC  'is it possible to also make a deck?'              none / ambiguous
+#   PC  'is there any way you can make a deck?'            none / ambiguous
+#   PA  'would it be possible to get a pdf of this?'       none / no-request
+#   PA  'can I download this as a file?'          create (a NEW document, in
+#                                                 place of the answer the
+#                                                 person had just read)
+#   PA  'may I download the answer as a file?'             none / ambiguous
+#
+# With a FORMAT named, the loss reached a fresh conversation as well: 'do you
+# have the bandwidth to make a pdf?' was `create`/['pdf'] on origin/dev under
+# P0, PA, PC and PF, and `none`/`ambiguous` under all four here.
+#
+# NONE of this was visible to the three instruments the branch was verified
+# with. tests/test_wider_misreads.py passed 137/137; the 119-case per-class
+# corpus (scratchpad intent-eval/score_intent.py) scored 67 (56%) before and
+# after, identical to origin/dev; the 77 authored chart requests moved 0 rows.
+# `tests/test_artifact_intent_labelled.py` DID hold the download case as item
+# v16 of the 205-item set, and passed anyway: its export-recall assertion is
+# `>= 0.85` and the set went 38/38 -> 37/38 (1.0000 -> 0.9737), inside the
+# threshold. The gates below are the ones that would have caught it.
+
+#: The AVAILABILITY / FEASIBILITY frames. Asking whether the assistant is
+#: free to do the thing, or whether the thing can be done, is how a polite
+#: person asks FOR the thing. Every one of these was a file on origin/dev.
+W2C_INDIRECT_REQUESTS = [
+    "do you have the bandwidth to also make a deck?",
+    "do you have time to also make a deck?",
+    "do you have the capacity to build a one-pager?",
+    "do you think you could make a deck?",
+    "is it possible to also make a deck?",
+    "is there any way you can make a deck?",
+    "any chance you could make a deck?",
+]
+
+
+@pytest.mark.parametrize("text", W2C_INDIRECT_REQUESTS)
+@pytest.mark.parametrize("ctx", [PC, PF], ids=["card-last", "file-earlier"])
+def test_an_indirect_request_for_a_file_still_makes_one(text: str, ctx: dict) -> None:
+    """A polite frame around a build verb is a request, not a question.
+
+    Six of these seven decided `none`/`ambiguous` under both contexts before
+    the QA fix of 2026-09-27 and `create` after it; "any chance you could make
+    a deck?" was already right and is here so the band cannot narrow again."""
+    got = I.decide(text, **ctx)
+    assert got.wants_file is True, (text, got.action, got.rule)
+    assert got.action == "create", (text, got.action, got.rule)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "PRE-EXISTING, not a W2 cost and not fixed here. Measured 2026-09-27 on "
+    "origin/dev 1f80aa3a2b and on this branch, identically, with and without "
+    "the question mark and under P0/PC/PF: 'would you mind making a deck of "
+    "this?' and 'do you mind making a deck?' decide none/no-request, and 'are "
+    "you able to make a deck?' decides none/about-format -- 'able to make a "
+    "deck' reads as a question ABOUT a format. A request marker for these "
+    "shapes changes nothing, because a different rule is refusing them; the "
+    "fix belongs to whoever owns `about-format` and the noun-phrase create "
+    "path. strict=True so this goes red, and gets deleted, the day it works."))
+@pytest.mark.parametrize("text", [
+    "would you mind making a deck of this?",
+    "do you mind making a deck?",
+    "are you able to make a deck?",
+])
+def test_two_more_polite_frames_are_still_not_read_as_requests(text: str) -> None:
+    assert I.decide(text, **PC).wants_file is True
+
+
+@pytest.mark.parametrize("ctx,ctx_id", [(P0, "fresh"), (PA, "answer-only"), (PC, "card-last"), (PF, "file-earlier")])
+def test_an_indirect_request_that_names_a_format_makes_one_in_every_context(ctx: dict, ctx_id: str) -> None:
+    """The format is what carried this into a FRESH conversation: 'do you have
+    the bandwidth to make a pdf?' was create/['pdf'] on origin/dev under all
+    four contexts and none/ambiguous under all four before the fix."""
+    got = I.decide("do you have the bandwidth to make a pdf?", **ctx)
+    assert got.wants_file is True, (ctx_id, got.action, got.rule)
+    assert "pdf" in got.formats, (ctx_id, got.formats)
+
+
+@pytest.mark.parametrize("text", [
+    "can I download this as a file?",
+    "may I download the answer as a file?",
+    "could I have this as a docx?",
+    "would it be possible to get a pdf of this?",
+])
+def test_asking_to_be_given_the_answer_exports_it_rather_than_writing_a_new_one(text: str) -> None:
+    """A first-person question about RECEIVING the answer hands over the
+    answer. `can I download this as a file?` is item v16 of
+    tests/fixtures/artifact_intent_set.py (gold `convert` under PA, which
+    `_accept` reads as `export`); before the fix it decided `create`, i.e. the
+    model was asked to invent a fresh document instead of rendering the one
+    the person had just read, and `may I download the answer as a file?`
+    decided none/ambiguous. The verb list after "can I" was a closed three
+    (get|have|please), so every other verb of receiving read as a question
+    about building."""
+    got = I.decide(text, **PA)
+    assert got.action == "export", (text, got.action, got.rule)
+    assert got.target == "previous_answer" and got.reference == "previous_answer", (text, got.target, got.reference)
+
+
+@pytest.mark.parametrize("text,is_request", [
+    ("is it possible to create a second excel for this?", True),
+    ("is it normal to create a second excel for this?", False),
+    ("is it usual to build a separate deck for this?", False),
+    ("do people normally make a deck for this?", False),
+    ("did you have time to make the deck?", False),
+    ("was a new report generated?", False),
+])
+def test_a_feasibility_question_is_a_request_and_a_norm_question_is_not(text: str, is_request: bool) -> None:
+    """THE LINE W2c HAD TO DRAW, and the reason "a build verb plus a
+    deliverable noun makes a file" is the wrong rule: every W2/W2b question
+    carries both of those ("did you make a new SHEET?", "do you want me to
+    write a MEMO?"), so that rule would reverse W2 and W2b. What separates the
+    families is who is asked to act and when -- `possible` is feasibility and
+    a request, `normal`/`usual`/`normally` ask about a practice, and `did`
+    asks about the past."""
+    assert I.decide(text, **PC).wants_file is is_request, (text, I.decide(text, **PC).rule)
+
+
+#: fix/question-not-edit-r2's `HELD_OUT_STILL_A_FILE`, copied here VERBATIM on
+#: 2026-09-27 as a permanent gate on this branch, because it is the list that
+#: caught the regression above and nothing in this file could see it. The two
+#: branches both edit orchestrator/app/artifacts/intent.py and are merged one
+#: after the other, so each needs the other's file-request list: item 38 below
+#: is the deck case, and it passes on origin/dev, on
+#: fix/question-not-edit-r2, on this branch after the fix and on the two
+#: merged together. If that branch's copy grows, copy the new cases here too.
+#: `(text, action, extra kwargs)`; the context is PC (a file card was the last
+#: turn), which is what CARD_LAST is there.
+HELD_OUT_STILL_A_FILE = [
+    # -- charts
+    ("show me the numbers in a bar chart", "create", {}),
+    ("show me the totals as a pie chart", "create", {}),
+    ("show me the rows on a line chart", "create", {}),
+    ("also show me the totals in a chart", "create", {}),
+    ("show me a chart of the totals", "create", {}),
+    ("show me the data in a chart", "create", {}),
+    ("show me the columns as a chart", "create", {}),
+    ("show me the sheet contents in a chart", "create", {}),
+    ("can you show me the data as a chart?", "create", {}),
+    ("please show me the totals in a bar chart", "create", {}),
+    ("show me the chart data", "create", {}),
+    ("show me the chart values as a table", "create", {}),
+    ("show me the chart you made", "create", {}),
+    ("show me the chart as a line graph", "create", {}),
+    ("show me it as a pie chart", "create", {}),
+    ("can you show me this as a bar chart", "create", {}),
+    ("show me the chart as a bar chart instead", "create", {}),
+    ("Bar chart of how many tickets each priority has.", "create", {}),
+    ("show me the numbers in a bar chart", "create", dict(has_dataset=True)),
+    # -- a format named as the target, in the same clause as the speech verb
+    ("summarise the sheet into a pdf", "convert", {}),
+    ("recap the sheet as a pdf", "convert", {}),
+    ("show me the sheet as a pdf", "convert", {}),
+    ("show me the tracker in pdf", "convert", {}),
+    ("show me the data in excel", "convert", {}),
+    ("summarise the report as a pdf", "convert", {}),
+    ("recap the tracker in slides", "convert", {}),
+    ("what i need is the sheet in pdf", "convert", {}),
+    ("what i want is a totals row in the sheet", "convert", {}),
+    ("tell me the summary and export it as pdf", "convert", dict(has_assistant_answer=True)),
+    ("summarise the sheet in a new document", "create", {}),
+    # -- one clause that both asks to be told AND asks for work
+    ("tell me the totals and put them in the sheet", "convert", {}),
+    ("please tell me the deadline and put it in the sheet", "convert", {}),
+    ("tell me the totals and add them to the sheet", "edit", {}),
+    ("tell me the deadline and add it to the tracker", "edit", {}),
+    ("read back the sheet and fix the totals", "edit", {}),
+    ("list the risks in the report and add a column for each", "edit", {}),
+    # -- a POLITE INSTRUCTION wearing a question word
+    ("what if you made it a pdf as well", "convert", {}),
+    ("do you have the bandwidth to also make a deck?", "create", {}),
+    ("is it possible to add a status column?", "edit", {}),
+    # -- the UI's "Edit with a prompt" box
+    ("what if you add a column for owner?", "edit", dict(artifact_id="a1")),
+    ("what if we add a column for owner?", "edit", dict(artifact_id="a1")),
+    ("how about you make it two pages", "edit", dict(artifact_id="a1")),
+    ("why not add a priority column?", "edit", dict(artifact_id="a1")),
+    ("why don't you add a totals row", "edit", dict(artifact_id="a1")),
+    ("what about adding a totals row?", "edit", dict(artifact_id="a1")),
+    ("is it possible to add a status column?", "edit", dict(artifact_id="a1")),
+    ("which columns do you want removed?", "edit", dict(artifact_id="a1")),
+    ("do you mind making it landscape", "edit", dict(artifact_id="a1")),
+]
+
+
+@pytest.mark.parametrize("text,action,extra", HELD_OUT_STILL_A_FILE,
+                         ids=[f"{t[:44]}|{k.get('artifact_id') or k.get('has_dataset') or ''}"
+                              for t, _a, k in HELD_OUT_STILL_A_FILE])
+def test_a_held_out_request_for_a_file_survives_the_wider_misread_fixes(text, action, extra):
+    """THE CROSS-BRANCH GATE. 48/48 on origin/dev 1f80aa3a2b and on
+    fix/question-not-edit-r2; 47/48 on this branch before the QA fix (item 38,
+    the deck) and 48/48 after it."""
+    kw = dict(PC)
+    kw.update(extra)
+    got = I.decide(text, **kw)
+    assert got.wants_file, (text, got.action, got.rule)
+    assert got.action == action, (text, got.action, got.rule)
+
+
 # ----------------------------------------------------------------------- W3 --
 def _pasted_rows(n: int) -> str:
     """`n` tab-separated rows, the shape a person pastes out of a
@@ -294,6 +503,51 @@ def test_the_two_format_vocabularies_agree(word: str, fmt: str) -> None:
     assert F.explicit_formats(word) == [fmt], "formats no longer reads this word"
     assert re.compile(I._FORMAT_WORD, re.I).fullmatch(word) is not None, (
         f"intent._FORMAT_WORD cannot see {word!r}, which formats maps to {fmt}")
+
+
+# --------------------------------------------------------------- W4b (QA) --
+#: A PLACE the data already lives is not a format. lexicon.py has carried
+#: `(?<!google )docs?` for exactly this since before W4; adding `sheets?` to
+#: `intent._FORMAT_WORD` without the same guard made "google sheets" a
+#: destination, and the create and convert paths acted on it. Each pair is
+#: (text, ctx) and each one produces NO file on origin/dev 1f80aa3a2b.
+W4B_GOOGLE_SHEETS = [
+    ("can you open the sheet in google sheets?", P0),
+    ("can you open the sheet in google sheets?", PA),
+    ("can you open the sheet in google sheets?", PC),
+    ("open the sheet in google sheets", PC),
+    ("is it possible to open the sheet in google sheets?", P0),
+    ("is it possible to open the sheet in google sheets?", PA),
+    ("the numbers live in google sheets", PC),
+    ("i keep the tracker in google sheets", PC),
+]
+
+
+@pytest.mark.parametrize("text,ctx", W4B_GOOGLE_SHEETS,
+                         ids=[f"{t[:40]}|{'PC' if c is PC else 'PA' if c is PA else 'P0'}"
+                              for t, c in W4B_GOOGLE_SHEETS])
+def test_google_sheets_is_a_place_and_not_a_format(text: str, ctx: dict) -> None:
+    """FIXED 2026-09-27 by `(?<!google )` in `_SHEET_FORMAT`. Before it, five
+    of these eight produced a file where origin/dev produced none: "can you
+    open the sheet in google sheets?" create/['xlsx'] under P0 and PA, "open
+    the sheet in google sheets" convert/['xlsx'] under PC, and the two "is it
+    possible ..." rows once the W2c fix stopped the question guard masking
+    them (create/['xlsx'] under P0, export/['xlsx'] under PA). The last two
+    rows are statements and were already right; they are here so the guard is
+    not narrowed to the interrogative forms."""
+    assert I.decide(text, **ctx).wants_file is False, (text, I.decide(text, **ctx).rule)
+
+
+@pytest.mark.parametrize("word", ["sheet", "sheets"])
+def test_the_google_guard_takes_only_the_product_name(word: str) -> None:
+    """The guard is a lookbehind on one word, so the format word itself still
+    reads everywhere else: "as a sheet" and "in sheets" are unaffected."""
+    import re
+
+    rx = re.compile(I._FORMAT_WORD, re.I)
+    assert rx.fullmatch(word) is not None, word
+    assert rx.search(f"google {word}") is None, f"google {word} must not be a format"
+    assert rx.search(f"a {word}") is not None, f"a bare {word} is still a format"
 
 
 #: WHAT THIS FIX DID NOT CLOSE, measured 2026-09-27 and pinned so the next
