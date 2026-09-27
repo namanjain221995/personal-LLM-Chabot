@@ -316,7 +316,45 @@ ORDINARY_ASKS_WITH_A_LIST = {
              "price 3. the warranty terms",
     "choose": "Which of these should I do first: 1. migrate the DB 2. upgrade vLLM "
               "3. add tests",
+    # THE THREE SHAPES THE FIRST GATE ACCEPTED, each a one-line question over
+    # a pasted document that commissions nothing. All three were measured on
+    # this branch before the fix: the handbook one gave commissioned() True,
+    # five MUST sections out of somebody else's table of contents,
+    # wants_loop() True and "0 of 5 sections; 5 requirements not yet met" for
+    # a correct one-sentence answer, while dev makes one model call and emits
+    # no step frames at all.
+    "handbook_contents": "What does clause 4.2 mean?\n\n"
+                         "PARTNER HANDBOOK v7 (a third-party PDF the person pasted)\n"
+                         "Contents: 1. Introduction 2. Scope and Definitions 3. "
+                         "Commercial Terms 4. Reseller Obligations 5. Termination\n"
+                         "Clause 4.2 covers commercial terms for resellers in EMEA.",
+    "handbook_chapters": "Which clause covers termination?\n\n"
+                         "RESELLER AGREEMENT (pasted)\n"
+                         "Chapters: 1. Introduction 2. Scope 3. Commercial Terms "
+                         "4. Reseller Obligations 5. Termination\n"
+                         "Termination is dealt with in clause 9.",
+    "third_person_need": "What does clause 4.2 mean?\n\n"
+                         "PARTNER HANDBOOK v7 (pasted)\n"
+                         "Partners need the reseller documentation before onboarding.\n"
+                         "Sections: 1. Introduction 2. Scope 3. Commercial Terms\n"
+                         "Clause 4.2 covers commercial terms.",
 }
+
+#: An ordinary question over a paste whose ELEMENT directives are all the
+#: document's own. Nothing here is a list and nothing here is a label, which
+#: is why the element floors needed the commission gate and not a reader fix:
+#: measured before it, four element MUSTs, wants_loop() True, and a correct
+#: one-sentence answer judged "4 requirements not yet met" with the reviser
+#: told to add 2 tables, 2 warning callouts, 2 numbered lists and 2 code
+#: blocks. Two of the three directive lines are imperatives, so no shape test
+#: on the clause could have told them from the person's own.
+PASTED_STYLE_GUIDE = (
+    "Why is this failing?\n\n"
+    "INTERNAL STYLE GUIDE (a third-party document the person pasted)\n"
+    "Authors must include tables for every metric.\n"
+    "Add warnings before each destructive step.\n"
+    "Use numbered steps for procedures and provide code samples.\n"
+)
 
 
 @pytest.mark.parametrize("name", sorted(ORDINARY_ASKS_WITH_A_LIST))
@@ -349,8 +387,88 @@ def test_the_commission_gate_keeps_every_shape_a_person_really_commissions():
         "Please prepare a handover document. Sections: 1. Alpha 2. Beta 3. Gamma",
         "I need a proposal covering 1. Alpha 2. Beta 3. Gamma",
         "Outline: 1. Alpha 2. Beta 3. Gamma",
+        # Narrowing the gate to the person's own clause must not cost these:
+        # a writing verb behind a question lead, and the first-person
+        # "want" that replaced the bare `need|want` alternation.
+        "Can you write a report on X? Sections: 1. Alpha 2. Beta 3. Gamma",
+        "We want a one-page overview. Sections: 1. Alpha 2. Beta 3. Gamma",
     ):
         assert contract.extract_rules(message).sections, message
+
+
+def test_a_pasted_documents_element_directives_are_not_the_persons():
+    """The element floors sit behind the commission gate, like the sections.
+
+    A directive clause needs no numbered list and no label, so before the
+    gate this ordinary question armed the whole loop out of a pasted style
+    guide. `wants_loop` fires on three elements, and there were four.
+    """
+    from app.core import max_loop
+
+    c = contract.extract_rules(PASTED_STYLE_GUIDE)
+    assert not contract.commissioned(contract.person_words(PASTED_STYLE_GUIDE))
+    assert [i for i in c.items if i.kind == "element"] == []
+    assert not max_loop.wants_loop(c)
+    report = contract.check(
+        c,
+        "It fails because the connection pool is exhausted; raise max_connections "
+        "and restart the pooler.",
+    )
+    assert report.failed_musts() == []
+    assert max_loop._unmet(report, []) == []
+
+
+#: A commission the person really made, seven sections numbered, three of them
+#: ordinary headings that `is_section_title` drops for carrying a finite verb
+#: or the second person. The gate is right to count only what it can read as a
+#: heading; what it may not do is call four of seven "all of them".
+SHORTENED_COMMISSION = (
+    "Write a technical report on our new platform.\n"
+    "Requirements: 1. Executive Summary 2. What Is Changing 3. Architecture "
+    "4. Data You Control 5. Who Is Responsible 6. Security 7. Conclusion\n"
+    "Do not skip any section.\n"
+)
+
+
+def test_the_brief_does_not_call_a_shortened_list_all_of_them():
+    """The title gate drops genuine headings at a rate that depends on the
+    sample — 8 of 20 on one held-out set measured today and 1 of 20 on
+    another, both in the module docstring — so a shortened list is not a
+    corner case. The brief lands in a role=system block, and "all of them"
+    there is the assistant being told that four is the whole commission."""
+    c = contract.extract_rules(SHORTENED_COMMISSION)
+    assert c.sections == ["Executive Summary", "Architecture", "Security", "Conclusion"]
+    assert c.uncounted_sections == 3
+    brief = contract.requirements_brief(c)
+    assert "all of them" not in brief
+    assert "not the whole of it" in brief
+    # And the unshortened case is untouched, word for word: the owner's
+    # fifteen sections all survive the gate.
+    owner = contract.extract_rules(OWNER_PROMPT)
+    assert owner.uncounted_sections == 0
+    assert (
+        "- 15 top-level sections, all of them, in the order listed between the "
+        "markers below." in contract.requirements_brief(owner)
+    )
+
+
+def test_the_check_does_not_report_a_shortened_list_as_complete():
+    """The other end of the same defect, on the step card the person reads:
+    an answer carrying only the four kept sections was reported as "4 of 4
+    sections; everything asked for is present" with failed_musts() empty for
+    a request that numbered seven."""
+    c = contract.extract_rules(SHORTENED_COMMISSION)
+    answer = "".join(
+        f"# {name}\n\nFirst paragraph.\n\nSecond paragraph.\n\n" for name in c.sections
+    )
+    report = contract.check(c, answer)
+    assert report.failed_musts() == []
+    assert report.uncounted_sections == 3
+    assert "everything asked for is present" not in report.detail()
+    assert report.detail() == (
+        "4 of 4 counted sections, 3 more the request listed not counted; "
+        "everything counted is present"
+    )
 
 
 def test_the_imported_reader_cannot_put_a_phrase_past_the_title_gate():

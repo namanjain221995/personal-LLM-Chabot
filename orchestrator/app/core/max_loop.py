@@ -251,7 +251,14 @@ class LoopResult:
     draft: Optional[dict] = None
 
     def as_meta(self) -> dict:
-        meta: Dict[str, Any] = {"phases": self.model_calls, "revised": self.revised}
+        # THE KEY IS THE NUMBER IT CARRIES. It was `phases`, and it has always
+        # held `model_calls`: measured today on the owner's own prompt, four
+        # phases ran — plan, draft, check, revise, with the critique correctly
+        # skipped — and the key reported 3, because the check costs no model
+        # call. Nothing outside this file reads it — grepped across the
+        # orchestrator, the tests and the frontend today — so it is renamed
+        # rather than kept as a wrong label.
+        meta: Dict[str, Any] = {"model_calls": self.model_calls, "revised": self.revised}
         if self.report is not None:
             meta["unmet"] = len(self.report.failed_musts())
         if self.refused:
@@ -463,9 +470,17 @@ def _with_plan(messages: Sequence[dict], plan: str, brief: str = "") -> List[dic
     if brief.strip():
         parts.append(brief.strip())
     if plan.strip():
+        # THE PLAN IS SCRUBBED, FOR THE SAME REASON THE SECTION NAMES ARE.
+        # The plan is main-model text written from the person's raw message,
+        # and that message can be somebody else's document in its entirety —
+        # the same provenance as the fenced half of this block. It is NOT
+        # fenced as data, because it is the one part of this block the writer
+        # is told to follow; what the scrub buys is that it cannot close the
+        # brief's `<<<END SECTIONS>>>` fence or forge one of its own and
+        # continue as a sentence of the system block it sits in.
         parts.append(
             "YOUR PLAN FOR THIS ANSWER (you wrote it a moment ago; follow it "
-            "and do not mention it):\n" + plan.strip()
+            "and do not mention it):\n" + C.scrub(plan.strip())
         )
     if not parts:
         return list(messages)
