@@ -67,6 +67,29 @@
 #          including when the database cannot be read or the schema predates
 #          V36 (the line says which).
 #
+# EXIT CODES, because a caller now maps them instead of swallowing them.
+# scripts/deploy.sh used to run `wait` with a trailing `|| true`, which turned
+# three different answers into one silence. They are a contract now:
+#
+#   0  drained  - the quiet window completed, or the last sample found nothing
+#                 in flight. Safe to recreate.
+#   2  advisory - the deadline passed while the service was still busy, or the
+#                 connection table could not be read from inside the container.
+#                 The deploy proceeds: a busy service must not be able to hold
+#                 production on a bad build, and stop_grace_period is what
+#                 protects those requests. A WARNING, not a failure.
+#   1  could not run at all - a usage error, no such container, or no
+#                 listening port to count against. NOT a drain result: it means
+#                 the check did not happen. A caller that hides this cannot
+#                 tell "nothing was in flight" from "nobody looked".
+#
+# `wait` is for LISTENERS. It counts ESTABLISHED connections to the service's
+# own published port, so a service that publishes no port (sync-worker: it
+# only dials out to Salesforce) has nothing to count and exits 1 with
+# "cannot determine ...'s listening port from the rendered config; pass
+# --port". That is the right answer to the wrong question, and the caller's job
+# is not to ask it.
+#
 # No mode ever stops, kills or recreates anything, and none of them writes.
 set -euo pipefail
 
