@@ -45,12 +45,24 @@ interpolated into a `run:` body - workflow_policy.py P6):
                                file; this script only ever reads a file, so
                                the decision stays testable and no network call
                                lives inside the gate;
-       --fallback-timestamp    github.event.head_commit.timestamp, which is
-                               always present on a push. Used when the API read
-                               did not work - a 403, a rate limit, no network.
-     Which one was used is PRINTED, because they measure slightly different
-     things: the commit timestamp is older than the gate's completion by
-     roughly the length of CI, so an age measured from it is conservative.
+       --fallback-timestamp    github.event.head_commit.timestamp, used when
+                               the API read did not work - a 403, a rate limit,
+                               no network. Always present on a push.
+     A KNOWN WEAKNESS, recorded rather than papered over. The fallback is the
+     COMMITTER's clock, not the release's, and it can be arbitrarily older: a
+     commit written on Monday and pushed on Wednesday carries Monday, so an age
+     measured from it can refuse a release that is not stale at all. The
+     earlier version of this comment claimed it was "older than the gate's
+     completion by roughly the length of CI", which is not true and made the
+     fallback look safer than it is.
+     It is kept because the alternative is worse. There is no better offline
+     source: the run's own start time is NOT in the `github` context - it is
+     not a property, and actionlint rejects `github.run_started_at` - and every
+     other way to read it is the same Actions API call that has just failed.
+     Measuring too large fails CLOSED, the refusal names the source it used,
+     and the dispatch it recommends deploys the same commit. A false refusal
+     that says which reading caused it beats a fail-open.
+     The gate's completion time therefore always wins when it is available.
 
 Neither parseable -> refuse. A guard that passes when it cannot see is not a
 guard; the whole point of this file is that the 3 a.m. path stops guessing.
@@ -59,7 +71,13 @@ A workflow_dispatch run is a human asking out loud, so the AGE check is
 reported and not enforced there. The tip check still applies: deploying a
 commit that main has moved past is a mistake whoever asked for it.
 
-Every refusal prints the exact command to deploy deliberately anyway.
+Every refusal prints what to do next, AND IT DIFFERS BY REASON. A single
+`gh workflow run --ref <branch>` footer was right for the two AGE refusals and
+wrong for the others: on "the branch has moved past this commit" it dispatches
+the NEWER tip, so it deploys something else and does not put the refused commit
+anywhere; on "the tip could not be resolved" it hits the same check and refuses
+identically; on a malformed github.sha it arrives with the same malformed
+value. Advice a pipeline cannot back up is the defect this file is about.
 """
 from __future__ import annotations
 
@@ -133,8 +151,71 @@ def gate_time_from_jobs_file(path: str | None, job_name: str) -> str | None:
 
 
 def deliberate_command(workflow: str, branch: str) -> str:
-    """The command an operator runs to deploy this anyway, on purpose."""
+    """The command an operator runs to deploy this anyway, on purpose.
+
+    Only honest for an AGE refusal, where the refused commit IS the tip: a
+    dispatch on the branch then rolls out that same commit with a human's name
+    on it. `remedy()` is what decides whether this is the right advice.
+    """
     return f"gh workflow run {workflow} --ref {branch} -f deploy=true"
+
+
+def remedy(reason: str, *, sha: str, origin_tip: str, branch: str, workflow: str) -> list[str]:
+    """What to actually do about THIS refusal, as printable lines.
+
+    One footer for every refusal was wrong three times out of four. Each case
+    below is the thing that genuinely moves the deploy forward, and where the
+    dispatch is not it, the lines say so rather than sending an operator to run
+    a command that cannot work.
+    """
+    lines = [""]
+    if reason == "wiring":
+        lines += [
+            "Nothing on the box has been touched.",
+            "",
+            "This is a wiring fault in the workflow, not a state to override: the commit id",
+            "reached this step empty or truncated. A dispatch arrives with the same value,",
+            f"so `{deliberate_command(workflow, branch)}` would refuse the same way.",
+            "Fix how github.sha is passed to this step.",
+        ]
+        return lines
+    if reason == "tip-unresolved":
+        lines += [
+            "Nothing on the box has been touched.",
+            "",
+            f"The tip of origin/{branch} could not be read FROM THE RUNNER, so this is a",
+            "network or credential fault on the runner, not a property of the release. A",
+            "dispatch runs this same check and would refuse identically.",
+            "Re-run this job once the runner can reach the remote again.",
+        ]
+        return lines
+    if reason == "tip-moved":
+        lines += [
+            f"Nothing on the box has been touched, and nothing needs to be: {origin_tip[:12]}",
+            "is the release now, and its own pipeline run deploys it. There is no action here.",
+            "",
+            f"`{deliberate_command(workflow, branch)}` is NOT the command for this:",
+            f"it would deploy {origin_tip[:12]}, not {sha[:12]}.",
+            f"To put {sha[:12]} specifically into production, it has to become the tip of",
+            f"{branch} again (revert on top), or be deployed by hand on the box with a",
+            "person present:",
+            "",
+            f"    scripts/deploy.sh --ref {sha}",
+        ]
+        return lines
+    # The two AGE refusals. Here the refused commit IS the tip, so a dispatch
+    # deploys exactly this commit and the only thing it adds is a human choice
+    # about the age - which is the whole distinction being drawn.
+    lines += [
+        "Nothing on the box has been touched.",
+        "To deploy this same commit deliberately, with the age on your name:",
+        "",
+        f"    {deliberate_command(workflow, branch)}",
+        "",
+        "A dispatch is a person taking responsibility for the age, which is the "
+        "difference this guard is drawing.",
+    ]
+    return lines
 
 
 def evaluate(
@@ -153,6 +234,10 @@ def evaluate(
     facts: list[tuple[str, str]] = []
     messages: list[str] = []
     ok = True
+    #: The FIRST thing that refused, because the advice differs by reason and
+    #: the earliest refusal is the most fundamental one. A malformed commit id
+    #: is not fixed by knowing the release is also stale.
+    reason = ""
 
     sha = (sha or "").strip().lower()
     origin_tip = (origin_tip or "").strip().lower()
@@ -161,6 +246,7 @@ def evaluate(
 
     if not SHA_RE.match(sha):
         ok = False
+        reason = reason or "wiring"
         messages.append(
             f"REFUSE: the commit being deployed is not a full commit id ({sha or '<missing>'}). "
             "This value comes from github.sha; an empty or short one means the job is "
@@ -168,6 +254,7 @@ def evaluate(
         )
     elif not SHA_RE.match(origin_tip):
         ok = False
+        reason = reason or "tip-unresolved"
         messages.append(
             f"REFUSE: the tip of origin/{branch} could not be resolved "
             f"({origin_tip or '<unresolved>'}). Without it there is no way to tell whether "
@@ -175,6 +262,7 @@ def evaluate(
         )
     elif sha != origin_tip:
         ok = False
+        reason = reason or "tip-moved"
         messages.append(
             f"REFUSE: {sha[:12]} is no longer the tip of origin/{branch} "
             f"(that is {origin_tip[:12]} now). Deploying this would put production on a "
@@ -183,14 +271,31 @@ def evaluate(
     else:
         messages.append(f"ok: {sha[:12]} is still the tip of origin/{branch}.")
 
-    gate = parse_timestamp(gate_completed_at)
-    fallback = parse_timestamp(fallback_timestamp)
-    stamp = gate or fallback
-    source = (
-        "the gate's completion time"
-        if gate is not None
-        else ("the deployed commit's timestamp (the gate's own time was unavailable)" if fallback else "<none>")
+    # PRECEDENCE, top to bottom, and the gate's completion time always wins
+    # when it is there: it is the only one of the two that measures what this
+    # guard is about.
+    #
+    # The commit timestamp is a WEAK second. It is the committer's clock, not
+    # the release's, and it can be arbitrarily older - a commit written on
+    # Monday and pushed on Wednesday carries Monday - so an age measured from it
+    # can refuse a release that is not stale. That is a known false-refusal
+    # path, not a rounding error, and it is kept only because measuring too
+    # large fails closed while having no measurement at all would not. The
+    # source is always named in the output so a refusal can be read for what it
+    # is. Nothing better exists offline: the run's own start time is not a
+    # `github` context property, and every other reading of it is the same API
+    # call that has already failed.
+    candidates = (
+        ("the gate's completion time", gate_completed_at),
+        ("the deployed commit's timestamp (the gate's own time was unavailable)", fallback_timestamp),
     )
+    stamp = None
+    source = "<none>"
+    for name, raw in candidates:
+        parsed = parse_timestamp(raw)
+        if parsed is not None:
+            stamp, source = parsed, name
+            break
     facts.append(("age measured from", source))
 
     if stamp is None:
@@ -198,9 +303,9 @@ def evaluate(
         if event_name == "workflow_dispatch":
             # A dispatch has no head_commit, so when the Actions API read also
             # fails there is no timestamp left. Refusing here would refuse the
-            # exact command every other refusal in this file tells an operator
-            # to run, which would leave the release path with no way out. A
-            # dispatch is a person choosing; the age is theirs to own.
+            # exact command the age refusals tell an operator to run, which
+            # would leave the release path with no way out. A dispatch is a
+            # person choosing; the age is theirs to own.
             messages.append(
                 "note: the age of this release could not be determined (no gate time and, "
                 "on a dispatch, no commit timestamp). This run was dispatched by hand, so "
@@ -208,6 +313,7 @@ def evaluate(
             )
         else:
             ok = False
+            reason = reason or "age-unknown"
             messages.append(
                 "REFUSE: neither the gate's completion time nor the commit timestamp could be "
                 "parsed, so the age of this release is unknown. An unknown age is a refusal: "
@@ -235,6 +341,7 @@ def evaluate(
                 )
             else:
                 ok = False
+                reason = reason or "age-stale"
                 messages.append(
                     f"REFUSE: this release is {age_minutes:.1f} minutes old, measured from "
                     f"{source}, and the window is {window_minutes} minutes. A rollout this far "
@@ -248,14 +355,9 @@ def evaluate(
             )
 
     if not ok:
-        messages.append("")
-        messages.append("Nothing on the box has been touched. To deploy this deliberately:")
-        messages.append("")
-        messages.append(f"    {deliberate_command(workflow, branch)}")
-        messages.append("")
-        messages.append(
-            "A dispatch is a person taking responsibility for the age, which is the "
-            "difference this guard is drawing."
+        facts.append(("refused because", reason or "unknown"))
+        messages += remedy(
+            reason, sha=sha, origin_tip=origin_tip, branch=branch, workflow=workflow
         )
     return ok, messages, facts
 

@@ -238,6 +238,19 @@ class TheRollbackGateRefusesWhatItCannotProve(unittest.TestCase):
         self.assertIn("proceed", out)
         self.assertIn("previous=41", out)
 
+    def test_the_rollbacks_own_direction_is_computable_and_reversible(self):
+        # The verdict the ROLLBACK files with its own release record. The
+        # transition is TARGET -> PREVIOUS, so the roles swap: what is running
+        # now is TARGET (knows V41), what is being started is PREVIOUS (knows
+        # V40), and the database is still V40 because `techsara up` never got
+        # far enough to migrate. Undoing this rollback is safe, and that is
+        # what the record should say - not the forward release's
+        # "forward-only", which is a fact about a different transition.
+        line = verdict("41", "40", "40")
+        self.assertIn("verdict=reversible", line)
+        self.assertIn("previous=41", line)
+        self.assertIn("after=40", line)
+
     def test_previous_ahead_of_the_live_database_proceeds(self):
         rc, out, _ = call("dr_rollback_is_reversible", verdict("42", "41", "41"), "41")
         self.assertEqual(rc, 0, out)
@@ -310,6 +323,27 @@ class TheDeployScriptActuallyUsesIt(unittest.TestCase):
             "the drain result is being swallowed by `|| true` again",
         )
         self.assertIn("could not drain $svc", self.deploy)
+
+    def test_the_rollback_files_its_own_verdict_and_not_the_forward_one(self):
+        # apply() is called TWICE - once for $TARGET and once for $PREVIOUS -
+        # and each call writes --reversibility into the release record it takes
+        # first. Passing $REVERSIBILITY_VERDICT both times files a verdict
+        # about PREVIOUS -> TARGET under a record whose `git.head` is $TARGET,
+        # which is a plausible-looking wrong fact in the one file a 3 a.m.
+        # reader trusts. apply() reads $APPLY_VERDICT, and the rollback path
+        # re-points it for its own direction before calling apply().
+        self.assertNotIn(
+            'record_args+=(--reversibility "$REVERSIBILITY_VERDICT")',
+            self.deploy_code,
+            "the rollback's release record is being filed with the FORWARD verdict",
+        )
+        self.assertIn('record_args+=(--reversibility "$APPLY_VERDICT")', self.deploy_code)
+        repointed = self.deploy_code.index('APPLY_VERDICT="$(dr_reversibility_verdict')
+        rolled_back = self.deploy_code.index('if apply "$PREVIOUS" && health; then')
+        self.assertLess(
+            repointed, rolled_back,
+            "the rollback's verdict must be computed before apply() writes the record",
+        )
 
     def test_the_sync_worker_is_no_longer_drained_as_a_listener(self):
         self.assertNotIn("for svc in orchestrator frontend sync-worker; do", self.deploy_code)

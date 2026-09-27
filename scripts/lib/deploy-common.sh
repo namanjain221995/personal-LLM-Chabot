@@ -329,10 +329,15 @@ PY
 # gate says "proceeding WITHOUT the compatibility check" and returns 0. On the
 # FORWARD path that is a considered trade. On the ROLLBACK path it was a
 # fail-open at exactly the wrong moment: the rollback is consulted only after
-# the health gate failed or `techsara up` failed, which is precisely when
-# /health is down and the compose project may be mid-recreate, so BOTH reads
-# can fail together. The gate then returned 0 and older code was started on a
-# newer schema - the outcome the rollback gate exists to prevent.
+# the health gate failed or `techsara up` failed, so the /health read is down by
+# definition and the whole answer rests on the `docker exec <pg> psql` fallback.
+# That fallback usually answers - a rolling deploy recreates the application
+# containers and leaves postgres alone - and does not when the database
+# container was recreated too (a --full deploy), when the compose project is
+# mid-recreate, or when Docker itself is unwell. On that path the gate returned
+# 0 and older code was started on a newer schema, unattended: the outcome the
+# rollback gate exists to prevent. Uncommon, and not acceptable for a step
+# nobody is watching.
 #
 # The fix is not a better read at rollback time. There is no better read at
 # rollback time; the box is broken by definition. The fix is to take the
@@ -492,6 +497,52 @@ dr_rollback_is_reversible() {
     return 0
   fi
   printf 'proceed previous=%s live=%s\n' "$previous" "$live_now"
+}
+
+# ------------------------------------------------ waiting inside a job ceiling
+# scripts/deploy.sh is DESIGNED to wait: it queues behind a hand-run deploy for
+# the deploy lock, and behind an automatic engine recovery for the engine lock.
+# A person at a terminal can wait as long as those waits need. A GitHub Actions
+# job cannot: `timeout-minutes` cancels it wherever the step happens to be, and
+# if that is inside `techsara up` the box is left part-recreated with no health
+# gate and no rollback - the one outcome the deploy path is arranged to prevent.
+#
+# Sizing each wait individually does not answer this, because the number of
+# waits is not one. A single deploy job runs deploy.sh TWICE (the preflight dry
+# run and the rollout), and the rollout's own apply() takes the engine lock once
+# on the way forward and AGAIN for the rollback - engine_lock_release() unsets
+# ENGINE_LOCK_HELD_BY, so the second acquire is a real acquire with a real
+# timeout, not the re-entrant no-op it looks like. Four waits, not two.
+#
+# So the ceiling is expressed as ONE wall-clock budget for the whole invocation
+# and every wait is clamped to what is left of it. A wait that has no time left
+# becomes a non-blocking attempt, which FAILS DIAGNOSABLY - the script says
+# which lock it could not get and who holds it - instead of the job being
+# cancelled mid-`up`.
+#
+# Pure: the clock is an argument, so the arithmetic is unit-testable
+# (.github/workflows/scripts/tests/test_rollback_reversibility.py).
+#
+#   dr_wait_within_budget REQUESTED STARTED_EPOCH CEILING_S NOW_EPOCH
+#
+# CEILING_S of 0, empty or non-numeric means NO budget, and REQUESTED is
+# returned unchanged. That is the hand-run default: nothing should quietly
+# shorten an operator's wait because a workflow needed a ceiling.
+dr_wait_within_budget() {
+  local requested="${1-}" started="${2-}" ceiling="${3-}" now="${4-}" remaining
+  _dr_is_uint "$requested" || return 1
+  if ! _dr_is_uint "$ceiling" || [ "$ceiling" -eq 0 ]; then
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  _dr_is_uint "$started" && _dr_is_uint "$now" || return 1
+  remaining=$(( started + ceiling - now ))
+  [ "$remaining" -lt 0 ] && remaining=0
+  if [ "$requested" -gt "$remaining" ]; then
+    printf '%s\n' "$remaining"
+  else
+    printf '%s\n' "$requested"
+  fi
 }
 
 # ------------------------------------------------------------------ env reads

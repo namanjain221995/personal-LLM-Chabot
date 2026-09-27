@@ -78,14 +78,35 @@
 #     consult the same schema_gate() as the forward deploy, and that function
 #     returns 0 without checking anything when the live schema version cannot
 #     be read. A rollback is only reached when the health gate failed or
-#     `techsara up` failed - i.e. when /health is down and the compose project
-#     may be mid-recreate - so the unreadable case was not an edge, it was the
-#     expected one. Now the verdict is computed at the forward gate while the
+#     `techsara up` failed, so the FIRST of the two readings behind
+#     dr_live_schema_version - /health - is down by definition, and the second
+#     one (`docker exec <pg> psql`) is all that stands between the gate and a
+#     shrug. HOW OFTEN is stated honestly, because the first version of this
+#     comment called it "the expected case" and that is too strong: postgres is
+#     usually still running when only the application containers were
+#     recreated, so the psql fallback usually answers. It does not answer when
+#     the database container was recreated too (a --full deploy), when the
+#     compose project is mid-recreate, or when Docker itself is unwell. That is
+#     an uncommon path, not an impossible one, and it is the path on which a
+#     fail-open starts old code on a new schema unattended. Now the verdict is
+#     computed at the forward gate while the
 #     stack is still healthy, printed, recorded in the release directory, and
 #     only CONSULTED at rollback time. Missing, unparseable, forward-only, or
 #     a live version that cannot be read: all four REFUSE.
 #     The FORWARD gate is unchanged, including its fail-open. It runs with a
 #     human watching; the rollback does not.
+#   * THE WAITS FIT THE CALLER'S CEILING. DEPLOY_LOCK_WAIT (default 1800) and
+#     ENGINE_LOCK_WAIT (default 1200) are how long this script queues behind a
+#     hand-run deploy and behind an automatic engine recovery. A person can
+#     wait that long; a CI job with `timeout-minutes` cannot, and being
+#     cancelled inside `techsara up` leaves the box part-recreated with no
+#     health gate and no rollback. Sizing the two numbers is not enough,
+#     because one job runs this script TWICE (a preflight dry run and the
+#     rollout) and the rollout takes the engine lock twice (forward, then
+#     rollback). DEPLOY_WALL_BUDGET_S is the caller's whole ceiling in seconds:
+#     every wait is clamped to what is left of it, so their SUM cannot exceed
+#     it. Unset means no ceiling and every wait keeps its full length, which is
+#     the hand-run default.
 set -euo pipefail
 
 ROOT="${TECHSARA_DEPLOY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -154,6 +175,49 @@ die() { printf '%s ERROR %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$LOG" >&2; exi
 # this script prints. A recovery reads one file, not two.
 DR_LOG="$LOG"
 
+# ------------------------------------------------ waiting inside a job ceiling
+# This script waits on purpose - for the deploy lock held by a hand-run deploy,
+# and for the engine recovery lock held by the sentinel. A person at a terminal
+# can wait as long as that takes. A caller with a ceiling cannot, and when the
+# ceiling wins mid-`techsara up` the box is left part-recreated with no health
+# gate and no rollback.
+#
+# DEPLOY_WALL_BUDGET_S, when set, is that caller's ceiling in seconds, measured
+# from HERE. Every lock wait below is clamped to what is left of it, so the sum
+# of the waits cannot exceed it however many of them there are - and there are
+# more than they look: apply() takes the engine lock on the way forward and
+# AGAIN for the rollback, because engine_lock_release() unsets
+# ENGINE_LOCK_HELD_BY and the second acquire is therefore a real one.
+#
+# Unset (the hand-run default) means NO ceiling and every wait keeps the full
+# length it was given. Nothing here shortens an operator's wait.
+DEPLOY_STARTED_EPOCH="$(date +%s)"
+LOCK_WAIT_ALLOWED=""
+# A budget that is SET but unreadable is worse than no budget, because the
+# caller believes it has a ceiling and does not. Said once, at the first wait,
+# rather than refusing: a typo in an env var should not be the reason a deploy
+# cannot run, but it must not be silent either.
+case "${DEPLOY_WALL_BUDGET_S:-}" in
+  '') : ;;                                  # unset: no ceiling, by design
+  *[!0-9]*)
+    say "  budget: WARNING DEPLOY_WALL_BUDGET_S=${DEPLOY_WALL_BUDGET_S} is not a whole number"
+    say "  budget: of seconds, so NO ceiling is being applied and every wait keeps its full"
+    say "  budget: length. If this runs under a job timeout, fix the value." ;;
+esac
+clamp_lock_wait() {  # clamp_lock_wait REQUESTED WHAT -> sets LOCK_WAIT_ALLOWED
+  local requested="$1" what="$2" now spent
+  now="$(date +%s)"
+  LOCK_WAIT_ALLOWED="$(dr_wait_within_budget \
+      "$requested" "$DEPLOY_STARTED_EPOCH" "${DEPLOY_WALL_BUDGET_S:-0}" "$now" 2>/dev/null)" \
+    || LOCK_WAIT_ALLOWED="$requested"
+  if [ "$LOCK_WAIT_ALLOWED" != "$requested" ]; then
+    spent=$(( now - DEPLOY_STARTED_EPOCH ))
+    say "  budget: the $what wait is cut from ${requested}s to ${LOCK_WAIT_ALLOWED}s -"
+    say "  budget: DEPLOY_WALL_BUDGET_S=${DEPLOY_WALL_BUDGET_S:-0} and ${spent}s of it is already spent."
+    say "  budget: failing here is deliberate - being cancelled inside 'techsara up' is worse."
+  fi
+}
+
 # ------------------------------------------------- the branch name is untrusted
 # DEPLOY_BRANCH arrives from a repository variable or a free-text
 # workflow_dispatch input and is then handed to `git branch` and `git checkout`
@@ -188,7 +252,8 @@ fi
 # between a workflow-triggered deploy and someone running this script by hand,
 # because BOTH paths run this file. `scripts/deploy-lock.sh -- <cmd>` puts any
 # other stack-touching command inside the same lock.
-dr_lock_acquire "${DEPLOY_LOCK_WAIT:-1800}" "deploy.sh --ref $REF$([ "$FULL" = 1 ] && printf ' --full')"
+clamp_lock_wait "${DEPLOY_LOCK_WAIT:-1800}" "deploy lock"
+dr_lock_acquire "$LOCK_WAIT_ALLOWED" "deploy.sh --ref $REF$([ "$FULL" = 1 ] && printf ' --full')"
 
 say "deploy start  root=$ROOT ref=$REF full=$FULL branch=${DEPLOY_BRANCH:-<detached>} log=$LOG"
 
@@ -835,6 +900,10 @@ v1_gateway_health() {  # after `up`: the gateway this tree renders runs its dige
 MANIFEST=""     # set by apply(): the release manifest the digest gate checks against
 RECORD_DIR=""   # set by apply(): .runtime/releases/<stamp>/ for the pre-deploy record
 RECORD_JSON=""  # set by apply(): that directory's record.json
+# READ by apply(): the reversibility verdict to file with the record it writes.
+# It starts as the forward verdict and the rollback path re-points it, because
+# a rollback is a different transition with a different answer.
+APPLY_VERDICT="$REVERSIBILITY_VERDICT"
 apply() {  # apply <sha> - move the checkout and bring the stack up
   local sha="$1" record svc rc
   local -a record_args
@@ -848,11 +917,18 @@ apply() {  # apply <sha> - move the checkout and bring the stack up
   #     the moment the containers are recreated, and every one of them is
   #     needed to roll back to what was there a minute ago.
   record_args=(--note "pre-deploy state, target $sha")
-  # The verdict computed at the forward gate, while /health still answered.
-  # Passed as an ARGUMENT rather than re-derived inside the record script, so
-  # there is exactly one reading and it is the healthy one.
-  if [ -n "$REVERSIBILITY_VERDICT" ]; then
-    record_args+=(--reversibility "$REVERSIBILITY_VERDICT")
+  # The verdict for the transition THIS apply is making, computed while the
+  # numbers behind it were still readable, and passed as an ARGUMENT rather
+  # than re-derived inside the record script so there is exactly one reading.
+  #
+  # APPLY_VERDICT, not REVERSIBILITY_VERDICT: the rollback calls apply() too,
+  # and the forward verdict describes PREVIOUS -> TARGET. Writing it into the
+  # rollback's own release record would file a verdict about a different
+  # transition under a record whose `git.head` is $TARGET, which is the kind of
+  # plausible-looking wrong fact a 3 a.m. reader has no way to catch. The
+  # rollback path re-points this before it calls apply().
+  if [ -n "$APPLY_VERDICT" ]; then
+    record_args+=(--reversibility "$APPLY_VERDICT")
   fi
   record="$("$ROOT/scripts/deploy-record.sh" "${record_args[@]}" 2>>"$LOG" | tail -1)" || record=""
   if [ -n "$record" ] && [ -f "$record" ]; then
@@ -901,7 +977,8 @@ PY
   # Waiting here (default 20 min) rides out a recovery in progress; the lock
   # is released as soon as `techsara up` returns so the health gate below
   # never runs under it.
-  engine_lock_acquire "${ENGINE_LOCK_WAIT:-1200}" "deploy.sh apply $sha$([ "$FULL" = 1 ] && printf ' --full')" \
+  clamp_lock_wait "${ENGINE_LOCK_WAIT:-1200}" "engine recovery lock"
+  engine_lock_acquire "$LOCK_WAIT_ALLOWED" "deploy.sh apply $sha$([ "$FULL" = 1 ] && printf ' --full')" \
     || { say "  engine lock: held by another actor (a recovery in progress?); not restarting anything"; return 1; }
   if [ "$FULL" = 1 ]; then
     # Every container goes, models included. `down` never passes -v, so the
@@ -1080,11 +1157,18 @@ fi
 #
 # THIS USED TO FAIL OPEN. It called schema_gate "$PREVIOUS", and that function
 # returns 0 without checking anything when the live schema version cannot be
-# read - which is the NORMAL state here, because the only way to reach this
-# line is that the health gate failed or `techsara up` failed, i.e. /health is
-# down and the compose project may be mid-recreate, so both the /health read
-# and the `docker exec <pg> psql` fallback can fail together. The gate returned
-# 0, `apply "$PREVIOUS"` ran, and V40 code started on a V41 database.
+# read. The only way to reach this line is that the health gate failed or
+# `techsara up` failed, so /health - the FIRST reading behind
+# dr_live_schema_version - is down by definition and the whole question rests
+# on its `docker exec <pg> psql` fallback. That fallback usually answers: a
+# rolling deploy recreates the application containers and leaves postgres
+# alone. It does NOT answer when the database container was recreated too (a
+# --full deploy), when the compose project is mid-recreate, or when Docker
+# itself is unwell - and on that path the gate returned 0, `apply "$PREVIOUS"`
+# ran, and V40 code started on a V41 database, with nobody watching. Uncommon
+# is not the same as acceptable for an unattended step, which is the whole
+# argument for closing it; calling it "the normal state", as this comment
+# first did, overstated it.
 #
 # Now: the verdict was computed at the forward gate while the stack was still
 # healthy, written into the release record, and only CONSULTED here. Every path
@@ -1150,6 +1234,16 @@ if [ "$ROLLBACK_OK" != 1 ]; then
 fi
 
 say "ROLLING BACK to $PREVIOUS"
+# The rollback's OWN reversibility verdict, for the record apply() is about to
+# write. The transition is TARGET -> PREVIOUS, so the roles swap: what is
+# running now is $TARGET, what is being started is $PREVIOUS, and the live
+# version is the one the gate above just read - which it must have read, or we
+# would not be on this line. Same computation, honest direction; if any of the
+# three numbers is unreadable the verdict is empty and the record says so.
+APPLY_VERDICT="$(dr_reversibility_verdict \
+    "$(dr_code_schema_version_from_git "$TARGET" 2>/dev/null || true)" \
+    "$(dr_code_schema_version_from_git "$PREVIOUS" 2>/dev/null || true)" \
+    "$ROLLBACK_LIVE" 2>/dev/null || true)"
 # The public-work and gateway guards report during a rollback but never wait:
 # the stack is failing its health gate, and restoring it comes first.
 DEPLOY_ROLLING_BACK=1

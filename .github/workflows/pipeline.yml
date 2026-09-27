@@ -1229,16 +1229,43 @@ jobs:
       # health gate and no rollback, which is the one outcome this whole file
       # is arranged to prevent.
       #
-      # 900 + 600 = 25 minutes of waiting inside 45, leaving 20 for the
-      # rollout itself (the measured rolling deploy is about 150 s).
+      # TWO NUMBERS ARE NOT ENOUGH, and getting this wrong twice is the reason
+      # the ceiling is now expressed as a budget rather than as a pair of
+      # per-wait limits. This job waits FOUR times, not two:
+      #
+      #   1. the PREFLIGHT DRY RUN takes the deploy lock. `deploy.sh
+      #      --dry-run` exits after the schema and reversibility reads, but
+      #      dr_lock_acquire runs before that, so the dry run queues too. The
+      #      step above it checks the lock with `flock -n`, which narrows the
+      #      window but does not close it: a hand-run deploy that starts one
+      #      second later is still ahead of this one.
+      #   2. the ROLLOUT takes the deploy lock again - a second invocation,
+      #      a second wait.
+      #   3. apply() takes the ENGINE lock on the way forward, and
+      #   4. apply() takes it AGAIN for the rollback. It looks re-entrant and
+      #      is not: engine_lock_release() unsets ENGINE_LOCK_HELD_BY, so the
+      #      second acquire is a real flock with a real timeout.
+      #
+      # 900 + 900 + 600 + 600 = 50 minutes, which is the number this pair of
+      # variables was set to remove.
+      #
+      # So DEPLOY_WALL_BUDGET_S (per invocation, set on each step below) caps
+      # the SUM of an invocation's waits, and deploy.sh clamps each wait to
+      # what is left of it. The arithmetic that has to hold is asserted from
+      # this file in
+      # .github/workflows/scripts/tests/test_deploy_lock_budget.py, so the
+      # next person to change a number here finds out in the `policy` job
+      # rather than in a cancelled rollout.
       #
       # BEHAVIOUR CHANGE, stated plainly: a hand-run deploy that holds the
       # lock for more than 15 minutes now makes this job FAIL instead of
-      # queueing behind it. That is the intended trade - a diagnosable
-      # failure an operator re-runs beats a SIGTERM landing inside
-      # `techsara up` - but the long wait was chosen deliberately, so it is
-      # worth seeing the sentence. The SCRIPT's own defaults are untouched,
-      # so a hand-run deploy still waits the full 30 + 20 minutes.
+      # queueing behind it, and once the budget is spent a later wait fails
+      # sooner than that. That is the intended trade - a diagnosable failure
+      # an operator re-runs beats a SIGTERM landing inside `techsara up` - but
+      # the long wait was chosen deliberately, so it is worth seeing the
+      # sentence. The SCRIPT's own defaults are untouched and it applies no
+      # budget unless one is given, so a hand-run deploy still waits the full
+      # 30 + 20 minutes.
       DEPLOY_LOCK_WAIT: "900"
       ENGINE_LOCK_WAIT: "600"
     steps:
@@ -1280,9 +1307,18 @@ jobs:
           DEPLOY_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_BRANCH: ${{ github.ref_name }}
-          # Always present on a push, absent on a dispatch. Older than the
-          # gate's completion by roughly the length of CI, so an age measured
-          # from it errs towards refusing - the safe direction.
+          # The ONLY fallback, and a weak one - stated plainly because the
+          # first version of this comment overstated it. It is the COMMITTER's
+          # clock, not the release's: a commit written on Monday and pushed on
+          # Wednesday carries Monday, so an age measured from it can be days
+          # larger than the truth and can refuse a deploy that is not stale at
+          # all. It is used only when the Actions API read above did not work,
+          # the refusal names it as the source, and `gh workflow run` deploys
+          # the same commit deliberately. There is nothing better available
+          # offline: the run's own start time is not in the `github` context
+          # (actionlint rejects `github.run_started_at`; it is not a property),
+          # and every other reading of it is the same API call that just
+          # failed. Absent on a dispatch.
           FALLBACK_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
           GH_API_TOKEN: ${{ github.token }}
         run: |
@@ -1362,6 +1398,14 @@ jobs:
       # configured branch would do, and changes nothing. It is the last chance
       # to see "cannot fast-forward" before it happens.
       - name: Preflight — dry run the real deploy script
+        env:
+          # This invocation takes the deploy lock too (dr_lock_acquire runs
+          # before the --dry-run exit), and the step above has just checked
+          # with `flock -n` that the lock is free. So a long wait here buys
+          # almost nothing and spends the job's ceiling on a read-only check:
+          # 5 minutes, and the whole invocation is capped at the same number.
+          DEPLOY_LOCK_WAIT: "300"
+          DEPLOY_WALL_BUDGET_S: "300"
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"
@@ -1377,6 +1421,14 @@ jobs:
           # .runtime/releases for the newest directory - picks the wrong
           # release whenever a hand-run deploy is in flight beside this one.
           DEPLOY_RESULT_FILE: ${{ runner.temp }}/deploy-result.env
+          # The ceiling for THIS invocation's waiting, all of it: the deploy
+          # lock plus the engine lock on the way forward plus the engine lock
+          # again for the rollback. deploy.sh clamps each wait to what is left,
+          # so their sum cannot pass 20 minutes however the contention falls.
+          # With the dry run's 5 minutes that is 25 minutes of waiting, leaving
+          # 20 of the job's 45 for two `techsara up` runs, two health gates and
+          # this job's other steps.
+          DEPLOY_WALL_BUDGET_S: "1200"
         run: |
           set -euo pipefail
           cd "$TECHSARA_DEPLOY_ROOT"

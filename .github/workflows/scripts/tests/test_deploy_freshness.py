@@ -186,6 +186,32 @@ class AnUnknownAgeIsARefusal(unittest.TestCase):
         self.assertEqual(rc, 1, output)
         self.assertIn("200.0 minutes old", output)
 
+    def test_the_commit_timestamp_fallback_can_refuse_a_release_that_is_not_stale(self):
+        """The known false-refusal path, recorded on purpose rather than hidden.
+
+        The fallback is the COMMITTER's clock. A commit written three hours
+        before it is pushed carries that hour, so with the Actions API read
+        unavailable a perfectly fresh release measures as three hours old and is
+        refused. The first version of this guard described the fallback as
+        "older than the gate's completion by roughly the length of CI", which is
+        not true and made it look safer than it is.
+
+        It is kept because measuring TOO LARGE fails closed and having no
+        measurement at all would not, and because nothing better exists
+        offline - the run's own start time is not a `github` context property.
+        What the refusal owes the operator instead is (a) the source it used,
+        so the reading can be recognised as the weak one, and (b) an escape
+        hatch that works. Both are asserted here. If someone later loosens this
+        into a pass, this test says out loud what was traded away.
+        """
+        rc, output = run(
+            sha=TIP, origin_tip=TIP, gate_completed_at="", fallback_timestamp=minutes_ago(180)
+        )
+        self.assertEqual(rc, 1, output)
+        self.assertIn("the deployed commit's timestamp", output)
+        self.assertIn("the gate's own time was unavailable", output)
+        self.assertIn("gh workflow run pipeline.yml --ref main -f deploy=true", output)
+
     def test_the_gate_time_wins_when_both_are_present(self):
         rc, output = run(
             sha=TIP, origin_tip=TIP,
@@ -197,18 +223,98 @@ class AnUnknownAgeIsARefusal(unittest.TestCase):
 
 
 class TheRefusalSaysHowToProceed(unittest.TestCase):
-    def test_every_refusal_prints_the_literal_gh_workflow_run_command(self):
+    """The advice has to be advice that works, and it is not the same advice.
+
+    CHANGED 2026-09-27, and deliberately so. This class used to assert that
+    ALL FOUR refusals print the literal `gh workflow run ... --ref main -f
+    deploy=true`, i.e. it asserted the defect: for three of the four that
+    command cannot do what the sentence above it promises.
+
+      * `sha != origin_tip` - a dispatch on the branch deploys the TIP, which
+        is the other commit. It never puts the refused commit anywhere, so
+        "to deploy this deliberately" is a false sentence.
+      * an unresolvable tip - a dispatch runs the same tip check against the
+        same unreachable remote and refuses identically.
+      * a malformed github.sha - a dispatch arrives with the same value.
+
+    Telling an operator at 3 a.m. to run a command that cannot work is the
+    exact class of defect this file was added to remove, so the assertion is
+    now per reason: the AGE refusals (where the refused commit IS the tip, so
+    a dispatch really does roll out this same commit) keep the command, and the
+    other three say what actually moves the deploy forward.
+    """
+
+    def test_the_two_age_refusals_print_the_literal_gh_workflow_run_command(self):
         cases = (
-            dict(sha=OTHER, origin_tip=TIP, gate_completed_at=minutes_ago(5)),
-            dict(sha=TIP, origin_tip=TIP, gate_completed_at=minutes_ago(91)),
-            dict(sha=TIP, origin_tip=TIP),
-            dict(sha=TIP, origin_tip=""),
+            dict(sha=TIP, origin_tip=TIP, gate_completed_at=minutes_ago(91)),   # stale
+            dict(sha=TIP, origin_tip=TIP),                                     # unknown age
         )
         for case in cases:
             with self.subTest(**case):
                 rc, output = run(**case)
                 self.assertEqual(rc, 1, output)
                 self.assertIn("gh workflow run pipeline.yml --ref main -f deploy=true", output)
+                self.assertIn("with the age on your name", output)
+
+    def test_every_refusal_says_nothing_on_the_box_was_touched(self):
+        cases = (
+            dict(sha=OTHER, origin_tip=TIP, gate_completed_at=minutes_ago(5)),
+            dict(sha=TIP, origin_tip=TIP, gate_completed_at=minutes_ago(91)),
+            dict(sha=TIP, origin_tip=TIP),
+            dict(sha=TIP, origin_tip=""),
+            dict(sha="abc", origin_tip=TIP),
+        )
+        for case in cases:
+            with self.subTest(**case):
+                rc, output = run(**case)
+                self.assertEqual(rc, 1, output)
+                self.assertIn("Nothing on the box has been touched", output)
+
+    def test_a_commit_the_branch_moved_past_is_not_sent_to_a_dispatch(self):
+        rc, output = run(sha=OTHER, origin_tip=TIP, gate_completed_at=minutes_ago(5))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("refused because", output)
+        # The command is named only to say it is the WRONG one, with the reason.
+        self.assertIn("is NOT the command for this", output)
+        self.assertIn(f"it would deploy {TIP[:12]}, not {OTHER[:12]}", output)
+        # And the thing that does work, on the box, with a person present.
+        self.assertIn(f"scripts/deploy.sh --ref {OTHER}", output)
+
+    def test_an_unresolvable_tip_is_a_runner_fault_not_an_override(self):
+        rc, output = run(sha=TIP, origin_tip="", gate_completed_at=minutes_ago(5))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("refuse identically", output)
+        self.assertIn("Re-run this job once the runner can reach the remote again", output)
+        self.assertNotIn("To deploy this same commit deliberately", output)
+
+    def test_a_malformed_sha_is_reported_as_wiring_not_as_an_override(self):
+        rc, output = run(sha="abc", origin_tip=TIP)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("wiring fault in the workflow", output)
+        self.assertIn("Fix how github.sha is passed to this step", output)
+        self.assertNotIn("To deploy this same commit deliberately", output)
+
+    def test_the_reason_is_named_in_the_facts_table(self):
+        for case, expected in (
+            (dict(sha="abc", origin_tip=TIP), "wiring"),
+            (dict(sha=TIP, origin_tip=""), "tip-unresolved"),
+            (dict(sha=OTHER, origin_tip=TIP, gate_completed_at=minutes_ago(5)), "tip-moved"),
+            (dict(sha=TIP, origin_tip=TIP, gate_completed_at=minutes_ago(91)), "age-stale"),
+            (dict(sha=TIP, origin_tip=TIP), "age-unknown"),
+        ):
+            with self.subTest(expected=expected):
+                rc, output = run(**case)
+                self.assertEqual(rc, 1, output)
+                self.assertIn(f"refused because        {expected}", output)
+
+    def test_the_earliest_refusal_owns_the_advice(self):
+        # Both the tip check and the age check refuse here. A malformed commit
+        # id is not made better by also knowing the release is old, so the
+        # advice is the wiring one and the age one must not also appear.
+        rc, output = run(sha="abc", origin_tip=TIP, gate_completed_at=minutes_ago(500))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("wiring fault in the workflow", output)
+        self.assertNotIn("with the age on your name", output)
 
     def test_a_pass_does_not_print_the_escape_hatch(self):
         rc, output = run(sha=TIP, origin_tip=TIP, gate_completed_at=minutes_ago(5))
