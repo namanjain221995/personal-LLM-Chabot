@@ -684,6 +684,29 @@ async def _open_stream(client, request: dict, **send: Any):
         return opened
 
 
+def _withdraw_window_on_size_refusal(exc: BaseException, base_url: str) -> None:
+    """A send-first request the engine refused ON SIZE proves the cached window
+    is not the one being served, so stop vouching for it.
+
+    `context.settle_pending_count` withdraws the mark when the served window
+    differs from the one a request was sized against — but it only runs on a
+    send that SUCCEEDED. A refusal takes `cancel_pending_count` instead, which
+    kills the count that would have reported the real window, so without this
+    the mark survives and every later turn is sized send-first against the same
+    stale window and refused again (QA 2026-09-27: 4 of 4 turns refused, for
+    the life of the process, whenever the refusal beat the /tokenize answer;
+    the blocking path served all four).
+
+    Only for a request that WAS sized send-first (`has_pending_count`): a size
+    refusal of a request that counted first says nothing about the window's
+    provenance, and must not cost every other endpoint user a round trip.
+    """
+    if not context.has_pending_count():
+        return
+    if isinstance(exc, _bad_request_error()) and _is_size_refusal(exc):
+        context.forget_server_window(base_url)
+
+
 @contextlib.asynccontextmanager
 async def _settling(sized: Sequence[dict], base_url: str):
     """Settle the exact prompt count `_fit` may have left running.
@@ -710,7 +733,8 @@ async def _settling(sized: Sequence[dict], base_url: str):
     """
     try:
         yield
-    except BaseException:
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, base_url)
         context.cancel_pending_count()
         raise
     else:
@@ -1122,6 +1146,9 @@ async def stream_chat_completion(
     try:
         opened = await _open_stream(client, request)
         dispatched = True
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, settings.openai_base_url)
+        raise
     finally:
         # Synchronous, so nothing can be cancelled between the dispatch and
         # the stream being taken below.
@@ -1592,6 +1619,9 @@ async def stream_chat_events(
             budget = None
             opened = await _open_stream(client, request, **send)
         dispatched = True
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, base_url)
+        raise
     finally:
         # Synchronous, so nothing can be cancelled between the dispatch and
         # the stream being taken below.

@@ -592,6 +592,37 @@ async def settle_pending_count(messages: Sequence[dict], base_url: str) -> None:
     _measured.set((pending.messages, base_url, int(count)) if exact else None)
 
 
+def has_pending_count() -> bool:
+    """Was the request in this context sized BEFORE its count came back?
+
+    True only between a send-first `fit_request` and its settlement, which is
+    exactly the window in which a refusal from the engine says something about
+    the window the request was sized against (`forget_server_window`).
+    """
+    return _pending_count.get() is not None
+
+
+def forget_server_window(base_url: str) -> None:
+    """Stop vouching for this endpoint's cached window.
+
+    `settle_pending_count` withdraws the mark when the served window turns out
+    not to be the one a request was sized against — but it only runs when the
+    send SUCCEEDED. When the engine REFUSES the oversized request instead, the
+    count that would have reported the real window is cancelled with the
+    request, nothing is written back, and the endpoint keeps its mark: every
+    later turn is sized send-first against the same stale window and is
+    refused again. Measured 2026-09-27 (QA): 4 of 4 `llm.chat_completion`
+    turns refused, for the life of the process, whenever the refusal arrived
+    before the /tokenize answer, where the blocking path served all four.
+
+    So `llm` calls this on a size refusal of a send-first request. The cache
+    itself is left alone — the next call takes the slow path and re-reads the
+    served window from the very count it is about to use, exactly as the
+    blocking path always did.
+    """
+    _window_from_server.discard(base_url)
+
+
 def cancel_pending_count() -> None:
     """Drop a pending count without waiting for it.
 

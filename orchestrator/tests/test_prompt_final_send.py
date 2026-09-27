@@ -947,3 +947,125 @@ def test_a_send_first_turn_puts_the_SAME_request_on_the_wire_as_a_blocking_one()
     assert sent_first, "the first turn waited for its /tokenize, so this compares nothing"
     assert len(calls) == 2
     assert calls[0] == calls[1], "the send-first turn put a different request on the wire"
+
+
+# ---------------------------------------------------------------------------
+# A send-first request the engine REFUSES on size
+# ---------------------------------------------------------------------------
+#
+# QA 2026-09-27. `settle_pending_count` withdraws the window mark when the
+# served window turns out not to be the one the request was sized against —
+# but it only ever runs when the send SUCCEEDED. When the engine refuses the
+# oversized request instead, `cancel_pending_count` kills the count that would
+# have reported the real window, nothing is written back, and the endpoint
+# keeps its mark: every later turn is sized send-first against the same stale
+# window and is refused again. Measured before the fix below, with the
+# refusal arriving before the /tokenize answer: 4 of 4 `llm.chat_completion`
+# turns refused, and `window_is_server_reported` still True, where the
+# blocking path served all four at max_tokens=2680.
+
+
+def _size_refusal(window: int, wanted: int):
+    """The 400 vLLM answers when prompt + max_tokens exceeds max_model_len."""
+    import openai
+
+    message = (
+        f"This model's maximum context length is {window} tokens. "
+        f"However, you requested {wanted} tokens"
+    )
+    return openai.BadRequestError(
+        message,
+        response=httpx.Response(
+            400, request=httpx.Request("POST", MAIN_URL), json={"error": {"message": message}}
+        ),
+        body={"error": {"message": message}},
+    )
+
+
+class _SizeStrictEngine:
+    """An engine that refuses exactly as vLLM does when the request does not
+    fit the window it is really serving."""
+
+    def __init__(self, served_window: int, prompt_tokens: int, base_url: str = MAIN_URL) -> None:
+        self.base_url = base_url
+        self.served_window = served_window
+        self.prompt_tokens = prompt_tokens
+        self.calls: list = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        wanted = self.prompt_tokens + int(kwargs.get("max_tokens") or 0)
+        if wanted > self.served_window:
+            raise _size_refusal(self.served_window, wanted)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok", reasoning_content=None, tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(prompt_tokens=self.prompt_tokens, completion_tokens=2),
+        )
+
+
+def test_a_send_first_request_refused_on_size_stops_vouching_for_the_window():
+    """The refusal must cost ONE turn, not every turn.
+
+    The engine came back serving 8,192 where a real count had once reported
+    1,000,000. The first turn was sized send-first against the stale window
+    and is refused — that is the documented cost of having already sent. The
+    SECOND turn must count first and be served, which is only possible if the
+    refusal withdrew the mark. The /tokenize answer is held until after the
+    refusal on purpose: that is the ordering in which the count cannot
+    withdraw anything itself.
+    """
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()
+        counter = _Tokenize(count=5000, window=8_192, gate=gate)
+        engine = _SizeStrictEngine(served_window=8_192, prompt_tokens=5000)
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        # A window a real count once vouched for, and no longer the served one.
+        context._window_cache[MAIN_URL] = 1_000_000
+        getattr(context, "_window_from_server", set()).add(MAIN_URL)
+
+        msgs = [{"role": "user", "content": "word " * 3000}]
+        first = None
+        turn = asyncio.get_running_loop().create_task(
+            llm.chat_completion(list(msgs), max_tokens=8000)
+        )
+        for _ in range(200):
+            if engine.calls:
+                break
+            await asyncio.sleep(0)
+        sent_before_its_count = bool(engine.calls) and not gate.is_set()
+        try:
+            await turn
+        except BaseException as exc:  # noqa: BLE001 - the refusal is the point
+            first = type(exc).__name__
+        gate.set()
+        await asyncio.sleep(0)
+        vouched_after_the_refusal = context.window_is_server_reported(MAIN_URL)
+
+        second = None
+        try:
+            await llm.chat_completion(list(msgs), max_tokens=8000)
+            second = "served"
+        except BaseException as exc:  # noqa: BLE001
+            second = type(exc).__name__
+        return (sent_before_its_count, first, vouched_after_the_refusal, second,
+                [c["max_tokens"] for c in engine.calls], len(_still_counting()))
+
+    with pytest.MonkeyPatch.context() as mp:
+        sent_first, first, vouched, second, max_tokens, counting = asyncio.run(run(mp))
+    assert sent_first, "the first turn waited for its count, so this proves nothing"
+    assert first == "BadRequestError", "the oversized request was not refused"
+    assert vouched is False, (
+        "the endpoint still vouches for a window the engine refused a request against, "
+        "so every later turn is sized send-first against it and refused again"
+    )
+    assert second == "served", "the turn after the refusal was refused too"
+    assert max_tokens[0] == 8000 and max_tokens[-1] == 2680, (
+        "the turn after the refusal was not sized from a fresh count"
+    )
+    assert counting == 0, "a count outlived the request that started it"
