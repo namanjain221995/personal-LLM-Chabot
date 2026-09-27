@@ -1144,6 +1144,56 @@ LONG_DOCUMENT_NOTE = "written as a long document"
 #: asked for. _worse()'s own floor is half; half of a nine-call document is
 #: still four pages lost in one call (QA B-1, 2026-09-18).
 CORRECTION_KEEP_FRACTION = 0.9
+#: How many blocks a document may carry: `S.DocumentSpec.blocks`' own
+#: max_length, named once here because two places in this module have to stop
+#: BEFORE validation would refuse the document rather than after.
+DOCUMENT_BLOCK_CEILING = 400
+
+
+def _top_sections(blocks: Sequence[Any]) -> int:
+    """How many level-1 headings a block list carries — raw model JSON and
+    validated block models alike, so the same count serves the draft the
+    sectioned writer returns and the spec the repair splices into."""
+    n = 0
+    for b in blocks:
+        if isinstance(b, dict):
+            if b.get("type") == "heading":
+                try:
+                    level = int(b.get("level") or 1)
+                except (TypeError, ValueError):
+                    level = 1
+                if level == 1:
+                    n += 1
+        elif isinstance(b, S.Heading) and int(b.level) == 1:
+            n += 1
+    return n
+
+
+def _document_shape(blocks: Sequence[Any]) -> Tuple[int, int]:
+    """(blocks, prose characters) counted the way `S.DocumentSpec._shape`
+    counts them, over validated block models."""
+    prose = sum(len(getattr(b, "text", "") or "") for b in blocks)
+    prose += sum(sum(len(i) for i in b.items) for b in blocks if isinstance(b, S.Bullets))
+    return len(blocks), prose
+
+
+def _long_document_note(target: LengthTarget, sections: int, calls: int) -> str:
+    """What the card says when the sectioned writer was chosen.
+
+    `sections` is how many sections the person will COUNT in the file and
+    `calls` what was really spent writing them — both read from the finished
+    work, never from the plan. Measured on the owner's fifteen-section
+    request 2026-09-27, after the coverage repair below was added: an
+    8-section plan, 15 sections delivered, 19 model calls, and this line
+    still read "written in 8 sections over 12 model calls". The whole
+    complaint of 2026-09-22 was our own arithmetic quoted back at him as if
+    it were his request; a count of the delivered file cannot drift from it.
+
+    The tail shape is `types._MODEL_CALLS_RE`'s, which strips it for the
+    reply, so it stays "written in N sections over M model calls".
+    """
+    return (f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about "
+            f"{target.words:,} words, written in {max(1, sections)} sections over {calls} model calls")
 
 
 def _stage_budget_s() -> float:
@@ -1473,6 +1523,7 @@ async def _write_missing_sections(
     written = [b.text for b in body.blocks if isinstance(b, S.Heading) and int(b.level) == 1]
     new: Dict[int, List[Any]] = {}
     calls = 0
+    paced = 0.0
     warnings: List[str] = []
     total = len(requested) or len(missing)
     for n, phrase in enumerate(missing):
@@ -1480,7 +1531,25 @@ async def _write_missing_sections(
             warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
                             "the time this job is allowed ran out")
             break
+        # THE RENDERER'S CEILING, BEFORE THE CALL THAT WOULD CROSS IT. The
+        # sectioned writer stops at the same two numbers by dropping whole
+        # sections off the end; a repair may only ADD, so it stops instead.
+        # Without this the splice goes straight onto `body.blocks`, which
+        # pydantic does not re-validate on assignment, and a document past
+        # `S.DocumentSpec`'s own limits reaches the renderer.
+        held, prose = _document_shape(list(body.blocks)
+                                      + [b for run in new.values() for b in run])
+        if held >= DOCUMENT_BLOCK_CEILING or prose >= T.MAX_TEXT_CHARS:
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the document is already as long as the file format allows")
+            break
         await say(62.0 + 3.0 * n / max(1, len(missing)), f"writing the section \u201c{phrase}\u201d")
+        # Let live chat through between two section calls, exactly as
+        # `compose_sectioned` does: this loop is the same back-to-back run of
+        # engine calls on the same TP=2 engine somebody is chatting to, and
+        # prefix caching is off on the pinned build, so each one re-prefills
+        # the whole material (memory: gdn-mtp-remediation-2026-09-11).
+        paced += await _pace()
         item = dict(planned.get(phrase.strip().casefold()) or {}, heading=phrase)
         item.setdefault("purpose", "")
         item.setdefault("elements", [])
@@ -1508,6 +1577,11 @@ async def _write_missing_sections(
         written.append(phrase)
     if new:
         body.blocks = _place_sections(body.blocks, requested, new)
+    if paced:
+        # Accounting, not a decision: `compose_sectioned` already puts the
+        # wait on the card, and a second "waited Ns" line would only crowd
+        # out the two warnings the answer can carry.
+        log.info("artifact compose: the coverage repair waited %.0fs between sections so chat could answer", paced)
     return calls, warnings
 
 
@@ -1605,7 +1679,8 @@ async def compose_sectioned(
     blocks: List[dict] = [b for sec in sections for b in sec]
     # The renderer's own ceilings, applied by dropping whole sections from
     # the end rather than letting validation refuse the document.
-    while len(sections) > 1 and (len(blocks) > 400 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
+    while len(sections) > 1 and (len(blocks) > DOCUMENT_BLOCK_CEILING
+                                 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
         sections.pop()
         blocks = [b for sec in sections for b in sec]
         warnings.append("the document was cut to the last section that fits the file's page limit")
@@ -1661,6 +1736,13 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
                  and target.words > SECTIONED_WRITER_WORDS
                  and (target.explicit or budget.outline_pass))
     ran_out_of_time = False
+    # Where the long-document note sits in `result_warnings`, and what the
+    # sectioned writer spent: the coverage repair below adds sections and
+    # model calls AFTER the note is written, and the note has to end up
+    # describing the file that was delivered (`_long_document_note`).
+    # Nothing between here and there removes a warning, only appends.
+    note_at = -1
+    sect_calls = 0
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
             req, budget, target, say=say, requested=requested)
@@ -1671,9 +1753,9 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         # person was never told their wording had bought it. It goes FIRST
         # so the answer's two-warning clause carries it (engines/
         # artifact.py::_warning_clause).
+        note_at = len(result_warnings)
         result_warnings.append(
-            f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about {target.words:,} words, "
-            f"written in {len((outline_json or {}).get('sections') or []) or 1} sections over {sect_calls} model calls")
+            _long_document_note(target, _top_sections(raw.get("blocks") or ()), sect_calls))
         result_warnings.extend(sect_warnings)
     else:
         if budget.outline_pass and req.operation != "edit":
@@ -1805,6 +1887,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             calls += repair_calls
             if repair_calls:
                 corrections += 1
+                # The card now describes the repaired file, not the plan.
+                sect_calls += repair_calls
+                if note_at >= 0:
+                    result_warnings[note_at] = _long_document_note(
+                        target, _top_sections(getattr(spec.body, "blocks", ())), sect_calls)
             result_warnings.extend(n for n in repair_notes if n not in result_warnings)
             missing = _missing_sections(spec, requested)
     elif missing:

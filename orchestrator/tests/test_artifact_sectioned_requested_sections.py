@@ -372,3 +372,75 @@ def test_place_sections_adds_and_never_moves_or_rewrites(monkeypatch):
     assert C._place_sections([lead], requested, {3: tail})[0] is lead
     assert [b.text for b in C._place_sections([lead], requested, {3: tail})
             if isinstance(b, S.Heading)] == ["Delta"]
+
+
+# ------------------------------- what the repair costs, and what it says ----
+
+
+def test_the_card_counts_the_sections_delivered_not_the_ones_planned(monkeypatch):
+    """The long-document note is written before the repair runs, so it has to
+    be re-read from the repaired file afterwards.
+
+    Measured on the owner's request 2026-09-27, with the repair in and this
+    guard out: eight sections planned, FIFTEEN delivered, nineteen model
+    calls — and the card said "written in 8 sections over 12 model calls".
+    His complaint of 2026-09-22 was our own arithmetic quoted back at him as
+    if it were his request; a number nobody can check against the file is
+    the same defect with a better answer behind it.
+    """
+    req, model, seen, result = _compose_with_a_short_plan(monkeypatch)
+
+    delivered = [b.text for b in result.spec.body.blocks
+                 if isinstance(b, S.Heading) and b.level == 1]
+    assert delivered == FIFTEEN_SECTIONS, delivered
+    note = next(w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE))
+    assert "written in 15 sections over 19 model calls" in note, note
+    assert result.model_calls == 19, result.model_calls
+    # 8 planned + 3 extensions + 7 repaired = 18 writes, plus the outline.
+    assert model.names().count("artifact_section_write") == 18, model.names()
+    assert result.warnings[0] is note, "the answer carries two warnings; this one goes first"
+    # And the tail the reply strips is still the shape types.py matches.
+    assert T._MODEL_CALLS_RE.search(note) is not None, note
+
+
+def test_the_repair_yields_to_live_chat_between_its_sections(monkeypatch):
+    """The repair is up to seven more back-to-back section calls on the same
+    TP=2 engine somebody is chatting to. `compose_sectioned` consults
+    `pipeline.pace()` once per section call; this loop is the same loop and
+    consults it the same way."""
+    from app.artifacts import pipeline as P
+
+    seen = {"n": 0}
+
+    async def _pace():
+        seen["n"] += 1
+        return 0.0
+
+    monkeypatch.setattr(P, "pace", _pace)
+    req, model, spied, result = _compose_with_a_short_plan(monkeypatch)
+    # 8 planned + 3 extensions are the writer's; the 7 repaired are this loop's.
+    assert model.names().count("artifact_section_write") == 18, model.names()
+    assert seen["n"] == 18, f"one pace() per section call, got {seen['n']}"
+
+
+def test_the_repair_stops_at_the_ceiling_the_file_format_allows(monkeypatch):
+    """A repair may only ADD, so it stops at the document ceiling instead of
+    dropping sections off the end the way the sectioned writer does.
+
+    It matters because the splice assigns straight to `body.blocks`, and
+    pydantic does not re-validate on assignment: without this the document
+    handed to the renderer can be one `S.DocumentSpec` would refuse.
+    """
+    # Four blocks a section, so the ceiling falls in the middle of the repair.
+    monkeypatch.setattr(C, "DOCUMENT_BLOCK_CEILING", 20)
+    req, model, seen, result = _compose_with_a_short_plan(monkeypatch)
+
+    blocks = list(result.spec.body.blocks)
+    assert len(blocks) < 20 + 8, f"the repair ran past the ceiling: {len(blocks)} blocks"
+    assert any("the document is already as long as the file format allows" in w
+               for w in result.warnings), result.warnings
+    # What it could not add is still named, not silently dropped.
+    left = next(w for w in result.warnings if w.startswith("requested sections not found"))
+    assert "Conclusion" in left, left
+    # And what it delivered is a document the schema still accepts.
+    S.DocumentSpec.model_validate(result.spec.body.model_dump(mode="json"))
