@@ -56,19 +56,34 @@ shape the app folds 232 of 240 messages and the shape folded 224, so every
 measurement carried eight extra verbatim messages (+1,760 chars) that
 production would not have sent.
 
-THE FACTS BLOCK IS THE APP'S RENDER PATH, NOT `facts_block(stored)`. Production
-builds the saved-facts system message as
-`facts.facts_block(context.prompt_facts(saved_facts))` (`app/main.py`), so the
-read-side durability gate runs on every turn between the stored rows and the
-prompt. This file used to render `facts.facts_block(stored)` and skip that gate,
-which let the shape carry a row production would never show: measured on this
-shape 2026-09-27, `context.prompt_facts` kept 199 of the 200 stored rows, and
-the one it dropped — "The user asks for Ελληνικά headings…", rejected because
-`facts._TRANSIENT_FACT_RE` matches a leading "the user asks" — was one of the
-ten non-ASCII probes. The test path showed 10 of 10 probes in the block and the
-app path 9 of 10. The probe is now worded durably and the test renders through
-`context.prompt_facts`, so the shape is measured through the call production
-makes.
+THE FACTS BLOCK IS THE APP'S RENDER PATH, NOT `facts_block(stored)`. THREE
+filters stand between a stored row and the rendered block, and `app/main.py`
+runs all three on every turn:
+
+    rows        = db.list_user_facts(viewer, settings.memory_max_facts)
+    saved_facts = identity.usable_facts(rows)          # read_facts(), main.py
+    facts_text  = facts.facts_block(context.prompt_facts(saved_facts))
+
+This file used to render `facts.facts_block(stored)` and skip the second and
+third, which let the shape carry a row production would never show: measured on
+this shape 2026-09-27, `context.prompt_facts` kept 199 of the 200 stored rows,
+and the one it dropped — "The user asks for Ελληνικά headings…", rejected
+because `facts._TRANSIENT_FACT_RE` matches a leading "the user asks" — was one
+of the ten non-ASCII probes. The test path showed 10 of 10 probes in the block
+and the app path 9 of 10. The probe is now worded durably and the test starts
+from `identity.usable_facts` and renders through `context.prompt_facts`, so the
+shape is measured through the whole chain production runs.
+
+`identity.usable_facts` is a no-op ON THIS SHAPE and is called anyway, because
+"it changes nothing today" is what was said about the gate that dropped a probe.
+Measured 2026-09-28 at every ceiling the suite parametrises (1, 2, 9, 10, 11,
+200): `identity.name_from_fact` returns "" for every generated fact and for all
+ten probes — including "The user writes their name as Söderqvist…", which names
+nobody by `_NAME_PATTERNS` — so `usable_facts` keeps 200 of 200. It has teeth
+that this shape does not reach: an unprovenanced `{"fact": "The user's name is
+Söderqvist.", "source": "document"}` is dropped 1 of 1. Every shape row carries
+`source='stated'`, which is in `db.TRUSTED_FACT_SOURCES` = ('stated', 'manual'),
+so a naming row here would survive on provenance even if one were added.
 
 ONLY THE APP'S PUBLIC WRITERS. `build_heavy_account` calls
 `db.create_conversation`, `db.add_user_fact`, `db.save_document`,
@@ -103,9 +118,12 @@ KNOWN LIMITS, NOT FIXED. Three, all deliberate:
   checked 2026-09-27, no character of any entry is in U+0590..U+08FF, every
   entry is already NFC and none contains a combining mark. Bidirectional
   rendering and NFD input are therefore uncovered seams. What the ten probes do
-  cover is byte width (excess over character count 1, 1, 1, 2, 4, 4, 6, 6, 8
-  bytes) across CJK, Latin, Cyrillic and Greek, which is what the refused
-  byte-counting cap broke on.
+  cover is byte width across CJK, Latin, Cyrillic and Greek, which is what the
+  refused byte-counting cap broke on. Re-measured 2026-09-28, TEN excesses of
+  utf-8 bytes over character count, in NON_ASCII_FACTS list order:
+  6, 6, 1, 1, 1, 2, 4, 1, 8, 4 — sorted, 1, 1, 1, 1, 2, 4, 4, 6, 6, 8. An
+  earlier version of this line listed nine of them, dropping one of the four
+  1-byte entries, in a file whose whole claim is the accuracy of its numbers.
 """
 from __future__ import annotations
 
@@ -113,12 +131,20 @@ import ast
 import asyncio
 import hashlib
 import inspect
-import re
 from pathlib import Path
 
 import pytest
 
-from app import compaction, context, db, facts, llm, memory_semantic, recall
+from app import (
+    compaction,
+    context,
+    db,
+    facts,
+    identity,
+    llm,
+    memory_semantic,
+    recall,
+)
 from app.config import settings
 
 # ---------------------------------------------------------------------------
@@ -161,15 +187,33 @@ PRODUCTION_MEMORY_MAX_FACTS_AS_OBSERVED = 200
 #: all ten were dropped: the shape carried them in the database only.
 #:
 #: EVERY ENTRY MUST BE DURABLE. Production renders
-#: `facts.facts_block(context.prompt_facts(saved_facts))`, so a fact that
-#: `facts.is_durable` rejects is dropped on every turn however it is stored.
-#: The Greek probe read "The user ASKS FOR Ελληνικά headings to stay
+#: `facts.facts_block(context.prompt_facts(identity.usable_facts(rows)))`, so a
+#: fact that `facts.is_durable` rejects is dropped on every turn however it is
+#: stored. The Greek probe read "The user ASKS FOR Ελληνικά headings to stay
 #: untranslated in the appendix." and was dropped for exactly that reason —
-#: `facts._TRANSIENT_FACT_RE` matches a leading "the user asks" — so keep these
-#: phrased as standing preferences ("keeps", "prefers", "always", "never") and
-#: never as a request. `test_every_shape_fact_survives_the_read_side_gate` is
-#: the guard: it fails if any entry here, or any generated fact, stops
-#: surviving the gate.
+#: `facts._TRANSIENT_FACT_RE` matches a leading "the user asks".
+#:
+#: HOW TO WORD A REPLACEMENT — two different mechanisms, and only one of them
+#: rescues a sentence. Measured 2026-09-28:
+#:
+#: * "always", "never", "prefers"/"prefer", "by default", "from now on" are in
+#:   `facts._DURABLE_PREFERENCE_RE`, so they make a sentence durable even when
+#:   it ALSO reads as a request: "The user asks that the team always keeps
+#:   Ελληνικά headings untranslated." is durable (TRANSIENT=True,
+#:   DURABLE_PREFERENCE=True).
+#: * "keeps" is NOT in that pattern. It works only by not tripping
+#:   `facts._TRANSIENT_FACT_RE`, which is anchored at the start of the
+#:   sentence. The shipped probe, "The user keeps Ελληνικά headings
+#:   untranslated in the appendix.", is durable with TRANSIENT=False and
+#:   DURABLE_PREFERENCE=False — nothing is rescuing it, it simply never asks.
+#:   Put a transient verb in front of it and "keeps" saves nothing: "The user
+#:   asks that the team keeps Ελληνικά headings untranslated." is NOT durable.
+#:
+#: So: lead with a standing statement, or carry one of the standing words.
+#: "The user keeps asking for X" happens to survive (the intervening "keeps"
+#: means `_TRANSIENT_FACT_RE` never reaches "asking"), but do not rely on that.
+#: `test_every_shape_fact_survives_the_read_side_gate` is the guard: it fails if
+#: any entry here, or any generated fact, stops surviving the gate.
 NON_ASCII_FACTS = [
     "The user reads the 日本語 edition of the operations handbook, not the English one.",
     "The user prefers dates written as 2026年9月22日 in internal summaries.",
@@ -697,12 +741,13 @@ def test_the_facts_reach_the_ceiling_and_keep_their_non_ascii(ceiling):
 def test_every_shape_fact_survives_the_read_side_gate(ceiling):
     """No row of this shape may be one production would drop on every turn.
 
-    Production renders `facts.facts_block(context.prompt_facts(saved_facts))`
-    (`app/main.py`), so `context.prompt_facts` sits between the store and the
-    prompt on every turn and a row it rejects is stored cost that is never
-    prompt cost. This ran as a pure function — no database, no builder — so it
-    fails on the CONSTANTS, where the defect lives, rather than only in the
-    end-to-end test.
+    Production renders
+    `facts.facts_block(context.prompt_facts(identity.usable_facts(rows)))`
+    (`app/main.py`), so BOTH read-side filters sit between the store and the
+    prompt on every turn and a row either one rejects is stored cost that is
+    never prompt cost. This runs as a pure function — no database, no builder —
+    so it fails on the CONSTANTS, where the defect lives, rather than only in
+    the end-to-end test.
 
     It catches the defect this file shipped with: the Greek probe read "The
     user asks for Ελληνικά headings…", which `facts._TRANSIENT_FACT_RE` rejects
@@ -729,6 +774,34 @@ def test_every_shape_fact_survives_the_read_side_gate(ceiling):
         "the read-side gate drops non-ASCII probes: "
         f"{[f for f in NON_ASCII_FACTS if f not in set(non_ascii_kept)]}; word "
         "them as standing preferences, never as requests"
+    )
+    # THE FILTER BEFORE THE GATE, on the same constants. `read_facts()` in
+    # `app/main.py` returns `identity.usable_facts(db.list_user_facts(...))`, so
+    # a row that names somebody without trusted provenance never reaches
+    # `prompt_facts` at all. It is a no-op on this shape — measured 2026-09-28,
+    # `identity.name_from_fact` is "" for every generated fact and all ten
+    # probes, so it keeps every row at every ceiling — and asserting the no-op
+    # is the point: "it changes nothing today" is exactly what was true of the
+    # durability gate until a probe was worded as a request.
+    rows = [
+        {"fact": f, "source": HEAVY_FACT_SOURCE, "source_excerpt": f}
+        for f in shape_facts
+    ]
+    usable = [row["fact"] for row in identity.usable_facts(rows)]
+    assert usable == shape_facts, (
+        f"{len(shape_facts) - len(usable)} of {len(shape_facts)} facts at "
+        f"ceiling {ceiling} are dropped by identity.usable_facts, so read_facts() "
+        "never returns them and the shape stores rows the prompt cannot carry: "
+        f"{[f for f in shape_facts if f not in set(usable)]}"
+    )
+    # …and the filter does have teeth this shape simply never reaches, so the
+    # assertion above is not passing because `usable_facts` is inert. Written
+    # with an untrusted source, a naming row IS dropped.
+    assert identity.usable_facts(
+        [{"fact": "The user's name is Söderqvist.", "source": "document"}]
+    ) == [], (
+        "identity.usable_facts no longer drops an unprovenanced naming row, so "
+        "the assertion above proves nothing about the shape"
     )
 
 
@@ -932,18 +1005,26 @@ def test_the_heavy_account_writes_the_rows_it_claims(as_user, stub_embeddings):
 def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings):
     """Stored is not the same as sent, and only sent is measurable.
 
-    TWO THINGS STAND BETWEEN A STORED ROW AND THE PROMPT, and this test has to
-    go through both, because production does:
+    THREE THINGS STAND BETWEEN A STORED ROW AND THE PROMPT, and this test goes
+    through all three, because `app/main.py` does — `read_facts()` is the first
+    two and the render is the third:
 
-        facts.facts_block(context.prompt_facts(saved_facts))   app/main.py
+        rows        = db.list_user_facts(viewer, settings.memory_max_facts)
+        saved_facts = identity.usable_facts(rows)
+        facts_text  = facts.facts_block(context.prompt_facts(saved_facts))
 
-    1. `context.prompt_facts`, the read-side durability gate, runs every turn.
+    1. `identity.usable_facts` drops a row that NAMES the person unless its V40
+       provenance says they are its source. On THIS shape it is a no-op, and it
+       is called anyway rather than reasoned about: measured 2026-09-28,
+       `name_from_fact` is "" for all 200 rows, so it keeps 200 of 200. The
+       assertion below is what will say so the day a probe names somebody.
+    2. `context.prompt_facts`, the read-side durability gate, runs every turn.
        Measured on this shape 2026-09-27, it kept 199 of 200 rows; the one it
        dropped was a non-ASCII probe worded as a request, so rendering
        `facts.facts_block(stored)` here showed 10 of 10 probes while the prompt
        production builds showed 9 of 10. This test called the un-gated form
        until then, which is why the defect was invisible.
-    2. `facts._BLOCK_MAX_CHARS`. On the unfixed shape that alone failed 10/10:
+    3. `facts._BLOCK_MAX_CHARS`. On the unfixed shape that alone failed 10/10:
        the facts were written first, so `db.list_user_facts` (updated_at DESC)
        put them last and the block stopped after 56 of 200 rows. The prompt the
        harness measured, and the prompt a byte-counting saved-facts cap would
@@ -958,15 +1039,31 @@ def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings)
 
     ceiling = int(settings.memory_max_facts)
     stored = db.list_user_facts(user_id, ceiling)
-    # Gate first, exactly as production does. Asserting the gate keeps
-    # everything separately from asserting the block renders everything keeps
-    # the two failure modes distinguishable in the message.
-    kept = context.prompt_facts(stored)
+    # Filter in production's order, exactly as `read_facts()` does: the
+    # identity filter first, on the rows `list_user_facts` returned, then the
+    # durability gate on its result. Asserting each filter separately from the
+    # block keeps the failure modes distinguishable in the message.
+    saved_facts = identity.usable_facts(stored)
+    unusable = [
+        row["fact"]
+        for row in stored
+        if row["fact"] not in {r["fact"] for r in saved_facts}
+    ]
+    assert unusable == [], (
+        f"{len(unusable)} of {len(stored)} stored facts are dropped by "
+        "identity.usable_facts before the prompt ever sees them, so the shape "
+        "stores rows read_facts() never returns: a row that NAMES the person is "
+        "kept only when its V40 provenance says they are its source — reword it "
+        f"or write it with a trusted source: {unusable}"
+    )
+    kept = context.prompt_facts(saved_facts)
     dropped = [
-        row["fact"] for row in stored if row["fact"] not in {r["fact"] for r in kept}
+        row["fact"]
+        for row in saved_facts
+        if row["fact"] not in {r["fact"] for r in kept}
     ]
     assert dropped == [], (
-        f"{len(dropped)} of {len(stored)} stored facts are dropped by "
+        f"{len(dropped)} of {len(saved_facts)} usable facts are dropped by "
         "context.prompt_facts on EVERY turn, so the shape stores rows the "
         f"prompt never carries: {dropped}"
     )
@@ -998,11 +1095,134 @@ def test_the_non_ascii_facts_reach_the_rendered_prompt(as_user, stub_embeddings)
     )
 
 
-#: How `app/main.py` builds the saved-facts system message, as a pattern rather
-#: than a literal so renaming the variable does not trip the guard below.
-PRODUCTION_FACTS_BLOCK_CALL = re.compile(
-    r"facts\.facts_block\(\s*context\.prompt_facts\("
-)
+# ---------------------------------------------------------------------------
+# the render-path guard
+#
+# Small AST readers, shared by both ends of
+# `test_the_rendered_prompt_test_uses_the_call_production_makes`. There is no
+# regex in this section on purpose, and that test's docstring is the reason:
+# the guard it replaced was a source-TEXT search over `app/main.py` and it was
+# wrong in both directions.
+# ---------------------------------------------------------------------------
+
+
+def _calls_to(tree: ast.AST, attr: str) -> list[ast.Call]:
+    """Every `<anything>.<attr>(...)` call in `tree`.
+
+    Matched on the attribute alone, not on the module name, so
+    `from . import identity as _identity` — which is how `app/main.py` binds it
+    — and any future rename of the import still count.
+    """
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+    ]
+
+
+def _names_bound_from(tree: ast.AST, attr: str) -> set[str]:
+    """Names assigned the result of a `<anything>.<attr>(...)` call.
+
+    So the rows may travel through a local — `gated = context.prompt_facts(x)`
+    then `facts.facts_block(gated)` — which is behaviour-identical to the
+    nested spelling and must not fail this guard. `await` is unwrapped.
+    """
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            value = node.value
+            if isinstance(value, ast.Await):
+                value = value.value
+            if not (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == attr
+            ):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            bound.update(t.id for t in targets if isinstance(t, ast.Name))
+    return bound
+
+
+def _renders_through(tree: ast.AST, *, outer: str, inner: str) -> list[ast.Call]:
+    """The `outer(...)` calls whose single argument came through `inner(...)`.
+
+    Either spelling counts: `outer(inner(rows))`, or `name = inner(rows)`
+    followed by `outer(name)`.
+    """
+    gated = _names_bound_from(tree, inner)
+    through = []
+    for call in _calls_to(tree, outer):
+        if len(call.args) != 1:
+            continue
+        arg = call.args[0]
+        if isinstance(arg, ast.Await):
+            arg = arg.value
+        if (isinstance(arg, ast.Name) and arg.id in gated) or (
+            isinstance(arg, ast.Call)
+            and isinstance(arg.func, ast.Attribute)
+            and arg.func.attr == inner
+        ):
+            through.append(call)
+    return through
+
+
+def _assignment_sources(tree: ast.AST, name: str) -> set[str]:
+    """Every name reachable, transitively, through what `name` is assigned.
+
+    `saved_facts = await reads.get("facts", read_facts)` puts `reads` and
+    `read_facts` in the set; one more hop would follow an alias. This is how
+    the guard below links the rendered rows to the reader that produced them
+    without depending on the exact spelling of the read registry.
+    """
+    edges: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            continue
+        if node.value is None:  # a bare annotation, `x: int`
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        mentioned = {n.id for n in ast.walk(node.value) if isinstance(n, ast.Name)}
+        for target in targets:
+            if isinstance(target, ast.Name):
+                edges.setdefault(target.id, set()).update(mentioned)
+    seen: set[str] = set()
+    queue = list(edges.get(name, ()))
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        queue.extend(edges.get(current, ()))
+    return seen
+
+
+def _readers_applying(tree: ast.AST, attr: str) -> set[str]:
+    """Functions whose return value came through `<anything>.<attr>(...)`.
+
+    `read_facts` in `app/main.py` is one: it returns
+    `_identity.usable_facts(rows)`.
+    """
+    readers: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        bound = _names_bound_from(node, attr)
+        for statement in ast.walk(node):
+            if not isinstance(statement, ast.Return) or statement.value is None:
+                continue
+            value = statement.value
+            if isinstance(value, ast.Await):
+                value = value.value
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == attr
+            ) or (isinstance(value, ast.Name) and value.id in bound):
+                readers.add(node.name)
+    return readers
 
 
 def test_the_rendered_prompt_test_uses_the_call_production_makes():
@@ -1016,72 +1236,170 @@ def test_the_rendered_prompt_test_uses_the_call_production_makes():
     later, the next time a fact is worded as a request. This test is what makes
     that edit fail now instead.
 
-    It pins the path from BOTH ends, because either end can move:
+    It pins the path from BOTH ends, and BOTH ends are walked as an AST, for the
+    reason `test_the_public_writer_guard_rejects_evasions` gives: a text check
+    is walked past with string surgery. The first version of this guard checked
+    the app's end with a source-text regex,
+    `re.compile(r"facts\\.facts_block\\(\\s*context\\.prompt_facts\\(")`, over
+    `app/main.py`, and it was wrong in both directions. Measured 2026-09-28,
+    25 tests in this file, own throwaway Postgres:
 
-    * the app's end — `app/main.py` must still build the block as
-      `facts.facts_block(context.prompt_facts(...))`. If production stops
-      gating, or gates somewhere else, the shape's claim to render "the call
-      production makes" is stale and this is where a reader is told.
-    * the test's end — walked as an AST, not searched as text, for the reason
-      `test_the_public_writer_guard_rejects_evasions` gives: a text check is
-      walked past with string surgery.
+        production stops gating, old call left as a comment above the new one
+            `# was: facts_text = facts.facts_block(context.prompt_facts(...))`
+            `facts_text = facts.facts_block(saved_facts)`
+            regex guard  25 passed      <- FALSE NEGATIVE, saw nothing
+            this guard   1 failed, 24 passed
+        production still gates, through a local (behaviour-identical refactor)
+            `gated_facts = context.prompt_facts(saved_facts)`
+            `facts_text = facts.facts_block(gated_facts)`
+            regex guard  1 failed, 24 passed   <- FALSE POSITIVE, correct code
+            this guard   25 passed
+        production stops gating, call deleted outright
+            regex guard  1 failed, 24 passed
+            this guard   1 failed, 24 passed
+        unchanged `app/main.py`
+            regex guard  25 passed
+            this guard   25 passed
+
+    Commenting out the old line while writing the new one is the commonest way
+    that edit is actually made, and a comment is the one thing an AST cannot
+    see — which is the whole argument for walking one.
+
+    WHAT EACH END ASSERTS, and how strong it is:
+
+    * the app's end, first assertion (DATAFLOW): `app/main.py` must render
+      `facts_block` over rows that came through `prompt_facts`, nested or via a
+      local. This is the one the regex got wrong twice.
+    * the app's end, second assertion (DATAFLOW, one hop weaker): the rows that
+      reach that render must come from a reader that returns
+      `identity.usable_facts(...)`. The link runs through the read registry —
+      `saved_facts = await reads.get("facts", read_facts)` — so it is followed
+      by name, through `_assignment_sources`, not by evaluating the registry.
+      Renaming `read_facts` is fine; moving the identity filter out of the
+      reader is not, and that is the point.
+    * the test's end: the end-to-end test must call `identity.usable_facts`,
+      feed its result to `context.prompt_facts`, and render `facts_block` over
+      that. Same three filters, same order.
+
+    WHAT THIS GUARD DOES NOT CATCH. It reads the source of `app/main.py`, so a
+    filter that is skipped at RUNTIME still passes: the Fast-lane timeout branch
+    (`saved_facts = []`, see KNOWN LIMITS) is a real production path this file
+    does not model, and a conditional that made the gate unreachable would read
+    as gated here. Nothing in this file can close that; it needs the running
+    app.
     """
     main_py = Path(__file__).resolve().parents[1] / "app" / "main.py"
     assert main_py.is_file(), (
         f"{main_py} is not where this guard expects the app to be, so the guard "
         "cannot check that the shape still renders the block production renders"
     )
-    main_source = main_py.read_text(encoding="utf-8")
-    assert PRODUCTION_FACTS_BLOCK_CALL.search(main_source), (
+    app_tree = ast.parse(main_py.read_text(encoding="utf-8"))
+
+    app_renders = _renders_through(app_tree, outer="facts_block", inner="prompt_facts")
+    assert app_renders, (
         f"{main_py} no longer builds the saved-facts block as "
-        "facts.facts_block(context.prompt_facts(...)). The shape below renders "
-        "through context.prompt_facts because production did; re-read the new "
-        "call and change both, or the shape measures a prompt production does "
-        "not send"
+        "facts.facts_block(context.prompt_facts(...)) — not nested, and not "
+        "through a local either. The shape below renders through "
+        "context.prompt_facts because production did; re-read the new call and "
+        "change both, or the shape measures a prompt production does not send"
     )
-
-    tree = ast.parse(inspect.getsource(test_the_non_ascii_facts_reach_the_rendered_prompt))
-    # Names bound from a `context.prompt_facts(...)` call, so the gated rows can
-    # travel through a local without defeating the check.
-    gated: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
-            continue
-        callee = node.value.func
-        if (
-            isinstance(callee, ast.Attribute)
-            and callee.attr == "prompt_facts"
-            and isinstance(callee.value, ast.Name)
-            and callee.value.id == "context"
-        ):
-            gated.update(t.id for t in node.targets if isinstance(t, ast.Name))
-    assert gated, (
-        "the end-to-end test no longer calls context.prompt_facts, so it renders "
-        "a block production never sends: production applies that gate on every "
-        "turn and it dropped 1 of this shape's 200 rows when the defect shipped"
-    )
-
-    rendered = [
-        call
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "facts_block"
+    # AND NOTHING ELSE RENDERS ONE. Requiring only that SOME gated render exists
+    # would let a second, un-gated `facts.facts_block(saved_facts)` be added
+    # beside the gated one — the shape would then be measuring one of two
+    # prompts. Measured 2026-09-28, `app/main.py` holds exactly one
+    # `facts_block` call (line 5048) and it is the gated one, so the honest
+    # assertion is all of them, not one of them.
+    all_app_renders = _calls_to(app_tree, "facts_block")
+    ungated = [
+        call.lineno for call in all_app_renders if call not in app_renders
     ]
-    assert rendered, "the end-to-end test no longer renders facts.facts_block"
-    for call in rendered:
-        assert len(call.args) == 1, "facts_block takes the rows as one argument"
+    assert not ungated, (
+        f"{main_py} renders facts.facts_block at line(s) {ungated} over rows "
+        "that did not go through context.prompt_facts, beside the gated render "
+        f"at line(s) {[c.lineno for c in app_renders]}. If that is deliberate — "
+        "a render that genuinely must not be gated — say so here and in this "
+        "file's docstring, because the shape measures the GATED prompt and a "
+        "reader needs to know there are two"
+    )
+
+    #: The rows each of those renders was handed, so the reader behind them can
+    #: be identified. A nested `prompt_facts(saved_facts)` and a local both end
+    #: at a name here.
+    rendered_rows: set[str] = set()
+    for call in app_renders:
         arg = call.args[0]
-        ok = (isinstance(arg, ast.Name) and arg.id in gated) or (
-            isinstance(arg, ast.Call)
-            and isinstance(arg.func, ast.Attribute)
-            and arg.func.attr == "prompt_facts"
+        if isinstance(arg, ast.Call):
+            rendered_rows.update(
+                n.id for n in ast.walk(arg) if isinstance(n, ast.Name)
+            )
+        elif isinstance(arg, ast.Name):
+            rendered_rows.add(arg.id)
+            rendered_rows.update(_assignment_sources(app_tree, arg.id))
+
+    identity_readers = _readers_applying(app_tree, "usable_facts")
+    assert identity_readers, (
+        f"{main_py} no longer reads the saved facts through "
+        "identity.usable_facts, so the third filter between a stored row and "
+        "the prompt is gone. The shape below starts from usable_facts because "
+        "production did: either it moved, in which case change both, or it was "
+        "dropped, in which case an unprovenanced row naming somebody else can "
+        "reach the prompt again (app/identity.py, measured 2026-09-21)"
+    )
+    linked = {
+        name
+        for row in rendered_rows
+        for name in ({row} | _assignment_sources(app_tree, row))
+        if name in identity_readers
+    }
+    assert linked, (
+        "the rows app/main.py renders into the facts block no longer come from "
+        f"a reader that applies identity.usable_facts. Readers that do apply it: "
+        f"{sorted(identity_readers)}; names reaching the render: "
+        f"{sorted(rendered_rows)}. The shape below filters through usable_facts "
+        "first because production did; re-read the new read path and change both"
+    )
+
+    test_tree = ast.parse(
+        inspect.getsource(test_the_non_ascii_facts_reach_the_rendered_prompt)
+    )
+    usable = _names_bound_from(test_tree, "usable_facts")
+    assert usable, (
+        "the end-to-end test no longer calls identity.usable_facts, so it "
+        "renders rows read_facts() would not have returned: production applies "
+        "that filter to every saved-facts read"
+    )
+    gated_through_identity = [
+        call
+        for call in _calls_to(test_tree, "prompt_facts")
+        if len(call.args) == 1
+        and (
+            (isinstance(call.args[0], ast.Name) and call.args[0].id in usable)
+            or (
+                isinstance(call.args[0], ast.Call)
+                and isinstance(call.args[0].func, ast.Attribute)
+                and call.args[0].func.attr == "usable_facts"
+            )
         )
-        assert ok, (
-            "facts.facts_block must be rendered over rows that went through "
-            f"context.prompt_facts (gated names: {sorted(gated)}); rendering the "
-            "stored rows skips the gate production runs on every turn"
-        )
+    ]
+    assert gated_through_identity, (
+        "the end-to-end test calls identity.usable_facts and context.prompt_facts "
+        "but does not feed one into the other, so the two filters are not in "
+        f"production's order (usable_facts binds: {sorted(usable)})"
+    )
+
+    test_renders = _renders_through(
+        test_tree, outer="facts_block", inner="prompt_facts"
+    )
+    all_renders = _calls_to(test_tree, "facts_block")
+    assert all_renders, "the end-to-end test no longer renders facts.facts_block"
+    for call in all_renders:
+        assert len(call.args) == 1, "facts_block takes the rows as one argument"
+    assert len(test_renders) == len(all_renders), (
+        "facts.facts_block must be rendered over rows that went through "
+        f"context.prompt_facts (gated names: "
+        f"{sorted(_names_bound_from(test_tree, 'prompt_facts'))}); rendering the "
+        "stored rows skips the gate production runs on every turn"
+    )
 
 
 def test_a_second_run_reuses_the_account_and_builds_its_own_conversation(
