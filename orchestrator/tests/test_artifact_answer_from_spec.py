@@ -133,10 +133,20 @@ def _create(owner, monkeypatch, *, composed=None, conv=CONV):
     return answer, events
 
 
-def _ask(owner, text, *, conv=CONV, effort="fast", history=(), action="answer", **fields):
-    """A turn whose intent carries the gate's QUESTION verdict."""
+def _ask(owner, text, *, conv=CONV, effort="fast", history=(), action="none", **fields):
+    """A turn whose intent carries the gate's QUESTION verdict.
+
+    THE VERDICT THE GATE ACTUALLY SHIPS (2026-09-27): `action` stays "none" —
+    no caller has to learn a new action to stop making a file — and
+    `answer_about_artifact` is True. This used to pass action="answer", one of
+    five action strings describe.ANSWER_ACTIONS advertised while the gate and
+    the reader were unsynchronised; those five are now one, because "describe"
+    and "inspect" are plausible future action names for a FILE request and
+    advertising them would divert it silently.
+    """
     events, emit = _events()
     intent = I.ArtifactIntent(action, rule="artifact-question", instruction=text, raw_text=text, **fields)
+    intent.answer_about_artifact = True
     assert D.is_artifact_question(intent) is True, "the seam this file is about"
     answer = asyncio.run(engine.run_artifact_engine(
         text, list(history), emit, intent=intent, conversation_id=conv, user_id=owner, generation_id="g2", effort=effort))
@@ -322,9 +332,9 @@ def test_an_ambiguous_question_asks_which_file_without_promising_a_change(owner,
 
 
 def test_the_flag_only_verdict_reaches_the_answer_too(owner, monkeypatch):
-    """The gate may record the verdict as `action="answer"` or as a boolean
-    beside `action="none"`. Both must reach this path, because which one lands
-    is the other track's choice."""
+    """The gate records the verdict as a boolean beside `action="none"`, which
+    is what it ships; an action of the same name is still read, so a later gate
+    that promotes the flag to an action needs no change in the engine."""
     _create(owner, monkeypatch)
     for flag in D.ANSWER_FLAGS:
         events, emit = _events()

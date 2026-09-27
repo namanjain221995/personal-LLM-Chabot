@@ -584,3 +584,119 @@ def test_verifier_a_backstop_job_without_a_card_does_not_say_here_is_the_file(as
     tokens = "".join(d["text"] for k, d in events if k == "token")
     assert "That file could not be made right now." in tokens and "Here is the file." not in tokens
     assert "artifacts" not in [d for k, d in events if k == "meta"][-1]
+
+
+# ---- a question about the PERSON'S file is not answered from OUR spec (e2e) --
+
+
+def _verdict_gate(monkeypatch):
+    """Make the intent gate record the QUESTION verdict for every turn.
+
+    The gate that really records it is the other half of this programme
+    (app/artifacts/intent.py, track `question-not-edit`); on this branch alone
+    `describe.is_artifact_question` can never fire, so the wiring in main.py
+    would be untested. Patched here, the whole turn runs through the real
+    route with the real engine.
+    """
+    from app.artifacts import intent as intent_rules
+
+    async def decide_with_hook(text, hook=None, **kw):
+        intent = intent_rules.decide(text, **{k: v for k, v in kw.items() if k != "has_dataset"})
+        intent.action = "none"
+        intent.answer_about_artifact = True
+        return intent
+
+    monkeypatch.setattr(intent_rules, "decide_with_hook", decide_with_hook)
+    monkeypatch.setenv("FAST_LANE_ENABLED", "false")
+
+
+def _make_artifact(client, conv, intent):
+    pipeline.set_composer(app_main._stub_composer_for_tests)
+    resp = _post(client, "Create a PDF about the pricing change.", conv=conv, intent=intent)
+    assert resp.status_code == 200
+    final = [d for k, d in _parse_sse(resp.text) if k == "meta"][-1]
+    assert final["route"] == "artifact" and final["artifacts"][0]["status"] == "completed"
+    return final["artifacts"][0]
+
+
+def test_a_question_about_an_earlier_photo_is_not_answered_from_the_artifacts_spec(monkeypatch):
+    """THE DEFECT (verifier, 2026-09-27). The read-back branch sits above both
+    image routes, so with the verdict set this very turn came back, measured on
+    this tree before the carve-out landed:
+
+        route=artifact
+        artifact_answer={... 'kind': 'document', 'topics': ['charts'],
+                         'grounded': True, 'model_used': False}
+        tokens='**Pricing Update** (v1) is a document of 1 page.'
+        run_vision_engine called with: []
+
+    — a description of the file WE made, to someone asking about their photo,
+    and the photo never opened. `wants_file` is False for such a turn, so
+    main.py's own image read at the top of the branch is skipped too: nothing
+    in the whole turn opens the file."""
+    from app.artifacts import db as adb
+    from app.engines import image_memory
+    from app.engines import vision as vision_mod
+
+    seen: list = []
+
+    async def fake_vision(text, images, history, emit, **kw):
+        seen.append(text)
+        await emit("token", {"text": "The chart shows tickets by priority."})
+        await emit("meta", {"route": "vision", "effort": kw.get("effort") or "fast"})
+        return "The chart shows tickets by priority."
+
+    monkeypatch.setattr(vision_mod, "run_vision_engine", fake_vision)
+
+    with TestClient(app) as client:
+        ref = _make_artifact(client, "art-chat-rs1", "int-art-rs1")
+        owner = int(db.get_user_by_username(_owner_name())["id"])
+        image_memory.remember(
+            "art-chat-rs1",
+            ["data:image/png;base64," + base64.b64encode(b"\x89PNG" + b"x" * 40).decode()],
+            question="here is a photo of the ticket chart",
+            answer="a bar chart of tickets by priority",
+            user_id=owner,
+        )
+        _verdict_gate(monkeypatch)
+        resp = _post(client, "what does the chart in that photo say?",
+                     conv="art-chat-rs1", intent="int-art-rs2")
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        final = [d for k, d in events if k == "meta"][-1]
+        tokens = "".join(d["text"] for k, d in events if k == "token")
+
+    assert seen == ["what does the chart in that photo say?"], "the photo was never read"
+    assert final["route"] == "vision", final
+    assert "artifact_answer" not in final, final
+    assert "Pricing Update" not in tokens, tokens
+    # And no version was published either way.
+    assert len(adb.list_versions(ref["artifact_id"], owner)) == 1
+
+
+def test_the_anchor_question_still_reads_the_artifact_back(monkeypatch):
+    """The other side of the same clause: with nothing of the person's own in
+    the conversation, the question is answered from the stored spec and no
+    version is written. Without this the carve-out could be widened until the
+    class it serves is empty."""
+    from app.artifacts import db as adb
+
+    with TestClient(app) as client:
+        ref = _make_artifact(client, "art-chat-rs2", "int-art-rs3")
+        owner = int(db.get_user_by_username(_owner_name())["id"])
+        _verdict_gate(monkeypatch)
+        resp = _post(client, "Ok What This sheet have ??",
+                     conv="art-chat-rs2", intent="int-art-rs4")
+        assert resp.status_code == 200
+        events = _parse_sse(resp.text)
+        final = [d for k, d in events if k == "meta"][-1]
+        tokens = "".join(d["text"] for k, d in events if k == "token")
+
+    assert final["route"] == "artifact", final
+    assert final["artifact_answer"]["grounded"] is True, final
+    # NOT `artifacts`: re-sending the ref would put the file card back in the
+    # transcript, which is what the person read as "it made the file again".
+    assert "artifacts" not in final, final
+    assert "**Pricing Update**" in tokens, tokens
+    assert "This is a text answer" not in tokens
+    assert len(adb.list_versions(ref["artifact_id"], owner)) == 1
