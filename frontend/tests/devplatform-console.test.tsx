@@ -1121,11 +1121,27 @@ describe('the limits form', () => {
     // waitFor's own default is 1 s: on a loaded CI runner the save round trip
     // crossed it and the failure read "expected false to be true" (run
     // 2026-09-16), a timeout wearing an assertion's clothes.
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
+    //
+    // THIRD OCCURRENCE, 2026-09-22 (run 35779832211): 15 s was crossed too,
+    // and the stack named `waitFor.timeout` -- no PUT observed yet, every
+    // assertion still true. The file runs all 139 of its tests in 4.20 s in
+    // isolation, so this is the machine, not the work. The sensitivity is
+    // userEvent on a saturated 2-vCPU hosted runner: one `user.click` is six
+    // dispatched events, each a macrotask hop, while vitest runs 181 files
+    // across those 2 vCPUs.
+    //
+    // Widened once more rather than rewritten, because this file's
+    // convention is userEvent (26 uses against one fireEvent.click) and
+    // swapping these calls would test something different from their
+    // siblings. IF IT RECURS, DO NOT WIDEN IT AGAIN: make the save
+    // observable rather than polled -- have the route handler resolve a
+    // promise the test awaits -- so the assertion stops depending on the
+    // wall clock at all.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 30_000 });
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(put.url).toBe(`/api/devplatform/projects/${PROJECT.id}/limits`);
     expect(JSON.parse(String(put.init.body))).toEqual({ input_tpm: 5 });
-  });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1227,14 +1243,30 @@ describe('usage limits when the server does not enforce them', () => {
     // waitFor's own default is 1 s: on a loaded CI runner the save round trip
     // crossed it and the failure read "expected false to be true" (run
     // 2026-09-16), a timeout wearing an assertion's clothes.
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
+    //
+    // THIRD OCCURRENCE, 2026-09-22 (run 35779832211): 15 s was crossed too,
+    // and the stack named `waitFor.timeout` -- no PUT observed yet, every
+    // assertion still true. The file runs all 139 of its tests in 4.20 s in
+    // isolation, so this is the machine, not the work. The sensitivity is
+    // userEvent on a saturated 2-vCPU hosted runner: one `user.click` is six
+    // dispatched events, each a macrotask hop, while vitest runs 181 files
+    // across those 2 vCPUs.
+    //
+    // Widened once more rather than rewritten, because this file's
+    // convention is userEvent (26 uses against one fireEvent.click) and
+    // swapping these calls would test something different from their
+    // siblings. IF IT RECURS, DO NOT WIDEN IT AGAIN: make the save
+    // observable rather than polled -- have the route handler resolve a
+    // promise the test awaits -- so the assertion stops depending on the
+    // wall clock at all.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 30_000 });
     const put = calls.find((c) => c.method === 'PUT')!;
     expect(JSON.parse(String(put.init.body))).toEqual({ max_output_tokens: 2048 });
     // This case renders the console twice and drives userEvent through a full
     // save; on a loaded CI runner it crossed vitest's 5 s default and failed
     // as a timeout while every assertion still held (2026-09-15). The work is
     // the same, the wall clock is not this test's subject.
-  }, 30_000);
+  }, 60_000);
 
   it('keeps every enforced field and its stored number when the server says the limits are on', async () => {
     state.search = new URLSearchParams('tab=limits');
@@ -1250,7 +1282,7 @@ describe('usage limits when the server does not enforce them', () => {
     expect(screen.getByText(/Saved: 60\./)).toBeTruthy();
     expect(screen.getByText(/They are enforced in the orchestrator/)).toBeTruthy();
     expect(screen.queryByText('Unlimited')).toBeNull();
-  });
+  }, 60_000);
 
   it('shows Unlimited in the project settings dialog instead of a stored rate', async () => {
     state.search = new URLSearchParams('tab=projects');
@@ -1519,10 +1551,26 @@ describe('the models table', () => {
     // waitFor's own default is 1 s: on a loaded CI runner the save round trip
     // crossed it and the failure read "expected false to be true" (run
     // 2026-09-16), a timeout wearing an assertion's clothes.
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
+    //
+    // THIRD OCCURRENCE, 2026-09-22 (run 35779832211): 15 s was crossed too,
+    // and the stack named `waitFor.timeout` -- no PUT observed yet, every
+    // assertion still true. The file runs all 139 of its tests in 4.20 s in
+    // isolation, so this is the machine, not the work. The sensitivity is
+    // userEvent on a saturated 2-vCPU hosted runner: one `user.click` is six
+    // dispatched events, each a macrotask hop, while vitest runs 181 files
+    // across those 2 vCPUs.
+    //
+    // Widened once more rather than rewritten, because this file's
+    // convention is userEvent (26 uses against one fireEvent.click) and
+    // swapping these calls would test something different from their
+    // siblings. IF IT RECURS, DO NOT WIDEN IT AGAIN: make the save
+    // observable rather than polled -- have the route handler resolve a
+    // promise the test awaits -- so the assertion stops depending on the
+    // wall clock at all.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 30_000 });
     expect(calls.find((c) => c.method === 'PUT')!.url).toBe('/api/devplatform/models/techsara-35b');
     expect(calls.some((c) => c.method === 'PATCH')).toBe(false);
-  });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2136,9 +2184,25 @@ describe('the models page lists every model the platform runs', () => {
     // waitFor's own default is 1 s: on a loaded CI runner the save round trip
     // crossed it and the failure read "expected false to be true" (run
     // 2026-09-16), a timeout wearing an assertion's clothes.
-    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 15_000 });
+    //
+    // THIRD OCCURRENCE, 2026-09-22 (run 35779832211): 15 s was crossed too,
+    // and the stack named `waitFor.timeout` -- no PUT observed yet, every
+    // assertion still true. The file runs all 139 of its tests in 4.20 s in
+    // isolation, so this is the machine, not the work. The sensitivity is
+    // userEvent on a saturated 2-vCPU hosted runner: one `user.click` is six
+    // dispatched events, each a macrotask hop, while vitest runs 181 files
+    // across those 2 vCPUs.
+    //
+    // Widened once more rather than rewritten, because this file's
+    // convention is userEvent (26 uses against one fireEvent.click) and
+    // swapping these calls would test something different from their
+    // siblings. IF IT RECURS, DO NOT WIDEN IT AGAIN: make the save
+    // observable rather than polled -- have the route handler resolve a
+    // promise the test awaits -- so the assertion stops depending on the
+    // wall clock at all.
+    await waitFor(() => expect(calls.some((c) => c.method === 'PUT')).toBe(true), { timeout: 30_000 });
     expect(calls.find((c) => c.method === 'PUT')!.url).toBe('/api/devplatform/models/techsara-whisper');
-  });
+  }, 60_000);
 
   it('keeps every publish switch on a 400px phone, with the ceilings on the cards instead of the table', async () => {
     mountModels();
