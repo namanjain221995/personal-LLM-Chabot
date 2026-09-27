@@ -439,7 +439,24 @@ fi
 printf '\n== SUMMARY ==\n'
 printf '  server        : PostgreSQL %s (production is %s)\n' "$SERVER_MAJOR" "$DEPLOYED_MAJOR"
 printf '  image tested  : %s (V%s)\n' "$ORCH_IMAGE" "$LATEST"
-printf '  upgraded from : %s\n' "${FROM_IMAGE:-<skipped: no older image on this box>}"
+# What a PERSON reads has to agree with the record the gate reads. `$FROM_IMAGE`
+# is the image this run was GIVEN, and it is set before anything tries to read
+# that image's migration table -- so naming it on its own claims an upgrade in
+# the one state where the arm above reported that the upgrade did NOT run:
+# image present, version unreadable. Measured today with the stubbed docker and
+# `--from-image orch:old`: this block printed "upgraded from : orch:old" four
+# lines under "FAIL cannot read the migration table out of the baseline image
+# orch:old", which is the single sentence in the SUMMARY that contradicted the
+# rest of it. `$FROM_VERSION` is the one thing that is only ever set once the
+# old schema was really read, so it is what the sentence turns on.
+if [ -z "$FROM_IMAGE" ]; then
+  UPGRADED_FROM='<skipped: no older image on this box>'
+elif [ -z "${FROM_VERSION:-}" ]; then
+  UPGRADED_FROM="<skipped: $FROM_IMAGE, its migration table could not be read>"
+else
+  UPGRADED_FROM="$FROM_IMAGE (V$FROM_VERSION)"
+fi
+printf '  upgraded from : %s\n' "$UPGRADED_FROM"
 printf '  passed        : %d\n  failed        : %d\n' "$PASS" "$FAIL"
 
 # The machine-readable outcome, written by the code that counted. `latest` and

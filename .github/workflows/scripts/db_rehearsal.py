@@ -506,13 +506,28 @@ def _incomplete_reason(arm: str, rec: dict) -> str:
 
     In a gate that zero is a lie by omission. `--require-upgrade` makes the
     script itself refuse, and this is the second lock on the same door: the
-    record says which image it upgraded FROM, so a record that upgraded from
-    nothing is caught here even if the flag is ever dropped from the workflow.
+    record says which image it upgraded FROM and which schema version it read
+    OUT of that image, so a record that upgraded from nothing is caught here
+    even if the flag is ever dropped from the workflow.
+
+    There are two ways for the phase not to have run, and the record shows them
+    apart: no baseline image at all (`from_image` empty), and a baseline image
+    whose migration table could not be read (`from_image` set, `from_version`
+    empty -- the script reports that as a FAILED assertion, so it should never
+    reach here as a `pass`, but this lock does not depend on that).
     """
-    if arm == "fresh-and-upgrade" and not str(rec.get("from_image") or ""):
+    if arm != "fresh-and-upgrade":
+        return ""
+    if not str(rec.get("from_image") or ""):
         return (
             "the record names no baseline image, so the UPGRADE phase was skipped. "
             "Fresh-install assertions alone do not prove an upgrade is safe."
+        )
+    if not str(rec.get("from_version") or ""):
+        return (
+            "the record names a baseline image whose migration table could not be read, "
+            "so there was no old schema to migrate forward and the UPGRADE phase was "
+            "skipped. Fresh-install assertions alone do not prove an upgrade is safe."
         )
     return ""
 

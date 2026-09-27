@@ -42,6 +42,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -248,7 +249,14 @@ def _record(arm: str, outcome: str, **extra) -> dict:
     return rec
 
 
-PASSING_UPGRADE = _record("fresh-and-upgrade", "pass", from_image="orchestrator:baseline")
+#: A complete upgrade record: BOTH the baseline image and the schema version
+#: that was read out of it. `scripts/deploy-db-rehearsal.sh` always writes both
+#: keys, and an empty `from_version` beside a named image is its way of saying
+#: the image's migration table could not be read -- so a fixture that stood for
+#: "this arm really ran" must carry the version too.
+PASSING_UPGRADE = _record(
+    "fresh-and-upgrade", "pass", from_image="orchestrator:baseline", from_version="40"
+)
 PASSING_REVERSE = _record("reversibility", "pass")
 
 
@@ -293,6 +301,32 @@ class TheVerdictRefusesSilence(unittest.TestCase):
     def test_a_missing_from_image_key_is_treated_the_same_as_an_empty_one(self):
         ok, _ = db_rehearsal.build_verdict([_record("fresh-and-upgrade", "pass"), PASSING_REVERSE])
         self.assertFalse(ok)
+
+    def test_a_baseline_whose_migration_table_could_not_be_read_is_not_proved_either(self):
+        """The second way for the upgrade phase not to have run.
+
+        The script names the baseline image it was GIVEN before it tries to read
+        the image's migration table, so a record can carry `from_image` and still
+        describe an arm that never ran; `from_version` is what says it ran. Today
+        that state also carries failed>=1, but this lock must not depend on the
+        arm's own count being right -- that is the point of a second lock.
+        """
+        for version in ("", None):
+            with self.subTest(from_version=version):
+                rec = _record(
+                    "fresh-and-upgrade",
+                    "pass",
+                    from_image="postgres:18-alpine",
+                    detail="the upgrade arm did NOT run: the migration table could not be read",
+                )
+                if version is not None:
+                    rec["from_version"] = version
+                ok, lines = db_rehearsal.build_verdict([rec, PASSING_REVERSE])
+                self.assertFalse(ok, lines)
+                line = next(one for one in lines if "fresh-and-upgrade" in one)
+                self.assertIn("NOT PROVED", line)
+                self.assertIn("migration table could not be read", line)
+                self.assertNotIn("**FACT**", line)
 
     def test_an_extra_arm_is_reported_but_does_not_decide(self):
         ok, lines = db_rehearsal.build_verdict(
@@ -429,7 +463,30 @@ class RunsTheRealScript:
         self.log = root / "docker.log"
         self.bindir = bindir
 
+    #: Every variable that decides what a scenario IS, and therefore none of
+    #: which may arrive from the shell that ran `python3 -m unittest`.
+    #:
+    #: `REHEARSAL_*` is what the `docker` stub reads to choose what to pretend,
+    #: and `DR_REHEARSAL_*` is the script's own env interface for `--pg-image`,
+    #: `--expect-major` and `--require-upgrade`. Either one, set ambiently, silently
+    #: rewrites the scenario a test thought it was running. Measured today on this
+    #: branch before this stripping existed: `REHEARSAL_FAKE_DB=1 python3 -m unittest
+    #: tests.test_db_rehearsal` -> FAILED (failures=2), and one of the two was
+    #: `test_an_unreachable_server_says_so_instead_of_exiting_silently` -- the guard
+    #: for the silent exit this whole file exists to pin -- because the stub's fake
+    #: database walked the script straight past the unreachable 127.0.0.1:1.
+    #:
+    #: A PREFIX and not a list of names on purpose: a list would have to be kept in
+    #: step with the stub, which is what let three new variables in unnoticed. A
+    #: test that wants one passes it through `**env`, which lands after this.
+    _SCENARIO_ENV_PREFIXES = ("REHEARSAL_", "DR_REHEARSAL_")
+
     def _run(self, *args: str, **env: str) -> subprocess.CompletedProcess:
+        inherited = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(self._SCENARIO_ENV_PREFIXES)
+        }
         return subprocess.run(
             ["bash", str(self.script), *args],
             capture_output=True,
@@ -437,7 +494,7 @@ class RunsTheRealScript:
             timeout=120,
             check=False,
             env={
-                **os.environ,
+                **inherited,
                 "PATH": f"{self.bindir}:{os.environ.get('PATH', '')}",
                 "REHEARSAL_DOCKER_LOG": str(self.log),
                 "TECHSARA_DEPLOY_ROOT": str(self.script.parent.parent),
@@ -448,6 +505,79 @@ class RunsTheRealScript:
             },
             stdin=subprocess.DEVNULL,
         )
+
+
+class TheHarnessRefusesToInheritAScenario(RunsTheRealScript, unittest.TestCase):
+    """The variables that choose a scenario must come from the test, not the shell.
+
+    Both scenarios below are ones a real test in this file depends on, and each
+    ambient variable here was measured today to change that scenario when it was
+    inherited. The first one is the important one: an inherited `REHEARSAL_FAKE_DB`
+    gives the script a fake database, so the test that proves an unreachable server
+    is reported instead of exiting silently reported a full green run instead.
+    """
+
+    UNREACHABLE = (
+        "--image", "orch:new",
+        "--server", "postgresql://u:p@127.0.0.1:1/postgres",
+        "--pg-image", "postgres@sha256:abc",
+        "--expect-major", "18",
+    )
+
+    #: Every row below is paired with a scenario that MEASURABLY changes when that
+    #: variable is inherited: checked by reverting the stripping and watching each
+    #: subtest go red. `DR_REHEARSAL_*` gets its own scenario because `UNREACHABLE`
+    #: passes `--pg-image` and `--expect-major` on the command line, which win over
+    #: the env -- so pairing those two with THIS scenario would pass either way and
+    #: prove nothing.
+
+    def test_an_ambient_variable_cannot_walk_a_scenario_past_the_unreachable_server(self):
+        for name, value in (("REHEARSAL_FAKE_DB", "1"), ("REHEARSAL_STACK", "1")):
+            with self.subTest(var=name), mock.patch.dict(os.environ, {name: value}):
+                proc = self._run(*self.UNREACHABLE)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("cannot reach the rehearsal server", proc.stderr)
+
+    def test_an_ambient_variable_cannot_supply_a_declaration_the_test_withheld(self):
+        """`DR_REHEARSAL_*` is the script's env interface for the CLI declaration.
+
+        This scenario passes NEITHER `--pg-image` nor `--expect-major`, so the
+        refusal it pins is "no stack and no declaration, so the major is unknown".
+        Half a declaration arriving from the shell turns that into the "TOGETHER"
+        refusal, which is a different refusal about a different mistake.
+        """
+        for name, value in (
+            ("DR_REHEARSAL_EXPECT_MAJOR", "17"),
+            ("DR_REHEARSAL_PG_IMAGE", "postgres@sha256:zzz"),
+        ):
+            with self.subTest(var=name), mock.patch.dict(os.environ, {name: value}):
+                proc = self._run(
+                    "--image", "orch:new", "--server", "postgresql://u:p@127.0.0.1:1/postgres"
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("unknown major", proc.stderr)
+                self.assertNotIn("TOGETHER", proc.stderr)
+
+    def test_an_ambient_variable_cannot_rewrite_the_stubbed_upgrade_scenario(self):
+        for name, value in (
+            ("REHEARSAL_FAKE_MAJOR", "17"),
+            ("REHEARSAL_FAKE_LATEST", "99"),
+            ("REHEARSAL_UNREADABLE_IMAGE", "orch:old"),
+            ("REHEARSAL_STACK", "1"),
+        ):
+            with self.subTest(var=name), mock.patch.dict(os.environ, {name: value}):
+                proc = self._run(
+                    *self.UNREACHABLE, "--from-image", "orch:old", REHEARSAL_FAKE_DB="1"
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, combined)
+                self.assertIn("upgraded from : orch:old (V41)", combined)
+
+    def test_a_variable_the_test_passes_still_reaches_the_script(self):
+        """The stripping must not decay into "the stub can never be configured"."""
+        proc = self._run(*self.UNREACHABLE, "--from-image", "orch:old", REHEARSAL_FAKE_DB="1")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("upgrading from orch:old (V41)", proc.stdout)
 
 
 class TheScriptRefusesTheWrongPostgres(RunsTheRealScript, unittest.TestCase):
@@ -596,6 +726,14 @@ class TheUpgradeArmRefusesABaselineItCannotRead(RunsTheRealScript, unittest.Test
         # findings survive, the run still summarises, and the record is written.
         self.assertIn("== SUMMARY ==", combined)
         self.assertIn("failed        : 1", combined)
+        # And the line a person reads has to say the same thing as the record.
+        # `$FROM_IMAGE` is set before its migration table is read, so printing it
+        # bare here announced an upgrade in the one state whose whole point is
+        # that the upgrade did not happen.
+        self.assertIn(
+            "upgraded from : <skipped: orch:old, its migration table could not be read>",
+            combined,
+        )
         self.assertTrue(out.exists(), "no arm JSON was written:\n" + combined)
         record = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(record["outcome"], "fail")
@@ -619,6 +757,10 @@ class TheUpgradeArmRefusesABaselineItCannotRead(RunsTheRealScript, unittest.Test
         combined = proc.stdout + proc.stderr
         self.assertNotIn("cannot read the migration table out of the baseline image", combined)
         self.assertIn("upgrading from orch:old (V41)", combined)
+        # The other direction of the SUMMARY line: it must not decay into
+        # "<skipped>" for a baseline that WAS read.
+        self.assertIn("upgraded from : orch:old (V41)", combined)
+        self.assertNotIn("upgraded from : <skipped", combined)
         self.assertEqual(proc.returncode, 0, combined)
         self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["outcome"], "pass")
 
