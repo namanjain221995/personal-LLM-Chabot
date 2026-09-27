@@ -20,6 +20,7 @@ What is checked here:
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -108,7 +109,12 @@ def test_every_nearest_view_offered_is_itself_drawable():
     ("make a choropleth of records by state", "choropleth"),
     ("draw a sankey of the funnel stages", "sankey"),
     ("make a word cloud of the feedback", "wordcloud"),
-    ("draw a network diagram of how the services talk", "network"),
+    # A network laid out FROM DATA, which is the limit the `why` names. The
+    # ask that names no data moved to
+    # test_a_network_diagram_of_named_parts_is_no_longer_refused below.
+    ("make a network graph of this data", "network"),
+    ("draw a node-link view of the co-authorship table", "network"),
+    ("draw a network diagram from this CSV", "network"),
     ("show me a venn diagram of the two lists", "venn"),
 ])
 def test_named_visuals_this_platform_cannot_draw(text, token):
@@ -402,3 +408,68 @@ def test_no_unsupported_reason_still_claims_a_diagram_cannot_be_drawn():
     for visual in V.unsupported():
         assert "draws no flow diagrams" not in visual.why, visual.token
         assert "draws no node-and-edge diagrams" not in visual.why, visual.token
+
+
+def test_a_network_diagram_of_named_parts_is_no_longer_refused():
+    """The refusal that outlived its reason, and the second half of the
+    correction this file's sankey tests are the first half of.
+
+    feat/document-vocabulary dropped `flow diagram` from the sankey pattern
+    because render/diagrams.py draws one, and reworded the network `why` from
+    "this platform draws no node-and-edge diagrams" to "never from the rows of
+    a table" — but left the PATTERN matching every network ask, so the
+    sentence and the gate disagreed. Measured before this edit: "draw a
+    network diagram of how the services talk" was REFUSED while "draw an
+    architecture diagram of the platform" and "can you draw a flow diagram of
+    the pipeline" were ANSWERED. Same picture, different noun.
+
+    It matters more on this branch than it did on r2: the composer can now ask
+    a section for a diagram, so a technical report draws these, and a person
+    who names the thing the report contains was the only one told no.
+    """
+    for text in (
+        "draw a network diagram of how the services talk",
+        "show me a network diagram of the request path",
+        "can you show me a network diagram of how these services talk to each other",
+        "a network diagram of the services",
+        "network diagram of the orchestrator and the two models please",
+    ):
+        assert V.named_unsupported(text) is None, text
+        assert V.asked_for(text) is None, text
+        assert I.decide(text).unsupported_visual == "", text
+
+
+@pytest.mark.parametrize("text", [
+    # The layout-algorithm names mean nothing except over rows.
+    "draw a node-link view of the co-authorship table",
+    "give me a force-directed layout of these rows",
+    "make a network graph of this data",
+    "show a network chart of the citations",
+    # ... and the diagram ask that points at its data, either way round.
+    "draw a network diagram from this CSV",
+    "build a network diagram from these rows",
+    "from the dataset, draw a network diagram",
+    "draw a network diagram of the adjacency matrix",
+    "show me a network diagram of this table",
+])
+def test_a_network_laid_out_from_data_is_still_refused(text):
+    """Dropping the bare noun must not drop the real limit with it. Nothing
+    here lays a graph out from an edge list, a matrix or a column of rows, and
+    the boxes-and-arrows renderer cannot: it draws what the model NAMES."""
+    visual = V.asked_for(text)
+    assert visual is not None and visual.token == "network", text
+
+
+def test_the_network_refusal_and_its_reason_cannot_drift_apart_again():
+    """The gate is held against the SENTENCE, so neither can move alone.
+
+    The `why` says the limit is the rows of a table. This asserts the pattern
+    agrees: an ask naming no data is not matched, and an ask naming data is.
+    A future edit that re-broadens the pattern without rewriting the reason
+    fails here rather than in production.
+    """
+    network = V.by_token("network")
+    assert network is not None
+    assert "never from the rows of a table" in network.why
+    assert re.search(network.pattern, "a network diagram of this table", re.I)
+    assert not re.search(network.pattern, "a network diagram of the services", re.I)

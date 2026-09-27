@@ -92,6 +92,17 @@ def test_a_scoped_section_call_is_told_a_diagram_is_available(monkeypatch):
     Built the way `test_a_scoped_section_call_is_told_a_section_has_parts`
     builds it: the model call is replaced, and what is inspected is the
     message `_write_one_section` actually assembled.
+
+    ASSERTED ON THE SCOPED HALF ONLY, because `in seen[0]` passed either
+    way. `seen[0]` is the WHOLE system message, and `_material_messages`
+    has already filled it with `_KIND_GUIDE['document']`, which carries the
+    same clause — so with the `+ DIAGRAM_CLAUSE +` inside
+    `_write_one_section` reverted this file still reported "10 passed"
+    (measured 2026-09-28), and the per-section prompt is the biggest
+    per-call cost and the route a long technical report actually takes.
+    Splitting on the marker is the idiom
+    `test_artifact_compose.py::test_a_scoped_section_call_is_told_a_section_has_parts`
+    already uses for exactly this reason.
     """
     seen: list = []
 
@@ -110,7 +121,19 @@ def test_a_scoped_section_call_is_told_a_diagram_is_available(monkeypatch):
         {"heading": "Architecture", "purpose": "how the parts connect", "elements": ["paragraphs", "diagram"]},
         written=[], words=400, position=(1, 5)))
     assert seen, "the section writer did not reach the model"
-    assert C.DIAGRAM_CLAUSE in seen[0]
+    marker = "YOU ARE WRITING ONE SECTION"
+    assert marker in seen[0], "the scoped append is no longer recognisable"
+    assert C.DIAGRAM_CLAUSE in seen[0].split(marker)[1], (
+        "the SCOPED half of the section prompt does not name a diagram; the whole-document "
+        "guide naming one is not the same thing, and this assertion used to be satisfied by it"
+    )
+    # The duplication is deliberate — see the DIAGRAM_CLAUSE comment block —
+    # so it is pinned rather than left to look like a slip. The cost of the
+    # second copy is in tests/test_diagram_clause_budget.py.
+    assert seen[0].count(C.DIAGRAM_CLAUSE) == 2, (
+        "the sectioned system message says the clause once from _KIND_GUIDE['document'] and once "
+        "from the scoped append; if that changed, re-measure the per-section cost"
+    )
 
 
 def test_the_prompt_teaches_exactly_the_roles_the_schema_accepts():
@@ -219,3 +242,62 @@ def test_a_deck_and_a_workbook_are_never_told_about_a_diagram():
         assert C.DIAGRAM_CLAUSE not in C._KIND_GUIDE[kind]
     assert "diagram" not in " ".join(S.Slide.model_fields)
     assert C.DIAGRAM_CLAUSE in C._requested_line(["Architecture"], kind="document")
+
+
+def test_no_assembled_deck_or_workbook_prompt_mentions_a_diagram():
+    """The same promise as the test above, asserted on what the model RECEIVES.
+
+    The test above checks two of the THREE places a kind can be told about a
+    block, and the third was leaking. `_material_messages` builds its system
+    message from `_KIND_GUIDE[kind]` AND `_TEMPLATE_GUIDE[template_id]`, and
+    `_TEMPLATE_GUIDE` is one flat dict holding document, deck and workbook ids
+    together, read with no kind gate. Measured over all 42 kind x template_id
+    pairs on 2026-09-28: `presentation|technical_report` and
+    `workbook|technical_report` each carried the technical report's own
+    diagram sentence, +124 characters, into a prompt whose schema has no
+    diagram in it.
+
+    LATENT, NOT LIVE — `formats.template_for` is kind-scoped and the three id
+    namespaces are disjoint today — but nothing pinned that disjointness
+    either, so both halves are pinned here: the gate, and the accident it
+    was relying on.
+    """
+    every_id = sorted({t for k in ("document", "presentation", "workbook") for t in S.templates_for(k)})
+    for kind in ("presentation", "workbook"):
+        for tpl in every_id:
+            req = C.ComposeRequest(kind=kind, formats=["pdf"], template_id=tpl, effort="think",
+                                   instruction="Write about the services.",
+                                   material=C.Material(instruction="Write about the services."))
+            system, user = (m["content"] for m in C._material_messages(
+                req, budget=T.EFFORT_BUDGETS["think"], target=C.target_for(req),
+                requested=["Architecture", "Limits"]))
+            assert C.DIAGRAM_CLAUSE not in system, f"{kind}|{tpl} system"
+            assert "diagram" not in system.lower(), f"{kind}|{tpl} system says 'diagram'"
+            assert "diagram" not in user.lower(), f"{kind}|{tpl} user says 'diagram'"
+    # A document still gets it, from both the kind guide and the template.
+    doc = C.ComposeRequest(kind="document", formats=["pdf"], template_id="technical_report", effort="think",
+                           instruction="Write about the services.",
+                           material=C.Material(instruction="Write about the services."))
+    doc_system = C._material_messages(doc, budget=T.EFFORT_BUDGETS["think"], target=C.target_for(doc))[0]["content"]
+    assert C.DIAGRAM_CLAUSE in doc_system and "A diagram where the architecture" in doc_system
+
+
+def test_the_template_id_namespaces_are_disjoint():
+    """What made the leak above latent rather than live, pinned so that a new
+    id shared between two kinds cannot quietly make it live. `grep -rn
+    'templates_for' tests/` returned nothing before this."""
+    for a, b in (("document", "presentation"), ("document", "workbook"), ("presentation", "workbook")):
+        shared = (set(S.templates_for(a)) & set(S.templates_for(b))) - {"generic"}
+        assert not shared, f"{a} and {b} now share {sorted(shared)}; _template_guide is the only thing between them"
+
+
+def test_a_template_from_another_kind_falls_back_to_the_generic_guide():
+    """The gate itself, on the pairing that leaked: a deck asked to use the
+    technical report's id gets the generic guide, not the document's."""
+    assert C._template_guide("presentation", "technical_report") == C._TEMPLATE_GUIDE["generic"]
+    assert C._template_guide("workbook", "technical_report") == C._TEMPLATE_GUIDE["generic"]
+    assert C._template_guide("document", "technical_report") == C._TEMPLATE_GUIDE["technical_report"]
+    assert C._template_guide("presentation", "ceo") == C._TEMPLATE_GUIDE["ceo"]
+    assert C._template_guide("workbook", "tracker") == C._TEMPLATE_GUIDE["tracker"]
+    # A stranger id behaves as the bare `.get` miss always did.
+    assert C._template_guide("document", "no_such_template") == C._TEMPLATE_GUIDE["generic"]
