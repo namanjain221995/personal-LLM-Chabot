@@ -85,8 +85,24 @@ _PROBE_W, _VERDICT_W = 18, 19
 
 
 class _Writer:
-    """Every line printed by this script passes through here, and therefore
-    through `sanitize`. There is no second way out."""
+    """Every line of the REPORT passes through here, and therefore through
+    `sanitize`.
+
+    Not every line this script prints. Three sites bypass it, all of them on
+    stderr, all of them fixed text chosen in this file, and all of them at
+    points where the report they would otherwise have joined does not exist:
+
+      * `_write_summary`'s note that the summary could not be written;
+      * `main`'s `--deploy-root` usage error;
+      * `main`'s last-resort refusal, which renders the exception's CLASS NAME
+        through `box_probes.render_fact` and never its message.
+
+    None of the three interpolates anything that came from the box, a file or an
+    argument. The earlier wording here was "there is no second way out", which
+    was simply not true; the property that IS true, and the one the allowlist
+    exists for, is that nothing derived from outside this file reaches stdout or
+    stderr without passing through an allowlist first.
+    """
 
     def __init__(self, out: TextIO) -> None:
         self._out = out
@@ -129,11 +145,11 @@ def run(
         )
 
     for result in results:
-        if not result.detail:
+        if not result.report_lines:
             continue
         say("")
         say(f"{result.probe}: the report engine_bind.py printed for itself")
-        for line in result.detail:
+        for line in result.report_lines:
             say(f"  {line}")
 
     refusals = [r for r in results if not r.ok]
@@ -247,7 +263,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         default_branch=args.default_branch,
         controller_url=args.controller_url,
     )
-    return run(env, summary_path=args.summary)
+    # THIS JOB ALWAYS REACHES A VERDICT. `deploy` has this job in its `needs:`,
+    # so a run that ends in a traceback instead of a verdict is a deploy that
+    # never happens AND an operator with no reason for it. box_probes.run_probe
+    # already turns anything a PROBE does into a refusal; this is the rest of
+    # the script -- the rendering, the wrapping, the summary write -- and it is
+    # the difference between "NOT READY, here is why" and a stack trace that
+    # also happens to print filesystem paths into a world-readable log.
+    #
+    # It refuses rather than passes: a reading that could not be completed is
+    # not evidence that the box is fine. Only the exception's CLASS NAME is
+    # printed, through the same allowlist every fact goes through, because an
+    # exception's message is how a value out of a file reaches a public log.
+    try:
+        return run(env, summary_path=args.summary)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as exc:  # noqa: BLE001 - a refusal, whatever went wrong
+        kind = box_probes.render_fact("exception_type", type(exc).__name__)
+        print(
+            f"\nVERDICT: NOT READY  (this reading could not be completed: {kind})",
+            file=sys.stderr,
+        )
+        print(
+            "box_readiness: the probes are guarded individually, so this is a "
+            "failure in the reporting path rather than in a probe. Re-run the "
+            "command in the step above by hand; it changes nothing on the box.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
 
 
 if __name__ == "__main__":

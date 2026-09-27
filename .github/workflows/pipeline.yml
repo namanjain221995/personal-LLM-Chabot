@@ -202,14 +202,56 @@ jobs:
       # protection the launcher job depends on, exercised on every commit.
       #
       # The floor counts tests that EXECUTED, not tests discovery collected
-      # (2026-09-13): 102 run today, and a module that skips itself at import
-      # no longer counts towards it.
+      # (2026-09-13), and a module that skips itself at import no longer counts
+      # towards it.
+      #
+      # 335 EXECUTE TODAY, 0 SKIPPED (measured 2026-09-28 on Python 3.12.3 and
+      # on 3.11.16, which is what CI runs; 291 before this branch's own cases
+      # were added). The floor was 95, under a comment
+      # that said "102 run today", and it stayed at 95 while the box-readiness
+      # suite took this directory from 183 tests to 291: 196 of them could have
+      # stopped executing with this gate still green, in a branch whose whole
+      # subject is gates that mean what they say.
+      #
+      # The reason given for leaving it -- that the number is "shared with other
+      # tracks" -- is not true, and checking it is one line:
+      #   grep -n 'min-tests' .github/workflows/pipeline.yml
+      # `--min-tests 95` appeared exactly once, against `--start
+      # .github/workflows/scripts/tests` and nothing else. The launcher suite
+      # carries its own floor (450, in the job below) and the monitoring suite a
+      # third (33), so raising this one cannot affect either.
+      #
+      # 325 against the 335 that execute: the same shape as the monitoring floor
+      # two jobs down - close enough that a class dropping out of discovery
+      # fails the job, with enough slack that it is not edited every time a test
+      # is added. tests/test_box_wiring.py asserts this number against a LIVE
+      # count of the directory in both directions, so it can neither rot three
+      # times too low again nor be set above what exists - which would be a gate
+      # that is permanently red rather than one that means something.
+      #
+      # THAT TEST COUPLES THIS NUMBER TO THIS DIRECTORY, on purpose: a branch
+      # that adds a whole test module here makes it red until this floor is
+      # raised in the same change. That is the coupling whose absence IS the
+      # defect -- 196 tests arrived under a floor of 95 and nothing said so --
+      # and the test's failure message prints the number to use.
+      #
+      # IT IS ALREADY OWED ONE BUMP. `origin/dev` at ff1a5d7c carries four test
+      # modules of its own under this directory (test_deploy_freshness 59,
+      # test_deploy_lock_budget 22, test_deploy_smoke_model_clock 20,
+      # test_rollback_reversibility 36) and left the floor at 95 as well.
+      # Measured on the real merge of that dev into this branch on 2026-09-28,
+      # load average 27.93: 472 collected, 472 executed, 0 skipped, 13 test
+      # modules. So THE MERGE COMMIT MUST RAISE THIS NUMBER TO 464 -- the test
+      # goes red until it does, and prints 464. It is deliberately not written as
+      # 464 here, because a branch has to be green on its own tree to be
+      # verifiable, and CI never builds this branch alone (`push` is main and dev
+      # only; a `pull_request` builds the merge result).
       - name: The CI gate scripts have tests, and they pass
         run: |
           python .github/workflows/scripts/unittest_gate.py \
             --label "workflow scripts" \
             --start .github/workflows/scripts/tests \
-            --min-tests 95
+            --min-tests 325
 
       - name: Migration table invariants (no database needed)
         run: |
@@ -1154,12 +1196,24 @@ jobs:
   #     true before each run started.
   #
   # So the FOUR most recent main-run failures were all box state, and the next
-  # two before them (34887763253, 34754339201) were test failures. The engine
-  # exposure one is still true TODAY: run 36304046169's log at
-  # 2026-09-27T08:26:48Z reports "3 non-cluster addresses: 1 blocked, 2
-  # ACCEPTED, 0 not proven". Which means the first push to main after this
-  # merges WILL refuse here with `engine-exposure exposed`, correctly and on
-  # purpose, and clearing it NEEDS ROOT - the refusal prints the commands.
+  # two before them (34887763253, 34754339201) were test failures.
+  #
+  # NO PREDICTION IS MADE HERE ABOUT THE FIRST PUSH, and an earlier version of
+  # this paragraph made one: it said the exposure failure was "still true TODAY"
+  # and that the first push after this merges WILL refuse with `engine-exposure
+  # exposed`. That was written on 2026-09-27 from run 36304046169's log and was
+  # already stale. Three consecutive runs of this branch's own
+  # probe_engine_exposure against the real box on 2026-09-28, load average
+  # 3.18 / 3.06 / 2.97, returned `closed` with exit code 0 in 9.62s / 9.39s /
+  # 9.41s, engine_bind reporting "3 non-cluster addresses: 3 blocked, 0
+  # ACCEPTED, 0 not proven" and "RESULT: PASSED" - all three "blocked (timed
+  # out)" rather than the mix at 08:26, with techsara-host-guard.service active
+  # and enabled. A prediction in a comment is a fact with an expiry date nobody
+  # sets: the first person to read a refusal here would have been sent to chase
+  # a state that was cleared the day before. What the runs above establish is
+  # the CLASS of failure this job moves an hour earlier; the probe reports what
+  # it reads at the moment it runs, which is the only thing that can still be
+  # true when someone reads it.
   #
   # ------------------------------------------------------------- THE GATING
   # `needs: [policy, security]`, and NOT `needs: [policy]`.
@@ -1179,12 +1233,26 @@ jobs:
   # THIS IS A MITIGATION, NOT A CURE. Neither `policy` nor `security` is a
   # code review. Anyone who can push to main can still cause this commit's
   # box_readiness.py — plus everything it subprocesses — to run on the
-  # production box. Only branch protection closes that, and at the time of
-  # writing `gh api repos/{owner}/{repo}/branches/main/protection` returns
-  # 404 "Branch not protected", `rulesets` returns `[]`, and the `production`
-  # environment has `"protection_rules": []` with `"can_admins_bypass": true`.
-  # "The script is read-only" is NOT the argument: read-only is a property of
-  # the intended code, not of whatever a commit contains.
+  # production box. "The script is read-only" is NOT the argument: read-only is
+  # a property of the intended code, not of whatever a commit contains.
+  #
+  # WHAT IS AND IS NOT CLOSED, re-read from the API on 2026-09-28 (an earlier
+  # version of this comment said main was unprotected, which the owner has since
+  # fixed - so the paragraph was describing a hole that no longer existed):
+  #   * `branches/main/protection` now returns `required_status_checks` with
+  #     `"contexts": ["CI passed"]`, `allow_force_pushes` false and
+  #     `allow_deletions` false. A push of arbitrary code straight to main no
+  #     longer reaches this job without that check first going green;
+  #   * `"enforce_admins": {"enabled": false}`, so an administrator still
+  #     bypasses it, and there is no `required_pull_request_reviews` block, so
+  #     nothing requires a human to have read the diff;
+  #   * `rulesets` returns `[]`, and the `production` environment still returns
+  #     `"protection_rules": []` with `"can_admins_bypass": true` and zero
+  #     variables and secrets.
+  # So the remaining hole is an ADMIN push, and the thing that closes it is a
+  # required reviewer on the `production` environment - which is precisely what
+  # `environment: production` on this job makes effective. Only the repository
+  # owner can set it.
   #
   # -------------------------------------------------------- THE CONCURRENCY
   # PER COMMIT, and deliberately NOT the release path's `deploy-dgx-spark`.
@@ -1220,12 +1288,11 @@ jobs:
   #
   #   * engine-exposure  exposed | unproven  -- `verify` checked this AFTER the
   #     rollout, so it was a post-deploy failure and is now a pre-deploy
-  #     refusal. Clearing `exposed` NEEDS ROOT (the host packet filter), and it
-  #     is true on this box today: run 36304046169's `verify` log at
-  #     2026-09-27T08:26:48Z reads "3 non-cluster addresses: 1 blocked, 2
-  #     ACCEPTED, 0 not proven". The first push to main after this merges will
-  #     refuse here until someone with root acts;
-  #   * engine-controller  not-ready | recovering | unreachable | unreadable;
+  #     refusal. Clearing `exposed` NEEDS ROOT (the host packet filter) and this
+  #     job cannot do it; the refusal prints the exact commands to hand over.
+  #     The port was measured CLOSED on 2026-09-28 (see WHY THIS EXISTS above);
+  #     no claim is made here about what it will be on the day this merges;
+  #   * engine-controller  recovering | unreachable | unreadable;
   #   * completion  wedged | empty-reply | unreachable | metrics-unreadable |
   #     model-unknown -- nothing pre-deploy asked the engine to generate before.
   #
@@ -1234,13 +1301,28 @@ jobs:
   # `behind` migration) is a refusal scripts/deploy.sh or this file's own
   # preflight already made - just an hour earlier.
   #
-  # Two verdicts are deliberately NOT refusals, because deploy.sh proceeds on
+  # THREE verdicts are deliberately NOT refusals, because deploy.sh proceeds on
   # them and refusing would be this job blocking a release the release path
-  # allows: `deploy-root wrong-branch` (deploy.sh detaches the production
-  # checkout on purpose on seven code paths, and the next deploy re-attaches it)
-  # and `migrations unreadable` (deploy.sh:244-252 proceeds without the check
-  # when the orchestrator is down and psql is unavailable - and a deploy is what
-  # brings a down stack back). Both are printed in the table either way.
+  # allows. All three are printed in the table either way:
+  #   * `deploy-root wrong-branch` - deploy.sh detaches the production checkout
+  #     on purpose on seven code paths, and the next deploy re-attaches it;
+  #   * `migrations unreadable` - deploy.sh:244-252 proceeds without the check
+  #     when the orchestrator is down and psql is unavailable, and a deploy is
+  #     what brings a down stack back;
+  #   * `engine-controller not-ready` - found on 2026-09-28 by running the probe
+  #     against the real box at load average 29.75, where the controller
+  #     answered DEGRADED (state_code 4) with its own reason reading "saturation,
+  #     not a wedge" - and Prometheus agreed without spending a generation:
+  #     `increase(vllm:generation_tokens_total{service="main"}[10m])` read 5605.
+  #     deploy.sh:938 gates on `scripts/cluster-status.sh`, which
+  #     downgrades a non-serving controller state to `check_warn`, and
+  #     `check_summary` (scripts/lib/cluster-common.sh:44-45) fails only on
+  #     `check_fail` - measured on that same box: "11 passed, 2 warnings, 0
+  #     failed", exit 0. A busy box would otherwise have skipped `deploy` for as
+  #     long as it stayed busy. The question the refusal was standing in for is
+  #     measured directly by probe 6, which refuses a wedge by the token counter
+  #     rather than by a status field. `recovering` still refuses, because a
+  #     recovery in flight is moving the same containers the rollout will move.
   #
   # ------------------------------------------------ WHAT IT DOES NOT CLAIM
   # It is a PRE-check taken minutes before the deploy, not a guarantee held at
@@ -1331,14 +1413,20 @@ jobs:
     # But box_probes.TIMEOUTS is per CALL, and three probes make more than one
     # call: deploy-root runs three git commands, migrations runs two, and the
     # completion probe runs four, one of them with a grace period on top of its
-    # own deadline. The real worst case is 570s, which does not fit in 480s -
-    # so the one box this job exists for, a slow and sick one, is exactly the
-    # box on which GitHub would kill the job before box_readiness.py printed
-    # the table of remedies that is the entire product of it.
+    # own deadline. That worst case did not fit in 480s - so the one box this
+    # job exists for, a slow and sick one, is exactly the box on which GitHub
+    # would kill the job before box_readiness.py printed the table of remedies
+    # that is the entire product of it.
+    #
+    # 16 and not 14: aligning the completion probe's curl deadline with the one
+    # `verify` gives the same curl (`-m 180`, see box_probes.TIMEOUTS) moved the
+    # measured worst case from 570s to 630s. 14 minutes still fits it, with 30s
+    # of headroom, and 30s is not headroom on a sick box. Measured 2026-09-28:
+    # worst case 630s, budget 780s, headroom 150s.
     # box_probes.JOB_TIMEOUT_MINUTES holds this number, and the test suite
     # MEASURES the worst case by running every probe against a recording
     # runner, so neither the ceiling nor the arithmetic can drift again.
-    timeout-minutes: 14
+    timeout-minutes: 16
     # PER COMMIT, and never the release path's `deploy-dgx-spark`; see THE
     # CONCURRENCY above.
     concurrency:
@@ -1372,7 +1460,14 @@ jobs:
       # served a green /health for five and a half hours on this box while
       # generating nothing. One tiny generation, thinking off, <= 8 tokens —
       # the main model is TP=2 across both nodes, so it costs both of them and
-      # it runs beside live chat.
+      # it runs beside live chat. It gives that curl the SAME `-m 180` the
+      # `verify` job's "The model actually generates" step gives it, so the
+      # pre-deploy read cannot refuse a slow prefill the post-deploy read would
+      # have passed. It reads the reply from `content` AND `reasoning_content`,
+      # because `chat_template_kwargs.enable_thinking` is honoured by the chat
+      # template and not by the server. It is STRICTER than verify in one place,
+      # on purpose: a `NaN`/`+Inf`/`-Inf` token counter is refused here, where
+      # verify's `awk` would add it and pass.
       #
       # Nothing that is not on an allowlist reaches stdout. This repository is
       # public, its run summaries are world-readable, and the deploy root's
@@ -1708,6 +1803,17 @@ jobs:
           check "prometheus /-/healthy"  "http://127.0.0.1:9090/-/healthy"    200
           [ "$fail" -eq 0 ]
 
+      # THE PRE-DEPLOY TWIN OF THIS STEP is box_probes.probe_real_completion,
+      # and the two are kept aligned on purpose: a readiness gate with a tighter
+      # deadline than the check it stands in for refuses boxes this step would
+      # have passed. Both give the completion curl `-m 180`. Both read the reply
+      # from `content` AND `reasoning_content` - `chat_template_kwargs` is
+      # honoured by the chat TEMPLATE, not by the server, so a template that
+      # ignores `enable_thinking` puts the tokens in `reasoning_content`, leaves
+      # `content` empty, and the old one-field read failed a healthy engine
+      # (and then fired `recovery`, which restarts the main model, to fix a
+      # reply-parsing bug). The probe is deliberately STRICTER in one place: it
+      # refuses a `NaN`/`+Inf`/`-Inf` sample where the awk below would add it.
       - name: The model actually generates (not just answers /health)
         env:
           ENGINE_URL: ${{ steps.engine.outputs.url }}
@@ -1723,7 +1829,7 @@ jobs:
           reply="$(curl -fsS -m 180 -H 'Content-Type: application/json' \
             -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: READY.\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
             "${ENGINE_URL}/v1/chat/completions" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip()[:40])')"
+            | python3 -c 'import json,sys; m=json.load(sys.stdin)["choices"][0]["message"]; print(((m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip())[:40])')"
           after="$(counter)"
           echo "reply=${reply@Q}  generation_tokens_total ${before} -> ${after}"
           {

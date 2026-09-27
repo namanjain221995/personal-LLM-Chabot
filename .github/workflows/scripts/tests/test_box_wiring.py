@@ -350,5 +350,136 @@ class TheCeilingIsBigEnoughToPrintTheRemedies(PipelineCase):
         self.assertGreater(box_probes.COMPLETION_CURL_GRACE_S, 0)
 
 
+class TheGateFloorCoversTheTestsThisBranchAdded(PipelineCase):
+    """The third defect this module exists for.
+
+    This branch took .github/workflows/scripts/tests from 183 executed tests to
+    291 and left `--min-tests 95` in place, under a comment that said "102 run
+    today". 196 of 291 tests could have stopped executing with the gate still
+    green - in a branch whose entire subject is gates that mean what they say.
+
+    The reason given for not fixing it was that the floor is "shared with other
+    tracks". It is not: `--min-tests 95` appeared exactly once in pipeline.yml,
+    against `--start .github/workflows/scripts/tests`; the launcher suite has
+    its own (450) and monitoring a third (33). So these cases assert the floor
+    against a LIVE COUNT of the directory, in both directions, rather than
+    against a number typed into a comment.
+    """
+
+    #: How far the floor may sit below what executes today. Slack enough that
+    #: adding a test is not an edit to pipeline.yml; tight enough that a class
+    #: dropping out of discovery fails the job.
+    SLACK = 20
+
+    #: The suite these cases are about.
+    OURS = ".github/workflows/scripts/tests"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        suite = unittest.defaultTestLoader.discover(str(HERE), top_level_dir=str(HERE))
+        cls.collected = suite.countTestCases()
+
+    def floors(self) -> dict:
+        """Every `--min-tests` in the file, keyed by the suite it gates.
+
+        Read from each `run:` block with its SHELL LINE CONTINUATIONS removed
+        rather than with one multi-line regex: the arguments are spread over
+        continuation lines in this job and sit on a single line in the launcher's,
+        and a pattern that has to cope with both is a pattern that quietly
+        matches neither after somebody reindents the YAML.
+        """
+        found = {}
+        for job in self.jobs.values():
+            for step in job.get("steps", []) or []:
+                flat = _flat(str(step.get("run", "")).replace("\\\n", " "))
+                for match in re.finditer(r"--start (\S+) --min-tests (\d+)", flat):
+                    found[match.group(1)] = int(match.group(2))
+                for match in re.finditer(r"--min-tests (\d+) --start (\S+)", flat):
+                    found[match.group(2)] = int(match.group(1))
+        return found
+
+    def test_the_file_still_gates_this_directory_at_all(self):
+        self.assertIn(self.OURS, self.floors(), self.floors())
+
+    def test_more_than_one_suite_is_gated_so_the_next_case_has_teeth(self):
+        self.assertGreater(len(self.floors()), 1, self.floors())
+
+    def test_the_floor_is_not_shared_with_another_suite(self):
+        """The claim that stopped this being fixed for two rounds, checked."""
+        floors = self.floors()
+        ours = floors[self.OURS]
+        others = {start: floor for start, floor in floors.items() if start != self.OURS}
+        self.assertNotIn(ours, others.values(), floors)
+
+    def test_the_floor_actually_covers_the_tests_in_this_directory(self):
+        floor = self.floors()[self.OURS]
+        self.assertGreaterEqual(
+            floor,
+            self.collected - self.SLACK,
+            f"{self.collected} tests are collected here and the floor is {floor}: "
+            f"{self.collected - floor} of them could stop executing with the gate "
+            f"still green. Raise `--min-tests` at the 'The CI gate scripts have "
+            f"tests, and they pass' step in pipeline.yml to {self.collected - 8}, "
+            f"and correct the count in the comment above it in the same edit.",
+        )
+
+    def test_the_floor_is_never_above_what_exists(self):
+        """A floor over the real count is a gate that is permanently red, which
+        is the other way to make a gate stop meaning something."""
+        floor = self.floors()[self.OURS]
+        self.assertLessEqual(floor, self.collected, f"floor {floor} > {self.collected} collected")
+
+
+class ThePreDeployCompletionMatchesThePostDeployOne(PipelineCase):
+    """The pre-deploy read must not refuse a box `verify` would have passed.
+
+    box_probes.probe_real_completion and `verify`'s "The model actually
+    generates (not just answers /health)" step ask the same engine the same
+    question. They gave their curl DIFFERENT deadlines - 120 here, 180 there -
+    so a slow prefill could refuse the deploy an hour before the step that would
+    have accepted it. The same argument as the disk floor: a readiness check
+    standing on a different number is noise rather than evidence.
+    """
+
+    def _verify_step(self) -> str:
+        for step in self.jobs["verify"]["steps"]:
+            if "actually generates" in str(step.get("name", "")):
+                return str(step["run"])
+        self.fail("the verify job no longer has a real-completion step")
+        raise AssertionError  # unreachable, for the type checker
+
+    def test_the_completion_deadline_is_the_one_verify_gives_the_same_curl(self):
+        run = self._verify_step()
+        deadlines = re.findall(r"curl -fsS -m (\d+) -H 'Content-Type: application/json'", run)
+        self.assertEqual(len(deadlines), 1, run)
+        self.assertEqual(int(deadlines[0]), box_probes.TIMEOUTS["completion"])
+
+    def test_both_read_the_reply_from_content_and_from_reasoning_content(self):
+        """`chat_template_kwargs.enable_thinking` is honoured by the chat
+        TEMPLATE, not by the server. A template that ignores it puts the tokens
+        in `reasoning_content`, and a one-field read then fails a healthy engine
+        - and in verify's case fires `recovery`, which restarts the main model,
+        to fix a reply-parsing bug."""
+        self.assertIn("reasoning_content", self._verify_step())
+        source = pathlib.Path(box_probes.__file__).read_text(encoding="utf-8")
+        self.assertIn("reasoning_content", source)
+
+    def test_both_ask_for_the_same_generation(self):
+        """The JSON body in the shell step carries backslash-escaped quotes, so
+        the comparison is made against the text with backslashes and whitespace
+        removed - not against a guess at how the shell was quoted today."""
+        run = self._verify_step()
+        naked = re.sub(r"[\s\\]+", "", run)
+        self.assertIn(re.sub(r"\s+", "", box_probes.COMPLETION_PROMPT), naked)
+        self.assertIn('"max_tokens":' + str(box_probes.COMPLETION_MAX_TOKENS), naked)
+        self.assertIn('"enable_thinking":false', naked)
+
+    def test_both_assert_the_global_counter_advanced_and_not_a_reply_alone(self):
+        run = self._verify_step()
+        self.assertIn("vllm:generation_tokens_total", run)
+        self.assertIn('[ "$after" -gt "$before" ]', run)
+
+
 if __name__ == "__main__":
     unittest.main()

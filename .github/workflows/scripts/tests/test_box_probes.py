@@ -363,6 +363,269 @@ class TheAcceptedCountMatchesTheRealReport(unittest.TestCase):
 # THE OUTPUT-SAFETY CASES (B6). These are the reason this library exists in
 # the shape it does, and they are what the second consumer inherits.
 # ==========================================================================
+class TheSecondConsumerSurfaceIsCallable(unittest.TestCase):
+    """The contract mismatch with fix/production-watch-r3, closed on this side.
+
+    That branch imports THIS module (PROBE_MODULE = "box_probes"), ships none of
+    its own, and asserts at import that four callables are present. Measured
+    against its own loader on 2026-09-28, before this change:
+
+        ProbeContractError: box_probes.py does not expose
+        probe_container_states, probe_host_guard_unit, probe_real_completion
+
+    and then, for the ONE name that did exist:
+
+        ProbeContractError: box_probes.probe_engine_exposure() requires a
+        parameter this watch cannot supply: 'env'. It offers deploy_root,
+        timeout.
+
+    The second half is the part nobody had seen: renaming the completion probe
+    alone would have left all four raising at CALL time instead of at import
+    time, because production_truth.call_probe passes only the context keys a
+    signature declares and refuses a required parameter it cannot supply. That
+    is this file's defect - its header has claimed "the shared library behind
+    two jobs" since the first commit while nothing in it was callable by a
+    consumer without an `Environment`.
+
+    These cases assert the property rather than the sibling's file, which is not
+    on this branch: no probe on the surface may have a REQUIRED parameter outside
+    the two keys the watch offers.
+    """
+
+    #: Exactly the keys production_truth's context carries.
+    OFFERED = {"deploy_root", "timeout"}
+
+    def test_the_surface_is_not_empty_so_the_rest_of_this_class_has_teeth(self):
+        self.assertTrue(box_probes.SECOND_CONSUMER_PROBES)
+
+    def test_every_name_on_the_surface_is_a_callable_this_module_exports(self):
+        for name in box_probes.SECOND_CONSUMER_PROBES:
+            self.assertTrue(callable(getattr(box_probes, name, None)), name)
+
+    def test_no_probe_on_the_surface_requires_anything_the_watch_cannot_supply(self):
+        import inspect
+
+        for name in box_probes.SECOND_CONSUMER_PROBES:
+            signature = inspect.signature(getattr(box_probes, name))
+            for param_name, param in signature.parameters.items():
+                if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+                    continue
+                if param.default is param.empty:
+                    self.assertIn(param_name, self.OFFERED, f"{name}({param_name})")
+
+    def test_every_probe_on_the_surface_accepts_both_offered_keys(self):
+        import inspect
+
+        for name in box_probes.SECOND_CONSUMER_PROBES:
+            names = set(inspect.signature(getattr(box_probes, name)).parameters)
+            self.assertLessEqual(self.OFFERED, names, name)
+
+    def test_a_probe_called_with_a_deploy_root_and_no_environment_still_runs(self):
+        """The watch's actual call shape, end to end against the fake box."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            result = box_probes.probe_engine_exposure(deploy_root=root, timeout=5)
+        self.assertEqual(result.probe, "engine-exposure")
+        self.assertIn(result.verdict, box_probes.PROBE_VERDICTS["engine-exposure"])
+
+    def test_a_probe_called_with_neither_refuses_rather_than_guessing_a_root(self):
+        with self.assertRaises(box_probes.ProbeCallRefused):
+            box_probes.probe_engine_exposure()
+
+    def test_the_two_completion_names_are_one_function(self):
+        """Two names, never two implementations of "ask the engine to generate"."""
+        self.assertIs(box_probes.probe_completion, box_probes.probe_real_completion)
+
+    def test_the_result_carries_everything_the_watch_reads_off_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = box_probes.probe_engine_exposure(deploy_root=make_box(tmp), timeout=5)
+        self.assertIsInstance(result.ok, bool)
+        self.assertIsInstance(result.could_run, bool)
+        self.assertIsInstance(result.detail, str)
+
+    def test_the_detail_the_watch_renders_is_one_line_and_allowlisted(self):
+        """production_truth prints it inside a single table cell. The full
+        engine_bind report lives on `report_lines`, which that consumer never
+        reads, so twenty lines cannot end up in one row."""
+        result = box_probes.ProbeResult(
+            "engine-exposure",
+            "exposed",
+            {"accepted_addresses": 2, "exit_code": 1},
+            ("line one", "line two"),
+        )
+        self.assertNotIn("\n", result.detail)
+        self.assertEqual(result.detail, "accepted_addresses 2 | exit_code 1")
+        self.assertEqual(list(result.report_lines), ["line one", "line two"])
+
+    def test_a_reading_that_was_never_taken_says_so(self):
+        """`could_run` is what stops the watch handing an unmeasured box to
+        Prometheus as a real fault and staying green."""
+        for verdict in sorted(box_probes.NOT_PERFORMED):
+            self.assertFalse(
+                box_probes.ProbeResult("completion", verdict).could_run, verdict
+            )
+        self.assertTrue(box_probes.ProbeResult("completion", "generated").could_run)
+
+    def test_not_performed_only_names_verdicts_a_probe_can_actually_report(self):
+        """A spare entry here is the same vacuous-coverage shape that let
+        ("engine-exposure", "unavailable") sit in the remedy table."""
+        declared = set(box_probes.UNIVERSAL_VERDICTS)
+        for verdicts in box_probes.PROBE_VERDICTS.values():
+            declared |= set(verdicts)
+        self.assertLessEqual(box_probes.NOT_PERFORMED, declared)
+
+    def test_the_only_verdict_that_is_both_passing_and_unperformed_is_the_documented_one(self):
+        """("migrations", "unreadable") is deliberately both: the probe could
+        not be performed, AND deploy.sh:244-252 proceeds in exactly that case.
+        Any OTHER overlap would be a probe that passes while admitting it never
+        ran, which is the shape this whole file is built to refuse."""
+        overlap = {
+            (probe, verdict)
+            for probe, verdicts in box_probes.PASSING.items()
+            for verdict in verdicts & box_probes.NOT_PERFORMED
+        }
+        self.assertEqual(overlap, {("migrations", "unreadable")})
+
+
+class TheTimeoutCapOnlyEverLowersADeadline(unittest.TestCase):
+    """A second consumer may not widen a deadline this file chose."""
+
+    def test_no_cap_means_this_files_own_timeouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner())
+            for kind, seconds in box_probes.TIMEOUTS.items():
+                self.assertEqual(env.budget(kind), float(seconds), kind)
+
+    def test_a_cap_lowers_every_call_that_is_longer_than_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner(), timeout_cap=20)
+            self.assertEqual(env.budget("exposure"), 20.0)
+            self.assertEqual(env.budget("lock"), 15.0)
+
+    def test_a_cap_can_never_widen_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner(), timeout_cap=10_000)
+            for kind, seconds in box_probes.TIMEOUTS.items():
+                self.assertEqual(env.budget(kind), float(seconds), kind)
+
+    def test_a_cap_is_never_zero_or_negative_however_it_is_passed(self):
+        """A probe with a zero timeout is a probe that cannot be performed, and
+        `CommandRunner` asserts a positive one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner(), timeout_cap=0)
+            self.assertGreaterEqual(env.budget("git"), 1.0)
+
+    def test_every_probe_asks_for_its_timeout_through_the_cap(self):
+        """Not one `TIMEOUTS[...]` read left in a probe: a probe that reads the
+        table directly is a probe a cap silently does not reach."""
+        source = pathlib.Path(box_probes.__file__).read_text(encoding="utf-8")
+        body = source.split("# -------------------------------------------------------------------- probes", 1)[1]
+        self.assertNotIn('TIMEOUTS["', body)
+
+
+class TheCompletionProbeReadsTheWholeReply(unittest.TestCase):
+    """A chat template that ignores `enable_thinking` must not fail a healthy box.
+
+    `chat_template_kwargs.enable_thinking` is honoured by the TEMPLATE, not by
+    the server. A template that ignores it puts the eight tokens in
+    `reasoning_content` and leaves `content` empty: the counter advances, the box
+    is healthy, and reading `content` alone reported `empty-reply` and refused
+    the deploy.
+    """
+
+    def _probe(self, message):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(
+                make_box(tmp),
+                FakeRunner(completion=box_probes.Completed(0, _json.dumps({"choices": [{"message": message}]}))),
+            )
+            return box_probes.probe_real_completion(env)
+
+    def test_content_alone_still_passes(self):
+        result = self._probe({"content": "READY."})
+        self.assertEqual(result.verdict, "generated")
+        self.assertEqual(result.facts["reply_chars"], 6)
+        self.assertEqual(result.facts["reasoning_chars"], 0)
+
+    def test_reasoning_content_alone_is_a_generation_and_not_an_empty_reply(self):
+        result = self._probe({"content": "", "reasoning_content": "READY"})
+        self.assertEqual(result.verdict, "generated")
+        self.assertEqual(result.facts["reply_chars"], 0)
+        self.assertEqual(result.facts["reasoning_chars"], 5)
+
+    def test_both_fields_null_is_still_an_empty_reply(self):
+        result = self._probe({"content": None, "reasoning_content": None})
+        self.assertEqual(result.verdict, "empty-reply")
+
+    def test_a_message_that_is_not_an_object_at_all_is_an_empty_reply(self):
+        result = self._probe("just a string")
+        self.assertEqual(result.verdict, "empty-reply")
+
+    def test_a_reply_with_a_still_counter_is_wedged_whichever_field_carried_it(self):
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(
+                make_box(tmp),
+                FakeRunner(
+                    metrics_counts=[1000, 1000],
+                    completion=box_probes.Completed(
+                        0, _json.dumps({"choices": [{"message": {"reasoning_content": "READY"}}]})
+                    ),
+                ),
+            )
+            self.assertEqual(box_probes.probe_real_completion(env).verdict, "wedged")
+
+
+class TheOnlyInterpolatedIdentifierIsCheckedWithoutAnAssert(unittest.TestCase):
+    """`python -O` strips `assert`, and that was the only check on the one
+    identifier `_schema_version` puts into a shell script. The workflow runs
+    plain `python3`, so it held; a future caller under -O would have lost it
+    with nothing going red.
+    """
+
+    def test_a_name_that_is_not_an_identifier_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner())
+            with self.assertRaises(box_probes.ProbeCallRefused):
+                box_probes._schema_version(env, env.deploy_root, "dr_live; rm -rf /")
+
+    def test_it_is_still_refused_under_dash_O(self):
+        """The whole point, so it is proved by running a real -O interpreter."""
+        import subprocess
+
+        scripts = str(pathlib.Path(box_probes.__file__).resolve().parent)
+        program = (
+            "import sys, pathlib; sys.path.insert(0, %r); import box_probes as bp;"
+            "env = bp.Environment(deploy_root=pathlib.Path('/'), repo_root=pathlib.Path('/'), ref='');"
+            "\ntry:\n bp._schema_version(env, env.deploy_root, 'x; rm -rf /')\n"
+            " print('NOT REFUSED')\nexcept bp.ProbeCallRefused:\n print('REFUSED')" % scripts
+        )
+        out = subprocess.run(
+            [sys.executable, "-O", "-c", program], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(out.stdout.strip(), "REFUSED", out.stderr)
+
+    def test_neither_shipped_module_contains_an_assert_statement_at_all(self):
+        """The rule, not just the one site. Parsed rather than grepped: the word
+        `assert` appears in prose in both files, and a test that greps for it
+        either fails on a comment or passes on a docstring that mentions it.
+
+        Both files run on the production box and decide whether a deploy
+        proceeds. An `assert` in either is a check that a future `python -O`
+        silently deletes, and this file's whole subject is checks that stop
+        checking without anything going red.
+        """
+        import ast
+
+        for module in (box_probes, box_readiness):
+            tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding="utf-8"))
+            statements = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assert)]
+            self.assertEqual(statements, [], f"{module.__name__} lines {statements}")
+
+
 class NothingSecretReachesStdout(unittest.TestCase):
     def _assert_clean(self, output: str) -> None:
         self.assertNotIn(SENTINEL_SECRET, output)

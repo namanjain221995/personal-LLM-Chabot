@@ -7,7 +7,18 @@ The shared library behind two jobs: `box-readiness` in pipeline.yml (the
 pre-deploy read, before the release path touches anything) and, later, the
 standing watch in production-watch.yml. Both ask the same question — "is this
 machine in a state where a deploy would succeed?" — and both answer it from a
-PUBLIC repository's log, so both need the same two properties:
+PUBLIC repository's log, so both need the same two properties.
+
+WHAT THE SECOND CONSUMER MAY CALL is SECOND_CONSUMER_PROBES, further down, and
+it is a short list. Until 2026-09-28 this paragraph claimed a shared library
+while nothing in the file was callable by a consumer that did not already hold
+an `Environment` — and box_readiness.py is the only thing that builds one, so
+"shared" was aspirational. The two probes on that surface now take a deploy root
+and a timeout by keyword, and the names and result shape there are the contract
+production_truth.REQUIRED_PROBES is reconciled against. Two probes that watch
+asks for are NOT here and are not meant to be; the surface says which and why.
+
+The two properties:
 
   1. EVERY PROBE IS READ-ONLY. Nothing here starts, stops, recreates, prunes
      or changes the STATE OF THE STACK. The deploy flock is ASKED whether it is
@@ -85,7 +96,8 @@ summary on this repository is world-readable. So:
     file reaches a log without anyone deciding that it should.
 
 The rule lives HERE rather than in the CLI so that the second consumer
-inherits it by construction instead of by remembering.
+inherits it by construction instead of by remembering — which is only true of a
+consumer that actually calls into this file, hence SECOND_CONSUMER_PROBES.
 
 WHAT THIS DOES NOT CLAIM
 ------------------------
@@ -143,11 +155,19 @@ COMPLETION_PROMPT = "Reply with the single word: READY."
 #:   * probe_deploy_root runs THREE git calls (is-inside-work-tree, status,
 #:     rev-parse), so its ceiling is 90s and not 30s;
 #:   * probe_migrations runs TWO bash calls (live, then code), so 90s not 45s;
-#:   * probe_completion runs FOUR calls -- resolve, /metrics, the completion,
-#:     /metrics again -- and the completion's own subprocess timeout is
-#:     TIMEOUTS["completion"] + COMPLETION_CURL_GRACE_S, so 180s not 120s.
+#:   * probe_real_completion runs FOUR calls -- resolve, /metrics, the
+#:     completion, /metrics again -- and the completion's own subprocess timeout
+#:     is TIMEOUTS["completion"] + COMPLETION_CURL_GRACE_S.
 #:
-#: The real worst case is 570s, which does NOT fit in eight minutes: a box
+#: `completion` is 180 and not 120 BECAUSE THAT IS WHAT `verify` GIVES THE SAME
+#: CURL (pipeline.yml, "The model actually generates (not just answers
+#: /health)": `curl -fsS -m 180`). The two were 120 and 180, which is a gate
+#: that refuses a box the job an hour later would have passed -- on a slow
+#: prefill, the pre-deploy read times out and the post-deploy read does not.
+#: A readiness check with a tighter deadline than the check it stands in for is
+#: noise, exactly as a different disk floor would be.
+#:
+#: The real worst case does NOT fit in eight minutes: a box
 #: slow enough to walk every call up to its ceiling would have the job killed
 #: by GitHub before box_readiness.py printed its table, and the table with the
 #: remedies in it is the entire product of this job. So the ceiling below is
@@ -162,7 +182,7 @@ TIMEOUTS = {
     "lock": 15,
     "exposure": 150,
     "controller": 15,
-    "completion": 120,
+    "completion": 180,
     "migrations": 45,
 }
 
@@ -177,7 +197,16 @@ COMPLETION_CURL_GRACE_S = 15
 #: asserts BOTH directions: that pipeline.yml declares exactly this number, and
 #: that the measured worst-case subprocess wall clock fits inside it with the
 #: checkout allowance subtracted. Neither can drift without a red test.
-JOB_TIMEOUT_MINUTES = 14
+#:
+#: It was 14 while TIMEOUTS["completion"] was 120 (worst case 570s, budget 660s,
+#: 90s of headroom). Aligning that deadline with the one `verify` gives the same
+#: curl (180) moved the worst case to 630s, which still fits in 14 -- but with
+#: 30s of headroom, and 30s is not headroom on the only box this job exists for.
+#: 16 restores it to 150s. The cost of a larger ceiling is bounded and small: a
+#: job that hangs delays the SKIP of a deploy that was not going to happen, by
+#: two minutes, against the 55 minutes of hosted CI this job is here to save.
+#: Measured on 2026-09-28: worst case 630s, budget 780s, headroom 150s.
+JOB_TIMEOUT_MINUTES = 16
 CHECKOUT_ALLOWANCE_S = 180
 
 WITHHELD = "<withheld>"
@@ -211,6 +240,24 @@ VERDICTS = frozenset(
 #: The two verdicts `run_probe` can report for ANY probe, whatever the probe
 #: itself does. They are the reason `remedy_for` has a fallback.
 UNIVERSAL_VERDICTS = frozenset({"probe-raised", "probe-timed-out"})
+
+#: Verdicts that mean the probe COULD NOT BE CARRIED OUT, as distinct from
+#: carried out and refused. `ProbeResult.could_run` reads this, and the second
+#: consumer reads that: a reading that was never taken must not be reported as
+#: a fault, because a fault is handed to Prometheus and stays green while a
+#: run that could not measure the box goes red.
+#:
+#: ("migrations", "unreadable") is deliberately in BOTH this set and
+#: PASSING["migrations"], and the two are not in conflict. They answer different
+#: questions: the probe could not be performed (this set), AND scripts/deploy.sh
+#: proceeds anyway in exactly that case (PASSING), so box-readiness does too.
+NOT_PERFORMED = frozenset(
+    {
+        "probe-raised", "probe-timed-out",
+        "git-unreadable", "unreadable", "unreachable", "unproven",
+        "metrics-unreadable", "model-unknown",
+    }
+)
 
 #: Which verdicts each probe can actually REPORT. Not decoration: the remedy
 #: coverage test iterates this rather than `VERDICTS`, and `VERDICTS` used to be
@@ -268,7 +315,50 @@ PASSING: Mapping[str, frozenset] = {
     # concurrency group.
     "deploy-lock": frozenset({"free", "never-created"}),
     "engine-exposure": frozenset({"closed"}),
-    "engine-controller": frozenset({"ready"}),
+    # `not-ready` PASSES, and it is reported. This is the same self-lockout
+    # shape as `wrong-branch`, found the same way -- by running the probe against
+    # the real box -- and the authority it was resting on does not exist.
+    #
+    # MEASURED 2026-09-28, load average 29.75: the controller answered `DEGRADED`
+    # (state_code 4, primary_ready false) with its own `reason` reading "canary
+    # timed out twice but the engine is progressing (2 running, 1 waiting, kv
+    # 22%): saturation, not a wedge". The box was busy, not broken, and that is
+    # not the controller's opinion but a measurement: Prometheus, queried at the
+    # same time and WITHOUT spending a generation, gave
+    # `increase(vllm:generation_tokens_total{service="main"}[10m])` = 5605 for
+    # Qwen/Qwen3.6-35B-A3B-NVFP4. The engine produced five and a half thousand
+    # tokens in ten minutes while the controller called itself DEGRADED. This
+    # probe refused, and `deploy` would therefore have been skipped for as long
+    # as the box stayed busy -- on a machine that is busy most of the time.
+    #
+    # THE RELEASE PATH ALLOWS IT. scripts/deploy.sh's post-rollout health gate
+    # (deploy.sh:938) runs `scripts/cluster-status.sh` and gates on its exit
+    # status. That script embeds `sys.exit(0 if code in (2, 3) else 3)` -- which
+    # is where this probe's (2, 3) comes from -- but it consumes that exit with
+    # `check_warn "engine controller reports a non-ready state"`, and
+    # `check_summary` in scripts/lib/cluster-common.sh:44-45 returns
+    # `[ "$CHECK_FAIL" -eq 0 ]`. A warning is not a failure. Measured on the same
+    # DEGRADED box: `./scripts/cluster-status.sh` printed "11 passed, 2 warnings,
+    # 0 failed" and exited 0. So the state this probe refused on is one the
+    # deploy's own health gate passes.
+    #
+    # AND THE QUESTION IT WAS STANDING IN FOR IS ANSWERED PROPERLY ELSEWHERE IN
+    # THIS JOB. What a non-ready controller might mean is "the engine cannot
+    # serve", and `probe_real_completion` measures that directly: a real
+    # generation, with `vllm:generation_tokens_total` required to advance. A
+    # wedged engine still refuses -- as `completion wedged`, by the strong
+    # signal, not by a state code. A saturated one passes, which is correct,
+    # because it is serving. This is the same rule as everywhere else here:
+    # prove an engine is wedged with a completion, never with a status field.
+    #
+    # `recovering` STAYS A REFUSAL, and the argument above is deliberately not
+    # extended to it: a recovery in flight is moving the same containers the
+    # rollout will move, which is a race the release path cannot see and
+    # cluster-status.sh's exit code says nothing about. `unreachable` and
+    # `unreadable` also stay refusals -- not from an argument, but from the
+    # absence of one: no reading of this box in either state has been taken, and
+    # the fail-closed default holds until somebody has one.
+    "engine-controller": frozenset({"ready", "not-ready"}),
     "completion": frozenset({"generated"}),
     # `unreadable` PASSES, because scripts/deploy.sh:244-252 deliberately
     # proceeds in exactly that case: "cannot read the live schema version
@@ -310,6 +400,7 @@ FACT_KINDS: Mapping[str, str] = {
     "tokens_before": "count",
     "tokens_after": "count",
     "reply_chars": "count",
+    "reasoning_chars": "count",
     "elapsed_s": "duration",
     "live_schema": "count",
     "code_schema": "count",
@@ -427,7 +518,13 @@ class ProbeResult:
     facts: Mapping[str, object] = dataclasses.field(default_factory=dict)
     #: Lines of FOREIGN output (today: engine_bind.py's own report) to show
     #: under the table. Sanitized on the way out, never trusted on the way in.
-    detail: Sequence[str] = ()
+    #:
+    #: It was called `detail` until the second consumer arrived. `detail` is now
+    #: the ONE-LINE property below, because production_truth.normalise() reads
+    #: an attribute of that name and renders it inside a single table cell:
+    #: handing it twenty lines of engine_bind report would have put the whole
+    #: report in one row of a 3 a.m. alert table.
+    report_lines: Sequence[str] = ()
 
     @property
     def ok(self) -> bool:
@@ -437,6 +534,28 @@ class ProbeResult:
     @property
     def safe_verdict(self) -> str:
         return self.verdict if self.verdict in VERDICTS else WITHHELD
+
+    @property
+    def could_run(self) -> bool:
+        """Was the probe CARRIED OUT at all, whatever it then found?
+
+        Part of the second-consumer surface: production_truth.normalise() reads
+        `performed`, falling back to `could_run`, and a probe that could not be
+        carried out must not be reported as a measurement of the box. Without
+        this property that fallback defaulted to True, so a `probe-raised`
+        reading would have been handed to Prometheus as a real fault instead of
+        making the run red.
+        """
+        return self.verdict not in NOT_PERFORMED
+
+    @property
+    def detail(self) -> str:
+        """ONE short allowlisted line, for a consumer that has no table.
+
+        The facts and nothing else: the verdict is what the consumer already
+        prints beside it, and every value here has been through `render_fact`.
+        """
+        return render_facts(self.facts)
 
 
 # --------------------------------------------------------------- the commands
@@ -485,6 +604,25 @@ class Environment:
     clock: Callable[[], float] = time.time
     default_branch: str = "main"
     controller_url: str = DEFAULT_CONTROLLER_URL
+    #: A CEILING a caller may put on every per-call subprocess timeout. None
+    #: means this library's own TIMEOUTS stand, which is what box-readiness
+    #: wants: its ceiling is measured against them. The standing watch passes
+    #: one, because a monitor that ticks on a schedule cannot spend this job's
+    #: worst case. It only ever LOWERS a timeout -- `budget` takes the min, so a
+    #: second consumer cannot widen a deadline this file chose.
+    timeout_cap: float | None = None
+
+    def budget(self, kind: str) -> float:
+        """The subprocess timeout for ONE call of `kind`, honouring the cap.
+
+        Every probe asks for its timeout here rather than reading TIMEOUTS
+        directly, so there is one place where a cap can be applied and one
+        place tests/test_box_wiring.py has to record to measure the worst case.
+        """
+        base = float(TIMEOUTS[kind])
+        if self.timeout_cap is None:
+            return base
+        return max(1.0, min(base, float(self.timeout_cap)))
 
     # Paths, kept in one place so no probe spells one twice.
     @property
@@ -509,6 +647,19 @@ class Environment:
 
 
 # ------------------------------------------------------------ the env reader
+
+class ProbeCallRefused(Exception):
+    """A probe was called with too little to build an Environment.
+
+    Fixed text, for the same reason EnvReadRefused carries fixed text: a caller
+    may render an exception's message, and nothing that reaches a public log
+    this way may have come out of a file or an argument.
+
+    A probe that raises this REFUSES -- `run_probe` turns it into
+    `probe-raised`, and production_truth.call_probe turns it into a reading that
+    was not performed. Neither is a pass.
+    """
+
 
 class EnvReadRefused(Exception):
     """Raised with a FIXED sentence. It never carries file content.
@@ -561,6 +712,76 @@ def read_env_keys(path: pathlib.Path, keys: Iterable[str]) -> dict[str, str]:
     return found
 
 
+# ------------------------------------------------- the second-consumer surface
+
+#: WHAT THIS LIBRARY OFFERS A CONSUMER THAT IS NOT box_readiness.py, and the
+#: question each entry answers. The contract, in one place, so reconciling it
+#: with production_truth.REQUIRED_PROBES is a diff and not archaeology.
+#:
+#: Two properties make an entry here different from any other function in this
+#: file, and tests/test_box_probes.py asserts both for every one of them:
+#:
+#:   1. IT IS CALLABLE WITHOUT AN `Environment`. production_truth.call_probe
+#:      passes only the context keys a signature declares, and REFUSES a
+#:      required parameter it cannot supply; it offers `deploy_root` and
+#:      `timeout`. Every probe here therefore takes `env` with a default and
+#:      accepts those two by keyword. This was the real defect behind the
+#:      contract mismatch: this file's header has claimed since its first commit
+#:      to be "the shared library behind two jobs", while no probe in it was
+#:      callable by anything that did not already hold an Environment -- and
+#:      box_readiness.py is the only thing that builds one. Measured against the
+#:      sibling branch's own loader on 2026-09-28: probe_engine_exposure raised
+#:      `ProbeContractError: box_probes.probe_engine_exposure() requires a
+#:      parameter this watch cannot supply: 'env'. It offers deploy_root,
+#:      timeout.`
+#:   2. ITS RESULT IS READABLE BY production_truth.normalise(): `ok` is a
+#:      bool property, `could_run` says whether the reading was taken at all,
+#:      and `detail` is ONE allowlisted line rather than a report.
+#:
+#: NOT OFFERED, and deliberately: `probe_container_states` and
+#: `probe_host_guard_unit`. production_truth.REQUIRED_PROBES names them, and
+#: they are not box-readiness probes -- a pre-deploy gate asks the seven in
+#: ALL_PROBES; a restart loop and a boot unit are a standing monitor's
+#: questions. production_truth.py's own header states where they belong:
+#: "implement it HERE or hand it back to that track -- never to edit their
+#: file." Implementing them in this file would mean shipping two probes that
+#: nothing on this branch runs and no test on this branch can exercise against
+#: the box, with a container expectation invented here rather than derived.
+SECOND_CONSUMER_PROBES: Mapping[str, str] = {
+    "probe_engine_exposure": (
+        "is the unauthenticated engine port unreachable from every non-cluster address"
+    ),
+    "probe_real_completion": (
+        "did a real completion advance vllm:generation_tokens_total (never /health)"
+    ),
+}
+
+
+def _env_for(
+    env: Environment | None,
+    deploy_root: pathlib.Path | str | None,
+    timeout: float | None,
+) -> Environment:
+    """The Environment a probe runs against, built if the caller has none.
+
+    `repo_root` is derived from this file's own path, which is correct for the
+    second consumer by construction: production_truth.py imports this module,
+    so it is sitting in the same checkout of the same repository.
+    """
+    if env is not None:
+        return env if timeout is None else dataclasses.replace(env, timeout_cap=timeout)
+    if deploy_root is None:
+        raise ProbeCallRefused(
+            "a probe was called with neither an Environment nor a deploy root"
+        )
+    return Environment(
+        deploy_root=pathlib.Path(deploy_root),
+        repo_root=pathlib.Path(__file__).resolve().parents[3],
+        ref="",
+        timeout_cap=timeout,
+    )
+
+
 # -------------------------------------------------------------------- probes
 
 def probe_deploy_root(env: Environment) -> ProbeResult:
@@ -587,14 +808,14 @@ def probe_deploy_root(env: Environment) -> ProbeResult:
     git = ["git", "--no-optional-locks", "-C", str(env.deploy_root)]
     inside = env.runner.run(
         git + ["rev-parse", "--is-inside-work-tree"],
-        timeout=TIMEOUTS["git"],
+        timeout=env.budget("git"),
     )
     if inside.rc != 0 or inside.stdout.strip() != "true":
         return ProbeResult("deploy-root", "not-a-checkout", {"exit_code": inside.rc})
 
     status = env.runner.run(
         git + ["status", "--porcelain", "--untracked-files=no"],
-        timeout=TIMEOUTS["git"],
+        timeout=env.budget("git"),
     )
     if status.rc != 0:
         return ProbeResult("deploy-root", "git-unreadable", {"exit_code": status.rc})
@@ -602,7 +823,7 @@ def probe_deploy_root(env: Environment) -> ProbeResult:
 
     branch = env.runner.run(
         git + ["rev-parse", "--abbrev-ref", "HEAD"],
-        timeout=TIMEOUTS["git"],
+        timeout=env.budget("git"),
     )
     if branch.rc != 0:
         return ProbeResult("deploy-root", "git-unreadable", {"exit_code": branch.rc})
@@ -626,7 +847,7 @@ def probe_disk(env: Environment) -> ProbeResult:
     """At least DISK_FLOOR_GB free on the deploy root's filesystem."""
     out = env.runner.run(
         ["df", "-BG", "--output=avail", str(env.deploy_root)],
-        timeout=TIMEOUTS["disk"],
+        timeout=env.budget("disk"),
     )
     if out.rc != 0:
         return ProbeResult("disk", "unreadable", {"exit_code": out.rc})
@@ -705,7 +926,7 @@ def probe_deploy_lock(env: Environment) -> ProbeResult:
         return ProbeResult("deploy-lock", "never-created")
     probe = env.runner.run(
         ["bash", "-c", 'exec 9<"$1" || exit 3; flock -n 9', "_", str(env.lock_file)],
-        timeout=TIMEOUTS["lock"],
+        timeout=env.budget("lock"),
     )
     if probe.rc == 0:
         return ProbeResult("deploy-lock", "free")
@@ -714,8 +935,18 @@ def probe_deploy_lock(env: Environment) -> ProbeResult:
     return ProbeResult("deploy-lock", "unreadable", {"exit_code": probe.rc})
 
 
-def probe_engine_exposure(env: Environment) -> ProbeResult:
+def probe_engine_exposure(
+    env: Environment | None = None,
+    *,
+    deploy_root: pathlib.Path | str | None = None,
+    timeout: float | None = None,
+) -> ProbeResult:
     """The unauthenticated engine port is unreachable from outside the cluster.
+
+    ON THE SECOND_CONSUMER_PROBES SURFACE, hence the keyword arguments: the
+    standing watch calls this with a deploy root and a timeout and holds no
+    Environment. box-readiness passes `env` positionally as every other probe
+    does. See SECOND_CONSUMER_PROBES.
 
     engine_bind.py is REUSED as a subprocess rather than reimplemented. Its own
     header states that it prints roles, counts, interface CLASSES and address
@@ -749,6 +980,7 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
     per-address pattern does not match, this still refuses, and it omits the
     count rather than guessing one.
     """
+    env = _env_for(env, deploy_root, timeout)
     out = env.runner.run(
         [
             "python3",
@@ -757,17 +989,17 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
             "--generated-env",
             str(env.generated_env),
         ],
-        timeout=TIMEOUTS["exposure"],
+        timeout=env.budget("exposure"),
     )
     text = (out.stdout or "") + (out.stderr or "")
-    detail = [line for line in text.splitlines() if line.strip()][:20]
+    report = [line for line in text.splitlines() if line.strip()][:20]
     accepted = len(_ACCEPTED_ADDRESS_RE.findall(text))
     if accepted:
         return ProbeResult(
             "engine-exposure",
             "exposed",
             {"accepted_addresses": accepted, "exit_code": out.rc},
-            detail,
+            report,
         )
     if _ACCEPTED_PHRASE_RE.search(text):
         # engine_bind reported an acceptance in a shape this probe cannot count.
@@ -775,10 +1007,10 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
         # never answer `closed` - and report no count rather than a made-up one.
         # The detail lines carry the real report, which is what the operator
         # needs in this case.
-        return ProbeResult("engine-exposure", "exposed", {"exit_code": out.rc}, detail)
+        return ProbeResult("engine-exposure", "exposed", {"exit_code": out.rc}, report)
     if out.rc == 0:
-        return ProbeResult("engine-exposure", "closed", {"exit_code": 0}, detail)
-    return ProbeResult("engine-exposure", "unproven", {"exit_code": out.rc}, detail)
+        return ProbeResult("engine-exposure", "closed", {"exit_code": 0}, report)
+    return ProbeResult("engine-exposure", "unproven", {"exit_code": out.rc}, report)
 
 
 def probe_engine_controller(env: Environment) -> ProbeResult:
@@ -790,7 +1022,7 @@ def probe_engine_controller(env: Environment) -> ProbeResult:
     """
     out = env.runner.run(
         ["curl", "-fsS", "-m", "5", env.controller_url + "/state"],
-        timeout=TIMEOUTS["controller"],
+        timeout=env.budget("controller"),
     )
     if out.rc != 0:
         return ProbeResult("engine-controller", "unreachable", {"exit_code": out.rc})
@@ -860,8 +1092,19 @@ def _generation_tokens(text: str) -> float | None:
     return total
 
 
-def probe_completion(env: Environment) -> ProbeResult:
+def probe_real_completion(
+    env: Environment | None = None,
+    *,
+    deploy_root: pathlib.Path | str | None = None,
+    timeout: float | None = None,
+) -> ProbeResult:
     """A REAL completion, and the token counter must advance.
+
+    ON THE SECOND_CONSUMER_PROBES SURFACE, hence the keyword arguments and
+    hence the name: `probe_real_completion` is what
+    production_truth.REQUIRED_PROBES asks for, and `probe_completion` below is
+    the same function under the name box-readiness's own table uses. See
+    SECOND_CONSUMER_PROBES.
 
     NEVER /health. A wedged vLLM engine served a green /health for five and a
     half hours on this box while generating nothing; /health, /v1/models and
@@ -878,8 +1121,41 @@ def probe_completion(env: Environment) -> ProbeResult:
 
     ONE tiny generation. The main model is TP=2 across both nodes, so this
     costs both of them, and it runs beside live chat.
+
+    THE REPLY IS READ FROM BOTH `content` AND `reasoning_content`. Thinking is
+    asked OFF, but `chat_template_kwargs.enable_thinking` is honoured by the
+    chat TEMPLATE, not by the server: a template that ignores it puts the eight
+    tokens in `reasoning_content` and leaves `content` empty. The counter would
+    advance, the box would be healthy, and reading `content` alone would report
+    `empty-reply` and refuse the deploy. Both are counted, and each is reported
+    as its own number so the log says which one carried the answer.
+
+    HOW THIS DIFFERS FROM `verify`'s "The model actually generates" STEP, stated
+    exactly, because the first version of this note claimed the two were
+    "character-for-character" the same probe and they were not:
+
+      * SAME, since 2026-09-28: the curl deadline (`-m 180`; it was 120 here and
+        180 there, so a slow prefill could refuse pre-deploy and pass
+        post-deploy), the prompt, max_tokens, temperature,
+        `chat_template_kwargs.enable_thinking`, reading the reply from `content`
+        or `reasoning_content`, and the check itself -- the GLOBAL
+        `vllm:generation_tokens_total` must advance.
+      * DIFFERENT, on purpose: `_generation_tokens` refuses a `NaN`, `+Inf` or
+        `-Inf` sample, where verify's `awk '/^vllm:generation_tokens_total/
+        {s+=$2}'` adds it and would pass. The divergence is in the strict
+        direction and is in this file's own reading, so it cannot make this
+        probe refuse something verify accepts.
+
+    STILL TRUE OF BOTH: the counter is global, so under concurrent live traffic
+    it can advance for someone else's request; `usage.completion_tokens` on the
+    response is the per-request number, and scripts/cluster-verify-engine.sh
+    uses it. Worth changing, and worth changing in BOTH -- which is now a real
+    argument rather than the cover it was while the two deadlines differed.
     """
     import tempfile
+
+    env = _env_for(env, deploy_root, timeout)
+    deadline = env.budget("completion")
 
     env_file = env.generated_env
     try:
@@ -902,7 +1178,7 @@ def probe_completion(env: Environment) -> ProbeResult:
                 "--github-output",
                 str(sink),
             ],
-            timeout=TIMEOUTS["controller"],
+            timeout=env.budget("controller"),
         )
         # resolve's STDOUT is deliberately dropped. Under GITHUB_ACTIONS it
         # emits a `::add-mask::` workflow command carrying the engine host,
@@ -921,7 +1197,7 @@ def probe_completion(env: Environment) -> ProbeResult:
     def counter() -> float | None:
         out = env.runner.run(
             ["curl", "-fsS", "-m", "15", url + "/metrics"],
-            timeout=TIMEOUTS["controller"],
+            timeout=env.budget("controller"),
         )
         return _generation_tokens(out.stdout) if out.rc == 0 else None
 
@@ -943,21 +1219,24 @@ def probe_completion(env: Environment) -> ProbeResult:
     )
     reply_out = env.runner.run(
         [
-            "curl", "-fsS", "-m", str(TIMEOUTS["completion"]),
+            "curl", "-fsS", "-m", str(int(deadline)),
             "-H", "Content-Type: application/json",
             "-d", body,
             url + "/v1/chat/completions",
         ],
-        timeout=TIMEOUTS["completion"] + COMPLETION_CURL_GRACE_S,
+        timeout=deadline + COMPLETION_CURL_GRACE_S,
     )
     elapsed = max(0.0, env.clock() - started)
     if reply_out.rc != 0:
         return ProbeResult("completion", "unreachable", {"exit_code": reply_out.rc, "elapsed_s": elapsed})
     try:
-        reply = json.loads(reply_out.stdout)["choices"][0]["message"]["content"]
+        message = json.loads(reply_out.stdout)["choices"][0]["message"]
     except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-        reply = ""
-    reply = (reply or "").strip()
+        message = None
+    if not isinstance(message, Mapping):
+        message = {}
+    content = str(message.get("content") or "").strip()
+    reasoning = str(message.get("reasoning_content") or "").strip()
 
     after = counter()
     if after is None:
@@ -968,14 +1247,23 @@ def probe_completion(env: Environment) -> ProbeResult:
     facts: dict[str, object] = {
         "tokens_before": int(before),
         "tokens_after": int(after),
-        "reply_chars": len(reply),
+        "reply_chars": len(content),
+        "reasoning_chars": len(reasoning),
         "elapsed_s": elapsed,
     }
-    if not reply:
+    if not content and not reasoning:
         return ProbeResult("completion", "empty-reply", facts)
     if after <= before:
         return ProbeResult("completion", "wedged", facts)
     return ProbeResult("completion", "generated", facts)
+
+
+#: The same function under the name box-readiness's table uses. ALL_PROBES and
+#: PROBE_VERDICTS key this probe as "completion", so the CLI-facing name stays
+#: `probe_completion`; SECOND_CONSUMER_PROBES needs `probe_real_completion`.
+#: One function, two names, so the two consumers cannot drift apart into two
+#: implementations of "ask the engine to generate".
+probe_completion = probe_real_completion
 
 
 def _schema_version(
@@ -995,7 +1283,15 @@ def _schema_version(
     less disciplined gets a shell injection for free, and the fix costs a
     positional parameter.
     """
-    assert function.replace("_", "").isalnum(), function
+    if not function.replace("_", "").isalnum():
+        # NOT an `assert`. `python -O` strips asserts, and this is the only
+        # check on the one identifier this function interpolates into a shell
+        # script -- everything else arrives as a positional parameter the shell
+        # never parses. The workflow runs plain `python3`, so the assert held
+        # today; a future caller under -O would have lost it silently, which is
+        # the class of "the gate is still there but it stopped checking" this
+        # whole branch exists to close.
+        raise ProbeCallRefused("the shell function name is not an identifier")
     out = env.runner.run(
         [
             "bash",
@@ -1005,7 +1301,7 @@ def _schema_version(
             str(env.deploy_common),
             *args,
         ],
-        timeout=TIMEOUTS["migrations"],
+        timeout=env.budget("migrations"),
         env={"TECHSARA_DEPLOY_ROOT": str(root)},
     )
     if out.rc != 0:
@@ -1144,10 +1440,6 @@ def _remedies(env: Environment) -> Mapping[tuple[str, str], tuple[str, ...]]:
             f"{root}/scripts/cluster-status.sh",
         ),
         ("engine-controller", "unreadable"): (f"{root}/scripts/cluster-status.sh",),
-        ("engine-controller", "not-ready"): (
-            f"{root}/scripts/cluster-status.sh",
-            f"{root}/scripts/cluster-verify-engine.sh",
-        ),
         ("engine-controller", "recovering"): (f"{root}/scripts/cluster-status.sh",),
         ("completion", "wedged"): (
             f"{root}/scripts/cluster-verify-engine.sh",

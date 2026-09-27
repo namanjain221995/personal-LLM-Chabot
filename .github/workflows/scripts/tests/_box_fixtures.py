@@ -95,10 +95,19 @@ RESULT: FAILED
 #: and never an address, so there is nothing here to redact). The bare phrase
 #: occurs THREE times for TWO accepting addresses, so before the fix this real
 #: log would have been reported as `accepted_addresses 3`.
+#:
+#: "Verbatim" was not true until 2026-09-28: the `- not probed (inside the
+#: cluster or the host)` line below was missing. It is restored from the run's
+#: own log, re-read with `gh run view 36304046169 --log`. No count and no
+#: assertion depended on it -- which is exactly why the word could be wrong for
+#: two rounds without anything going red, and why the line is back rather than
+#: the word softened. A fixture that says "verbatim" is a claim someone will
+#: rely on when they reason about what the real report can contain.
 BIND_EXPOSED_TWO = """### Main engine exposure: can the unauthenticated engine API be reached from outside the cluster?
 - engine port 8000 listeners: 1 wildcard (IPv4), 0 wildcard (IPv6/dual-stack), 0 loopback, 0 on the configured address, 0 on another specific address
 - configuration: asks for a wildcard (the approved cluster shape; outside proof is mandatory)
 - a wildcard is in play: proving from the worker that only the cluster fabric reaches the engine port
+- not probed (inside the cluster or the host): 1 second-rail fabric, 2 fabric-link link-local, 52 docker bridge and 2 loopback address(es); 2 link-local address(es) no wildcard listener covers
 - cluster fabric address: reachable from the worker (required)
 - 3 non-cluster addresses: 1 blocked, 2 ACCEPTED, 0 not proven (required: all blocked)
   - non-cluster address (interface class: lan, IPv4): ACCEPTED the connection on the engine port

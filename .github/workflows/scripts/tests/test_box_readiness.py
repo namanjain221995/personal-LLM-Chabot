@@ -27,6 +27,8 @@ from _box_fixtures import (  # noqa: E402
     BIND_EXPOSED_TWO,
     BIND_EXPOSED_UNCOUNTABLE,
     CONTROLLER_READY,
+    SENTINEL_SECRET,
+    SENTINEL_SECRET_PATH,
     FakeRunner,
     Raises,
     make_box,
@@ -305,13 +307,65 @@ class TheEngineController(BoxCase):
                 )
                 self.assertRefused(code, output, "engine-controller", "unreadable")
 
-    def test_a_state_that_is_not_serving_refuses(self):
+    def test_a_state_that_is_not_serving_is_reported_and_does_not_block(self):
+        """`not-ready` used to refuse, and that was the same self-lockout shape
+        as `wrong-branch` - found the same way, by running the probe against the
+        real box.
+
+        Measured 2026-09-28 at load average 29.75: the controller answered
+        DEGRADED (state_code 4, primary_ready false) with its own `reason`
+        reading "canary timed out twice but the engine is progressing (2 running,
+        1 waiting, kv 22%): saturation, not a wedge". The box was busy, not
+        broken, and that is measured rather than taken on the controller's word:
+        `increase(vllm:generation_tokens_total{service="main"}[10m])` read 5605
+        from Prometheus at the same moment, without spending a generation. This
+        probe refused anyway - so `deploy` would have been skipped for as long as
+        the box stayed busy, on a machine that is busy most of the time.
+
+        The release path passes that state. deploy.sh:938 gates on
+        `scripts/cluster-status.sh`, which downgrades a non-serving controller
+        state to `check_warn`, and `check_summary`
+        (scripts/lib/cluster-common.sh:44-45) returns `[ "$CHECK_FAIL" -eq 0 ]`.
+        On the same DEGRADED box that script printed "11 passed, 2 warnings, 0
+        failed" and exited 0.
+
+        What the refusal was standing in for is measured properly by
+        `probe_real_completion` in this same job - see TheWedgedEngine below,
+        which still refuses a wedge by the token counter rather than by a status
+        field."""
         doc = CONTROLLER_READY.replace('"state_code": 2', '"state_code": 5').replace(
             '"state": "READY"', '"state": "DEGRADED"'
         )
         code, output = self.readiness(**{"controller": box_probes.Completed(0, doc)})
-        self.assertRefused(code, output, "engine-controller", "not-ready")
+        self.assertReportedButNotRefused(code, output, "engine-controller", "not-ready")
         self.assertIn("engine_state DEGRADED", output)
+        self.assertIn("state_code 5", output)
+
+    def test_a_degraded_controller_does_not_stop_a_wedge_being_caught(self):
+        """The whole argument for widening it: the strong signal still refuses.
+
+        A DEGRADED controller AND a still token counter is a wedged engine, and
+        it has to refuse - by the completion, not by the state code."""
+        doc = CONTROLLER_READY.replace('"state_code": 2', '"state_code": 5').replace(
+            '"state": "READY"', '"state": "DEGRADED"'
+        )
+        code, output = self.readiness(
+            **{"controller": box_probes.Completed(0, doc), "metrics_counts": [1000, 1000]}
+        )
+        self.assertRefused(code, output, "completion", "wedged")
+        self.assertRegex(output, r"(?m)^engine-controller\s+not-ready\b")
+
+    def test_a_recovery_still_refuses_even_though_the_state_no_longer_does(self):
+        """The argument is deliberately not extended to `recovering`: a recovery
+        in flight is moving the same containers the rollout will move, which is a
+        race cluster-status.sh's exit code says nothing about."""
+        doc = (
+            CONTROLLER_READY.replace('"in_progress": false', '"in_progress": true')
+            .replace('"state_code": 2', '"state_code": 5')
+            .replace('"state": "READY"', '"state": "DEGRADED"')
+        )
+        code, output = self.readiness(**{"controller": box_probes.Completed(0, doc)})
+        self.assertRefused(code, output, "engine-controller", "recovering")
 
 
 class TheWedgedEngine(BoxCase):
@@ -470,6 +524,151 @@ class AProbeThatCannotBePerformedIsARefusal(BoxCase):
         self.assertEqual(code, box_readiness.EXIT_REFUSED)
         self.assertIn("REFUSED by 2 of 7 probes. Nothing was changed.", output)
         self.assertRegex(output, r"(?m)^completion\s+generated")
+
+
+class ThisJobAlwaysReachesAVerdict(BoxCase):
+    """`deploy` has this job in its `needs:`, so a run that ends in a traceback
+    instead of a verdict is a deploy that never happens AND an operator with no
+    reason for it.
+
+    box_probes.run_probe already turns anything a PROBE does into a refusal, and
+    the classes above prove that. What was unguarded was the REST of the script -
+    the rendering, the wrapping, the summary write - and a traceback out of there
+    would have printed filesystem paths into a world-readable log with no verdict
+    anywhere in it.
+    """
+
+    def test_a_failure_in_the_reporting_path_is_a_refusal_and_not_a_traceback(self):
+        def explode(_env, **_kwargs):
+            raise RuntimeError("the reporting path fell over")
+
+        original = box_readiness.run
+        box_readiness.run = explode
+        self.addCleanup(lambda: setattr(box_readiness, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = box_readiness.main(["--deploy-root", str(root), "--ref", "abc1234"])
+        self.assertEqual(code, box_readiness.EXIT_REFUSED)
+        self.assertIn("VERDICT: NOT READY", err.getvalue())
+        self.assertIn("RuntimeError", err.getvalue())
+
+    def test_it_refuses_rather_than_passes_because_an_unfinished_reading_is_not_evidence(self):
+        def explode(_env, **_kwargs):
+            raise MemoryError()
+
+        original = box_readiness.run
+        box_readiness.run = explode
+        self.addCleanup(lambda: setattr(box_readiness, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = box_readiness.main(["--deploy-root", str(root), "--ref", "abc1234"])
+        self.assertNotEqual(code, box_readiness.EXIT_OK)
+
+    def test_the_exceptions_message_is_never_printed_only_its_class(self):
+        """`str(exc)` is how a value out of a file reaches a public log."""
+        def explode(_env, **_kwargs):
+            raise RuntimeError(f"secret in the message: {SENTINEL_SECRET} {SENTINEL_SECRET_PATH}")
+
+        original = box_readiness.run
+        box_readiness.run = explode
+        self.addCleanup(lambda: setattr(box_readiness, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                box_readiness.main(["--deploy-root", str(root), "--ref", "abc1234"])
+        text = err.getvalue()
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn(SENTINEL_SECRET, text)
+        self.assertNotIn(SENTINEL_SECRET_PATH, text)
+
+    def test_a_class_name_that_is_not_a_plain_identifier_is_withheld(self):
+        """The class name comes from outside this file too, so it goes through
+        the same allowlist every fact does rather than straight to the log."""
+        weird = type("Bad Name://x", (RuntimeError,), {})
+
+        def explode(_env, **_kwargs):
+            raise weird()
+
+        original = box_readiness.run
+        box_readiness.run = explode
+        self.addCleanup(lambda: setattr(box_readiness, "run", original))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                box_readiness.main(["--deploy-root", str(root), "--ref", "abc1234"])
+        self.assertIn(box_probes.WITHHELD, err.getvalue())
+        self.assertNotIn("://", err.getvalue())
+
+    def test_an_operator_pressing_ctrl_c_is_not_swallowed_into_a_verdict(self):
+        original = box_readiness.run
+        self.addCleanup(lambda: setattr(box_readiness, "run", original))
+        for exc in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exc=exc.__name__):
+                def explode(_env, _exc=exc, **_kwargs):
+                    raise _exc()
+
+                box_readiness.run = explode
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        root = make_box(tmp)
+                        with self.assertRaises(exc):
+                            box_readiness.main(["--deploy-root", str(root), "--ref", "abc1234"])
+                finally:
+                    box_readiness.run = original
+
+    def test_the_realistic_shared_checkout_state_still_reaches_a_verdict(self):
+        """A DETACHED HEAD and a DIRTY TREE at the same time, which is what the
+        shared production checkout looks like while several sessions are in it
+        and deploy.sh has detached it. One verdict is reported and does not
+        block (`wrong-branch`); the other refuses (`dirty-tree`, deploy.sh:189).
+        The job reaches a verdict either way, with the command to clear it."""
+        code, output = self.readiness(
+            **{"git-branch": box_probes.Completed(0, "HEAD\n"),
+               "git-status": box_probes.Completed(0, " M orchestrator/app/chat.py\n")}
+        )
+        self.assertRefused(code, output, "deploy-root", "dirty-tree")
+        self.assertIn("on_default_branch no", output)
+        self.assertIn("SHARED working tree", output)
+        self.assertIn(f"git -C {self.root} status --porcelain --untracked-files=no", output)
+
+    def test_every_probe_refusing_at_once_still_prints_a_verdict_and_seven_remedies(self):
+        """The worst case for the reporting path: nothing to report but refusals."""
+        code, output = self.readiness(
+            **{
+                "git-status": box_probes.Completed(0, " M x.py\n"),
+                "df": box_probes.Completed(0, "Avail\n1G\n"),
+                "flock": box_probes.Completed(1, ""),
+                "bind-check": Raises(RuntimeError("boom")),
+                "controller": box_probes.Completed(7, ""),
+                "metrics": box_probes.Completed(7, ""),
+                "schema-live": box_probes.Completed(0, "99\n"),
+                "schema-code": box_probes.Completed(0, "41\n"),
+            }
+        )
+        self.assertEqual(code, box_readiness.EXIT_REFUSED, output)
+        self.assertIn("REFUSED by 7 of 7 probes. Nothing was changed.", output)
+        self.assertIn("VERDICT: NOT READY", output)
+        self.assertIn("To clear it, run:", output)
+
+    def test_a_verdict_no_probe_declares_is_withheld_rather_than_printed(self):
+        """The last line of the fail-closed default: a string that reached a
+        verdict field from outside this library is not printed as one, and the
+        table still has a row and the run still has a verdict."""
+        original = box_probes.ALL_PROBES
+        box_probes.ALL_PROBES = (
+            ("disk", lambda _env: box_probes.ProbeResult("disk", "http://evil/x")),
+        )
+        self.addCleanup(lambda: setattr(box_probes, "ALL_PROBES", original))
+        code, output = self.readiness()
+        self.assertEqual(code, box_readiness.EXIT_REFUSED, output)
+        self.assertIn(box_probes.WITHHELD, output)
+        self.assertNotIn("evil", output)
+        self.assertIn("VERDICT: NOT READY", output)
 
 
 class TheCommandLine(unittest.TestCase):
