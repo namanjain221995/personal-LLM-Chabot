@@ -495,9 +495,13 @@ def _with_plan(messages: Sequence[dict], plan: str, brief: str = "") -> List[dic
 async def _plan(message: str, grounding: str, mode: str, brief: str = "") -> str:
     """One call, THINKING OFF, PLAN_MAX_TOKENS of answer.
 
-    It always runs on the main model: engines/chat.py gates this whole
-    branch on `model_choice == "smart"` and llm.chat_completion sends to
-    settings.llm_model, so there is no model to choose here.
+    It always runs on the main model, because llm.chat_completion sends to
+    settings.llm_model — so there is no model to choose here. This used to
+    credit engines/chat.py's `model_choice == "smart"` gate for that; the
+    gate was dropped on 2026-09-27 (effort decides effort, and it had started
+    routing a legacy `model: "fast"` Max turn into best-of-N instead of this
+    loop) and the property is unchanged, because it never came from the gate:
+    llm.resolve_model_choice returns the main model for EVERY choice.
 
     THE DESIGN SAID THINKING ON. Measured on the owner's own prompt, live,
     GPU idle before each call, same messages, same 700-token answer ceiling:
