@@ -375,6 +375,7 @@ def test_csv_with_styling_also_delivers_a_styled_xlsx(tmp_path):
 #: on the artifact path only — no chat effort pays it. Class docstrings
 #: become schema `description`, so the reasoning for these models lives in
 #: comments above them rather than in their docstrings.
+#: signed off at integration 2026-09-27 with feat/document-vocabulary
 BASE_SCHEMA_LENGTHS = {"document": 17519, "presentation": 12872, "workbook": 21356}
 
 
