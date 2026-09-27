@@ -45,7 +45,7 @@ if rh="$(ssh_worker hostname 2>/dev/null)"; then
   facts="$(ssh_worker "$(detect_snippet)
 for a in '${CLUSTER_WORKER_IP}' '${CLUSTER_WORKER_IP_2:-}'; do [ -n \"\$a\" ] || continue; ifn=\$(detect_ifname_for_ip \"\$a\"); hca=\$(detect_hca_for_ifname \"\${ifn:-none}\" 2>/dev/null); echo LINK=\$a\\|\${ifn:-}\\|\$(cat /sys/class/net/\${ifn:-none}/operstate 2>/dev/null)\\|\${hca:-}\\|\$(rdma_state_for_hca \"\${hca:-none}\" 2>/dev/null)\\|\$(mtu_for_ifname \"\${ifn:-none}\"); done
 echo IB=\$(test -e /dev/infiniband/rdma_cm && echo yes || echo no)
-echo RUNTIME=\$( (docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia) && echo nvidia || { command -v nvidia-container-runtime-hook >/dev/null 2>&1 || command -v nvidia-ctk >/dev/null 2>&1; } && echo toolkit || echo none)
+if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then echo RUNTIME=nvidia; elif command -v nvidia-container-runtime-hook >/dev/null 2>&1 || command -v nvidia-ctk >/dev/null 2>&1; then echo RUNTIME=toolkit; else echo RUNTIME=none; fi
 echo GPU=\$(nvidia-smi -L 2>/dev/null | head -n1)
 echo MEM=\$(awk '/MemTotal/{t=\$2} /MemAvailable/{a=\$2} END{printf \"%d %d\", t/1024/1024, a/1024/1024}' /proc/meminfo)
 echo UFW=\$(grep -E '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2)
