@@ -197,12 +197,16 @@ class AnUnknownAgeIsARefusal(unittest.TestCase):
         not true and made it look safer than it is.
 
         It is kept because measuring TOO LARGE fails closed and having no
-        measurement at all would not, and because nothing better exists
-        offline - the run's own start time is not a `github` context property.
-        What the refusal owes the operator instead is (a) the source it used,
-        so the reading can be recognised as the weak one, and (b) an escape
-        hatch that works. Both are asserted here. If someone later loosens this
-        into a pass, this test says out loud what was traded away.
+        measurement at all would not. It is no longer kept because "nothing
+        better exists offline": the gate can publish its own completion time as
+        a job output, and `TheGatesOwnClockCrossesTheJobBoundary` below is that
+        source. This reading is now the THIRD one and is reached only when both
+        of the others are missing.
+
+        What the refusal owes the operator when it IS reached is (a) the source
+        it used, so the reading can be recognised as the weak one, and (b) an
+        escape hatch that works. Both are asserted here. If someone later
+        loosens this into a pass, this test says out loud what was traded away.
         """
         rc, output = run(
             sha=TIP, origin_tip=TIP, gate_completed_at="", fallback_timestamp=minutes_ago(180)
@@ -505,6 +509,153 @@ class TimestampParsing(unittest.TestCase):
         for raw in (None, "", "   ", "later", "2026-09-19T07:33:29+99:00"):
             with self.subTest(raw=raw):
                 self.assertIsNone(deploy_freshness.parse_timestamp(raw))
+
+
+class TheGatesOwnClockCrossesTheJobBoundary(unittest.TestCase):
+    """The offline source that is NOT the committer's clock.
+
+    The gate's completion time out of the Actions API is the right reading and
+    stays first. When that read fails - a 403, a rate limit, no network - the
+    guard used to have only `github.event.head_commit.timestamp` left, which is
+    the COMMITTER's clock and refuses releases that are not stale (the test
+    above measures that at 180 minutes on a release pushed seconds ago).
+
+    The workflow's own comments claimed there was nothing better, because "every
+    other reading of it is the same API call that has just failed". That was not
+    true: `ci-ok` can publish its completion time as a job output and `deploy`
+    can read `needs.ci-ok.outputs.completed_at` with no API call at all - the
+    mechanism the rollout already uses to hand `manifest` and `record` to
+    `verify`. These tests pin the precedence that came out of fixing it.
+    """
+
+    def test_the_job_output_is_used_when_the_api_read_failed(self):
+        rc, output = run(
+            sha=TIP, origin_tip=TIP,
+            gate_completed_at="",
+            gate_self_reported_at=minutes_ago(3),
+            fallback_timestamp=minutes_ago(480),
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("the gate's own clock, published as a job output", output)
+        self.assertIn("3.0 minutes old", output)
+
+    def test_the_api_reading_still_wins_over_the_job_output(self):
+        # The API time is what the job ACTUALLY finished at; the job output is a
+        # step's own clock a few seconds earlier. When both are there, the
+        # better one decides.
+        rc, output = run(
+            sha=TIP, origin_tip=TIP,
+            gate_completed_at=minutes_ago(5),
+            gate_self_reported_at=minutes_ago(6),
+            fallback_timestamp=minutes_ago(480),
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("the gate's completion time", output)
+        self.assertIn("5.0 minutes old", output)
+
+    def test_the_job_output_beats_the_committers_clock_and_stops_the_false_refusal(self):
+        # THE case this source was added for, and the same numbers as the
+        # false-refusal test above: a release pushed seconds ago whose commit
+        # was written three hours earlier. On the committer's clock that is
+        # 180 minutes and a REFUSAL; on the gate's own clock it is fresh.
+        stale_commit = minutes_ago(180)
+        refused, _ = run(
+            sha=TIP, origin_tip=TIP, gate_completed_at="", fallback_timestamp=stale_commit
+        )
+        self.assertEqual(refused, 1)
+        rc, output = run(
+            sha=TIP, origin_tip=TIP,
+            gate_completed_at="",
+            gate_self_reported_at=minutes_ago(0.2),
+            fallback_timestamp=stale_commit,
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("the gate's own clock, published as a job output", output)
+
+    def test_an_unparseable_job_output_falls_through_to_the_commit_timestamp(self):
+        # An empty or malformed output must not swallow the reading behind it.
+        for raw in ("", "   ", "not-a-time", "2026-13-45T99:99:99Z"):
+            with self.subTest(raw=raw):
+                rc, output = run(
+                    sha=TIP, origin_tip=TIP,
+                    gate_completed_at="",
+                    gate_self_reported_at=raw,
+                    fallback_timestamp=minutes_ago(30),
+                )
+                self.assertEqual(rc, 0, output)
+                self.assertIn("the deployed commit's timestamp", output)
+
+    def test_a_stale_job_output_still_refuses(self):
+        # It is a source, not an exemption: the queued-for-two-days case is
+        # exactly as refused when this is the reading that measured it.
+        rc, output = run(
+            sha=TIP, origin_tip=TIP,
+            gate_completed_at="",
+            gate_self_reported_at=minutes_ago(3277),
+            fallback_timestamp=minutes_ago(3277),
+        )
+        self.assertEqual(rc, 1, output)
+        self.assertIn("the gate's own clock, published as a job output", output)
+        self.assertIn("3277.0 minutes old", output)
+
+    def test_with_no_source_at_all_the_push_path_still_refuses(self):
+        rc, output = run(
+            sha=TIP, origin_tip=TIP,
+            gate_completed_at="", gate_self_reported_at="", fallback_timestamp="",
+        )
+        self.assertEqual(rc, 1, output)
+
+
+class ThePipelineActuallyPublishesAndReadsThatClock(unittest.TestCase):
+    """A source the workflow does not wire up is a docstring.
+
+    Structural, because the crossing itself needs a real Actions run: what can
+    be asserted here is that `ci-ok` declares the output, that the step writing
+    it is the LAST one in that job (so the instant is as close to the job's own
+    completion as a step can get), and that the freshness step reads it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        pipeline = pathlib.Path(__file__).resolve().parents[4] / ".github/workflows/pipeline.yml"
+        cls.document = yaml.safe_load(pipeline.read_text(encoding="utf-8"))
+        cls.gate = cls.document["jobs"]["ci-ok"]
+        cls.deploy = cls.document["jobs"]["deploy"]
+
+    def test_the_gate_declares_its_completion_time_as_a_job_output(self):
+        self.assertEqual(
+            "${{ steps.finished.outputs.completed_at }}",
+            (self.gate.get("outputs") or {}).get("completed_at"),
+        )
+
+    def test_the_step_that_writes_it_is_the_last_step_of_the_gate(self):
+        last = self.gate["steps"][-1]
+        self.assertEqual("finished", last.get("id"))
+        self.assertIn("completed_at=", last["run"])
+        self.assertIn('>> "$GITHUB_OUTPUT"', last["run"])
+
+    def test_the_freshness_step_reads_it_through_the_environment(self):
+        # Through env:, never interpolated into the run: body - workflow_policy
+        # P6, and the same rule every other input to this step follows.
+        steps = [s for s in self.deploy["steps"] if "Freshness" in str(s.get("name"))]
+        self.assertEqual(1, len(steps), [s.get("name") for s in self.deploy["steps"]])
+        env = steps[0]["env"]
+        self.assertEqual(
+            "${{ needs.ci-ok.outputs.completed_at }}",
+            env.get("GATE_SELF_REPORTED_AT"),
+            "the freshness step no longer reads the gate's own completion time, so the only "
+            "offline source left is the COMMITTER's clock - which refuses releases that are "
+            "not stale",
+        )
+        self.assertNotIn("GATE_SELF_REPORTED_AT=", steps[0]["run"])
+
+    def test_the_gate_is_a_dependency_of_the_deploy_job(self):
+        # needs.ci-ok.outputs resolves only while ci-ok is in `needs`.
+        needs = self.deploy["needs"]
+        needs = [needs] if isinstance(needs, str) else list(needs)
+        self.assertIn("ci-ok", needs)
 
 
 if __name__ == "__main__":

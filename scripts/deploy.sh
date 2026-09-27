@@ -89,10 +89,10 @@
 #     compose project is mid-recreate, or when Docker itself is unwell. That is
 #     an uncommon path, not an impossible one, and it is the path on which a
 #     fail-open starts old code on a new schema unattended. Now the verdict is
-#     computed at the forward gate while the
-#     stack is still healthy, printed, recorded in the release directory, and
-#     only CONSULTED at rollback time. Missing, unparseable, forward-only, or
-#     a live version that cannot be read: all four REFUSE.
+#     computed at the forward gate while the stack is still healthy, printed,
+#     recorded in the release directory, and only CONSULTED at rollback time.
+#     Missing, unparseable, forward-only, or a live version that cannot be read:
+#     all four REFUSE.
 #     The FORWARD gate is unchanged, including its fail-open. It runs with a
 #     human watching; the rollback does not.
 #   * THE WAITS FIT THE CALLER'S CEILING. DEPLOY_LOCK_WAIT (default 1800) and
@@ -1065,6 +1065,14 @@ PY
   #     explicitly. Written LAST and truncating, so the file always describes
   #     the apply that just completed, including a rollback's.
   #
+  #     EVERY key here is about THIS apply, including the verdict: $sha, the
+  #     manifest, the record and the release directory are all the rollback's
+  #     own when the rollback is the apply running, so a verdict about
+  #     PREVIOUS -> TARGET would be the one line in the file describing a
+  #     different transition. That is why it reads $APPLY_VERDICT, which the
+  #     rollback path re-points before it calls apply(), and not
+  #     $REVERSIBILITY_VERDICT, which is the forward answer for good.
+  #
   #     Nothing in this script knows about GitHub Actions; the caller points
   #     DEPLOY_RESULT_FILE wherever it likes and reads `key=value` back.
   if [ -n "${DEPLOY_RESULT_FILE:-}" ]; then
@@ -1073,7 +1081,7 @@ PY
       printf 'manifest=%s\n' "$MANIFEST"
       printf 'record=%s\n' "$RECORD_JSON"
       printf 'release_dir=%s\n' "$RECORD_DIR"
-      printf 'reversibility=%s\n' "$REVERSIBILITY_VERDICT"
+      printf 'reversibility=%s\n' "$APPLY_VERDICT"
     } >"$DEPLOY_RESULT_FILE" 2>>"$LOG"; then
       say "  result: paths for this apply written to $DEPLOY_RESULT_FILE"
     else

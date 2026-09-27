@@ -36,6 +36,7 @@ pipeline.yml with no thought for the ceiling fails a test instead of a rollout.
 from __future__ import annotations
 
 import pathlib
+import re
 import subprocess
 import unittest
 
@@ -58,9 +59,22 @@ DEPLOY_SH = REPO / "scripts" / "deploy.sh"
 #:   * the job's other steps - checkout, freshness, the two preflights, "the
 #:     box is serving the commit we asked for", "report what is now serving".
 #:
-#: Nothing here is a claim about how long a deploy takes. It is the slack the
-#: waiting must leave behind, and if it is too small the assertion below fails
-#: in CI rather than the rollout being cancelled on the box.
+#: Nothing here is a claim about how long a deploy takes, and NOTHING HERE CAN
+#: MEASURE ONE. An earlier version of this comment said that if the allowance
+#: were too small "the assertion below fails in CI rather than the rollout being
+#: cancelled on the box, which is the safe direction". It cannot: the assertion
+#: reads constants out of pipeline.yml, so the only thing that can make it fail
+#: is somebody editing a number. A deploy that genuinely takes longer than this
+#: allowance is cancelled on the box exactly as it would be without this file.
+#:
+#: What the file does buy is the thing that actually went wrong: a wait raised,
+#: a budget deleted, or `timeout-minutes` lowered can no longer pass review
+#: unnoticed. Timing the real thing needs a real Actions run.
+#:
+#: It is also the ROLLING path's allowance. A `--full` deploy reloads the main
+#: model on purpose and does not fit - see
+#: TheFullDeployPathIsOutsideTheCeiling below, which keeps pipeline.yml's
+#: written acknowledgement of that and the arithmetic in agreement.
 WORK_ALLOWANCE_S = 900
 
 
@@ -85,10 +99,27 @@ class TheDeployJob:
     """The deploy job as pipeline.yml actually declares it."""
 
     def __init__(self) -> None:
-        document = yaml.safe_load(PIPELINE.read_text(encoding="utf-8"))
+        self.text = PIPELINE.read_text(encoding="utf-8")
+        document = yaml.safe_load(self.text)
         self.job = document["jobs"]["deploy"]
         self.timeout_s = int(self.job["timeout-minutes"]) * 60
         self.job_env = {str(k): str(v) for k, v in (self.job.get("env") or {}).items()}
+        # YAML 1.1 reads a bare `on:` as the boolean true, which is what PyYAML
+        # hands back for a workflow's trigger block.
+        self.triggers = document.get("on") or document.get(True) or {}
+
+    def model_reload_seconds(self) -> int:
+        """The worst case the workflow itself puts on one model reload.
+
+        Parsed out of the `full` input's own description rather than restated
+        here, so the two cannot drift: "+15-25 min: the main model reloads".
+        """
+        description = str(
+            self.triggers["workflow_dispatch"]["inputs"]["full"]["description"]
+        )
+        match = re.search(r"\+\s*(\d+)\s*-\s*(\d+)\s*min", description)
+        assert match, f"the `full` input no longer states a reload cost: {description!r}"
+        return int(match.group(2)) * 60
 
     def invocations(self) -> list[tuple[str, dict[str, str]]]:
         """(step name, effective env) for every step that runs deploy.sh.
@@ -278,6 +309,66 @@ class TheDeployScriptActuallyClampsWithIt(unittest.TestCase):
                 break
             header.append(line)
         self.assertIn("DEPLOY_WALL_BUDGET_S", "\n".join(header))
+
+
+class TheFullDeployPathIsOutsideTheCeiling(unittest.TestCase):
+    """The case the budget cannot fix, written down instead of implied.
+
+    Everything above is about WAITING, which a budget can bound. A `--full`
+    deploy's cost is WORK: pipeline.yml's own `full` input says "+15-25 min: the
+    main model reloads", and the rollback path runs `techsara up` twice, so the
+    worst case is two reloads - more than the whole job timeout on its own,
+    whatever the budget is set to.
+
+    This branch does not cause that, and it makes it less likely to bite: the
+    permitted waiting here is 1500 s, against 6000 s with the
+    DEPLOY_LOCK_WAIT/ENGINE_LOCK_WAIT defaults this job now overrides and 3000 s
+    with the "first fix" the module docstring describes - all three re-derived
+    from the workflow file on 2026-09-27. What is still not true for the --full
+    path is "all the waiting plus the work fits inside the job timeout", and the
+    test that defends it cannot tell. So the workflow says so in words, and this
+    class keeps the words and the numbers in agreement in BOTH directions: if
+    someone later sizes the job so the --full rollback does fit, the note has to
+    go.
+    """
+
+    #: The sentence pipeline.yml must carry while the numbers do not fit.
+    ACKNOWLEDGEMENT = (
+        "a --full deploy's rollback path does not fit inside this job's timeout"
+    )
+
+    def setUp(self):
+        self.deploy = TheDeployJob()
+        self.waiting_s = sum(
+            self.deploy.waits(name, env) for name, env in self.deploy.invocations()
+        )
+
+    def test_the_rollback_path_of_a_full_deploy_needs_two_model_reloads(self):
+        # The premise: apply() runs for the forward release and again for the
+        # rollback, and with --full each one reloads the engine.
+        self.assertGreater(self.deploy.model_reload_seconds(), 0)
+        self.assertGreater(2 * self.deploy.model_reload_seconds(), self.deploy.timeout_s)
+
+    def test_the_note_and_the_arithmetic_agree(self):
+        needed = self.waiting_s + 2 * self.deploy.model_reload_seconds()
+        fits = needed <= self.deploy.timeout_s
+        written_down = self.ACKNOWLEDGEMENT in self.deploy.text
+        self.assertEqual(
+            not fits, written_down,
+            f"a --full deploy's rollback path needs {needed}s worst case "
+            f"({self.waiting_s}s of permitted waiting plus two "
+            f"{self.deploy.model_reload_seconds()}s model reloads) against a "
+            f"{self.deploy.timeout_s}s job timeout, so it "
+            + ("does NOT fit" if not fits else "DOES fit")
+            + " - and pipeline.yml "
+            + ("does not say so" if not written_down else "says it does not")
+            + ". Either the note or the numbers is now wrong.",
+        )
+
+    def test_the_rolling_path_does_fit_which_is_what_the_budget_defends(self):
+        # Stated next to the case that does not, so a reader is not left to
+        # infer that the ceiling is decorative. This is the unattended path.
+        self.assertLessEqual(self.waiting_s + WORK_ALLOWANCE_S, self.deploy.timeout_s)
 
 
 if __name__ == "__main__":

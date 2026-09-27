@@ -456,8 +456,14 @@ dr_rollback_is_reversible() {
     *) printf 'refuse reason=unparseable-verdict\n'; return 1 ;;
   esac
   _dr_is_uint "$previous" || { printf 'refuse reason=unparseable-verdict\n'; return 1; }
-  # THE case this whole helper exists for. /health is down and psql did not
-  # answer, which is the normal state when a rollback is being considered.
+  # THE case this whole helper exists for: /health is down (a rollback is only
+  # reached when the health gate or `techsara up` failed) and the psql fallback
+  # did not answer either. Postgres is USUALLY still running when only the
+  # application containers were recreated, so this is an uncommon path rather
+  # than "the normal state when a rollback is being considered" - the wording
+  # this comment used to carry, and the same overstatement scripts/deploy.sh
+  # corrected in its own two copies. Uncommon is not impossible, and it is the
+  # path on which a fail-open starts old code on a newer schema unattended.
   if ! _dr_is_uint "$live_now"; then
     printf 'refuse reason=live-schema-unreadable previous=%s\n' "$previous"; return 1
   fi
@@ -521,7 +527,7 @@ dr_rollback_is_reversible() {
 # cancelled mid-`up`.
 #
 # Pure: the clock is an argument, so the arithmetic is unit-testable
-# (.github/workflows/scripts/tests/test_rollback_reversibility.py).
+# (.github/workflows/scripts/tests/test_deploy_lock_budget.py).
 #
 #   dr_wait_within_budget REQUESTED STARTED_EPOCH CEILING_S NOW_EPOCH
 #
@@ -543,6 +549,53 @@ dr_wait_within_budget() {
   else
     printf '%s\n' "$requested"
   fi
+}
+
+# ------------------------------------------------------- the model clock
+# Did the main model's clock do what THIS deploy asked of it?
+#
+# This is one function because two callers disagreed about it, and wiring them
+# together turned that disagreement into a red pipeline. The verify job's own
+# step exits 0 when `needs.deploy.outputs.was_full == 'true'`, because `--full`
+# reloads the models on purpose and asserting the clock did not move would be
+# asserting the opposite of what was asked for. scripts/deploy-smoke.sh's
+# MODEL CLOCK check had no such exemption - harmless while nothing called it,
+# and a failed verify plus a recovery job on the first deliberate `--full`
+# deploy once something did.
+#
+#   dr_model_clock_verdict RECORDED_STARTED_AT OBSERVED_STARTED_AT RESTART_EXPECTED
+#
+# Prints exactly one verdict word, and exits 0 when what was observed is what
+# was asked for and 1 when it is not:
+#
+#   preserved     the instants are equal and no reload was asked for   -> 0
+#   reloaded      they differ and a reload WAS asked for               -> 0
+#   restarted     they differ and nothing asked for that               -> 1
+#   not-reloaded  they are equal and a reload was asked for            -> 1
+#   unreadable    either instant is missing                            -> 1
+#
+# RESTART_EXPECTED is 1 only for `--full`. Anything else - empty, 0, a word -
+# means a rolling deploy, because the assertion that the engine was PRESERVED
+# is the one that must not be switched off by a typo.
+#
+# An empty instant is not a verdict of its own: only the caller knows whether
+# that is a missing baseline or a missing container, so it says which.
+# Unit-tested at .github/workflows/scripts/tests/test_deploy_smoke_model_clock.py.
+dr_model_clock_verdict() {
+  local recorded="${1-}" observed="${2-}" expected="${3-}"
+  if [ -z "$recorded" ] || [ -z "$observed" ]; then
+    printf 'unreadable\n'; return 1
+  fi
+  if [ "$expected" = 1 ]; then
+    if [ "$recorded" = "$observed" ]; then
+      printf 'not-reloaded\n'; return 1
+    fi
+    printf 'reloaded\n'; return 0
+  fi
+  if [ "$recorded" = "$observed" ]; then
+    printf 'preserved\n'; return 0
+  fi
+  printf 'restarted\n'; return 1
 }
 
 # ------------------------------------------------------------------ env reads

@@ -45,27 +45,48 @@ interpolated into a `run:` body - workflow_policy.py P6):
                                file; this script only ever reads a file, so
                                the decision stays testable and no network call
                                lives inside the gate;
+       --gate-self-reported-at the gate's OWN clock, published by the `CI
+                               passed` job as a job output and read back with
+                               `needs.ci-ok.outputs.completed_at`. No API call
+                               and no network: job outputs cross a job
+                               boundary by themselves, which is the same
+                               mechanism the rollout already uses for
+                               `manifest` and `record`. It is a few seconds
+                               early - a step cannot time its own job's last
+                               instant - and that direction is the safe one,
+                               because a slightly EARLIER reading measures a
+                               slightly LARGER age;
        --fallback-timestamp    github.event.head_commit.timestamp, used when
-                               the API read did not work - a 403, a rate limit,
-                               no network. Always present on a push.
-     A KNOWN WEAKNESS, recorded rather than papered over. The fallback is the
-     COMMITTER's clock, not the release's, and it can be arbitrarily older: a
+                               neither of those yielded an instant - the API
+                               read got a 403 or a rate limit AND the job
+                               output was missing. Always present on a push.
+     A KNOWN WEAKNESS OF THE LAST ONE, recorded rather than papered over. The
+     committer's clock is not the release's, and it can be arbitrarily older: a
      commit written on Monday and pushed on Wednesday carries Monday, so an age
-     measured from it can refuse a release that is not stale at all. The
-     earlier version of this comment claimed it was "older than the gate's
-     completion by roughly the length of CI", which is not true and made the
-     fallback look safer than it is.
-     It is kept because the alternative is worse. There is no better offline
-     source: the run's own start time is NOT in the `github` context - it is
-     not a property, and actionlint rejects `github.run_started_at` - and every
-     other way to read it is the same Actions API call that has just failed.
-     Measuring too large fails CLOSED, the refusal names the source it used,
-     and the dispatch it recommends deploys the same commit. A false refusal
-     that says which reading caused it beats a fail-open.
-     The gate's completion time therefore always wins when it is available.
+     measured from it can refuse a release that is not stale at all. MEASURED
+     here on 2026-09-27, by running this script: a release pushed ten seconds
+     ago whose commit was written three hours earlier reports
+     `age  180.2 min` / `refused because  age-stale`. An earlier
+     version of this comment claimed it was "older than the gate's completion
+     by roughly the length of CI", which is not true and made the fallback look
+     safer than it is.
+     A version after THAT claimed there was nothing better offline, because
+     "every other way to read it is the same Actions API call that has just
+     failed". That was also wrong, and it is the reason --gate-self-reported-at
+     exists: the gate can hand its own completion time forward as a job output,
+     with no API call to fail. What remains true is only the narrow part - the
+     run's start time is NOT in the `github` context, it is not a property, and
+     actionlint rejects `github.run_started_at`.
+     The committer's clock is therefore now the THIRD source and not the
+     second, and it is kept because measuring too large fails CLOSED: the
+     refusal names the source it used, and the dispatch it recommends deploys
+     the same commit. A false refusal that says which reading caused it beats a
+     fail-open.
+     The gate's completion time still wins whenever the API read worked.
 
-Neither parseable -> refuse. A guard that passes when it cannot see is not a
-guard; the whole point of this file is that the 3 a.m. path stops guessing.
+None of the three parseable -> refuse. A guard that passes when it cannot see
+is not a guard; the whole point of this file is that the 3 a.m. path stops
+guessing.
 
 A workflow_dispatch run is a human asking out loud, so the AGE check is
 reported and not enforced there. The tip check still applies: deploying a
@@ -223,6 +244,7 @@ def evaluate(
     sha: str,
     origin_tip: str,
     gate_completed_at: str | None,
+    gate_self_reported_at: str | None,
     fallback_timestamp: str | None,
     now: dt.datetime,
     window_minutes: int,
@@ -271,22 +293,29 @@ def evaluate(
     else:
         messages.append(f"ok: {sha[:12]} is still the tip of origin/{branch}.")
 
-    # PRECEDENCE, top to bottom, and the gate's completion time always wins
-    # when it is there: it is the only one of the two that measures what this
-    # guard is about.
+    # PRECEDENCE, top to bottom. The gate's completion time from the Actions
+    # API wins whenever it is there: it is the reading that measures exactly
+    # what this guard is about.
     #
-    # The commit timestamp is a WEAK second. It is the committer's clock, not
+    # SECOND, and the reason the fallback below is no longer the only offline
+    # source: the gate's own clock, published by the `CI passed` job as a job
+    # output. Job outputs cross a job boundary with no API call, so this one
+    # survives the 403 or the rate limit that takes the reading above away. It
+    # is a few seconds early, because a step cannot time the instant its own
+    # job ends, and early means the age measures slightly LARGER - the closed
+    # direction.
+    #
+    # THIRD, and weak: the commit timestamp. It is the committer's clock, not
     # the release's, and it can be arbitrarily older - a commit written on
     # Monday and pushed on Wednesday carries Monday - so an age measured from it
     # can refuse a release that is not stale. That is a known false-refusal
     # path, not a rounding error, and it is kept only because measuring too
     # large fails closed while having no measurement at all would not. The
     # source is always named in the output so a refusal can be read for what it
-    # is. Nothing better exists offline: the run's own start time is not a
-    # `github` context property, and every other reading of it is the same API
-    # call that has already failed.
+    # is.
     candidates = (
         ("the gate's completion time", gate_completed_at),
+        ("the gate's own clock, published as a job output", gate_self_reported_at),
         ("the deployed commit's timestamp (the gate's own time was unavailable)", fallback_timestamp),
     )
     stamp = None
@@ -374,6 +403,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gate-completed-at", default=_env("GATE_COMPLETED_AT"))
     parser.add_argument("--gate-jobs-file", default=_env("GATE_JOBS_FILE"))
     parser.add_argument("--gate-job-name", default=os.environ.get("GATE_JOB_NAME") or "CI passed")
+    parser.add_argument(
+        "--gate-self-reported-at", default=_env("GATE_SELF_REPORTED_AT")
+    )
     parser.add_argument("--fallback-timestamp", default=_env("FALLBACK_TIMESTAMP"))
     parser.add_argument("--event-name", default=os.environ.get("EVENT_NAME", "push"))
     parser.add_argument("--branch", default=os.environ.get("RELEASE_BRANCH", "main"))
@@ -404,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         sha=args.sha or "",
         origin_tip=args.origin_tip or "",
         gate_completed_at=gate_completed_at,
+        gate_self_reported_at=args.gate_self_reported_at,
         fallback_timestamp=args.fallback_timestamp,
         now=now,
         window_minutes=args.window_minutes,

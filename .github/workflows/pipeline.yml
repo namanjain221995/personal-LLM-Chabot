@@ -1078,6 +1078,19 @@ jobs:
     # It reads a JSON payload and writes a table. If this takes ten minutes,
     # something is wrong with the runner, not with the gate.
     timeout-minutes: 10
+    # WHEN THIS GATE FINISHED, handed forward to `deploy` so its freshness check
+    # has an offline source for the age of the release. The Actions API read in
+    # that step is the better reading and stays first; this one exists because
+    # the API read can 403 or hit a rate limit, and the only fallback left then
+    # used to be the COMMITTER's clock, which can be days older than the
+    # release and refuses deploys that are not stale. A job output crosses a job
+    # boundary by itself - no API call, nothing to fail - and it is the
+    # mechanism `deploy` already uses to hand `manifest` and `record` to
+    # `verify`. It is a few seconds early, because a step cannot time the
+    # instant its own job ends, and early measures a LARGER age: the closed
+    # direction.
+    outputs:
+      completed_at: ${{ steps.finished.outputs.completed_at }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Every required suite must have reported success
@@ -1117,6 +1130,14 @@ jobs:
                 echo "No deploy: this is not a push to main." ;;
             esac
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # LAST in the job, so the instant it records is as close to the job's own
+      # completion as a step can get. Read by `deploy`'s freshness check as
+      # needs.ci-ok.outputs.completed_at.
+      - name: Publish when this gate finished
+        id: finished
+        run: |
+          printf 'completed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
   # ==========================================================================
   # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
@@ -1307,18 +1328,26 @@ jobs:
           DEPLOY_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
           RELEASE_BRANCH: ${{ github.ref_name }}
-          # The ONLY fallback, and a weak one - stated plainly because the
-          # first version of this comment overstated it. It is the COMMITTER's
-          # clock, not the release's: a commit written on Monday and pushed on
-          # Wednesday carries Monday, so an age measured from it can be days
-          # larger than the truth and can refuse a deploy that is not stale at
-          # all. It is used only when the Actions API read above did not work,
-          # the refusal names it as the source, and `gh workflow run` deploys
-          # the same commit deliberately. There is nothing better available
-          # offline: the run's own start time is not in the `github` context
-          # (actionlint rejects `github.run_started_at`; it is not a property),
-          # and every other reading of it is the same API call that just
-          # failed. Absent on a dispatch.
+          # SECOND source, and the reason the commit timestamp below is no
+          # longer the only thing left when the API read fails: the `CI passed`
+          # job publishes its own completion time as a job output, and a job
+          # output crosses a job boundary with no API call to fail. Empty only
+          # if that job never reached its last step - and `deploy` does not run
+          # unless it succeeded.
+          GATE_SELF_REPORTED_AT: ${{ needs.ci-ok.outputs.completed_at }}
+          # THIRD and weakest, stated plainly because two earlier versions of
+          # this comment overstated it. It is the COMMITTER's clock, not the
+          # release's: a commit written on Monday and pushed on Wednesday
+          # carries Monday, so an age measured from it can be days larger than
+          # the truth and can refuse a deploy that is not stale at all -
+          # measured 2026-09-27, a release pushed ten seconds ago whose commit
+          # was written three hours earlier reports 180.2 min and REFUSES. It is
+          # reached only when BOTH readings above are unavailable, the refusal
+          # names it as the source, and `gh workflow run` deploys the same
+          # commit deliberately. The one thing that is genuinely unavailable
+          # offline is the run's own start time: it is not in the `github`
+          # context and actionlint rejects `github.run_started_at`. Absent on a
+          # dispatch.
           FALLBACK_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
           GH_API_TOKEN: ${{ github.token }}
         run: |
@@ -1428,6 +1457,29 @@ jobs:
           # With the dry run's 5 minutes that is 25 minutes of waiting, leaving
           # 20 of the job's 45 for two `techsara up` runs, two health gates and
           # this job's other steps.
+          #
+          # THAT ARITHMETIC IS FOR A ROLLING DEPLOY. Said plainly, because the
+          # test that guards the sum cannot see it:
+          # a --full deploy's rollback path does not fit inside this job's timeout.
+          # The `full` input is described as "+15-25 min: the main model
+          # reloads", and a rollback means TWO of those reloads - 30 to 50
+          # minutes of work on its own, before any waiting, against a 45-minute
+          # job. The budget cannot buy that back: it bounds WAITING, and a model
+          # reload is WORK.
+          #
+          # Left as it is, and NOT because someone is watching: the repository
+          # variable DEPLOY_FULL above makes EVERY push to main a --full deploy,
+          # unattended, so `inputs.full` is not the only way in. It is left
+          # because `timeout-minutes` is one number for the whole job - sized
+          # for a --full rollback it would also become the ceiling a stuck
+          # ROLLING deploy gets, and that is the unattended path every push
+          # takes. What a --full deploy does get from this budget is that its
+          # timeout is spent on WORK instead of queueing: the waiting is bounded
+          # at 1500 s worst case, against the 6000 s the same two invocations
+          # could spend on the DEPLOY_LOCK_WAIT/ENGINE_LOCK_WAIT defaults this
+          # job now overrides (both re-derived from this file on 2026-09-27).
+          # .github/workflows/scripts/tests/test_deploy_lock_budget.py asserts
+          # that this note and the arithmetic still agree with each other.
           DEPLOY_WALL_BUDGET_S: "1200"
         run: |
           set -euo pipefail
@@ -1769,7 +1821,19 @@ jobs:
       #               threshold: lifetime RestartCount is the launcher
       #               foot-gun that once disabled three healthy services.
       #   MODEL CLOCK the main model container did not restart, asserted
-      #               against the pre-deploy record rather than observed.
+      #               against the pre-deploy record rather than observed - in
+      #               the DIRECTION this deploy asked for. `--full` reloads the
+      #               models on purpose, so it is handed
+      #               --expect-model-restart and the check then requires the
+      #               clock to have MOVED. Without that, wiring this script up
+      #               for the first time would have turned every deliberate
+      #               --full deploy red: deploy-smoke.sh's own MODEL CLOCK
+      #               block had no exemption, while the step above it has had
+      #               one since it was written, and `--baseline` is always
+      #               passed. Measured on 2026-09-27 against a real
+      #               .runtime/releases/*/record.json: `FAIL the main model
+      #               RESTARTED: <was> -> <now>. A routine deploy must not
+      #               reset this clock.`, exit 1.
       #
       # WITHOUT --with-model, on purpose. The step above already does a real
       # completion and asserts vllm:generation_tokens_total advanced; a second
@@ -1779,13 +1843,17 @@ jobs:
       # The paths come from `deploy` as job outputs. If they are missing the
       # script still runs in its documented degraded mode (tags instead of
       # promoted ids, and no model-clock baseline) and says so - a path that
-      # was not published must not be able to fail an otherwise good deploy,
-      # and the model-clock property is independently asserted above.
+      # was not published must not be able to fail an otherwise good deploy.
+      # The step above asserts the rolling case of the model clock and EXITS 0
+      # on --full, so it is not a second opinion on the --full case: which
+      # direction to assert has to be told to this script too, and SMOKE_WAS_FULL
+      # is the same job output that step reads.
       - name: Post-rollout invariants (promoted images, code vs schema, no restart loop)
         if: ${{ !cancelled() }}
         env:
           SMOKE_MANIFEST: ${{ needs.deploy.outputs.manifest }}
           SMOKE_RECORD: ${{ needs.deploy.outputs.record }}
+          SMOKE_WAS_FULL: ${{ needs.deploy.outputs.was_full }}
         run: |
           set -euo pipefail
           args=()
@@ -1799,6 +1867,16 @@ jobs:
             args+=(--baseline "$SMOKE_RECORD")
           else
             degraded="${degraded:+$degraded; }no pre-deploy record path, so MODEL CLOCK could only observe"
+          fi
+          # `--full` asked for the reload (inputs.full, or vars.DEPLOY_FULL on a
+          # push), so the assertion turns around rather than being skipped: the
+          # clock MUST have moved, and a --full deploy that left the engine
+          # running is a failed --full deploy. Compared against the literal
+          # 'true' the rollout step writes, so anything else - including an
+          # output that never arrived - leaves the preservation assertion armed.
+          if [ "${SMOKE_WAS_FULL:-}" = "true" ]; then
+            args+=(--expect-model-restart)
+            echo "--full was asked for: MODEL CLOCK asserts the model RELOADED, not that it was preserved"
           fi
           smoke="$RUNNER_TEMP/deploy-smoke.log"
           rc=0

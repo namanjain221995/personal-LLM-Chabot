@@ -277,6 +277,23 @@ class TheDeployScriptActuallyUsesIt(unittest.TestCase):
         self.deploy_code = "\n".join(
             line for line in self.deploy.splitlines() if not line.lstrip().startswith("#")
         )
+        self.apply_body = self._apply_body(self.deploy)
+
+    @staticmethod
+    def _apply_body(source: str) -> str:
+        """The CODE lines of apply(), from its `apply() {` to its closing brace.
+
+        Scoped rather than whole-file because $REVERSIBILITY_VERDICT is correct
+        everywhere else in deploy.sh - it is the forward gate's own answer, and
+        the rollback gate reads it as a fallback. It is only inside apply()
+        that it is wrong, because apply() runs for BOTH transitions.
+        """
+        lines = source.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("apply() {"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
+        return "\n".join(
+            line for line in lines[start : end + 1] if not line.lstrip().startswith("#")
+        )
 
     def test_the_rollback_no_longer_consults_the_fail_open_schema_gate(self):
         self.assertNotIn(
@@ -343,6 +360,40 @@ class TheDeployScriptActuallyUsesIt(unittest.TestCase):
         self.assertLess(
             repointed, rolled_back,
             "the rollback's verdict must be computed before apply() writes the record",
+        )
+
+    def test_nothing_inside_apply_reads_the_forward_verdict_directly(self):
+        # The assertion above pinned ONE line, and the same defect was sitting
+        # five lines from it: apply() also writes DEPLOY_RESULT_FILE, and that
+        # write still used $REVERSIBILITY_VERDICT, so a rollback's hand-off
+        # file paired the rollback's sha, manifest, record and release_dir with
+        # a verdict about PREVIOUS -> TARGET. Nothing reads that key today,
+        # which made it a wrong fact rather than a wrong decision - and a file
+        # whose whole purpose is to stop the caller guessing is the last place
+        # to leave one. Scoped to apply(), so the forward gate and the rollback
+        # gate can go on reading $REVERSIBILITY_VERDICT where it is the truth.
+        offenders = [
+            line.strip()
+            for line in self.apply_body.splitlines()
+            if "REVERSIBILITY_VERDICT" in line
+        ]
+        self.assertEqual(
+            [], offenders,
+            "apply() runs for the forward release AND for the rollback, so every fact "
+            "it writes must come from $APPLY_VERDICT; $REVERSIBILITY_VERDICT is the "
+            "forward transition's answer and is wrong on the rollback path",
+        )
+        self.assertIn('printf \'reversibility=%s\\n\' "$APPLY_VERDICT"', self.apply_body)
+
+    def test_the_result_file_and_the_release_record_agree_on_their_source(self):
+        # Both facts in the hand-off file and in the release record describe the
+        # same apply, so they must read the same variable. When these two drift
+        # apart again, one of the two is lying about the transition it made.
+        self.assertEqual(
+            1, self.apply_body.count('record_args+=(--reversibility "$APPLY_VERDICT")')
+        )
+        self.assertEqual(
+            1, self.apply_body.count('printf \'reversibility=%s\\n\' "$APPLY_VERDICT"')
         )
 
     def test_the_sync_worker_is_no_longer_drained_as_a_listener(self):
