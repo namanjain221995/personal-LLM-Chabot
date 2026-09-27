@@ -316,8 +316,28 @@ elif [ -z "$FROM_IMAGE" ]; then
   dr_warn "no older orchestrator image is present, so the upgrade phase cannot use real"
   dr_warn "historical code. Skipping it rather than faking an old schema by deleting"
   dr_warn "rows from schema_migrations - that would test a state that never existed."
+elif ! FROM_VERSION="$(dr_code_schema_version_from_image "$FROM_IMAGE")"; then
+  # The SAME silent-exit trap as the SERVER_MAJOR line above, on the other
+  # command substitution in this script that is allowed to fail. The baseline
+  # image is built from an ARBITRARY historical commit, so "its /app/app/db.py
+  # cannot be read" is an ordinary outcome -- a Dockerfile that has since been
+  # renamed, a layout that moved, an image that is not an orchestrator at all.
+  #
+  # Measured today on this branch with `--from-image postgres:18-alpine` before
+  # this guard existed: EXIT=1 whose last line was
+  # "== UPGRADE (old image -> data -> new image) ==", with no ERROR line, no
+  # SUMMARY and NO arm JSON written at all -- so `db_rehearsal.py verdict` could
+  # only say "NOT PROVED `fresh-and-upgrade`: this arm reported nothing", which
+  # is the wording reserved for a step that was deleted or never ran.
+  #
+  # `bad` and not `dr_die`, for the reason the branch above already gives: the
+  # fresh-install assertions are real findings, the RESTORE phase falls back to
+  # the fresh database on its own, and a verdict that says WHICH arm failed and
+  # why beats one that says an arm was silent. The run is red either way.
+  bad "cannot read the migration table out of the baseline image $FROM_IMAGE.
+      No old schema means no upgrade to rehearse; refusing to report an upgrade
+      arm that did not run. Is that image an orchestrator image?"
 else
-  FROM_VERSION="$(dr_code_schema_version_from_image "$FROM_IMAGE")"
   dr_say "upgrading from $FROM_IMAGE (V$FROM_VERSION) to the image under test (V$LATEST)"
   psql_admin "CREATE DATABASE \"$UPGRADE_DB\"" >/dev/null
 
@@ -440,6 +460,11 @@ from_v = os.environ.get("DR_J_FROM_VERSION") or ""
 latest = os.environ["DR_J_LATEST"]
 if not frm:
     moved = "the upgrade arm did NOT run: no baseline image was supplied"
+elif not from_v:
+    moved = (
+        "the upgrade arm did NOT run: the migration table could not be read out of "
+        f"the baseline image {frm}, so there was no old schema to migrate forward"
+    )
 elif from_v == latest:
     moved = (
         f"the schema did not move in this commit: the baseline {frm} and the image under "

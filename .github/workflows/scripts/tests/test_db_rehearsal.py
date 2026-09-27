@@ -20,8 +20,17 @@ anybody noticing:
   * the rehearsal SCRIPT's refusals to rehearse against the wrong PostgreSQL.
     These run the real `scripts/deploy-db-rehearsal.sh` with a `docker` stub, and
     every one of them exits before the script creates anything -- the stub is
-    never asked to impersonate a database, only to answer or refuse the two
+    not asked to impersonate a database, only to answer or refuse the two
     inspection calls that tell the script whether a deployed stack is present.
+
+  * the SILENT EXIT, which this script has two places to fall into and which no
+    amount of reading finds: under `set -euo pipefail` an assignment whose
+    command substitution fails takes that status and ends the script AT the
+    assignment, before the `dr_die` or `bad` on the next line can say anything.
+    One case is an unreachable server; the other is a baseline image whose
+    migration table cannot be read. The second one needs the script to reach its
+    UPGRADE phase, so the stub grows an opt-in arm that fakes the calls the
+    fresh-install phase makes. That arm proves control flow, never SQL.
 """
 from __future__ import annotations
 
@@ -322,11 +331,16 @@ class TheWriteSmokeCannotCollideWithItself(unittest.TestCase):
         self.assertIn("assert rows", source)
 
 
-#: A `docker` that answers ONLY the two inspection calls the script uses to
-#: decide whether a deployed stack is present, and refuses everything else with
-#: an exit code the script cannot mistake for data. It is deliberately not a
-#: database: every scenario below exits before the script creates anything, and
-#: a stub that pretended to be PostgreSQL would be testing the stub.
+#: A `docker` that answers the two inspection calls the script uses to decide
+#: whether a deployed stack is present, and refuses everything else with an exit
+#: code the script cannot mistake for data.
+#:
+#: `REHEARSAL_FAKE_DB=1` adds a second arm that also answers `create`/`cp`/`rm`
+#: and the handful of `docker run` calls the fresh-install phase makes, which is
+#: the only way to walk the script as far as the UPGRADE phase. It is OFF by
+#: default, so every refusal that must stop at the unreachable server still
+#: does, and it is deliberately not a database: it returns fixed strings, so a
+#: test built on it can only ever assert control flow.
 _DOCKER_STUB = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$REHEARSAL_DOCKER_LOG"
 case "$1 $2" in
@@ -345,17 +359,55 @@ case "$1" in
     [ "$2" = inspect ] || exit 97
     printf '%s\n' "${REHEARSAL_DECLARED_IMAGE_ID:-sha256:declared}"; exit 0 ;;
 esac
+
+[ "${REHEARSAL_FAKE_DB:-0}" = 1 ] || exit 97
+
+# Fixed answers, not a database. Enough of them that the script's FRESH phase
+# passes its four assertions and control reaches the UPGRADE phase.
+fake_latest="${REHEARSAL_FAKE_LATEST:-41}"
+case "$1" in
+  create)
+    # `docker create IMAGE true`. The id carries the image so that `cp` can
+    # decide whether THAT image has a readable /app/app/db.py.
+    printf 'cid-%s\n' "$2"; exit 0 ;;
+  rm) exit 0 ;;
+  cp)
+    # `docker cp CID:/app/app/db.py FILE`
+    img="${2%%:/*}"; img="${img#cid-}"
+    [ "$img" = "${REHEARSAL_UNREADABLE_IMAGE:-}" ] && exit 1
+    printf '_MIGRATIONS = (\n    (%s, _MIGRATION_V%s),\n)\n' "$fake_latest" "$fake_latest" > "$3"
+    exit 0 ;;
+  run)
+    entry=""; want=0
+    for a in "$@"; do
+      [ "$want" = 1 ] && { entry="$a"; want=0; continue; }
+      [ "$a" = --entrypoint ] && want=1
+    done
+    case "$entry" in
+      python|pg_restore) exit 0 ;;
+      pg_dump) printf 'not-a-real-archive\n'; exit 0 ;;
+      psql)
+        sql=""; for a in "$@"; do sql="$a"; done
+        case "$sql" in
+          *"SHOW server_version"*) printf '%s.4\n' "${REHEARSAL_FAKE_MAJOR:-18}" ;;
+          *"MAX(version)"*)        printf '%s\n' "$fake_latest" ;;
+          *"md5("*)                printf 'fake-digest\n' ;;
+          *"count(*)"*)            printf '0\n' ;;
+          *) : ;;  # CREATE/DROP DATABASE and the pg_database probe say nothing
+        esac
+        exit 0 ;;
+    esac
+    exit 97 ;;
+esac
 exit 97
 """
 
 
-class TheScriptRefusesTheWrongPostgres(unittest.TestCase):
-    """`scripts/deploy-db-rehearsal.sh`'s identity rules, run for real.
+class RunsTheRealScript:
+    """Puts the real `scripts/deploy-db-rehearsal.sh` behind a stubbed `docker`.
 
-    A rehearsal on the wrong PostgreSQL major proves nothing, and a digest says
-    nothing about a version -- which is why the deployed major is read from the
-    running server, and why a hosted runner has to DECLARE it. Each case here
-    exits before a database exists.
+    The script is copied out of the repository, not reimplemented: a test that
+    read a copy of the logic would keep passing after the real one rotted.
     """
 
     def setUp(self) -> None:
@@ -396,6 +448,16 @@ class TheScriptRefusesTheWrongPostgres(unittest.TestCase):
             },
             stdin=subprocess.DEVNULL,
         )
+
+
+class TheScriptRefusesTheWrongPostgres(RunsTheRealScript, unittest.TestCase):
+    """`scripts/deploy-db-rehearsal.sh`'s identity rules, run for real.
+
+    A rehearsal on the wrong PostgreSQL major proves nothing, and a digest says
+    nothing about a version -- which is why the deployed major is read from the
+    running server, and why a hosted runner has to DECLARE it. Each case here
+    exits before a database exists.
+    """
 
     def test_the_script_still_parses(self):
         proc = subprocess.run(["bash", "-n", str(REAL_SCRIPT)], capture_output=True, text=True, check=False)
@@ -490,6 +552,75 @@ class TheScriptRefusesTheWrongPostgres(unittest.TestCase):
         proc = self._run("--not-a-flag")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("unknown option", proc.stderr)
+
+
+class TheUpgradeArmRefusesABaselineItCannotRead(RunsTheRealScript, unittest.TestCase):
+    """A baseline image whose migration table cannot be read is a FAILED arm.
+
+    This is the second silent-exit trap in the script, and the likelier of the
+    two to fire on a real Actions run: the baseline image is built from an
+    ARBITRARY historical commit, so "its /app/app/db.py cannot be read" is an
+    ordinary outcome -- a Dockerfile that has since been renamed, a layout that
+    moved, an image that is not an orchestrator at all.
+
+    Measured on this branch before the guard existed, with the real script, a
+    real PostgreSQL 18.6 and `--from-image postgres:18-alpine`: EXIT=1 whose last
+    line of output was "== UPGRADE (old image -> data -> new image) ==", with no
+    ERROR line, no SUMMARY, and no arm JSON written at all -- so
+    `db_rehearsal.py verdict` could only say "NOT PROVED `fresh-and-upgrade`:
+    this arm reported nothing", which is the wording reserved for a step that was
+    deleted or never ran.
+    """
+
+    def _rehearse(self, unreadable: str) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        out = pathlib.Path(self.tmp.name) / "arm.json"
+        proc = self._run(
+            "--image", "orch:new",
+            "--from-image", "orch:old",
+            "--server", "postgresql://u:p@127.0.0.1:1/postgres",
+            "--pg-image", "postgres@sha256:abc",
+            "--expect-major", "18",
+            "--json", str(out),
+            REHEARSAL_FAKE_DB="1",
+            REHEARSAL_UNREADABLE_IMAGE=unreadable,
+        )
+        return proc, out
+
+    def test_it_names_the_image_and_still_reports_the_arm(self):
+        proc, out = self._rehearse("orch:old")
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, combined)
+        self.assertIn("cannot read the migration table out of the baseline image orch:old", combined)
+        # The half that a bare `dr_die` would NOT have delivered, and the half
+        # that decides whether the verdict can name anything: the fresh-install
+        # findings survive, the run still summarises, and the record is written.
+        self.assertIn("== SUMMARY ==", combined)
+        self.assertIn("failed        : 1", combined)
+        self.assertTrue(out.exists(), "no arm JSON was written:\n" + combined)
+        record = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(record["outcome"], "fail")
+        self.assertEqual(record["from_image"], "orch:old")
+        self.assertEqual(record["from_version"], "")
+        self.assertIn("could not be read", record["detail"])
+
+    def test_the_verdict_names_the_failed_arm_instead_of_calling_it_silent(self):
+        _proc, out = self._rehearse("orch:old")
+        records = [json.loads(out.read_text(encoding="utf-8")), PASSING_REVERSE]
+        ok, lines = db_rehearsal.build_verdict(records)
+        self.assertFalse(ok)
+        line = next(one for one in lines if "fresh-and-upgrade" in one)
+        self.assertIn("**FACT**", line)
+        self.assertIn("FAILED", line)
+        self.assertNotIn("reported nothing", line)
+
+    def test_a_baseline_it_CAN_read_is_not_refused(self):
+        """The guard must not degrade into "every baseline is refused"."""
+        proc, out = self._rehearse("")
+        combined = proc.stdout + proc.stderr
+        self.assertNotIn("cannot read the migration table out of the baseline image", combined)
+        self.assertIn("upgrading from orch:old (V41)", combined)
+        self.assertEqual(proc.returncode, 0, combined)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["outcome"], "pass")
 
 
 class TheJobIsWiredIntoThePipelineButNotYetIntoTheGate(unittest.TestCase):

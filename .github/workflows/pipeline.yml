@@ -205,7 +205,7 @@ jobs:
       # (2026-09-13): a module that skips itself at import no longer counts
       # towards it.
       #
-      # 217 run today, 0 skipped (measured 2026-09-27), of which 34 are the new
+      # 220 run today, 0 skipped (measured 2026-09-27), of which 37 are the new
       # db-rehearsal suite. The floor was still 95 from the day it was written,
       # by which point it could no longer catch what it exists to catch: a whole
       # module dropping out of discovery and taking a hundred tests with it while
