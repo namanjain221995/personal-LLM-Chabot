@@ -66,12 +66,63 @@
 #     python3 .github/workflows/scripts/production_truth.py --dry-run
 #
 # COMMIT TWO is a ONE-LINE commit adding a `schedule:` trigger (every 30-60
-# minutes). It is merged only after the owner confirms that the Prometheus
-# node-exporter textfile directory exists on the box and that node-exporter
-# is started with `--collector.textfile.directory`. That install is a root
-# action on the blocked list and this workflow does not work around it: until
-# it is done, every fault verdict is RED (see below), and a red scheduled run
-# mails.
+# minutes). THREE things must be true before it is merged, and none of them is
+# work this file can do:
+#
+#   1. `box_probes.py` must expose the four probes REQUIRED_PROBES names.
+#      Measured 2026-09-27: the module is not on dev at all, and on
+#      `ci/box-readiness` it has probe_engine_exposure, probe_completion,
+#      probe_deploy_lock, probe_disk, probe_deploy_root,
+#      probe_engine_controller and probe_migrations -- so probe_real_completion,
+#      probe_container_states and probe_host_guard_unit are all missing. Until
+#      the reconciliation lands, every run of this workflow is
+#      `verdict unavailable / channel not reached / RED`, exit 1.
+#
+#   2. The node-exporter textfile sink must EXIST, be WRITABLE BY THE RUNNER
+#      ACCOUNT, and be read by node-exporter. Both halves are root actions.
+#      Measured 2026-09-27: /var/lib/node_exporter does not exist, and
+#      `docker inspect` on the running node-exporter shows no
+#      --collector.textfile.directory flag.
+#
+#      The writer here is the self-hosted runner's own account, NOT root (the
+#      deploy root is under /home/techsphere), so a root-only directory is not
+#      enough: with the directory present but unwritable by that account,
+#      write_textfile raises "the textfile write failed (PermissionError)" ->
+#      ChannelError, which makes EVERY fault verdict RED -- and once the cron
+#      lands, a red scheduled run mails, the one outcome the owner forbade.
+#      Measured 2026-09-27 against the real writer on a directory with mode
+#      0555, which is how `-o root -g root -m 0755` looks to this account. So
+#      the root action to hand over is a directory the runner account can write
+#      (group-writable and setgid keeps the root host-guard timer's writes and
+#      the runner's in one place), and the node-exporter recreate beside it:
+#
+#        sudo install -d -o root -g techsphere -m 2775 \
+#          /var/lib/node_exporter/textfile_collector
+#        # then recreate node-exporter with
+#        #   --collector.textfile.directory=/host/var/lib/node_exporter/textfile_collector
+#        # (the host root is already mounted at /host read-only -- see
+#        #  monitoring/developer-api/README.md, "host packet filter")
+#
+#      `python3 .github/workflows/scripts/production_truth.py --dry-run` writes
+#      nothing and names this blocker, so run it BEFORE spending the root
+#      action and again after.
+#
+#   3. A Prometheus ALERT RULE for `techsara_production_truth_*` under
+#      monitoring/prometheus/rules/, plus its entry in
+#      monitoring/developer-api/metrics-contract.json. Measured 2026-09-27:
+#      `grep -rn techsara_production_truth monitoring/` returns NOTHING, while
+#      the precedent `techsara_host_guard_*` has both
+#      (monitoring/prometheus/rules/developer-api.yml:541 and :558, contract
+#      lines 43-45). This one is not paperwork: the readback below proves only
+#      that Prometheus SCRAPED the file, so "hands the fault to Prometheus,
+#      which owns alerting" -- the sole justification for this job being green
+#      over a real fault -- is unbacked at the alert layer until the rule
+#      exists. The rule also needs `absent()`, not staleness alone: a run whose
+#      write never lands leaves no series at all, and a staleness comparison
+#      against
+#      `techsara_production_truth_check_timestamp_seconds` is silent over an
+#      absent series (the host-guard rule at developer-api.yml:558 has that
+#      same gap).
 #
 # ======================================================================
 # GREEN OVER A REAL FAULT -- THE DELIBERATE EXCEPTION
@@ -187,8 +238,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      # READ-ONLY, and it yields to a release: its first probe is the deploy
-      # flock, and a held lock means `deferred`, exit 0, nothing touched.
+      # READ-ONLY apart from ONE write -- the node-exporter textfile that
+      # carries the verdict, rewritten on every run that actually observed the
+      # box, `ok` included, because rewriting it is the only thing that turns a
+      # previous run's fault back off. It takes no lock, restarts nothing and
+      # never touches the engine. And it yields to a release: its first probe
+      # is the deploy flock, and a held lock means `deferred`, exit 0, nothing
+      # probed and nothing written.
       #
       # Every line it prints goes through its own scrubber first -- this
       # repository is PUBLIC and a scheduled run's log is public with it. What

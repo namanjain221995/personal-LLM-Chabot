@@ -19,6 +19,7 @@ import contextlib
 import io
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,18 @@ def scraped_timestamp(text: str) -> float:
         if line.startswith(f"{pt.READBACK_EXPR} "):
             return float(line.split()[-1])
     raise AssertionError(f"{pt.READBACK_EXPR} is not in the textfile at all")
+
+
+def verdict_series(text: str) -> dict[str, str]:
+    """`{label: value}` for every `_verdict{verdict="..."}` series in a textfile.
+
+    Parsed out of the rendered text rather than read off a constant, so a
+    series that appears or disappears is visible to the tests.
+    """
+    pattern = re.compile(
+        rf'{re.escape(pt.METRIC_PREFIX)}_verdict\{{verdict="([^"]+)"\}} (\S+)'
+    )
+    return {m.group(1): m.group(2) for m in (pattern.fullmatch(line) for line in text.splitlines()) if m}
 
 
 def perfect_prometheus(writer: Recorder):
@@ -734,6 +747,125 @@ class DryRunWritesNothingAnywhere(unittest.TestCase):
 
 
 class TheTextfileSaysExactlyOneThing(unittest.TestCase):
+    """Every series in the file is one a REAL run can set, and no more.
+
+    The contract is pinned in both directions here, because the interesting
+    failure is not a wrong number, it is a series that reads plausibly and
+    that nothing can ever move. The file used to carry
+    `verdict{verdict="unavailable"}`, `verdict{verdict="deferred"}` and a
+    `check_ok` whose HELP said "0 means the verdict carries no information" --
+    and all three were unreachable, because `main()` only renders the verdicts
+    in REPORTED_VERDICTS and a run that observed nothing writes no file at all.
+    An alert written against any of them would have waited forever.
+    """
+
+    #: One probe set per verdict `main()` can WRITE, so the reachability test
+    #: below drives the real path instead of calling the renderer by hand. Each
+    #: fault verdict comes from FAULT_FOR_PROBE: engine exposure -> `exposed`,
+    #: the real-completion probe -> `wedged`, container states -> `degraded`.
+    PROBES_FOR_VERDICT: dict[str, dict] = {
+        "ok": {},
+        "exposed": {"probe_engine_exposure": {"ok": False}},
+        "wedged": {"probe_real_completion": {"ok": False}},
+        "degraded": {"probe_container_states": {"ok": False}},
+    }
+
+    def test_the_series_labels_are_exactly_the_verdicts_that_can_be_written(self):
+        series = verdict_series(pt.render_textfile("ok", 1.0, []))
+        self.assertEqual(set(series), set(pt.REPORTED_VERDICTS))
+        self.assertEqual(set(pt.VERDICT_SERIES), set(pt.REPORTED_VERDICTS))
+        # The two that made this a defect. `unavailable` is carried by the run
+        # going RED, `deferred` by the absence of a new write; neither is a
+        # label here, because no file this script writes could ever set it to 1.
+        self.assertNotIn("unavailable", series)
+        self.assertNotIn("deferred", series)
+
+    def test_every_verdict_main_can_reach_writes_the_whole_label_set(self):
+        self.assertEqual(
+            set(self.PROBES_FOR_VERDICT),
+            set(pt.REPORTED_VERDICTS),
+            "a verdict became writable (or stopped being writable) and this table did not follow",
+        )
+        for verdict, overrides in sorted(self.PROBES_FOR_VERDICT.items()):
+            with self.subTest(verdict=verdict):
+                writer = Recorder()
+                runtime, _, _, _ = make_runtime(
+                    probes=fake_probes(**overrides),
+                    writer=writer,
+                    samples=perfect_prometheus(writer),
+                )
+                code, text = run(runtime)
+                self.assertEqual(code, pt.EXIT_OK, text)
+                self.assertRegex(text, rf"verdict\s+{verdict}")
+                self.assertEqual(len(writer.calls), 1, text)
+                written = writer.calls[-1][1]
+                series = verdict_series(written)
+                self.assertEqual(set(series), set(pt.REPORTED_VERDICTS))
+                self.assertEqual(
+                    {name for name, value in series.items() if value == "1"},
+                    {verdict},
+                    written,
+                )
+                self.assertIn(f"{pt.METRIC_PREFIX}_check_ok 1", written)
+                self.assertNotIn(f"{pt.METRIC_PREFIX}_check_ok 0", written)
+
+    def test_no_run_that_writes_a_file_can_mark_the_check_as_blind(self):
+        # THIS TEST WAS `test_unavailable_marks_the_check_as_carrying_no_
+        # information`, and it proved nothing: it called
+        # `pt.render_textfile("unavailable", 1.0, [])` directly, an input
+        # `main()` never supplies, so it was green over a branch production
+        # could not take -- the same blind-test shape as the clean-run test
+        # replaced in commit d7d7485. `check_ok 0` is now gone from the file
+        # entirely; what says "the watch could not look" is the run exiting 1
+        # and writing nothing, which
+        # `ARunThatObservedNothingClearsNothing.test_an_unavailable_run_does_
+        # not_clear_a_previous_runs_fault` pins.
+        for verdict in sorted(pt.REPORTED_VERDICTS):
+            with self.subTest(verdict=verdict):
+                text = pt.render_textfile(verdict, 1.0, [])
+                self.assertIn(f"{pt.METRIC_PREFIX}_check_ok 1", text)
+                self.assertNotIn(f"{pt.METRIC_PREFIX}_check_ok 0", text)
+
+    def test_check_ok_never_branches_on_a_verdict_the_file_cannot_carry(self):
+        # The dead branch was `0 if verdict == 'unavailable' else 1`. It is not
+        # observable from a written file -- `main()` never renders that verdict
+        # -- so it is pinned here at the renderer, over EVERY verdict the script
+        # knows about, including the two it never writes.
+        def check_ok(verdict: str) -> str:
+            prefix = f"{pt.METRIC_PREFIX}_check_ok "
+            lines = [
+                line for line in pt.render_textfile(verdict, 1.0, []).splitlines()
+                if line.startswith(prefix)
+            ]
+            self.assertEqual(len(lines), 1, lines)
+            return lines[0][len(prefix):]
+
+        self.assertEqual(
+            {verdict: check_ok(verdict) for verdict in sorted(pt.SEVERITY)},
+            {verdict: "1" for verdict in sorted(pt.SEVERITY)},
+            "check_ok branched on a verdict, and the only reachable value is 1",
+        )
+
+    def test_the_help_text_promises_only_values_the_file_can_carry(self):
+        emitted = {
+            line.split()[-1]
+            for verdict in pt.REPORTED_VERDICTS
+            for line in pt.render_textfile(verdict, 1.0, []).splitlines()
+            if line.startswith(f"{pt.METRIC_PREFIX}_check_ok ")
+        }
+        self.assertEqual(emitted, {"1"})
+        help_line = next(
+            line
+            for line in pt.render_textfile("ok", 1.0, []).splitlines()
+            if line.startswith(f"# HELP {pt.METRIC_PREFIX}_check_ok")
+        )
+        promised = set(re.findall(r"(?<![\w.])[01](?![\w.])", help_line))
+        self.assertLessEqual(
+            promised,
+            emitted,
+            f"the HELP promises {sorted(promised - emitted)}, which no run can emit: {help_line}",
+        )
+
     def test_one_verdict_series_is_one_and_every_other_is_zero(self):
         text = pt.render_textfile("exposed", 1_700_000_000.0, ["a reason"])
         ones = [line for line in text.splitlines() if line.startswith(f"{pt.METRIC_PREFIX}_verdict") and line.endswith(" 1")]
@@ -741,10 +873,6 @@ class TheTextfileSaysExactlyOneThing(unittest.TestCase):
         self.assertIn('verdict="exposed"', ones[0])
         self.assertIn(f"{pt.METRIC_PREFIX}_check_ok 1", text)
         self.assertIn(f"{pt.READBACK_EXPR} 1700000000", text)
-
-    def test_unavailable_marks_the_check_as_carrying_no_information(self):
-        text = pt.render_textfile("unavailable", 1.0, [])
-        self.assertIn(f"{pt.METRIC_PREFIX}_check_ok 0", text)
 
     def test_the_directory_is_never_created_by_the_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -944,6 +1072,80 @@ class TheWorkflowFileMatchesTheseRules(unittest.TestCase):
     def test_the_file_does_not_claim_the_release_gate_can_be_retired(self):
         lowered = self.text.lower()
         self.assertIn("does not retire", lowered)
+
+    def test_the_step_comment_does_not_call_the_job_purely_read_only(self):
+        # The script writes the node-exporter textfile on every observed run,
+        # `ok` included. The step comment used to open "READ-ONLY, and it yields
+        # to a release" with no caveat, three lines from the text the previous
+        # commit corrected, in a PUBLIC file. Match the module docstring.
+        self.assertIn("READ-ONLY apart from ONE write", self.text)
+        self.assertNotIn("READ-ONLY, and it yields to a release", self.text)
+
+    def test_the_cron_gate_lists_all_three_blockers(self):
+        # A cron makes a red run mail, so the things that must be true before
+        # the `schedule:` commit are listed in the file, not in a chat message.
+        # Blocker 3 was missing: without an alert rule, the readback proves only
+        # that Prometheus SCRAPED the file, so "hands the fault to Prometheus,
+        # which owns alerting" -- the whole justification for being green over a
+        # real fault -- is unbacked at the alert layer.
+        self.assertIn("box_probes.py", self.text)
+        self.assertIn("WRITABLE BY THE RUNNER", self.text)
+        self.assertIn("monitoring/prometheus/rules/", self.text)
+        self.assertIn("metrics-contract.json", self.text)
+        self.assertIn("absent()", self.text)
+
+
+class TheDocsDoNotCiteAControlThisRepositoryLacks(unittest.TestCase):
+    """The green-over-a-failed-write path may not name an alert that is absent.
+
+    `refresh_channel` used to justify staying green when a CLEAN run's write
+    fails with "the staleness of `check_timestamp_seconds` is what says the
+    write is not landing, and that belongs to Prometheus like every other alert
+    this job hands over." Measured 2026-09-27: no rule mentioning
+    `techsara_production_truth_*` exists under monitoring/prometheus/rules/ and
+    the metric is not in monitoring/developer-api/metrics-contract.json, so the
+    control was imaginary -- and a refresh that has NEVER landed leaves no
+    series at all, which no staleness expression fires on without `absent()`.
+
+    This test fails BOTH ways on purpose: if the claim comes back while the rule
+    is still missing, and if the rule lands while the docstring still says it
+    does not exist.
+    """
+
+    REPO = pathlib.Path(__file__).resolve().parents[4]
+    SOURCE = pathlib.Path(pt.__file__)
+    WITHDRAWN = "belongs to Prometheus like every other alert this job hands over"
+
+    def rule_exists(self) -> bool:
+        rules = self.REPO / "monitoring" / "prometheus" / "rules"
+        contract = self.REPO / "monitoring" / "developer-api" / "metrics-contract.json"
+        files = sorted(rules.glob("*.yml")) + sorted(rules.glob("*.yaml")) if rules.is_dir() else []
+        if contract.is_file():
+            files.append(contract)
+        return any(pt.METRIC_PREFIX in path.read_text(encoding="utf-8") for path in files)
+
+    def test_the_withdrawn_sentence_stays_withdrawn_while_no_rule_exists(self):
+        # assertFalse over a membership test, not assertNotIn: the haystack is
+        # the whole script, and a failure message carrying it is unreadable.
+        source = self.SOURCE.read_text(encoding="utf-8")
+        if self.rule_exists():
+            self.assertFalse(
+                "finds no Prometheus rule" in source,
+                "a rule for this metric now exists under monitoring/prometheus/rules/ or in "
+                "the metrics contract: update the docstrings that still say it does not",
+            )
+            return
+        self.assertFalse(
+            self.WITHDRAWN in source,
+            "no rule under monitoring/prometheus/rules/ reads this metric and it is not in "
+            "monitoring/developer-api/metrics-contract.json, so this sentence names a "
+            f"compensating control that does not exist: {self.WITHDRAWN!r}",
+        )
+        self.assertIn(
+            "absent()",
+            pt.refresh_channel.__doc__ or "",
+            "the caveat about an absent series must stay with the code that needs it",
+        )
 
 
 if __name__ == "__main__":

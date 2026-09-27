@@ -86,10 +86,26 @@ write landed, and stays green either way -- a healthy box must never mail.
 
 The readback is what makes the green honest. Without it, "wrote a file" is
 indistinguishable from "wrote a file nobody reads" -- and on this box today
-nobody reads it: `/var/lib/node_exporter/textfile_collector` does not exist,
-and the running node-exporter carries no `--collector.textfile.directory`
-flag. That install is an owner/root action, and this script does not work
-around it; it reports RED until it is done.
+nobody reads it: `/var/lib/node_exporter/textfile_collector` does not exist
+(verified 2026-09-27: `ls -ld` says "No such file or directory"), and the
+running node-exporter carries no `--collector.textfile.directory` flag
+(verified the same day: `docker inspect --format '{{json .Config.Cmd}}'
+sf-local-ai-node-exporter-1` lists --path.rootfs, --path.procfs, --path.sysfs,
+--web.listen-address, the netdev/netclass collectors, four --no-collector flags
+and a filesystem mount-point exclusion, and no textfile flag). That install is
+an owner/root action, and this script does not work around it; it reports RED
+until it is done.
+
+AND THE HANDOVER IS NOT COMPLETE EITHER, YET. "Hands the fault to Prometheus,
+which owns alerting" is the justification for being green over a real fault,
+and the readback proves only the first half of it: that Prometheus SCRAPED the
+file. Nothing yet ACTS on the scrape. Measured 2026-09-27 on this branch:
+`grep -rn techsara_production_truth monitoring/` returns nothing -- no rule
+under monitoring/prometheus/rules/ and no entry in
+monitoring/developer-api/metrics-contract.json, where the precedent metric
+`techsara_host_guard_*` has both. Writing that rule is the THIRD blocker on
+the cron commit, listed with the other two in production-watch.yml; until it
+exists, a fault this watch reports is read by a person or by nobody.
 
 Usage:
     production_truth.py [--dry-run] [--deploy-root PATH] [--textfile-dir PATH]
@@ -200,8 +216,20 @@ FAULT_VERDICTS = frozenset({"exposed", "wedged", "degraded"})
 #: performed -- and a run that measured nothing must not zero another run's fault
 #: or advance the freshness timestamp. Their silence leaves the last real reading
 #: in place and lets the age of `check_timestamp_seconds` say "the watch has not
-#: looked lately", which is a different statement from "the box is well".
+#: looked lately", which is a different statement from "the box is well" -- to a
+#: person reading it. No alert rule reads that age yet; see `refresh_channel`.
+#:
+#: `unavailable` is therefore carried by the RED RUN and not by this metric. A
+#: blind run exits 1 and writes nothing at all, which is why no series below
+#: stands for it.
 REPORTED_VERDICTS = frozenset({"ok"}) | FAULT_VERDICTS
+
+#: The verdict series the textfile carries, worst last, derived from
+#: REPORTED_VERDICTS rather than written out again. Deriving it is the point: a
+#: series for a verdict `main()` never renders would be 0 in every file this
+#: script can write -- a label a reader could alert on that nothing can ever
+#: set. `unavailable` and `deferred` had exactly that shape and are gone.
+VERDICT_SERIES: tuple[str, ...] = tuple(sorted(REPORTED_VERDICTS, key=lambda name: SEVERITY[name]))
 
 METRIC_PREFIX = "techsara_production_truth"
 READBACK_EXPR = f"{METRIC_PREFIX}_check_timestamp_seconds"
@@ -525,18 +553,34 @@ def render_textfile(verdict: str, now: float, reasons: list[str]) -> str:
     `now` is expected to be quantised already (`quantise_timestamp`), and the
     timestamp goes out through `format_timestamp`, so the number written here
     and the number `readback` compares cannot drift apart.
+
+    Every series here is one a run can actually set. The label set is
+    VERDICT_SERIES -- i.e. REPORTED_VERDICTS -- so `unavailable` and `deferred`
+    get NO series at all: `main()` never renders them (a run that observed
+    nothing writes nothing), so a series for either would read 0 in every file
+    this script can write, which is a label promising information that nothing
+    can ever put there. `unavailable` is carried by the run going RED, not by
+    this metric.
     """
     lines = [
         f"# HELP {METRIC_PREFIX}_verdict 1 for the verdict this watch reached, 0 for the others.",
         f"# TYPE {METRIC_PREFIX}_verdict gauge",
     ]
-    for name in ("ok", "degraded", "wedged", "exposed", "unavailable", "deferred"):
+    for name in VERDICT_SERIES:
         lines.append(f'{METRIC_PREFIX}_verdict{{verdict="{name}"}} {1 if name == verdict else 0}')
     lines += [
-        f"# HELP {METRIC_PREFIX}_check_ok 1 when every probe could be performed; 0 means the verdict carries no information.",
+        # 1 in every file that exists, and that is the whole statement: only a
+        # run that performed every probe writes this file. There is no reachable
+        # 0 -- a run that could not perform a probe leaves the previous file
+        # alone -- so the presence of this series means "a watch run got a
+        # reading", and its ABSENCE (with no file at all) is the blind case.
+        f"# HELP {METRIC_PREFIX}_check_ok 1 whenever this file exists: only a run that performed every probe writes it.",
         f"# TYPE {METRIC_PREFIX}_check_ok gauge",
-        f"{METRIC_PREFIX}_check_ok {0 if verdict == 'unavailable' else 1}",
-        f"# HELP {METRIC_PREFIX}_faults How many probes reported a fault or could not run.",
+        f"{METRIC_PREFIX}_check_ok 1",
+        # Faults only. A probe that could not be PERFORMED makes the verdict
+        # `unavailable` (SEVERITY 4 outranks every fault), and that run writes
+        # no file at all, so a could-not-run probe can never be counted here.
+        f"# HELP {METRIC_PREFIX}_faults How many probes reported a fault in the run that wrote this file.",
         f"# TYPE {METRIC_PREFIX}_faults gauge",
         f"{METRIC_PREFIX}_faults {len(reasons)}",
         f"# HELP {READBACK_EXPR} Unix time of the last watch run.",
@@ -703,10 +747,28 @@ def refresh_channel(
     No readback, and `required=False`. The readback buys the right to be green
     OVER A FAULT and there is no fault here to justify; spending the Prometheus
     deadline on every healthy tick would hold the production box's single runner
-    for nothing. A refusal is REPORTED and the run stays green, because `ok`
-    must never mail -- the staleness of `check_timestamp_seconds` is what says
-    the write is not landing, and that belongs to Prometheus like every other
-    alert this job hands over.
+    for nothing. A refusal is REPORTED -- in the step summary and in the run's
+    log -- and the run stays green, because `ok` must never mail.
+
+    WHAT THAT COSTS, plainly, because an earlier version of this docstring
+    named a compensating control that does not exist. If a clean run's write
+    keeps failing and no fault verdict comes along to force the RED write path,
+    nothing alerts: a refresh that has NEVER landed leaves no series at all,
+    and a staleness expression over an absent series does not fire without
+    `absent()`. Measured on this branch on 2026-09-27: `grep -rn
+    techsara_production_truth` over this repository finds no Prometheus rule
+    for this metric under monitoring/prometheus/rules/ and no entry in
+    monitoring/developer-api/metrics-contract.json, while the precedent metric
+    `techsara_host_guard_*` has both: the rules at
+    monitoring/prometheus/rules/developer-api.yml:541 and :558, and the
+    contract at lines 43-45. And even that staleness rule
+    -- `(time() - techsara_host_guard_check_timestamp_seconds) > 900` --
+    is silent while the series is missing. So today the only reader of a
+    failed refresh is the person reading this run's summary. Catching it
+    unattended needs an `absent()`-and-staleness rule for
+    `techsara_production_truth_check_timestamp_seconds`, and that rule is the
+    THIRD blocker on the cron commit (production-watch.yml, "SHIPPED IN TWO
+    COMMITS") -- not a control this function may claim.
     """
     now = quantise_timestamp(runtime.now())
     try:
