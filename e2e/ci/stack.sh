@@ -77,6 +77,10 @@ FRONT="${STACK_FRONT_NAME:?}"
 ORCH_PORT="${STACK_ORCH_PORT:?}"
 FRONT_PORT="${STACK_FRONT_PORT:?}"
 ENGINE_PORT="${STACK_ENGINE_PORT:?}"
+# The extra DNS names the one stub container answers on, so each engine key
+# has its OWN address and app/publicapi/registry.py does not withdraw five of
+# the six public models. See the long comment in ci.env.
+ENGINE_ALIASES="${STACK_ENGINE_ALIASES:-}"
 DATA_VOL="${PROJECT}-data"
 REPORTS_VOL="${PROJECT}-reports"
 ENV_FILE="$STACK_TMP/e2e-ci.env"
@@ -96,7 +100,7 @@ guard_names() {
   # may look like production. The check is on the VALUES, because a typo that
   # pointed `docker rm -f` at a production name is the one mistake here that
   # cannot be undone.
-  local all="$PROJECT$NET$ENGINE$ORCH$FRONT$DATA_VOL$REPORTS_VOL"
+  local all="$PROJECT$NET$ENGINE$ORCH$FRONT$DATA_VOL$REPORTS_VOL$ENGINE_ALIASES"
   case "$all" in
     *sf-local-ai*) die "refusing to run: a target name looks like production" ;;
   esac
@@ -104,6 +108,15 @@ guard_names() {
     *e2e-ci*) ;;
     *) die "refusing to run: the names do not all carry 'e2e-ci'" ;;
   esac
+  # Each alias, individually: `*e2e-ci*` over the whole joined string would pass
+  # while one entry in the list named anything at all.
+  local alias
+  for alias in $(printf '%s' "$ENGINE_ALIASES" | tr ',' ' '); do
+    case "$alias" in
+      *e2e-ci*) ;;
+      *) die "refusing to run: engine alias '$alias' does not carry 'e2e-ci'" ;;
+    esac
+  done
   # lib/config.js refuses 3000 and 8080 on every host as production ports;
   # this stack must not bind them either, whatever ci.env says.
   case "$FRONT_PORT:$ORCH_PORT" in
@@ -166,6 +179,45 @@ engine_healthy() {
 }
 
 orch_healthy() { curl -fsS -m 15 "http://127.0.0.1:${ORCH_PORT}/health" >/dev/null; }
+
+# A 200 FROM /health IS NOT A HEALTHY ORCHESTRATOR (2026-09-27).
+# `/health` answers 200 with `"status": "degraded"`, so `curl -fsS` cannot tell a
+# booted stack from a booted-broken one. Measured on the first local run of this
+# stage: the stack came up reporting `degraded`, with `checks.duckdb.status ==
+# "error"` and the engine controller unreachable, and every wait_for here was
+# satisfied.
+#
+# The two checks that decide whether this stack can be tested at all are named
+# explicitly; everything else that is not `ok` is PRINTED with its detail rather
+# than silently tolerated. A warehouse file that does not exist yet on a stack
+# five seconds old is not a reason to refuse, and it is a reason to say so.
+assert_orch_health() {
+  docker exec -i "$ORCH" python3 - <<'HEALTHPY'
+import json
+import sys
+import urllib.request
+
+with urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=20) as response:
+    body = json.load(response)
+
+checks = body.get("checks") or {}
+print(f"orchestrator /health: status={body.get('status')!r}")
+for name, check in sorted(checks.items()):
+    if isinstance(check, dict) and check.get("status") != "ok":
+        detail = str(check.get("detail") or "")[:300]
+        print(f"  NOT OK  {name}: {check.get('status')} {detail}")
+
+required = ("app_db", "vllm")
+broken = [
+    f"{name}={(checks.get(name) or {}).get('status')!r}"
+    for name in required
+    if (checks.get(name) or {}).get("status") != "ok"
+]
+if broken:
+    sys.exit("the orchestrator answered /health but is not usable: " + ", ".join(broken))
+print(f"  app_db ok at schema version {(checks.get('app_db') or {}).get('schema_version')}")
+HEALTHPY
+}
 front_healthy() { curl -fsS -m 10 "http://127.0.0.1:${FRONT_PORT}/login" >/dev/null; }
 
 seed_account() { # seed_account <username> <role> <password-file>
@@ -195,10 +247,21 @@ up() {
   docker rm -f "$ENGINE" >/dev/null 2>&1 || true
   # --read-only: the stub writes nothing, so nothing may write to it either.
   # No -p: the only things that may reach it are its peers on $NET.
+  # One --network-alias per engine key (see ci.env): six addresses, one process.
+  # The `${a[@]+"${a[@]}"}` form below expands to NOTHING when the list is empty
+  # instead of tripping `set -u`, which it does on bash 3.2 (macOS).
+  local alias_args=() alias
+  for alias in $(printf '%s' "$ENGINE_ALIASES" | tr ',' ' '); do
+    alias_args+=(--network-alias "$alias")
+  done
+  # ONLY engine.js, not the whole directory. The stub is a network server; it has
+  # no business reading ci.env, seed.py or redact.js, and a credential that ever
+  # lands in ci.env by mistake must not be one `cat` away inside a container
+  # that is listening on a socket.
   docker run -d --name "$ENGINE" \
-    --network "$NET" --network-alias "$ENGINE" \
+    --network "$NET" --network-alias "$ENGINE" "${alias_args[@]+"${alias_args[@]}"}" \
     --read-only --tmpfs /tmp:rw,size=16m \
-    -v "$HERE:/srv:ro" \
+    -v "$HERE/engine.js:/srv/engine.js:ro" \
     -e "STUB_ENGINE_PORT=$ENGINE_PORT" \
     -e "STUB_ENGINE_MODELS=${STUB_ENGINE_MODELS}" \
     -e "STUB_ENGINE_MAX_MODEL_LEN=${STUB_ENGINE_MAX_MODEL_LEN}" \
@@ -221,6 +284,10 @@ up() {
   if ! wait_for "orchestrator" 300 orch_healthy; then
     docker logs "$ORCH" --tail 200
     die "orchestrator did not become healthy"
+  fi
+  if ! assert_orch_health; then
+    docker logs "$ORCH" --tail 200
+    die "the orchestrator answered /health but is not usable (see above)"
   fi
 
   say "starting $FRONT on 127.0.0.1:$FRONT_PORT"

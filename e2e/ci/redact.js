@@ -215,6 +215,13 @@ function* walk(target) {
 function main(argv) {
   const targets = [];
   const secrets = [];
+  // A --secrets-file that cannot be read is a FAILURE, and it must not be a
+  // reason to redact nothing (2026-09-27). This used to `return 1` on the spot,
+  // before a single file had been rewritten, while the workflow's upload step
+  // runs on `if: failure()` and would have uploaded the untouched report — the
+  // one situation the whole file exists to prevent. So: say so, count it, keep
+  // going with the rules we do have, and still exit non-zero at the end.
+  let argFailures = 0;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--secrets-file') {
@@ -227,8 +234,10 @@ function main(argv) {
       try {
         secrets.push(...readSecretsFile(file));
       } catch (err) {
-        process.stderr.write(`redact: cannot read ${file}: ${err.code || err.message}\n`);
-        return 1;
+        process.stderr.write(
+          `redact: cannot read ${file}: ${err.code || err.message} — its literal value will NOT be redacted\n`,
+        );
+        argFailures += 1;
       }
     } else if (arg === '--secret-env') {
       // The NAME of an environment variable holding one secret, so the value
@@ -260,7 +269,7 @@ function main(argv) {
   const totals = {};
   let files = 0;
   let changed = 0;
-  let failed = 0;
+  let failed = argFailures;
   for (const target of targets) {
     let entries;
     try {

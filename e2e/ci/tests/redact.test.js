@@ -178,3 +178,31 @@ test('redact never throws on the odd shapes a report really contains', () => {
     assert.doesNotThrow(() => redact(input, { secrets: SECRETS }));
   }
 });
+
+test('an unreadable --secrets-file still redacts everything else, and still fails', () => {
+  // THE FAIL-OPEN THIS CLOSES (2026-09-27). main() used to `return 1` the
+  // moment a --secrets-file could not be read, BEFORE rewriting a single file.
+  // The workflow's upload step runs on `if: failure()`, so the failing collect
+  // step would have been followed by an upload of the untouched report — the
+  // exact outcome this file exists to prevent. Now: the missing literal is
+  // reported, every other rule still runs, and the exit code is still non-zero.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { main } = require('../redact');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'redact-test-'));
+  const report = path.join(dir, 'results.md');
+  fs.writeFileSync(report, `key tsk_live_01JABC_deadbeef and ts_session=abc123def456 and ${ADMIN_PASSWORD}\n`);
+  const good = path.join(dir, 'admin.pw');
+  fs.writeFileSync(good, `${ADMIN_PASSWORD}\n`);
+
+  const code = main(['--secrets-file', good, '--secrets-file', path.join(dir, 'does-not-exist.pw'), dir]);
+  const after = fs.readFileSync(report, 'utf8');
+
+  assert.equal(code, 1, 'a secrets file that could not be read must still fail the step');
+  assert.ok(!after.includes('tsk_live_01JABC_deadbeef'), after);
+  assert.ok(!after.includes('abc123def456'), after);
+  assert.ok(!after.includes(ADMIN_PASSWORD), `the readable file's literal survived: ${after}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

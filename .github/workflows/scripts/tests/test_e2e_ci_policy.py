@@ -235,13 +235,18 @@ class NothingLeavesTheRunnerUnredacted(unittest.TestCase):
                 return i
         return -1
 
-    def test_the_redactor_runs_and_is_given_both_generated_passwords(self):
+    def test_the_redactor_runs_and_is_given_every_generated_secret(self):
         idx = self._index_of(lambda s: "node e2e/ci/redact.js" in str(s.get("run", "")))
         self.assertGreater(idx, -1, "no step runs e2e/ci/redact.js")
         body = str(self.steps[idx]["run"])
         self.assertIn("--secrets-file", body)
-        self.assertIn("e2e-admin.pw", body)
-        self.assertIn("e2e-member.pw", body)
+        # The two account passwords, AND the two secrets stack.sh generates into
+        # the orchestrator's environment (2026-09-27). A traceback that prints
+        # settings, or a log line that echoes the environment, writes the
+        # session signing key or the API key pepper into the collected log, and
+        # a pattern cannot catch a random hex string -- only the value can.
+        for name in ("e2e-admin.pw", "e2e-member.pw", "e2e-ci-session.key", "e2e-ci-pepper.key"):
+            self.assertIn(name, body, f"{name} is not passed to the redactor")
 
     def test_the_redactor_runs_before_the_upload(self):
         redact = self._index_of(lambda s: "node e2e/ci/redact.js" in str(s.get("run", "")))
@@ -397,9 +402,27 @@ class TheCheckedInDefaultsAreNonSecret(unittest.TestCase):
         self.assertGreater(int(self.values["PUBLIC_API_MIN_FREE_DISK_BYTES"]), 0)
 
     def test_every_engine_url_points_at_the_in_repo_stub(self):
+        # `_BASE_URLS` (plural) as well: ASR takes a comma-separated list, and a
+        # rule that only read the singular would have let a real speech endpoint
+        # into CI unnoticed.
         for key, value in self.values.items():
-            if key.endswith("_BASE_URL"):
-                self.assertIn("e2e-ci-engine", value, f"{key} does not point at the stub engine")
+            if key.endswith("_BASE_URL") or key.endswith("_BASE_URLS"):
+                for one in value.split(","):
+                    if one.strip():
+                        self.assertIn("e2e-ci-engine", one, f"{key} does not point at the stub engine")
+
+    def test_the_engine_controller_is_pinned_at_the_stub_too(self):
+        # UNSET, app/config.py:2182 defaults it to `http://vllm:9838/state` -- a
+        # PRODUCTION container name. A hosted runner then looks that name up on
+        # every poll for the length of the job (measured 2026-09-27: "controller
+        # unreachable: ConnectError: [Errno -3] Temporary failure in name
+        # resolution"), and a search domain or a wildcard zone on the runner
+        # would turn the lookup into a request to a host nobody chose.
+        url = self.values.get("ENGINE_CONTROLLER_URL")
+        self.assertIsNotNone(url, "ENGINE_CONTROLLER_URL is not pinned; the default names a production container")
+        self.assertIn("e2e-ci-engine", url, url)
+        self.assertNotIn("vllm", url, url)
+
 
     def test_no_value_looks_like_a_credential(self):
         # `OPENAI_API_KEY=local` is the placeholder a local inference server
@@ -412,6 +435,122 @@ class TheCheckedInDefaultsAreNonSecret(unittest.TestCase):
                 len(value), 16, f"{key} holds a {len(value)}-character value; ci.env must hold no credential"
             )
 
+
+class EverySixthPublicModelIsReallyConfigured(unittest.TestCase):
+    """The defect the first local run of this stage found, pinned.
+
+    app/publicapi/registry.py WITHDRAWS a public model whose engine shares an
+    address with the main engine -- `_router_configured` (:721),
+    `_ocr_configured` (:769), `_embed_configured` (:807) and
+    `_rerank_configured` (:845) all end in
+    `not _same_address(url, openai_base_url)`. That guard is correct: a profile
+    pointing a sidecar at the main engine would publish the main model a second
+    time, around its breaker and its admission lanes.
+
+    With every `*_BASE_URL` in ci.env on ONE address it did exactly that, and
+    `/v1/models` listed `techsara-35b` alone, so the suite's
+    `v1.models-published` check failed:
+
+        missing from /v1/models: techsara-8b-vision, techsara-ocr,
+        techsara-embed, techsara-rerank, techsara-whisper
+
+    The fix is one DNS name per engine key (network aliases on the one stub
+    container). These assertions are what stops a later edit collapsing them
+    back onto one address and re-breaking the stage 40 minutes into a run.
+    """
+
+    #: engine key -> the ci.env variable holding its address. AGENT and VISION
+    #: are deliberately absent: in production the agent runs on the router's
+    #: engine and vision on the main one, and ci.env mirrors that.
+    PUBLIC_ENGINE_URL_KEYS = ("ROUTER_BASE_URL", "OCR_BASE_URL", "EMBED_BASE_URL", "RERANK_BASE_URL")
+
+    def setUp(self):
+        self.values = dict(
+            line.split("=", 1)
+            for line in CI_ENV.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+
+    @staticmethod
+    def _address(url: str) -> str:
+        parts = urlparse(url.strip())
+        return f"{parts.scheme}://{parts.hostname}:{parts.port or ''}"
+
+    def test_no_public_engine_shares_the_main_engine_address(self):
+        main = self._address(self.values["OPENAI_BASE_URL"])
+        for key in self.PUBLIC_ENGINE_URL_KEYS:
+            self.assertNotEqual(
+                self._address(self.values[key]),
+                main,
+                f"{key} is on the main engine's address, so registry.py withdraws its public model",
+            )
+
+    def test_each_public_engine_has_its_own_address(self):
+        seen: dict[str, str] = {}
+        for key in self.PUBLIC_ENGINE_URL_KEYS:
+            address = self._address(self.values[key])
+            self.assertNotIn(
+                address,
+                seen,
+                f"{key} shares {address} with {seen.get(address)}; one of the two is withdrawn from /v1/models",
+            )
+            seen[address] = key
+
+    def test_speech_is_configured_so_techsara_whisper_is_published(self):
+        # _asr_configured (registry.py:879) wants all three, and does not probe
+        # the endpoint. ASR_ENABLED=false withdrew `techsara-whisper`.
+        self.assertEqual(self.values.get("ASR_ENABLED"), "true")
+        self.assertTrue(self.values.get("ASR_BASE_URLS", "").strip())
+        self.assertTrue(self.values.get("ASR_MODEL", "").strip())
+        self.assertNotEqual(
+            self.values["ASR_MODEL"],
+            self.values["LLM_MODEL"],
+            "a sidecar naming the MAIN checkpoint withdraws itself (_configured_name)",
+        )
+
+    def test_the_stub_publishes_every_model_name_ci_env_names(self):
+        published = {m.strip() for m in self.values["STUB_ENGINE_MODELS"].split(",") if m.strip()}
+        for key in ("MAIN_MODEL", "LLM_MODEL", "ROUTER_MODEL", "AGENT_MODEL", "VISION_MODEL",
+                    "EMBED_MODEL", "OCR_MODEL", "RERANK_MODEL", "ASR_MODEL"):
+            self.assertIn(self.values[key], published, f"{key}={self.values[key]} is not in STUB_ENGINE_MODELS")
+
+    def test_every_engine_alias_carries_e2e_ci_and_is_used(self):
+        aliases = [a.strip() for a in self.values["STACK_ENGINE_ALIASES"].split(",") if a.strip()]
+        self.assertTrue(aliases, "STACK_ENGINE_ALIASES is empty, so every sidecar is back on one address")
+        urls = " ".join(
+            value for key, value in self.values.items()
+            if key.endswith("_BASE_URL") or key.endswith("_BASE_URLS") or key == "ENGINE_CONTROLLER_URL"
+        )
+        for alias in aliases:
+            self.assertIn("e2e-ci", alias, f"alias {alias!r} does not carry 'e2e-ci'")
+            self.assertIn(alias, urls, f"alias {alias!r} is declared but no address uses it")
+
+
+class TheJobAndCiEnvDoNotDriftApart(unittest.TestCase):
+    """The account emails live in TWO places and both are load-bearing.
+
+    `stack.sh` SEEDS the accounts and reads them from ci.env (load_ci_env
+    exports every value, overriding the process environment -- deliberately, so
+    an engine URL cannot be repointed from outside the reviewed file). The
+    SUITE runs on the runner and reads them from the job's `env:`. Change one
+    and not the other and the stack seeds one pair of accounts while the suite
+    signs in as another, which fails as "incorrect email or password" 25 checks
+    deep with nothing pointing at the cause.
+    """
+
+    def test_the_account_emails_agree(self):
+        env = load_pipeline()["jobs"][JOB_ID]["env"]
+        values = dict(
+            line.split("=", 1)
+            for line in CI_ENV.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        for key in ("E2E_ADMIN_EMAIL", "E2E_MEMBER_EMAIL"):
+            self.assertEqual(
+                str(env[key]),
+                values[key],
+                f"{key} differs: the job seeds one account and the suite signs in as another",
+            )
 
 if __name__ == "__main__":
     unittest.main()

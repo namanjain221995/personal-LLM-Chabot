@@ -1063,24 +1063,52 @@ jobs:
   #   * sign-in, sign-out, and a session that is dead SERVER-side afterwards;
   #   * who may open what while signed out, including `/v1` correctly ignoring
   #     cookies;
-  #   * the SSE wire contract end to end: the leading `meta` carrying
-  #     generation_id and intent_id, and the intent reaching `completed`;
+  #   * the send handshake as the BROWSER performs it, and what the server then
+  #     holds: the stored answer keyed by the stream's generation_id, the
+  #     stored question carrying the send intent, the intent reaching
+  #     `completed`, and one answer after a reload. See the withdrawal below
+  #     for what this is NOT;
   #   * a chunked upload that RESUMES across a dropped connection;
   #   * API key create and revoke, with `/v1` refusing a revoked key at once;
-  #   * the public OpenAPI document checked against a RUNNING server. This is
-  #     genuinely new signal: api_contract.py imports app.publicapi.openapi, so
-  #     it structurally cannot see a route registered at runtime, middleware
-  #     that forgets auth, or the gateway's relay.
+  #   * the PUBLIC MODEL CATALOGUE against a running deployment: `/v1/models`
+  #     listing all six ids and each one resolving. api_contract.py cannot see
+  #     this — the catalogue is filtered at run time by which engines the
+  #     deployment is configured with (app/publicapi/registry.py), and the
+  #     first local run of this stage caught exactly that: five of the six were
+  #     missing because every engine URL in ci.env named one address.
   #
   # WHAT ITS GREEN DOES NOT MEAN — repeated in the run summary so nobody reads
-  # more into it than is there:
+  # more into it than is there. Every item below is MEASURED from local runs of
+  # this stack on 2026-09-27, not inferred: the first run of the stage as
+  # committed reported 41 pass, 1 fail, 1 skip of 43 and is what found the
+  # catalogue defect; after the fix, 42 pass, 0 fail, 1 skip:
   #   * nothing about the CUDA image: this runs Dockerfile.cpu, production
   #     runs Dockerfile.cuda;
   #   * nothing about aarch64: hosted runners are x86_64 and the DGX is not;
   #   * nothing about the engine, token timing or the 15-second SSE heartbeat:
   #     the stub serves a whole stream in one write;
+  #   * NOT the orchestrator's SSE writer, and not its /chat worker. This is a
+  #     WITHDRAWN CLAIM: in `--chat-mode stub` the suite intercepts
+  #     `POST /api/chat` IN THE BROWSER (e2e/platform/suites/chat.js:22) and
+  #     answers it from its own fixture (lib/stubs.js:41), so the orchestrator
+  #     never writes a chat stream during this stage. Conversation titling and
+  #     the API console's playground execute call are intercepted the same way
+  #     (chat.js:47, suites/console.js:231), so the router path and
+  #     `/v1/responses` streaming are not exercised either;
   #   * nothing about the orchestrator's own persist of an answer, which the
-  #     suite's README already documents as outside stub mode.
+  #     suite's README already documents as outside stub mode;
+  #   * `artifacts.panel` SKIPS itself in stub mode ("no conversation with
+  #     artifacts, so the panel is not reachable without a model generation"),
+  #     so the artifacts panel is not covered here at all;
+  #   * NOT the public OpenAPI document. An earlier version of this comment
+  #     claimed it; no check in e2e/platform fetches it. `api_contract` above
+  #     is still the only proof of that surface, from the imported module;
+  #   * very little of e2e/ci/engine.js. Measured over the whole local run, the
+  #     stub served 13 requests: 7 GET /health, 3 GET /v1/models and 3 POST
+  #     /score (the reranker canary, app/rerank.py:159). Its chat, completions,
+  #     embeddings and tokenize handlers were never called through the product
+  #     — they are covered by e2e/ci/tests/engine.test.js and by nothing else
+  #     in this job.
   #
   # NO SECRETS. The two account passwords are generated per run with
   # `openssl rand -hex 24`, written under $RUNNER_TEMP and passed by FILE
@@ -1094,21 +1122,39 @@ jobs:
   # the pipeline (see "UNMEASURED" below), and a stage nobody has watched run
   # does not get to block a merge. Promotion is its own change, after real runs.
   #
-  # UNMEASURED, and it must stay labelled until a real Actions run says
-  # otherwise: this job's wall clock, its peak memory and its disk high-water
-  # mark. `timeout-minutes` below is therefore a CEILING TO KILL A WEDGED JOB,
-  # not a measurement — every other ceiling in this file carries the run ids it
-  # was sized on and this one cannot yet. The "Runner capacity" step prints
-  # nproc, free -g, df -h / and docker stats with the stack up, which is the
-  # measurement the ceiling has to be re-sized on the first time it runs.
+  # WHAT IS MEASURED NOW, and what is still not (2026-09-27, local run of this
+  # exact stack on the aarch64 box; `docker compose` untouched, own Postgres):
+  #   * `node --test e2e/ci/tests/`      0.2 s (34 cases)
+  #   * `stack.sh up`                    9.4-10.0 s over three runs — stub
+  #     engine ready after 1 s, orchestrator after 4 s WITH every migration run
+  #     to schema V41 against an empty database (the database was dropped and
+  #     recreated between runs), frontend after 2 s, then both account seeds
+  #   * `node e2e/platform/run.js`       2 m 17.6 s / 2 m 29.7 s / 2 m 21.5 s
+  #     (43 checks; the middle run under a load average of 7)
+  # so bring-up plus the suite is 2.5 minutes, on a 20-core box whose load
+  # average was between 1.0 and 9.1 across the three runs. Peak container
+  # memory with the stack up and the suite finished: orchestrator 301 MiB,
+  # frontend 85 MiB, stub engine 9 MiB, Postgres 67 MiB.
+  #
+  # STILL UNMEASURED, and it must stay labelled: the two IMAGE BUILDS on a
+  # 4-vCPU hosted runner (both were cache hits locally — 2.9 s and 0.3 s — so
+  # the local numbers say nothing), this job's peak memory, and its disk
+  # high-water mark. The nearest real evidence for the build half is the
+  # `images` job on the same runner class: run 35788196359 built FOUR images
+  # cold in 4 m 24 s ("Build (native)"), and that job's whole ceiling is 45
+  # minutes. `timeout-minutes` below is therefore still a CEILING TO KILL A
+  # WEDGED JOB rather than a measurement, and it is deliberately NOT lowered on
+  # the strength of a run on different hardware: the "Runner capacity" step
+  # prints nproc, free -g, df -h / and docker stats with the stack up, and that
+  # is what the ceiling gets re-sized on the first time this runs for real.
   # ==========================================================================
   e2e-hosted:
     name: End-to-end (hosted)
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # UNMEASURED (see above). Two image builds, a boot that runs every
-    # migration, and a suite measured at ~2.5 min on the box it was written on.
+    # See "WHAT IS MEASURED NOW" above: bring-up plus the suite is 2 m 27 s
+    # measured locally; the two image builds on a hosted runner are not.
     timeout-minutes: 60
     services:
       postgres:
@@ -1307,7 +1353,11 @@ jobs:
             echo "- nothing about the CUDA image: this runs \`Dockerfile.cpu\`, production runs \`Dockerfile.cuda\`"
             echo "- nothing about aarch64: hosted runners are x86_64"
             echo "- nothing about the engine, token timing or the 15 s SSE heartbeat: the stub serves the whole stream at once"
+            echo "- NOT the orchestrator's SSE writer: in stub mode the suite answers \`POST /api/chat\` in the browser from its own fixture (\`suites/chat.js\`, \`lib/stubs.js\`). Conversation titling and the console playground are intercepted the same way"
             echo "- nothing about the orchestrator's own persist of an answer, which stub mode does not cover"
+            echo "- \`artifacts.panel\` skips itself in stub mode: the artifacts panel is not covered"
+            echo "- NOT the public OpenAPI document: no check in \`e2e/platform\` fetches it; \`api_contract\` remains the only proof of that surface"
+            echo "- little of the stub engine itself: a whole local run reached it 13 times (health, /v1/models, and the reranker canary on /score)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # FAILURE ONLY, REDACTED, AND SHORT-LIVED. e2e/platform keeps failures
@@ -1327,10 +1377,32 @@ jobs:
           bash e2e/ci/stack.sh logs techsara-e2e-ci-frontend 200 > "$E2E_OUT/logs/frontend.log" || true
           bash e2e/ci/stack.sh logs techsara-e2e-ci-engine 200 > "$E2E_OUT/logs/stub-engine.log" || true
           cp "$RUNNER_TEMP/runner-capacity.txt" "$E2E_OUT/" 2>/dev/null || true
-          node e2e/ci/redact.js \
-            --secrets-file "$RUNNER_TEMP/e2e-admin.pw" \
-            --secrets-file "$RUNNER_TEMP/e2e-member.pw" \
-            "$E2E_OUT"
+          # EVERY GENERATED SECRET, not only the two account passwords
+          # (2026-09-27). stack.sh also generates the session signing key and
+          # the API key pepper per run and puts them in the orchestrator's
+          # environment, so a traceback that prints settings, or a log line
+          # that echoes the environment, writes them into the file collected
+          # just above. A pattern cannot catch a random hex string; only the
+          # value can, which is the whole argument of e2e/ci/redact.js.
+          #
+          # Built as a LIST of files that exist: a missing one must not be the
+          # reason the other literals go unredacted. redact.js also no longer
+          # returns before doing the work when a named file cannot be read,
+          # because `actions/upload-artifact` below runs on `if: failure()` and
+          # would have uploaded the untouched report.
+          # `if`, not `[ -s "$f" ] && …`: under `set -e` a failing AND-list as
+          # the last command in a loop body ends the step, and a missing file
+          # here is the normal case, not an error.
+          secret_args=()
+          for f in "$RUNNER_TEMP/e2e-admin.pw" "$RUNNER_TEMP/e2e-member.pw" \
+                   "$RUNNER_TEMP/e2e-ci-session.key" "$RUNNER_TEMP/e2e-ci-pepper.key"; do
+            if [ -s "$f" ]; then
+              secret_args+=(--secrets-file "$f")
+            else
+              echo "redact: no $f on this runner; its literal value is not in the rule set"
+            fi
+          done
+          node e2e/ci/redact.js "${secret_args[@]+"${secret_args[@]}"}" "$E2E_OUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()

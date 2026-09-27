@@ -20,7 +20,12 @@
  *   POST /score                  app/rerank.py score_url(): root, not /v1
  *   POST /tokenize               app/context.py:400 reads count + max_model_len
  *   GET  /metrics                vllm:generation_tokens_total, which `verify`
- *                                and the engine-state code read as liveness
+ *                                and the engine-state code read as liveness,
+ *                                plus techsara_ci_stub_engine_info, which says
+ *                                in the scrape itself that no model ran
+ *   GET  /state                  the engine controller's document
+ *                                (app/engine_state.py), answered
+ *                                MONITORING_UNKNOWN: "cannot observe"
  * Anything else answers 404 with an OpenAI-shaped error AND logs the method
  * and path loudly, so the first real Actions run tells us what this file is
  * still missing instead of leaving a timeout to be guessed at.
@@ -356,6 +361,13 @@ function tokenizePayload(body) {
 
 function metricsText() {
   return [
+    // THE MARKER. Everything below this is in the `vllm:` namespace because
+    // that is the contract app/health.py and scripts/cluster-verify-engine.sh
+    // read, and a scrape of those names alone is indistinguishable from a real
+    // engine's. This series says, in the scrape itself, that it is not one.
+    '# HELP techsara_ci_stub_engine_info The CI stub engine (e2e/ci/engine.js). No model, no weights, no sampling: every `vllm:` series below is synthetic.',
+    '# TYPE techsara_ci_stub_engine_info gauge',
+    'techsara_ci_stub_engine_info{engine="techsara-ci-stub",real_model="none"} 1',
     '# HELP vllm:generation_tokens_total Number of generation tokens processed.',
     '# TYPE vllm:generation_tokens_total counter',
     `vllm:generation_tokens_total{model_name="${MODELS[0] || 'stub-main'}"} ${counters.completionTokens}`,
@@ -396,6 +408,26 @@ async function handle(req, res) {
   }
   if (req.method === 'GET' && route === '/version') {
     send(res, 200, { version: 'techsara-ci-stub' });
+    return log(200);
+  }
+  if (req.method === 'GET' && route === '/state') {
+    // The engine controller's document (app/engine_state.py:685 onwards).
+    // MONITORING_UNKNOWN, code 0, is the one honest answer here: it is in
+    // neither SERVING nor OPENS_BREAKER (:81, :87), so the orchestrator reads
+    // it as "cannot observe" and no breaker, queue or admission decision is
+    // made from it. A 404 would be treated the same way but would print
+    // UNIMPLEMENTED on stderr on every poll for the length of the job, which
+    // is exactly the signal this file's loud 404 exists to give.
+    send(res, 200, {
+      state: 'MONITORING_UNKNOWN',
+      state_code: 0,
+      reason: 'the CI stub engine has no controller: no head, no ranks, nothing to observe',
+      primary_ready: false,
+      router_available: null,
+      generated_at: Date.now() / 1000,
+      signals: {},
+      recovery: { step: 'idle' },
+    });
     return log(200);
   }
 

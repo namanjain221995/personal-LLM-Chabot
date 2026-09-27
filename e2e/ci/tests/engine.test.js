@@ -219,3 +219,35 @@ test('the stub never echoes an Authorization header back to the caller', async (
   const text = await res.text();
   assert.ok(!text.includes('tsk_live'), text);
 });
+
+test('GET /metrics carries a marker that says the `vllm:` series are synthetic', async () => {
+  // WHY (2026-09-27): every other surface of this stub names itself —
+  // /health returns engine "techsara-ci-stub", /version the same, the models
+  // are `stub-*` and owned_by techsara-ci-stub, and a chat id is
+  // `chatcmpl-stub-…`. /metrics was the one exception: it emitted
+  // `vllm:generation_tokens_total` and `vllm:prompt_tokens_total` under exactly
+  // the names a real engine uses, so a scrape, a pasted sample or a dashboard
+  // could not tell the two apart. The marker is a series of its own, so
+  // nothing that parses the `vllm:` names is affected.
+  const text = await (await fetch(`${base}/metrics`)).text();
+  assert.match(text, /^techsara_ci_stub_engine_info\{engine="techsara-ci-stub",real_model="none"\} 1$/m, text);
+  assert.match(text, /# HELP techsara_ci_stub_engine_info .*No model/, text);
+});
+
+test('GET /state answers MONITORING_UNKNOWN, the one state that changes no decision', async () => {
+  // ci.env points ENGINE_CONTROLLER_URL here so CI never resolves `vllm`, the
+  // PRODUCTION container name app/config.py:2182 defaults to. The document
+  // must parse under app/engine_state.py's strict rules — `state` one of the
+  // nine names and `state_code` agreeing with it — and MONITORING_UNKNOWN is
+  // in neither SERVING (engine_state.py:87) nor OPENS_BREAKER (:81), so the
+  // orchestrator reads it as "cannot observe" and opens no breaker, queues no
+  // generation and closes no admission lane on it.
+  const res = await fetch(`${base}/state`);
+  assert.equal(res.status, 200);
+  const doc = await res.json();
+  assert.equal(doc.state, 'MONITORING_UNKNOWN');
+  assert.equal(doc.state_code, 0);
+  assert.equal(doc.primary_ready, false);
+  assert.ok(typeof doc.generated_at === 'number' && doc.generated_at > 1e9, `generated_at: ${doc.generated_at}`);
+  assert.match(String(doc.reason), /stub/i);
+});
