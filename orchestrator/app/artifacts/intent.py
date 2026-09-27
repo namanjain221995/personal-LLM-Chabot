@@ -689,10 +689,31 @@ _FOLLOWUP_VERB_RE = re.compile(
 _KEEP_VERB_RE = re.compile(r"\b(?:save|download|export|convert|_convert_)\b", re.I)
 #: "as a file", "into a nice looking document", "in a doc".
 _AS_FILE_RE = re.compile(rf"\b(?:as|in|into|to)\s+(?:an?\s+)?(?:{_ADJ}\s+){{0,2}}(?:file|document|doc|downloadable)\b", re.I)
+#: The words a person types the moment the product missed: "no, I meant
+#: pdf", "I said pdf", "as I said, pdf", "again, pdf". `_FORMAT_ONLY_RE`
+#: below is ANCHORED, and its leading set was a closed seven words
+#: (a|an|the|just|only|also|and), so a correction opener displaced the
+#: format word from position 0 and the match failed -- bare "pdf" exported
+#: the answer and every one of these six reached `no-request` (W5, measured
+#: 2026-09-27). The fallbacks could not cover it either: export-content-free
+#: and export-destination-only both require `not _content_words(low)`, and
+#: `meant`, `said`, `asked` are not in `_FUNCTION_WORDS_RE`, so they read as
+#: TOPIC words. This is the second strike in the owner's three-strike
+#: transcript, whose third turn opens "I said ???".
+#:
+#: BOUNDED BY A TEST THAT ALREADY PASSED: with a finite verb phrase after
+#: the opener ("no, I meant give me a pdf of that") the same openers cost
+#: nothing today, so only the ELLIPTICAL form was broken and widening the
+#: leading set is the whole fix.
+_CORRECTION_PREFACE = (
+    r"(?:(?:no|nope|nah|sorry|my\s+bad|oops|again|as)\W+)?"
+    r"(?:(?:i|we)\s+(?:meant|mean|said|asked\s+for|told\s+you|wanted|want)\W*)?"
+)
 #: A format with nothing but "please"/"version"/"of this": "docx version
-#: please", "pdf of this pls", "word file too".
+#: please", "pdf of this pls", "word file too" -- or a correction preface in
+#: front of exactly that (see `_CORRECTION_PREFACE`).
 _FORMAT_ONLY_RE = re.compile(
-    rf"^\W*(?:(?:a|an|the|just|only|also|and)\s+)?(?:{_ADJ}\s+)?(?:{_FORMAT_WORD})(?:\s+(?:file|version|copy|format|doc))?"
+    rf"^\W*{_CORRECTION_PREFACE}(?:(?:a|an|the|just|only|also|and)\s+)?(?:{_ADJ}\s+)?(?:{_FORMAT_WORD})(?:\s+(?:file|version|copy|format|doc))?"
     rf"(?:\s+(?:of|for)\s+(?:it|this|that|_this_|the\s+above|everything|all\s+of\s+(?:it|this|that)))?"
     rf"(?:\s+(?:please|too|as\s+well|also))*\W*$",
     re.I,

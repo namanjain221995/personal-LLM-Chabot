@@ -394,11 +394,38 @@ W5_CORRECTIONS = [
 
 
 @pytest.mark.parametrize("text", W5_CORRECTIONS)
-@pytest.mark.xfail(strict=True, reason="W5: _FORMAT_ONLY_RE allows only seven leading words, and `meant`/`said`/`asked` are topic words to _content_words (intent.py:597/1016)")
 def test_an_elliptical_correction_still_asks_for_the_file(text: str) -> None:
     """The correction names the format and nothing else. It is the same ask
-    as the bare word, said by someone the product has already missed once."""
+    as the bare word, said by someone the product has already missed once.
+
+    FIXED 2026-09-27 by `_CORRECTION_PREFACE` in front of the anchored
+    `_FORMAT_ONLY_RE`. All six were none/no-request before and are
+    export/['pdf']/export-format-only after."""
     assert I.decide(text, **PA).wants_file is True
+
+
+@pytest.mark.parametrize("text,fmt", [
+    ("no, I meant excel", "xlsx"), ("again, sheet", "xlsx"), ("sorry, I meant doc", "docx"),
+    ("no I meant pdf, not excel", "pdf"),
+])
+def test_the_correction_carries_whichever_format_was_named(text: str, fmt: str) -> None:
+    """The same shape in the other formats, including the one the survey
+    paired it with: "not excel, pdf" and "pdf instead of excel" already
+    exported, and "no I meant pdf, not excel" -- the same meaning in a
+    different word order -- did not."""
+    got = I.decide(text, **PA)
+    assert got.action == "export" and got.formats == [fmt], (text, got)
+
+
+@pytest.mark.parametrize("text", [
+    "sorry", "no thanks", "I said no", "no, I meant the blue one",
+    "what is a PDF?", "what should I put in it?",
+])
+def test_a_correction_opener_with_no_format_is_still_not_a_file(text: str) -> None:
+    """THE BOUND on W5: the preface is optional and decides nothing on its
+    own -- a format word still has to be the whole of what follows. These
+    six were `none` before the fix and are `none` after."""
+    assert I.decide(text, **PA).wants_file is False
 
 
 def test_the_bare_format_word_is_already_a_request() -> None:
