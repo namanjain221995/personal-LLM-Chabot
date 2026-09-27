@@ -539,11 +539,113 @@ def test_the_edge_label_inside_the_arrow_is_read_instead_of_losing_the_diagram(l
     'A["T"] -- a|b --> B["Q"]',
     # Nor an unbounded label: the cap is 120 characters, as it is for `|...|`.
     'A["T"] -- ' + "x" * 121 + ' --> B["Q"]',
-    # Nor a directive dressed as a label.
+    # Trailing text after a role: `:::x fill:#f00` is not a node. (This case
+    # used to be commented "a directive dressed as a label", which it is not —
+    # it refuses because of what follows `:::x`, not because of the label. The
+    # label half is pinned for what it really does, below.)
     'A["T"] -- fill:#f00 --> B["Q"]:::x fill:#f00',
 ])
 def test_the_wider_edge_grammar_did_not_open_the_closed_one(line):
     assert D.parse_mermaid(f'flowchart TD\n  {line}\n') is None
+
+
+@pytest.mark.parametrize("line", [
+    # A CHAIN is several edges, not one. The mid-label class excludes only `"`
+    # and `|`, so before the guard at diagrams.py's
+    # `_MID_LABEL_SWALLOWED_AN_ARROW_RE` the label swallowed the second arrow
+    # and the line came back as ONE edge with a node missing. Measured on
+    # 4fe0b09, each of these against `X["x"] --> Y["y"]`:
+    #   A --> B --> C              -> ('A','C','> B')          B lost
+    #   A -- yes --> B -- no --> C -> ('A','C','yes --> B -- no')  B lost
+    #   A -.-> B -.-> C            -> ('A','C','-> B -')        B lost
+    #   A == x ==> B == y ==> C    -> ('A','C','x ==> B == y')   B lost
+    #   A --> B; C --> D           -> ('A','D','> B; C')      B and C lost
+    # Raw mermaid printed on the arrow, `notes` empty, nothing warned. All
+    # five are refused on 381a62d, the commit before the mid-label form
+    # existed, so accepting them was a NEW wrong picture, which this module's
+    # docstring promises never to draw.
+    'A --> B --> C',
+    'A -- yes --> B -- no --> C',
+    'A -.-> B -.-> C',
+    'A == x ==> B == y ==> C',
+    'A --> B; C --> D',
+    'A["T"] -- a --> b --> B["Q"]',
+    'Start -- ok --> Mid -- no --> End',
+    # An HTML label: the module docstring says an HTML label refuses the whole
+    # source. It is escaped downstream, so this is honesty, not XSS.
+    'A -- <b>html</b> --> B',
+])
+def test_a_chained_edge_refuses_the_source_instead_of_drawing_a_wrong_picture(line):
+    assert D.parse_mermaid(f'flowchart TD\n  X["x"] --> Y["y"]\n  {line}\n') is None
+
+
+def test_the_declare_then_chain_idiom_falls_back_to_the_callout_not_to_a_wrong_picture():
+    """The shape DIAGRAM_INSTRUCTION asks for — one statement per line, every
+    label in double quotes, every node given a role — written with the edges
+    chained on the last line. Measured on 4fe0b09 it came back as four boxes
+    and ONE arrow A->D labelled `> B --> C`: three real edges deleted, a false
+    edge invented, two boxes orphaned and `notes` empty. It must refuse, and
+    md_import must say so."""
+    from app.artifacts import md_import
+
+    source = (
+        'flowchart TD\n'
+        '  A["Sign up"]:::service\n'
+        '  B["Verify email"]:::service\n'
+        '  C["Create workspace"]:::store\n'
+        '  D["Invite team"]:::service\n'
+        '  A --> B --> C --> D\n'
+    )
+    assert D.parse_mermaid(source) is None
+
+    doc, notes = md_import.markdown_to_document(
+        "# Onboarding\n\n```mermaid\n" + source + "```\n\nOrdinary prose after the fence.\n"
+    )
+    assert [type(b).__name__ for b in doc.blocks] == ["Callout", "Paragraph"]
+    assert any("could not be read" in n for n in notes)
+
+    # The same graph with one edge per line is still DRAWN — the guard refuses
+    # the chain, not the relations.
+    ok, ok_notes = md_import.markdown_to_document(
+        "# Onboarding\n\n```mermaid\n"
+        + source.replace('  A --> B --> C --> D\n', '  A --> B\n  B --> C\n  C --> D\n')
+        + "```\n\nOrdinary prose after the fence.\n"
+    )
+    drawn = [b for b in ok.blocks if type(b).__name__ == "DiagramBlock"]
+    assert len(drawn) == 1
+    assert [(e.source, e.target) for e in drawn[0].diagram.edges] == [("A", "B"), ("B", "C"), ("C", "D")]
+    assert ok_notes == []
+
+
+@pytest.mark.parametrize("line,label", [
+    # A mid-label that merely LOOKS like a directive is accepted and drawn as
+    # ordinary text. Nothing is interpreted: there is no colour or style field
+    # on a Diagram, the renderer colours by the declared role, and every
+    # renderer escapes the string. 4fe0b09's message listed this under
+    # "verified still refused", which was wrong — measured here so the true
+    # behaviour is pinned rather than described.
+    ('C -- fill:#f00 --> D["Tier 1"]', "fill:#f00"),
+    ('C -- classDef --> D["Tier 1"]', "classDef"),
+    # A hyphen inside a word is not an arrow, and must not trip the guard.
+    ('C -- e-mail sent --> D["Tier 1"]', "e-mail sent"),
+])
+def test_a_directive_shaped_mid_label_is_drawn_as_text_while_every_directive_statement_refuses(line, label):
+    fields = D.parse_mermaid(f'flowchart TD\n  A["Ticket"] --> C["Triage"]\n  {line}\n')
+    assert fields is not None, line
+    assert fields["edges"][1]["label"] == label
+    d = S.Diagram(**fields)
+    assert not hasattr(d, "colour") and not hasattr(d, "style")
+    assert [n.kind for n in d.nodes] == ["service", "service", "service"]
+    # Every directive STATEMENT is still refused outright.
+    for directive in (
+        "style A fill:#f00",
+        "classDef svc fill:#f00",
+        "linkStyle 0 stroke:#f00",
+        'click A "http://example.invalid"',
+        "subgraph one",
+        "%%{init: {'theme':'dark'}}%%",
+    ):
+        assert D.parse_mermaid(f'flowchart TD\n  A["T"] --> B["Q"]\n  {directive}\n') is None, directive
 
 
 def test_the_mid_label_grammar_does_not_backtrack():
@@ -928,9 +1030,27 @@ def test_the_biggest_diagram_the_schema_allows_is_cheap_to_draw(tmp_path):
     elapsed_ms = (time.perf_counter() - t0) * 1000
     assert elapsed_ms < 5000, f"the largest allowed diagram took {elapsed_ms:.0f} ms"
     assert (tmp_path / "big.png").stat().st_size > 0
-    # Whatever it lays out at, it is REPORTED: the floor and the flag agree,
-    # so nothing below 8 pt can reach a page claiming to fit.
-    assert layout.fits == (layout.effective_pt >= D.MIN_EFFECTIVE_PT - 1e-9)
+
+    # CORRECTED AGAIN 2026-09-27. The line that replaced the deleted fit
+    # assertion was `layout.fits == (layout.effective_pt >= MIN_EFFECTIVE_PT
+    # - 1e-9)`, which is the `fits` property's own definition
+    # (diagrams.py:253-255) written out, so it could not fail — a gate that
+    # does not gate, which is the defect this whole branch exists to remove.
+    # What is asserted instead is the one thing that is NOT a definition: the
+    # point size the layout REPORTS is the point size the PNG it actually
+    # wrote will print at. Measured here today for seed 7: the file is
+    # 6.005 x 9.165 in, the portrait box is 6.3 x 8.4 in, so the page can
+    # only give it 8.707 pt of the 9.5 pt base, and `effective_pt` says
+    # 8.703. If the fitter ever reported a size the drawing does not have,
+    # this fails; a tautology never could.
+    w_in, h_in = D.png_size_in(tmp_path / "big.png")
+    assert (w_in, h_in) == pytest.approx(layout.fig_in, abs=0.02)
+    box_w, box_h = layout.box_in
+    from_the_file = D.FONT_PT * min(1.0, box_w / w_in, box_h / h_in)
+    assert layout.effective_pt == pytest.approx(from_the_file, abs=0.05), (
+        f"reported {layout.effective_pt:.3f} pt but the PNG on the page prints at {from_the_file:.3f} pt"
+    )
+    assert layout.display_in[0] <= box_w + 0.01 and layout.display_in[1] <= box_h + 0.01
 
 
 def test_a_label_in_another_script_picks_a_font_that_can_draw_it(tmp_path):

@@ -84,6 +84,25 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     )
 
 
+def test_the_withdrawn_byte_claim_is_not_restated_anywhere():
+    """The unit correction above was made in this file first and left standing
+    in the two places a reader actually meets it, so the branch still carried
+    the number it had withdrawn. Measured 2026-09-27: 1,082 CHARACTERS on both
+    trees, 1,086 UTF-8 bytes on origin/dev and 1,088 on this branch — so
+    "1,082 bytes" is true of neither tree and must not reappear in the comment
+    beside the string or in the golden manifest's note. This reads the files
+    rather than trusting the fix, because a prose claim has no other gate.
+    """
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("app/engines/__init__.py", "tests/fixtures/context_assembly_golden/MANIFEST.json"):
+        text = (root / rel).read_text(encoding="utf-8")
+        for wrong in ("1,082 bytes", "1082 bytes"):
+            offenders = [line.strip() for line in text.splitlines() if wrong in line]
+            assert not offenders, f"{rel} still states the withdrawn claim {wrong!r}: {offenders}"
+        assert "1,082 CHARACTERS" in text, f"{rel} should name the unit that is actually 1,082"
+        assert "1,086" in text and "1,088" in text, f"{rel} should carry both re-measured byte counts"
+
+
 def test_the_conservative_rules_are_all_still_there():
     for rule in (
         "at most ONE diagram per answer",

@@ -121,11 +121,19 @@ FORMAT_INSTRUCTION = (
 # path, which never imports this string. What the ban on style/classDef
 # becomes is a ROLE: the model names what a node is from a closed list and the
 # renderers pick the colour, which is what makes a coloured diagram possible
-# without letting a model choose an unreadable pair. Measured: the string was
-# 1,082 bytes before this edit and is 1,082 bytes after it, and
-# tests/test_diagram_instruction_budget.py fails if it grows. (+8 tokens per
-# prompt on the pinned tokenizer, 30,832 -> 30,928 across the twelve golden
-# fixtures: about 0.8 ms of prefill.)
+# without letting a model choose an unreadable pair. Measured 2026-09-27 by
+# importing the string on each tree: 1,082 CHARACTERS before this edit and
+# 1,082 characters after it, which is 1,086 UTF-8 bytes before and 1,088
+# after — the string held two em dashes (U+2014, three UTF-8 bytes each) and
+# now holds three, so the character count stayed put while the byte count
+# grew by two. An earlier version of this note gave that character count as a
+# byte count, before and after, which was true of neither tree;
+# tests/test_diagram_instruction_budget.py holds BOTH ceilings, fails if
+# either grows, and reads this comment so the unit cannot slip back. (The
+# tokenizer figure that used to stand here, +8 tokens per
+# prompt / 30,832 -> 30,928 across the twelve golden fixtures, needs the
+# pinned engine's tokenizer and has not been re-measured since, so it is not
+# restated as fact.)
 #
 # THE CHAT UI IS UNAFFECTED, CHECKED RATHER THAN ASSUMED. `A["x"]:::role`
 # reaches the browser's mermaid, which has no `classDef` for these names.

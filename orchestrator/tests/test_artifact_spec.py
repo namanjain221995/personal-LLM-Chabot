@@ -602,6 +602,61 @@ def test_text_of_covers_every_prose_field():
         assert needle in text
 
 
+def test_a_figures_title_and_caption_are_prose_while_its_contents_are_not():
+    """Both halves of the line `text_of` draws, pinned together.
+
+    THE DEFECT, measured on 4fe0b09 before this test existed: the two blocks
+    this branch introduces were invisible to `text_of`, so the placeholder
+    gate and the figure gate could not see them. A DocumentSpec holding a
+    diagram titled "TODO: rename me", captioned "Revenue rose to 41,200 in Q3
+    [Insert real number]." and a Code block captioned "TODO: finish this
+    caption" measured text_of == 'Quarterly plan\nOrdinary prose.',
+    placeholders_in == [] and unsupported_figures(spec, 'nothing here') == [],
+    so an unfinished document went out instead of back for a correction
+    (compose.py runs both gates off this function). On dev neither block type
+    exists, so the hole opens with this branch.
+
+    THE OTHER HALF, which must stay shut: a snippet's own text and a diagram's
+    node and edge labels are NOT prose. `YOUR_COMPANY_NAME` in a box and a
+    `TODO` in a shell line are not an unfinished document, a port or a version
+    inside a snippet is not an unsupported figure, and pasted code must not be
+    able to satisfy a length check.
+    """
+    d = S.Diagram(
+        title="TODO: rename me",
+        nodes=[{"id": "a", "label": "YOUR_COMPANY_NAME"}, {"id": "b", "label": "Service"}],
+        edges=[{"source": "a", "target": "b", "label": "TODO"}],
+        caption="Revenue rose to 41,200 in Q3 [Insert real number].",
+    )
+    body = S.DocumentSpec(
+        title="Quarterly plan",
+        template_id="technical_report",
+        blocks=[
+            S.Paragraph(text="Ordinary prose."),
+            S.DiagramBlock(diagram=d),
+            S.Code(language="bash", text="export PORT=8443  # TODO: lorem ipsum",
+                   caption="TODO: finish this caption"),
+        ],
+    )
+    spec = S.ArtifactSpec(kind="document", document=body)
+    text = S.text_of(spec)
+
+    # The figure's own words are read.
+    assert "TODO: rename me" in text
+    assert "Revenue rose to 41,200 in Q3 [Insert real number]." in text
+    assert "TODO: finish this caption" in text
+    assert S.placeholders_in(spec) == ["TODO", "[Insert real number]"]
+    assert S.unsupported_figures(spec, "nothing here") == ["41,200"]
+
+    # Its contents are not.
+    assert "YOUR_COMPANY_NAME" not in text, "a node label is not prose"
+    assert "export PORT=8443" not in text, "a snippet's text is not prose"
+    assert "8443" not in text, "a port inside a snippet must not become an unsupported figure"
+    assert "lorem ipsum" not in text, "a TODO inside a snippet is not an unfinished document"
+    # And the material can still justify the caption's figure.
+    assert S.unsupported_figures(spec, "revenue reached 41,200 in Q3") == []
+
+
 # --------------------------------------------------------------- formats --
 
 

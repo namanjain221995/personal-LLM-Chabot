@@ -1098,16 +1098,31 @@ def text_of(spec: ArtifactSpec) -> str:
     """Every piece of PROSE in the spec, joined — for the placeholder scan,
     the content review and the length check. No structure, no formatting.
 
-    A `Code` block and a `Diagram`'s labels are deliberately NOT prose here,
-    and the omission is a decision rather than an oversight. The placeholder
-    scan would read a snippet's `TODO` comment or `YOUR_API_KEY` as an
-    unfinished document; `unsupported_figures` would read a version number
-    or a port in a snippet as a figure the material never gave; and the
-    length check would let a page of pasted code stand in for the writing
-    the person asked for. The parity eval draws the same line — its word
-    count excludes code and diagram fences. The prose CEILING
-    (`DocumentSpec._shape`) does count `Code.text`, because that one is
-    about how much text a renderer is asked to carry.
+    A `Code` block's TEXT and a `Diagram`'s node and edge LABELS are
+    deliberately NOT prose here, and the omission is a decision rather than
+    an oversight. The placeholder scan would read a snippet's `TODO` comment
+    or `YOUR_API_KEY` as an unfinished document; `unsupported_figures` would
+    read a version number or a port in a snippet as a figure the material
+    never gave; and the length check would let a page of pasted code stand in
+    for the writing the person asked for. The parity eval draws the same
+    line — its word count excludes code and diagram fences. The prose CEILING
+    (`DocumentSpec._shape`) does count `Code.text`, because that one is about
+    how much text a renderer is asked to carry.
+
+    A FIGURE'S TITLE AND CAPTION ARE PROSE, ADDED 2026-09-27. They were
+    missed when the two blocks were introduced, and the gap was silent: a
+    DocumentSpec holding a diagram titled "TODO: rename me", captioned
+    "Revenue rose to 41,200 in Q3 [Insert real number]." and a code block
+    captioned "TODO: finish this caption" measured `text_of` ==
+    "Quarterly plan\nOrdinary prose.", `placeholders_in` == [] and
+    `unsupported_figures` == [], so an unfinished document shipped instead of
+    going back for a correction round (compose.py's placeholder warning and
+    figure check both read this function). A title and a caption are sentences
+    a reader reads, unlike a snippet's contents, so they belong here and the
+    line stays drawn where the reasoning above put it. This also gives
+    `theme.font_coverage_warning` and docx.py's `_cs_font_for` back their
+    view of a non-Latin diagram title or code caption, which both read
+    `text_of` and could not see either.
     """
     parts: List[str] = [spec.title]
     body = spec.body
@@ -1123,6 +1138,12 @@ def text_of(spec: ArtifactSpec) -> str:
                 parts.extend(str(c) for row in b.table.rows for c in row if c is not None)
             elif isinstance(b, KPIRow):
                 parts.extend(f"{k.label} {k.value} {k.note}" for k in b.items)
+            elif isinstance(b, DiagramBlock):
+                # The figure's own words only: never a node or edge label.
+                parts.extend([b.diagram.title, b.diagram.caption])
+            elif isinstance(b, Code):
+                # The caption only: never `text`, for the reasons above.
+                parts.append(b.caption)
     elif isinstance(body, PresentationSpec):
         for s in body.slides:
             parts.extend([s.title, s.subtitle, *s.bullets, *s.left, *s.right, s.notes])

@@ -331,6 +331,38 @@ _MID_ARROW = (
 )
 _EDGE_MID_RE = re.compile(rf"^{_node_part('a')}\s*{_MID_ARROW}\s*{_node_part('b')}$")
 
+#: A MID-LABEL MAY NOT CARRY ARROW OR STATEMENT PUNCTUATION, and this is the
+#: guard that says so. `_MID_LABEL` excludes only `"` and `|`, so it is free to
+#: SWALLOW a second arrow: the class is non-greedy, but backtracking widens it
+#: until `_node_part('b')` can reach the end of the line. A CHAINED statement
+#: was therefore read as ONE edge. Measured on this branch, 2026-09-27, before
+#: this guard existed:
+#:
+#:     A -- yes --> B -- no --> C     -> one edge A->C labelled "yes --> B -- no"
+#:     A --> B --> C --> D            -> one edge A->D labelled "> B --> C"
+#:     A --> B; C --> D               -> one edge A->D labelled "> B; C"
+#:     A == x ==> B == y ==> C        -> one edge A->C labelled "x ==> B == y"
+#:     A -.-> B -.-> C                -> one edge A->C labelled "-> B -"
+#:     A -- <b>html</b> --> B         -> an HTML label accepted as text
+#:
+#: In the declare-then-chain shape the model is taught to write — every label
+#: quoted, every node given a role — four boxes came back with a single A->D
+#: arrow: three real edges deleted, one false edge invented, two boxes left
+#: orphaned, raw mermaid painted on the arrow, and `notes` empty, so nothing
+#: told the reader anything was lost. That is the wrong picture this module
+#: promises never to draw, and it is the same defect the `_DIR_RE` fix above
+#: closed for a bare `flowchart` line.
+#:
+#: A chained statement is SEVERAL edges, not one, so a label holding `--`,
+#: `-.`, `.-`, `==`, `<`, `>` or `;` means the line is not readable here and
+#: the whole source refuses to the callout — which is exactly what these
+#: shapes did before the mid-label form was accepted at all (`_EDGE_MID_RE`
+#: does not exist on 381a62d, where every one of the six lines above is
+#: refused). Reading a chain properly, as consecutive edges, is a real
+#: capability and a separate change; drawing it wrong is not a substitute.
+#: Hyphenated words are unaffected: "e-mail sent" holds no arrow.
+_MID_LABEL_SWALLOWED_AN_ARROW_RE = re.compile(r"--|-\.|\.-|==|[<>;]")
+
 _DECL_RE = re.compile(rf"^{_node_part('a')}$")
 
 
@@ -402,9 +434,16 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             # of the three alternatives can have matched, so exactly one label
             # group and one tail group are not None.
             g = m.groupdict()
+            label = next((g[k] for k in ("mlabel_s", "mlabel_d", "mlabel_t") if g[k] is not None), "")
+            if _MID_LABEL_SWALLOWED_AN_ARROW_RE.search(label):
+                # The label ate a second arrow, so this line is a chain or
+                # several statements rather than one edge. Refuse the whole
+                # source here rather than fall through: `_DECL_RE`'s id class
+                # accepts `-`, so a fall-through could read the leftovers as a
+                # node and put a box in the drawing that nobody wrote.
+                return None
             touch(g["aid"], g["alabel"], g["arole"])
             touch(g["bid"], g["blabel"], g["brole"])
-            label = next((g[k] for k in ("mlabel_s", "mlabel_d", "mlabel_t") if g[k] is not None), "")
             edges.append({
                 "source": g["aid"],
                 "target": g["bid"],
