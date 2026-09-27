@@ -108,10 +108,22 @@ which read the word "sheet" INSIDE the question as a conversion target, and
 two through `ui-edit`) and thirty-four made no file and no answer either.
 Step 1a now decides them: `action` stays "none" — no caller has to learn a
 new action to stop making a file — and `answer_about_artifact` is True, with
-`reference` naming the artifact the answer is read back from. The ask still
-wins when both are said ("tell me what the sheet has and then convert it to
-pdf"), and the gate reads the person's OWN prose, so an instruction pasted
-under the question cannot order a file (see `_own_prose`).
+`reference` naming the artifact the answer is read back from. The ask wins
+when both are said, in two clauses ("tell me what the sheet has and then
+convert it to pdf") or in one ("show me the totals as a pie chart", "tell me
+the totals and put them in the sheet"): `_names_a_deliverable` reads the
+question's OWN clause for the thing to be produced. The gate reads the
+person's OWN prose, so an instruction pasted under the question cannot order
+a file (see `_own_prose`).
+
+Those 119 turns were authored the same day as the gate, so they are
+in-sample. On a 180-turn corpus with 61 HELD-OUT neighbours added (measured
+2026-09-27, each labelled with the class 1f80aa3 satisfies): 1f80aa3 scores
+115/180 with 16 files nobody asked for and 4 asked-for files missing; the
+first version of this gate scored 125/180 but took 43 further requested files
+down with it — every "show me … as a pie chart" (the class PR #77 shipped)
+and every polite instruction typed into the UI edit box; this version scores
+173/180 with 0 files nobody asked for and the same 4 missing as 1f80aa3.
 
 "IN THE REPORT" IS A PLACE. "The numbers in the report are wrong" was a
 create (the destination rule read "in the report" as a deliverable). A
@@ -1328,10 +1340,30 @@ _Q_FILE_CONTENTS_RE = re.compile(
 #: word comes first, the noun last, and "is sheet me kya kya hai" reverses
 #: them).
 _Q_WH_CONTENT_RE = re.compile(
-    rf"{_Q_WH}(?:\W+\w+){{0,5}}?\W+{_Q_CONTENT_NOUN}\b"
-    rf"|\b{_Q_CONTENT_NOUN}\b(?:\W+\w+){{0,5}}?\W+{_Q_WH}",
+    rf"{_Q_WH}(?:\W+\w+){{0,5}}?\W+{_Q_CONTENT_NOUN}\b",
     re.I,
 )
+#: The REVERSED order — the content word first, the question word after it —
+#: read only when a question mark closed the clause. Unmarked it claimed a
+#: noun-first chart REQUEST: `charts?` is a content noun and "how many"
+#: follows within five words, so the repository's own authored chart ask
+#: (tests/fixtures/chart_requests.py t02, "Bar chart of how many tickets each
+#: priority has.") was answered instead of drawn — measured 2026-09-27
+#: against 1f80aa3, which draws it (create/create-chart).
+_Q_CONTENT_WH_RE = re.compile(
+    rf"\b{_Q_CONTENT_NOUN}\b(?:\W+\w+){{0,5}}?\W+{_Q_WH}",
+    re.I,
+)
+
+
+def _q_wh_content(clause: str, marked: bool) -> bool:
+    """A question word and a content word in the same clause. The reversed
+    order needs the question mark; see `_Q_CONTENT_WH_RE`."""
+    if _Q_WH_CONTENT_RE.search(clause):
+        return True
+    return (marked or "?" in clause) and bool(_Q_CONTENT_WH_RE.search(clause))
+
+
 #: The postposition forms the normaliser writes: "is sheet me kya hai"
 #: becomes "_this_ sheet _in_ kya hai", where the question word can be
 #: anywhere. `_in_` is written only for me/mein/में/માં, so this shape
@@ -1352,6 +1384,30 @@ _Q_DID_YOU_RE = re.compile(
     r"(?:did\s+|do\s+|have\s+)?you\s+(?:\w+\s+){0,2}?"
     r"(?:do|does|did|done|mak\w*|made|creat\w*|add\w*|put|includ\w*|writ\w*|wrote|generat\w*|build|built|"
     r"sav\w*|us\w*|used|choos\w*|chose|pick\w*|nam\w*|call\w*|set|insert\w*|fill\w*|leave|left)\b",
+    re.I,
+)
+#: The same shape with NO NOUN PHRASE OF ITS OWN between the question word
+#: and `you`: the question word governs `you` directly ("what you created",
+#: "what did you put …"), or the clause OPENS with the auxiliary ("did you
+#: include the due dates?").
+#:
+#: The four-word gap in `_Q_DID_YOU_RE` exists for "which SHEETS did you
+#: create?" and "what FORMAT did you save it in ??", and it also let a
+#: question about something else entirely wear this hat: "what model are you
+#: using?" matched <wh> model are you us… and was answered from the workbook.
+#: Measured 2026-09-27: 1f80aa3 decides that none/no-request — ordinary chat —
+#: and answering it from the spec would describe the workbook to someone who
+#: asked which model is running. A `what-you-did` clause must therefore either
+#: name the file or something in it, or have this tighter shape.
+_Q_DID_YOU_VERB = (
+    r"(?:do|does|did|done|mak\w*|made|creat\w*|add\w*|put|includ\w*|writ\w*|wrote|generat\w*|build|built|"
+    r"sav\w*|us\w*|used|choos\w*|chose|pick\w*|nam\w*|call\w*|set|insert\w*|fill\w*|leave|left)"
+)
+_Q_DID_YOU_DIRECT_RE = re.compile(
+    rf"\b(?:what'?s?|which|why|where|when|how)\s+(?:did\s+|do\s+|does\s+|have\s+|has\s+)?you\s+"
+    rf"(?:\w+\s+){{0,2}}?{_Q_DID_YOU_VERB}\b"
+    rf"|^\W*(?:(?:ok|okay|so|and|also|but|now|then|please|pls|hey|hi|sir|bro|just|i\s+said)\W+)*"
+    rf"(?:did|do|does|have|has|are|were|was)\s+you\s+(?:\w+\s+){{0,2}}?{_Q_DID_YOU_VERB}\b",
     re.I,
 )
 #: A yes/no question about the contents: "does it have a status column?",
@@ -1389,7 +1445,27 @@ _Q_NOT_CONTENTS_RE = re.compile(
     r"|\bdo\s+you\s+(?:think|reckon|feel|suggest|recommend|advise|prefer)\b"
     r"|\bwhat\s+(?:do|did)\s+you\s+think\b|\byour\s+(?:opinion|advice|thoughts)\b"
     r"|\bany\s+(?:ideas|suggestions|advice|thoughts)\b"
-    r"|\bwho\s+(?:else\s+)?(?:can|could|may|has|have|is|are)\b",
+    r"|\bwho\s+(?:else\s+)?(?:can|could|may|has|have|is|are)\b"
+    # A POLITE INSTRUCTION wearing a question word. "what if you made it a
+    # pdf as well", "how about you make it two pages", "why don't you add a
+    # totals row", "do you mind making it landscape", "is it possible to add
+    # a status column?", "which columns do you want removed?" and "do you
+    # have the bandwidth to also make a deck?" all ask for WORK. They open
+    # with the question word, so `_Q_IMPERATIVE_LEAD_RE` cannot see the build
+    # verb; measured 2026-09-27 against 1f80aa3, which gives them
+    # convert/['pdf'], edit and create/create-first-clause respectively, and
+    # edit/ui-edit for every one of them typed into the UI's edit box.
+    r"|\b(?:what|how)\s+if\s+(?:you|we)\b|\b(?:what|how)\s+about\b"
+    r"|\bwhy\s+(?:not|do\s?n['’]?t|dont|do\s+not)\b"
+    r"|\b(?:is|are|was|were|would|will)\s+(?:it|this|that)\s+(?:be\s+)?possible\b"
+    r"|\bdo\s+you\s+mind\b|\bdo\s+you\s+have\s+(?:the\s+)?(?:time|bandwidth|capacity|availability)\b"
+    r"|\bdo\s+you\s+(?:want|wanna|need|propose|plan)\b"
+    r"|\b(?:how\s+many|how\s+much)(?:\W+\w+){0,4}?\W+can\s+you\b"
+    # "what I want is a totals row in the sheet", "what I need is the sheet
+    # in pdf": a STATEMENT of the deliverable, not a question about the
+    # contents — and "what I want to know is …" is untouched, because `is`
+    # has to follow the verb directly.
+    r"|\bwhat\s+(?:i|we)\s+(?:really\s+|just\s+)?(?:want|wanted|need|needed|would\s+like)\s+is\b",
     re.I,
 )
 #: "just tell me", "tell me only", "i want to know", "sirf bata do": the
@@ -1445,6 +1521,20 @@ _Q_IMPERATIVE_LEAD_RE = re.compile(
     r"shorten|lengthen|expand|trim|cut|fix|tweak|adjust|replac|swap|reorder|restructur|colou?r|styl)\w*\b",
     re.I,
 )
+#: WRITE THIS INTO the file: "put them in the sheet", "copy that into the
+#: tracker", "stick it on slide 3". `_EDIT_VERBS_RE` carries no `put`, and
+#: widening that list would change the edit path everywhere, so the shape is
+#: named here and read only by the question gate. Measured 2026-09-27: "tell
+#: me the totals and put them in the sheet" is ONE clause, and with no shape
+#: for it the gate kept the whole turn as a question (1f80aa3:
+#: convert/['xlsx']). A question ABOUT what was written is exempt from the
+#: veto, so "what did you put in the second sheet ??" is untouched.
+_Q_WRITE_INTO_RE = re.compile(
+    rf"\b(?:put|place|stick|paste|enter|log|append)\s+"
+    rf"(?:(?:it|them|that|this|those|these|_this_|the\s+\w+|a\s+\w+|an\s+\w+)\s+)?"
+    rf"(?:in|into|inside|on|onto|to)\s+{_Q_THIS_FILE}",
+    re.I,
+)
 #: A line that opens PASTED material: a table row, a quote marker, a rule, a
 #: fence, or a mail/chat header. What follows is DATA, never instruction.
 _Q_PASTE_LINE_RE = re.compile(
@@ -1452,15 +1542,22 @@ _Q_PASTE_LINE_RE = re.compile(
     r"|(?:system|assistant|user|human|ai|from|to|cc|bcc|subject|sent|date|re)\s*:)",
     re.I,
 )
-#: A clause boundary for the question gate: sentence punctuation, or the
-#: joiners a second instruction is hung on ("… and then convert it to pdf").
-#: The boundary TEXT is kept with the clause it closes, because "?" is what
-#: makes "does it have a status column?" a question and "delete the last
-#: column" an instruction — splitting it away made every yes/no question
-#: unreadable (measured on the corpus: q12/q13/q27).
+#: A clause boundary for the question gate: sentence punctuation, a bare
+#: comma, or the joiners a second instruction is hung on ("… and then convert
+#: it to pdf"). The boundary TEXT is kept with the clause it closes, because
+#: "?" is what makes "does it have a status column?" a question and "delete
+#: the last column" an instruction — splitting it away made every yes/no
+#: question unreadable (measured on the corpus: q12/q13/q27).
+#: The BARE comma was added 2026-09-27: without it "which columns are wrong,
+#: fix them" was one clause and `_asks_for_work` never saw "fix them".
+#: A bare " and " is deliberately NOT a boundary. Several of the gate's own
+#: verbs are also nouns the person may be asking about, and splitting there
+#: turned "tell me the structure and format of the sheet" into a request to
+#: format the sheet. The second instruction hung on "and" is read inside the
+#: clause instead, by `_names_a_deliverable`.
 _Q_CLAUSE_SPLIT_RE = re.compile(
     r"[?.;:!…]+|\s+and\s+then\s+|\s+then\s+|\s+and\s+(?=(?:can|could|would|will|please|pls|now|also)\b)"
-    r"|,\s*(?:and|but|also|plus|then)\s+",
+    r"|,\s*(?:and|but|also|plus|then)?\s*",
     re.I,
 )
 
@@ -1504,16 +1601,22 @@ def _artifact_question_kind(clause: str, marked: bool = False) -> str:
         return ""
     if _Q_FILE_CONTENTS_RE.search(clause) or _Q_SOV_RE.search(clause):
         return "contents"
-    if _Q_WH_CONTENT_RE.search(clause):
+    if _q_wh_content(clause, marked):
         return "contents"
-    if _Q_DID_YOU_RE.search(clause):
+    if _Q_DID_YOU_RE.search(clause) and (
+        # The clause has to be about THE FILE. Without this, "what model are
+        # you using?" wore the `what-you-did` hat (see
+        # `_Q_DID_YOU_DIRECT_RE`).
+        _Q_THIS_FILE_RE.search(clause) or _Q_CONTENT_NOUN_RE.search(clause)
+        or _Q_INSIDE_RE.search(clause) or _Q_DID_YOU_DIRECT_RE.search(clause)
+    ):
         return "what-you-did"
     if (marked or "?" in clause) and _Q_YES_NO_RE.match(clause) and (
         _Q_CONTENT_NOUN_RE.search(clause) or _Q_INSIDE_RE.search(clause)
     ):
         return "contents"
     if _Q_TELL_RE.search(clause) and (
-        _Q_FILE_CONTENTS_RE.search(clause) or _Q_WH_CONTENT_RE.search(clause)
+        _Q_FILE_CONTENTS_RE.search(clause) or _q_wh_content(clause, marked)
         or _Q_SOV_RE.search(clause) or _Q_DID_YOU_RE.search(clause)
         or _Q_THIS_FILE_RE.search(clause)
     ):
@@ -1521,29 +1624,88 @@ def _artifact_question_kind(clause: str, marked: bool = False) -> str:
     return ""
 
 
-def _asks_for_work(clause: str) -> bool:
-    """Does this clause ask for a file to be made or changed? Read only on
-    the clauses that are NOT the question, so that "what is in it? and can
-    you add a total row?" keeps its edit and "what you create inside the
-    sheet" — where the verb belongs to the question — does not lose its
-    answer."""
+def _chart_ask(clause: str) -> bool:
+    """These words ask for a CHART to be drawn — the same test the create
+    path makes (`chart_ask`, step 4), so the question gate vetoes itself
+    exactly where a chart would otherwise have been produced. A chart merely
+    MENTIONED is not this: "what is in the chart?" names no ask verb, which
+    is why `LX.chart_signal` alone cannot stand here."""
+    return (LX.chart_signal(clause) and bool(_CHART_ASK_RE.search(clause))
+            and not _QUESTION_ABOUT_RE.match(clause.strip())
+            and not _STORY_PLOT_RE.search(clause))
+
+
+def _names_a_deliverable(clause: str) -> bool:
+    """Does THIS clause — the one that also reads as a question — name the
+    thing to be PRODUCED? A format to put the content in, a new file, a chart
+    to draw, an edit to make, or a second instruction hung on "and".
+
+    `_CREATE_RE` and `F.explicit_formats` are deliberately absent. Both match
+    inside the owner's own question — "what you create inside the sheet" has
+    the verb `create` and the format word `sheet` — and reading either as a
+    deliverable is the defect this gate exists to fix.
+
+    `_AS_FORMAT_RE` is not read on an SOV clause. Its postposition arm exists
+    for "pdf me de do" (give it IN pdf), but `_in_` is also the locative of
+    the question itself: corpus q31 "kya hai is sheet me ??" normalises to
+    "kya hai _this_ sheet _in_", where that arm matched "sheet _in_" and the
+    Hinglish question went back to converting the workbook (measured
+    2026-09-27). `_Q_SOV_RE` is exactly that shape, and it needs a question
+    word, so "is sheet ko pdf me de do" is untouched."""
     return bool(
-        _CREATE_RE.search(clause) or _POSITIONAL_CREATE_RE.search(clause) or _NEW_FILE_RE.search(clause)
-        or _CONVERT_RE.search(clause) or _AS_FORMAT_RE.search(clause) or _MAKE_IT_FORMAT_RE.search(clause)
-        or _EDIT_VERBS_RE.search(clause) or _MORE_EDIT_VERBS_RE.search(clause) or _MAKE_IT_RE.match(clause.strip())
+        _CONVERT_RE.search(clause) or _MAKE_IT_FORMAT_RE.search(clause)
+        or (_AS_FORMAT_RE.search(clause) and not _Q_SOV_RE.search(clause))
+        or _NEW_FILE_RE.search(clause) or _POSITIONAL_CREATE_RE.search(clause)
+        or _EDIT_VERBS_RE.search(clause) or _MORE_EDIT_VERBS_RE.search(clause)
+        or _Q_WRITE_INTO_RE.search(clause) or _MAKE_IT_RE.match(clause.strip())
+        or _chart_ask(clause)
+    )
+
+
+def _asks_for_work(clause: str) -> bool:
+    """Does this clause ask for a file to be made or changed? Read on the
+    clauses that are NOT the question, where the broad creation shapes are
+    safe: "what is in it? and can you add a total row?" keeps its edit."""
+    return bool(
+        _CREATE_RE.search(clause) or _Q_IMPERATIVE_LEAD_RE.match(clause)
+        or _names_a_deliverable(clause)
     )
 
 
 def _artifact_question(own_low: str) -> str:
     """The question these words ask about the file, or "": a question in one
-    clause and no OTHER clause asking for work. The ask wins when both are
-    said ("tell me what the sheet has and then convert it to pdf")."""
+    clause, and no clause — the question's own included — asking for work.
+    The ask wins when both are said, whether they are said in two clauses
+    ("tell me what the sheet has and then convert it to pdf") or in one
+    ("tell me the totals and put them in the sheet", "show me the totals as a
+    pie chart").
+
+    A clause that is a question ABOUT WHAT WAS DONE (`_Q_DID_YOU_RE`) is the
+    one exception: the verb there belongs to the question, so "what you create
+    inside the sheet", "did you include the due dates?", "why did you add a
+    priority column?" (corpus q26) and "what did you put in the second sheet
+    ??" (q11) keep their answer. The test is that shape and NOT the kind
+    label: q11 and q26 are labelled `contents`, because a past-tense question
+    about the contents is still a question about the contents. A polite
+    instruction that wears a question word ("why don't you add a totals row")
+    never reaches this point — `_Q_NOT_CONTENTS_RE` drops it first.
+
+    Until 2026-09-27 the veto ran only on the clauses that produced NO kind,
+    so one clause that both asked to be told and asked for a file was decided
+    as a question. Measured against 1f80aa3: that cost 43 of the 61 held-out
+    corpus neighbours their file, and 50 of a 118-case probe wave over the two
+    verifiers' phrasings. Among them every "show me … as a pie chart"
+    (create/create-chart) and every "… and add them to the sheet"
+    (edit/edit-element)."""
     clauses = _q_clauses(own_low)
     kinds = [_artifact_question_kind(c, marked) for c, marked in clauses]
     if not any(kinds):
         return ""
     for (clause, _marked), kind in zip(clauses, kinds):
-        if not kind and _asks_for_work(clause):
+        if not kind:
+            if _asks_for_work(clause):
+                return ""
+        elif not _Q_DID_YOU_RE.search(clause) and _names_a_deliverable(clause):
             return ""
     return next(k for k in kinds if k)
 
@@ -2098,6 +2260,14 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
         # runs out, so a decision that can be flipped into a file by a model
         # is a decision that fails under load — which is how the transcript's
         # "please tell me Only Not create" came back as a third workbook.
+        #
+        # This line removes the recovery path for a MISREAD, so it is only
+        # honest while the rules do not misread. Re-measured 2026-09-27 on the
+        # 180-turn corpus after the clause-level veto landed: of the 61
+        # held-out neighbours, 0 file requests are claimed as questions
+        # (no_file 4, the same 4 that 1f80aa3 misses) and 0 turns that are not
+        # about the artifact are claimed either (over_grounded 0). Before the
+        # veto those two counts were 43 and 5.
         return False
     if intent.ambiguous:
         return True

@@ -401,3 +401,170 @@ def test_the_answer_names_the_artifact_it_would_be_read_from():
     assert intent.target == "artifact", intent
     #: The question itself is kept: the answer is written from it.
     assert intent.instruction == "what is in this sheet", intent
+
+
+# ----------------------------------------- 7. THE HELD-OUT NEIGHBOURS (r2) --
+#
+# Everything above this line was written alongside the fix, and so was
+# `<scratchpad>/intent-eval/intent_corpus.json`: its 119 turns were authored
+# at 13:54 on 2026-09-27 and the fix committed at 14:54 the same day, with the
+# diff's own comments citing corpus ids (q12/q13/q27/q34/q35) as the reason
+# for particular regex choices. The corpus numbers are therefore IN-SAMPLE,
+# and they were: 115/119 with REGRESSED (0).
+#
+# Two verifiers then wrote held-out phrasings of their own and measured both
+# trees. 57 of the phrasings below asked for a file that origin/dev 1f80aa3
+# produced and that the first version of this gate swallowed
+# (action="none", answer_about_artifact=True, formats=[]) — among them every
+# "show me … as a pie chart" (create/create-chart, the class PR #77 shipped),
+# the repository's OWN authored chart request t02, and every polite
+# instruction typed into the UI's "Edit with a prompt" box
+# ("why not add a priority column?" -> edit/ui-edit on dev).
+#
+# Each action below was measured on 1f80aa3 on 2026-09-27 with the context
+# named in the case. These are the guard: if the question gate reclaims any
+# of them, this file fails.
+
+#: (text, the action origin/dev 1f80aa3 decides, extra `decide` kwargs)
+HELD_OUT_STILL_A_FILE = [
+    # -- charts. `_Q_TELL_RE` matches a bare "show me", and `_Q_THIS_FILE`
+    #    matches "the totals"/"the numbers"/"the rows", so the canonical
+    #    produce ask read as a request to be told.
+    ("show me the numbers in a bar chart", "create", {}),
+    ("show me the totals as a pie chart", "create", {}),
+    ("show me the rows on a line chart", "create", {}),
+    ("also show me the totals in a chart", "create", {}),
+    ("show me a chart of the totals", "create", {}),
+    ("show me the data in a chart", "create", {}),
+    ("show me the columns as a chart", "create", {}),
+    ("show me the sheet contents in a chart", "create", {}),
+    ("can you show me the data as a chart?", "create", {}),
+    ("please show me the totals in a bar chart", "create", {}),
+    ("show me the chart data", "create", {}),
+    ("show me the chart values as a table", "create", {}),
+    ("show me the chart you made", "create", {}),
+    ("show me the chart as a line graph", "create", {}),
+    ("show me it as a pie chart", "create", {}),
+    ("can you show me this as a bar chart", "create", {}),
+    ("show me the chart as a bar chart instead", "create", {}),
+    # tests/fixtures/chart_requests.py t02 — the repository's own authored
+    # chart set. `charts?` is a content noun and "how many" follows within
+    # five words, so the REVERSED arm of `_Q_WH_CONTENT_RE` claimed it.
+    ("Bar chart of how many tickets each priority has.", "create", {}),
+    # the dataset lane reaches step 1a first, so it needs its own case
+    ("show me the numbers in a bar chart", "create", dict(has_dataset=True)),
+    # -- a format named as the target, in the same clause as the speech verb
+    ("summarise the sheet into a pdf", "convert", {}),
+    ("recap the sheet as a pdf", "convert", {}),
+    ("show me the sheet as a pdf", "convert", {}),
+    ("show me the tracker in pdf", "convert", {}),
+    ("show me the data in excel", "convert", {}),
+    ("summarise the report as a pdf", "convert", {}),
+    ("recap the tracker in slides", "convert", {}),
+    ("what i need is the sheet in pdf", "convert", {}),
+    ("what i want is a totals row in the sheet", "convert", {}),
+    ("tell me the summary and export it as pdf", "convert", dict(has_assistant_answer=True)),
+    ("summarise the sheet in a new document", "create", {}),
+    # -- one clause that both asks to be told AND asks for work. There is no
+    #    clause boundary here: `_Q_CLAUSE_SPLIT_RE` splits on "and then" and
+    #    on "and <can|could|would|will|please|now|also>", not on "and put".
+    ("tell me the totals and put them in the sheet", "convert", {}),
+    ("please tell me the deadline and put it in the sheet", "convert", {}),
+    ("tell me the totals and add them to the sheet", "edit", {}),
+    ("tell me the deadline and add it to the tracker", "edit", {}),
+    ("read back the sheet and fix the totals", "edit", {}),
+    ("list the risks in the report and add a column for each", "edit", {}),
+    # -- a POLITE INSTRUCTION wearing a question word. `_Q_DID_YOU_RE` opens
+    #    with a literal list holding what|how|do|does|why, so <wh> … you …
+    #    <build verb> matched; `_Q_IMPERATIVE_LEAD_RE` cannot catch these
+    #    because the clause opens with the question word.
+    ("what if you made it a pdf as well", "convert", {}),
+    ("do you have the bandwidth to also make a deck?", "create", {}),
+    ("is it possible to add a status column?", "edit", {}),
+    # -- the UI's "Edit with a prompt" box. The person opened THAT artifact in
+    #    order to change it and that box has no other way to ask for work, so
+    #    a prompt naming a build verb must stay an edit.
+    ("what if you add a column for owner?", "edit", dict(artifact_id="a1")),
+    ("what if we add a column for owner?", "edit", dict(artifact_id="a1")),
+    ("how about you make it two pages", "edit", dict(artifact_id="a1")),
+    ("why not add a priority column?", "edit", dict(artifact_id="a1")),
+    ("why don't you add a totals row", "edit", dict(artifact_id="a1")),
+    ("what about adding a totals row?", "edit", dict(artifact_id="a1")),
+    ("is it possible to add a status column?", "edit", dict(artifact_id="a1")),
+    ("which columns do you want removed?", "edit", dict(artifact_id="a1")),
+    ("do you mind making it landscape", "edit", dict(artifact_id="a1")),
+]
+
+
+@pytest.mark.parametrize("text,action,extra", HELD_OUT_STILL_A_FILE,
+                         ids=[f"{t[:44]}|{k.get('artifact_id') or k.get('has_dataset') or ''}"
+                              for t, _a, k in HELD_OUT_STILL_A_FILE])
+def test_a_held_out_request_for_a_file_is_not_claimed_as_a_question(text, action, extra):
+    kw = dict(CARD_LAST)
+    kw.update(extra)
+    intent = I.decide(text, **kw)
+    assert not _answers(intent), (
+        f"{text!r} asks for a file; the question gate claimed it as rule={intent.rule!r}")
+    assert intent.wants_file, (text, intent)
+    assert intent.action == action, (text, intent)
+
+
+@pytest.mark.parametrize("text", [
+    # A chart MENTIONED is not a chart ASKED FOR: `_chart_ask` requires the
+    # ask verb that the create path requires, so `LX.chart_signal` alone
+    # cannot veto these.
+    "what is in the chart?",
+    "what does the chart show?",
+    "how many bars are in the chart?",
+    "tell me what the chart shows",
+    "explain the graph you made",
+    # A question about what was DONE keeps its answer although the same
+    # clause carries an edit verb: the verb belongs to the question. Corpus
+    # q11 and q26.
+    "what did you put in the second sheet ??",
+    "why did you add a priority column?",
+    "did you include the due dates?",
+    "which sheets did you create?",
+    "what format did you save it in ??",
+    # A speech verb with no deliverable named is still a question. These are
+    # corpus q15 and q17 — neither carries a question mark, so a rule that
+    # demanded one would lose both.
+    "summarise the tracker you made",
+    "list the headings in the document",
+    "recap the tracker",
+    "show me the data",
+    "tell me the structure and format of the sheet",
+])
+def test_the_held_out_questions_keep_their_answer(text):
+    intent = I.decide(text, **CARD_LAST)
+    assert intent.action == "none" and intent.wants_file is False, (text, intent)
+    assert _answers(intent), (text, intent)
+
+
+@pytest.mark.parametrize("text", [
+    # A question about the ASSISTANT is not a question about the file.
+    # `_Q_DID_YOU_RE`'s four-word gap let <wh> model are you us… wear the
+    # `what-you-did` hat; 1f80aa3 decides this none/no-request, i.e. ordinary
+    # chat, and answering it from the workbook's spec would describe the
+    # workbook to someone who asked which model is running.
+    "what model are you using?",
+    "what temperature do you use?",
+    "which api are you calling?",
+])
+def test_a_question_about_the_assistant_is_not_an_artifact_question(text):
+    for ctx in (CARD_LAST, EDIT_BOX):
+        intent = I.decide(text, **ctx)
+        assert not _answers(intent), (text, ctx, intent)
+
+
+def test_the_hinglish_locative_is_not_a_deliverable():
+    """Corpus q31. "kya hai is sheet me ??" normalises to
+    "kya hai _this_ sheet _in_", and `_AS_FORMAT_RE`'s postposition arm —
+    which exists for "pdf me de do", give it IN pdf — matched "sheet _in_".
+    Read as a deliverable target it sent the Hinglish question back to
+    converting the workbook."""
+    intent = I.decide("kya hai is sheet me ??", **CARD_LAST)
+    assert intent.action == "none" and _answers(intent), intent
+    #: and the real postposition ask is untouched
+    other = I.decide("is sheet ko pdf me de do", **CARD_LAST)
+    assert other.action == "convert" and not _answers(other), other
