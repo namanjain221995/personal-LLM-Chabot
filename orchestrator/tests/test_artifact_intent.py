@@ -623,12 +623,19 @@ _YES = {"action": "export", "formats": ["docx"], "target": "previous_answer", "s
 
 @pytest.fixture
 def counted():
+    """Metrics zeroed, the saturation probe answered, and the timeout
+    cool-down forgotten on BOTH sides. The timeout test below spends two
+    consecutive timeouts, which opens the cool-down for COOLDOWN_S; without
+    this reset the next classify() in the next 30 seconds is skipped without
+    a call, in this file or in whichever file pytest collects next."""
     from app import metrics
 
     metrics.reset()
+    IL.reset_state()
     IL.set_saturation_probe(lambda: False)
     yield metrics
     IL.set_saturation_probe(None)
+    IL.reset_state()
 
 
 def _seen(metrics, result):
@@ -667,6 +674,23 @@ def test_as3_classifier_times_out_at_fast_and_the_rules_answer_stands(counted, m
 
     d = asyncio.run(I.decide_with_hook("Excel sheet bana ke de.", slow_hook, has_assistant_answer=True))
     assert d.action == "none" and d.rule == "no-request"
+
+
+def test_the_cool_down_the_test_above_earned_does_not_reach_this_one(counted):
+    """THE GUARD for a leak measured on 2026-09-27. The test above times out
+    twice on purpose — the direct classify() and the one inside slow_hook —
+    which is exactly COOLDOWN_AFTER_TIMEOUTS, so it leaves the cool-down open
+    for COOLDOWN_S in module globals. A probe collected straight after that
+    file read `cooldown_remaining=29.85 timeouts_in_a_row=2` and its
+    classify() returned None having made no call at all.
+
+    Two things keep that from happening: the `counted` fixture above resets
+    the module state on both sides, and tests/conftest.py resets it around
+    every test in the suite. Remove both and this test fails."""
+    assert IL.cooldown_remaining() == 0.0, "a cool-down earned by another test reached this one"
+    v = asyncio.run(IL.classify("isko word me de sakte ho?", last_answer_head="# Audit", completion=_completion(_YES)))
+    assert v is not None, "the classifier was skipped, not consulted: the cool-down leaked"
+    assert _seen(counted, "accepted")
 
 
 def test_as3_classifier_skips_when_busy_or_disabled(monkeypatch):
