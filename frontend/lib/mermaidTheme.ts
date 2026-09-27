@@ -60,22 +60,37 @@ export interface RolePaint {
  * Literal fallbacks, mirroring the `--ts-diagram-*` tokens in globals.css.
  *
  * Measured against the real card surfaces (#1e1e1e dark, #f4f4f4 light):
- * ink-on-fill 10.5-14.9:1, stroke-on-surface 3.21-6.46:1, worst all-pairs CVD
+ * ink-on-fill 10.5-14.9:1, stroke-on-surface 3.69-6.46:1, worst all-pairs CVD
  * stroke separation 42.9 (protan/deutan/tritan, Brettel). The fill is a tint
  * that carries the hue (ΔL* 6.6-10.6 from the card, against the shipped 0.88);
  * the STROKE is what carries the 3:1 separation, which is why the contrast
  * floor is set on the stroke and not on the fill.
+ *
+ * A stroke has TWO neighbours, though, and only one of them was ever checked.
+ * Re-measured 2026-09-27 with the dataviz skill's validator, dark `service`
+ * #2f6fb2 was 2.58:1 against its OWN #22303f fill and light `store` #b7791f
+ * 2.79:1 against its own #eae0d2 — outlines that cleared the card and then
+ * disappeared into the box they were drawing. DIAG-07b is the check that was
+ * missing. Lifting the dark blue alone collapsed blue↔violet to an all-pairs
+ * normal-vision ΔE of 14.9 (floor 15), so `model` moved with it; the new dark
+ * pair scores BETTER than the shipped one on every separation check (CVD 8.2
+ * → 9.9, normal-vision 16.5 → 17.2). Stroke on its OWN fill is now
+ * 3.27-3.65:1 dark and 3.11-4.97:1 light.
+ *
+ * These literals are the SSR/test fallback and globals.css is the source of
+ * truth, so they must agree value for value — DIAG-25b reads the stylesheet
+ * and fails on any drift.
  */
 const ROLE_FALLBACK: Record<ThemeMode, Record<DiagramRole, RolePaint>> = {
   dark: {
-    service: { fill: '#22303f', stroke: '#2f6fb2', ink: '#ececec' },
+    service: { fill: '#22303f', stroke: '#3783be', ink: '#ececec' },
     store: { fill: '#40321e', stroke: '#b7791f', ink: '#ececec' },
-    model: { fill: '#362c4e', stroke: '#8b5cf6', ink: '#ececec' },
+    model: { fill: '#362c4e', stroke: '#9b6bff', ink: '#ececec' },
     external: { fill: '#462934', stroke: '#d55181', ink: '#ececec' },
   },
   light: {
     service: { fill: '#d4dfe9', stroke: '#2f6fb2', ink: '#0d0d0d' },
-    store: { fill: '#eae0d2', stroke: '#b7791f', ink: '#0d0d0d' },
+    store: { fill: '#eae0d2', stroke: '#ac721d', ink: '#0d0d0d' },
     model: { fill: '#ded3f0', stroke: '#6d28d9', ink: '#0d0d0d' },
     external: { fill: '#e7d6d9', stroke: '#a33a4d', ink: '#0d0d0d' },
   },

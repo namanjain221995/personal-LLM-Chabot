@@ -20,6 +20,8 @@
  * browser and looking at it; these tests pin the values the browser was given.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CATEGORICAL_SLOTS,
@@ -214,6 +216,35 @@ describe('DIAG-05…10 · the role palette is legible and distinguishable', () =
       expect(
         contrast(paints[role].stroke, SURFACE[mode]),
         `${mode}/${role} stroke on card`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it.each(MODES)("DIAG-07b · %s · …and 3:1 on the role's OWN fill", (mode) => {
+    /**
+     * The other side of the same line.
+     *
+     * DIAG-07 above checks the stroke against the CARD, which is the boundary
+     * a person sees from outside the box. A stroke is drawn BETWEEN two
+     * colours, and the one on the inside is the role's own fill — a rule the
+     * card check cannot see at all, because the fill is a tint of the stroke's
+     * own hue and therefore the neighbour most likely to swallow it.
+     *
+     * Measured with the dataviz skill's validator, 2026-09-27: dark `service`
+     * #2f6fb2 on its own #22303f fill was 2.58:1 and light `store` #b7791f on
+     * #eae0d2 was 2.79:1 — outlines that passed DIAG-07 and then vanished
+     * into the box. Both are moved; this test is what stops them coming back.
+     *
+     * Not a stricter floor than DIAG-07 on purpose: 3:1 is the non-text
+     * contrast minimum, and the fill deliberately sits close to the card, so
+     * a stroke that clears 3:1 on both sides is the most a tint-plus-outline
+     * node can be asked for.
+     */
+    const paints = resolveRolePaints(mode);
+    for (const role of DIAGRAM_ROLES) {
+      expect(
+        contrast(paints[role].stroke, paints[role].fill),
+        `${mode}/${role} stroke on its own fill`,
       ).toBeGreaterThanOrEqual(3);
     }
   });
@@ -782,6 +813,46 @@ describe('DIAG-25 · the tokens are the source of truth', () => {
     const paints = resolveRolePaints('dark', {} as Element);
     expect(paints.service.fill).toMatch(/^#[0-9a-f]{6}$/i);
     expect(paints.service.stroke).toMatch(/^#[0-9a-f]{6}$/i);
+  });
+
+  it('DIAG-25b · the literals equal the tokens they mirror, value for value', () => {
+    /**
+     * The runtime reads globals.css; every test in this file reads the
+     * literals. So a drift between them is invisible in BOTH directions: the
+     * suite would keep proving contrast on values the browser never paints.
+     *
+     * That is not hypothetical — this file's three stroke moves had to be made
+     * twice, once in each place, and the ONLY thing that would have caught a
+     * half-done edit is this test. It parses the two token blocks out of the
+     * stylesheet by the `--ts-diagram-ink` that opens each (dark first, then
+     * the `html.light` override) rather than by line number.
+     */
+    const css = readFileSync(
+      fileURLToPath(new URL('../app/globals.css', import.meta.url)),
+      'utf8',
+    );
+    const blocks = css.split('--ts-diagram-ink:').slice(1);
+    expect(blocks, 'one --ts-diagram-ink block per theme').toHaveLength(2);
+    const modes: ThemeMode[] = ['dark', 'light'];
+    modes.forEach((mode, i) => {
+      const block = blocks[i];
+      const ink = /^\s*(#[0-9a-f]{6})\s*;/i.exec(block)?.[1];
+      const paints = resolveRolePaints(mode);
+      expect(ink?.toLowerCase(), `${mode} --ts-diagram-ink`).toBe(
+        paints.service.ink.toLowerCase(),
+      );
+      for (const role of DIAGRAM_ROLES) {
+        for (const channel of ['fill', 'stroke'] as const) {
+          const token = new RegExp(
+            `--ts-diagram-${role}-${channel}:\\s*(#[0-9a-f]{6})\\s*;`,
+            'i',
+          ).exec(block)?.[1];
+          expect(token?.toLowerCase(), `${mode} --ts-diagram-${role}-${channel}`).toBe(
+            paints[role][channel].toLowerCase(),
+          );
+        }
+      }
+    });
   });
 
   it('resolves to the literals with no DOM at all', () => {

@@ -45,13 +45,38 @@ def _mermaid_theme() -> str:
     return (FRONTEND / "lib" / "mermaidTheme.ts").read_text(encoding="utf-8")
 
 
+#: The sentence that OFFERS the vocabulary, between the phrase that opens the
+#: closed list and the one that closes it. Asserting inside this window rather
+#: than against the whole instruction is the difference between a real check
+#: and a vacuous one: "model", "service", "store" and "external" are ordinary
+#: English words, and `role in DIAGRAM_INSTRUCTION` passed on a prompt that
+#: offered no roles at all.
+_LIST_OPENS = "CLOSED list, written with `:::`:"
+_LIST_CLOSES = "Tag only the nodes"
+
+
+def _offered_list() -> str:
+    assert _LIST_OPENS in DIAGRAM_INSTRUCTION, _LIST_OPENS
+    after = DIAGRAM_INSTRUCTION.split(_LIST_OPENS, 1)[1]
+    assert _LIST_CLOSES in after, _LIST_CLOSES
+    return after.split(_LIST_CLOSES, 1)[0]
+
+
 def test_the_instruction_offers_the_role_form_and_exactly_the_four_names():
     # The `:::` form is the whole point: it is what the frontend turns into a
     # classDef. Before 2026-09-27 this assertion failed on every role.
+    offered_list = _offered_list()
     for role in DIAGRAM_ROLES:
-        assert f":::{role}" in DIAGRAM_INSTRUCTION or role in DIAGRAM_INSTRUCTION, role
+        assert role in offered_list, role
     assert ":::" in DIAGRAM_INSTRUCTION
     assert 'A["Payments API"]:::service' in DIAGRAM_INSTRUCTION
+
+    # Each name is offered with a gloss of what the node IS, never of a colour:
+    # that is what makes the vocabulary something the model can apply and the
+    # two sides can validate. A gloss naming a colour would put the model back
+    # in the business of choosing one.
+    assert not re.search(r"\b(blue|red|green|amber|orange|violet|purple|pink|grey|gray)\b",
+                         offered_list, re.IGNORECASE), offered_list
 
     # And nothing else may be offered with it. A name the frontend has no
     # classDef for paints the default node -- grey, which is the bug.
