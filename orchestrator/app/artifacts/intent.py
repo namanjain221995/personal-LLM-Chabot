@@ -1285,18 +1285,44 @@ def _dataset_ask(low: str, raw: str, chart: bool) -> str:
 #: absent — "what is a PDF?" asks about the format as a concept
 #: (`_ABOUT_FORMAT_RE`) — and so are the file nouns themselves, so "what do
 #: you think of the tracker?" cannot reach these rules through its noun.
-_Q_CONTENT_NOUN = (
-    r"(?:columns?|colums?|rows?|sheets?|worksheets?|tabs?|sections?|headings?|headers?|titles?|subtitles?|"
-    r"pages?|slides?|cells?|fields?|formulas?|formulae|totals?|subtotals?|charts?|graphs?|tables?|"
-    r"data|datasets?|contents?|records?|entries|values|figures|numbers|names|labels?|"
-    r"paragraphs?|bullets?|dates?|structure|format)"
+#:
+#: The nouns are a LIST, not a pattern, because two other patterns below are
+#: this list with something taken out of it, and a copy of the list cannot be
+#: trusted to stay a copy (2026-09-28: the first attempt at
+#: `_Q_CONTENT_ONLY_NOUN` restated all 37 of them by hand).
+_Q_CONTENT_NOUN_WORDS = (
+    "columns?", "colums?", "rows?", "sheets?", "worksheets?", "tabs?", "sections?", "headings?",
+    "headers?", "titles?", "subtitles?", "pages?", "slides?", "cells?", "fields?", "formulas?",
+    "formulae", "totals?", "subtotals?", "charts?", "graphs?", "tables?", "data", "datasets?",
+    "contents?", "records?", "entries", "values", "figures", "numbers", "names", "labels?",
+    "paragraphs?", "bullets?", "dates?", "structure", "format",
 )
 #: The file itself, as a noun a determiner can point at.
-_Q_FILE_WORD = (
-    r"(?:files?|documents?|docs?|pdfs?|docx|xlsx|xls|excel|csv|pptx|powerpoint|ppt|work ?books?|"
-    r"spread ?sheets?|sheets?|trackers?|reports?|decks?|presentations?|attachments?|outputs?|"
-    r"deliverables?|versions?)"
+_Q_FILE_WORD_WORDS = (
+    "files?", "documents?", "docs?", "pdfs?", "docx", "xlsx", "xls", "excel", "csv", "pptx",
+    "powerpoint", "ppt", "work ?books?", "spread ?sheets?", "sheets?", "trackers?", "reports?",
+    "decks?", "presentations?", "attachments?", "outputs?", "deliverables?", "versions?",
 )
+
+
+def _alt(words) -> str:
+    """The words as one non-capturing alternation, in the order given."""
+    return "(?:" + "|".join(words) + ")"
+
+
+_Q_CONTENT_NOUN = _alt(_Q_CONTENT_NOUN_WORDS)
+_Q_FILE_WORD = _alt(_Q_FILE_WORD_WORDS)
+#: The content nouns a DATASET owns just as much as a file this platform made —
+#: the content nouns MINUS the file words, COMPUTED (2026-09-28). A noun that is
+#: also a file word (`sheets?` is the only one today) still points at our file,
+#: and every other one of them names something a CSV has too, so it points at
+#: nothing on its own. The difference is taken here rather than written out
+#: because a hand-copied list is a claim about two other lists that nothing
+#: checks; this one cannot be wrong, and
+#: tests/test_artifact_answer_read_source.py pins what the difference currently
+#: is so that adding an overlapping word to either list is a decision someone
+#: has to make on purpose.
+_Q_CONTENT_ONLY_NOUN = _alt(w for w in _Q_CONTENT_NOUN_WORDS if w not in _Q_FILE_WORD_WORDS)
 #: THIS file: a bare pronoun (with an artifact in the room, "it" is the
 #: artifact), a determiner and a file or content word, or a numbered part.
 #: An INDEFINITE article is not here: "a pdf" is the format as a concept.
@@ -1340,6 +1366,7 @@ _Q_GAP = r"(?:\w+\W+){0,4}?"
 #: The three atoms above, as whole words, for the tests that need one of them
 #: present anywhere in a clause.
 _Q_CONTENT_NOUN_RE = re.compile(rf"\b{_Q_CONTENT_NOUN}\b", re.I)
+_Q_CONTENT_ONLY_NOUN_RE = re.compile(rf"\b{_Q_CONTENT_ONLY_NOUN}\b", re.I)
 _Q_INSIDE_RE = re.compile(rf"\b{_Q_INSIDE}\b", re.I)
 _Q_THIS_FILE_RE = re.compile(rf"\b{_Q_THIS_FILE}", re.I)
 #: THIS file, with the CONTENT nouns removed: a pronoun the artifact owns
@@ -1361,11 +1388,31 @@ _Q_THIS_FILE_RE = re.compile(rf"\b{_Q_THIS_FILE}", re.I)
 #: is no other file for the question to be about, and the broad reading is
 #: right.
 _Q_OUR_FILE = (
-    rf"(?:(?:it|this|that|these|those|them|_this_)\b"
-    rf"|(?:the|this|that|these|those|my|our|your)\s+(?:\w+\s+){{0,2}}?{_Q_FILE_WORD}\b"
+    rf"(?:(?:it|this|that|these|those|them|_this_)\b(?!\s+{_Q_CONTENT_ONLY_NOUN}\b)"
+    rf"|(?:the|this|that|these|those|my|our|your|_this_)\s+(?:\w+\s+){{0,2}}?{_Q_FILE_WORD}\b"
     rf"|(?:slide|page|sheet|tab|section|column|row)\s+\d+\b)"
 )
 _Q_OUR_FILE_RE = re.compile(rf"\b{_Q_OUR_FILE}", re.I)
+#: THE SOV POINTER — a file word, then the postposition the normaliser writes
+#: (2026-09-28). `_Q_SOV_RE` cannot serve as one, and reading it as one is what
+#: sent every Indian-language value question to the workbook: its first arm is
+#: <wh> … `_in_` with NO file reference in it at all, and its second ORs
+#: `_Q_CONTENT_NOUN` straight back in — the exact set `_Q_OUR_FILE` subtracts.
+#: Measured through POST /chat with customers.csv and a workbook in one
+#: conversation: "डेटा में कुल spend कितना है ?", "data में कुल spend कितना है ?"
+#: and "rows में कितने countries हैं ?" were each answered "**Workflow Tracker**
+#: (v1) is a workbook with 1 sheet: `Tasks`", while the English equivalent
+#: ("what is the total spend in the data ?") reached the dataset engine — the
+#: same question, answered correctly in one language and not the other.
+#:
+#: `\b` IS LOAD-BEARING at the front: `it` closes ordinary words, so without it
+#: "credit note में क्या है ?" — normalised "credit note _in_ kya hai" — matched
+#: through the `it` inside "credit" and pointed a question about the person's
+#: own credit note at our workbook.
+_Q_SOV_OUR_FILE_RE = re.compile(
+    rf"\b(?:{_Q_OUR_FILE}|{_Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b",
+    re.I,
+)
 #: …and THEIR file, named as their own: "the csv i uploaded", "the attachment",
 #: "the sheet i sent". It vetoes the pointer above, because our own artifacts
 #: are xlsx/pdf/docx/pptx AND csv (formats.py's `data` template makes a CSV), so
@@ -1568,6 +1615,57 @@ _Q_REFUSE_CREATE_RE = re.compile(
     r"(?:a\s+|an\s+|any\s+|another\s+|the\s+)?(?:new|other|second|extra|more|another)\b",
     re.I,
 )
+#: WORDS THAT NAME NOTHING: politeness, discourse filler, the pronouns and
+#: auxiliaries the ask to be told is built from, and the bare objects a refusal
+#: takes ("a new one", "anything", "a file"). Whatever survives this AND the
+#: three phrase patterns above is a subject the person named for themselves.
+#: `d` is in it because the transcript's own turn ends "Not create d??".
+_Q_NO_SUBJECT_FILLER_RE = re.compile(
+    r"\b(?:i|we|me|us|my|our|you|your|it|its|this|that|just|only|simply|sirf|fakt|faqt|khali|bas|"
+    r"please|pls|kindly|ok|okay|no|nope|yes|ya|and|but|so|now|then|also|first|na|hey|hi|sir|bro|yaar|"
+    r"bhai|said|want|wanted|need|needed|wanna|would|like|to|know|d|"
+    r"a|an|the|any|another|new|other|second|extra|more|one|ones|anything|something|thing|files?)\b"
+    r"|\W+",
+    re.I,
+)
+
+
+def _names_nothing_but_the_ask(text: str) -> bool:
+    """Is the whole message the ask to be TOLD and/or the refusal of a new file,
+    and nothing else?
+
+    WHY THIS IS THE TEST (2026-09-28). A refusal says which OUTPUT the person
+    wants — a sentence, not a file — and never which FILE the question is about.
+    Reading it as a pointer at the artifact is what answered three questions
+    about an uploaded dataset with a description of a workbook; measured through
+    POST /chat with customers.csv and a workbook in one conversation, "dont
+    create a file, just tell me the total spend", "please tell me only, do not
+    make a new file - what is the average spend per country?" and "sirf bata do
+    nayi file mat banao - total spend kitna hai" each came back
+    `meta.route` "artifact" and "**Workflow Tracker** (v1) is a workbook with 1
+    sheet: `Tasks`".
+
+    What the refusal CAN say is that the message names no subject at all — and
+    then the file card the last assistant turn showed is the only thing left for
+    it to be about. That is the transcript's own third turn, "i want to Know ??
+    please tell me Only Not create d??", which names nothing: it keeps its
+    read-back with a dataset in the room, and the three above do not.
+
+    A SUBTRACTION, not a list of shapes. The three phrase patterns are the ones
+    the gate already uses to recognise the ask and the refusal, so this cannot
+    drift away from them; the residual is measured, not enumerated. It must be
+    read on the UNBLANKED text (`decide`'s `own_unblanked`): `_rule_view` blanks
+    negated clauses, and on these turns that blanks the question itself — the
+    whole of "sirf bata do nayi file mat banao - total spend kitna hai" reduces
+    to a single space there, which is how a first attempt at this rule passed a
+    turn that names a total straight through.
+    """
+    rest = _Q_TELL_ONLY_RE.sub(" ", text)
+    rest = _Q_REFUSE_CREATE_RE.sub(" ", rest)
+    rest = _Q_TELL_RE.sub(" ", rest)
+    return not _Q_NO_SUBJECT_FILLER_RE.sub(" ", rest).strip()
+
+
 #: A clause that OPENS WITH A BUILD VERB is an instruction, whatever
 #: question word stands later in it: "make it show what the totals are"
 #: changes the file. The speech verbs (tell, list, explain, summarise, read
@@ -1936,8 +2034,16 @@ def decide(
             or (
                 (_Q_OUR_FILE_RE.search(own_text())
                  or _Q_DID_YOU_RE.search(own_text())
-                 or _Q_SOV_RE.search(own_text())
-                 or kind in ("told-not-to-create", "tell-me-only"))
+                 or _Q_SOV_OUR_FILE_RE.search(own_text())
+                 # A REFUSAL IS NOT A POINTER — unless the message names
+                 # nothing else at all (2026-09-28; see
+                 # `_names_nothing_but_the_ask`, which measures that). "Don't
+                 # make a file, just tell me X" says which OUTPUT the person
+                 # wants and leaves X to say what the question is about; "just
+                 # tell me" after the file card names nothing, so the card is
+                 # the only thing left.
+                 or (kind in ("told-not-to-create", "tell-me-only")
+                     and _names_nothing_but_the_ask(own_unblanked())))
                 # …unless the person named the file as THEIRS.
                 and not _Q_THEIR_UPLOAD_RE.search(own_text())
             )

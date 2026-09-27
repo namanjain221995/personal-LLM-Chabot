@@ -240,9 +240,10 @@ def test_a_link_the_person_pasted_is_not_answered_from_our_spec(question, label,
     """D2. The read-back branch sits ABOVE the GitHub route, the crawl routes
     and the URL route, and a link is not a file, so the six file checks in
     `_carries_a_file_to_read` could not see one. `link_to_fetch` is code, not
-    words: `github_ref`/`crawl_url`/`url_list`, all three already past
-    `links_are_the_request`, so an incidental URL in a long paste cannot cost
-    the read-back a turn."""
+    words: `github_ref`/`crawl_url`/`url_list` — the disjunction of the three
+    route conditions below it. All three are now past `links_are_the_request`;
+    the crawl one was not until 2026-09-28, which is what
+    `test_an_incidental_crawl_instruction_in_a_paste_is_not_a_crawl` pins."""
     conv = "art-link-" + label
     with TestClient(app) as client:
         _make_artifact(client, conv, conv)
@@ -280,3 +281,158 @@ def test_the_anchor_questions_still_answer_with_a_dataset_in_the_room(question):
         assert str(answered.get("artifact_id")) == str(made[0]["id"]), (answered, made)
         assert int(answered.get("version") or 0) == 1, answered
         assert "artifacts" not in final, final
+
+
+# ---------------------------------------------------------------------------
+# ROUND 3 (2026-09-28). Three ways the read-back still claimed a turn whose
+# subject was the person's own data, each measured through POST /chat with
+# customers.csv and a workbook in ONE conversation, and each answered
+# "**Workflow Tracker** (v1) is a workbook with 1 sheet: `Tasks`":
+#
+# N1  a REFUSAL was read as a pointer. "don't make a file, just tell me X"
+#     says which OUTPUT the person wants; X says what the question is about.
+# N2  the content-noun subtraction was applied to `the data` and not to `this
+#     data` — one word apart — and `lexicon` rewrites `isme` / `is <noun>` to
+#     `_this_`, so the Hinglish forms went the same way.
+# N3  `_Q_SOV_RE` was read as a pointer although its first arm carries no file
+#     reference at all, so EVERY Indian-language value question reached the
+#     workbook while its English equivalent reached the dataset engine.
+#
+# The rules are pinned in tests/test_artifact_answer_read_source.py. These are
+# the whole turns, because `meta.route` is what the person feels.
+
+N1_A_REFUSAL_IS_NOT_A_POINTER = (
+    "dont create a file, just tell me the total spend",
+    "please tell me only, do not make a new file - what is the average spend per country?",
+    "sirf bata do nayi file mat banao - total spend kitna hai",
+)
+N2_A_BARE_DEMONSTRATIVE_IS_NOT_A_POINTER = (
+    "which countries are in this data?",
+    "isme total spend kitna hai ??",
+    "is data me total spend kitna hai ??",
+)
+N3_THE_SOV_ORDER_NEEDS_A_FILE_WORD = (
+    "\u0921\u0947\u091f\u093e \u092e\u0947\u0902 \u0915\u0941\u0932 spend \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?",
+    "data \u092e\u0947\u0902 \u0915\u0941\u0932 spend \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?",
+    "rows \u092e\u0947\u0902 \u0915\u093f\u0924\u0928\u0947 countries \u0939\u0948\u0902 ?",
+    "credit note \u092e\u0947\u0902 \u0915\u094d\u092f\u093e \u0939\u0948 ?",
+)
+
+
+@pytest.mark.parametrize("question", [
+    *N1_A_REFUSAL_IS_NOT_A_POINTER,
+    *N2_A_BARE_DEMONSTRATIVE_IS_NOT_A_POINTER,
+    *N3_THE_SOV_ORDER_NEEDS_A_FILE_WORD,
+])
+def test_a_question_about_the_uploaded_dataset_reaches_the_dataset_engine(question):
+    """The whole turn, not the rule: `meta.route` must be the engine that has
+    the rows, and the reply must not be the workbook sentence."""
+    conv = "art-r3-" + hashlib.md5(question.encode()).hexdigest()[:10]
+    with TestClient(app) as client:
+        before = _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, question)
+        assert "artifact_answer" not in final, (question, final, tokens[:300])
+        assert "Workflow Tracker" not in tokens, (question, tokens[:300])
+        assert final.get("route") == "dataset", (question, final, tokens[:300])
+    rows = adb.list_artifacts(_owner_id(), conv)
+    assert len(rows) == 1 and str(rows[0]["id"]) == str(before[0]["id"]), (rows, before)
+
+
+#: THE SAME QUESTION IN TWO LANGUAGES. This platform's own user base writes
+#: Hindi, Hinglish and Gujlish, and before 2026-09-28 the English form of this
+#: question reached the dataset engine while every Indian-language form of it
+#: was answered from the workbook. The pair is the assertion: not "Hindi works"
+#: but "Hindi and English agree".
+SAME_QUESTION_TWO_LANGUAGES = (
+    # the person's own data, both ways round
+    ("\u0921\u0947\u091f\u093e \u092e\u0947\u0902 \u0915\u0941\u0932 spend \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?", "what is the total spend in the data ?"),
+    ("is data me total spend kitna hai ??", "what is the total spend in this data ??"),
+    ("rows \u092e\u0947\u0902 \u0915\u093f\u0924\u0928\u0947 countries \u0939\u0948\u0902 ?", "how many countries are in the rows ?"),
+    # ...and OUR file, both ways round: the pair has to hold in both
+    # directions, or "Hindi goes to the dataset engine" would be a way of
+    # losing the read-back rather than a way of routing correctly.
+    ("is sheet me kya hai ??", "what is in this sheet ??"),
+    ("sheet me kitne columns hai ??", "how many columns are in the sheet ??"),
+    ("report me kitne pages hai ??", "how many pages are in the report ??"),
+    ("isme kitne rows hai ??", "how many rows are in it ??"),
+)
+
+
+@pytest.mark.parametrize("indic,english", SAME_QUESTION_TWO_LANGUAGES,
+                         ids=[e[:40] for _i, e in SAME_QUESTION_TWO_LANGUAGES])
+def test_the_indic_and_english_forms_of_one_question_take_the_same_route(indic, english):
+    routes = {}
+    for label, question in (("indic", indic), ("english", english)):
+        conv = "art-r3-lang-" + label + "-" + hashlib.md5(question.encode()).hexdigest()[:8]
+        with TestClient(app) as client:
+            _make_artifact(client, conv, conv)
+            _add_dataset(conv)
+            final, tokens = _answer_turn(client, conv, question)
+            routes[label] = (final.get("route"), "Workflow Tracker" in tokens)
+    assert routes["indic"] == routes["english"], routes
+
+
+def test_the_residual_of_the_bare_demonstrative_stated_rather_than_hidden():
+    """WHERE THE TWO LANGUAGES STILL PART, measured and recorded (2026-09-28).
+
+    A bare demonstrative with no noun of its own is a pointer at our file, and
+    it has to be: "how many rows are in it ??" is a question about the workbook
+    and so is "isme kitne rows hai ??". The subtraction that closed N2 is
+    POSITIONAL — a demonstrative immediately followed by a content noun ("this
+    data", "_this_ total") is not a pointer — and Hindi merges "in this" into
+    one token that stands BEFORE the noun while English puts it AFTER. So
+    "isme total spend kitna hai ??" reaches the dataset engine and "what is the
+    total spend in this ??" does not.
+
+    It is the residual this module already records for q13/q14/q21 and for "what
+    is in the csv?": `totals?` and `rows?` are what a workbook and a CSV have in
+    common, and no words rule separates a value question from a structure
+    question when the only noun is one of those. Closing it needs the dataset's
+    own column names at the route. Pinned here so that it is a known cost with a
+    measurement beside it, not a surprise."""
+    conv = "art-r3-residual"
+    with TestClient(app) as client:
+        _make_artifact(client, conv, conv)
+        _add_dataset(conv)
+        final, tokens = _answer_turn(client, conv, "what is the total spend in this ??")
+        assert final.get("route") == "artifact", (final, tokens[:300])
+        assert "Workflow Tracker" in tokens, tokens[:300]
+
+
+#: A pasted DOCUMENT that happens to say "crawling <url>" in its body. 2,487
+#: characters and 31 lines, which is what `links_are_the_request` is measured
+#: against (500 characters / 15 lines).
+A_PASTE_THAT_MENTIONS_A_CRAWL = (
+    "Sprint 41 engineering notes\n\n"
+    "Platform: the nightly job finished crawling https://docs.acme.invalid/guide and wrote 812 pages\n"
+    "into the store. Ops raised two incidents, both resolved inside the hour.\n\n"
+    + ("Detail line: throughput held at 41 pages per second across the whole window, with no retries.\n" * 24)
+    + "\nWhat is in the sheet you made?\n"
+)
+
+
+def test_an_incidental_crawl_instruction_in_a_paste_is_not_a_crawl():
+    """N4 (2026-09-28). `_carries_a_file_to_read` documented `link_to_fetch` as
+    "all three past `links_are_the_request`, so an incidental URL inside a long
+    paste is already excluded upstream and cannot cost the read-back a turn".
+    That was false for `crawl_url`: `detect_crawl` asks only for a crawl word
+    within 80 characters of a URL, and nothing applied the paste test to it.
+
+    Measured through POST /chat before the guard: `meta.route` "crawl" and the
+    whole answer was "I can't crawl docs.acme.invalid: its robots.txt could not
+    be read, so I assume crawling is not welcome there." The 2,487-character
+    paste and the question it ends with were never read. That is the 2026-08-11
+    owner report reproduced in the crawl phase, and it cost the read-back this
+    turn as well."""
+    conv = "art-r3-paste"
+    with TestClient(app) as client:
+        _make_artifact(client, conv, conv)
+        final, tokens = _answer_turn(client, conv, A_PASTE_THAT_MENTIONS_A_CRAWL)
+        assert final.get("route") != "crawl", (final, tokens[:300])
+        assert "robots.txt" not in tokens, tokens[:300]
+        # The question the paste ENDS with is about the file we made, so this
+        # turn is the read-back's; the assertion that matters is that a
+        # whole-site walk nobody asked for did not claim it.
+        assert final.get("route") == "artifact", (final, tokens[:300])
+        assert "Workflow Tracker" in tokens, tokens[:300]

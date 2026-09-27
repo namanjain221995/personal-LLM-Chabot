@@ -312,9 +312,14 @@ def _intent_that_asks_about(text: str, **kw):
 ])
 def test_a_link_this_turn_carries_is_a_read_source_without_any_words_test(text):
     """`link_to_fetch` is the route's `github_ref is not None`, `crawl_url is
-    not None` or a non-empty `url_list`. All three are derived from THIS turn's
-    text and all three are already past `links_are_the_request`, so there is no
-    second words test to get wrong here."""
+    not None` or a non-empty `url_list` — the disjunction of the three route
+    conditions below this branch, which is all the flag has to mean: a route
+    under it will fetch a source for this turn. There is no second words test
+    here to get wrong.
+
+    What each of the three IS is pinned by the two tests below it, because the
+    first version of this docstring said all three were links from this turn's
+    text past `links_are_the_request` and that was true of two of them."""
     from app.main import _carries_a_file_to_read
 
     assert _carries_a_file_to_read(text, _request(text), False, False,
@@ -325,26 +330,83 @@ def test_a_link_this_turn_carries_is_a_read_source_without_any_words_test(text):
                                    link_to_fetch=False) is False
 
 
-def test_the_three_detectors_the_route_composes_each_raise_the_flag():
-    """`link_to_fetch` is one expression over three detectors, so each one is
-    exercised here rather than trusted: a pasted page (`url_list`), a GitHub
-    repo (`github_ref`) and a whole-site crawl (`crawl_url`). Pure — nothing
-    is fetched; these are the same functions the route calls before the chain."""
+#: A pasted DOCUMENT whose body happens to say "crawling <url>": 2,487
+#: characters and 31 lines, against `links_are_the_request`'s 500 characters and
+#: 15 lines.
+A_PASTE_THAT_MENTIONS_A_CRAWL = (
+    "Sprint 41 engineering notes\n\n"
+    "Platform: the nightly job finished crawling https://docs.acme.invalid/guide and wrote 812 pages\n"
+    "into the store. Ops raised two incidents, both resolved inside the hour.\n\n"
+    + ("Detail line: throughput held at 41 pages per second across the whole window, with no retries.\n" * 24)
+    + "\nWhat is in the sheet you made?\n"
+)
+
+
+def _link_to_fetch(text: str) -> bool:
+    """The route's own expression, in the order the route computes it."""
     from app.config import settings
     from app.core.repo import detect_github
     from app.core.urls import extract_urls, links_are_the_request
     from app.engines.crawl import detect_crawl
 
-    def flag(text: str) -> bool:
-        urls = extract_urls(text, limit=settings.url_max_pages)
-        github = detect_github(text) is not None and links_are_the_request(text, urls)
-        return bool(github or detect_crawl(text) is not None or (urls and links_are_the_request(text, urls)))
+    urls = extract_urls(text, limit=settings.url_max_pages)
+    are_the_request = bool(urls) and links_are_the_request(text, urls)
+    github = detect_github(text) is not None and are_the_request
+    crawl = detect_crawl(text) is not None and are_the_request
+    return bool(github or crawl or (urls and are_the_request))
 
-    assert flag("what does this page say? https://example.invalid/pricing") is True
-    assert flag("what is in this repo? https://github.com/acme/widgets") is True
-    assert flag("crawl this site https://example.invalid and tell me what it says") is True
+
+def test_the_three_detectors_the_route_composes_each_raise_the_flag():
+    """`link_to_fetch` is one expression over three detectors, so each one is
+    exercised here rather than trusted: a pasted page (`url_list`), a GitHub
+    repo (`github_ref`) and a whole-site crawl (`crawl_url`). Pure — nothing
+    is fetched; these are the same functions the route calls before the chain."""
+    assert _link_to_fetch("what does this page say? https://example.invalid/pricing") is True
+    assert _link_to_fetch("what is in this repo? https://github.com/acme/widgets") is True
+    assert _link_to_fetch("crawl this site https://example.invalid and tell me what it says") is True
     # The anchor question carries no link at all.
-    assert flag("Ok What This sheet have ??") is False
+    assert _link_to_fetch("Ok What This sheet have ??") is False
+
+
+def test_an_incidental_crawl_instruction_in_a_paste_is_not_a_link_to_fetch():
+    """N4 (2026-09-28): `crawl_url` did not satisfy the premise this branch was
+    given. `detect_crawl` asks only for a crawl word within 80 characters of a
+    URL, and nothing applied `links_are_the_request` to it — so a pasted sprint
+    note whose body said "the nightly job finished crawling <url>" raised the
+    flag, the read-back stood down, and the crawl route below claimed the turn.
+    Measured through POST /chat before the guard (see
+    tests/test_artifact_question_route.py): `meta.route` "crawl", and the whole
+    answer was "I can't crawl docs.acme.invalid: its robots.txt could not be
+    read". The paste and the question it ends with were never read."""
+    from app.config import settings
+    from app.core.urls import extract_urls, links_are_the_request
+    from app.engines.crawl import detect_crawl
+
+    paste = A_PASTE_THAT_MENTIONS_A_CRAWL
+    urls = extract_urls(paste, limit=settings.url_max_pages)
+    # The detector still fires — that is not what was fixed...
+    assert detect_crawl(paste) is not None
+    # ...the paste test says the links are not the request, and the route now
+    # reads it for the crawl phase exactly as it does for the other two.
+    assert links_are_the_request(paste, urls) is False
+    assert _link_to_fetch(paste) is False
+
+
+def test_continue_crawling_carries_no_link_from_this_turns_text():
+    """…and the OTHER half of the corrected claim. `crawl_url` is not always
+    from this turn's text: "continue crawling" is the phrase the capped-crawl
+    message advertises, `engines/crawl.detect_resume` requires that the turn
+    carry NO URL, and the dispatcher then takes the newest crawled site of this
+    conversation. Such a turn still belongs to the crawl route, which is the
+    only thing `link_to_fetch` has to be right about — so it counts, and the
+    docstring now says so instead of claiming all three come from this turn."""
+    from app.core.urls import extract_urls
+    from app.engines.crawl import detect_crawl, detect_resume
+
+    text = "continue crawling please"
+    assert extract_urls(text, limit=5) == []
+    assert detect_crawl(text) is None
+    assert detect_resume(text) is True
 
 
 def test_a_schemeless_host_reaches_no_fetch_route_on_this_tree_either():
@@ -590,3 +652,192 @@ def test_the_measured_cost_of_the_dataset_arm_over_the_whole_labelled_class():
         if not D.answers_from_spec(decided, has_dataset=True):
             lost.append(case_id)
     assert lost == ["q13", "q14", "q21"], lost
+
+
+# ---------------------------------------------------------------------------
+# ROUND 3 (2026-09-28). Three more ways `names_our_file` said "our file" about a
+# question whose subject was the person's own data. Each was measured through
+# POST /chat with customers.csv and a workbook in one conversation, and each was
+# answered "**Workflow Tracker** (v1) is a workbook with 1 sheet: `Tasks`"; the
+# whole turns are in tests/test_artifact_question_route.py.
+
+
+def test_the_content_only_nouns_are_the_difference_of_the_two_lists():
+    """`_Q_CONTENT_ONLY_NOUN` is the content nouns MINUS the file words, and it
+    is computed from them rather than restated. This pins the difference: today
+    exactly one noun is in both lists, `sheets?`, and it stays a pointer because
+    "this sheet" names a file. Adding an overlapping word to either list changes
+    what points at our file, so it should fail here and be decided on purpose."""
+    from app.artifacts import intent as I
+
+    overlap = sorted(set(I._Q_CONTENT_NOUN_WORDS) & set(I._Q_FILE_WORD_WORDS))
+    assert overlap == ["sheets?"], overlap
+    assert I._Q_CONTENT_NOUN == I._alt(I._Q_CONTENT_NOUN_WORDS)
+    assert I._Q_FILE_WORD == I._alt(I._Q_FILE_WORD_WORDS)
+    assert I._Q_CONTENT_ONLY_NOUN == I._alt(
+        w for w in I._Q_CONTENT_NOUN_WORDS if w not in I._Q_FILE_WORD_WORDS)
+    # The one that stays a pointer, and one that does not.
+    assert I._Q_CONTENT_ONLY_NOUN_RE.search("sheet") is None
+    assert I._Q_CONTENT_ONLY_NOUN_RE.search("data") is not None
+
+
+#: N1 — A REFUSAL IS NOT A POINTER. "Don't make a file, just tell me X" says
+#: which OUTPUT the person wants; X says what the question is about.
+HELD_OUT_A_REFUSAL_IS_NOT_A_POINTER = (
+    "dont create a file, just tell me the total spend",
+    "please tell me only, do not make a new file - what is the average spend per country?",
+    "sirf bata do nayi file mat banao - total spend kitna hai",
+    "don't create anything, what is the average order value?",
+    "no new file please, which country spent the most?",
+)
+#: …and the same refusal when the message names NOTHING ELSE. Then the file card
+#: the last assistant turn showed is the only thing left for it to be about, and
+#: the read-back is right. The first two are the production transcript's own
+#: turns, which is why this arm exists at all.
+HELD_OUT_A_REFUSAL_THAT_NAMES_NOTHING_ELSE = (
+    "i want to Know ?? please tell me Only Not create d??",
+    "please tell me Only Not create",
+    "i dont want a new one, just tell me",
+    "just tell me",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_REFUSAL_IS_NOT_A_POINTER)
+def test_a_refusal_of_a_new_file_does_not_point_at_our_file(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_REFUSAL_THAT_NAMES_NOTHING_ELSE)
+def test_a_refusal_that_names_nothing_else_still_points_at_our_file(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_refusal_rule_is_read_on_the_unblanked_text():
+    """The view is the rule's other half. `_rule_view` blanks negated clauses so
+    the rest of the message can decide, and on these turns that blanks the
+    question: "sirf bata do nayi file mat banao - total spend kitna hai" reduces
+    to a single space there. A first attempt at this rule read that view and let
+    a turn naming a total through."""
+    from app.artifacts import intent as I
+    from app.artifacts import lexicon as LX
+
+    text = "sirf bata do nayi file mat banao - total spend kitna hai"
+    blanked = I._rule_view(I._clean(I._own_prose(text)))
+    assert blanked.strip() == "", repr(blanked)
+    unblanked = LX.normalize(I._clean(I._own_prose(text)).lower())
+    assert "total" in unblanked, repr(unblanked)
+    assert I._names_nothing_but_the_ask(blanked) is True
+    assert I._names_nothing_but_the_ask(unblanked) is False
+
+
+#: N2 — THE SUBTRACTION WAS APPLIED TO ONE ARM AND NOT THE OTHER. `the data`
+#: was not a pointer and `this data` was, one word apart; and
+#: `lexicon` rewrites `isme` and `is <noun>` to `_this_`, so both Hinglish
+#: forms took the bare-demonstrative arm.
+HELD_OUT_A_BARE_DEMONSTRATIVE_IS_NOT_A_POINTER = (
+    "which countries are in this data?",
+    "which countries are in the data?",
+    "what is in that data?",
+    "isme total spend kitna hai ??",
+    "is data me total spend kitna hai ??",
+)
+#: …and the bare demonstrative that IS a pointer, because nothing a dataset owns
+#: follows it. Losing these would be the other way of getting N2 wrong, and it
+#: is the verifier's measured warning: a lookahead on ANY following word costs
+#: six more of the 49.
+HELD_OUT_A_BARE_DEMONSTRATIVE_THAT_STILL_POINTS = (
+    "what is in it?",
+    "what is in this sheet",
+    "is sheet me kya kya hai ??",
+    "how many rows are in it?",
+    "what is on slide 3?",
+    "does it have a status column?",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_BARE_DEMONSTRATIVE_IS_NOT_A_POINTER)
+def test_a_demonstrative_followed_by_a_content_noun_is_not_a_pointer(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_BARE_DEMONSTRATIVE_THAT_STILL_POINTS)
+def test_a_demonstrative_that_names_no_dataset_noun_after_it_still_points(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+#: N3 — `_Q_SOV_RE` CANNOT BE A POINTER. Its first arm is <wh> … `_in_` with no
+#: file reference in it at all, and its second ORs `_Q_CONTENT_NOUN` back in —
+#: the exact set the pointer subtracts. So every Indian-language value question
+#: reached the workbook while its English equivalent reached the dataset engine.
+HELD_OUT_THE_SOV_ORDER_WITHOUT_A_FILE_WORD = (
+    "\u0921\u0947\u091f\u093e \u092e\u0947\u0902 \u0915\u0941\u0932 spend \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?",
+    "data \u092e\u0947\u0902 \u0915\u0941\u0932 spend \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?",
+    "rows \u092e\u0947\u0902 \u0915\u093f\u0924\u0928\u0947 countries \u0939\u0948\u0902 ?",
+    # `\b` at the front of the pattern: `it` closes ordinary words, so without
+    # it "credit note _in_ kya hai" matched through the `it` inside "credit".
+    "credit note \u092e\u0947\u0902 \u0915\u094d\u092f\u093e \u0939\u0948 ?",
+    "profit summary \u092e\u0947\u0902 \u0915\u093f\u0924\u0928\u093e \u0939\u0948 ?",
+)
+#: …and the SOV order that DOES carry a file word, which is what the pointer is
+#: for: corpus q36 "sheet _in_ su su che" and its neighbours.
+HELD_OUT_THE_SOV_ORDER_WITH_A_FILE_WORD = (
+    "sheet me su su che ??",
+    "is sheet me kya kya hai ??",
+    "report me kitne pages hai ??",
+    "sheet ma su su che ae kaho, navi file na banavo",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THE_SOV_ORDER_WITHOUT_A_FILE_WORD)
+def test_the_sov_order_without_a_file_word_is_not_a_pointer(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THE_SOV_ORDER_WITH_A_FILE_WORD)
+def test_the_sov_order_with_a_file_word_still_points_at_our_file(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_word_boundary_at_the_front_of_the_sov_pointer_is_load_bearing():
+    """Measured 2026-09-28: without the leading `\b`, `credit`, `profit` and
+    `deposit` all end in `it`, which is the pointer's first alternative, so any
+    Hindi turn that put one of them before a postposition pointed a question
+    about the person's own credit note at our workbook."""
+    import re
+
+    from app.artifacts import intent as I
+
+    without = re.compile(
+        rf"(?:{I._Q_OUR_FILE}|\b{I._Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b", re.I)
+    for norm in ("credit note _in_ kya hai", "profit summary _in_ kitna hai",
+                 "deposit slip _in_ kya hai"):
+        assert without.search(norm) is not None, norm
+        assert I._Q_SOV_OUR_FILE_RE.search(norm) is None, norm
+    # …and the pointer it exists for is untouched.
+    for norm in ("sheet _in_ su su che", "_this_ sheet _in_ kya kya hai",
+                 "report _in_ kitne pages hai"):
+        assert I._Q_SOV_OUR_FILE_RE.search(norm) is not None, norm
+
+
+def test_the_first_arm_of_the_sov_shape_carries_no_file_reference():
+    """Why `_Q_SOV_RE` could not be the pointer, asserted rather than asserted
+    in prose: its first alternative is a question word and a postposition, with
+    nothing between them that names a file. It stays what it is — the shape test
+    that says "this is a question" — and the pointer is its own pattern."""
+    from app.artifacts import intent as I
+
+    norm = "kitna _in_ hai"
+    assert I._Q_SOV_RE.search(norm) is not None, norm
+    assert I._Q_SOV_OUR_FILE_RE.search(norm) is None, norm

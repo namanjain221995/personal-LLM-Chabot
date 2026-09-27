@@ -3045,13 +3045,33 @@ def _carries_a_file_to_read(
     https://github.com/acme/widgets" were both answered "**Workflow Tracker**
     (v1) is a workbook with 1 sheet: `Tasks`" and neither the page nor the
     repository was ever fetched. `link_to_fetch` is the caller's `github_ref is
-    not None`, `crawl_url is not None` or a non-empty `url_list` — all three
-    derived from THIS turn's text, all three past `links_are_the_request`, so
-    an incidental URL inside a long paste is already excluded upstream and
-    cannot cost the read-back a turn. A repo indexed or a site crawled in an
-    EARLIER turn (`repo_followup`, `crawl_site_hits`) is deliberately not here:
-    no link in this turn's words, and the read-back is then the more specific
-    claim.
+    not None`, `crawl_url is not None` or a non-empty `url_list`: the disjunction
+    of the three route conditions BELOW, which is the whole of what this flag
+    means — a route under this branch will fetch a source for this turn, so this
+    branch must not claim it.
+
+    WHAT EACH OF THE THREE IS, corrected 2026-09-28 (the first version of this
+    paragraph said all three were links from this turn's text that had passed
+    `links_are_the_request`; that was true of two of them):
+
+      * `github_ref` — a GitHub link in THIS turn's text, past
+        `links_are_the_request`.
+      * `url_list` — links in THIS turn's text, past `links_are_the_request`.
+      * `crawl_url` — USUALLY a crawl instruction in this turn's text, now past
+        `links_are_the_request` too (it was not until 2026-09-28, and an
+        incidental "…finished crawling <url>" inside a 2,487-character paste
+        took the turn to the crawl engine; see the guard at the crawl phase).
+        It can ALSO be the newest crawled site of THIS CONVERSATION, with no
+        link in this turn's words at all: "continue crawling" is the phrase the
+        capped-crawl message advertises, and `engines/crawl.detect_resume`
+        requires that the turn carry no URL. A turn like that still belongs to
+        the crawl route, which is the only thing this flag has to be right
+        about, so it counts here.
+
+    A repo indexed or a site crawled in an EARLIER turn that this turn does NOT
+    ask to continue (`repo_followup`, `crawl_site_hits`) is deliberately not
+    here: those are relevance hits, no route below is committed to fetching
+    anything, and the read-back is then the more specific claim.
 
     IT YIELDS TO EXACTLY WHAT A ROUTE BELOW CAN FETCH, which is `https?://`
     only. `core/urls._URL_RE` and `core/repo._REPO_RE` both require the scheme,
@@ -5226,6 +5246,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and github_ref is None
                 and not lane.entered
             ):
+                from .core.urls import (
+                    extract_urls as _extract_for_crawl,
+                    links_are_the_request as _links_are_the_request,
+                )
                 from .engines.crawl import (
                     _URL_RE,
                     detect_crawl,
@@ -5233,6 +5257,30 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 )
 
                 crawl_url = detect_crawl(request.text)
+                # …but only when the links ARE the request — the same test the
+                # GitHub phase above and the URL phase below apply, and the one
+                # `_carries_a_file_to_read` already documented as holding for
+                # all three. It did not hold here (2026-09-28). `detect_crawl`
+                # asks only for a crawl word within 80 characters of a URL, so
+                # a 2,487-character pasted sprint note whose body happened to
+                # say "the nightly job finished crawling <url>" was routed to
+                # the crawl engine: measured through POST /chat with an artifact
+                # in the conversation, `meta.route` came back "crawl" and the
+                # answer was "I can't crawl docs.acme.invalid: its robots.txt
+                # could not be read", while the paste and the question it ended
+                # with ("What is in the sheet you made?") were never read. That
+                # is the 2026-08-11 owner report — a document discarded because
+                # it mentioned a URL — reproduced in the crawl phase, and the
+                # cost of getting it wrong here is larger than for one page: a
+                # whole-site walk nobody asked for.
+                if crawl_url is not None and not _links_are_the_request(
+                    request.text, _extract_for_crawl(request.text, limit=settings.url_max_pages)
+                ):
+                    logging.getLogger(__name__).info(
+                        "ignoring an incidental crawl instruction in a %d-character message",
+                        len(request.text),
+                    )
+                    crawl_url = None
                 if (
                     crawl_url is None
                     and request.conversation_id
