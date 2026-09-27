@@ -702,9 +702,11 @@ async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Option
     3,000 words, explicit): without it `caps_for` returned (8, 12) where
     with it it returns (17, 12), so the outline was told "Limits: at most 8
     top-level sections" AND "Plan 8 sections (at most 8)" for a request
-    that named fifteen — and the fifteen names (`_requested_line`, which
-    carries "none skipped, none merged, none renamed") never reached this
-    call at all. The model obeyed the eight, and the document came back
+    that named fifteen. The fifteen names themselves were in the call — they
+    are inside the raw request text this prompt carries — but
+    `_requested_line`, which is the sentence that says "none skipped, none
+    merged into another, none renamed" and the block vocabulary that goes
+    with it, was not. The model obeyed the eight, and the document came back
     with 8 of the 15 sections."""
     messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
@@ -1148,6 +1150,11 @@ CORRECTION_KEEP_FRACTION = 0.9
 #: max_length, named once here because two places in this module have to stop
 #: BEFORE validation would refuse the document rather than after.
 DOCUMENT_BLOCK_CEILING = 400
+#: How many citations a document's manifest may carry: `S.DocumentSpec.sources`'
+#: own max_length. The coverage repair adds to that manifest, so it is the same
+#: unvalidated-assignment class as the block ceiling and stops at the same kind
+#: of number.
+DOCUMENT_SOURCE_CEILING = 60
 
 
 def _top_sections(blocks: Sequence[Any]) -> int:
@@ -1175,6 +1182,32 @@ def _document_shape(blocks: Sequence[Any]) -> Tuple[int, int]:
     prose = sum(len(getattr(b, "text", "") or "") for b in blocks)
     prose += sum(sum(len(i) for i in b.items) for b in blocks if isinstance(b, S.Bullets))
     return len(blocks), prose
+
+
+def _over_document_limits(blocks: Sequence[Any], sources: int) -> str:
+    """Why `S.DocumentSpec` would REFUSE a document of these blocks and this
+    many citations, or "" when it would not. Every number is one of that
+    model's own: `blocks`' max_length, `_shape`'s prose sum against
+    `T.MAX_TEXT_CHARS`, and `sources`' max_length.
+
+    It has to be answerable BEFORE the document is assigned, because
+    `body.blocks = ...` is not re-validated by pydantic — `_Strict` sets only
+    extra="forbid" and str_strip_whitespace. A document over a limit therefore
+    fails nowhere near here: it fails in `render/worker.py`'s
+    `S.load(job["spec"])` as "The render job could not be read.", and the
+    person gets no file at all. Measured 2026-09-28 on a 20-section request
+    with a 390-block draft behind it: the repair spliced 420 blocks and
+    `S.load` refused it with "List should have at most 400 items after
+    validation, not 420".
+    """
+    held, prose = _document_shape(blocks)
+    if held > DOCUMENT_BLOCK_CEILING:
+        return f"{held} blocks, the ceiling is {DOCUMENT_BLOCK_CEILING}"
+    if prose > T.MAX_TEXT_CHARS:
+        return f"{prose} characters of prose, the ceiling is {T.MAX_TEXT_CHARS}"
+    if sources > DOCUMENT_SOURCE_CEILING:
+        return f"{sources} citations, the ceiling is {DOCUMENT_SOURCE_CEILING}"
+    return ""
 
 
 def _long_document_note(target: LengthTarget, sections: int, calls: int) -> str:
@@ -1445,13 +1478,19 @@ def _place_sections(blocks: Sequence[Any], requested: Sequence[str],
 
 
 def _section_blocks_for_spec(req: ComposeRequest, body: S.DocumentSpec,
-                             blocks: Sequence[Any]) -> Optional[List[Any]]:
+                             blocks: Sequence[Any]) -> Optional[Tuple[List[Any], List[Any]]]:
     """One section's raw blocks as validated block models, ready to splice
-    into `body`, or None when they do not validate.
+    into `body`, WITH the citations the document's manifest would have to
+    grow by to keep them legal — or None when they do not validate.
+
+    It returns those citations rather than appending them itself. Appending
+    is a decision about the WHOLE document (`DocumentSpec.sources` has a
+    max_length of its own, and a section that is refused for length must not
+    leave its references behind in the manifest), and the caller is the only
+    place that can see the whole document.
 
     The citations go through `_reconcile_sources` like every other model
-    answer — a section may not invent a reference either — and a source it
-    legitimately cites is added to the document's own manifest so
+    answer — a section may not invent a reference either — so that
     `_check_source_refs` still holds for the spliced document.
     """
     raw_blocks = [b for b in blocks if isinstance(b, dict)]
@@ -1473,11 +1512,12 @@ def _section_blocks_for_spec(req: ComposeRequest, body: S.DocumentSpec,
                  S.validation_summary(exc).replace("\n", " | ")[:300])
         return None
     known = {c.id for c in body.sources}
+    fresh: List[Any] = []
     for c in parsed.sources:
         if c.id not in known:
-            body.sources.append(c)
+            fresh.append(c)
             known.add(c.id)
-    return list(parsed.blocks)
+    return list(parsed.blocks), fresh
 
 
 async def _write_missing_sections(
@@ -1512,6 +1552,11 @@ async def _write_missing_sections(
     body = spec.body
     if not isinstance(body, S.DocumentSpec):
         return 0, []
+    # What the person already has. A coverage repair may only ADD, so the
+    # draft is worth more than the sections it lacks: if the repaired
+    # document turns out to be one `S.DocumentSpec` refuses, this is what
+    # goes back (see the re-validation after the loop).
+    kept_blocks, kept_sources = list(body.blocks), list(body.sources)
     plan = outline_json if isinstance(outline_json, dict) else {}
     planned = {str(s.get("heading") or "").strip().casefold(): s
                for s in (plan.get("sections") or []) if isinstance(s, dict)}
@@ -1531,12 +1576,11 @@ async def _write_missing_sections(
             warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
                             "the time this job is allowed ran out")
             break
-        # THE RENDERER'S CEILING, BEFORE THE CALL THAT WOULD CROSS IT. The
-        # sectioned writer stops at the same two numbers by dropping whole
-        # sections off the end; a repair may only ADD, so it stops instead.
-        # Without this the splice goes straight onto `body.blocks`, which
-        # pydantic does not re-validate on assignment, and a document past
-        # `S.DocumentSpec`'s own limits reaches the renderer.
+        # A MODEL CALL NOT WORTH MAKING, not the guard. The document is
+        # already AT one of the renderer's ceilings, so nothing this call
+        # could return would fit; the guard that decides what is admitted is
+        # `_over_document_limits` below, AFTER the section exists, because a
+        # section is many blocks and this test cannot know how many.
         held, prose = _document_shape(list(body.blocks)
                                       + [b for run in new.values() for b in run])
         if held >= DOCUMENT_BLOCK_CEILING or prose >= T.MAX_TEXT_CHARS:
@@ -1573,10 +1617,39 @@ async def _write_missing_sections(
         if placed is None:
             warnings.append(f"the section \u201c{phrase}\u201d could not be added to the document")
             continue
-        new[index.get(phrase, len(requested) + n)] = placed
+        section_blocks, section_sources = placed
+        # THE GUARD, WITH THIS SECTION COUNTED IN. A section is many blocks
+        # and several citations; testing the document without it can only be
+        # an optimisation (above). `S.DocumentSpec` is not re-validated when
+        # `body.blocks` is assigned, so a section admitted past a ceiling
+        # here is a document the renderer refuses and a person with no file —
+        # strictly worse than the truncated one they would have had.
+        over = _over_document_limits(
+            list(body.blocks) + [b for run in new.values() for b in run] + section_blocks,
+            len(body.sources) + len(section_sources))
+        if over:
+            log.info("artifact compose: the coverage repair stopped before \u201c%s\u201d: the document "
+                     "would have had %s", phrase[:60], over)
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the document is already as long as the file format allows")
+            break
+        body.sources.extend(section_sources)
+        new[index.get(phrase, len(requested) + n)] = section_blocks
         written.append(phrase)
     if new:
         body.blocks = _place_sections(body.blocks, requested, new)
+        # THE MODEL ITSELF, ONCE PER JOB, not this module's reading of it.
+        # Everything above is arithmetic over `S.DocumentSpec`'s numbers, and
+        # arithmetic drifts from a schema; `render/worker.py` line 71 runs
+        # `S.load(job["spec"])` and there is no warning left to give by then.
+        # A repair that costs the person their file is undone instead.
+        try:
+            S.DocumentSpec.model_validate(body.model_dump(mode="json"))
+        except ValidationError as exc:
+            log.warning("artifact compose: the coverage repair was undone, the repaired document did "
+                        "not validate: %s", S.validation_summary(exc).replace("\n", " | ")[:300])
+            body.blocks, body.sources = kept_blocks, kept_sources
+            warnings.append("the requested sections could not be added to the document")
     if paced:
         # Accounting, not a decision: `compose_sectioned` already puts the
         # wait on the card, and a second "waited Ns" line would only crowd
@@ -1736,12 +1809,14 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
                  and target.words > SECTIONED_WRITER_WORDS
                  and (target.explicit or budget.outline_pass))
     ran_out_of_time = False
-    # Where the long-document note sits in `result_warnings`, and what the
-    # sectioned writer spent: the coverage repair below adds sections and
-    # model calls AFTER the note is written, and the note has to end up
-    # describing the file that was delivered (`_long_document_note`).
-    # Nothing between here and there removes a warning, only appends.
-    note_at = -1
+    # What the sectioned writer spent. The coverage repair below adds
+    # sections and model calls AFTER the long-document note is written, and
+    # the note has to end up describing the file that was DELIVERED
+    # (`_long_document_note`), so it is rewritten in place down there.
+    # It is found by its own prefix rather than by the index it was appended
+    # at: an index would be a standing bet that nothing ever inserts ahead of
+    # it, and the cost of losing that bet is somebody else's warning
+    # overwritten with this one. There is exactly one note per job.
     sect_calls = 0
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
@@ -1753,7 +1828,6 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         # person was never told their wording had bought it. It goes FIRST
         # so the answer's two-warning clause carries it (engines/
         # artifact.py::_warning_clause).
-        note_at = len(result_warnings)
         result_warnings.append(
             _long_document_note(target, _top_sections(raw.get("blocks") or ()), sect_calls))
         result_warnings.extend(sect_warnings)
@@ -1889,6 +1963,8 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
                 corrections += 1
                 # The card now describes the repaired file, not the plan.
                 sect_calls += repair_calls
+                note_at = next((i for i, w in enumerate(result_warnings)
+                                if w.startswith(LONG_DOCUMENT_NOTE)), -1)
                 if note_at >= 0:
                     result_warnings[note_at] = _long_document_note(
                         target, _top_sections(getattr(spec.body, "blocks", ())), sect_calls)

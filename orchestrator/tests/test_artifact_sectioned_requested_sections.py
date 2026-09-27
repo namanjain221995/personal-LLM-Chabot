@@ -16,9 +16,11 @@ sf-local-ai-orchestrator-1 on 2026-09-27:
     'none skipped' line present? system: False | user: False
     SECTION WRITER prompt: limit line: 'at most 8 top-level sections'
 
-The model was told EIGHT, twice, for a request that numbered fifteen — and
-`_requested_line`, which carries "none skipped, none merged into another, none renamed"
-and the fifteen names, never reached this path at all.
+The model was told EIGHT, twice, for a request that numbered fifteen. The
+names themselves were in the call — they are inside the raw request text the
+prompt carries — but `_requested_line`, the sentence that says "none skipped,
+none merged into another, none renamed", never reached this path at all, and
+that sentence is the contract. The tests below assert on that marker.
 
 The second half of the file is the coverage repair. A sectioned draft that
 misses sections used to be repaired by ONE whole-document `_compose_once`
@@ -31,8 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-
-import pytest
+import types as _pytypes
 
 from app import llm
 from app.artifacts import compose as C
@@ -223,6 +224,19 @@ def test_every_section_call_of_a_sectioned_document_carries_the_requested_sectio
         assert _limit_line(c["system"]) == "Limits: at most 17 top-level sections", _limit_line(c["system"])
         assert "none skipped, none merged into another, none renamed" in c["user"]
         assert "none skipped" not in c["system"], "the names stay out of the system message"
+        # WHY THE OUTPUT WAS FLAT. `_requested_line` carries the section
+        # names AND the mapping from the request's words to the schema's own
+        # block vocabulary, and it is one string: a section call without it
+        # gets neither. Measured on the owner's request against the pinned
+        # engine 2026-09-28 — origin/dev ff1a5d7c delivered 0 bullets blocks,
+        # 0 numbered and 0 callouts in 103 blocks; this branch delivered 18
+        # bullets, 7 numbered and 3 callouts in 106 blocks on the same
+        # request (and 18 / 4 / 9 on a second sample).
+        for vocabulary in ("a bullets block for an enumeration",
+                           "a numbered block for a sequence of steps",
+                           "a table where things are compared",
+                           "sub-headings at LEVEL 2"):
+            assert vocabulary in c["user"], vocabulary
     # It still writes ONE section: the one-section instruction is in the
     # prompt and `_as_section` is the code that holds the answer to it.
     assert "YOU ARE WRITING ONE SECTION" in section_calls[0]["system"]
@@ -279,9 +293,6 @@ def test_the_repair_puts_a_missing_section_where_the_request_asked_for_it(monkey
     """A section missing from the MIDDLE goes back in its own place, not at
     the end — and the blocks around it keep their order and their bytes."""
     req = _req()
-    requested = C.requested_sections(req.instruction)
-    target = C.target_for(req)
-    keep = [h for h in FIFTEEN_SECTIONS if h != "RAG Pipeline"]
 
     model = _Recorder()
     monkeypatch.setattr(llm, "json_completion", model)
@@ -423,24 +434,349 @@ def test_the_repair_yields_to_live_chat_between_its_sections(monkeypatch):
     assert seen["n"] == 18, f"one pace() per section call, got {seen['n']}"
 
 
+# -------------------------------- the ceilings the renderer cannot survive --
+
+#: Twenty section names with no digit in them, so `requested_sections` reads
+#: all twenty (its own cap) — and twenty is what a 400-block ceiling needs to
+#: be reachable at thirty blocks a section.
+TWENTY_SECTIONS = [
+    "Executive Summary", "Architecture Overview", "Hardware Layer", "Inference Layer",
+    "Backend Architecture", "Frontend Architecture", "Database Architecture",
+    "Retrieval Pipeline", "Authentication", "Security", "Monitoring", "Scaling Strategy",
+    "Failure Recovery", "Performance Optimization", "Cost Model", "Data Governance",
+    "Disaster Planning", "Vendor Comparison", "Migration Path", "Conclusion",
+]
+BIG_INSTRUCTION = (
+    "Create a detailed technical report titled:\n\"Enterprise Local AI Platform\"\n"
+    "Requirements: " + " ".join(f"{i}. {h}" for i, h in enumerate(TWENTY_SECTIONS, 1))
+    + "\nDo not skip any section."
+)
+
+
+def _big_req():
+    return C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
+                            instruction=BIG_INSTRUCTION,
+                            material=C.Material(instruction=BIG_INSTRUCTION))
+
+
+def _fat_section(heading, blocks=30, words=40):
+    """One section as `blocks` blocks — the shape a real 3,000-word-target
+    section came back as on the engine, scaled until the 400-block ceiling is
+    inside reach of the repair."""
+    out = [{"type": "heading", "level": 1, "text": heading}]
+    out += [{"type": "paragraph", "text": " ".join([heading.split()[0].lower()] * words) + f" p{i}"}
+            for i in range(blocks - 1)]
+    return {"blocks": out}
+
+
+class _BigRecorder:
+    """Twenty sections, thirty blocks each, and an outline that plans only
+    `plan_sections` of them — so the draft is 30 * plan_sections blocks and
+    the repair is what walks it into the ceiling."""
+
+    def __init__(self, *, plan_sections=13, blocks_per_section=30, words=40):
+        self.plan_sections = plan_sections
+        self.blocks_per_section = blocks_per_section
+        self.words = words
+        self.calls = []
+
+    def names(self):
+        return [c["name"] for c in self.calls]
+
+    async def __call__(self, messages, *, json_schema=None, schema_name="", temperature=0.0,
+                       max_tokens=None, thinking=False, effort=None):
+        user = "\n\n".join(m["content"] for m in messages[1:])
+        self.calls.append({"name": schema_name, "user": user})
+        if schema_name == "artifact_outline":
+            return json.dumps({"title": "Enterprise Local AI Platform", "audience": "eng",
+                               "purpose": "the platform",
+                               "sections": [{"heading": h, "purpose": "x", "elements": ["paragraphs"]}
+                                            for h in TWENTY_SECTIONS[: self.plan_sections]],
+                               "needs_current_facts": False, "assumptions": []})
+        if schema_name == "artifact_section_write":
+            heading = next((h for h in TWENTY_SECTIONS if f"\u201c{h}\u201d" in user), TWENTY_SECTIONS[0])
+            return json.dumps(_fat_section(heading, self.blocks_per_section, self.words))
+        if schema_name == "artifact_document":
+            return json.dumps({"title": "Enterprise Local AI Platform", "template_id": "generic",
+                               "blocks": [b for h in TWENTY_SECTIONS for b in _fat_section(h, 4)["blocks"]],
+                               "sources": [], "assumptions": []})
+        return json.dumps({"ok": True, "issues": []})
+
+
 def test_the_repair_stops_at_the_ceiling_the_file_format_allows(monkeypatch):
     """A repair may only ADD, so it stops at the document ceiling instead of
     dropping sections off the end the way the sectioned writer does.
 
-    It matters because the splice assigns straight to `body.blocks`, and
-    pydantic does not re-validate on assignment: without this the document
-    handed to the renderer can be one `S.DocumentSpec` would refuse.
+    THIS IS THE REGRESSION GUARD, at the REAL ceiling, not a patched one.
+    `body.blocks = ...` is an assignment and pydantic does not re-validate an
+    assignment (`_Strict` sets extra="forbid" and str_strip_whitespace and
+    nothing else), so a section admitted past `DocumentSpec.blocks`'
+    max_length is not refused here — it is refused in `render/worker.py`'s
+    `S.load(job["spec"])`, as "The render job could not be read.", and the
+    person gets NO file. Measured on 2026-09-28 with the ceiling tested only
+    BEFORE each section call: a 390-block 13-section draft, one more
+    30-block section admitted, 420 blocks, and both
+    `DocumentSpec.model_validate` and `S.load` refused it with "List should
+    have at most 400 items after validation, not 420". The truncated file the
+    person would have had is worth more than the section that costs it.
     """
-    # Four blocks a section, so the ceiling falls in the middle of the repair.
-    monkeypatch.setattr(C, "DOCUMENT_BLOCK_CEILING", 20)
-    req, model, seen, result = _compose_with_a_short_plan(monkeypatch)
+    assert C.DOCUMENT_BLOCK_CEILING == 400 == S.DocumentSpec.model_fields["blocks"].metadata[-1].max_length
+    model = _BigRecorder(plan_sections=13)
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    seen = {}
+    original = C._write_missing_sections
+
+    async def spy(*a, **kw):
+        seen["before"] = [b.model_dump(mode="json") for b in a[3].body.blocks]
+        return await original(*a, **kw)
+
+    monkeypatch.setattr(C, "_write_missing_sections", spy)
+    result = asyncio.run(C.compose(_big_req()))
 
     blocks = list(result.spec.body.blocks)
-    assert len(blocks) < 20 + 8, f"the repair ran past the ceiling: {len(blocks)} blocks"
+    assert len(seen["before"]) == 390, f"the draft this exercises must be near the ceiling: {len(seen['before'])}"
+    assert len(blocks) <= C.DOCUMENT_BLOCK_CEILING, f"the repair ran past the ceiling: {len(blocks)} blocks"
     assert any("the document is already as long as the file format allows" in w
                for w in result.warnings), result.warnings
     # What it could not add is still named, not silently dropped.
     left = next(w for w in result.warnings if w.startswith("requested sections not found"))
     assert "Conclusion" in left, left
-    # And what it delivered is a document the schema still accepts.
+    # The draft is untouched: a refused section leaves nothing behind.
+    assert json.dumps([b.model_dump(mode="json") for b in blocks]) == json.dumps(seen["before"])
+    # And what it delivered survives BOTH reads that stand between the
+    # composer and a file: the body's own schema, and the envelope
+    # `render/worker.py` loads.
     S.DocumentSpec.model_validate(result.spec.body.model_dump(mode="json"))
+    S.load(json.loads(result.spec.model_dump_json()))
+
+
+def _document(blocks, sources=()):
+    """An `ArtifactSpec` around a hand-built document, the shape
+    `_write_missing_sections` mutates."""
+    return S.ArtifactSpec.model_validate({
+        "kind": "document",
+        "document": {"title": "Enterprise Local AI Platform", "template_id": "generic",
+                     "blocks": blocks, "sources": list(sources)}})
+
+
+async def _repair(req, spec, missing, requested, *, deadline_s=600.0, plan=None):
+    async def say(pct, detail):
+        return None
+
+    return await C._write_missing_sections(
+        req, T.EFFORT_BUDGETS["fast"], C.target_for(req), spec, plan or {"sections": []},
+        missing, requested, say=say, deadline=C.time.monotonic() + deadline_s)
+
+
+def test_the_repair_stops_at_the_prose_ceiling_the_file_format_allows(monkeypatch):
+    """The other half of the same ceiling, at the real `T.MAX_TEXT_CHARS`.
+
+    `DocumentSpec._shape` sums every block's text and refuses the document
+    over 200,000 characters. Measured 2026-09-28 with the test before the
+    call: 197,811 characters of draft, one section admitted, 200,816 — refused
+    with "document prose is 200816 characters; the ceiling is 200000".
+    """
+    assert T.MAX_TEXT_CHARS == 200_000
+    req = _big_req()
+    requested = C.requested_sections(req.instruction)
+    body_blocks = []
+    for h in TWENTY_SECTIONS[:19]:
+        body_blocks.append({"type": "heading", "level": 1, "text": h})
+        # 5,200 twice, not 10,400 once: `Paragraph.text` is max_length=6000,
+        # so a draft near the prose ceiling is many paragraphs by construction.
+        body_blocks += [{"type": "paragraph", "text": "x" * 5_200}] * 2
+    spec = _document(body_blocks)
+    before = sum(len(b.text) for b in spec.body.blocks)
+    assert 190_000 < before < T.MAX_TEXT_CHARS, before
+
+    model = _BigRecorder(plan_sections=19, blocks_per_section=2, words=500)
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    calls, warnings = asyncio.run(_repair(req, spec, ["Conclusion"], requested))
+
+    assert calls == 1, "the section was written, then refused for length"
+    prose = sum(len(getattr(b, "text", "") or "") for b in spec.body.blocks)
+    assert prose <= T.MAX_TEXT_CHARS, f"the repair ran past the prose ceiling: {prose}"
+    assert prose == before, "a refused section leaves nothing behind"
+    assert any("as long as the file format allows" in w for w in warnings), warnings
+    S.DocumentSpec.model_validate(spec.body.model_dump(mode="json"))
+
+
+def test_the_repair_stops_at_the_citation_ceiling_the_file_format_allows(monkeypatch):
+    """The third of `DocumentSpec`'s own limits: `sources` is
+    Field(max_length=60), and the repair GROWS that manifest — a section may
+    cite a source the draft never did. It is the same unvalidated-assignment
+    class as the block ceiling and it stops at the same kind of number.
+    """
+    assert C.DOCUMENT_SOURCE_CEILING == 60 == S.DocumentSpec.model_fields["sources"].metadata[-1].max_length
+    material = C.Material(
+        instruction=BIG_INSTRUCTION,
+        sources=[C.Source(id=f"s{i:02d}", title=f"Source {i}", text=f"body {i}", url=f"https://e.test/{i}")
+                 for i in range(66)])
+    req = C.ComposeRequest(kind="document", formats=["pdf"], template_id="generic", effort="fast",
+                           instruction=BIG_INSTRUCTION, material=material)
+    requested = C.requested_sections(req.instruction)
+    # `Paragraph.sources` is max_length=8, so fifty-eight citations are
+    # fifty-eight citations across eight paragraphs, not one impossible block.
+    draft = [{"type": "heading", "level": 1, "text": "Executive Summary"}]
+    draft += [{"type": "paragraph", "text": f"the draft already leans on these, batch {n}",
+               "sources": [f"s{i:02d}" for i in range(n * 8, min(58, n * 8 + 8))]}
+              for n in range(8)]
+    spec = _document(draft, sources=[{"id": f"s{i:02d}", "title": f"Source {i}",
+                                      "url": f"https://e.test/{i}"} for i in range(58)])
+    assert len(spec.body.sources) == 58
+
+    class _Citing:
+        async def __call__(self, messages, *, json_schema=None, schema_name="", temperature=0.0,
+                           max_tokens=None, thinking=False, effort=None):
+            return json.dumps({"blocks": [
+                {"type": "heading", "level": 1, "text": "Conclusion"},
+                {"type": "paragraph", "text": "and this one cites four the draft never did",
+                 "sources": [f"s{i:02d}" for i in range(58, 62)]}]})
+
+    monkeypatch.setattr(llm, "json_completion", _Citing())
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    calls, warnings = asyncio.run(_repair(req, spec, ["Conclusion"], requested))
+
+    assert calls == 1
+    assert len(spec.body.sources) <= C.DOCUMENT_SOURCE_CEILING, len(spec.body.sources)
+    assert len(spec.body.sources) == 58, "a refused section leaves its references behind nowhere"
+    assert len(spec.body.blocks) == 9, "and no blocks either"
+    assert any("as long as the file format allows" in w for w in warnings), warnings
+    S.DocumentSpec.model_validate(spec.body.model_dump(mode="json"))
+
+
+def test_a_repair_the_arithmetic_let_through_is_undone_rather_than_shipped(monkeypatch):
+    """The last line of defence: the schema itself, once per job.
+
+    Everything above is this module's arithmetic over `DocumentSpec`'s
+    numbers, and arithmetic drifts from a schema. So the repaired document is
+    re-validated before it is kept, and a repair that would cost the person
+    their file is undone — they keep the draft they had. This test breaks the
+    arithmetic on purpose (`_over_document_limits` always says "fits") to
+    prove the schema still stops it.
+    """
+    req = _big_req()
+    requested = C.requested_sections(req.instruction)
+    spec = _document([b for h in TWENTY_SECTIONS[:13] for b in _fat_section(h, 30)["blocks"]])
+    before = json.dumps([b.model_dump(mode="json") for b in spec.body.blocks])
+    assert len(spec.body.blocks) == 390
+
+    monkeypatch.setattr(C, "_over_document_limits", lambda blocks, sources: "")
+    model = _BigRecorder(plan_sections=13)
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    calls, warnings = asyncio.run(_repair(req, spec, ["Cost Model", "Conclusion"], requested))
+
+    assert calls >= 1
+    assert json.dumps([b.model_dump(mode="json") for b in spec.body.blocks]) == before, \
+        "a repair that does not validate must leave the draft exactly as it was"
+    assert any("could not be added to the document" in w for w in warnings), warnings
+    S.DocumentSpec.model_validate(spec.body.model_dump(mode="json"))
+    S.load(json.loads(spec.model_dump_json()))
+
+
+# ------------------------------------ the two bounds that had no guard at all --
+
+
+def test_the_repair_stops_when_the_stage_clock_runs_out(monkeypatch):
+    """The only bound on up to twenty extra section calls.
+
+    `requested_sections` caps at 20, so a repair can ask the engine for
+    twenty more sections back to back inside the compose stage's own wall
+    clock. Without this check the stage timeout fires and the WHOLE job is
+    lost — the draft included. The clock here is a fake one the section
+    writer advances, so the test measures the loop rather than the machine.
+    """
+    req = _big_req()
+    requested = C.requested_sections(req.instruction)
+    spec = _document([{"type": "heading", "level": 1, "text": "Executive Summary"},
+                      {"type": "paragraph", "text": "the draft"}])
+    now = {"t": 1_000.0}
+    monkeypatch.setattr(C, "time", _pytypes.SimpleNamespace(monotonic=lambda: now["t"]))
+
+    class _Slow:
+        def __init__(self):
+            self.n = 0
+
+        async def __call__(self, messages, *, json_schema=None, schema_name="", temperature=0.0,
+                           max_tokens=None, thinking=False, effort=None):
+            self.n += 1
+            now["t"] += 40.0     # each section costs forty seconds of the stage
+            user = "\n\n".join(m["content"] for m in messages[1:])
+            heading = next((h for h in TWENTY_SECTIONS if f"\u201c{h}\u201d" in user), TWENTY_SECTIONS[0])
+            return json.dumps(_fat_section(heading, 3))
+
+    model = _Slow()
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    missing = TWENTY_SECTIONS[1:]
+    # Room for two forty-second sections and the reserve, not nineteen: the
+    # loop tests `now + SECTION_RESERVE_S >= deadline` before each call, so
+    # the third test is 1080 + 60 >= 1140 and the third call is not made.
+    calls, warnings = asyncio.run(_repair(req, spec, missing, requested,
+                                          deadline_s=C.SECTION_RESERVE_S + 2 * 40.0))
+
+    assert model.n == calls == 2, f"the loop bought {calls} sections against a 2-section clock"
+    assert any("the time this job is allowed ran out" in w for w in warnings), warnings
+    assert any(w.startswith(f"{len(missing) - 2} of the requested sections") for w in warnings), warnings
+    # The two it did buy are in the document, in the order the request named.
+    heads = [b.text for b in spec.body.blocks if isinstance(b, S.Heading) and int(b.level) == 1]
+    assert heads == TWENTY_SECTIONS[:3], heads
+    # And an already-spent clock buys nothing at all, rather than one more call.
+    spent = _document([{"type": "heading", "level": 1, "text": "Executive Summary"}])
+    calls2, warnings2 = asyncio.run(_repair(req, spent, missing, requested, deadline_s=0.0))
+    assert calls2 == 0, "a stage with no time left does not start a section call"
+    assert any("the time this job is allowed ran out" in w for w in warnings2), warnings2
+
+
+def test_the_card_counts_the_sections_delivered_when_the_writer_STOPPED_early(monkeypatch):
+    """The first `_long_document_note` call, which the coverage repair never
+    reaches: a writer that ran out of time is not repaired, so the note it
+    wrote is the note the person reads.
+
+    Measured 2026-09-28 with the plan count restored in its place
+    (`len(outline_json["sections"]) or 1`): a fifteen-section plan, ONE
+    section in the file, and a card that said "written in 15 sections". This
+    is the same defect as the post-repair rewrite — our arithmetic quoted
+    back at him as his request — one branch earlier in the same function.
+    """
+    req = _req()
+    model = _Recorder(plan_sections=15)
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(llm, "get_finish_reason", lambda: "stop")
+    monkeypatch.setattr(C, "_stage_budget_s", lambda: 1.0)
+    result = asyncio.run(C.compose(req))
+
+    delivered = [b.text for b in result.spec.body.blocks
+                 if isinstance(b, S.Heading) and b.level == 1]
+    assert len(delivered) == 1, delivered
+    note = next(w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE))
+    assert f"written in {len(delivered)} sections over 2 model calls" in note, note
+    assert "written in 15 sections" not in note, note
+    # The plan really did say fifteen, so this is the delivered count and not
+    # the plan count that happened to agree with it.
+    assert len(model.prompts("artifact_outline")) == 1
+    assert any("the time this job is allowed ran out" in w for w in result.warnings), result.warnings
+    assert T._MODEL_CALLS_RE.search(note) is not None, note
+
+
+def test_rewriting_the_card_does_not_overwrite_another_warning(monkeypatch):
+    """The post-repair rewrite replaces ONE line of `result_warnings`, and
+    which line is decided by the note's own prefix rather than by the index it
+    was appended at. A positional index is a standing bet that nothing ever
+    inserts ahead of it, and losing that bet costs somebody else's warning.
+
+    So: a run whose card carries several warnings, and every one of them
+    except the note comes out of the rewrite untouched.
+    """
+    req, model, seen, result = _compose_with_a_short_plan(monkeypatch)
+    notes = [w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE)]
+    assert len(notes) == 1, result.warnings
+    assert "written in 15 sections over 19 model calls" in notes[0], notes[0]
+    # Every other warning is still a whole warning, not a long-document note
+    # written over the top of one.
+    others = [w for w in result.warnings if w is not notes[0]]
+    assert not any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in others), result.warnings
+    assert result.warnings.index(notes[0]) == 0, "the note still goes first"
