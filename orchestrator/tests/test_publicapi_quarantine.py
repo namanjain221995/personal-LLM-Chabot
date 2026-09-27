@@ -430,8 +430,11 @@ def test_a_sidecar_that_refuses_connections_for_the_whole_grace_fails_retryably(
     # dispatch-to-check latency, 5 with 60 ms. A doubled grace gives 15-17
     # (12/12), so 13 separates them and no wall clock is involved. A time
     # bound here would not: `failed_at - calls[0]` already reaches 0.49 s
-    # unmutated against a 0.8 s mutation, and CI's full-suite heap pauses for
-    # ~0.5 s, so any constant that catches the regression also flakes.
+    # unmutated against a 0.8 s mutation, and a full GC pass over this suite's
+    # heap paused CI for ~0.5 s (see `_no_gc_pause` in test_ocr_classify.py),
+    # so any constant that catches the regression also flakes. That same pause
+    # is why none of these bounds needs `gc.freeze`: it can only widen the two
+    # lower bounds and shrink the count.
     assert len(calls) <= 13
     row = durable_store.get_run(router_spec.response_id)
     assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
