@@ -465,6 +465,11 @@ async def _count_beside_the_send(base_url: str, model: str, msgs: list):
     verdict is returned here and written back by `settle_pending_count` in
     the caller's own context instead.
     """
+    # Redundant today, and deliberately kept: `count_tokens` sets this var on
+    # BOTH of its exits (True after a successful parse, False in its except
+    # branch), so measured 2026-09-28 removing this line leaves the suite
+    # green. It makes the returned verdict describe THIS call even if a future
+    # count path ever returns without setting it.
     _last_count_exact.set(False)
     count, served_window = await count_tokens(base_url, model, msgs)
     return int(count), served_window, bool(_last_count_exact.get())
@@ -501,11 +506,28 @@ def _may_send_first(
     5. Every message is a plain `{role, content}` text turn. Neither
        `estimate_messages` nor `upper_bound_messages` counts `tool_calls`
        arguments at all — an assistant message with `content=None` and
-       120,000 characters of tool arguments bounds at 55 against a real
-       prompt of ~30,000 tokens — and image parts, `role: "tool"` turns and
-       any other key the chat template renders are outside what the bound
-       covers. `compaction._certainly_no_compaction` refuses the same shapes
-       for the same reason.
+       120,000 characters of tool arguments bounds at 26, estimate 12
+       (measured 2026-09-28 and asserted in the tests, so the figure cannot
+       drift), against a real prompt of ~30,000 tokens — and image parts,
+       `role: "tool"` turns and any other key the chat template renders are
+       outside what the bound covers.
+       `compaction._certainly_no_compaction` refuses the same shapes for the
+       same reason.
+    6. The ceiling is within the chat surface's LONG_OUTPUT threshold, which
+       is what makes condition 4's "a chat-origin NORMAL ticket charges no
+       KV" true rather than merely true today. `lane_for` returns LONG_OUTPUT
+       on a planned output ABOVE that threshold, and `_admit`'s LONG_OUTPUT
+       branch DOES charge KV from `tokens` — the estimate on this path, which
+       under-counts the real tokenizer by up to 2.3x on control characters.
+       Nothing reaches it from chat today (the chat send passes no
+       `max_tokens`, and the `_planned_max_tokens` that stands in for it is
+       set only by app/publicapi, whose origin condition 4 already excludes),
+       so this changes no live call: `settings.max_output_tokens` is 65,536
+       and the unbounded-thinking entry points floor their ceiling AT it,
+       which is why the test is `<=`, matching `lane_for`'s own `>`. Measured
+       2026-09-28: the largest `max_tokens` any caller in app/ asks for is
+       16,000. The gate tests the property instead of resting on a call site
+       two modules away.
 
     A continuation never reaches here at all: `llm._fit` dispatches to
     `_fit_continuation` before `fit_request` is called.
@@ -532,6 +554,8 @@ def _may_send_first(
     from . import admission  # local: admission imports this module
 
     if admission.current_origin() == admission.ORIGIN_V1:
+        return False
+    if int(ceiling) > admission.chat_long_output_threshold_tokens():
         return False
     return True
 
@@ -560,7 +584,20 @@ async def settle_pending_count(messages: Sequence[dict], base_url: str) -> None:
     except asyncio.CancelledError:
         _discard_count(pending.task)
         raise
-    except Exception:  # pragma: no cover - count_tokens swallows its own
+    except Exception:
+        # `count_tokens` swallows its own failures and returns an estimate, so
+        # nothing here should raise — which is exactly why a bare `return` was
+        # wrong: a genuine bug inside `_count_beside_the_send` would leave
+        # `_measured` None and `_last_count_exact` False for the rest of the
+        # turn with no log, no metric and no way to notice. Logged once, at
+        # WARNING, with the traceback.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "the exact count running beside the send failed; this turn reports "
+            "'not measured' and the next one waits for its count",
+            exc_info=True,
+        )
         return
 
     if served_window and int(served_window) != pending.window:
@@ -570,6 +607,14 @@ async def settle_pending_count(messages: Sequence[dict], base_url: str) -> None:
         # overflow. Having sent first, this call cannot. So the mark is
         # withdrawn: every later call takes the slow path and re-reads the
         # window there, until a fresh successful count vouches for it again.
+        #
+        # The cache write below is BELT AND BRACES, not the thing that heals
+        # the cache: `count_tokens` already wrote this value into the same
+        # module-global dict from inside the count task. Measured 2026-09-28
+        # — removing this line leaves the suite green, including the
+        # assertion that the cache holds 8,192 afterwards — so it is here to
+        # keep the withdrawal self-contained if that write ever becomes
+        # context-local, and NOT because it is untested behaviour.
         _window_cache[base_url] = int(served_window)
         _window_from_server.discard(base_url)
         from . import metrics  # local: keeps this module import-light

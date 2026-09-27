@@ -697,13 +697,50 @@ def _withdraw_window_on_size_refusal(exc: BaseException, base_url: str) -> None:
     the life of the process, whenever the refusal beat the /tokenize answer;
     the blocking path served all four).
 
+    ALL THREE DISPATCH SITES NEED IT. b2ac0a5's commit message recorded that
+    `stream_chat_events` "self-heals by luck" because its `stream_options`
+    re-send gives the count time to land. That is WRONG, and it is why the two
+    streaming sites shipped with no test: measured 2026-09-27 and again
+    2026-09-28 on a tree with this call removed from `stream_chat_events`,
+    four consecutive streamed turns against a shrunken window went
+    BadRequestError x4 with 8 engine calls, 0 /tokenize answers landed and the
+    window still vouched for. The re-send happens on a REFUSED
+    `stream_options`, not on a size refusal, and a size refusal never reaches
+    it. The test that holds this is parametrised over all three sites.
+
     Only for a request that WAS sized send-first (`has_pending_count`): a size
     refusal of a request that counted first says nothing about the window's
     provenance, and must not cost every other endpoint user a round trip.
+
+    COUNTED AND LOGGED HERE, not in `context.forget_server_window`: this is the
+    one place that knows the withdrawal followed a REFUSED turn. The refusal is
+    the only user-visible failure send-first sizing introduces — the blocking
+    path served the same turn — and until 2026-09-28 it was invisible:
+    `context_window_changed_under_send_total` is incremented by
+    `settle_pending_count`, i.e. only when the send SUCCEEDED, so the shrink
+    that costs nobody a turn was counted and the shrink that costs one was not
+    (measured: served window 500,000 -> counter 1; served window 8,192, the
+    turn refused -> counter dict empty). Every turn already dispatched against
+    the same stale window is refused too, so the count is per refused request,
+    not per withdrawal.
+
+    It is NOT rate-limited: the mark is withdrawn on the first refusal, so
+    later turns count first and cannot reach this branch until a fresh
+    successful count vouches for the window again.
     """
     if not context.has_pending_count():
         return
     if isinstance(exc, _bad_request_error()) and _is_size_refusal(exc):
+        metrics.inc(
+            "llm_send_first_refused_on_size_total",
+            "Turns the engine refused on size after being sized send-first against a "
+            "cached window it no longer serves; send-first is withdrawn until a fresh count.",
+        )
+        log.warning(
+            "the engine refused this turn on size (%s: %s) against the window a real count "
+            "had vouched for on %s; sizing will wait for its count again",
+            type(exc).__name__, str(exc)[:200], base_url,
+        )
         context.forget_server_window(base_url)
 
 
