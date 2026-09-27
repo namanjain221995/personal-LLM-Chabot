@@ -8,12 +8,29 @@ prefill on every Fast turn in nine engines, and the only prompt-size budget
 the suite otherwise has (`test_fast_lane_classifier.py`) covers the
 small-talk lane, which skips this string entirely.
 
-THE NUMBER. 1,082 bytes, measured on origin/dev at 593af55 before the roles
-edit of 2026-09-22 and unchanged by it: the ban on `style`, `classDef`,
-`linkStyle`, `click` and `%%{init}%%` became a ban on those PLUS colours and
-hex values, and gained the four role names, paid for by shortening prose
-elsewhere. Raising this ceiling is a decision about Fast latency in nine
-engines and needs the measurement that justifies it, not a bump.
+THE NUMBER, CORRECTED 2026-09-27. It is 1,082 CHARACTERS, not bytes — this
+guard was written as `PRE_EDIT_BYTES` over `len()` of a `str`, which counts
+characters, and the commit message repeated the mistake as "1,082 bytes
+before, 1,082 bytes after". Re-measured on both trees:
+
+    origin/dev 593af55 (and 1f80aa3, which does not touch this file)
+        1,082 characters, 1,086 UTF-8 bytes
+    feat/document-vocabulary
+        1,082 characters, 1,088 UTF-8 bytes
+
+The characters did not move. The BYTES grew by 2, because the roles edit
+spends one more em dash (U+2014, three bytes in UTF-8) than the sentence it
+replaced. Prefill is charged in tokens, and the tokens were measured
+separately at +8 per prompt across the twelve golden fixtures, so the two
+bytes buy nothing and cost nothing — but a guard that names the wrong unit
+is a guard that will mislead the next person to raise it, so both units are
+now pinned, each against its own re-measured number.
+
+WHAT THE EDIT ITSELF WAS: the ban on `style`, `classDef`, `linkStyle`,
+`click` and `%%{init}%%` became a ban on those PLUS colours and hex values,
+and gained the four role names, paid for by shortening prose elsewhere.
+Raising either ceiling is a decision about Fast latency in nine engines and
+needs the measurement that justifies it, not a bump.
 
 WHAT MUST NOT CHANGE, and why each one is here rather than in a comment:
 the one-diagram cap and the "ordinary questions get none" rule are what stop
@@ -29,14 +46,41 @@ from pathlib import Path
 
 from app.engines import DIAGRAM_INSTRUCTION
 
-#: origin/dev 593af55, before feat/document-vocabulary.
-PRE_EDIT_BYTES = 1082
+#: `len()` of a `str` is CHARACTERS. Measured on origin/dev at 593af55,
+#: before feat/document-vocabulary: 1,082.
+PRE_EDIT_CHARS = 1082
+
+#: The same string in UTF-8, measured on the same commit: 1,086. This edit
+#: takes it to 1,088 — two bytes, one extra em dash — so the ceiling is the
+#: RE-MEASURED number and not the old one. It is stated rather than hidden
+#: because the earlier claim was "1,082 bytes before and after", which was
+#: the character count wearing a byte's name.
+PRE_EDIT_UTF8_BYTES = 1086
+UTF8_BYTES_CEILING = 1088
 
 
-def test_the_instruction_did_not_grow():
-    assert len(DIAGRAM_INSTRUCTION) <= PRE_EDIT_BYTES, (
-        f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} bytes, {len(DIAGRAM_INSTRUCTION) - PRE_EDIT_BYTES} more "
-        "than before; it reaches eleven chat call sites at every effort"
+def test_the_instruction_did_not_grow_in_characters():
+    assert len(DIAGRAM_INSTRUCTION) <= PRE_EDIT_CHARS, (
+        f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} characters, {len(DIAGRAM_INSTRUCTION) - PRE_EDIT_CHARS} "
+        "more than before; it reaches eleven chat call sites at every effort"
+    )
+
+
+def test_the_instruction_is_measured_in_the_unit_it_names():
+    """The two units, each against what it really is, so neither can be
+    quoted as the other again. The byte ceiling is the re-measured 1,088, not
+    the 1,086 of origin/dev: the +2 is real and is recorded here rather than
+    asserted away."""
+    chars = len(DIAGRAM_INSTRUCTION)
+    encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
+    assert chars == PRE_EDIT_CHARS
+    assert encoded <= UTF8_BYTES_CEILING, (
+        f"DIAGRAM_INSTRUCTION is {encoded} UTF-8 bytes, over the {UTF8_BYTES_CEILING} measured for this edit"
+    )
+    assert encoded > chars, "this string carries non-ASCII, so the two units are not interchangeable"
+    assert encoded - PRE_EDIT_UTF8_BYTES == 2, (
+        f"the roles edit was measured at +2 UTF-8 bytes over origin/dev; it is now "
+        f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this."
     )
 
 

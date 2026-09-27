@@ -41,11 +41,14 @@ altChunk, OLE object or external image of the upload reaches the new file.
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, List, Optional, Sequence, Tuple
 
 from . import spec as S
 from . import types as T
+
+log = logging.getLogger(__name__)
 
 #: Validator ceilings from spec.py, mirrored so the importer splits instead of
 #: letting pydantic clip (a clipped list item is lost text).
@@ -298,6 +301,15 @@ class _Builder:
             self.blocks.append(S.DiagramBlock(diagram=S.Diagram(**fields)))
             return True
         except Exception:
+            # A LINE, because silence here is indistinguishable from a fence
+            # the grammar refused. `parse_mermaid` returning None is the
+            # ordinary, expected path and stays quiet; an EXCEPTION is a bug
+            # in this module or in spec.Diagram's validation, and it reached
+            # the person as "Diagram omitted" with nothing in the log to say
+            # a diagram had been read and then lost. Not `log.exception`: this
+            # runs per fence on a user-supplied document, so a hostile upload
+            # must not be able to fill the log with tracebacks.
+            log.info("md_import: a mermaid fence parsed but did not build a DiagramBlock", exc_info=False)
             return False
 
     def compact(self) -> None:

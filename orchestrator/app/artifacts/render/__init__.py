@@ -318,10 +318,32 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
             report.chart_files.append(name)
             if not layout.fits:
                 # Said plainly rather than shipped as an unreadable picture.
+                #
+                # ONE DECIMAL, not zero. `:.0f` printed "about 8 pt" for a
+                # 7.53 pt label — the floor the figure had just failed — so
+                # the sentence understated the very problem it exists to
+                # report. Measured on plain TD chains: 7.53 pt read "about
+                # 8 pt", 5.64 pt read "about 6 pt".
+                #
+                # THE ADVICE IS SHAPE-AWARE because landscape only helps the
+                # wide shape. Every diagram that reaches this branch is the
+                # TALL shape — `_split_wide_layers` folds a wide layer, so
+                # width stays inside the box and only depth overflows — and
+                # for a tall figure landscape is measurably worse: a 12-step
+                # chain goes 7.53 -> 5.02 pt and a 24-step chain 3.76 ->
+                # 2.51 pt on the 9.7 x 5.6 in landscape box. Telling the
+                # person to turn the page would send them the wrong way.
+                taller_than_wide = layout.fig_in[1] > layout.fig_in[0]
+                remedy = (
+                    "Splitting it into two diagrams, or describing some of these steps in prose instead, would make it "
+                    "readable — turning the page landscape would make it smaller still, because it is already taller "
+                    "than it is wide."
+                    if taller_than_wide else
+                    "Splitting it into two diagrams, or turning the page landscape, would make it readable."
+                )
                 report.warnings.append(
                     f"The diagram “{diagram.title or 'untitled'}” has more in it than fits one page at a readable "
-                    f"size, so its labels print at about {layout.effective_pt:.0f} pt. Splitting it into two diagrams, or "
-                    "turning the page landscape, would make it readable."
+                    f"size, so its labels print at about {layout.effective_pt:.1f} pt. " + remedy
                 )
 
     # 2. Formats, then 3. preview.pdf. `paths` is keyed role:format:slug

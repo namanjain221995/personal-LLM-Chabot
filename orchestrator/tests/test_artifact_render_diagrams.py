@@ -11,7 +11,15 @@ an assertion:
                   disconnected graph and the 15-node architecture graph all
                   lay out with every node on the page and no two boxes
                   overlapping
-    8 pt floor    `FONT_PT * scale >= 8` for every diagram in the corpus
+    8 pt floor    `FONT_PT * scale >= 8` for every diagram in the corpus,
+                  AND — added 2026-09-27, when the first statement of this
+                  was found to have been generalised past what it covers —
+                  the real bound: the floor is a limit on the laid-out
+                  figure's SIZE, so it holds up to about 11 layers of
+                  one-line labels and 8 of wrapped ones, the 24-node schema
+                  cap is NOT a legibility guarantee (3 of 40 random graphs
+                  at that cap reach 8 pt), and whatever misses the floor
+                  says so in the render report with its real point size
     colour        the four role colours separate under the dataviz
                   validator's all-pairs rule, AND four distinct fills are
                   read back out of the rendered pixels
@@ -230,6 +238,92 @@ def test_a_graph_that_cannot_fit_says_so_rather_than_shrinking_silently():
     assert layout.effective_pt < 8.0
 
 
+def _chain(n: int, label: str = "Step") -> S.Diagram:
+    """The shape DIAGRAM_INSTRUCTION licenses by name: a multi-step process."""
+    return diagram(
+        [{"id": f"s{i}", "label": f"{label} {i}", "kind": "service"} for i in range(n)],
+        [{"source": f"s{i}", "target": f"s{i+1}"} for i in range(n - 1)],
+    )
+
+
+def test_the_eight_point_floor_is_bounded_by_depth_not_by_node_count():
+    """WHAT THE FLOOR REALLY COVERS, and why this test exists.
+
+    The first statement of the floor was "every diagram in the corpus >= 8 pt"
+    (true) generalised to "the largest diagram the schema allows still fits at
+    8.7 pt" (not true — 8.7 pt is one random seed's value). Re-measured
+    2026-09-27: of 40 random graphs at exactly the 24-node / 40-edge cap, 3
+    reach 8 pt and 37 do not, and the worst is 5.19 pt.
+
+    The real bound is the SIZE of the laid-out figure — at most 7.48 in wide
+    and 9.97 in tall, the page box divided by 8.0/9.5. `_split_wide_layers`
+    keeps WIDTH inside that; nothing keeps HEIGHT inside it, so the bound in
+    practice is DEPTH. This test pins that, in both directions, so nobody
+    reads the node cap as a legibility guarantee again — and so that a later
+    depth fold, which is the missing capability, announces itself here by
+    making the second half fail.
+    """
+    # Shallow is safe whatever the node count: 24 nodes wide, 2 layers deep.
+    wide = diagram(
+        [{"id": f"w{i}", "label": f"Step {i}", "kind": "service"} for i in range(24)],
+        [{"source": "w0", "target": f"w{i}"} for i in range(1, 24)],
+    )
+    wide_layout = D.layout_diagram(wide)
+    assert wide_layout.fits, f"24 shallow nodes lay out at {wide_layout.effective_pt:.2f} pt"
+    assert wide_layout.fig_in[0] <= 7.49, "the wide-layer split is what keeps width inside the bound"
+
+    # Deep is not, at a THIRD of that node count. 8 nodes is not a big graph.
+    deep = D.layout_diagram(_chain(14))
+    assert not deep.fits, f"a 14-step chain lays out at {deep.effective_pt:.2f} pt"
+    assert deep.effective_pt < D.MIN_EFFECTIVE_PT
+    assert deep.fig_in[1] > 9.97, "it is the HEIGHT that overflows, not the width"
+    assert deep.fig_in[0] <= 7.49
+
+    # The boundary is between 11 and 14 layers of short one-line labels
+    # (measured: 11 -> 8.21 pt, 12 -> 7.53 pt). Asserted as a crossing rather
+    # than an exact layer so a matplotlib metrics change moves it without
+    # turning this into a false alarm.
+    assert D.layout_diagram(_chain(11)).fits
+    pts = [D.layout_diagram(_chain(n)).effective_pt for n in range(11, 15)]
+    assert pts == sorted(pts, reverse=True), f"deeper must never print larger: {pts}"
+
+
+def test_at_least_one_graph_inside_the_schema_cap_fails_the_floor_and_admits_it():
+    """The claim under test is not "everything fits" — it is "nothing lies".
+
+    A graph the schema accepts can miss the floor, and when it does the only
+    acceptable behaviour is to say so. Over the 40 seeds measured, 37 miss it;
+    this walks them until it finds one and checks the flag and the number
+    agree, so a future change cannot start shipping a 5 pt label with
+    fits=True.
+    """
+    misses = []
+    for seed in range(12):
+        layout = D.layout_diagram(_random_graph_at_the_schema_cap(seed))
+        if not layout.fits:
+            misses.append((seed, round(layout.effective_pt, 2)))
+            assert layout.effective_pt < D.MIN_EFFECTIVE_PT
+    assert misses, "expected a 24-node/40-edge graph inside the schema cap to miss the 8 pt floor"
+
+
+def test_landscape_does_not_rescue_a_deep_diagram():
+    """Why the warning no longer offers it for the tall shape.
+
+    Every diagram that misses the floor is the TALL shape, because width is
+    already folded. On the 9.7 x 5.6 in landscape box a tall figure gets
+    SMALLER, measured: a 12-step chain 7.53 -> 5.02 pt, a 24-step chain
+    3.76 -> 2.51 pt. Advice that sends the person the wrong way is worse than
+    no advice, so this pins the direction of the effect.
+    """
+    for n in (12, 16, 24):
+        portrait = D.layout_diagram(_chain(n), box_in=D.PORTRAIT_BOX_IN)
+        landscape = D.layout_diagram(_chain(n), box_in=D.LANDSCAPE_BOX_IN)
+        assert not portrait.fits and not landscape.fits
+        assert landscape.effective_pt < portrait.effective_pt, (
+            f"{n}-step chain: landscape {landscape.effective_pt:.2f} pt vs portrait {portrait.effective_pt:.2f} pt"
+        )
+
+
 # ---------------------------------------------------------------- colour --
 
 
@@ -378,6 +472,94 @@ def test_a_fence_with_one_node_or_no_edges_is_not_a_diagram():
     assert D.parse_mermaid("") is None
 
 
+# The two grammar defects the 2026-09-22 verifiers found by hand, fixed
+# 2026-09-27. Both were measured on real model output before the fix.
+
+
+def test_a_bare_direction_line_is_read_as_a_direction_not_drawn_as_a_box():
+    """In mermaid, `flowchart` on its own is legal and means `flowchart TD`.
+
+    THE DEFECT: `_DIR_RE` required a direction, so a bare `flowchart` line
+    failed it, failed `_EDGE_RE`, and then MATCHED `_DECL_RE`, which reads a
+    bare word as a node id. The word "flowchart" became a box in the picture,
+    beside the real graph. That is worse than refusing: this module promises
+    that a source it cannot read falls back to the callout and NEVER to a
+    wrong drawing, and here it read the source wrong and drew.
+    """
+    for head in ("flowchart", "graph", "FLOWCHART", "graph;"):
+        fields = D.parse_mermaid(f'{head}\n  A["Ingest"] --> B["Index"]\n')
+        assert fields is not None, head
+        assert fields["direction"] == "TD", head
+        assert [n["id"] for n in fields["nodes"]] == ["A", "B"], (head, fields["nodes"])
+        assert not any(n["id"].lower() in ("flowchart", "graph") for n in fields["nodes"]), head
+
+    # The explicit forms are unchanged.
+    assert D.parse_mermaid('flowchart LR\n  A["a"] --> B["b"]\n')["direction"] == "LR"
+    assert D.parse_mermaid('graph BT\n  A["a"] --> B["b"]\n')["direction"] == "TD"
+
+
+@pytest.mark.parametrize("line,label,style", [
+    ('C -- Yes --> D["Tier 1"]', "Yes", "solid"),
+    ('C -- "Yes" --> D["Tier 1"]', "Yes", "solid"),
+    ('C --Yes--> D["Tier 1"]', "Yes", "solid"),
+    ('C -- retry --- D["Tier 1"]', "retry", "solid"),
+    ('C -. on miss .-> D["Tier 1"]', "on miss", "dashed"),
+    ('C -. on miss .- D["Tier 1"]', "on miss", "dashed"),
+    ('C == bulk ==> D["Tier 1"]', "bulk", "solid"),
+    ('C -- Yes --> D["Tier 1"]:::store', "Yes", "solid"),
+])
+def test_the_edge_label_inside_the_arrow_is_read_instead_of_losing_the_diagram(line, label, style):
+    """`A -- Yes --> B` is mermaid's other legal edge label, and it is what
+    models write.
+
+    THE DEFECT, and why it mattered more than it looks: the grammar accepted
+    only `A -->|"Yes"| B`, so this line made `parse_mermaid` refuse the WHOLE
+    source, md_import fell back to the "Diagram omitted" callout, and the
+    person got the exact defect this track exists to close. The model had
+    broken no rule the prompt states — it put one statement on the line and
+    quoted its node labels. Measured over real model output: 2 of 7 diagrams
+    were lost to this shape, on the old prompt and the new one alike.
+    """
+    fields = D.parse_mermaid(f'flowchart TD\n  A["Ticket"] --> C["Triage"]\n  {line}\n')
+    assert fields is not None, f"the whole source was refused for: {line}"
+    edge = fields["edges"][1]
+    assert (edge["source"], edge["target"]) == ("C", "D")
+    assert edge["label"] == label
+    assert edge["style"] == style
+    # It still becomes a real Diagram, not just a dict.
+    d = S.Diagram(**fields)
+    assert [n.id for n in d.nodes] == ["A", "C", "D"]
+
+
+@pytest.mark.parametrize("line", [
+    # An arrow with no tail is not an edge; it must still refuse the source.
+    'A["T"] -- B["Q"]',
+    'A["T"] -. B["Q"]',
+    # A mid-label may not smuggle a pipe or a quote past the closed grammar.
+    'A["T"] -- a|b --> B["Q"]',
+    # Nor an unbounded label: the cap is 120 characters, as it is for `|...|`.
+    'A["T"] -- ' + "x" * 121 + ' --> B["Q"]',
+    # Nor a directive dressed as a label.
+    'A["T"] -- fill:#f00 --> B["Q"]:::x fill:#f00',
+])
+def test_the_wider_edge_grammar_did_not_open_the_closed_one(line):
+    assert D.parse_mermaid(f'flowchart TD\n  {line}\n') is None
+
+
+def test_the_mid_label_grammar_does_not_backtrack():
+    """The label class is bounded at 120 characters, so a pathological line
+    cannot make the alternation walk. Measured: each of these returns in
+    under a millisecond."""
+    for source in (
+        'flowchart TD\n  A["T"] -- ' + "-" * 6000 + ' --> B["Q"]\n',
+        'flowchart TD\n  A["T"] -- ' + "a" * 5000 + ' --> B["Q"]\n',
+        'flowchart TD\n  A -- ' + "--" * 3000 + '> B\n',
+    ):
+        t0 = time.perf_counter()
+        D.parse_mermaid(source)
+        assert (time.perf_counter() - t0) < 0.5, "the mid-label alternation backtracked"
+
+
 # --------------------------------------------------------------- the files --
 
 
@@ -504,6 +686,90 @@ def test_a_markdown_answer_with_a_mermaid_fence_exports_to_a_pdf_with_a_picture(
     assert images >= 1
 
 
+def test_a_diagram_that_misses_the_floor_reports_its_real_size_and_the_right_remedy(tmp_path):
+    """The warning IS the honesty mechanism for the depth limit, and until
+    2026-09-27 nothing pinned it — while it was saying two wrong things.
+
+    It printed the size with `:.0f`, so a 7.53 pt label read "about 8 pt":
+    the sentence reported the floor the figure had just failed. And it offered
+    "turning the page landscape", which for the tall shape — the only shape
+    that ever reaches this branch, because a wide layer is folded — makes the
+    label smaller (measured: a 12-step chain 7.53 -> 5.02 pt).
+
+    So: the number in the sentence must be below the floor, and the sentence
+    must not send a deep diagram to landscape.
+    """
+    pytest.importorskip("weasyprint")
+    from app.artifacts.render import render_version
+
+    deep = _chain(16)
+    layout = D.layout_diagram(deep)
+    assert not layout.fits and layout.fig_in[1] > layout.fig_in[0]
+
+    spec = _doc(S.Heading(level=1, text="Pipeline"), S.DiagramBlock(diagram=deep))
+    report = render_version(spec, ["pdf"], tmp_path, title_slug="deep", version=1, effort="think")
+
+    said = [w for w in report.warnings if "readable" in w and "diagram" in w.lower()]
+    assert said, f"the fit warning did not reach the report: {report.warnings}"
+    sentence = said[0]
+
+    stated = re.search(r"at about ([0-9]+(?:\.[0-9]+)?) pt", sentence)
+    assert stated, sentence
+    assert float(stated.group(1)) < D.MIN_EFFECTIVE_PT, (
+        f"the warning states {stated.group(1)} pt, which is not below the {D.MIN_EFFECTIVE_PT} pt floor it failed: {sentence}"
+    )
+    assert float(stated.group(1)) == pytest.approx(layout.effective_pt, abs=0.05)
+    assert "turning the page landscape would make it readable" not in sentence
+    assert "taller than it is wide" in sentence
+    # It still reaches the user: the report is what pipeline.py merges into
+    # the answer's warnings.
+    assert sentence in report.to_json()["warnings"]
+
+
+def test_every_diagram_that_misses_the_floor_is_the_tall_shape():
+    """The fact the shape-aware advice rests on, so it cannot rot silently.
+
+    `_split_wide_layers` folds a layer that is wider than the box, so WIDTH
+    never overflows; only DEPTH does. Measured over 400 random graphs inside
+    the schema cap, with three label lengths and both declared directions:
+    114 missed the 8 pt floor and every one of the 114 was taller than it was
+    wide — zero wide failures. That is why the warning sends a failing
+    diagram to "split it or describe it in prose" and never to landscape.
+
+    The wide branch of that sentence is therefore defensive today, not
+    reached; it stays because `box_in` is a caller's parameter. If a change
+    to the wide fold ever makes a wide failure reachable, this test says so
+    and the sentence is already right for it.
+    """
+    import random
+
+    misses, wide_misses = 0, []
+    for seed in range(60):
+        random.seed(seed)
+        n = random.randrange(3, 25)
+        label = random.choice(["Step", "Service number", "Ingest and normalise the uploaded document"])
+        nodes = [{"id": f"n{i}", "label": f"{label} {i}", "kind": D.DIAGRAM_ROLES[i % 4]} for i in range(n)]
+        edges, seen = [], set()
+        target = min(40, random.randrange(max(1, n - 1), 2 * n))
+        guard = 0
+        while len(edges) < target and guard < 20_000:
+            guard += 1
+            a, b = random.randrange(n), random.randrange(n)
+            if a == b or (a, b) in seen:
+                continue
+            seen.add((a, b))
+            edges.append({"source": f"n{a}", "target": f"n{b}"})
+        layout = D.layout_diagram(diagram(nodes, edges, direction=random.choice(["TD", "LR"])))
+        if layout.fits:
+            continue
+        misses += 1
+        assert layout.fig_in[0] <= 7.49, "width must never be what overflows: the wide fold exists"
+        if layout.fig_in[0] >= layout.fig_in[1]:
+            wide_misses.append((seed, round(layout.fig_in[0], 2), round(layout.fig_in[1], 2)))
+    assert misses, "expected some random graph inside the schema cap to miss the floor"
+    assert not wide_misses, f"a failing layout was wider than tall, so the advice must be revisited: {wide_misses}"
+
+
 def test_the_png_filename_is_minted_from_an_integer():
     """pdf.py's fetcher serves a bare name from the assets directory and
     needs no change — but only while no model string reaches a filename."""
@@ -621,32 +887,50 @@ def test_render_cost_is_small(tmp_path):
     assert min(times) < 3000, f"15 nodes took {min(times):.0f} ms"
 
 
-def test_the_biggest_diagram_the_schema_allows_still_fits_and_is_cheap(tmp_path):
-    """The ceiling, not the typical case: 24 nodes and 40 edges is the most
-    the schema permits. It has to lay out at a readable size and it has to
-    stay far away from the 180 s render timeout — the fitter tries up to
-    eight configurations and each one counts crossings pairwise, so this is
-    where an accidental quadratic would show."""
+def _random_graph_at_the_schema_cap(seed: int, nodes_n: int = 24, edges_n: int = 40):
+    """A graph of exactly the size the schema permits, from one seed."""
     import random
 
-    random.seed(7)
-    nodes = [{"id": f"n{i}", "label": f"Service number {i}", "kind": D.DIAGRAM_ROLES[i % 4]} for i in range(24)]
+    random.seed(seed)
+    nodes = [{"id": f"n{i}", "label": f"Service number {i}", "kind": D.DIAGRAM_ROLES[i % 4]} for i in range(nodes_n)]
     edges, seen = [], set()
-    while len(edges) < 40:
-        a, b = random.randrange(24), random.randrange(24)
+    while len(edges) < edges_n:
+        a, b = random.randrange(nodes_n), random.randrange(nodes_n)
         if a == b or (a, b) in seen:
             continue
         seen.add((a, b))
         edges.append({"source": f"n{a}", "target": f"n{b}"})
-    big = S.Diagram(title="Ceiling", nodes=nodes, edges=edges)
+    return S.Diagram(title="Ceiling", nodes=nodes, edges=edges)
+
+
+def test_the_biggest_diagram_the_schema_allows_is_cheap_to_draw(tmp_path):
+    """The ceiling, not the typical case: 24 nodes and 40 edges is the most
+    the schema permits, and it has to stay far away from the 180 s render
+    timeout — the fitter tries up to eight configurations and each one counts
+    crossings pairwise, so this is where an accidental quadratic would show.
+
+    CORRECTED 2026-09-27. This test also asserted `layout.fits and
+    layout.effective_pt >= 8.0` on this one `random.seed(7)` graph, and the
+    commit message read that as "the largest diagram the schema allows still
+    fits at 8.7 pt". 8.7 pt is what seed 7 happens to lay out at. Measured
+    over 40 seeds at the same 24/40 size, 3 fit and 37 do not, worst 5.19 pt
+    — so the fit half of this assertion was a lottery, not a gate, and it is
+    now stated where it is true, in
+    `test_the_eight_point_floor_is_bounded_by_depth_not_by_node_count`.
+    The COST half was never in doubt and stays here.
+    """
+    big = _random_graph_at_the_schema_cap(7)
 
     D.render_diagram_png(big, tmp_path / "warm.png")
     D._LAYOUT_MEMO.clear()
     t0 = time.perf_counter()
     layout = D.render_diagram_png(big, tmp_path / "big.png")
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    assert layout.fits and layout.effective_pt >= 8.0
     assert elapsed_ms < 5000, f"the largest allowed diagram took {elapsed_ms:.0f} ms"
+    assert (tmp_path / "big.png").stat().st_size > 0
+    # Whatever it lays out at, it is REPORTED: the floor and the flag agree,
+    # so nothing below 8 pt can reach a page claiming to fit.
+    assert layout.fits == (layout.effective_pt >= D.MIN_EFFECTIVE_PT - 1e-9)
 
 
 def test_a_label_in_another_script_picks_a_font_that_can_draw_it(tmp_path):

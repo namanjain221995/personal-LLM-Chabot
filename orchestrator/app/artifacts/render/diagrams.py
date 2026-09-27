@@ -62,9 +62,34 @@ RAG loop landed at 5.4 pt. Both are under the ~8 pt floor at which a printed
 label stops being readable. So the layout takes the page box as INPUT: it
 wraps a layer that is too wide into sub-rows, tries both orientations and
 several label-wrap widths, and reports the effective point size it achieves.
-When no configuration reaches 8 pt the caller is told (`fits=False`) and puts
-the figure on a landscape or full-page run instead of silently shipping a
-6 pt label.
+When no configuration reaches 8 pt the caller is told (`fits=False`) and says
+so in the render report, instead of silently shipping a 6 pt label.
+
+WHAT THE 8 pt FLOOR ACTUALLY COVERS, re-measured 2026-09-27 after the first
+statement of it was found to be a property of the test corpus rather than of
+the schema. The floor is bounded by the SIZE of the laid-out figure, not by
+the node count: it holds while the figure is at most 7.48 in wide and 9.97 in
+tall, which is the page box divided by 8.0/9.5. `_split_wide_layers` keeps
+WIDTH inside that bound; nothing keeps HEIGHT inside it, because no pass
+folds a deep graph into columns. So, on portrait (6.3 x 8.4 in):
+
+  * a chain of short one-line labels holds to 11 layers (8.21 pt) and breaks
+    at 12 (7.53 pt); labels that wrap to several lines hold to 8 layers
+    (8.23 pt) and break at 9 (7.31 pt). The deepest diagram in the test
+    corpus, the 15-node architecture graph, is 9 layers at 9.50 pt.
+  * the 24-node / 40-edge schema cap does NOT bound it. Of 40 random graphs
+    at exactly that size, 3 reach 8 pt and 37 do not; the worst is 5.19 pt,
+    and a 24-node cycle is 24 layers at 3.70 pt. An earlier note here read
+    "the largest diagram the schema allows still fits at 8.7 pt" — 8.7 pt is
+    the value for one random seed, not a bound.
+
+A diagram past that depth is not shipped as a silent 6 pt label: `fits` is
+False and render/__init__.py puts a sentence in the report that names the
+real point size. The missing capability is a fold of a deep graph into
+columns, which would make the tall case fit the way `_split_wide_layers`
+already makes the wide case fit; turning the page landscape does NOT help,
+and is measured to make it worse (a 12-step chain 7.53 -> 5.02 pt, a 24-step
+chain 3.76 -> 2.51 pt), because a deep graph is already the tall shape.
 
 COST (measured in this worktree, aarch64, matplotlib 3.11.1; see
 tests/test_artifact_render_diagrams.py::test_render_cost_is_small): a 15-node
@@ -253,7 +278,15 @@ class DiagramError(ValueError):
 #: The mermaid subset the chat prompt restricts the model to, and the only
 #: thing this parser accepts. Anything else makes the whole source refuse, so
 #: a half-understood graph is never drawn: the caller keeps today's callout.
-_DIR_RE = re.compile(r"^(?:flowchart|graph)\s+(TD|TB|LR|RL|BT)$", re.IGNORECASE)
+#: The direction is OPTIONAL, because in mermaid it is: a bare `flowchart` or
+#: `graph` line is legal and defaults to TD. Requiring it here did not refuse
+#: such a source — it fell through to `_DECL_RE`, which reads a bare word as a
+#: node id, so the word "flowchart" became a box in the drawing next to the
+#: real graph. That broke this module's own promise that a source it cannot
+#: read falls back to the callout and never to a wrong picture. Measured
+#: before the fix: `flowchart\nA["Ingest"] --> B["Index"]` gave three nodes,
+#: one of them called "flowchart".
+_DIR_RE = re.compile(r"^(?:flowchart|graph)(?:\s+(TD|TB|LR|RL|BT))?$", re.IGNORECASE)
 
 
 def _node_part(prefix: str) -> str:
@@ -270,6 +303,34 @@ def _node_part(prefix: str) -> str:
 _ARROW = r"(?P<arrow>-->|---|-\.->|-\.-|==>)"
 _EDGE_LABEL = r'(?:\|\s*"?(?P<elabel>[^"|]{0,120})"?\s*\|)?'
 _EDGE_RE = re.compile(rf"^{_node_part('a')}\s*{_ARROW}\s*{_EDGE_LABEL}\s*{_node_part('b')}$")
+
+#: MERMAID'S OTHER LEGAL EDGE LABEL, and why refusing it was expensive.
+#:
+#: `A -->|"Yes"| B` is the form DIAGRAM_INSTRUCTION teaches. `A -- Yes --> B`
+#: is the form models actually write, it is equally legal mermaid, and nothing
+#: in the instruction forbids it: the model has satisfied "one statement per
+#: line" and "every label in double quotes" and still lost its whole diagram,
+#: because one unreadable line makes `parse_mermaid` refuse the entire source
+#: and md_import falls back to the "Diagram omitted" callout — the exact
+#: defect this module exists to close. Measured over real model output:
+#: 2 of 7 diagrams were lost to this line shape, on both the old prompt and
+#: the new one. The grammar is the cheap side to fix, because
+#: DIAGRAM_INSTRUCTION is at its byte ceiling.
+#:
+#: The label sits between the two halves of the arrow, and each arrow family
+#: keeps its own style: `--`/`-->`/`---` solid, `-.`/`.->`/`.-` dashed,
+#: `==`/`==>` solid-thick (drawn as solid, as `==>` already is). The label
+#: class is bounded at 120 characters, as the `|...|` form is, so the
+#: alternation cannot backtrack unboundedly.
+_MID_LABEL = r'\s*"?(?P<{name}>[^"|]{{0,120}}?)"?\s*'
+_MID_ARROW = (
+    r"(?:--" + _MID_LABEL.format(name="mlabel_s") + r"(?P<mtail_s>-->|---)"
+    r"|-\." + _MID_LABEL.format(name="mlabel_d") + r"(?P<mtail_d>\.->|\.-)"
+    r"|==" + _MID_LABEL.format(name="mlabel_t") + r"(?P<mtail_t>==>)"
+    r")"
+)
+_EDGE_MID_RE = re.compile(rf"^{_node_part('a')}\s*{_MID_ARROW}\s*{_node_part('b')}$")
+
 _DECL_RE = re.compile(rf"^{_node_part('a')}$")
 
 
@@ -317,7 +378,10 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         line = line.rstrip(";")
         m = _DIR_RE.match(line)
         if m:
-            got = m.group(1).upper()
+            # The group is optional now, so a bare `flowchart` means TD —
+            # mermaid's own default. Without the `or`, this raised
+            # AttributeError on None.
+            got = (m.group(1) or "TD").upper()
             direction = "LR" if got in ("LR", "RL") else "TD"
             continue
         m = _EDGE_RE.match(line)
@@ -330,6 +394,22 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
                 "target": g["bid"],
                 "label": (g["elabel"] or "").strip(),
                 "style": "dashed" if g["arrow"].startswith("-.") else "solid",
+            })
+            continue
+        m = _EDGE_MID_RE.match(line)
+        if m:
+            # The same edge, written with the label inside the arrow. Only one
+            # of the three alternatives can have matched, so exactly one label
+            # group and one tail group are not None.
+            g = m.groupdict()
+            touch(g["aid"], g["alabel"], g["arole"])
+            touch(g["bid"], g["blabel"], g["brole"])
+            label = next((g[k] for k in ("mlabel_s", "mlabel_d", "mlabel_t") if g[k] is not None), "")
+            edges.append({
+                "source": g["aid"],
+                "target": g["bid"],
+                "label": (label or "").strip(),
+                "style": "dashed" if g["mtail_d"] is not None else "solid",
             })
             continue
         m = _DECL_RE.match(line)
