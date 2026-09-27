@@ -25,9 +25,9 @@
     "",
     "2026-09-12 (reviewed, three more entropy hits, none a credential):",
     "  * frontend/tests/artifact-card.test.tsx, commit 321cf70, lines 336 and 369",
-    "                            - the fixture file id `activeKey=\"fedcba…\"` a card test",
+    "                            - the fixture file id `activeKey=\"fedcba\u2026\"` a card test",
     "                              passes to mark the file the panel is showing: the",
-    "                              16-hex file-id SHAPE of CONTRACT-2 §2, accepted nowhere;",
+    "                              16-hex file-id SHAPE of CONTRACT-2 \u00a72, accepted nowhere;",
     "  * docs/availability/ADR-0002-high-availability.md, commit d2d15a7, line 95",
     "                            - prose naming the config key ADMISSION_NORMAL_MAX",
     "                              and its value 10 beside the word `tokens`.",
@@ -55,9 +55,27 @@
     "                              shape as the background.ts and idempotency.ts entries;",
     "  * frontend/tests/fe-audit-chat-responsive.test.tsx, commit af2f925, line 137",
     "                            - an example.com URL whose query string ends in a placeholder",
-    "                              `token=`, used to test that a long URL wraps in a dialog."
+    "                              `token=`, used to test that a long URL wraps in a dialog.",
+    "",
+    "2026-09-27 (reviewed, three entropy hits from the hosted end-to-end stage, none a credential):",
+    "  * e2e/ci/tests/redact.test.js, commit fd71830, lines 18 and 19",
+    "                            - ADMIN_PASSWORD and MEMBER_PASSWORD, two FABRICATED",
+    "                              48-hex fixtures of the shape `openssl rand -hex 24`",
+    "                              produces. They have to look exactly like the real",
+    "                              thing: the rules they exercise are the LITERAL-value",
+    "                              rules, which exist because no pattern can catch a",
+    "                              random hex string. Each appears in this one file and",
+    "                              nowhere else in the tree, and no stack ever used them;",
+    "  * e2e/ci/tests/redact.test.js, commit fd71830, line 25",
+    "                            - `tsk_test_01JABCDEF_9f8e7d6c5b4a32109876543210abcdef`,",
+    "                              a fake key inside the report fixture the api-key rule",
+    "                              is asserted against. Counting hex, never minted.",
+    "  FOUND BY: gitleaks in `git` mode over a real CLONE. Scanning the worktree the",
+    "  branch was developed in reports \"0 commits scanned\" and \"no leaks found\", so the",
+    "  stage would have failed the `policy` job on its first push with three NEW",
+    "  findings and nothing local would have said so."
   ],
-  "reviewed": "2026-09-13",
+  "reviewed": "2026-09-27",
   "findings": [
     {
       "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
@@ -190,6 +208,24 @@
       "rule": "generic-api-key",
       "file": "docs/developer-platform/STANDARDS.md",
       "line": 803
+    },
+    {
+      "fingerprint": "fd71830e51be42aa0824c46798f5101a0a9cb500:e2e/ci/tests/redact.test.js:generic-api-key:18",
+      "rule": "generic-api-key",
+      "file": "e2e/ci/tests/redact.test.js",
+      "line": 18
+    },
+    {
+      "fingerprint": "fd71830e51be42aa0824c46798f5101a0a9cb500:e2e/ci/tests/redact.test.js:generic-api-key:19",
+      "rule": "generic-api-key",
+      "file": "e2e/ci/tests/redact.test.js",
+      "line": 19
+    },
+    {
+      "fingerprint": "fd71830e51be42aa0824c46798f5101a0a9cb500:e2e/ci/tests/redact.test.js:generic-api-key:25",
+      "rule": "generic-api-key",
+      "file": "e2e/ci/tests/redact.test.js",
+      "line": 25
     }
   ]
 }
