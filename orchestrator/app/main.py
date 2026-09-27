@@ -3001,8 +3001,9 @@ def _carries_a_file_to_read(
     video_followup: bool,
     image_followup: bool = False,
     stored_documents: bool = False,
+    link_to_fetch: bool = False,
 ) -> bool:
-    """Does this turn hold a file of the PERSON'S OWN for another route to read?
+    """Does this turn hold a SOURCE of the PERSON'S OWN for another route to read?
 
     WHY IT EXISTS (verifier, 2026-09-27). The artifact read-back branch below
     claims a turn the intent gate called a question, and it sits ABOVE the
@@ -3036,6 +3037,32 @@ def _carries_a_file_to_read(
     residual sentences answer and those 13 do not: does the question name the
     upload as the person's own, or a page or timestamp inside it.
 
+    A LINK IS A SOURCE TOO, AND IT IS CODE (verifier, 2026-09-27). This branch
+    also sits above the GitHub route, the crawl routes and the URL route, and
+    a pasted link is not a file, so the six checks below could not see one:
+    measured on the integrated tree, "what does this page say?
+    https://example.invalid/pricing" and "what is in this repo?
+    https://github.com/acme/widgets" were both answered "**Workflow Tracker**
+    (v1) is a workbook with 1 sheet: `Tasks`" and neither the page nor the
+    repository was ever fetched. `link_to_fetch` is the caller's `github_ref is
+    not None`, `crawl_url is not None` or a non-empty `url_list` — all three
+    derived from THIS turn's text, all three past `links_are_the_request`, so
+    an incidental URL inside a long paste is already excluded upstream and
+    cannot cost the read-back a turn. A repo indexed or a site crawled in an
+    EARLIER turn (`repo_followup`, `crawl_site_hits`) is deliberately not here:
+    no link in this turn's words, and the read-back is then the more specific
+    claim.
+
+    IT YIELDS TO EXACTLY WHAT A ROUTE BELOW CAN FETCH, which is `https?://`
+    only. `core/urls._URL_RE` and `core/repo._REPO_RE` both require the scheme,
+    so a bare host ("github.com/acme/widgets") reaches no fetch route on the
+    integrated tree AND none on origin/dev — measured on both, 2026-09-27:
+    `detect_github` None, `extract_urls` [], `detect_crawl` None. Such a turn
+    still reaches the read-back. That is a pre-existing gap in the platform's
+    link surface, not this branch's to widen: making the fetch routes accept a
+    schemeless host is a change to what this platform will clone and GET, and
+    it belongs with the routes that do the fetching.
+
     KNOWN RESIDUAL, decided rather than left open (the programme asked which
     way this would go). "what does this document say?" with a PDF uploaded
     earlier still reaches the read-back: no words rule can separate it from
@@ -3054,6 +3081,7 @@ def _carries_a_file_to_read(
         or request.pdf_data
         or request.image_data
         or image_followup
+        or link_to_fetch
     ):
         return True
     if not stored_documents:
@@ -5943,7 +5971,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     has_read_source=_carries_a_file_to_read(
                         text, request, video_followup, bool(image_followup_images),
                         stored_documents=bool(stored_docs),
+                        # A pasted link, a GitHub ref or a crawl instruction is
+                        # a source only the routes BELOW can fetch.
+                        link_to_fetch=(
+                            github_ref is not None or crawl_url is not None or bool(url_list)
+                        ),
                     ),
+                    # ...AND THE DATASET IN THE ROOM IS THE THIRD FILE. It is
+                    # not carried by the turn, so `has_read_source` cannot see
+                    # it; `answers_from_spec` reads the gate's
+                    # `names_our_file` against it.
+                    has_dataset=bool(dataset_ready),
                 )
             ):
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —

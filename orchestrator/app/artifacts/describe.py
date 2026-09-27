@@ -774,7 +774,9 @@ def is_artifact_question(intent: Any) -> bool:
     return any(bool(getattr(intent, flag, False)) for flag in ANSWER_FLAGS)
 
 
-def answers_from_spec(intent: Any, *, has_read_source: bool = False) -> bool:
+def answers_from_spec(
+    intent: Any, *, has_read_source: bool = False, has_dataset: bool = False
+) -> bool:
     """Is this turn answered from a stored spec — the whole rule, in one place.
 
     The gate's verdict is necessary and NOT sufficient. This module can only
@@ -791,8 +793,52 @@ def answers_from_spec(intent: Any, *, has_read_source: bool = False) -> bool:
     `has_read_source` is the CALLER'S to compute, because only the route knows
     what the turn carries (app.main._carries_a_file_to_read). It is a
     parameter rather than a lookup so this module stays pure and testable.
+
+    `has_dataset` IS THE THIRD FILE, AND IT NEEDED ITS OWN ARM (verifier,
+    2026-09-27). An uploaded dataset is not carried BY the turn — it sits in
+    the conversation and is answered by the dataset engine, below this branch,
+    from real rows. A read-back holds the artifact's STRUCTURE and never a
+    cell value, so a value question diverted here replaces a real number with
+    a description of the wrong file: measured on the integrated tree, "what is
+    the total spend?", "what is the date range?" and "which countries are in
+    the data?" over a conversation holding customers.csv AND a workbook were
+    each answered "**Workflow Tracker** (v1) is a workbook with 1 sheet:
+    `Tasks`".
+
+    `has_read_source` cannot carry it. The turn holds nothing; what decides is
+    whether the QUESTION points at the artifact, which is
+    `intent.names_our_file` — recorded by the gate, where the normalised text
+    already is. With no dataset in the room there is no other file the
+    question could be about, so this arm is not read at all and the 48
+    answered turns of the intent corpus are untouched.
+
+    MEASURED COST, stated rather than hidden: with a dataset in the room, 3 of
+    the corpus's 49 labelled artifact questions lose the read-back — q13 "is
+    there a column for owner?", q14 "how many columns and rows ??" and q21
+    "what does the Status column contain?". Each names a content noun and no
+    file, and `columns`/`rows` are exactly what a workbook and a CSV have in
+    common, so no words rule separates them; they go where origin/dev sent
+    them, to the dataset engine, which answers them from the real data.
+
+    AND ITS RESIDUAL, in the same spirit: a BARE format word both files share
+    ("what is in the csv?") still reaches the read-back, because this platform
+    publishes CSV artifacts too (artifacts/formats.py's `data` template), so
+    the word names either file. Naming it as theirs closes it
+    (`intent._Q_THEIR_UPLOAD_RE` — "the csv i uploaded", "the attachment");
+    the bare form needs the picked artifact's KIND at the route, which the
+    route does not have until the engine picks it. That is the same limit
+    app.main._carries_a_file_to_read already records for "what does this
+    document say?", and the same mitigation applies: the read-back opens with
+    the artifact's own title and kind, so the person can see which file was
+    read and say so.
     """
-    return bool(is_artifact_question(intent)) and not bool(has_read_source)
+    if not bool(is_artifact_question(intent)):
+        return False
+    if bool(has_read_source):
+        return False
+    if bool(has_dataset) and not bool(getattr(intent, "names_our_file", False)):
+        return False
+    return True
 
 
 __all__ = [

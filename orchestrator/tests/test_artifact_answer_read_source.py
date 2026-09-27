@@ -265,3 +265,328 @@ def test_held_out_questions_about_their_upload_reach_the_document(text):
     # so the same words read the artifact back rather than answering nothing.
     assert _carries_a_file_to_read(text, _request(text), False, False,
                                    stored_documents=False) is False
+
+
+# ---------------------------------------------------------------------------
+# A LINK AND A DATASET ARE THE OTHER TWO SUBJECTS (verifier, 2026-09-27).
+#
+# The same shape of defect as the photo above, two branches further down the
+# same elif chain, and combination-only: neither fix/question-not-edit-r2 nor
+# fix/answer-from-the-spec-r2 shows either alone.
+#
+#   D1  "what is the total spend?" over a conversation holding customers.csv
+#       AND a workbook was answered "**Workflow Tracker** (v1) is a workbook
+#       with 1 sheet: `Tasks`". The read-back holds the artifact's STRUCTURE
+#       and never a cell value — of either file — so the real number was never
+#       computed.
+#   D2  "what does this page say? https://example.invalid/pricing" and "what is
+#       in this repo? https://github.com/acme/widgets" got the same sentence,
+#       and neither the page nor the repository was fetched.
+#
+# The two arms are deliberately different, because the two facts are:
+#   * a LINK is carried BY the turn, so it is code — `link_to_fetch`, from the
+#     route's own `github_ref` / `crawl_url` / `url_list`, no words test;
+#   * a DATASET sits in the CONVERSATION, so `has_read_source` cannot see it.
+#     What decides is whether the QUESTION points at the artifact, which the
+#     gate records as `intent.names_our_file`.
+
+
+def _intent_that_asks_about(text: str, **kw):
+    """The gate's real verdict for `text` with an artifact in the room — the
+    `names_our_file` these tests read is computed there, not here."""
+    from app.artifacts import intent as I
+
+    kw.setdefault("has_artifacts", True)
+    kw.setdefault("last_turn_is_artifact", True)
+    kw.setdefault("artifact_hints", ("TechSara AI Engineering Workflow Tracker",))
+    return I.decide(text, **kw)
+
+
+# ----------------------------------------------------------------- D2: links --
+
+
+@pytest.mark.parametrize("text", [
+    "what does this page say? https://example.invalid/pricing",
+    "what is in this repo? https://github.com/acme/widgets",
+    "what does it say? https://example.invalid/a https://example.invalid/b",
+])
+def test_a_link_this_turn_carries_is_a_read_source_without_any_words_test(text):
+    """`link_to_fetch` is the route's `github_ref is not None`, `crawl_url is
+    not None` or a non-empty `url_list`. All three are derived from THIS turn's
+    text and all three are already past `links_are_the_request`, so there is no
+    second words test to get wrong here."""
+    from app.main import _carries_a_file_to_read
+
+    assert _carries_a_file_to_read(text, _request(text), False, False,
+                                   link_to_fetch=True) is True
+    # The same words with NO link the platform can fetch read the artifact
+    # back, because then nothing below this branch can answer them either.
+    assert _carries_a_file_to_read(text, _request(text), False, False,
+                                   link_to_fetch=False) is False
+
+
+def test_the_three_detectors_the_route_composes_each_raise_the_flag():
+    """`link_to_fetch` is one expression over three detectors, so each one is
+    exercised here rather than trusted: a pasted page (`url_list`), a GitHub
+    repo (`github_ref`) and a whole-site crawl (`crawl_url`). Pure — nothing
+    is fetched; these are the same functions the route calls before the chain."""
+    from app.config import settings
+    from app.core.repo import detect_github
+    from app.core.urls import extract_urls, links_are_the_request
+    from app.engines.crawl import detect_crawl
+
+    def flag(text: str) -> bool:
+        urls = extract_urls(text, limit=settings.url_max_pages)
+        github = detect_github(text) is not None and links_are_the_request(text, urls)
+        return bool(github or detect_crawl(text) is not None or (urls and links_are_the_request(text, urls)))
+
+    assert flag("what does this page say? https://example.invalid/pricing") is True
+    assert flag("what is in this repo? https://github.com/acme/widgets") is True
+    assert flag("crawl this site https://example.invalid and tell me what it says") is True
+    # The anchor question carries no link at all.
+    assert flag("Ok What This sheet have ??") is False
+
+
+def test_a_schemeless_host_reaches_no_fetch_route_on_this_tree_either():
+    """The residual, pinned so it is not mistaken for a hole this fix opened.
+    The platform's link surface is `https?://` only — `core/urls._URL_RE` and
+    `core/repo._REPO_RE` both require the scheme — so a bare host reaches no
+    fetch route here AND none on origin/dev (measured on both, 2026-09-27).
+    Widening it is a change to what this platform will clone and GET, and it
+    belongs with the routes that fetch, not with this branch."""
+    from app.config import settings
+    from app.core.repo import detect_github
+    from app.core.urls import extract_urls
+    from app.engines.crawl import detect_crawl
+
+    text = "what is in this repo? github.com/acme/widgets"
+    assert detect_github(text) is None
+    assert extract_urls(text, limit=settings.url_max_pages) == []
+    assert detect_crawl(text) is None
+
+
+def test_the_anchor_question_is_not_diverted_by_a_link_flag_it_does_not_set():
+    """The flag is per-turn: an artifact question in a conversation where an
+    EARLIER turn pasted a link is unaffected, because `github_ref`, `crawl_url`
+    and `url_list` all read this turn's words."""
+    from app.main import _carries_a_file_to_read
+
+    text = "Ok What This sheet have ??"
+    assert _carries_a_file_to_read(text, _request(text), False, False,
+                                   link_to_fetch=False) is False
+
+
+# --------------------------------------------------------------- D1: datasets --
+
+
+def test_answers_from_spec_reads_names_our_file_only_when_a_dataset_is_present():
+    """The third arm, stated as its own rule. With no dataset in the room there
+    is no other file the question could be about, so `names_our_file` is not
+    read at all — which is why the 48 answered turns of the 119-case corpus are
+    untouched by this fix."""
+    pointing = _intent_that_asks_about("what is in this sheet")
+    value = _intent_that_asks_about("what is the total spend?")
+    assert pointing.answer_about_artifact is True and pointing.names_our_file is True
+    assert value.answer_about_artifact is True and value.names_our_file is False
+
+    # No dataset: both are answered from the spec, exactly as before.
+    assert D.answers_from_spec(pointing, has_dataset=False) is True
+    assert D.answers_from_spec(value, has_dataset=False) is True
+    # A dataset in the room: only the one that points at the artifact.
+    assert D.answers_from_spec(pointing, has_dataset=True) is True
+    assert D.answers_from_spec(value, has_dataset=True) is False
+    # The other two arms still stand on their own.
+    assert D.answers_from_spec(pointing, has_read_source=True, has_dataset=False) is False
+    assert D.answers_from_spec(value, has_read_source=True, has_dataset=True) is False
+
+
+def test_names_our_file_is_set_on_the_question_verdict_and_nowhere_else():
+    """It is a fact about a QUESTION, so a create, an edit and a convert must
+    not carry it — a later reader must not be able to mistake it for "this turn
+    mentions a file"."""
+    for text in ("make me a tracker for the team",
+                 "make slide 4 shorter",
+                 "give me that as a pdf"):
+        decided = _intent_that_asks_about(text)
+        assert decided.answer_about_artifact is False, (text, decided.rule)
+        assert decided.names_our_file is False, (text, decided.rule)
+
+
+#: Questions about a file THIS PLATFORM made that must keep the read-back even
+#: when the conversation ALSO holds an uploaded dataset. Held out: written
+#: before the rule was measured, and not in the programme's 119-case corpus.
+HELD_OUT_OURS_DESPITE_A_DATASET = (
+    "what is in this sheet",
+    "Ok What This sheet have ??",
+    "what columns does it have?",
+    "how many rows are in it?",
+    "tell me what is inside the workbook",
+    "what does the tracker contain ??",
+    "just tell me what the tracker has, don't create anything",
+    "summarise the tracker you made",
+    "which sheets did you create?",
+    "what did you put in the second sheet ??",
+    "what format did you save it in ??",
+    "what is on slide 3?",
+    "what sections does the report have?",
+    "list the headings in the document",
+    "kya hai is sheet me ??",
+    "isme kya kya columns hai?",
+    "sheet ma su su che ae kaho, navi file na banavo",
+    "what data is in the excel you just made",
+    "read back what the sheet has",
+    "why did you add a priority column?",
+    "did you include the due dates?",
+    "explain what you created",
+    "what formulas are in it?",
+    "is the tracker two sheets or one ??",
+    "what's in it 🤔📊",
+    "does it have a status column?",
+)
+
+#: Questions about the person's own DATA whose answer is a real value only the
+#: dataset engine can compute. Every one must come out of the route WITHOUT a
+#: read-back when a dataset is in the room.
+#:
+#: Measured 2026-09-27: the gate calls the first four `answer_about_artifact`
+#: (a content noun behind a determiner is "this file" to `_Q_THIS_FILE`), and
+#: declines the last four as `no-request` before this fix is reached at all —
+#: which is why the assertion below is about the OUTCOME and names the gate's
+#: verdict only where there is one to name.
+HELD_OUT_THEIR_DATA = (
+    "what is the total spend?",
+    "what is the date range?",
+    "which countries are in the data?",
+    "what are the top five values?",
+    "what is the average order value?",
+    "how many distinct customers are there?",
+    "which month had the highest revenue?",
+    "what is the sum of the amounts?",
+)
+#: …and the four of them the gate itself calls a question, so the ROUTE is the
+#: only thing standing between them and the wrong answer.
+HELD_OUT_THEIR_DATA_THE_GATE_CLAIMS = HELD_OUT_THEIR_DATA[:4]
+
+
+@pytest.mark.parametrize("text", HELD_OUT_OURS_DESPITE_A_DATASET)
+def test_held_out_questions_about_our_file_survive_a_dataset(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.answer_about_artifact is True, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THEIR_DATA)
+def test_held_out_questions_about_their_data_stand_the_read_back_down(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THEIR_DATA_THE_GATE_CLAIMS)
+def test_the_route_is_what_stops_the_data_questions_the_gate_claims(text):
+    """These four the gate DOES call a question about the artifact — that
+    verdict is about SHAPE and it is not wrong, because the same words with no
+    dataset uploaded have nothing else to be about. The route settles the
+    subject, which is the whole point of `answers_from_spec`."""
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.answer_about_artifact is True, (text, decided.rule)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+    # …and with no dataset uploaded there is nothing else to answer from, so
+    # the same words read the artifact back rather than answering nothing.
+    assert D.answers_from_spec(decided, has_dataset=False) is True, (text, decided.rule)
+
+
+#: Questions that name the person's OWN file as theirs. `csv`, `excel` and
+#: `spread sheet` are all in `_Q_FILE_WORD` — and they have to be, because
+#: formats.py's `data` template makes our artifacts CSVs too — so the pointer
+#: alone cannot say whose file is meant. "i uploaded", "i sent", "the
+#: attachment" can, and they veto it.
+HELD_OUT_THEY_NAMED_IT_AS_THEIRS = (
+    "what is in the csv i uploaded?",
+    "what is in the sheet i sent?",
+    "what does the attachment contain?",
+    "how many rows are in the file i uploaded?",
+    "what columns does the spreadsheet i shared have?",
+    "what is in the uploaded csv?",
+)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_THEY_NAMED_IT_AS_THEIRS)
+def test_naming_the_file_as_their_own_vetoes_the_pointer(text):
+    decided = _intent_that_asks_about(text, has_dataset=True)
+    assert decided.names_our_file is False, (text, decided.rule)
+    assert D.answers_from_spec(decided, has_dataset=True) is False, (text, decided.rule)
+
+
+def test_the_upload_veto_cannot_reach_a_question_about_our_own_file():
+    r"""It is narrow on purpose: the same vocabulary app.main._NAMES_AN_UPLOAD_RE
+    uses one layer up, MINUS the `page \d+` and timestamp arms, because a PDF
+    this platform made HAS pages. Measured 2026-09-27: 0 of the corpus's 119
+    turns match it."""
+    from app.artifacts import intent as I
+
+    for text in ("what's on page 3 of the report you made?",
+                 "what is on slide 3?",
+                 "what did you put in the second sheet ??",
+                 "i pasted the source rows below, what columns does this sheet have?"):
+        assert I._Q_THEIR_UPLOAD_RE.search(text.lower()) is None, text
+        decided = _intent_that_asks_about(text, has_dataset=True)
+        assert decided.names_our_file is True, (text, decided.rule)
+
+
+def test_a_bare_format_word_shared_by_both_files_is_a_stated_residual():
+    """THE RESIDUAL, pinned rather than left to be discovered. "what is in the
+    csv?" with a CSV uploaded AND a workbook made still reaches the read-back:
+    this platform publishes CSV artifacts (artifacts/formats.py's `data`
+    template), so the word names either file and no words rule separates them.
+    Closing it needs the picked artifact's KIND at the route, which the route
+    does not have until the engine picks it — the same limit
+    `_carries_a_file_to_read` already records for "what does this document
+    say?". The mitigation is in the reply: the read-back opens with the
+    artifact's own title and kind, so the person can see which file was read."""
+    for text in ("what is in the csv?", "how many rows does the csv have?"):
+        decided = _intent_that_asks_about(text, has_dataset=True)
+        assert decided.names_our_file is True, (text, decided.rule)
+        assert D.answers_from_spec(decided, has_dataset=True) is True, (text, decided.rule)
+
+
+def test_the_measured_cost_of_the_dataset_arm_over_the_whole_labelled_class():
+    """The class, not a sample: of the 49 turns the programme's corpus labels
+    `answer_about_artifact`, exactly THREE lose the read-back when a dataset is
+    in the room. Each names a content noun and no file, and `columns`/`rows`
+    are what a workbook and a CSV have in common, so no words rule separates
+    them; they go where origin/dev sent them, to the dataset engine.
+
+    This is a CEILING, asserted so the cost cannot grow unnoticed."""
+    import json
+    import os
+
+    path = os.environ.get("INTENT_CORPUS") or ""
+    if not path or not os.path.isfile(path):
+        pytest.skip("the programme corpus is not on this machine (set INTENT_CORPUS)")
+    items = json.load(open(path, encoding="utf-8"))["items"]
+
+    def _text_of(item):
+        if (item.get("text") or "").strip():
+            return item["text"]
+        r = item.get("text_build") or {}
+        rows = "".join(
+            str(r.get("row_template", "")).format(i=i, owner=i % 7, day=1 + i % 28, pri=1 + i % 4)
+            for i in range(1, int(r.get("rows", 0)) + 1)
+        )
+        return str(r.get("prefix", "")) + str(r.get("header", "")) + rows
+
+    labelled = [(it["id"], _text_of(it)) for it in items
+                if it.get("want") == "answer_about_artifact"]
+    assert len(labelled) == 49, len(labelled)
+    lost = []
+    for case_id, text in labelled:
+        decided = _intent_that_asks_about(text, has_dataset=True)
+        if not D.is_artifact_question(decided):
+            # q39 (Arabic) is the one turn of the 49 the gate does not answer
+            # even alone — the corpus score is 48/49, not 49/49 — so it is not
+            # this arm's cost.
+            continue
+        if not D.answers_from_spec(decided, has_dataset=True):
+            lost.append(case_id)
+    assert lost == ["q13", "q14", "q21"], lost

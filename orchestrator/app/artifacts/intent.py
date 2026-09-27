@@ -463,6 +463,22 @@ class ArtifactIntent:
     #: branch on it); `reference` and `reference_hint` say WHICH artifact,
     #: and `instruction` keeps the question the answer is written from.
     answer_about_artifact: bool = False
+    #: The question POINTS AT the artifact — a pronoun it owns ("what is in
+    #: it"), a determiner and a file word ("this sheet", "the workbook", "the
+    #: tracker"), a numbered part ("slide 3"), a question about what YOU did
+    #: ("which sheets did you create?"), the SOV order the Indian languages
+    #: use, or a refusal of a new file while asking to be told. Set only on an
+    #: artifact-question verdict, and False on every other intent.
+    #:
+    #: It exists because `answer_about_artifact` alone cannot say WHICH file
+    #: the question is about, and the route needs that when the conversation
+    #: also holds an uploaded dataset: "what is the total spend?" is an
+    #: artifact question by shape and a DATASET question by subject. Computed
+    #: here, where the normalised text and the question's own shape are
+    #: already in hand, so the route does not normalise a second time
+    #: (`decide` runs on the event loop). Read by
+    #: artifacts/describe.answers_from_spec.
+    names_our_file: bool = False
 
     @property
     def wants_file(self) -> bool:
@@ -1326,6 +1342,49 @@ _Q_GAP = r"(?:\w+\W+){0,4}?"
 _Q_CONTENT_NOUN_RE = re.compile(rf"\b{_Q_CONTENT_NOUN}\b", re.I)
 _Q_INSIDE_RE = re.compile(rf"\b{_Q_INSIDE}\b", re.I)
 _Q_THIS_FILE_RE = re.compile(rf"\b{_Q_THIS_FILE}", re.I)
+#: THIS file, with the CONTENT nouns removed: a pronoun the artifact owns
+#: ("what is in it"), a determiner and a word for a FILE ("this sheet", "the
+#: workbook", "the tracker"), or a numbered part ("slide 3"). It is
+#: `_Q_THIS_FILE` minus `_Q_CONTENT_NOUN`, and the subtraction is the point.
+#:
+#: WHY IT EXISTS (verifier, 2026-09-27). `_Q_THIS_FILE` admits `the` + a
+#: content noun, and `totals?`, `dates?`, `data`, `values`, `numbers` and
+#: `figures` are content nouns — so "what is the TOTAL spend?", "what is the
+#: DATE range?" and "which countries are in the DATA?" all point at "this
+#: file" as far as that pattern is concerned. They are questions about the
+#: person's own uploaded DATASET, whose answer is a real number the dataset
+#: engine computes; the read-back holds the artifact's structure and never a
+#: cell value, so answering them from it replaces the number with a
+#: description of the wrong file. This pattern is what `names_our_file`
+#: records, and it is read ONLY when the conversation also holds a dataset
+#: (artifacts/describe.answers_from_spec) — with no dataset in the room there
+#: is no other file for the question to be about, and the broad reading is
+#: right.
+_Q_OUR_FILE = (
+    rf"(?:(?:it|this|that|these|those|them|_this_)\b"
+    rf"|(?:the|this|that|these|those|my|our|your)\s+(?:\w+\s+){{0,2}}?{_Q_FILE_WORD}\b"
+    rf"|(?:slide|page|sheet|tab|section|column|row)\s+\d+\b)"
+)
+_Q_OUR_FILE_RE = re.compile(rf"\b{_Q_OUR_FILE}", re.I)
+#: …and THEIR file, named as their own: "the csv i uploaded", "the attachment",
+#: "the sheet i sent". It vetoes the pointer above, because our own artifacts
+#: are xlsx/pdf/docx/pptx AND csv (formats.py's `data` template makes a CSV), so
+#: `csv`, `excel` and `spread sheet` are in `_Q_FILE_WORD` and cannot say whose
+#: file is meant on their own: measured 2026-09-27, "what is in the csv i
+#: uploaded?" pointed at OUR workbook. Naming the artifact by its TITLE still
+#: wins — that is the most specific pointer there is.
+#:
+#: NARROW, and it is the same vocabulary app.main._NAMES_AN_UPLOAD_RE uses one
+#: layer up, minus the `page \d+` / timestamp arms: a PDF this platform made
+#: HAS pages. Measured over the programme's 119-turn corpus: 0 rows match, so
+#: it cannot cost the read-back class.
+_Q_THEIR_UPLOAD_RE = re.compile(
+    r"\b(?:i|we)\s+(?:just\s+)?(?:sent|uploaded|shared|attached)\b"
+    r"|\b(?:the|that|this|my)\s+(?:attach(?:ment|ed)|upload(?:ed)?)\b"
+    r"|\b(?:attach(?:ed|ment)|upload(?:ed)?)\s+"
+    r"(?:file|csv|xlsx?|excel|sheet|workbook|spread ?sheet|data ?set|data|pdf|doc|document)\b",
+    re.I,
+)
 
 #: "what is in it", "what's inside the workbook", "what does this sheet
 #: contain", "what the tracker has", "what is on slide 3".
@@ -1864,8 +1923,27 @@ def decide(
             return None
         kw.setdefault("reference", _which(low, artifact_hints))
         kw.setdefault("reference_hint", _hint(low, artifact_hints))
+        # WHICH file the question is about, recorded for the route (see
+        # `ArtifactIntent.names_our_file`). The shape signals are as good as
+        # the pointer here: a question about what YOU did is about the file
+        # you made, the SOV order carries the file word as its object
+        # ("sheet _in_ su su che" — corpus q36), and a person refusing a new
+        # file while asking to be told is talking about the one that exists.
+        names_ours = bool(
+            # The artifact by TITLE outranks everything: nothing is more
+            # specific than the file's own name.
+            _mentions_hint(own_text(), artifact_hints)
+            or (
+                (_Q_OUR_FILE_RE.search(own_text())
+                 or _Q_DID_YOU_RE.search(own_text())
+                 or _Q_SOV_RE.search(own_text())
+                 or kind in ("told-not-to-create", "tell-me-only"))
+                # …unless the person named the file as THEIRS.
+                and not _Q_THEIR_UPLOAD_RE.search(own_text())
+            )
+        )
         return made("none", rule=f"answer-artifact:{kind}", answer_about_artifact=True,
-                    target="artifact", formats=[], **kw)
+                    names_our_file=names_ours, target="artifact", formats=[], **kw)
 
     # 0. The UI's "Edit with a prompt" names the artifact (AS3 (i)); the
     #    caller checked that the person owns it.
