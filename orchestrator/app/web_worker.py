@@ -55,7 +55,7 @@ import logging
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import db, metrics, web_index
 from .config import settings
@@ -79,6 +79,70 @@ def kick() -> None:
             _wake.set()
         except RuntimeError:  # pragma: no cover — loop closing
             pass
+
+
+#: Answers "is somebody chatting right now?" — installed by main.py at
+#: startup, because this module must not import main. None = never busy.
+#: The same probe the video and artifact pipelines pace against.
+_busy_probe: Optional[Callable[[], bool]] = None
+
+
+def set_busy_probe(fn: Optional[Callable[[], bool]]) -> None:
+    global _busy_probe
+    _busy_probe = fn
+
+
+async def pace() -> float:
+    """Hold the background drain while a person is waiting for an answer.
+
+    WHY THIS WORKER NEEDS IT TOO. The video and artifact pipelines have paced
+    against live chat since 2026-09-09; this one never did, and it is the only
+    other thing on this box that puts a big batch through a model with nobody
+    waiting on it. `llm.embed_texts` has no priority lane, so the sidecar
+    serves an index batch and a chat turn's query embedding strictly in
+    arrival order. Measured 2026-09-21/22 against the live sidecar: a query
+    embedding costs 15.3 ms mean on an idle one and 756.7 ms mean behind a
+    single 64-chunk index batch; through this function, with a simulated
+    3 s chat turn and the real `web_index._embed_batched` (n=5 each arm,
+    load average 5.2), 1138.4 ms mean with pacing off against 30.9 ms with
+    it on, for the same 1.18 s of index embedding either way. The live
+    orchestrator's own meter says the same thing:
+    `embed_seconds{kind="index"}` 798 ms mean over n=40 against
+    `embed_seconds{kind="query"}` 41 ms over n=14.
+
+    So the drain asks first whether a chat generation is in flight and, if so,
+    waits a second and asks again, up to `WEB_INDEX_PACE_MAX_WAIT_S`. A quiet
+    box drains at full speed; a busy one drains in the gaps. The cap stops a
+    continuously busy box from starving the backlog for ever: past it the
+    drain runs anyway, the same escape valve `video.pipeline.pace` has.
+
+    CALLED FROM THE WORKER, NEVER FROM `web_index`. `index_pending` holds
+    `_index_lock` for the whole pass, and the request-path callers of
+    `index_pending` (the Fast lookup, the post-search write-behind) queue on
+    that lock. Sleeping inside it would make a background nap block a user's
+    request — the exact cost this is meant to remove. Pacing here happens
+    before the lock is taken.
+
+    Returns the seconds waited, for the caller's own bookkeeping.
+    """
+    waited = 0.0
+    limit = float(settings.web_index_pace_max_wait_s)
+    while _busy_probe is not None and limit > 0 and waited < limit:
+        try:
+            busy = bool(_busy_probe())
+        except Exception:  # noqa: BLE001 — the probe is advisory
+            busy = False
+        if not busy:
+            break
+        await asyncio.sleep(1.0)
+        waited += 1.0
+    if waited:
+        metrics.observe(
+            "web_index_pace_seconds",
+            waited,
+            "seconds the background web index drain waited for chat to finish",
+        )
+    return waited
 
 
 def _ttl_for(row: Dict[str, Any]) -> int:
@@ -360,6 +424,10 @@ async def run_once() -> Dict[str, int]:
         "blocked": 0,
     }
 
+    # Nobody is waiting on this drain, and somebody may be waiting on the
+    # embedding sidecar it is about to occupy for most of a second. Wait for
+    # a gap in the chat first (see `pace`).
+    await pace()
     started = time.perf_counter()
     try:
         done["indexed"] = await web_index.index_pending(limit=40)
@@ -408,7 +476,11 @@ async def run_once() -> Dict[str, int]:
         metrics.worker_job("refresh", done["failed"] == 0, time.perf_counter() - started)
 
         # Newly-changed pages had their watermark cleared; embed them now
-        # rather than waiting a whole cycle to become answerable.
+        # rather than waiting a whole cycle to become answerable. Paced like
+        # the first drain: "now rather than next cycle" still means "in a gap",
+        # and the refresh above may have taken minutes, so the box's state at
+        # the top of the cycle says nothing about its state here.
+        await pace()
         try:
             done["indexed"] += await web_index.index_pending(limit=40)
         except Exception:  # noqa: BLE001

@@ -19,8 +19,25 @@ production cluster, so every property the owner asked for is pinned here:
   install the same bytes;
 * `remove` deletes only its own table.
 
-Nothing here runs the real nft, ip, ss, ssh or curl: each is a fake on PATH
-that reads a fixture and records its argv. The rules are also read back by a
+And, since 2026-09-22, that it comes back after a reboot. The table is kernel
+memory; it was applied on 2026-09-16, the 2026-09-21T18:11 reboot dropped it
+and the raw model API was open to the office LAN and the tailnet for hours.
+`install-boot` writes a oneshot systemd unit; the properties pinned here are:
+
+* the unit runs a COPY of the script, not the deploy checkout, which moves on
+  every push to main;
+* it is ordered after the network and BEFORE dockerd, which starts the engines
+  that listen on the guarded ports, and only ordered -- never `Requires=`;
+* it has no `ExecStop=` (stopping a unit must not re-open the raw model API)
+  and no `Condition*=` (an unmet condition skips a unit in silence);
+* the role is stored on the node and read back, never guessed;
+* when the full apply fails at boot the fallback still drops the office LAN
+  and the tailnet on the guarded ports, and drops NOTHING else -- above all
+  not rail A, where the worker's healthcheck kills its rank after 8 misses --
+  and the unit fails loudly instead of looking healthy.
+
+Nothing here runs the real nft, ip, ss, ssh, curl, systemctl or sleep: each is
+a fake on PATH that reads a fixture and records its argv. The rules are also read back by a
 Python evaluator written independently of the script's bash one, so a bug has
 to be made twice, the same way, to pass.
 """
@@ -177,6 +194,20 @@ class HostGuardTests(unittest.TestCase):
         self._fake("curl", 'echo "curl $*" >>"$FAKE_LOG"\nprintf 200\n')
         self._fake("ssh", 'echo "ssh $*" >>"$FAKE_LOG"\nexit 255\n')
         self._fake("sudo", 'echo "sudo $*" >>"$FAKE_LOG"\nexit 99\n')
+        self._fake(
+            "systemctl",
+            'echo "systemctl $*" >>"$FAKE_LOG"\n'
+            'case "$*" in\n'
+            '  "is-enabled nftables.service") s="${FAKE_NFTABLES:-disabled}"; echo "$s"; [ "$s" = enabled ] || exit 1 ;;\n'
+            '  "is-enabled techsara-host-guard.service") s="${FAKE_UNIT_ENABLED:-disabled}"; echo "$s"; [ "$s" = enabled ] || exit 1 ;;\n'
+            "  *) exit 0 ;;\n"
+            "esac\n",
+        )
+        # Nothing may actually sleep: the wait for the fabric is asserted, not waited out.
+        self._fake("sleep", 'echo "sleep $*" >>"$FAKE_LOG"\n')
+        self.boot_script = self.root / "sbin" / "techsara-host-guard"
+        self.boot_conf = self.root / "etc" / "host-guard.conf"
+        self.boot_unit = self.root / "etc" / "systemd" / "techsara-host-guard.service"
 
     def _fake(self, name: str, body: str) -> None:
         path = self.bin / name
@@ -190,6 +221,10 @@ class HostGuardTests(unittest.TestCase):
             "FAKE_LOG": str(self.log),
             "FAKE_DIR": str(self.root),
             "GUARD_STATE_DIR": str(self.state),
+            # Never the real /usr/local/sbin, /etc/techsara or /etc/systemd/system.
+            "GUARD_BOOT_SCRIPT": str(self.boot_script),
+            "GUARD_BOOT_CONF": str(self.boot_conf),
+            "GUARD_BOOT_UNIT": str(self.boot_unit),
             "LC_ALL": "C",
         }
         environment.update(env)
@@ -418,6 +453,296 @@ class HostGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("the installed ruleset is the one this checkout plans", result.stdout)
         self.assertTrue(any("http://127.0.0.1:8000/health" in c for c in self.calls("curl")))
+
+
+    # -- the boot path -----------------------------------------------------------
+    UNIT_MUST_CONTAIN = (
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        "Wants=network-online.target",
+        "After=network-online.target nftables.service",
+        "Before=docker.service",
+        "WantedBy=multi-user.target",
+    )
+
+    @staticmethod
+    def unit_directives(text: str) -> dict[str, list[str]]:
+        directives: dict[str, list[str]] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            key, _, value = line.partition("=")
+            directives.setdefault(key, []).append(value)
+        return directives
+
+    def test_install_boot_dry_run_prints_the_unit_and_every_command_and_changes_nothing(self) -> None:
+        result = self.run_guard("install-boot", "--role", "head", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in self.UNIT_MUST_CONTAIN:
+            self.assertIn(line, result.stdout)
+        self.assertIn(f"ExecStart={self.boot_script} apply-at-boot", result.stdout)
+        self.assertIn(f"EnvironmentFile={self.boot_conf}", result.stdout)
+        self.assertIn("GUARD_ROLE=head", result.stdout)
+        self.assertIn("+ systemctl daemon-reload", result.stdout)
+        self.assertIn("+ systemctl enable techsara-host-guard.service", result.stdout)
+        for path in (self.boot_script, self.boot_conf, self.boot_unit):
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(self.calls("nft") + self.calls("sudo"), [])
+        self.assertEqual(self.calls("systemctl"), ["systemctl is-enabled nftables.service"])
+
+    def test_install_boot_refuses_to_guess_which_spark_this_is(self) -> None:
+        result = self.run_guard("install-boot", "--dry-run")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("will not guess", result.stderr)
+
+    def test_install_boot_refuses_without_root(self) -> None:
+        result = self.run_guard("install-boot", "--role", "worker")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("needs root", result.stderr)
+        self.assertFalse(self.boot_unit.exists())
+
+    def test_install_boot_warns_when_the_stock_nftables_service_would_flush_the_table(self) -> None:
+        result = self.run_guard("install-boot", "--role", "head", "--dry-run", FAKE_NFTABLES="enabled")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("flush ruleset", result.stderr)
+
+    def test_install_boot_copies_this_script_and_records_where_it_came_from(self) -> None:
+        result = self.run_guard("install-boot", "--role", "worker", FAKE_UID="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.boot_script.read_bytes(), SCRIPT.read_bytes())
+        self.assertEqual(self.boot_script.stat().st_mode & 0o777, 0o755)
+        conf = self.boot_conf.read_text()
+        self.assertIn("GUARD_ROLE=worker\n", conf)
+        self.assertIn("GUARD_SOURCE_SHA256=" + hashlib.sha256(SCRIPT.read_bytes()).hexdigest() + "\n", conf)
+        # enable, never `enable --now` and never `start`: installing the unit must
+        # not apply a ruleset as a side effect of an install.
+        self.assertEqual(
+            self.calls("systemctl"),
+            [
+                "systemctl is-enabled nftables.service",
+                "systemctl daemon-reload",
+                "systemctl enable techsara-host-guard.service",
+            ],
+        )
+        self.assertEqual(self.calls("nft"), [])
+
+    def test_install_boot_run_from_the_boot_copy_itself_does_not_try_to_copy_it(self) -> None:
+        # On the worker there is no checkout, so the copy under /usr/local/sbin
+        # is also the script an operator runs.
+        self.assertEqual(self.run_guard("install-boot", "--role", "worker", FAKE_UID="0").returncode, 0)
+        result = subprocess.run(
+            ["bash", str(self.boot_script), "install-boot", "--role", "worker"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                "PATH": f"{self.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                "HOME": str(self.root),
+                "FAKE_LOG": str(self.log),
+                "FAKE_DIR": str(self.root),
+                "FAKE_UID": "0",
+                "GUARD_STATE_DIR": str(self.state),
+                "GUARD_BOOT_SCRIPT": str(self.boot_script),
+                "GUARD_BOOT_CONF": str(self.boot_conf),
+                "GUARD_BOOT_UNIT": str(self.boot_unit),
+                "LC_ALL": "C",
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("this very file", result.stdout)
+        self.assertEqual(self.boot_script.read_bytes(), SCRIPT.read_bytes())
+
+    def test_re_running_install_boot_writes_the_same_unit_and_the_same_copy(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        first = (self.boot_script.read_bytes(), self.boot_unit.read_text())
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.assertEqual((self.boot_script.read_bytes(), self.boot_unit.read_text()), first)
+
+    def test_the_unit_is_ordered_and_never_re_opens_the_ports_when_it_is_stopped(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        directives = self.unit_directives(self.boot_unit.read_text())
+        self.assertEqual(directives["Type"], ["oneshot"])
+        self.assertEqual(directives["RemainAfterExit"], ["yes"])
+        self.assertEqual(directives["Wants"], ["network-online.target"])
+        self.assertEqual(directives["After"], ["network-online.target nftables.service"])
+        # dockerd starts the engines that listen on the guarded ports.
+        self.assertEqual(directives["Before"], ["docker.service"])
+        self.assertEqual(directives["WantedBy"], ["multi-user.target"])
+        self.assertEqual(directives["EnvironmentFile"], [str(self.boot_conf)])
+        self.assertEqual(directives["ExecStart"], [f"{self.boot_script} apply-at-boot"])
+        # `systemctl stop` must never delete the table; a guard that cannot install
+        # must never keep the cluster down; an unmet condition skips a unit silently.
+        for forbidden in ("ExecStop", "Requires", "BindsTo", "Restart", "PartOf"):
+            self.assertNotIn(forbidden, directives)
+        self.assertEqual([k for k in directives if k.startswith(("Condition", "Assert"))], [])
+        # The start timeout has to outlast the wait for the fabric addresses.
+        self.assertGreater(int(directives["TimeoutStartSec"][0]), 90)
+
+    def test_the_unit_runs_the_boot_copy_and_not_the_deploy_checkout(self) -> None:
+        # The deploy job checks main out in the shared working tree on every push,
+        # and the worker has no checkout at all.
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        unit = self.boot_unit.read_text()
+        self.assertNotIn(str(SCRIPT), unit)
+        self.assertIn(f"ExecStart={self.boot_script} apply-at-boot", unit)
+        self.assertIn(f"GUARD_SOURCE_PATH={SCRIPT}\n", self.boot_conf.read_text())
+
+    def test_uninstall_boot_disables_the_unit_and_deliberately_leaves_the_table_loaded(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.log.write_text("")
+        result = self.run_guard("uninstall-boot", FAKE_UID="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.boot_unit.exists())
+        self.assertFalse(self.boot_conf.exists())
+        # The copy stays: on a node with no checkout it is the rollback tool.
+        self.assertTrue(self.boot_script.exists())
+        self.assertTrue((self.root / "table").exists())
+        self.assertTrue((self.state / "state").exists())
+        self.assertEqual(self.calls("nft"), [])
+        self.assertEqual(
+            self.calls("systemctl"),
+            ["systemctl disable techsara-host-guard.service", "systemctl daemon-reload"],
+        )
+
+    def test_uninstall_boot_refuses_without_root(self) -> None:
+        result = self.run_guard("uninstall-boot")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("needs root", result.stderr)
+
+    # -- apply-at-boot ------------------------------------------------------------
+    def test_apply_at_boot_installs_the_full_ruleset_and_records_the_mode(self) -> None:
+        planned = self.plan("head")
+        result = self.run_guard("apply-at-boot", FAKE_UID="0", GUARD_ROLE="head")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installed = sorted(self.root.glob("installed-*"))
+        self.assertEqual([f.read_text() for f in installed], [planned])
+        self.assertIn("GUARD_MODE=full\n", (self.state / "state").read_text())
+        self.assertEqual(self.calls("sleep"), [])
+
+    def test_apply_at_boot_refuses_to_guess_the_role_and_installs_nothing(self) -> None:
+        result = self.run_guard("apply-at-boot", FAKE_UID="0")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("will not guess the role", result.stderr)
+        self.assertIn(str(self.boot_conf), result.stderr)
+        self.assertEqual(self.calls("nft"), [])
+
+    def test_apply_at_boot_waits_for_the_fabric_because_network_online_target_promises_nothing(self) -> None:
+        # Neither NetworkManager-wait-online nor systemd-networkd-wait-online is
+        # enabled on these nodes, so network-online.target says nothing about
+        # whether the rail carries its address yet.
+        result = self.run_guard(
+            "apply-at-boot",
+            FAKE_UID="0",
+            GUARD_ROLE="head",
+            GUARD_RAIL_A_IFNAME="enp9s0",
+            GUARD_BOOT_WAIT_SECS="6",
+            GUARD_BOOT_POLL_SECS="2",
+        )
+        self.assertEqual(self.calls("sleep"), ["sleep 2"] * 3)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+
+    def test_apply_at_boot_falls_back_to_a_ruleset_that_closes_the_lan_and_the_tailnet_and_nothing_else(self) -> None:
+        result = self.run_guard(
+            "apply-at-boot",
+            FAKE_UID="0",
+            GUARD_ROLE="head",
+            GUARD_RAIL_A_IFNAME="enp9s0",   # the rail was renamed: the full apply must refuse
+            GUARD_BOOT_WAIT_SECS="0",
+        )
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("HOST GUARD: DEGRADED ON THIS NODE", result.stderr)
+        installed = sorted(self.root.glob("installed-*"))
+        self.assertEqual(len(installed), 1, "the full apply must never have reached nft")
+        ruleset = installed[0].read_text()
+        self.assertIn("GUARD_MODE=degraded\n", (self.state / "state").read_text())
+        # The exposure the audit walked in through is still closed ...
+        for port in (8000, 8005, 9100, 9835, 9838):
+            self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.20"), "drop")
+            self.assertEqual(python_verdict(ruleset, port, "tailscale0", "100.64.0.9"), "drop")
+            self.assertEqual(python_verdict(ruleset, port, "tailscale0", "fd7a:115c:a1e0::9"), "drop")
+        # ... and nothing that could kill a rank or lock an operator out is dropped.
+        # The rail is still called enp1s0f1np1 here even though the rules name
+        # enp9s0: with no catch-all drop it is accepted anyway, which is the whole
+        # point -- 8 missed healthchecks over rail A kill the worker's rank.
+        self.assertEqual(python_verdict(ruleset, 8000, "enp1s0f1np1", "10.100.184.2"), "accept")
+        self.assertEqual(python_verdict(ruleset, 8000, "wlP9s9", "192.168.50.3"), "accept")
+        self.assertEqual(python_verdict(ruleset, 22, "enP7s7", "192.168.9.20"), "accept")
+        self.assertEqual(python_verdict(ruleset, 29501, "enp1s0f1np1", "10.100.184.2"), "accept")
+
+    def test_apply_at_boot_says_no_filter_and_fails_when_even_the_fallback_cannot_load(self) -> None:
+        result = self.run_guard("apply-at-boot", FAKE_UID="0", GUARD_ROLE="head", FAKE_NFT_CHECK_FAIL="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("HOST GUARD: NO FILTER ON THIS NODE", result.stderr)
+        self.assertFalse((self.root / "table").exists())
+        self.assertFalse((self.state / "state").exists())
+
+    def test_the_worker_fallback_still_admits_only_the_head_over_the_office_lan(self) -> None:
+        result = self.run_guard("plan", "--role", "worker", "--degraded")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ruleset = result.stdout
+        self.assertIn("DEGRADED fallback", ruleset)
+        for port in (30004, 30007, 9100, 9835):
+            self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.20"), "drop")
+            self.assertEqual(python_verdict(ruleset, port, "tailscale0", "100.64.0.9"), "drop")
+            self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.54"), "accept")
+        self.assertEqual(python_verdict(ruleset, 9839, "enp1s0f1np1", "10.100.184.1"), "accept")
+        self.assertEqual(python_verdict(ruleset, 22, "enP7s7", "192.168.9.20"), "accept")
+        self.assertEqual(python_verdict(ruleset, 30004, "wlP9s9", "192.168.50.3"), "accept")
+
+    # -- verify sees the boot path ------------------------------------------------
+    def test_verify_warns_that_nothing_re_applies_the_table_at_boot(self) -> None:
+        # The defect itself: applied 2026-09-16, gone at the 2026-09-21 reboot.
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        result = self.run_guard("verify", "--role", "head", "--no-remote")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("nothing re-applies this table at boot", result.stdout)
+
+    def test_verify_passes_the_boot_checks_once_the_unit_is_installed_and_enabled(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        result = self.run_guard("verify", "--role", "head", "--no-remote", FAKE_UNIT_ENABLED="enabled")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("is enabled: the guard is re-applied at every boot", result.stdout)
+        self.assertIn("byte-identical to this script", result.stdout)
+
+    def test_verify_fails_when_the_unit_is_installed_but_not_enabled(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        result = self.run_guard("verify", "--role", "head", "--no-remote")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("will NOT come back after a reboot", result.stdout)
+
+    def test_verify_fails_when_the_boot_copy_has_drifted_from_this_checkout(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        self.boot_script.write_text(SCRIPT.read_text() + "\n# edited on the node\n")
+        result = self.run_guard("verify", "--role", "head", "--no-remote", FAKE_UNIT_ENABLED="enabled")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("has DRIFTED from this script", result.stdout)
+
+    def test_verify_fails_when_the_stored_role_is_not_the_role_being_checked(self) -> None:
+        self.assertEqual(self.run_guard("install-boot", "--role", "worker", FAKE_UID="0").returncode, 0)
+        self.assertEqual(self.run_guard("apply", "--role", "head", FAKE_UID="0").returncode, 0)
+        result = self.run_guard("verify", "--role", "head", "--no-remote", FAKE_UNIT_ENABLED="enabled")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("stores role='worker'", result.stdout)
+
+    def test_verify_fails_while_the_node_is_running_the_degraded_fallback(self) -> None:
+        self.assertEqual(
+            self.run_guard(
+                "apply-at-boot",
+                FAKE_UID="0",
+                GUARD_ROLE="head",
+                GUARD_RAIL_A_IFNAME="enp9s0",
+                GUARD_BOOT_WAIT_SECS="0",
+            ).returncode,
+            3,
+        )
+        result = self.run_guard("verify", "--role", "head", "--no-remote")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("DEGRADED FALLBACK", result.stdout)
 
 
 if __name__ == "__main__":

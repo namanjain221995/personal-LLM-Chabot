@@ -766,6 +766,89 @@ Then from the head `scripts/ocr.sh verify` and `scripts/whisper.sh verify`
 must still succeed, the worker's Prometheus targets stay UP, and from an
 office laptop `curl -m 5 http://192.168.9.68:30004/v1/models` times out.
 
+### Surviving a reboot
+
+The table is kernel memory. It was applied on 2026-09-16, the reboot of
+2026-09-21T18:11 dropped it, and the unauthenticated engine ports were open to
+the office LAN and the tailnet for hours until it was re-applied by hand.
+`install-boot` closes that. It copies the script to
+`/usr/local/sbin/techsara-host-guard`, stores the node's role in
+`/etc/techsara/host-guard.conf`, and writes and enables
+`techsara-host-guard.service`: a `Type=oneshot` unit with
+`RemainAfterExit=yes`, ordered `After=network-online.target nftables.service`
+and **`Before=docker.service`**, so the filter is in the kernel before dockerd
+starts the engines that listen on the guarded ports. Run it once per node;
+`--dry-run` prints the unit file, the role file and every command it would
+run, and needs no root.
+
+```bash
+# head, from the deploy root
+sudo scripts/host-guard.sh install-boot --dry-run --role head   # read it first
+sudo scripts/host-guard.sh install-boot --role head
+sudo systemctl restart techsara-host-guard.service              # prove it without rebooting
+systemctl status techsara-host-guard.service --no-pager
+scripts/host-guard.sh verify --role head
+
+# worker (no checkout there; "$W" as in the block above)
+scp scripts/host-guard.sh "$W":.techsara-cluster/host-guard.sh
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh install-boot --dry-run --role worker'
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh install-boot --role worker'
+ssh -t "$W" 'sudo systemctl restart techsara-host-guard.service'
+ssh    "$W" 'bash ~/.techsara-cluster/host-guard.sh verify --role worker'
+```
+
+`restart`, not `start`: `start` on an active `RemainAfterExit` oneshot does
+nothing. Re-applying installs the same bytes in one `nft` transaction and
+restarts no container, engine or model.
+
+**The unit runs the copy under `/usr/local/sbin`, not the checkout**, because
+the deploy job checks `main` out in the shared working tree on every push and
+the worker has no checkout at all — root code that runs at boot must not be
+whatever the tree happens to hold at that moment. `install-boot` is the only
+thing that writes that copy, always from the repository file, and it records
+the source checksum, so `verify` reports `has DRIFTED from this script` when
+the two diverge. Re-run `install-boot` after any change to
+`scripts/host-guard.sh`.
+
+**A failure at boot is never silent.** `apply-at-boot` waits up to 90 s for the
+interfaces and addresses the rules name (`network-online.target` promises
+nothing here: neither `NetworkManager-wait-online` nor
+`systemd-networkd-wait-online` is enabled on either node), then:
+
+| exit | what is loaded | the unit |
+|---|---|---|
+| 0 | the guard | `active (exited)` |
+| 3 | the **degraded fallback**: the office LAN and the tailnet still dropped on the guarded ports, every other ingress accepted | `failed`, on purpose |
+| 1 | nothing; the ports are open | `failed`, on purpose |
+
+Exit 3 and exit 1 both write the reason into the journal in block capitals and
+make `scripts/host-guard.sh verify` fail. In the degraded case the state file
+says `GUARD_MODE=degraded` and the textfile exporter reports
+`techsara_host_guard_table_present 0`, because the guard is not in place. The
+fix is the same either way: repair the host, then
+`sudo /usr/local/sbin/techsara-host-guard apply --role head|worker`.
+
+**What fails open and what fails closed at boot, and why.** Dropping too much
+at boot costs more than dropping too little on one class of traffic:
+
+| port class | at boot | why |
+|---|---|---|
+| the engine port and the sentinel from the rails, and everything on loopback | **open** | the worker's rank curls the head over rail A and `kill -9`s itself after 8 misses; a boot-time drop there is a cold start of a 35B model across both nodes |
+| every port outside the guarded set — ssh above all, the torch master port, the NCCL and Gloo listeners | **open** | these nodes have no console, so a guard that locks an operator out cannot be undone remotely |
+| an ingress interface the rules do not name | **open** | it may be a rail under a new name after a kernel update, which is the likeliest reason the full apply refused in the first place |
+| the guarded ports arriving on `enP7s7` or `tailscale0` | **closed** | that is the exposure the audit reached the box through, and being wrong there costs one operator a path they should not have been using |
+| the exporters and the controller from the Docker bridges | open | a lost scrape is a blind dashboard, not an outage, and dockerd has not started yet at that point |
+
+**Stopping the unit does not remove the table**, and neither does
+`uninstall-boot`: `systemctl stop` must never be a way to re-open the raw model
+API. The rollback stays explicit —
+`sudo /usr/local/sbin/techsara-host-guard remove`.
+
+Never enable the stock `nftables.service` on these nodes: its
+`/etc/nftables.conf` begins with `flush ruleset`, which deletes Docker's NAT
+and filter rules along with this table. `install-boot` warns if it finds it
+enabled.
+
 ### Day to day
 
 * `scripts/host-guard.sh explain 8000 enp1s0f1np1 10.100.184.2` — what the
@@ -777,9 +860,11 @@ office laptop `curl -m 5 http://192.168.9.68:30004/v1/models` times out.
   bridge with a custom name) must be added to the script's rules **and** its
   consumer table, then `apply` re-run; `apply` refuses while such a peer is
   connected and would be cut.
-* The table does not survive a reboot. Never persist it through the stock
-  `/etc/nftables.conf` (it starts with `flush ruleset`, which deletes Docker's
-  rules); use the oneshot systemd unit in DISPOSITION.md OA-4.
+* `techsara-host-guard.service` re-applies the table at every boot (above);
+  `systemctl status techsara-host-guard.service` and `scripts/host-guard.sh
+  verify` each say whether it still will. Never persist the table through the
+  stock `/etc/nftables.conf`: it starts with `flush ruleset`, which deletes
+  Docker's rules too.
 * Not covered: Docker-published ports (`0.0.0.0:8080`, `:3000`, `:9000`)
   traverse Docker's FORWARD path, not the input hook (DISPOSITION.md OA-7,
   OA-8).

@@ -338,7 +338,7 @@ def _windows_data(command: Command) -> dict:
 
 
 def choose_cache_path(project_root: Path, env: dict[str, str] | None = None) -> Path:
-    env = env or os.environ
+    env = os.environ if env is None else env
     override = env.get("TECHSARA_MODEL_CACHE", "").strip()
     if override:
         return Path(override).expanduser().resolve()
@@ -497,7 +497,7 @@ def detect_hardware(
         )
 
     if values.get("gpu_vendor") == "nvidia" and docker["running"] and docker["linux_containers"]:
-        override = (environ or os.environ).get("TECHSARA_GPU_SMOKE_IMAGE", "").strip()
+        override = (os.environ if environ is None else environ).get("TECHSARA_GPU_SMOKE_IMAGE", "").strip()
         smoke_images = [override] if override else [
             # Prefer an image the host already has, so ordinary re-detection
             # never pulls. The pinned tiny probe is the clean-clone fallback.

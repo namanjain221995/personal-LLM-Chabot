@@ -3,7 +3,9 @@
 # (2026-09-13, monitoring/developer-api/README.md "host packet filter").
 #
 # WHY A TEXTFILE. The filter is one nftables table (`inet techsara_guard`,
-# scripts/host-guard.sh) and it does not survive a reboot. Listing a table
+# scripts/host-guard.sh). It lives in kernel memory; since 2026-09-22 a
+# systemd unit re-applies it at every boot (`host-guard.sh install-boot`), and
+# this writer is how you find out that it did not. Listing a table
 # needs CAP_NET_ADMIN ("Operation not permitted (you must be root)" as the
 # normal user), and no network probe from inside the cluster can tell a
 # filtered port from an open one, because every in-cluster path is one the
@@ -18,6 +20,12 @@
 #               remove; /run is tmpfs, so a reboot clears it. It proves
 #               "applied since boot and not removed by the script", NOT that
 #               nobody flushed the ruleset by hand. Prefer root.
+#
+# THE DEGRADED FALLBACK COUNTS AS ABSENT. When the boot unit cannot install
+# the guard it loads a fallback under the SAME table name, which closes the
+# office LAN and the tailnet and nothing else. Both sources detect it (the
+# rule comment under nft, GUARD_MODE under state_file) and report
+# table_present=0, because the guard is not in place.
 #
 # Output (atomic rename into the textfile directory):
 #   techsara_host_guard_table_present{source}   1 loaded, 0 not loaded
@@ -47,11 +55,16 @@ fi
 
 case "$MODE" in
   nft)
-    if err="$("$NFT" list table inet "$TABLE" 2>&1 >/dev/null)"; then
-      present=1; ok=1
+    if out="$("$NFT" list table inet "$TABLE" 2>/dev/null)"; then
+      ok=1
+      case "$out" in
+        *"DEGRADED fallback"*) present=0 ;;
+        *) present=1 ;;
+      esac
     else
       # A missing table is ENOENT ("No such file or directory"); anything
       # else (no permission, no nf_tables) is a check that did not run.
+      err="$("$NFT" list table inet "$TABLE" 2>&1 >/dev/null)" || true
       case "$err" in
         *"No such file or directory"*) present=0; ok=1 ;;
         *) present=0; ok=0 ;;
@@ -60,7 +73,12 @@ case "$MODE" in
     ;;
   state_file)
     if [ -e "$STATE" ]; then
-      if grep -q '^GUARD_APPLIED_AT=' "$STATE" 2>/dev/null; then present=1; ok=1; else ok=0; fi
+      if grep -q '^GUARD_APPLIED_AT=' "$STATE" 2>/dev/null; then
+        ok=1
+        if grep -q '^GUARD_MODE=degraded$' "$STATE" 2>/dev/null; then present=0; else present=1; fi
+      else
+        ok=0
+      fi
     else
       # `-e` is false both for a file that is not there and for one this user
       # cannot see. "Absent" is only honest when the lookup could have found

@@ -571,6 +571,28 @@ class Settings:
         self.artifact_selfcheck_budget_max_s: float = _float("ARTIFACT_SELFCHECK_BUDGET_MAX_S", 90.0)
         # --- end AS3 agentic-selfcheck ---
 
+        # --- prompt-comprehension release, 2026-09-22 ---------------------
+        # Two switches DECLARED here and read elsewhere. They are declared
+        # together, by the one track that owns this file for the release,
+        # because two tracks editing config.py concurrently is a merge
+        # conflict by design and one declaration up front costs nothing.
+        # REAL fields, not getattr defaults: Settings reads the environment
+        # here, once, so only a field can be switched off by env.
+        #
+        # ANSWER FIRST, THEN THE FILE (engines/artifact.py). A request for a
+        # document is answered in the chat as Markdown and the DOCX/PDF is
+        # exported from that same answer by `md_import.markdown_to_document`
+        # — deterministic, zero model calls — instead of being composed a
+        # second time from a second prompt. Off = the file is composed
+        # independently, which is what produced a four-page document sharing
+        # nothing with what the chat would have said.
+        self.artifact_answer_first: bool = _bool("ARTIFACT_ANSWER_FIRST", True)
+        # MAX'S PLAN -> DRAFT -> CHECK -> CRITIQUE -> REVISE LOOP
+        # (core/max_loop.py), Max only. Off = Max keeps best-of-N. Neither
+        # Fast nor Think is affected by this setting at any value.
+        self.max_loop_enabled: bool = _bool("MAX_LOOP_ENABLED", True)
+        # --- end prompt-comprehension release ---
+
         # --- Reranker ------------------------------------------------------
         # Backward compatibility: RERANK_ENABLED=false still disables the
         # feature when no backend is named. New profiles select an explicit
@@ -1170,6 +1192,14 @@ class Settings:
         # column so a restart resumes rather than forgets.
         self.web_knowledge_worker_enabled: bool = _bool("WEB_KNOWLEDGE_WORKER_ENABLED", True)
         self.web_worker_interval_s: int = _int("WEB_WORKER_INTERVAL_S", 300)
+        # PACING, like the video and artifact pipelines. Before each embedding
+        # drain the worker waits — up to this long — while a chat generation is
+        # in flight, because one index batch occupies the embedding sidecar for
+        # most of a second and the query embedding on a chat turn's retrieval
+        # path then queues behind it (measured 2026-09-22 through the real
+        # drain: 1138.4 ms with pacing off, 30.9 ms with it on, for the same
+        # index work). 0 disables pacing and restores the old behaviour.
+        self.web_index_pace_max_wait_s: float = _float("WEB_INDEX_PACE_MAX_WAIT_S", 20.0)
         self.web_refresh_max_pages_per_cycle: int = _int("WEB_REFRESH_MAX_PAGES_PER_CYCLE", 8)
         self.web_refresh_concurrency: int = _int("WEB_REFRESH_CONCURRENCY", 2)
         # Per-level re-read deadlines. A page about an office holder is worth

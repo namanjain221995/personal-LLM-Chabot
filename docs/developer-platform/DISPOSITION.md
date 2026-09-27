@@ -382,38 +382,40 @@ to one new connection (for example `explain 8000 enp1s0f1np1 10.100.184.2`).
 `sudo nft list table inet techsara_guard` shows the per-rule counters: the rail
 A accept should climb by about two packets a minute from the healthcheck.
 
-**Persistence.** The table lives in kernel memory; a reboot clears it and the
-ports are open again until it is reapplied. Do **not** put it in the stock
-`/etc/nftables.conf` and enable `nftables.service`: that file begins with
+**Persistence (built 2026-09-22).** The table lives in kernel memory and
+nothing re-applied it: it was applied on 2026-09-16, the reboot of
+2026-09-21T18:11 cleared it, and the raw model API sat open to the office LAN
+and the tailnet until the owner re-applied it by hand. Do **not** put it in the
+stock `/etc/nftables.conf` and enable `nftables.service`: that file begins with
 `flush ruleset`, which deletes Docker's NAT and filter rules on every load and
-cuts every published port and the tunnel. After a week of clean counters, copy
-the script out of the deploy checkout (a `git checkout` must not change it
-under a boot) and run it from a oneshot unit:
-
-```ini
-# /etc/systemd/system/techsara-host-guard.service
-[Unit]
-Description=techsara host guard (nftables table inet techsara_guard)
-Wants=network-online.target
-After=network-online.target docker.service tailscaled.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/local/sbin/techsara-host-guard apply --role head
-ExecStop=/usr/local/sbin/techsara-host-guard remove
-
-[Install]
-WantedBy=multi-user.target
-```
+cuts every published port and the tunnel. `scripts/host-guard.sh install-boot`
+now writes and enables the unit itself, from the repository's own script:
 
 ```bash
-sudo install -m 0755 scripts/host-guard.sh /usr/local/sbin/techsara-host-guard
-sudo systemctl daemon-reload && sudo systemctl enable techsara-host-guard.service
+sudo scripts/host-guard.sh install-boot --dry-run --role head   # the unit, the role file, every command
+sudo scripts/host-guard.sh install-boot --role head
+sudo systemctl restart techsara-host-guard.service              # prove it without a reboot
+scripts/host-guard.sh verify --role head
 ```
 
-(`enable` without `--now` changes nothing until the next boot; the table
-installed in step 2 stays.)
+It installs `/usr/local/sbin/techsara-host-guard` — a copy, because the deploy
+checkout moves on every push to `main` and the worker has no checkout, and root
+code that runs at boot must not be whatever the tree happens to hold;
+`install-boot` records the source checksum and `verify` reports the drift —
+plus `/etc/techsara/host-guard.conf` (the role, stored and read back, never
+guessed from a hostname) and `/etc/systemd/system/techsara-host-guard.service`:
+`Type=oneshot`, `RemainAfterExit=yes`, `After=network-online.target
+nftables.service`, `Before=docker.service` so the filter is loaded before
+dockerd starts the engines. Ordering only — no `Requires=` (a guard that cannot
+install must not keep the cluster down), no `Condition*=` (an unmet condition
+skips a unit in silence) and no `ExecStop=` (stopping a unit must never re-open
+the raw model API; the rollback stays an explicit `remove`). `enable` without
+`--now`, so the table already loaded is untouched. A boot-time failure loads a
+fallback that keeps the office LAN and the tailnet closed and drops nothing
+else, and leaves the unit `failed`: the exit codes and the
+fail-open/fail-closed reasoning per port class are in OPERATIONS.md §13
+"Surviving a reboot". `uninstall-boot` reverses it and deliberately leaves the
+loaded table alone.
 
 Out of scope of this filter and still wildcard on the head: `0.0.0.0:8080`
 (orchestrator), `0.0.0.0:3000` (frontend) and `0.0.0.0:9000` (portainer) are
@@ -498,7 +500,10 @@ targets must stay UP; the engine controller's
 ssh -t techsphere@10.100.184.2 'sudo bash ~/.techsara-cluster/host-guard.sh remove'
 ```
 
-Persist it on the worker the same way as OA-4 (`--role worker` in the unit).
+Persist it on the worker the same way as OA-4, with `--role worker`:
+`ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh install-boot --role worker'`,
+then `ssh -t "$W" 'sudo systemctl restart techsara-host-guard.service'` to
+prove it without a reboot.
 The cleartext hop of user images over the office LAN (N016) is not closed by
 this; it needs the rail move described in that row.
 
