@@ -74,6 +74,17 @@ PLAN = {"Executive Summary": 350, "Current Architecture": 900, "Target Architect
         "Risks and Mitigations": 900, "Cost Model": 700, "Team and Ownership": 500, "Recommendations": 600}
 PLAN_TOTAL = sum(PLAN.values())          # 12,050
 
+#: The same judgement inside the ceiling a bare one-line request buys at Fast
+#: (`compose.size_bounds` → 8 sections, 8 x PLANNED_SECTION_CEILING = 5,400).
+#: Used wherever a test needs the model's own numbers to survive untouched:
+#: PLAN itself is 12,050 over fifteen sections, which is more than a request
+#: of one sentence justifies at any effort, and it is CUT — out loud — by
+#: `size_from_plan`.
+FITS = {"Executive Summary": 350, "Current Architecture": 900, "Target Architecture": 1_100,
+        "Service Boundaries": 950, "Data Strategy": 800, "API Gateway": 500, "Observability": 450,
+        "Recommendations": 350}
+FITS_TOTAL = sum(FITS.values())          # 5,400
+
 
 class _Model:
     """A scripted `llm.json_completion` that records every prompt."""
@@ -207,6 +218,56 @@ def test_a_section_the_model_did_not_size_is_sized_by_code_and_named():
     assert C._plan_words({"words": "1,200"}) == 1_200 and C._plan_words({"words": -5}) is None
 
 
+def test_the_bound_the_request_justifies_is_read_off_the_request_alone():
+    """`size_bounds` is the guard between a size the MODEL decided and a size
+    an UPLOAD decided, and it is pure: the effort, the request's own target and
+    the sections the request named, and nothing from the material.
+
+    `PLANNED_SECTION_CEILING` is `length.MAX_WORDS // OUTLINE_MAX_SECTIONS`, so
+    a request that justifies all forty sections is bounded at exactly the
+    file's own limit and nothing tighter is invented."""
+    fast, think, mx = (T.EFFORT_BUDGETS[e] for e in ("fast", "think", "max"))
+    assert C.PLANNED_SECTION_CEILING == L.MAX_WORDS // C.OUTLINE_MAX_SECTIONS == 675
+    assert C.size_bounds(fast) == (8, 5_400)
+    assert C.size_bounds(think) == (12, 8_100)
+    assert C.size_bounds(mx) == (16, 10_800)
+    # The sections the request NAMED raise it; `caps_for` allows two over.
+    assert C.size_bounds(fast, L.LengthTarget(), [f"S{i}" for i in range(15)]) == (17, 11_475)
+    # A size the request already justified is never cut below itself.
+    assert C.size_bounds(fast, L.LengthTarget(words=9_000, explicit=True))[1] >= 9_000
+    # And the ceiling stops at the file's own.
+    assert C.size_bounds(fast, L.LengthTarget(), [f"S{i}" for i in range(60)]) == (40, L.MAX_WORDS)
+
+
+def test_a_plan_over_the_bound_is_cut_to_it_and_the_cut_is_named():
+    """The pure half of the upload defence. Both cuts are separate sentences,
+    because a 40-section plan cut to 8 and a 216,000-word plan cut to 5,400 are
+    two different things to have happened."""
+    plan = _plan({f"Section {i}": 27_000 for i in range(40)})
+    decided, warnings = C.size_from_plan(plan, L.LengthTarget(), max_sections=8, max_words=5_400)
+    assert decided.words == 5_400 and decided.sections == 8
+    assert warnings == [
+        "the model planned 40 sections, more than the 8 this request allows; it was cut to 8",
+        "the model planned 216,000 words, more than the 5,400 this request allows; it was cut to 5,400"]
+    # Passing no bound means the file's own limits, which is what every caller
+    # that is not the deciding pass gets.
+    assert C.size_from_plan(plan)[0].words == L.MAX_WORDS
+
+
+def test_the_section_count_something_decided_replaces_the_arithmetic_one():
+    """`caps_for` read `max(sections_for(words), target.sections)` for one day,
+    so a plan CUT to eight sections was handed back the fourteen that
+    `sections_for` reads out of its own 5,400-word ceiling — and the bound
+    bought nothing, because the cost is one scoped write per section."""
+    fast = T.EFFORT_BUDGETS["fast"]
+    assert C.caps_for(fast, L.LengthTarget(words=5_400, sections=8))[0] == 8
+    assert L.sections_for(5_400) == 14, "which is what it used to widen back to"
+    # Nothing decided a count: the word target still implies one.
+    assert C.caps_for(fast, L.LengthTarget(words=5_400))[0] == 14
+    # And the effort's own floor still holds under both.
+    assert C.caps_for(fast, L.LengthTarget(words=400, sections=1))[0] == 8
+
+
 # ------------------------------------------------ who gets asked, and when --
 
 
@@ -250,60 +311,122 @@ def test_a_size_the_product_worked_out_is_a_floor_the_plan_may_beat():
     assert C.plans_size(data) is True
 
 
-def test_the_deciding_call_is_not_told_to_be_concise_or_to_fit_eight_sections():
-    """What the pass that decides the size is allowed to see. Fast's tone
-    line and Fast's eight-section limit are both numbers that would decide
-    the answer before the model did."""
+def test_the_deciding_call_is_not_told_to_be_concise_and_is_bounded_by_the_request():
+    """What the pass that decides the size is allowed to see. Fast's tone line
+    is a number that would decide the answer before the model did, so it is
+    gone. The section CAP is not: it is `size_bounds`, read off the request
+    alone, and stating it is what keeps the prompt and the rule the composer
+    enforces the same number.
+
+    For one day this read the renderer's 40 at every effort and for every
+    request, which is how an upload came to ask for forty sections of 27,000
+    words (see `test_text_inside_an_upload_cannot_decide_the_size`)."""
     model = _Model([_plan(PLAN)] + [_section(h, int(w * 0.7)) for h, w in PLAN.items()])
     llm.json_completion = model
     asyncio.run(C.compose(_req(NO_SHAPE)))
     system = _system(model, "artifact_outline")
     assert "Be concise and concrete." not in system
     assert "the length is yours to decide from the subject and the material" in system
-    assert "at most 40 top-level sections" in system, "the renderer's bound, not the effort's"
     assert "Decide the size here." in system
-    # No number is suggested anywhere in it: a suggested number is what the
-    # model would anchor on.
+    # A bare one-line request justifies Fast's own eight sections and no more,
+    # and the ceiling those eight come to is stated rather than sprung.
+    assert "at most 8 top-level sections" in system
+    assert "keep that total at or under 5,400 words" in system
+    assert model.named("artifact_outline")[0]["plan_cap"] == 8
+    # No size is SUGGESTED anywhere in it: a suggested number is what the
+    # model would anchor on. A ceiling is not a suggestion.
     assert "words" in system and "about 400 words" not in system and "Write about" not in system
-    assert model.named("artifact_outline")[0]["plan_cap"] == 40
+
+    # THE SAME REQUEST WITH ITS SECTIONS NUMBERED raises the cap, which is the
+    # case the renderer's 40 was reaching for — without letting an upload have
+    # the same effect.
+    fifteen = _req("Write the platform report.\nRequirements:\n"
+                   + "\n".join(f"{i}. {n}" for i, n in enumerate(FIFTEEN, 1)))
+    assert C.size_bounds(T.EFFORT_BUDGETS["fast"], C.target_for(fifteen),
+                         C.requested_sections(fifteen.instruction)) == (17, 11_475)
+    assert C.size_bounds(T.EFFORT_BUDGETS["fast"], C.target_for(_req(NO_SHAPE))) == (8, 5_400)
+    assert C.size_bounds(T.EFFORT_BUDGETS["think"], C.target_for(_req(NO_SHAPE))) == (12, 8_100)
+    assert C.size_bounds(T.EFFORT_BUDGETS["max"], C.target_for(_req(NO_SHAPE))) == (16, 10_800)
 
 
 def test_the_decided_size_reaches_the_prompt_the_document_and_the_card():
     """The owner's own prompt, end to end. Before: 735 words, 6 sections,
-    "Be concise and concrete.", "at most 8 top-level sections". After: the
-    model's 12,050 words in the fifteen sections it planned."""
-    model = _Model([_plan(PLAN)] + [_section(h, int(w * 0.7)) for h, w in PLAN.items()])
+    "Be concise and concrete.", "at most 8 top-level sections"."""
+    model = _Model([_plan(FITS)] + [_section(h, int(w * 0.7)) for h, w in FITS.items()])
     llm.json_completion = model
     result = asyncio.run(C.compose(_req(NO_SHAPE)))
 
     system = _system(model, "artifact_section_write")
     assert "Be concise and concrete." not in system
-    assert ("Write about 12,050 words in 15 top-level sections, about 803 words of real prose in each"
+    assert ("Write about 5,400 words in 8 top-level sections, about 675 words of real prose in each"
             in system)
-    assert "at most 8 top-level sections" not in system
-    assert len(_headings(result.spec)) == 15
-    assert len(S.text_of(result.spec).split()) == 8_464
+    assert len(_headings(result.spec)) == 8
+    assert len(S.text_of(result.spec).split()) == 3_795
     note = next(w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE))
-    assert "the 15 sections the model planned" in note and "12,050 words" in note
+    assert "the 8 sections the model planned" in note and "5,400 words" in note
+    assert "written in 8 sections" in note
 
-    # EACH SECTION IS ASKED FOR ITS OWN PLANNED LENGTH, not the average.
+    # EACH SECTION IS ASKED FOR ITS OWN PLANNED LENGTH, not the average — the
+    # numbers still add up to the decided total, so the plan's shape is the
+    # shape that gets written.
     asked = [c["messages"][-1]["content"] for c in model.named("artifact_section_write")]
     assert "Write about 350 words in this section." in asked[0], "the executive summary"
-    assert "Write about 1,200 words in this section." in asked[10], "the migration phases"
+    assert "Write about 1,100 words in this section." in asked[2], "the target architecture"
+
+
+def test_a_plan_bigger_than_the_request_justifies_is_cut_out_loud_and_in_the_writes():
+    """PLAN is 12,050 words over fifteen sections for a request of one
+    sentence. `size_bounds` says a bare ask at Fast buys eight sections and
+    5,400 words, so the plan is cut to that — and the CUT reaches the writes,
+    which is the half that was missing for a day: the card said 5,400 while
+    every scoped write was asked for the plan's own number."""
+    # Each scripted section writes the 675 it is asked for, so no extension
+    # pass runs and the call count is one per section and nothing else.
+    model = _Model([_plan(PLAN)] + [_section(h, 675) for h in PLAN])
+    llm.json_completion = model
+    result = asyncio.run(C.compose(_req(NO_SHAPE)))
+    asked = [c["messages"][-1]["content"] for c in model.named("artifact_section_write")]
+    assert len(asked) == 8, "one scoped write per section the request bought, and no more"
+    assert all("Write about 675 words in this section." in a for a in asked), asked
+    # 6,550 is the first EIGHT sections of PLAN: the section cut comes first and
+    # only the sections that survive are counted, as
+    # `test_a_hundred_sections_is_clamped_to_what_one_file_holds_and_says_so`
+    # pins. Both cuts are on the card.
+    assert ["the model planned 15 sections, more than the 8 this request allows; it was cut to 8",
+            "the model planned 6,550 words, more than the 5,400 this request allows; "
+            "it was cut to 5,400"] == [w for w in result.warnings if w.startswith("the model planned")]
 
 
 def test_the_size_is_the_same_at_every_effort_level():
     """The size is a property of the work, not of a dropdown. Before this
-    change the SAME request produced 735 words at Fast and 4,232 at Think."""
+    change the SAME request produced 735 words at Fast and 4,232 at Think.
+
+    The effort sets one thing about the size and only one: the CEILING, which
+    is the cost the person chose (`size_bounds`). Inside it the answer is the
+    model's and it is the same at all three."""
     written = {}
     for effort in ("fast", "think", "max"):
-        answers = [_plan(PLAN)] + [_section(h, int(w * 0.7)) for h, w in PLAN.items()]
+        answers = [_plan(FITS)] + [_section(h, int(w * 0.7)) for h, w in FITS.items()]
         answers.append({"ok": True, "issues": []})          # Think and Max review
         model = _Model(answers)
         llm.json_completion = model
         result = asyncio.run(C.compose(_req(NO_SHAPE, effort=effort)))
         written[effort] = (len(_headings(result.spec)), len(S.text_of(result.spec).split()))
-    assert written == {"fast": (15, 8_464), "think": (15, 8_464), "max": (15, 8_464)}, written
+    assert written == {"fast": (8, 3_795), "think": (8, 3_795), "max": (8, 3_795)}, written
+
+    # And the ceiling is the one number the effort still moves. A plan of
+    # twenty sections is over all three, so each is cut to the sections its own
+    # effort bought — one scoped write each, which is the cost the person chose.
+    twenty = {f"Part {i}": 600 for i in range(1, 21)}            # 12,000 words
+    ceilings = {}
+    for effort in ("fast", "think", "max"):
+        answers = [_plan(twenty)] + [_section(h, 675) for h in twenty]
+        answers.append({"ok": True, "issues": []})
+        model = _Model(answers)
+        llm.json_completion = model
+        asyncio.run(C.compose(_req(NO_SHAPE, effort=effort)))
+        ceilings[effort] = len(model.named("artifact_section_write"))
+    assert ceilings == {"fast": 8, "think": 12, "max": 16}, ceilings
 
 
 def test_the_plan_is_not_paid_for_twice():
@@ -351,10 +474,10 @@ def test_a_size_the_product_decided_buys_the_sectioned_writer(monkeypatch):
     """`sectioned` read `(target.explicit or budget.outline_pass)`. The
     model's 12,050 words are not explicit, and Fast has no outline pass, so
     before today this request would have been one whole-document call."""
-    model = _Model([_plan(PLAN)] + [_section(h, int(w * 0.7)) for h, w in PLAN.items()])
+    model = _Model([_plan(FITS)] + [_section(h, int(w * 0.7)) for h, w in FITS.items()])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(NO_SHAPE)))
-    assert [c["schema"] for c in model.calls] == ["artifact_outline"] + ["artifact_section_write"] * 15
+    assert [c["schema"] for c in model.calls] == ["artifact_outline"] + ["artifact_section_write"] * 8
     assert any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings)
 
 
@@ -376,24 +499,59 @@ def test_a_short_draft_is_repaired_whoever_decided_the_size(monkeypatch):
     assert len(S.text_of(result.spec).split()) == 1_806
 
 
-def test_a_correction_cannot_gut_a_document_the_product_sized(monkeypatch):
-    """The CORRECTION_KEEP_FRACTION floor read `(target.explicit or
-    sectioned)`. A planned size that takes the single-call path had
-    neither, so one review correction could cut it by 45% — over `_worse`'s
-    own half, which is why that floor exists. The candidate below keeps
-    every section and two thirds of the blocks, so `_worse` accepts it and
-    only the keep-fraction floor can refuse it."""
-    small = {"One": 700, "Two": 700, "Three": 700}
-    model = _Model([_plan(small), _doc({"One": 600, "Two": 600, "Three": 600}),
-                    {"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more",
-                                              "severity": "must"}]},
-                    _doc({"One": 330, "Two": 330, "Three": 330})])
+def test_a_correction_cannot_gut_a_document_the_sectioned_writer_built(monkeypatch):
+    """WHICH DRAFTS THE 0.9 FLOOR PROTECTS. `CORRECTION_KEEP_FRACTION` refuses
+    a correction that keeps less than 90% of the draft it replaces, and it
+    reads `(target.explicit or sectioned)` — a size the person NAMED, or a
+    draft the sectioned writer built one call at a time.
+
+    For one day it read `target.words` alone. Every created document has a
+    planned size now, so that put the 0.9 floor on every correction in the
+    product, and a placeholder fix that came back 15% shorter was refused with
+    the placeholder still in the file (see
+    `test_a_correction_that_removes_a_placeholder_is_still_applied`). A draft
+    that cost one call is not the draft that floor was written for: the guard
+    there is `_worse`, which refuses anything under half.
+
+    The candidate below keeps every section and a bit over half the words, so
+    `_worse` accepts it and only the keep-fraction floor can refuse it."""
+    # A PLANNED size over SECTIONED_WRITER_WORDS: nine calls behind the draft.
+    planned = {f"Part {i}": 500 for i in range(1, 7)}            # 3,000 words, 6 sections
+    answers = [_plan(planned)] + [_section(h, 500) for h in planned]
+    answers += [{"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more",
+                                          "severity": "must"}]}]
+    answers += [_doc({h: 275 for h in planned})]                 # 1,650 of 3,000: 55%
+    model = _Model(answers)
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(NO_SHAPE, effort="think")))
-    assert _headings(result.spec) == ["One", "Two", "Three"], "the draft survives the correction"
+    assert _headings(result.spec) == list(planned), "the draft survives the correction"
     cut = next(w for w in result.warnings if "would have cut the document" in w)
-    assert "2,100 words this document was planned at" in cut, cut
-    assert "words that were asked for" not in cut, "he never asked for 2,100"
+    assert "3,000 words this document was planned at" in cut, cut
+    assert "words that were asked for" not in cut, "he never asked for 3,000"
+
+
+def test_a_single_call_drafts_correction_is_held_to_worse_and_not_to_the_floor(monkeypatch):
+    """The other side of the same rule. A planned size UNDER
+    SECTIONED_WRITER_WORDS is one whole-document call, so a correction that
+    keeps 55% of it is applied — and one that keeps under half is still
+    refused, by `_worse`, which is the guard that was always there."""
+    small = {"One": 700, "Two": 700, "Three": 700}               # 2,100 words
+    kept = _Model([_plan(small), _doc({"One": 600, "Two": 600, "Three": 600}),
+                   {"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more",
+                                             "severity": "must"}]},
+                   _doc({"One": 330, "Two": 330, "Three": 330})])
+    monkeypatch.setattr(llm, "json_completion", kept)
+    result = asyncio.run(C.compose(_req(NO_SHAPE, effort="think")))
+    assert len(S.text_of(result.spec).split()) == 996, "the correction was applied"
+    assert not [w for w in result.warnings if "would have cut the document" in w], result.warnings
+
+    gutted = _Model([_plan(small), _doc({"One": 600, "Two": 600, "Three": 600}),
+                     {"ok": False, "issues": [{"where": "all", "problem": "thin", "fix": "more",
+                                               "severity": "must"}]},
+                     _doc({"One": 100})])
+    monkeypatch.setattr(llm, "json_completion", gutted)
+    result = asyncio.run(C.compose(_req(NO_SHAPE, effort="think")))
+    assert _headings(result.spec) == ["One", "Two", "Three"], "the draft survives"
 
 
 # -------------------------------------------------------------- the tone line --

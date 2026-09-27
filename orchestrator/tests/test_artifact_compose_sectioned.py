@@ -101,11 +101,25 @@ def test_a_fast_big_report_prompt_drops_be_concise():
     plain = _system(plain_req)
     assert "Be concise and concrete." in plain and "Write about" not in plain
     assert C.plans_size(plain_req) is True
-    deciding = C._material_messages(plain_req, budget=T.EFFORT_BUDGETS["fast"],
-                                    target=C._deciding_target(C.target_for(plain_req)))[0]["content"]
+    fast = T.EFFORT_BUDGETS["fast"]
+    deciding = C._material_messages(plain_req, budget=fast, target=C._deciding_target(
+        C.target_for(plain_req), C.size_bounds(fast, C.target_for(plain_req))[0]))[0]["content"]
     assert "Be concise and concrete." not in deciding
     assert "the length is yours to decide" in deciding
-    assert "at most 40 top-level sections" in deciding, "the renderer's bound, not Fast's eight"
+    # The bound is what the REQUEST justifies (compose.size_bounds), and for
+    # a bare note at Fast that is Fast's eight. It was the renderer's 40 for
+    # one day, while the bound the composer ENFORCED was a different number —
+    # so an upload could ask for forty sections and a plan made to the letter
+    # of this prompt was cut on arrival. A request that NAMES its sections
+    # raises the same bound, which is the case the 40 was reaching for.
+    assert "at most 8 top-level sections" in deciding
+    named = ("Write the platform report.\nRequirements:\n1. Executive Summary\n2. Current Architecture\n"
+             "3. Target Architecture\n4. Service Boundaries\n5. Data Strategy\n6. API Gateway\n"
+             "7. Observability\n8. Deployment Pipeline\n9. Testing Strategy\n10. Security\n"
+             "11. Migration Phases\n12. Risks and Mitigations\n13. Cost Model\n14. Team and Ownership\n"
+             "15. Recommendations")
+    fifteen = _req(named)
+    assert C.size_bounds(fast, C.target_for(fifteen), C.requested_sections(named)) == (17, 11_475)
 
 
 def test_section_and_slide_caps_follow_the_target():
