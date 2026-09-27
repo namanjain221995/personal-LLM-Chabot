@@ -768,12 +768,138 @@ export function sanitizeDiagramSource(code: string): string {
   return out.replace(/^\s*\n/, '').replace(/\n{3,}/g, '\n\n');
 }
 
+/** The characters a role name is made of, after `:::`. */
+const ROLE_NAME_CHAR = /[\w-]/;
+
+/**
+ * A whole `class A,B role` statement — the other way a class is attached.
+ *
+ * `class\s+` and not `class`, so `classDef` (handled by COLOUR_DIRECTIVE) can
+ * never match this, and a `classDiagram`'s `class Foo {` cannot either: it ends
+ * in a brace, and a classDiagram takes our classDefs anyway, so this is never
+ * run over one.
+ *
+ * The trailing name must be one of the four ROLES, which is narrower than
+ * "any class statement" on purpose: outside the flowchart family a line is
+ * only a statement in SOME grammars, and in a `mindmap` or a `timeline` the
+ * words are free text — a node whose label happens to read "class diagram"
+ * must not be deleted. What this defends against is the one shape the prompt
+ * now teaches, in the one place it is fatal.
+ */
+const CLASS_STATEMENT = /^\s*class\s+[\w,.-]+\s+([\w-]+)\s*$/;
+
+function isRoleClassStatement(part: string): boolean {
+  const match = CLASS_STATEMENT.exec(part);
+  return !!match && (DIAGRAM_ROLES as readonly string[]).includes(match[1]);
+}
+
+/** Drop every `:::role` from ONE statement, leaving quoted labels alone. */
+function withoutRoleSuffixes(part: string): string {
+  if (!part.includes(':::')) return part;
+  let out = '';
+  let inQuote = false;
+  for (let i = 0; i < part.length; i += 1) {
+    const ch = part[i];
+    if (inQuote) {
+      out += ch;
+      if (ch === '"') inQuote = false;
+      continue;
+    }
+    if (ch === '"') {
+      inQuote = true;
+      out += ch;
+      continue;
+    }
+    if (ch === '%' && part[i + 1] === '%') {
+      // A comment runs to end of line and is inert: kept verbatim.
+      out += part.slice(i);
+      break;
+    }
+    if (ch === ':' && part.startsWith(':::', i)) {
+      let j = i + 3;
+      while (j < part.length && ROLE_NAME_CHAR.test(part[j])) j += 1;
+      i = j - 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** What is left of a statement once its role is gone: just an identifier. */
+const BARE_ID = /^\s*[\w.-]+\s*$/;
+
+/**
+ * The same diagram with every role APPLICATION removed — the RETRY source.
+ *
+ * Measured today, Chromium 153 / mermaid 11.17: outside the flowchart family a
+ * role is not ignored, it is FATAL. In a sequenceDiagram `U:::external` raises
+ * "Parse error on line 6 … Expecting '()', 'SOLID_OPEN_ARROW', … got 'TXT'"
+ * and `class U external` the same error with "got 'NEWLINE'". The block
+ * catches it and the answer shows source under "Couldn't render this diagram"
+ * — no diagram at all, which is strictly worse than the grey one this track is
+ * fixing. The orchestrator's prompt now teaches the `:::` form
+ * (`DIAGRAM_ROLES` in orchestrator/app/engines) and says it is for
+ * `flowchart`/`graph` only; this is the half that does not depend on the model
+ * obeying.
+ *
+ * WHY THIS IS A RETRY AND NOT A FILTER
+ * -----------------------------------
+ * MermaidBlock calls it only after a render has already THROWN, so a diagram
+ * that works is never touched — which is what makes it safe to be blunt here.
+ * A filter on the happy path would have to know, per diagram type, whether a
+ * role is fatal (sequenceDiagram), inert (an unknown name in a flowchart:
+ * measured, it degrades to the default node, which DIAG-19 pins) or legal, and
+ * whether the identifier left behind is a statement or a node's own label — a
+ * bare word is content in `mindmap` and in `timeline`. Guessing that per
+ * grammar is how a filter deletes a node nobody asked it to touch. After a
+ * failure the trade is unambiguous: the role could not have been painted (we
+ * append classDefs only where the grammar takes them), so dropping it and the
+ * identifier it leaves behind costs at most one node of a diagram that was
+ * showing nothing.
+ *
+ * Three removals, in order, per STATEMENT rather than per line — `;` is a
+ * separator and a role can ride behind one:
+ *   1. `:::role` wherever it appears outside a quoted label,
+ *   2. a whole `class A,B <role>` statement, role names only (see
+ *      CLASS_STATEMENT: a `mindmap` label reading "class diagram" is content),
+ *   3. a statement a removal has reduced to a bare identifier, which is what
+ *      `U:::external` leaves behind and is itself a parse error where the
+ *      original was.
+ */
+export function withoutRoleApplications(code: string): string {
+  if (!code || (!code.includes(':::') && !/\bclass\s/.test(code))) return code;
+  const out: string[] = [];
+  for (const line of code.split('\n')) {
+    const parts = splitStatements(line);
+    const kept: string[] = [];
+    for (const part of parts) {
+      if (isRoleClassStatement(part)) continue;
+      const stripped = withoutRoleSuffixes(part);
+      // Only a statement we CHANGED can have been reduced to a bare id; an
+      // identifier the author wrote on its own is left alone.
+      if (stripped !== part && BARE_ID.test(stripped)) continue;
+      kept.push(stripped);
+    }
+    const rebuilt = kept.join(';');
+    if (rebuilt === line) {
+      out.push(line);
+      continue;
+    }
+    // A line that was ONLY a role application leaves no statement behind;
+    // pushing the empty string would leave a blank line where it was.
+    if (rebuilt.trim()) out.push(rebuilt);
+  }
+  return out.join('\n');
+}
+
 /**
  * The source that is RENDERED: sanitised, with our role classDefs appended
  * where the grammar takes them.
  *
  * The same string is what the Code tab shows, so what a person copies is what
- * was drawn.
+ * was drawn — including when the block has had to fall back to
+ * `withoutRoleApplications` to draw anything at all.
  */
 export function prepareDiagramSource(
   code: string,

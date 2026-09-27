@@ -104,6 +104,20 @@ FORMAT_INSTRUCTION = (
     "of a summary."
 )
 
+#: The CLOSED role vocabulary a diagram may attach to a node.
+#:
+#: Shared verbatim with the frontend: `DIAGRAM_ROLES` in
+#: frontend/lib/mermaidTheme.ts turns each name into the `classDef` that paints
+#: it, and frontend/app/globals.css holds the paints as `--ts-diagram-<role>-*`
+#: for both themes. A diagram names a ROLE and never a colour, which is the
+#: whole reason a role can be allowed where a hex cannot: a name is a
+#: vocabulary we can validate on both sides, a hex is not.
+#:
+#: Adding a fifth name here without a paint on the other side would render as
+#: an uncoloured node, so tests/test_diagram_role_vocabulary.py asserts this
+#: tuple against the frontend's list and its CSS tokens.
+DIAGRAM_ROLES = ("service", "store", "model", "external")
+
 # Diagrams: the UI renders ```mermaid blocks as real, zoomable, downloadable
 # diagrams. The instruction is deliberately conservative — an earlier, more
 # eager version made the model decorate ordinary answers with diagrams and
@@ -121,10 +135,40 @@ DIAGRAM_INSTRUCTION = (
     "`flowchart LR`; one statement per line; every label in double quotes "
     '(e.g. A["Login page"]) and short, with no parentheses, brackets, pipes '
     "or markdown inside labels; NEVER use style, classDef, linkStyle, click "
-    "or %%{init}%% directives — the app applies its own theme and custom "
-    "colors break dark mode. Never draw ASCII-art boxes. Right after the "
-    "diagram, add one or two plain, simple sentences explaining what it "
-    "shows so a non-technical reader can follow it."
+    "or %%{init}%% directives and never write a colour of your own (no hex, "
+    "no rgb(), no colour name) — the app applies its own theme and custom "
+    "colors break dark mode. Never draw ASCII-art boxes. "
+    # Roles, 2026-09-27. The app has carried a four-colour role palette since
+    # 2026-09-22 (DIAGRAM_ROLES above) and no answer could reach it: this block
+    # banned classDef and never mentioned the `:::` form, so a chat diagram
+    # was painted entirely in the one default node fill. Measured today in
+    # Chromium 153 against a bundle of the real MermaidBlock, five-node
+    # flowchart: without roles all five nodes came back fill rgb(51,56,61)
+    # stroke rgb(139,148,158) in dark and fill rgb(228,231,234) stroke
+    # rgb(107,115,123) in light -- one grey for the whole diagram, which is
+    # the owner's report. With the roles below the same five nodes paint
+    # rgb(34,48,63)/rgb(47,111,178) service, rgb(64,50,30)/rgb(183,121,31)
+    # store, rgb(54,44,78)/rgb(139,92,246) model and
+    # rgb(70,41,52)/rgb(213,81,129) external.
+    #
+    # The vocabulary is named for what a node IS, never for a colour, and the
+    # diagram types are named explicitly because a role outside them is fatal,
+    # not inert: measured today, `U:::external` in a sequenceDiagram is
+    # "Parse error on line 6 ... got 'TXT'" and the answer shows no diagram at
+    # all. The frontend strips one as a belt-and-braces guard; the prompt not
+    # asking for it is the belt.
+    "In a `flowchart`/`graph` you MAY tag a node with ONE role from this "
+    "CLOSED list, written with `:::`: service (code that runs a request), "
+    "store (anything that holds data), model (an AI model), external (a "
+    'person, browser or third-party system) — e.g. A["Payments API"]:::service. '
+    "Tag only the nodes a role genuinely fits and never invent a name — an "
+    "unknown one paints nothing. Put NO role in any other diagram type "
+    "(sequenceDiagram, erDiagram, pie, journey, timeline, mindmap, gitGraph): "
+    "there `:::` is a syntax error and the whole diagram fails to draw. The "
+    "LABEL carries the meaning — two nodes must never differ by colour alone, "
+    "so the diagram still reads for someone who cannot see colour. "
+    "Right after the diagram, add one or two plain, simple sentences "
+    "explaining what it shows so a non-technical reader can follow it."
 )
 
 # Code: the UI renders fenced blocks with syntax highlighting and a copy
