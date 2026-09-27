@@ -86,13 +86,26 @@ def _doc(title, heading, words):
 
 def test_a_fast_big_report_prompt_drops_be_concise():
     system = _system(_req("please give Big report ?? on the customers file", tables=[_table()]))
-    assert "about 3,000 words" in system
     assert "Be concise and concrete." not in system, "Fast's brevity line is the bug the owner reported"
-    assert "every section several paragraphs" in system
+    # The sentence says the size AND the shape it is written in, all of it
+    # computed from the one decided number: 3,000 words, sections_for(3,000)
+    # = 8 sections, section_words(3,000, 8) = 375 words each.
+    assert "Write about 3,000 words in 8 top-level sections, about 375 words of real prose in each" in system
 
-    # Nothing asked for a size: the tone line is exactly what it was.
-    plain = _system(_req("write a note about the price change"))
-    assert "Be concise and concrete." in plain and "words:" not in plain
+    # A SIZE NOBODY NAMED reaches this builder as no size at all — and that
+    # is the only state in which the effort's own adjective survives.
+    # `compose` never writes a document in that state any more: it decides a
+    # size first (`plans_size`), and the deciding call's own tone line is
+    # the question, not "Be concise and concrete."
+    plain_req = _req("write a note about the price change")
+    plain = _system(plain_req)
+    assert "Be concise and concrete." in plain and "Write about" not in plain
+    assert C.plans_size(plain_req) is True
+    deciding = C._material_messages(plain_req, budget=T.EFFORT_BUDGETS["fast"],
+                                    target=C._deciding_target(C.target_for(plain_req)))[0]["content"]
+    assert "Be concise and concrete." not in deciding
+    assert "the length is yours to decide" in deciding
+    assert "at most 40 top-level sections" in deciding, "the renderer's bound, not Fast's eight"
 
 
 def test_section_and_slide_caps_follow_the_target():

@@ -48,6 +48,22 @@ class _Model:
         return answer if isinstance(answer, str) else json.dumps(answer)
 
 
+def _plan(headings, words=0):
+    """An outline as the model returns one, with the words it says each
+    section needs. Since 2026-09-27 a document whose size nobody named is
+    PLANNED before it is written (compose.plans_size), so a script that
+    drives compose() over such a request answers this first.
+
+    `words=0` leaves the sections unsized, which `size_from_plan` sizes at
+    length.WORDS_PER_SECTION each and says so — the tests below pass a
+    number their fixture draft already satisfies, so the size machinery
+    stays out of a test about something else."""
+    return {"title": "Pricing Update", "audience": "the pricing team", "purpose": "what changed",
+            "needs_current_facts": False, "assumptions": [],
+            "sections": [{"heading": h, "purpose": f"what {h} covers", "elements": ["paragraphs"],
+                          "words": words} for h in headings]}
+
+
 def _req(effort="fast", **over):
     kw = dict(kind="document", formats=["docx", "pdf"], template_id="generic", effort=effort,
               material=C.Material(instruction="Write a short pricing update.", history_text="user: prices are changing", sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))
@@ -334,12 +350,15 @@ def test_history_material_keeps_the_recent_turns():
 
 
 def test_tables_are_offered_as_data_the_model_must_not_recompute(monkeypatch):
-    model = _Model([_doc_json()])
+    model = _Model([_plan(["Summary"], 10), _doc_json()])
     monkeypatch.setattr(llm, "json_completion", model)
     req = _req("fast", material=C.Material(instruction="x", tables=[C.DataTable("t1", "Pipeline", ["Stage", "Amount"], [["A", 10], ["B", 20]])]))
     asyncio.run(C.compose(req))
-    user = model.calls[0]["messages"][1]["content"]
+    user = next(c["messages"][1]["content"] for c in model.calls if c["schema"] == "artifact_document")
     assert "do not recompute totals" in user and "TABLE t1: Pipeline" in user and "A | 10" in user
+    # The size-deciding call gets the same data, for the same reason.
+    planned = next(c["messages"][1]["content"] for c in model.calls if c["schema"] == "artifact_outline")
+    assert "TABLE t1: Pipeline" in planned
 
 
 def test_the_sources_manifest_is_built_from_the_material_not_the_model(monkeypatch):
@@ -370,7 +389,7 @@ def test_the_sources_manifest_is_built_from_the_material_not_the_model(monkeypat
 
 def test_no_material_sources_means_no_manifest_at_all(monkeypatch):
     invented = _doc_json(sources=[{"id": "s1", "title": "Made up", "url": "https://example.com/x"}])
-    monkeypatch.setattr(llm, "json_completion", _Model([invented]))
+    monkeypatch.setattr(llm, "json_completion", _Model([_plan(["Summary"], 10), invented]))
     req = _req("fast", material=C.Material(instruction="x"))
     result = asyncio.run(C.compose(req))
     assert result.spec.body.sources == [] and result.spec.body.blocks[1].sources == []
@@ -650,11 +669,22 @@ def test_requested_sections_are_parsed_from_include_with_and_sections_lists():
     assert C.requested_sections("") == [] and C.requested_sections("Create a brief.") == []
 
 
-def _draft(headings):
+def _draft(headings, words=600):
+    """A draft with real prose under each heading.
+
+    `words` per section, and 600 of them since 2026-09-27: this request has
+    sources and says "report", so `length.DATA_REPORT_FLOOR` sizes it at
+    1,500 words — and the pass that rewrites a draft under
+    SHORT_DRAFT_FRACTION of its size no longer asks who decided that size
+    (it read `target.explicit` until today, so the person whose size the
+    product worked out got no repair). A two-sentence draft would now buy a
+    whole extra call in a test about section coverage.
+    """
     blocks = []
     for h in headings:
         blocks.append({"type": "heading", "level": 1, "text": h})
-        blocks.append({"type": "paragraph", "text": f"Content of {h} with the $59 price.", "sources": ["s1"]})
+        blocks.append({"type": "paragraph", "text": f"Content of {h} with the $59 price. "
+                                                    + " ".join(["detail"] * max(0, words)), "sources": ["s1"]})
     return _doc_json(blocks=blocks)
 
 
@@ -667,24 +697,31 @@ def test_missing_requested_sections_get_one_correction_naming_them_at_every_effo
     holey = _draft(["Executive Summary", "Next Steps"])
     holey["blocks"][1]["text"] = "TBD"
     full = _draft(["Executive Summary", "Key Risks", "Roadmap for FY27", "Next Steps"])
-    model = _Model([holey, partial, full])
+    # This request says "report" over a source, so `length.DATA_REPORT_FLOOR`
+    # gives it 1,500 words — a size the PRODUCT worked out, which since
+    # 2026-09-27 is a floor the model is asked to beat rather than the answer
+    # (compose.plans_size). So the script answers a plan first: four sections
+    # at 400 words, over the floor and under what `_draft` writes, which
+    # keeps the separate short-draft pass out of the call count.
+    sized = _plan(["Executive Summary", "Key Risks", "Roadmap for FY27", "Next Steps"], 400)
+    model = _Model([sized, holey, partial, full])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert result.corrections == 2 and len(model.calls) == 3, "the placeholder correction, then the coverage correction — past Fast's budget of one"
-    prompt = model.calls[2]["messages"][-1]["content"]
+    assert result.corrections == 2 and len(model.calls) == 4, "the size plan, the placeholder correction, then the coverage correction — past Fast's budget of one"
+    prompt = model.calls[3]["messages"][-1]["content"]
     assert "does not have: risks, roadmap" in prompt and "executive summary" not in prompt.lower().split("does not have")[1]
     assert [b.text for b in result.spec.body.blocks if b.type == "heading"] == ["Executive Summary", "Key Risks", "Roadmap for FY27", "Next Steps"]
     assert not any("requested sections" in w for w in result.warnings)
     # Still missing after the one correction: a warning, no loop.
-    model = _Model([partial, partial])
+    model = _Model([sized, partial, partial])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert len(model.calls) == 2 and any(w == "requested sections not found in the document: risks, roadmap" for w in result.warnings)
-    # Every section present: no correction at all.
-    model = _Model([full])
+    assert len(model.calls) == 3 and any(w == "requested sections not found in the document: risks, roadmap" for w in result.warnings)
+    # Every section present: no correction at all — the plan and the write.
+    model = _Model([sized, full])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert len(model.calls) == 1 and result.corrections == 0
+    assert len(model.calls) == 2 and result.corrections == 0
 
 
 def test_section_cap_never_falls_below_the_requested_sections_plus_two():

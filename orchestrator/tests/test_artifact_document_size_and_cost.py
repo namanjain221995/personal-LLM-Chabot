@@ -68,9 +68,13 @@ def _prose(words, chunk=600):
     return out
 
 
-def _outline(headings):
+def _outline(headings, words=0):
+    """An outline as the model returns one. `words` is what it says each
+    section needs — the number `size_from_plan` reads when nothing in the
+    request decided a size (2026-09-27)."""
     return {"title": "Customer Report", "audience": "the operations team", "purpose": "what the data shows",
-            "sections": [{"heading": h, "purpose": f"what {h} covers", "elements": ["paragraphs"]} for h in headings],
+            "sections": [{"heading": h, "purpose": f"what {h} covers", "elements": ["paragraphs"],
+                          "words": words} for h in headings],
             "needs_current_facts": False, "assumptions": []}
 
 
@@ -203,11 +207,17 @@ def test_the_answer_says_when_a_long_document_was_chosen(monkeypatch):
     assert "“big”" in note and "3,000 words" in note and "3 sections" in note and "4 model calls" in note, note
     assert result.warnings[0] is note, "the answer carries at most two warnings; this one goes first"
 
-    # A document nobody sized says nothing of the sort.
-    plain = _Model([{"title": "Note", "template_id": "generic",
+    # A document THE MODEL sized small says nothing of the sort. Nothing in
+    # "write a note about the price change" names a length, so the size is
+    # planned (2026-09-27) — and a plan of two 150-word sections is 300
+    # words, well under SECTIONED_WRITER_WORDS, so it is one write call and
+    # no long-document note.
+    plain = _Model([_outline(["Note", "What changes"], 150),
+                    {"title": "Note", "template_id": "generic",
                      "blocks": [{"type": "heading", "level": 1, "text": "Note"}] + _prose(300)}])
     monkeypatch.setattr(llm, "json_completion", plain)
     quiet = asyncio.run(C.compose(_req("write a note about the price change")))
+    assert plain.calls == ["artifact_outline", "artifact_document"], plain.calls
     assert not any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in quiet.warnings), quiet.warnings
 
 
@@ -292,27 +302,41 @@ def test_fifteen_named_sections_derive_a_size_without_claiming_the_person_named_
     assert C.target_for(_req(OWNER_PROMPT, operation="edit")).words == 0
 
 
-def test_fast_writes_the_owners_fifteen_section_report_in_exactly_one_model_call(monkeypatch):
-    """The two cost guards, together, on the request that needs them.
-    Without them this is the sectioned writer: one outline call plus one
-    call per section, and then a short-draft correction on top."""
-    model = _Model([_doc(FIFTEEN_SECTIONS, 60)])
+def test_fast_writes_the_owners_fifteen_section_report_the_way_think_does(monkeypatch):
+    """2026-09-27: THE ASYMMETRY IS GONE, and this test is its record.
+
+    Until today the derived 6,000-word target bought the sectioned writer
+    only where `budget.outline_pass` was already true, so the owner's Fast
+    request took one whole-document call and the SAME request at Think took
+    sixteen. Measured on the running container's own code with a scripted
+    model, Fast wrote 735 words across 6 of his 15 sections and warned that
+    nine were missing; Think wrote 4,232 across all 15. The cheaper path was
+    the worse document, and which one he got depended on a dropdown.
+
+    A size is a size now, whoever decided it: `sectioned` reads
+    `target.words > SECTIONED_WRITER_WORDS` and nothing else."""
+    model = _Model([_outline(FIFTEEN_SECTIONS, 600)] + [_section(h, 420) for h in FIFTEEN_SECTIONS])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(OWNER_PROMPT)))
-    assert model.calls == ["artifact_document"], model.calls
-    assert result.model_calls == 1
+    # ONE plan call, reused as the sectioned writer's outline, then one call
+    # per section — the same sixteen Think spent before today.
+    assert model.calls == ["artifact_outline"] + ["artifact_section_write"] * 15, model.calls
     assert _headings(result.spec) == FIFTEEN_SECTIONS
-    assert not any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
-    # And the card no longer carries our own budget warning.
+    note = next((w for w in result.warnings if w.startswith(C.LONG_DOCUMENT_NOTE)), None)
+    assert note is not None, result.warnings
+    # The derived 6,000 (15 x WORDS_PER_SECTION) was a floor; the model said
+    # 9,000, and the card does not claim he typed either number.
+    assert "the 15 sections the model planned" in note and "9,000 words" in note, note
+    assert "16 model calls" in note, note
+    # And the card still carries no budget warning of our own.
     assert not any("top-level sections" in w and "at most" in w for w in result.warnings), result.warnings
     assert C._enforce_caps(result.spec, T.EFFORT_BUDGETS["fast"], FIFTEEN_SECTIONS,
                            target=C.target_for(_req(OWNER_PROMPT))) == []
 
 
 def test_a_size_the_person_named_still_buys_the_sectioned_writer_at_fast(monkeypatch):
-    """The guard is on the DERIVED target only. "A big report" is still
-    3,000 words, still over SECTIONED_WRITER_WORDS, still sectioned at
-    Fast — exactly as it was before this change."""
+    """"A big report" is 3,000 words, over SECTIONED_WRITER_WORDS, and
+    sectioned at Fast — as it was before this change and after it."""
     model = _Model([_outline(["One", "Two", "Three"])] + [_section(h, 1_100) for h in ("One", "Two", "Three")])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("give me a big report on the customers file", tables=[_table()])))
@@ -320,8 +344,8 @@ def test_a_size_the_person_named_still_buys_the_sectioned_writer_at_fast(monkeyp
 
 
 def test_think_may_spend_the_sectioned_writer_on_a_derived_size(monkeypatch):
-    """Think and Max already pay for an outline pass, so a derived size
-    buys them the sectioned writer; Fast does not have one and does not."""
+    """The derived size at Think — the path that used to be Think's alone.
+    The test above pins that Fast now takes the same one."""
     model = _Model([_outline(FIFTEEN_SECTIONS)] + [_section(h, 400) for h in FIFTEEN_SECTIONS]
                    + [{"ok": True, "issues": []}])
     monkeypatch.setattr(llm, "json_completion", model)
@@ -361,4 +385,7 @@ def test_a_correction_cannot_halve_a_sectioned_draft_a_derived_size_bought(monke
     assert cut is not None, result.warnings
     assert "5,609 words to 4,006" in cut and "was not applied" in cut, cut
     # And the sentence does not tell the person they asked for 2,800 words.
-    assert "words that were asked for" not in cut and "2,800 words this document was sized at" in cut, cut
+    # (The scripted plan sizes none of its sections, so `size_from_plan`
+    # sizes each at WORDS_PER_SECTION and 2,800 is what it comes to — a
+    # planned size, said as one.)
+    assert "words that were asked for" not in cut and "2,800 words this document was planned at" in cut, cut

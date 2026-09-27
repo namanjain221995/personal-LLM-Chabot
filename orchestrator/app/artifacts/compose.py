@@ -401,6 +401,11 @@ def caps_for(budget: Any, target: Optional[LengthTarget] = None, requested: Sequ
     if target is not None:
         if target.words:
             sections = max(sections, _length.sections_for(target.words))
+        # A plan that says how many sections the work needs is the floor
+        # too: a 900-word subject the model split into five parts is five
+        # sections, not the two `sections_for` computes from the words.
+        if target.sections:
+            sections = max(sections, int(target.sections))
         if target.slides:
             slides = max(slides, target.slides)
     return sections, min(slides, T.MAX_SLIDES)
@@ -463,13 +468,81 @@ def _material_words(m: Material) -> int:
     return cells + len((m.uploads_text or "").split())
 
 
+#: The tone line of the SIZE-DECIDING pass. It names no number, because a
+#: number code suggests is the constant this release removes and the model
+#: anchors on whatever it is shown.
+_DECIDE_SIZE_LINE = (
+    "Nobody named a length, so the length is yours to decide from the subject and the material. Judge what the "
+    "work actually needs: neither a summary of it nor padding around it."
+)
+
+
+def _size_was(target: LengthTarget, *, asked: str, planned: str, derived: str) -> str:
+    """One sentence fragment per provenance, so nothing ever tells the person
+    they asked for a number they never typed. The owner's complaint of
+    2026-09-22 was exactly that: the one sentence he read on the card was our
+    own arithmetic quoted back at him as if it were his request."""
+    if target.explicit:
+        return asked
+    return planned if target.source == _length.SOURCE_PLANNED else derived
+
+
+def _deciding_target(target: Optional[LengthTarget]) -> LengthTarget:
+    """The target the size-deciding pass runs under: no size at all, and the
+    RENDERER's section bound instead of the effort's, so the call that
+    decides the shape is not asked to fit Fast's eight sections — the very
+    number the owner's fifteen-section request contradicted fifteen times
+    over."""
+    return LengthTarget(words=0, slides=(target.slides if target is not None else 0), phrase="",
+                        explicit=False, sections=OUTLINE_MAX_SECTIONS, source=_length.SOURCE_PLANNED)
+
+
 def _size_line(target: Optional[LengthTarget]) -> str:
-    """What the prompt says about length. Empty when nothing asked for a
-    size, which is every request that worked before this round."""
-    if target is None or not target.words:
+    """What the prompt says about length — and, since 2026-09-27, the whole
+    of what it says about how much to write.
+
+    It replaced the effort's tone line for a size the PERSON named
+    (2026-09-17). The line it replaced is "Be concise and concrete." at
+    Fast, and for a document whose size nobody named it survived: measured
+    on the running container, "Write a technical report on migrating our
+    monolith to microservices." reached the model with a word target of 0,
+    an empty size line and that sentence — the opposite of what a technical
+    report asks for. A size is now decided for every document before the
+    first write (`compose`), so the tone follows the decided size at every
+    effort and the effort's own adjective is left to the kinds that have no
+    word target: a deck, a workbook, an edit.
+
+    The numbers in the sentence are all code's: the total the plan summed
+    to, the sections it is written in, and the words that leaves per
+    section. The model is told what it decided, in the units it has to
+    write in.
+    """
+    if target is None:
         return ""
-    return (f"Write about {target.words:,} words: every section several paragraphs, with a table or a chart "
-            "wherever the data supports one. Do not stop early and do not summarise what you have already written.")
+    if not target.words:
+        if target.source == _length.SOURCE_PLANNED:
+            # The size-deciding pass. Its "size line" is the question that
+            # pass exists to ask, so the effort's own adjective — "Be
+            # concise and concrete." at Fast — never reaches the call that
+            # decides how much to write.
+            return _DECIDE_SIZE_LINE
+        # The person asked for LESS. That is a decided size too, and their
+        # own wording says it better than an effort adjective does.
+        #
+        # `shrink_asked(target.phrase)`, not `target.explicit` alone: a
+        # document request that names a SLIDE count ("a report and a 10
+        # slide deck") also comes back words=0, explicit=True with "10
+        # slides" as the phrase, and reading that as a shrink would tell
+        # the model his report must be short.
+        if target.explicit and target.phrase and _length.shrink_asked(target.phrase):
+            return (f"The request asks for a short file (“{target.phrase}”). Write it tight: no padding, no "
+                    "repetition, and nothing the request did not ask for.")
+        return ""
+    n = max(1, target.section_count)
+    per = _length.section_words(target.words, n)
+    return (f"Write about {target.words:,} words in {n} top-level section{'' if n == 1 else 's'}, about "
+            f"{per:,} words of real prose in each, with a table or a chart wherever the data supports one. "
+            "Do not stop early and do not summarise what you have already written.")
 
 
 def _requested_line(requested: Sequence[str]) -> str:
@@ -620,6 +693,12 @@ async def _json(messages: List[dict], schema: dict, name: str, *, thinking: bool
     return obj
 
 
+#: The most sections any plan may be read as. It is the renderer's bound,
+#: not a size: `_outline_schema` already refuses to widen `maxItems` past
+#: it, and a document of 40 sections is already at T.MAX_TEXT_CHARS.
+#: `size_from_plan` clamps to it and SAYS it clamped.
+OUTLINE_MAX_SECTIONS = 40
+
 _OUTLINE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -635,8 +714,18 @@ _OUTLINE_SCHEMA = {
                     "heading": {"type": "string", "maxLength": 120},
                     "purpose": {"type": "string", "maxLength": 200},
                     "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "callout", "kpis", "numbered"]}},
+                    # WHAT THIS SECTION NEEDS, in the model's own judgement.
+                    # It is the one number the composer cannot compute: how
+                    # much this subject is worth saying. Everything code can
+                    # compute from it — the total, the per-section target,
+                    # the token ceiling, the section cap, the tone line — is
+                    # computed by `size_from_plan` and never asked for.
+                    # `maximum` is the renderer's page limit read per section
+                    # (length.MAX_WORDS), so a mad answer is a clamp with a
+                    # warning rather than a refused document.
+                    "words": {"type": "integer", "minimum": 0, "maximum": _length.MAX_WORDS},
                 },
-                "required": ["heading", "purpose", "elements"],
+                "required": ["heading", "purpose", "elements", "words"],
             },
         },
         "needs_current_facts": {"type": "boolean"},
@@ -683,7 +772,7 @@ def _max_tokens_for(kind: str, effort: str, target: Optional[LengthTarget] = Non
 def _outline_schema(max_sections: int) -> dict:
     """The outline schema, widened when the target needs more sections than
     the 20 the fixed schema allows."""
-    want = max(1, min(int(max_sections), 40))
+    want = max(1, min(int(max_sections), OUTLINE_MAX_SECTIONS))
     if want <= int(_OUTLINE_SCHEMA["properties"]["sections"]["maxItems"]):
         return _OUTLINE_SCHEMA
     schema = json.loads(json.dumps(_OUTLINE_SCHEMA))
@@ -692,25 +781,213 @@ def _outline_schema(max_sections: int) -> dict:
 
 
 async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Optional[LengthTarget] = None,
-                  max_tokens: int = 2500) -> dict:
-    messages = _material_messages(req, budget=budget, target=target)
+                  max_tokens: int = 2500, requested: Sequence[str] = ()) -> dict:
+    # `requested` since 2026-09-27. The plan decides the document's shape and
+    # now its size, and until today it was the one call in the composer that
+    # never saw the sections the person had NUMBERED — so a plan for the
+    # owner's fifteen-section request was free to invent its own fifteen, and
+    # `_missing_sections` then reported his as missing on a document written
+    # section by section from that plan.
+    messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
         "\n\nFIRST, plan only: return the outline — title, audience, purpose, "
-        "the sections in order with what each is for and which elements it "
-        "uses, whether the request needs current external facts you were not "
-        "given, and the assumptions you will make."
+        "the sections in order with what each is for, which elements it uses "
+        "and about how many words it needs, whether the request needs current "
+        "external facts you were not given, and the assumptions you will make."
     )
     sections, _slides = caps_for(budget, target)
     if target is not None and target.words:
-        want = _length.sections_for(target.words)
+        want = max(1, target.section_count)
         messages[0]["content"] += (
             f"\n\nPlan {want} sections (at most {sections}), each worth about "
             f"{_length.section_words(target.words, want):,} words, so the whole file comes to about "
             f"{target.words:,} words. Every section must be a different part of the subject — never the same "
             "content under two headings."
         )
+    else:
+        # NOTHING HAS DECIDED THE SIZE, so this call decides it and
+        # `size_from_plan` reads its answer. No number is suggested: the
+        # model anchors on whatever it is shown, and a number code
+        # suggests here is the constant this release exists to remove.
+        messages[0]["content"] += (
+            f"\n\nDecide the size here. Plan as many sections as the subject genuinely has (at most {sections}) "
+            "and put on each the number of words it genuinely needs: a section too thin to be worth a heading "
+            "should not be a section, and a subject with twelve real parts is not three. Every section must be "
+            "a different part of the subject — never the same content under two headings. The file will be "
+            "written to the total of the numbers you give, so give the numbers the work needs."
+        )
     return await _json(messages, _outline_schema(sections), "artifact_outline", thinking=budget.thinking,
                        max_tokens=max_tokens, effort=req.effort)
+
+
+# ------------------------------------------------- the model decides the size --
+#
+# THE OWNER'S REQUIREMENT, 2026-09-27: "Our ai decide it own What need ??
+# there is No token limit for docs and for sheet ?? or for any think ??"
+# The answer is not a bigger constant. Before today a document's size came
+# from `length.parse_size` (a size WORD the person typed) or from
+# `target_for` (400 words per named section) and was 0 for everything else
+# — measured on the running container, "Write a technical report on
+# migrating our monolith to microservices." reached the model as 0 words,
+# an empty size line, "Be concise and concrete." and "at most 8 top-level
+# sections".
+#
+# So when nothing in the request decided the size, the MODEL decides it:
+# one plan call that says how many sections the work has and how many words
+# each needs. Code then computes everything that follows from those numbers
+# — the total, the per-section target, the section cap, the tone line, the
+# token ceiling — and computes nothing about how much the subject is worth
+# saying. `size_from_plan` is pure, so every clamp it applies is pinned by
+# a test without a model.
+#
+# COST. The plan is the outline: at Think and Max, where a plan call was
+# already budgeted, this is the SAME call, reused (`compose` passes it into
+# `compose_sectioned` and `_compose_once`). At Fast it is one extra call,
+# which is the price of not guessing, and the engine's "outline" stage now
+# says so instead of "Fast goes straight to writing".
+
+
+def _plan_words(section: Any) -> Optional[int]:
+    """The word estimate the model put on ONE planned section, or None when
+    it gave none. Non-numeric and negative are None, not zero: "the model
+    did not say" and "the model said nothing is needed" get different
+    sentences on the card."""
+    if not isinstance(section, dict):
+        return None
+    raw = section.get("words")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        try:
+            n = int(float(str(raw).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            return None
+    return n if n >= 0 else None
+
+
+def plan_items(plan: Optional[dict]) -> List[dict]:
+    """The planned sections that have a heading, in order."""
+    sections = (plan or {}).get("sections") if isinstance(plan, dict) else None
+    return [s for s in (sections or []) if isinstance(s, dict) and str(s.get("heading") or "").strip()]
+
+
+def size_from_plan(plan: Optional[dict], target: Optional[LengthTarget] = None) -> Tuple[LengthTarget, List[str]]:
+    """The size the MODEL decided, as a target, plus a warning per clamp.
+
+    Pure. The total is the sum of the per-section numbers the model gave —
+    code adds them up, it does not invent them. Three answers are absurd
+    and each is clamped OUT LOUD, because a silent clamp is the defect this
+    replaces:
+
+      no sections at all  the plan is unusable; the size stays undecided
+                          and the document is written at the effort's own
+                          size, said plainly.
+      zero words          nothing was decided; the sections it DID plan are
+                          sized at `length.WORDS_PER_SECTION` each.
+      more than the file  clamped to OUTLINE_MAX_SECTIONS sections and to
+        can hold          `length.MAX_WORDS`, both of which are the
+                          renderers' own ceilings.
+
+    `target.words` — a size the PRODUCT worked out, the data-report floor or
+    the sections a request numbered — is a FLOOR here and nothing more. Both
+    of those numbers are a constant times a count, which is the kind of
+    answer this release stops treating as an answer: the model may say the
+    work needs more, and when it says less the floor holds and says so.
+    """
+    warnings: List[str] = []
+    items = plan_items(plan)
+    if not items:
+        return (target if target is not None else LengthTarget()), [
+            "the model planned no sections, so the document was written at this effort level's own size"]
+
+    planned = len(items)
+    if planned > OUTLINE_MAX_SECTIONS:
+        warnings.append(f"the model planned {planned} sections, more than the {OUTLINE_MAX_SECTIONS} a single "
+                        f"file can hold; it was cut to {OUTLINE_MAX_SECTIONS}")
+        items = items[:OUTLINE_MAX_SECTIONS]
+    n = len(items)
+
+    words = 0
+    unsized = 0
+    for item in items:
+        w = _plan_words(item)
+        if w is None:
+            unsized += 1
+        else:
+            words += w
+    if unsized:
+        words += unsized * _length.WORDS_PER_SECTION
+        warnings.append(f"the model did not say how long {unsized} of its {n} sections should be; "
+                        f"each was sized at {_length.WORDS_PER_SECTION:,} words")
+    if words <= 0:
+        words = n * _length.WORDS_PER_SECTION
+        warnings.append(f"the model planned {n} sections and no words for any of them, which is not a document; "
+                        f"it was sized at {words:,} words")
+    if words > _length.MAX_WORDS:
+        warnings.append(f"the model planned {words:,} words, more than the {_length.MAX_WORDS:,} "
+                        f"({T.MAX_PAGES} pages) one file can hold; it was cut to {_length.MAX_WORDS:,}")
+        words = _length.MAX_WORDS
+
+    floor = int(target.words) if target is not None else 0
+    if floor and words < floor:
+        warnings.append(f"the model planned {words:,} words, under the {floor:,} that {target.phrase} asks "
+                        f"for; the document was written to {floor:,}")
+        return LengthTarget(words=floor, slides=target.slides, sections=n, phrase=target.phrase,
+                            explicit=False, source=_length.SOURCE_DERIVED), warnings
+
+    decided = LengthTarget(
+        words=words, slides=(target.slides if target is not None else 0), sections=n,
+        phrase=f"the {n} section{'' if n == 1 else 's'} the model planned",
+        explicit=False, source=_length.SOURCE_PLANNED,
+    )
+    return decided, warnings
+
+
+def plans_size(req: ComposeRequest, target: Optional[LengthTarget] = None) -> bool:
+    """True when the composer will ask the model how big this file should be:
+    a document being written from scratch that nothing has sized.
+
+    An EDIT is excluded — its words name a change, not a length. A deck and
+    a workbook are excluded: a deck's length is its slide count and a sheet
+    is as long as its rows. A size the person NAMED is excluded, and so is
+    "short": the person deciding is the point, and asking the model to
+    second-guess them would be the same defect the other way round.
+
+    A size the PRODUCT worked out is NOT excluded. `length.DATA_REPORT_FLOOR`
+    (1,500) and `target_for`'s sections-times-`WORDS_PER_SECTION` are each a
+    constant times a count, and a constant times a count is the thing this
+    release stops calling a decision. They stay as FLOORS: `size_from_plan`
+    keeps the larger of the two and says which it kept.
+    """
+    if req.kind != "document" or req.operation != "create":
+        return False
+    if target is None:
+        target = target_for(req)
+    return not target.explicit
+
+
+async def plan_size(req: ComposeRequest, budget: T.EffortBudget, target: Optional[LengthTarget] = None,
+                    *, requested: Sequence[str] = (),
+                    ) -> Tuple[Optional[dict], LengthTarget, int, List[str]]:
+    """Ask the model what the work needs. Returns (the plan, the decided
+    target, model calls, warnings). The plan is returned so the write that
+    follows uses it rather than paying for a second one.
+
+    A plan that cannot be produced is not a failed job: the size stays
+    where it was and the card says the size was not decided, which is the
+    behaviour of every release before today."""
+    before = target if target is not None else LengthTarget()
+    try:
+        plan = await outline(req, budget, target=_deciding_target(before), max_tokens=4_000,
+                             requested=requested)
+    except ComposeError as exc:
+        log.info("artifact compose: the size could not be planned: %s", exc)
+        return None, before, 1, ["the size of this document could not be planned, so it was written at this "
+                                 "effort level's own size"]
+    decided, warnings = size_from_plan(plan, before)
+    return plan, decided, 1, warnings
 
 
 async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_json: Optional[dict], extra: str = "",
@@ -1301,22 +1578,38 @@ async def compose_sectioned(
     *,
     say: Progress,
     requested: Sequence[str] = (),
+    plan: Optional[dict] = None,
 ) -> Tuple[dict, dict, int, List[str], bool]:
     """A big document, one section per call. Returns (raw document JSON,
-    the outline it followed, model calls, warnings, stopped early)."""
+    the outline it followed, model calls, warnings, stopped early).
+
+    `plan` is an outline already paid for — the size-deciding pass's, which
+    planned these same sections and said how long each should be. Passed
+    in, this path costs exactly what it cost before the model started
+    deciding the size; planned again, it would cost one call more."""
     deadline = time.monotonic() + max(0.0, _stage_budget_s() * SECTION_DEADLINE_FRACTION)
     warnings: List[str] = []
     calls = 0
     paced = 0.0
 
-    await say(10.0, "planning the sections")
-    plan = await outline(req, budget, target=target, max_tokens=4_000)
-    calls += 1
+    if plan is None:
+        await say(10.0, "planning the sections")
+        plan = await outline(req, budget, target=target, max_tokens=4_000, requested=requested)
+        calls += 1
     cap, _slides = caps_for(budget, target, requested)
     items = _outline_items(plan, cap)
     if not items:
         raise ComposeError("model_failure", "The model did not plan any sections for the document.")
     per_section = _length.section_words(target.words, len(items))
+    # EACH SECTION GETS THE LENGTH ITS OWN PLAN GAVE IT, where the plan gave
+    # one. An even split is what a total divided by a count can say; the
+    # plan says an executive summary is 250 words and a migration-phases
+    # section is 900, and dividing the total by the count throws that away.
+    # `section_words(w, 1)` is length.py's own floor of 120 read once, not a
+    # second constant here. A section the plan sized at 0 falls back to the
+    # even split: 0 counts as an answer for the TOTAL (`size_from_plan` says
+    # so on the card) but it is not a length one call can be asked to write.
+    per_item = [_length.section_words(w, 1) if (w := _plan_words(item)) else per_section for item in items]
     # The engine closes its "outline" stage on this word (engines/
     # artifact.py): a Think job whose outline never ended would show a
     # stage running for the whole compose.
@@ -1338,7 +1631,7 @@ async def compose_sectioned(
         try:
             async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                 blocks = await _write_one_section(
-                    req, budget, target, plan, item, written=headings, words=per_section,
+                    req, budget, target, plan, item, written=headings, words=per_item[i],
                     position=(i + 1, len(items)),
                 )
             calls += 1
@@ -1364,8 +1657,8 @@ async def compose_sectioned(
     written_words = sum(_words_in_blocks(b) for b in sections)
     if (not stopped and written_words < target.words * SHORT_DRAFT_FRACTION
             and time.monotonic() + SECTION_RESERVE_S < deadline):
-        short = sorted(range(len(sections)), key=lambda i: _words_in_blocks(sections[i]))
-        short = [i for i in short if _words_in_blocks(sections[i]) < per_section][:SECTION_EXTEND_MAX]
+        short = sorted(range(len(sections)), key=lambda i: _words_in_blocks(sections[i]) - per_item[i])
+        short = [i for i in short if _words_in_blocks(sections[i]) < per_item[i]][:SECTION_EXTEND_MAX]
         for n, i in enumerate(short):
             if time.monotonic() + SECTION_RESERVE_S >= deadline:
                 break
@@ -1374,7 +1667,7 @@ async def compose_sectioned(
             try:
                 async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                     grown = await _write_one_section(
-                        req, budget, target, plan, items[i], written=headings, words=per_section,
+                        req, budget, target, plan, items[i], written=headings, words=per_item[i],
                         position=(i + 1, len(items)), current=sections[i],
                     )
                 calls += 1
@@ -1426,22 +1719,34 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     target = target_for(req)
 
     outline_json: Optional[dict] = None
-    # THE SECTIONED WRITER IS BOUGHT BY THE PERSON, NOT BY CODE. A target
-    # code DERIVED from the number of sections a request names crosses
-    # SECTIONED_WRITER_WORDS at fifteen sections (15 x 400 = 6,000), and
-    # at Fast that is an outline call plus one call per section — roughly
-    # sixteen calls and minutes of an engine that is also answering live
-    # chat, for a request whose words named no size at all. A size the
-    # PERSON named still buys this path at any effort; a size code derived
-    # buys it only where an outline pass is already budgeted, which is
-    # Think and Max.
+    # THE MODEL DECIDES THE SIZE WHEN NOTHING IN THE REQUEST DID (owner
+    # requirement, 2026-09-27). One plan call says how many sections the
+    # work has and how long each needs; `size_from_plan` sums those numbers
+    # and clamps only what no file could hold, out loud. The plan is kept
+    # and handed to the write below, so at Think and Max — where a plan call
+    # was already budgeted — this costs nothing extra.
+    planned = plans_size(req, target)
+    if planned:
+        await say(8.0, "deciding how long this needs to be")
+        outline_json, target, plan_calls, plan_warnings = await plan_size(req, budget, target,
+                                                                          requested=requested)
+        calls += plan_calls
+        result_warnings.extend(plan_warnings)
+
+    # THE SECTIONED WRITER FOLLOWS THE SIZE, NOT WHO DECIDED IT. Until
+    # 2026-09-27 this read `(target.explicit or budget.outline_pass)`, so a
+    # size the PERSON typed bought the sectioned writer at every effort
+    # while a size the product worked out from the fifteen sections they
+    # numbered bought it only at Think and Max. That handed the person who
+    # wrote out their whole table of contents and no word count the WORSE
+    # path — the defect, read as a cost guard. The cost it was guarding is
+    # now paid once, in the plan above, and the path is the same for both.
     sectioned = (req.kind == "document" and req.operation != "edit"
-                 and target.words > SECTIONED_WRITER_WORDS
-                 and (target.explicit or budget.outline_pass))
+                 and target.words > SECTIONED_WRITER_WORDS)
     ran_out_of_time = False
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
-            req, budget, target, say=say, requested=requested)
+            req, budget, target, say=say, requested=requested, plan=outline_json)
         calls += sect_calls
         # SAY THAT A LONG DOCUMENT WAS CHOSEN, and say what chose it. The
         # sectioned writer is the expensive path — one model call per
@@ -1451,13 +1756,17 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         # artifact.py::_warning_clause).
         result_warnings.append(
             f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about {target.words:,} words, "
-            f"written in {len((outline_json or {}).get('sections') or []) or 1} sections over {sect_calls} model calls")
+            f"written in {len((outline_json or {}).get('sections') or []) or 1} sections over {calls} model calls")
         result_warnings.extend(sect_warnings)
     else:
-        if budget.outline_pass and req.operation != "edit":
+        # `not planned`: the size-deciding pass above IS an outline pass —
+        # it planned these sections against this material — so outlining
+        # again would be the same call twice, and outlining again after it
+        # FAILED would be a second attempt at a call that just failed.
+        if budget.outline_pass and req.operation != "edit" and not planned:
             await say(10.0, "outlining")
             try:
-                outline_json = await outline(req, budget, target=target)
+                outline_json = await outline(req, budget, target=target, requested=requested)
                 calls += 1
             except ComposeError:
                 outline_json = None  # a missing outline is a smaller loss than a missing document
@@ -1502,19 +1811,14 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         calls += repaired
         result_warnings.extend(n for n in notes if n not in result_warnings)
         why = _worse(spec, candidate, allow_shrink=allow_shrink)
-        # `target.explicit`, not `target.words`: DATA_REPORT_FLOOR gives words
-        # to any report over tables, which is code's own judgement and comes
-        # from a single call with no sectioned draft to protect (verifier,
-        # 2026-09-18). The floor is for a length the PERSON named.
-        #
-        # `or sectioned` since 2026-09-22, and it is the same rule read
-        # literally rather than a new one: the clause that follows says
-        # "the draft it replaces may be the work of nine", and the reason
-        # a derived target was excluded was that it "comes from a single
-        # call with no sectioned draft to protect". A target derived from
-        # the sections a request names CAN buy the sectioned writer, at
-        # Think and Max, so from today there is a draft to protect.
-        if not why and (target.explicit or sectioned) and target.words and not allow_shrink:
+        # `target.words` ALONE since 2026-09-27. This read `target.explicit`
+        # (2026-09-18), then `(target.explicit or sectioned)` (2026-09-22),
+        # each time to keep the floor off a size code had worked out rather
+        # than read. Every document now has a size and any of them can be
+        # the work of nine calls, so the floor is on the size, not on who
+        # decided it: there is nothing about a 6,000-word draft that makes
+        # losing 53% of it acceptable because the number came from a plan.
+        if not why and target.words and not allow_shrink:
             # A correction is ONE call over the whole file; the draft it
             # replaces may be the work of nine. _worse() only refuses a
             # correction that keeps less than HALF, so a 47% cut passed:
@@ -1527,8 +1831,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             after_words = len(S.text_of(candidate).split())
             if before_words >= 40 and after_words < before_words * CORRECTION_KEEP_FRACTION:
                 why = (f"would have cut the document from {before_words:,} words to {after_words:,}, "
-                       + (f"against the {target.words:,} words that were asked for" if target.explicit
-                          else f"against the {target.words:,} words this document was sized at"))
+                       + _size_was(
+                           target,
+                           asked=f"against the {target.words:,} words that were asked for",
+                           planned=f"against the {target.words:,} words this document was planned at",
+                           derived=f"against the {target.words:,} words this document was sized at"))
         if why:
             result_warnings.append(f"a correction {why} and was not applied; the draft before it is what you see")
             log.info("artifact compose: a correction (%s) %s; kept the draft", detail, why)
@@ -1587,16 +1894,21 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # sections, and a writer that ran out of time is not asked for more.
     if target.words and req.kind == "document" and req.operation != "edit":
         words = len(S.text_of(spec).split())
-        # `target.explicit`, the same distinction CORRECTION_KEEP_FRACTION
-        # makes a few lines above: a whole extra whole-document call is
-        # the person's to buy by naming a size, not code's to spend on a
-        # number it derived. The measured counterfactual came in at 3,785
-        # of a derived 6,000 = 63%, only just over the 60% line.
-        if (words < target.words * SHORT_DRAFT_FRACTION and target.explicit
+        # `target.explicit` was a condition here until 2026-09-27, so a
+        # document short of a size the PRODUCT decided got no repair pass
+        # while one short of a size the person typed did. Both are the same
+        # document, the same fraction short, and the same one call to fix
+        # it; the asymmetry only decided who got the worse file.
+        if (words < target.words * SHORT_DRAFT_FRACTION
                 and not sectioned and not ran_out_of_time):
+            was = _size_was(
+                target,
+                asked=f"the request asked for about {target.words:,}",
+                planned=f"the plan for it came to about {target.words:,}",
+                derived=f"{target.phrase} comes to about {target.words:,}")
             await correct(
                 65.0, "writing the document out in full",
-                f"Your draft is about {words:,} words; the request asked for about {target.words:,}. "
+                f"Your draft is about {words:,} words; {was}. "
                 "Write the WHOLE document again, keeping every section you have and its content, and write each "
                 "one out properly: several paragraphs of real prose per section, with the tables and charts the "
                 "material supports. Add the sections the subject needs to reach that length. Do not pad, do not "
@@ -1604,15 +1916,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
             )
             words = len(S.text_of(spec).split())
         if words < target.words * SHORT_DRAFT_FRACTION:
-            # "asked for" only when the person DID ask. A target code
-            # derived is code's judgement, and the owner's whole complaint
-            # of 2026-09-22 was that the one sentence he read on the card
-            # was our own budget arithmetic quoted back at him as if it
-            # were his request.
-            result_warnings.append(
-                f"the document is about {words:,} words against the {target.words:,} asked for"
-                if target.explicit else
-                f"the document is about {words:,} words; {target.phrase} suggested about {target.words:,}")
+            result_warnings.append(_size_was(
+                target,
+                asked=f"the document is about {words:,} words against the {target.words:,} asked for",
+                planned=f"the document is about {words:,} words; the plan for it came to about {target.words:,}",
+                derived=f"the document is about {words:,} words; {target.phrase} suggested about {target.words:,}"))
 
     # Figures the material never gave. Named on the version at every effort;
     # handed to the reviewer where there is one.
@@ -2695,5 +3003,6 @@ __all__ = [
     "ComposeError", "Source", "DataTable", "Material", "ComposeRequest", "ComposeResult",
     "compose", "outline", "content_review", "visual_review", "revise", "classify_intent", "write_section", "revise_section",
     "compose_sectioned", "caps_for", "target_for", "LengthTarget", "strip_style_clauses",
+    "plan_size", "plans_size", "size_from_plan", "plan_items", "OUTLINE_MAX_SECTIONS",
     "material_from_history", "requested_sections", "body_json_for_prompt", "REWRITE_BATCH_ROWS", "REWRITE_MAX_BATCHES",
 ]

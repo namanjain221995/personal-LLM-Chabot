@@ -56,6 +56,15 @@ shrink word disables it, which is what keeps a one-page brief one page.
 
 THE CEILINGS are the renderers' own (`types.MAX_PAGES`, `types.MAX_SLIDES`):
 no target may ask for a file the renderer would refuse to make.
+
+WHAT THIS MODULE NO LONGER DECIDES (owner requirement, 2026-09-27: "Our ai
+decide it own What need ??"). A size this module returns for the person's own
+WORDS is still the answer — they typed it. A size it works out for them is
+now only a FLOOR: `DATA_REPORT_FLOOR` and the sections-times-WORDS_PER_SECTION
+rule in `compose.target_for` are each a constant times a count, and
+`compose.size_from_plan` keeps the larger of that floor and what the model
+says the work needs. Nothing here is asked for a size the request does not
+contain; `compose.plan_size` asks the model instead.
 """
 from __future__ import annotations
 
@@ -90,25 +99,48 @@ MAX_WORDS = T.MAX_PAGES * WORDS_PER_PAGE      # 27,000
 MAX_SLIDES = T.MAX_SLIDES                     # 40
 
 
+#: Where a size came from. It decides only WORDING, never which path the
+#: composer takes: from 2026-09-27 a size the product worked out buys
+#: exactly what a size the person typed buys (see compose.compose's
+#: `sectioned`). Before that date `explicit` gated three paths, so the
+#: person who numbered fifteen sections and no word count got the cheaper,
+#: worse one.
+SOURCE_ASKED = "asked"        # the person's own words
+SOURCE_DERIVED = "derived"    # code read their shape: named sections, data floor
+SOURCE_PLANNED = "planned"    # the model was asked what the work needs
+SOURCE_NONE = ""
+
+
 @dataclass(frozen=True)
 class LengthTarget:
     """What the file should come to.
 
-    `words` is 0 when nothing asked the document to grow — that is the
-    normal case and it means "compose as before". `explicit` is True when
-    the person NAMED a size (grow or shrink); it is False for the
-    data-report floor, which is code's judgement and not the person's
-    words. `phrase` is the wording that decided it, for the prompt and for
-    the version warning.
+    `words` is 0 when no size has been decided yet. `explicit` is True when
+    the person NAMED a size (grow or shrink); it is False for a size the
+    product worked out — the data-report floor, the sections a request
+    numbers, or the plan the model returned. `phrase` is the wording that
+    decided it, for the prompt and for the version warning. `sections` is
+    how many top-level sections that size is meant to be written in, when
+    something decided that too (the model's plan does); 0 means "derive it
+    from the words". `source` is one of the SOURCE_* constants above and is
+    read only when a sentence has to say WHO decided.
     """
 
     words: int = 0
     slides: int = 0
     phrase: str = ""
     explicit: bool = False
+    sections: int = 0
+    source: str = SOURCE_NONE
 
     def __bool__(self) -> bool:
         return bool(self.words or self.slides)
+
+    @property
+    def section_count(self) -> int:
+        """The sections this size is written in: what decided the size said,
+        or what the word count implies."""
+        return int(self.sections) or (sections_for(self.words) if self.words else 0)
 
     @property
     def pages(self) -> int:
@@ -278,7 +310,8 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
         # A deck's length is its slide count; a workbook has none.
         phrase = slide_phrase if kind == "presentation" else ""
         return LengthTarget(words=0, slides=slides if kind == "presentation" else 0,
-                            phrase=phrase, explicit=bool(phrase))
+                            phrase=phrase, explicit=bool(phrase),
+                            source=SOURCE_ASKED if phrase else SOURCE_NONE)
 
     candidates: List[Tuple[int, str]] = list(numbered_words)
     m = _BIG_RE.search(text)
@@ -296,17 +329,21 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
 
     if candidates:
         words, phrase = max(candidates)
-        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, phrase=phrase, explicit=True)
+        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, phrase=phrase, explicit=True,
+                            source=SOURCE_ASKED)
 
     if _SHRINK_RE.search(text):
         # The person asked for less. No growth target, and the data-report
         # floor below must not put one back.
-        return LengthTarget(words=0, slides=slides, phrase=_SHRINK_RE.search(text).group(0), explicit=True)
+        return LengthTarget(words=0, slides=slides, phrase=_SHRINK_RE.search(text).group(0), explicit=True,
+                            source=SOURCE_ASKED)
 
     if has_data and is_data_report(text):
-        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides, phrase="a report over data", explicit=False)
+        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides, phrase="a report over data", explicit=False,
+                            source=SOURCE_DERIVED)
 
-    return LengthTarget(words=0, slides=slides, phrase=slide_phrase, explicit=bool(slide_phrase))
+    return LengthTarget(words=0, slides=slides, phrase=slide_phrase, explicit=bool(slide_phrase),
+                        source=SOURCE_ASKED if slide_phrase else SOURCE_NONE)
 
 
 # ------------------------------------------------------------- the shapes --
@@ -326,6 +363,7 @@ def section_words(words: int, sections: int) -> int:
 
 __all__ = [
     "LengthTarget", "parse_size", "shrink_asked", "is_data_report", "sections_for", "section_words",
+    "SOURCE_ASKED", "SOURCE_DERIVED", "SOURCE_PLANNED", "SOURCE_NONE",
     "WORDS_PER_PAGE", "WORDS_PER_SECTION", "BIG_WORDS", "COMPREHENSIVE_WORDS", "DATA_REPORT_FLOOR",
     "MAX_WORDS", "MAX_SLIDES",
 ]

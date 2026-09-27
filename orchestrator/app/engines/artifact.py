@@ -572,21 +572,34 @@ async def _compose_for_pipeline_inner(ctx: "pipeline.ComposeContext"):
         await ctx.progress_stage("outline", "skipped", "conversion keeps the content")
         return ctx.parent_spec
 
-    if budget.outline_pass and ctx.operation != "edit":
-        await ctx.progress_stage("outline", "running", "")
-    else:
-        await ctx.progress_stage("outline", "skipped", "Fast goes straight to writing" if not budget.outline_pass else "an edit keeps the structure")
-
     req = C.ComposeRequest(
         kind=ctx.kind, formats=ctx.formats, template_id=ctx.template_id, effort=ctx.effort,
         operation="edit" if ctx.operation == "edit" else "create", material=material,
         parent_spec=ctx.parent_spec if ctx.operation == "edit" else None,
         instruction=ctx.instruction, date=_dt.date.today().strftime("%d %B %Y"),
     )
+    # THE STAGE SAYS WHAT THE COMPOSER DOES. Since 2026-09-27 a document
+    # whose size nobody named is planned first at EVERY effort, so the
+    # composer's plan call is not `budget.outline_pass` any more
+    # (compose.plans_size). Reading the budget alone printed "Fast goes
+    # straight to writing" over a Fast plan call, and left the stage stuck
+    # at running/skipped because the `detail == "writing"` hand-off was
+    # gated on the same flag. The request has to exist before the stage can
+    # be decided, so the stage line moved below it.
+    planning = ctx.operation != "edit" and (budget.outline_pass or C.plans_size(req))
+    if planning:
+        await ctx.progress_stage("outline", "running", "")
+    else:
+        # A non-edit that reaches here always has `budget.outline_pass`
+        # False, which is Fast alone — so the sentence the person has read
+        # since this stage existed is still the true one.
+        await ctx.progress_stage("outline", "skipped",
+                                 "an edit keeps the structure" if ctx.operation == "edit"
+                                 else "Fast goes straight to writing")
     outline_seen = {"done": False}
 
     async def progress(pct: Optional[float], detail: str) -> None:
-        if not outline_seen["done"] and detail == "writing" and budget.outline_pass and ctx.operation != "edit":
+        if not outline_seen["done"] and detail == "writing" and planning:
             outline_seen["done"] = True
             await ctx.progress_stage("outline", "done", "")
         await ctx.progress(pct, detail)
