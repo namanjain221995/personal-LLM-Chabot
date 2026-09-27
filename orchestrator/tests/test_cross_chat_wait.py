@@ -64,6 +64,7 @@ SYNTHETIC DATA ONLY: every account, message and question below is invented.
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 
@@ -565,7 +566,21 @@ def test_a_failing_candidate_load_counts_and_cancels_the_speculative_embedding(
             raise db.OperationalError("no connection slots left")
 
         monkeypatch.setattr(memory_semantic, "_load_candidates", exploding)
-        return await memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+        out = await memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+        # AND AWAITED, not merely cancelled. This is the ONLY assertion in the
+        # file that reaches `_discard`'s `await asyncio.wait({task})`; the
+        # preamble above promises "every early return and every failure path
+        # cancels and AWAITS the sibling task", and until this line nothing
+        # tested it — reducing `_discard` to a bare `task.cancel()` left all
+        # nineteen tests green (QA, 2026-09-28). `cancel()` only REQUESTS;
+        # the child gets no chance to unwind until someone yields to it, so
+        # without the await the task is still alive here, against a bounded
+        # thread pool in front of a Postgres that has run out of connection
+        # slots before. Asserted inside the coroutine because `asyncio.run`
+        # closes the loop on its way out and takes the evidence with it.
+        alive = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        assert alive == [], f"the speculative embedding was left running: {alive}"
+        return out
 
     began = time.perf_counter()
     assert asyncio.run(scenario()) == []
@@ -674,7 +689,21 @@ def test_a_turn_cancelled_while_the_candidate_load_runs_counts_its_embedding(
     flight when the turn goes another way, and a newer message replaces a turn
     outright. The embedding is already on the sidecar's wire by then, so
     cancelling the turn does not un-spend it, and it is counted under its own
-    reason rather than sharing one with a stale cache entry."""
+    reason rather than sharing one with a stale cache entry.
+
+    NO CLOCK (2026-09-28). This test used to arm `await asyncio.sleep(0.03)`
+    against a load that slept 0.15 s in a worker thread and cancel in between.
+    That is a race with a 5x margin, and this repo's own CI defeats it: the
+    9,000-test heap has recorded ~0.5 s garbage-collection pauses on the hosted
+    runner. Emulating a loop block of exactly that shape in this worktree,
+    anything past roughly 0.13 s of blocked loop flips the outcome — at 0.25 s
+    `wasted_by_reason()` comes back `{}` while `pytest.raises` still holds, so
+    the failure reads as a counter bug rather than a timing one, and at 0.50 s
+    the turn completes instead of cancelling (QA, 2026-09-28). The handshake
+    below replaces the clock: two `threading.Event`s make the cancellation
+    provably land while the load is still inside the worker thread, so a
+    blocked event loop delays this test instead of changing its verdict.
+    """
     stamps = Stamps()
     real_load = memory_semantic._load_candidates
 
@@ -682,16 +711,34 @@ def test_a_turn_cancelled_while_the_candidate_load_runs_counts_its_embedding(
         await warm_key(account, "new-conv")
         stamp_embed_query(monkeypatch, stamps, delay=0.5)
 
-        def slow(*a, **k):
-            time.sleep(0.15)
+        inside_load = threading.Event()
+        may_finish = threading.Event()
+
+        def blocking(*a, **k):
+            inside_load.set()
+            # Bounded so a broken handshake fails the test instead of hanging
+            # the shard; the release below is what normally ends this wait.
+            may_finish.wait(30.0)
             return real_load(*a, **k)
 
-        monkeypatch.setattr(memory_semantic, "_load_candidates", slow)
+        monkeypatch.setattr(memory_semantic, "_load_candidates", blocking)
         turn = asyncio.ensure_future(
             memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
         )
-        await asyncio.sleep(0.03)
+        # Wait for the worker thread to be INSIDE the load. `Event.wait` is
+        # blocking, so it is awaited on the loop's own executor rather than
+        # spun on: this coroutine must not hold the loop while the thread hop
+        # it is waiting for is still being dispatched.
+        await asyncio.get_running_loop().run_in_executor(None, inside_load.wait, 30.0)
+        assert inside_load.is_set(), "the candidate load never started"
         turn.cancel()
+        # `db.run_in_thread` is `anyio.to_thread.run_sync`, which does not
+        # abandon its thread on cancellation: the CancelledError is delivered
+        # only once the worker returns. So the load is released AFTER the
+        # cancel is armed and BEFORE the turn is awaited — the ordering that
+        # makes this deterministic, and without which the await would sit here
+        # for the full 30 s bound.
+        may_finish.set()
         with pytest.raises(asyncio.CancelledError):
             await turn
 
@@ -709,11 +756,26 @@ def test_the_speculation_is_off_by_default_and_the_default_keeps_head_s_order(
     """The flag's default is the behaviour production runs, so it is asserted
     here and not left to a comment. With it off, a WARM candidate cache — the
     one state in which the gate would otherwise fire — still embeds strictly
-    after the load returns, exactly as dev does, and nothing is counted."""
-    assert memory_semantic.CROSS_CHAT_SPECULATIVE_EMBED is False
+    after the load returns, exactly as dev does, and nothing is counted.
+
+    THE DEFAULT IS READ FROM A CLEAN ENVIRONMENT (2026-09-28). The assertion
+    below used to read the ambient one, which made this test fail for a reason
+    that has nothing to do with the code: exporting CROSS_CHAT_SPECULATIVE_EMBED=1
+    in a shell that then runs the suite — which is exactly what turning the flag
+    on means, and the first thing anyone evaluating it would do — reddened it.
+    The shipped default is a property of the source, so it is asserted against a
+    `Settings()` built with the variable unset, and the module constant is only
+    checked when the environment did not set it.
+    """
     from app import config as _config
 
+    if not (os.environ.get("CROSS_CHAT_SPECULATIVE_EMBED") or "").strip():
+        # An import-time read of the environment: only meaningful when the
+        # environment this process started in was silent about it.
+        assert memory_semantic.CROSS_CHAT_SPECULATIVE_EMBED is False
+    monkeypatch.delenv("CROSS_CHAT_SPECULATIVE_EMBED", raising=False)
     assert _config.Settings().cross_chat_speculative_embed is False
+    assert memory_semantic._env_bool("CROSS_CHAT_SPECULATIVE_EMBED", False) is False
 
     stamps = Stamps()
 

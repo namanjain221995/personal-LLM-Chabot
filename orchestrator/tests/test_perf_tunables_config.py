@@ -61,6 +61,7 @@ TUNABLES = (
     Tunable("KNOWLEDGE_FAST_CONCURRENT_RETRIEVE", "knowledge_fast_concurrent_retrieve", bool, True, lk, "_env_bool"),
     Tunable("HEALTH_DEPENDENCY_CACHE_S", "health_dependency_cache_s", float, 4.0, health, "_env_float"),
     Tunable("CROSS_CHAT_EMBEDDINGS_CACHE_S", "cross_chat_embeddings_cache_s", float, 60.0, memory_semantic, "_env_float"),
+    Tunable("CROSS_CHAT_SPECULATIVE_EMBED", "cross_chat_speculative_embed", bool, False, memory_semantic, "_env_bool"),
     Tunable("CONTEXT_CONCURRENT_READS", "context_concurrent_reads", bool, True, main, "_env_bool"),
     Tunable("CONTEXT_READS_CONCURRENCY", "context_reads_concurrency", int, 6, main, "_env_int"),
     Tunable("CONTEXT_READS_PROCESS_LIMIT", "context_reads_process_limit", int, 6, main, "_env_int"),
@@ -229,6 +230,23 @@ def _memory_ttl(monkeypatch, t, settings_value, module_value):
     return 0.0 if len(fetches) == 2 else 60.0
 
 
+def _speculative_embed(monkeypatch, t, settings_value, module_value):
+    """Whether the query embedding may start beside the candidate load.
+
+    Registered 2026-09-28. `memory_semantic` added a SECOND private environment
+    parser for this flag — `_env_bool`, with its own copy of config.py's truthy
+    set — and the flag was not in this registry, so the drift guard that exists
+    precisely to stop a module's private parser diverging from `Settings` did
+    not cover it. Nothing failed, because `TUNABLES` is a hand-written tuple
+    with no completeness scan over the modules.
+
+    No NOT_YET_WIRED entry: `_speculative_embed_enabled()` already prefers the
+    `Settings` attribute, unlike its sibling CROSS_CHAT_EMBEDDINGS_CACHE_S.
+    """
+    monkeypatch.setattr(memory_semantic, "CROSS_CHAT_SPECULATIVE_EMBED", module_value)
+    return memory_semantic._speculative_embed_enabled()
+
+
 def _sse_window_ms(monkeypatch, t, settings_value, module_value):
     return sse._coalesce_seconds() * 1000.0
 
@@ -315,6 +333,7 @@ PROBES: dict = {
     ),
     "HEALTH_DEPENDENCY_CACHE_S": (_health_ttl, [(0.0, 60.0), (60.0, 0.0)]),
     "CROSS_CHAT_EMBEDDINGS_CACHE_S": (_memory_ttl, [(0.0, 60.0), (60.0, 0.0)]),
+    "CROSS_CHAT_SPECULATIVE_EMBED": (_speculative_embed, [(False, True), (True, False)]),
     "CONTEXT_CONCURRENT_READS": (_concurrent_reads, [(False, True), (True, False)]),
     "CONTEXT_READS_CONCURRENCY": (_reads_in_flight, [(2, 6), (6, 2)]),
     "CONTEXT_READS_PROCESS_LIMIT": (_reads_in_flight_across_turns, [(2, 6), (6, 2)]),
