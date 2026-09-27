@@ -205,11 +205,36 @@ _ROLE = (
     "'TBD' or 'TODO'."
 )
 
+#: THE ONE SENTENCE THAT TELLS A COMPOSER A DIAGRAM EXISTS, used verbatim
+#: wherever a block vocabulary is listed. It was missing, and the omission
+#: was the whole reason a model-composed technical report held no picture:
+#: `spec.DocumentBlock` gained a `diagram` member and `_schema_with_defs`
+#: has accepted one since, but `_OUTLINE_SCHEMA.elements` is a CLOSED enum
+#: and the comment at `_write_one_section` records what that costs — "the
+#: model follows it literally: fifteen scoped calls produced fifteen
+#: headings and no sub-heading at all, twice measured". A block the
+#: vocabulary does not name is a block the model does not write.
+#:
+#: THE ROLE NAMES ARE READ OFF `spec.DIAGRAM_ROLES` RATHER THAN SPELLED
+#: AGAIN. Three copies of this vocabulary already exist in this module and
+#: they have drifted apart in wording; a fourth copy of the ROLE list would
+#: drift into teaching a role `spec.DiagramNode` refuses, and a refused role
+#: is silently re-coloured rather than reported. Roles are also what
+#: render/diagrams.py colours by, so a name that misses the set loses its
+#: hue as well as its meaning.
+DIAGRAM_CLAUSE = (
+    "a diagram when the point is how parts CONNECT rather than how numbers compare — an architecture, a "
+    "pipeline, a request path as boxes and arrows, each box given its role ("
+    + ", ".join(S.DIAGRAM_ROLES)
+    + "), never a picture of numbers and never decoration"
+)
+
 _KIND_GUIDE = {
     "document": (
         "Write a document: a title, then blocks in reading order. Use heading "
         "levels for structure, short paragraphs, bullet lists for enumerations, "
-        "a table when the material has rows, a chart when numbers compare, a "
+        "a table when the material has rows, a chart when numbers compare, "
+        + DIAGRAM_CLAUSE + ", a "
         "callout for a warning or key takeaway, a kpis row for a brief's "
         "headline numbers. Put an assumptions list where you had to infer. "
         "Do not repeat the same content in two blocks."
@@ -242,7 +267,7 @@ _TEMPLATE_GUIDE = {
     "executive_report": "Executive report: cover on, an executive summary first (five sentences at most), then findings, then recommendations clearly separated from findings, then appendix material.",
     "brief": "One-page executive brief: no cover, a kpis row at the top, three to five tight sections, no section longer than 120 words. It must fit one page.",
     "sop": "Standard operating procedure: purpose, scope, roles, then NUMBERED steps with a warning callout where a step can go wrong, then a checklist.",
-    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. Precise, no marketing language.",
+    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. A diagram where the architecture, the data path or the process is the point — that is what a technical reader opens it for. Precise, no marketing language.",
     "research_report": "Research report: question, method, findings with citations on every claim that came from a source, discussion, sources.",
     "proposal": "Proposal: the need, the proposed approach, scope, timeline (a table), pricing or effort if given, next steps.",
     "meeting_summary": "Meeting summary: attendees if known, decisions, action items with owners as a table, open questions.",
@@ -472,7 +497,7 @@ def _size_line(target: Optional[LengthTarget]) -> str:
             "wherever the data supports one. Do not stop early and do not summarise what you have already written.")
 
 
-def _requested_line(requested: Sequence[str]) -> str:
+def _requested_line(requested: Sequence[str], *, kind: str = "document") -> str:
     """The sections the person named, in their words and their order.
 
     Until 2026-09-22 they reached the model only as the integer inside
@@ -498,7 +523,13 @@ def _requested_line(requested: Sequence[str]) -> str:
         "heading at LEVEL 1; the parts inside a section are sub-headings at LEVEL 2, and a section of several "
         "hundred words needs two or three of them. Write real prose under every heading rather than a heading "
         "followed by a single line. Use the block the request's own words ask for: a bullets block for an "
-        "enumeration, a numbered block for a sequence of steps, a table where things are compared, a callout "
+        "enumeration, a numbered block for a sequence of steps, a table where things are compared, "
+        # A DIAGRAM IS A DOCUMENT BLOCK AND ONLY A DOCUMENT BLOCK. This line
+        # is built for every kind — the caller passes `req.kind` — and
+        # `Slide` has no diagram field, so naming one to a deck or a workbook
+        # would teach a block its schema refuses.
+        + (DIAGRAM_CLAUSE + ", " if kind == "document" else "")
+        + "a callout "
         "with kind \"warning\" and a title for a caution or a risk, a callout with kind \"note\" and a title "
         "for an aside or a note, and recommendations written as recommendations where the request asks for them."
     )
@@ -577,7 +608,7 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     # what the user message is for. Pinned by
     # test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
     user = "\n\n".join(
-        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested)]
+        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested, kind=req.kind)]
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -634,7 +665,7 @@ _OUTLINE_SCHEMA = {
                 "properties": {
                     "heading": {"type": "string", "maxLength": 120},
                     "purpose": {"type": "string", "maxLength": 200},
-                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "callout", "kpis", "numbered"]}},
+                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "diagram", "callout", "kpis", "numbered"]}},
                 },
                 "required": ["heading", "purpose", "elements"],
             },
@@ -1257,7 +1288,8 @@ async def _write_one_section(
         " Break the section into its parts and head each part at LEVEL 2 under your level-1 heading — two or "
         "three of them, unless the section really is one single idea. Use the "
         "block the request's own words ask for: a bullets block for an enumeration, a numbered block for a "
-        "sequence of steps, a table where things are compared, a callout with kind \"warning\" and a title for a "
+        "sequence of steps, a table where things are compared, " + DIAGRAM_CLAUSE + ", a callout with kind "
+        "\"warning\" and a title for a "
         "caution or a risk, a callout with kind \"note\" and a title for an aside, and a recommendation written "
         "plainly as a recommendation where the request asks for them."
     )
