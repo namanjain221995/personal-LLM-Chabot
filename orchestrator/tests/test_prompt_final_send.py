@@ -591,3 +591,359 @@ def test_a_caller_that_does_not_settle_gets_todays_blocking_behaviour():
         pending, measured = asyncio.run(run(mp))
     assert pending is None
     assert measured == 40
+
+
+# ---------------------------------------------------------------------------
+# THE STREAMED SITES (verification 2026-09-27)
+# ---------------------------------------------------------------------------
+#
+# WHY THESE EXIST. Everything above settles through `llm._settling`, which the
+# non-streaming calls use. The two STREAMING sites do NOT use it: they hold a
+# `dispatched` flag, cancel the count in a `finally` when nothing was
+# dispatched, and settle INSIDE `_consume` with the stream already held. That
+# hand-rolled pair is the most fragile code in this change and the file it was
+# added by tested none of it — the proof lived in scripts that were never
+# committed. A Stop landing on the settlement must close the stream and
+# release its admission lane; a dispatch that never happened must drop the
+# count; and a settlement that happens must reach the lanes. Each is asserted
+# here against the real `llm` functions.
+
+
+class _StreamDouble:
+    """A streamed response that records its own close."""
+
+    def __init__(self, hold=None) -> None:
+        self.closed = 0
+        self.hold = hold
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        if self.hold is not None:
+            await self.hold.wait()
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="ok", reasoning_content=None),
+                finish_reason=None,
+            )],
+            usage=None,
+        )
+
+    async def close(self):
+        self.closed += 1
+
+
+class _StreamEngine:
+    """A streaming engine client. `raise_on_send` refuses the dispatch."""
+
+    def __init__(self, raise_on_send=None, hold=None, base_url: str = MAIN_URL) -> None:
+        self.base_url = base_url
+        self.calls: list = []
+        self.streams: list = []
+        self.raise_on_send = raise_on_send
+        self.hold = hold
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raise_on_send is not None:
+            raise self.raise_on_send
+        stream = _StreamDouble(self.hold)
+        self.streams.append(stream)
+        return stream
+
+
+def _still_counting() -> list:
+    return [t for t in getattr(context, "_INFLIGHT_COUNTS", ()) if not t.done()]
+
+
+@pytest.mark.parametrize("site", ["stream_chat_completion", "stream_chat_events"])
+def test_a_streamed_turn_sends_first_and_settles_with_the_stream_already_open(site):
+    """The body goes on the wire before the count answers, and the count still
+    reaches the lanes — on BOTH streaming sites."""
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()
+        counter = _Tokenize(count=4242, window=1_000_000, gate=gate)
+        engine = _StreamEngine()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+
+        async def drive():
+            if site == "stream_chat_completion":
+                async for _ in llm.stream_chat_completion(
+                    [{"role": "user", "content": "hello"}], max_tokens=8000
+                ):
+                    pass
+            else:
+                async for _ in llm.stream_chat_events(
+                    messages=[{"role": "user", "content": "hello"}], max_tokens=8000
+                ):
+                    pass
+
+        turn = asyncio.get_running_loop().create_task(drive())
+        for _ in range(200):
+            if engine.calls:
+                break
+            await asyncio.sleep(0)
+        sent_while_uncounted = bool(engine.calls) and not gate.is_set()
+        gate.set()
+        await turn
+        # `_measured` is a ContextVar: read it in the task that settled it.
+        return sent_while_uncounted, len(counter.calls), _still_counting()
+
+    with pytest.MonkeyPatch.context() as mp:
+        sent_first, counts, left = asyncio.run(run(mp))
+    assert sent_first, "the streamed request waited for its /tokenize before going on the wire"
+    assert counts == 1, "the count was duplicated or skipped"
+    assert left == [], "the turn ended with its count still running"
+
+
+def test_a_stop_on_the_settlement_closes_the_stream_and_releases_its_lane():
+    """The settlement is awaited with the stream ALREADY held, so a Stop
+    landing on it runs `_consume`'s close — the admission lane and the
+    breaker permit the stream holds are released instead of being stranded."""
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()          # /tokenize never answers
+        counter = _Tokenize(count=40, window=1_000_000, gate=gate)
+        engine = _StreamEngine()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+
+        async def drive():
+            async for _ in llm.stream_chat_events(
+                messages=[{"role": "user", "content": "hello"}], max_tokens=8000
+            ):
+                pass
+
+        turn = asyncio.get_running_loop().create_task(drive())
+        for _ in range(200):
+            if engine.streams:
+                break
+            await asyncio.sleep(0)
+        # Park the turn on the settlement, then Stop it there.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+        for _ in range(20):
+            await asyncio.sleep(0)
+        left = _still_counting()
+        gate.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        return (sum(s.closed for s in engine.streams),
+                len(engine.streams),
+                admission.lanes().normal.active,
+                left)
+
+    with pytest.MonkeyPatch.context() as mp:
+        closed, opened, lane_active, left = asyncio.run(run(mp))
+    assert opened == 1
+    assert closed == 1, "a Stop on the settlement stranded an open stream"
+    assert lane_active == 0, "a Stop on the settlement stranded the admission lane"
+    assert left == [], "a Stop on the settlement left the count running"
+
+
+def test_a_streamed_dispatch_that_never_happened_drops_its_count():
+    """`_open_stream` refused, so nothing was sent: the count owes nothing and
+    must be dropped by the `finally`, not left for a settlement that will
+    never come."""
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()
+        counter = _Tokenize(count=40, window=1_000_000, gate=gate)
+        engine = _StreamEngine(raise_on_send=RuntimeError("engine down"))
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+
+        async def drive():
+            async for _ in llm.stream_chat_events(
+                messages=[{"role": "user", "content": "hello"}], max_tokens=8000
+            ):
+                pass
+
+        # BOUNDED on purpose. A tree that blocks on its /tokenize before the
+        # dispatch never reaches the engine at all, so it must FAIL here with
+        # a timeout rather than hang the suite.
+        with pytest.raises(BaseException) as refused:
+            await asyncio.wait_for(drive(), timeout=5.0)
+        assert isinstance(refused.value, RuntimeError) and not isinstance(
+            refused.value, asyncio.TimeoutError
+        ), "the request never reached the engine: it was still waiting for its /tokenize"
+        for _ in range(20):
+            await asyncio.sleep(0)
+        pending = context._pending_count.get()
+        left = _still_counting()
+        gate.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        return pending, left
+
+    with pytest.MonkeyPatch.context() as mp:
+        pending, left = asyncio.run(run(mp))
+    assert pending is None, "a refused dispatch left a count owed to nobody"
+    assert left == [], "a refused dispatch left its count running"
+
+
+# ---------------------------------------------------------------------------
+# THE GUIDED-JSON DOWNGRADE (verification 2026-09-27)
+# ---------------------------------------------------------------------------
+
+
+def test_the_guided_json_downgrade_still_settles_its_count():
+    """The 400 that turns a guided JSON call into an unconstrained one is a
+    caught exception INSIDE the settlement, not a failed turn: the request did
+    reach the engine, so the count is still owed to the lanes and the meter.
+    Settling inside the `try` would cancel it on the way to the re-send."""
+
+    class _Downgrading:
+        def __init__(self) -> None:
+            self.base_url = MAIN_URL
+            self.calls: list = []
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        async def _create(self, **kwargs):
+            self.calls.append(kwargs)
+            if "response_format" in kwargs:
+                raise llm._bad_request_error()(
+                    "guided decoding unavailable",
+                    response=httpx.Response(
+                        400, request=httpx.Request("POST", MAIN_URL + "/chat/completions")
+                    ),
+                    body=None,
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content='{"ok": true}', reasoning_content=None,
+                                            tool_calls=None),
+                    finish_reason="stop",
+                )],
+                usage=SimpleNamespace(prompt_tokens=40, completion_tokens=2),
+            )
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=4242, window=1_000_000)
+        engine = _Downgrading()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+        text = await llm.json_completion(
+            [{"role": "user", "content": "hello"}],
+            json_schema={"type": "object"}, max_tokens=800,
+        )
+        sized = engine.calls[-1]["messages"]
+        return (text, len(engine.calls), len(counter.calls),
+                context.measured_prompt_tokens(sized, MAIN_URL), _still_counting())
+
+    with pytest.MonkeyPatch.context() as mp:
+        text, sends, counts, measured, left = asyncio.run(run(mp))
+    assert text == '{"ok": true}'
+    assert sends == 2, "the downgrade did not re-send"
+    assert counts == 1, "the downgrade counted the prompt twice"
+    assert measured == 4242, "the downgrade lost the count the lanes and the meter are owed"
+    assert left == []
+
+
+# ---------------------------------------------------------------------------
+# THE ANSWER INVARIANT, IN THE SUITE (verification 2026-09-27)
+# ---------------------------------------------------------------------------
+#
+# The change's central claim is that the body on the wire is byte-identical.
+# It was proved by scripts that were never committed, so nothing in the suite
+# would notice a later edit to `_may_send_first` that changed `max_tokens` —
+# dropping `max(ceiling, MIN_OUTPUT_TOKENS)`, or admitting a shape the bound
+# does not cover. These two tests are that guard.
+
+
+_SIZING_CASES = [
+    # (label, window, ceiling, messages)
+    ("greeting", 1_000_000, 8_000, [{"role": "user", "content": "hi"}]),
+    ("system+user", 1_000_000, 8_000,
+     [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello " * 400}]),
+    ("assistant history", 1_000_000, 8_000,
+     [{"role": "system", "content": "s"}]
+     + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"} for i in range(40)]),
+    ("classifier ceiling 4", 1_000_000, 4, [{"role": "user", "content": "yes or no"}]),
+    ("ceiling above the window", 8_192, 100_000, [{"role": "user", "content": "hi"}]),
+    ("a prompt near the window", 8_192, 256, [{"role": "user", "content": "x" * 6_000}]),
+    ("empty content", 1_000_000, 8_000, [{"role": "user", "content": ""}]),
+]
+
+
+@pytest.mark.parametrize("label,window,ceiling,msgs", _SIZING_CASES,
+                         ids=[c[0] for c in _SIZING_CASES])
+def test_the_fast_path_sizes_every_shape_exactly_as_the_blocking_path(label, window, ceiling, msgs):
+    """Whatever the gate decides, the two paths must agree to the token.
+
+    A shape the gate REFUSES is covered too: then both runs are the blocking
+    path and the test only says so, which is what keeps this table honest as
+    the gate changes."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=max(1, context.estimate_messages(msgs)), window=window)
+        _tokenize(monkeypatch, counter)
+        _warm(counter)
+
+        slow = await context.fit_request(msgs, base_url=MAIN_URL, model="m",
+                                         requested_max_tokens=ceiling)
+        with context.settles_pending_count():
+            fast = await context.fit_request(msgs, base_url=MAIN_URL, model="m",
+                                             requested_max_tokens=ceiling)
+        fired = context._pending_count.get() is not None
+        await context.settle_pending_count(fast[0], MAIN_URL)
+        return slow, fast, fired
+
+    with pytest.MonkeyPatch.context() as mp:
+        slow, fast, fired = asyncio.run(run(mp))
+    assert fast[0] == slow[0], f"{label}: the fast path changed the messages"
+    assert fast[1] == slow[1], f"{label}: the fast path changed max_tokens"
+    if fired:
+        # The gate's own arithmetic: it only fires where max_tokens is the
+        # caller's ceiling exactly, never a trimmed budget.
+        assert fast[1] == ceiling, f"{label}: fired without pinning max_tokens to the ceiling"
+
+
+def test_a_send_first_turn_puts_the_SAME_request_on_the_wire_as_a_blocking_one():
+    """One process, one engine double, two turns of the same shape: the first
+    with the fast path available, the second with the window mark withdrawn so
+    it blocks. The recorded request objects must be equal — and the first must
+    really have gone before its count, or this proves nothing."""
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()
+        counter = _Tokenize(count=40, window=1_000_000, gate=gate)
+        engine = _Engine()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+        msgs = [{"role": "system", "content": "be brief"},
+                {"role": "user", "content": "how does the deploy chain work"}]
+
+        turn = asyncio.get_running_loop().create_task(
+            llm.chat_completion(list(msgs), max_tokens=8000)
+        )
+        for _ in range(200):
+            if engine.calls:
+                break
+            await asyncio.sleep(0)
+        sent_first = bool(engine.calls) and not gate.is_set()
+        gate.set()
+        await turn
+
+        # Withdraw the mark: the next turn must count before it sends.
+        getattr(context, "_window_from_server", set()).discard(MAIN_URL)
+        await llm.chat_completion(list(msgs), max_tokens=8000)
+        return sent_first, engine.calls
+
+    with pytest.MonkeyPatch.context() as mp:
+        sent_first, calls = asyncio.run(run(mp))
+    assert sent_first, "the first turn waited for its /tokenize, so this compares nothing"
+    assert len(calls) == 2
+    assert calls[0] == calls[1], "the send-first turn put a different request on the wire"
