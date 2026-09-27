@@ -11,6 +11,12 @@ const { clickByText, sleep, waitForText } = require('../lib/browser');
 const { truncate } = require('../lib/http');
 const { playgroundStubStream } = require('../lib/stubs');
 
+//: The empty-state text Playground.tsx:527 renders INSIDE
+//: [data-testid="playground-output"] when there is no output and no run in
+//: flight. It is not output, and a wait that treats it as output is satisfied
+//: before the run begins.
+const PLAYGROUND_OUTPUT_PLACEHOLDER = 'The answer appears here.';
+
 const TABS = [
   ['overview', /developer platform|overview/i],
   ['projects', /^projects$/i],
@@ -242,13 +248,45 @@ function register(t, cfg) {
       const inputs = await page.$$('textarea');
       await inputs[inputs.length - 1].type('Say hello in five words.');
       assert.ok(await clickByText(page, 'button', /^run$/i), 'no Run button');
+      // THE REQUEST FIRST, THEN THE RENDER (2026-09-27). This check was red
+      // about one run in five, with "expected one playground execute call, saw
+      // 0" after 0.4 s, and the cause is in the two lines it used to wait on:
+      //
+      //   * frontend/components/devplatform/Playground.tsx:527 renders
+      //     `{output || (running ? '' : 'The answer appears here.')}` INSIDE
+      //     [data-testid="playground-output"], so `innerText.trim().length > 0`
+      //     is ALREADY TRUE before the run starts, on the placeholder;
+      //   * the "and it has stopped running" half was
+      //     `button[aria-label="Stop"], button.stop`, and Playground.tsx:472
+      //     renders the Stop button as a plain <button> with neither — so that
+      //     selector matched NOTHING and the half was a no-op.
+      //
+      // Measured today against a fixture of Playground.tsx:505-528 driven in
+      // headless Chrome: the old predicate was true with the placeholder
+      // showing before the run (0 aria-label/class matches for a Stop button
+      // that was up, 1 by text), and true again mid-stream. So waitForFunction
+      // could return before the POST was even issued and fall straight through
+      // to the assert below. Waiting on the intercepted call closes the race at
+      // its source; the predicate is repaired as well so it means what it says.
+      if (ctx.cfg.chatMode === 'stub') {
+        const deadline = Date.now() + 20_000;
+        while (calls.length === 0 && Date.now() < deadline) await sleep(100);
+        assert.equal(calls.length, 1, `expected one playground execute call, saw ${calls.length}`);
+      }
       await page.waitForFunction(
-        () => {
+        (placeholder) => {
           const out = document.querySelector('[data-testid="playground-output"]');
           const alert = document.querySelector('section[aria-label="Response"] [role="alert"]');
-          return (out && out.innerText.trim().length > 0 && !document.querySelector('button[aria-label="Stop"], button.stop')) || alert;
+          const text = out ? out.innerText.trim() : '';
+          // The Stop button by its TEXT: it carries no aria-label and no class
+          // this suite can key on (Playground.tsx:471-475).
+          const running = Array.from(document.querySelectorAll('button')).some(
+            (b) => (b.textContent || '').trim().toLowerCase() === 'stop',
+          );
+          return Boolean(alert) || (text.length > 0 && text !== placeholder && !running);
         },
         { timeout: ctx.cfg.chatMode === 'stub' ? 20_000 : 170_000, polling: 500 },
+        PLAYGROUND_OUTPUT_PLACEHOLDER,
       );
       const output = await page.$eval('[data-testid="playground-output"]', (e) => e.innerText.trim()).catch(() => '');
       const alert = await page.$eval('section[aria-label="Response"] [role="alert"]', (e) => e.innerText.trim()).catch(() => '');

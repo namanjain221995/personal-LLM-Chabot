@@ -30,6 +30,7 @@ are the kind of change a later edit reverts by accident.
 from __future__ import annotations
 
 import ipaddress
+import json
 import pathlib
 import re
 import unittest
@@ -40,6 +41,7 @@ import yaml
 REPO = pathlib.Path(__file__).resolve().parents[4]
 PIPELINE = REPO / ".github" / "workflows" / "pipeline.yml"
 E2E_STACK = REPO / "scripts" / "e2e-stack.sh"
+CI_STACK = REPO / "e2e" / "ci" / "stack.sh"
 CI_ENV = REPO / "e2e" / "ci" / "ci.env"
 
 JOB_ID = "e2e-hosted"
@@ -53,6 +55,76 @@ FORBIDDEN_IN_ENV = ("${{ inputs.", "${{ github.event", "${{ vars.", "${{ github.
 #: lib/config.js:123 refuses these on every host: they are the production
 #: frontend and orchestrator ports, published on loopback too.
 PRODUCTION_PORTS = {3000, 8080}
+
+
+#: A `docker exec` whose program (or whose program's input) comes from stdin
+#: needs `-i`. Without it the container gets an EMPTY stdin: `python3 -` reads
+#: an empty program and exits 0, so every assertion in the heredoc is skipped
+#: and the step is green. Measured today, 2026-09-27, against a live container
+#: with a heredoc whose only statements are `echo` and `exit 7`:
+#:
+#:     docker exec    c sh - <<EOS ...   -> printed nothing, rc 0
+#:     docker exec -i c sh - <<EOS ...   -> printed the line,  rc 7
+#:
+#: The same no-op was written twice in this branch's own history: it was caught
+#: in e2e/ci/stack.sh's assert_orch_health and left in pipeline.yml's "The
+#: container reports the capacity values it was given" step, where it made two
+#: asserts unreachable behind an empty green step. Hence a rule rather than a
+#: fix.
+_EXEC_BARE_STDIN_ARG = re.compile(r"(?:^|\s)-(?=\s|$)")
+
+
+def _exec_flags(argv: str) -> list[str]:
+    """The option tokens between `docker exec` and the container name."""
+    flags: list[str] = []
+    for token in argv.split():
+        if token.startswith("-"):
+            flags.append(token)
+        else:
+            break
+    return flags
+
+
+def _carries_interactive(argv: str) -> bool:
+    for flag in _exec_flags(argv):
+        if flag == "--interactive":
+            return True
+        if not flag.startswith("--") and "i" in flag[1:]:
+            return True
+    return False
+
+
+def docker_exec_stdin_findings(text: str, label: str) -> list[str]:
+    """Findings for every `docker exec` in `text` that needs `-i` and lacks it.
+
+    Three shapes need it, and each of the three is a silent no-op without it
+    rather than an error:
+      * a heredoc (`<<`) on the same line — the program itself is on stdin;
+      * a bare `-` program argument (`python3 -`, `sh -`) for the same reason;
+      * anything PIPED into `docker exec`, where the input is discarded.
+    """
+    findings: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        # A COMMENT that quotes the broken form is the record of the fix, not
+        # the fix being undone.
+        if stripped.startswith("#") or "docker exec" not in stripped:
+            continue
+        before, _, argv = stripped.partition("docker exec")
+        needs = []
+        if "<<" in stripped:
+            needs.append("a heredoc feeds it")
+        if _EXEC_BARE_STDIN_ARG.search(argv):
+            needs.append("its program argument is a bare `-`")
+        if before.rstrip().endswith("|"):
+            needs.append("it is on the right of a pipe")
+        if not needs or _carries_interactive(argv):
+            continue
+        findings.append(
+            f"{label}:{lineno}: `docker exec` without -i, and {needs[0]}, "
+            "so the container gets an empty stdin and the program is a no-op that exits 0"
+        )
+    return findings
 
 
 def load_pipeline() -> dict:
@@ -348,13 +420,31 @@ class TheLiveFixesInTheBoxStackScript(unittest.TestCase):
             "scripts/e2e-stack.sh still copies the production environment through a DENYLIST",
         )
         self.assertTrue(
-            "E2E_ENV_ALLOWLIST" in self.text,
+            "ENV_ALLOWLIST" in self.text,
             "scripts/e2e-stack.sh no longer names an environment ALLOWLIST",
         )
         inspect_lines = [ln for ln in self.text.splitlines() if "docker inspect" in ln and "Config.Env" in ln]
         self.assertTrue(inspect_lines, "the environment copy is gone entirely; this test needs rewriting")
         window = self.text.split("Config.Env", 1)[1][:400]
         self.assertIn("grep -E", window, "the environment is no longer filtered through an allowlist")
+
+    def test_the_allowlist_cannot_be_widened_from_the_environment(self):
+        # It used to be `E2E_ENV_ALLOWLIST="${E2E_ENV_ALLOWLIST:-...}"`, so
+        # `E2E_ENV_ALLOWLIST='.*'` outside the reviewed file restored the
+        # wholesale copy of production's environment -- session signing key, API
+        # key pepper, tunnel token, every model and third-party key -- into a
+        # container on a box several sessions share. An allowlist a caller can
+        # widen to `.*` is not an allowlist. E2E_EXTRA_ENV_FILE is the reviewed
+        # way to add one variable and is unaffected.
+        for line in self.text.splitlines():
+            if line.lstrip().startswith("#") or "ENV_ALLOWLIST=" not in line:
+                continue
+            self.assertNotRegex(
+                line,
+                r"ENV_ALLOWLIST=\"\$\{",
+                "the environment allowlist is overridable from outside this file again",
+            )
+        self.assertIn("E2E_EXTRA_ENV_FILE", self.text, "the reviewed way to add one variable is gone")
 
     def test_no_docker_exec_line_carries_a_password_argument(self):
         for lineno, line in enumerate(self.text.splitlines(), 1):
@@ -551,6 +641,245 @@ class TheJobAndCiEnvDoNotDriftApart(unittest.TestCase):
                 values[key],
                 f"{key} differs: the job seeds one account and the suite signs in as another",
             )
+
+
+class TheStepsThatRunAProgramInsideTheContainer(unittest.TestCase):
+    """`docker exec` must carry `-i` wherever the program comes from stdin.
+
+    This is not style. The capacity step in this job printed NOTHING and exited
+    0 while claiming to prove that two watermarks reached the container: with no
+    `-i`, `python3 -` read an empty program. A reader saw an empty green step.
+    Measured today on a live container (see `_EXEC_BARE_STDIN_ARG` above):
+    without `-i`, a heredoc whose only statements are `echo` and `exit 7`
+    printed nothing and returned 0; with `-i` it printed and returned 7.
+    """
+
+    def test_no_run_body_in_this_job_execs_without_stdin(self):
+        job = load_pipeline()["jobs"][JOB_ID]
+        findings: list[str] = []
+        for i, step in enumerate(job_steps(job)):
+            body = str(step.get("run", ""))
+            if "docker exec" not in body:
+                continue
+            findings += docker_exec_stdin_findings(body, f"pipeline.yml {JOB_ID} step {i} ({step.get('name')})")
+        self.assertEqual(findings, [], findings)
+
+    def test_no_run_body_anywhere_in_the_pipeline_execs_without_stdin(self):
+        # The rule is cheap enough to hold over the whole file, so the next
+        # job that shells into a container inherits it.
+        doc = load_pipeline()
+        findings: list[str] = []
+        for job_id, job in (doc.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            for i, step in enumerate(job_steps(job)):
+                findings += docker_exec_stdin_findings(
+                    str(step.get("run", "")), f"pipeline.yml {job_id} step {i}"
+                )
+        self.assertEqual(findings, [], findings)
+
+    def test_both_stack_scripts_exec_with_stdin(self):
+        for path in (REPO / "e2e" / "ci" / "stack.sh", E2E_STACK):
+            text = path.read_text(encoding="utf-8")
+            self.assertEqual(docker_exec_stdin_findings(text, path.name), [], path.name)
+
+    def test_the_capacity_step_is_the_one_that_regressed_and_is_pinned(self):
+        # Named, because this exact step is where the no-op shipped.
+        steps = job_steps(load_pipeline()["jobs"][JOB_ID])
+        bodies = [str(s.get("run", "")) for s in steps if "min_free_bytes" in str(s.get("run", ""))]
+        self.assertTrue(bodies, "no step reads the capacity watermarks out of the container any more")
+        for body in bodies:
+            self.assertIn("docker exec -i", body)
+            # And the asserts it exists for are still there.
+            self.assertIn("assert files ==", body)
+            self.assertIn("assert disk ==", body)
+
+
+class TheDockerExecRuleCanFail(unittest.TestCase):
+    """The failing fixtures for the rule above, one per shape it catches."""
+
+    def test_a_heredoc_without_i_is_refused(self):
+        findings = docker_exec_stdin_findings("docker exec c python3 - <<'PY'", "fixture")
+        self.assertTrue(any("heredoc" in f for f in findings), findings)
+
+    def test_a_bare_dash_program_without_i_is_refused(self):
+        findings = docker_exec_stdin_findings('docker exec "$ORCH" python3 -', "fixture")
+        self.assertTrue(any("bare" in f for f in findings), findings)
+
+    def test_a_pipe_into_exec_without_i_is_refused(self):
+        findings = docker_exec_stdin_findings('printf x | docker exec "$ORCH" psql -f -', "fixture")
+        self.assertTrue(findings, findings)
+
+    def test_the_fixed_forms_pass(self):
+        for good in (
+            "docker exec -i c python3 - <<'PY'",
+            'docker exec --interactive "$ORCH" python3 - <<\'PY\'',
+            'printf x | docker exec -i "$ORCH" python3 -c "$prog"',
+            # No stdin wanted: these are correct WITHOUT -i and must not be flagged.
+            'docker exec "$ENGINE" node -e "fetch(1)"',
+            "docker exec \"$ORCH\" python3 -c 'from app import db; print(db.LATEST_SCHEMA_VERSION)'",
+            '  # It used to: docker exec -i "$ORCH" python3 - "$name" "$pw"',
+        ):
+            self.assertEqual(docker_exec_stdin_findings(good, "fixture"), [], good)
+
+    def test_a_combined_flag_counts_as_interactive(self):
+        self.assertEqual(docker_exec_stdin_findings("docker exec -it c sh - ", "fixture"), [])
+
+
+
+class TheThrowawayStackScriptCanBeTornDownAndCannotEatAPeersStack(unittest.TestCase):
+    """e2e/ci/stack.sh, read as text. Four defects that shipped once, pinned.
+
+    All four were measured on this branch on 2026-09-27 before the fix:
+      * `( unset E2E_CI_ORCH_IMAGE E2E_CI_FRONT_IMAGE; bash stack.sh down )`
+        exited 1 with "set E2E_CI_ORCH_IMAGE to the orchestrator-cpu image this
+        job built" and removed nothing, because the two image tags were
+        top-level `${VAR:?}`. `down` and `logs` use no image tag, the job's
+        teardown step is `if: always()`, and its FIRST step is
+        `node --test e2e/ci/tests/` -- so any failure before the build step left
+        the stack up behind a message about a variable teardown does not need;
+      * `wait_for "orchestrator" 300 orch_healthy` was `for i in $(seq 1 300)`
+        around a probe that is itself `curl -m 15`, so a hung-but-listening
+        orchestrator cost 300 x 16 s = 80 minutes against a 60-minute job
+        ceiling: the ceiling killed the job instead of the budget printing
+        `docker logs`;
+      * up() ran `docker rm -f` and down() ran `docker volume rm` /
+        `docker network rm` on FIXED names whether or not that invocation
+        created them. A peer session had this exact stack up during
+        verification;
+      * the header said flatly that a real engine could not be reached, which
+        was argued from ci.env rather than measured. On this box the route
+        exists (0.0.0.0:8000 is the live engine, and the orchestrator container
+        gets `--add-host host.docker.internal:host-gateway` for the database).
+    """
+
+    def setUp(self):
+        self.text = CI_STACK.read_text(encoding="utf-8")
+        self.job = load_pipeline()["jobs"][JOB_ID]
+
+    def _body(self, func: str) -> str:
+        start = self.text.index(f"\n{func}() {{")
+        end = self.text.index("\n}\n", start)
+        return self.text[start:end]
+
+    def test_the_image_tags_are_required_by_up_and_not_at_top_level(self):
+        for name in ("E2E_CI_ORCH_IMAGE", "E2E_CI_FRONT_IMAGE"):
+            for lineno, line in enumerate(self.text.splitlines(), 1):
+                if line.lstrip().startswith("#") or name not in line:
+                    continue
+                self.assertNotIn(
+                    f"${{{name}:?",
+                    line,
+                    f"stack.sh:{lineno} makes {name} mandatory at top level, so `down` and `logs` exit 1",
+                )
+            self.assertIn(name, self._body("up"), f"up() no longer requires {name} at all")
+
+    def test_the_teardown_step_still_runs_on_failure_which_is_why_that_matters(self):
+        teardown = [s for s in job_steps(self.job) if "stack.sh down" in str(s.get("run", ""))]
+        self.assertTrue(teardown, "nothing tears the stack down any more")
+        for step in teardown:
+            self.assertEqual(str(step.get("if", "")).strip(), "always()")
+
+    def test_every_wait_budget_fits_under_the_jobs_ceiling(self):
+        # The arithmetic the old loop got wrong: worst case is the budget plus
+        # ONE probe, and only if the budget is a wall-clock deadline. `seq` makes
+        # it budget x probe.
+        self.assertNotIn(
+            'for i in $(seq 1 "$budget")',
+            self.text,
+            "wait_for counts iterations again, so a blocking probe multiplies the budget by its own timeout",
+        )
+        self.assertIn("deadline=$(( start + budget ))", self.text, "wait_for no longer uses a wall-clock deadline")
+        budgets = [int(m) for m in re.findall(r'wait_for "[^"]+" (\d+) ', self.text)]
+        self.assertTrue(budgets, "no wait_for call found; this test needs rewriting")
+        probes = [int(m) for m in re.findall(r"curl -fsS -m (\d+)", self.text)]
+        self.assertTrue(probes, "no curl probe found; this test needs rewriting")
+        worst = max(budgets) + max(probes)
+        ceiling = int(self.job["timeout-minutes"]) * 60
+        self.assertLess(worst, ceiling, f"worst-case wait {worst}s is not under the job's {ceiling}s ceiling")
+
+    def test_up_refuses_a_stack_something_else_is_already_running(self):
+        self.assertIn("refuse_on_collision", self._body("up"), "up() no longer refuses an existing stack")
+        self.assertIn("STACK_FORCE", self.text, "the deliberate override is gone, so the refusal cannot be bypassed")
+
+    def test_down_removes_only_what_this_invocation_started(self):
+        down = self._body("down")
+        for destructive in ('docker volume rm "$DATA_VOL"', 'docker network rm "$NET"'):
+            # Allowed ONLY under the explicit STACK_FORCE branch.
+            if destructive in down:
+                before = down.split(destructive, 1)[0]
+                self.assertIn("STACK_FORCE", before, f"{destructive} runs unconditionally again")
+        self.assertIn("owned ", down, "down() no longer scopes removal to the objects it labelled")
+        self.assertIn("--label", self._body("up"), "up() no longer labels what it creates, so down() cannot scope")
+
+    def test_the_header_does_not_claim_a_real_engine_is_unreachable(self):
+        header = self.text.split("set -euo pipefail", 1)[0]
+        self.assertNotIn(
+            "NOT ALLOWED TO DO: reach a real engine",
+            header,
+            "the header claims unreachability again; it is argued from ci.env, not measured",
+        )
+        self.assertIn("No request is made", header, "the header no longer states what is actually true")
+
+
+class TheJobCommentSaysWhatWasMeasured(unittest.TestCase):
+    """Two figures in this job's own prose went stale inside one branch.
+
+    The stub-usage count was measured before the SAME change pinned
+    ENGINE_CONTROLLER_URL at the stub, after which the orchestrator polls
+    `GET /state` every ENGINE_STATE_POLL_S for the life of the stack; and
+    ci.env described a route the stub had stopped answering that way. Prose is
+    what a reviewer decides this stack is safe from, so the two specific
+    sentences are pinned.
+    """
+
+    def test_the_stale_stub_usage_figure_is_not_back(self):
+        text = PIPELINE.read_text(encoding="utf-8")
+        for stale in ("stub served 13 requests", "reached it 13 times"):
+            self.assertNotIn(stale, text, f"the pre-ENGINE_CONTROLLER_URL figure is back: {stale!r}")
+
+    def test_the_job_names_the_route_the_stub_really_serves_most(self):
+        text = PIPELINE.read_text(encoding="utf-8")
+        job = text[text.index("6b. END TO END") : text.index("7. THE AGGREGATE RELEASE GATE")]
+        self.assertIn("GET /state", job, "the job comment does not name the controller poll at all")
+        self.assertIn("ENGINE_STATE_POLL_S", job, "the job comment does not say what sets the poll rate")
+
+    def test_ci_env_does_not_claim_the_stub_404s_on_state(self):
+        text = CI_ENV.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "loud 404 for /state",
+            text,
+            "ci.env claims a 404 on /state again; e2e/ci/engine.js answers 200 MONITORING_UNKNOWN",
+        )
+        self.assertIn("MONITORING_UNKNOWN", text, "ci.env no longer says what the stub answers on /state")
+
+    def test_the_baseline_note_forbids_a_squash_merge(self):
+        # The three 2026-09-27 fingerprints are keyed to one commit. A squash
+        # rewrites it, so the target branch gets three STALE entries AND the same
+        # three lines as NEW, and secret_gate.py fails on either.
+        baseline = json.loads((REPO / ".github" / "workflows" / "gitleaks-baseline.json").read_text(encoding="utf-8"))
+        note = " ".join(baseline["_comment"])
+        self.assertIn("NEVER SQUASH", note, "the baseline note does not forbid a squash merge")
+        fingerprints = {f["fingerprint"].split(":", 1)[0] for f in baseline["findings"]}
+        named = {word.strip(".,;") for word in note.split() if len(word.strip(".,;")) == 40}
+        self.assertTrue(
+            named & fingerprints,
+            "the note forbids a squash without naming a commit the fingerprints are keyed to",
+        )
+
+    def test_the_baseline_note_names_the_job_that_actually_runs_the_scan(self):
+        baseline = json.loads((REPO / ".github" / "workflows" / "gitleaks-baseline.json").read_text(encoding="utf-8"))
+        note = " ".join(baseline["_comment"])
+        doc = load_pipeline()
+        running = {
+            job_id
+            for job_id, job in (doc.get("jobs") or {}).items()
+            if isinstance(job, dict)
+            and any("secret_gate.py" in str(s.get("run", "")) for s in job_steps(job))
+        }
+        self.assertEqual(running, {"security"}, f"secret_gate.py moved job: {sorted(running)}")
+        self.assertIn("`security` job", note, "the baseline note names the wrong job for the secret scan")
+
 
 if __name__ == "__main__":
     unittest.main()

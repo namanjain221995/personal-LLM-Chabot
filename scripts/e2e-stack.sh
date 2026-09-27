@@ -170,13 +170,21 @@ up() {
   # Genuinely need one more? Put it in a file of your own with mode 600 and
   # name it in E2E_EXTRA_ENV_FILE. That is a decision somebody makes in
   # writing, rather than a default nobody reviewed.
-  E2E_ENV_ALLOWLIST="${E2E_ENV_ALLOWLIST:-OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED}"
+  #
+  # AND IT IS NOT OVERRIDABLE FROM OUTSIDE THIS FILE (2026-09-27). It used to be
+  # `${E2E_ENV_ALLOWLIST:-...}`, so `E2E_ENV_ALLOWLIST='.*'` in the environment
+  # restored the wholesale copy this change removed -- production's session
+  # signing key, its API key pepper, the tunnel token and every model and
+  # third-party key -- into .runtime/e2e.env on a box several sessions share.
+  # That is the exact fail-open the allowlist exists to close, and it earned
+  # nothing: E2E_EXTRA_ENV_FILE is already the reviewed way to add one variable.
+  ENV_ALLOWLIST="OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED}"
   # An empty match is a hard error rather than an empty file: `grep` exiting 1
   # under `set -o pipefail` would otherwise take the whole script down with no
   # explanation, and a silently empty engine contract would start a stack that
   # points at nothing.
   if ! docker inspect "$PROD_ORCH" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-       | grep -E "^($E2E_ENV_ALLOWLIST)=" >> "$ROOT/.runtime/e2e.env"; then
+       | grep -E "^($ENV_ALLOWLIST)=" >> "$ROOT/.runtime/e2e.env"; then
     die "could not read the engine contract from $PROD_ORCH (is it running?)"
   fi
   # Generated FRESH for this stack, never inherited: a QA stack signing its

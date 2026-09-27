@@ -1077,11 +1077,29 @@ jobs:
   #     first local run of this stage caught exactly that: five of the six were
   #     missing because every engine URL in ci.env named one address.
   #
+  # AND IT HAS TO BE RELIABLY GREEN, which it was not at first. Independent
+  # verification ran the stage five times and one of the five was RED with
+  # "FAIL console.playground — expected one playground execute call, saw 0"
+  # after 0.4 s (41/1/1, exit 1). A job that is red one run in five is a job
+  # people learn to ignore, which defeats this one's purpose, so the race is
+  # closed rather than labelled: e2e/platform/suites/console.js now waits for
+  # the intercepted execute call before asserting on it, and its wait for the
+  # rendered answer excludes the placeholder that Playground.tsx:527 renders
+  # INSIDE the output pane — which made the old wait true BEFORE the run
+  # started. Measured 2026-09-27 in headless Chrome against a fixture of that
+  # pane: the old predicate was true with the placeholder showing and true again
+  # mid-stream, and its "has stopped running" half keyed on
+  # `button[aria-label="Stop"], button.stop`, which matches NOTHING the
+  # component renders (0 matches, against 1 for a match on the button's text).
+  # e2e/ci/tests/playground-wait.test.js fails if either half comes back.
+  #
   # WHAT ITS GREEN DOES NOT MEAN — repeated in the run summary so nobody reads
   # more into it than is there. Every item below is MEASURED from local runs of
   # this stack on 2026-09-27, not inferred: the first run of the stage as
   # committed reported 41 pass, 1 fail, 1 skip of 43 and is what found the
-  # catalogue defect; after the fix, 42 pass, 0 fail, 1 skip:
+  # catalogue defect; after the catalogue fix and the playground fix, two full
+  # local cycles against a dropped-and-recreated database were 42 pass, 0 fail,
+  # 1 skip, exit 0:
   #   * nothing about the CUDA image: this runs Dockerfile.cpu, production
   #     runs Dockerfile.cuda;
   #   * nothing about aarch64: hosted runners are x86_64 and the DGX is not;
@@ -1103,12 +1121,32 @@ jobs:
   #   * NOT the public OpenAPI document. An earlier version of this comment
   #     claimed it; no check in e2e/platform fetches it. `api_contract` above
   #     is still the only proof of that surface, from the imported module;
-  #   * very little of e2e/ci/engine.js. Measured over the whole local run, the
-  #     stub served 13 requests: 7 GET /health, 3 GET /v1/models and 3 POST
-  #     /score (the reranker canary, app/rerank.py:159). Its chat, completions,
-  #     embeddings and tokenize handlers were never called through the product
-  #     — they are covered by e2e/ci/tests/engine.test.js and by nothing else
-  #     in this job.
+  #   * very little of e2e/ci/engine.js. RE-MEASURED 2026-09-27 on the tree
+  #     that ships: the earlier figure here ("13 requests: 7 GET /health, 3 GET
+  #     /v1/models and 3 POST /score") was taken BEFORE the same change pinned
+  #     ENGINE_CONTROLLER_URL at the stub, and it is wrong in both directions.
+  #     Over two whole local cycles — bring-up plus the 43-check suite, each
+  #     against a dropped-and-recreated database — the stub served 53 requests
+  #     in 233 s of container life and 40 in 166 s, and the route it serves by
+  #     far the most is the one nothing in the suite asks for:
+  #       46 / 33 GET /state   the orchestrator's controller poll. Both work out
+  #                        at one every 5.0 s (46/233 = 0.197/s, 33/166 =
+  #                        0.199/s), which is ENGINE_STATE_POLL_S's default
+  #                        (app/config.py:2184), for as long as the stack is up.
+  #                        It answers 200 MONITORING_UNKNOWN (engine.js:413-432),
+  #                        which app/engine_state.py excludes from both SERVING
+  #                        (:87) and OPENS_BREAKER (:81), so no breaker, queue or
+  #                        admission decision is made from it;
+  #        5 / 5 GET /health    the orchestrator's own probe;
+  #        1 / 1 GET /v1/models;
+  #        1 / 1 POST /score    the reranker canary (app/rerank.py:159).
+  #     The total is therefore a function of how long the stack is up, not of
+  #     the suite: only the last three lines are the suite's, and they were
+  #     identical in both cycles. chat,
+  #     completions, embeddings and tokenize were never called through the
+  #     product — zero UNIMPLEMENTED lines in the stub's log, and no such route
+  #     in it at all. They are covered by e2e/ci/tests/engine.test.js and by
+  #     nothing else in this job.
   #
   # NO SECRETS. The two account passwords are generated per run with
   # `openssl rand -hex 24`, written under $RUNNER_TEMP and passed by FILE
@@ -1137,12 +1175,16 @@ jobs:
   # frontend 85 MiB, stub engine 9 MiB, Postgres 67 MiB.
   #
   # STILL UNMEASURED, and it must stay labelled: the two IMAGE BUILDS on a
-  # 4-vCPU hosted runner (both were cache hits locally — 2.9 s and 0.3 s — so
-  # the local numbers say nothing), this job's peak memory, and its disk
-  # high-water mark. The nearest real evidence for the build half is the
-  # `images` job on the same runner class: run 35788196359 built FOUR images
-  # cold in 4 m 24 s ("Build (native)"), and that job's whole ceiling is 45
-  # minutes. `timeout-minutes` below is therefore still a CEILING TO KILL A
+  # 4-vCPU hosted runner (cache hits on every local attempt — 2.9 s and 0.3 s
+  # when this was written, 2.6 s and 0.5 s again on 2026-09-27 — so the local
+  # numbers say nothing), this job's peak memory, and its disk high-water mark.
+  # The nearest real evidence for the build half is the `images` job on the same
+  # runner class: run 35788196359, whose "Container images" job took 9 m 00 s of
+  # wall clock (21:43:02Z -> 21:52:02Z, from the Actions API) for FOUR images
+  # against a ceiling of 45 minutes. A "4 m 24 s" split for the "Build (native)"
+  # step alone was quoted here earlier; the step log could not be retrieved to
+  # confirm it, so it is UNVERIFIED and is not repeated.
+  # `timeout-minutes` below is therefore still a CEILING TO KILL A
   # WEDGED JOB rather than a measurement, and it is deliberately NOT lowered on
   # the strength of a run on different hardware: the "Runner capacity" step
   # prints nproc, free -g, df -h / and docker stats with the stack up, and that
@@ -1281,7 +1323,16 @@ jobs:
       - name: The container reports the capacity values it was given
         run: |
           set -euo pipefail
-          docker exec techsara-e2e-ci-orchestrator python3 - <<'PY'
+          # `-i`, and it is load-bearing: without it docker exec gives the
+          # container an empty stdin, `python3 -` reads an empty program and
+          # exits 0, and the two asserts below never run. Measured today
+          # 2026-09-27 on this branch with a heredoc whose only statements
+          # print and then `exit 7`: without -i nothing printed and rc was 0,
+          # with -i the line printed and rc was 7. e2e/ci/stack.sh:195 carries
+          # the same -i for the same reason, and
+          # test_e2e_ci_policy.py::TheStepsThatRunAProgramInsideTheContainer
+          # fails if any docker exec in this job feeds a heredoc without it.
+          docker exec -i techsara-e2e-ci-orchestrator python3 - <<'PY'
           from app.apifiles import limits
           from app.publicapi import disk_ledger
           gib = 1024 ** 3
@@ -1357,7 +1408,7 @@ jobs:
             echo "- nothing about the orchestrator's own persist of an answer, which stub mode does not cover"
             echo "- \`artifacts.panel\` skips itself in stub mode: the artifacts panel is not covered"
             echo "- NOT the public OpenAPI document: no check in \`e2e/platform\` fetches it; \`api_contract\` remains the only proof of that surface"
-            echo "- little of the stub engine itself: a whole local run reached it 13 times (health, /v1/models, and the reranker canary on /score)"
+            echo "- little of the stub engine itself. Measured over two whole local cycles on 2026-09-27: 53 requests in 233 s and 40 in 166 s, of which 46 and 33 were the orchestrator's \`GET /state\` controller poll (one every 5.0 s for as long as the stack is up, answered \`MONITORING_UNKNOWN\`). What the SUITE drove was the same in both: 5 \`GET /health\`, 1 \`GET /v1/models\` and 1 \`POST /score\` (the reranker canary). Chat, completions, embeddings and tokenize were never reached through the product"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # FAILURE ONLY, REDACTED, AND SHORT-LIVED. e2e/platform keeps failures

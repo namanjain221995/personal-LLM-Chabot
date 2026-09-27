@@ -24,12 +24,29 @@
 # is available, affordable or safe on a hosted runner, and the last one is a
 # thing this stage must never learn to do.
 #
-# WHAT IT IS NOT ALLOWED TO DO: reach a real engine (`--chat-mode live` is
-# refused by the job), hold a stored secret (every credential here is
+# WHAT IT IS NOT ALLOWED TO DO: hold a stored secret (every credential here is
 # generated for this run and dies with the runner), or publish anything on an
 # address that is not loopback.
 #
+# WHAT IT DOES NOT DO, AND WHAT STILL STANDS BETWEEN IT AND A REAL ENGINE
+# (corrected 2026-09-27; the earlier wording said flatly that a real engine
+# could not be reached, and that was argued from configuration, not measured).
+# No request is made to one: every *_BASE_URL(S) and ENGINE_CONTROLLER_URL in
+# ci.env names the in-repo stub, `--chat-mode live` is refused by the job, and
+# test_e2e_ci_policy.py pins both. On a HOSTED runner there is nothing else
+# there. On a box that also runs production -- which is where this script is in
+# fact run while it is being developed -- the ROUTE exists: the orchestrator
+# container is started with `--add-host host.docker.internal:host-gateway` so
+# it can reach the job's database, and this host has a listener on
+# 0.0.0.0:8000 (measured today with `ss -ltn '( sport = :8000 )'`), which is
+# the live engine. Only the reviewed ci.env stands between the two, so an edit
+# that repoints one address is a production-reaching change, not a CI one.
+#
 # Usage:  stack.sh up | down | logs [container] [lines] | schema
+#
+# STACK_FORCE=1 overrides two refusals, and only for a human on a shared box:
+# `up` taking over container names something else already holds, and `down`
+# removing the fixed names when it cannot tell whether this shell started them.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,14 +103,40 @@ REPORTS_VOL="${PROJECT}-reports"
 ENV_FILE="$STACK_TMP/e2e-ci.env"
 
 # The images this job built. Never a moving tag, never a pull.
-ORCH_IMAGE="${E2E_CI_ORCH_IMAGE:?set E2E_CI_ORCH_IMAGE to the orchestrator-cpu image this job built}"
-FRONT_IMAGE="${E2E_CI_FRONT_IMAGE:?set E2E_CI_FRONT_IMAGE to the frontend image this job built}"
+#
+# REQUIRED BY up() AND BY NOTHING ELSE (2026-09-27). These used to be
+# `${VAR:?...}` here, at top level, so `down` and `logs` -- which do not use an
+# image tag at all -- exited 1 with "set E2E_CI_ORCH_IMAGE to the
+# orchestrator-cpu image this job built". Measured on this branch before the
+# fix: `( unset E2E_CI_ORCH_IMAGE E2E_CI_FRONT_IMAGE; bash stack.sh down )`
+# exited 1 without removing anything. The job's teardown step is
+# `if: always()`, and its FIRST step is `node --test e2e/ci/tests/`, so any
+# failure before the build step left the stack up behind a confusing message.
+ORCH_IMAGE="${E2E_CI_ORCH_IMAGE:-}"
+FRONT_IMAGE="${E2E_CI_FRONT_IMAGE:-}"
 # The stub engine runs on the SAME node base the frontend image pins, by
 # digest. Nothing here pulls a moving tag, and no model image is pulled at all.
 ENGINE_IMAGE="${E2E_CI_ENGINE_IMAGE:-node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293}"
 
 ADMIN_PASSWORD_FILE="${E2E_ADMIN_PASSWORD_FILE:-}"
 MEMBER_PASSWORD_FILE="${E2E_MEMBER_PASSWORD_FILE:-}"
+
+# WHOSE STACK IS THIS (2026-09-27). The object names are FIXED in ci.env,
+# because the workflow steps and test_e2e_ci_policy.py name them literally, so
+# two invocations on one host collide on every one of them: up() `docker rm -f`s
+# whatever holds the name and down() removes the shared volumes and network,
+# whether or not this invocation created them. On a hosted runner nothing
+# pre-exists and that is harmless. On the shared box it is not: a peer session
+# had this exact stack up while this branch was being verified, and the
+# verifier had to rename every object by hand to avoid destroying their
+# containers and volumes.
+#
+# So every object up() creates is LABELLED with a token written under
+# $STACK_TMP, and down() removes only what carries the token. $STACK_TMP is
+# $RUNNER_TEMP inside the job, which up() and down() share, so the hosted job
+# is unaffected.
+STACK_LABEL="techsara.e2e.ci.stack"
+STACK_ID_FILE="$STACK_TMP/e2e-ci-stack.id"
 
 guard_names() {
   # Every object this script creates or destroys must carry `e2e-ci`, and none
@@ -122,6 +165,41 @@ guard_names() {
   case "$FRONT_PORT:$ORCH_PORT" in
     3000:*|*:8080|8080:*|*:3000) die "refusing to bind a production port ($FRONT_PORT/$ORCH_PORT)" ;;
   esac
+}
+
+# The containers, volumes and networks carrying this invocation's ownership
+# token. One `docker ... ls` per kind; `--filter label=k=v` is an exact match.
+owned() { # owned <containers|volumes|networks> <token>
+  local kind="$1" token="$2"
+  case "$kind" in
+    containers) docker ps -a --filter "label=$STACK_LABEL=$token" --format '{{.Names}}' ;;
+    volumes)    docker volume ls --filter "label=$STACK_LABEL=$token" --format '{{.Name}}' ;;
+    networks)   docker network ls --filter "label=$STACK_LABEL=$token" --format '{{.Name}}' ;;
+  esac
+}
+
+# REFUSE A STACK SOMETHING ELSE IS ALREADY RUNNING. `docker rm -f` on a name a
+# peer session holds is the one mistake in this script that destroys work
+# outside it, and it used to be unconditional. On a hosted runner no container
+# of these names can pre-exist, so this never fires there.
+refuse_on_collision() {
+  local found name
+  found=""
+  for name in "$ENGINE" "$ORCH" "$FRONT"; do
+    if [ -n "$(docker ps -a --filter "name=^${name}\$" --format '{{.Names}}' 2>/dev/null)" ]; then
+      found="$found $name"
+    fi
+  done
+  [ -n "$found" ] || return 0
+  if [ "${STACK_FORCE:-0}" = "1" ]; then
+    say "STACK_FORCE=1: taking over$found"
+    return 0
+  fi
+  die "refusing to run: the container(s)$found already exist. \
+The names in ci.env are fixed, so bringing this stack up would 'docker rm -f' them and \
+tearing it down would remove the volumes and network they share. \
+Remove that stack first (bash e2e/ci/stack.sh down from the shell that started it), \
+or set STACK_FORCE=1 to take the names over deliberately."
 }
 
 # A fresh 32-byte hex value, written with mode 600 and never echoed. Generated
@@ -161,17 +239,28 @@ write_env_file() {
   chmod 600 "$ENV_FILE"
 }
 
+# A WALL-CLOCK DEADLINE, NOT A LOOP COUNT (2026-09-27). `for i in $(seq 1 300)`
+# with `sleep 1` only costs 300 s when the probe returns immediately, which is
+# what connection-refused does. A probe that BLOCKS costs its own timeout every
+# iteration: orch_healthy is `curl -m 15`, so an orchestrator that accepts the
+# connection and then hangs made this 300 x (15 + 1) = 80 minutes, above the
+# job's `timeout-minutes: 60` -- the job would be killed by the ceiling instead
+# of printing `docker logs` and "orchestrator did not become healthy", which is
+# the whole point of the budget. With a deadline the worst case is the budget
+# plus one probe (300 s + 15 s here).
 wait_for() { # wait_for <label> <seconds> <command...>
   local label="$1" budget="$2"; shift 2
-  local i
-  for i in $(seq 1 "$budget"); do
+  local start deadline
+  start="$(date +%s)"
+  deadline=$(( start + budget ))
+  while :; do
     if "$@" >/dev/null 2>&1; then
-      say "$label ready after ${i}s"
+      say "$label ready after $(( $(date +%s) - start ))s"
       return 0
     fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
     sleep 1
   done
-  return 1
 }
 
 engine_healthy() {
@@ -235,13 +324,34 @@ up() {
   guard_names
   command -v docker >/dev/null || die "docker is not on PATH"
   command -v openssl >/dev/null || die "openssl is not on PATH"
+  # Here, not at top level: `down` and `logs` use no image tag, and the job's
+  # teardown step must not fail because the build step never ran.
+  [ -n "$ORCH_IMAGE" ] || die "set E2E_CI_ORCH_IMAGE to the orchestrator-cpu image this job built"
+  [ -n "$FRONT_IMAGE" ] || die "set E2E_CI_FRONT_IMAGE to the frontend image this job built"
   [ -n "$ADMIN_PASSWORD_FILE" ] && [ -s "$ADMIN_PASSWORD_FILE" ] || die "E2E_ADMIN_PASSWORD_FILE is unset or empty"
   [ -n "$MEMBER_PASSWORD_FILE" ] && [ -s "$MEMBER_PASSWORD_FILE" ] || die "E2E_MEMBER_PASSWORD_FILE is unset or empty"
+  refuse_on_collision
+
+  # The ownership token, so down() can tell this stack from a peer's.
+  if [ ! -s "$STACK_ID_FILE" ]; then
+    ( umask 077; openssl rand -hex 8 > "$STACK_ID_FILE" )
+  fi
+  local token label
+  token="$(tr -d '\r\n' < "$STACK_ID_FILE")"
+  label="$STACK_LABEL=$token"
+  say "stack token $token (from $STACK_ID_FILE); down removes only what carries it"
 
   write_env_file
-  docker network inspect "$NET" >/dev/null 2>&1 || docker network create "$NET" >/dev/null
-  docker volume create "$DATA_VOL" >/dev/null
-  docker volume create "$REPORTS_VOL" >/dev/null
+  docker network inspect "$NET" >/dev/null 2>&1 \
+    || docker network create --label "$label" "$NET" >/dev/null
+  # FRESH /data AND /reports. A volume left behind by an earlier stack of these
+  # fixed names would hand this one a warehouse, a workspace and a reports
+  # directory it did not create, and "against a genuinely empty database" is
+  # half of what this stage proves. Safe here and only here: refuse_on_collision
+  # above has already established that no container of these names is running.
+  docker volume rm "$DATA_VOL" "$REPORTS_VOL" >/dev/null 2>&1 || true
+  docker volume create --label "$label" "$DATA_VOL" >/dev/null
+  docker volume create --label "$label" "$REPORTS_VOL" >/dev/null
 
   say "starting $ENGINE (stub engine, no host port)"
   docker rm -f "$ENGINE" >/dev/null 2>&1 || true
@@ -258,7 +368,7 @@ up() {
   # no business reading ci.env, seed.py or redact.js, and a credential that ever
   # lands in ci.env by mistake must not be one `cat` away inside a container
   # that is listening on a socket.
-  docker run -d --name "$ENGINE" \
+  docker run -d --name "$ENGINE" --label "$label" \
     --network "$NET" --network-alias "$ENGINE" "${alias_args[@]+"${alias_args[@]}"}" \
     --read-only --tmpfs /tmp:rw,size=16m \
     -v "$HERE/engine.js:/srv/engine.js:ro" \
@@ -271,7 +381,7 @@ up() {
 
   say "starting $ORCH on 127.0.0.1:$ORCH_PORT (migrations run at boot)"
   docker rm -f "$ORCH" >/dev/null 2>&1 || true
-  docker run -d --name "$ORCH" \
+  docker run -d --name "$ORCH" --label "$label" \
     --network "$NET" --network-alias "$ORCH" \
     --env-file "$ENV_FILE" \
     --add-host host.docker.internal:host-gateway \
@@ -292,7 +402,7 @@ up() {
 
   say "starting $FRONT on 127.0.0.1:$FRONT_PORT"
   docker rm -f "$FRONT" >/dev/null 2>&1 || true
-  docker run -d --name "$FRONT" \
+  docker run -d --name "$FRONT" --label "$label" \
     --network "$NET" --network-alias "$FRONT" \
     -e "ORCHESTRATOR_URL=http://$ORCH:8080" \
     -e "NEXT_PUBLIC_APP_NAME=TechSara AI (e2e-ci)" \
@@ -313,16 +423,51 @@ schema() {
   say "schema: $(docker exec "$ORCH" python3 -c 'from app import db; print(db.LATEST_SCHEMA_VERSION)' 2>/dev/null || echo '?')"
 }
 
+# REMOVES WHAT THIS INVOCATION STARTED, and nothing else. The names are fixed,
+# so "remove the containers called techsara-e2e-ci-*" is not the same question
+# as "remove MY containers" on a host where more than one session runs this
+# script. The ownership token under $STACK_TMP answers the second one.
+#
+# No token file means this shell started nothing, which is the normal state of
+# the job's `if: always()` teardown when the run failed before `up`. It removes
+# nothing and says so, rather than reaching for a peer's stack or exiting 1.
+# STACK_FORCE=1 restores the unconditional by-name teardown, for a human who
+# started a stack from a shell whose $STACK_TMP is gone.
 down() {
   guard_names
-  docker rm -f "$FRONT" "$ORCH" "$ENGINE" >/dev/null 2>&1 || true
-  docker volume rm "$DATA_VOL" "$REPORTS_VOL" >/dev/null 2>&1 || true
-  docker network rm "$NET" >/dev/null 2>&1 || true
+  local token="" removed name
+  [ -s "$STACK_ID_FILE" ] && token="$(tr -d '\r\n' < "$STACK_ID_FILE")"
+  if [ "${STACK_FORCE:-0}" = "1" ]; then
+    say "STACK_FORCE=1: removing $FRONT $ORCH $ENGINE and their volumes and network by NAME"
+    docker rm -f "$FRONT" "$ORCH" "$ENGINE" >/dev/null 2>&1 || true
+    docker volume rm "$DATA_VOL" "$REPORTS_VOL" >/dev/null 2>&1 || true
+    docker network rm "$NET" >/dev/null 2>&1 || true
+  elif [ -n "$token" ]; then
+    removed=""
+    # Containers first: a network with an endpoint on it cannot be removed.
+    for name in $(owned containers "$token"); do
+      docker rm -f "$name" >/dev/null 2>&1 || true
+      removed="$removed $name"
+    done
+    for name in $(owned volumes "$token"); do
+      docker volume rm "$name" >/dev/null 2>&1 || true
+      removed="$removed $name"
+    done
+    for name in $(owned networks "$token"); do
+      docker network rm "$name" >/dev/null 2>&1 || true
+      removed="$removed $name"
+    done
+    rm -f "$STACK_ID_FILE"
+    say "removed what stack token $token owned:${removed:- nothing}"
+  else
+    say "no stack token in $STACK_TMP: this shell started nothing, so nothing was removed \
+(STACK_FORCE=1 removes the fixed names unconditionally)"
+  fi
   # The generated credentials go with the stack, not at the end of the job:
   # $RUNNER_TEMP is removed by the runner, but a file that held a session
   # signing key should not outlive the thing it signed for.
   rm -f "$ENV_FILE" "$STACK_TMP/e2e-ci-session.key" "$STACK_TMP/e2e-ci-pepper.key"
-  say "removed containers, volumes, network and the generated environment"
+  say "removed the generated environment"
 }
 
 logs() {

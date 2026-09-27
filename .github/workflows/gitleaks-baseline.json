@@ -72,8 +72,18 @@
     "                              is asserted against. Counting hex, never minted.",
     "  FOUND BY: gitleaks in `git` mode over a real CLONE. Scanning the worktree the",
     "  branch was developed in reports \"0 commits scanned\" and \"no leaks found\", so the",
-    "  stage would have failed the `policy` job on its first push with three NEW",
-    "  findings and nothing local would have said so."
+    "  stage would have failed the `security` job -- pipeline.yml section 4, step",
+    "  \"Secret scan (full git history)\"; an earlier version of this note said `policy`,",
+    "  which does not run gitleaks -- on its first push with three NEW findings, and",
+    "  nothing local would have said so.",
+    "  MERGE OR FAST-FORWARD, NEVER SQUASH. The three fingerprints above are keyed to",
+    "  commit fd71830e51be42aa0824c46798f5101a0a9cb500, and a fingerprint is",
+    "  <commit>:<file>:<rule>:<line>. A SQUASH merge rewrites the commit that",
+    "  introduced e2e/ci/tests/redact.test.js lines 18, 19 and 25, so the target branch",
+    "  would get three STALE entries AND the same three lines reported as NEW, and",
+    "  secret_gate.py fails on either. Verified in both directions on 2026-09-27: with",
+    "  fd71830 present, 25 findings all baselined and exit 0; against the pre-96f4449",
+    "  baseline, three NEW findings and exit 1."
   ],
   "reviewed": "2026-09-27",
   "findings": [
