@@ -476,10 +476,57 @@ def test_a_source_with_anything_outside_the_grammar_is_refused_whole(source):
     assert D.parse_mermaid(source) is None
 
 
-def test_an_unknown_role_name_in_a_fence_falls_to_the_default_not_to_a_colour():
+def test_an_invented_role_name_paints_nothing_and_never_a_colour():
+    """RETARGETED 2026-09-27, to the promise the prompt actually makes.
+
+    This test was `..._falls_to_the_default_not_to_a_colour` and asserted
+    `["service", "service"]`. The first half of its name was the whole point
+    and still holds — a `:::crimson` must never reach a renderer as a colour.
+    The second half was the defect: DIAGRAM_INSTRUCTION tells the model "Tag
+    only the nodes one fits; an invented name paints nothing", and `parse_
+    mermaid` was answering "service", so a name the model invented came back
+    painted as a service, an untagged box was indistinguishable from one the
+    model had called a service, and `_legend_for` then printed "service" in
+    the figure's key for boxes nobody had classified. The browser's mermaid
+    has always done the truthful thing here (an undefined `:::class` is a CSS
+    class nothing styles), so this is the FILE renderer catching up to both
+    the prompt and the chat UI. `kind=None` is unclassified; the vocabulary
+    is still closed at four names and None is not a fifth.
+    """
     fields = D.parse_mermaid('flowchart TD\n  A["a"]:::crimson --> B["b"]\n')
     assert fields is not None
-    assert [n["kind"] for n in fields["nodes"]] == ["service", "service"]
+    assert [n["kind"] for n in fields["nodes"]] == [None, None]
+    d = S.Diagram(**fields)
+    assert [n.kind for n in d.nodes] == [None, None]
+    # "paints nothing" means the neutral surface, which is what an unknown
+    # role has always folded to — not a colour the model chose, and not a
+    # role it did not write.
+    assert D.role_colour(None) == D.NEUTRAL
+    assert D.NEUTRAL not in D.ROLE_COLOURS.values()
+
+
+def test_an_untagged_node_is_neutral_and_stays_out_of_the_legend():
+    """The other half of the same promise: "Tag only the nodes one fits".
+
+    A model that tags two of four boxes gets two painted boxes and two
+    neutral ones, and the legend names the two roles that are really there.
+    Before 2026-09-27 the two untagged boxes came back as `service`, so the
+    picture showed three services and the legend swore to it."""
+    fields = D.parse_mermaid(
+        'flowchart LR\n'
+        '  A["User"]:::external --> B["API"]:::service\n'
+        '  B --> C["Cache"]\n'
+        '  C --> E["Worker"]\n'
+    )
+    d = S.Diagram(**fields)
+    assert [(n.id, n.kind) for n in d.nodes] == [
+        ("A", "external"), ("B", "service"), ("C", None), ("E", None)]
+    layout = D.layout_diagram(d)
+    by_id = {n.nid: n for n in layout.real_nodes()}
+    assert D.role_colour(by_id["C"].role) == D.NEUTRAL
+    assert D.role_colour(by_id["E"].role) == D.NEUTRAL
+    assert D.role_colour(by_id["B"].role) == D.ROLE_COLOURS["service"]
+    assert set(layout.legend) == {"external", "service"}, layout.legend
 
 
 def test_a_fence_with_one_node_or_no_edges_is_not_a_diagram():
@@ -589,9 +636,61 @@ def test_the_wider_edge_grammar_did_not_open_the_closed_one(line):
     # An HTML label: the module docstring says an HTML label refuses the whole
     # source. It is escaped downstream, so this is honesty, not XSS.
     'A -- <b>html</b> --> B',
+    # The same chain with the spaces taken out. Found 2026-09-27 while
+    # measuring the proposed prototype below; it drew ('A','C','>B').
+    'A-->B-->C',
 ])
 def test_a_chained_edge_refuses_the_source_instead_of_drawing_a_wrong_picture(line):
     assert D.parse_mermaid(f'flowchart TD\n  X["x"] --> Y["y"]\n  {line}\n') is None
+
+
+#: The class from the mid-label swallow prototype put up during the
+#: 2026-09-27 review. Its IDEA is what ships; its class is not, and the test
+#: below is the reason, executed rather than described.
+_PROPOSED_PROTOTYPE_CLASS = re.compile(r"--|==|\.-|->|<-")
+
+
+def test_the_swallow_class_is_strictly_wider_than_the_proposed_prototype(monkeypatch):
+    '''WHY THE PROTOTYPE WAS NOT TAKEN AS WRITTEN — measured, not asserted.
+
+    A first version of this branch's notes justified rejecting the proposed
+    patch by describing what it SKIPS. That was the wrong test, and the
+    description was wrong too. What matters is what it DRAWS, so this runs
+    `parse_mermaid` with only the class swapped and pins the gap: the
+    prototype refuses four of the seven chained shapes and still draws three
+    wrong pictures, because it has no `;` and its `->`/`<-` both need the
+    hyphen, so a bare `>` or `<` walks through it.
+
+    If a future edit narrows the shipped class back toward the prototype's,
+    this test is what goes red.
+    '''
+    shapes = [
+        'A -- yes --> B -- no --> C',
+        'A --> B --> C --> D',
+        'A == x ==> B == y ==> C',
+        'A -.-> B -.-> C',
+        'A --> B; C --> D',
+        'A -- <b>html</b> --> B',
+        'A-->B-->C',
+    ]
+
+    def drew(line):
+        return D.parse_mermaid(f'flowchart TD\n  X["x"] --> Y["y"]\n  {line}\n') is not None
+
+    # Shipped: every one of the seven falls back to the callout.
+    assert [l for l in shapes if drew(l)] == []
+
+    monkeypatch.setattr(D, "_MID_LABEL_SWALLOWED_AN_ARROW_RE", _PROPOSED_PROTOTYPE_CLASS)
+    assert [l for l in shapes if drew(l)] == [
+        'A --> B; C --> D',
+        'A -- <b>html</b> --> B',
+        'A-->B-->C',
+    ], "the prototype's class no longer draws what it was measured to draw"
+
+    # And what those three come back as, so the cost is on the record.
+    fields = D.parse_mermaid('flowchart TD\n  A --> B; C --> D\n  X["x"] --> Y["y"]\n')
+    assert fields["edges"][0] == {"source": "A", "target": "D", "label": "> B; C", "style": "solid"}
+    assert [n["id"] for n in fields["nodes"]] == ["A", "D", "X", "Y"], "B and C are simply gone"
 
 
 def test_the_declare_then_chain_idiom_falls_back_to_the_callout_not_to_a_wrong_picture():
@@ -650,7 +749,9 @@ def test_a_directive_shaped_mid_label_is_drawn_as_text_while_every_directive_sta
     assert fields["edges"][1]["label"] == label
     d = S.Diagram(**fields)
     assert not hasattr(d, "colour") and not hasattr(d, "style")
-    assert [n.kind for n in d.nodes] == ["service", "service", "service"]
+    # Untagged since 2026-09-27: none of the three nodes here carries a
+    # `:::role`, and an untagged node is unclassified rather than a service.
+    assert [n.kind for n in d.nodes] == [None, None, None]
     # Every directive STATEMENT is still refused outright.
     for directive in (
         "style A fill:#f00",
@@ -1102,3 +1203,111 @@ def test_the_module_imports_no_layout_library():
     source = Path(D.__file__).read_text(encoding="utf-8")
     for banned in ("networkx", "pydot", "pygraphviz", "graphviz", "playwright", "mermaid"):
         assert f"import {banned}" not in source
+
+
+# ------------------------------------------------- an id is a name, not an --
+# ------------------------------------------------- arrow that lost its space --
+
+
+@pytest.mark.parametrize("line,why", [
+    ("A--B", "a `--` link written without spaces; mermaid draws A -> B"),
+    ("A--B---C", "the first id would be `A--B`"),
+    ("A----B", "the first id would be `A-`"),
+    ("A-----B", "the first id would be `A--`"),
+    ("A- --> B", "the first id would be `A-`"),
+    # Refused by the id class itself (an id opens with a letter or `_`), not
+    # by the guard. Here so the shape is covered whichever one catches it.
+    ("-A --> B", "an id may not open with a dash"),
+])
+def test_a_dash_run_is_never_read_as_a_node_id(line, why):
+    """`_node_part`'s id class admits `-`, because mermaid ids do. Measured
+    2026-09-27, that let a dash run become a BOX:
+
+        A--B      -> one node whose id and label were both "A--B"  (_DECL_RE)
+        A--B---C  -> an edge FROM a node called "A--B"             (_EDGE_RE)
+        A----B    -> an edge from a node called "A-" to "B"        (_EDGE_RE)
+        A-----B   -> an edge from a node called "A--" to "B"       (_EDGE_RE)
+        A- --> B  -> an edge from a node called "A-" to "B"        (_EDGE_RE)
+
+    Every one of those is a box the author never wrote, which is the exact
+    promise this module makes and the same defect the bare `flowchart` line
+    had. The hole is NOT reachable through the mid-label swallow guard —
+    none of these lines matches `_EDGE_MID_RE` — so it is closed at every
+    site an id comes from instead of beside that guard.
+    """
+    source = f'flowchart TD\n  {line}\n  Z["end"] --> Y["also"]\n'
+    assert D.parse_mermaid(source) is None, (line, why)
+
+
+@pytest.mark.parametrize("source,ids", [
+    ('flowchart TD\n  api-gateway["API gateway"] --> my-store["Postgres"]\n',
+     ["api-gateway", "my-store"]),
+    ('flowchart TD\n  a-b["A"] --> c-d-e["B"]\n', ["a-b", "c-d-e"]),
+    # `---` is mermaid's open link: the arrow eats all three dashes and the
+    # ids either side are single letters. This must keep working.
+    ('flowchart TD\n  A---B\n  B --> C["c"]\n', ["A", "B", "C"]),
+    ('flowchart TD\n  A["a"] -.- B["b"]\n', ["A", "B"]),
+])
+def test_a_hyphenated_id_is_still_an_ordinary_id(source, ids):
+    """The guard above must not cost the ids people really write."""
+    fields = D.parse_mermaid(source)
+    assert fields is not None, source
+    assert [n["id"] for n in fields["nodes"]] == ids
+
+
+def test_the_neutral_fill_of_an_untagged_node_is_in_the_rendered_pixels(tmp_path):
+    """The claim proved on the OUTPUT. An untagged box is drawn with the
+    neutral fill and border, and the four role colours are not used for it."""
+    from PIL import Image
+
+    d = S.Diagram(direction="LR", nodes=[
+        {"id": "A", "label": "User", "kind": "external"},
+        {"id": "B", "label": "API", "kind": "service"},
+        {"id": "C", "label": "Cache"},
+    ], edges=[{"source": "A", "target": "B"}, {"source": "B", "target": "C"}])
+    D.render_diagram_png(d, tmp_path / "mixed.png")
+    with Image.open(tmp_path / "mixed.png") as im:
+        present = {colour for _n, colour in im.convert("RGB").getcolors(maxcolors=1 << 20)}
+    assert _rgb(D.NEUTRAL) in present, "the neutral border is not in the picture"
+    assert _rgb(D.role_fill("")) in present, "the neutral fill is not in the picture"
+    # Exactly the two roles that were written, and no third.
+    for role in ("external", "service"):
+        assert _rgb(D.ROLE_COLOURS[role]) in present, role
+    for role in ("store", "model"):
+        assert _rgb(D.ROLE_COLOURS[role]) not in present, f"{role} was painted and nobody asked for it"
+
+
+def test_the_neutral_is_not_a_fifth_ROLE_and_never_stands_on_colour_alone():
+    """Re-derived here, without node, from the dataviz validator's run.
+
+    The four roles separate under all pairs (that check lives above). The
+    NEUTRAL does not separate from them and is not supposed to: it is what an
+    unclassified box looks like, and a grey that stood apart from four hues
+    like a fifth hue would read as a fifth role. Measured light, surface
+    #FFFFFF: #6B7280↔#2F6FB2 ΔE 10.3 under normal vision, below the floor of
+    15. So this pins the encodings that carry the difference instead.
+    """
+    worst = min(_delta_e(D.NEUTRAL, D.ROLE_COLOURS[r]) for r in D.DIAGRAM_ROLES)
+    assert worst < 15.0, (
+        f"the neutral now separates from the roles at ΔE {worst:.1f}; if that is "
+        "deliberate it is a fifth role and needs a validator run, a name and a paint"
+    )
+
+    # 1. Every box says what it is in words. The schema will not accept a
+    #    node without a label, so this can never be colour alone.
+    with pytest.raises(Exception):
+        S.DiagramNode(id="A", label="")
+
+    # 2. An unclassified box claims nothing in the key.
+    d = S.Diagram(direction="TD", nodes=[
+        {"id": "A", "label": "Ingest", "kind": "service"},
+        {"id": "B", "label": "Unknown box"},
+        {"id": "C", "label": "Ledger", "kind": "store"},
+    ], edges=[{"source": "A", "target": "B"}, {"source": "B", "target": "C"}])
+    layout = D.layout_diagram(d)
+    assert set(layout.legend) == {"service", "store"}
+    assert "neutral" not in layout.legend and D.NEUTRAL not in layout.legend
+
+    # 3. And alone against paper it is legible, which is its own check.
+    assert D.PAPER == "#FFFFFF"
+    assert _delta_e(D.NEUTRAL, D.PAPER) >= 15.0

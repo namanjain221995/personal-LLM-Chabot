@@ -1,19 +1,19 @@
 {
   "captured_on": "2026-09-27",
   "captured_from": {
-    "commit": "integ/diagram-group: fix/document-vocabulary-r2 (38f28bb) with fix/diagram-roles (5020b02) merged in, branched from dev at 4164bb8",
-    "orchestrator_tree_captured_from": "this worktree's tree, whose DIAGRAM_INSTRUCTION is the reason for the recapture",
+    "commit": "integ/diagram-group-r2: integ/diagram-group (7f16f4b7) plus the r2 round -- three pieces of origin/dev prose restored to DIAGRAM_INSTRUCTION, the id-class hole closed, and an untagged diagram node made neutral instead of 'service'",
+    "orchestrator_tree_captured_from": "this worktree's tree, whose DIAGRAM_INSTRUCTION is the reason for the recapture (second recapture of the day; the first was integ/diagram-group's reconciled wording)",
     "merged_tree": "the two branches that independently rewrote DIAGRAM_INSTRUCTION to teach `:::role`, reconciled into ONE wording; nothing else on either branch reaches a chat prompt",
     "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=<own throwaway postgres:18-alpine, --locale=C, fsync off> pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice into two scratch directories; `diff -r` between them reported no difference",
     "FAST_LANE_ENABLED": "MUST be false for a capture, and capture_from_baseline.py now sets it itself. Without it `first_message` ('hello there') takes the small-talk lane and captures a 3-line system prompt instead of the full path's 24-line one, so the golden would then compare a different code path and pass. Measured here on 2026-09-27: the first capture attempt did exactly that, and first_message.meta.json moved with it."
   },
   "determinism": "the two captures were diff -r identical",
   "this_capture_changed": {
-    "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE line: the DIAGRAMS paragraph. Verified by parsing each fixture and diffing element by element: changed elements [0], and within element 0 exactly one line removed and one added, in all twelve.",
+    "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE line: the DIAGRAMS paragraph. Verified by parsing each fixture and diffing element by element against the checked-in files: changed elements [0], and within element 0 exactly one line removed and one added, in all twelve. The twelve *.meta.json are byte-identical.",
     "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
-    "why": "fix/document-vocabulary-r2 and fix/diagram-roles both rewrote this paragraph to teach the `:::role` form, and only diagram-roles banned a role OUTSIDE `flowchart`/`graph`, where `:::` is a parse error that loses the whole diagram. The merged wording keeps that ban, its colour-value ban and its two accessibility rules, and re-compresses the prose around them.",
-    "size": "MEASURED 2026-09-27 by importing the string on each tree. origin/dev (1f80aa3, 4164bb8): 1,082 CHARACTERS, 1,086 UTF-8 bytes. fix/document-vocabulary-r2: 1,082 characters, 1,088 bytes. fix/diagram-roles: 1,848 characters, 1,858 bytes. A naive conflict resolution toward diagram-roles' wording: 1,822 characters, 1,832 bytes. This tree: 1,549 characters, 1,553 bytes -- +467 characters over origin/dev and -273 against the naive merge. It is concatenated at eleven chat call sites at every effort, so growth is a Fast-path cost; tests/test_diagram_instruction_budget.py holds both ceilings at the numbers above.",
-    "token cost": "NOT measured and NOT estimated. The +N tokens of the raise needs the pinned engine's tokenizer over these twelve fixtures, off the hot path; this work was forbidden from touching the GPUs, so the token delta is open. The character and byte deltas above are first-hand."
+    "why": "The reconciliation that produced integ/diagram-group's 1,549-character wording dropped three pieces of origin/dev's prose with no test holding any of them: 'inside labels' (which scopes the punctuation ban to a label's CONTENTS -- unscoped it forbids the brackets of A[\"Payments API\"], which the same string then requires), 'custom colours break dark mode' (the reason the directive ban exists), and 'prefer' over 'use' for flowchart TD/LR (which otherwise contradicts the seven other diagram types the same string goes on to discuss). All three are back and pinned by tests/test_diagram_instruction_budget.py.",
+    "size": "MEASURED 2026-09-27 by importing the string on each tree. origin/dev (1f80aa3, 4164bb8): 1,082 CHARACTERS, 1,086 UTF-8 bytes. fix/document-vocabulary-r2: 1,082 characters, 1,088 bytes. fix/diagram-roles: 1,848 characters, 1,858 bytes. A naive conflict resolution toward diagram-roles' wording: 1,822 characters, 1,832 bytes. integ/diagram-group: 1,549 characters, 1,553 bytes. THIS TREE: 1,602 characters, 1,606 bytes -- +520 characters over origin/dev and -246 against the naive merge. It is concatenated at eleven chat call sites at every effort, so growth is a Fast-path cost; tests/test_diagram_instruction_budget.py holds both ceilings at the numbers above.",
+    "token cost": "MEASURED 2026-09-27, on CPU, with the pinned engine's tokenizer (tokenizers 0.23.2 over Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json); no GPU was touched and no engine was called. DIAGRAM_INSTRUCTION alone: origin/dev 232 tokens, fix/document-vocabulary-r2 240, fix/diagram-roles 415, integ/diagram-group 356, THIS TREE 365 -- so +133 tokens per prompt over origin/dev. Over these twelve fixtures: 41,496 tokens on origin/dev (mean 3,458 per prompt) against 43,092 here, +1,596 in total and exactly +133 on each of the twelve, which is 3.85% of the mean prompt. The +183 / 5.3% figure quoted during the release is fix/diagram-roles' 1,848-character wording, not this one. An earlier version of this note said the token cost was unmeasured; it is measured now."
   },
   "normalised": [
     "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -26,29 +26,29 @@
     "sources"
   ],
   "sha256": {
-    "first_message.messages.json": "5a5c8b2524176190a216c03914d575299e003f88a7020c58cb4acae140a9d10f",
+    "first_message.messages.json": "cd1ff65d8ec84a80dc5a743693bc604b9377cdaed28172ec0f3bbb36f8f70b54",
     "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "74793af27a69d3d3dbf5add3ed528447093bc6e2315eb8d588c22a2ef81ae670",
+    "living_knowledge_topical_fast.messages.json": "6eebdaf74614e9aef11522b9aee5f1bfb603eb4da9746ac363a0e0dffdb47bb2",
     "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "74793af27a69d3d3dbf5add3ed528447093bc6e2315eb8d588c22a2ef81ae670",
+    "living_knowledge_topical_fast_at_production_latency.messages.json": "6eebdaf74614e9aef11522b9aee5f1bfb603eb4da9746ac363a0e0dffdb47bb2",
     "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_think.messages.json": "74793af27a69d3d3dbf5add3ed528447093bc6e2315eb8d588c22a2ef81ae670",
+    "living_knowledge_topical_think.messages.json": "6eebdaf74614e9aef11522b9aee5f1bfb603eb4da9746ac363a0e0dffdb47bb2",
     "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "real_fast_accented_page.messages.json": "143c1fdefccc01035bb00ee3b2226b7f05adaf4671d3e7db3049e4e3a402ca9e",
+    "real_fast_accented_page.messages.json": "2c7353d34850234c638b7eb2983c8ae51012d0332c1775131d6ecb7db6cd9c33",
     "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
-    "real_fast_eval_topical_hit.messages.json": "8f9e8800a3f331b66d5819709e96835d9f18675b25555b6979e1a9850e11627b",
+    "real_fast_eval_topical_hit.messages.json": "002d4fb5e49fec3cf996d5fa9ab4d96b79958e4102cd200e26cc5f93ed85641e",
     "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "real_fast_passage_past_200k.messages.json": "8c976fbecb31902b32ddca9e5342eb6eacce8159b15f4dbf8780c3649485c36a",
+    "real_fast_passage_past_200k.messages.json": "c1deae44872f1e0b80afd2a03e2ad04f230a3e8ebf613e36a65c6437ba51783c",
     "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "4adf2282c6bf625b562cf76e46261eea20e2691c5264bd933c2157170936d287",
+    "real_fast_timeless_task_with_a_matching_page.messages.json": "fe7b92b7ebc508855c5d223406a9e25a8610050a4b540cb656c502449f1de946",
     "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
-    "real_think_eval_topical_hit.messages.json": "8f9e8800a3f331b66d5819709e96835d9f18675b25555b6979e1a9850e11627b",
+    "real_think_eval_topical_hit.messages.json": "002d4fb5e49fec3cf996d5fa9ab4d96b79958e4102cd200e26cc5f93ed85641e",
     "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "rich_fast.messages.json": "4223f592ed53bb62d00c9b0036aea57d2a123d356793ca46256bcf2dd9869be5",
+    "rich_fast.messages.json": "3074900c3e91fa4da70d78890e7bbe560438368390fd60a3f0d4a2c2575827ae",
     "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
-    "rich_think.messages.json": "0452e362c52a66db23091954eef2512fafc443e01ef8782893ff70669596e9b3",
+    "rich_think.messages.json": "141b9812ca127a79f94625252618f5aabaa9e6615e9491f45ace6f60e0caf1a3",
     "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
-    "salesforce.messages.json": "57a9d79a6c26a74c1f0a4640cc9c4e8f305e56eea51560e153a6b5501cf40132",
+    "salesforce.messages.json": "9fd3a2fb5c169d1ab9d0d6d0a27a03a9eb54a27420be9f7327615b914cc9906e",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
   },
   "scenarios": {

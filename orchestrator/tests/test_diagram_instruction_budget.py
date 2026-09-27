@@ -44,23 +44,67 @@ integration keeps that ban and re-compresses everything around it:
     fix/document-vocabulary-r2             1,082 characters, 1,088 bytes
     fix/diagram-roles                      1,848 characters, 1,858 bytes
     naive merge (diagram-roles' wording)   1,822 characters, 1,832 bytes
-    integ/diagram-group, measured today    1,549 characters, 1,553 bytes
+    integ/diagram-group (7f16f4b7)         1,549 characters, 1,553 bytes
+    THIS TREE, measured today              1,602 characters, 1,606 bytes
 
-So the raise is +467 characters and +467 UTF-8 bytes over origin/dev (both
-deltas are the same number by coincidence: the string gained two em dashes
-and lost one, so its non-ASCII count did not move), and −273 characters
-against the naive merge. What could NOT be removed, counted: 71
-characters are the seven diagram-type names the ban has to name to be
-concrete (sequenceDiagram, erDiagram, pie, journey, timeline, mindmap,
-gitGraph), and the remainder is the role list with its glosses, the "do not
-invent a name" rule and the two accessibility rules. The ceilings below are
-the measured numbers, and a `<=` plus an exact pin, so the next character
-still has to be argued for.
+So the raise is +520 characters and +520 UTF-8 bytes over origin/dev (both
+deltas are the same number because the string gained two em dashes and lost
+one, so its non-ASCII count did not move), and −246 characters against the
+naive merge. What could NOT be removed, counted: 71 characters are the seven
+diagram-type names the ban has to name to be concrete (sequenceDiagram,
+erDiagram, pie, journey, timeline, mindmap, gitGraph), and the remainder is
+the role list with its glosses, the "do not invent a name" rule and the two
+accessibility rules. The ceilings below are the measured numbers, and a `<=`
+plus an exact pin, so the next character still has to be argued for.
 
-THE TOKEN COST OF THAT RAISE IS NOT MEASURED AND IS NOT GUESSED HERE. It
-needs the pinned engine's tokenizer over the twelve golden fixtures, off the
-hot path; the release forbade touching the GPUs, so it is open work. The
-character and byte numbers above are first-hand; no token number is stated.
+THE LAST 53 CHARACTERS ARE THREE PIECES OF origin/dev's OWN PROSE, PUT BACK.
+The reconciliation at 1,549 dropped them silently, and no test held any of
+them, so they are pinned below — with the reason each one is load-bearing:
+
+  * "inside labels" (+13). The ban reads "no parentheses, brackets, pipes or
+    markdown INSIDE LABELS". Without the last two words it is a ban on
+    brackets anywhere, which forbids `A["Payments API"]` — the form the very
+    next sentence of this same string requires.
+  * "custom colours break dark mode" (+32). The REASON the directive ban
+    exists. The compression replaced it with "the app paints a ROLE
+    instead", which says what happens next and not why the model must not.
+  * "prefer" over "use" for `flowchart TD`/`LR` (+4, in the file's own
+    spelling). "use" states the flowchart as mandatory, and four sentences
+    later the same string tells the model what to do in a sequenceDiagram,
+    erDiagram, pie, journey, timeline, mindmap or gitGraph. "prefer" is
+    origin/dev's word and is the one that does not contradict itself.
+
+Two further origin/dev fragments are gone and are NOT coming back, so that
+the list above is the whole account: the worked example `(e.g. A["Login
+page"])`, because the role sentence carries `A["Payments API"]:::service`,
+the identical quoted-label form, and a second example costs 22 characters to
+teach nothing new (a test below keeps ONE such example in the string); and
+the adjective in "plain, SIMPLE sentences", because the clause it sits in
+already ends "so a non-technical reader can follow it".
+
+THE TOKEN COST, MEASURED 2026-09-27 (this is the unit prefill is charged in,
+so it is the one that decides). Pinned engine tokenizer, on CPU, no GPU
+touched: tokenizers 0.23.2 over
+Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json,
+load average 2.76.
+
+    origin/dev                                232 tokens
+    fix/document-vocabulary-r2                240 tokens   (+8)
+    fix/diagram-roles                         415 tokens   (+183)
+    integ/diagram-group (7f16f4b7)            356 tokens   (+124)
+    THIS TREE                                 365 tokens   (+133)
+
++133 tokens per prompt, at every effort, in nine engines. Against the twelve
+golden fixtures in tests/fixtures/context_assembly_golden, whose mean prompt
+on origin/dev is 3,458 tokens (41,496 over twelve), that is 3.85%; the same
+fixtures on this tree total 43,092, and the delta is exactly +133 on each of
+the twelve, which is how we know the string is the only thing that moved.
+
+The +183 / 5.3% figure that was carried into this release is `fix/diagram-
+roles`' 1,848-character wording, NOT this one; it was the cost the
+integration accepted, and this tree comes in under it at +133. An earlier
+version of this docstring said the token cost was unmeasured — it is
+measured now, and no GPU was involved in measuring it.
 
 WHAT MUST NOT CHANGE, and why each one is here rather than in a comment:
 the one-diagram cap and the "ordinary questions get none" rule are what stop
@@ -82,9 +126,10 @@ from app.engines import DIAGRAM_INSTRUCTION
 PRE_EDIT_CHARS = 1082
 
 #: What the reconciled wording actually measures, imported on this tree on
-#: 2026-09-27. It is the CEILING: every rule from both branches is in the
-#: string at this size, so anything larger is a rule nobody has argued for.
-CHARS_CEILING = 1549
+#: 2026-09-27. It is the CEILING: every rule from both branches, plus the
+#: three restored origin/dev fragments above, is in the string at this size,
+#: so anything larger is a rule nobody has argued for.
+CHARS_CEILING = 1602
 
 #: The same string in UTF-8, measured on the same commit: 1,086. This edit
 #: takes it to 1,088 — two bytes, one extra em dash — so the ceiling is the
@@ -93,9 +138,9 @@ CHARS_CEILING = 1549
 #: the character count wearing a byte's name.
 PRE_EDIT_UTF8_BYTES = 1086
 
-#: The same string in UTF-8 on this tree: 1,553. Two em dashes (U+2014, three
+#: The same string in UTF-8 on this tree: 1,606. Two em dashes (U+2014, three
 #: UTF-8 bytes each) account for the four bytes over the character count.
-UTF8_BYTES_CEILING = 1553
+UTF8_BYTES_CEILING = 1606
 
 
 def test_the_instruction_did_not_grow_in_characters():
@@ -125,9 +170,11 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
         f"the reconciled wording spends two em dashes, so UTF-8 is 4 bytes over the "
         f"character count; it is now {encoded - chars}"
     )
-    assert encoded - PRE_EDIT_UTF8_BYTES == 467, (
-        f"the raise over origin/dev was measured at +467 UTF-8 bytes; it is now "
-        f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this."
+    assert encoded - PRE_EDIT_UTF8_BYTES == 520, (
+        f"the raise over origin/dev was measured at +520 UTF-8 bytes; it is now "
+        f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this "
+        f"(the measurement of record is +133 tokens per prompt, 3.85% of the 3,458-token "
+        f"mean golden prompt, 2026-09-27)."
     )
 
 
@@ -161,6 +208,40 @@ def test_the_conservative_rules_are_all_still_there():
     ):
         assert rule in DIAGRAM_INSTRUCTION, rule
     assert "sentences saying what it shows" in DIAGRAM_INSTRUCTION
+
+
+def test_the_three_restored_fragments_are_pinned_so_they_cannot_vanish_again():
+    """origin/dev's prose, dropped by the 1,549-character reconciliation and
+    put back at 1,602. Each of the three was lost with no test holding it,
+    which is the only reason the loss was silent; they are held here now.
+
+    These are not style. Each one changes what the model is told:
+    """
+    # The punctuation ban is about what goes INSIDE a label. Unscoped, it
+    # forbids the brackets of `A["Payments API"]`, which the same string then
+    # requires — a rule that contradicts the example beside it.
+    assert "markdown inside labels" in DIAGRAM_INSTRUCTION
+    # WHY the directive ban exists. "the app paints a ROLE instead" says what
+    # happens next; it does not say what goes wrong if the model disobeys.
+    assert "custom colours break dark mode" in DIAGRAM_INSTRUCTION
+    # `flowchart` is PREFERRED, not mandatory: four sentences later this same
+    # string tells the model what to do inside seven other diagram types.
+    assert "prefer `flowchart TD`" in DIAGRAM_INSTRUCTION
+    assert "use `flowchart TD`" not in DIAGRAM_INSTRUCTION
+
+
+def test_one_worked_example_of_a_quoted_label_survives():
+    """origin/dev carried two demonstrations of the label form — `(e.g.
+    A["Login page"])` beside the quoting rule and none elsewhere. This string
+    carries one, inside the role sentence. Dropping the first is deliberate
+    (22 characters of Fast prefill for a form already shown); dropping BOTH
+    would leave the quoting rule with nothing to point at, so the survivor is
+    pinned here rather than left to the next compression."""
+    import re as _re
+
+    assert _re.search(r'[A-Z]\["[^"]+"\]', DIAGRAM_INSTRUCTION), (
+        "no worked example of a double-quoted label is left in the instruction"
+    )
 
 
 def test_the_role_clause_teaches_the_closed_list_and_bans_colour():

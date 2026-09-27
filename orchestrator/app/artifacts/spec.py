@@ -255,7 +255,19 @@ class DiagramNode(_Strict):
 
     id: str = Field(min_length=1, max_length=40)
     label: str = Field(min_length=1, max_length=48)
-    kind: DiagramRole = "service"
+    #: OPTIONAL, and `None` is not the same as "service". A node the author
+    #: did not classify is drawn NEUTRAL grey by render/diagrams.py, which is
+    #: what the chat prompt promises ("Tag only the nodes one fits; an
+    #: invented name paints nothing") and what the browser's mermaid already
+    #: does with a `:::class` nothing defines. The default used to be
+    #: "service", so every untagged box was painted as a service and the
+    #: figure's legend claimed a role nobody had written. The vocabulary
+    #: itself is still CLOSED at four names: `None` means unclassified, it is
+    #: not a fifth role, and it has no colour of its own.
+    kind: Optional[DiagramRole] = Field(
+        default=None,
+        description="What the box IS: service (code), store (data), model (an AI model), external (a person or outside system). Omit it when none of the four fits — an unclassified box is drawn neutral grey, never guessed into a role.",
+    )
 
     @field_validator("id")
     @classmethod

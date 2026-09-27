@@ -148,7 +148,8 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 #   fix/document-vocabulary-r2             1,082 characters, 1,088 bytes
 #   fix/diagram-roles                      1,848 characters, 1,858 bytes
 #   naive merge, diagram-roles' wording    1,822 characters, 1,832 bytes
-#   THIS FILE, both rewrites reconciled    1,549 characters, 1,553 bytes
+#   integ/diagram-group (7f16f4b7)         1,549 characters, 1,553 bytes
+#   THIS FILE                              1,602 characters, 1,606 bytes
 #
 # The two branches wrote the same fix twice. This is ONE wording carrying every
 # rule from both: fix/diagram-roles' ban on a role outside `flowchart`/`graph`
@@ -156,19 +157,41 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 # by its author in mermaid 11.17 — strictly worse than grey, which is why that
 # wording was chosen over the shorter one), its colour-value ban and its two
 # accessibility rules, plus fix/document-vocabulary-r2's compression of the
-# surrounding prose. +467 characters over origin/dev is what could not be
+# surrounding prose. +520 characters over origin/dev is what could not be
 # removed while keeping the type ban: 71 of them are the seven diagram-type
 # names the ban has to name to be concrete, and the rest is the role list, its
 # glosses, the "do not invent a name" rule and the two accessibility rules.
 # tests/test_diagram_instruction_budget.py pins both units at the numbers
 # above and reads this comment, so neither can drift back.
 #
-# NOT MEASURED, AND NOT GUESSED: the token cost. The old note here claimed
-# "+8 tokens per prompt / 30,832 -> 30,928 across the twelve golden fixtures";
-# that figure needs the pinned engine's tokenizer, has not been re-measured
-# since, and is NOT restated as fact. The character and byte deltas above are
-# first-hand; the token delta of this merge is unmeasured and is recorded as
-# open work, not as a number.
+# THE LAST 53 CHARACTERS ARE origin/dev's OWN PROSE, PUT BACK. The 1,549
+# reconciliation dropped three fragments that no test held, which is why the
+# loss was silent. Each changes what the model is told, so each is back and
+# pinned: "inside labels" (+13), without which the ban on brackets and pipes
+# reads globally and forbids the `A["Payments API"]` this very string then
+# requires; "custom colours break dark mode" (+32), the REASON the directive
+# ban exists, which the compression had replaced with what happens next;
+# and "prefer" over "use" for `flowchart TD`/`LR` (+4), because "use" makes
+# the flowchart mandatory four sentences before this string explains what to
+# do inside seven other diagram types. Two further fragments stay dropped and
+# are listed in the budget test so the account is complete: the second worked
+# example `(e.g. A["Login page"])`, and the adjective in "plain, SIMPLE".
+#
+# THE TOKEN COST, MEASURED 2026-09-27 — this is the unit prefill is charged
+# in. Pinned engine tokenizer, on CPU, no GPU touched (tokenizers 0.23.2 over
+# Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json):
+#
+#   origin/dev 232 tokens; document-vocabulary-r2 240; diagram-roles 415;
+#   integ/diagram-group 356; THIS FILE 365.
+#
+# So +133 tokens per prompt over origin/dev, at every effort, in nine engines.
+# Against the twelve context_assembly_golden fixtures — 41,496 tokens on
+# origin/dev, mean 3,458 per prompt, 43,092 here, exactly +133 on each of the
+# twelve — that is 3.85% of the mean prompt. The +183 / 5.3% figure carried
+# through the release is fix/diagram-roles' 1,848-character wording, NOT this
+# one. The old note here claimed "+8 tokens per prompt / 30,832 -> 30,928
+# across the twelve golden fixtures"; that claim stays withdrawn, and the
+# numbers above replace it with first-hand ones.
 #
 # THE CHAT UI IS UNAFFECTED, CHECKED RATHER THAN ASSUMED. `A["x"]:::role`
 # reaches the browser's mermaid, which has no `classDef` for these names.
@@ -177,29 +200,33 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 # up and never raises, so an undefined class is a CSS class nothing styles.
 # The frontend's own classDefs (fix/diagram-roles) are what paint them.
 DIAGRAM_INSTRUCTION = (
-    "\n\nDIAGRAMS: ```mermaid blocks render as zoomable, downloadable "
+    "\n\n"
+    "DIAGRAMS: ```mermaid blocks render as zoomable, downloadable "
     "diagrams. Include one ONLY when the user explicitly asks for a "
-    "diagram/flowchart/visualization, or when a picture is easier to follow "
-    "than prose for something genuinely complex (a system architecture, a "
-    "multi-step process, entity relationships). Ordinary questions, short "
-    "answers and conversation must NOT contain a diagram. When you do, follow "
-    "ALL of these rules: at most ONE diagram per answer; keep it SMALL "
-    "(under ~20 nodes — summarize, don't enumerate); use `flowchart TD` or "
-    "`flowchart LR`; one statement per line; every label in double quotes "
-    "and short, with no parentheses, brackets, pipes or markdown; NEVER use "
-    "style, classDef, linkStyle, click or %%{init}%% directives and never "
-    "write a colour of your own (no hex, no rgb(), no colour name): the app "
-    "paints a ROLE instead. In a `flowchart`/`graph` you MAY give a node ONE "
-    "role from this CLOSED list, written with `:::`: service (code), store "
-    "(data), model (an AI model), external (a person or outside system) "
-    '— A["Payments API"]:::service. Tag only the nodes one fits; an invented '
-    "name paints nothing. Put NO role in any other type (sequenceDiagram, "
-    "erDiagram, pie, journey, timeline, mindmap, gitGraph): there `:::` is a "
-    "syntax error and the diagram fails to draw. The LABEL carries the "
-    "meaning: two nodes must never differ by colour alone, so it reads for "
-    "someone who cannot see colour. Never draw ASCII-art boxes. Right after "
-    "it, add one or two plain sentences saying what it shows so a "
-    "non-technical reader can follow it."
+    "diagram/flowchart/visualization, or when a picture is easier to "
+    "follow than prose for something genuinely complex (a system "
+    "architecture, a multi-step process, entity relationships). "
+    "Ordinary questions, short answers and conversation must NOT "
+    "contain a diagram. When you do, follow ALL of these rules: at most "
+    "ONE diagram per answer; keep it SMALL (under ~20 nodes — "
+    "summarize, don't enumerate); prefer `flowchart TD` or `flowchart "
+    "LR`; one statement per line; every label in double quotes and "
+    "short, with no parentheses, brackets, pipes or markdown inside "
+    "labels; NEVER use style, classDef, linkStyle, click or %%{init}%% "
+    "directives and never write a colour of your own (no hex, no rgb(), "
+    "no colour name): custom colours break dark mode, and the app "
+    "paints a ROLE instead. In a `flowchart`/`graph` you MAY give a "
+    "node ONE role from this CLOSED list, written with `:::`: service "
+    "(code), store (data), model (an AI model), external (a person or "
+    'outside system) — A["Payments API"]:::service. Tag only the nodes '
+    "one fits; an invented name paints nothing. Put NO role in any "
+    "other type (sequenceDiagram, erDiagram, pie, journey, timeline, "
+    "mindmap, gitGraph): there `:::` is a syntax error and the diagram "
+    "fails to draw. The LABEL carries the meaning: two nodes must never "
+    "differ by colour alone, so it reads for someone who cannot see "
+    "colour. Never draw ASCII-art boxes. Right after it, add one or two "
+    "plain sentences saying what it shows so a non-technical reader can "
+    "follow it."
 )
 
 # Code: the UI renders fenced blocks with syntax highlighting and a copy

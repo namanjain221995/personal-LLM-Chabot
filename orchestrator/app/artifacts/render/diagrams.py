@@ -123,7 +123,32 @@ ROLE_COLOURS: Dict[str, str] = {
     "external": "#C0566B",
 }
 
-#: A role the vocabulary does not know folds here. The palette never cycles.
+#: A role the vocabulary does not know folds here — and, since 2026-09-27, so
+#: does a node nobody tagged (`DiagramNode.kind is None`). The palette never
+#: cycles.
+#:
+#: THE NEUTRAL IS NOT A FIFTH SLOT, AND THE VALIDATOR SAYS SO OUT LOUD. Before
+#: 2026-09-27 this grey could not appear in a validated figure at all —
+#: `DiagramNode.kind` was a closed Literal with a "service" default, so every
+#: node arrived carrying one of the four. Making an untagged node honest puts
+#: the grey on the page beside them, so the five were run through the dataviz
+#: validator together (light, surface #FFFFFF, `--pairs all`):
+#:
+#:     #2F6FB2,#E07B00,#0E9D9A,#C0566B            ALL CHECKS PASS
+#:     the same four + #6B7280                    FAILED
+#:         chroma floor   #6B7280 at 0.023 — reads gray
+#:         all-pairs CVD  #6B7280↔#C0566B ΔE 3.4 (protan), tritan 7.5
+#:         normal vision  #6B7280↔#2F6FB2 ΔE 10.3, under the floor of 15
+#:
+#: That FAIL is the design, not a defect to fix: the neutral's job is to look
+#: UNPAINTED, and a grey that separated from four hues like a fifth hue would
+#: read as a fifth role. What it means is that colour alone must never be what
+#: tells an unclassified box from a `service` or an `external` one — and it
+#: never is. Every node carries its own text label (`spec.DiagramNode.label`
+#: is min_length=1), and `_legend_for` lists only the roles a diagram actually
+#: declares, so an untagged box appears in no key and claims nothing. Alone
+#: against paper the grey passes its own check: contrast 3:1 or better.
+#: tests/test_artifact_render_diagrams.py pins both halves of that.
 NEUTRAL = "#6B7280"
 
 #: #C0566B is also chart_colours.LOSS. A document could therefore show that
@@ -361,7 +386,74 @@ _EDGE_MID_RE = re.compile(rf"^{_node_part('a')}\s*{_MID_ARROW}\s*{_node_part('b'
 #: refused). Reading a chain properly, as consecutive edges, is a real
 #: capability and a separate change; drawing it wrong is not a substitute.
 #: Hyphenated words are unaffected: "e-mail sent" holds no arrow.
+#:
+#: WHY `return None` AND NOT A FALL-THROUGH, corrected 2026-09-27. An earlier
+#: note here said a fall-through "could read the leftovers as a node and put a
+#: box in the drawing that nobody wrote", citing `_DECL_RE`'s id class. That
+#: hazard is real (see `_ID_IS_AN_ARROW_RE` below, which closes it) but it is
+#: NOT what these lines do: measured on all seven chained shapes,
+#: `_DECL_RE.match(line)` fails on every one of them, so a fall-through would
+#: have reached the loop's final `return None` anyway and the outcome is
+#: identical. The reason to refuse HERE is the plain one: the line has been
+#: read, it is understood to be several statements, and this module's promise
+#: is that a source it cannot read as one picture becomes the callout. Naming
+#: a hazard the guard never sees was the wrong reason for the right line.
+#:
+#: THE PROPOSED PROTOTYPE, AND WHY THE CLASS IS WIDER THAN IT. A prototype
+#: put up during the 2026-09-27 review proposed this same guard with the
+#: narrower class `--|==|\.-|->|<-` and a fall-through in place of the
+#: refusal. Its IDEA is what is shipped here. Its class is not, and the
+#: reason is measured, not asserted — run over `parse_mermaid` with only the
+#: class swapped (the swap is a test, not a story:
+#: tests/test_artifact_render_diagrams.py::
+#: test_the_swallow_class_is_strictly_wider_than_the_proposed_prototype):
+#:
+#:     A -- yes --> B -- no --> C   prototype REFUSES     shipped REFUSES
+#:     A --> B --> C --> D          prototype REFUSES     shipped REFUSES
+#:     A == x ==> B == y ==> C      prototype REFUSES     shipped REFUSES
+#:     A -.-> B -.-> C              prototype REFUSES     shipped REFUSES
+#:     A --> B; C --> D             prototype DRAWS A->D labelled "> B; C"
+#:     A -- <b>html</b> --> B       prototype DRAWS A->B labelled "<b>html</b>"
+#:     A-->B-->C                    prototype DRAWS A->C labelled ">B"
+#:
+#: So the prototype closes four of the seven wrong pictures and leaves three
+#: standing: it has no `;`, and its `->`/`<-` need the hyphen, so a bare `>`
+#: or `<` passes — which is every chain written without spaces, every
+#: semicolon-separated pair, and every HTML label. `-\.`, `<`, `>` and `;` in
+#: the class below are exactly those three rows. An earlier justification for
+#: rejecting the prototype described what it skips rather than what it draws;
+#: it was wrong, and the table above is what replaced it.
 _MID_LABEL_SWALLOWED_AN_ARROW_RE = re.compile(r"--|-\.|\.-|==|[<>;]")
+
+#: AN ID IS A NAME, NOT AN ARROW THAT LOST ITS SPACES.
+#:
+#: `_node_part` admits `-` inside an id, because mermaid does: `api-gateway`
+#: is a legal node id and is written in real sources. The cost of that, found
+#: by the 2026-09-27 review and measured here before the fix:
+#:
+#:     A--B        -> ONE node whose id and label are both "A--B"   (_DECL_RE)
+#:     A--B---C    -> an edge FROM a node called "A--B"             (_EDGE_RE)
+#:     A----B      -> an edge from a node called "A-" to "B"        (_EDGE_RE)
+#:
+#: mermaid reads all three as links (`--`, `----` are open links of different
+#: lengths); this grammar read the extra dashes as part of a name and drew a
+#: box nobody wrote — the same class of defect as the bare `flowchart` line
+#: above, and the same broken promise. It is NOT reached through
+#: `_MID_LABEL_SWALLOWED_AN_ARROW_RE`: that guard sees only lines that matched
+#: `_EDGE_MID_RE`, and none of these three does. So it is closed here, at
+#: every site an id comes from, rather than beside that guard.
+#:
+#: A single inner hyphen stays legal, which is the whole point: `api-gateway`
+#: and `my-node` pass, `A--B`, `-A` and `A-` do not. `A---B` keeps working as
+#: mermaid's `---` link, because the arrow consumes all three dashes and the
+#: ids either side are `A` and `B`.
+_ID_IS_AN_ARROW_RE = re.compile(r"^-|--|-$")
+
+
+def _ids_are_names(*ids: Optional[str]) -> bool:
+    """True when every id a matched line produced is a name, not a dash run."""
+    return not any(_ID_IS_AN_ARROW_RE.search(i) for i in ids if i)
+
 
 _DECL_RE = re.compile(rf"^{_node_part('a')}$")
 
@@ -419,6 +511,8 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         m = _EDGE_RE.match(line)
         if m:
             g = m.groupdict()
+            if not _ids_are_names(g["aid"], g["bid"]):
+                return None
             touch(g["aid"], g["alabel"], g["arole"])
             touch(g["bid"], g["blabel"], g["brole"])
             edges.append({
@@ -437,10 +531,14 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             label = next((g[k] for k in ("mlabel_s", "mlabel_d", "mlabel_t") if g[k] is not None), "")
             if _MID_LABEL_SWALLOWED_AN_ARROW_RE.search(label):
                 # The label ate a second arrow, so this line is a chain or
-                # several statements rather than one edge. Refuse the whole
-                # source here rather than fall through: `_DECL_RE`'s id class
-                # accepts `-`, so a fall-through could read the leftovers as a
-                # node and put a box in the drawing that nobody wrote.
+                # several statements rather than one edge, and a chain drawn
+                # as one edge is the wrong picture. Refuse the whole source:
+                # this module's promise is the callout, never a half-read
+                # graph. (A fall-through would land on the loop's own
+                # `return None` for every shape measured — see the regex's
+                # note; refusing here says so at the point it is decided.)
+                return None
+            if not _ids_are_names(g["aid"], g["bid"]):
                 return None
             touch(g["aid"], g["alabel"], g["arole"])
             touch(g["bid"], g["blabel"], g["brole"])
@@ -454,6 +552,8 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         m = _DECL_RE.match(line)
         if m:
             g = m.groupdict()
+            if not _ids_are_names(g["aid"]):
+                return None
             touch(g["aid"], g["alabel"], g["arole"])
             continue
         return None
@@ -464,7 +564,15 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         return None
     return {
         "direction": direction,
-        "nodes": [{"id": nid, "label": labels[nid], "kind": roles.get(nid, "service")} for nid in order],
+        # `roles` holds only the names the closed vocabulary knows, so a node
+        # nobody tagged — and a node tagged with a name nobody defined —
+        # arrives as `kind=None` and is drawn NEUTRAL. That is what
+        # DIAGRAM_INSTRUCTION promises the model ("Tag only the nodes one
+        # fits; an invented name paints nothing") and what the browser's
+        # mermaid already did with an undefined `:::class`. It used to say
+        # "service" here, so an untagged box came back painted as a service
+        # and the figure's legend named a role the model never wrote.
+        "nodes": [{"id": nid, "label": labels[nid], "kind": roles.get(nid)} for nid in order],
         "edges": edges,
     }
 
