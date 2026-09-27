@@ -888,13 +888,13 @@ class Settings:
         self.cross_chat_embeddings_cache_s: float = _float("CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
         # CROSS_CHAT_SPECULATIVE_EMBED — start the query embedding beside the
         # candidate load above instead of after it, on the one turn shape where
-        # the load is certain to return rows. OFF: the saving is bounded above
-        # by the load leg it hides, and against a PostgreSQL on this host (which
-        # is production's topology) that leg is 0.76-1.10 ms, so the measured
-        # saving is 0.01 ms p50 — against the 5 ms bar the change had to clear.
-        # Four attempts got 0.19 / 0.86 / 4.2 / 0.01 ms; the largest of them
-        # measured across the network to the other node. The full reasoning, the
-        # numbers and the two preconditions for turning it on are at
+        # the load is certain to return rows. OFF: what it saves is the wait it
+        # overlaps — the whole awaited candidate load — and nothing else. Against
+        # a PostgreSQL on this host (which is production's topology) that wait is
+        # 1.21-1.32 ms and the saving is 1.13-1.35 ms p50 over five alternating
+        # passes (2026-09-27), nowhere near the 5 ms bar the change had to clear.
+        # The full reasoning, the measurements, why an `asyncio.sleep` double
+        # reads this as zero, and the two preconditions for turning it on are at
         # app/memory_semantic.py, CROSS_CHAT_SPECULATIVE_EMBED.
         self.cross_chat_speculative_embed: bool = _bool(
             "CROSS_CHAT_SPECULATIVE_EMBED", False

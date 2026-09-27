@@ -19,10 +19,15 @@ first of the three and said in the code that it was the only one; the tests
 below now pin all three.
 
 THE WHOLE PATH IS OFF BY DEFAULT (`CROSS_CHAT_SPECULATIVE_EMBED`, false),
-because the saving is bounded above by the candidate-load leg it hides, and
-against a PostgreSQL on this host — production's topology — that leg is
-0.76-1.10 ms, so the saving measures 0.01 ms p50. Four separate attempts got
-0.19 / 0.86 / 4.2 / 0.01 ms p50 against the 5 ms bar the change had to clear.
+because what it saves is the wait it overlaps — the whole awaited candidate
+load — and nothing else, and against a PostgreSQL on this host, production's
+topology, that wait is 1.21-1.32 ms: the saving measures 1.13-1.35 ms p50 over
+five alternating passes (2026-09-27), against the 5 ms bar the change had to
+clear. An earlier
+harness read this as 0.01 ms because its embedding double was
+`await asyncio.sleep(27 ms)`, and an asyncio timer is armed through epoll,
+whose timeout rounds up to a whole millisecond; the numbers and the direct
+measurement of that are beside the flag in app/memory_semantic.py.
 The fixtures below turn it ON, because that is the behaviour these tests exist
 to pin; one test pins the default itself and proves the default is HEAD's
 order.
@@ -573,6 +578,92 @@ def test_a_failing_candidate_load_counts_and_cancels_the_speculative_embedding(
     assert wasted_by_reason() == {"load_failed": 1}
     # Cancelled, not awaited: the 0.5 s embedding never held the turn.
     assert elapsed < 0.45, f"the failing load waited {elapsed:.3f}s for the embedding"
+
+
+def _embedding_that_counts_itself(monkeypatch, counter: dict, delay: float = 0.5):
+    """A query-embedding double that records whether its body ever RAN.
+
+    `asyncio.ensure_future` only schedules; the loop has to give the coroutine a
+    turn before anything reaches the sidecar. That distinction is the subject of
+    the two tests below, so it is counted inside the coroutine, not at the call.
+    """
+
+    async def embed_query(text, **kw):
+        counter["n"] += 1
+        await asyncio.sleep(delay)
+        return [1.0, 0.0, 0.0]
+
+    monkeypatch.setattr(llm, "embed_query", embed_query)
+
+
+def test_load_failed_counts_a_request_that_really_was_sent_on_the_documented_failure(
+    account, monkeypatch
+):
+    """THE KILL SWITCH'S WORST REASON MUST COUNT REAL REQUESTS.
+
+    `load_failed` is the reason that can climb fast, because the documented
+    failure — PostgreSQL out of connection slots — makes the candidate load raise
+    on every turn. That failure raises inside `_load_candidates`, i.e. inside the
+    worker thread, which means `db.run_in_thread` has already suspended and the
+    speculative embedding's coroutine HAS run: what the counter records is a
+    request that was really put on the shared sidecar. Asserted here rather than
+    assumed, because the comment beside the counter asserts it in prose.
+    """
+    embed_started = {"n": 0}
+
+    async def scenario():
+        await warm_key(account, "new-conv")
+        _embedding_that_counts_itself(monkeypatch, embed_started)
+        embed_started["n"] = 0        # only the MEASURED turn is counted
+
+        def exploding(*a, **k):
+            raise db.OperationalError("no connection slots left")
+
+        monkeypatch.setattr(memory_semantic, "_load_candidates", exploding)
+        return await memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+
+    began = time.perf_counter()
+    assert asyncio.run(scenario()) == []
+    elapsed = time.perf_counter() - began
+    assert embed_started["n"] == 1, "the counted request was never actually sent"
+    assert wasted_by_reason() == {"load_failed": 1}
+    # Cancelled, not awaited: the 0.5 s embedding never held the turn.
+    assert elapsed < 0.45, f"the failing load waited {elapsed:.3f}s for the embedding"
+
+
+def test_a_synchronous_raise_from_run_in_thread_over_counts_and_that_is_left_as_is(
+    account, monkeypatch
+):
+    """THE ONE SHAPE WHERE `load_failed` OVER-COUNTS (QA, 2026-09-27).
+
+    If `db.run_in_thread` raises before its own first suspension, the loop never
+    gives the scheduled embedding a turn: nothing reaches the sidecar, and
+    `load_failed` is recorded anyway. This is NOT the documented failure — that
+    one raises inside the worker thread and is counted exactly (the test above) —
+    and the over-count is deliberately kept, because a kill switch that fires
+    early errs the safe way. Pinned here so the behaviour and the comments beside
+    the counter cannot drift apart: the comments now say the request is
+    *normally* on the wire, and this is the exception they name.
+    """
+    embed_started = {"n": 0}
+
+    async def scenario():
+        await warm_key(account, "new-conv")
+        _embedding_that_counts_itself(monkeypatch, embed_started)
+        embed_started["n"] = 0
+
+        async def raising_before_suspension(fn, *a, **k):
+            raise db.OperationalError("no connection slots left")
+
+        monkeypatch.setattr(db, "run_in_thread", raising_before_suspension)
+        return await memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+
+    assert asyncio.run(scenario()) == []
+    assert embed_started["n"] == 0, (
+        "the embedding coroutine ran after all — then this shape is not an "
+        "over-count and the comments beside the counter should say so"
+    )
+    assert wasted_by_reason() == {"load_failed": 1}
 
 
 def test_a_turn_cancelled_while_the_candidate_load_runs_counts_its_embedding(

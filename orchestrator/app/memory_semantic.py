@@ -154,24 +154,54 @@ _CANDIDATE_CACHE_MAX = 16
 #: load instead of after it, on the one turn shape where the load is certain to
 #: return rows (`_cached_candidates_nonempty` below, and `semantic_hits`).
 #:
-#: OFF BY DEFAULT, AND THE DEFAULT IS WHAT PRODUCTION RUNS. The saving this can
-#: ever buy is bounded above by the candidate-load leg it hides, and on this box
-#: that leg is UNDER A MILLISECOND, so the saving is too. Four independent
-#: measurements of the one shape it acts on (a second turn of the same
-#: conversation, with a question the embedding LRU has not seen) came back
-#: 0.19, 0.86, 4.2 and 0.01 ms p50 against a 5 ms bar this change was required
-#: to clear. The last of those is the one to trust for production and it is the
-#: smallest: the first three drove a test PostgreSQL on the OTHER node, across
-#: the network, which inflates the very leg being hidden, while production's
-#: PostgreSQL is a container on this host. Measured there, over two alternating
-#: 31- and 41-pair passes on a 1,280-row account at 1024 dimensions, the load
-#: leg is 0.76-1.10 ms, which is the CEILING on anything this can ever save.
+#: OFF BY DEFAULT, AND THE DEFAULT IS WHAT PRODUCTION RUNS. What this buys is
+#: the wait it overlaps — the whole `await db.run_in_thread(_load_candidates,
+#: ...)` below — and nothing else, because that is the only wait it covers. On
+#: this box that wait is about a millisecond, so the saving is about a
+#: millisecond, and the 5 ms bar this change was required to clear is out of
+#: reach here.
+#:
+#: MEASURED 2026-09-27 on the one shape it acts on (a second turn of the same
+#: conversation, with a question the embedding LRU has not seen): one process,
+#: one toggle, real `_load_candidates` including its fingerprint SELECT, real
+#: `db.run_in_thread` hop, real `_rank_candidates`, a 1,280-message account over
+#: 40 conversations at 1024 dimensions, a PostgreSQL container on this host
+#: (production's topology), arms alternating within each pair, the gate counted
+#: (yes on every speculating turn, no misses), and the engine gauge
+#: `vllm:num_requests_running` read 0.0 before each pass:
+#:
+#:   pairs  embedding double   overlapped await   saving p50   paired median
+#:     31   socket (fd event)      1.214 ms         +1.146 ms     +1.108 ms
+#:     41   socket (fd event)      1.259 ms         +1.165 ms     +1.235 ms
+#:     31   asyncio.sleep timer    1.318 ms         -0.076 ms     +0.045 ms
+#:
+#: Three further socket passes gave +1.350 / +1.197 / +1.132 ms and three
+#: further timer passes +0.070 / -0.014 / -0.110 ms, so the split above is the
+#: instrument's, not one pass's luck.
+#:
+#: MEASURE THIS WITH A DOUBLE THAT ARRIVES ON AN FD, NOT A TIMER. The earlier
+#: round of this work reported 0.01 ms p50 here from a harness whose embedding
+#: double was `await asyncio.sleep(27 ms)`, and that number was an artefact of
+#: the instrument: an asyncio timer is armed through `epoll_wait`, whose timeout
+#: is rounded UP to a whole millisecond, so a wake mid-sleep — the load's thread
+#: hop completing, which happens in the speculating arm and not in the serial
+#: one — re-arms it late and swallows a sub-millisecond saving whole. Measured
+#: directly, 400 samples each: `asyncio.sleep(27 ms)` alone returns at
+#: 27.130 ms and with a concurrent 1.0 ms `run_in_executor` hop at 28.349 ms,
+#: while a socket wake returns at 27.173 ms and 27.176 ms — unmoved. The same
+#: thing shows in the legs of the A/B above: with the timer double the embed leg
+#: grows from 27.216 ms (serial) to 28.460 ms (speculating), while with the
+#: socket double it is 27.263 ms against 27.261 ms. So the embedding leg does
+#: NOT lengthen through event-loop contention; only the timer's own granularity
+#: does.
 #:
 #: The mechanism is not broken and is not being hidden: forced to a genuinely
-#: expensive load leg it saves the whole leg (+8.02 ms measured at a 9.08 ms
-#: leg, same harness, same pass structure), which is exactly what it claims to
-#: do. It stays here, behind a flag, so the A/B is one toggle in one process on
-#: a deployment whose load leg is larger — rather than being deleted and
+#: expensive load leg it saves the whole leg — +9.434 ms over 31 pairs with the
+#: socket double, where `_load_candidates`' own body measured 9.144 ms, and the
+#: timer double reads +7.987 ms at a 8.925 ms body, short by the same
+#: millisecond — which is exactly what it claims to do.
+#: It stays here, behind a flag, so the A/B is one toggle in one process on a
+#: deployment whose load leg is larger — rather than being deleted and
 #: re-derived from scratch when somebody wants the answer again.
 #:
 #: Two things must be true before it is turned on: something has to watch
@@ -297,9 +327,18 @@ def _cached_candidates_nonempty(
     also raise, or be cancelled. Those three residuals are counted, one reason
     each, by `_count_speculative_embed_waste`, and the embedding is cancelled;
     a cancelled caller releases its EMBED_MAX_INFLIGHT slot at once, exactly as
-    an abandoned flight does on HEAD (llm.py:2167-2175). The request itself is
-    already on the sidecar's wire by then, which is why it is counted rather
-    than called free.
+    an abandoned flight does on HEAD (llm.py:2167-2175). By then the request is
+    normally already on the sidecar's wire, which is why it is counted rather
+    than called free. There is ONE shape where `load_failed` over-counts: if
+    `db.run_in_thread` raises before its own first suspension, the embedding
+    coroutine has not run at all and nothing was spent, yet the reason is still
+    recorded (measured 2026-09-27 on this exact shape, on Python 3.11 as the CI
+    shards run and on 3.12 as the local venv does: the coroutine body starts 0
+    times). That is NOT the documented failure — an exhausted connection pool
+    raises inside the worker thread, after `anyio.to_thread.run_sync` has
+    suspended and the embedding has started, and there the count is exact. Both
+    shapes are pinned in tests/test_cross_chat_wait.py. A kill switch that errs
+    towards firing early is the right way round, so the over-count stays.
 
     Whether the gate is consulted at all is `_speculative_embed_enabled()`.
     """
@@ -699,7 +738,7 @@ async def semantic_hits(
         except BaseException as exc:
             # THE LOAD FAILED, OR THE TURN WAS CANCELLED (a newer message
             # replaced it, or main.py's `reads.close()` closed this read).
-            # HEAD starts no embedding here, so the one already in flight IS
+            # HEAD starts no embedding here, so the one this turn started IS
             # work HEAD does not do, and it is counted — under its own reason,
             # because it is not the same event as a stale cache entry. The
             # first version of this branch left it uncounted and claimed the
