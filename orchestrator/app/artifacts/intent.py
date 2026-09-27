@@ -1192,36 +1192,123 @@ _IMPERATIVE_CREATE_RE = re.compile(
 )
 
 
-#: THE INFINITIVE OF WORK. `to make`, `to also build`, `to put together`,
-#: `to get`: a bare-infinitive verb of PRODUCING or HANDING OVER something.
-#: This is the structural half of the indirect-request rule below.
+#: THE VERBS THAT ARE NOT WORK -- and the list is this way round on purpose.
 #:
-#: Written out rather than reused from `_STRICT_CREATE_VERBS` and
-#: `_HANDOVER_VERBS`: those two carry first-person phrases ("give me", "i
-#: need", "we would like") that cannot follow `to`, and this one carries the
-#: hand-over verbs that only read as production in this position (`get`,
-#: `download`, `email`, `attach`) -- a bare "get" or "send" elsewhere is as
-#: often conversation. A verb of ACCESS is deliberately absent: `review`,
-#: `read`, `see`, `open`, `explain`, `undo` and `know` keep their wrappers
-#: questions, which `NON_BUILD_VERB_FRAMES` in tests/test_wider_misreads.py
-#: pins.
-_BUILD_INFINITIVE_VERBS = (
-    r"(?:make|create|generate|build|write|draft|prepare|produce|compile|assemble|put\s+together|"
-    r"design|develop|export|convert|turn|save|render|print|format|send|share|provide|deliver|"
-    r"give|get|download|email|attach|knock\s+up|whip\s+up)"
+#: W2d (2026-09-27) replaced an enumeration of politeness WRAPPERS with an
+#: enumeration of thirty build VERBS and called the open end closed. It was
+#: the same defect one level down, and QA defeated it the same day with `put`
+#: (the list held `put together` only), `collate`, `extract`, `organise`,
+#: `package` and `translate`, then with thirty-odd more of the same kind:
+#: `pull together`, `throw together`, `work up`, `draw up`, `type up`,
+#: `set up`, `mock up`, `sketch out`, `lay out`, `populate`, `tabulate`,
+#: `fill in`, `log`, `capture`, `copy`, `stick`, `pop`, `chuck`, `zip up`,
+#: `outline`, `publish`, `upload`, `summarise`, `chart`, `graph`, `plot`,
+#: `forward`, `shoot`, `ping`, `supply`, `hand over`, `hand me`. MEASURED
+#: 2026-09-28 on 852 rows over four contexts: origin/dev -> 581ffd67 gained
+#: 0 files and lost 52, and 32 of those losses -- twelve phrasings -- were
+#: indirect requests origin/dev built and the branch did not, in the exact
+#: family the branch exists to close. Every one was invisible to a probe that
+#: varies the wrapper, because the probe never varied the verb.
+#:
+#: So the verb is not enumerated either. ANY infinitive that governs a
+#: deliverable is read as work, EXCEPT the verbs that take the deliverable as
+#: their TOPIC or their EXISTING object: access, cognition, speech-about and
+#: undoing. "to REVIEW my pdf", "to READ the pdf", "to KNOW who edited the
+#: sheet", "to UNDO the last edit to the deck" -- `NON_BUILD_VERB_FRAMES` in
+#: tests/test_wider_misreads.py pins all seven of those. That class has a
+#: boundary English respects; "the verbs of producing" has none.
+#:
+#: AND THIS IS WHERE THE OPEN END BELONGS, which is what W2d's own commit
+#: message claimed and did not deliver. A verb missing from THIS list is an
+#: unwanted file: the person sees the card, says no, and W1's refusal path
+#: honours the no. A verb missing from the old build-verb list was a file
+#: that was asked for and silently never made. Same for the adverb list and
+#: the determiner list below -- a word missing from either makes the WORD
+#: ITSELF the candidate verb, which can only ever produce a file, never
+#: withhold one.
+#:
+#: THE LIST IS A TUPLE, not a pattern, so the tests can WALK it: every word in
+#: it is asserted to be a question in a request wrapper
+#: (`test_every_non_work_verb_is_still_a_question`), which is the check that
+#: catches a word put here by mistake. Three were, and were measured out again
+#: on the day it was written: `walk` ("to WALK me through this in a DECK" is a
+#: request for the deck, which origin/dev builds under PA, PC and PF), `scan`
+#: ("to SCAN this into a spreadsheet") and `drop` ("to DROP this into a
+#: spreadsheet"). A word wrongly ON this list is a LOST file; a word MISSING
+#: from it is a spurious card. That asymmetry is the whole reason the list is
+#: this way round, and it is also why the list is kept SHORT and each entry has
+#: to have no production sense at all.
+_NON_WORK_VERB_WORDS = (
+    # ACCESS: the deliverable already exists and is being looked at.
+    "read", "re-?read", "review", "proofread", "check", "re-?check", "verify", "confirm",
+    "validate", "see", "look", "view", "watch", "examine", "inspect", "skim", "browse",
+    "open", "close", "access", "revisit",
+    # COGNITION and OPINION.
+    "know", "understand", "learn", "think", "reckon", "remember", "recall", "forget",
+    "guess", "realise", "realize", "decide", "consider", "compare", "judge", "assess",
+    "evaluate",
+    # SPEECH ABOUT the deliverable rather than production of it.
+    "explain", "clarify", "describe", "discuss", "talk", "chat", "speak", "mention",
+    "comment", "ask", "answer", "reply", "respond", "tell", "say", "go", "meet", "sync",
+    # UNDOING and REMOVAL.
+    "undo", "revert", "rollback", r"roll\s+back", "delete", "remove", "cancel", "stop",
+    "ignore", "skip", "archive",
+    # FINDING what is already there.
+    "find", "locate", "search",
 )
-#: THE OPENING CLAUSE, up to eight words, then a build infinitive, then the
-#: deliverable it names: `do you have a moment` + `to make` + `a deck`. Both
-#: gaps are bounded and lazy, and neither can cross a sentence end -- which is
-#: also what keeps the head+tail window (`_decide_window` joins the two halves
-#: with " . ") from letting the TAIL of a long paste supply the wrapper. The
-#: eight-word bound and the `.match` are what make this the person's own
-#: opening ask rather than any `to make a deck` anywhere in the message.
+_NON_WORK_INFINITIVE_VERBS = "(?:" + "|".join(_NON_WORK_VERB_WORDS) + ")"
+#: The words that cannot BE the verb because they are not verbs: determiners,
+#: pronouns and the copula. Without this, "is it relevant to a deck?" reads
+#: `a` as the verb and builds the deck. A genuinely closed class, unlike the
+#: verbs above.
+_NOT_A_VERB_AFTER_TO = (
+    r"(?:a|an|the|this|that|these|those|my|our|your|his|her|their|its|it|me|us|you|u|them|him|"
+    r"some|any|no|one|two|three|both|each|every|all|more|most|another|such|what|which|who|whom|"
+    r"whose|be|being|been|here|there)"
+)
+#: The adverbs that may sit between `to` and the verb: "to ALSO make a deck",
+#: "to QUICKLY knock up a deck". `[a-z]+ly` is generic, with the -ly VERBS
+#: excluded -- `supply` is one of the verbs the old enumeration was defeated
+#: with, so reading it as an adverb would re-open the defect.
+_INF_ADVERBS = (
+    r"(?:also|just|then|now|maybe|perhaps|please|kindly|first|even|already|still|only|"
+    r"(?!(?:supply|apply|reply|imply|comply|multiply|rely|ply|fly)\b)[a-z]+ly)"
+)
+#: A word that cannot be the infinitive's verb, in any of the three ways.
+_NOT_THE_VERB = rf"(?:{_NON_WORK_INFINITIVE_VERBS}|{_NOT_A_VERB_AFTER_TO}|{_INF_ADVERBS})"
+#: The words that end the noun phrase, so the deliverable has to be reached
+#: without crossing one: "to email priya AND ask her for a deck" is not a
+#: request to email a deck. The gap may not cross a sentence end either
+#: (`.?!;` are outside its separator class), which is what keeps the head+tail
+#: window (`_decide_window` joins the two halves with " . ") from letting the
+#: TAIL of a long paste supply a deliverable.
+#:
+#: `to` IS NOT ONE OF THEM, and that was measured: "do you have a moment to
+#: convert this TO excel?" reaches its deliverable through the resultative
+#: preposition, and breaking on `to` cost that row in P0 and PA against both
+#: origin/dev and W2d (2026-09-28). An infinitive `to` inside the phrase is
+#: harmless, because the verb after it then has to fail the noun test anyway.
+_CLAUSE_BREAK_WORDS = (
+    r"(?:and|or|but|because|so|if|when|whether|that|which|who|while|since|unless|although|"
+    r"though|before|after|then)"
+)
+#: THE INFINITIVE AND ITS DELIVERABLE: `to make` + `a deck`, `to put` +
+#: `this in a spreadsheet`, `to make` + `a clean professional client ready
+#: deck`. Searched, not anchored: `_asks_you_to_build` below owns the wrapper,
+#: because the wrapper's three exclusions and its word bound are decided per
+#: CANDIDATE, and the first `to <verb>` in a turn is not always the ask ("SORRY
+#: TO BOTHER YOU, do you have a moment to make a deck?").
+#:
+#: The ten-word gap is a performance bound, not a grammar one: the gap is
+#: lazy and the candidates are linear in the turn, so the whole predicate
+#: stays linear. It is also generous enough that the clause-break guard, not
+#: the count, is what normally ends the phrase -- the longest deliverable
+#: phrase measured in the corpus is six words ("a clean professional client
+#: ready deck").
 _BUILD_INFINITIVE_RE = re.compile(
-    r"^\W*(?:[\w'\u2019-]+[^\w.?!;]+){0,8}?"
-    r"(?P<inf>to\s+(?:(?:also|just|then|now|maybe|please|kindly|quickly|first)\s+){0,2}"
-    rf"{_BUILD_INFINITIVE_VERBS}\b)"
-    rf"(?:\W+\w+){{0,4}}?\W+{_ARTIFACT_NOUNS}\b",
+    rf"(?P<inf>\bto\s+(?:{_INF_ADVERBS}\s+){{0,3}}(?!{_NOT_THE_VERB}\b)[a-z][\w'’-]*)"
+    rf"(?:[^\w.?!;]+(?!{_CLAUSE_BREAK_WORDS}\b)[\w'’-]+){{0,10}}?"
+    rf"[^\w.?!;]+{_ARTIFACT_NOUNS}\b",
     re.I,
 )
 #: The wrapper asks about a PRACTICE, not about this piece of work: "is it
@@ -1267,20 +1354,37 @@ _THIRD_PARTY_CLAUSE_RE = re.compile(
     r"our\s+\w+|their\s+\w+)\s+"
     r"(?:need|needs|want|wants|wanted|expect|expects|ask|asks|asked|has|have|is|are|will|would|"
     r"said|says|plans?|planned|intends?|tried|tries|try)\b", re.I)
-#: A wrapper is a POLITENESS WRAPPER when its own SUBJECT is the assistant
-#: (`you`) or the act (`it`, `there`), after any number of discourse openers.
-#: The subject position is what makes this structural: "I forgot to make a
-#: deck" and "we decided to build a deck" are neither, and a bare "contains
-#: `it` anywhere" test would have taken "is it clear what they need to make a
-#: deck?" as well as the shapes it is for.
-_WRAPPER_SUBJECT_RE = re.compile(
-    r"^\W*(?:(?:ok|okay|k|so|hey|hi|hello|right|well|alright|anyway|and|then|also|plus|"
-    r"please|pls|kindly|just|now|actually|sorry|thanks|quick\s+one|quick\s+question|"
-    r"one\s+more\s+thing|by\s+the\s+way|btw|hmm|umm?)\W+)*"
-    r"(?:(?:do|does|dont|don't|do\s+not|would|wouldnt|will|wont|won't|can|cant|can't|could|"
-    r"couldnt|may|might|shall|should|have|havent|haven't|has|had|are|arent|is|isnt|was|were|"
-    r"any|if|whether)\s+)?"
-    r"(?:you|u|it|there)\b", re.I)
+#: THE WRAPPER IS ADDRESSED: it mentions the assistant (`you`) or the act
+#: (`it`, `there`). "I forgot to make a deck" and "we decided to build a deck"
+#: mention neither, and they are the shapes the test is for.
+#:
+#: THIS USED TO BE AN ANCHORED MATCH over a list of 25 discourse openers
+#: (`ok|so|hey|right|well|...`) followed by an optional auxiliary, and that
+#: list was a third open end on the SILENT side: "WHEN you get a chance, do
+#: you have a moment to make a deck?" lost its file because `when` was not on
+#: it, where the identical turn opening "if you get a chance" kept it
+#: (measured 2026-09-28, origin/dev builds the file for both). A list of the
+#: ways a person may open a sentence is not a list that can be finished, so
+#: the openers are not read at all: what is read is whether the assistant or
+#: the act is named anywhere before the infinitive. The three exclusions
+#: below -- the past, someone else's work, a practice -- are what keep a
+#: mention from being enough on its own, and they are searched over the same
+#: text.
+_ADDRESSED_WRAPPER_RE = re.compile(r"\b(?:you|u|it|there)\b", re.I)
+#: The turn's OPENING CLAUSE: leading punctuation skipped, then everything up
+#: to the first sentence end. `_asks_you_to_build` reads this and nothing
+#: else, which is what stops a request quoted at the bottom of a pasted mail
+#: thread from arming the rule (W3's disclosed exposure stays bounded to the
+#: quoted IMPERATIVE, which predates this branch).
+_OPENING_CLAUSE_RE = re.compile(r"^\W*([^.?!;]*)")
+#: HOW FAR IN THE ASK MAY START, in words of the wrapper. THIS IS THE ONE
+#: NUMBER LEFT ON THE SILENT SIDE of this rule and it is a floor, not a
+#: proof: a politeness wrapper longer than this loses the file, silently.
+#: Sixteen was chosen against the longest wrapper anyone has written down --
+#: "i know you are busy but do you have a moment to" is eleven -- and it is
+#: the bound that keeps a 5-row or 40-row paste (25 words and up, plus the
+#: `.` in a quoted From: address) from reaching a quoted ask.
+_WRAPPER_WORD_BOUND = 16
 
 
 def _asks_you_to_build(low: str) -> bool:
@@ -1298,10 +1402,12 @@ def _asks_you_to_build(low: str) -> bool:
     (a TYPO), "is it viable to ..." -- each of them `create` on origin/dev
     2559fd1f36 under PC and PF and `none`/`ambiguous` here.
 
-    So the wrapper is not read at all. What is read is the INFINITIVE OF
-    WORK: a clause that says `to <build verb>` and names a deliverable is
-    asking for that deliverable, whatever words open it, and the typo, the
-    noun and the adjective all stop mattering.
+    So the wrapper is not read at all, and NEITHER IS THE VERB. What is read
+    is the INFINITIVE: a clause that says `to <verb>` and names a deliverable
+    is asking for that deliverable, whatever words open it and whatever the
+    verb is, so the typo, the availability noun, the feasibility adjective and
+    the thirty-word build-verb list all stop mattering. The only verbs read
+    are the ones that CANNOT be work (`_NON_WORK_INFINITIVE_VERBS`).
 
     THREE FAMILIES MUST STILL BE QUESTIONS, and each is excluded by a
     property of the wrapper rather than by a phrase:
@@ -1310,11 +1416,6 @@ def _asks_you_to_build(low: str) -> bool:
       `_PAST_WRAPPER_RE`. This is why the rule is the infinitive and not "a
       build verb plus a deliverable noun": "did you make a new sheet?" (W2b)
       has both and no infinitive.
-
-    ...and the wrapper itself has to be ADDRESSED: its subject is `you`, `it`
-    or `there`, after any number of discourse openers (`_WRAPPER_SUBJECT_RE`).
-    "I forgot to make a deck" and "we decided to build a deck" are statements
-    about the person, and this rule leaves them where they were.
     * SOMEONE ELSE'S WORK. "do you want me to write a memo?" (W2) puts the
       memo on the person. `_OTHER_AGENT_RE`, the pronoun before `to`, and
       `_THIRD_PARTY_CLAUSE_RE` for an embedded clause with its own subject
@@ -1323,26 +1424,62 @@ def _asks_you_to_build(low: str) -> bool:
       "is it usual to build a separate deck for this?" ask whether people do
       this, not for the thing. `_NORM_WRAPPER_RE`.
 
-    THE INVERSION IS THE POINT, and it is a judgement, not a measurement.
-    `possible|feasible|doable` and `bandwidth|time|capacity|…` are lists of
-    the shapes that MUST make a file, so a word missing from them is a file
-    the person asked for and did not get -- silent, invisible in every
-    instrument this repo has, and the defect that shipped twice.
-    `normal|usual|typical|…` is a list of the shapes that must NOT, so a word
-    missing from THAT list is an unwanted file -- which the person can see,
-    can say no to, and which W1's refusal path then honours. The open end is
-    moved to the side where the failure is visible. Neither list is a proof;
-    both are floors.
+    ...and the wrapper itself has to be ADDRESSED: it names `you`, `it` or
+    `there` somewhere before the infinitive (`_ADDRESSED_WRAPPER_RE`). "I
+    forgot to make a deck" and "we decided to build a deck" name none of the
+    three, and this rule leaves them where they were.
+
+    EVERY CANDIDATE IS TRIED, not just the first. The first `to <verb>` in a
+    turn is often not the ask -- "SORRY TO BOTHER YOU, do you have a moment to
+    make a deck?" -- and with the verb no longer enumerated there is nothing
+    to stop `to bother` from being the leftmost match. Each candidate carries
+    its own wrapper, so each is excluded on its own.
+
+    THE INVERSION IS THE POINT, and W2d only got it half right. Version 3
+    (2026-09-28) finished it. `possible|feasible|doable` and
+    `bandwidth|time|capacity|…` are lists of the shapes that MUST make a file,
+    so a word missing from them is a file the person asked for and did not get
+    -- silent, invisible in every instrument this repo has, and the defect
+    that shipped twice. W2d moved the wrapper to a structural test and then
+    put the SAME open-ended list one level down, as thirty build verbs plus a
+    four-word deliverable gap, an eight-word wrapper bound and 25 discourse
+    openers. Measured on 852 rows: that cost 32 rows of files origin/dev
+    builds, in twelve phrasings, all silent. All four are now inverted or
+    removed:
+
+    * THE VERB is any verb except the verbs of access, cognition,
+      speech-about, undoing and finding (`_NON_WORK_VERB_WORDS`). A word
+      MISSING there is an unwanted file -- the visible side. A word wrongly
+      PRESENT is a lost file, which the inversion does NOT fix: `walk`, `scan`
+      and `drop` were three, found by sweeping 130 verbs against origin/dev,
+      and `test_every_non_work_verb_is_still_a_question` walks the tuple in
+      three wrappers so the next one is caught the same way.
+    * THE DELIVERABLE GAP ends at a clause-break word, not at a word count;
+      the count that remains is a performance bound at ten, which the corpus
+      never reaches (six is the longest).
+    * THE OPENERS are not read at all (`_ADDRESSED_WRAPPER_RE`).
+    * THE WRAPPER BOUND is `_WRAPPER_WORD_BOUND`, sixteen words, and IT IS
+      THE OTHER THING LEFT ON THE SILENT SIDE. It cannot be removed without an
+      attribution model, because it is also what stops a request quoted in a
+      pasted mail thread from arming the rule (W3). Named in the commit
+      message's left_open, with the measured row count.
+
+    Neither list is a proof; both are floors, and the floors whose OMISSIONS
+    can only cost a spurious card are the ones that are allowed to stay open.
     """
-    m = _BUILD_INFINITIVE_RE.match(low)
-    if m is None:
-        return False
-    wrapper = low[: m.start("inf")]
-    if _PAST_WRAPPER_RE.search(wrapper) or _NORM_WRAPPER_RE.search(wrapper):
-        return False
-    if _OTHER_AGENT_RE.search(wrapper) or _THIRD_PARTY_CLAUSE_RE.search(wrapper):
-        return False
-    return bool(_WRAPPER_SUBJECT_RE.match(wrapper))
+    clause = _OPENING_CLAUSE_RE.match(low).group(1)
+    for m in _BUILD_INFINITIVE_RE.finditer(clause):
+        wrapper = clause[: m.start("inf")]
+        if len(wrapper.split()) > _WRAPPER_WORD_BOUND:
+            # Candidates only move right, so no later one is closer in.
+            return False
+        if _PAST_WRAPPER_RE.search(wrapper) or _NORM_WRAPPER_RE.search(wrapper):
+            continue
+        if _OTHER_AGENT_RE.search(wrapper) or _THIRD_PARTY_CLAUSE_RE.search(wrapper):
+            continue
+        if _ADDRESSED_WRAPPER_RE.search(wrapper):
+            return True
+    return False
 
 
 def _question_not_a_request(low: str, *, raw: str = "") -> bool:

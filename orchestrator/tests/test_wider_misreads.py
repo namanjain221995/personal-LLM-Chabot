@@ -433,14 +433,23 @@ def test_a_held_out_request_for_a_file_survives_the_wider_misread_fixes(text, ac
 # A moment. A sec. `have you got` instead of `do you have`. A TYPO. `viable`
 # instead of `possible`. Five more strings would have bought the sixth
 # phrasing, so the rule no longer reads the wrapper at all: `_asks_you_to_build`
-# reads the INFINITIVE OF WORK (`to <build verb>` plus a deliverable noun) and
-# excludes the three families that must stay questions by a property of the
-# wrapper -- the past, someone else's work, and a practice.
+# reads the INFINITIVE (`to <verb>` plus a deliverable noun) and excludes the
+# three families that must stay questions by a property of the wrapper -- the
+# past, someone else's work, and a practice.
 #
-# THE CLASS IS OPEN-ENDED AND THIS LIST IS A FLOOR, NOT A PROOF. English has
-# no closed set of ways to ask politely. What the list is for is that a
-# phrasing once measured can never be lost again, and that the next one found
-# is added HERE rather than to a pattern.
+# AND THE VERB WENT THE SAME WAY, one round later (2026-09-28). W2d's first
+# pass enumerated thirty BUILD verbs, and `NOT_ENUMERATED_VERBS` below is the
+# list QA defeated it with: twelve phrasings, 32 rows of files origin/dev
+# builds and W2d silently did not, measured over P0/PA/PC/PF. The verb is now
+# read by what it CANNOT be (`intent._NON_WORK_INFINITIVE_VERBS`: access,
+# cognition, speech-about, undoing), so a word nobody listed makes a spurious
+# card and never a missing one.
+#
+# THE CLASS IS OPEN-ENDED AND THESE LISTS ARE A FLOOR, NOT A PROOF. English
+# has no closed set of ways to ask politely and no closed set of ways to say
+# "make". What the lists are for is that a phrasing once measured can never be
+# lost again, and that the next one found is added HERE rather than to a
+# pattern.
 
 #: The seven W2c was written for and the five QA found after it, in one
 #: permanent list. Every one of these is a file on origin/dev 2559fd1f36
@@ -477,64 +486,288 @@ NOT_ENUMERATED_EITHER = [
     # `would you` opener), so it is here as a floor rather than as a fix.
     "would you have a spare minute to write a one-pager?",
 ]
+#: THE VERB SIDE, and the twelve phrasings that defeated W2d's build-verb
+#: enumeration. MEASURED 2026-09-28 over P0/PA/PC/PF on 852 rows: every one of
+#: these is a file on origin/dev (create, or export of the answer under PA)
+#: and was none/ambiguous on 581ffd67, 32 rows in all. Six fail on the VERB
+#: (`_BUILD_INFINITIVE_VERBS` held `put together` but not bare `put`, and held
+#: none of `collate`, `extract`, `organise`, `package`, `translate`); one on
+#: the four-word DELIVERABLE GAP; three on the eight-word WRAPPER BOUND and
+#: its opener list. Two of them carry the wrappers W2d itself was written for,
+#: which is the whole point: the fix closed the wrapper and left the verb open.
+NOT_ENUMERATED_VERBS = [
+    # -- the verb is not on any list
+    "do you have a moment to put this in a spreadsheet?",
+    "have you got time to put this in a spreadsheet?",      # W2d's own wrapper
+    "is it viable to put this in a spreadsheet?",           # W2d's own wrapper
+    "do you have a moment to collate this into a report?",
+    "do you have a moment to extract this into a csv?",
+    "do you have a moment to organise this into a spreadsheet?",
+    "do you have a moment to package this as a pdf?",
+    "do you have a moment to translate this into a pdf?",
+    # -- the deliverable sits more than four words after the infinitive
+    "do you have a moment to make a clean professional client ready deck?",
+    # -- the wrapper is longer than eight words, or opens with a word that was
+    #    not on the 25-opener list (`when`, where `if` was there)
+    "do you by any chance happen to have a moment to make a deck?",
+    "if you get a chance, do you have a moment to make a deck?",
+    "when you get a chance, do you have a moment to make a deck?",
+]
+#: NOBODY ENUMERATED THESE EITHER, and they are the verb-side twin of
+#: `NOT_ENUMERATED_EITHER`: written after the inversion existed, added to no
+#: pattern, and green because any verb that is not a verb of access counts.
+#: Sixteen more ways of saying "make", of the kind the old thirty-word list
+#: would have had to grow for one at a time.
+NOT_ENUMERATED_VERBS_EITHER = [
+    "do you have a moment to pull together a deck?",
+    "do you have a moment to throw together a deck?",
+    "do you have a moment to work up a one-pager?",
+    "do you have a moment to draw up a one-pager?",
+    "do you have a moment to type up a memo?",
+    "do you have a moment to set up a tracker?",
+    "do you have a moment to mock up a deck?",
+    "do you have a moment to sketch out a one-pager?",
+    "do you have a moment to lay out a deck?",
+    "do you have a moment to supply a deck?",
+    "do you have a moment to hand over a deck?",
+    "do you have a moment to populate a tracker?",
+    "do you have a moment to outline a deck?",
+    "do you have a moment to publish a report?",
+    "do you have a moment to zip up the deck?",
+]
+_INDIRECT_GATE = (HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER
+                  + NOT_ENUMERATED_VERBS + NOT_ENUMERATED_VERBS_EITHER)
 
 
-@pytest.mark.parametrize("text", HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER,
-                         ids=[t[:46] for t in HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER])
+_WRAPPER_GATE = HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER
+_VERB_GATE = NOT_ENUMERATED_VERBS + NOT_ENUMERATED_VERBS_EITHER
+
+
+@pytest.mark.parametrize("text", _WRAPPER_GATE, ids=[t[:46] for t in _WRAPPER_GATE])
 @pytest.mark.parametrize("ctx", [PC, PF], ids=["card-last", "file-earlier"])
 def test_the_indirect_request_family_still_makes_the_file(text: str, ctx: dict) -> None:
-    """THE PERMANENT GATE ON THIS CLASS, run beside `HELD_OUT_STILL_A_FILE`.
+    """THE PERMANENT GATE ON THE WRAPPER SIDE, beside `HELD_OUT_STILL_A_FILE`.
 
-    12 phrasings x 2 contexts for the measured ones, 6 x 2 for the ones no
-    pattern was ever widened for. The five of W2d decided none/ambiguous on
-    the integration head and on the shipping pair before `_asks_you_to_build`
-    and create/create-first-clause after it; the seven of W2c were already
-    green and are here so the band cannot narrow again."""
+    18 phrasings x 2 contexts: the twelve W2c and W2d were written for, and six
+    no pattern was ever widened for. Measured on the integration head
+    1a660b58d7 this gate was 8/18 -- ten of the eighteen were none/ambiguous
+    there, the five of W2d and five of the six written after the rule -- and it
+    is 18/18 on origin/dev, on 581ffd67 and here.
+
+    These all name a NEW deliverable with no source ("make a deck"), so the
+    verdict is `create` in both contexts. The verb-side gate below asks only
+    for a file, because half of those name the previous answer as the source
+    ("put THIS in a spreadsheet") and origin/dev exports it."""
     got = I.decide(text, **ctx)
     assert got.wants_file is True, (text, got.action, got.rule)
     assert got.action == "create", (text, got.action, got.rule)
 
 
-#: The phrasings in `HELD_OUT_INDIRECT_REQUESTS` that carry a build
-#: infinitive, which is the half `_asks_you_to_build` decides on its own. The
-#: other four ("do you think you could make a deck?", "is there any way you
-#: can make a deck?", "any chance you could make a deck?", "do you have the
-#: capacity to build a one-pager?" -- that last one HAS an infinitive) are
-#: named openers in `_REQUEST_OF_YOU_RE` and are listed above, not here.
-_INFINITIVE_CARRIED = [t for t in HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER
-                       if I._BUILD_INFINITIVE_RE.match(t.lower())]
+#: THE 32 ROWS, as the CONTEXTS origin/dev 2559fd1f36 makes a file in --
+#: measured 2026-09-28, `F` = a file, `.` = none, over P0/PA/PC/PF. Recorded
+#: as data rather than asserted as "always a file", because half of these name
+#: the previous answer as the source ("put THIS in a spreadsheet") and there is
+#: nothing to put in it in a fresh chat. Every `F` here was none/ambiguous on
+#: 581ffd67: that is the 32.
+_VERB_ROWS = [
+    ("do you have a moment to put this in a spreadsheet?", "FFFF"),
+    ("have you got time to put this in a spreadsheet?", "FFFF"),
+    ("is it viable to put this in a spreadsheet?", "FFFF"),
+    ("do you have a moment to collate this into a report?", ".FFF"),
+    ("do you have a moment to extract this into a csv?", "FFFF"),
+    ("do you have a moment to organise this into a spreadsheet?", "FFFF"),
+    ("do you have a moment to package this as a pdf?", "FFFF"),
+    ("do you have a moment to translate this into a pdf?", "FFFF"),
+    ("do you have a moment to make a clean professional client ready deck?", "..FF"),
+    ("do you by any chance happen to have a moment to make a deck?", "..FF"),
+    ("if you get a chance, do you have a moment to make a deck?", "..FF"),
+    ("when you get a chance, do you have a moment to make a deck?", "..FF"),
+]
+_VERB_ROW_CTX = [(P0, "fresh"), (PA, "answer-only"), (PC, "card-last"), (PF, "file-earlier")]
+
+
+@pytest.mark.parametrize("text,dev", _VERB_ROWS, ids=[t[:52] for t, _d in _VERB_ROWS])
+def test_the_indirect_request_VERBS_still_make_the_file_dev_makes(text: str, dev: str) -> None:
+    """THE PERMANENT GATE ON THE VERB SIDE (QA, 2026-09-28).
+
+    Twelve phrasings, 32 rows, every one a file on origin/dev and
+    none/ambiguous on 581ffd67 because the verb was not on a thirty-word list:
+    six on the VERB (`put`, `collate`, `extract`, `organise`, `package`,
+    `translate`), one on the four-word deliverable gap, three on the eight-word
+    wrapper bound and its opener list, and two of them carrying W2d's own
+    wrappers. The action is not pinned -- create in a fresh chat,
+    export/export-followup once there is an answer to put in the sheet, and
+    both are right -- but the `.` columns are, so a later change that starts
+    inventing a file with nothing to put in it goes red here too."""
+    for want, (ctx, ctx_id) in zip(dev, _VERB_ROW_CTX):
+        got = I.decide(text, **ctx)
+        assert got.wants_file is (want == "F"), (text, ctx_id, want, got.action, got.rule)
+
+
+@pytest.mark.parametrize("text", NOT_ENUMERATED_VERBS_EITHER, ids=[t[:52] for t in NOT_ENUMERATED_VERBS_EITHER])
+def test_sixteen_more_verbs_nobody_listed_are_read_as_work(text: str) -> None:
+    """THE INVERSION'S FLOOR ON THE VERB SIDE, pinned where it is this rule's
+    to pin: at the PREDICATE.
+
+    `pull together`, `throw together`, `work up`, `draw up`, `type up`,
+    `set up`, `mock up`, `sketch out`, `lay out`, `supply`, `hand over`,
+    `populate`, `outline`, `publish`, `zip up` -- fifteen ways of saying "make"
+    that the thirty-word list would have had to grow for one at a time, and
+    that are work here because the verb is read by what it cannot be.
+
+    AND WHAT THIS TEST DOES NOT CLAIM, measured 2026-09-28: none of the sixteen
+    produces a file in ANY of P0/PA/PC/PF, on origin/dev 2559fd1f36 either.
+    `_asks_you_to_build` only declines to VETO -- see the note above
+    `_asks_you_to_build`, all three call sites use it that way -- and the file
+    still needs the CREATE vocabulary, where none of these sixteen verbs
+    appears. That is a second, pre-existing open end, on the silent side, and
+    it belongs to whoever owns `_STRICT_CREATE_VERBS`; it is named in this
+    round's commit message under left_open and is NOT closed here."""
+    assert I._asks_you_to_build(text) is True, text
+    assert I.decide(text, **PC).wants_file is False, (
+        "if this now makes a file, the create vocabulary grew too -- move the "
+        "phrasing into _VERB_ROWS with its measured dev columns")
 
 
 def test_the_structural_rule_and_not_the_enumeration_carries_these() -> None:
     """WHAT MAKES THIS A RULE AND NOT A LIST.
 
-    Ten of the eighteen gated phrasings above are decided by
-    `_asks_you_to_build` reading `to <build verb> <deliverable>`, with no
-    availability noun and no feasibility adjective consulted. Measured today:
-    deleting the availability alternative from `_REQUEST_OF_YOU_RE` entirely
-    moves 0 of 920 probe rows, 0 of `HELD_OUT_STILL_A_FILE`, 0 of these 18, 0
-    of the 686 labelled items and 0 of the 77 authored chart requests --
-    that constant no longer decides anything a build infinitive covers."""
-    assert len(_INFINITIVE_CARRIED) >= 10, _INFINITIVE_CARRIED
-    for text in _INFINITIVE_CARRIED:
+    Most of the gated phrasings above are decided by `_asks_you_to_build`
+    reading `to <verb> <deliverable>`, with no availability noun, no
+    feasibility adjective, no build-verb list and no opener list consulted.
+    Measured 2026-09-27: deleting the availability alternative from
+    `_REQUEST_OF_YOU_RE` entirely moves 0 of `HELD_OUT_STILL_A_FILE`, 0 of the
+    686 labelled items and 0 of the 77 authored chart requests.
+
+    `_INFINITIVE_CARRIED` is computed INSIDE the test on purpose. It used to be
+    a module-level comprehension over `I._BUILD_INFINITIVE_RE`, which meant
+    that reverting the fix took this whole W1-W5 guard file dark at COLLECTION
+    -- "AttributeError: module app.artifacts.intent has no attribute
+    _BUILD_INFINITIVE_RE", zero assertions run -- instead of failing the one
+    section that owns the rule (QA, 2026-09-28)."""
+    carried = [t for t in _INDIRECT_GATE if I._BUILD_INFINITIVE_RE.search(t.lower())]
+    assert len(carried) >= 40, carried
+    for text in carried:
         assert I._asks_you_to_build(text.lower()) is True, text
 
 
-def test_the_two_indirect_request_enumerations_are_frozen() -> None:
-    """THE TRIPWIRE, and the only reason the two enumerations are still here.
+def test_the_indirect_request_enumerations_are_frozen() -> None:
+    """THE TRIPWIRE, and the only reason the remaining enumerations are here.
 
-    W2c widened these two lists for seven phrasings and QA found five more the
-    same day; W2d's answer is that the class is open-ended, so the lists stop
-    growing and `HELD_OUT_INDIRECT_REQUESTS` grows instead. If you are here
-    because a phrasing was reported lost: add the phrasing to that list, make
-    `_asks_you_to_build` cover it, and leave these two alone. If a word really
-    must be added -- because the shape carries no infinitive, which is the
-    only case that justifies it -- add the phrasing to the held-out list in
-    the same commit and re-pin the string here."""
+    W2c widened two lists for seven phrasings and QA found five more the same
+    day; W2d froze those two and enumerated thirty build VERBS instead, and QA
+    defeated that the next day with twelve more. The answer is that none of
+    these classes can be finished, so the lists stop growing and
+    `HELD_OUT_INDIRECT_REQUESTS`, `NOT_ENUMERATED_VERBS` and their `_EITHER`
+    twins grow instead. If you are here because a phrasing was reported lost:
+    add the phrasing to a held-out list, make `_asks_you_to_build` cover it,
+    and leave these alone.
+
+    The one list that IS allowed to grow is `_NON_WORK_INFINITIVE_VERBS`,
+    because a word missing from THAT one is a spurious card and not a missing
+    file -- which is the whole inversion."""
     assert I._CAPACITY_NOUNS == (
         r"(?:bandwidth|time|capacity|capabilit(?:y|ies)|abilit(?:y|ies)|resources?|room|cycles|"
         r"headroom|energy)")
     assert r"(?:possible|feasible|doable)" in I._REQUEST_OF_YOU_RE.pattern
+    # And the build-verb enumeration is GONE, not merely unused: the name must
+    # not come back, because its failure direction is a silently missing file.
+    assert not hasattr(I, "_BUILD_INFINITIVE_VERBS"), (
+        "the build-verb enumeration is back; the verb is read by what it cannot be")
+    assert not hasattr(I, "_WRAPPER_SUBJECT_RE"), (
+        "the 25-opener list is back; the wrapper is read by whether it addresses you")
+
+
+#: `(text, is a request)` for the INVERSION itself: a verb nobody has ever
+#: listed still asks for the file, and a verb of ACCESS still does not,
+#: whatever the wrapper. The first four verbs are invented.
+ANY_VERB_IS_WORK = [
+    ("do you have a moment to frobnicate a deck?", True),
+    ("do you have a moment to zhuzh up a one-pager?", True),
+    ("is it viable to splork this into a spreadsheet?", True),
+    ("do you have a moment to gubbins the numbers into a tracker?", True),
+    ("do you have a moment to put this in a spreadsheet?", True),
+    ("do you have a moment to collate this into a report?", True),
+    ("do you have a moment to convert this to excel?", True),
+    # ...and the verbs that cannot be work, in the same wrappers.
+    ("do you have a moment to review the deck?", False),
+    ("do you have a moment to read the report?", False),
+    ("is it viable to delete the tracker?", False),
+    ("do you have a moment to discuss the deck?", False),
+    ("do you have a moment to think about the deck?", False),
+    ("is it viable to compare the two decks?", False),
+    # ...and a word that is not a verb at all cannot be one.
+    ("is it relevant to a deck?", False),
+    ("is it close to the deck?", False),
+    # ...and an -ly adverb is not the verb, but `supply` is not an adverb.
+    ("do you have the bandwidth to really review my pdf?", False),
+    ("do you have a moment to quickly review the deck?", False),
+    ("do you have a moment to supply a deck?", True),
+    ("do you have a moment to quickly knock up a deck?", True),
+]
+
+
+#: A verb of work with NO deliverable is not a request. Both halves are
+#: required, and this is the half that keeps the inverted verb test from
+#: reading every infinitive in the language as an order.
+NO_DELIVERABLE_NO_REQUEST = [
+    "do you have a moment to tabulate the numbers?",
+    "do you have a moment to chart the numbers?",
+    "do you have a moment to look at this?",
+    "do you have a moment to make it clearer?",
+    "do you have a moment to help me with this?",
+]
+
+
+@pytest.mark.parametrize("text", NO_DELIVERABLE_NO_REQUEST, ids=[t[:52] for t in NO_DELIVERABLE_NO_REQUEST])
+def test_a_build_verb_with_no_deliverable_is_not_a_request(text: str) -> None:
+    """THE OTHER HALF OF THE RULE, and the reason inverting the verb list does
+    not read every infinitive as an order: `_BUILD_INFINITIVE_RE` needs a
+    DELIVERABLE NOUN as well. "the numbers" is not one, so "do you have a
+    moment to tabulate the numbers?" is no-request here and on origin/dev
+    2559fd1f36 (measured 2026-09-28) -- and "to tabulate this into a SHEET?" is
+    a file on both, which is the difference the noun makes."""
+    assert I._asks_you_to_build(text) is False, text
+
+
+@pytest.mark.parametrize("verb", [v for v in I._NON_WORK_VERB_WORDS if "?" not in v and "\\" not in v],
+                         ids=[v for v in I._NON_WORK_VERB_WORDS if "?" not in v and "\\" not in v])
+@pytest.mark.parametrize("wrapper", [
+    "do you have a moment to {v} a deck?",
+    "is it viable to {v} this into a spreadsheet?",
+    "have you got time to {v} the report?",
+])
+def test_every_non_work_verb_is_still_a_question(verb: str, wrapper: str) -> None:
+    """THE LIST IS WALKED, which is the only check that catches a word put on it
+    by mistake (QA, 2026-09-28).
+
+    `_NON_WORK_VERB_WORDS` is the one enumeration this rule still reads, and a
+    word wrongly ON it is a LOST file -- silent, and the failure the whole
+    inversion exists to avoid. Three words were caught this way on the day the
+    list was written, by sweeping 130 verbs x 3 wrappers x 4 contexts against
+    origin/dev: `walk` ("to walk me through this in a DECK" is a file on
+    origin/dev under PA, PC and PF), `scan` and `drop` ("to scan / drop this
+    into a spreadsheet"). All three were taken off.
+
+    So anything added here has to survive this test in all three wrappers,
+    which is a real constraint: it means the word can have no production sense
+    at all. The remaining losses that sweep found are the QUESTION guard doing
+    its job -- "is it viable to REVIEW this into a spreadsheet?" is a file on
+    origin/dev, and it is not English anyone types."""
+    text = wrapper.format(v=verb.replace("-?", ""))
+    assert I._asks_you_to_build(text) is False, text
+
+
+@pytest.mark.parametrize("text,is_request", ANY_VERB_IS_WORK, ids=[t[:52] for t, _r in ANY_VERB_IS_WORK])
+def test_any_verb_is_work_unless_it_cannot_be(text: str, is_request: bool) -> None:
+    """THE INVERSION, pinned at the predicate.
+
+    W2d read `to <build verb>` off a thirty-word list and QA defeated it with
+    `put`, `collate`, `extract`, `organise`, `package` and `translate` on the
+    day it was written. So the verb is read by what it CANNOT be. An invented
+    verb asks for the file; `review`, `read`, `delete`, `discuss`, `think` and
+    `compare` do not, and neither does a determiner."""
+    assert I._asks_you_to_build(text) is is_request, text
 
 
 #: THE OTHER SIDE OF THE SAME RULE, and the list that IS enumerated now.
@@ -766,10 +999,17 @@ _QUOTED_ASK = ("\n\n> From: priya@client.example\n"
                "> Ravi, please make a deck of this before Friday.")
 
 
-@pytest.mark.parametrize("rows", [5, 40, 120, 400, 10_000])
-def test_a_quoted_third_party_imperative_is_read_as_a_request_at_every_size(rows: int) -> None:
+def test_a_quoted_third_party_imperative_is_read_the_same_at_every_size() -> None:
     """THE DISCLOSED COST OF W3, MEASURED AND ACCEPTED -- see the decision
     note above this test.
+
+    THE ASSERTION IS THAT THE FIVE VERDICTS AGREE, not that they are `create`.
+    This test used to hard-code `create`/`create`, which pinned the accepted
+    DEFECT rather than the property it says it is for: the day the attribution
+    model lands it would have gone red beside the strict xfail below, and
+    unlike the xfail its docstring did not say to delete it (QA, 2026-09-28).
+    Written this way it survives that fix and still fails if the verdict ever
+    starts depending on the size of the paste again, which is what W3 was for.
 
     Measured 2026-09-27 on origin/dev 2559fd1f36 and here, `decide()` rules
     only, P0, `_pasted_rows(n)` then `_QUOTED_ASK`:
@@ -789,9 +1029,14 @@ def test_a_quoted_third_party_imperative_is_read_as_a_request_at_every_size(rows
     rescued by an accident. What this test asserts is the property W3 was
     for: the verdict no longer depends on the size of the paste. The
     origin/dev column is the measurement above, recorded, not re-derived."""
-    text = _pasted_rows(rows) + _QUOTED_ASK
-    got = I.decide(text, **P0)
-    assert got.action == "create" and got.rule == "create", (rows, got.action, got.rule)
+    verdicts = {}
+    for rows in (5, 40, 120, 400, 10_000):
+        got = I.decide(_pasted_rows(rows) + _QUOTED_ASK, **P0)
+        verdicts[rows] = (got.action, got.rule)
+    assert len(set(verdicts.values())) == 1, verdicts
+    # ...and the one thing that must not change silently: whether a file is
+    # produced at all. Recorded as the measurement, so a change is a decision.
+    assert all(v == ("create", "create") for v in verdicts.values()), verdicts
 
 
 @pytest.mark.xfail(strict=True, reason=(
@@ -828,6 +1073,102 @@ def test_the_indirect_request_rule_cannot_be_ARMED_from_the_tail(tail: str) -> N
     text = _pasted_rows(400) + "\n\n> From: priya@client.example\n" + tail
     got = I.decide(text, **P0)
     assert got.wants_file is False, (tail, got.action, got.rule)
+
+
+#: Quoted asks, at the paste sizes where `_decide_window` does NOT truncate.
+_QUOTED_TAILS = [
+    "> Ravi, can you make a deck of this for the Friday review?",
+    "> Ravi, do you have the bandwidth to make a deck of this?",
+    "> Ravi, is it viable to make a deck of this?",
+    "> Ravi, when you get a chance, do you have a moment to make a deck?",
+    "> Ravi, do you have a moment to put this in a spreadsheet?",
+]
+
+
+@pytest.mark.parametrize("rows", [1, 5, 40, 119, 400])
+@pytest.mark.parametrize("tail", _QUOTED_TAILS, ids=[t[8:44] for t in _QUOTED_TAILS])
+def test_the_indirect_rule_is_never_armed_from_a_quote_at_any_paste_size(rows: int, tail: str) -> None:
+    """THE HOLE THE TEST ABOVE LEAVES, and the reason the wrapper still has a
+    word bound at all (QA, 2026-09-28).
+
+    The test above uses 400 rows only, where `_decide_window` truncates and
+    joins the halves with " . " -- so a `.` sits between the start of the
+    window and the quote and no wrapper can cross it, whatever its length. At
+    1, 5, 40 and 119 rows there is NO truncation and no injected `.`, and the
+    only things between position 0 and the quoted ask are the paste itself
+    (five words a row against `_WRAPPER_WORD_BOUND`) and the `.` inside the
+    quoted From: address. That is the bound this round widened from eight words
+    to sixteen, so it is asserted at the sizes where it is the only bound
+    there is."""
+    text = _pasted_rows(rows) + "\n\n> From: priya@client.example\n" + tail
+    assert I._asks_you_to_build(I._clean(text).lower()) is False, (rows, tail)
+    assert I._asks_you_to_build(text.lower()) is False, (rows, tail)
+
+
+@pytest.mark.parametrize("rows", [1, 5, 40, 119, 400])
+@pytest.mark.parametrize("tail", _QUOTED_TAILS[:4], ids=[t[8:44] for t in _QUOTED_TAILS[:4]])
+def test_a_quoted_QUESTION_still_makes_no_file(rows: int, tail: str) -> None:
+    """The four QUESTION-shaped quotes reach no file at any size, here and on
+    the integration head; on origin/dev they are none/ambiguous up to 40 rows
+    and none/no-request beyond, which is the truncation W3 removed."""
+    text = _pasted_rows(rows) + "\n\n> From: priya@client.example\n" + tail
+    got = I.decide(text, **P0)
+    assert got.wants_file is False, (rows, tail, got.action, got.rule)
+
+
+@pytest.mark.parametrize("rows", [1, 5, 40, 119, 400])
+def test_W3s_EXPOSURE_IS_WIDER_THAN_THE_IMPERATIVE_and_this_records_it(rows: int) -> None:
+    """A CORRECTION TO W3's OWN DECISION NOTE, measured 2026-09-28.
+
+    That note says "only the quoted IMPERATIVE reaches a file; every quoted
+    QUESTION form is none/ambiguous here". It is not: a quoted "> Ravi, do you
+    have a moment to PUT THIS IN A SPREADSHEET?" is create/create at 1, 5 and
+    40 rows on ORIGIN/DEV as well (ff1a5d7c, whose app/artifacts/ is identical
+    to the 2559fd1f36 W2d measured against), and at 119 and 400 rows here and
+    on the integration head, because `put this in a spreadsheet` reads as a
+    positional create on its own -- `_asks_you_to_build` returns False for it
+    at every size (asserted above), so this is not the indirect-request rule
+    and not this round's doing. It is the same pre-existing gap the xfail above
+    owns: the rules have no model of quotation. Recorded as a test so the note
+    cannot be quoted as a bound it does not hold."""
+    text = _pasted_rows(rows) + "\n\n> From: priya@client.example\n" + _QUOTED_TAILS[4]
+    got = I.decide(text, **P0)
+    assert got.action == "create", (rows, got.action, got.rule)
+
+
+def test_the_indirect_request_predicate_is_linear_in_the_turn() -> None:
+    """THE COST OF DROPPING THE WORD COUNTS, measured rather than argued.
+
+    `_asks_you_to_build` now tries EVERY candidate infinitive instead of the
+    leftmost one, and its deliverable gap ends at a clause-break word rather
+    than at four words. Both could have been quadratic. They are not: the gap
+    is lazy over disjoint character classes, so there is one way to split a run
+    of words and nothing to backtrack over, and `_WRAPPER_WORD_BOUND` stops the
+    candidate loop after at most a handful of iterations.
+
+    Measured 2026-09-28 on this box, median of 5, load 10.1-14.6:
+    `to make a ` x500/1000/2000/4000/8000 -> 3.74 / 7.50 / 15.02 / 30.11 /
+    60.38 ms, i.e. 16x the text for 16.1x the time; and the shape where every
+    candidate matches and none is addressed ("i forgot " + "to make a deck " xN)
+    -> 0.05 / 0.06 / 0.08 / 0.13 / 0.23 ms. Through `decide()`, which windows
+    the text to 4,000 collapsed characters first, both are 35-38 ms at 80 kB
+    and 120 kB. This test asserts the RATIO, which is what a quadratic blow-up
+    would break, with a wide tolerance so it does not go red on a loaded box."""
+    import statistics
+    import time
+    small = "do you have a moment " + "to make a " * 500 + "deck?"
+    large = "do you have a moment " + "to make a " * 4000 + "deck?"
+
+    def med(text: str) -> float:
+        runs = []
+        for _ in range(5):
+            t0 = time.perf_counter()
+            I._asks_you_to_build(text)
+            runs.append(time.perf_counter() - t0)
+        return statistics.median(runs)
+
+    ratio = med(large) / max(med(small), 1e-6)
+    assert ratio < 24, ratio          # linear is 8x; quadratic would be 64x
 
 
 # ----------------------------------------------------------------------- W4 --
