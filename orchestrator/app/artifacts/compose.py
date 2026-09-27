@@ -747,13 +747,29 @@ TOKENS_PER_SLIDE = 600
 #: which is the distinction this whole function now follows.
 TOKENS_PER_TYPED_ROW = 60
 
-#: Tokens to leave for reasoning when the whole-file call has thinking on.
-#: THINKING_BUDGET_MODE is `off` in the container, so `json_completion`'s
-#: unbounded branch sends `max(max_tokens, MAX_OUTPUT_TOKENS)` and the
-#: reasoning block draws from the SAME pool as the answer. An under-sized
-#: pool comes back as EMPTY content with finish_reason 'length' — the
-#: documented failure that silently turned Think into Fast plus two minutes
-#: of thinking. A derived answer budget must therefore be sized for both.
+#: Tokens to leave for reasoning when the whole-file call has thinking on,
+#: because the reasoning block draws from the SAME pool as the answer and an
+#: under-sized pool comes back as EMPTY content with finish_reason 'length'.
+#:
+#: INERT ON TODAY'S CONFIGURATION, and the shape is what keeps it honest
+#: rather than the number (QA r1, still_open 6). `json_completion` adds the
+#: floor only inside `if thinking:` (llm.py, `_thinking_allowed`), so:
+#:
+#:   * at FAST thinking is off, nothing is added here and the derived number
+#:     IS what goes on the wire — measured today, a 15,000-word document asks
+#:     45,360 and the request carries 45,360;
+#:   * at THINK and MAX, THINKING_BUDGET_MODE is `off`, so the unbounded
+#:     branch sends `max(max_tokens, MAX_OUTPUT_TOKENS)` = at least 65,536
+#:     whatever this constant makes compose ask. Measured today: compose asks
+#:     34,000 with no size named and 61,360 for 15,000 words, and BOTH go on
+#:     the wire as 65,536.
+#:
+#: So this cannot have caused - and cannot now prevent - an empty
+#: finish_reason='length' on this deployment: the pool was already 65,536.
+#: It is kept because it is the correct shape for `budgeted` mode, where
+#: `thinking_budget(effort)` returns a number and the caller's value is what
+#: is sent. Every lifted cap in this module must therefore be verified AT
+#: FAST; at Think and Max the constant never binds.
 THINKING_HEADROOM_TOKENS = 16_000
 
 #: Tokens a second one call may assume when deciding whether a size can be
@@ -1312,12 +1328,29 @@ def _ordinal_run_items(text: str) -> List[str]:
     if len(run) < _ORDINAL_RUN_MIN:
         return []
     items: List[str] = []
+    ran_over = False
     for i, m in enumerate(run):
         end = run[i + 1].start() if i + 1 < len(run) else len(text)
         chunk = text[m.end():end]
         stop = _ITEM_END_RE.search(chunk)
         items.append(chunk[: stop.start()] if stop else chunk)
-    return _trim_runover(items)
+        if i + 1 == len(run):
+            ran_over = stop is not None and stop.group(0) != "\n"
+    # ONLY A LAST ITEM THAT ACTUALLY RAN OVER IS TRIMMED (QA r1, new_defect 1).
+    # `_trim_runover` exists for the ONE-LINE list, whose last item has no
+    # newline to end it. A newline-delimited list's last item is already
+    # correctly bounded by `_ITEM_END_RE`, so applying the instruction-verb cut
+    # and the sibling backstop to it could only destroy a real heading:
+    # measured before this fix, 'Requirements:\n1. Executive Summary\n2. Data
+    # Model\n3. Acceptable Use Policy' lost its last heading to 'Acceptable',
+    # and 'How We Use Data' -> 'How We', 'Output Format Standards' -> 'Output',
+    # 'Conclusions And Recommendations' -> 'Conclusions'. That is a wrong
+    # heading in the section-writer prompt AND a false "requested sections not
+    # found in the document" warning - the very defect this trim was added to
+    # remove. `_ITEM_END_RE` is [.;:!?\n], so the terminator says which case
+    # this is: a newline ended the item properly, anything else (or running to
+    # the end of the block with no terminator at all) is the one-line shape.
+    return _trim_runover(items) if ran_over else items
 
 
 def _list_items(block: str) -> List[str]:
@@ -1328,11 +1361,14 @@ def _list_items(block: str) -> List[str]:
     owner's fifteen), not two."""
     marks = list(_LIST_MARKER_RE.finditer(block))
     items: List[str] = []
+    ran_over = False
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(block)
         chunk = block[m.end():end]
         stop = _ITEM_END_RE.search(chunk)
         items.append(chunk[: stop.start()] if stop else chunk)
+        if i + 1 == len(marks):
+            ran_over = stop is not None and stop.group(0) != "\n"
     # THE LAST ITEM OF A ONE-LINE LIST RUNS INTO THE SENTENCE AFTER IT.
     # Measured on the owner's own instruction of 2026-09-22, which is a
     # single line with no newline anywhere in it: "15. Conclusion Use
@@ -1346,7 +1382,22 @@ def _list_items(block: str) -> List[str]:
     # fix needs no new guess: trim the last item back to the longest of its
     # siblings' word counts. A list of two-word headings does not have a
     # six-word last one; where the siblings really are long, nothing is cut.
-    return _trim_runover(items)
+    #
+    # ONLY A LAST ITEM THAT ACTUALLY RAN OVER IS TRIMMED (QA r1, new_defect 1).
+    # `_trim_runover` exists for the ONE-LINE list, whose last item has no
+    # newline to end it. A newline-delimited list's last item is already
+    # correctly bounded by `_ITEM_END_RE`, so applying the instruction-verb cut
+    # and the sibling backstop to it could only destroy a real heading:
+    # measured before this fix, 'Requirements:\n1. Executive Summary\n2. Data
+    # Model\n3. Acceptable Use Policy' lost its last heading to 'Acceptable',
+    # and 'How We Use Data' -> 'How We', 'Output Format Standards' -> 'Output',
+    # 'Conclusions And Recommendations' -> 'Conclusions'. That is a wrong
+    # heading in the section-writer prompt AND a false "requested sections not
+    # found in the document" warning - the very defect this trim was added to
+    # remove. `_ITEM_END_RE` is [.;:!?\n], so the terminator says which case
+    # this is: a newline ended the item properly, anything else (or running to
+    # the end of the block with no terminator at all) is the one-line shape.
+    return _trim_runover(items) if ran_over else items
 
 
 def requested_sections(instruction: str) -> List[str]:
@@ -1874,8 +1925,27 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # honest answer where a bound genuinely cannot be removed. A workbook is
     # also told how many rows that leaves, because "fewer rows than you asked
     # for" is the part the person can act on.
-    want_tokens, ceiling_tokens = one_call_shortfall(
-        req.kind, req.effort, target, thinking=budget.thinking, budget=budget)
+    # A DOCUMENT THAT WILL BE WRITTEN IN MANY CALLS IS NOT TOLD IT NEEDS ONE
+    # (QA r1, new_defect 3). This note used to be computed BEFORE the
+    # `sectioned` decision below, so a document delivered in sixteen scoped
+    # calls carried "the size asked for needs about 60,000 tokens in one model
+    # call and this job's time allows about 45,360" immediately above the true
+    # note "written as a long document ... written in 15 sections over 16 model
+    # calls". The two sentences contradict each other, and at this container's
+    # stage budget EVERY document over about 11,340 words (45,360 /
+    # TOKENS_PER_WORD) got it. Measured through a real compose() of "Write a
+    # 15,000 word report on our platform" at Fast: the document came back in
+    # full, 15,031 words over 16 calls, under a warning saying it could not.
+    # The one-call ceiling is a real bound for a deck or a workbook, which
+    # genuinely have no per-part write path, and those still get the note.
+    # `sectioned` below reads this same value, so the gate and the warning
+    # cannot drift apart.
+    will_be_sectioned = (req.kind == "document" and req.operation != "edit"
+                         and target.words > SECTIONED_WRITER_WORDS)
+    want_tokens, ceiling_tokens = (
+        (0, 0) if will_be_sectioned
+        else one_call_shortfall(req.kind, req.effort, target,
+                                thinking=budget.thinking, budget=budget))
     if want_tokens:
         note = (f"the size asked for needs about {want_tokens:,} tokens in one model call and this job's "
                 f"time allows about {ceiling_tokens:,}")
@@ -1909,8 +1979,7 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     #
     # `compose_sectioned` runs its own outline call unconditionally, so it
     # does NOT need `budget.outline_pass` to work at Fast.
-    sectioned = (req.kind == "document" and req.operation != "edit"
-                 and target.words > SECTIONED_WRITER_WORDS)
+    sectioned = will_be_sectioned
     ran_out_of_time = False
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
@@ -2863,9 +2932,14 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             + f"Draft (JSON):\n{body_json_for_prompt(spec)}"
         )},
     ]
-    # 2,000 was the number that returned EMPTY with finish_reason 'length' when
-    # thinking is on and reasoning shares the pool (the documented json_completion
-    # trap). The verdict itself is small; the reasoning in front of it is not.
+    # The verdict itself is small; the reasoning in front of it is not, and
+    # both draw from one pool when thinking is on. NOTE (QA r1): 2,000 cannot
+    # have been the number that returned EMPTY with finish_reason 'length' on
+    # THIS deployment - this call only passes `thinking=budget.thinking`, which
+    # is true at Think and Max, and there `json_completion` floors the request
+    # at MAX_OUTPUT_TOKENS = 65,536 whatever is asked here. See
+    # THINKING_HEADROOM_TOKENS. The addition is kept for `budgeted` mode, where
+    # the caller's number is the one that is sent.
     return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking,
                        max_tokens=2_000 + (THINKING_HEADROOM_TOKENS if budget.thinking else 0),
                        effort=req.effort)

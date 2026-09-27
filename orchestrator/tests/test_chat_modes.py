@@ -177,18 +177,47 @@ def test_stream_chat_events_yields_reasoning_then_tokens(monkeypatch):
     )
 
 
-def test_stream_chat_events_fast_model_no_effort_line(monkeypatch):
+def test_a_legacy_model_value_does_not_veto_the_chosen_effort(monkeypatch):
+    """The legacy `model: "fast"` names WEIGHTS, and it selects none.
+
+    Until 2026-09-27 this test asserted the opposite — that model_choice
+    "fast" switched the reasoning pass off whatever effort said — which is
+    the entanglement itself written down. `llm.resolve_model_choice` serves
+    the SAME weights for every choice (asserted just above), so a stored
+    preference no control can clear may not quietly spend the level the
+    person picked. Effort decides; the choice only still resolves the model id.
+    """
     events, rec = _collect_events(
         monkeypatch, [(None, "hey")], model_choice="fast", effort="high"
     )
     assert events == [("token", "hey")]
-    # One model serves every picker choice (CONTRACT v2 §1); "fast" only
-    # switches the reasoning pass off.
+    # One model serves every picker choice (CONTRACT v2 §1).
     assert rec["base_url"] == settings.openai_base_url
     kwargs = rec["chat_kwargs"]
     assert kwargs["model"] == settings.llm_model
     assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
-    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}, (
+        "effort=high (alias -> think) must reason, whatever `model` says"
+    )
+    # ...and Fast is still Fast on the same legacy value: it is the EFFORT
+    # that switches the reasoning pass, at every choice.
+    _, rec_fast = _collect_events(
+        monkeypatch, [(None, "hey")], model_choice="fast", effort="fast"
+    )
+    assert rec_fast["chat_kwargs"]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+
+
+def test_thinking_is_decided_by_effort_at_every_model_choice():
+    """GUARD (2026-09-27). `wants_thinking` used to return False for every
+    choice but "smart". Revert that line and this fails on "fast"."""
+    for choice in (*llm.MODEL_CHOICES, "", "gpt-4o", "router"):
+        assert llm.wants_thinking(choice, "max") is True, choice
+        assert llm.wants_thinking(choice, "think") is True, choice
+        assert llm.wants_thinking(choice, "extra_high") is True, choice  # alias
+        assert llm.wants_thinking(choice, "fast") is False, choice
+        assert llm.wants_thinking(choice, "low") is False, choice  # alias
 
 
 def test_the_answer_stream_refuses_any_engine_but_the_main_model(monkeypatch):

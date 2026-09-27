@@ -343,24 +343,35 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
     if m:
         candidates.append((COMPREHENSIVE_WORDS, m.group(0)))
 
+    # A DOCUMENT TARGET CARRIES NO ROWS AND NO SHEETS (QA r1, new_defect 2).
+    # `_ROWS_RE`/`_SHEETS_RE` match "rows", "records", "entries" and "line
+    # items" in ANY request, and `compose._shape_tokens` reads rows and sheets
+    # for `kind == "workbook"` ONLY, so on a document they can buy nothing and
+    # can only do harm: carrying them here made `explicit` True for an
+    # ordinary phrase, and `compose.target_for` derives a document's sections
+    # target `if req.kind == "document" and not target.explicit`. Measured
+    # before the fix: "Write a technical report about the 20 rows in the
+    # table" plus fifteen numbered sections came back words=0, explicit=True,
+    # sectioned=False - the four-page one-call document this branch exists to
+    # end - against words=6000, explicit=False, sectioned=True on origin/dev.
+    # Keeping them off a document target also keeps `__bool__` honest: a
+    # document that named no document size stays falsy.
     if candidates:
         words, phrase = max(candidates)
-        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, rows=rows, sheets=sheets,
-                            phrase=phrase, explicit=True)
+        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, phrase=phrase, explicit=True)
 
     if _SHRINK_RE.search(text):
         # The person asked for less. No growth target, and the data-report
         # floor below must not put one back.
-        return LengthTarget(words=0, slides=slides, rows=rows, sheets=sheets,
+        return LengthTarget(words=0, slides=slides,
                             phrase=_SHRINK_RE.search(text).group(0), explicit=True)
 
     if has_data and is_data_report(text):
-        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides, rows=rows, sheets=sheets,
+        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides,
                             phrase="a report over data", explicit=False)
 
-    return LengthTarget(words=0, slides=slides, rows=rows, sheets=sheets,
-                        phrase=slide_phrase or shape_phrase,
-                        explicit=bool(slide_phrase or shape_phrase))
+    return LengthTarget(words=0, slides=slides, phrase=slide_phrase,
+                        explicit=bool(slide_phrase))
 
 
 # ------------------------------------------------------------- the shapes --

@@ -639,6 +639,25 @@ _SYNTHETIC_CONV_KEY_RE = _re.compile(r"^u\d+-")
 _TEST_CASE_ID_RE = _re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
+#: The smallest share a single stored item is ever cut to. 48,000 characters
+#: is what the UPLOAD turn itself passes for one document, so a conversation
+#: with many uploads never drops below the budget one upload got.
+MIN_SHARED_CONTEXT_CHARS = 48_000
+
+
+def _shared_context_chars(items: int) -> int:
+    """`document_context_chars` SHARED across `items`, not spent on each.
+
+    The setting names how much stored material one prompt may carry, and both
+    follow-up blocks in /chat apply it per item over a list with no LIMIT
+    (`db.get_documents`, and the stored-page read beside it). Dividing is what
+    makes the name true; the floor keeps a ten-upload conversation from
+    starving every one of them.
+    """
+    return max(MIN_SHARED_CONTEXT_CHARS,
+               settings.document_context_chars // max(1, int(items or 1)))
+
+
 def _checked_session_id(value: str) -> str:
     """The session label of a bare call, validated like the conversation id it
     becomes half of (F034, 2026-09-12).
@@ -5202,8 +5221,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             # was answered from 6,000 characters of itself on
                             # every follow-up. One derived budget now, the same
                             # one an uploaded document gets.
+                            # ONE BUDGET SHARED, NOT ONE BUDGET EACH (QA r1,
+                            # new_defect 6). `document_context_chars` is a
+                            # PER-ITEM budget on a list with no LIMIT, so N
+                            # shared pages in one conversation multiplied it by
+                            # N. Same shape and same fix as the stored-document
+                            # block below.
                             + select_relevant(d["text"], request.text,
-                                              settings.document_context_chars)
+                                              _shared_context_chars(len(stored)))
                             for i, d in enumerate(stored, start=1)
                         ]
                         history = [
@@ -5242,8 +5267,23 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         # Postgres, against 48,000 on the upload turn. Same
                         # document, same question, 6x apart. Now the one
                         # derived budget both turns share.
+                        # ONE BUDGET SHARED, NOT ONE BUDGET EACH (QA r1,
+                        # new_defect 6). This budget is applied PER STORED
+                        # DOCUMENT and `db.get_documents` runs "SELECT
+                        # filename, text, total_pages FROM documents WHERE
+                        # conversation_id = %s ORDER BY id" with no LIMIT, so
+                        # nothing named a total. At this container's
+                        # MAIN_MODEL_MAX_LEN=1000000 the per-item budget is
+                        # 300,000 characters: ten uploads in one conversation
+                        # is up to 3,000,000 characters of document text in one
+                        # prompt, where the inline 8000 it replaced gave
+                        # 80,000. `context.fit_request` stops that 400ing, but
+                        # its trim is generic, so WHICH document loses text is
+                        # arbitrary and may be the relevant one. The branch's
+                        # own judge already solved this shape in the same diff
+                        # (core/best_of.py, `_JUDGE_PROMPT_CHARS // len(usable)`).
                         + "\n" + _doc_select(d["text"], request.text,
-                                             settings.document_context_chars)
+                                             _shared_context_chars(len(stored_docs)))
                         for i, d in enumerate(stored_docs, start=1)
                     ]
                     history = [

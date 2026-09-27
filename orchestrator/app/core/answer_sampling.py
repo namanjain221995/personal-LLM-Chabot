@@ -567,6 +567,35 @@ def _material_spans(text: str) -> List[Tuple[int, int]]:
     return spans
 
 
+def _asks_for_written_output(text: str, _compose) -> bool:
+    """True when this turn's own shape says a derived word FLOOR belongs on it.
+
+    Two signals, both of them code that already exists and is already trusted
+    for exactly this kind of decision - nothing new is guessed here:
+
+      * `shape_for` is not `prose`. It is the classifier the Fast length caps
+        are built on, and it reads "write", "report", "document", "detailed",
+        "essay", "complete", a code fence, a table or a diagram. A request
+        that asks for a WRITTEN piece may be sized by the sections it names.
+      * or the items are laid out as a table of contents: under a list
+        heading - "Requirements:", "Sections:", "Structure:", "Contents:",
+        "Outline:", "Include:" (`compose._LIST_HEADING_RE`) - or each at the
+        head of its own line (`compose._LIST_LINE_RE`). A person who types a
+        table of contents has described a document whatever verb they used.
+
+    A one-line comparison QUESTION has neither, which is the whole point: it
+    is prose, and its enumeration is the thing being compared rather than the
+    shape of an answer. Pure string work over text `requested_shape_words`
+    has already bounded.
+    """
+    if shape_for(text) != SHAPE_PROSE:
+        return True
+    if _compose._LIST_HEADING_RE.search(text):
+        return True
+    lines = [ln for ln in text.split("\n") if _compose._LIST_LINE_RE.match(ln)]
+    return len(lines) >= _compose.DERIVED_TARGET_MIN_SECTIONS
+
+
 def requested_shape_words(message: str) -> Optional[int]:
     """The length a request implies by naming its own SHAPE, or None.
 
@@ -600,6 +629,33 @@ def requested_shape_words(message: str) -> Optional[int]:
     try:
         names = _compose.requested_sections(text)
         if len(names) < _compose.DERIVED_TARGET_MIN_SECTIONS:
+            return None
+        # A TABLE OF CONTENTS, NOT ANY THREE NUMBERED WORDS (QA r1,
+        # new_defect 4). On the ARTIFACT path a derived target only ever sizes
+        # a file the person already asked for. On the CHAT path it decides how
+        # long an ordinary answer must be, and with
+        # DERIVED_TARGET_MIN_SECTIONS at 3 any inline enumeration in a
+        # question reached it. Measured before this fix: "Which should I use:
+        # 1. Postgres 2. MySQL 3. SQLite" -> 1,200 words, "What is the
+        # difference between 1. a container 2. a VM 3. a unikernel" -> 1,200,
+        # "Rank these for me: 1. speed 2. cost 3. accuracy" -> 1,200. 1,200 is
+        # over continuation._TARGET_MIN_WORDS = 800, so the target was live:
+        # `_length_plan` told the FIRST call to plan three sections of 400
+        # words and to reach 1,200 before it ended, and a short normal stop
+        # bought another segment. A one-line comparison question got a
+        # three-section essay, and its size was decided by
+        # `length.WORDS_PER_SECTION` x 3 - a constant deciding the size, which
+        # is the very thing this branch exists to end. The outline prompt it
+        # added says "nothing is padded to meet a number".
+        #
+        # So the turn has to ASK FOR WRITTEN OUTPUT - `shape_for` is not
+        # `prose`, the same classifier the Fast caps already use - or lay its
+        # items out as a table of contents. The owner's own request satisfies
+        # both ("Create a professional technical report", and
+        # "Requirements:"). A one-line comparison question satisfies neither,
+        # and gets no floor. This narrows the CHAT path only;
+        # `compose.target_for` is untouched.
+        if not _asks_for_written_output(text, _compose):
             return None
         if _length.shrink_asked(text):
             # "a SHORT summary with these three parts" asked for less.
