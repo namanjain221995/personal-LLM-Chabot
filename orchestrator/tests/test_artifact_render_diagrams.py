@@ -360,7 +360,22 @@ def test_the_role_vocabulary_is_the_shared_one():
 
     from app.engines import DIAGRAM_INSTRUCTION
 
-    assert ", ".join(D.DIAGRAM_ROLES[:-1]) + " or " + D.DIAGRAM_ROLES[-1] in DIAGRAM_INSTRUCTION
+    # RETARGETED 2026-09-27, and made stronger rather than weaker. This used to
+    # match one literal rendering of the list, `", ".join(...[:-1]) + " or " +
+    # ...[-1]`, which is fix/document-vocabulary-r2's sentence and not the
+    # rule: fix/diagram-roles offers the same four names each with a gloss of
+    # what the node IS, so the literal broke while the vocabulary was intact.
+    # What matters is that every name is offered INSIDE the closed-list
+    # sentence -- `role in DIAGRAM_INSTRUCTION` alone is vacuous, because
+    # "model", "service", "store" and "external" are ordinary English words and
+    # that check passed on a prompt offering no roles at all.
+    opens, closes = "CLOSED list, written with `:::`:", "Tag only the nodes"
+    assert opens in DIAGRAM_INSTRUCTION, opens
+    offered = DIAGRAM_INSTRUCTION.split(opens, 1)[1]
+    assert closes in offered, closes
+    offered = offered.split(closes, 1)[0]
+    for role in D.DIAGRAM_ROLES:
+        assert role in offered, f"{role} is not offered in the prompt's closed list"
 
 
 def test_the_four_role_colours_separate_under_all_pairs():

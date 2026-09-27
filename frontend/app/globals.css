@@ -132,9 +132,23 @@
 
      The FILL is a tint that carries the hue (ΔL* 8.0-10.6 from the #1e1e1e
      card, against the 0.88 the old config actually painted); the STROKE
-     carries the separation at 3.21-4.58:1, which is why the contrast floor
-     sits on the stroke. Ink on fill is 10.5-11.4:1. Worst all-pairs CVD
-     stroke separation 42.9 (protan/deutan/tritan).
+     carries the separation, which is why the contrast floor sits on the
+     stroke. Ink on fill is 10.5-11.4:1. Worst all-pairs CVD stroke separation
+     42.9 (protan/deutan/tritan).
+
+     A stroke is a BOUNDARY, so it has to clear 3:1 on BOTH sides of itself —
+     against the card outside the box AND against the role's own fill inside
+     it. Only the card side was ever measured. Re-measured 2026-09-27 with the
+     dataviz skill's validator: `service` #2f6fb2 sat at 2.58:1 on its own
+     #22303f fill, i.e. a blue box whose outline was barely a line, and
+     `model` #8b5cf6 at 3.05:1 was on the boundary. #3783be lifts service to
+     3.30:1 on its fill and 4.09:1 on the card; brightening service alone
+     pulled the blue into the violet (all-pairs normal-vision ΔE 14.9, under
+     the 15 floor), so `model` moves with it to #9b6bff — which also raises
+     the worst all-pairs CVD separation from 8.2 to 9.9 and the normal-vision
+     floor from 16.5 to 17.2. Measured over the four dark roles: ink on its
+     own fill 10.50-11.38:1, stroke on its own fill 3.27-3.65:1, stroke on the
+     card 4.09-4.72:1.
 
      Three of the four hues are already repo tokens: --ts-engine-report blue,
      --ts-engine-sql amber, --ts-engine-agent violet. Deliberately no teal and
@@ -142,11 +156,11 @@
      and teal is the Records engine identity. */
   --ts-diagram-ink: #ececec;
   --ts-diagram-service-fill: #22303f;
-  --ts-diagram-service-stroke: #2f6fb2;
+  --ts-diagram-service-stroke: #3783be;
   --ts-diagram-store-fill: #40321e;
   --ts-diagram-store-stroke: #b7791f;
   --ts-diagram-model-fill: #362c4e;
-  --ts-diagram-model-stroke: #8b5cf6;
+  --ts-diagram-model-stroke: #9b6bff;
   --ts-diagram-external-fill: #462934;
   --ts-diagram-external-stroke: #d55181;
 
@@ -332,12 +346,19 @@ html.light,
      mermaid's stock theme on our grey card (#ececff nodes at 1.06:1,
      mediumpurple borders, highlighter-yellow clusters) and nobody reported it
      because the owner works in dark mode. Ink on fill 13.6-14.9:1, stroke on
-     the #f4f4f4 card 3.31-6.46:1, worst CVD stroke separation 50.4. */
+     the #f4f4f4 card 3.69-6.46:1, worst CVD stroke separation 50.4.
+
+     Same boundary rule as the dark block above, same omission: re-measured
+     2026-09-27, `store` #b7791f was 2.79:1 against its own #eae0d2 fill — an
+     amber outline on an amber tint. #ac721d takes it to 3.11:1 on the fill
+     and 3.69:1 on the card and leaves every other check passing (all-pairs
+     CVD 8.8, normal-vision floor 16.0). Measured over the four light roles:
+     stroke on its own fill 3.11-4.97:1. */
   --ts-diagram-ink: #0d0d0d;
   --ts-diagram-service-fill: #d4dfe9;
   --ts-diagram-service-stroke: #2f6fb2;
   --ts-diagram-store-fill: #eae0d2;
-  --ts-diagram-store-stroke: #b7791f;
+  --ts-diagram-store-stroke: #ac721d;
   --ts-diagram-model-fill: #ded3f0;
   --ts-diagram-model-stroke: #6d28d9;
   --ts-diagram-external-fill: #e7d6d9;

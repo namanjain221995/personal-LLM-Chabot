@@ -32,6 +32,36 @@ and gained the four role names, paid for by shortening prose elsewhere.
 Raising either ceiling is a decision about Fast latency in nine engines and
 needs the measurement that justifies it, not a bump.
 
+THE CEILING WAS RAISED ONCE, 2026-09-27, AND THIS IS THE MEASUREMENT. Two
+branches shipped the same `:::role` fix: this one, which held 1,082
+characters, and fix/diagram-roles, which took the string to 1,848 and alone
+carried the rule that a role OUTSIDE `flowchart`/`graph` is a parse error
+that loses the whole diagram. Resolving the conflict toward that wording
+naively gives 1,822 characters, which this guard correctly failed. The
+integration keeps that ban and re-compresses everything around it:
+
+    origin/dev (1f80aa3, 4164bb8)          1,082 characters, 1,086 bytes
+    fix/document-vocabulary-r2             1,082 characters, 1,088 bytes
+    fix/diagram-roles                      1,848 characters, 1,858 bytes
+    naive merge (diagram-roles' wording)   1,822 characters, 1,832 bytes
+    integ/diagram-group, measured today    1,549 characters, 1,553 bytes
+
+So the raise is +467 characters and +467 UTF-8 bytes over origin/dev (both
+deltas are the same number by coincidence: the string gained two em dashes
+and lost one, so its non-ASCII count did not move), and −273 characters
+against the naive merge. What could NOT be removed, counted: 71
+characters are the seven diagram-type names the ban has to name to be
+concrete (sequenceDiagram, erDiagram, pie, journey, timeline, mindmap,
+gitGraph), and the remainder is the role list with its glosses, the "do not
+invent a name" rule and the two accessibility rules. The ceilings below are
+the measured numbers, and a `<=` plus an exact pin, so the next character
+still has to be argued for.
+
+THE TOKEN COST OF THAT RAISE IS NOT MEASURED AND IS NOT GUESSED HERE. It
+needs the pinned engine's tokenizer over the twelve golden fixtures, off the
+hot path; the release forbade touching the GPUs, so it is open work. The
+character and byte numbers above are first-hand; no token number is stated.
+
 WHAT MUST NOT CHANGE, and why each one is here rather than in a comment:
 the one-diagram cap and the "ordinary questions get none" rule are what stop
 an eager model decorating every answer; the ~20-node cap is legibility; the
@@ -47,8 +77,14 @@ from pathlib import Path
 from app.engines import DIAGRAM_INSTRUCTION
 
 #: `len()` of a `str` is CHARACTERS. Measured on origin/dev at 593af55,
-#: before feat/document-vocabulary: 1,082.
+#: before feat/document-vocabulary: 1,082. Kept as the HISTORICAL floor, so
+#: the raise below is always read against the string this branch started from.
 PRE_EDIT_CHARS = 1082
+
+#: What the reconciled wording actually measures, imported on this tree on
+#: 2026-09-27. It is the CEILING: every rule from both branches is in the
+#: string at this size, so anything larger is a rule nobody has argued for.
+CHARS_CEILING = 1549
 
 #: The same string in UTF-8, measured on the same commit: 1,086. This edit
 #: takes it to 1,088 — two bytes, one extra em dash — so the ceiling is the
@@ -56,13 +92,18 @@ PRE_EDIT_CHARS = 1082
 #: because the earlier claim was "1,082 bytes before and after", which was
 #: the character count wearing a byte's name.
 PRE_EDIT_UTF8_BYTES = 1086
-UTF8_BYTES_CEILING = 1088
+
+#: The same string in UTF-8 on this tree: 1,553. Two em dashes (U+2014, three
+#: UTF-8 bytes each) account for the four bytes over the character count.
+UTF8_BYTES_CEILING = 1553
 
 
 def test_the_instruction_did_not_grow_in_characters():
-    assert len(DIAGRAM_INSTRUCTION) <= PRE_EDIT_CHARS, (
-        f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} characters, {len(DIAGRAM_INSTRUCTION) - PRE_EDIT_CHARS} "
-        "more than before; it reaches eleven chat call sites at every effort"
+    assert len(DIAGRAM_INSTRUCTION) <= CHARS_CEILING, (
+        f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} characters, {len(DIAGRAM_INSTRUCTION) - CHARS_CEILING} "
+        f"over the {CHARS_CEILING} measured for the reconciled wording "
+        f"({len(DIAGRAM_INSTRUCTION) - PRE_EDIT_CHARS} over origin/dev's {PRE_EDIT_CHARS}); "
+        "it reaches eleven chat call sites at every effort"
     )
 
 
@@ -73,13 +114,19 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     asserted away."""
     chars = len(DIAGRAM_INSTRUCTION)
     encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
-    assert chars == PRE_EDIT_CHARS
+    assert chars == CHARS_CEILING, (
+        f"{chars} characters; the reconciled wording measured {CHARS_CEILING} on 2026-09-27"
+    )
     assert encoded <= UTF8_BYTES_CEILING, (
         f"DIAGRAM_INSTRUCTION is {encoded} UTF-8 bytes, over the {UTF8_BYTES_CEILING} measured for this edit"
     )
     assert encoded > chars, "this string carries non-ASCII, so the two units are not interchangeable"
-    assert encoded - PRE_EDIT_UTF8_BYTES == 2, (
-        f"the roles edit was measured at +2 UTF-8 bytes over origin/dev; it is now "
+    assert encoded - chars == 4, (
+        f"the reconciled wording spends two em dashes, so UTF-8 is 4 bytes over the "
+        f"character count; it is now {encoded - chars}"
+    )
+    assert encoded - PRE_EDIT_UTF8_BYTES == 467, (
+        f"the raise over origin/dev was measured at +467 UTF-8 bytes; it is now "
         f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this."
     )
 
@@ -124,7 +171,15 @@ def test_the_role_clause_teaches_the_closed_list_and_bans_colour():
         assert role in DIAGRAM_INSTRUCTION, role
     for banned in ("colour", "hex", "style", "classDef", "linkStyle", "click", "%%{init}%%"):
         assert banned in DIAGRAM_INSTRUCTION, banned
-    assert "NEVER a colour" in DIAGRAM_INSTRUCTION
+    # RETARGETED 2026-09-27, same rule, surviving words. This branch wrote the
+    # ban as "NEVER a colour"; fix/diagram-roles wrote it as "never write a
+    # colour of your own (no hex, no rgb(), no colour name)", which is the
+    # wording the integration kept, and which tests/test_diagram_role_vocabulary.py
+    # also pins. Carrying both phrases would have cost ~50 characters of Fast
+    # prefill to satisfy two tests of ONE rule, so the phrase moved and the
+    # rule did not.
+    assert "never write a colour of your own" in DIAGRAM_INSTRUCTION
+    assert "no rgb()" in DIAGRAM_INSTRUCTION
 
 
 def test_the_composer_does_not_import_it():
