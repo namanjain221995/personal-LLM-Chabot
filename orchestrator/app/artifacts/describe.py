@@ -27,12 +27,17 @@ mail — all of it came from a person's own message or an upload, and none of
 it is an instruction. Two defences, the same two the dataset engine uses
 (engines/dataset.py):
 
-  * a deterministic answer quotes every name in a Markdown code span, with
-    newlines, control characters and backticks removed (`_q`), so nothing
-    read back out of a spec can restructure the reply that carries it;
+  * every name is cleaned once, when a Description is built: newlines,
+    control characters, backticks and RUNS of angle brackets are removed
+    (`_plain`, `_q`). So nothing read back out of a spec can restructure
+    what carries it — not a newline that adds a bullet, not a backtick that
+    closes a code span early, and not a "<<<END FILE CONTENTS>>>" written
+    into a sheet name, which fits in 31 characters and would otherwise end
+    the digest's fence;
+  * a deterministic answer then quotes every name in a Markdown code span;
   * the digest handed to the model for a JUDGEMENT question is wrapped in
     DATA_START/DATA_END with SECURITY_NOTE, worded as dataset.py words its
-    profile block.
+    profile block, and carries STRUCTURE only — never cell values.
 
 FACT OR JUDGEMENT. "What columns does it have?" has one right answer and
 code gives it, so it cannot be wrong and costs no model call. "Is this any
@@ -78,13 +83,22 @@ NAME_CHARS = 80
 LIST_LIMIT = 12
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+#: A run of two or more angle brackets, collapsed to one. DATA_START and
+#: DATA_END are "<<<...>>>" and a sheet name may be 31 characters, so
+#: "<<<END FILE CONTENTS>>>" FITS IN ONE: a person could name a sheet that and
+#: close the fence early, putting the rest of the digest outside it. Ordinary
+#: angle brackets in a header ("<50", "a > b") are left alone.
+_FENCE_RE = re.compile(r"(<{2,}|>{2,})")
 
 
 def _q(value: Any, limit: int = NAME_CHARS) -> str:
     """One name out of a spec, as an inline code span. Whitespace collapsed,
-    control characters and backticks removed, cut at `limit`: a name is
-    DATA, and a reply that carries it must not be restructurable by it."""
+    control characters, backticks and bracket runs removed, cut at `limit`: a
+    name is DATA, and a reply that carries it must not be restructurable by
+    it — not by a newline that adds a bullet, not by a backtick that closes
+    the span early, and not by a delimiter that ends the digest's fence."""
     text = _CONTROL_RE.sub(" ", str(value if value is not None else ""))
+    text = _FENCE_RE.sub(lambda m: m.group(0)[0], text)
     text = " ".join(text.replace("`", "").split())
     if len(text) > limit:
         text = text[: limit - 1].rstrip() + "…"
@@ -92,11 +106,13 @@ def _q(value: Any, limit: int = NAME_CHARS) -> str:
 
 
 def _plain(value: Any, limit: int = NAME_CHARS) -> str:
-    """The same cleaning without the code span — for the fenced digest,
-    where the delimiters and SECURITY_NOTE do the fencing."""
+    """The same cleaning without the code span — for the fenced digest, where
+    the delimiters and SECURITY_NOTE do the fencing. Applied when a
+    Description is BUILT, so a value is cleaned once and every reader of it
+    (the reply, the digest) gets the cleaned form."""
     text = _CONTROL_RE.sub(" ", str(value if value is not None else ""))
-    text = " ".join(text.split())
-    return text[:limit]
+    text = _FENCE_RE.sub(lambda m: m.group(0)[0], text)
+    return " ".join(text.split())[:limit]
 
 
 def _names(values: Sequence[Any], *, limit: int = LIST_LIMIT) -> str:
@@ -327,14 +343,20 @@ def _field(entry: Any, name: str) -> Any:
     return getattr(entry, name, None)
 
 
-def of_row(row: Any, *, version: int = 0) -> Description:
+def of_row(row: Any, *, version: int = 0, files: Optional[Sequence[Any]] = None) -> Description:
     """What an artifact ROW alone says — the fallback when spec.json cannot
     be read. `spec_read=False`, so every sentence built from it says the
-    contents are not known instead of implying the file is empty."""
+    contents are not known instead of implying the file is empty.
+
+    `files` is passed when the caller already has THAT version's file list:
+    the row's `current` holds the newest version's files, and reporting them
+    under an older version's number would state a size and a page count that
+    belong to a different file."""
     if not isinstance(row, dict):
-        return Description(spec_read=False)
+        return Description(spec_read=False, files=_file_facts(files or ()))
     current = row.get("current") if isinstance(row.get("current"), dict) else {}
-    files = current.get("files") or row.get("files") or ()
+    if files is None:
+        files = current.get("files") or row.get("files") or ()
     return Description(
         kind=str(row.get("kind") or ""),
         title=_plain(row.get("title") or "", 120),
@@ -391,8 +413,14 @@ _JUDGEMENT_RE = re.compile(
 
 
 def topics_in(question: str) -> Tuple[str, ...]:
-    """Which fact topics the words ask about. Empty means "the whole thing"
-    — "what does this have?" names nothing and gets the overview."""
+    """Which fact topics the words ask about. Empty means "the whole thing" —
+    "what does this have?" names nothing and gets the overview.
+
+    THE PATTERNS ARE ENGLISH, AND THAT IS WHY EMPTY MEANS EVERYTHING. A
+    question in Hindi, Gujarati or Arabic matches no topic and therefore gets
+    the FULL read-back — every sheet, its columns, its rows and the formats —
+    rather than nothing. Narrowing is the optimisation here; completeness is
+    the default, because the complaint was being told nothing."""
     head = (question or "")[:QUESTION_CHARS]
     return tuple(name for name, rx in _TOPIC_RES if rx.search(head))
 

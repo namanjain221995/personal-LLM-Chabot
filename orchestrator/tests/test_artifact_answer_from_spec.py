@@ -226,6 +226,17 @@ def test_a_question_about_version_one_reads_that_versions_spec(owner, monkeypatc
     assert len(_versions(owner, artifact_id)) == 1
 
 
+def test_a_question_about_a_version_that_is_not_there_says_so(owner, monkeypatch):
+    """Answering from the CURRENT version's files under the asked-for version
+    number would state a size and a page count for a file that never existed."""
+    _, first = _create(owner, monkeypatch)
+    artifact_id = _meta(first)["artifacts"][0]["artifact_id"]
+    answer, events = _ask(owner, "what columns did version 9 have?", version=9)
+    assert answer == "**TechSara AI Engineering Workflow Tracker** has no version 9 — it is at v1."
+    assert "artifacts" not in _meta(events)
+    assert len(_versions(owner, artifact_id)) == 1
+
+
 # --------------------------------------------------------------- judgement --
 
 

@@ -1002,6 +1002,14 @@ def _answer_metric(outcome: str, *, kind: str = "") -> None:
         pass
 
 
+def _clean_title(row: dict) -> str:
+    """An artifact's title, cleaned for a sentence. A title comes from the
+    person's own words by way of the spec, so it is DATA: newlines, control
+    characters and bracket runs are removed (artifacts/describe) before it is
+    put inside `**...**`, where a newline would break the emphasis."""
+    return _describe.of_row(row).title or "that file"
+
+
 def _which_one(candidates: Sequence[dict], intent: ArtifactIntent) -> str:
     """The clarifying question for a QUESTION turn. pick_artifact's own words
     ("Which one should I change") promise a change; this turn changes
@@ -1010,7 +1018,7 @@ def _which_one(candidates: Sequence[dict], intent: ArtifactIntent) -> str:
     named = [c for c in candidates if hint and hint in str(c.get("title") or "").lower()]
     if len(named) < 2:
         return ""
-    return "Which one do you mean — " + " or ".join(f"**{c.get('title')}**" for c in named[:2]) + "?"
+    return "Which one do you mean — " + " or ".join(f"**{_clean_title(c)}**" for c in named[:2]) + "?"
 
 
 async def _model_answer_from_digest(question: str, answer: Any, emit: Emit, *, effort: str) -> str:
@@ -1099,7 +1107,7 @@ async def answer_about_artifact(
             # CURRENT version's files under the asked-for version number
             # would state a falsehood about a file that does not exist.
             highest = int(current.get("version") or parent_row.get("current_version") or 1)
-            line = f"**{parent_row.get('title')}** has no version {version} — it is at v{highest}."
+            line = f"**{_clean_title(parent_row)}** has no version {version} — it is at v{highest}."
             await emit("token", {"text": line})
             await emit("meta", {"route": "artifact", "effort": effort})
             _answer_metric("no_such_version", kind=str(parent_row.get("kind") or ""))
@@ -1110,7 +1118,7 @@ async def answer_about_artifact(
         # The spec could not be read (a version from a newer build, a file
         # gone from the volume). The row still knows the formats; saying
         # "it has no sheets" would be a fabricated fact.
-        desc = _describe.of_row(parent_row, version=version)
+        desc = _describe.of_row(parent_row, version=version, files=files)
         _answer_metric("spec_unreadable", kind=str(parent_row.get("kind") or ""))
     answer = _describe.answer(question, desc)
     line = answer.text
