@@ -596,6 +596,23 @@ def cmd_verdict(args: argparse.Namespace) -> int:
 
     ok, lines = build_verdict(records)
 
+    # A **NOT PROVED** bullet about THIS JOB's own subject cannot sit under the
+    # header "SAFE AND REVERSIBLE". The major is the fact the whole rehearsal
+    # turns on -- a rehearsal on the wrong PostgreSQL major proves nothing, which
+    # is why the script reads it off the running server and refuses a declaration
+    # that disagrees -- so a run that did not record it has not earned the green,
+    # and before this it got one anyway with exit 0.
+    #
+    # Not the same as the closing "NOT PROVED here, by construction" line, which
+    # is permanent and names something deliberately OUT of scope (the deploy).
+    # This one names something IN scope that went missing.
+    #
+    # Not reachable from the pipeline as it stands - the step always passes
+    # --pg-major "$PG_MAJOR" - which is exactly why it was worth closing: the
+    # next person to edit that step is the one who finds out.
+    if not args.pg_major:
+        ok = False
+
     head = args.head or "<unknown>"
     previous = args.previous or "<unresolved>"
     body = [

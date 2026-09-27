@@ -732,9 +732,17 @@ jobs:
   #      orchestrator-cpu/cuda against that image's pinned dependency set. A
   #      migration that needs a psycopg feature the image's version does not
   #      have is green in `schema` and red on the box. So this job BUILDS a
-  #      real orchestrator-cpu image and runs the migrations out of it -- the
-  #      same thing scripts/deploy-db-rehearsal.sh does before a deploy, which
-  #      is why this job runs that script rather than a CI-only copy of it.
+  #      real orchestrator-cpu image and runs the migrations out of it, through
+  #      scripts/deploy-db-rehearsal.sh rather than a CI-only copy of it -- the
+  #      same script a release runs BY HAND before a deploy.
+  #
+  #      By hand, and not automatically: no deploy path invokes it. `grep -rn
+  #      rehears scripts/deploy.sh scripts/deploy-preflight.sh
+  #      scripts/deploy-rollback.sh techsara` is empty, and this workflow is its
+  #      only caller in the repository. An earlier version of this comment said
+  #      "the same thing it does before a deploy", which reads as if the box
+  #      already ran it on every deploy. It does not, and that is the reason
+  #      this job exists: CI is where it actually runs.
   #
   #   2. AN IMAGE ROLLBACK DOES NOT ROLL THE DATABASE BACK. There are no down
   #      migrations and `init_schema` skips versions already recorded in
@@ -899,6 +907,14 @@ jobs:
       # turns "no baseline image, so the upgrade phase was skipped" into a
       # failure: on a laptop that skip is honest, in a gate it is a green that
       # means nothing.
+      #
+      # --require-upgrade is BELT AND BRACES here and cannot fire as this step is
+      # written: --from-image is always "$OLD_IMAGE", which is a literal tag and
+      # never empty, so the script always has a baseline to look at. It is kept
+      # for the edit that drops --from-image, and because it is not the only lock
+      # on that door -- `_incomplete_reason` in db_rehearsal.py refuses a `pass`
+      # record whose `from_image` or `from_version` is empty, which catches the
+      # same thing from the verdict's side even if this flag is ever removed.
       - name: FRESH and UPGRADE, out of the real images
         run: |
           set -euo pipefail

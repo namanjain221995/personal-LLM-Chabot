@@ -146,7 +146,56 @@ if [ -n "$DECLARED_MAJOR" ]; then
 fi
 
 DEPLOYED_MAJOR="$(dr_deployed_pg_major || true)"
-PG_IMAGE="$(dr_container_image_id "$(dr_container_for postgres)")"
+PG_CONTAINER="$(dr_container_for postgres)"
+PG_IMAGE="$(dr_container_image_id "$PG_CONTAINER")"
+
+# HALF A STACK IS NOT NO STACK.
+#
+# The two reads above fail INDEPENDENTLY, and for different reasons: the major
+# needs the container to be RUNNING (`docker exec "$pg" postgres --version`),
+# the image id only needs it to EXIST (`docker inspect`). The stack-present test
+# below is an AND over both, so either read failing on its own demoted a box
+# that HAS a stack to "no stack here" and let --expect-major/--pg-image decide -
+# which is the override the header two screens up says is refused. Measured with
+# a stub whose `exec` fails and whose `inspect` succeeds, plus `--pg-image
+# postgres@sha256:not-the-box --expect-major 11`:
+#
+#   no deployed stack here; rehearsing against the DECLARED PostgreSQL: major 11
+#
+# DR_REHEARSAL_EXPECT_MAJOR and DR_REHEARSAL_PG_IMAGE make that settable from
+# the environment, so a flag is not the only way in.
+#
+# NOT probed with a third `docker` call. An existence probe would have to be
+# `docker inspect` again - the same command whose failure is being diagnosed -
+# so it returns "no container here" in precisely the case it is needed for, and
+# an unreadable image id would still be blamed on the version. The read that
+# SUCCEEDED is the evidence instead, and it is conclusive either way round: a
+# major that came back means something answered `postgres --version` INSIDE that
+# container, and an image id that came back means `docker inspect` found it. So
+# exactly one of these two can be empty while a stack is demonstrably present,
+# and each message names the half that failed because the other half proves it.
+#
+# Both empty is the genuine no-stack case and falls through untouched, which is
+# what a hosted runner needs: the pipeline's PostgreSQL is a `services:`
+# container under a name GitHub chooses, never $PG_CONTAINER, so neither refusal
+# can fire there and the declared-identity path is unaffected.
+#
+# The second refusal also restores a diagnostic this script used to have. Before
+# the declared path existed an unreadable image id said so; the rewrite replaced
+# it with "cannot read the PostgreSQL version", which on the box is the most
+# confusing sentence this script can print when the version read perfectly well.
+if [ -n "$DEPLOYED_MAJOR" ] && [ -z "$PG_IMAGE" ]; then
+  dr_die "cannot read the image id of the production postgres container $PG_CONTAINER.
+ Its PostgreSQL version read fine (major $DEPLOYED_MAJOR), so the container is here and
+ running - it is the IMAGE ID that could not be read, not the version. Refusing to treat
+ a box with a stack as a bare runner."
+fi
+if [ -z "$DEPLOYED_MAJOR" ] && [ -n "$PG_IMAGE" ]; then
+  dr_die "the postgres container $PG_CONTAINER exists on this box - its image id reads as
+ $PG_IMAGE - but its PostgreSQL version could not be read; reading that needs the
+ container RUNNING. Refusing to treat a box with a stack as a bare runner, and refusing
+ to rehearse against an unknown major."
+fi
 
 if [ -n "$DEPLOYED_MAJOR" ] && [ -n "$PG_IMAGE" ]; then
   # There is a stack here. It is the truth, and a declaration that disagrees
