@@ -123,8 +123,12 @@ name: Production watch
 
 # NO `schedule:` HERE. It arrives in its own one-line commit once the
 # textfile exporter exists on the box -- see "SHIPPED IN TWO COMMITS" above.
-# `grep -n schedule .github/workflows/production-watch.yml` returning nothing
-# is the acceptance test for the no-mail promise at merge time.
+#
+# The acceptance test for the no-mail promise at merge time is
+# `test_commit_one_carries_no_schedule_trigger`, which parses this file and
+# asserts `schedule` is not among its TRIGGERS. A plain `grep -n schedule` over
+# this file is NOT that test and never was: the word appears a dozen times in
+# the prose above, explaining why the cron is not here yet.
 on:
   workflow_dispatch:
 
@@ -187,9 +191,19 @@ jobs:
       # flock, and a held lock means `deferred`, exit 0, nothing touched.
       #
       # Every line it prints goes through its own scrubber first -- this
-      # repository is PUBLIC and a scheduled run's log is public with it, so
-      # no address, URL, hostname or ssh target ever reaches the output. It
-      # opens no environment file of its own; the probes it imports own that.
+      # repository is PUBLIC and a scheduled run's log is public with it. What
+      # the scrubber actually covers, and all it covers: IPv4, IPv6 including
+      # the compressed form this cluster's tailnet uses, anything carrying
+      # `://`, any path naming generated.env, and the VALUES of environment
+      # variables whose key ends in IP/ADDR/ADDRESS/HOST/SSH/IFNAME.
+      #
+      # A bare hostname, a tailnet DNS name and a `user@host` ssh target are
+      # NOT matched by those patterns. Nothing feeds them today -- probe detail
+      # comes from box_probes.py, which sanitizes the same classes -- so this is
+      # a limit to respect when writing a probe, not a live leak: report ROLES
+      # and interface CLASSES, and never put a name in `detail`.
+      #
+      # It opens no environment file of its own; the probes it imports own that.
       - name: Is the box still true?
         run: |
           set -euo pipefail
