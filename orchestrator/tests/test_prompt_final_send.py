@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import struct
 from types import SimpleNamespace
 
@@ -361,11 +362,19 @@ def test_a_message_the_bound_does_not_cover_takes_the_slow_path(label):
 
 
 def test_the_tool_argument_shape_really_does_defeat_both_counters():
-    """The premise of the test above, asserted rather than assumed."""
+    """The premise of the test above, asserted rather than assumed.
+
+    The EXACT figures are pinned because `_may_send_first`'s condition-5
+    docstring quotes them: it said "bounds at 55" until 2026-09-28, which is
+    not what the code returns for this shape.
+    """
     msgs = SHAPES["tool-call-with-null-content"]
-    assert context.estimate_messages(msgs) < 100
-    assert context.upper_bound_messages(msgs) < 100
     assert len(_TOOL_ARGS) > 100_000
+    assert context.upper_bound_messages(msgs) == 26, (
+        "the figure condition 5's docstring quotes has moved; update the docstring too"
+    )
+    assert context.estimate_messages(msgs) == 12
+    assert context.upper_bound_messages(msgs[1:]) == 16, "the single-message form, for the record"
 
 
 # ---------------------------------------------------------------------------
@@ -750,48 +759,6 @@ def test_a_stop_on_the_settlement_closes_the_stream_and_releases_its_lane():
     assert left == [], "a Stop on the settlement left the count running"
 
 
-def test_a_streamed_dispatch_that_never_happened_drops_its_count():
-    """`_open_stream` refused, so nothing was sent: the count owes nothing and
-    must be dropped by the `finally`, not left for a settlement that will
-    never come."""
-
-    async def run(monkeypatch):
-        gate = asyncio.Event()
-        counter = _Tokenize(count=40, window=1_000_000, gate=gate)
-        engine = _StreamEngine(raise_on_send=RuntimeError("engine down"))
-        _tokenize(monkeypatch, counter)
-        _engine(monkeypatch, engine)
-        _warm(counter)
-
-        async def drive():
-            async for _ in llm.stream_chat_events(
-                messages=[{"role": "user", "content": "hello"}], max_tokens=8000
-            ):
-                pass
-
-        # BOUNDED on purpose. A tree that blocks on its /tokenize before the
-        # dispatch never reaches the engine at all, so it must FAIL here with
-        # a timeout rather than hang the suite.
-        with pytest.raises(BaseException) as refused:
-            await asyncio.wait_for(drive(), timeout=5.0)
-        assert isinstance(refused.value, RuntimeError) and not isinstance(
-            refused.value, asyncio.TimeoutError
-        ), "the request never reached the engine: it was still waiting for its /tokenize"
-        for _ in range(20):
-            await asyncio.sleep(0)
-        pending = context._pending_count.get()
-        left = _still_counting()
-        gate.set()
-        for _ in range(50):
-            await asyncio.sleep(0)
-        return pending, left
-
-    with pytest.MonkeyPatch.context() as mp:
-        pending, left = asyncio.run(run(mp))
-    assert pending is None, "a refused dispatch left a count owed to nobody"
-    assert left == [], "a refused dispatch left its count running"
-
-
 # ---------------------------------------------------------------------------
 # THE GUIDED-JSON DOWNGRADE (verification 2026-09-27)
 # ---------------------------------------------------------------------------
@@ -998,6 +965,9 @@ class _SizeStrictEngine:
         wanted = self.prompt_tokens + int(kwargs.get("max_tokens") or 0)
         if wanted > self.served_window:
             raise _size_refusal(self.served_window, wanted)
+        if kwargs.get("stream"):
+            # The streamed sites dispatch through the same engine.
+            return _StreamDouble()
         return SimpleNamespace(
             choices=[SimpleNamespace(
                 message=SimpleNamespace(content="ok", reasoning_content=None, tool_calls=None),
@@ -1007,8 +977,35 @@ class _SizeStrictEngine:
         )
 
 
-def test_a_send_first_request_refused_on_size_stops_vouching_for_the_window():
-    """The refusal must cost ONE turn, not every turn.
+
+
+async def _drive_dispatch_site(site: str, msgs, max_tokens: int = 8000):
+    """One turn through whichever entry point dispatches it."""
+    if site == "chat_completion":
+        return await llm.chat_completion(list(msgs), max_tokens=max_tokens)
+    if site == "stream_chat_completion":
+        async for _ in llm.stream_chat_completion(list(msgs), max_tokens=max_tokens):
+            pass
+        return None
+    if site == "stream_chat_events":
+        async for _ in llm.stream_chat_events(messages=list(msgs), max_tokens=max_tokens):
+            pass
+        return None
+    raise AssertionError(f"unknown dispatch site {site!r}")
+
+
+#: EVERY site that can dispatch a send-first request. `_settling` covers the
+#: non-streaming ones; the two streaming ones call
+#: `llm._withdraw_window_on_size_refusal` by hand, and until 2026-09-28 both of
+#: those calls could be deleted with this whole file still green (measured: 36
+#: passed with either one removed, while four consecutive turns went
+#: BadRequestError x4 — the exact defect the withdrawal exists to fix).
+_DISPATCH_SITES = ["chat_completion", "stream_chat_completion", "stream_chat_events"]
+
+
+@pytest.mark.parametrize("site", _DISPATCH_SITES)
+def test_a_send_first_request_refused_on_size_stops_vouching_for_the_window(site):
+    """The refusal must cost ONE turn, not every turn — at EVERY dispatch site.
 
     The engine came back serving 8,192 where a real count had once reported
     1,000,000. The first turn was sized send-first against the stale window
@@ -1017,6 +1014,14 @@ def test_a_send_first_request_refused_on_size_stops_vouching_for_the_window():
     refusal withdrew the mark. The /tokenize answer is held until after the
     refusal on purpose: that is the ordering in which the count cannot
     withdraw anything itself.
+
+    BOUNDED, and the gate is released in a `finally`. The r3 version awaited
+    the turn with the gate still held and released it only afterwards, so on
+    any tree where the request waits for its count the turn never finished and
+    the test HUNG instead of failing (measured 2026-09-28 with the fast path
+    forced off on this branch: `timeout -s KILL 90 pytest -k refused_on_size`
+    -> EXIT=137). A red test is worth a shard; a wedged one costs the 90-minute
+    CI ceiling.
     """
 
     async def run(monkeypatch):
@@ -1031,41 +1036,453 @@ def test_a_send_first_request_refused_on_size_stops_vouching_for_the_window():
 
         msgs = [{"role": "user", "content": "word " * 3000}]
         first = None
-        turn = asyncio.get_running_loop().create_task(
-            llm.chat_completion(list(msgs), max_tokens=8000)
-        )
-        for _ in range(200):
-            if engine.calls:
-                break
-            await asyncio.sleep(0)
-        sent_before_its_count = bool(engine.calls) and not gate.is_set()
+        turn = asyncio.get_running_loop().create_task(_drive_dispatch_site(site, msgs))
         try:
-            await turn
-        except BaseException as exc:  # noqa: BLE001 - the refusal is the point
-            first = type(exc).__name__
-        gate.set()
+            for _ in range(200):
+                if engine.calls:
+                    break
+                await asyncio.sleep(0)
+            sent_before_its_count = bool(engine.calls) and not gate.is_set()
+            try:
+                # `asyncio.timeout`, not `wait_for`: CI runs Python 3.11, where
+                # `wait_for` can swallow a cancellation delivered in the same
+                # pass and hang (it wedged PR #65's CI at 45 minutes).
+                async with asyncio.timeout(5.0):
+                    await turn
+            except asyncio.TimeoutError:
+                first = "TimeoutError (the turn waited for its count)"
+            except BaseException as exc:  # noqa: BLE001 - the refusal is the point
+                first = type(exc).__name__
+        finally:
+            gate.set()
+            if not turn.done():
+                turn.cancel()
+            with contextlib.suppress(BaseException):
+                await turn
         await asyncio.sleep(0)
         vouched_after_the_refusal = context.window_is_server_reported(MAIN_URL)
+        refusals = _counter("llm_send_first_refused_on_size_total")
 
         second = None
         try:
-            await llm.chat_completion(list(msgs), max_tokens=8000)
+            async with asyncio.timeout(5.0):
+                await _drive_dispatch_site(site, msgs)
             second = "served"
         except BaseException as exc:  # noqa: BLE001
             second = type(exc).__name__
         return (sent_before_its_count, first, vouched_after_the_refusal, second,
-                [c["max_tokens"] for c in engine.calls], len(_still_counting()))
+                [c["max_tokens"] for c in engine.calls], len(_still_counting()), refusals)
 
     with pytest.MonkeyPatch.context() as mp:
-        sent_first, first, vouched, second, max_tokens, counting = asyncio.run(run(mp))
+        sent_first, first, vouched, second, max_tokens, counting, refusals = asyncio.run(run(mp))
     assert sent_first, "the first turn waited for its count, so this proves nothing"
-    assert first == "BadRequestError", "the oversized request was not refused"
+    assert first == "BadRequestError", f"[{site}] the oversized request was not refused: {first}"
     assert vouched is False, (
-        "the endpoint still vouches for a window the engine refused a request against, "
-        "so every later turn is sized send-first against it and refused again"
+        f"[{site}] the endpoint still vouches for a window the engine refused a request "
+        "against, so every later turn is sized send-first against it and refused again"
     )
-    assert second == "served", "the turn after the refusal was refused too"
-    assert max_tokens[0] == 8000 and max_tokens[-1] == 2680, (
-        "the turn after the refusal was not sized from a fresh count"
+    assert second == "served", f"[{site}] the turn after the refusal was refused too: {second}"
+    assert max_tokens[0] >= 8000 and max_tokens[-1] == 2680, (
+        f"[{site}] the turn after the refusal was not sized from a fresh count: {max_tokens}"
     )
     assert counting == 0, "a count outlived the request that started it"
+    # The one new user-visible failure this change introduces is COUNTED. Until
+    # 2026-09-28 nothing recorded it: `context_window_changed_under_send_total`
+    # is incremented by `settle_pending_count`, i.e. only on a send that
+    # SUCCEEDED, so the shrink that cost nobody a turn was counted and the
+    # shrink that cost one was invisible in Prometheus and in the log.
+    assert refusals == 1.0, (
+        f"[{site}] a turn was refused because the window shrank under it and nothing counted it"
+    )
+
+
+def test_the_refused_turn_says_so_in_the_log(caplog):
+    """A refused turn that is only a counter is still hard to act on: the log
+    line names the endpoint and the engine's own message."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=5000, window=8_192, gate=asyncio.Event())
+        engine = _SizeStrictEngine(served_window=8_192, prompt_tokens=5000)
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        context._window_cache[MAIN_URL] = 1_000_000
+        getattr(context, "_window_from_server", set()).add(MAIN_URL)
+        with contextlib.suppress(BaseException):
+            async with asyncio.timeout(5.0):
+                await _drive_dispatch_site(
+                    "chat_completion", [{"role": "user", "content": "word " * 3000}]
+                )
+
+    with caplog.at_level("WARNING", logger="app.llm"):
+        with pytest.MonkeyPatch.context() as mp:
+            asyncio.run(run(mp))
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("refused this turn on size" in line and MAIN_URL in line for line in lines), lines
+
+
+def test_a_size_refusal_of_a_request_that_counted_first_keeps_the_window_mark():
+    """The narrowing to `has_pending_count` is the difference between one
+    endpoint user paying a round trip and ALL of them paying one after any
+    size refusal — a refusal of a request that counted first says nothing
+    about the window's provenance (a /v1 request, a continuation, a shape the
+    bound does not cover)."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=5000, window=1_000_000)
+        engine = _SizeStrictEngine(served_window=8_192, prompt_tokens=5000)
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+        # An image part: outside what the bound covers, so this turn COUNTS
+        # first — and the engine refuses it on size all the same.
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "what is this"},
+                                             _png_part(1024, 1024)]}]
+        refused = None
+        try:
+            async with asyncio.timeout(5.0):
+                await llm.chat_completion(msgs, max_tokens=8000)
+        except BaseException as exc:  # noqa: BLE001
+            refused = type(exc).__name__
+        return refused, context.window_is_server_reported(MAIN_URL), _counter(
+            "llm_send_first_refused_on_size_total")
+
+    with pytest.MonkeyPatch.context() as mp:
+        refused, vouched, refusals = asyncio.run(run(mp))
+    assert refused == "BadRequestError", "the count-first request was not refused on size"
+    assert vouched is True, (
+        "a size refusal of a request that COUNTED first withdrew the window mark, so every "
+        "later turn on this endpoint pays a round trip it did not have to"
+    )
+    assert refusals == 0.0, "a count-first refusal was counted as a send-first one"
+
+
+# ---------------------------------------------------------------------------
+# EVERY settlement site, not just the two that happened to be covered
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-09-28: removing `async with _settling(...)` from
+# `chat_with_tools`, from `router_chat_completion` or from
+# `chat_completion_with_reasoning` each left this file at 36 passed, although
+# each loses the exact count for `_measured`, `_last_count_exact` and the meter
+# at that entry point. (`chat_completion` went 3 failed / 33 passed and
+# `json_completion` 1 failed / 35 passed.) This parametrised test is the guard
+# for all five.
+
+
+_NON_STREAMING_SITES = ["chat_completion", "chat_completion_with_reasoning",
+                        "chat_with_tools", "json_completion", "router_chat_completion"]
+
+
+async def _drive_non_streaming(site: str, msgs):
+    if site == "chat_completion":
+        return await llm.chat_completion(list(msgs), max_tokens=8000)
+    if site == "chat_completion_with_reasoning":
+        return await llm.chat_completion_with_reasoning(list(msgs), max_tokens=8000)
+    if site == "chat_with_tools":
+        return await llm.chat_with_tools(list(msgs), tools=[{"type": "function", "function": {
+            "name": "decide", "parameters": {"type": "object"}}}], max_tokens=8000)
+    if site == "json_completion":
+        return await llm.json_completion(list(msgs), json_schema={"type": "object"},
+                                         max_tokens=800)
+    if site == "router_chat_completion":
+        return await llm.router_chat_completion(list(msgs), max_tokens=200)
+    raise AssertionError(f"unknown site {site!r}")
+
+
+@pytest.mark.parametrize("site", _NON_STREAMING_SITES)
+def test_every_non_streaming_entry_point_settles_its_count(site):
+    """One /tokenize per turn, and the count reaches `_measured` — at every
+    non-streaming entry point, not only the two whose other assertions
+    happened to fail without it."""
+    url = ROUTER_URL if site == "router_chat_completion" else MAIN_URL
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=4242, window=1_000_000)
+        engine = _Engine(base_url=url)
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        context._window_cache[url] = counter.window
+        getattr(context, "_window_from_server", set()).add(url)
+
+        await _drive_non_streaming(site, [{"role": "user", "content": "hello"}])
+        sized = engine.calls[-1]["messages"]
+        # Read in the SAME task the turn ran in: `_measured` is a ContextVar.
+        return (context.measured_prompt_tokens(sized, url), len(counter.calls),
+                context._last_count_exact.get(), _still_counting())
+
+    with pytest.MonkeyPatch.context() as mp:
+        measured, counts, exact, left = asyncio.run(run(mp))
+    assert measured == 4242, f"[{site}] the count never reached the meter"
+    assert exact is True, f"[{site}] the turn reports 'not measured' after settling"
+    assert counts == 1, f"[{site}] the prompt was counted {counts} times"
+    assert left == [], f"[{site}] the turn ended with its count still running"
+
+
+@pytest.mark.parametrize("site", ["stream_chat_completion", "stream_chat_events"])
+def test_a_streamed_dispatch_that_never_happened_drops_its_count(site):
+    """`_open_stream` refused, so nothing was sent: the count owes nothing and
+    must be dropped by the `finally`, not left for a settlement that will
+    never come. BOTH streaming sites: `stream_chat_completion`'s guard could
+    be deleted with this file green until 2026-09-28."""
+
+    async def run(monkeypatch):
+        gate = asyncio.Event()
+        counter = _Tokenize(count=40, window=1_000_000, gate=gate)
+        engine = _StreamEngine(raise_on_send=RuntimeError("engine down"))
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+
+        # BOUNDED on purpose. A tree that blocks on its /tokenize before the
+        # dispatch never reaches the engine at all, so it must FAIL here with
+        # a timeout rather than hang the suite.
+        with pytest.raises(BaseException) as refused:
+            async with asyncio.timeout(5.0):
+                await _drive_dispatch_site(site, [{"role": "user", "content": "hello"}])
+        assert isinstance(refused.value, RuntimeError) and not isinstance(
+            refused.value, asyncio.TimeoutError
+        ), "the request never reached the engine: it was still waiting for its /tokenize"
+        for _ in range(20):
+            await asyncio.sleep(0)
+        pending = context._pending_count.get()
+        left = _still_counting()
+        gate.set()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        return pending, left
+
+    with pytest.MonkeyPatch.context() as mp:
+        pending, left = asyncio.run(run(mp))
+    assert pending is None, f"[{site}] a refused dispatch left a count owed to nobody"
+    assert left == [], f"[{site}] a refused dispatch left its count running"
+
+
+# ---------------------------------------------------------------------------
+# The gate's own safety, tested instead of argued
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ceiling,fast", [
+    # `lane_for` returns LONG_OUTPUT on max_tokens ABOVE the threshold, so the
+    # boundary itself must stay on the fast path: the unbounded-thinking entry
+    # points (`chat_with_tools`, `json_completion`,
+    # `chat_completion_with_reasoning`, `stream_chat_events`) floor their
+    # ceiling at `settings.max_output_tokens`, which IS 65,536.
+    (8_000, True),
+    (65_536, True),
+    (65_537, False),
+    (200_000, False),
+])
+def test_a_ceiling_that_could_take_the_long_output_lane_is_counted_first(ceiling, fast):
+    """Condition 4's argument is "a chat-origin NORMAL ticket charges no KV".
+    `admission.lane_for` returns LONG_OUTPUT above the chat threshold and
+    `_admit`'s LONG_OUTPUT branch charges KV from `tokens` — the ESTIMATE on
+    this path, which under-counts the real tokenizer by up to 2.3x. Nothing
+    reaches that branch from chat today, so condition 6 costs no live call;
+    it makes the argument true by construction rather than by a property of a
+    call site two modules away."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=40, window=1_000_000)
+        _tokenize(monkeypatch, counter)
+        _warm(counter)
+        with context.settles_pending_count():
+            await context.fit_request(
+                [{"role": "user", "content": "hello"}],
+                base_url=MAIN_URL, model="m", requested_max_tokens=ceiling,
+            )
+        fired = context._pending_count.get() is not None
+        context.cancel_pending_count()
+        return fired, len(counter.calls)
+
+    with pytest.MonkeyPatch.context() as mp:
+        fired, counts = asyncio.run(run(mp))
+    assert fired is fast, (
+        f"ceiling {ceiling}: fast path fired={fired}, expected {fast} "
+        f"(chat LONG_OUTPUT threshold {admission.chat_long_output_threshold_tokens()})"
+    )
+    if not fast:
+        assert counts == 1, "the slow path did not count the prompt before sizing"
+
+
+def test_the_settlement_refuses_a_count_that_describes_another_request():
+    """`settle_pending_count` writes back only for the list it was started
+    for. Without the identity check a caller that settled the wrong list would
+    publish one request's count as another's."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=4242, window=1_000_000)
+        _tokenize(monkeypatch, counter)
+        _warm(counter)
+        with context.settles_pending_count():
+            sized, _ = await context.fit_request(
+                [{"role": "user", "content": "hello"}],
+                base_url=MAIN_URL, model="m", requested_max_tokens=8000,
+            )
+        other = [{"role": "user", "content": "a different request"}]
+        await context.settle_pending_count(other, MAIN_URL)
+        # A cancelled task is not `done()` until the loop has run again.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return (context.measured_prompt_tokens(sized, MAIN_URL),
+                context.measured_prompt_tokens(other, MAIN_URL),
+                context._pending_count.get(), _still_counting())
+
+    with pytest.MonkeyPatch.context() as mp:
+        for_sized, for_other, pending, left = asyncio.run(run(mp))
+    assert for_other is None, "one request's count was published as another's"
+    assert for_sized is None, "a count settled against the wrong list was written back anyway"
+    assert pending is None and left == [], "the mis-settled count was left running"
+
+
+def test_a_send_first_turn_reports_not_measured_until_it_settles():
+    """Between the dispatch and the settlement the turn must not report a
+    PREVIOUS turn's exactness or count: admission runs in that gap."""
+
+    seen: dict = {}
+
+    class _Sampling(_Engine):
+        async def _create(self, **kwargs):
+            seen["exact"] = context._last_count_exact.get()
+            seen["measured"] = context._measured.get()
+            return await super()._create(**kwargs)
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=4242, window=1_000_000)
+        engine = _Sampling()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+        # A first turn that settles an exact count, so the ContextVars are
+        # True/not-None when the second turn is sized.
+        await llm.chat_completion([{"role": "user", "content": "first"}], max_tokens=8000)
+        assert context._last_count_exact.get() is True
+        await llm.chat_completion([{"role": "user", "content": "second"}], max_tokens=8000)
+        return seen, context._last_count_exact.get()
+
+    with pytest.MonkeyPatch.context() as mp:
+        at_dispatch, after = asyncio.run(run(mp))
+    assert at_dispatch["exact"] is False, (
+        "a send-first turn carried the previous turn's exactness into its own dispatch"
+    )
+    assert at_dispatch["measured"] is None, (
+        "a send-first turn carried the previous turn's count into its own dispatch"
+    )
+    assert after is True, "the settlement did not write the exact count back"
+
+
+def test_the_count_task_reports_its_own_exactness_not_the_callers():
+    """`_count_beside_the_send` runs in a COPY of the caller's context, so the
+    verdict has to be RETURNED. It sets `_last_count_exact` False first: a
+    failed count inside the task must not report the caller's stale True."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=40, window=1_000_000, fail=True)
+        _tokenize(monkeypatch, counter)
+        context._last_count_exact.set(True)
+        count, window, exact = await context._count_beside_the_send(MAIN_URL, "m",
+                                                                   [{"role": "user", "content": "hi"}])
+        return count, window, exact
+
+    with pytest.MonkeyPatch.context() as mp:
+        count, window, exact = asyncio.run(run(mp))
+    assert exact is False, "a failed count reported the caller's stale exactness"
+    assert count > 0 and window is None
+
+
+def test_a_failed_count_is_retrieved_so_the_loop_never_logs_it():
+    """`_swallow_count_result` retrieves the exception of a count nobody
+    awaits. Without it the loop logs "Task exception was never retrieved" for
+    every abandoned count — noise that hides real ones."""
+
+    async def run():
+        async def boom():
+            raise RuntimeError("count broke")
+
+        task = asyncio.get_running_loop().create_task(boom())
+        context._INFLIGHT_COUNTS.add(task)
+        task.add_done_callback(context._swallow_count_result)
+        for _ in range(10):
+            if task.done():
+                break
+            await asyncio.sleep(0)
+        # The done callback is scheduled with `call_soon`, so it has not run
+        # yet at the moment the task finishes.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        # NOT awaited: awaiting would retrieve the exception itself and prove
+        # nothing. `_log_traceback` is the flag `Task.__del__` reads before it
+        # complains, and it is cleared only by a retrieval.
+        assert hasattr(task, "_log_traceback"), "this Python names the flag differently"
+        return task.done(), task in context._INFLIGHT_COUNTS, task._log_traceback
+
+    done, still_registered, will_log = asyncio.run(run())
+    assert done and not still_registered, "the finished count stayed in the registry"
+    assert will_log is False, "an abandoned count will be logged by the event loop"
+
+
+def test_the_fast_path_cancels_a_count_it_is_about_to_replace():
+    """One pending count per context, by construction. Nothing in llm.py
+    awaits between a fit and its send, so no caller can reach here with a
+    count already pending — the guard is what makes that structural instead
+    of a promise every future caller has to keep."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=40, window=1_000_000, gate=asyncio.Event())
+        _tokenize(monkeypatch, counter)
+        _warm(counter)
+        with context.settles_pending_count():
+            await context.fit_request(
+                [{"role": "user", "content": "first"}],
+                base_url=MAIN_URL, model="m", requested_max_tokens=8000,
+            )
+            stale = context._pending_count.get().task
+            await context.fit_request(
+                [{"role": "user", "content": "second"}],
+                base_url=MAIN_URL, model="m", requested_max_tokens=8000,
+            )
+        fresh = context._pending_count.get().task
+        for _ in range(20):
+            await asyncio.sleep(0)
+        cancelled = stale.cancelled()
+        context.cancel_pending_count()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return stale is not fresh, cancelled, _still_counting()
+
+    with pytest.MonkeyPatch.context() as mp:
+        replaced, cancelled, left = asyncio.run(run(mp))
+    assert replaced, "the second fit reused the first fit's count"
+    assert cancelled, "the count the second fit replaced was left running"
+    assert left == [], "a count outlived the request that started it"
+
+
+def test_a_broken_count_beside_the_send_is_logged_not_swallowed(caplog):
+    """`count_tokens` swallows its own failures, so `settle_pending_count`'s
+    `except Exception` can only fire on a genuine bug in
+    `_count_beside_the_send`. Returning silently left `_measured` None and
+    `_last_count_exact` False for the rest of the turn with nothing to notice
+    it by."""
+
+    async def run(monkeypatch):
+        counter = _Tokenize(count=4242, window=1_000_000)
+        engine = _Engine()
+        _tokenize(monkeypatch, counter)
+        _engine(monkeypatch, engine)
+        _warm(counter)
+
+        async def broken(base_url, model, msgs):
+            raise RuntimeError("the count task itself broke")
+
+        monkeypatch.setattr(context, "_count_beside_the_send", broken)
+        await llm.chat_completion([{"role": "user", "content": "hello"}], max_tokens=8000)
+        sized = engine.calls[-1]["messages"]
+        return context.measured_prompt_tokens(sized, MAIN_URL), _still_counting()
+
+    with caplog.at_level("WARNING", logger="app.context"):
+        with pytest.MonkeyPatch.context() as mp:
+            measured, left = asyncio.run(run(mp))
+    assert measured is None, "a turn whose count broke reported a number anyway"
+    assert left == []
+    lines = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("count running beside the send failed" in line for line in lines), lines
