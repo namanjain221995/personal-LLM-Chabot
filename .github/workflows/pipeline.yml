@@ -205,13 +205,32 @@ jobs:
       # (2026-09-13): a module that skips itself at import no longer counts
       # towards it.
       #
-      # 225 run today, 0 skipped (measured 2026-09-27), of which 42 are the new
-      # db-rehearsal suite. The floor was still 95 from the day it was written,
-      # by which point it could no longer catch what it exists to catch: a whole
-      # module dropping out of discovery and taking a hundred tests with it while
-      # the rest still pass. 205 is a little under the current count, which is
-      # what the gate's own docstring asks for; deliberately deleting tests means
-      # lowering it in the same commit, where a reviewer reads the line.
+      # MEASURED, on the merge of this branch into dev at ff1a5d7c: 395 executed,
+      # 0 skipped, of 395 collected, across 11 modules, of which 75 are the new
+      # db-rehearsal suite. Three runs, same number each time (load average
+      # 13.1-13.3, 11.6-13.2 s wall). dev alone is 320.
+      #
+      # Earlier drafts of this comment said 220/37 and then 225/42. Both were
+      # true of this branch standing alone and neither was true of the merge,
+      # because dev gained five test modules while the branch sat unmerged. The
+      # number here is the merged one, since that is the number the gate will
+      # actually count.
+      #
+      # WHAT 205 CATCHES AND WHAT IT DOES NOT. The floor was 95 from the day it
+      # was written, which by 320 could not catch a whole module dropping out of
+      # discovery and taking a hundred tests with it while the rest still pass.
+      # 205 catches a catastrophic loss - roughly half the suite - and it does
+      # NOT catch one module going missing: losing all 75 db-rehearsal tests
+      # leaves 320, which clears it. It is deliberately loose, not tight: there
+      # are ~18 branches in flight against this directory, and a floor set just
+      # under the current count turns any one of them that nets the total down
+      # into a red `policy` job that blocks every other merge. Tighten it to just
+      # under the measured count once the wave has landed and the count is stable
+      # - that is a one-line change and it is the point at which this line starts
+      # doing its whole job.
+      #
+      # Deliberately deleting tests still means lowering this number in the same
+      # commit, where a reviewer reads the line.
       - name: The CI gate scripts have tests, and they pass
         run: |
           python .github/workflows/scripts/unittest_gate.py \
