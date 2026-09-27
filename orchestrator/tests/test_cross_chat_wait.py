@@ -9,8 +9,25 @@ WHAT THESE TESTS PIN, and nothing more. Inside `semantic_hits` the candidate loa
 fingerprint SELECT, then cached rows or a fetch) and the query embedding do
 not depend on each other, and they ran one after the other.
 
-Running them side by side moves work; it never creates any. That distinction
-is the whole design, and it is what most of this file asserts:
+Running them side by side moves work on the normal path. It does NOT "never
+create any": three paths start an embedding HEAD would never have started (the
+fingerprint invalidates the cache entry and the refetch returns nothing, the
+load raises, or the turn is cancelled mid-load), and the honest version of the
+design is that every one of them is counted, one reason each, in the counter
+that is the kill switch. The first version of this branch counted only the
+first of the three and said in the code that it was the only one; the tests
+below now pin all three.
+
+THE WHOLE PATH IS OFF BY DEFAULT (`CROSS_CHAT_SPECULATIVE_EMBED`, false),
+because the saving is bounded above by the candidate-load leg it hides, and
+against a PostgreSQL on this host — production's topology — that leg is
+0.76-1.10 ms, so the saving measures 0.01 ms p50. Four separate attempts got
+0.19 / 0.86 / 4.2 / 0.01 ms p50 against the 5 ms bar the change had to clear.
+The fixtures below turn it ON, because that is the behaviour these tests exist
+to pin; one test pins the default itself and proves the default is HEAD's
+order.
+
+What this file asserts:
 
   * the embedding starts early ONLY when this module's own in-process
     candidate cache already holds a non-empty, unexpired entry for the key —
@@ -156,6 +173,17 @@ def wasted() -> float:
     return sum(counter.values())
 
 
+def wasted_by_reason() -> dict:
+    """The kill-switch counter split by reason, so a test can say WHICH case it
+    caught. An unregistered reason would arrive here as "other" (metrics.py
+    closes the label), which is itself worth failing on."""
+    return {
+        dict(key).get("reason"): value
+        for key, value in (metrics._counters.get("cross_chat_speculative_embed_wasted_total")
+                           or {}).items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # accounts
 # ---------------------------------------------------------------------------
@@ -169,6 +197,10 @@ def account(monkeypatch):
     monkeypatch.setattr(settings, "embed_base_url", "http://embed.test/v1")
     monkeypatch.setattr(settings, "cross_chat_embeddings_cache_s", 60.0, raising=False)
     monkeypatch.setattr(memory_semantic, "CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
+    # Production runs with this OFF (see the module docstring). Turned on here
+    # because these tests exist to pin what it does when it is on;
+    # test_the_speculation_is_off_by_default pins the default.
+    monkeypatch.setattr(settings, "cross_chat_speculative_embed", True, raising=False)
     memory_semantic.invalidate_message_embeddings()
     metrics.reset()
 
@@ -193,6 +225,10 @@ def lonely_account(monkeypatch):
     monkeypatch.setattr(settings, "embed_base_url", "http://embed.test/v1")
     monkeypatch.setattr(settings, "cross_chat_embeddings_cache_s", 60.0, raising=False)
     monkeypatch.setattr(memory_semantic, "CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
+    # Production runs with this OFF (see the module docstring). Turned on here
+    # because these tests exist to pin what it does when it is on;
+    # test_the_speculation_is_off_by_default pins the default.
+    monkeypatch.setattr(settings, "cross_chat_speculative_embed", True, raising=False)
     memory_semantic.invalidate_message_embeddings()
     metrics.reset()
 
@@ -213,6 +249,10 @@ def big_account(monkeypatch):
     monkeypatch.setattr(settings, "embed_base_url", "http://embed.test/v1")
     monkeypatch.setattr(settings, "cross_chat_embeddings_cache_s", 60.0, raising=False)
     monkeypatch.setattr(memory_semantic, "CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0)
+    # Production runs with this OFF (see the module docstring). Turned on here
+    # because these tests exist to pin what it does when it is on;
+    # test_the_speculation_is_off_by_default pins the default.
+    monkeypatch.setattr(settings, "cross_chat_speculative_embed", True, raising=False)
     memory_semantic.invalidate_message_embeddings()
     metrics.reset()
 
@@ -385,10 +425,10 @@ def test_the_turn_embeds_no_more_often_than_head(account, monkeypatch, question,
         )
         monkeypatch.setattr(llm, "embed_query", counting_embed_query)
         with pytest.MonkeyPatch.context() as patch:
-            # HEAD's order: the gate never fires, so the candidate load is
-            # awaited before anything is embedded.
-            patch.setattr(memory_semantic, "_cached_candidates_nonempty",
-                          lambda *a, **k: False, raising=False)
+            # HEAD's order, through the production switch rather than a
+            # stand-in for it: with the flag off the gate is never consulted,
+            # so the candidate load is awaited before anything is embedded.
+            patch.setattr(settings, "cross_chat_speculative_embed", False, raising=False)
             memory_semantic.invalidate_message_embeddings()
             await one_turn()                   # warm the candidate cache
             head = await one_turn()
@@ -428,10 +468,11 @@ def test_more_than_two_hundred_rows_rank_identically_with_the_overlap_on_and_off
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(memory_semantic, "_rank_candidates", capture(name))
             if not speculate:
-                # HEAD's order exactly: the gate never fires, so the candidate
-                # load is awaited to completion before anything is embedded.
-                patch.setattr(memory_semantic, "_cached_candidates_nonempty",
-                              lambda *a, **k: False, raising=False)
+                # HEAD's order exactly, and through the production switch: with
+                # the flag off the candidate load is awaited to completion
+                # before anything is embedded.
+                patch.setattr(settings, "cross_chat_speculative_embed", False,
+                              raising=False)
             await memory_semantic.semantic_hits(big_account, question, "new-conv")  # warm
             out = await memory_semantic.semantic_hits(big_account, question, "new-conv")
             block = await memory_semantic.cross_chat_block(big_account, question, "new-conv")
@@ -486,7 +527,27 @@ def test_an_unavailable_embedding_raised_while_the_load_still_runs_gives_the_sam
     assert llm._EMBED_INFLIGHT == {}
 
 
-def test_a_failing_candidate_load_cancels_the_speculative_embedding(account, monkeypatch):
+def test_a_failing_candidate_load_counts_and_cancels_the_speculative_embedding(
+    account, monkeypatch
+):
+    """CHANGED 2026-09-27, and the change is the point of it.
+
+    This test used to assert `wasted() == 0` here, on the reasoning that a
+    failed load degrades the turn on HEAD too so the guess was not "wrong".
+    That reasoning was wrong, and the assertion was pinning a defect: HEAD
+    starts NO embedding on this path, the branch has already put one on a
+    sidecar shared with every other user of the box, and the counter that is
+    this change's declared kill switch could not see it. The documented failure
+    mode is Postgres out of connection slots — which makes the load raise on
+    EVERY turn, so this is the one reason that can climb fast, and it was the
+    one reading zero.
+
+    It now asserts the corrected behaviour: counted, under `load_failed`, and
+    still cancelled rather than awaited. It therefore also fails on dev (where
+    no counter exists) for a real reason, which the version it replaces did
+    not — that one passed on dev vacuously, because with no speculation there
+    is nothing to cancel and every assertion held trivially.
+    """
     stamps = Stamps()
     started = {"n": 0}
 
@@ -507,12 +568,81 @@ def test_a_failing_candidate_load_cancels_the_speculative_embedding(account, mon
     assert started["n"] == 1
     assert dropped() == {}
     assert llm._EMBED_INFLIGHT == {}
-    # NOT counted as a wrong guess: the load failed, so HEAD produced no hits
-    # either and the counter keeps its one meaning (the cache said rows, the
-    # refetch said none).
-    assert wasted() == 0
+    # THE REGRESSION THIS TEST NOW GUARDS: one embedding HEAD never sends, on
+    # the wire, visible to the kill switch and attributed to the right cause.
+    assert wasted_by_reason() == {"load_failed": 1}
     # Cancelled, not awaited: the 0.5 s embedding never held the turn.
     assert elapsed < 0.45, f"the failing load waited {elapsed:.3f}s for the embedding"
+
+
+def test_a_turn_cancelled_while_the_candidate_load_runs_counts_its_embedding(
+    account, monkeypatch
+):
+    """The second half of the same regression, on the path production reaches
+    most often: `reads.close()` in main.py cancels any cross-chat read still in
+    flight when the turn goes another way, and a newer message replaces a turn
+    outright. The embedding is already on the sidecar's wire by then, so
+    cancelling the turn does not un-spend it, and it is counted under its own
+    reason rather than sharing one with a stale cache entry."""
+    stamps = Stamps()
+    real_load = memory_semantic._load_candidates
+
+    async def scenario():
+        await warm_key(account, "new-conv")
+        stamp_embed_query(monkeypatch, stamps, delay=0.5)
+
+        def slow(*a, **k):
+            time.sleep(0.15)
+            return real_load(*a, **k)
+
+        monkeypatch.setattr(memory_semantic, "_load_candidates", slow)
+        turn = asyncio.ensure_future(
+            memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+        )
+        await asyncio.sleep(0.03)
+        turn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    asyncio.run(scenario())
+    assert wasted_by_reason() == {"cancelled": 1}
+    assert llm._EMBED_INFLIGHT == {}
+
+
+# ---------------------------------------------------------------------------
+# (7) the switch itself: off in production, and off means HEAD exactly
+# ---------------------------------------------------------------------------
+def test_the_speculation_is_off_by_default_and_the_default_keeps_head_s_order(
+    account, monkeypatch
+):
+    """The flag's default is the behaviour production runs, so it is asserted
+    here and not left to a comment. With it off, a WARM candidate cache — the
+    one state in which the gate would otherwise fire — still embeds strictly
+    after the load returns, exactly as dev does, and nothing is counted."""
+    assert memory_semantic.CROSS_CHAT_SPECULATIVE_EMBED is False
+    from app import config as _config
+
+    assert _config.Settings().cross_chat_speculative_embed is False
+
+    stamps = Stamps()
+
+    async def scenario():
+        await warm_key(account, "new-conv")
+        # Undo the fixture's override: this test wants the shipped default.
+        monkeypatch.setattr(settings, "cross_chat_speculative_embed", False, raising=False)
+        stamp_legs(monkeypatch, stamps, load_delay=0.04)
+        stamp_embed_query(monkeypatch, stamps, delay=0.04)
+        return await memory_semantic.semantic_hits(account, PLAIN_QUESTION, "new-conv")
+
+    asyncio.run(scenario())
+
+    assert stamps.count("load") == 1 and stamps.count("embed") == 1
+    assert stamps.overlap_ms("load", "embed") < 0.0, (
+        "with the flag off the embedding must start after the load returns, "
+        f"but the legs overlapped by {stamps.overlap_ms('load', 'embed'):.3f} ms"
+    )
+    assert wasted_by_reason() == {}
+    assert llm._EMBED_INFLIGHT == {}
 
 
 # ---------------------------------------------------------------------------

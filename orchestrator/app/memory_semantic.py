@@ -129,6 +129,14 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """config._bool semantics (unset or blank -> default), same truthy set."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 #: How long one user's candidate rows are reused (2026-09-13, plan item 3e).
 #: Every assistant turn re-read the newest 500 message_embeddings rows WITH
 #: their full message content — 754 kB of content plus 2 MB of vectors for
@@ -141,6 +149,38 @@ CROSS_CHAT_EMBEDDINGS_CACHE_S = _env_float("CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0
 #: Entries are per (user, model, excluded conversation, limit) because the
 #: exclusion changes WHICH 500 rows come back. Worst case ~3 MB each.
 _CANDIDATE_CACHE_MAX = 16
+
+#: CROSS_CHAT_SPECULATIVE_EMBED — run the query embedding BESIDE the candidate
+#: load instead of after it, on the one turn shape where the load is certain to
+#: return rows (`_cached_candidates_nonempty` below, and `semantic_hits`).
+#:
+#: OFF BY DEFAULT, AND THE DEFAULT IS WHAT PRODUCTION RUNS. The saving this can
+#: ever buy is bounded above by the candidate-load leg it hides, and on this box
+#: that leg is UNDER A MILLISECOND, so the saving is too. Four independent
+#: measurements of the one shape it acts on (a second turn of the same
+#: conversation, with a question the embedding LRU has not seen) came back
+#: 0.19, 0.86, 4.2 and 0.01 ms p50 against a 5 ms bar this change was required
+#: to clear. The last of those is the one to trust for production and it is the
+#: smallest: the first three drove a test PostgreSQL on the OTHER node, across
+#: the network, which inflates the very leg being hidden, while production's
+#: PostgreSQL is a container on this host. Measured there, over two alternating
+#: 31- and 41-pair passes on a 1,280-row account at 1024 dimensions, the load
+#: leg is 0.76-1.10 ms, which is the CEILING on anything this can ever save.
+#:
+#: The mechanism is not broken and is not being hidden: forced to a genuinely
+#: expensive load leg it saves the whole leg (+8.02 ms measured at a 9.08 ms
+#: leg, same harness, same pass structure), which is exactly what it claims to
+#: do. It stays here, behind a flag, so the A/B is one toggle in one process on
+#: a deployment whose load leg is larger — rather than being deleted and
+#: re-derived from scratch when somebody wants the answer again.
+#:
+#: Two things must be true before it is turned on: something has to watch
+#: `cross_chat_speculative_embed_wasted_total` (it is the kill switch and
+#: nothing currently reads it), and `_CANDIDATE_CACHE_MAX` above has to be
+#: larger than the number of conversations active at once, because the cache
+#: key holds the EXCLUDED conversation — past 16 concurrent conversations the
+#: entry is evicted before the second turn arrives and this gate never fires.
+CROSS_CHAT_SPECULATIVE_EMBED = _env_bool("CROSS_CHAT_SPECULATIVE_EMBED", False)
 
 #: key -> (monotonic stamp, fingerprint, rows). Filled and read from worker
 #: threads, hence the lock.
@@ -253,10 +293,15 @@ def _cached_candidates_nonempty(
 
     It does NOT check the fingerprint (that is a database round trip, which is
     the very wait being overlapped), so a "yes" can still be followed by an
-    invalidated refetch that returns nothing. That residual is counted as
-    `cross_chat_speculative_embed_wasted_total` and the embedding is
-    cancelled; a cancelled caller releases its EMBED_MAX_INFLIGHT slot at
-    once, exactly as an abandoned flight does on HEAD (llm.py:2167-2175).
+    invalidated refetch that returns nothing — and the load it precedes can
+    also raise, or be cancelled. Those three residuals are counted, one reason
+    each, by `_count_speculative_embed_waste`, and the embedding is cancelled;
+    a cancelled caller releases its EMBED_MAX_INFLIGHT slot at once, exactly as
+    an abandoned flight does on HEAD (llm.py:2167-2175). The request itself is
+    already on the sidecar's wire by then, which is why it is counted rather
+    than called free.
+
+    Whether the gate is consulted at all is `_speculative_embed_enabled()`.
     """
     ttl = float(getattr(settings, "cross_chat_embeddings_cache_s", CROSS_CHAT_EMBEDDINGS_CACHE_S))
     if ttl <= 0:
@@ -269,6 +314,43 @@ def _cached_candidates_nonempty(
             return False
         stamp, _fingerprint, rows = hit
         return bool(rows) and (now - stamp) < ttl
+
+
+def _speculative_embed_enabled() -> bool:
+    """Whether the query embedding may start beside the candidate load at all.
+
+    Read per call, not at import, so an operator can turn it on without a
+    rebuild and a test can exercise both paths in one process. Default false:
+    see CROSS_CHAT_SPECULATIVE_EMBED above for the measurements that put it
+    there.
+    """
+    return bool(
+        getattr(settings, "cross_chat_speculative_embed", CROSS_CHAT_SPECULATIVE_EMBED)
+    )
+
+
+def _count_speculative_embed_waste(reason: str) -> None:
+    """Count one query embedding that was started early and that HEAD would not
+    have started at all.
+
+    THIS IS THE KILL SWITCH, so it has to see every such case, not the tidiest
+    one. The first version counted only `refetch_empty` and said in a comment
+    that this was "the only case in which this branch does work HEAD does not";
+    that was wrong. When the candidate load RAISES, or the turn is cancelled
+    while the load is still running, the request is already on the shared
+    embedding sidecar's wire and HEAD sent none — and the documented failure
+    mode, Postgres out of connection slots, makes the load raise on EVERY turn,
+    which is precisely when a blind counter is worst (QA, 2026-09-23).
+
+    `reason` is closed in metrics.SPECULATIVE_EMBED_WASTE_REASONS, so each
+    label keeps one meaning and the series stays bounded.
+    """
+    metrics.inc(
+        "cross_chat_speculative_embed_wasted_total",
+        "query embeddings started beside the candidate load that HEAD would "
+        "not have started at all",
+        reason=reason,
+    )
 
 
 async def _discard(task: "asyncio.Task") -> None:
@@ -589,10 +671,20 @@ async def semantic_hits(
         # failed 'busy' after 1.0 s"). So the query embedding starts beside the
         # candidate load ONLY when this module's own in-process cache already
         # holds a non-empty, unexpired entry for this key — i.e. only when
-        # HEAD would certainly have embedded too. The work is moved, never
-        # created.
+        # HEAD would almost certainly have embedded too.
+        #
+        # ALMOST, not certainly: THREE paths reach here having started an
+        # embedding HEAD would not have started — the fingerprint invalidates
+        # the entry and the refetch returns nothing, the load raises, or the
+        # turn is cancelled mid-load. All three are counted, each under its own
+        # reason (`_count_speculative_embed_waste`). "The work is moved, never
+        # created" was this change's original claim and it is not true; what IS
+        # true is that the work is moved on the normal path and every exception
+        # to that is visible in one counter. That counter is the kill switch,
+        # and this whole path is off by default until something watches it
+        # (CROSS_CHAT_SPECULATIVE_EMBED).
         embed_task: Optional[asyncio.Task] = None
-        if _cached_candidates_nonempty(
+        if _speculative_embed_enabled() and _cached_candidates_nonempty(
             user_id, settings.embed_model, exclude_conversation_id, _CANDIDATE_LIMIT
         ):
             embed_task = asyncio.ensure_future(llm.embed_query(query))
@@ -604,29 +696,35 @@ async def semantic_hits(
                 exclude_conversation_id,
                 _CANDIDATE_LIMIT,
             )
-        except BaseException:
-            # The load failed, or the turn was cancelled (a newer message
-            # replaced it). The embedding is cancelled and the turn is
-            # degraded either way, on HEAD as here, so this is NOT counted as
-            # a wrong guess: the counter below has to keep exactly one
-            # meaning, or nobody can read it.
+        except BaseException as exc:
+            # THE LOAD FAILED, OR THE TURN WAS CANCELLED (a newer message
+            # replaced it, or main.py's `reads.close()` closed this read).
+            # HEAD starts no embedding here, so the one already in flight IS
+            # work HEAD does not do, and it is counted — under its own reason,
+            # because it is not the same event as a stale cache entry. The
+            # first version of this branch left it uncounted and claimed the
+            # refetch case was the only one; when Postgres runs out of
+            # connection slots the load raises on EVERY turn, so that choice
+            # made the kill switch read zero during exactly the incident the
+            # cache was built for (QA, 2026-09-23).
             if embed_task is not None:
+                _count_speculative_embed_waste(
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "load_failed"
+                )
                 await _discard(embed_task)
             raise
         if not candidates:
             if embed_task is not None:
-                # THE GATE WAS WRONG, and this counter counts only that: the
-                # cache said this key had rows, the fingerprint disagreed and
-                # the refetch came back empty, so HEAD would have embedded
-                # nothing and this turn embedded once. It is the only case in
-                # which this branch does work HEAD does not. Measured zero
-                # over 200 turns across five account shapes (2026-09-22); if
-                # it is ever non-zero in production, the speculation goes.
-                metrics.inc(
-                    "cross_chat_speculative_embed_wasted_total",
-                    "query embeddings started beside the candidate load on a "
-                    "cache entry the fingerprint then invalidated to nothing",
-                )
+                # THE GATE WAS WRONG: the cache said this key had rows, the
+                # fingerprint disagreed and the refetch came back empty, so
+                # HEAD would have embedded nothing and this turn embedded
+                # once. One of THREE reasons the same counter carries — see
+                # `_count_speculative_embed_waste`; the other two are on the
+                # failure path above. Measured zero over 200 turns across five
+                # account shapes (2026-09-22).
+                _count_speculative_embed_waste("refetch_empty")
                 await _discard(embed_task)
             return []
         if embed_task is not None:
