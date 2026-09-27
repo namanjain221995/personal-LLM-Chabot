@@ -1,6 +1,6 @@
 # TechSara frontend
 
-Next.js 15/React 19 user interface for the TechSara local Salesforce analytics
+Next.js 16/React 19 user interface for the TechSara local Salesforce analytics
 and chat platform. The normal full-platform entrypoint is `../techsara`; the npm
 commands on this page are for frontend development and verification.
 
@@ -21,7 +21,7 @@ hide or disable behavior its probed backend does not support.
 
 ## Stack
 
-- Next.js 15 App Router with standalone output;
+- Next.js 16 App Router with standalone output (`next ^16.3.3`);
 - React 19 and TypeScript;
 - Tailwind CSS 3 with dark/light TechSara tokens;
 - Apache ECharts through `echarts-for-react`;
@@ -41,12 +41,19 @@ The Next.js API routes proxy the browser contract to the orchestrator. Report
 and history proxies use explicit path/method allowlists rather than open
 passthrough behavior.
 
-## Local identity and history
+## Identity and history
 
-This application has no sign-in, sign-up, session cookie, or route-gating
-flow. `/api/auth/me` returns a stable single local identity used for labeling
-and history cache scoping. This matches the supported loopback, single-user
-deployment; it is not suitable as public application authentication.
+This application HAS sign-in and route-gating. `app/login/page.tsx` is the
+sign-in page, `middleware.ts` decides whether a request is let through or
+bounced to `/login`, and every `/api/*` proxy forwards the `ts_session` cookie
+upstream — validity is the orchestrator's decision, not the frontend's.
+`/api/auth/me` proxies to `/auth/me` and passes the status through honestly,
+401 included; it does not synthesise a local identity. `MOCK_MODE=true` is the
+only path that still answers from canned data.
+
+(This section described the pre-retrofit frontend — no sign-in, no session
+cookie, a stable single local identity — until 2026-09-28. It was already
+false when the enterprise auth retrofit landed.)
 
 Conversation history is server-backed. The browser keeps a synchronous
 in-memory mirror persisted write-behind as one IndexedDB record per
@@ -89,10 +96,12 @@ npm run build               # production standalone build
 `package-lock.json` is committed; use `npm ci` rather than generating a new
 dependency resolution for verification.
 
-The Vitest suite matches `tests/**/*.test.ts`. It covers state and wire
-contracts, not mounted React components or browser end-to-end behavior. No
-current pass count is claimed here because the frontend suite was not rerun in
-the portable-runtime documentation pass.
+The Vitest suite matches `tests/**/*.test.ts` and `tests/**/*.test.tsx`
+(`vitest.config.mts`). The `.ts` half covers state and wire contracts in the
+node environment; the `.test.tsx` files opt into jsdom with a
+`// @vitest-environment jsdom` docblock and do mount React components. Browser
+end-to-end behavior is still out of scope. Measured on this branch on
+2026-09-28: `182 passed (182)` files, `3531 passed | 11 skipped (3542)` tests.
 
 ## Layout
 
@@ -128,8 +137,9 @@ the deploy root's tree was from 2026-09-09 — nine days older than its own
 `package.json` — so it was missing `remark-breaks`, which was added on
 2026-09-18 and is imported at module scope by `components/Markdown.tsx`. The
 suite answered with 39 of 181 files failing on `Failed to resolve import
-"remark-breaks"`, and, worse, collected 2790 tests instead of 3542 while still
-printing a tidy summary.
+"remark-breaks"`, and, worse, collected 2790 tests instead of 3523 while still
+printing a tidy summary. (3523 is what that branch point collects with a clean
+tree; 3542 is the total once this guard's own tests are counted.)
 
 `npm run check:deps` answers that question on its own: it compares every
 `dependency` and `devDependency` against what is installed and names what is
