@@ -18,7 +18,7 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
-from typing import Awaitable, Callable, List, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
 from .. import continuation, llm
@@ -429,6 +429,23 @@ def _messages(
     )
 
 
+def _effort_degraded(reason: str, detail: str) -> dict:
+    """meta.effort_degraded — "you chose Max and this is not Max".
+
+    A downgrade the code cannot avoid has to be VISIBLE; silence is the
+    defect. Same shape and same job as meta.search_degraded
+    (engines/search.py): `reason` is the machine key, `detail` the one human
+    line, and it rides on the answer's metadata so the stored turn carries it
+    through a reload rather than living only in a log.
+    """
+    return {
+        "asked": "max",
+        "delivered": "single_generation",
+        "reason": reason,
+        "detail": detail,
+    }
+
+
 async def run_chat_engine(
     message: str,
     history: Sequence[dict],
@@ -496,11 +513,22 @@ async def run_chat_engine(
     # the winner's thinking + answer stream to the UI (core/best_of.py).
     # Zero usable candidates falls through to the ordinary single stream —
     # best-of-N must never make extra_high worse than high.
-    if (
-        effort == "max"
-        and model_choice == "smart"
-        and settings.extra_high_samples > 1
-    ):
+    #
+    # EFFORT DECIDES EFFORT (2026-09-27). This gate also required
+    # `model_choice == "smart"`, which guarded nothing real: the candidates
+    # come from best_of.generate_candidates → llm.chat_completion_with_reasoning,
+    # which is main-model-only and reads the level from `effort` alone, and
+    # llm.resolve_model_choice serves those same weights for EVERY choice.
+    # What the clause did do was take the whole Max feature away from a client
+    # sending the legacy `model: "fast"` — a value frontend/lib/prefs.ts still
+    # keeps when it loads a stored preference, that today's effort picker can
+    # neither produce nor clear, and that ChatRequest.model still accepts.
+    # Measured on origin/dev (4164bb8) today, model="fast" + effort="max":
+    # 0 candidates generated, thinking off, meta {"route": "chat"} — the person
+    # paid for Max and was told nothing. `degraded` below is that silence's fix:
+    # anything Max asked for and did not get is named in the answer's metadata.
+    degraded: Optional[dict] = None
+    if effort == "max" and settings.extra_high_samples > 1:
         prompt = _messages(message, history, mode, grounding)
         candidates = await best_of.generate_candidates(
             prompt,
@@ -527,6 +555,26 @@ async def run_chat_engine(
             answer = await _say_what_was_left_out(message, answer, emit, meta)
             await emit("meta", meta)
             return answer
+        # Every candidate failed. The single stream below is still the right
+        # answer — best-of-N may never make Max WORSE than Think — but N
+        # drafts were asked for and one was delivered, so it is recorded.
+        degraded = _effort_degraded(
+            "candidates_failed",
+            f"all {settings.extra_high_samples} Max drafts failed; "
+            "answered with a single generation",
+        )
+    elif effort == "max":
+        # EXTRA_HIGH_SAMPLES <= 1: the operator has best-of-N switched off, so
+        # Max is Think with a longer leash. A deployment choice, not a bug —
+        # but not what the picker promises either ("drafts several answers in
+        # parallel, keeps the best"), so the person is told rather than left
+        # to assume they got it.
+        degraded = _effort_degraded(
+            "best_of_disabled",
+            "best-of-N is off on this deployment "
+            f"(EXTRA_HIGH_SAMPLES={settings.extra_high_samples}); "
+            "answered with a single generation",
+        )
 
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
     # call and stays exactly that; the total an answer may run to is decided
@@ -602,6 +650,8 @@ async def run_chat_engine(
     # so through it (stop_reason "repetition": "This answer stops here: it had
     # begun repeating itself.").
     meta = {"route": "chat"}
+    if degraded is not None:
+        meta["effort_degraded"] = degraded
     if long.segment_count > 1 or long.truncated:
         meta["continuation"] = long.as_meta()
     if guard.verdict is not None:

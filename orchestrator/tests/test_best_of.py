@@ -195,7 +195,136 @@ def test_no_usable_candidates_falls_through_to_single_stream(monkeypatch):
         "q", [], emit, mode="assistant", effort="extra_high",
     ))
     assert answer == "plain answer"
-    assert [d for k, d in events if k == "meta"] == [{"route": "chat"}]
+    # ...and it SAYS so. This used to assert meta == [{"route": "chat"}]: Max
+    # was asked for, one generation was delivered, and nothing on the turn
+    # recorded the difference (2026-09-27). A downgrade may happen; being
+    # silent about it may not.
+    meta = [d for k, d in events if k == "meta"]
+    assert len(meta) == 1 and meta[0]["route"] == "chat"
+    assert meta[0]["effort_degraded"] == {
+        "asked": "max",
+        "delivered": "single_generation",
+        "reason": "candidates_failed",
+        "detail": "all 2 Max drafts failed; answered with a single generation",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GUARD (2026-09-27): effort decides effort, and a downgrade is never silent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model_choice", ["smart", "fast", "", "gpt-4o"])
+def test_max_gets_best_of_n_whatever_the_model_value_says(monkeypatch, model_choice):
+    """The defect this pins: /app/app/engines/chat.py gated best-of-N on
+    `model_choice == "smart"`, so a client holding the legacy
+    `model: "fast"` preference (frontend/lib/prefs.ts keeps a stored 'fast'
+    on load; today's effort picker can neither produce nor clear it) chose Max
+    and silently got the ordinary single stream. Measured on origin/dev
+    (4164bb8): 0 candidates, thinking off, meta {"route": "chat"}.
+
+    Restore the `model_choice == "smart"` clause and every case but "smart"
+    fails here — generate_candidates is never reached and `must_not_stream`
+    fires instead.
+    """
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+    seen = {}
+
+    async def fake_generate(prompt, *, n, temperature, max_tokens):
+        seen["n"] = n
+        return _candidates("loser one", "the winning answer", "loser two")
+
+    async def fake_select(question, candidates):
+        return candidates[1], "clearest"
+
+    async def must_not_stream(messages, **kwargs):  # pragma: no cover
+        raise AssertionError(
+            f"Max with model={model_choice!r} fell through to a single stream"
+        )
+        yield  # make it an async generator
+
+    monkeypatch.setattr(best_of, "generate_candidates", fake_generate)
+    monkeypatch.setattr(best_of, "select_best", fake_select)
+    monkeypatch.setattr(llm, "stream_chat_events", must_not_stream)
+
+    events, emit = _collect_emit()
+    answer = asyncio.run(chat.run_chat_engine(
+        "hard question", [], emit, mode="assistant",
+        model_choice=model_choice, effort="max",
+    ))
+
+    assert seen["n"] == 3, "best-of-N must run for every model value at Max"
+    assert answer == "the winning answer"
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["best_of"] == 3 and meta["best_of_winner"] == 2
+    # Nothing was downgraded, so nothing claims it was.
+    assert "effort_degraded" not in meta
+
+
+@pytest.mark.parametrize("model_choice", ["smart", "fast"])
+def test_max_thinks_whatever_the_model_value_says(monkeypatch, model_choice):
+    """The other half of the same entanglement: `llm.wants_thinking` returned
+    False for every choice but "smart", so the fall-through stream ran with
+    the reasoning pass off on a turn the person had set to Max."""
+    monkeypatch.setattr(settings, "extra_high_samples", 1)  # force the stream
+    seen = {}
+
+    async def fake_stream(messages, *, model_choice, effort, temperature, max_tokens):
+        seen["thinking"] = llm.wants_thinking(model_choice, effort)
+        yield "token", "single"
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+
+    events, emit = _collect_emit()
+    asyncio.run(chat.run_chat_engine(
+        "q", [], emit, mode="assistant", model_choice=model_choice, effort="max",
+    ))
+    assert seen["thinking"] is True
+
+
+def test_max_without_best_of_n_says_so_in_the_metadata(monkeypatch):
+    """EXTRA_HIGH_SAMPLES=1 is an operator choice, not a bug — but the picker
+    promises Max "drafts several answers in parallel, keeps the best", so the
+    turn that did not carries the reason rather than looking like Max."""
+    monkeypatch.setattr(settings, "extra_high_samples", 1)
+
+    async def fake_stream(messages, *, model_choice, effort, temperature, max_tokens):
+        yield "token", "single"
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+
+    events, emit = _collect_emit()
+    asyncio.run(chat.run_chat_engine(
+        "q", [], emit, mode="assistant", effort="max",
+    ))
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["effort_degraded"] == {
+        "asked": "max",
+        "delivered": "single_generation",
+        "reason": "best_of_disabled",
+        "detail": (
+            "best-of-N is off on this deployment (EXTRA_HIGH_SAMPLES=1); "
+            "answered with a single generation"
+        ),
+    }
+
+
+@pytest.mark.parametrize("effort", ["fast", "think"])
+def test_below_max_carries_no_downgrade_claim(monkeypatch, effort):
+    """Fast and Think never asked for best-of-N, so telling them they did not
+    get it would be noise — the key belongs to a broken promise only."""
+    monkeypatch.setattr(settings, "extra_high_samples", 1)
+
+    # **kwargs: at Fast the engine also passes `answer_plan`
+    # (core/answer_sampling.fast_sampling_for), which Max has no plan for.
+    async def fake_stream(messages, **kwargs):
+        yield "token", "single"
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+
+    events, emit = _collect_emit()
+    asyncio.run(chat.run_chat_engine("q", [], emit, mode="assistant", effort=effort))
+    assert "effort_degraded" not in [d for k, d in events if k == "meta"][0]
 
 
 def test_samples_of_one_disables_best_of(monkeypatch):
