@@ -331,16 +331,31 @@ def test_a_sidecar_that_refuses_connections_for_the_whole_grace_fails_retryably(
 
     What the grace promises, from `_after_interrupt`: the first refused
     connection stamps `run.sidecar_down_since`, and a later refusal fails the
-    run once `now - sidecar_down_since >= engine_down_grace_s()`. That check
-    runs after the dispatch and BEFORE the backoff sleep, so only the failure
-    DECISION is guaranteed to be a full grace past the first refusal; the last
-    DISPATCH sits somewhere in the backoff sawtooth and may precede the
-    boundary by up to one CONNECT_BACKOFF_MAX_S. Asserting on the last
-    dispatch's time (`calls[-1] - calls[0] >= 0.4`) therefore measured
-    something the code never promised, and reddened CI run #259 by 0.33 ms --
-    0.082% of the grace -- on a tree that passed the same shard twice. So
-    measure the failure, not the last dispatch. Both bounds below are
-    one-sided by construction, so load can only widen them.
+    run once `now - sidecar_down_since >= engine_down_grace_s()`. Only the
+    failure DECISION is guaranteed to be a full grace past the first refusal.
+    The dispatch that triggers that decision happens EARLIER than it, by one
+    dispatch-to-check latency: the fake engine's generator raises, and only
+    then does `_after_interrupt` read the clock and compare. So the last
+    dispatch sits BELOW the boundary by that latency, which nothing in the
+    backoff bounds -- it is scheduling and GC, and it grows with load.
+    Asserting on the last dispatch's time (`calls[-1] - calls[0] >= 0.4`)
+    therefore measured something the code never promised, and reddened CI run
+    #259 by 0.33 ms -- 0.082% of the grace -- on a tree that passed the same
+    shard twice. Re-created here by busy-waiting inside `ConnectError`, that
+    old assertion is red 21/50 at 2 ms of latency (shortfall 0.03-3.30 ms) and
+    12/12 at 60 ms (shortfall 26.4-49.8 ms, load ~26): the shortfall tracks
+    the injected latency, not the ladder. So measure the failure, not the last
+    dispatch. Both lower bounds below are one-sided by construction, so load
+    can only widen them.
+
+    What they do NOT catch, measured rather than assumed: the lower bounds
+    settle only that the decision was not EARLY, and their slack is one
+    backoff step of quantisation (the check runs only on a refusal, so the
+    decision lands 30.9-44.3 ms past the boundary here) plus 3.6-12.5 ms of
+    observation lag. A regression that fires the grace up to ~one
+    CONNECT_BACKOFF_MAX_S early therefore still passes. Closing that needs a
+    deterministic clock (`durable.Runtime.configure(clock=...)` with
+    `tests.publicapi_fake_engine.VirtualClock`), not a tighter constant.
     """
     from app.publicapi import engines
 
@@ -402,7 +417,22 @@ def test_a_sidecar_that_refuses_connections_for_the_whole_grace_fails_retryably(
     # the first dispatch plus a grace, because `sidecar_down_since` is stamped
     # only after that dispatch has been refused.
     assert seen["failed_at"] - calls[0] >= grace_s
+    # Weaker than it reads: the if/elif in `_after_interrupt` stamps on the
+    # first refusal and can only decide on a later one, so this cannot fail
+    # while the grace is reached at all. Kept as documentation of intent.
     assert len(calls) >= 2  # retried; not failed on the first refusal
+    # The OTHER side, which nothing asserted before this test: a grace that
+    # regressed LONGER would still satisfy every bound above. Counted, not
+    # timed, because the count's error direction under load is the safe one --
+    # a stalled process gets FEWER dispatches in before the boundary, never
+    # more. Measured on this ladder (0.02 -> 0.05 cap, 0.4 s grace): exactly
+    # 10 dispatches in 40/40 runs at load 10.9-14.9, 9-10 with 2 ms of
+    # dispatch-to-check latency, 5 with 60 ms. A doubled grace gives 15-17
+    # (12/12), so 13 separates them and no wall clock is involved. A time
+    # bound here would not: `failed_at - calls[0]` already reaches 0.49 s
+    # unmutated against a 0.8 s mutation, and CI's full-suite heap pauses for
+    # ~0.5 s, so any constant that catches the regression also flakes.
+    assert len(calls) <= 13
     row = durable_store.get_run(router_spec.response_id)
     assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
     # "retryably", which the name claimed and nothing checked: the sidecar
@@ -476,6 +506,10 @@ def test_a_sidecar_that_answers_between_two_outages_gets_a_fresh_grace_for_the_s
 
     records = asyncio.run(scenario())
     kinds = [kind for kind, _ in dispatches]
+    # Both of these are fixed by `flaky`'s own `len(dispatches) == 3`, so on
+    # correct code they assert only "at least 4" and "at least 5 dispatches
+    # happened". They are here to name the shape of the scenario, not to
+    # detect a regression in it.
     assert kinds[:4] == ["refused", "refused", "refused", "answers"]
     assert kinds[4:] and set(kinds[4:]) == {"refused"}  # the second outage
     assert records[-1][1] == "response.failed"
@@ -488,6 +522,12 @@ def test_a_sidecar_that_answers_between_two_outages_gets_a_fresh_grace_for_the_s
     # the failure would land about (grace - the first outage) after the second
     # one began, which is well short of this.
     assert seen["failed_at"] - dispatches[4][1] >= grace_s
+    # And the same counted upper bound as the single-outage test, for the same
+    # reason: measured 14 dispatches in 25/25 runs at load 13.1-15.2, against
+    # 21 (10/10) with the grace doubled. Timing it would be worse here than
+    # there -- the second outage's span already reaches 0.639 s unmutated
+    # against a 0.808 s mutation.
+    assert len(dispatches) <= 17
     row = durable_store.get_run(router_spec.response_id)
     assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
     assert (row["metadata"] or {}).get("should_retry") is None  # retryable
