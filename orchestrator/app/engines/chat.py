@@ -429,7 +429,9 @@ def _messages(
     )
 
 
-def _effort_degraded(reason: str, detail: str) -> dict:
+def _effort_degraded(
+    reason: str, detail: str, *, delivered: str = "single_generation"
+) -> dict:
     """meta.effort_degraded — "you chose Max and this is not Max".
 
     A downgrade the code cannot avoid has to be VISIBLE; silence is the
@@ -437,10 +439,14 @@ def _effort_degraded(reason: str, detail: str) -> dict:
     (engines/search.py): `reason` is the machine key, `detail` the one human
     line, and it rides on the answer's metadata so the stored turn carries it
     through a reload rather than living only in a log.
+
+    `delivered` names what the person actually got, because "not Max" has
+    more than one shape: no comparison at all ("single_generation"), or a
+    comparison over fewer drafts than were asked for ("best_of_2").
     """
     return {
         "asked": "max",
-        "delivered": "single_generation",
+        "delivered": delivered,
         "reason": reason,
         "detail": detail,
     }
@@ -546,12 +552,40 @@ async def run_chat_engine(
             answer = rewrite_shape.shape(message, winner.answer)
             for start in range(0, len(answer), 200):
                 await emit("token", {"text": answer[start : start + 200]})
+            # ASKED vs COMPARED. `best_of` is the N the operator configured
+            # and asked for; it is NOT how many drafts the judge got to see.
+            # A candidate that fails comes back unusable rather than fatal
+            # (core/best_of.generate_candidates), and select_best judges only
+            # the usable ones — down to "only one candidate produced an
+            # answer", which is no comparison at all. Reporting the asked
+            # count alone made that case claim a best-of-3 it never ran
+            # (2026-09-27): the same silence as the two branches below, one
+            # `if` earlier, so it is named the same way.
+            compared = sum(1 for c in candidates if c.usable)
             meta = {
                 "route": "chat",
                 "best_of": settings.extra_high_samples,
+                "best_of_compared": compared,
                 "best_of_winner": winner.index,
                 "best_of_reason": reason,
             }
+            if compared < settings.extra_high_samples:
+                failed = settings.extra_high_samples - compared
+                meta["effort_degraded"] = _effort_degraded(
+                    "candidates_partially_failed",
+                    f"{failed} of {settings.extra_high_samples} Max drafts "
+                    + (
+                        "failed; the one that survived was used without a "
+                        "comparison"
+                        if compared == 1
+                        else f"failed; the best of {compared} was kept"
+                    ),
+                    delivered=(
+                        "single_generation"
+                        if compared == 1
+                        else f"best_of_{compared}"
+                    ),
+                )
             answer = await _say_what_was_left_out(message, answer, emit, meta)
             await emit("meta", meta)
             return answer

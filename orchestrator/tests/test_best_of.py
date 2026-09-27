@@ -309,6 +309,108 @@ def test_max_without_best_of_n_says_so_in_the_metadata(monkeypatch):
     }
 
 
+def _mixed(*answers):
+    """Candidates where a None answer is a FAILED draft, as
+    generate_candidates returns it: unusable, not fatal (see
+    test_a_failed_candidate_becomes_empty_not_fatal)."""
+    out = []
+    for i, a in enumerate(answers):
+        if a is None:
+            out.append(best_of.Candidate(index=i + 1, error="backend hiccup"))
+        else:
+            out.append(best_of.Candidate(index=i + 1, reasoning=f"r{i+1}", answer=a))
+    return out
+
+
+def test_meta_reports_how_many_drafts_were_actually_compared(monkeypatch):
+    """GUARD (2026-09-27). `meta["best_of"]` is the N asked for, and it was
+    the ONLY count reported — so a Max turn where 2 of 3 drafts failed
+    claimed a best-of-3 that never happened. Drop `best_of_compared` and the
+    partial branch and this fails: meta says 3 drafts, one ran.
+    """
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+
+    async def two_dead(prompt, *, n, temperature, max_tokens):
+        return _mixed(None, "the only survivor", None)
+
+    async def must_not_stream(messages, **kwargs):  # pragma: no cover
+        raise AssertionError("a usable candidate must not fall through")
+        yield
+
+    monkeypatch.setattr(best_of, "generate_candidates", two_dead)
+    monkeypatch.setattr(llm, "stream_chat_events", must_not_stream)
+
+    events, emit = _collect_emit()
+    answer = asyncio.run(chat.run_chat_engine(
+        "q", [], emit, mode="assistant", effort="max",
+    ))
+    assert answer == "the only survivor"
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["best_of"] == 3, "the asked-for N is still reported"
+    assert meta["best_of_compared"] == 1, "...beside what was really compared"
+    # One draft survived, so no comparison happened at all: that is a single
+    # generation wearing a Max badge, and it says so.
+    assert meta["effort_degraded"] == {
+        "asked": "max",
+        "delivered": "single_generation",
+        "reason": "candidates_partially_failed",
+        "detail": (
+            "2 of 3 Max drafts failed; the one that survived was used "
+            "without a comparison"
+        ),
+    }
+
+
+def test_a_narrower_comparison_is_named_as_one_not_as_a_single_generation(monkeypatch):
+    """Two of three drafts usable IS a comparison — just not the one asked
+    for. `delivered` says which, so the metadata never overstates OR
+    understates what ran."""
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+
+    async def one_dead(prompt, *, n, temperature, max_tokens):
+        return _mixed("first draft", None, "second draft")
+
+    async def fake_select(question, candidates):
+        usable = [c for c in candidates if c.usable]
+        return usable[-1], "clearest"
+
+    monkeypatch.setattr(best_of, "generate_candidates", one_dead)
+    monkeypatch.setattr(best_of, "select_best", fake_select)
+
+    events, emit = _collect_emit()
+    answer = asyncio.run(chat.run_chat_engine(
+        "q", [], emit, mode="assistant", effort="max",
+    ))
+    assert answer == "second draft"
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["best_of_compared"] == 2
+    assert meta["effort_degraded"]["delivered"] == "best_of_2"
+    assert meta["effort_degraded"]["detail"] == (
+        "1 of 3 Max drafts failed; the best of 2 was kept"
+    )
+
+
+def test_a_full_house_of_drafts_claims_no_downgrade(monkeypatch):
+    """The other side of the guard above: when every draft the operator asked
+    for was compared, nothing was lost and nothing says it was."""
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+
+    async def all_good(prompt, *, n, temperature, max_tokens):
+        return _candidates("one", "two", "three")
+
+    async def fake_select(question, candidates):
+        return candidates[0], "clearest"
+
+    monkeypatch.setattr(best_of, "generate_candidates", all_good)
+    monkeypatch.setattr(best_of, "select_best", fake_select)
+
+    events, emit = _collect_emit()
+    asyncio.run(chat.run_chat_engine("q", [], emit, mode="assistant", effort="max"))
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["best_of"] == 3 and meta["best_of_compared"] == 3
+    assert "effort_degraded" not in meta
+
+
 @pytest.mark.parametrize("effort", ["fast", "think"])
 def test_below_max_carries_no_downgrade_claim(monkeypatch, effort):
     """Fast and Think never asked for best-of-N, so telling them they did not
