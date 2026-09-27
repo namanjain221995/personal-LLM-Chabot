@@ -414,6 +414,270 @@ def test_a_held_out_request_for_a_file_survives_the_wider_misread_fixes(text, ac
     assert got.action == action, (text, got.action, got.rule)
 
 
+# --------------------------------------------------------------- W2d (QA) --
+# W2d IS W2c A SECOND TIME, AND THE REASON THIS SECTION IS A HELD-OUT LIST
+# RATHER THAN A PATTERN. W2c widened `_REQUEST_OF_YOU_RE` with an
+# availability NOUN (`bandwidth|time|capacity|...`) and a feasibility
+# ADJECTIVE (`possible|feasible|doable`), and QA then measured FIVE MORE
+# phrasings of the same family losing the same file -- on the integration
+# head 1a660b58d7 AND on it merged with fix/question-not-edit-r2. Measured
+# again here on 2026-09-27 against origin/dev 2559fd1f36, `decide()` rules
+# only, no model and no network:
+#
+#   PC, PF  'do you have a moment to make a deck?'      create/create-first-clause
+#   PC, PF  'do you have a sec to make a deck of this?'            -> none/ambiguous
+#   PC, PF  'have you got time to make a deck?'                    (10 rows of 20;
+#   PC, PF  'do you have the bandwith to make a deck?'              P0 and PA are
+#   PC, PF  'is it viable to make a deck?'                          none on dev too)
+#
+# A moment. A sec. `have you got` instead of `do you have`. A TYPO. `viable`
+# instead of `possible`. Five more strings would have bought the sixth
+# phrasing, so the rule no longer reads the wrapper at all: `_asks_you_to_build`
+# reads the INFINITIVE OF WORK (`to <build verb>` plus a deliverable noun) and
+# excludes the three families that must stay questions by a property of the
+# wrapper -- the past, someone else's work, and a practice.
+#
+# THE CLASS IS OPEN-ENDED AND THIS LIST IS A FLOOR, NOT A PROOF. English has
+# no closed set of ways to ask politely. What the list is for is that a
+# phrasing once measured can never be lost again, and that the next one found
+# is added HERE rather than to a pattern.
+
+#: The seven W2c was written for and the five QA found after it, in one
+#: permanent list. Every one of these is a file on origin/dev 2559fd1f36
+#: under PC and PF.
+HELD_OUT_INDIRECT_REQUESTS = [
+    # -- the seven of W2c (2026-09-27, first pass)
+    "do you have the bandwidth to also make a deck?",
+    "do you have time to also make a deck?",
+    "do you have the capacity to build a one-pager?",
+    "do you think you could make a deck?",
+    "is it possible to also make a deck?",
+    "is there any way you can make a deck?",
+    "any chance you could make a deck?",
+    # -- the five QA found on the integration head AND on the shipping pair
+    "do you have a moment to make a deck?",
+    "do you have a sec to make a deck of this?",
+    "have you got time to make a deck?",
+    "do you have the bandwith to make a deck?",   # the person's typo, kept
+    "is it viable to make a deck?",
+]
+#: NOBODY ENUMERATED THESE, and that is what they are here for: they were
+#: written after `_asks_you_to_build` existed, never added to any pattern, and
+#: they pass because the rule is structural. If a later change makes this
+#: list go red while the twelve above stay green, the rule has been narrowed
+#: back into an enumeration.
+NOT_ENUMERATED_EITHER = [
+    "do you have any appetite to make a deck?",
+    "have you got the bandwidth to put together a one-pager?",
+    "is it conceivable to make a deck?",
+    "is it at all realistic to put together a deck of this?",
+    "do you have a window to draft a one-pager?",
+    # `minute` is in no list either, and this one was already a file on the
+    # integration head for a different reason (the question guard is off for a
+    # `would you` opener), so it is here as a floor rather than as a fix.
+    "would you have a spare minute to write a one-pager?",
+]
+
+
+@pytest.mark.parametrize("text", HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER,
+                         ids=[t[:46] for t in HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER])
+@pytest.mark.parametrize("ctx", [PC, PF], ids=["card-last", "file-earlier"])
+def test_the_indirect_request_family_still_makes_the_file(text: str, ctx: dict) -> None:
+    """THE PERMANENT GATE ON THIS CLASS, run beside `HELD_OUT_STILL_A_FILE`.
+
+    12 phrasings x 2 contexts for the measured ones, 6 x 2 for the ones no
+    pattern was ever widened for. The five of W2d decided none/ambiguous on
+    the integration head and on the shipping pair before `_asks_you_to_build`
+    and create/create-first-clause after it; the seven of W2c were already
+    green and are here so the band cannot narrow again."""
+    got = I.decide(text, **ctx)
+    assert got.wants_file is True, (text, got.action, got.rule)
+    assert got.action == "create", (text, got.action, got.rule)
+
+
+#: The phrasings in `HELD_OUT_INDIRECT_REQUESTS` that carry a build
+#: infinitive, which is the half `_asks_you_to_build` decides on its own. The
+#: other four ("do you think you could make a deck?", "is there any way you
+#: can make a deck?", "any chance you could make a deck?", "do you have the
+#: capacity to build a one-pager?" -- that last one HAS an infinitive) are
+#: named openers in `_REQUEST_OF_YOU_RE` and are listed above, not here.
+_INFINITIVE_CARRIED = [t for t in HELD_OUT_INDIRECT_REQUESTS + NOT_ENUMERATED_EITHER
+                       if I._BUILD_INFINITIVE_RE.match(t.lower())]
+
+
+def test_the_structural_rule_and_not_the_enumeration_carries_these() -> None:
+    """WHAT MAKES THIS A RULE AND NOT A LIST.
+
+    Ten of the eighteen gated phrasings above are decided by
+    `_asks_you_to_build` reading `to <build verb> <deliverable>`, with no
+    availability noun and no feasibility adjective consulted. Measured today:
+    deleting the availability alternative from `_REQUEST_OF_YOU_RE` entirely
+    moves 0 of 920 probe rows, 0 of `HELD_OUT_STILL_A_FILE`, 0 of these 18, 0
+    of the 686 labelled items and 0 of the 77 authored chart requests --
+    that constant no longer decides anything a build infinitive covers."""
+    assert len(_INFINITIVE_CARRIED) >= 10, _INFINITIVE_CARRIED
+    for text in _INFINITIVE_CARRIED:
+        assert I._asks_you_to_build(text.lower()) is True, text
+
+
+def test_the_two_indirect_request_enumerations_are_frozen() -> None:
+    """THE TRIPWIRE, and the only reason the two enumerations are still here.
+
+    W2c widened these two lists for seven phrasings and QA found five more the
+    same day; W2d's answer is that the class is open-ended, so the lists stop
+    growing and `HELD_OUT_INDIRECT_REQUESTS` grows instead. If you are here
+    because a phrasing was reported lost: add the phrasing to that list, make
+    `_asks_you_to_build` cover it, and leave these two alone. If a word really
+    must be added -- because the shape carries no infinitive, which is the
+    only case that justifies it -- add the phrasing to the held-out list in
+    the same commit and re-pin the string here."""
+    assert I._CAPACITY_NOUNS == (
+        r"(?:bandwidth|time|capacity|capabilit(?:y|ies)|abilit(?:y|ies)|resources?|room|cycles|"
+        r"headroom|energy)")
+    assert r"(?:possible|feasible|doable)" in I._REQUEST_OF_YOU_RE.pattern
+
+
+#: THE OTHER SIDE OF THE SAME RULE, and the list that IS enumerated now.
+#: `(text, why)`. None of these may produce a file in any context: they ask
+#: about a practice, about the past, or about work the PERSON would do.
+STILL_A_QUESTION = [
+    ("is it normal to create a second excel for this?", "a practice (W2b)"),
+    ("is it usual to build a separate deck for this?", "a practice"),
+    ("is it OK to create a second excel for this?", "a practice"),
+    ("is it the norm to create a second excel for this?", "a practice"),
+    ("is it good practice to build a separate deck for this?", "a practice"),
+    ("was it possible to build a deck?", "the past"),
+    ("is it clear what they need to make a deck?", "a third party's clause"),
+    ("is it overkill to build a separate deck for this?", "a practice"),
+    ("is it worth making a separate deck?", "a practice"),
+    ("is it rude to ask you to make a deck?", "a practice"),
+    ("do people normally make a deck for this?", "a practice"),
+    ("did you have time to make the deck?", "the past"),
+    ("did you manage to make the deck?", "the past"),
+    ("do you want me to write a memo?", "the person's own work (W2)"),
+    ("do you want me to make a deck?", "the person's own work"),
+    ("do you need me to build a deck?", "the person's own work"),
+]
+
+
+@pytest.mark.parametrize("text,why", STILL_A_QUESTION, ids=[t[:46] for t, _w in STILL_A_QUESTION])
+@pytest.mark.parametrize("ctx,ctx_id", [(P0, "fresh"), (PC, "card-last"), (PF, "file-earlier")])
+def test_a_practice_the_past_and_someone_elses_work_stay_questions(
+        text: str, why: str, ctx: dict, ctx_id: str) -> None:
+    """THE CONTRAST FOR W2d, and the three exclusions `_asks_you_to_build`
+    carries. Six of these twelve contain a build infinitive AND a deliverable
+    noun ("is it normal to create a second EXCEL"), which is why the rule is
+    not "a build verb plus a deliverable noun makes a file" -- that reading
+    reverses W2 and W2b. All 36 rows are no-file here; on origin/dev
+    2559fd1f36 the PC and PF halves of most of them are create."""
+    got = I.decide(text, **ctx)
+    assert got.wants_file is False, (text, why, ctx_id, got.action, got.rule)
+
+
+#: `_asks_you_to_build` ON ITS OWN, as a truth table. `decide()` has other
+#: rules in front of it -- a discourse opener already turns the question guard
+#: off, so several of the False rows below are files anyway for a reason that
+#: has nothing to do with this predicate -- so the predicate is tested here
+#: directly. `(text, is a request of the assistant)`.
+ASKS_YOU_TO_BUILD = [
+    # -- the wrapper is not read: no availability noun, no feasibility
+    #    adjective, and an invented word in either slot works the same
+    ("do you have a thingummy to make a deck?", True),
+    ("is it thingummy to make a deck?", True),
+    ("do you have a moment to make a deck?", True),
+    ("have you got time to make a deck?", True),
+    ("do you have the bandwith to make a deck?", True),
+    ("is it viable to make a deck?", True),
+    ("is it possible for you to make a deck?", True),
+    # -- a discourse opener before the wrapper does not hide it
+    ("ok, do you have a moment to make a deck?", True),
+    ("right, is it viable to make a deck?", True),
+    ("by the way, do you have a moment to make a deck?", True),
+    # -- A PRACTICE
+    ("is it normal to create a second excel for this?", False),
+    ("is it the norm to create a second excel for this?", False),
+    ("is it good practice to build a separate deck for this?", False),
+    ("is it rude to ask you to make a deck?", False),
+    # -- THE PAST, inverted or declarative, opener or none
+    ("did you have time to make the deck?", False),
+    ("ok, did you have time to make the deck?", False),
+    ("was it possible to build a deck?", False),
+    ("there was no time to make a deck", False),
+    # -- SOMEONE ELSE'S WORK
+    ("do you want me to write a memo?", False),
+    ("do you need me to build a deck?", False),
+    ("is it clear what they need to make a deck?", False),
+    ("the client asked us to make a deck by friday", False),
+    # -- not addressed at all: a statement about the person
+    ("i forgot to make a deck", False),
+    ("we decided to make a deck of this", False),
+    # -- a verb of ACCESS is not a verb of production
+    ("do you have the bandwidth to review my pdf?", False),
+    ("is it possible to read the pdf?", False),
+]
+
+
+@pytest.mark.parametrize("text,is_request", ASKS_YOU_TO_BUILD, ids=[t[:46] for t, _r in ASKS_YOU_TO_BUILD])
+def test_asks_you_to_build_reads_the_infinitive_and_not_the_wrapper(text: str, is_request: bool) -> None:
+    """THE INVERSION AND THE THREE EXCLUSIONS, pinned at the predicate.
+
+    `_asks_you_to_build` reads no list of polite openers; the one list it
+    reads is `_NORM_WRAPPER_RE`, the practice words, which is why an invented
+    availability noun and an invented feasibility adjective both work. A word
+    missing from a list of shapes that MUST make a file is a file the person
+    asked for and silently did not get -- the W2c/W2d defect, invisible to
+    every instrument in this repo. A word missing from `_NORM_WRAPPER_RE` is
+    an unwanted file, which the person can see and refuse, and which W1's
+    refusal path then honours. Neither list is a proof; the open end is on the
+    visible side."""
+    assert I._asks_you_to_build(text) is is_request, text
+
+
+def test_the_practice_words_are_read_in_the_predicate_and_not_anywhere() -> None:
+    """The first draft of `_NORM_WRAPPER_RE` was a bare word list, and `ok`
+    and `right` are discourse openers before they are judgements: "ok, do you
+    have a moment to make a deck?" lost the file to it. The word has to sit in
+    a copula's predicate, or be the -ly adverb."""
+    assert I._NORM_WRAPPER_RE.search("is it normal to ") is not None
+    assert I._NORM_WRAPPER_RE.search("do people normally ") is not None
+    assert I._NORM_WRAPPER_RE.search("ok, do you have a moment ") is None
+    assert I._NORM_WRAPPER_RE.search("right, is it viable ") is None
+
+
+#: THE BOUND ON THE BUILD-VERB SET, as the ACTION origin/dev 2559fd1f36 gives
+#: under PC -- not as "no file", because three of these already re-render or
+#: restore the artifact there, and that is the anchor case of the owner's
+#: complaint, owned by fix/question-not-edit-r2 and not by this rule. The
+#: `rule` is deliberately not pinned: question-not-edit-r2 relabels one of
+#: these (`no-request` -> `answer-artifact:contents`) without changing the
+#: action, and this list has to hold on that branch too.
+NON_BUILD_VERB_FRAMES = [
+    ("do you have the bandwidth to review my pdf?", "none"),
+    ("do you have time to explain the sheet to me?", "none"),
+    ("is there any way to know who edited the sheet?", "none"),
+    ("is it possible to open the sheet in google sheets?", "convert"),
+    ("is it possible to read the pdf?", "convert"),
+    ("is it possible to see the sheet?", "convert"),
+    ("is it possible to undo the last edit to the deck?", "edit"),
+]
+
+
+@pytest.mark.parametrize("text,action", NON_BUILD_VERB_FRAMES, ids=[t[:46] for t, _a in NON_BUILD_VERB_FRAMES])
+def test_a_polite_frame_around_a_NON_build_verb_decides_what_dev_decides(text: str, action: str) -> None:
+    """`review`, `explain`, `know`, `open`, `read`, `see` and `undo` are verbs
+    of ACCESS, so the same wrappers ask a question about the artifact.
+
+    Both halves measured 2026-09-27 on origin/dev 2559fd1f36, on the
+    integration head 1a660b58d7, here, and on the merge with
+    fix/question-not-edit-r2. The second assertion is the branch-independent
+    one: it fails the day `_asks_you_to_build` starts reading a verb of access
+    as a verb of production, whatever any other rule then does with the
+    turn."""
+    assert I._asks_you_to_build(text) is False, text
+    got = I.decide(text, **PC)
+    assert got.action == action, (text, got.action, got.rule)
+
+
 # ----------------------------------------------------------------------- W3 --
 def _pasted_rows(n: int) -> str:
     """`n` tab-separated rows, the shape a person pastes out of a
@@ -470,6 +734,100 @@ def test_a_swallowed_ask_at_least_reaches_the_classifier(rows: int) -> None:
     text = _pasted_rows(rows) + "\n\nMake a sheet of this for me please"
     assert I.decide(text, **P0).wants_file is True
     assert I._should_consult(I.ArtifactIntent("none", rule="no-request"), text) is True
+
+
+# THE DECISION ON W3's DISCLOSED COST (2026-09-27, r3). QA disclosed that the
+# head+tail window lets a request QUOTED from someone else, at the bottom of a
+# pasted mail thread, be read as the person's own. DECIDED: ACCEPT IT, DO NOT
+# CLOSE IT HERE, and record it as an xfail so it cannot be forgotten. Three
+# reasons, in the order they decided it:
+#
+# 1. IT IS NOT A REGRESSION OF W3. The same quoted imperative is a file on
+#    origin/dev 2559fd1f36 above the paste at every size, and below a paste of
+#    40 rows or fewer. The rules have never had a model of quotation. What
+#    `_decide_window` removed is a TRUNCATION that hid the shape once a paste
+#    passed 4,000 collapsed characters -- an accident, not a guard, and one
+#    that swallowed the person's own ask in the same breath (that is W3).
+# 2. CLOSING IT IS A CAPABILITY, NOT A GUARD. It needs attribution: `>`
+#    prefixes, "From:", "wrote:", "-----Original Message-----", and the
+#    knowledge that everything under them is somebody else's sentence. Bolted
+#    on as one more veto it would have to run at EVERY position or it would
+#    just move the inconsistency, and it would take the person's own quoted
+#    ask ("he asked for a deck -- please make one") with it.
+# 3. THE EXPOSURE IS BOUNDED, AND IT IS THE VISIBLE DIRECTION. Only the
+#    quoted IMPERATIVE reaches a file; every quoted QUESTION form is
+#    none/ambiguous here, measured below, including the indirect requests this
+#    commit adds. An unwanted file is a card the person can see and refuse,
+#    and W1's refusal path now honours the refusal. The loss on the other side
+#    is silent.
+
+#: A QUOTED THIRD-PARTY REQUEST: `>`-quoted mail, addressed to a colleague.
+_QUOTED_ASK = ("\n\n> From: priya@client.example\n"
+               "> Ravi, please make a deck of this before Friday.")
+
+
+@pytest.mark.parametrize("rows", [5, 40, 120, 400, 10_000])
+def test_a_quoted_third_party_imperative_is_read_as_a_request_at_every_size(rows: int) -> None:
+    """THE DISCLOSED COST OF W3, MEASURED AND ACCEPTED -- see the decision
+    note above this test.
+
+    Measured 2026-09-27 on origin/dev 2559fd1f36 and here, `decide()` rules
+    only, P0, `_pasted_rows(n)` then `_QUOTED_ASK`:
+
+      rows   collapsed chars   origin/dev              here
+         5              263    create/create           create/create
+        40            1,558    create/create           create/create
+       120            4,518    none/no-request         create/create
+       400           14,878    none/no-request         create/create
+    10,000          370,079    none/no-request         create/create
+
+    and with the SAME quote placed ABOVE the paste, origin/dev decides
+    create/create at 5 and at 400 rows. So the rules have never told the
+    person's words from a quotation: what `_decide_window` removed is the
+    truncation that HID the shape once a paste passed 4,000 collapsed
+    characters, and the three rows it changes are the three that used to be
+    rescued by an accident. What this test asserts is the property W3 was
+    for: the verdict no longer depends on the size of the paste. The
+    origin/dev column is the measurement above, recorded, not re-derived."""
+    text = _pasted_rows(rows) + _QUOTED_ASK
+    got = I.decide(text, **P0)
+    assert got.action == "create" and got.rule == "create", (rows, got.action, got.rule)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "OPEN AND ACCEPTED, NOT FIXED: the rules have no model of QUOTATION, so a "
+    "request a colleague made inside a pasted mail thread reads as the "
+    "person's own. Measured 2026-09-27: it is a file on origin/dev "
+    "2559fd1f36 too whenever the truncation does not swallow it (above the "
+    "paste at every size, below a paste of 40 rows or fewer), so this is not "
+    "a regression of `_decide_window` -- it is a pre-existing gap that the "
+    "window made size-independent. Closing it needs an attribution model "
+    "('>' prefixes, 'From:', 'wrote:') applied at EVERY position, which is a "
+    "capability and not a guard, and belongs to whoever owns the paste path. "
+    "strict=True so this goes red, and gets deleted, the day that lands."))
+def test_a_quoted_third_party_request_should_not_make_a_file() -> None:
+    text = _pasted_rows(400) + _QUOTED_ASK
+    assert I.decide(text, **P0).wants_file is False
+
+
+@pytest.mark.parametrize("tail", [
+    "> Ravi, can you make a deck of this for the Friday review?",
+    "> Ravi, do you have the bandwidth to make a deck of this?",
+    "> Ravi, is it viable to make a deck of this?",
+])
+def test_the_indirect_request_rule_cannot_be_ARMED_from_the_tail(tail: str) -> None:
+    """THE BOUND ON W2d's OWN EXPOSURE TO W3, which is why
+    `_BUILD_INFINITIVE_RE` is matched against the START of the window and its
+    word gap cannot cross a sentence end.
+
+    `_decide_window` joins the head and the tail with " . ", so the new rule
+    reads the opening clause of the HEAD and nothing else: a polite request
+    quoted at the bottom of a 400-row paste decides none/ambiguous here, as
+    it does on the integration head 1a660b58d7. Only the quoted IMPERATIVE
+    above reaches a file, and that one predates this branch."""
+    text = _pasted_rows(400) + "\n\n> From: priya@client.example\n" + tail
+    got = I.decide(text, **P0)
+    assert got.wants_file is False, (tail, got.action, got.rule)
 
 
 # ----------------------------------------------------------------------- W4 --

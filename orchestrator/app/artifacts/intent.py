@@ -1084,6 +1084,20 @@ _MODAL_QUESTION_RE = re.compile(
 #: BANDWIDTH to also make a deck?". Asking whether the assistant is free to
 #: do the thing is the politest way there is of asking for the thing, and it
 #: is not a question about whether the thing is a good idea.
+#:
+#: FROZEN ON 2026-09-27, AND DO NOT ADD A WORD TO IT. This list is what made
+#: W2c ship the same defect twice: a moment, a sec, `have you got`, and the
+#: person's typo `bandwith` are all this frame and none of them is here.
+#: `_asks_you_to_build` below reads the INFINITIVE instead and needs no noun,
+#: which makes this constant vestigial for every shape that carries one:
+#: measured today, deleting this alternative from `_REQUEST_OF_YOU_RE` moves
+#: 0 of 920 probe rows, 0 of the 48 `HELD_OUT_STILL_A_FILE` cases, 0 of the
+#: 18 `HELD_OUT_INDIRECT_REQUESTS` cases, 0 of the 686 labelled items and 0
+#: of the 77 authored chart requests. It is kept only because deleting it is
+#: a wider change than the defect needs. THE NEXT PHRASING FOUND GOES TO
+#: `HELD_OUT_INDIRECT_REQUESTS` in tests/test_wider_misreads.py and is closed
+#: structurally; `test_the_two_indirect_request_enumerations_are_frozen`
+#: fails if this line or the feasibility adjectives below grow instead.
 _CAPACITY_NOUNS = (r"(?:bandwidth|time|capacity|capabilit(?:y|ies)|abilit(?:y|ies)|resources?|room|cycles|"
                    r"headroom|energy)")
 #: The turn is addressed to the assistant AS A REQUEST. Narrower than
@@ -1178,6 +1192,159 @@ _IMPERATIVE_CREATE_RE = re.compile(
 )
 
 
+#: THE INFINITIVE OF WORK. `to make`, `to also build`, `to put together`,
+#: `to get`: a bare-infinitive verb of PRODUCING or HANDING OVER something.
+#: This is the structural half of the indirect-request rule below.
+#:
+#: Written out rather than reused from `_STRICT_CREATE_VERBS` and
+#: `_HANDOVER_VERBS`: those two carry first-person phrases ("give me", "i
+#: need", "we would like") that cannot follow `to`, and this one carries the
+#: hand-over verbs that only read as production in this position (`get`,
+#: `download`, `email`, `attach`) -- a bare "get" or "send" elsewhere is as
+#: often conversation. A verb of ACCESS is deliberately absent: `review`,
+#: `read`, `see`, `open`, `explain`, `undo` and `know` keep their wrappers
+#: questions, which `NON_BUILD_VERB_FRAMES` in tests/test_wider_misreads.py
+#: pins.
+_BUILD_INFINITIVE_VERBS = (
+    r"(?:make|create|generate|build|write|draft|prepare|produce|compile|assemble|put\s+together|"
+    r"design|develop|export|convert|turn|save|render|print|format|send|share|provide|deliver|"
+    r"give|get|download|email|attach|knock\s+up|whip\s+up)"
+)
+#: THE OPENING CLAUSE, up to eight words, then a build infinitive, then the
+#: deliverable it names: `do you have a moment` + `to make` + `a deck`. Both
+#: gaps are bounded and lazy, and neither can cross a sentence end -- which is
+#: also what keeps the head+tail window (`_decide_window` joins the two halves
+#: with " . ") from letting the TAIL of a long paste supply the wrapper. The
+#: eight-word bound and the `.match` are what make this the person's own
+#: opening ask rather than any `to make a deck` anywhere in the message.
+_BUILD_INFINITIVE_RE = re.compile(
+    r"^\W*(?:[\w'\u2019-]+[^\w.?!;]+){0,8}?"
+    r"(?P<inf>to\s+(?:(?:also|just|then|now|maybe|please|kindly|quickly|first)\s+){0,2}"
+    rf"{_BUILD_INFINITIVE_VERBS}\b)"
+    rf"(?:\W+\w+){{0,4}}?\W+{_ARTIFACT_NOUNS}\b",
+    re.I,
+)
+#: The wrapper asks about a PRACTICE, not about this piece of work: "is it
+#: NORMAL to create a second excel for this?" (W2b). THIS is the enumerated
+#: list now, and the inversion is deliberate -- see `_asks_you_to_build`.
+#:
+#: The word has to sit in the PREDICATE of a copula ("is it ok to ...") or be
+#: the -ly adverb ("do people normally ..."). A bare word list would have read
+#: the discourse openers people actually type -- "ok, do you have a moment to
+#: make a deck?", "right, is it viable to make a deck?" -- as norm questions
+#: and swallowed the request: measured 2026-09-27, both of those lost the file
+#: with the first draft of this pattern and keep it with this one.
+_NORM_WRAPPER_RE = re.compile(
+    r"\b(?:is|are|was|were|would|will|it's|it’s|its)\s+(?:it\s+|that\s+|this\s+)?(?:be\s+)?"
+    r"(?:really\s+|actually\s+|even\s+|ever\s+|at\s+all\s+|always\s+|generally\s+)?"
+    r"(?:normal|usual|typical|standard|customary|common|ok|okay|fine|acceptable|advisable|"
+    r"appropriate|proper|right|wise|sensible|smart|silly|necessary|needed|required|expected|"
+    r"mandatory|overkill|worth|weird|odd|strange|unusual|rude|allowed|permitted|legal|ethical|"
+    r"the\s+norm|good\s+practice|best\s+practice|standard\s+practice)\b"
+    r"|\b(?:normally|usually|typically|customarily|conventionally)\b", re.I)
+#: The wrapper puts the work on SOMEONE ELSE, so the infinitive is not being
+#: asked of the assistant: "do you want ME to write a memo?" (W2), "can I ask
+#: Ravi to make a deck?". The pronoun sits immediately before `to`.
+_OTHER_AGENT_RE = re.compile(
+    r"\b(?:me|us|him|her|them|myself|ourselves|someone|somebody|anyone|anybody|everyone|"
+    r"people|they|he|she)\s*$", re.I)
+#: The wrapper is about the PAST: "DID you have time to make the deck?",
+#: "WAS it possible to build a deck?" -- W2b's own family. Searched rather
+#: than anchored, because a discourse opener comes first often enough ("ok,
+#: did you have time to make the deck?"), and the auxiliary has to govern a
+#: subject so that "I had a thought" is not read as a past question.
+_PAST_WRAPPER_RE = re.compile(
+    r"\b(?:did|was|were|had)\s+(?:you|u|i|we|it|there|he|she|they|that|this)\b"
+    r"|\b(?:you|u|i|we|it|there|he|she|they|that|this|nobody|no\s+one)\s+"
+    r"(?:did|was|were|had|didn[\u2019']?t|wasn[\u2019']?t|weren[\u2019']?t|hadn[\u2019']?t)\b", re.I)
+#: The wrapper embeds SOMEBODY ELSE'S clause, so the infinitive is theirs:
+#: "is it clear what THEY NEED to make a deck?". A subject in the third
+#: person with its own verb, anywhere in the wrapper. `_OTHER_AGENT_RE` above
+#: only sees the pronoun directly before `to`, which is the "do you want me
+#: to" shape and not this one.
+_THIRD_PARTY_CLAUSE_RE = re.compile(
+    r"\b(?:they|he|she|someone|somebody|anyone|anybody|everyone|people|the\s+\w+|my\s+\w+|"
+    r"our\s+\w+|their\s+\w+)\s+"
+    r"(?:need|needs|want|wants|wanted|expect|expects|ask|asks|asked|has|have|is|are|will|would|"
+    r"said|says|plans?|planned|intends?|tried|tries|try)\b", re.I)
+#: A wrapper is a POLITENESS WRAPPER when its own SUBJECT is the assistant
+#: (`you`) or the act (`it`, `there`), after any number of discourse openers.
+#: The subject position is what makes this structural: "I forgot to make a
+#: deck" and "we decided to build a deck" are neither, and a bare "contains
+#: `it` anywhere" test would have taken "is it clear what they need to make a
+#: deck?" as well as the shapes it is for.
+_WRAPPER_SUBJECT_RE = re.compile(
+    r"^\W*(?:(?:ok|okay|k|so|hey|hi|hello|right|well|alright|anyway|and|then|also|plus|"
+    r"please|pls|kindly|just|now|actually|sorry|thanks|quick\s+one|quick\s+question|"
+    r"one\s+more\s+thing|by\s+the\s+way|btw|hmm|umm?)\W+)*"
+    r"(?:(?:do|does|dont|don't|do\s+not|would|wouldnt|will|wont|won't|can|cant|can't|could|"
+    r"couldnt|may|might|shall|should|have|havent|haven't|has|had|are|arent|is|isnt|was|were|"
+    r"any|if|whether)\s+)?"
+    r"(?:you|u|it|there)\b", re.I)
+
+
+def _asks_you_to_build(low: str) -> bool:
+    """The opening clause asks the assistant, however politely, to build a
+    named deliverable: "do you have a MOMENT to make a deck?".
+
+    THIS IS THE STRUCTURAL RULE, and it exists because the alternative --
+    naming the politeness wrapper -- is an open-ended enumeration that lost
+    the same file twice. `_REQUEST_OF_YOU_RE` above spells out an
+    availability NOUN (`bandwidth|time|capacity|…`) and a feasibility
+    ADJECTIVE (`possible|feasible|doable`), and English has no end of either:
+    QA found five more phrasings on 2026-09-27 AFTER the seven that constant
+    was widened for -- "do you have a moment to ...", "do you have a sec to
+    ...", "have you got time to ...", "do you have the bandwith to ..."
+    (a TYPO), "is it viable to ..." -- each of them `create` on origin/dev
+    2559fd1f36 under PC and PF and `none`/`ambiguous` here.
+
+    So the wrapper is not read at all. What is read is the INFINITIVE OF
+    WORK: a clause that says `to <build verb>` and names a deliverable is
+    asking for that deliverable, whatever words open it, and the typo, the
+    noun and the adjective all stop mattering.
+
+    THREE FAMILIES MUST STILL BE QUESTIONS, and each is excluded by a
+    property of the wrapper rather than by a phrase:
+
+    * THE PAST. "did you have time to make the deck?" asks what happened.
+      `_PAST_WRAPPER_RE`. This is why the rule is the infinitive and not "a
+      build verb plus a deliverable noun": "did you make a new sheet?" (W2b)
+      has both and no infinitive.
+
+    ...and the wrapper itself has to be ADDRESSED: its subject is `you`, `it`
+    or `there`, after any number of discourse openers (`_WRAPPER_SUBJECT_RE`).
+    "I forgot to make a deck" and "we decided to build a deck" are statements
+    about the person, and this rule leaves them where they were.
+    * SOMEONE ELSE'S WORK. "do you want me to write a memo?" (W2) puts the
+      memo on the person. `_OTHER_AGENT_RE`, the pronoun before `to`, and
+      `_THIRD_PARTY_CLAUSE_RE` for an embedded clause with its own subject
+      ("is it clear what they need to make a deck?").
+    * A PRACTICE. "is it normal to create a second excel for this?" (W2b) and
+      "is it usual to build a separate deck for this?" ask whether people do
+      this, not for the thing. `_NORM_WRAPPER_RE`.
+
+    THE INVERSION IS THE POINT, and it is a judgement, not a measurement.
+    `possible|feasible|doable` and `bandwidth|time|capacity|…` are lists of
+    the shapes that MUST make a file, so a word missing from them is a file
+    the person asked for and did not get -- silent, invisible in every
+    instrument this repo has, and the defect that shipped twice.
+    `normal|usual|typical|…` is a list of the shapes that must NOT, so a word
+    missing from THAT list is an unwanted file -- which the person can see,
+    can say no to, and which W1's refusal path then honours. The open end is
+    moved to the side where the failure is visible. Neither list is a proof;
+    both are floors.
+    """
+    m = _BUILD_INFINITIVE_RE.match(low)
+    if m is None:
+        return False
+    wrapper = low[: m.start("inf")]
+    if _PAST_WRAPPER_RE.search(wrapper) or _NORM_WRAPPER_RE.search(wrapper):
+        return False
+    if _OTHER_AGENT_RE.search(wrapper) or _THIRD_PARTY_CLAUSE_RE.search(wrapper):
+        return False
+    return bool(_WRAPPER_SUBJECT_RE.match(wrapper))
+
+
 def _question_not_a_request(low: str, *, raw: str = "") -> bool:
     """The turn ASKS about making a file instead of ordering one.
 
@@ -1193,6 +1360,8 @@ def _question_not_a_request(low: str, *, raw: str = "") -> bool:
     already looked for it there, so it passes none.
     """
     if "?" not in (raw or low) or _REQUEST_OF_YOU_RE.match(low) or _IMPERATIVE_CREATE_RE.match(low):
+        return False
+    if _asks_you_to_build(low):
         return False
     return bool(_QUESTION_ABOUT_RE.match(low) or _MODAL_QUESTION_RE.match(low))
 
