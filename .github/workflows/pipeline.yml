@@ -1093,6 +1093,15 @@ jobs:
       # A skipped job reports NO reason — GitHub shows "skipped" and nothing
       # else — so a deploy that does not happen is otherwise a guessing game.
       # This states the inputs to that decision while they are still visible.
+      #
+      # `deploy` needs TWO gates: `ci-ok` (this job) and `box-readiness`. This
+      # step can only see its own half, so it says so rather than promising a
+      # deploy on the strength of half the graph. It cannot take
+      # `box-readiness` as a `needs:` — that job is self-hosted and skips on
+      # every pull_request, and ci_gate.py counts a skipped dependency as a
+      # failure, so it would redden every PR (see P4 and the box-readiness job
+      # comment). Naming it in the text costs nothing and is asserted in
+      # tests/test_box_wiring.py so it cannot drift back.
       - name: Will the deploy run?
         env:
           KILL_SWITCH: ${{ vars.DEPLOY_ON_PUSH }}
@@ -1110,9 +1119,13 @@ jobs:
             echo ""
             case "${EVENT}:${REF}:${KILL_SWITCH}" in
               push:refs/heads/main:false|push:refs/heads/main:0|push:refs/heads/main:no|push:refs/heads/main:off)
-                echo "Deploy is **held**: the kill switch is set." ;;
+                echo "Deploy is **held**: the kill switch is set."
+                echo ""
+                echo "\`Box readiness\` is held with it: it carries the same deploy-intent clause, so the box is not read either." ;;
               push:refs/heads/main:*)
-                echo "Deploy **will run**." ;;
+                echo "Deploy **will run if both gates pass**: this job (\`CI passed\`) AND \`Box readiness\`, the read-only pre-deploy reading of the box."
+                echo ""
+                echo "This step can only see its own half. A refusal from \`Box readiness\` skips the deploy, and its own log says which probe refused and what to run." ;;
               *)
                 echo "No deploy: this is not a push to main." ;;
             esac
@@ -1126,14 +1139,27 @@ jobs:
   # "can this machine be deployed to?" on the box, while lane A is still
   # running, and the two meet at `deploy`.
   #
-  # Until now the first thing that looked at the box was `deploy` itself,
-  # after the full ~31-minute CI had passed. So every box-state refusal cost
-  # a CI run before it was even asked. Measured on recorded runs: one burned
-  # ~55 minutes of CI before a 3m53s deploy failure that had nothing to do
-  # with the code; another's `verify` reported non-cluster addresses ACCEPTING
-  # a connection to the unauthenticated engine port, a fact that was already
-  # true before the run started. Two of the three most recent main-run
-  # failures were box state, not code.
+  # Until now the first thing that looked at the box was `deploy` itself, after
+  # the full CI had passed. So every box-state refusal cost a CI run before it
+  # was even asked. RE-MEASURED from the GitHub Actions API on 2026-09-27, so
+  # the run ids below can be checked rather than believed:
+  #
+  #   * run 35002778440 (push, 31db65b2bf76, 2026-09-15): 55.4 minutes of wall
+  #     clock elapsed before the `deploy` job STARTED, and it then failed in
+  #     233s (3m53s) at the step "The box is serving the commit we asked for" -
+  #     box state, not code;
+  #   * runs 35100814873 (2026-09-16), 35427466262 (2026-09-19) and
+  #     36304046169 (2026-09-27) each failed in `verify` at "The engine API
+  #     cannot be reached from outside the cluster" - a fact that was already
+  #     true before each run started.
+  #
+  # So the FOUR most recent main-run failures were all box state, and the next
+  # two before them (34887763253, 34754339201) were test failures. The engine
+  # exposure one is still true TODAY: run 36304046169's log at
+  # 2026-09-27T08:26:48Z reports "3 non-cluster addresses: 1 blocked, 2
+  # ACCEPTED, 0 not proven". Which means the first push to main after this
+  # merges WILL refuse here with `engine-exposure exposed`, correctly and on
+  # purpose, and clearing it NEEDS ROOT - the refusal prints the commands.
   #
   # ------------------------------------------------------------- THE GATING
   # `needs: [policy, security]`, and NOT `needs: [policy]`.
@@ -1184,6 +1210,37 @@ jobs:
   #   (b) the deploy-lock probe REFUSES when the flock is held.
   # If a second runner is ever added on the head, this job must take a read
   # lock or rejoin `deploy-dgx-spark`.
+  #
+  # --------------------------- WHAT IT BLOCKS THAT NOTHING BLOCKED BEFORE
+  # This job is a CAPABILITY CHANGE, not only an earlier reading, and it has NO
+  # override of any kind - no input, no repository variable, no environment
+  # variable. Three refusals are states no part of the release path used to
+  # stop, so a box in any of them could previously be deployed to and now
+  # cannot:
+  #
+  #   * engine-exposure  exposed | unproven  -- `verify` checked this AFTER the
+  #     rollout, so it was a post-deploy failure and is now a pre-deploy
+  #     refusal. Clearing `exposed` NEEDS ROOT (the host packet filter), and it
+  #     is true on this box today: run 36304046169's `verify` log at
+  #     2026-09-27T08:26:48Z reads "3 non-cluster addresses: 1 blocked, 2
+  #     ACCEPTED, 0 not proven". The first push to main after this merges will
+  #     refuse here until someone with root acts;
+  #   * engine-controller  not-ready | recovering | unreachable | unreadable;
+  #   * completion  wedged | empty-reply | unreachable | metrics-unreadable |
+  #     model-unknown -- nothing pre-deploy asked the engine to generate before.
+  #
+  # Plus `probe-raised` and `probe-timed-out` on any of the seven. Everything
+  # else it refuses (a dirty deploy root, the 20 GB floor, a held deploy lock, a
+  # `behind` migration) is a refusal scripts/deploy.sh or this file's own
+  # preflight already made - just an hour earlier.
+  #
+  # Two verdicts are deliberately NOT refusals, because deploy.sh proceeds on
+  # them and refusing would be this job blocking a release the release path
+  # allows: `deploy-root wrong-branch` (deploy.sh detaches the production
+  # checkout on purpose on seven code paths, and the next deploy re-attaches it)
+  # and `migrations unreadable` (deploy.sh:244-252 proceeds without the check
+  # when the orchestrator is down and psql is unavailable - and a deploy is what
+  # brings a down stack back). Both are printed in the table either way.
   #
   # ------------------------------------------------ WHAT IT DOES NOT CLAIM
   # It is a PRE-check taken minutes before the deploy, not a guarantee held at
@@ -1236,8 +1293,37 @@ jobs:
     runs-on: [self-hosted, dgx-spark]
     permissions:
       contents: read
-    # Seven reads. Measured on the box on 2026-09-23: 10.0s wall clock on a
-    # healthy head.
+    # INSIDE THE SAME GATE AS `deploy`. This job was the first thing in the
+    # graph to execute anything on the production box, and it was doing it
+    # OUTSIDE the `production` environment that `deploy` declares - the gate
+    # this file's own header recommends as the approval gate ("Add required
+    # reviewers and a deployment-branch policy to this environment in repo
+    # settings to turn every production deploy into an approval gate"). Without
+    # this line, configuring that gate would NOT keep code off the box:
+    # box_readiness.py plus everything it subprocesses - git in the shared
+    # deploy root, df, `flock -n` on the real deploy lock, engine_bind.py (which
+    # ssh's to the worker and opens TCP connections), curl asking the
+    # unauthenticated engine for a live generation, and a `bash -c` whose
+    # fallback runs `docker exec <production postgres> psql` - would all run on
+    # any push to main before a reviewer clicked approve. `verify` and
+    # `recovery` are also environment-less, but they run only AFTER `deploy`, so
+    # the gate has already been passed by the time they touch the box.
+    #
+    # It costs nothing today, measured on 2026-09-27:
+    # `gh api repos/{owner}/{repo}/environments/production` returns
+    # "protection_rules": [] with "can_admins_bypass": true, and the environment
+    # declares zero variables and zero secrets, so nothing about this run
+    # changes. The cost arrives with the gate: a reviewer would then approve
+    # twice per release, once for the box reading and once for the rollout. That
+    # is the honest price of the gate meaning what it says, and it is the reason
+    # this is a line of YAML rather than a paragraph in STILL OPEN.
+    environment: production
+    # Seven reads. Wall clock on a healthy head is NOT measured on this branch:
+    # the "10.0s on 2026-09-23" figure recorded on the original commit has not
+    # been reproduced since, and running this job on the box would cost a live
+    # generation on the shared TP=2 model, so it is not asserted here. What IS
+    # measured, by tests/test_box_wiring.py against a recording runner, is the
+    # WORST case - which is the only number the ceiling below depends on.
     #
     # The ceiling is NOT 8 minutes, and the arithmetic behind that number was
     # wrong. It read "the sum of the per-probe subprocess timeouts (405s) plus

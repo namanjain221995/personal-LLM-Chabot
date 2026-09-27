@@ -10,9 +10,31 @@ machine in a state where a deploy would succeed?" — and both answer it from a
 PUBLIC repository's log, so both need the same two properties:
 
   1. EVERY PROBE IS READ-ONLY. Nothing here starts, stops, recreates, prunes
-     or writes. The deploy flock is ASKED whether it is free, by exactly the
-     mechanism scripts/lib/deploy-common.sh's own `dr_lock_is_held` uses: a
-     non-blocking `flock -n` on a descriptor that is closed immediately.
+     or changes the STATE OF THE STACK. The deploy flock is ASKED whether it is
+     free, by exactly the mechanism scripts/lib/deploy-common.sh's own
+     `dr_lock_is_held` uses: a non-blocking `flock -n` on a descriptor that is
+     closed immediately.
+
+     "Nothing writes" was too strong, and is corrected here. Two places touch
+     something, and both are named so that nobody has to discover them:
+
+       * `git status` REFRESHES THE INDEX unless it is told not to. Measured on
+         git 2.43.0 in a scratch repository on this box on 2026-09-27: a plain
+         `git status --porcelain --untracked-files=no` against a stale index
+         opens `.git/index.lock` with O_CREAT|O_EXCL and rewrites `.git/index`
+         (mtime moved), while `git --no-optional-locks status ...` opens no lock
+         and leaves the index byte-for-byte alone. The deploy root is a SHARED
+         working tree, so every git call this library makes there carries
+         `--no-optional-locks`. (The same measurement also refutes the worry
+         that a peer holding `.git/index.lock` makes this probe fail: with a
+         lock file present, plain `git status --porcelain` still exited 0 with
+         empty stderr -- the refresh is best-effort and git skips it silently.)
+       * `probe_migrations` reaches `dr_live_schema_version`, whose fallback
+         runs `docker exec <production postgres> psql -tAc 'SELECT
+         COALESCE(MAX(version), 0) FROM schema_migrations'`
+         (scripts/lib/deploy-common.sh:274-275). That is a SELECT, but it is a
+         command executed inside the production database container, which is
+         more than the phrase "seven reads" suggests on its own.
 
      An earlier version of this paragraph said the flock was "OBSERVED, never
      taken". That was not true and the claim is withdrawn: `flock -n` DOES
@@ -174,7 +196,7 @@ VERDICTS = frozenset(
         # deploy-lock
         "free", "held", "never-created",
         # engine-exposure
-        "closed", "exposed", "unproven", "unavailable",
+        "closed", "exposed", "unproven",
         # engine-controller
         "ready", "not-ready", "recovering", "unreachable",
         # completion
@@ -186,11 +208,58 @@ VERDICTS = frozenset(
     }
 )
 
+#: The two verdicts `run_probe` can report for ANY probe, whatever the probe
+#: itself does. They are the reason `remedy_for` has a fallback.
+UNIVERSAL_VERDICTS = frozenset({"probe-raised", "probe-timed-out"})
+
+#: Which verdicts each probe can actually REPORT. Not decoration: the remedy
+#: coverage test iterates this rather than `VERDICTS`, and `VERDICTS` used to be
+#: the only list, which made that test ask for a remedy for impossible pairs
+#: like ("disk", "wedged") -- 200-odd pairs that all fell through to
+#: `remedy_for`'s catch-all, so the test passed with the whole remedy table
+#: deleted. Measured on 2026-09-27 by deleting `_remedies()`'s body: 23 tests,
+#: OK. tests/test_box_probes.py now asserts this map against VERDICTS in both
+#: directions, so a verdict a probe cannot produce cannot sit in either list
+#: pretending to be covered -- which is how `unavailable` (declared for
+#: engine-exposure, returned by nothing) survived review.
+PROBE_VERDICTS: Mapping[str, frozenset] = {
+    "deploy-root": frozenset(
+        {"clean-on-default", "dirty-tree", "wrong-branch", "not-a-checkout", "git-unreadable"}
+    ),
+    "disk": frozenset({"ok", "below-floor", "unreadable"}),
+    "deploy-lock": frozenset({"free", "held", "never-created", "unreadable"}),
+    "engine-exposure": frozenset({"closed", "exposed", "unproven"}),
+    "engine-controller": frozenset({"ready", "not-ready", "recovering", "unreachable", "unreadable"}),
+    "completion": frozenset(
+        {"generated", "wedged", "empty-reply", "metrics-unreadable", "model-unknown", "unreachable"}
+    ),
+    "migrations": frozenset({"equal", "forward", "behind", "unreadable"}),
+}
+
 #: The verdicts that let a probe pass. EVERYTHING ELSE IS A REFUSAL — including
 #: any verdict added later and forgotten here, which is the direction a
 #: fail-closed default has to lean.
 PASSING: Mapping[str, frozenset] = {
-    "deploy-root": frozenset({"clean-on-default"}),
+    # `wrong-branch` PASSES, and it is reported. It was a refusal, and that was
+    # a self-lockout: scripts/deploy.sh puts the production checkout on a
+    # DETACHED HEAD on seven distinct paths (`detach_to`, deploy.sh:290, called
+    # from deploy.sh:310/314/332/338/346/356/361), one of which is "the branch
+    # is checked out in another worktree" -- a state deploy.sh's own comment
+    # calls "a real configuration on this box". `git rev-parse --abbrev-ref
+    # HEAD` then prints `HEAD`, so on_default_branch is false. Refusing on that
+    # blocked `deploy` on every subsequent push AND dispatch until a human ran
+    # `git checkout main` in the shared checkout -- while the very deploy being
+    # blocked is what recovers it: `land_on_branch` (deploy.sh:300) checks the
+    # branch out and fast-forwards it.
+    #
+    # And there was no authority behind the refusal. Nothing in the release
+    # path requires the deploy root to be ON a branch: deploy.sh's preflight
+    # does not check, `land()` handles an unset DEPLOY_BRANCH by detaching ON
+    # PURPOSE, and the workflow's own "the box is serving the commit we asked
+    # for" step compares `git rev-parse HEAD`, which reads the same on a
+    # detached HEAD. So the branch is a FACT worth printing (on_default_branch
+    # is in the table either way) and not a verdict worth blocking a release on.
+    "deploy-root": frozenset({"clean-on-default", "wrong-branch"}),
     "disk": frozenset({"ok"}),
     # A lock file that was never created is the first-deploy state, and it is
     # what the deploy's own preflight already accepts. `held` is a refusal: a
@@ -201,7 +270,24 @@ PASSING: Mapping[str, frozenset] = {
     "engine-exposure": frozenset({"closed"}),
     "engine-controller": frozenset({"ready"}),
     "completion": frozenset({"generated"}),
-    "migrations": frozenset({"equal", "forward"}),
+    # `unreadable` PASSES, because scripts/deploy.sh:244-252 deliberately
+    # proceeds in exactly that case: "cannot read the live schema version
+    # (orchestrator down and psql unavailable) ... proceeding WITHOUT the
+    # compatibility check - this is the one case where the check cannot be made,
+    # and it is worth knowing it was skipped". Refusing it here meant a stack
+    # that is DOWN could no longer be deployed to through CI -- and a deploy is
+    # what brings it back. deploy.sh:256-257 tolerates an unreadable CODE
+    # version for the same reason. Whichever number WAS readable stays in the
+    # facts, so the table still reports the reading that could not be taken:
+    # that is deploy.sh's "proceed and say so", not a shrug.
+    #
+    # `behind` stays a refusal. deploy.sh refuses it too (deploy.sh:263-271),
+    # and its ALLOW_SCHEMA_DOWNGRADE=1 override has never been reachable from
+    # CI on any branch -- verified on 2026-09-27: `git grep ALLOW_SCHEMA_DOWNGRADE
+    # origin/dev -- .github/` and the same on this branch both return nothing.
+    # It is a hand-run-deploy override, and a hand-run deploy does not pass
+    # through this job at all.
+    "migrations": frozenset({"equal", "forward", "unreadable"}),
 }
 
 # -------------------------------------------------------------- print allowlist
@@ -253,6 +339,17 @@ _IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 #: colons. Each candidate is then handed to `ipaddress` to decide, so a short
 #: sha, a duration or a count is never mistaken for an address.
 _IPV6_CANDIDATE_RE = re.compile(r"[0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:]*(?:%[0-9A-Za-z_.-]+)?")
+
+
+#: engine_bind.py's PER-ADDRESS detail line, which is one line per address that
+#: accepted a connection to the engine port (engine_bind.py:879). Anchored to
+#: the start of the line and to the list-item dash so that the summary
+#: `report.fail` renders as "- FAIL: ... ACCEPTED the connection: ..." cannot be
+#: counted as an address.
+_ACCEPTED_ADDRESS_RE = re.compile(r"(?m)^\s*-\s.*ACCEPTED the connection on the engine port\s*$")
+
+#: The bare phrase, used only as a trip-wire: see probe_engine_exposure.
+_ACCEPTED_PHRASE_RE = re.compile(r"ACCEPTED the connection")
 
 
 def _is_ip_literal(text: str) -> bool:
@@ -469,21 +566,34 @@ def read_env_keys(path: pathlib.Path, keys: Iterable[str]) -> dict[str, str]:
 def probe_deploy_root(env: Environment) -> ProbeResult:
     """Is the deploy root a clean checkout of the default branch?
 
-    The same two preconditions scripts/deploy.sh enforces (deploy.sh:189 reads
-    `git status --porcelain --untracked-files=no` and aborts on any output).
-    This is the most likely refusal of the seven: the deploy root is a SHARED
-    working tree that several sessions write to at once, and a dirty tree
-    blocks the deploy after the full CI has already run.
+    The DIRTY-TREE half is the precondition scripts/deploy.sh enforces
+    (deploy.sh:189 reads `git status --porcelain --untracked-files=no` and
+    aborts on any output). It is the most likely refusal of the seven: the
+    deploy root is a SHARED working tree that several sessions write to at once,
+    and a dirty tree blocks the deploy after the full CI has already run.
+
+    The BRANCH half is reported and never refused -- see the comment on
+    PASSING["deploy-root"] for why a detached production checkout is a state the
+    release path creates on purpose and recovers from by itself.
+
+    `--no-optional-locks` ON EVERY CALL. Without it `git status` refreshes the
+    index: measured on git 2.43.0 here on 2026-09-27, a plain
+    `git status --porcelain --untracked-files=no` against a stale index opens
+    `.git/index.lock` (O_CREAT|O_EXCL) and rewrites `.git/index`, and the flag
+    removes both. The rev-parse calls never took the lock in that measurement,
+    and carry the flag anyway so that "this probe does not write to the shared
+    deploy root" is a property of the whole function rather than of one call.
     """
+    git = ["git", "--no-optional-locks", "-C", str(env.deploy_root)]
     inside = env.runner.run(
-        ["git", "-C", str(env.deploy_root), "rev-parse", "--is-inside-work-tree"],
+        git + ["rev-parse", "--is-inside-work-tree"],
         timeout=TIMEOUTS["git"],
     )
     if inside.rc != 0 or inside.stdout.strip() != "true":
         return ProbeResult("deploy-root", "not-a-checkout", {"exit_code": inside.rc})
 
     status = env.runner.run(
-        ["git", "-C", str(env.deploy_root), "status", "--porcelain", "--untracked-files=no"],
+        git + ["status", "--porcelain", "--untracked-files=no"],
         timeout=TIMEOUTS["git"],
     )
     if status.rc != 0:
@@ -491,7 +601,7 @@ def probe_deploy_root(env: Environment) -> ProbeResult:
     dirty = [line for line in status.stdout.splitlines() if line.strip()]
 
     branch = env.runner.run(
-        ["git", "-C", str(env.deploy_root), "rev-parse", "--abbrev-ref", "HEAD"],
+        git + ["rev-parse", "--abbrev-ref", "HEAD"],
         timeout=TIMEOUTS["git"],
     )
     if branch.rc != 0:
@@ -505,6 +615,9 @@ def probe_deploy_root(env: Environment) -> ProbeResult:
         # not something a public log needs.
         return ProbeResult("deploy-root", "dirty-tree", facts)
     if not on_default:
+        # A PASSING verdict: reported in the table, never a refusal. The branch
+        # NAME is still not printed - `on_default_branch no` is the fact, and
+        # the remedy command is what shows which branch it is.
         return ProbeResult("deploy-root", "wrong-branch", facts)
     return ProbeResult("deploy-root", "clean-on-default", facts)
 
@@ -613,6 +726,28 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
     combination should be impossible, which is exactly why it is worth
     checking: a gate that trusts one signal cannot notice when it stops
     meaning what it meant.
+
+    THE COUNT IS THE PER-ADDRESS LINES, and that is the fix for a wrong number
+    this probe used to print. engine_bind.py emits the phrase "ACCEPTED the
+    connection" TWICE per exposed run: once per address, in its own indented
+    detail line (engine_bind.py:879), and once more in the summary that
+    `report.fail` renders as "- FAIL: N non-cluster address ... ACCEPTED the
+    connection: ..." (engine_bind.py:896 through Report.fail at :647-649), which
+    main() prints at :988. Counting the bare phrase therefore reported one
+    address too many. Measured on 2026-09-27 by driving the real
+    `engine_bind.evaluate` through tests/test_engine_bind.check():
+
+        1 accepting address -> bare phrase 2, per-address lines 1
+        2 accepting addresses -> bare phrase 3, per-address lines 2
+
+    The verdict was never wrong -- it fails closed on any match -- but
+    `accepted_addresses` is the one number this probe exists to report, and it
+    is read at 3 a.m.
+
+    Narrowing a pattern can turn a gate blind, so the bare phrase is kept as a
+    TRIP-WIRE: if engine_bind ever reports an acceptance in a shape the
+    per-address pattern does not match, this still refuses, and it omits the
+    count rather than guessing one.
     """
     out = env.runner.run(
         [
@@ -626,7 +761,7 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
     )
     text = (out.stdout or "") + (out.stderr or "")
     detail = [line for line in text.splitlines() if line.strip()][:20]
-    accepted = len(re.findall(r"ACCEPTED the connection", text))
+    accepted = len(_ACCEPTED_ADDRESS_RE.findall(text))
     if accepted:
         return ProbeResult(
             "engine-exposure",
@@ -634,6 +769,13 @@ def probe_engine_exposure(env: Environment) -> ProbeResult:
             {"accepted_addresses": accepted, "exit_code": out.rc},
             detail,
         )
+    if _ACCEPTED_PHRASE_RE.search(text):
+        # engine_bind reported an acceptance in a shape this probe cannot count.
+        # Refuse anyway - a gate that has lost track of the report it reads must
+        # never answer `closed` - and report no count rather than a made-up one.
+        # The detail lines carry the real report, which is what the operator
+        # needs in this case.
+        return ProbeResult("engine-exposure", "exposed", {"exit_code": out.rc}, detail)
     if out.rc == 0:
         return ProbeResult("engine-exposure", "closed", {"exit_code": 0}, detail)
     return ProbeResult("engine-exposure", "unproven", {"exit_code": out.rc}, detail)
@@ -875,11 +1017,17 @@ def _schema_version(
 def probe_migrations(env: Environment) -> ProbeResult:
     """The incoming commit's migrations against what the database has applied.
 
-    Read with the helpers scripts/lib/deploy-common.sh already exposes, so this
-    cannot disagree with the numbers deploy.sh and deploy-rollback.sh use:
+    Read with the helpers scripts/lib/deploy-common.sh already exposes:
     `dr_live_schema_version` (the orchestrator's /health, falling back to
-    PostgreSQL itself, which matters precisely when the orchestrator is the
-    thing that is down) and `dr_code_schema_version_from_git`.
+    `docker exec <production postgres> psql` -- deploy-common.sh:274-275 -- which
+    matters precisely when the orchestrator is the thing that is down) and
+    `dr_code_schema_version_from_git`.
+
+    It therefore cannot disagree with deploy.sh about the NUMBERS. It is allowed
+    to disagree about the DECISION, and the earlier wording here claimed
+    otherwise. Where it disagrees, deploy.sh wins and this probe is aligned to
+    it -- see the comment on PASSING["migrations"]. `behind` is the one verdict
+    where they agree to refuse.
 
     The two calls point DR_ROOT at different trees ON PURPOSE. The live version
     belongs to the deploy root; the code version belongs to the commit being
@@ -952,16 +1100,21 @@ def run_all(env: Environment) -> list[ProbeResult]:
 # ------------------------------------------------------------------ remedies
 
 def _remedies(env: Environment) -> Mapping[tuple[str, str], tuple[str, ...]]:
+    """One entry per REFUSING (probe, verdict) pair, and no others.
+
+    tests/test_box_probes.py asserts that set equality against
+    PROBE_VERDICTS minus PASSING, in both directions. Both directions matter:
+    a missing entry is a refusal with no command behind it, and a SPARE entry is
+    text that can never print, which is what ("engine-exposure", "unavailable")
+    was -- a remedy for a verdict no probe can report, sitting in the table
+    making a vacuous coverage test look like coverage.
+    """
     root = str(env.deploy_root)
     repo = str(env.repo_root)
     return {
         ("deploy-root", "dirty-tree"): (
             f"git -C {root} status --porcelain --untracked-files=no",
             f"git -C {root} diff",
-        ),
-        ("deploy-root", "wrong-branch"): (
-            f"git -C {root} rev-parse --abbrev-ref HEAD",
-            f"git -C {root} checkout {env.default_branch}",
         ),
         ("deploy-root", "not-a-checkout"): (f"git -C {root} status", f"ls -la {root}"),
         ("deploy-root", "git-unreadable"): (f"git -C {root} status",),
@@ -985,10 +1138,6 @@ def _remedies(env: Environment) -> Mapping[tuple[str, str], tuple[str, ...]]:
             f"python3 {repo}/.github/workflows/scripts/engine_bind.py check "
             f"--generated-env {root}/.runtime/generated.env",
             "sudo systemctl status techsara-host-guard.service",
-        ),
-        ("engine-exposure", "unavailable"): (
-            f"python3 {repo}/.github/workflows/scripts/engine_bind.py check "
-            f"--generated-env {root}/.runtime/generated.env",
         ),
         ("engine-controller", "unreachable"): (
             "docker ps --filter name=sf-local-ai-engine-controller-1 --format '{{.Names}} {{.Status}}'",
@@ -1015,10 +1164,6 @@ def _remedies(env: Environment) -> Mapping[tuple[str, str], tuple[str, ...]]:
             f"bash -c '. {root}/scripts/lib/deploy-common.sh; dr_live_schema_version'",
             f"git -C {root} log --oneline -5 -- orchestrator/app/db.py",
         ),
-        ("migrations", "unreadable"): (
-            f"bash -c '. {root}/scripts/lib/deploy-common.sh; dr_live_schema_version'",
-            "docker ps --filter name=sf-local-ai-postgres-1 --format '{{.Names}} {{.Status}}'",
-        ),
     }
 
 
@@ -1030,10 +1175,6 @@ NOTES: Mapping[tuple[str, str], str] = {
         "Ask before discarding anything, and never run `git stash`, `git reset --hard`, "
         "`git clean -fd` or `git checkout -- .` there: a stale checkout also empties "
         "running containers' bind mounts."
-    ),
-    ("deploy-root", "wrong-branch"): (
-        "The deploy job compares the deploy root's HEAD with the commit it is deploying, "
-        "so the deploy root stays on the default branch."
     ),
     ("disk", "below-floor"): (
         "Do NOT prune images before reading .runtime/releases/: the previous release's "
@@ -1074,7 +1215,11 @@ def remedy_for(env: Environment, result: ProbeResult) -> tuple[str, ...]:
     key = (result.probe, result.verdict)
     if key in table:
         return table[key]
-    # probe-raised / probe-timed-out, and any verdict added without a remedy.
+    # The UNIVERSAL_VERDICTS, which belong to `run_probe` rather than to any one
+    # probe and cannot have a probe-specific remedy. This fallback is also why
+    # the coverage test in tests/test_box_probes.py asserts the KEY is in
+    # `_remedies(env)` rather than asserting that `remedy_for` returned
+    # something: asking this function was a test that could not fail.
     return (
         f"python3 {env.repo_root}/.github/workflows/scripts/box_readiness.py "
         f"--deploy-root {env.deploy_root} --ref {env.ref}",

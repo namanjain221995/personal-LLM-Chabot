@@ -72,10 +72,48 @@ BIND_CLOSED = f"""### Main engine exposure: can the unauthenticated engine API b
 RESULT: PASSED
 """
 
+#: engine_bind.py's own report, ONE address accepting. The `- FAIL:` line is
+#: part of the real output and is here for a reason: engine_bind prints
+#: "ACCEPTED the connection" once per address (engine_bind.py:879) AND once more
+#: inside `report.fail` (engine_bind.py:896, rendered by Report.fail at
+#: :647-649, printed by main() at :988). A fixture without it hid an off-by-one
+#: in box_probes.probe_engine_exposure: measured on 2026-09-27 against the real
+#: `engine_bind.evaluate`, the bare phrase occurs 2 times for 1 accepting
+#: address and 3 times for 2, so `accepted_addresses` was always one too many
+#: and no test could see it.
 BIND_EXPOSED = f"""### Main engine exposure: can the unauthenticated engine API be reached from outside the cluster?
 - 3 non-cluster addresses: 2 blocked, 1 ACCEPTED, 0 not proven (required: all blocked)
   - non-cluster address (interface class: lan, IPv4): ACCEPTED the connection on the engine port
+- FAIL: 1 non-cluster address (interface class: lan) ACCEPTED the connection: the unauthenticated engine API is reachable from outside the cluster (apply scripts/host-guard.sh, see docs/developer-platform/OPERATIONS.md section 13)
 - the address that answered was {SENTINEL_ADDRESS} at http://{SENTINEL_ADDRESS}:8000
+RESULT: FAILED
+"""
+
+#: TWO addresses accepting. This is not invented: it is the engine_bind report
+#: the `verify` job printed on the production box in run 36304046169 at
+#: 2026-09-27T08:26:48Z, copied verbatim (engine_bind prints interface CLASSES
+#: and never an address, so there is nothing here to redact). The bare phrase
+#: occurs THREE times for TWO accepting addresses, so before the fix this real
+#: log would have been reported as `accepted_addresses 3`.
+BIND_EXPOSED_TWO = """### Main engine exposure: can the unauthenticated engine API be reached from outside the cluster?
+- engine port 8000 listeners: 1 wildcard (IPv4), 0 wildcard (IPv6/dual-stack), 0 loopback, 0 on the configured address, 0 on another specific address
+- configuration: asks for a wildcard (the approved cluster shape; outside proof is mandatory)
+- a wildcard is in play: proving from the worker that only the cluster fabric reaches the engine port
+- cluster fabric address: reachable from the worker (required)
+- 3 non-cluster addresses: 1 blocked, 2 ACCEPTED, 0 not proven (required: all blocked)
+  - non-cluster address (interface class: lan, IPv4): ACCEPTED the connection on the engine port
+  - non-cluster address (interface class: tailnet, IPv4): ACCEPTED the connection on the engine port
+  - non-cluster address (interface class: tailnet, IPv6): blocked (refused); control port reachable, so the path is proven
+- FAIL: 2 non-cluster addresses (interface class: lan, tailnet) ACCEPTED the connection: the unauthenticated engine API is reachable from outside the cluster (apply scripts/host-guard.sh, see docs/developer-platform/OPERATIONS.md section 13)
+
+RESULT: FAILED (1 reason(s) above)
+"""
+
+#: engine_bind said an address accepted, but NOT in the per-address shape the
+#: probe counts - the trip-wire case. A narrowed pattern must not be able to
+#: turn this gate blind, so this still has to refuse, with no count invented.
+BIND_EXPOSED_UNCOUNTABLE = """### Main engine exposure: can the unauthenticated engine API be reached from outside the cluster?
+- FAIL: 1 non-cluster address (interface class: lan) ACCEPTED the connection: the unauthenticated engine API is reachable from outside the cluster
 RESULT: FAILED
 """
 

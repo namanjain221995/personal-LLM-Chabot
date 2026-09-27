@@ -6,11 +6,13 @@ WHY THIS EXISTS
 The pipeline used to be a line: nine hosted test jobs, an aggregate gate, and
 only then a self-hosted `deploy` job whose FIRST act was a preflight against
 the box. Every box-state refusal therefore cost a full CI run before it was
-even asked. Measured on recorded runs: one burned ~55 minutes of CI before a
-3m53s deploy failure that had nothing to do with the code, and another's
-`verify` reported non-cluster addresses ACCEPTING a connection to the
-unauthenticated engine port - a fact that was true before the run started. Two
-of the three most recent main-run failures were box state, not code.
+even asked. Re-measured from the GitHub Actions API on 2026-09-27: run
+35002778440 spent 55.4 minutes of wall clock before the `deploy` job started
+and then failed in 233s (3m53s) at "The box is serving the commit we asked
+for", and runs 35100814873, 35427466262 and 36304046169 each failed in `verify`
+at "The engine API cannot be reached from outside the cluster" - a fact that
+was already true before each run started. The four most recent main-run
+failures were all box state, not code.
 
 So the graph becomes two pipes that converge at `deploy`: test evidence on
 hosted runners, and box evidence gathered at the same time on the box. This is
@@ -30,11 +32,23 @@ pipeline.yml for what gates it and what that does and does not buy.
 
 EVERYTHING IT DOES IS READ-ONLY
 -------------------------------
-Seven probes, all of them reads. The deploy flock is asked whether it is free
-by the same non-blocking `flock -n` scripts/lib/deploy-common.sh uses, which
-holds it for the lifetime of a `bash -c` that does nothing else; the earlier
-claim that it is "never taken" was withdrawn as untrue, and box_probes.py says
-exactly what happens instead.
+Seven probes. None of them starts, stops, recreates, prunes or changes the state
+of the stack. Three things are worth saying out loud rather than letting the
+phrase "seven reads" cover them:
+
+  * the deploy flock is asked whether it is free by the same non-blocking
+    `flock -n` scripts/lib/deploy-common.sh uses, which holds it for the
+    lifetime of a `bash -c` that does nothing else. The earlier claim that it is
+    "never taken" was withdrawn as untrue, and box_probes.py says exactly what
+    happens instead;
+  * every git call against the shared deploy root carries
+    `--no-optional-locks`, because `git status` otherwise takes
+    `.git/index.lock` there and rewrites `.git/index` (measured on git 2.43.0 on
+    2026-09-27; box_probes.probe_deploy_root has the measurement);
+  * the migrations probe reaches `dr_live_schema_version`, whose fallback runs
+    `docker exec <production postgres> psql -tAc 'SELECT COALESCE(MAX(version),
+    0) FROM schema_migrations'`. A SELECT, but a command run inside the
+    production database container.
 
 Every probe fails closed: a probe that cannot be performed is a refusal, and a
 probe that raises or times out is a refusal too. Every refusal prints the exact

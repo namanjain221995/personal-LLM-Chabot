@@ -181,27 +181,182 @@ class EveryProbeFailsClosed(unittest.TestCase):
         self.assertEqual(result.verdict, "probe-raised")
 
 
+def refusing_pairs() -> set:
+    """Every (probe, verdict) pair that is a REFUSAL and belongs to a probe.
+
+    The universal pair is excluded on purpose: `probe-raised` and
+    `probe-timed-out` come from `run_probe`, not from a probe, and cannot have a
+    probe-specific command behind them.
+    """
+    return {
+        (probe, verdict)
+        for probe, verdicts in box_probes.PROBE_VERDICTS.items()
+        for verdict in verdicts - box_probes.PASSING[probe]
+    }
+
+
+class TheVerdictVocabularyIsDeclaredPerProbe(unittest.TestCase):
+    """PROBE_VERDICTS is what gives the remedy coverage test teeth, so it has to
+    be true. Before it existed the coverage test iterated the FLAT `VERDICTS`
+    set for every probe, which asked for a remedy for pairs no probe can report
+    (("disk", "wedged") and 200-odd others); every one of them fell through
+    `remedy_for`'s catch-all, so the test passed with the entire remedy table
+    deleted. Measured on 2026-09-27 by replacing `_remedies()`'s body with
+    `return {}`: test_box_probes.py reported "Ran 23 tests ... OK"."""
+
+    def test_the_flat_vocabulary_is_exactly_the_per_probe_one_plus_the_universal_pair(self):
+        union = set(box_probes.UNIVERSAL_VERDICTS)
+        for verdicts in box_probes.PROBE_VERDICTS.values():
+            union |= set(verdicts)
+        self.assertEqual(
+            union,
+            set(box_probes.VERDICTS),
+            "a verdict is declared in one list and not the other; the extras are "
+            "verdicts no probe can report, which is how `unavailable` survived",
+        )
+
+    def test_every_probe_declares_its_verdicts_and_its_passing_set(self):
+        for name, _ in box_probes.ALL_PROBES:
+            self.assertIn(name, box_probes.PROBE_VERDICTS, name)
+            self.assertIn(name, box_probes.PASSING, name)
+            self.assertLessEqual(
+                set(box_probes.PASSING[name]), set(box_probes.PROBE_VERDICTS[name]), name
+            )
+
+    def test_every_verdict_a_probe_reports_against_the_fake_box_is_declared(self):
+        """The map against the code, not just against the other map. Every
+        scenario the other test files drive, in one loop."""
+        scenarios = [
+            {}, {"git-inside": box_probes.Completed(128, "")},
+            {"git-status": box_probes.Completed(129, "")},
+            {"git-status": box_probes.Completed(0, " M x\n")},
+            {"git-branch": box_probes.Completed(0, "HEAD\n")},
+            {"df": box_probes.Completed(1, "")}, {"df": box_probes.Completed(0, "Avail\n1G\n")},
+            {"flock": box_probes.Completed(1, "")}, {"flock": box_probes.Completed(3, "")},
+            {"bind-check": box_probes.Completed(1, "nothing proved\n")},
+            {"controller": box_probes.Completed(7, "")},
+            {"controller": box_probes.Completed(0, "not json")},
+            {"completion": box_probes.Completed(7, "")},
+            {"metrics": box_probes.Completed(0, "# empty\n")},
+            {"schema-live": box_probes.Completed(1, "")},
+            {"schema-code": box_probes.Completed(0, "1\n")},
+        ]
+        seen = set()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_box(tmp)
+            for overrides in scenarios:
+                for result in box_probes.run_all(make_env(root, FakeRunner(**overrides))):
+                    seen.add((result.probe, result.verdict))
+        for probe, verdict in sorted(seen):
+            self.assertIn(
+                verdict, box_probes.PROBE_VERDICTS[probe], f"{probe} reported {verdict}"
+            )
+
+
 class EveryRefusalCarriesACommand(unittest.TestCase):
-    def test_every_non_passing_verdict_of_every_probe_has_a_remedy(self):
+    def test_the_remedy_table_holds_exactly_the_refusing_pairs(self):
+        """Asking `remedy_for` was a test that could not fail: it has a catch-all
+        fallback for the universal pair, so `assertTrue(remedy)` was true for
+        every input. This asserts the TABLE instead, in both directions - a
+        missing entry is a refusal with no command behind it, and a spare entry
+        is text that can never print."""
         with tempfile.TemporaryDirectory() as tmp:
             env = make_env(make_box(tmp), FakeRunner())
-            for probe, passing in box_probes.PASSING.items():
-                for verdict in sorted(box_probes.VERDICTS - passing):
-                    remedy = box_probes.remedy_for(env, box_probes.ProbeResult(probe, verdict))
-                    self.assertTrue(remedy, f"{probe}/{verdict}")
-                    for command in remedy:
-                        self.assertNotIn("<", command, f"{probe}/{verdict}: {command}")
+            table = box_probes._remedies(env)
+        self.assertEqual(set(table), refusing_pairs())
+
+    def test_every_remedy_is_a_command_and_never_a_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner())
+            table = box_probes._remedies(env)
+            for (probe, verdict), remedy in sorted(table.items()):
+                self.assertTrue(remedy, f"{probe}/{verdict}")
+                for command in remedy:
+                    self.assertNotIn("<", command, f"{probe}/{verdict}: {command}")
+
+    def test_the_universal_pair_falls_back_and_nothing_else_does(self):
+        """The fallback exists for `probe-raised` and `probe-timed-out` only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner())
+            table = box_probes._remedies(env)
+            for probe, verdict in sorted(refusing_pairs()):
+                self.assertIn((probe, verdict), table, f"{probe}/{verdict}")
+            for verdict in sorted(box_probes.UNIVERSAL_VERDICTS):
+                result = box_probes.ProbeResult("disk", verdict)
+                self.assertNotIn(("disk", verdict), table)
+                self.assertIn("box_readiness.py", box_probes.remedy_for(env, result)[0])
+
+    def test_a_note_only_ever_sits_on_a_pair_that_can_print_it(self):
+        """A note is only rendered under a refusal, so a note on a passing or
+        impossible verdict is text nobody will ever read."""
+        self.assertLessEqual(set(box_probes.NOTES), refusing_pairs())
 
     def test_no_remedy_or_note_leaks_an_address(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = make_env(make_box(tmp), FakeRunner())
-            for probe, passing in box_probes.PASSING.items():
-                for verdict in sorted(box_probes.VERDICTS - passing):
-                    lines = list(box_probes.remedy_for(env, box_probes.ProbeResult(probe, verdict)))
-                    lines.append(box_probes.note_for(box_probes.ProbeResult(probe, verdict)))
-                    for line in lines:
-                        self.assertNotIn("://", line, f"{probe}/{verdict}")
-                        self.assertEqual([], ip_literals(line), f"{probe}/{verdict}")
+            for probe, verdict in sorted(refusing_pairs() | {
+                ("disk", v) for v in box_probes.UNIVERSAL_VERDICTS
+            }):
+                lines = list(box_probes.remedy_for(env, box_probes.ProbeResult(probe, verdict)))
+                lines.append(box_probes.note_for(box_probes.ProbeResult(probe, verdict)))
+                for line in lines:
+                    self.assertNotIn("://", line, f"{probe}/{verdict}")
+                    self.assertEqual([], ip_literals(line), f"{probe}/{verdict}")
+
+
+class TheAcceptedCountMatchesTheRealReport(unittest.TestCase):
+    """The count against engine_bind ITSELF, not against a fixture.
+
+    A fixture is a guess about another program's output, and this is the defect
+    that guess hid: `_box_fixtures.BIND_EXPOSED` omitted engine_bind's own
+    `- FAIL: ... ACCEPTED the connection: ...` summary line, so an
+    `accepted_addresses` that was always one too high asserted clean. The real
+    program prints the phrase once per address (engine_bind.py:879) and once more
+    through `report.fail` (:896, rendered at :647-649, printed at :988).
+
+    So this drives the real `engine_bind.evaluate`, through the fake prober
+    test_engine_bind already owns, and feeds its actual report into the probe.
+    Nothing here touches a network, a host or the GPU: every connection attempt
+    is the fake prober, and the address list is test_engine_bind's fixture.
+    """
+
+    @staticmethod
+    def _report_text(accepting):
+        import test_engine_bind as eb
+
+        report, _text, _prober, _made = eb.check(
+            prober=eb.FakeProber({(address, eb.PORT): "connected" for address in accepting})
+        )
+        return "\n".join(report.lines)
+
+    def _probe(self, text, rc):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = make_env(make_box(tmp), FakeRunner(**{"bind-check": box_probes.Completed(rc, text)}))
+            return box_probes.probe_engine_exposure(env)
+
+    def test_one_accepting_address_is_reported_as_one(self):
+        import test_engine_bind as eb
+
+        text = self._report_text([eb.LAN])
+        self.assertEqual(text.count("ACCEPTED the connection"), 2, text)
+        result = self._probe(text, 1)
+        self.assertEqual(result.verdict, "exposed")
+        self.assertEqual(result.facts["accepted_addresses"], 1)
+
+    def test_two_accepting_addresses_are_reported_as_two(self):
+        import test_engine_bind as eb
+
+        text = self._report_text([eb.LAN, eb.TAILNET6])
+        self.assertEqual(text.count("ACCEPTED the connection"), 3, text)
+        result = self._probe(text, 1)
+        self.assertEqual(result.verdict, "exposed")
+        self.assertEqual(result.facts["accepted_addresses"], 2)
+
+    def test_a_closed_report_is_not_counted_as_an_acceptance(self):
+        text = self._report_text([])
+        self.assertNotIn("ACCEPTED the connection", text)
+        result = self._probe(text, 0)
+        self.assertEqual(result.verdict, "closed")
 
 
 # ==========================================================================

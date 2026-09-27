@@ -203,6 +203,87 @@ class ARefusalIsRedAndNeverASilentSkip(PipelineCase):
         self.assertEqual(workflow_policy._write_scopes(self.job["permissions"]), [])
 
 
+class ItRunsInsideTheSameApprovalGateAsTheDeploy(PipelineCase):
+    """The gate this repository already advertises has to actually hold.
+
+    This job is the FIRST thing in the graph to execute anything on the
+    production box - box_readiness.py plus git in the shared deploy root, df,
+    `flock -n` on the real deploy lock, engine_bind.py (which ssh's to the worker
+    and opens TCP connections), curl asking the unauthenticated engine for a live
+    generation, and a `bash -c` whose fallback runs `docker exec <production
+    postgres> psql`. It declared no `environment:`, so once anyone configured the
+    `production` environment's required reviewers - which pipeline.yml's own
+    comment recommends - all of that would still have run on any push to main
+    BEFORE a reviewer clicked approve.
+
+    Measured on 2026-09-27: `gh api .../environments/production` returns
+    "protection_rules": [] and declares zero variables and zero secrets, so
+    adding the line changes nothing about how a run behaves today. It changes
+    what configuring the gate BUYS.
+    """
+
+    def test_it_declares_the_same_environment_as_the_deploy(self):
+        self.assertEqual(self.job.get("environment"), self.jobs[DEPLOY].get("environment"))
+        self.assertEqual(self.job.get("environment"), "production")
+
+    def test_no_job_reaches_the_box_ahead_of_that_environment(self):
+        """The general form, so a future job cannot walk in front of the gate the
+        way this one did. `verify` and `recovery` are environment-less too, but
+        they `needs:` the deploy, so the gate is already passed by then."""
+        gated = {DEPLOY}
+        for name, job in self.jobs.items():
+            runs_on = [str(x) for x in (job.get("runs-on") or [])]
+            if "self-hosted" not in runs_on:
+                continue
+            if job.get("environment") == "production":
+                gated.add(name)
+                continue
+            needs = job.get("needs") or []
+            needs = needs if isinstance(needs, list) else [needs]
+            self.assertTrue(
+                any(n in gated for n in needs),
+                f"{name} runs on the box, declares no production environment, and does "
+                f"not need a job that does: needs={needs!r}",
+            )
+
+
+class TheDeployDecisionStepDoesNotPromiseHalfAGraph(PipelineCase):
+    """`ci-ok`'s "Will the deploy run?" step exists because "A skipped job
+    reports NO reason - GitHub shows 'skipped' and nothing else - so a deploy
+    that does not happen is otherwise a guessing game", the failure class the
+    same file blames for three lost green pushes to main. `deploy` now needs
+    `box-readiness` as well, so a bare "Deploy will run." reintroduced exactly
+    that guessing game inside this branch's own blast radius."""
+
+    def _decision_step(self):
+        for step in self.jobs["ci-ok"]["steps"]:
+            if step.get("name") == "Will the deploy run?":
+                return str(step.get("run", ""))
+        self.fail("ci-ok no longer has a 'Will the deploy run?' step")
+
+    def test_the_push_to_main_arm_names_box_readiness_as_the_second_condition(self):
+        body = self._decision_step()
+        arm = body.split("push:refs/heads/main:*)", 1)
+        self.assertEqual(len(arm), 2, body)
+        arm = arm[1].split(";;", 1)[0]
+        self.assertIn("Box readiness", arm)
+        self.assertNotRegex(arm, r'Deploy \*\*will run\*\*\.')
+
+    def test_the_held_arm_says_the_box_half_is_held_too(self):
+        """box-readiness carries the same deploy-intent clause, so the kill
+        switch silences it as well - and the summary should say so rather than
+        leaving a reader to wonder why the box was never read."""
+        body = self._decision_step()
+        held = body.split("the kill switch is set.", 1)
+        self.assertEqual(len(held), 2, body)
+        self.assertIn("Box readiness", held[1].split(";;", 1)[0])
+
+    def test_the_step_still_prints_the_three_inputs_to_the_decision(self):
+        body = self._decision_step()
+        for token in ("EVENT", "REF", "KILL_SWITCH", "GITHUB_STEP_SUMMARY"):
+            self.assertIn(token, body)
+
+
 class TheCeilingIsBigEnoughToPrintTheRemedies(PipelineCase):
     """The second defect this module exists for.
 

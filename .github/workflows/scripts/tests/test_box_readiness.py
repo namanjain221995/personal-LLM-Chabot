@@ -24,6 +24,8 @@ import box_probes  # noqa: E402
 import box_readiness  # noqa: E402
 from _box_fixtures import (  # noqa: E402
     BIND_EXPOSED,
+    BIND_EXPOSED_TWO,
+    BIND_EXPOSED_UNCOUNTABLE,
     CONTROLLER_READY,
     FakeRunner,
     Raises,
@@ -52,6 +54,19 @@ class BoxCase(unittest.TestCase):
         self.assertRegex(output, rf"(?m)^{probe}\s+{verdict}\b")
         self.assertIn(f"  {probe}: {verdict}", output)
 
+    def assertReportedButNotRefused(self, code, output, probe, verdict):
+        """The verdict is in the table and the job is still green.
+
+        For the two verdicts where scripts/deploy.sh itself proceeds. A refusal
+        here would be this job blocking a deploy the release path allows -- and
+        in both cases the deploy being blocked is what clears the state.
+        """
+        self.assertEqual(code, box_readiness.EXIT_OK, output)
+        self.assertIn("VERDICT: READY  (7 of 7 probes passed", output)
+        self.assertRegex(output, rf"(?m)^{probe}\s+{verdict}\b")
+        self.assertNotIn("VERDICT: NOT READY", output)
+        self.assertNotIn(f"  {probe}: {verdict}", output)
+
 
 class AHealthyBoxPasses(BoxCase):
     def test_every_probe_passes_and_the_job_would_go_green(self):
@@ -62,7 +77,10 @@ class AHealthyBoxPasses(BoxCase):
                       "engine-controller", "completion", "migrations"):
             self.assertRegex(output, rf"(?m)^{probe}\s+\S+")
 
-    def test_it_never_takes_the_deploy_lock(self):
+    def test_the_lock_is_taken_only_for_an_instant_and_never_waited_for(self):
+        """What is actually true: `flock -n` on a read-only descriptor inside a
+        `bash -c` that does nothing else, so the lock is held for microseconds,
+        is never waited for, and is never taken in order to act."""
         _code, _output = self.readiness()
         joined = [" ".join(call) for call in self.runner.calls]
         self.assertTrue(any("flock -n 9" in c for c in joined), joined)
@@ -91,13 +109,60 @@ class TheSharedDeployRoot(BoxCase):
         # what shows them, not this log.
         self.assertNotIn("orchestrator/app/chat.py", output)
 
-    def test_the_wrong_branch_refuses_and_names_the_checkout_command(self):
-        code, output = self.readiness(**{"git-branch": box_probes.Completed(0, "dev\n")})
-        self.assertRefused(code, output, "deploy-root", "wrong-branch")
+    def test_every_git_call_against_the_shared_root_refuses_to_take_its_index_lock(self):
+        """`git status` refreshes the index unless told not to, and the deploy
+        root is a working tree several sessions write to. Measured on git 2.43.0
+        on 2026-09-27: a plain `git status --porcelain --untracked-files=no`
+        against a stale index opens `.git/index.lock` with O_CREAT|O_EXCL and
+        rewrites `.git/index`; with `--no-optional-locks` it opens no lock and
+        the index mtime does not move. box_probes.py and box_readiness.py both
+        claim this library does not write, so the flag is the claim's guard."""
+        self.readiness()
+        git_calls = [c for c in self.runner.calls if c[0] == "git"]
+        self.assertEqual(len(git_calls), 3, git_calls)
+        for call in git_calls:
+            self.assertIn("--no-optional-locks", call, call)
+            # Before the path, so it is a git option and not a subcommand's.
+            self.assertLess(call.index("--no-optional-locks"), call.index("-C"), call)
+
+    def test_a_branch_that_is_not_the_default_is_reported_and_does_not_block(self):
+        """`wrong-branch` used to refuse, and that was a SELF-LOCKOUT.
+
+        Nothing in the release path requires the deploy root to be on a branch:
+        deploy.sh's `land()` detaches on purpose when DEPLOY_BRANCH is unset, and
+        the workflow's "the box is serving the commit we asked for" step compares
+        `git rev-parse HEAD`, which reads the same detached. Meanwhile
+        deploy.sh's `detach_to` (deploy.sh:290) is reached from seven call sites
+        on an ORDINARY push-to-main deploy -- one of them "checked out in another
+        worktree", which deploy.sh's own comment calls "a real configuration on
+        this box". So a refusal blocked `deploy` on a state the release path
+        creates itself, and `land_on_branch` recovers from it on the very deploy
+        that was being blocked."""
+        branch = "feat-some-private-branch-name"
+        code, output = self.readiness(**{"git-branch": box_probes.Completed(0, branch + "\n")})
+        self.assertReportedButNotRefused(code, output, "deploy-root", "wrong-branch")
         self.assertIn("on_default_branch no", output)
-        self.assertIn(f"git -C {self.root} checkout main", output)
-        # The branch NAME is not printed - the flag is. The command shows it.
-        self.assertIn(f"git -C {self.root} rev-parse --abbrev-ref HEAD", output)
+        # The branch NAME is still not printed anywhere - only the flag is.
+        self.assertNotIn(branch, output)
+
+    def test_a_detached_production_checkout_does_not_lock_the_release_path_out(self):
+        """The exact state `workflow_dispatch` with `branch: '-'` leaves behind:
+        pipeline.yml sets DEPLOY_BRANCH="" for '-', deploy.sh detaches, and
+        `git rev-parse --abbrev-ref HEAD` then prints `HEAD` (measured on git
+        2.43.0 on 2026-09-27). A refusal here blocked every subsequent push AND
+        dispatch until a human ran `git checkout main` in the shared checkout."""
+        code, output = self.readiness(**{"git-branch": box_probes.Completed(0, "HEAD\n")})
+        self.assertReportedButNotRefused(code, output, "deploy-root", "wrong-branch")
+        self.assertIn("on_default_branch no", output)
+
+    def test_a_dirty_tree_is_still_a_refusal_even_on_the_default_branch(self):
+        """Widening `wrong-branch` must not widen `dirty-tree`: that one has
+        deploy.sh:189 behind it, which aborts on any porcelain output."""
+        code, output = self.readiness(
+            **{"git-status": box_probes.Completed(0, " M x.py\n"),
+               "git-branch": box_probes.Completed(0, "main\n")}
+        )
+        self.assertRefused(code, output, "deploy-root", "dirty-tree")
 
     def test_a_deploy_root_that_is_not_a_checkout_refuses(self):
         code, output = self.readiness(**{"git-inside": box_probes.Completed(128, "", "fatal")})
@@ -133,7 +198,12 @@ class TheDiskFloorIsTheDeploysOwnNumber(BoxCase):
         self.assertRefused(code, output, "disk", "unreadable")
 
 
-class TheDeployLockIsObservedNeverTaken(BoxCase):
+class TheDeployLockIsAskedWithANonBlockingFlock(BoxCase):
+    """Named for what is asserted. The class used to be called
+    `TheDeployLockIsObservedNeverTaken`, which restated the claim the commit
+    itself withdrew -- `flock -n` DOES take the lock -- to every reader of a
+    test run."""
+
     def test_a_held_lock_refuses_and_names_the_holder(self):
         code, output = self.readiness(**{"flock": box_probes.Completed(1, "")})
         self.assertRefused(code, output, "deploy-lock", "held")
@@ -157,11 +227,35 @@ class TheDeployLockIsObservedNeverTaken(BoxCase):
 
 class TheEngineExposureAssertion(BoxCase):
     def test_an_accepted_non_cluster_address_refuses_and_asks_for_root(self):
+        """The fixture carries engine_bind's real `- FAIL:` line, which is what
+        made this number wrong: the bare phrase "ACCEPTED the connection" occurs
+        twice per exposed run, so ONE accepting address used to be reported as
+        `accepted_addresses 2`. Measured on 2026-09-27 against the real
+        `engine_bind.evaluate` (see test_box_probes.TheAcceptedCountMatchesTheRealReport)."""
         code, output = self.readiness(**{"bind-check": box_probes.Completed(1, BIND_EXPOSED)})
         self.assertRefused(code, output, "engine-exposure", "exposed")
         self.assertIn("accepted_addresses 1", output)
+        self.assertNotIn("accepted_addresses 2", output)
         self.assertIn("NEEDS ROOT", output)
         self.assertIn("sudo systemctl restart techsara-host-guard.service", output)
+
+    def test_two_accepted_addresses_are_counted_as_two(self):
+        code, output = self.readiness(**{"bind-check": box_probes.Completed(1, BIND_EXPOSED_TWO)})
+        self.assertRefused(code, output, "engine-exposure", "exposed")
+        self.assertIn("accepted_addresses 2", output)
+        self.assertNotIn("accepted_addresses 3", output)
+
+    def test_an_acceptance_the_probe_cannot_count_still_refuses_and_invents_no_number(self):
+        """The trip-wire. Narrowing the pattern to the per-address line is what
+        fixed the count; if engine_bind ever reports an acceptance in some other
+        shape, this gate must not answer `closed` - and it must not guess a
+        count either."""
+        code, output = self.readiness(
+            **{"bind-check": box_probes.Completed(1, BIND_EXPOSED_UNCOUNTABLE)}
+        )
+        self.assertRefused(code, output, "engine-exposure", "exposed")
+        self.assertNotIn("accepted_addresses", output)
+        self.assertIn("ACCEPTED the connection", output)
 
     def test_an_accepted_line_refuses_even_when_the_exit_code_says_success(self):
         # Fail closed on the stronger signal. If these two ever disagree, the
@@ -296,9 +390,33 @@ class TheMigrationBoundary(BoxCase):
         self.assertEqual(code, box_readiness.EXIT_OK, output)
         self.assertIn("forward_n 2", output)
 
-    def test_a_schema_version_that_cannot_be_read_refuses(self):
+    def test_a_live_schema_that_cannot_be_read_is_reported_and_does_not_block(self):
+        """scripts/deploy.sh:244-252 PROCEEDS in exactly this case -- "orchestrator
+        down and psql unavailable ... proceeding WITHOUT the compatibility check -
+        this is the one case where the check cannot be made, and it is worth
+        knowing it was skipped". Refusing here meant a stack that is DOWN could
+        no longer be deployed to through CI, and a deploy is what brings it back.
+        The reading that WAS taken still prints, which is deploy.sh's "proceed
+        and say so"."""
         code, output = self.readiness(**{"schema-live": box_probes.Completed(1, "")})
-        self.assertRefused(code, output, "migrations", "unreadable")
+        self.assertReportedButNotRefused(code, output, "migrations", "unreadable")
+        self.assertIn("code_schema 41", output)
+        self.assertNotIn("live_schema", output)
+
+    def test_a_code_schema_that_cannot_be_read_is_reported_and_does_not_block(self):
+        """deploy.sh:256-257 skips the check for the same reason on this side."""
+        code, output = self.readiness(**{"schema-code": box_probes.Completed(1, "")})
+        self.assertReportedButNotRefused(code, output, "migrations", "unreadable")
+        self.assertIn("live_schema 41", output)
+
+    def test_behind_is_still_a_refusal_because_deploy_sh_refuses_it_too(self):
+        """Widening `unreadable` must not widen `behind`. deploy.sh:263-271
+        refuses a downgrade, and its ALLOW_SCHEMA_DOWNGRADE=1 override has never
+        been reachable from CI on any branch - verified 2026-09-27,
+        `git grep ALLOW_SCHEMA_DOWNGRADE origin/dev -- .github/` finds nothing,
+        and the same on this branch - so nothing is lost by refusing here."""
+        code, output = self.readiness(**{"schema-code": box_probes.Completed(0, "39\n")})
+        self.assertRefused(code, output, "migrations", "behind")
 
     def test_the_live_and_code_versions_are_read_from_different_trees(self):
         """The live number belongs to the deploy root; the code number belongs
