@@ -192,6 +192,25 @@ class TheEngineController(BoxCase):
         self.assertRefused(code, output, "engine-controller", "recovering")
         self.assertIn("recovery_in_progress yes", output)
 
+    def test_a_recovery_field_that_is_not_an_object_refuses_rather_than_reading_as_idle(self):
+        """The reading that let a box mid-recovery pass. `recovery` was read as
+        `doc.get("recovery") or {}` and `in_progress` only when it happened to
+        be a dict, so a `recovery` of any other shape silently meant "nothing
+        is recovering" and a READY/BUSY state_code then carried the probe. A
+        document this probe cannot read is a probe that cannot be performed."""
+        for malformed in ('[]', '"starting"', '3'):
+            with self.subTest(recovery=malformed):
+                code, output = self.readiness(
+                    **{
+                        "controller": box_probes.Completed(
+                            0,
+                            '{"state": "READY", "state_code": 2, '
+                            '"primary_ready": true, "recovery": ' + malformed + "}",
+                        )
+                    }
+                )
+                self.assertRefused(code, output, "engine-controller", "unreadable")
+
     def test_a_state_that_is_not_serving_refuses(self):
         doc = CONTROLLER_READY.replace('"state_code": 2', '"state_code": 5').replace(
             '"state": "READY"', '"state": "DEGRADED"'
@@ -235,6 +254,21 @@ class TheWedgedEngine(BoxCase):
     def test_metrics_that_cannot_be_read_refuse_rather_than_pass(self):
         code, output = self.readiness(**{"metrics": box_probes.Completed(0, "# nothing here\n")})
         self.assertRefused(code, output, "completion", "metrics-unreadable")
+
+    def test_a_counter_that_is_not_a_finite_number_refuses(self):
+        """The Prometheus text format permits NaN, +Inf and -Inf, and `float()`
+        accepts all three. Every comparison against NaN is false, so a NaN
+        total would make the wedged test (`after <= before`) false whatever the
+        engine did, and the probe would report `generated` on a box that
+        generated nothing."""
+        for sample in ("NaN", "+Inf", "-Inf"):
+            with self.subTest(sample=sample):
+                body = (
+                    "# TYPE vllm:generation_tokens_total counter\n"
+                    'vllm:generation_tokens_total{model_name="m"} ' + sample + "\n"
+                )
+                code, output = self.readiness(**{"metrics": box_probes.Completed(0, body)})
+                self.assertRefused(code, output, "completion", "metrics-unreadable")
 
     def test_a_deploy_root_with_no_main_model_refuses(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -281,6 +315,23 @@ class TheMigrationBoundary(BoxCase):
         self.assertEqual(roots["live"], str(self.root))
         self.assertEqual(roots["code"], str(self.root.parent / "workspace"))
         self.assertNotEqual(roots["live"], roots["code"])
+
+
+    def test_the_commit_reaches_bash_as_an_argument_and_never_as_script_text(self):
+        """`dr_code_schema_version_from_git` used to be built by interpolating
+        the ref into the `bash -c` script (`f'... "{env.ref}"'`). Today's ref is
+        $GITHUB_SHA and is forty hex digits, so nothing was exploitable - but
+        that is the shape in which a future caller's `--ref` becomes shell code,
+        and a positional parameter costs nothing."""
+        self.readiness()
+        ref = "bd532e383e5bcafe0123456789abcdef01234567"
+        calls = [c for c in self.runner.calls if "dr_code_schema_version_from_git" in " ".join(c)]
+        self.assertEqual(len(calls), 1, self.runner.calls)
+        argv = calls[0]
+        script = argv[2]
+        self.assertNotIn(ref, script, "the commit is script text, not data")
+        self.assertIn(ref, argv[3:], f"the commit is not a positional argument: {argv!r}")
+        self.assertIn('"$@"', script)
 
 
 class AProbeThatCannotBePerformedIsARefusal(BoxCase):

@@ -1169,7 +1169,12 @@ jobs:
   # `box-readiness`; `needs.box-readiness.result` would then be `cancelled`,
   # the deploy's `if:` would be false, and the deploy would be SKIPPED with no
   # reason given — the exact failure class that once cost three green pushes
-  # to main. A per-sha group cannot evict anything and cannot be evicted.
+  # to main. A per-sha group cannot evict the release path's, and it cannot be
+  # contended either - but only because the WORKFLOW-level group
+  # (`pipeline-${{ github.ref }}`) already admits one run per ref at a time and
+  # every path to this job is refs/heads/main, so two runs at one sha can queue
+  # but never overlap. "Cannot be evicted" is a property of that top-level
+  # block, not of per-sha naming, which is why this names it.
   #
   # The property the shared group was meant to buy — never run during a
   # rollout — is delivered by two things that actually hold, and both are
@@ -1193,6 +1198,27 @@ jobs:
   # P4 exists to keep self-hosted jobs out of the PR-facing gate. When this
   # job refuses it goes RED on its own, with the reason in its own log, which
   # is the opposite of a silent skip.
+  #
+  # ----------------------------------------------- IT ASKS FOR THE SAME THING
+  # The `if:` carries the deploy job's DEPLOY-INTENT clause verbatim, not just
+  # the branch guard. The first version guarded on `refs/heads/main` alone, and
+  # that was wrong in the direction that costs the most:
+  #
+  #   * DEPLOY_ON_PUSH is a KILL SWITCH, and the reason given on the deploy job
+  #     for making it one is "when the box is mid-incident and nobody wants to
+  #     wait on a commit and a CI run to stop the bleeding". With the switch
+  #     thrown, a push to main is not a release. A branch-only guard would
+  #     still land a self-hosted job on that mid-incident box, take its one
+  #     runner, ask the engine it is bleeding from for a generation, and turn
+  #     the run RED for box state nobody had asked about. A kill switch that
+  #     silences only half the pipeline is not a kill switch.
+  #   * `workflow_dispatch` with the `deploy` input OFF means "run the tests
+  #     only". Reading the production box is not running the tests.
+  #
+  # Evaluating the same clause in two jobs is fail-closed in both directions.
+  # Thrown between them: `deploy` skips on its own clause. Un-thrown between
+  # them: `deploy` skips anyway, because `box-readiness` is a `needs:` and it
+  # skipped - no box evidence, no deploy.
   # ==========================================================================
   box-readiness:
     name: Box readiness
@@ -1200,15 +1226,35 @@ jobs:
     if: >-
       needs.policy.result == 'success' &&
       needs.security.result == 'success' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      (
+        (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
+        (github.event_name == 'push' &&
+         !contains(fromJSON('["false","0","no","off"]'),
+                   format('{0}', vars.DEPLOY_ON_PUSH)))
+      )
     runs-on: [self-hosted, dgx-spark]
     permissions:
       contents: read
     # Seven reads. Measured on the box on 2026-09-23: 10.0s wall clock on a
-    # healthy head. The ceiling is the sum of the per-probe subprocess
-    # timeouts (405s) plus the checkout, so even a box where every probe hangs
-    # finishes inside it.
-    timeout-minutes: 8
+    # healthy head.
+    #
+    # The ceiling is NOT 8 minutes, and the arithmetic behind that number was
+    # wrong. It read "the sum of the per-probe subprocess timeouts (405s) plus
+    # the checkout, so even a box where every probe hangs finishes inside it".
+    # But box_probes.TIMEOUTS is per CALL, and three probes make more than one
+    # call: deploy-root runs three git commands, migrations runs two, and the
+    # completion probe runs four, one of them with a grace period on top of its
+    # own deadline. The real worst case is 570s, which does not fit in 480s -
+    # so the one box this job exists for, a slow and sick one, is exactly the
+    # box on which GitHub would kill the job before box_readiness.py printed
+    # the table of remedies that is the entire product of it.
+    # box_probes.JOB_TIMEOUT_MINUTES holds this number, and the test suite
+    # MEASURES the worst case by running every probe against a recording
+    # runner, so neither the ceiling nor the arithmetic can drift again.
+    timeout-minutes: 14
+    # PER COMMIT, and never the release path's `deploy-dgx-spark`; see THE
+    # CONCURRENCY above.
     concurrency:
       group: box-readiness-${{ github.sha }}
       cancel-in-progress: false
@@ -1225,11 +1271,16 @@ jobs:
         with:
           ref: ${{ github.sha }}
 
-      # STRICTLY READ-ONLY, and it never takes the deploy lock — it observes
-      # whether the lock is free, which is a different act. Every probe fails
-      # closed: a probe that cannot be performed, that raises, or that times
-      # out is a refusal, never a shrug. Every refusal prints the exact
-      # command a human runs to clear it.
+      # STRICTLY READ-ONLY: nothing here starts, stops, recreates, prunes or
+      # writes. It asks whether the deploy lock is free with the same
+      # non-blocking `flock -n` that scripts/lib/deploy-common.sh's own
+      # `dr_lock_is_held` uses. That DOES briefly take the lock - the claim
+      # that it "never takes the deploy lock" was withdrawn as untrue - but
+      # only for the lifetime of a `bash -c` that does nothing else, never
+      # waiting for it and never acting on it. Every probe fails closed: a
+      # probe that cannot be performed, that raises, or that times out is a
+      # refusal, never a shrug. Every refusal prints the exact command a human
+      # runs to clear it.
       #
       # Probe 6 is a REAL completion, never /health: a wedged vLLM engine
       # served a green /health for five and a half hours on this box while

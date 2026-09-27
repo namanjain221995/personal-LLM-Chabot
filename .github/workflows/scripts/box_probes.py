@@ -9,10 +9,18 @@ standing watch in production-watch.yml. Both ask the same question — "is this
 machine in a state where a deploy would succeed?" — and both answer it from a
 PUBLIC repository's log, so both need the same two properties:
 
-  1. EVERY PROBE IS READ-ONLY. Nothing here starts, stops, recreates, prunes,
-     writes or locks. The deploy flock in particular is OBSERVED, never taken:
-     asking "is it free?" and taking it are different acts, and only the first
-     one is safe to do next to a rollout.
+  1. EVERY PROBE IS READ-ONLY. Nothing here starts, stops, recreates, prunes
+     or writes. The deploy flock is ASKED whether it is free, by exactly the
+     mechanism scripts/lib/deploy-common.sh's own `dr_lock_is_held` uses: a
+     non-blocking `flock -n` on a descriptor that is closed immediately.
+
+     An earlier version of this paragraph said the flock was "OBSERVED, never
+     taken". That was not true and the claim is withdrawn: `flock -n` DOES
+     take the lock. What is true, and is the property that matters next to a
+     rollout, is that it is held only for the lifetime of a `bash -c` that
+     does nothing else, it is never waited for, and it is never taken in order
+     to act. A rollout that wants it is delayed by microseconds, never by this
+     job's decision, and never for the length of a probe.
 
   2. NOTHING THAT IS NOT ON AN ALLOWLIST REACHES STDOUT. See THE PRINT
      ALLOWLIST below. This is a security control, not formatting.
@@ -102,9 +110,30 @@ CONTROLLER_SERVING_CODES = (2, 3)
 COMPLETION_MAX_TOKENS = 8
 COMPLETION_PROMPT = "Reply with the single word: READY."
 
-#: Per-probe subprocess ceilings, in seconds. Their sum plus the checkout has
-#: to stay inside the job's 8-minute ceiling even when every one of them times
-#: out: 30 + 30 + 15 + 150 + 15 + 120 + 45 = 405s.
+#: Per-probe subprocess ceilings, in seconds.
+#:
+#: These are PER CALL, not per probe, and that distinction is the bug this
+#: comment used to hide. It read "their sum plus the checkout has to stay
+#: inside the job's 8-minute ceiling even when every one of them times out:
+#: 30 + 30 + 15 + 150 + 15 + 120 + 45 = 405s". Every term of that sum was
+#: wrong in the same direction:
+#:
+#:   * probe_deploy_root runs THREE git calls (is-inside-work-tree, status,
+#:     rev-parse), so its ceiling is 90s and not 30s;
+#:   * probe_migrations runs TWO bash calls (live, then code), so 90s not 45s;
+#:   * probe_completion runs FOUR calls -- resolve, /metrics, the completion,
+#:     /metrics again -- and the completion's own subprocess timeout is
+#:     TIMEOUTS["completion"] + COMPLETION_CURL_GRACE_S, so 180s not 120s.
+#:
+#: The real worst case is 570s, which does NOT fit in eight minutes: a box
+#: slow enough to walk every call up to its ceiling would have the job killed
+#: by GitHub before box_readiness.py printed its table, and the table with the
+#: remedies in it is the entire product of this job. So the ceiling below is
+#: the one pipeline.yml declares, and the arithmetic is no longer written down
+#: anywhere as a number a human maintains: tests/test_box_wiring.py MEASURES
+#: it by running every probe against a recording runner, and asserts both that
+#: it fits under JOB_TIMEOUT_MINUTES and that pipeline.yml declares that same
+#: number.
 TIMEOUTS = {
     "git": 30,
     "disk": 30,
@@ -114,6 +143,20 @@ TIMEOUTS = {
     "completion": 120,
     "migrations": 45,
 }
+
+#: How much longer the completion's subprocess may live than the deadline curl
+#: was itself given, so that a curl which honours `-m` reports its own timeout
+#: (an exit code, which names a remedy) instead of being killed from outside it
+#: (a TimeoutExpired, which names none).
+COMPLETION_CURL_GRACE_S = 15
+
+#: The `timeout-minutes` pipeline.yml declares on the `box-readiness` job, and
+#: the slice of it reserved for actions/checkout on the box. The test suite
+#: asserts BOTH directions: that pipeline.yml declares exactly this number, and
+#: that the measured worst-case subprocess wall clock fits inside it with the
+#: checkout allowance subtracted. Neither can drift without a red test.
+JOB_TIMEOUT_MINUTES = 14
+CHECKOUT_ALLOWANCE_S = 180
 
 WITHHELD = "<withheld>"
 
@@ -527,10 +570,14 @@ def _holder_facts(env: Environment) -> dict[str, object]:
 
 
 def probe_deploy_lock(env: Environment) -> ProbeResult:
-    """Is the deploy flock FREE? Observed, never taken.
+    """Is the deploy flock FREE? Asked the way deploy-common.sh asks it.
 
-    `flock -n` on a duplicate descriptor, released the instant the subshell
-    exits. The descriptor is opened READ-ONLY (`exec 9<`), which is stricter
+    `flock -n` on a descriptor that is closed the instant the subshell exits.
+    This DOES take the lock for that instant -- see the module docstring, where
+    the claim that it never does is withdrawn -- and the reason that is safe is
+    that the subshell does nothing else, never waits, and never acts on it.
+
+    The descriptor is opened READ-ONLY (`exec 9<`), which is stricter
     than deploy-common.sh's own `dr_lock_is_held` (`exec 9>>`): flock(2) does
     not need write access, and a readiness check has no business opening a
     production file for writing. The lock file's absence is NOT a refusal —
@@ -612,7 +659,16 @@ def probe_engine_controller(env: Environment) -> ProbeResult:
     if not isinstance(doc, dict):
         return ProbeResult("engine-controller", "unreadable")
 
-    recovery = doc.get("recovery") or {}
+    # A `recovery` that is present but is not an object is a document this
+    # probe cannot read, and "cannot read it" is a refusal, not a shrug. The
+    # first version treated it as "no recovery in progress", which is the one
+    # reading that lets a box mid-recovery pass: `in_progress` would silently
+    # be False and a READY/BUSY state_code would carry the probe.
+    recovery = doc.get("recovery")
+    if recovery is None:
+        recovery = {}
+    if not isinstance(recovery, dict):
+        return ProbeResult("engine-controller", "unreadable")
     facts: dict[str, object] = {}
     state = doc.get("state")
     if isinstance(state, str):
@@ -621,7 +677,7 @@ def probe_engine_controller(env: Environment) -> ProbeResult:
     if isinstance(code, int) and not isinstance(code, bool):
         facts["state_code"] = code
     facts["primary_ready"] = bool(doc.get("primary_ready"))
-    in_progress = bool(recovery.get("in_progress")) if isinstance(recovery, dict) else False
+    in_progress = bool(recovery.get("in_progress"))
     facts["recovery_in_progress"] = in_progress
 
     if in_progress:
@@ -632,7 +688,19 @@ def probe_engine_controller(env: Environment) -> ProbeResult:
 
 
 def _generation_tokens(text: str) -> float | None:
-    """Sum every `vllm:generation_tokens_total` series in a /metrics body."""
+    """Sum every `vllm:generation_tokens_total` series in a /metrics body.
+
+    None means the body did not carry a readable counter, which is a refusal.
+
+    The Prometheus text format permits `NaN`, `+Inf` and `-Inf` as sample
+    values, and `float()` accepts all three. A NaN total would make the wedged
+    test (`after <= before`) FALSE whatever the engine did, because every
+    comparison against NaN is false -- so a NaN counter would report
+    `generated` on a box that generated nothing. It happens that `int(nan)`
+    raises further down and the probe refuses anyway, but a fail-closed default
+    that depends on an unrelated line raising is not one anybody can rely on.
+    A non-finite sample is therefore rejected here, where the reading is taken.
+    """
     total = None
     for line in text.splitlines():
         if not line.startswith("vllm:generation_tokens_total"):
@@ -644,6 +712,8 @@ def _generation_tokens(text: str) -> float | None:
             value = float(parts[-1])
         except ValueError:
             continue
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
         total = value if total is None else total + value
     return total
 
@@ -736,7 +806,7 @@ def probe_completion(env: Environment) -> ProbeResult:
             "-d", body,
             url + "/v1/chat/completions",
         ],
-        timeout=TIMEOUTS["completion"] + 15,
+        timeout=TIMEOUTS["completion"] + COMPLETION_CURL_GRACE_S,
     )
     elapsed = max(0.0, env.clock() - started)
     if reply_out.rc != 0:
@@ -766,10 +836,33 @@ def probe_completion(env: Environment) -> ProbeResult:
     return ProbeResult("completion", "generated", facts)
 
 
-def _schema_version(env: Environment, root: pathlib.Path, snippet: str) -> int | None:
-    """One number out of deploy-common.sh, with DR_ROOT pointed where asked."""
+def _schema_version(
+    env: Environment,
+    root: pathlib.Path,
+    function: str,
+    *args: str,
+) -> int | None:
+    """One number out of deploy-common.sh, with DR_ROOT pointed where asked.
+
+    `function` is a literal in THIS file; everything variable arrives as a
+    positional argument, so the commit sha is data the shell never parses.
+    The first version interpolated the ref into the script text
+    (`f'dr_code_schema_version_from_git "{env.ref}"'`). Today's ref is
+    `$GITHUB_SHA` and is forty hex digits, so nothing was exploitable -- but
+    the shape is the one where a future caller passing `--ref` from somewhere
+    less disciplined gets a shell injection for free, and the fix costs a
+    positional parameter.
+    """
+    assert function.replace("_", "").isalnum(), function
     out = env.runner.run(
-        ["bash", "-c", f'. "$1" || exit 9; {snippet}', "_", str(env.deploy_common)],
+        [
+            "bash",
+            "-c",
+            f'. "$1" || exit 9; shift; {function} "$@"',
+            "_",
+            str(env.deploy_common),
+            *args,
+        ],
         timeout=TIMEOUTS["migrations"],
         env={"TECHSARA_DEPLOY_ROOT": str(root)},
     )
@@ -799,7 +892,7 @@ def probe_migrations(env: Environment) -> ProbeResult:
     here saves the hour of CI that would otherwise run first.
     """
     live = _schema_version(env, env.deploy_root, "dr_live_schema_version")
-    code = _schema_version(env, env.repo_root, f'dr_code_schema_version_from_git "{env.ref}"')
+    code = _schema_version(env, env.repo_root, "dr_code_schema_version_from_git", env.ref)
     if live is None or code is None:
         facts: dict[str, object] = {}
         if live is not None:

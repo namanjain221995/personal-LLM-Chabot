@@ -30,7 +30,12 @@ pipeline.yml for what gates it and what that does and does not buy.
 
 EVERYTHING IT DOES IS READ-ONLY
 -------------------------------
-Seven probes, all of them reads. The deploy flock is OBSERVED, never taken.
+Seven probes, all of them reads. The deploy flock is asked whether it is free
+by the same non-blocking `flock -n` scripts/lib/deploy-common.sh uses, which
+holds it for the lifetime of a `bash -c` that does nothing else; the earlier
+claim that it is "never taken" was withdrawn as untrue, and box_probes.py says
+exactly what happens instead.
+
 Every probe fails closed: a probe that cannot be performed is a refusal, and a
 probe that raises or times out is a refusal too. Every refusal prints the exact
 command a human runs to clear it, in full.
