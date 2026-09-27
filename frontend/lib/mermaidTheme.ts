@@ -409,14 +409,63 @@ function categoricalVariables(
 // --------------------------------------------------------------- the config
 
 /**
- * Keys a `%%{init: …}%%` directive in MODEL OUTPUT may not override.
+ * Config keys an IN-SOURCE override may not set.
+ *
+ * Mermaid applies both channels — a `%%{init: …}%%` directive and a YAML
+ * frontmatter `config:` block — through the same `addDirective`, and
+ * `mermaidAPI` deletes every key named here from a directive before it merges
+ * (`sanitize` in config.ts; `secure` is never applied to what WE pass to
+ * `mermaid.initialize`, so listing a key we set ourselves costs nothing —
+ * mermaid's own five defaults are all keys it sets itself).
  *
  * Mermaid's own defaults are `['secure', 'securityLevel', 'startOnLoad',
- * 'maxTextSize', 'suppressErrorRendering']`. Adding `theme` and
- * `themeVariables` is what actually stops the colour ban being a polite
- * request: measured, a model-emitted `%%{init: {'theme':'default'}}%%` used to
- * paint mermaid's light lavender (#ececff nodes) inside our dark chat, and
- * with these two keys secured the same source renders in our theme.
+ * 'maxTextSize', 'suppressErrorRendering']`. Everything after them is ours,
+ * and each one was measured today (Chromium 153.0.8010.36 / mermaid 11.17.0,
+ * real esbuild bundle of <MermaidBlock>) to change what the diagram looks like
+ * when an author sets it:
+ *
+ *   theme            `%%{init: {'theme':'default'}}%%` painted mermaid's light
+ *                    lavender (#ececff nodes) inside our dark chat.
+ *   themeVariables   the whole palette this file declares.
+ *   themeCSS         raw CSS, namespaced to the diagram's own `#mmd-N` and
+ *                    injected into its `<style>`: a frontmatter block set a
+ *                    plain node to rgb(255,0,0) on a rgb(0,255,0) 6 px
+ *                    outline, its edge to rgb(255,0,255) at 5 px, every pie
+ *                    slice and every sequence actor to rgb(255,0,0), and
+ *                    `display:none` on `.flowchart-link` erased both edges of
+ *                    a three-node flowchart — a WRONG picture, not an ugly one.
+ *   htmlLabels       re-enables <foreignObject> labels: a `<b style=
+ *                    "color:#ff0000">` label then computed rgb(255,0,0), and
+ *                    the export canvas went from clean to tainted
+ *                    (`SecurityError` out of getImageData, 0 ink pixels), so
+ *                    "Download PNG" silently degrades to the SVG fallback.
+ *   flowchart        carries its own `htmlLabels`, same effect.
+ *   look             `look: handDrawn` swapped every `g.node` for a rough.js
+ *                    `.rough-node` path set (measured: 0 nodes, 2 rough nodes,
+ *                    `data-look="handDrawn"`).
+ *   layout           picks a different layout engine for the same graph.
+ *   fontFamily /     fed into `--mermaid-font-family`. Measured inert on its
+ *   altFontFamily    own (mermaid namespaces its `:root` rule into
+ *                    `#mmd-N :root`, which matches nothing) — secured anyway,
+ *                    because "inert" here is one upstream bug fix away from
+ *                    "Comic Sans in a chat answer".
+ *   fontSize,        size and wrapping of the same content.
+ *   markdownAutoWrap
+ *   darkMode         flips mermaid's own light/dark derivations.
+ *   class, sequence, the per-diagram config objects that carry their own
+ *   gantt, journey,  fonts, paddings and colours.
+ *   pie, quadrantChart,
+ *   xyChart, mindmap,
+ *   timeline, gitGraph,
+ *   requirement, er,
+ *   state, block, sankey,
+ *   packet, radar, treemap,
+ *   architecture, kanban
+ *
+ * This list is the SECOND line of defence. The first is
+ * `sanitizeDiagramSource`, which removes both override channels from the
+ * source before mermaid ever sees them; this is what holds if a future mermaid
+ * grows a third channel we have not met.
  */
 export const SECURE_KEYS = [
   'secure',
@@ -426,6 +475,36 @@ export const SECURE_KEYS = [
   'suppressErrorRendering',
   'theme',
   'themeVariables',
+  'themeCSS',
+  'htmlLabels',
+  'flowchart',
+  'look',
+  'layout',
+  'fontFamily',
+  'altFontFamily',
+  'fontSize',
+  'markdownAutoWrap',
+  'darkMode',
+  'class',
+  'sequence',
+  'gantt',
+  'journey',
+  'pie',
+  'quadrantChart',
+  'xyChart',
+  'mindmap',
+  'timeline',
+  'gitGraph',
+  'requirement',
+  'er',
+  'state',
+  'block',
+  'sankey',
+  'packet',
+  'radar',
+  'treemap',
+  'architecture',
+  'kanban',
 ] as const;
 
 /**
@@ -645,6 +724,189 @@ export function roleClassDefs(
   });
 }
 
+// --------------------------------------------------------- the preamble guard
+
+/**
+ * The leading YAML frontmatter block, in EXACTLY mermaid's own shape.
+ *
+ * Copied character for character from `frontMatterRegex` in mermaid 11.17.0
+ * (`dist/chunks/mermaid.core/chunk-DU6HZSFF.mjs`). It has to be the same
+ * regex, not a similar one: a block this misses but mermaid matches is a
+ * config override we do not see and it does, and a block this matches but
+ * mermaid does not is a piece of DIAGRAM BODY we would delete. Three details
+ * are load-bearing and were all reproduced today:
+ *
+ *  - `([^\S\n\r]*)` — only HORIZONTAL whitespace before the opening `---`,
+ *    captured, and the closing `---` must carry the same indent. An indented
+ *    block is frontmatter to mermaid (measured: an indented `themeCSS` painted
+ *    rgb(255,0,0)), so it has to be one here.
+ *  - `[\n\r]` rather than `\n` — and the CRLF normalisation below, because
+ *    mermaid's `cleanupText` runs first. A CRLF `config: themeCSS` block
+ *    painted rgb(255,0,0) too.
+ *  - the trailing `[\n\r]+` — a block at the very end of the text with no line
+ *    after it is NOT frontmatter to mermaid, so it must stay body here.
+ */
+const FRONTMATTER_RE = /^([^\S\n\r]*)-{3}\s*[\n\r](.*?)[\n\r]\1-{3}\s*[\n\r]+/s;
+
+/**
+ * The ONE thing a frontmatter block may carry: a caption.
+ *
+ * This is a positive allowlist and it is deliberately the narrowest one that
+ * keeps a legitimate diagram whole: a single `title:` line with a plain scalar
+ * value. `config:` is the channel this guard exists to close, but the rule is
+ * not "no config" — it is "nothing but a title", so a key nobody here has met
+ * (mermaid's `displayMode`, or whatever 11.18 adds) is refused by default
+ * rather than admitted by omission.
+ *
+ * Why a line test and not a YAML parse: agreeing with mermaid's parser would
+ * mean shipping js-yaml into this file and matching its schema, resolution and
+ * indent handling exactly — a second parser whose disagreements ARE the bug.
+ * A block that is not exactly one `title:` line is dropped whole instead, so
+ * there is nothing to disagree about.
+ *
+ * The value must not open with a YAML indicator: `|`/`>` start a block scalar
+ * whose content would be on lines this rule has already refused to allow,
+ * `&`/`*` are an anchor and an alias, `!` is a tag (a custom tag makes
+ * mermaid's own `load` THROW, which the block would show as a failed render
+ * rather than as a drawing), and
+ * `{`/`[` start a collection — mermaid renders `parsed.title.toString()`, so a
+ * map here draws the literal text "[object Object]".
+ */
+const TITLE_LINE = /^title:[ \t]+([^\s|>&*!{[][^\n]*)$/;
+
+/** The `title:` line to keep, or `''` when this block may not be kept. */
+function allowedFrontmatter(body: string[]): string {
+  if (body.length !== 1) return '';
+  const line = body[0].trimEnd();
+  return TITLE_LINE.test(line) ? line : '';
+}
+
+/**
+ * Both IN-SOURCE config channels, removed before mermaid can read either.
+ *
+ * Mermaid takes a config override from a `%%{init: …}%%` directive AND from a
+ * YAML frontmatter `config:` block, merges them with `cleanAndMerge` and
+ * applies the result through the same `addDirective`. Only the directive was
+ * ever removed here. Measured today, Chromium 153.0.8010.36 / mermaid 11.17.0,
+ * real esbuild bundle of `<MermaidBlock>`:
+ *
+ *     ---
+ *     config:
+ *       themeCSS: |
+ *         .node rect { fill: #ff0000 !important; stroke: #00ff00 !important;
+ *                      stroke-width: 6px !important; }
+ *         .flowchart-link { stroke: #ff00ff !important; stroke-width: 5px
+ *                      !important; }
+ *     ---
+ *     flowchart TD
+ *       SVC[Gateway]:::service --> PLAIN[Plain node]
+ *
+ * drew PLAIN at `fill: rgb(255, 0, 0)`, `stroke: rgb(0, 255, 0)`,
+ * `stroke-width: 6px` and its edge at `stroke: rgb(255, 0, 255)`, `5px`,
+ * against rgb(51,56,61)/rgb(139,148,158)/1px and rgb(154,163,173)/1px for the
+ * same diagram without the block. A roled node was the only thing that held,
+ * and only by accident: `classDef` lands as an INLINE `!important` style,
+ * which beats a stylesheet rule. A `sequenceDiagram` or a `pie` gets no
+ * classDefs at all, and there every actor rect and every slice went
+ * rgb(255,0,0).
+ *
+ * The same channel also carries `htmlLabels: true`, which put a
+ * `<b style="color:#ff0000">` label at computed rgb(255,0,0) and tainted the
+ * export canvas (`SecurityError` from getImageData, 0 ink pixels — "Download
+ * PNG" degrades to the SVG fallback), and `look: handDrawn`, which replaced
+ * every `g.node` with a rough.js path set.
+ *
+ * STRIP OR REFUSE. The preamble is stripped, not refused, because neither
+ * channel can change WHAT is drawn: mermaid removes both from the text before
+ * it parses a single statement, so they carry presentation and nothing else,
+ * and the picture that comes out of a stripped source is the same graph in our
+ * own theme. A refusal here would cost a correct diagram for nothing. The one
+ * case that IS refused is a directive crafted so `}%%` sits inside its own
+ * string value: the balanced strip stops at that inner `}%%` and leaves a
+ * fragment mid-statement, and there is no way to remove the fragment without
+ * guessing where the statement around it began — dropping its line can delete
+ * a real `A-->B`, and keeping it draws whatever the fragment happens to parse
+ * as. A wrong picture is worse than no picture, so the whole source is
+ * refused and the block shows the source instead.
+ */
+export interface GuardedSource {
+  /** The source to render, and to show. */
+  code: string;
+  /** Why the source must not be rendered at all; `''` when it may be. */
+  refusal: string;
+}
+
+export function guardDiagramSource(code: string): GuardedSource {
+  if (!code) return { code: '', refusal: '' };
+  // mermaid's `cleanupText` normalises line endings before it looks for
+  // frontmatter, so this has to as well — a CRLF block is invisible to an
+  // `\n`-only reader and fully live in the renderer.
+  let out = code.replace(/\r\n?/g, '\n');
+  /** The one allowed `---\ntitle: …\n---` block, once it has been found. */
+  let head = '';
+  /**
+   * TO A FIXED POINT, because removing one preamble PROMOTES the next.
+   *
+   * Two ways round a single pass, both caught by writing this loop and then
+   * reproducing them against it:
+   *
+   *  1. two frontmatter blocks. Mermaid extracts only the FIRST, so a second
+   *     one is body and a parse error — but once this guard drops a
+   *     config-bearing first block, the second block becomes the first thing in
+   *     the text, and the source mermaid is then handed has a live
+   *     `config: themeCSS` at its head.
+   *  2. a `%%{init}%%` line ABOVE a frontmatter block. Mermaid extracts
+   *     frontmatter before directives, so that block is not frontmatter to
+   *     mermaid and the whole thing fails to parse — but this guard strips the
+   *     directive, and `sanitizeDiagramSource` then trims the blank line it
+   *     left, which lifts the block to column 0 of line 1 and makes it live.
+   *
+   * Both exist only because the guard itself rewrites the text. (1) needs the
+   * LOOP: with `pass < 1` the second block survives and DIAG-35f fails. (2)
+   * needs the ORDER inside it — directives, then the blank-line trim, then the
+   * frontmatter scan: move the scan above the strip and DIAG-35g fails. Each
+   * pass strictly shortens `out`, so the bound guards a future edit rather than
+   * any source seen here.
+   */
+  for (let pass = 0; pass < 64; pass += 1) {
+    const before = out;
+    // `%%{ … }%%` directives, including multi-line ones. Run before the
+    // statement split so a directive that itself contains `;` cannot confuse
+    // it, and before the frontmatter scan so case 2 above cannot hide a block.
+    out = out.replace(/%%\{[\s\S]*?\}%%/g, '');
+    // An unterminated `%%{init: …` is a comment to mermaid rather than a
+    // directive, but it must not reach the Code tab looking like one.
+    out = out.replace(/%%\{[^\n]*/g, '');
+    if (/\}%%/.test(out)) {
+      return { code: out, refusal: 'it carries a malformed %%{…}%% directive' };
+    }
+    // The leading blank lines `sanitizeDiagramSource` trims at the end anyway.
+    // Trimming them HERE is what makes case 2 visible instead of smuggled.
+    out = out.replace(/^(?:[ \t]*\n)+/, '');
+    const fm = FRONTMATTER_RE.exec(out);
+    if (!fm) break;
+    const indent = fm[1];
+    const body = fm[2]
+      .split('\n')
+      .map((l) => (indent && l.startsWith(indent) ? l.slice(indent.length) : l));
+    const title = allowedFrontmatter(body);
+    out = out.slice(fm[0].length);
+    if (title) {
+      // Mermaid stops at the first block too, so nothing behind this one can
+      // be config to it either. Keep it and stop promoting.
+      head = `---\n${title}\n---\n`;
+      break;
+    }
+    if (out === before) break;
+  }
+  return { code: head + out, refusal: '' };
+}
+
+/** Why this source may not be rendered at all, or `''`. */
+export function diagramRefusal(code: string): string {
+  return guardDiagramSource(code).refusal;
+}
+
 // -------------------------------------------------------------- the sanitiser
 
 /** The statement keywords that can carry a colour. Matched per STATEMENT. */
@@ -748,9 +1010,15 @@ function splitStatements(line: string): string[] {
  *     statement separator in the flowchart grammar, so "the line starts with
  *     style" was never the right question.
  *
- * What is removed: `%%{ … }%%` directives wherever they appear, including the
- * multi-line form, and any `classDef`, `style`, `linkStyle` or `click`
- * STATEMENT — whether it opens its line or follows a `;`.
+ * What is removed: the PREAMBLE, via `guardDiagramSource` — a YAML frontmatter
+ * block reduced to at most a `title:` line, and `%%{ … }%%` directives wherever
+ * they appear, including the multi-line form — and then any `classDef`,
+ * `style`, `linkStyle` or `click` STATEMENT, whether it opens its line or
+ * follows a `;`.
+ *
+ * The preamble is removed FIRST and by that guard, not here, so a frontmatter
+ * `themeCSS` block can never be read as diagram statements: its CSS lines are
+ * full of `{`, `}` and `;` and `splitStatements` has no business seeing them.
  *
  * What survives untouched: `A:::role`, `class A,B role`, and a
  * `classDiagram`'s own `class Foo { … }` blocks. None of those carries a
@@ -764,12 +1032,7 @@ function splitStatements(line: string): string[] {
  */
 export function sanitizeDiagramSource(code: string): string {
   if (!code) return '';
-  // `%%{ … }%%` directives, including multi-line ones. Run before the
-  // statement split so a directive that itself contains `;` cannot confuse it.
-  let out = code.replace(/%%\{[\s\S]*?\}%%/g, '');
-  // An unterminated `%%{init: …` is a comment to mermaid rather than a
-  // directive, but it must not reach the Code tab looking like one.
-  out = out.replace(/%%\{[^\n]*/g, '');
+  let out = guardDiagramSource(code).code;
   out = out
     .split('\n')
     .map((line) => {
@@ -922,7 +1185,10 @@ export function prepareDiagramSource(
   root?: Element | null,
 ): string {
   const clean = sanitizeDiagramSource(code);
-  if (!clean.trim() || !acceptsClassDefs(clean)) return clean;
+  // A refused source is never rendered, so it gets no classDefs either: four
+  // `classDef` lines under a "this diagram was refused" notice would be the
+  // app's own text presented as the author's.
+  if (!clean.trim() || diagramRefusal(code) || !acceptsClassDefs(clean)) return clean;
   const defs = roleClassDefs(mode, root);
   return `${clean.replace(/\s+$/, '')}\n${defs.join('\n')}\n`;
 }
