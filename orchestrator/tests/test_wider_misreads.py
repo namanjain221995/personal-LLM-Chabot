@@ -213,9 +213,14 @@ def _pasted_rows(n: int) -> str:
 #: 120 rows (~4.4 kB) is not, because `_clean(text)[:4000]` has already cut
 #: the sentence off. Nothing is logged and no metric counts it.
 @pytest.mark.parametrize("rows", [120, 400, 10_000])
-@pytest.mark.xfail(strict=True, reason="W3: the ask lies past _DECIDE_CHARS=4000 and _should_consult truncates the same way (intent.py:118/1648)")
 def test_an_ask_after_a_pasted_table_is_still_a_request(rows: int) -> None:
-    """Paste the data, then ask. The ask must survive the paste."""
+    """Paste the data, then ask. The ask must survive the paste.
+
+    FIXED 2026-09-27 by `_decide_window`: the rules read the first 3,000
+    collapsed characters and the last 1,000 instead of the first 4,000, so
+    the total scanned length -- the bound that exists to keep a quadratic
+    regex off the event loop -- is unchanged. All three decided
+    none/no-request before the fix and create/['xlsx'] after it."""
     text = _pasted_rows(rows) + "\n\nMake a sheet of this for me please"
     assert I.decide(text, **P0).wants_file is True
 
@@ -236,12 +241,20 @@ def test_the_same_ask_stated_first_survives_any_paste(rows: int) -> None:
 
 
 @pytest.mark.parametrize("rows", [120, 400])
-@pytest.mark.xfail(strict=True, reason="W3: LX.file_signal is given the same 4000-char prefix, so the classifier is never consulted (intent.py:1648)")
 def test_a_swallowed_ask_at_least_reaches_the_classifier(rows: int) -> None:
     """The escape hatch for a shape the rules cannot read is the classifier.
-    It is behind the same truncation, so a swallowed ask reaches nothing."""
+    It was behind the same truncation, so a swallowed ask reached nothing:
+    `_should_consult` measured False at 120 and 400 rows.
+
+    FIXED 2026-09-27: it is given the same `_decide_window`. Both halves are
+    asserted, because the first alone would no longer exercise the second --
+    the rules now read this ask themselves, and `_should_consult` is False
+    for any turn that already has a verdict. The second assertion hands it
+    the `none` verdict directly, which is the only way to test the window it
+    is given rather than the verdict it is handed."""
     text = _pasted_rows(rows) + "\n\nMake a sheet of this for me please"
-    assert I._should_consult(I.decide(text, **P0), text) is True
+    assert I.decide(text, **P0).wants_file is True
+    assert I._should_consult(I.ArtifactIntent("none", rule="no-request"), text) is True
 
 
 # ----------------------------------------------------------------------- W4 --

@@ -116,8 +116,32 @@ from . import visuals as VIS
 
 Action = str  # "create" | "edit" | "convert" | "export" | "none"
 
-#: How much of a message the rules read.
+#: How much of a message the rules read, in whitespace-collapsed
+#: characters. The bound is deliberate: a regex with a word gap is
+#: quadratic in what it scans and a 250 kB paste held the event loop for
+#: minutes (review 2026-09-11).
 _DECIDE_CHARS = 4000
+#: ...and WHERE those characters come from. The bound used to be the HEAD
+#: alone, which silently swallowed the ask people type AFTER their data: a
+#: 120-row paste (4,475 collapsed chars) then "Make a sheet of this for me
+#: please" decided none/no-request, where the identical words over 40 rows
+#: (1,515 chars) decided create, and the same ask ABOVE the paste survived
+#: 10,000 rows. The loss was POSITIONAL, not about length, and nothing
+#: logged it (W3, measured 2026-09-27).
+#:
+#: THE COST, measured today on the same box, median of 40 `decide` calls on
+#: a tab-separated paste with NO ask anywhere, so the verdict is identical
+#: either way and only the window differs: 120 rows 27.6 -> 28.1 ms, 400
+#: rows 27.7 -> 28.1 ms, 10,000 rows 29.8 -> 30.1 ms, 100,000 rows (3.84 MB)
+#: 54.5 -> 52.8 ms. Half a millisecond at most, and still flat in the size
+#: of the paste, because the TOTAL scanned length is unchanged: the head is
+#: 3,000 characters instead of 4,000 and the tail is the other 1,000.
+#: Deciding a FILE for one of these turns costs a further ~4.7 ms (27.6 ->
+#: 32.4 ms at 120 rows), which is the create path running on the window
+#: rather than falling through to `no-request` -- the price of the right
+#: answer, not of the window.
+_DECIDE_HEAD_CHARS = 3000
+_DECIDE_TAIL_CHARS = _DECIDE_CHARS - _DECIDE_HEAD_CHARS
 #: A conversation artifact's title is matched as a whole phrase, and only
 #: when it is distinctive enough to mean something: "The" or "Plan" would
 #: turn every later message with an edit verb into an edit.
@@ -466,6 +490,21 @@ class ArtifactIntent:
 
 def _clean(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def _decide_window(cleaned: str) -> str:
+    """The bounded slice of a whitespace-collapsed message the rules read:
+    its first `_DECIDE_HEAD_CHARS` characters and its last
+    `_DECIDE_TAIL_CHARS`, or all of it when it is short enough.
+
+    See `_DECIDE_HEAD_CHARS`. The two halves are joined by a full stop so
+    the head's cut-off clause cannot glue onto the tail's first one: every
+    clause-end pattern in this module ends at `.`, and without it "Team 3
+    Engineer" + "Make a sheet" would read as one clause.
+    """
+    if len(cleaned) <= _DECIDE_CHARS:
+        return cleaned
+    return cleaned[:_DECIDE_HEAD_CHARS] + " . " + cleaned[-_DECIDE_TAIL_CHARS:]
 
 
 def _first_clause(low: str) -> str:
@@ -1334,7 +1373,13 @@ def decide(
     # event loop for minutes (review, 2026-09-11). The engine gets the
     # whole text in `raw_text`.
     original = text or ""
-    raw = _clean(original)[:_DECIDE_CHARS]
+    cleaned = _clean(original)
+    # `raw` is the WINDOW the rules read (`_decide_window`: head and tail);
+    # `instruction` stays the head slice, because it is what the composer
+    # is handed and a job's instruction must read as the person's own
+    # opening words (test_artifact_engine.py:808, test_artifact_intent.py:410).
+    raw = _decide_window(cleaned)
+    instruction = cleaned[:_DECIDE_CHARS]
     if not raw:
         return ArtifactIntent("none", rule="empty")
     # The rules read the NORMALISED text (AS3: typos, Hindi/Gujarati/
@@ -1354,7 +1399,7 @@ def decide(
 
     def made(action: Action, **kw) -> ArtifactIntent:
         kw.setdefault("formats", explicit)
-        kw.setdefault("instruction", raw)
+        kw.setdefault("instruction", instruction)
         if action == "none":
             kw.setdefault("target", "none")
         elif action == "export":
@@ -1773,7 +1818,10 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
         # classifier believes; asking it would only buy back the document
         # the 2026-09-16 incident produced.
         return False
-    return LX.file_signal(text[:_DECIDE_CHARS])
+    # The SAME window `decide` read. It used to be `text[:_DECIDE_CHARS]`,
+    # so a swallowed ask had no escape hatch either: measured False at 120
+    # and 400 rows (W3, 2026-09-27).
+    return LX.file_signal(_decide_window(_clean(text)))
 
 
 def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: bool, has_assistant_answer: bool,
@@ -1860,7 +1908,9 @@ async def decide_with_hook(
     if verdict is None:
         return intent
     if not isinstance(verdict, ArtifactIntent):
-        if str(getattr(verdict, "action", "")) in ("create", "export") and not LX.request_marker((text or "")[:_DECIDE_CHARS]):
+        # The same window again: a verdict whose request marker sits below a
+        # long paste would otherwise be thrown away at the exit (W3).
+        if str(getattr(verdict, "action", "")) in ("create", "export") and not LX.request_marker(_decide_window(_clean(text))):
             # A statement that mentions a format is not a request for a new
             # file, whatever the classifier's confidence (verifier 2026-09-15).
             return intent
