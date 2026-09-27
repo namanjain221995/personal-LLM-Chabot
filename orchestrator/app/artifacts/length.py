@@ -78,6 +78,13 @@ COMPREHENSIVE_WORDS = 4_500
 #: A report over real data with no size word at all.
 DATA_REPORT_FLOOR = 1_500
 
+#: One top-level section, in words. Short enough that the model writes
+#: prose rather than a bullet list, long enough that 3,000 words is not
+#: thirty headings. `sections_for` divides by it; the composer, which
+#: derives a word target from the number of sections a request NAMES,
+#: multiplies by it — one constant, read in both directions.
+WORDS_PER_SECTION = 400
+
 #: The renderers' hard ceilings, in the units this module speaks.
 MAX_WORDS = T.MAX_PAGES * WORDS_PER_PAGE      # 27,000
 MAX_SLIDES = T.MAX_SLIDES                     # 40
@@ -149,13 +156,28 @@ _AMBIGUOUS_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: The qualifiers that turn `summary` from a size word into a SECTION NAME.
+#: An executive summary is the first heading of most reports. The owner's
+#: request of 2026-09-22 numbered "1. Executive Summary" as section one of
+#: fifteen, the bare `summary` alternative below matched it at offset 363,
+#: and `parse_size` returns at its shrink branch BEFORE the data-report
+#: floor is considered — so a fifteen-section technical report was read as
+#: "the person asked for less" and came back as four pages. One negative
+#: lookbehind per qualifier, each fixed-width, which is exactly the guard
+#: `_AMBIGUOUS_RE` already gives complete|full|whole|entire. Deliberately
+#: narrow: "a short summary", "a concise summary" and "summarise the
+#: release" all still ask for less.
+_SECTION_NAME_BEFORE_SUMMARY = ("executive", "management", "technical")
+_NOT_A_SECTION_NAME = "".join(rf"(?<!{word}[\s-])" for word in _SECTION_NAME_BEFORE_SUMMARY)
+
 #: Words that ask for LESS. "Summary" is here as a document kind ("a short
 #: summary"), which is why a growth word in the same request wins over it:
 #: "include an executive summary" names a section, not the file's size.
 _SHRINK_RE = re.compile(
     r"\b(?:short|shorter|shortest|brief|briefly|briefer|concise|concisely|succinct|terse|snappy|crisp|"
     r"one[-\s]?pager?|1[-\s]?pager?|single[-\s]?page|half[-\s]?(?:a[-\s]?)?page|"
-    r"summary|summarise|summarize|summarised|summarized|tl;?dr|high[-\s]?level|at[-\s]?a[-\s]?glance|"
+    + _NOT_A_SECTION_NAME +
+    r"(?:summary|summarise|summarize|summarised|summarized)|tl;?dr|high[-\s]?level|at[-\s]?a[-\s]?glance|"
     r"quick|bullet[-\s]?points?\s+only|keep\s+it\s+(?:short|small|tight)|not\s+too\s+long|no\s+fluff)\b",
     re.IGNORECASE,
 )
@@ -291,11 +313,8 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
 
 
 def sections_for(words: int) -> int:
-    """How many top-level sections a word target needs. 400 words is a
-    section of several paragraphs — short enough that the model writes
-    prose rather than a bullet list, long enough that 3,000 words is not
-    thirty headings."""
-    return max(1, math.ceil(max(0, int(words)) / 400))
+    """How many top-level sections a word target needs."""
+    return max(1, math.ceil(max(0, int(words)) / WORDS_PER_SECTION))
 
 
 def section_words(words: int, sections: int) -> int:
@@ -307,5 +326,6 @@ def section_words(words: int, sections: int) -> int:
 
 __all__ = [
     "LengthTarget", "parse_size", "shrink_asked", "is_data_report", "sections_for", "section_words",
-    "WORDS_PER_PAGE", "BIG_WORDS", "COMPREHENSIVE_WORDS", "DATA_REPORT_FLOOR", "MAX_WORDS", "MAX_SLIDES",
+    "WORDS_PER_PAGE", "WORDS_PER_SECTION", "BIG_WORDS", "COMPREHENSIVE_WORDS", "DATA_REPORT_FLOOR",
+    "MAX_WORDS", "MAX_SLIDES",
 ]
