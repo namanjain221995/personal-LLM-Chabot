@@ -205,16 +205,17 @@ jobs:
       # (2026-09-13): a module that skips itself at import no longer counts
       # towards it.
       #
-      # MEASURED, on the merge of this branch into dev at ff1a5d7c: 395 executed,
-      # 0 skipped, of 395 collected, across 11 modules, of which 75 are the new
+      # MEASURED, on the merge of this branch into dev at ff1a5d7c: 402 executed,
+      # 0 skipped, of 402 collected, across 11 modules, of which 82 are the new
       # db-rehearsal suite. Three runs, same number each time (load average
-      # 13.1-13.3, 11.6-13.2 s wall). dev alone is 320.
+      # 28.3-30.8, 21.4-24.1 s wall). dev alone is 320.
       #
-      # Earlier drafts of this comment said 220/37 and then 225/42. Both were
-      # true of this branch standing alone and neither was true of the merge,
-      # because dev gained five test modules while the branch sat unmerged. The
-      # number here is the merged one, since that is the number the gate will
-      # actually count.
+      # Earlier drafts of this comment said 220/37, then 225/42, then 395/75, and
+      # each was stale by the next commit. Two lessons, both worth the line: a
+      # count of THIS BRANCH alone is not the count the gate will see, because
+      # dev gained five test modules while the branch sat unmerged; and a count
+      # measured before the last commit is not a count of the branch. The number
+      # here is the merged one, taken after the final commit.
       #
       # WHAT 205 CATCHES AND WHAT IT DOES NOT. The floor was 95 from the day it
       # was written, which by 320 could not catch a whole module dropping out of

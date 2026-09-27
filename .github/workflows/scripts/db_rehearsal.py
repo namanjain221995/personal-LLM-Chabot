@@ -532,6 +532,29 @@ def _incomplete_reason(arm: str, rec: dict) -> str:
     return ""
 
 
+def _one_line(value: object) -> str:
+    """A record's free text, flattened so it cannot become a second bullet.
+
+    Every bullet in the verdict is one line beginning `- **FACT**` or
+    `- **NOT PROVED**`, and `detail` is free text that arrived in a JSON file.
+    A newline in it ends the bullet and whatever follows is rendered as its own
+    line, so a `detail` containing "\n- **FACT** `reversibility`: PASSED" put a
+    forged verdict for another arm into the step summary. Measured: the gate was
+    NOT fooled - it still exited 1 and printed the real "- **NOT PROVED**
+    `reversibility`: this arm reported nothing" two lines below - but the summary
+    then stated both, about the same arm, and the forged line was the friendlier
+    of the two.
+
+    Not reachable from the pipeline as it stands: `detail` is composed by
+    scripts/deploy-db-rehearsal.sh out of --image and --from-image, which are
+    literal env values in the workflow. It is flattened anyway, because this
+    job's whole claim is that its green summary cannot be misread, and
+    `Findings.bad` already does exactly this to keep an annotation on one line.
+    """
+    text = str(value or "")
+    return " ".join(text.split("\n")).strip()
+
+
 def build_verdict(records: list[dict], *, required: tuple[str, ...] = REQUIRED_ARMS) -> tuple[bool, list[str]]:
     """Return (ok, markdown lines). Every line says FACT or NOT PROVED.
 
@@ -553,7 +576,7 @@ def build_verdict(records: list[dict], *, required: tuple[str, ...] = REQUIRED_A
             )
             continue
         outcome = str(rec.get("outcome") or "")
-        detail = str(rec.get("detail") or "")
+        detail = _one_line(rec.get("detail"))
         if outcome == "pass":
             incomplete = _incomplete_reason(arm, rec)
             if incomplete:
@@ -573,7 +596,7 @@ def build_verdict(records: list[dict], *, required: tuple[str, ...] = REQUIRED_A
 
     for arm in sorted(set(by_arm) - set(required)):
         rec = by_arm[arm]
-        outcome = str(rec.get("outcome") or "")
+        outcome = _one_line(rec.get("outcome"))
         label = "FACT" if outcome in ("pass", "fail") else "NOT PROVED"
         lines.append(f"- **{label}** `{arm}` (not required): {outcome or '<none>'}")
 

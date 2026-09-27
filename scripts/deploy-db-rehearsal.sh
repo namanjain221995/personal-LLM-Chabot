@@ -100,7 +100,20 @@ done
 
 dr_need docker; dr_need python3
 
-STAMP="$(date -u +%Y%m%d%H%M%S)"
+# Whole seconds are not unique enough to name a database with. Two rehearsals
+# that start in the SAME SECOND against the same server got the same three names,
+# and the second `CREATE DATABASE` lost. Measured, twice, with two real runs
+# against one PostgreSQL 18.6: one exited 2 on
+# `duplicate key value violates unique constraint "pg_database_datname_index"`
+# and the OTHER reported `FAIL init_schema failed on an empty database` - a
+# finding that reads exactly like a broken migration and was nothing of the kind.
+# A false RED rather than a false green, but a false red on the migration code is
+# the worst possible place for one.
+#
+# `$$` is the pid, which is what the reversibility arm's write smoke already uses
+# to keep its rows unique for the same reason. Underscore and not a hyphen: these
+# become SQL identifiers and a docker container name.
+STAMP="$(date -u +%Y%m%d%H%M%S)_$$"
 FRESH_DB="test_rehearsal_fresh_$STAMP"
 UPGRADE_DB="test_rehearsal_upgrade_$STAMP"
 RESTORE_DB="test_rehearsal_restore_$STAMP"
@@ -140,8 +153,22 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL + 1)); }
 # fail HERE, loudly, rather than downstream as a string comparison against
 # `SHOW server_version` that can never match and reads as a version mismatch.
 if [ -n "$DECLARED_MAJOR" ]; then
+  # The character class is ENUMERATED and not the range `[!0-9]`, and a leading
+  # zero is rejected, because two values got through the range and then failed
+  # downstream as the very "version mismatch" this block exists to prevent:
+  #
+  #   --expect-major ١٨   ->  major version mismatch (18 != ١٨)
+  #   --expect-major 018   ->  major version mismatch (18 != 018)
+  #
+  # measured against a real PostgreSQL 18.6. `0-9` is a COLLATION range, and
+  # under this box's en_US.utf8 it accepts Arabic-Indic digits; `0123456789` is
+  # an exact set and does not. `018` is an ordinary typo and `١٨` is what a
+  # copy-paste out of a localised document gives, and both of them named the
+  # SERVER as the wrong version when the flag was what was malformed. A bare `0`
+  # goes with them: there is no PostgreSQL major 0.
   case "$DECLARED_MAJOR" in
-    ''|*[!0-9]*) dr_die "--expect-major must be a whole PostgreSQL major such as 18, not '$DECLARED_MAJOR'" ;;
+    ''|*[!0123456789]*|0*)
+      dr_die "--expect-major must be a whole PostgreSQL major such as 18, not '$DECLARED_MAJOR'" ;;
   esac
 fi
 

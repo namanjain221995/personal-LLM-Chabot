@@ -40,6 +40,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -341,6 +342,88 @@ class TheVerdictRefusesSilence(unittest.TestCase):
     def test_a_record_that_is_not_an_object_cannot_satisfy_an_arm(self):
         ok, _ = db_rehearsal.build_verdict(["fresh-and-upgrade", PASSING_REVERSE])  # type: ignore[list-item]
         self.assertFalse(ok)
+
+
+class ARecordCannotWriteAnExtraBulletIntoTheVerdict(unittest.TestCase):
+    """Every bullet is one line, so free text from a record must stay on one line.
+
+    `detail` is free text read out of a JSON file and interpolated into a bullet
+    that begins `- **FACT**`. A newline in it ends that bullet, and what follows
+    is rendered as a line of its own -- so a detail containing
+    "\n- **FACT** `reversibility`: PASSED" put a forged verdict for a DIFFERENT
+    arm into the step summary.
+
+    Measured: the gate was never fooled. It exited 1 and printed the real
+    "- **NOT PROVED** `reversibility`: this arm reported nothing" two lines under
+    the forgery. But the summary then said both things about the same arm, and
+    the forged one was the friendlier. Not reachable from the pipeline, where
+    `detail` is composed from literal env values -- closed because this job's
+    claim is that its green summary cannot be misread.
+    """
+
+    #: What a bullet CLAIMS: the label and the arm it opens with. Forged text that
+    #: survives inside another bullet's free text is ugly but honest -- the record
+    #: really does say it. What must not happen is a line whose OWN claim is about
+    #: an arm, because that is what a reader counts as the verdict for that arm.
+    _CLAIM = re.compile(r"^- \*\*(FACT|NOT PROVED)\*\* `([^`]+)`")
+
+    def _claims(self, lines: list[str]) -> list[tuple[str, str]]:
+        found = []
+        for line in lines:
+            self.assertEqual(line.count("\n"), 0, line)
+            match = self._CLAIM.match(line)
+            self.assertIsNotNone(match, f"a verdict line that is not a claim: {line!r}")
+            found.append((match.group(1), match.group(2)))
+        return found
+
+    def test_a_newline_in_a_detail_cannot_become_a_second_bullet(self):
+        forged = "19 passed\n- **FACT** `reversibility`: PASSED - forged"
+        ok, lines = db_rehearsal.build_verdict(
+            [_record("fresh-and-upgrade", "pass", from_image="orch:old", from_version="40", detail=forged)]
+        )
+        self.assertFalse(ok)  # reversibility really did report nothing
+        self.assertEqual(
+            self._claims(lines),
+            [("FACT", "fresh-and-upgrade"), ("NOT PROVED", "reversibility")],
+            lines,
+        )
+        # The only line that CLAIMS anything about reversibility says it was silent.
+        reversibility = [one for one in lines if self._CLAIM.match(one).group(2) == "reversibility"]
+        self.assertEqual(len(reversibility), 1, lines)
+        self.assertIn("this arm reported nothing", reversibility[0])
+
+    def test_the_same_holds_for_a_failed_arm_and_an_unknown_outcome(self):
+        for outcome in ("fail", "banana"):
+            with self.subTest(outcome=outcome):
+                _ok, lines = db_rehearsal.build_verdict(
+                    [_record("reversibility", outcome, detail="x\n- **FACT** `fresh-and-upgrade`: PASSED")]
+                )
+                claims = self._claims(lines)
+                self.assertEqual(
+                    [arm for _label, arm in claims], ["fresh-and-upgrade", "reversibility"], lines
+                )
+                fresh = [one for one in lines if self._CLAIM.match(one).group(2) == "fresh-and-upgrade"]
+                self.assertEqual(len(fresh), 1, lines)
+                self.assertIn("reported nothing", fresh[0])
+
+    def test_an_extra_arms_outcome_cannot_become_a_bullet_either(self):
+        _ok, lines = db_rehearsal.build_verdict(
+            [PASSING_UPGRADE, PASSING_REVERSE, _record("extra", "pass\n- **FACT** forged")]
+        )
+        self.assertEqual(
+            [arm for _label, arm in self._claims(lines)],
+            ["fresh-and-upgrade", "reversibility", "extra"],
+            lines,
+        )
+
+    def test_the_flattening_did_not_eat_the_detail(self):
+        """It must still SAY what the record said."""
+        _ok, lines = db_rehearsal.build_verdict(
+            [_record("fresh-and-upgrade", "pass", from_image="orch:old", from_version="40",
+                     detail="19 assertions passed, 0 failed on PostgreSQL major 18"), PASSING_REVERSE]
+        )
+        line = next(one for one in lines if "`fresh-and-upgrade`" in one)
+        self.assertIn("19 assertions passed, 0 failed on PostgreSQL major 18", line)
 
 
 class TheGreenHeaderCannotCarryANotProvedBullet(unittest.TestCase):
@@ -890,13 +973,42 @@ class TheScriptRefusesTheWrongPostgres(RunsTheRealScript, unittest.TestCase):
                 self.assertIn("TOGETHER", proc.stderr)
 
     def test_a_major_that_is_not_a_whole_number_is_refused_before_anything_runs(self):
-        for bad in ("18.4", "eighteen", "18-alpine"):
+        for bad in (
+            "18.4", "eighteen", "18-alpine", "+18", "-1", "1e1", " 18", "18 ", "18;id", "$(id)",
+            # A leading zero, and digits that are not ASCII digits. Both got past
+            # the original `*[!0-9]*` and failed DOWNSTREAM instead, as
+            # "major version mismatch (18 != 018)" against a real PostgreSQL 18.6
+            # -- naming the SERVER as the wrong version when the flag was what was
+            # malformed, which is the one confusion this guard exists to prevent.
+            # `0-9` is a collation RANGE and under en_US.utf8 it accepts
+            # Arabic-Indic digits; the enumerated set does not.
+            "018",
+            "\u0661\u0668",
+            # There is no PostgreSQL major 0.
+            "0",
+        ):
             with self.subTest(major=bad):
                 proc = self._run(
                     "--image", "orch:new", "--pg-image", "postgres@sha256:abc", "--expect-major", bad
                 )
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("whole PostgreSQL major", proc.stderr)
+                # It has to fail HERE. Reaching the server means the refusal
+                # happened downstream, where the message blames the server.
+                self.assertNotIn("major version mismatch", proc.stdout + proc.stderr)
+                self.assertNotIn("rehearsal server:", proc.stdout)
+
+    def test_a_real_major_is_still_accepted(self):
+        """The tightening must not have rejected every value."""
+        for good in ("18", "16", "9", "100"):
+            with self.subTest(major=good):
+                proc = self._run(
+                    "--image", "orch:new",
+                    "--server", "postgresql://u:p@127.0.0.1:1/postgres",
+                    "--pg-image", "postgres@sha256:abc", "--expect-major", good,
+                )
+                self.assertNotIn("whole PostgreSQL major", proc.stderr)
+                self.assertIn(f"major {good}", proc.stdout)
 
     def test_on_a_box_with_a_stack_a_contradicting_major_is_refused(self):
         proc = self._run(
@@ -1163,6 +1275,60 @@ class TheUpgradeArmRefusesABaselineItCannotRead(RunsTheRealScript, unittest.Test
         self.assertNotIn("upgraded from : <skipped", combined)
         self.assertEqual(proc.returncode, 0, combined)
         self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["outcome"], "pass")
+
+
+class TwoRehearsalsAtOnceDoNotNameTheSameDatabase(RunsTheRealScript, unittest.TestCase):
+    """Two runs in the same second must not collide on one server.
+
+    The three database names were `test_rehearsal_*_$(date -u +%Y%m%d%H%M%S)`,
+    whole seconds, so two rehearsals that started in the same second asked for the
+    same three databases. Measured with two real concurrent runs against one
+    PostgreSQL 18.6: one exited 2 on `duplicate key value violates unique
+    constraint "pg_database_datname_index"` and the other reported
+
+        FAIL init_schema failed on an empty database
+
+    which reads exactly like a broken migration and was another run's database.
+    A false RED, not a false green - and on the migration code, which is the worst
+    place to put one. This box runs many agents against one server, so it is not
+    a hypothetical.
+
+    Asserted behaviourally, on the names the script really asks `CREATE DATABASE`
+    for, and not by reading the STAMP line: the line contains `$$` either way, and
+    an assert that reads the source is the same vacuous assert `fetch-depth: 0`
+    was already caught by.
+    """
+
+    _NAME = re.compile(r"test_rehearsal_[a-z]+_[0-9_]+")
+
+    def _names(self) -> set[str]:
+        proc = self._run(
+            "--image", "orch:new",
+            "--server", "postgresql://u:p@127.0.0.1:1/postgres",
+            "--pg-image", "postgres@sha256:abc",
+            "--expect-major", "18",
+            REHEARSAL_FAKE_DB="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        logged = self.log.read_text(encoding="utf-8")
+        names = set(self._NAME.findall(logged))
+        self.assertTrue(names, "the stub logged no database name:\n" + logged)
+        return names
+
+    def test_two_runs_in_the_same_second_ask_for_different_databases(self):
+        first = self._names()
+        self.log.write_text("", encoding="utf-8")
+        second = self._names()
+        self.assertEqual(
+            first & second,
+            set(),
+            f"two runs shared a database name: {sorted(first & second)}",
+        )
+
+    def test_the_names_still_carry_the_timestamp_a_person_reads(self):
+        """The pid must not have replaced the stamp; --keep prints these names."""
+        for name in self._names():
+            self.assertRegex(name, r"^test_rehearsal_(fresh|upgrade|restore)_[0-9]{14}_[0-9]+$")
 
 
 class TheArmRecordSaysWhichUpgradeItActuallyProved(RunsTheRealScript, unittest.TestCase):
