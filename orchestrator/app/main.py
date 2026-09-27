@@ -5197,7 +5197,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     if stored:
                         blocks = [
                             f'[{i}] {d["title"]} ({d["url"]})\n'
-                            + select_relevant(d["text"], request.text, 6000)
+                            # Was a bare literal 6000 sitting inline in a
+                            # 7,000-line handler: a long page the person shared
+                            # was answered from 6,000 characters of itself on
+                            # every follow-up. One derived budget now, the same
+                            # one an uploaded document gets.
+                            + select_relevant(d["text"], request.text,
+                                              settings.document_context_chars)
                             for i, d in enumerate(stored, start=1)
                         ]
                         history = [
@@ -5226,7 +5232,18 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     doc_blocks = [
                         f'[{i}] {d["filename"]}'
                         + (f' ({d["total_pages"]} pages)' if d["total_pages"] else "")
-                        + "\n" + _doc_select(d["text"], request.text, 8000)
+                        # THE REAL FOLLOW-UP PATH, and the worst number in the
+                        # input surface. This was a bare `8000` — no name, no
+                        # setting, no env var, no relation to the window —
+                        # deciding how much of the person's own uploaded
+                        # document the model may see for the whole rest of the
+                        # conversation. Measured: 1.87% of a real 84-page,
+                        # 428,122-character file that is stored WHOLE in
+                        # Postgres, against 48,000 on the upload turn. Same
+                        # document, same question, 6x apart. Now the one
+                        # derived budget both turns share.
+                        + "\n" + _doc_select(d["text"], request.text,
+                                             settings.document_context_chars)
                         for i, d in enumerate(stored_docs, start=1)
                     ]
                     history = [

@@ -337,12 +337,25 @@ DATA_FENCE_RULE = (
 )
 
 
+#: How many of a table's rows the PROMPT shows. Was 40 — nested inside a
+#: separate 200-row slice, so two different numbers decided the same thing and
+#: the tighter one always won. This is what the model knows about the person's
+#: data when it writes about it, and 40 rows of a 3,000-row upload is not a
+#: dataset, it is a sample it cannot know is unrepresentative. Raised to the
+#: row ceiling a document table may itself carry (T.MAX_TABLE_ROWS), so the
+#: prompt and the renderable table agree on one number. Rows beyond it are
+#: still counted in the "… N more rows" line, and the aggregate work is done in
+#: code (`tables.py`) rather than by the model reading every row.
+PROMPT_TABLE_ROWS = T.MAX_TABLE_ROWS
+
+
 def _table_block(tables: Sequence[DataTable]) -> str:
     out: List[str] = []
     for t in tables:
-        rows = t.rows[: T.MAX_TABLE_ROWS]
-        body = "\n".join(" | ".join("" if c is None else str(c) for c in r) for r in rows[:40])
-        more = f"\n… {len(t.rows) - 40} more rows (all of them are available to the file)" if len(t.rows) > 40 else ""
+        rows = t.rows[:PROMPT_TABLE_ROWS]
+        body = "\n".join(" | ".join("" if c is None else str(c) for c in r) for r in rows)
+        more = (f"\n… {len(t.rows) - len(rows):,} more rows (all of them are available to the file)"
+                if len(t.rows) > len(rows) else "")
         out.append(
             DATA_FENCE_OPEN.format(id=t.id)
             + f"\nTABLE {t.id}: {t.title}\ncolumns: {' | '.join(t.columns)}\n{body}{more}\n"
@@ -406,12 +419,16 @@ def caps_for(budget: Any, target: Optional[LengthTarget] = None, requested: Sequ
     return sections, min(slides, T.MAX_SLIDES)
 
 
-#: How many sections a request must NAME before the composer derives a
-#: size from them. Every section-naming case in the suite before
-#: 2026-09-22 named three to five; a table of contents of six or more is a
-#: report, and nothing smaller changes size. The floor is what bounds the
-#: blast radius of the rule below.
-DERIVED_TARGET_MIN_SECTIONS = 6
+#: How many sections a request must NAME before the composer derives a size
+#: from them. Was 6, which meant a request naming three, four or five
+#: sections got NO target at all — no `_size_line` in the prompt, and at Fast
+#: the tone line "Be concise and concrete." standing over a request for a
+#: five-part report. Three is the same number `_ORDINAL_RUN_MIN` uses to
+#: decide a numbered list is a table of contents, so the two agree: a person
+#: who names three parts has described a document's shape. Two is left out
+#: deliberately — "include a summary and a conclusion" is a remark about a
+#: document, not its structure.
+DERIVED_TARGET_MIN_SECTIONS = 3
 
 
 def target_for(req: ComposeRequest) -> LengthTarget:
@@ -551,10 +568,32 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     # what "give me a big report" asked for (owner report, 2026-09-17).
     size = _size_line(target)
     tone = size or _TONE.get(req.effort, "")
+    # A LIMIT SENTENCE MUST NEVER CONTRADICT THE PERSON (2026-09-27).
+    #
+    # This read "Limits: at most N top-level sections, …" unconditionally, and
+    # on the owner's recorded run of 2026-09-22 it told the model "at most 8
+    # top-level sections" for a request that numbered FIFTEEN. A cap enforced
+    # by instructing the model to disobey the person is the weakest possible
+    # layer and the most confusing one: the model wrote fifteen headings
+    # anyway, each of them about seventy words, which is how fifteen sections
+    # became four pages.
+    #
+    # `caps_for` already raises the cap to `len(requested) + 2`, so where a
+    # request names its sections the number is no longer wrong — but the WORD
+    # is. "At most" describes a ceiling the person is bumping against; what
+    # they need to read is the requirement. So when the request named its
+    # shape, the sentence states the room available as room, and
+    # `_requested_line` (user role) carries the requirement itself.
+    if requested:
+        limits = (f"You have room for {max_sections} top-level sections, {max_slides} slides and "
+                  f"{budget.max_sheets} sheets — the request's own sections come first and none of "
+                  "them may be dropped or merged to save space. ")
+    else:
+        limits = (f"Limits: at most {max_sections} top-level sections, "
+                  f"{max_slides} slides, {budget.max_sheets} sheets. ")
     system = (
         f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
-        f"{tone} Limits: at most {max_sections} top-level sections, "
-        f"{max_slides} slides, {budget.max_sheets} sheets. "
+        f"{tone} {limits}"
         f"Set template_id to \"{req.template_id}\"."
         + (f" Author: {req.author}." if req.author else "") + (f" Date: {req.date}." if req.date else "")
     )
@@ -635,8 +674,19 @@ _OUTLINE_SCHEMA = {
                     "heading": {"type": "string", "maxLength": 120},
                     "purpose": {"type": "string", "maxLength": 200},
                     "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "callout", "kpis", "numbered"]}},
+                    # THE MODEL SAYS HOW LONG ITS OWN SECTION NEEDS TO BE
+                    # (2026-09-27). Until today the only translator between
+                    # a request's shape and a word budget was
+                    # `length.WORDS_PER_SECTION = 400` — a constant someone
+                    # picked, read forwards to size a section and backwards
+                    # to count them. The model is planning this section
+                    # here; it knows whether "Authentication and
+                    # Authorization" is a page or six, and 400 was never
+                    # anything but an average. `section_words` keeps its
+                    # arithmetic as the FLOOR for a model that omits this.
+                    "words": {"type": "integer", "minimum": 80, "maximum": 6000},
                 },
-                "required": ["heading", "purpose", "elements"],
+                "required": ["heading", "purpose", "elements", "words"],
             },
         },
         "needs_current_facts": {"type": "boolean"},
@@ -668,16 +718,158 @@ _REVIEW_SCHEMA = {
 }
 
 
-def _max_tokens_for(kind: str, effort: str, target: Optional[LengthTarget] = None) -> int:
-    """The answer's ceiling for ONE whole-file call. A word target buys
-    room at three tokens a word — a 2,500-word report does not fit in the
-    12,000 tokens that were the ceiling whatever was asked for."""
+# THE PER-UNIT COSTS THE BUDGET IS DERIVED FROM. Every one of these was
+# MEASURED on 2026-09-27 against the live engine's own /tokenize
+# (Qwen/Qwen3.6-35B-A3B-NVFP4, the served window 1,000,000) over the real
+# stored specs in /reports/artifacts — not estimated. They exist so a
+# request that names its own shape produces a NUMBER, instead of meeting a
+# constant somebody picked.
+
+#: Tokens one prose word of a document costs as spec JSON. Measured over all
+#: 22 real stored documents: 3.057 pooled, and 3.593 on the largest and
+#: densest of them (8,065 words in 400 blocks = 28,974 tokens). 4 covers
+#: that worst case. The old code used 3, which is below what the biggest
+#: real document actually costs.
+TOKENS_PER_WORD = 4
+
+#: Tokens one slide costs. Measured on the one real stored deck: 12 slides =
+#: 1,841 tokens, 153.4 a slide, and that deck's speaker notes are short. The
+#: schema allows 3,000 characters of notes per slide (spec.py), roughly
+#: another 750 tokens, so 600 is four times the measured plain-slide cost
+#: and still covers a notes-heavy one.
+TOKENS_PER_SLIDE = 600
+
+#: Tokens one row the MODEL types costs. Measured over the 7 real stored
+#: workbooks: 43.8 pooled, 50.7 on the largest (40 rows). 60 covers it, and
+#: matches the figure a second reader measured independently the same day.
+#: Rows that CODE copies or generates cost nothing here — `_enforce_caps`
+#: already holds those to the hard ceiling instead of the effort's cap,
+#: which is the distinction this whole function now follows.
+TOKENS_PER_TYPED_ROW = 60
+
+#: Tokens to leave for reasoning when the whole-file call has thinking on.
+#: THINKING_BUDGET_MODE is `off` in the container, so `json_completion`'s
+#: unbounded branch sends `max(max_tokens, MAX_OUTPUT_TOKENS)` and the
+#: reasoning block draws from the SAME pool as the answer. An under-sized
+#: pool comes back as EMPTY content with finish_reason 'length' — the
+#: documented failure that silently turned Think into Fast plus two minutes
+#: of thinking. A derived answer budget must therefore be sized for both.
+THINKING_HEADROOM_TOKENS = 16_000
+
+#: Tokens a second one call may assume when deciding whether a size can be
+#: DECODED inside the compose stage's wall clock. MEASURED 2026-09-27 on the
+#: live cluster at load average 10.3: 400 completion tokens in 4.55 s = 87.8
+#: tok/s including TTFT. 60 is deliberately BELOW that, because this number
+#: decides whether an asked-for size is promised — over-estimating the rate
+#: would promise a file the stage deadline then kills half-written.
+DECODE_TOKENS_PER_S = 60.0
+
+#: What ONE whole-file call may spend of the compose stage, leaving the rest
+#: for validation, the render and the corrections after it. The sectioned
+#: writer has its own SECTION_DEADLINE_FRACTION; this is the one-call path's.
+ONE_CALL_DEADLINE_FRACTION = 0.6
+
+
+def one_call_token_ceiling() -> int:
+    """The most tokens one call can DECODE inside the compose stage.
+
+    This is the only ceiling in this function that is not arbitrary: it is
+    physics and a wall clock, derived from a measured decode rate and the
+    stage timeout the pipeline already enforces. It is not a cap on what the
+    person may ask for — `_max_tokens_for` reports when a derived need
+    exceeds it so the CARD can say so, which is the honest answer where a
+    bound cannot be removed.
+    """
+    return max(12_000, int(DECODE_TOKENS_PER_S * _stage_budget_s() * ONE_CALL_DEADLINE_FRACTION))
+
+
+def _shape_tokens(kind: str, target: Optional[LengthTarget], budget: Any = None, *,
+                  named_only: bool = False) -> int:
+    """What the SHAPE THE REQUEST NAMED costs, in tokens. 0 when it named
+    none — and 0 is the only case in which a floor decides anything.
+
+    `named_only` drops the one inference this function makes (a workbook's
+    rows from the effort's own cap), so a caller deciding whether to WARN
+    the person talks about the size THEY asked for and not about a number
+    code chose on their behalf.
+    """
+    if target is None:
+        return 0
+    if kind == "document":
+        return TOKENS_PER_WORD * int(target.words or 0)
+    if kind == "presentation":
+        # `parse_size` gives a deck words=0 by construction, so until
+        # 2026-09-27 a slide count could not move this budget at all: "make
+        # a 30 slide deck" was budgeted at 8,000 tokens in ONE call, and
+        # there is no per-slide write path to fall back on. The number was
+        # in `target.slides` the whole time and nothing read it.
+        return TOKENS_PER_SLIDE * int(target.slides or 0)
+    if kind == "workbook":
+        rows = int(target.rows or 0)
+        sheets = int(target.sheets or 0) or 1
+        if not rows and budget is not None and not named_only:
+            # No row count named: size for the rows this effort would let the
+            # model type, so the token budget and `max_rows_per_sheet` stop
+            # contradicting each other. Fast advertised 2,000 rows a sheet
+            # while its 12,000 tokens carried about 199 — measured, a 10x
+            # disagreement, and the sheet just came back short.
+            rows = int(getattr(budget, "max_rows_per_sheet", 0) or 0)
+        return TOKENS_PER_TYPED_ROW * rows * sheets
+    return 0
+
+
+def _max_tokens_for(kind: str, effort: str, target: Optional[LengthTarget] = None, *,
+                    thinking: bool = False, budget: Any = None, named_only: bool = False) -> int:
+    """The answer's ceiling for ONE whole-file call, DERIVED from the shape
+    the request named.
+
+    The three base numbers below are FLOORS — what a request that named no
+    shape at all gets — and they are the only constants left in the
+    calculation. They used to be ceilings: a document was 12,000 tokens, a
+    deck 8,000 and a workbook 12,000 however large a thing had been asked
+    for, and only `target.words` could raise any of them. A slide count and
+    a row count could not, because nothing read them.
+    """
+    want = _wanted_tokens(kind, effort, target, thinking=thinking, budget=budget, named_only=named_only)
+    # ALWAYS SAFE TO SEND. The clamp is here, not at the call site, so no
+    # caller can hand the engine a number no call could ever decode: an 8-sheet
+    # workbook of 5,000 typed rows each derives 2,400,000 tokens, which is over
+    # twice the whole served window. `one_call_shortfall` reports the shortfall
+    # to the person separately, from the UNCLAMPED need.
+    return min(want, _call_ceiling(thinking))
+
+
+def _wanted_tokens(kind: str, effort: str, target: Optional[LengthTarget] = None, *,
+                   thinking: bool = False, budget: Any = None, named_only: bool = False) -> int:
+    """What the shape asks for, BEFORE the decode-time clamp."""
     base = {"document": 12_000, "presentation": 8_000, "workbook": 12_000}[kind]
     if effort != "fast":
         base = int(base * 1.5)
-    if target is not None and target.words:
-        return max(base, 12_000, 3 * target.words)
-    return base
+    want = max(base, _shape_tokens(kind, target, budget, named_only=named_only))
+    if thinking:
+        # Reasoning and the answer share this pool (see
+        # THINKING_HEADROOM_TOKENS). Sizing for the answer alone is how a
+        # raised budget returns empty with finish_reason 'length'.
+        want += THINKING_HEADROOM_TOKENS
+    return want
+
+
+def _call_ceiling(thinking: bool) -> int:
+    """What one call may be given: the decode-feasible ceiling, plus the
+    reasoning headroom where reasoning shares the pool."""
+    return one_call_token_ceiling() + (THINKING_HEADROOM_TOKENS if thinking else 0)
+
+
+def one_call_shortfall(kind: str, effort: str, target: Optional[LengthTarget] = None, *,
+                       thinking: bool = False, budget: Any = None) -> Tuple[int, int]:
+    """(what the shape NAMED needs, what one call can decode in time) — so the
+    caller can WARN when the second is smaller. Returns (0, 0) when the need
+    fits, or when nothing was named, because there is then nothing to say."""
+    if not _shape_tokens(kind, target, budget, named_only=True):
+        return 0, 0
+    want = _wanted_tokens(kind, effort, target, thinking=thinking, budget=budget, named_only=True)
+    ceiling = _call_ceiling(thinking)
+    return (want, ceiling) if want > ceiling else (0, 0)
 
 
 def _outline_schema(max_sections: int) -> dict:
@@ -691,26 +883,67 @@ def _outline_schema(max_sections: int) -> dict:
     return schema
 
 
+#: Tokens one planned section costs in the outline JSON. The outline carries
+#: a heading (<=120 chars), a purpose (<=200), up to six element names and now
+#: a word figure; at the 3.057 tokens-per-word measured on real spec JSON that
+#: is comfortably under 150, and 200 leaves room for a long heading.
+OUTLINE_TOKENS_PER_SECTION = 200
+#: What the outline's title, audience, purpose and assumptions cost on top.
+OUTLINE_TOKENS_FIXED = 2_000
+
+
+def _outline_tokens(sections: int, *, thinking: bool = False) -> int:
+    """The outline call's budget, DERIVED from the number of sections it is
+    being asked to plan.
+
+    This used to be the literal 2,500 (or 4,000 from the sectioned writer)
+    whatever the plan's size, and an outline is a thinking-on
+    `json_completion`: reasoning and answer share one pool, so an under-sized
+    budget returns EMPTY with finish_reason 'length' rather than a short
+    outline. Forty sections at 200 tokens each do not fit 2,500, and the
+    schema now widens to forty.
+    """
+    want = OUTLINE_TOKENS_FIXED + OUTLINE_TOKENS_PER_SECTION * max(1, int(sections))
+    if thinking:
+        want += THINKING_HEADROOM_TOKENS
+    return want
+
+
 async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Optional[LengthTarget] = None,
-                  max_tokens: int = 2500) -> dict:
+                  requested: Sequence[str] = ()) -> dict:
     messages = _material_messages(req, budget=budget, target=target)
     messages[0]["content"] += (
         "\n\nFIRST, plan only: return the outline — title, audience, purpose, "
-        "the sections in order with what each is for and which elements it "
-        "uses, whether the request needs current external facts you were not "
-        "given, and the assumptions you will make."
+        "the sections in order with what each is for, which elements it "
+        "uses and HOW MANY WORDS it needs, whether the request needs current "
+        "external facts you were not given, and the assumptions you will make."
+        # YOU DECIDE THE SIZE. This sentence is the whole of the owner's ask
+        # of 2026-09-27 ("Our ai decide it own What need ??"): where the
+        # request did not state a length, the model states it here and every
+        # budget downstream follows that number instead of a constant.
+        " For each section, `words` is YOUR judgement of how long that "
+        "section needs to be to answer the request properly — a short "
+        "framing section and a section carrying the technical detail are not "
+        "the same length, and nothing is padded to meet a number."
     )
-    sections, _slides = caps_for(budget, target)
+    sections, _slides = caps_for(budget, target, requested)
     if target is not None and target.words:
         want = _length.sections_for(target.words)
+        if requested:
+            # The person's own count, never our arithmetic's: `sections_for`
+            # divides the derived target by WORDS_PER_SECTION, which for a
+            # target derived FROM those same sections just returns the count
+            # again — but where a size word set the target, a request that
+            # also numbers its sections must still get the number it wrote.
+            want = len(requested)
         messages[0]["content"] += (
-            f"\n\nPlan {want} sections (at most {sections}), each worth about "
-            f"{_length.section_words(target.words, want):,} words, so the whole file comes to about "
-            f"{target.words:,} words. Every section must be a different part of the subject — never the same "
-            "content under two headings."
+            f"\n\nPlan {want} sections (at most {sections}). The whole file should come to about "
+            f"{target.words:,} words; divide that between the sections as each one needs it, and put each "
+            f"section's own figure in its `words`. Every section must be a different part of the subject — "
+            "never the same content under two headings."
         )
     return await _json(messages, _outline_schema(sections), "artifact_outline", thinking=budget.thinking,
-                       max_tokens=max_tokens, effort=req.effort)
+                       max_tokens=_outline_tokens(sections, thinking=budget.thinking), effort=req.effort)
 
 
 async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_json: Optional[dict], extra: str = "",
@@ -728,7 +961,14 @@ async def _compose_once(req: ComposeRequest, budget: T.EffortBudget, *, outline_
     if extra:
         messages.append({"role": "user", "content": extra})
     tables = list((req.material.tables if req.material is not None else []) or [])
-    return await _json(messages, S.schema_for(req.kind, tables=tables), f"artifact_{req.kind}", thinking=budget.thinking, max_tokens=_max_tokens_for(req.kind, req.effort, target), effort=req.effort)
+    # The budget follows the shape the request named, sized for reasoning too
+    # where thinking is on, and clamped inside `_max_tokens_for` by what one
+    # call can DECODE within the stage's wall clock. Where that clamp bites,
+    # `compose` says so on the card rather than shortening the work in silence.
+    return await _json(messages, S.schema_for(req.kind, tables=tables), f"artifact_{req.kind}",
+                       thinking=budget.thinking, effort=req.effort,
+                       max_tokens=_max_tokens_for(req.kind, req.effort, target,
+                                                  thinking=budget.thinking, budget=budget))
 
 
 def body_json_for_prompt(spec: S.ArtifactSpec) -> str:
@@ -984,6 +1224,102 @@ def _list_block(text: str, start: int) -> str:
     return "\n".join(kept)
 
 
+#: The most words a SECTION NAME may have. A bound on one phrase, so a whole
+#: sentence cannot become a heading; five was cutting real headings
+#: ("How We Will Grow The Business Next Year" is seven).
+MAX_SECTION_WORDS = 8
+
+#: The most section names one request may carry through. Tied to
+#: `_outline_schema`, which widens `sections.maxItems` to 40: the parser and
+#: the schema must agree, and 20 was the tighter of the two for no reason.
+MAX_REQUESTED_SECTIONS = 40
+
+#: How many consecutively-numbered items make a bare list a table of
+#: contents. Three, and they must run 1, 2, 3 from the start.
+_ORDINAL_RUN_MIN = 3
+
+#: An ordinal item's marker WITH its number captured, for the bare-list scan.
+_ORDINAL_ITEM_RE = re.compile(r"(?:\A|(?<=\s))\(?(\d{1,2})[.)][ \t]+")
+
+
+#: The verbs a FORMATTING INSTRUCTION starts with. A one-line numbered list
+#: has no newline to end its last item, so the item runs on into whatever the
+#: person wrote next — and what they write next is almost always an
+#: instruction about the file. Measured on the owner's request of 2026-09-22:
+#: "… 15. Conclusion Use professional Markdown." arrived as the section name
+#: 'Conclusion Use professional Markdown', which put a wrong heading in the
+#: prompt AND made `_missing_sections` report "Conclusion" missing from a
+#: document that has one. Narrow on purpose: each of these is a verb in the
+#: imperative, none of them is a plausible word to find INSIDE a heading, and
+#: the cut only ever applies to the LAST item of a list.
+_INSTRUCTION_VERB_RE = re.compile(
+    r"\b(?:use|using|write|do|don\'?t|make|format|include|including|add|ensure|keep|avoid|"
+    r"provide|follow|apply|prefer|note that|remember)\b", re.I)
+
+
+def _trim_runover(items: List[str]) -> List[str]:
+    """Cut the LAST item of a one-line list back to its heading.
+
+    Two bounds, both read off the list itself rather than guessed:
+      1. an instruction verb — the sentence after the list starts with one;
+      2. the longest of the earlier items — a list of two-word headings does
+         not have a six-word last one.
+    Nothing is cut when neither applies, so a genuinely long last heading
+    survives.
+    """
+    if len(items) < 2:
+        return items
+    last = items[-1]
+    m = _INSTRUCTION_VERB_RE.search(last)
+    if m is not None and m.start() > 0:
+        cut = last[: m.start()].strip()
+        if cut:
+            items[-1] = cut
+            return items
+    # THE SIBLING BOUND IS A BACKSTOP AND IS DELIBERATELY TIMID. It fires only
+    # on a list long enough for "the usual length here" to mean something
+    # (four items), only when the earlier items are themselves multi-word, and
+    # only when the last item is more than one word longer than any of them.
+    # Without those three conditions it destroys real headings: a two-item
+    # list of "Intro" and "The Complete Regulatory Landscape Review" would
+    # have had its second heading cut to one word.
+    words = last.split()
+    sibling_words = max((len(x.split()) for x in items[:-1]), default=0)
+    if len(items) >= 4 and sibling_words >= 2 and len(words) > sibling_words + 1:
+        items[-1] = " ".join(words[:sibling_words])
+    return items
+
+
+def _ordinal_run_items(text: str) -> List[str]:
+    """The items of a bare numbered list that runs 1, 2, 3 … from one.
+
+    No heading required. Returns [] unless the run starts at 1 and is at
+    least `_ORDINAL_RUN_MIN` long, which is what tells a table of contents
+    from a stray ordinal in prose. Bounded: the scan is one linear pass over
+    text the caller has already clipped to `_SECTION_SCAN_CHARS`, and it
+    stops at the first number that does not continue the run.
+    """
+    marks = list(_ORDINAL_ITEM_RE.finditer(text))
+    run: List[re.Match] = []
+    for m in marks:
+        n = int(m.group(1))
+        if n == len(run) + 1:
+            run.append(m)
+        elif n == 1:
+            run = [m]
+        else:
+            break
+    if len(run) < _ORDINAL_RUN_MIN:
+        return []
+    items: List[str] = []
+    for i, m in enumerate(run):
+        end = run[i + 1].start() if i + 1 < len(run) else len(text)
+        chunk = text[m.end():end]
+        stop = _ITEM_END_RE.search(chunk)
+        items.append(chunk[: stop.start()] if stop else chunk)
+    return _trim_runover(items)
+
+
 def _list_items(block: str) -> List[str]:
     """One phrase per marked item, in the order the list numbered them.
     An item runs from its marker to the next marker, or to the first
@@ -997,7 +1333,20 @@ def _list_items(block: str) -> List[str]:
         chunk = block[m.end():end]
         stop = _ITEM_END_RE.search(chunk)
         items.append(chunk[: stop.start()] if stop else chunk)
-    return items
+    # THE LAST ITEM OF A ONE-LINE LIST RUNS INTO THE SENTENCE AFTER IT.
+    # Measured on the owner's own instruction of 2026-09-22, which is a
+    # single line with no newline anywhere in it: "15. Conclusion Use
+    # professional Markdown." has no next marker, so the item ran to the
+    # first "." and item 15 arrived as 'Conclusion Use professional
+    # Markdown'. That is a wrong heading in the prompt and a false negative
+    # in `_missing_sections` — the document HAS a "Conclusion" and the
+    # coverage check said it was missing.
+    #
+    # The list's own earlier items say what shape an item has here, so the
+    # fix needs no new guess: trim the last item back to the longest of its
+    # siblings' word counts. A list of two-word headings does not have a
+    # six-word last one; where the siblings really are long, nothing is cut.
+    return _trim_runover(items)
 
 
 def requested_sections(instruction: str) -> List[str]:
@@ -1024,8 +1373,27 @@ def requested_sections(instruction: str) -> List[str]:
     seen: set = set()
 
     def eligible(ph: str) -> bool:
+        # A HEADING MAY CARRY A NUMBER AND MAY BE LONGER THAN FIVE WORDS
+        # (2026-09-27). The old rule discarded any phrase containing a digit
+        # and any phrase over five words, and both discards were measured
+        # destroying real asks: "Sections:\n1. Q3 2026 Revenue\n2. Data
+        # Model\n3. Top 10 Accounts" returned NOTHING, because two of the
+        # three names carry digits and the `minimum=2` rule then threw the
+        # lone survivor away too; "How We Will Grow The Business Next Year"
+        # is seven words and was dropped. The ordinal is already stripped by
+        # `_section_phrase` before this runs, so a digit here belongs to the
+        # person's own heading.
+        #
+        # The two guards that remain are the ones that were doing real work:
+        # a font size ("11 pt") is styling, and a phrase that is ONLY digits
+        # and punctuation is a number, not a heading. MAX_SECTION_WORDS is a
+        # bound on a PHRASE, not on a document — a sentence is not a heading.
         words = ph.split()
-        if not ph or not 1 <= len(words) <= 5 or any(ch.isdigit() for ch in ph) or re.search(r"\d\s*pt\b", ph, re.I):
+        if not ph or not 1 <= len(words) <= MAX_SECTION_WORDS:
+            return False
+        if re.search(r"\d\s*pt\b", ph, re.I):
+            return False
+        if not any(ch.isalpha() for ch in ph):
             return False
         content = _content_words(ph)
         return bool(content) and not content <= {_stem(w) for w in _NOT_SECTION_WORDS}
@@ -1052,13 +1420,34 @@ def requested_sections(instruction: str) -> List[str]:
     for m in _LIST_HEADING_RE.finditer(raw):
         add([_section_phrase(x) for x in _list_items(_list_block(raw, m.end()))], 2)
 
+    # A NUMBERED LIST IS A TABLE OF CONTENTS WITH OR WITHOUT A HEADING OVER
+    # IT (2026-09-27). `_LIST_HEADING_RE` needs one of "requirements:",
+    # "sections:", "structure:", "contents:", "outline:" or "include:", and
+    # measured, the same fifteen-item list under the plain preamble "Write a
+    # technical report on our platform." returned ZERO sections — and with
+    # them went the size, the section names in the prompt, the coverage check
+    # and the repair pass, all at once.
+    #
+    # The trigger is the ORDINAL RUN itself, and it is deliberately stricter
+    # than the heading one: `_ORDINAL_RUN_MIN` consecutive items numbered 1,
+    # 2, 3 … from one. A person who numbers three or more things in sequence
+    # has written a table of contents; a stray "2) see below" has not. The
+    # scan still reads only `_own_words` (never a fenced paste) and only the
+    # first `_SECTION_SCAN_CHARS` of it, so the CPU bound is unchanged.
+    if not found:
+        add([_section_phrase(x) for x in _ordinal_run_items(raw)], _ORDINAL_RUN_MIN)
+
     for m in _SECTIONS_COLON_RE.finditer(text):
         take(m.group("list"), 1)
     for m in _SECTION_LIST_RE.finditer(text):
         take(m.group("list"), 2 if m.group("verb").lower() == "with" else 1)
-    # 20, not 12: `_OUTLINE_SCHEMA`'s own `sections.maxItems` is 20, and a
-    # request that numbers fifteen sections is not a request for twelve.
-    return found[:20]
+    # MAX_REQUESTED_SECTIONS, not 20: `_outline_schema` already widens
+    # `sections.maxItems` to 40 when the target needs it, so 20 was throwing
+    # away names the rest of the pipeline could carry. Measured: a request
+    # naming 25 sections kept 20, and the five it dropped reached neither
+    # `_requested_line` nor `_missing_sections`, and cost the derived target
+    # 2,000 words.
+    return found[:MAX_REQUESTED_SECTIONS]
 
 
 def _missing_sections(spec: S.ArtifactSpec, requested: Sequence[str]) -> List[str]:
@@ -1108,8 +1497,14 @@ def _missing_sections(spec: S.ArtifactSpec, requested: Sequence[str]) -> List[st
 SECTIONED_WRITER_WORDS = 2_500
 #: A draft under this fraction of its target gets one more pass.
 SHORT_DRAFT_FRACTION = 0.6
-#: One section's answer ceiling.
-SECTION_MAX_TOKENS = 16_000
+#: Tokens one section's call gets per planned word. The measured cost of real
+#: spec JSON is 3.057 tokens a word pooled and 3.593 at its densest
+#: (2026-09-27, the engine's own /tokenize over 22 stored documents); 6 is
+#: comfortably clear of both, and a ceiling that merely goes unused costs
+#: nothing because max_tokens is a bound and not a reservation.
+SECTION_TOKENS_PER_WORD = 6
+#: One section's answer floor, for a section planned very short.
+SECTION_MIN_TOKENS = 4_000
 #: How much of the compose stage the sectioned writer may spend.
 SECTION_DEADLINE_FRACTION = 0.75
 #: What it keeps back for validation and the corrections after it.
@@ -1214,6 +1609,19 @@ def _as_section(heading: str, blocks: Sequence[Any]) -> List[dict]:
     return out
 
 
+def _planned_words(item: dict, fallback: int) -> int:
+    """How long the OUTLINE said this section needs to be, or the even split
+    when it did not say. Bounded by the schema's own 80..6000, so a model
+    that returns nonsense cannot size a call from it."""
+    try:
+        want = int(item.get("words") or 0)
+    except (TypeError, ValueError):
+        want = 0
+    if want <= 0:
+        return max(1, int(fallback))
+    return max(80, min(6_000, want))
+
+
 def _outline_items(plan: dict, cap: int) -> List[dict]:
     items: List[dict] = []
     for s in (plan.get("sections") or []) if isinstance(plan, dict) else []:
@@ -1286,7 +1694,16 @@ async def _write_one_section(
     messages.append({"role": "user", "content": "\n\n".join(parts)})
     obj = await _json(
         messages, _schema_with_defs(S.DocumentSpec, "blocks"), "artifact_section_write",
-        thinking=False, max_tokens=min(SECTION_MAX_TOKENS, max(4_000, words * 6)), effort=req.effort,
+        # A SECTION'S BUDGET FOLLOWS THE PLAN'S WORD FIGURE. This was already
+        # the one place in the composer where a budget followed a decision
+        # rather than a constant — `max(4_000, words * 6)` — but a flat
+        # SECTION_MAX_TOKENS = 16_000 then clamped it, which bound above 2,666
+        # planned words. The outline may now plan up to 6,000 words for one
+        # section, so the clamp is the DECODED one: what a call can finish
+        # inside the stage's wall clock. Thinking is off on this call, so the
+        # whole budget is the answer's.
+        thinking=False, effort=req.effort,
+        max_tokens=min(one_call_token_ceiling(), max(SECTION_MIN_TOKENS, words * SECTION_TOKENS_PER_WORD)),
     )
     blocks = obj.get("blocks")
     if not isinstance(blocks, list) or not blocks:
@@ -1310,13 +1727,19 @@ async def compose_sectioned(
     paced = 0.0
 
     await say(10.0, "planning the sections")
-    plan = await outline(req, budget, target=target, max_tokens=4_000)
+    plan = await outline(req, budget, target=target, requested=requested)
     calls += 1
     cap, _slides = caps_for(budget, target, requested)
     items = _outline_items(plan, cap)
     if not items:
         raise ComposeError("model_failure", "The model did not plan any sections for the document.")
-    per_section = _length.section_words(target.words, len(items))
+    # THE PLAN'S OWN WORD FIGURE WINS (2026-09-27). `section_words` divides
+    # the target evenly, which is code's arithmetic over code's constant; the
+    # outline was just asked how long each section needs to be, and that is
+    # the product's own model answering about the work in front of it. The
+    # even split stays as the FLOOR for a model that omitted the field.
+    even = _length.section_words(target.words, len(items))
+    planned = [_planned_words(item, even) for item in items]
     # The engine closes its "outline" stage on this word (engines/
     # artifact.py): a Think job whose outline never ended would show a
     # stage running for the whole compose.
@@ -1338,7 +1761,7 @@ async def compose_sectioned(
         try:
             async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                 blocks = await _write_one_section(
-                    req, budget, target, plan, item, written=headings, words=per_section,
+                    req, budget, target, plan, item, written=headings, words=planned[i],
                     position=(i + 1, len(items)),
                 )
             calls += 1
@@ -1365,7 +1788,7 @@ async def compose_sectioned(
     if (not stopped and written_words < target.words * SHORT_DRAFT_FRACTION
             and time.monotonic() + SECTION_RESERVE_S < deadline):
         short = sorted(range(len(sections)), key=lambda i: _words_in_blocks(sections[i]))
-        short = [i for i in short if _words_in_blocks(sections[i]) < per_section][:SECTION_EXTEND_MAX]
+        short = [i for i in short if _words_in_blocks(sections[i]) < planned[i]][:SECTION_EXTEND_MAX]
         for n, i in enumerate(short):
             if time.monotonic() + SECTION_RESERVE_S >= deadline:
                 break
@@ -1374,7 +1797,7 @@ async def compose_sectioned(
             try:
                 async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                     grown = await _write_one_section(
-                        req, budget, target, plan, items[i], written=headings, words=per_section,
+                        req, budget, target, plan, items[i], written=headings, words=planned[i],
                         position=(i + 1, len(items)), current=sections[i],
                     )
                 calls += 1
@@ -1386,12 +1809,25 @@ async def compose_sectioned(
                 sections[i] = grown
 
     blocks: List[dict] = [b for sec in sections for b in sec]
-    # The renderer's own ceilings, applied by dropping whole sections from
-    # the end rather than letting validation refuse the document.
-    while len(sections) > 1 and (len(blocks) > 400 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
+    # The renderer's own ceilings, applied by dropping whole sections from the
+    # end rather than letting validation refuse the document. The block bound
+    # is now T.MAX_DOCUMENT_BLOCKS, derived from MAX_PAGES (1,500 rather than a
+    # flat 400, which was 3.5x tighter than the 60 pages the product
+    # advertises), so this loop should be very hard to reach — and when it IS
+    # reached the warning now NAMES the ceiling and what it cost, because a
+    # bound that cannot be removed must at least say so instead of quietly
+    # shortening the work.
+    trimmed = 0
+    while len(sections) > 1 and (len(blocks) > T.MAX_DOCUMENT_BLOCKS
+                                 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
         sections.pop()
+        trimmed += 1
         blocks = [b for sec in sections for b in sec]
-        warnings.append("the document was cut to the last section that fits the file's page limit")
+    if trimmed:
+        warnings.append(
+            f"the last {trimmed} section(s) were cut: the document reached the file's limit of "
+            f"{T.MAX_DOCUMENT_BLOCKS:,} blocks / {T.MAX_TEXT_CHARS:,} characters "
+            f"({T.MAX_PAGES} pages)")
     if paced:
         warnings.append(f"the document waited {paced:.0f}s between sections so chat could answer")
     assumptions = [str(a)[:200] for a in (plan.get("assumptions") or []) if isinstance(a, str)][:20]
@@ -1425,19 +1861,56 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     requested = requested_sections(req.instruction or material.instruction) if req.kind == "document" and req.operation != "edit" else []
     target = target_for(req)
 
+    # A SIZE THAT CANNOT BE DECODED IN TIME IS SAID, NOT SWALLOWED.
+    #
+    # `_max_tokens_for` now derives the budget from the shape the request
+    # named, and for a deck or a workbook there is no per-section path to
+    # spread that over: a 40-slide deck or an 8-sheet workbook of 5,000 typed
+    # rows each is ONE call. Some of those asks cost more decode time than the
+    # compose stage has (`one_call_token_ceiling`, itself derived from a
+    # measured 87.8 tok/s and the pipeline's own 1,260 s stage timeout). The
+    # budget is clamped there because the alternative is a job the deadline
+    # kills half-written — but the clamp is reported on the card, which is the
+    # honest answer where a bound genuinely cannot be removed. A workbook is
+    # also told how many rows that leaves, because "fewer rows than you asked
+    # for" is the part the person can act on.
+    want_tokens, ceiling_tokens = one_call_shortfall(
+        req.kind, req.effort, target, thinking=budget.thinking, budget=budget)
+    if want_tokens:
+        note = (f"the size asked for needs about {want_tokens:,} tokens in one model call and this job's "
+                f"time allows about {ceiling_tokens:,}")
+        if req.kind == "workbook":
+            note += f" — roughly {ceiling_tokens // TOKENS_PER_TYPED_ROW:,} rows the model types"
+        result_warnings.append(note)
+
     outline_json: Optional[dict] = None
-    # THE SECTIONED WRITER IS BOUGHT BY THE PERSON, NOT BY CODE. A target
-    # code DERIVED from the number of sections a request names crosses
-    # SECTIONED_WRITER_WORDS at fifteen sections (15 x 400 = 6,000), and
-    # at Fast that is an outline call plus one call per section — roughly
-    # sixteen calls and minutes of an engine that is also answering live
-    # chat, for a request whose words named no size at all. A size the
-    # PERSON named still buys this path at any effort; a size code derived
-    # buys it only where an outline pass is already budgeted, which is
-    # Think and Max.
+    # A DERIVED TARGET IS AS REAL AS AN EXPLICIT ONE (owner, 2026-09-27:
+    # "Our ai decide it own What need ??").
+    #
+    # This gate used to read `(target.explicit or budget.outline_pass)`, and
+    # that clause was a COST guard: it said a size code derived from the
+    # sections a request names may buy the sectioned writer only where an
+    # outline pass was already budgeted, which is Think and Max. Measured on
+    # the owner's own recorded request of 2026-09-22 — fifteen numbered
+    # sections under "Requirements:", 6,000 derived words, effort Fast —
+    # that clause is exactly what produced the four-page file he complained
+    # about: `sectioned` was False, so fifteen sections were written in ONE
+    # call, and the stored output is 1,067 words in 59 blocks with fifteen
+    # level-1 headings and not one level-2 sub-heading.
+    #
+    # A request that numbers fifteen sections is MORE specific about its
+    # shape than one that says "detailed", and it was getting the worse
+    # path. The derived target IS the product's own reading of the request,
+    # so disbelieving it is disbelieving our own decision. The cost is real
+    # — an outline call plus one call per section — and it is the cost of
+    # doing what was asked; `_pace()` between sections already keeps live
+    # chat answering, and SECTION_DEADLINE_FRACTION already bounds the
+    # wall clock. Cost is not a reason to write a shorter document.
+    #
+    # `compose_sectioned` runs its own outline call unconditionally, so it
+    # does NOT need `budget.outline_pass` to work at Fast.
     sectioned = (req.kind == "document" and req.operation != "edit"
-                 and target.words > SECTIONED_WRITER_WORDS
-                 and (target.explicit or budget.outline_pass))
+                 and target.words > SECTIONED_WRITER_WORDS)
     ran_out_of_time = False
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
@@ -1457,7 +1930,7 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         if budget.outline_pass and req.operation != "edit":
             await say(10.0, "outlining")
             try:
-                outline_json = await outline(req, budget, target=target)
+                outline_json = await outline(req, budget, target=target, requested=requested)
                 calls += 1
             except ComposeError:
                 outline_json = None  # a missing outline is a smaller loss than a missing document
@@ -1587,12 +2060,16 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # sections, and a writer that ran out of time is not asked for more.
     if target.words and req.kind == "document" and req.operation != "edit":
         words = len(S.text_of(spec).split())
-        # `target.explicit`, the same distinction CORRECTION_KEEP_FRACTION
-        # makes a few lines above: a whole extra whole-document call is
-        # the person's to buy by naming a size, not code's to spend on a
-        # number it derived. The measured counterfactual came in at 3,785
-        # of a derived 6,000 = 63%, only just over the 60% line.
-        if (words < target.words * SHORT_DRAFT_FRACTION and target.explicit
+        # THE REPAIR PASS NO LONGER ASKS WHO NAMED THE SIZE (2026-09-27).
+        # It used to require `target.explicit`, which made it unreachable at
+        # EVERY effort for the owner's fifteen-section request (measured:
+        # repair=False at fast, think and max). At Fast that left nothing at
+        # all — a draft that came back at 1,067 of 6,000 derived words, 18%
+        # of target and far under the 0.6 line, got a warning string and no
+        # second pass. One more call is what writes the document out in
+        # full, and a size the product derived from the person's own
+        # numbered list is a size that was asked for.
+        if (words < target.words * SHORT_DRAFT_FRACTION
                 and not sectioned and not ran_out_of_time):
             await correct(
                 65.0, "writing the document out in full",
@@ -2376,10 +2853,22 @@ async def content_review(req: ComposeRequest, spec: S.ArtifactSpec, budget: T.Ef
             + (f"Figures in the draft that appear nowhere in the material (each is derived, assumed or invented — "
                f"a 'must' unless the draft says which; the fix is to state the assumption or the arithmetic beside "
                f"the figure, or to say the figure is not given — never a placeholder, never a zero): {', '.join(figures[:12])}\n\n" if figures else "")
-            + f"Draft (JSON):\n{body_json_for_prompt(spec)[:60_000]}"
+            # THE REVIEWER READS THE WHOLE DRAFT. At 60,000 characters a
+            # review of a long document could not see its last third — and it
+            # then drove a WHOLE-DOCUMENT correction from that partial view,
+            # which is how a review shortens the thing it was meant to improve.
+            # A 27,000-word document is about 250,000 characters of spec JSON
+            # against a 1,000,000-token window; `context.fit_request` trims if
+            # it genuinely does not fit.
+            + f"Draft (JSON):\n{body_json_for_prompt(spec)}"
         )},
     ]
-    return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking, max_tokens=2000, effort=req.effort)
+    # 2,000 was the number that returned EMPTY with finish_reason 'length' when
+    # thinking is on and reasoning shares the pool (the documented json_completion
+    # trap). The verdict itself is small; the reasoning in front of it is not.
+    return await _json(messages, _REVIEW_SCHEMA, "artifact_review", thinking=budget.thinking,
+                       max_tokens=2_000 + (THINKING_HEADROOM_TOKENS if budget.thinking else 0),
+                       effort=req.effort)
 
 
 # ------------------------------------------------------------- visual QA --
@@ -2556,7 +3045,13 @@ async def write_section(req: ComposeRequest, spec: S.ArtifactSpec, item: Dict[st
                      f"paragraph, list or table that does what the request asks. The heading alone is not a section. "
                      f"Heading block: {json.dumps(current, ensure_ascii=False)}")
     else:
-        parts.append(f"CURRENT CONTENT OF {what} (JSON):\n{json.dumps(current, ensure_ascii=False)[:40_000]}")
+        # THE WRITER MUST SEE THE WHOLE OF WHAT IT IS REWRITING. 40,000
+        # characters of a section, paired with the 4,000-token answer ceiling
+        # below, meant the model was shown a TRUNCATED section and asked to
+        # return the whole of it — which is how an edit silently shortens a
+        # long section. The section is one part of one file; `context.fit_request`
+        # is the backstop if a pathological one does not fit the window.
+        parts.append(f"CURRENT CONTENT OF {what} (JSON):\n{json.dumps(current, ensure_ascii=False)}")
     parts.append(f"REQUEST: {item.get('instruction') or req.instruction}")
     # Requested by Track A: an edit that asks for a chart ("also i want
     # plots on this doc") reached the section writer with no chart rules at
@@ -2567,7 +3062,21 @@ async def write_section(req: ComposeRequest, spec: S.ArtifactSpec, item: Dict[st
     # edit is not told how to plot.
     system = _SECTION_SYSTEM + _chart_guide_for(req, m, item.get("instruction") or req.instruction)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
-    obj = await _json(messages, schema, "artifact_section", thinking=False, max_tokens=4000 if req.effort == "fast" else 6000, effort=req.effort)
+    # THE EDIT WRITER'S BUDGET FOLLOWS WHAT IT IS REWRITING (2026-09-27).
+    # Was `4000 if fast else 6000` — about 1,530 prose words at Fast — with
+    # nothing in the request able to raise either number, so a request to
+    # expand a long section could not be carried out at all. It now derives
+    # from the size of the section in hand: what is there, plus room to grow
+    # it, at the measured SECTION_TOKENS_PER_WORD, floored at the old Fast
+    # number so a small edit costs exactly what it always did. Thinking is off
+    # on this call, so the whole budget is the answer's.
+    current_words = len(json.dumps(current, ensure_ascii=False).split())
+    edit_max_tokens = min(
+        one_call_token_ceiling(),
+        max(4_000, SECTION_TOKENS_PER_WORD * max(current_words, 400) * 2),
+    )
+    obj = await _json(messages, schema, "artifact_section", thinking=False,
+                      max_tokens=edit_max_tokens, effort=req.effort)
     value = obj.get(key)
     if key == "blocks":
         if not isinstance(value, list) or not value:

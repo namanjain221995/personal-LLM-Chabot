@@ -62,7 +62,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import types as T
 
@@ -97,18 +97,32 @@ class LengthTarget:
     `words` is 0 when nothing asked the document to grow — that is the
     normal case and it means "compose as before". `explicit` is True when
     the person NAMED a size (grow or shrink); it is False for the
-    data-report floor, which is code's judgement and not the person's
-    words. `phrase` is the wording that decided it, for the prompt and for
-    the version warning.
+    data-report floor and for a size DERIVED from the sections a request
+    numbers, which are code's reading of the request rather than a size
+    word in it. `phrase` is the wording that decided it, for the prompt and
+    for the version warning.
+
+    EVERY UNIT A REQUEST CAN NAME ITS OWN SHAPE IN LIVES HERE (2026-09-27).
+    Until today only `words` and `slides` did, and only `words` ever reached
+    a token budget: `_max_tokens_for` grew on `target.words` alone, so "a 30
+    slide deck" and "a 5,000 row workbook" were budgeted as if neither
+    number had been said. `rows` and `sheets` are here so the budget can
+    follow them the same way — the number is in the request, and the whole
+    point is that nothing constant decides the size when the person already
+    did.
     """
 
     words: int = 0
     slides: int = 0
+    #: Rows per sheet the request named ("a 5,000 row sheet"). 0 = unsaid.
+    rows: int = 0
+    #: Sheets the request named ("8 tabs"). 0 = unsaid.
+    sheets: int = 0
     phrase: str = ""
     explicit: bool = False
 
     def __bool__(self) -> bool:
-        return bool(self.words or self.slides)
+        return bool(self.words or self.slides or self.rows or self.sheets)
 
     @property
     def pages(self) -> int:
@@ -193,6 +207,14 @@ _PAGES_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>\d[\d,]*){_TAIL}pages?\b", re.I
 _WORDS_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>\d[\d,]*){_TAIL}words?\b", re.IGNORECASE)
 _SLIDES_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>\d[\d,]*){_TAIL}slides?\b", re.IGNORECASE)
 
+#: A WORKBOOK'S OWN SHAPE (2026-09-27). `parse_size` used to return
+#: words=0, slides=0, explicit=False for every workbook whatever the request
+#: said, so "build a workbook with 5,000 rows across 8 sheets" reached
+#: `_max_tokens_for` as silence and was budgeted at the bare base constant.
+#: A row count is a size the person named as plainly as a word count is.
+_ROWS_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>\d[\d,]*){_TAIL}(?:rows?|records?|entries|line\s+items?)\b", re.IGNORECASE)
+_SHEETS_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>\d[\d,]*){_TAIL}(?:sheets?|tabs?|worksheets?)\b", re.IGNORECASE)
+
 #: The counts people spell out. Only up to twenty plus the round tens: past
 #: that everyone types digits.
 _SPELLED = {
@@ -200,7 +222,7 @@ _SPELLED = {
     "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
     "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
 }
-_SPELLED_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>{'|'.join(_SPELLED)})[-\s]+(?P<unit>pages?|slides?)\b", re.IGNORECASE)
+_SPELLED_RE = re.compile(rf"(?P<lead>{_LEAD})(?P<n>{'|'.join(_SPELLED)})[-\s]+(?P<unit>pages?|slides?|sheets?|tabs?|worksheets?)\b", re.IGNORECASE)
 
 
 def _int(text: str) -> Optional[int]:
@@ -210,12 +232,17 @@ def _int(text: str) -> Optional[int]:
         return None
 
 
-def _numbered(text: str) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
-    """(word candidates, slide candidates) the request states as numbers,
+#: What the request states as numbers, by unit. One dict so a new unit is
+#: one regex and one key, not a wider tuple at every call site.
+_UNIT_RES = (("slides", _SLIDES_RE, 1), ("rows", _ROWS_RE, 1), ("sheets", _SHEETS_RE, 1))
+
+
+def _numbered(text: str) -> Tuple[List[Tuple[int, str]], Dict[str, List[Tuple[int, str]]]]:
+    """(word candidates, {unit: candidates}) the request states as numbers,
     each with the phrase that carried it. A single page is not a growth
     target — "a one-page brief" is the opposite of one."""
     words: List[Tuple[int, str]] = []
-    slides: List[Tuple[int, str]] = []
+    units: Dict[str, List[Tuple[int, str]]] = {"slides": [], "rows": [], "sheets": []}
     for m in _PAGES_RE.finditer(text):
         n = _int(m.group("n"))
         if n is not None and n >= 2:
@@ -224,17 +251,21 @@ def _numbered(text: str) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
         n = _int(m.group("n"))
         if n is not None and n >= 100:
             words.append((n, m.group(0).strip()))
-    for m in _SLIDES_RE.finditer(text):
-        n = _int(m.group("n"))
-        if n is not None and n >= 1:
-            slides.append((n, m.group(0).strip()))
+    for unit, pattern, floor in _UNIT_RES:
+        for m in pattern.finditer(text):
+            n = _int(m.group("n"))
+            if n is not None and n >= floor:
+                units[unit].append((n, m.group(0).strip()))
     for m in _SPELLED_RE.finditer(text):
         n = _SPELLED[m.group("n").lower()]
-        if m.group("unit").lower().startswith("slide"):
-            slides.append((n, m.group(0).strip()))
+        unit = m.group("unit").lower()
+        if unit.startswith("slide"):
+            units["slides"].append((n, m.group(0).strip()))
+        elif unit.startswith(("sheet", "tab", "worksheet")):
+            units["sheets"].append((n, m.group(0).strip()))
         elif n >= 2:
             words.append((n * WORDS_PER_PAGE, m.group(0).strip()))
-    return words, slides
+    return words, units
 
 
 def shrink_asked(instruction: str) -> bool:
@@ -266,19 +297,37 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
     get neither: a sheet is as long as its rows (out of scope, CONTRACT-3).
     """
     text = " ".join((instruction or "").split())
-    numbered_words, numbered_slides = _numbered(text)
+    numbered_words, units = _numbered(text)
 
     slides = 0
     slide_phrase = ""
-    if numbered_slides:
-        slides, slide_phrase = max(numbered_slides)
+    if units["slides"]:
+        slides, slide_phrase = max(units["slides"])
         slides = min(slides, MAX_SLIDES)
 
+    rows = sheets = 0
+    shape_phrase = ""
+    if units["rows"]:
+        rows, shape_phrase = max(units["rows"])
+        rows = min(rows, T.MAX_ROWS_PER_SHEET)
+    if units["sheets"]:
+        sheets, sheet_phrase = max(units["sheets"])
+        sheets = min(sheets, T.MAX_SHEETS)
+        shape_phrase = f"{shape_phrase} and {sheet_phrase}" if shape_phrase else sheet_phrase
+
     if kind != "document":
-        # A deck's length is its slide count; a workbook has none.
-        phrase = slide_phrase if kind == "presentation" else ""
-        return LengthTarget(words=0, slides=slides if kind == "presentation" else 0,
-                            phrase=phrase, explicit=bool(phrase))
+        # A DECK'S LENGTH IS ITS SLIDE COUNT AND A WORKBOOK'S IS ITS ROWS
+        # AND SHEETS (2026-09-27). Until today this branch threw the
+        # workbook's numbers away — `words=0, slides=0, explicit=False`
+        # whatever the request said — and `_max_tokens_for`, which grows on
+        # `target.words` alone, therefore budgeted every workbook at its
+        # base constant. "8 sheets of 5,000 rows" is a size the person
+        # named; it now travels, and the budget follows it.
+        if kind == "presentation":
+            return LengthTarget(words=0, slides=slides, rows=rows, sheets=sheets,
+                        phrase=slide_phrase or shape_phrase, explicit=bool(slide_phrase or shape_phrase))
+        return LengthTarget(words=0, slides=0, rows=rows, sheets=sheets,
+                            phrase=shape_phrase, explicit=bool(shape_phrase))
 
     candidates: List[Tuple[int, str]] = list(numbered_words)
     m = _BIG_RE.search(text)
@@ -296,17 +345,22 @@ def parse_size(instruction: str, kind: str = "document", *, has_data: bool = Fal
 
     if candidates:
         words, phrase = max(candidates)
-        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, phrase=phrase, explicit=True)
+        return LengthTarget(words=min(words, MAX_WORDS), slides=slides, rows=rows, sheets=sheets,
+                            phrase=phrase, explicit=True)
 
     if _SHRINK_RE.search(text):
         # The person asked for less. No growth target, and the data-report
         # floor below must not put one back.
-        return LengthTarget(words=0, slides=slides, phrase=_SHRINK_RE.search(text).group(0), explicit=True)
+        return LengthTarget(words=0, slides=slides, rows=rows, sheets=sheets,
+                            phrase=_SHRINK_RE.search(text).group(0), explicit=True)
 
     if has_data and is_data_report(text):
-        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides, phrase="a report over data", explicit=False)
+        return LengthTarget(words=DATA_REPORT_FLOOR, slides=slides, rows=rows, sheets=sheets,
+                            phrase="a report over data", explicit=False)
 
-    return LengthTarget(words=0, slides=slides, phrase=slide_phrase, explicit=bool(slide_phrase))
+    return LengthTarget(words=0, slides=slides, rows=rows, sheets=sheets,
+                        phrase=slide_phrase or shape_phrase,
+                        explicit=bool(slide_phrase or shape_phrase))
 
 
 # ------------------------------------------------------------- the shapes --

@@ -991,6 +991,10 @@ async def chat_completion_with_reasoning(
     as the streaming path.
     """
     model_id = model or settings.llm_model
+    # Cleared before the send, exactly as `chat_completion` and
+    # `json_completion` clear it: get_finish_reason() must describe THIS call
+    # and never a value left over from an earlier one in the same context.
+    reset_finish_reason()
     thinking_on = _thinking_allowed(wants_thinking("smart", effort))  # Fast never thinks
     budget_tokens = thinking_budget(effort) if thinking_on else None
     requested = max_tokens
@@ -1039,6 +1043,16 @@ async def chat_completion_with_reasoning(
     # Best-of-N candidates were invisible to usage_events until 2026-09-13
     # (F045); recorded exactly as chat_completion records it.
     _capture_usage(resp)
+    # AND WHY IT STOPPED (2026-09-27). `chat_completion` has recorded both
+    # since it was written (`_capture_usage` then `_capture_finish`); this
+    # function, the ONLY generator on the Max path, recorded only usage. A Max
+    # answer is one non-streaming call with no continuation after it, so this
+    # was the single line between "the answer was cut at 65,536 tokens" and
+    # nobody being able to tell — measured live with one 2.59 s generation: a
+    # visibly truncated answer reported finish_reason None from inside the
+    # call. Without it no continuation can trigger and no notice can be
+    # written.
+    _capture_finish(resp)
     return split_reasoning(resp.choices[0].message, settings.main_capabilities)
 
 

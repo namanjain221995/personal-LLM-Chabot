@@ -365,7 +365,10 @@ def test_csv_with_styling_also_delivers_a_styled_xlsx(tmp_path):
 #: 2026-09-16: +1826 for the six advanced chart types (their names in the
 #: `type` enum and the bullet chart's `target` column). The number is pinned
 #: so that anything ELSE creeping into guided decoding is caught here.
-BASE_SCHEMA_LENGTHS = {"document": 14972, "presentation": 12872, "workbook": 21356}
+#: document is 14973 (was 14972) since 2026-09-27: DocumentSpec.blocks'
+#: max_length is derived from the page ceiling now (T.MAX_DOCUMENT_BLOCKS =
+#: 1500, four digits where the flat 400 had three).
+BASE_SCHEMA_LENGTHS = {"document": 14973, "presentation": 12872, "workbook": 21356}
 
 
 @pytest.mark.parametrize("kind", sorted(BASE_SCHEMA_LENGTHS))

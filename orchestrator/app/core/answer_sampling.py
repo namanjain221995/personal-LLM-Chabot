@@ -567,6 +567,49 @@ def _material_spans(text: str) -> List[Tuple[int, int]]:
     return spans
 
 
+def requested_shape_words(message: str) -> Optional[int]:
+    """The length a request implies by naming its own SHAPE, or None.
+
+    A DERIVED target, the chat path's counterpart to
+    `artifacts.compose.target_for` — and it exists because until 2026-09-27
+    the chat path had no such thing at all. `requested_words` is a regex for an
+    explicit "N words", so a request that named fifteen numbered sections
+    returned None at fast, think AND max (measured with the real functions in
+    the running container). With None the whole length mechanism is off: no
+    `_length_plan` on the first call, no `_WordGauge` note on continuations,
+    and `continuation`'s short-normal-stop extension can never fire. If the
+    model wrote four of the fifteen sections and stopped, the run ended
+    `complete` and nothing knew fifteen had been asked for.
+
+    The machinery is not new — `compose.requested_sections` and
+    `length.sections_for` have been deciding exactly this for the artifact path
+    — it was simply never wired to chat. Imported lazily: the artifact module
+    is heavy and every chat turn would otherwise pay for it at import time.
+
+    The result is always a FLOOR (`continuation`'s `target_is_floor`): a number
+    the product derived may lengthen an answer, never cut one.
+    """
+    text = message or ""
+    if not text.strip():
+        return None
+    try:
+        from ..artifacts import compose as _compose
+        from ..artifacts import length as _length
+    except Exception:  # noqa: BLE001 — a derived target is a bonus, never a 500
+        return None
+    try:
+        names = _compose.requested_sections(text)
+        if len(names) < _compose.DERIVED_TARGET_MIN_SECTIONS:
+            return None
+        if _length.shrink_asked(text):
+            # "a SHORT summary with these three parts" asked for less.
+            return None
+        words = min(len(names) * _length.WORDS_PER_SECTION, _length.MAX_WORDS)
+    except Exception:  # noqa: BLE001
+        return None
+    return words or None
+
+
 def requested_words(message: str) -> Optional[int]:
     """The number of words the message asks the answer to run to, or None.
 

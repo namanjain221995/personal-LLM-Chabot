@@ -85,6 +85,18 @@ def test_the_clause_costs_fast_mode_no_extra_model_call():
     import inspect
 
     source = inspect.getsource(chat_engine.run_chat_engine)
-    # One streamed completion, plus the best-of branch that only `max` reaches.
-    assert source.count("stream_long_completion") == 1
-    assert "effort == \"max\"" in source
+    # TWO call sites since 2026-09-27, and Fast still reaches exactly one of
+    # them. The second belongs to the best-of (Max) branch: Max used to return
+    # before `continuation` was ever reached, so a Max answer was ONE 65,536-
+    # token call with nothing able to continue it — the only effort on this
+    # surface with a hard one-call ceiling, and the one a person picks for the
+    # longest work. A cut Max winner is now continued like Fast and Think.
+    calls = [ln for ln in source.splitlines()
+             if "await continuation.stream_long_completion(" in ln]
+    assert len(calls) == 2, calls
+    # Fast's own path is unchanged: the Max branch is behind this gate.
+    assert 'effort == "max"' in source
+    max_gate = source.index('effort == "max"')
+    second_call = source.index("await continuation.stream_long_completion(", max_gate)
+    first_call = source.index("await continuation.stream_long_completion(")
+    assert first_call == second_call, "the extra call site is inside the max gate"

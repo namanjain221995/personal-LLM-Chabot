@@ -858,8 +858,72 @@ class Settings:
         # ended three exchanges ago. Whichever of the two triggers fires
         # first now wins, so older turns become a summary at a size that
         # actually occurs. 0 disables the absolute one.
+        #
+        # 2026-09-27: THAT REASON IS GONE, AND THE CEILING OUTLIVED IT.
+        #
+        # The engine-side slice this 40,000 was compensating for has since been
+        # fixed — CHAT_HISTORY_TURNS is 400 and `recent_turns` keeps every
+        # pinned system block — so the compensation is now the only thing
+        # deciding. Measured 2026-09-27: a 60-message chat at 78,909 tokens is
+        # folded so the model sees 13,560 tokens, 17.2% of what the person
+        # wrote, with 65,349 tokens of their own words replaced by a
+        # <=2,000-token summary WHILE 912,387 TOKENS OF WINDOW SAT UNUSED. That
+        # is 4.0% of the window and 4.2% of the 949,915-token needle this
+        # cluster has verified.
+        #
+        # And it is not physics: of 868 production conversations, ZERO exceed
+        # the verified needle depth, and the two that are actually folded are
+        # folded with 716,271-912,387 tokens spare. A number someone picked was
+        # summarising conversations that fit in the window whole.
+        #
+        # So it is DERIVED now: a fraction of the window the engine actually
+        # serves. The absolute ceiling still exists — it must, because a
+        # conversation really can outgrow any window and `compaction` is how a
+        # chat survives that — but it now sits where the window is, not where a
+        # 262,144-token deployment left it. The literal stays as the FLOOR so a
+        # small-window deployment is unaffected.
+        self.context_compact_window_fraction: float = _float(
+            "CONTEXT_COMPACT_WINDOW_FRACTION", 0.50
+        )
         self.context_compact_max_tokens: int = _int(
-            "CONTEXT_COMPACT_MAX_TOKENS", 40_000
+            "CONTEXT_COMPACT_MAX_TOKENS",
+            max(40_000, int(self.model_max_context * self.context_compact_window_fraction)),
+        )
+        # HOW MUCH OF THE PERSON'S OWN UPLOADED DOCUMENT REACHES THE MODEL.
+        #
+        # This was three bare literals in two files, none of them a setting,
+        # none derived from anything: 48_000 on the UPLOAD turn
+        # (engines/document.py), 8_000 on every later turn about the same file
+        # (a bare `8000` inline in main.py), and 6_000 for a page the person
+        # shared. Postgres stores the full text with no LIMIT, so the document
+        # was there all along.
+        #
+        # Measured 2026-09-27 with the real `select_relevant` against the four
+        # largest real stored documents: an 84-page, 428,122-character file
+        # handed the model 7,993 characters — 1.87% of itself — on a follow-up
+        # question, and 47,912 (11.19%) on the upload turn. The same document
+        # and the same question, 6x apart, because two authors picked two
+        # numbers in two files. That file is about 143,000 tokens and would fit
+        # the served window seven times over.
+        #
+        # Now ONE number, derived from the window the engine actually serves:
+        # DOCUMENT_CONTEXT_WINDOW_FRACTION of it, converted to characters at
+        # context._CHARS_PER_TOKEN. At MAIN_MODEL_MAX_LEN=1000000 that is about
+        # 300,000 characters, which carries 117 of the 118 real stored
+        # documents whole. `context.fit_request` remains the backstop: a
+        # request that still does not fit the window is trimmed there, which is
+        # the only place physics belongs.
+        #
+        # The typical document (average 14,221 characters) is unaffected —
+        # `select_relevant` passes anything under the budget through untouched
+        # — so the extra prefill is paid only by the five stored documents over
+        # 48,000 characters.
+        self.document_context_window_fraction: float = float(
+            os.environ.get("DOCUMENT_CONTEXT_WINDOW_FRACTION", "0.10")
+        )
+        self.document_context_chars: int = _int("DOCUMENT_CONTEXT_CHARS", 0) or max(
+            48_000,
+            int(self.model_max_context * self.document_context_window_fraction * 3.0),
         )
         self.keep_recent_turns: int = _int("KEEP_RECENT_TURNS", 8)
         self.summary_max_tokens: int = _int("SUMMARY_MAX_TOKENS", 2000)

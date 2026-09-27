@@ -667,24 +667,35 @@ def test_missing_requested_sections_get_one_correction_naming_them_at_every_effo
     holey = _draft(["Executive Summary", "Next Steps"])
     holey["blocks"][1]["text"] = "TBD"
     full = _draft(["Executive Summary", "Key Risks", "Roadmap for FY27", "Next Steps"])
-    model = _Model([holey, partial, full])
+    # 2026-09-27: naming four sections now DERIVES a size (4 x
+    # length.WORDS_PER_SECTION = 1,600 words), and a derived target buys the
+    # short-draft repair exactly as an explicit one does — so each case below
+    # ends with one more whole-document call than it used to. `_draft` builds a
+    # 44-word stub, which is 3% of that target. The repair is the point of this
+    # release, so it is asserted here rather than scripted around.
+    model = _Model([holey, partial, full, full])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert result.corrections == 2 and len(model.calls) == 3, "the placeholder correction, then the coverage correction — past Fast's budget of one"
+    assert result.corrections == 3 and len(model.calls) == 4, "placeholder, then coverage, then the short-draft repair"
     prompt = model.calls[2]["messages"][-1]["content"]
     assert "does not have: risks, roadmap" in prompt and "executive summary" not in prompt.lower().split("does not have")[1]
+    assert "asked for about" in model.calls[3]["messages"][-1]["content"], "the last call is the size repair"
     assert [b.text for b in result.spec.body.blocks if b.type == "heading"] == ["Executive Summary", "Key Risks", "Roadmap for FY27", "Next Steps"]
     assert not any("requested sections" in w for w in result.warnings)
     # Still missing after the one correction: a warning, no loop.
-    model = _Model([partial, partial])
+    model = _Model([partial, partial, partial])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert len(model.calls) == 2 and any(w == "requested sections not found in the document: risks, roadmap" for w in result.warnings)
-    # Every section present: no correction at all.
-    model = _Model([full])
+    assert len(model.calls) == 3 and any(w == "requested sections not found in the document: risks, roadmap" for w in result.warnings)
+    # Every section present: no COVERAGE correction — only the size repair, and
+    # its warning names the derived phrase rather than claiming the person
+    # asked for a word count they never typed.
+    model = _Model([full, full])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req("fast", instruction=instruction, material=C.Material(instruction=instruction, sources=[C.Source("s1", "Finance note", "Team tier to $59.")]))))
-    assert len(model.calls) == 1 and result.corrections == 0
+    assert len(model.calls) == 2 and result.corrections == 1
+    assert not any("does not have" in c["messages"][-1]["content"] for c in model.calls[1:])
+    assert any("the 4 sections the request named suggested about 1,600" in w for w in result.warnings), result.warnings
 
 
 def test_section_cap_never_falls_below_the_requested_sections_plus_two():
@@ -1126,8 +1137,14 @@ def test_the_prompt_names_every_requested_section_and_the_callout_kinds():
     for name in FIFTEEN_SECTIONS:
         assert name in user, name
         assert name not in system, f"{name} reached the system message"
+    # 2026-09-27: where the request named its sections the sentence states the
+    # ROOM, not a ceiling. "At most" describes a limit the person is bumping
+    # against; on the owner's recorded run it said "at most 8" against his
+    # fifteen, which is the model being told to contradict him.
     assert "at most 8 top-level sections" not in system
-    assert "at most 17 top-level sections" in system
+    assert "Limits: at most" not in system
+    assert "room for 17 top-level sections" in system
+    assert "none of them may be dropped or merged" in system
     assert "sub-heading" in user
     assert '"warning"' in user and '"note"' in user
 

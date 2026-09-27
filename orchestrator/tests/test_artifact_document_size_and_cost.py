@@ -283,30 +283,71 @@ def test_fifteen_named_sections_derive_a_size_without_claiming_the_person_named_
     assert target.phrase == "the 15 sections the request named"
     assert L.sections_for(target.words) == 15, "400 is sections_for's own constant, inverted"
 
-    # Under the floor of six names nothing changes: every section-naming
-    # case in this suite before today named three to five.
+    # THREE NAMED SECTIONS NOW DERIVE A SIZE TOO (2026-09-27).
+    # DERIVED_TARGET_MIN_SECTIONS was 6, which meant a request naming three,
+    # four or five parts got NO target at all — no size line in the prompt,
+    # and at Fast the tone line "Be concise and concrete." standing over a
+    # request for a three-part report.
     small = _req("Create a report including an executive summary, risks and a roadmap")
-    assert C.target_for(small).words == 0
+    assert C.target_for(small).words == 3 * L.WORDS_PER_SECTION == 1_200
+
+    # Two is still not a structure: "a summary and a conclusion" is a remark
+    # about a document, not its shape.
+    two = _req("Create a report including an executive summary and a roadmap")
+    assert C.target_for(two).words == 0
 
     # An edit still has no size target at all.
     assert C.target_for(_req(OWNER_PROMPT, operation="edit")).words == 0
 
 
-def test_fast_writes_the_owners_fifteen_section_report_in_exactly_one_model_call(monkeypatch):
-    """The two cost guards, together, on the request that needs them.
-    Without them this is the sectioned writer: one outline call plus one
-    call per section, and then a short-draft correction on top."""
-    model = _Model([_doc(FIFTEEN_SECTIONS, 60)])
+def test_fast_writes_the_owners_fifteen_section_report_section_by_section(monkeypatch):
+    """THE OWNER'S OWN REQUEST, ON THE PATH IT REALLY TAKES (2026-09-27).
+
+    This test asserted the opposite until today: that Fast writes his
+    fifteen-section report in EXACTLY ONE model call, because a target code
+    derived bought neither the sectioned writer nor the short-draft repair.
+    That is the four-page file he complained about. The recorded run is still
+    on disk — artifact 2c98e9c4127848829e7067017dfda52f, effort `fast`, 59
+    blocks, fifteen level-1 headings, ZERO level-2 sub-headings, 1,067 words
+    of a 6,000-word derived target, and the stored warning "the document has
+    15 top-level sections; this effort level asked for at most 8".
+
+    A request that numbers fifteen sections is more specific about its shape
+    than one that says "detailed", and it was getting the worse path. It now
+    gets an outline call plus one call per section, at every effort.
+    """
+    model = _Model([_outline(FIFTEEN_SECTIONS)] + [_section(h, 400) for h in FIFTEEN_SECTIONS])
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(OWNER_PROMPT)))
-    assert model.calls == ["artifact_document"], model.calls
-    assert result.model_calls == 1
+    assert model.calls == ["artifact_outline"] + ["artifact_section_write"] * 15, model.calls
+    assert result.model_calls == 16
     assert _headings(result.spec) == FIFTEEN_SECTIONS
-    assert not any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
-    # And the card no longer carries our own budget warning.
+    assert any(w.startswith(C.LONG_DOCUMENT_NOTE) for w in result.warnings), result.warnings
+    # Fifteen sections of real length, not fifteen headings over a paragraph.
+    assert len(S.text_of(result.spec).split()) > 4_000
+    # And the card still never carries our own budget arithmetic as a cap.
     assert not any("top-level sections" in w and "at most" in w for w in result.warnings), result.warnings
     assert C._enforce_caps(result.spec, T.EFFORT_BUDGETS["fast"], FIFTEEN_SECTIONS,
                            target=C.target_for(_req(OWNER_PROMPT))) == []
+
+
+def test_a_derived_target_buys_the_short_draft_repair_too(monkeypatch):
+    """The other half of the asymmetry. The repair pass required
+    `target.explicit`, so on the owner's request it was unreachable at fast,
+    think AND max — a draft that came back at 18% of its target got a warning
+    string and no second pass. A one-call draft that lands far short now gets
+    the extra call whoever named the size."""
+    short = _doc(FIFTEEN_SECTIONS[:3], 40)          # ~120 words of a 1,200 target
+    full = _doc(FIFTEEN_SECTIONS[:3], 400)
+    model = _Model([short, full])
+    monkeypatch.setattr(llm, "json_completion", model)
+    req = _req("Create a report including an executive summary, risks and a roadmap")
+    target = C.target_for(req)
+    assert target.words == 1_200 and target.explicit is False
+    assert target.words < C.SECTIONED_WRITER_WORDS, "this is the ONE-call path, so the repair is the fix"
+    result = asyncio.run(C.compose(req))
+    assert model.calls == ["artifact_document", "artifact_document"], model.calls
+    assert result.corrections == 1, "the draft was written out in full"
 
 
 def test_a_size_the_person_named_still_buys_the_sectioned_writer_at_fast(monkeypatch):

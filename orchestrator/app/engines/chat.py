@@ -491,43 +491,6 @@ async def run_chat_engine(
         total_max_tokens = min(answer_plan.total_max_tokens, total_max_tokens)
     # --- effort_policy (answer quality) end ---
 
-    # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
-    # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
-    # the winner's thinking + answer stream to the UI (core/best_of.py).
-    # Zero usable candidates falls through to the ordinary single stream —
-    # best-of-N must never make extra_high worse than high.
-    if (
-        effort == "max"
-        and model_choice == "smart"
-        and settings.extra_high_samples > 1
-    ):
-        prompt = _messages(message, history, mode, grounding)
-        candidates = await best_of.generate_candidates(
-            prompt,
-            n=settings.extra_high_samples,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        if any(c.usable for c in candidates):
-            winner, reason = await best_of.select_best(message, candidates)
-            best_of.log_losers(candidates, winner)
-            for start in range(0, len(winner.reasoning), 1000):
-                await emit(
-                    "reasoning", {"text": winner.reasoning[start : start + 1000]}
-                )
-            answer = rewrite_shape.shape(message, winner.answer)
-            for start in range(0, len(answer), 200):
-                await emit("token", {"text": answer[start : start + 200]})
-            meta = {
-                "route": "chat",
-                "best_of": settings.extra_high_samples,
-                "best_of_winner": winner.index,
-                "best_of_reason": reason,
-            }
-            answer = await _say_what_was_left_out(message, answer, emit, meta)
-            await emit("meta", meta)
-            return answer
-
     # LONG ANSWERS ARE MANY CALLS. `max_tokens` above is the ceiling on ONE
     # call and stays exactly that; the total an answer may run to is decided
     # by the effort the person chose (continuation.budget_for) — except at
@@ -565,6 +528,126 @@ async def run_chat_engine(
         if guard.verdict is not None:
             raise continuation.StopGeneration(continuation.STOP_REPETITION)
 
+    # The length the person asked for. Hoisted out of the continuation call
+    # because the best-of (Max) path below needs the same number: a Max answer
+    # that continues must honour the ask exactly as Fast and Think do.
+    #
+    # AND, FAILING THAT, THE LENGTH THE REQUEST'S OWN SHAPE IMPLIES. A person
+    # who writes fifteen numbered sections and no word count has said how long
+    # the answer is; `requested_words` is a regex for "N words" and returned
+    # None for them, which switched the entire length mechanism off. A derived
+    # target is a FLOOR (`target_is_floor`) — it may lengthen an answer that
+    # stopped early, and it may never cut one, because nobody typed it.
+    ask = _length_ask(message)
+    target_words = answer_sampling.requested_words(ask)
+    target_is_floor = False
+    if target_words is None:
+        target_words = answer_sampling.requested_shape_words(ask)
+        target_is_floor = target_words is not None
+
+    # extra_high = best-of-N: EXTRA_HIGH_SAMPLES candidates generated
+    # CONCURRENTLY, a thinking-off guided-JSON judge picks the winner, and
+    # the winner's thinking + answer stream to the UI (core/best_of.py).
+    # Zero usable candidates falls through to the ordinary single stream —
+    # best-of-N must never make extra_high worse than high.
+    #
+    # THIS BLOCK USED TO SIT ABOVE THE LOOP GUARD AND ABOVE `_out`, and that
+    # position was two defects at once (2026-09-27):
+    #
+    #   1. Max was the ONLY effort with a hard one-call ceiling. It returned
+    #      before `continuation.stream_long_completion` was ever reached, so
+    #      the whole answer was one call of 65,536 tokens SHARED between
+    #      unbounded reasoning and the text, with nothing to continue it.
+    #      Fast and Think both run to 1,000,000 across stitched segments.
+    #      Measured in production: the eight longest route=chat answers are
+    #      ALL Fast (largest 330,439 chars / 89,566 tokens / 12 segments,
+    #      stop_reason=complete) while Max topped out at 14,788 chars. The
+    #      effort a person picks for the longest work was the one that could
+    #      not finish.
+    #   2. A Max answer passed through NEITHER the loop guard nor the shaper,
+    #      because both are defined below. That was survivable only while Max
+    #      was structurally one call; a Max answer that may now continue needs
+    #      the same runaway defence every other effort has.
+    #
+    # Moving it here fixes both: the winner streams through `_out`, so the
+    # guard sees it, and a winner the engine CUT is handed to the same
+    # continuation Fast and Think use, with the text so far as its seed. The
+    # model, not a constant, decides when a Max answer is finished.
+    if (
+        effort == "max"
+        and model_choice == "smart"
+        and settings.extra_high_samples > 1
+    ):
+        prompt = _messages(message, history, mode, grounding)
+        candidates = await best_of.generate_candidates(
+            prompt,
+            n=settings.extra_high_samples,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if any(c.usable for c in candidates):
+            winner, reason = await best_of.select_best(message, candidates)
+            best_of.log_losers(candidates, winner)
+            #: The guard raises StopGeneration through `_out`; caught here
+            #: because this block drives the stream itself.
+            halted = False
+
+            async def _feed(kind: str, text: str) -> None:
+                nonlocal halted
+                if halted or not text:
+                    return
+                try:
+                    await _out(kind, text)
+                except continuation.StopGeneration:
+                    halted = True
+
+            for start in range(0, len(winner.reasoning), 1000):
+                await _feed("reasoning", winner.reasoning[start : start + 1000])
+            for start in range(0, len(winner.answer), 200):
+                await _feed("answer", winner.answer[start : start + 200])
+            meta = {
+                "route": "chat",
+                "best_of": settings.extra_high_samples,
+                "best_of_winner": winner.index,
+                "best_of_reason": reason,
+            }
+            # A MAX ANSWER THAT WAS CUT IS CONTINUED, not silently handed over
+            # short. `winner.truncated` is only knowable because
+            # `chat_completion_with_reasoning` now records finish_reason and
+            # `Candidate` carries it out of its task — both were missing, which
+            # is why no Max turn in production has ever reported `truncated`.
+            if winner.truncated and not halted:
+                long = await continuation.stream_long_completion(
+                    prompt,
+                    on_delta=_out,
+                    model_choice=model_choice,
+                    effort=effort,
+                    temperature=temperature,
+                    segment_max_tokens=max_tokens,
+                    total_max_tokens=total_max_tokens,
+                    deadline_s=settings.continuation_deadline_s or None,
+                    target_words=target_words,
+                    target_is_floor=target_is_floor,
+                    seed=guard.shown,
+                )
+                meta["continuation"] = long.as_meta()
+            elif winner.truncated:
+                # Cut by the engine AND stopped by the guard: say the first
+                # thing, because the answer is short for a reason the person
+                # cannot otherwise see.
+                meta["truncated"] = True
+            if shaper is not None and guard.verdict is None:
+                for piece in guard.feed(shaper.finish()):
+                    await emit("token", {"text": piece})
+            for piece in guard.finish():
+                await emit("token", {"text": piece})
+            if guard.verdict is not None:
+                meta["loop_guard"] = guard.verdict.as_meta()
+                await answer_guard.record(guard.verdict, effort=effort, route="chat")
+            answer = await _say_what_was_left_out(message, guard.shown, emit, meta)
+            await emit("meta", meta)
+            return answer
+
     # THINKING IS THE PERSON'S CHOICE, NOT THIS ENGINE'S (2026-09-17). Fast
     # turns used to be classified here (core/effort_policy.py) and a prompt
     # that looked like a multi-step reasoning task was given a bounded
@@ -587,7 +670,8 @@ async def run_chat_engine(
         # The length the person asked for, as a target rather than only a
         # budget: "10,000 words" came back as 24,364 words one run and 5,340
         # the next (backlog 14). None when the ask names no length.
-        target_words=answer_sampling.requested_words(_length_ask(message)),
+        target_words=target_words,
+        target_is_floor=target_is_floor,
         **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
     if shaper is not None and guard.verdict is None:

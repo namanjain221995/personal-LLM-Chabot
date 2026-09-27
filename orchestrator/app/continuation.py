@@ -306,9 +306,16 @@ class _WordGauge:
     with a letter or digit in it, so a table pipe or a `---` rule is not one;
     a word split across two deltas is counted once."""
 
-    def __init__(self, target: int) -> None:
+    def __init__(self, target: int, *, floor_only: bool = False) -> None:
         self.target = target
-        self.high = math.ceil(target * _TARGET_HIGH)
+        # A FLOOR-ONLY TARGET NEVER CUTS (2026-09-27). A length the product
+        # DERIVED from the shape a request names ("fifteen numbered sections")
+        # is there to stop an answer ending early — it must not also cut one
+        # short at 140%, because the derived number is an estimate and the
+        # person never typed it. `math.inf` rather than a flag so every read of
+        # `high` behaves, and `_length_plan` and the short-stop extension still
+        # get the target they need.
+        self.high = math.inf if floor_only else math.ceil(target * _TARGET_HIGH)
         self.words = 0
         self.over = False
         #: Characters emitted since `over` was set.
@@ -513,6 +520,8 @@ async def stream_long_completion(
     on_segment: Optional[Callable[[LongResult], Awaitable[None]]] = None,
     answer_plan: Optional[Any] = None,
     target_words: Optional[int] = None,
+    target_is_floor: bool = False,
+    seed: str = "",
 ) -> LongResult:
     """Produce one text across as many calls as the budget allows.
 
@@ -537,10 +546,26 @@ async def stream_long_completion(
     (`_length_plan`) and every continuation the counts.
     None, or a target under `_TARGET_MIN_WORDS`, sends exactly what a call
     without it sends.
+
+    `target_is_floor` says the target was DERIVED by the product (from the
+    sections, rows, slides or pages a request names) rather than typed by the
+    person. It then acts only as a floor: the section plan and the
+    short-normal-stop extension still use it, and the 140% over-run cut is
+    switched off, because a number nobody typed must never shorten an answer.
+
+    `seed` is text ALREADY PRODUCED AND ALREADY SHOWN TO THE READER, which
+    this run continues rather than rewrites. It exists for best-of-N (Max
+    effort), whose answer is one non-streaming call made before this function
+    is reached: with a seed the first call here is a CONTINUATION — the same
+    prompt shape, seam stripping and overlap defence every later segment gets
+    — and `on_delta` therefore receives only what is new. `text` in the result
+    is the whole answer, seed included, because that is what the caller
+    stores. Without a seed nothing changes: the run opens exactly as it always
+    did.
     """
     plan_kwargs = {} if answer_plan is None else {"answer_plan": answer_plan}
     target = int(target_words) if target_words and target_words >= _TARGET_MIN_WORDS else None
-    gauge = _WordGauge(target) if target is not None else None
+    gauge = _WordGauge(target, floor_only=target_is_floor) if target is not None else None
     #: The one extra segment a short normal stop may get has been used, and
     #: whether the NEXT segment is that one (its prompt says so).
     extended = False
@@ -561,7 +586,11 @@ async def stream_long_completion(
     #: Whether a second call can happen at all. When it cannot, several
     #: seam defences are pure cost and are switched off.
     may_continue = total_cap > segment_cap and segments_cap > 1
-    produced = ""
+    produced = seed or ""
+    #: A seeded run is continuing text that already exists, so its FIRST call
+    #: is a continuation and its first segment must strip a re-emitted opening
+    #: exactly as any later one does.
+    seeded = bool(seed)
     segs: List[Segment] = []
     errors: List[str] = []
     empty_runs = 0
@@ -597,7 +626,7 @@ async def stream_long_completion(
             break
         ask = min(segment_cap, max(remaining, settings.continuation_min_segment_tokens))
 
-        if index == 0:
+        if index == 0 and not seeded:
             prompt = _first_messages(base, target)
         elif gauge is None:
             prompt = _continuation_messages(base, produced, tail)
@@ -618,7 +647,7 @@ async def stream_long_completion(
         # everything after it goes straight through, delta by delta. The first
         # segment holds nothing at all, so ordinary answers stream exactly as
         # they did before this file existed.
-        holding = index > 0
+        holding = index > 0 or seeded
         head: List[str] = []
         head_len = 0
         stripped = 0

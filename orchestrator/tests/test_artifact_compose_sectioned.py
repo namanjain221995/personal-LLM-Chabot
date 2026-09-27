@@ -155,7 +155,11 @@ def test_a_target_over_2500_words_uses_the_sectioned_writer(monkeypatch):
     assert [c["schema"] for c in model.calls] == ["artifact_outline"] + ["artifact_section_write"] * 3
     assert result.model_calls == 4 and result.corrections == 0, "assembled once, validated once, no repair"
     assert all(c["thinking"] is False for c in model.calls), "Fast never thinks, outline included"
-    assert all(c["max_tokens"] <= C.SECTION_MAX_TOKENS for c in model.calls[1:])
+    # A section's budget FOLLOWS the plan's word figure (SECTION_TOKENS_PER_WORD)
+    # and is bounded by what one call can decode inside the stage's wall clock,
+    # not by the flat SECTION_MAX_TOKENS = 16_000 that used to clamp it.
+    assert all(c["max_tokens"] <= C.one_call_token_ceiling() for c in model.calls[1:])
+    assert all(c["max_tokens"] >= C.SECTION_MIN_TOKENS for c in model.calls[1:])
     assert [b.text for b in result.spec.body.blocks if isinstance(b, S.Heading)] == headings, "outline order"
     assert result.spec.title == "Customer Report"
     assert len(S.text_of(result.spec).split()) > 2_000

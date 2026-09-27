@@ -238,12 +238,44 @@ MAX_TABLE_ROWS = 200
 MAX_TABLE_COLUMNS = 12
 MAX_CHART_POINTS = 200
 MAX_TEXT_CHARS = 200_000      # the whole spec's prose, summed
+
+#: Words one document block holds. MEASURED 2026-09-27 over all 22 real stored
+#: specs in /reports/artifacts: 26.72 pooled, and 19.5-21.3 on the LONG ones,
+#: which are the documents this bound is about. The low end is the one to
+#: divide by — a document made of many short blocks is the case that hits a
+#: block ceiling first.
+WORDS_PER_BLOCK = 19
+
+#: The most blocks one document may carry, DERIVED from the page ceiling this
+#: module already promises rather than picked.
+#:
+#: It was a flat 400 in `spec.DocumentSpec`, which at the measured 19 words a
+#: block is about 7,600 words — 3.5x TIGHTER than the 27,000 words
+#: `MAX_PAGES * length.WORDS_PER_PAGE` promises and than the 60 pages promised
+#: right here. So neither advertised ceiling could ever be reached, and the way
+#: the tightest one was enforced is the part that mattered: whole sections
+#: deleted from the END of the document (`compose._trim_to_renderer_limits`),
+#: with one warning string as the only trace. Measured binding on a real file:
+#: /reports/artifacts/2/e325547132154573aae98d44b05b58d9/v1/spec.json sits at
+#: EXACTLY 400 blocks and 8,044 words.
+#:
+#: 60 pages x 450 words a page / 19 words a block = 1,421, rounded up for
+#: headroom. This is a schema bound on a list the renderer walks once, so the
+#: cost of widening it is linear and small; the cost of leaving it was a
+#: silently truncated report.
+MAX_DOCUMENT_BLOCKS = 1_500
 MAX_FILE_BYTES = 50 * 1024 * 1024
 #: `GET …/zip` is refused when the version's recorded sizes sum past this:
 #: the bundle is streamed, so the bound is on what a person downloads, not
 #: on memory.
 MAX_ZIP_BYTES = 200 * 1024 * 1024
-MAX_PREVIEW_PAGES = 40        # pages rasterised for the viewer
+#: Pages rasterised for the viewer. Was 40 against MAX_PAGES = 60, so twenty
+#: pages of a document the product will happily make could not be previewed —
+#: which is exactly how a long document LOOKS short to the person who asked
+#: for it. Aligned to the page ceiling: a document the renderer will make is a
+#: document the viewer will show. The cost is rasterising up to 20 more pages
+#: at PREVIEW_WIDTHS, paid once per version at render time, never per view.
+MAX_PREVIEW_PAGES = MAX_PAGES
 PREVIEW_WIDTHS: Tuple[int, ...] = (240, 1400)   # thumbnail, page
 
 # --------------------------------------------------------------- storage --

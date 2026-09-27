@@ -26,7 +26,26 @@ log = logging.getLogger(__name__)
 
 #: The judge reads ANSWERS, not reasoning: the verdict is about what the user
 #: would receive, and N × 24k reasoning tokens would drown the judge prompt.
+#:
+#: This was a flat 4,000 characters. Measured against this deployment's own
+#: data on 2026-09-27, that is not "a seventh" of a candidate as once claimed
+#: but it is still real: the longest best-of-N answer ever stored here is
+#: 14,788 characters, so the judge read 27.0% of it, and 38.0% of the second
+#: longest — it picked a winner while blind to 73% and 62% of the text it was
+#: choosing between. Nothing forced the number. The judge's own answer is a
+#: 300-token {winner, reason} verdict with thinking off, and the served window
+#: measured 1,000,000 tokens, so three whole 65,536-token candidates fit with
+#: room to spare. The floor stays as a floor for a short answer; the window
+#: now FOLLOWS the candidates.
 _JUDGE_ANSWER_CHARS = 4000
+
+#: What the judge prompt may grow to, in characters, across ALL candidates.
+#: Derived rather than picked: the engine's window is 1,000,000 tokens and the
+#: measured cost of real prose is about 3 characters a token, so 600,000
+#: characters is well inside it while leaving the question, the system line
+#: and the verdict room. `context.fit_request` trims anything that still does
+#: not fit, so this is a budget and not a promise.
+_JUDGE_PROMPT_CHARS = 600_000
 
 _JUDGE_SCHEMA = {
     "type": "object",
@@ -58,10 +77,28 @@ class Candidate:
     #: inside the candidate's own task), or None when nothing was reported.
     #: Carried out of the task because the task's context dies with it.
     usage: Optional[dict] = None
+    #: WHY THIS CANDIDATE STOPPED, read inside its own task for exactly the
+    #: same reason `usage` is (2026-09-27). A task runs in a COPY of the
+    #: parent's context, so a finish_reason recorded inside the task is
+    #: invisible to the gather — the identical mechanism that lost candidate
+    #: usage until F045. None means NOT REPORTED and must never be read as
+    #: "finished cleanly".
+    finish_reason: Optional[str] = None
 
     @property
     def usable(self) -> bool:
         return bool(self.answer.strip())
+
+    @property
+    def truncated(self) -> bool:
+        """The engine stopped this candidate because it ran out of tokens.
+
+        This is the whole point of carrying the reason: a Max answer is ONE
+        non-streaming call, so unless somebody asks this question the person
+        is handed a sentence that stops mid-word with no notice and no way to
+        continue it.
+        """
+        return self.finish_reason == "length"
 
 
 async def _generate_one(
@@ -79,6 +116,7 @@ async def _generate_one(
     # the turn (2026-09-13: F045 made the candidates record, the gather
     # dropped it all — best-of-N turns still reached the ledger unmeasured).
     llm.reset_usage()
+    llm.reset_finish_reason()
     try:
         reasoning, answer = await llm.chat_completion_with_reasoning(
             messages,
@@ -87,7 +125,8 @@ async def _generate_one(
             max_tokens=max_tokens,
         )
         return Candidate(
-            index=index, reasoning=reasoning, answer=answer, usage=llm.get_usage()
+            index=index, reasoning=reasoning, answer=answer, usage=llm.get_usage(),
+            finish_reason=llm.get_finish_reason(),
         )
     except (QueuedForRecovery, LeaseLost) as exc:
         # Not a bad sample: the turn is parked for the main model (CONTRACT
@@ -170,8 +209,12 @@ async def select_best(
     if len(usable) == 1:
         return usable[0], "only one candidate produced an answer"
 
+    # THE WINDOW FOLLOWS THE CANDIDATES. Each candidate gets an equal share of
+    # the prompt budget, never less than the old flat floor, so a judge
+    # choosing between three long answers sees all of them.
+    per_candidate = max(_JUDGE_ANSWER_CHARS, _JUDGE_PROMPT_CHARS // max(1, len(usable)))
     numbered = "\n\n".join(
-        f"CANDIDATE {c.index}:\n{c.answer[:_JUDGE_ANSWER_CHARS]}" for c in usable
+        f"CANDIDATE {c.index}:\n{c.answer[:per_candidate]}" for c in usable
     )
     try:
         raw = await llm.json_completion(

@@ -71,15 +71,44 @@ from ..core.urls import select_relevant
 
 log = logging.getLogger(__name__)
 
+
+def _int_env(name: str, default: int) -> int:
+    """One env var read, for a module constant that has a settings default."""
+    try:
+        return int(str(os.environ.get(name, "")).strip() or default)
+    except (TypeError, ValueError):
+        return int(default)
+
 Emit = Callable[[str, dict], Awaitable[None]]
 
 #: A page with at least this much embedded text is born-digital — its text
 #: layer is trusted and the OCR model is not spent on it.
 TEXT_OK_CHARS = 200
 #: How many thin-text pages may go through the 3.3B OCR sidecar per upload.
-OCR_PAGE_BUDGET = 40
+#:
+#: Was a flat 40, against PUBLIC_API_FILES_OCR_PAGE_BUDGET = 1_000 for the same
+#: file through the public API — the same OCR sidecar, on the same worker Spark,
+#: 25x apart. Nothing about the model, the GPU or the request justified the gap:
+#: two numbers picked independently in two files, and the chat user (who is the
+#: owner) got the smaller one, so a scan past its 40th thin page was never read
+#: at all. Chat now reads the SAME setting the API reads, so there is one
+#: number and one place to change it. It stays a bound because OCR is real
+#: worker GPU minutes per page and that is a resource, not an answer's length.
+OCR_PAGE_BUDGET = _int_env("OCR_PAGE_BUDGET", getattr(settings, "public_api_files_ocr_page_budget", 1_000))
+#: Past this many characters a text upload is logged when it is stored. NOT a
+#: cap: the text is kept whole and the prompt-size question is answered at
+#: delivery time by `settings.document_context_chars`. It exists so an operator
+#: can see a very large ingest without a truncation having to happen for them
+#: to find out. The old 400,000-character cut destroyed the tail at ingest.
+_INGEST_TEXT_SOFT_CHARS = 400_000
+
 #: Per-question char budget for document context in the answer prompt.
-DOC_CONTEXT_CHARS = 48_000
+#: DERIVED from the served window now (settings.document_context_chars), and
+#: the SAME number every later turn about the same file uses — the 48,000 here
+#: against a bare 8,000 in main.py meant answer quality dropped 6x between the
+#: upload turn and the next question about it, for no reason either file gave.
+#: The literal stays as the floor, so nothing shrinks if the window is small.
+DOC_CONTEXT_CHARS = max(48_000, int(settings.document_context_chars))
 #: Documents the ENGINE will merge into one question. A chat request carries
 #: at most five references, but one of them may be an ARCHIVE whose expansion
 #: legitimately yields more members than that.
@@ -730,7 +759,29 @@ async def extract_document(
             )
         else:
             try:
-                full_text = raw.decode("utf-8", errors="replace")[:400_000]
+                # THE ONLY IRREVERSIBLE CAP ON THIS PATH. Everything else in the
+                # input surface shortens a PROMPT — lift it and old
+                # conversations immediately get better. This one cut the text
+                # before it was written to Postgres, so the remainder is gone
+                # unless the person uploads the file again. One real stored
+                # document sits at EXACTLY 400,000 characters, which is the
+                # fingerprint of a file this line truncated.
+                #
+                # The bound that belongs here is the UPLOAD bound the product
+                # already enforces (types.MAX_FILE_BYTES = 50 MB), not a second
+                # smaller one invented at decode time. A file that passed the
+                # upload check is a file the person is entitled to keep whole,
+                # and the DELIVERY budget (settings.document_context_chars,
+                # with `select_relevant` choosing what is relevant) is where the
+                # prompt-size question is answered — after the text is stored,
+                # where it can be answered again differently tomorrow.
+                full_text = raw.decode("utf-8", errors="replace")
+                if len(full_text) > _INGEST_TEXT_SOFT_CHARS:
+                    log.info(
+                        "large text upload %s: %d characters stored whole "
+                        "(delivery is budgeted at %d)",
+                        label, len(full_text), settings.document_context_chars,
+                    )
             except Exception:
                 full_text = ""
     return _Doc(name, full_text, [], 0, 0, []), None

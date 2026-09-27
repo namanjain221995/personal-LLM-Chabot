@@ -853,6 +853,13 @@ def _exact_counting(calls: list, window: int = 1_000_000):
 def test_a_settled_thread_is_not_recounted_in_front_of_the_next_answer(monkeypatch):
     uid = _local_user()
     db.create_conversation(uid, "carry-1", "d")
+    # THE FOLD TRIGGER IS PINNED HERE ON PURPOSE (2026-09-27). This test is
+    # about compaction's COUNTING and CARRY behaviour, not about where the
+    # ceiling sits. `context_compact_max_tokens` is derived from the served
+    # window now (a flat 40,000 was folding conversations that fit in the
+    # window whole), so `_long_thread()` no longer crosses the default and
+    # this fixture would silently stop exercising a fold at all.
+    monkeypatch.setattr(settings, "context_compact_max_tokens", 40_000)
     _no_carried_state(monkeypatch)
     calls: list = []
     monkeypatch.setattr(context, "count_tokens", _exact_counting(calls))
@@ -904,6 +911,13 @@ def test_an_estimated_count_is_never_carried(monkeypatch):
     prompt past the cap look as though it had been proved under it."""
     uid = _local_user()
     db.create_conversation(uid, "carry-4", "d")
+    # THE FOLD TRIGGER IS PINNED HERE ON PURPOSE (2026-09-27). This test is
+    # about compaction's COUNTING and CARRY behaviour, not about where the
+    # ceiling sits. `context_compact_max_tokens` is derived from the served
+    # window now (a flat 40,000 was folding conversations that fit in the
+    # window whole), so `_long_thread()` no longer crosses the default and
+    # this fixture would silently stop exercising a fold at all.
+    monkeypatch.setattr(settings, "context_compact_max_tokens", 40_000)
     _no_carried_state(monkeypatch)
     calls: list = []
     counter = _exact_counting(calls)
@@ -936,6 +950,13 @@ def test_an_estimated_count_is_never_carried(monkeypatch):
 def test_a_transcript_that_moved_since_it_was_counted_is_counted_again(monkeypatch, change):
     uid = _local_user()
     db.create_conversation(uid, "carry-2", "d")
+    # THE FOLD TRIGGER IS PINNED HERE ON PURPOSE (2026-09-27). This test is
+    # about compaction's COUNTING and CARRY behaviour, not about where the
+    # ceiling sits. `context_compact_max_tokens` is derived from the served
+    # window now (a flat 40,000 was folding conversations that fit in the
+    # window whole), so `_long_thread()` no longer crosses the default and
+    # this fixture would silently stop exercising a fold at all.
+    monkeypatch.setattr(settings, "context_compact_max_tokens", 40_000)
     _no_carried_state(monkeypatch)
     calls: list = []
     monkeypatch.setattr(context, "count_tokens", _exact_counting(calls))

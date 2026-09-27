@@ -168,9 +168,28 @@ def test_the_absolute_ceiling_can_be_turned_off(monkeypatch):
 
 def test_between_the_two_triggers_nothing_is_left_unbounded():
     """The property, stated once: any conversation large enough to matter is
-    condensed by one trigger or the other."""
+    condensed by one trigger or the other.
+
+    "Large enough to matter" is now measured against the WINDOW (2026-09-27).
+    The absolute ceiling was a flat 40,000 tokens, written when the fractions
+    were mis-tuned for a small window and the engines showed the model only the
+    last few turns. That engine-side slice has since been fixed, and the
+    ceiling outlived its reason: measured, a 60-message chat at 78,909 tokens
+    was folded so the model saw 13,560 tokens — 17.2% of what the person wrote
+    — while 912,387 tokens of window sat unused, and of 868 production
+    conversations ZERO exceed the 949,915-token verified needle depth.
+
+    So a 50,000-token conversation in a 1,000,000-token window is NOT folded
+    any more, and that is the fix rather than a regression. What must still
+    hold is that nothing is unbounded: past the derived ceiling, or past the
+    fraction of the usable window, one trigger always fires.
+    """
     threshold = settings.context_compact_threshold
-    for used in (50_000, 200_000, 800_000, 5_000_000):
+    ceiling = settings.context_compact_max_tokens
+    # Below the ceiling and below the fraction: kept verbatim, on purpose.
+    assert compaction.should_compact(_budget(used=ceiling - 1), threshold) is False
+    # Past either trigger: always condensed.
+    for used in (ceiling + 1, 800_000, 5_000_000):
         assert compaction.should_compact(_budget(used=used), threshold) is True, used
 
 

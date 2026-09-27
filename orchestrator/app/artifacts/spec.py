@@ -251,7 +251,11 @@ class DocumentSpec(_Strict):
     author: str = Field(default="", max_length=120)
     date: str = Field(default="", max_length=40)
     orientation: Literal["portrait", "landscape"] = "portrait"
-    blocks: List[DocumentBlock] = Field(min_length=1, max_length=400)
+    #: DERIVED from the page ceiling (types.MAX_DOCUMENT_BLOCKS), not picked.
+    #: A flat 400 here was the tightest ceiling in the whole artifact surface
+    #: and it was enforced by deleting whole sections from the END of the
+    #: document.
+    blocks: List[DocumentBlock] = Field(min_length=1, max_length=T.MAX_DOCUMENT_BLOCKS)
     sources: List[Citation] = Field(default_factory=list, max_length=60)
     assumptions: List[str] = Field(default_factory=list, max_length=20)
     #: How the document looks (style.StyleSpec): written by code, never by the model.
