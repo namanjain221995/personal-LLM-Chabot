@@ -109,3 +109,30 @@ For platform startup, profiles, data preservation, and security boundaries,
 see [`../docs/PORTABLE-RUNTIME.md`](../docs/PORTABLE-RUNTIME.md).
 
 ## Initial setup for frontend changes
+
+Install into **your own** working copy, and only into it:
+
+```bash
+cd <your checkout>/frontend
+npm ci
+```
+
+Never run `npm ci` or `npm install` in the deploy root: it is a shared
+production checkout that several engineers work in at once, and the images
+running on this box are built from it.
+
+Do not seed `node_modules` by copying it out of another checkout unless you
+run `npm ci` afterwards. A copied tree is only as fresh as the day that
+checkout was last installed, and nothing about it looks wrong. On 2026-09-27
+the deploy root's tree was from 2026-09-09 — nine days older than its own
+`package.json` — so it was missing `remark-breaks`, which was added on
+2026-09-18 and is imported at module scope by `components/Markdown.tsx`. The
+suite answered with 39 of 181 files failing on `Failed to resolve import
+"remark-breaks"`, and, worse, collected 2790 tests instead of 3542 while still
+printing a tidy summary.
+
+`npm run check:deps` answers that question on its own: it compares every
+`dependency` and `devDependency` against what is installed and names what is
+missing or out of range, with the command that fixes it. The same check runs
+as Vitest's `globalSetup` (`scripts/check-node-modules.mjs`), so `npm test`
+stops with that one message rather than blaming the branch you are on.
