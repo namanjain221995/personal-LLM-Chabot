@@ -1,0 +1,27 @@
+{
+  "_comment": "DERIVED calibration data, and deliberately nothing else. The floors in checklist.py were placed below what one other assistant achieved on the owner's exact prompt (prompt.txt, 914 characters); these are that answer's observed counts. The answer ITSELF is not here and must not be: it is a third-party-generated business document and this repository is public (.gitignore excludes backups/). Integers and one ratio carry no prose, no client detail and no identifier, and they are all the calibration guard needs. Regenerate with tests/parity/test_parity.py's _observe(); test_reference_passes_when_present re-derives it whenever the reference is in reach and fails if this file has drifted from it.",
+  "_derived_from": "one other assistant's answer to prompt.txt, recorded 2026-09-22",
+  "_scorer": "tests/parity/score.py at the commit that introduced this file",
+  "_prompt_checks_passed": "17/17",
+  "observed": {
+    "min_section_words": 102,
+    "max_section_words": 296,
+    "sections": 15,
+    "total_words": 2475,
+    "headings": 73,
+    "sections_with_subheading": 13,
+    "tables": 6,
+    "code_fences": 3,
+    "bullet_lists": 22,
+    "numbered_lists": 4,
+    "bold_runs": 58,
+    "callouts": 7,
+    "warning_callouts": 3,
+    "recommendation_mentions": 6,
+    "context_items_used": 12,
+    "duplicate_headings": 0,
+    "max_paragraph_shingle_overlap": 0.0,
+    "diagrams": 5,
+    "roled_diagram_nodes": 0
+  }
+}
