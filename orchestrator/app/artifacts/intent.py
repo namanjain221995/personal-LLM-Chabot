@@ -213,7 +213,14 @@ _FILE_NOUNS = (
     r"excel|xlsx|spread ?sheet|work ?book|tracker|calculator|financial model|document|doc|report|sop|memo|brief|"
     r"one[- ]pagers?|proposal|policy|letter|handout|write[- ]?up|whitepaper|csv|data ?set|data file|file|dashboard)"
 )
-_NEW_FILE_RE = re.compile(rf"\b(?:new|another|separate|fresh|second|different)\s+(?:\w+\s+){{0,2}}?{_FILE_NOUNS}\b", re.I)
+#: The determiner words that make a file a NEW one, and the phrase they
+#: build. Named, because the refusal guard (`_REFUSED_NEW_FILE_RE` below)
+#: has to negate exactly the phrase this creates: W1 (measured 2026-09-27)
+#: was 24 turns where a refusal built the file, because the create signal
+#: and the negation guards read different vocabularies.
+_NEW_DETERMINER = r"(?:new|another|separate|fresh|second|different)"
+_NEW_FILE_PHRASE = rf"{_NEW_DETERMINER}\s+(?:\w+\s+){{0,2}}?{_FILE_NOUNS}"
+_NEW_FILE_RE = re.compile(rf"\b{_NEW_FILE_PHRASE}\b", re.I)
 #: "as a PDF" / "in Word" / "to Excel" — the deliverable named as a form.
 #: Up to two adjectives between the preposition and the format (AS3 (c)):
 #: "in a standard and classy format" is not this, "in a classy pdf" is.
@@ -307,6 +314,31 @@ _FIRST_PERSON_NEGATION_RE = re.compile(rf"\b(?:i|we)\s+(?:{_NEGATION_ADVERBS}\s+
 #: "not a Word document", "rather than a deck", "instead of Excel": a
 #: format the person ruled out, which must not become one of the files.
 _NEGATED_FORMAT_RE = re.compile(rf"\b(?:not|never|no|rather than|instead of|don['’]?t\s+want|do\s+not\s+want|no\s+need\s+for)\s+(?:(?:as|in|into|to)\s+)?(?:an?\s+|the\s+)?{_FORMAT_WORD}\b", re.I)
+#: The VOLITION verbs of a refusal. They are here and not in
+#: `_NEGATED_VERBS` on purpose: `_NEGATED_CLAUSE_RE` blanks the clause it
+#: matches unless `_FIRST_PERSON_NEGATION_RE` protects it, and "I don't
+#: want" is first person, so adding `want` there would have changed
+#: nothing. A refusal is a wish, not an inability.
+_REFUSAL_VERBS = r"(?:want(?:ed|s)?|need(?:ed|s)?|require(?:d|s)?|ask(?:ed|ing)?\s+for|bother(?:ed)?\s+with|care\s+for)"
+#: "I don't want another file", "I didn't ask for a new excel", "don't
+#: bother with another deck": a refusal of ANOTHER file, written in the
+#: determiner words `_NEW_FILE_RE` keys on. Every negation guard above
+#: wants the refused noun ADJACENT to its determiner
+#: (`_NEGATED_CLAUSE_RE`, `_NEGATED_FORMAT_RE`, `_CHAT_ONLY_RE`,
+#: `_NEGATED_FILE_RE`), and `new|another|separate|fresh|second|different`
+#: sits between them - so the one phrase carrying the strongest create
+#: signal was the one phrase no guard could see, and 24 of 24 measured
+#: refusals built a file once an artifact was in the room while 0 of 24
+#: did without one (W1, 2026-09-27). Only the volition verbs above are
+#: taken: an IMPERATIVE negation of a new file rules out a SECOND file and
+#: not the first, which is why `_NEGATED_FILE_RE` excludes it and why
+#: "Create a PDF. Don't create a separate file for the appendix." is still
+#: a create (QA 2026-09-18).
+_REFUSED_NEW_FILE_RE = re.compile(
+    rf"\b(?:{_NEGATION}|did\s?n['’]?t|didnt|no\s+need\s+for)\s+(?:{_NEGATION_ADVERBS}\s+)*"
+    rf"{_REFUSAL_VERBS}\s+(?:me\s+)?(?:an?\s+|any\s+|the\s+)?{_NEW_FILE_PHRASE}\b",
+    re.I,
+)
 #: A line of a pasted table: a tab, a pipe, or a comma/semicolon record
 #: of four or more cells with no space after the separators (a CSV export;
 #: a sentence puts a space after its commas). The prose the row count is
@@ -686,6 +718,27 @@ def _negates_every_file(low: str) -> bool:
         # and is blanked there, so one scan of the rest is enough.
         after = _without_negated_clauses(low[m.end():])
         return not (_CREATE_RE.search(after) or _AS_FORMAT_RE.search(after) or _NEW_FILE_RE.search(after))
+    return False
+
+
+def _refuses_another_file(low: str) -> bool:
+    """`low` (lower-cased, NOT yet clause-blanked) refuses ANOTHER file and
+    asks for nothing else in the same turn. See `_REFUSED_NEW_FILE_RE`.
+
+    A request on EITHER side of the refusal wins, because the refusal then
+    bounds a request rather than replacing it: "Create a PDF, I don't want
+    another excel" is the PDF and "I don't want another file, make a deck
+    instead" is the deck. Same shape as `_negates_every_file` above, one
+    scan of the text either side of the first match.
+    """
+    for m in _REFUSED_NEW_FILE_RE.finditer(low):
+        before = _without_negated_clauses(low[: m.start()])
+        if _CREATE_RE.search(before) or _AS_FORMAT_RE.search(before):
+            continue
+        after = _without_negated_clauses(low[m.end():])
+        if _CREATE_RE.search(after) or _AS_FORMAT_RE.search(after) or _NEW_FILE_RE.search(after):
+            continue
+        return True
     return False
 
 #: Chart phrasing that asks for one: a verb, "chart of|with|for", a chart
@@ -1290,6 +1343,11 @@ def decide(
     # "Update the report, don't create a file" edits that report.
     no_file = (bool(_answer_placed_here(low) or _negates_every_file(raw.lower()))
                and not (chart or _NAMED_FILE_RE.search(low)) and not _FILE_DESPITE_RE.search(low))
+    # A refusal of ANOTHER file (W1) is read the same way, minus the
+    # `_NAMED_FILE_RE` veto: the format that veto finds IS the refused one
+    # ("I don't want another pdf" named the pdf in order to rule it out).
+    if not no_file and not chart and not _FILE_DESPITE_RE.search(low) and _refuses_another_file(raw.lower()):
+        no_file = True
     if (_CHAT_ONLY_RE.search(low) and not _FILE_DESPITE_RE.search(low)) or (no_file and not has_artifacts):
         return made("none", rule="chat-only", instruction="")
     shape = LX.negative_shape(low, uploads)

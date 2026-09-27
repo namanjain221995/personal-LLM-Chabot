@@ -116,10 +116,14 @@ W1_REFUSALS = [
 
 
 @pytest.mark.parametrize("text", W1_REFUSALS)
-@pytest.mark.xfail(strict=True, reason="W1: no negation guard sees a determiner word before the noun (_NEW_FILE_RE, intent.py:216/1427)")
 @pytest.mark.parametrize("ctx", [PC, PF], ids=["card-last", "file-earlier"])
 def test_a_refusal_of_another_file_makes_no_file(text: str, ctx: dict) -> None:
-    """The person says they do not want one. Nothing may be built."""
+    """The person says they do not want one. Nothing may be built.
+
+    FIXED 2026-09-27 by `_REFUSED_NEW_FILE_RE` / `_refuses_another_file`:
+    the refusal now reads the same determiner words the create signal does.
+    All 24 of these (12 refusals x 2 artifact contexts) decided `create`
+    before the fix and `none` (`no-file-asked`) after it."""
     assert I.decide(text, **ctx).wants_file is False
 
 
