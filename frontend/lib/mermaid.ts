@@ -23,8 +23,30 @@ const DIAGRAM_HEADS = [
   'architecture', 'kanban', 'radar', 'treemap', 'c4context',
 ];
 
+/**
+ * Drop a diagram's PREAMBLE: a leading YAML frontmatter block and any
+ * `%%{ … }%%` directive.
+ *
+ * Both are legal mermaid 11 and neither is a body line, so anything that reads
+ * "the first line" has to look past them. Measured before this existed: a
+ * source opening with a multi-line `%%{init: {` or with `---\nconfig:\n …\n---`
+ * never rendered AT ALL — `looksRenderable` read `'theme': 'default'` or `---`
+ * as the head, found no known diagram type, and the block sat on the Code tab
+ * for the whole answer. The colour directive was inert, but so was the
+ * diagram.
+ *
+ * Only CLOSED blocks are dropped. A half-written `%%{init: {` mid-stream has
+ * no `}%%` yet, stays, and keeps the streaming guard refusing — which is what
+ * it is for.
+ */
+export function withoutPreamble(code: string): string {
+  return (code || '')
+    .replace(/%%\{[\s\S]*?\}%%/g, '')
+    .replace(/^\s*---[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*---[ \t]*(\r?\n|$)/, '');
+}
+
 export function looksRenderable(code: string): boolean {
-  const lines = (code || '')
+  const lines = withoutPreamble(code)
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith('%%'));
@@ -36,7 +58,7 @@ export function looksRenderable(code: string): boolean {
 /** Slug used for the downloaded file name. */
 export function diagramFileName(code: string, ext = 'png'): string {
   const first =
-    (code || '')
+    withoutPreamble(code)
       .split('\n')
       .map((l) => l.trim())
       .find((l) => l && !l.startsWith('%%')) ?? 'diagram';

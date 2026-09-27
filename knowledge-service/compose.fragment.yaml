@@ -1,0 +1,51 @@
+# Add this service to docker-compose.yml, beside `sync-worker`.
+#
+# Additive only. It does NOT change the orchestrator, and it does NOT turn off
+# brain/packs — `BRAIN_ENABLED` stays true and sf_intel.py keeps calling
+# brain.matched_packs(). Run both paths in parallel until the evaluation
+# dataset shows the new one is better; `BRAIN_ENABLED=false` is then a
+# one-line switch with a one-line rollback.
+
+  knowledge-service:
+    build: ./knowledge-service
+    environment:
+      KNOWLEDGE_BUNDLE_DIR: /data/knowledge
+      # Reached by service name on the compose network, same as the
+      # orchestrator reaches them.
+      EMBED_BASE_URL: http://vllm-embed:30003/v1
+      # vllm-reranker is defined in the dgx-spark overlay, not the base file.
+      # Blank on a profile without it; rerank then degrades to hybrid rather
+      # than failing the request.
+      RERANK_BASE_URL: ${KNOWLEDGE_RERANK_URL:-}
+      # Semantic search is GIL-bound in pure Python (~117 ms of CPU per query,
+      # serialised across threads). Fine for chat and for the evaluation
+      # runner; if concurrent load grows, add numpy to
+      # knowledge-service/requirements.txt -- its matmul releases the GIL and
+      # takes the scan to ~1 ms.
+      KNOWLEDGE_SEMANTIC: ${KNOWLEDGE_SEMANTIC:-true}
+      # Off by default: measured 2026-09-24 the cross-encoder both rescued a
+      # rank-12 answer and promoted an unrelated field to rank 1. Turn on once
+      # the 78-case dataset has scored it.
+      KNOWLEDGE_RERANK: ${KNOWLEDGE_RERANK:-false}
+    volumes:
+      # The bundle is DATA: 85 MB, read-only, rebuilt offline from the mirror.
+      # A new version is a mount change, not an image rebuild.
+      - ./brain/knowledge/v1:/data/knowledge:ro
+      # graphrag is mounted rather than baked in: building it into the image
+      # would need a build context at the repository root (403 MB), which would
+      # pull the metadata mirror and its live credentials into an image layer.
+      - ./brain/Salesforce-Org-Data-main/src/graphrag:/app/vendor/graphrag:ro
+    ports:
+      # Loopback only. Nothing outside this host needs it, and it has no auth
+      # of its own — it answers questions about schema, not about records.
+      - "127.0.0.1:8006:8006"
+    restart: unless-stopped
+    healthcheck:
+      # Asks "is this process serving?", not "is every artifact present?" —
+      # /health reports a degraded bundle in its body and still returns 200,
+      # so an operator sees which file is missing instead of a crash loop.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8006/health -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

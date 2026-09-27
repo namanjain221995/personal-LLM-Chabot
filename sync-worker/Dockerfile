@@ -2,7 +2,16 @@
 # Base image is multi-arch (amd64/arm64); the digest is the same python:3.11-slim
 # index the orchestrator's CPU image pins, so both application containers are
 # reproducible from one immutable base rather than a moving tag.
-FROM python:3.11-slim@sha256:90744cff8f32887f075c47d747a173ff333e9e98801667af93c357fa9f5e28ff
+# BUMPED 2026-09-23. The previous pin,
+#   sha256:90744cff8f32887f075c47d747a173ff333e9e98801667af93c357fa9f5e28ff
+# carried CVE-2026-13221 (perl: incorrect regular expression processing) and
+# CVE-2026-42496 (perl-archive-tar: path traversal) -- both CRITICAL, both with
+# a fixed version available, so the blocking image pass
+#   trivy image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1
+# exits 1 on it. This digest is the SAME python:3.11-slim tag (3.11.16-slim-trixie),
+# rebuilt 2026-09-19, and scans clean under that policy. It is the multi-arch INDEX
+# digest, so it resolves on CI's amd64 and on the box's arm64 alike.
+FROM python:3.11-slim@sha256:da047cb8f9d1d98e5c070f5300ba9f7274e33b8fc0e5be5ed88740aed1b95ba9
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
