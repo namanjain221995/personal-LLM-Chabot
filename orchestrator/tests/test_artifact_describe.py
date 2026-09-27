@@ -427,13 +427,40 @@ def test_is_artifact_question_reads_every_verdict_shape_the_gate_may_record():
         assert D.is_artifact_question(_I(action="none", **{flag: False})) is False, flag
 
 
-def test_a_real_intent_from_todays_rules_is_not_read_as_a_question():
-    """origin/dev's rules have no such verdict, so this module is inert until
-    the gate sets one — it can never hijack a turn on its own."""
+@pytest.mark.parametrize("text", [
+    "convert it to PDF",
+    "also give it as Word",
+    "make it shorter",
+    "add a column for the owner",
+    "Make sheet for Me ??",
+    "save the answer above as an excel file",
+])
+def test_a_turn_that_asks_for_a_file_is_never_read_as_a_question(text):
+    """The invariant that must hold whatever the gate decides: a create, an
+    edit, a convert or an export is a FILE request and must not be diverted
+    into a read-back.
+
+    It is deliberately NOT asserted here that the gate says "none" for
+    "Ok What This sheet have ??": on this branch alone it does (this module is
+    inert until the gate records a verdict), and track `question-not-edit`
+    makes it say "question" — measured by overlaying that branch's intent.py
+    on this tree, where the earlier form of this test failed and every other
+    test in the file still passed. Pinning the pre-fix answer would have
+    turned a correct gate into a red test."""
     from app.artifacts import intent as I
 
-    for text in ("Ok What This sheet have ??", "convert it to PDF", "make it shorter", "Make sheet for Me ??"):
-        assert D.is_artifact_question(I.decide(text, has_artifacts=True, last_turn_is_artifact=True)) is False
+    intent = I.decide(text, has_artifacts=True, last_turn_is_artifact=True, has_assistant_answer=True)
+    assert intent.action in ("create", "edit", "convert", "export"), f"{text!r} -> {intent.action}/{intent.rule}"
+    assert D.is_artifact_question(intent) is False
+
+
+def test_an_intent_object_with_no_verdict_at_all_is_inert():
+    """A build whose gate records nothing leaves this module switched off: it
+    can never hijack a turn on its own."""
+    from app.artifacts import intent as I
+
+    assert D.is_artifact_question(I.ArtifactIntent("none", rule="no-request")) is False
+    assert D.is_artifact_question(I.ArtifactIntent("create", rule="create")) is False
 
 
 # ------------------------------------------------------------- the store --
