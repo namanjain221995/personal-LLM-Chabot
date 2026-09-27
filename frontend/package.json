@@ -9,6 +9,7 @@
     "start": "next start",
     "start:3001": "next start -p 3001",
     "lint": "eslint app components lib --ext .ts,.tsx",
+    "check:deps": "node scripts/check-node-modules.mjs",
     "test": "vitest run"
   },
   "dependencies": {

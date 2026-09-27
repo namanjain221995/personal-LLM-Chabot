@@ -29,5 +29,16 @@ export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
     environment: 'node',
+    // Refuse to run against a node_modules that disagrees with package.json.
+    //
+    // This runs once, before the first file is collected, and it exists
+    // because the alternative is what actually happened: a tree copied from
+    // the deploy root was missing `remark-breaks`, and the suite answered
+    // with 39 `Failed to resolve import` errors in files that have nothing to
+    // do with markdown — while quietly collecting 2790 tests instead of 3523
+    // and still printing a tidy summary. One accurate message up front is
+    // worth more than 39 misleading ones, and far more than a green run that
+    // skipped a fifth of the suite. See scripts/check-node-modules.mjs.
+    globalSetup: ['./scripts/check-node-modules.mjs'],
   },
 });
