@@ -69,43 +69,95 @@
 # minutes). THREE things must be true before it is merged, and none of them is
 # work this file can do:
 #
-#   1. `box_probes.py` must expose the four probes REQUIRED_PROBES names.
-#      Measured 2026-09-27: the module is not on dev at all, and on
-#      `ci/box-readiness` it has probe_engine_exposure, probe_completion,
-#      probe_deploy_lock, probe_disk, probe_deploy_root,
-#      probe_engine_controller and probe_migrations -- so probe_real_completion,
-#      probe_container_states and probe_host_guard_unit are all missing. Until
-#      the reconciliation lands, every run of this workflow is
+#   1. `box_probes.py` must expose the four probes REQUIRED_PROBES names, AND
+#      expose them with a signature this watch can call. Two separate pieces of
+#      work, and the second one is the larger:
+#
+#      NAMES. Measured 2026-09-27, re-measured 2026-09-28: the module is not on
+#      dev at all; on `ci/box-readiness` (1642fa5) and on
+#      `fix/box-readiness-r3` (3b6a15c) it has probe_deploy_root, probe_disk,
+#      probe_deploy_lock, probe_engine_exposure, probe_engine_controller,
+#      probe_completion and probe_migrations -- so probe_real_completion,
+#      probe_container_states and probe_host_guard_unit are all missing.
+#
+#      SIGNATURES. All seven probes it DOES expose are `def probe_x(env:
+#      Environment) -> ProbeResult`, one required positional parameter, and
+#      `call_probe` here offers a context of exactly `deploy_root` and
+#      `timeout`. So adding the three missing NAMES is not enough: even
+#      probe_engine_exposure, the one name that already matches, cannot be
+#      called. Measured 2026-09-28 against the real module with all four names
+#      present: `box_probes.probe_engine_exposure() requires a parameter this
+#      watch cannot supply: 'env'. It offers deploy_root, timeout.` ->
+#      `verdict unavailable / channel not reached / RED`, exit 1, nothing
+#      written. It fails CLOSED and it names the parameter, which is the point
+#      of refusing rather than guessing -- calling a probe with a default that
+#      happens to parse would read the answer as if it meant something.
+#
+#      Either side can close it: `box_probes.py` grows probes whose required
+#      arguments this watch can supply, or `call_probe`'s context here learns
+#      to build that track's `Environment`. The second is not a change this
+#      file may make unilaterally -- `Environment` is theirs, and this watch
+#      imports their module rather than copying or editing it.
+#
+#      Until the reconciliation lands, every run of this workflow is
 #      `verdict unavailable / channel not reached / RED`, exit 1.
 #
 #   2. The node-exporter textfile sink must EXIST, be WRITABLE BY THE RUNNER
-#      ACCOUNT, and be read by node-exporter. Both halves are root actions.
-#      Measured 2026-09-27: /var/lib/node_exporter does not exist, and
-#      `docker inspect` on the running node-exporter shows no
-#      --collector.textfile.directory flag.
+#      ACCOUNT, and be read by node-exporter. TWO OWNER ACTIONS, 2a and 2b
+#      below, and NEITHER of them is work any CI job, agent or script in this
+#      repository may do for itself. They are listed separately because doing
+#      only 2a is worse than doing neither: the directory would exist, the
+#      write would land, and nothing would read it -- "wrote a file nobody
+#      reads", which is the exact display this design exists to refuse.
 #
-#      The writer here is the self-hosted runner's own account, NOT root (the
-#      deploy root is under /home/techsphere), so a root-only directory is not
-#      enough: with the directory present but unwritable by that account,
-#      write_textfile raises "the textfile write failed (PermissionError)" ->
-#      ChannelError, which makes EVERY fault verdict RED -- and once the cron
-#      lands, a red scheduled run mails, the one outcome the owner forbade.
-#      Measured 2026-09-27 against the real writer on a directory with mode
-#      0555, which is how `-o root -g root -m 0755` looks to this account. So
-#      the root action to hand over is a directory the runner account can write
-#      (group-writable and setgid keeps the root host-guard timer's writes and
-#      the runner's in one place), and the node-exporter recreate beside it:
+#      Measured 2026-09-27, re-measured 2026-09-28: `ls -ld
+#      /var/lib/node_exporter` says "No such file or directory", and
+#      `docker inspect --format '{{json .Config.Cmd}}'
+#      sf-local-ai-node-exporter-1` lists --path.rootfs, --path.procfs,
+#      --path.sysfs, --web.listen-address, the netdev/netclass collectors, five
+#      --no-collector flags and a filesystem mount-point exclusion, and NO
+#      --collector.textfile.directory.
+#
+#      2a. THE DIRECTORY -- needs root, and needs the right group. The writer
+#      here is the self-hosted runner's own account, NOT root (the deploy root
+#      is under /home/techsphere), so a root-only directory is not enough: with
+#      the directory present but unwritable by that account, write_textfile
+#      raises "the textfile write failed (PermissionError)" -> ChannelError,
+#      which makes EVERY fault verdict RED -- and once the cron lands, a red
+#      scheduled run mails, the one outcome the owner forbade. Measured
+#      2026-09-27 against the real writer on a directory with mode 0555, which
+#      is how `-o root -g root -m 0755` looks to this account. Group-writable
+#      and setgid keeps the root host-guard timer's writes and the runner's in
+#      one place:
 #
 #        sudo install -d -o root -g techsphere -m 2775 \
 #          /var/lib/node_exporter/textfile_collector
-#        # then recreate node-exporter with
-#        #   --collector.textfile.directory=/host/var/lib/node_exporter/textfile_collector
-#        # (the host root is already mounted at /host read-only -- see
-#        #  monitoring/developer-api/README.md, "host packet filter")
+#
+#      2b. THE EXPORTER RECREATE -- does NOT need root on this box (the
+#      techsphere account is in the `docker` group, gid 988, verified
+#      2026-09-28), and it is the owner's anyway: it recreates a running
+#      container in the live production stack, and a partial `-f` chain is how
+#      this repository has downgraded services to stale images before. Add one
+#      line to the head's node-exporter `command:` in
+#      compose/compose.monitoring.yaml (the `node-exporter:` service, beside
+#      the other collector flags) and bring the monitoring profile back up
+#      through the script that owns the full chain:
+#
+#        # compose/compose.monitoring.yaml, node-exporter `command:`
+#        - --collector.textfile.directory=/host/var/lib/node_exporter/textfile_collector
+#        # then, from the deploy root:
+#        scripts/monitoring.sh up
+#
+#      The host root is already mounted at /host read-only, which is all a
+#      textfile collector needs -- see monitoring/developer-api/README.md,
+#      "host packet filter", which asks for the same recreate for
+#      techsara_host_guard_* and is still waiting for it. `scripts/monitoring.sh
+#      up` touches no model service: the monitoring profile is not a dependency
+#      of vLLM, the orchestrator or the frontend.
 #
 #      `python3 .github/workflows/scripts/production_truth.py --dry-run` writes
-#      nothing and names this blocker, so run it BEFORE spending the root
-#      action and again after.
+#      nothing and names whichever half is still missing, so run it BEFORE
+#      spending the owner action and again after.
 #
 #   3. A Prometheus ALERT RULE for `techsara_production_truth_*` under
 #      monitoring/prometheus/rules/, plus its entry in
@@ -155,6 +207,17 @@
 # The readback is what makes the green honest: without it, "wrote a file" is
 # indistinguishable from "wrote a file nobody reads".
 #
+# AND THE READBACK IS SCOPED to this run's own writer -- `{job="node",
+# node="..."}`, the same shape every host-guard rule in this repository uses --
+# because a series of the right NAME is not the same thing as this run's series.
+# Unscoped, the query took the highest value it could find: measured 2026-09-28,
+# one foreign series of the same metric name from another instance, an hour
+# ahead, turned a live engine exposure into `result GREEN`, exit 0, printing
+# "the verdict reached a sink that reads it". `--readback-node` names the node
+# whose exporter reads this run's file; getting it wrong fails CLOSED (the
+# metric reads ABSENT and the run goes red), and the default is pinned against
+# monitoring/prometheus/prometheus.yml by the test suite.
+#
 # A CLEAN run writes that file too, and does NOT read it back. The metric is one
 # series per verdict and the file is replaced whole, so the only thing that turns
 # `verdict{verdict="exposed"} 1` back into 0 -- and the only thing that moves the
@@ -195,7 +258,9 @@ permissions: {}
 
 jobs:
   production-truth:
-    name: Production truth (scheduled)
+    # The name says `main only` because the `if:` below is the only thing that
+    # answers a dispatcher, and it answers by saying nothing. See the guard.
+    name: Production truth (main only; any other ref is SKIPPED)
     runs-on: [self-hosted, dgx-spark]
     permissions:
       contents: read
@@ -226,6 +291,19 @@ jobs:
     # A scheduled run executes on the default branch, so this guard holds
     # honestly rather than by exemption. workflow_policy.py P4 fullmatches
     # this exact literal on a self-hosted job; do not reword it.
+    #
+    # AND IT IS SILENT, on the only trigger that exists today. `schedule:` is
+    # not here yet (see "SHIPPED IN TWO COMMITS"), so every run of this workflow
+    # is a `workflow_dispatch` -- and dispatching it from any ref other than
+    # main satisfies nothing, runs no step, and produces a `skipped` job with NO
+    # reason given. That is this repository's own documented failure class: a
+    # skipped job reports no reason, and it once cost three green pushes to main
+    # before anybody noticed. The reason cannot be printed from inside the job,
+    # because a job whose `if:` is false runs none of its steps and writes no
+    # step summary, and P4 forbids moving the guard into a step. So it is in the
+    # one string the run's UI shows beside the skip: the job's `name:` above.
+    # If you dispatched this and got one skipped job, that is why -- re-dispatch
+    # it on main.
     if: github.ref == 'refs/heads/main'
     env:
       TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}

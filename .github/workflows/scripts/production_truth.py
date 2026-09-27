@@ -87,14 +87,24 @@ write landed, and stays green either way -- a healthy box must never mail.
 The readback is what makes the green honest. Without it, "wrote a file" is
 indistinguishable from "wrote a file nobody reads" -- and on this box today
 nobody reads it: `/var/lib/node_exporter/textfile_collector` does not exist
-(verified 2026-09-27: `ls -ld` says "No such file or directory"), and the
-running node-exporter carries no `--collector.textfile.directory` flag
-(verified the same day: `docker inspect --format '{{json .Config.Cmd}}'
-sf-local-ai-node-exporter-1` lists --path.rootfs, --path.procfs, --path.sysfs,
---web.listen-address, the netdev/netclass collectors, four --no-collector flags
-and a filesystem mount-point exclusion, and no textfile flag). That install is
-an owner/root action, and this script does not work around it; it reports RED
-until it is done.
+(verified 2026-09-27 and again 2026-09-28: `ls -ld` says "No such file or
+directory"), and the running node-exporter carries no
+`--collector.textfile.directory` flag (verified both days: `docker inspect
+--format '{{json .Config.Cmd}}' sf-local-ai-node-exporter-1` lists
+--path.rootfs, --path.procfs, --path.sysfs, --web.listen-address, the
+netdev/netclass collectors, FIVE --no-collector flags -- mdadm, nfs, nfsd, zfs,
+xfs -- and a filesystem mount-point exclusion, and no textfile flag). That
+install is TWO owner actions, both listed in production-watch.yml under blocker
+2: the directory (root: `sudo install -d -o root -g techsphere -m 2775 ...`,
+because the writer is the runner account and not root) and the node-exporter
+recreate that makes something read it. This script does not work around either;
+it reports RED until they are done, and doing only the first is worse than
+doing neither, because then the write lands and still nobody reads it.
+
+THE READBACK IS SCOPED to this run's own writer. A series of the right NAME is
+not this run's series: see READBACK_JOB for the measurement that made a live
+engine exposure green through one foreign sample, and `--readback-node` for the
+label that refuses it.
 
 AND THE HANDOVER IS NOT COMPLETE EITHER, YET. "Hands the fault to Prometheus,
 which owns alerting" is the justification for being green over a real fault,
@@ -109,7 +119,8 @@ exists, a fault this watch reports is read by a person or by nobody.
 
 Usage:
     production_truth.py [--dry-run] [--deploy-root PATH] [--textfile-dir PATH]
-                        [--prometheus-url URL] [--scrape-interval-seconds N]
+                        [--prometheus-url URL] [--readback-node NODE]
+                        [--scrape-interval-seconds N]
                         [--readback-deadline-seconds N] [--step-summary FILE]
 
 `--dry-run` performs every read-only probe and reaches the same verdict and
@@ -232,8 +243,64 @@ REPORTED_VERDICTS = frozenset({"ok"}) | FAULT_VERDICTS
 VERDICT_SERIES: tuple[str, ...] = tuple(sorted(REPORTED_VERDICTS, key=lambda name: SEVERITY[name]))
 
 METRIC_PREFIX = "techsara_production_truth"
-READBACK_EXPR = f"{METRIC_PREFIX}_check_timestamp_seconds"
+
+#: The series NAME the textfile carries. Bare, with no labels: node-exporter's
+#: textfile collector emits what is in the file and Prometheus attaches `job`,
+#: `instance`, `node` and `role` itself (monitoring/prometheus/prometheus.yml,
+#: `job_name: node`), so a label written here would either collide with those
+#: or invent an identity the scrape does not agree with.
+READBACK_METRIC = f"{METRIC_PREFIX}_check_timestamp_seconds"
+
+#: THE READBACK IS SCOPED, and this is the whole of why. The readback is the
+#: only thing that buys this job the right to be GREEN over a real fault, and it
+#: used to query the BARE metric name and then take `max(samples, key=value)`
+#: across every series that came back. Measured 2026-09-28, driving `main()` with
+#: a live engine exposure, this run's own file written but NEVER scraped, and one
+#: FOREIGN series of the same name from another instance whose value was an hour
+#: ahead: `verdict exposed / channel written and read back from Prometheus,
+#: sample 0s old / result GREEN`, exit 0, printing "the verdict reached a sink
+#: that reads it" -- when it had reached nobody. `value >= written_at` separates
+#: this writer's own earlier file from its newer one; it cannot separate this
+#: writer from a different one.
+#:
+#: So the query names the job and the node, exactly as every host-guard rule in
+#: this repository does (`{job="node"}` and `on(node)`,
+#: monitoring/prometheus/rules/developer-api.yml:541, :542, :558, :560), and a
+#: match on MORE THAN ONE series is a channel failure rather than an argmax:
+#: after scoping there is one writer, and if there are two this run cannot tell
+#: which sample is its own.
+READBACK_JOB = "node"
+
+#: The `node` label prometheus.yml attaches to the HEAD's node-exporter target.
+#: The watch runs on the head -- there is one self-hosted runner and it is there
+#: -- so this is the node whose textfile carries this run's write.
+#: `test_the_readback_node_matches_the_prometheus_target` pins this against
+#: monitoring/prometheus/prometheus.yml so it cannot drift silently, and running
+#: the watch anywhere else fails CLOSED: the scoped query returns nothing, the
+#: readback reports the metric ABSENT, and the run goes red.
+DEFAULT_READBACK_NODE = "spark-1"
+
 TEXTFILE_NAME = f"{METRIC_PREFIX}.prom"
+
+
+#: A Prometheus label value is interpolated into a query string here, so the
+#: characters that could end the string or the selector are refused rather than
+#: escaped. A label value on this box is `spark-1`; anything outside this class
+#: is a mistake, and a mistake in the readback's scope must not be a query that
+#: still parses and means something else.
+NODE_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+
+
+def readback_expr(node: str) -> str:
+    """The instant query the readback asks, scoped to this run's own writer."""
+    if not NODE_LABEL_RE.match(node):
+        raise ValueError(
+            "the readback node must be a plain label value (letters, digits, "
+            f"'_', '.', ':' and '-'), not {node!r}: it is interpolated into a "
+            "Prometheus selector, and a value that can close the string could "
+            "widen the scope this query exists to narrow"
+        )
+    return f'{READBACK_METRIC}{{job="{READBACK_JOB}", node="{node}"}}'
 
 #: The node-exporter textfile convention this repository already uses -- see
 #: monitoring/exporters/host-guard/host_guard_textfile.sh, which writes the
@@ -561,7 +628,27 @@ def render_textfile(verdict: str, now: float, reasons: list[str]) -> str:
     this script can write, which is a label promising information that nothing
     can ever put there. `unavailable` is carried by the run going RED, not by
     this metric.
+
+    AND IT REFUSES ANYTHING ELSE. Narrowing the label set to REPORTED_VERDICTS
+    cost this function its fail-closed edge: with the `unavailable` series gone,
+    an out-of-contract verdict -- `unavailable`, `deferred`, or a typo -- used to
+    render a perfectly well-formed file with EVERY verdict series at 0, plus
+    `check_ok 1` and a fresh `check_timestamp_seconds`. That file says "a watch
+    run got a reading" and names no reading: it would clear a live fault and move
+    the freshness timestamp forward on the strength of a verdict this metric
+    cannot express. Before the narrowing the same input at least set its own
+    label to 1, so the shape was visible. `main()` cannot reach it -- it renders
+    only REPORTED_VERDICTS, which
+    `test_every_verdict_main_can_reach_writes_the_whole_label_set` pins -- and
+    that is exactly why it is refused HERE rather than trusted to stay
+    unreachable: the next caller is the one that would not know.
     """
+    if verdict not in REPORTED_VERDICTS:
+        raise ValueError(
+            f"{verdict!r} is not a verdict this metric can carry, so there is no "
+            "honest file for it. A run that did not observe the box writes "
+            f"NOTHING; only {', '.join(sorted(REPORTED_VERDICTS))} are written."
+        )
     lines = [
         f"# HELP {METRIC_PREFIX}_verdict 1 for the verdict this watch reached, 0 for the others.",
         f"# TYPE {METRIC_PREFIX}_verdict gauge",
@@ -583,9 +670,9 @@ def render_textfile(verdict: str, now: float, reasons: list[str]) -> str:
         f"# HELP {METRIC_PREFIX}_faults How many probes reported a fault in the run that wrote this file.",
         f"# TYPE {METRIC_PREFIX}_faults gauge",
         f"{METRIC_PREFIX}_faults {len(reasons)}",
-        f"# HELP {READBACK_EXPR} Unix time of the last watch run.",
-        f"# TYPE {READBACK_EXPR} gauge",
-        f"{READBACK_EXPR} {format_timestamp(now)}",
+        f"# HELP {READBACK_METRIC} Unix time of the last watch run.",
+        f"# TYPE {READBACK_METRIC} gauge",
+        f"{READBACK_METRIC} {format_timestamp(now)}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -658,28 +745,51 @@ def http_query(base_url: str, expr: str, timeout: float = 10.0) -> list[tuple[fl
 def readback(
     runtime: Runtime,
     *,
+    expr: str,
     written_at: float,
     scrape_interval: int,
     deadline_seconds: int,
 ) -> Channel:
     """Did Prometheus actually pick up THIS run's write, and is it live?
 
-    Two questions, both of which a naive "the metric exists" check answers
-    wrongly. `value >= written_at` proves the scrape saw this run's file
-    rather than a stale one left by a previous run, and the sample's own age
-    proves Prometheus is still scraping at all.
+    THREE questions, and a naive "the metric exists" check answers all three
+    wrongly. `value >= written_at` proves the scrape saw this run's file rather
+    than a stale one left by an earlier run of this same writer; the sample's own
+    age proves Prometheus is still scraping at all; and `expr` -- scoped to
+    `job` and `node`, see READBACK_JOB -- proves the series is THIS writer's and
+    not some other producer of the same metric name. The third one is not
+    theoretical padding: unscoped, a single foreign series with a future value
+    made a live engine exposure green (measured 2026-09-28, see READBACK_JOB).
+
+    More than one series under a scoped query is a CHANNEL FAILURE, not an
+    argmax. `max(samples, key=value)` was the old behaviour and it is exactly
+    the wrong reflex here: picking the highest value means preferring whichever
+    series is furthest in the future, i.e. preferring the foreign one. After
+    scoping there is one writer on one node; two samples means the scope no
+    longer identifies this run, and a readback that cannot tell which sample is
+    its own has not read anything back.
     """
     window = 2 * scrape_interval
     started = runtime.now()
     last = "the readback never ran"
     while True:
         try:
-            samples = runtime.query(READBACK_EXPR)
+            samples = runtime.query(expr)
         except ChannelError as exc:
             last = str(exc)
             samples = []
+        if len(samples) > 1:
+            return Channel(
+                required=True,
+                ok=False,
+                detail=(
+                    f"the readback matched {len(samples)} series, not one: scoped to "
+                    f"job={READBACK_JOB!r} and one node it must identify exactly this "
+                    "run's writer, and it cannot tell which sample is this run's"
+                ),
+            )
         if samples:
-            at, value = max(samples, key=lambda pair: pair[1])
+            at, value = samples[0]
             if value < written_at:
                 last = (
                     "the metric is present but STALE: the scraped sample predates "
@@ -699,7 +809,11 @@ def readback(
                         detail=f"written and read back from Prometheus, sample {age:.0f}s old",
                     )
         elif last == "the readback never ran":
-            last = "the metric is ABSENT from Prometheus: the textfile is written but not scraped"
+            last = (
+                "the metric is ABSENT from Prometheus under this run's own scope: the "
+                "textfile is written but not scraped, or --readback-node does not name "
+                "the node whose exporter reads it"
+            )
         if runtime.now() - started >= deadline_seconds:
             return Channel(required=True, ok=False, detail=last)
         runtime.sleep(min(float(scrape_interval), 5.0))
@@ -711,6 +825,7 @@ def use_channel(
     verdict: str,
     reasons: list[str],
     textfile_dir: pathlib.Path,
+    expr: str,
     scrape_interval: int,
     deadline_seconds: int,
 ) -> Channel:
@@ -726,6 +841,7 @@ def use_channel(
         return Channel(required=True, ok=False, detail=f"the textfile write failed ({type(exc).__name__})")
     return readback(
         runtime,
+        expr=expr,
         written_at=now,
         scrape_interval=scrape_interval,
         deadline_seconds=deadline_seconds,
@@ -791,13 +907,19 @@ def refresh_channel(
     )
 
 
-def predict_channel(runtime: Runtime, *, textfile_dir: pathlib.Path) -> Channel:
-    """`--dry-run`: probe the sink instead of using it, and say so."""
+def predict_channel(runtime: Runtime, *, textfile_dir: pathlib.Path, expr: str) -> Channel:
+    """`--dry-run`: probe the sink instead of using it, and say so.
+
+    It asks the SCOPED query a real run would ask, so a `--readback-node` that
+    names nothing is visible by hand before a scheduled run depends on it. An
+    empty result is still an answer here -- the file has not been written -- so
+    only a query Prometheus refuses outright is a predicted failure.
+    """
     blocker = runtime.textfile_blocker(textfile_dir)
     if blocker:
         return Channel(required=True, ok=False, detail=f"predicted: {blocker}")
     try:
-        runtime.query(READBACK_EXPR)
+        runtime.query(expr)
     except ChannelError as exc:
         return Channel(required=True, ok=False, detail=f"predicted: {exc}")
     return Channel(
@@ -876,6 +998,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--textfile-dir", default=DEFAULT_TEXTFILE_DIR)
     parser.add_argument("--prometheus-url", default=DEFAULT_PROMETHEUS_URL)
+    parser.add_argument(
+        "--readback-node",
+        default=os.environ.get("TECHSARA_WATCH_NODE") or DEFAULT_READBACK_NODE,
+        help=(
+            "the `node` label prometheus.yml attaches to the node-exporter that reads "
+            "this run's textfile; the readback is scoped to it so a foreign series of "
+            "the same metric name cannot satisfy it"
+        ),
+    )
     parser.add_argument("--scrape-interval-seconds", type=int, default=DEFAULT_SCRAPE_INTERVAL_SECONDS)
     parser.add_argument(
         "--readback-deadline-seconds", type=int, default=DEFAULT_READBACK_DEADLINE_SECONDS
@@ -912,11 +1043,21 @@ def main(argv: list[str] | None = None, runtime: Runtime | None = None) -> int:
         print("FATAL: the scrape interval must be positive and the deadline non-negative", file=sys.stderr)
         return EXIT_USAGE
 
+    if not args.readback_node.strip():
+        print("FATAL: --readback-node must name a node, or the readback is unscoped", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        readback_expr(args.readback_node.strip())
+    except ValueError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
     runtime = runtime or default_runtime(args)
     report = Report()
     step_summary = pathlib.Path(args.step_summary) if args.step_summary else None
     deploy_root = pathlib.Path(args.deploy_root)
     textfile_dir = pathlib.Path(args.textfile_dir)
+    expr = readback_expr(args.readback_node.strip())
 
     try:
         # ---------------------------------------------- FIRST PROBE, before any other
@@ -987,13 +1128,14 @@ def main(argv: list[str] | None = None, runtime: Runtime | None = None) -> int:
             channel = Channel(required=False, ok=False, detail="not consulted (the verdict is unavailable)")
         elif verdict in FAULT_VERDICTS:
             if args.dry_run:
-                channel = predict_channel(runtime, textfile_dir=textfile_dir)
+                channel = predict_channel(runtime, textfile_dir=textfile_dir, expr=expr)
             else:
                 channel = use_channel(
                     runtime,
                     verdict=verdict,
                     reasons=reasons,
                     textfile_dir=textfile_dir,
+                    expr=expr,
                     scrape_interval=args.scrape_interval_seconds,
                     deadline_seconds=args.readback_deadline_seconds,
                 )
@@ -1002,7 +1144,8 @@ def main(argv: list[str] | None = None, runtime: Runtime | None = None) -> int:
             # fault clears, and the run is green whatever the sink says.
             if args.dry_run:
                 channel = dataclasses.replace(
-                    predict_channel(runtime, textfile_dir=textfile_dir), required=False
+                    predict_channel(runtime, textfile_dir=textfile_dir, expr=expr),
+                    required=False,
                 )
             else:
                 channel = refresh_channel(

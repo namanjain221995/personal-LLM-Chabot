@@ -20,6 +20,7 @@ import io
 import os
 import pathlib
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -93,9 +94,9 @@ def scraped_timestamp(text: str) -> float:
     `readback` compares one against the other.
     """
     for line in text.splitlines():
-        if line.startswith(f"{pt.READBACK_EXPR} "):
+        if line.startswith(f"{pt.READBACK_METRIC} "):
             return float(line.split()[-1])
-    raise AssertionError(f"{pt.READBACK_EXPR} is not in the textfile at all")
+    raise AssertionError(f"{pt.READBACK_METRIC} is not in the textfile at all")
 
 
 def verdict_series(text: str) -> dict[str, str]:
@@ -134,6 +135,7 @@ def make_runtime(
     writer: Recorder | None = None,
     blocker: str = "",
     samples=None,
+    samples_for_expr=None,
     query_error: BaseException | None = None,
     clock: Clock | None = None,
 ) -> tuple[pt.Runtime, Clock, Recorder, dict]:
@@ -151,6 +153,12 @@ def make_runtime(
         seen["queried"].append(expr)
         if query_error is not None:
             raise query_error
+        if samples_for_expr is not None:
+            # A fake that reads the SELECTOR, for the tests about scoping: a
+            # Prometheus that answers the bare metric name and the scoped query
+            # differently is the whole distinction the scope exists to make, and
+            # a fake that ignores `expr` cannot express it.
+            return samples_for_expr(clock, expr)
         if samples is None:
             return [(clock(), clock())]
         if callable(samples):
@@ -170,6 +178,10 @@ def make_runtime(
 
 
 ARGS = ["--textfile-dir", "/nowhere/textfile_collector", "--readback-deadline-seconds", "0"]
+
+#: The scoped instant query a real run asks, for the tests that call `readback`
+#: directly rather than through `main()`.
+EXPR = pt.readback_expr(pt.DEFAULT_READBACK_NODE)
 
 
 def run(runtime, argv=None) -> tuple[int, str]:
@@ -706,11 +718,24 @@ class TheLockProbeMatchesTheDeployPath(unittest.TestCase):
                  "fd=os.open(sys.argv[1], os.O_RDWR|os.O_APPEND)\n"
                  "fcntl.flock(fd, fcntl.LOCK_EX)\n"
                  "sys.stdout.write('held\\n'); sys.stdout.flush()\n"
-                 "time.sleep(30)\n",
+                 "time.sleep(120)\n",
                  str(lock)],
                 stdout=subprocess.PIPE, text=True,
             )
             try:
+                # BOUNDED. This was a bare `readline()` on a real child process,
+                # the only untimed wait in this file: a child that never prints
+                # -- a Python that will not start, a runner under enough load to
+                # miss its own scheduling -- hung the step until the job's
+                # `timeout-minutes` and reported nothing. `select` puts a ceiling
+                # on it and says what happened. The child writes 'held\n' in one
+                # write, so one readable event carries the whole line.
+                ready, _, _ = select.select([holder.stdout], [], [], 30.0)
+                if not ready:
+                    self.fail(
+                        "the lock holder did not report within 30s; it never took the "
+                        "lock, so nothing about deploy_lock_state has been measured"
+                    )
                 self.assertEqual(holder.stdout.readline().strip(), "held")
                 self.assertEqual(pt.deploy_lock_state(lock), "held")
             finally:
@@ -829,8 +854,8 @@ class TheTextfileSaysExactlyOneThing(unittest.TestCase):
     def test_check_ok_never_branches_on_a_verdict_the_file_cannot_carry(self):
         # The dead branch was `0 if verdict == 'unavailable' else 1`. It is not
         # observable from a written file -- `main()` never renders that verdict
-        # -- so it is pinned here at the renderer, over EVERY verdict the script
-        # knows about, including the two it never writes.
+        # -- so it is pinned here at the renderer, over every verdict the file
+        # can carry.
         def check_ok(verdict: str) -> str:
             prefix = f"{pt.METRIC_PREFIX}_check_ok "
             lines = [
@@ -841,10 +866,55 @@ class TheTextfileSaysExactlyOneThing(unittest.TestCase):
             return lines[0][len(prefix):]
 
         self.assertEqual(
-            {verdict: check_ok(verdict) for verdict in sorted(pt.SEVERITY)},
-            {verdict: "1" for verdict in sorted(pt.SEVERITY)},
+            {verdict: check_ok(verdict) for verdict in sorted(pt.REPORTED_VERDICTS)},
+            {verdict: "1" for verdict in sorted(pt.REPORTED_VERDICTS)},
             "check_ok branched on a verdict, and the only reachable value is 1",
         )
+
+    def test_a_verdict_the_file_cannot_carry_is_REFUSED_not_rendered_blank(self):
+        # This test used to feed `unavailable` to the renderer and assert
+        # `check_ok 1`, i.e. it asserted the SHAPE of the file that input
+        # produces. Once the label set narrowed to REPORTED_VERDICTS that shape
+        # became a file with every verdict series at 0, `check_ok 1` and a fresh
+        # timestamp -- "a watch run got a reading" naming no reading, which would
+        # clear a live fault and advance the freshness window on a verdict the
+        # metric cannot express. Measured on the tip before the fix:
+        # render_textfile("unavailable"|"deferred"|"nonsense-typo", ...) each
+        # returned {'ok': '0', 'degraded': '0', 'wedged': '0', 'exposed': '0'}
+        # with check_ok 1. Asserting the shape blessed it; the renderer must
+        # refuse it instead.
+        #
+        # `main()` cannot reach this input -- that is what the reachability test
+        # above pins -- so this guard is for the NEXT caller, and it fails closed:
+        # a ValueError out of render_textfile reaches main()'s catch-all, which
+        # prints a scrubbed FATAL and returns EXIT_FAIL. Nothing is written,
+        # because the write happens after the render.
+        cannot_carry = sorted(set(pt.SEVERITY) - set(pt.REPORTED_VERDICTS))
+        self.assertEqual(
+            cannot_carry,
+            ["unavailable"],
+            "the set of verdicts main() can reach but the file cannot carry changed",
+        )
+        for verdict in cannot_carry + ["deferred", "nonsense-typo", ""]:
+            with self.subTest(verdict=verdict):
+                with self.assertRaises(ValueError) as caught:
+                    pt.render_textfile(verdict, 1.0, [])
+                self.assertIn("is not a verdict this metric can carry", str(caught.exception))
+
+    def test_the_renderer_refusing_is_a_red_run_that_wrote_nothing(self):
+        # The fail-closed claim above, driven through the real exit path rather
+        # than asserted about it: a renderer that refuses must not leave a
+        # half-written file behind or a green exit code.
+        writer = Recorder()
+        runtime, _, _, _ = make_runtime(probes=fake_probes(), writer=writer)
+        original = pt.render_textfile
+        try:
+            pt.render_textfile = lambda *a, **k: original("nonsense-typo", 1.0, [])
+            code, text = run(runtime)
+        finally:
+            pt.render_textfile = original
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertEqual(writer.calls, [], "a refused render must write nothing")
 
     def test_the_help_text_promises_only_values_the_file_can_carry(self):
         emitted = {
@@ -872,7 +942,7 @@ class TheTextfileSaysExactlyOneThing(unittest.TestCase):
         self.assertEqual(len(ones), 1)
         self.assertIn('verdict="exposed"', ones[0])
         self.assertIn(f"{pt.METRIC_PREFIX}_check_ok 1", text)
-        self.assertIn(f"{pt.READBACK_EXPR} 1700000000", text)
+        self.assertIn(f"{pt.READBACK_METRIC} 1700000000", text)
 
     def test_the_directory_is_never_created_by_the_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -979,26 +1049,208 @@ class TheReadbackAsksTwoQuestions(unittest.TestCase):
     def _channel(self, samples, *, deadline=0):
         clock = Clock()
         runtime, _, _, _ = make_runtime(samples=samples, clock=clock)
-        return pt.readback(runtime, written_at=clock(), scrape_interval=10, deadline_seconds=deadline)
+        return pt.readback(runtime, expr=EXPR, written_at=clock(), scrape_interval=10, deadline_seconds=deadline)
 
     def test_a_sample_at_the_freshness_boundary_is_accepted(self):
         clock = Clock()
         runtime, _, _, _ = make_runtime(samples=lambda c: [(c() - 20.0, c())], clock=clock)
-        channel = pt.readback(runtime, written_at=clock(), scrape_interval=10, deadline_seconds=0)
+        channel = pt.readback(runtime, expr=EXPR, written_at=clock(), scrape_interval=10, deadline_seconds=0)
         self.assertTrue(channel.ok, channel.detail)
 
     def test_a_sample_one_second_past_the_boundary_is_refused(self):
         clock = Clock()
         runtime, _, _, _ = make_runtime(samples=lambda c: [(c() - 21.0, c())], clock=clock)
-        channel = pt.readback(runtime, written_at=clock(), scrape_interval=10, deadline_seconds=0)
+        channel = pt.readback(runtime, expr=EXPR, written_at=clock(), scrape_interval=10, deadline_seconds=0)
         self.assertFalse(channel.ok)
 
     def test_it_keeps_asking_until_the_deadline_then_gives_up(self):
         clock = Clock()
         runtime, _, _, seen = make_runtime(samples=[], clock=clock)
-        channel = pt.readback(runtime, written_at=clock(), scrape_interval=10, deadline_seconds=20)
+        channel = pt.readback(runtime, expr=EXPR, written_at=clock(), scrape_interval=10, deadline_seconds=20)
         self.assertFalse(channel.ok)
         self.assertGreaterEqual(len(seen["slept"]), 1, "it must retry, not ask once")
+
+
+class TheReadbackIdentifiesThisRunsOwnWriter(unittest.TestCase):
+    """A series of the right NAME is not the same thing as this run's series.
+
+    The readback is the only reason a fault verdict is allowed to be green, and
+    it used to ask for the bare metric name and then take `max(samples, key=
+    value)` over everything that came back. Measured 2026-09-28 by driving
+    `main()` with a live engine exposure, this run's own file written but NEVER
+    scraped, and ONE foreign series of the same name whose value was an hour
+    ahead: `channel written and read back from Prometheus, sample 0s old /
+    result GREEN`, exit 0, and the note "the verdict reached a sink that reads
+    it" -- while it had reached nobody. `value >= written_at` separates this
+    writer's older file from its newer one and nothing else.
+    """
+
+    PROMETHEUS = pathlib.Path(__file__).resolve().parents[4] / "monitoring" / "prometheus" / "prometheus.yml"
+
+    def _node_job(self) -> dict:
+        import yaml
+
+        if not self.PROMETHEUS.is_file():
+            self.fail(f"{self.PROMETHEUS} is missing: the readback's scope cannot be checked")
+        doc = yaml.safe_load(self.PROMETHEUS.read_text(encoding="utf-8"))
+        for config in doc.get("scrape_configs") or []:
+            if config.get("job_name") == pt.READBACK_JOB:
+                return config
+        self.fail(f"prometheus.yml has no scrape job named {pt.READBACK_JOB!r}")
+
+    def test_the_readback_node_matches_the_prometheus_target(self):
+        # The one hardcoded label in the query, pinned against the file that
+        # actually attaches it. Renaming the node in prometheus.yml without
+        # touching the script would leave the readback scoped to a node that no
+        # longer exists -- which fails closed, but as an unexplained red run.
+        heads = [
+            static["labels"]["node"]
+            for static in self._node_job().get("static_configs") or []
+            if (static.get("labels") or {}).get("role") == "head"
+        ]
+        self.assertEqual(
+            heads,
+            [pt.DEFAULT_READBACK_NODE],
+            "the head's node-exporter target is labelled differently from the node the "
+            "readback scopes to, and the watch runs on the head",
+        )
+
+    def test_the_scrape_interval_default_matches_the_node_job(self):
+        # The freshness window is two scrape intervals, and the script's default
+        # cites this job. A scrape_interval change here silently widens or
+        # narrows the window the readback allows.
+        self.assertEqual(
+            self._node_job().get("scrape_interval"),
+            f"{pt.DEFAULT_SCRAPE_INTERVAL_SECONDS}s",
+        )
+
+    def test_the_query_names_the_job_and_the_node(self):
+        writer = Recorder()
+        runtime, _, writer, seen = make_runtime(
+            probes=fake_probes(probe_engine_exposure={"ok": False}),
+            writer=writer,
+            samples=perfect_prometheus(writer),
+        )
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_OK, text)
+        self.assertTrue(seen["queried"], "the fault path must read the verdict back")
+        for expr in seen["queried"]:
+            self.assertIn(f'job="{pt.READBACK_JOB}"', expr)
+            self.assertIn(f'node="{pt.DEFAULT_READBACK_NODE}"', expr)
+            self.assertTrue(expr.startswith(pt.READBACK_METRIC + "{"), expr)
+        # And the file itself stays BARE: `job`, `instance` and `node` are the
+        # scrape's to attach, so a label written into the textfile would either
+        # collide with them or invent an identity the scrape does not agree with.
+        written = writer.calls[-1][1]
+        self.assertIn(f"{pt.READBACK_METRIC} ", written)
+        self.assertNotIn(f"{pt.READBACK_METRIC}{{", written)
+
+    def test_a_foreign_series_of_the_same_name_cannot_make_a_fault_green(self):
+        # The measured defect, as a test, against a fake Prometheus that behaves
+        # like the real one: the BARE metric name matches a series this box never
+        # wrote, and the SCOPED selector matches nothing, because this run's own
+        # file has not been scraped. Unscoped this is GREEN with the note "the
+        # verdict reached a sink that reads it"; scoped it is the metric ABSENT,
+        # and red.
+        writer = Recorder()
+        clock = Clock()
+
+        def prometheus(clk, expr):
+            if expr == pt.READBACK_METRIC:
+                # Another producer of the same name, an hour in the future.
+                return [(clk(), clk() + 3600.0)]
+            return []
+
+        runtime, _, writer, _ = make_runtime(
+            probes=fake_probes(
+                probe_engine_exposure={"ok": False, "detail": "a non-cluster address ACCEPTED"}
+            ),
+            writer=writer,
+            samples_for_expr=prometheus,
+            clock=clock,
+        )
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertRegex(text, r"verdict\s+exposed")
+        self.assertIn("ABSENT", text)
+        self.assertNotIn("the verdict reached a sink that reads it", text)
+        self.assertIn("the verdict reached nobody", text)
+        # The write still happened: a fault is written and then proven, in that
+        # order, so a failed readback never means a missing file.
+        self.assertEqual(len(writer.calls), 1, text)
+
+    def test_a_node_that_names_nothing_fails_closed(self):
+        # The one hardcoded label is a liability only if getting it wrong is
+        # silent. A --readback-node nothing matches must be red, not green.
+        writer = Recorder()
+        clock = Clock()
+
+        def prometheus(clk, expr):
+            if expr == pt.readback_expr(pt.DEFAULT_READBACK_NODE):
+                return [(clk(), scraped_timestamp(writer.calls[-1][1]))]
+            return []
+
+        runtime, _, writer, _ = make_runtime(
+            probes=fake_probes(probe_engine_exposure={"ok": False}),
+            writer=writer,
+            samples_for_expr=prometheus,
+            clock=clock,
+        )
+        code, text = run(runtime, ARGS + ["--readback-node", "spark-does-not-exist"])
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertIn("--readback-node", text)
+
+    def test_a_foreign_series_inside_the_scope_is_refused_not_argmaxed(self):
+        # If two series ever match the scoped query, the old `max(samples,
+        # key=value)` would pick the one FURTHEST IN THE FUTURE -- i.e. prefer
+        # the foreign one. Two samples means the scope stopped identifying this
+        # run, and that is a channel failure.
+        writer = Recorder()
+        clock = Clock()
+        runtime, _, writer, _ = make_runtime(
+            probes=fake_probes(probe_engine_exposure={"ok": False}),
+            writer=writer,
+            samples=lambda c: [
+                (c(), scraped_timestamp(writer.calls[-1][1])),
+                (c(), c() + 3600.0),
+            ] if writer.calls else [],
+            clock=clock,
+        )
+        code, text = run(runtime)
+        self.assertEqual(code, pt.EXIT_FAIL, text)
+        self.assertIn("matched 2 series, not one", text)
+        self.assertNotIn("the verdict reached a sink that reads it", text)
+
+    def test_readback_node_must_not_be_empty(self):
+        # An empty label would scope to nothing at all and silently reproduce the
+        # bare query, so it is a usage error rather than a default.
+        runtime, _, _, _ = make_runtime(probes=fake_probes())
+        code, text = run(runtime, ARGS + ["--readback-node", "   "])
+        self.assertEqual(code, pt.EXIT_USAGE, text)
+        self.assertIn("unscoped", text)
+
+    def test_a_node_label_that_could_close_the_selector_is_refused(self):
+        # The one value this script interpolates into a query string. Refused,
+        # not escaped: a value that can close the string could WIDEN the scope
+        # this query exists to narrow, and the widened query would still parse.
+        for bad in ('spark-1", node=~".*', 'spark-1"}', "spark 1", "{spark}", "-spark", "spark\\1"):
+            with self.subTest(node=bad):
+                with self.assertRaises(ValueError):
+                    pt.readback_expr(bad)
+                runtime, _, writer, _ = make_runtime(probes=fake_probes())
+                code, text = run(runtime, ARGS + ["--readback-node", bad])
+                self.assertEqual(code, pt.EXIT_USAGE, text)
+                self.assertEqual(writer.calls, [])
+        for good in ("spark-1", "spark-2", "spark_1", "node.1", "host:9100"):
+            with self.subTest(node=good):
+                self.assertIn(f'node="{good}"', pt.readback_expr(good))
+
+    def test_the_dry_run_asks_the_scoped_query_too(self):
+        runtime, _, writer, seen = make_runtime(probes=fake_probes(probe_engine_exposure={"ok": False}))
+        code, text = run(runtime, ARGS + ["--dry-run"])
+        self.assertEqual(writer.calls, [], "--dry-run writes nothing")
+        self.assertTrue(seen["queried"], text)
+        self.assertIn(f'node="{pt.DEFAULT_READBACK_NODE}"', seen["queried"][-1])
 
 
 class ClassificationPicksTheWorst(unittest.TestCase):
@@ -1038,6 +1290,21 @@ class TheWorkflowFileMatchesTheseRules(unittest.TestCase):
         if not self.WORKFLOW.is_file():
             self.fail(f"{self.WORKFLOW.name} is missing")
         self.text = self.WORKFLOW.read_text(encoding="utf-8")
+        #: The same text with every run of whitespace collapsed to one space.
+        #: Assertions about PROSE use this, because a sentence in a comment block
+        #: wraps wherever the column runs out and `"a b c" in text` is then False
+        #: for reasons that have nothing to do with the sentence being there. The
+        #: guard in TheDocsDoNotCiteAControlThisRepositoryLacks passed either way
+        #: for exactly that reason. Assertions about a COMMAND or a flag stay on
+        #: `self.text`, where a line break would be a real defect.
+        #:
+        #: The leading `#` of each comment line goes too. Almost every sentence
+        #: in this file lives in a comment block, so collapsing alone would turn
+        #: `(env:\n#      Environment)` into `(env: # Environment)` and the
+        #: needle would still not match.
+        self.collapsed = " ".join(
+            " ".join(re.sub(r"^\s*#\s?", "", line) for line in self.text.splitlines()).split()
+        )
 
     def test_commit_one_carries_no_schedule_trigger(self):
         # The no-alert-mail promise at merge time. A cron arrives in its own
@@ -1046,7 +1313,23 @@ class TheWorkflowFileMatchesTheseRules(unittest.TestCase):
 
         doc = yaml.safe_load(self.text)
         triggers = doc.get("on", doc.get(True))
-        self.assertNotIn("schedule", triggers, "a cron here would mail on every red tick")
+        # The failure message is the handover. Whoever adds the cron will see
+        # THIS test go red first and will delete it -- so it is the last place
+        # that can tell them what has to land in the same commit, because the
+        # blocker list itself is only prose once this assertion is gone.
+        self.assertNotIn(
+            "schedule",
+            triggers,
+            "a cron here would mail on every red tick. Three things must land with it, "
+            "and they are spelled out under 'SHIPPED IN TWO COMMITS' in "
+            "production-watch.yml: (1) box_probes.py exposing all four probes WITH a "
+            "signature call_probe can satisfy, (2) the node-exporter textfile directory "
+            "AND the exporter recreate -- both owner actions, and doing only the first "
+            "is worse than doing neither, and (3) an absent()-and-staleness alert rule "
+            "for this metric plus its metrics-contract.json entry, without which a "
+            "clean run whose write never lands is green with no reader at all. Do not "
+            "delete this test without them.",
+        )
 
     def test_the_watch_never_shares_the_release_paths_concurrency_group(self):
         # Asserted on the PARSED groups, not on the raw text: the header
@@ -1070,16 +1353,15 @@ class TheWorkflowFileMatchesTheseRules(unittest.TestCase):
         self.assertEqual(job["permissions"], {"contents": "read"})
 
     def test_the_file_does_not_claim_the_release_gate_can_be_retired(self):
-        lowered = self.text.lower()
-        self.assertIn("does not retire", lowered)
+        self.assertIn("does not retire", self.collapsed.lower())
 
     def test_the_step_comment_does_not_call_the_job_purely_read_only(self):
         # The script writes the node-exporter textfile on every observed run,
         # `ok` included. The step comment used to open "READ-ONLY, and it yields
         # to a release" with no caveat, three lines from the text the previous
         # commit corrected, in a PUBLIC file. Match the module docstring.
-        self.assertIn("READ-ONLY apart from ONE write", self.text)
-        self.assertNotIn("READ-ONLY, and it yields to a release", self.text)
+        self.assertIn("READ-ONLY apart from ONE write", self.collapsed)
+        self.assertNotIn("READ-ONLY, and it yields to a release", self.collapsed)
 
     def test_the_cron_gate_lists_all_three_blockers(self):
         # A cron makes a red run mail, so the things that must be true before
@@ -1089,10 +1371,66 @@ class TheWorkflowFileMatchesTheseRules(unittest.TestCase):
         # which owns alerting" -- the whole justification for being green over a
         # real fault -- is unbacked at the alert layer.
         self.assertIn("box_probes.py", self.text)
-        self.assertIn("WRITABLE BY THE RUNNER", self.text)
+        self.assertIn("WRITABLE BY THE RUNNER", self.collapsed)
         self.assertIn("monitoring/prometheus/rules/", self.text)
         self.assertIn("metrics-contract.json", self.text)
         self.assertIn("absent()", self.text)
+
+    def test_blocker_one_names_the_signature_gap_and_not_only_the_names(self):
+        # The reconciliation is TWO pieces of work and the list used to name one.
+        # All seven probes box_probes.py exposes take a required `env:
+        # Environment`, and call_probe's context offers deploy_root and timeout,
+        # so adding the three missing names leaves every probe uncallable --
+        # including probe_engine_exposure, the name that already matches.
+        # Measured 2026-09-28 against the real module with all four names
+        # present: "requires a parameter this watch cannot supply: 'env'".
+        # A reader who plans only the rename plans the wrong work.
+        for probe in pt.REQUIRED_PROBES:
+            self.assertIn(probe, self.text, f"blocker 1 must name {probe}")
+        self.assertIn("env: Environment", self.collapsed)
+        self.assertIn("call_probe", self.text)
+        for offered in ("deploy_root", "timeout"):
+            self.assertIn(offered, self.text, "blocker 1 must say what the context offers")
+
+    def test_blocker_two_names_both_owner_actions_with_their_commands(self):
+        # Doing only the directory is WORSE than doing neither: the write lands
+        # and nothing reads it, which is the display this whole design refuses.
+        # So both halves are named, each with the command that does it, and the
+        # file says out loud that neither is CI's to run.
+        self.assertIn("sudo install -d -o root -g techsphere -m 2775", self.text)
+        self.assertIn(
+            "--collector.textfile.directory=/host/var/lib/node_exporter/textfile_collector",
+            self.text,
+        )
+        self.assertIn("compose/compose.monitoring.yaml", self.text)
+        self.assertIn("scripts/monitoring.sh up", self.collapsed)
+        self.assertIn("worse than", self.collapsed.lower())
+
+    def test_a_dispatch_on_another_ref_explains_its_own_silence(self):
+        # `schedule:` is not here yet, so every run today is a dispatch, and a
+        # dispatch from a non-main ref satisfies nothing: no step runs, no step
+        # summary is written, and GitHub shows one `skipped` job with no reason.
+        # That is the repository's own documented failure class. The reason
+        # cannot be printed from inside the job and P4 forbids moving the guard
+        # into a step, so it lives in the one string the UI shows beside the
+        # skip: the job's name.
+        import yaml
+
+        job = yaml.safe_load(self.text)["jobs"]["production-truth"]
+        self.assertIn("main only", job["name"])
+        self.assertIn("SKIPPED", job["name"])
+        self.assertEqual(job["name"], job["name"].encode("ascii", "replace").decode())
+        self.assertIn("workflow_dispatch", self.text)
+        self.assertIn("skipped", self.collapsed.lower())
+        self.assertIn("no reason", self.collapsed.lower())
+
+    def test_the_file_says_the_readback_is_scoped(self):
+        # The readback is the only reason a fault verdict may be green, and it is
+        # green only for THIS run's own series. A reader of this file who thinks
+        # the query is the bare metric name will not understand why a wrong
+        # --readback-node goes red.
+        self.assertIn('{job="node"', self.text)
+        self.assertIn("--readback-node", self.text)
 
 
 class TheDocsDoNotCiteAControlThisRepositoryLacks(unittest.TestCase):
