@@ -692,17 +692,38 @@ def _outline_schema(max_sections: int) -> dict:
 
 
 async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Optional[LengthTarget] = None,
-                  max_tokens: int = 2500) -> dict:
-    messages = _material_messages(req, budget=budget, target=target)
+                  max_tokens: int = 2500, requested: Sequence[str] = ()) -> dict:
+    """The plan. `requested` is NOT optional in practice: it is what tells
+    this call how many sections the person asked for, and the plan it
+    returns is what `compose_sectioned` then writes one call at a time.
+
+    Measured in sf-local-ai-orchestrator-1 on the owner's request
+    ("a detailed technical report" + 15 numbered sections, Fast, target
+    3,000 words, explicit): without it `caps_for` returned (8, 12) where
+    with it it returns (17, 12), so the outline was told "Limits: at most 8
+    top-level sections" AND "Plan 8 sections (at most 8)" for a request
+    that named fifteen — and the fifteen names (`_requested_line`, which
+    carries "none skipped, none merged, none renamed") never reached this
+    call at all. The model obeyed the eight, and the document came back
+    with 8 of the 15 sections."""
+    messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
         "\n\nFIRST, plan only: return the outline — title, audience, purpose, "
         "the sections in order with what each is for and which elements it "
         "uses, whether the request needs current external facts you were not "
         "given, and the assumptions you will make."
     )
-    sections, _slides = caps_for(budget, target)
+    sections, _slides = caps_for(budget, target, requested)
     if target is not None and target.words:
-        want = _length.sections_for(target.words)
+        # THE REAL NUMBER, NOT THE ARITHMETIC. `sections_for` divides the
+        # word target by WORDS_PER_SECTION, which on the owner's 3,000-word
+        # request is 8 — a number he never said, for a request that numbered
+        # fifteen sections. When the request names its sections, the count it
+        # names is the plan; `caps_for` already guarantees it fits (it never
+        # falls below len(requested) + 2), and `section_words` then divides
+        # the words across the sections that were actually asked for
+        # (3,000 / 15 = 200, against the 375 the eight-section plan used).
+        want = min(max(_length.sections_for(target.words), len(requested)), sections)
         messages[0]["content"] += (
             f"\n\nPlan {want} sections (at most {sections}), each worth about "
             f"{_length.section_words(target.words, want):,} words, so the whole file comes to about "
@@ -1233,13 +1254,20 @@ async def _write_one_section(
     words: int,
     position: Tuple[int, int],
     current: Optional[Sequence[Any]] = None,
+    requested: Sequence[str] = (),
 ) -> List[dict]:
     """One scoped call: the blocks of ONE section. Thinking off at every
     effort. `current` makes it an extension of a section already written
-    rather than a first draft of it."""
+    rather than a first draft of it.
+
+    `requested` goes to `_material_messages` for the same reason `outline`
+    needs it: without it the shared limits line read "Limits: at most 8
+    top-level sections" on the owner's fifteen-section request (measured in
+    sf-local-ai-orchestrator-1 today), which is `caps_for`'s Fast floor
+    quoted into a prompt whose whole job is to write ONE section."""
     index, total = position
     heading = str(item.get("heading") or "").strip()
-    messages = _material_messages(req, budget=budget, target=target)
+    messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
         "\n\nYOU ARE WRITING ONE SECTION of this file, not the whole file. Return JSON with `blocks` only: that "
         "section's own blocks, the first of them its heading (type heading, level 1, the heading you are given). "
@@ -1252,8 +1280,14 @@ async def _write_one_section(
         # back with fifteen headings and not one sub-heading (measured,
         # Think, file route: 0 of 15). The vocabulary sentence is the same
         # one the whole-document prompt carries, said once per section
-        # instead of once per document — the fifteen section NAMES are
-        # deliberately not repeated here, because this call writes one.
+        # instead of once per document.
+        #
+        # The section names DO travel now, in the user message that
+        # `_material_messages` builds from `requested` — they are the
+        # document's contract and this call has to know which of the
+        # fifteen is its own. They are not repeated again in this block:
+        # what follows says, twice and last, that this call writes one
+        # section, and `_as_section` is the code that holds it to that.
         " Break the section into its parts and head each part at LEVEL 2 under your level-1 heading — two or "
         "three of them, unless the section really is one single idea. Use the "
         "block the request's own words ask for: a bullets block for an enumeration, a numbered block for a "
@@ -1294,6 +1328,189 @@ async def _write_one_section(
     return _as_section(heading, blocks)
 
 
+# ------------------------------------ the coverage repair, section by section --
+
+
+def _section_runs(blocks: Sequence[Any]) -> List[List[Any]]:
+    """A document's blocks split into one run per level-1 heading, with
+    anything before the first heading kept as the opening run. The block
+    objects are carried over, never copied or rebuilt."""
+    runs: List[List[Any]] = []
+    for b in blocks:
+        if not runs or (isinstance(b, S.Heading) and int(b.level) == 1):
+            runs.append([b])
+        else:
+            runs[-1].append(b)
+    return runs
+
+
+def _run_head(run: Sequence[Any]) -> Optional[Any]:
+    return next((b for b in run if isinstance(b, S.Heading) and int(b.level) == 1), None)
+
+
+def _place_sections(blocks: Sequence[Any], requested: Sequence[str],
+                    new: Dict[int, List[Any]]) -> List[Any]:
+    """`blocks` with each newly written section put where the request asked
+    for it: straight after the last requested section that IS present, or
+    before the first headed section when none of the earlier ones are.
+
+    EVERY EXISTING BLOCK IS CARRIED OVER AS THE SAME OBJECT, in its original
+    relative order. That is the whole point of this function: a coverage
+    repair may add, never rewrite. `new` maps a requested index to that
+    section's validated blocks.
+    """
+    runs = _section_runs(list(blocks))
+    covers: Dict[int, int] = {}                       # requested index -> run index
+    for ri, run in enumerate(runs):
+        head = _run_head(run)
+        if head is None:
+            continue
+        hw = _content_words(head.text)
+        for qi, phrase in enumerate(requested):
+            words = _content_words(phrase)
+            # 0.6 is `_missing_sections`' own overlap rule (CONTRACT-2 §11),
+            # read the same way here so "present" means one thing.
+            if qi not in covers and words and len(words & hw) / len(words) >= 0.6:
+                covers[qi] = ri
+                break
+    after: Dict[int, List[List[Any]]] = {}
+    front: List[List[Any]] = []
+    for qi in sorted(new):
+        prev = max((covers[j] for j in covers if j < qi), default=-1)
+        (after.setdefault(prev, []) if prev >= 0 else front).append(new[qi])
+    headed = [ri for ri, run in enumerate(runs) if _run_head(run) is not None]
+    first_headed = headed[0] if headed else len(runs)
+    out: List[Any] = []
+    for ri, run in enumerate(runs):
+        if ri == first_headed:
+            for r in front:
+                out.extend(r)
+        out.extend(run)
+        for r in after.get(ri, ()):
+            out.extend(r)
+    if first_headed >= len(runs):
+        for r in front:
+            out.extend(r)
+    return out
+
+
+def _section_blocks_for_spec(req: ComposeRequest, body: S.DocumentSpec,
+                             blocks: Sequence[Any]) -> Optional[List[Any]]:
+    """One section's raw blocks as validated block models, ready to splice
+    into `body`, or None when they do not validate.
+
+    The citations go through `_reconcile_sources` like every other model
+    answer — a section may not invent a reference either — and a source it
+    legitimately cites is added to the document's own manifest so
+    `_check_source_refs` still holds for the spliced document.
+    """
+    raw_blocks = [b for b in blocks if isinstance(b, dict)]
+    if not raw_blocks:
+        return None
+    # `title: ""` on purpose. `_tidy_document`'s title-repeat drop is for the
+    # FIRST heading of a WHOLE document (the renderer prints the title);
+    # this is one section from the middle of one, and its heading is the
+    # requested name that `_as_section` just pinned. The numeric-column
+    # inference is what this call is for.
+    _tidy_document({"title": "", "blocks": raw_blocks}, req)
+    mini: Dict[str, Any] = {"title": body.title, "template_id": body.template_id,
+                            "blocks": raw_blocks, "sources": []}
+    _reconcile_sources(mini, req.material, None)
+    try:
+        parsed = S.DocumentSpec.model_validate(mini)
+    except ValidationError as exc:
+        log.info("artifact compose: a repaired section did not validate: %s",
+                 S.validation_summary(exc).replace("\n", " | ")[:300])
+        return None
+    known = {c.id for c in body.sources}
+    for c in parsed.sources:
+        if c.id not in known:
+            body.sources.append(c)
+            known.add(c.id)
+    return list(parsed.blocks)
+
+
+async def _write_missing_sections(
+    req: ComposeRequest, budget: T.EffortBudget, target: LengthTarget, spec: S.ArtifactSpec,
+    outline_json: Optional[dict], missing: Sequence[str], requested: Sequence[str],
+    *, say: Progress, deadline: float,
+) -> Tuple[int, List[str]]:
+    """The requested sections a SECTIONED draft does not cover, written ONE
+    CALL EACH and spliced in where the request asked for them. Mutates
+    `spec`; returns (model calls, warnings).
+
+    WHY THIS IS NOT ONE WHOLE-DOCUMENT CORRECTION. The correction it
+    replaces is `_compose_once`, and for `operation == "create"` that call
+    carries the material, the outline and the sentence "keep everything
+    else" — but NOT the draft: the current-content block is added only for
+    an edit (`req.operation == "edit" and req.parent_spec is not None`). So
+    the model was asked to keep content it could not see, in one call, at
+    `_max_tokens_for`'s ceiling.
+
+    Measured in sf-local-ai-orchestrator-1 today, on the owner's request
+    (3,000 words, 15 named sections, Fast) with an 8-section 1,621-word
+    sectioned draft behind it: the repair call's ceiling was 12,000 tokens
+    where the 3,000-word target alone costs about 9,000 tokens of JSON, the
+    draft was absent from its prompt, and `_worse()` then refused what came
+    back — "a correction dropped most of the content and was not applied".
+    Thirteen model calls, and not one section added.
+
+    One call per missing section costs the same order and cannot lose the
+    draft: the blocks already in `spec` are never regenerated, they are
+    carried over as the same objects by `_place_sections`.
+    """
+    body = spec.body
+    if not isinstance(body, S.DocumentSpec):
+        return 0, []
+    plan = outline_json if isinstance(outline_json, dict) else {}
+    planned = {str(s.get("heading") or "").strip().casefold(): s
+               for s in (plan.get("sections") or []) if isinstance(s, dict)}
+    # The same per-section word share the sectioned writer used, taken over
+    # the sections the REQUEST named rather than the ones the plan managed.
+    words = (_length.section_words(target.words, max(1, len(requested)))
+             if target.words else _length.WORDS_PER_SECTION)
+    index = {phrase: i for i, phrase in enumerate(requested)}
+    written = [b.text for b in body.blocks if isinstance(b, S.Heading) and int(b.level) == 1]
+    new: Dict[int, List[Any]] = {}
+    calls = 0
+    warnings: List[str] = []
+    total = len(requested) or len(missing)
+    for n, phrase in enumerate(missing):
+        if time.monotonic() + SECTION_RESERVE_S >= deadline:
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the time this job is allowed ran out")
+            break
+        await say(62.0 + 3.0 * n / max(1, len(missing)), f"writing the section \u201c{phrase}\u201d")
+        item = dict(planned.get(phrase.strip().casefold()) or {}, heading=phrase)
+        item.setdefault("purpose", "")
+        item.setdefault("elements", [])
+        try:
+            async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
+                blocks = await _write_one_section(
+                    req, budget, target, plan, item, written=written, words=words,
+                    position=(index.get(phrase, n) + 1, total), requested=requested,
+                )
+            calls += 1
+        except TimeoutError:
+            calls += 1
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the time this job is allowed ran out")
+            break
+        except ComposeError as exc:
+            calls += 1
+            log.info("artifact compose: the missing section %r could not be written: %s", phrase[:60], exc)
+            continue
+        placed = _section_blocks_for_spec(req, body, blocks)
+        if placed is None:
+            warnings.append(f"the section \u201c{phrase}\u201d could not be added to the document")
+            continue
+        new[index.get(phrase, len(requested) + n)] = placed
+        written.append(phrase)
+    if new:
+        body.blocks = _place_sections(body.blocks, requested, new)
+    return calls, warnings
+
+
 async def compose_sectioned(
     req: ComposeRequest,
     budget: T.EffortBudget,
@@ -1310,7 +1527,7 @@ async def compose_sectioned(
     paced = 0.0
 
     await say(10.0, "planning the sections")
-    plan = await outline(req, budget, target=target, max_tokens=4_000)
+    plan = await outline(req, budget, target=target, max_tokens=4_000, requested=requested)
     calls += 1
     cap, _slides = caps_for(budget, target, requested)
     items = _outline_items(plan, cap)
@@ -1339,7 +1556,7 @@ async def compose_sectioned(
             async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                 blocks = await _write_one_section(
                     req, budget, target, plan, item, written=headings, words=per_section,
-                    position=(i + 1, len(items)),
+                    position=(i + 1, len(items)), requested=requested,
                 )
             calls += 1
         except TimeoutError:
@@ -1375,7 +1592,7 @@ async def compose_sectioned(
                 async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                     grown = await _write_one_section(
                         req, budget, target, plan, items[i], written=headings, words=per_section,
-                        position=(i + 1, len(items)), current=sections[i],
+                        position=(i + 1, len(items)), current=sections[i], requested=requested,
                     )
                 calls += 1
             except (TimeoutError, ComposeError) as exc:
@@ -1413,6 +1630,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     result_warnings: List[str] = []
     calls = 0
     corrections = 0
+    # The compose stage's wall-clock, started here because compose() IS the
+    # compose stage. The coverage repair below spends one model call per
+    # missing section and has to leave the stage time to validate and answer,
+    # exactly as compose_sectioned does inside its own share of it.
+    job_deadline = time.monotonic() + max(0.0, _stage_budget_s())
 
     async def say(pct: Optional[float], detail: str) -> None:
         if progress is not None:
@@ -1457,7 +1679,7 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         if budget.outline_pass and req.operation != "edit":
             await say(10.0, "outlining")
             try:
-                outline_json = await outline(req, budget, target=target)
+                outline_json = await outline(req, budget, target=target, requested=requested)
                 calls += 1
             except ComposeError:
                 outline_json = None  # a missing outline is a smaller loss than a missing document
@@ -1569,7 +1791,23 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # request itself), then a warning if the model still cannot.
     # Skipped for edits (AS3): an edit's words name changes, not chapters.
     missing = _missing_sections(spec, requested)
-    if missing:
+    if missing and sectioned:
+        # A SECTIONED DRAFT IS REPAIRED SECTION BY SECTION, not by one
+        # whole-document call. `correct()` below is `_compose_once`, which on
+        # a create does not carry the draft at all — see
+        # `_write_missing_sections` for what that measured out as today. A
+        # writer that already ran out of time is not asked for more, which
+        # is the rule the short-draft pass below follows too.
+        if not ran_out_of_time:
+            repair_calls, repair_notes = await _write_missing_sections(
+                req, budget, target, spec, outline_json, missing, requested,
+                say=say, deadline=job_deadline)
+            calls += repair_calls
+            if repair_calls:
+                corrections += 1
+            result_warnings.extend(n for n in repair_notes if n not in result_warnings)
+            missing = _missing_sections(spec, requested)
+    elif missing:
         await correct(
             62.0, "adding the requested sections",
             f"The request asked for these sections, which your draft does not have: {', '.join(missing)}. "
