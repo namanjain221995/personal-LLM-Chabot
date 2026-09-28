@@ -63,7 +63,15 @@ _KIND_RULES: Tuple[Tuple[str, str, str], ...] = (
     # (kind, rule name, pattern)
     ("presentation", "deck words", r"\b(presentation|slides?|slide ?deck|deck|pitch ?deck|powerpoint|power ?point|pptx?|keynote)\b"),
     ("workbook", "spreadsheet words", r"\b(spread ?sheet|work ?book|excel|xlsx?|tracker|budget|calculator|financial model|pivot|dashboard sheet|data extract|csv|data ?set|data file|sample data|sample records|table file|synthetic data|dummy data|test data|mock data)\b"),
-    ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|one[- ]page|proposal|policy|letter|handout|summary|write[- ]?up|whitepaper|white paper|guide|manual|plan|pdf|docx|word)\b"),
+    # `word` CARRIES A LOOKAHEAD and `plan` a lookbehind, because neither word
+    # names a document when something else qualifies it (2026-09-28). "make a
+    # word cloud of the ticket descriptions" read as "document words" — the
+    # `word` inside "word cloud" — and shipped a .docx for a picture, which is
+    # the 2026-09-16 map-answered-with-a-Word-file incident on a new visual.
+    # "floor plan" and "seating plan" are drawings, not documents, and lost
+    # their honest refusal the same way. A project plan, a test plan and a
+    # rollout plan are untouched.
+    ("document", "document words", r"\b(document|report|sop|standard operating procedure|memo|brief|one[- ]pager|one[- ]page|proposal|policy|letter|handout|summary|write[- ]?up|whitepaper|white paper|guide|manual|(?<!floor )(?<!seating )(?<!site )plan|pdf|docx|word(?!\s*clouds?\b))\b"),
     # Counted rows, LAST: after the document rule, so "write a report on the
     # 250 rows we logged" is still a report, and "generate 250 realistic
     # sample rows of support tickets" — which names no other kind — is the

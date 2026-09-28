@@ -38,6 +38,8 @@ rules synchronously on the event loop for every small-talk candidate.
 from __future__ import annotations
 
 import re
+
+from . import pictures as PIC
 import unicodedata
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Pattern, Sequence, Tuple
@@ -114,6 +116,13 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _script_word(r"बार\s+चार्ट|બાર\s+ચાર્ટ", "bar chart"),
     _script_word(r"पाई\s+चार्ट|પાઇ\s+ચાર્ટ", "pie chart"),
     _script_word(r"चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ", "chart"),
+    # The chart TYPE said in script. Without these, "દર મહિનાના વેચાણનો લાઇન
+    # ગ્રાફ" normalised to "…વેચાણનો લાઇન chart" — the possessive and the picture
+    # word were readable and the type between them was not, so the whole
+    # request read as no request (measured 2026-09-28).
+    _script_word(r"लाइन|लाईन|લાઇન|લાઈન", "line"),
+    _script_word(r"बार|બાર", "bar"),
+    _script_word(r"पाई|પાઇ|પાઈ", "pie"),
     _script_word(r"फ़ाइल|फाइल|फ़ाईल|फाईल|ફાઇલ|ફાઈલ", "file"),
     _script_word(r"रिपोर्ट|રિપોર્ટ", "report"),
     _script_word(r"जवाब|उत्तर|જવાબ", "answer"),
@@ -246,6 +255,22 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"chnage|chng|chang|chage|cahnge|chnge", "change"),
     _word(r"tittle|titel|tilte|titile", "title"),
     _word(r"colum|coloumn|collumn|colmn|coulmn|colunm", "column"),
+    # THE PICTURE WORDS, MISTYPED. Three of the product's own 77 authored chart
+    # requests are typo rows that reached no chart at all, purely on the
+    # spelling: "pie chrat of staus", "bar grpah of revnue per regoin",
+    # "histogarm of hours" (measured 2026-09-28). Every string here is a
+    # transposition that is not a word in English, Hindi, Gujarati or Hinglish.
+    #
+    # `chat` IS DELIBERATELY ABSENT, and that is why "bar chat of status counts"
+    # still reaches no chart. This product's own name for its main surface is
+    # "chat": rewriting it to "chart" would read "what did I ask in the chat?"
+    # as a plotting request. A miss is better than that.
+    _word(r"chrat|chatr|cahrt|charrt|chartt|chrt", "chart"),
+    _word(r"grpah|grahp|grph|garph|graf", "graph"),
+    _word(r"histogarm|histogrm|histrogram|hisogram", "histogram"),
+    _word(r"scater|scattter|sactter", "scatter"),
+    _word(r"diagrm|diagam|digram|diagramm|daigram", "diagram"),
+    _word(r"flowchrt|flwochart", "flowchart"),
     (re.compile(_w(r"ad") + r"(?=\s+(?:a|an|the|new|one|column|row|section|slide|chart|table|page|footer|header|total)\b)"), " add "),
     _word(r"hedings|headngs|headins|heddings", "headings"),
     _word(r"heding|headng|headin|hedding", "heading"),
@@ -309,6 +334,10 @@ FORMAT_ALIASES = {
 }
 _FORMAT_RE = re.compile(_w("|".join(f"(?:{p})" for p in FORMAT_ALIASES.values())))
 _FILE_NOUN_RE = re.compile(_w(r"files?|documents?|docs?|reports?|attachments?|downloadable|download"))
+#: The slide-family nouns. They live in `FORMAT_ALIASES["pptx"]` as a FORMAT;
+#: `file_noun_signal` needs them as a THING as well, so a diagram asked for
+#: inside a deck reaches the deck.
+_DECK_NOUN_RE = re.compile(_w(r"decks?|slides?|presentations?|workbooks?|spreadsheets?|sheets?"))
 _CHART_RE = re.compile(_w(
     r"(?:bar|line|pie|donut|doughnut|area|scatter|bubble|column|stacked(?:\s+bar)?|combo|radar|funnel|waterfall|gantt(?:-style)?|box|"
     r"histogram|heat\s*map)\s+(?:chart|graph|plot)s?|charts?|graphs?|plots?|histograms?|heat\s*maps?|scatter\s*plots?|"
@@ -322,8 +351,14 @@ _CHART_RE = re.compile(_w(
     # while their bare forms are ordinary words.
     r"tree\s*maps?|sunbursts?|candlesticks?|ohlc|"
     # AS3 integration (live 2026-09-15): a chart type named as a noun, "scatter of Salary vs Experience".
-    r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)"
+    r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)|"
+    # A QUADRANT OF TWO MEASURES (2026-09-28): "put these vendors on a quadrant
+    # of price vs rating" drew nothing, because `quadrant` was in no chart
+    # vocabulary at all. The measure pair is what makes it a plot; a quadrant
+    # named alone is the 2x2 concept and `pictures` draws it as mermaid.
+    r"quadrants?\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|against|by|over)"
 ))
+
 #: A chart TYPE said in words — chart_spec.CHART_TYPES plus the words people
 #: type for them. One home, read by intent.py (which routes "make it a bar
 #: chart instead" to an edit) and by edits.py (which turns it into a
@@ -337,6 +372,98 @@ CHART_TYPE_WORDS = (
     # instead" has to reach the set_chart edit the same way "bar chart" does.
     r"tree\s*map|sunburst|candlestick|ohlc|pareto|violin|bullet"
 )
+
+#: A CHART TYPE NAMED AS A BARE NOUN, with a data relation — no "chart",
+#: "graph" or "plot" anywhere. This is how a third of the product's own 77
+#: authored chart requests are written, and none of them reached a chart:
+#: measured 2026-09-28 with a table bound and a spreadsheet uploaded,
+#:
+#:   "Stacked bar of status broken down by priority."   rule=no-request
+#:   "Average score by owner, bars please."             rule=no-request
+#:   "Headcount per department as a pie."                rule=no-request
+#:   "Funnel of the conversion stages."                 rule=no-request
+#:   "Revenue per quarter as columns."                  rule=no-request
+#:
+#: `_CHART_RE` needs the literal picture word and the create rules need a
+#: request verb, and these have neither. CI never saw it: the fixture's own
+#: tests resolve every oracle offline and score VALUES, not routing.
+#:
+#: THIS IS DELIBERATELY NOT PART OF `chart_signal`. Widening that would put
+#: every sentence containing the word "line" or "area" on the plot path with no
+#: table in sight — a wrong lane is a wrong answer delivered confidently.
+#: `intent._dataset_ask` is the only reader, and it runs only when a dataset is
+#: actually bound to the conversation, so the table the plot needs is there.
+_CHART_TYPE_NOUN_ASK_RE = re.compile(
+    # The type LEADING the message: "Stacked bar of status broken down by
+    # priority", "Funnel of the conversion stages".
+    r"^\W*(?:(?:please|now|ok|okay|and|also|just|kindly)\s+)*(?:\d+\s*%?\s+)?(?:an?\s+|the\s+)?"
+    rf"(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s+(?:of|for|from|showing|comparing|by|per|with|broken\s+down|vs\.?|versus)\b"
+    # …or the type as the FORM the answer should take: "Headcount per department
+    # as a pie", "Revenue per quarter as columns", "…, bars please", and the
+    # Hinglish postposition "stacked bar me do" (the normaliser writes `_in_`).
+    rf"|\b(?:as|in|_in_)\s+(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})s?\b"
+    rf"|\b(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s+(?:_in_|me|mein|ma|maa)\s+"
+    r"(?:do|de|dedo|dijiye|dena|_give_|_read_)\b"
+    # …or SET OFF at the end, which is how a request that led with the question
+    # names its picture: "Tickets per category, bar chart in dark blue.",
+    # "Units by product, horizontal bars, show data labels.", "Critical and
+    # high priority tickets by owner, stacked.", "…? Column chart."
+    #
+    # THE POSITION IS THE GUARD. Only after a comma, colon, semicolon, dash,
+    # question mark or full stop — never mid-clause — because mid-clause is
+    # where a chart is TALKED ABOUT rather than asked for: "explain the bar
+    # chart you drew" names a type and asks for no plot, and it does not match.
+    rf"|(?:^|[,;:.?!—–-]\s*)(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?[\s-]*(?:charts?|graphs?|plots?)"
+    # …AND THE PHRASE HAS TO END ITS CLAUSE. Without this lookahead the arm
+    # matched a REMARK about a chart that already exists — "the bar chart is
+    # wrong", "the line chart looks off" both opened a new chart job, measured
+    # 2026-09-28 — because a remark also begins with "the <type> chart". A
+    # request names the picture and then stops, or hangs a style clause off it;
+    # a remark continues into a verb.
+    r"(?=\s*(?:$|[.,;:!?]|\s+(?:in|with|of|for|by|from|per|showing|using|please|pls|only|kindly)\b))"
+    rf"|[,;:]\s*(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s*(?:\.|$|,\s|\s+(?:please|pls|only|kindly)\b)"
+    # THE INDIAN-LANGUAGE POSSESSIVE, which puts the picture LAST. Hindi,
+    # Gujarati and Hinglish say "<subject>-of <picture>", so there is no
+    # punctuation and no verb in front of the chart — the arms above cannot see
+    # it. Measured 2026-09-28 with a table bound and an xlsx uploaded, four of
+    # the product's own authored rows reached no chart on this shape alone:
+    #
+    #   "region wise sales ka bar chart, neele rang me"          no-request
+    #   "क्षेत्र के अनुसार बिक्री का बार चार्ट"                          no-request
+    #   "प्राथमिकता के अनुसार टिकटों की संख्या का चार्ट"                   no-request
+    #   "દર મહિનાના વેચાણનો લાઇન ગ્રાફ"                            no-request
+    #
+    # The Gujarati possessive is a SUFFIX (વેચાણનો = "of the sales"), so નો/ના/ની
+    # are matched without a leading word boundary; the Latin ones need one.
+    # `no`, `na` and `nu` are NOT in the Latin list, although they are real
+    # Gujlish possessives: "no chart please" matched `\bno` + "chart" and opened
+    # a chart job for a message that refused one (measured 2026-09-28, before
+    # this note). Gujarati is served by its own script forms below, which
+    # collide with nothing.
+    rf"|(?:का|के|की|नो|ના|નો|ની|નું|નાં|\bka\b|\bki\b|\bke\b|\bkaa\b)\s+"
+    rf"(?:an?\s+|the\s+)?(?:(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?[\s-]*)?"
+    r"(?:charts?|graphs?|plots?)\b"
+    # "Chart Q1 units by product from the docx" — the picture word AS THE VERB
+    # at the head of the message, with the data relation later in it. `plot` is
+    # deliberately absent: "plot of the movie Inception" is a story, and
+    # `_STORY_PLOT_RE` should not be the only thing standing between that and a
+    # chart file.
+    r"|^\W*(?:charts?|graphs?|visuali[sz]e)\s+(?!of\b)\S+(?:\s+\S+){0,8}?\s+(?:by|per|of|for|from|vs\.?|versus|against|over)\b"
+    # "Which product brings the most revenue? Chart it." — the question first,
+    # the picture asked of its answer.
+    r"|[.?!]\s*(?:chart|graph|plot|visuali[sz]e)\s+(?:it|this|that|these|those|_this_)\b",
+    re.I,
+)
+
+
+def chart_type_noun_ask(text: str) -> bool:
+    """Does this name a chart TYPE as a bare noun, over data it points at?
+
+    Read only by `intent._dataset_ask`, and only with a table bound — see
+    `_CHART_TYPE_NOUN_ASK_RE`.
+    """
+    return bool(_CHART_TYPE_NOUN_ASK_RE.search(_ensure_norm(text)))
+
 
 _REQUEST_VERB_RE = re.compile(_w(
     r"make|create|generate|build|prepare|produce|export|convert|turn|put|save|download|give|send|share|provide|deliver|"
@@ -364,11 +491,48 @@ def file_signal(text: str) -> bool:
     """Does the message name a file format, a file, or a chart? Reads raw or
     normalised text (normalises when it looks raw)."""
     norm = _ensure_norm(text)
-    return bool(_FORMAT_RE.search(norm) or _CHART_RE.search(norm) or _FILE_NOUN_RE.search(norm))
+    return bool(_FORMAT_RE.search(norm) or chart_signal(norm) or _FILE_NOUN_RE.search(norm))
+
+
+def file_noun_signal(text: str) -> bool:
+    """Does the message name a FILE as a thing — "a file", "a report", "the
+    document", "the deck"? Not a format (that is `formats.explicit_formats`)
+    and not a chart. Read by `intent`'s diagram rule, which must stand aside
+    when the picture was asked for INSIDE something: "add a process flow
+    diagram to that report" edits the report."""
+    return bool(_FILE_NOUN_RE.search(_ensure_norm(text)) or _DECK_NOUN_RE.search(_ensure_norm(text)))
 
 
 def chart_signal(text: str) -> bool:
-    return bool(_CHART_RE.search(_ensure_norm(text)))
+    """Do these words ask for a PLOT OF NUMBERS?
+
+    THE WORD IS NOT THE MEANING (2026-09-28). `_CHART_RE` carries the bare
+    alternatives `charts?|graphs?|plots?`, so every phrase ending in one of
+    them read as a request to plot a spreadsheet — and the owner, who asked for
+    a "Flow Chart of Api Which Coonect to Db", was told to attach a CSV. The
+    match is still made by `_CHART_RE`; what is new is that a match which a
+    DIAGRAM PHRASE already accounts for is not evidence of a plot. "flow chart"
+    names one picture, and its noun is "flow".
+
+    This is not a list of banned words. `pictures.SUBJECTS` names what the
+    picture is OF — a flow, an org, a sequence, a dependency — and a subject
+    earns its place there because no chart type can plot it from rows, so the
+    data lane is always the wrong answer for it. A chart word ELSEWHERE in the
+    same sentence survives: "a flow chart of the approval steps and a bar chart
+    of tickets per owner" still asks for the bar chart, and still gets it.
+
+    Dual subjects (gantt, timeline, quadrant, pyramid, roadmap) are drawn both
+    ways here and are deliberately NOT discounted — see `pictures.spans`.
+    `intent.decide`, which knows whether a table is bound, settles those.
+    """
+    norm = _ensure_norm(text)
+    found = list(_CHART_RE.finditer(norm))
+    if not found:
+        return False
+    diagrams = PIC.spans(norm)
+    if not diagrams:
+        return True
+    return any(not any(s < m.end() and m.start() < e for s, e in diagrams) for m in found)
 
 
 def _ensure_norm(text: str) -> str:
@@ -676,7 +840,7 @@ def language_of(text: str) -> Language:
 
 __all__ = [
     "request_marker",
-    "StylePhrase", "normalize", "formats_in", "file_signal", "chart_signal", "style_phrases", "strip_style_clauses",
+    "StylePhrase", "normalize", "formats_in", "file_signal", "file_noun_signal", "chart_signal", "chart_type_noun_ask", "style_phrases", "strip_style_clauses",
     "undo_signal", "negative_shape", "reads_source", "language_of", "FORMAT_ALIASES", "DEST_AFTER",
     "CHART_TYPE_WORDS",
 ]

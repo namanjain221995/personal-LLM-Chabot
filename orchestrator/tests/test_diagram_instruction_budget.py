@@ -191,11 +191,47 @@ def _flat(path: Path) -> str:
 #: the raise below is always read against the string this branch started from.
 PRE_EDIT_CHARS = 1082
 
-#: What the reconciled wording actually measures, imported on this tree on
-#: 2026-09-27. It is the CEILING: every rule from both branches, plus the
-#: three restored origin/dev fragments above, is in the string at this size,
-#: so anything larger is a rule nobody has argued for.
-CHARS_CEILING = 1602
+#: What the reconciled wording measured on 2026-09-27, kept as the previous
+#: ceiling so the raise below is read against it.
+RECONCILED_2026_09_27_CHARS = 1602
+
+#: THE CEILING, RAISED 2026-09-28 by feat/understand-every-picture-ask, and
+#: what the raise bought.
+#:
+#: The 1,602-character string named NINE of the twenty-three diagram heads
+#: `frontend/lib/mermaid.ts` DIAGRAM_HEADS draws (flowchart, graph,
+#: sequenceDiagram, erDiagram, pie, journey, timeline, mindmap, gitGraph) and
+#: named the other fourteen nowhere — so the model had no way to know the
+#: browser would draw them. Measured live in the running container that day:
+#: "timeline of the project milestones" came back as prose sections (16.3 s)
+#: and "kanban board of my open tasks" came back asking for the data and
+#: offering an Excel file (22.3 s). Neither drew the diagram the browser
+#: renders. It also still carried, verbatim, "at most ONE diagram per answer"
+#: and "under ~20 nodes" — the two caps a release note had reported removed,
+#: and had not removed.
+#:
+#: This wording names TWENTY-TWO of the twenty-three and drops both caps.
+#: `architecture` is deliberately the one left out: mermaid's
+#: `architecture-beta` is experimental and `flowchart` draws a system
+#: architecture better, so naming it would spend tokens to make the model
+#: reach for the worse renderer.
+#:
+#: THE COST, measured the same way the note in app/engines/__init__.py measures
+#: it — pinned engine tokenizer, on CPU, inside the running container, no GPU
+#: touched (tokenizers 0.22.2 over
+#: Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json), at
+#: load average 7.49 on 2026-09-28:
+#:
+#:   1,602 chars / 1,606 UTF-8 bytes / 365 tokens   (origin/main, ae25da28)
+#:   2,082 chars / 2,086 UTF-8 bytes / 497 tokens   (this tree)
+#:
+#: +132 tokens per prompt, at every effort, at all eleven chat call sites —
+#: 3.82% of the 3,458-token mean golden prompt, and 1 token BELOW the +133
+#: the 2026-09-27 raise was accepted at. A first draft of this wording glossed
+#: every type and measured +312; it was compressed to a bare list for exactly
+#: this reason, and the gloss survives only where the type name alone does not
+#: say when to use it (gantt, quadrantChart, the flowchart family).
+CHARS_CEILING = 2082
 
 #: The same string in UTF-8, measured on the same commit: 1,086. The
 #: document-vocabulary edit took it to 1,088 — two bytes, one extra em dash —
@@ -204,9 +240,17 @@ CHARS_CEILING = 1602
 #: after", which was the character count wearing a byte's name.
 PRE_EDIT_UTF8_BYTES = 1086
 
-#: The same string in UTF-8 on this tree: 1,606. Two em dashes (U+2014, three
-#: UTF-8 bytes each) account for the four bytes over the character count.
-UTF8_BYTES_CEILING = 1606
+#: The same string in UTF-8 on this tree: 2,086. Two em dashes (U+2014, three
+#: UTF-8 bytes each) account for the four bytes over the character count — the
+#: count is still two, so the two units still differ by exactly 4.
+UTF8_BYTES_CEILING = 2086
+
+#: The measured token counts above, so the arithmetic in the prose is
+#: arithmetic this file performs. Re-measure both with the pinned tokenizer
+#: before moving the ceiling again; a character count is not a token count.
+TOKENS_MAIN = 365
+TOKENS_THIS_TREE = 497
+TOKENS_ACCEPTED_RAISE_2026_09_27 = 133
 
 #: The reconciliation this tree restored three fragments ON TOP OF, measured
 #: on integ/diagram-group at 7f16f4b7. The three deltas below have to add up
@@ -236,9 +280,27 @@ RESTORED_FRAGMENT_CHARS = {
 def test_the_instruction_did_not_grow_in_characters():
     assert len(DIAGRAM_INSTRUCTION) <= CHARS_CEILING, (
         f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} characters, {len(DIAGRAM_INSTRUCTION) - CHARS_CEILING} "
-        f"over the {CHARS_CEILING} measured for the reconciled wording "
+        f"over the {CHARS_CEILING} measured for the every-picture wording "
         f"({len(DIAGRAM_INSTRUCTION) - PRE_EDIT_CHARS} over origin/dev's {PRE_EDIT_CHARS}); "
         "it reaches eleven chat call sites at every effort"
+    )
+
+
+def test_the_raise_stayed_inside_the_cost_already_accepted():
+    """The 2026-09-28 raise is justified by tokens, not by characters.
+
+    The gate this file is cannot measure tokens — the pinned tokenizer is not a
+    test dependency and loading a 35B model's vocabulary on every run would be
+    a worse tax than the string. So the token counts are PINNED here from a
+    measurement made in the running container, and this test asserts only the
+    relationship the raise was argued on: the new wording costs fewer extra
+    tokens than the raise before it was accepted at.
+    """
+    assert TOKENS_THIS_TREE - TOKENS_MAIN <= TOKENS_ACCEPTED_RAISE_2026_09_27, (
+        f"+{TOKENS_THIS_TREE - TOKENS_MAIN} tokens per prompt is over the "
+        f"+{TOKENS_ACCEPTED_RAISE_2026_09_27} already accepted; compress the wording "
+        "or argue the cost, and re-measure with the pinned tokenizer rather than "
+        "converting characters"
     )
 
 
@@ -256,7 +318,7 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     chars = len(DIAGRAM_INSTRUCTION)
     encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
     assert chars == CHARS_CEILING, (
-        f"{chars} characters; the reconciled wording measured {CHARS_CEILING} on 2026-09-27"
+        f"{chars} characters; the every-picture wording measured {CHARS_CEILING} on 2026-09-28"
     )
     assert encoded <= UTF8_BYTES_CEILING, (
         f"DIAGRAM_INSTRUCTION is {encoded} UTF-8 bytes, over the {UTF8_BYTES_CEILING} measured for this edit"
@@ -266,11 +328,11 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
         f"the reconciled wording spends two em dashes, so UTF-8 is 4 bytes over the "
         f"character count; it is now {encoded - chars}"
     )
-    assert encoded - PRE_EDIT_UTF8_BYTES == 520, (
-        f"the raise over origin/dev was measured at +520 UTF-8 bytes; it is now "
+    assert encoded - PRE_EDIT_UTF8_BYTES == 1000, (
+        f"the raise over origin/dev was measured at +1000 UTF-8 bytes; it is now "
         f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this "
-        f"(the measurement of record is +133 tokens per prompt, 3.85% of the 3,458-token "
-        f"mean golden prompt, 2026-09-27)."
+        f"(the measurement of record is +132 tokens per prompt over ae25da28, 3.82% of "
+        f"the 3,458-token mean golden prompt, 2026-09-28)."
     )
 
 
@@ -286,7 +348,13 @@ def test_the_three_fragment_costs_are_the_arithmetic_of_their_own_total():
     strings: +3 ("fer"), +14 (" inside labels"), +36 (" custom colours break
     dark mode, and").
     """
-    assert sum(RESTORED_FRAGMENT_CHARS.values()) == CHARS_CEILING - RECONCILED_CHARS == 53
+    # AGAINST THE 2026-09-27 SIZE, not against the current ceiling. These three
+    # fragments were restored ON TOP OF the 1,549-character reconciliation and
+    # took it to 1,602; that arithmetic is a fact about those two strings and
+    # does not move when a later edit raises the ceiling. It was written as
+    # `CHARS_CEILING - RECONCILED_CHARS`, which coupled it to every future
+    # raise, and the 2026-09-28 raise is what exposed that.
+    assert sum(RESTORED_FRAGMENT_CHARS.values()) == RECONCILED_2026_09_27_CHARS - RECONCILED_CHARS == 53
     root = Path(__file__).resolve().parents[1]
     prose = _flat(root / "app" / "engines" / "__init__.py")
     mine = _flat(Path(__file__))
@@ -316,10 +384,13 @@ def test_the_delta_against_the_naive_merge_is_arithmetic_and_not_a_referent_erro
     reads it, and its sha256 map covers the 24 fixture files only — so
     correcting that note costs no recapture.)
     """
-    assert NAIVE_MERGE_CHARS - CHARS_CEILING == 220
-    assert DIAGRAM_ROLES_CHARS - CHARS_CEILING == 246
+    # Also against the 2026-09-27 size, and for the same reason: the MANIFEST
+    # note these assertions read back was written when that was the size.
+    assert NAIVE_MERGE_CHARS - RECONCILED_2026_09_27_CHARS == 220
+    assert DIAGRAM_ROLES_CHARS - RECONCILED_2026_09_27_CHARS == 246
     root = Path(__file__).resolve().parents[1]
-    naive, roles = NAIVE_MERGE_CHARS - CHARS_CEILING, DIAGRAM_ROLES_CHARS - CHARS_CEILING
+    naive = NAIVE_MERGE_CHARS - RECONCILED_2026_09_27_CHARS
+    roles = DIAGRAM_ROLES_CHARS - RECONCILED_2026_09_27_CHARS
     manifest = _flat(root / "tests/fixtures/context_assembly_golden/MANIFEST.json")
     assert f"-{naive} against the naive merge" in manifest
     assert f"-{roles} against the naive merge" not in manifest, "the wrong referent is back"
@@ -391,16 +462,64 @@ def test_the_withdrawn_byte_claim_is_not_restated_anywhere():
 
 
 def test_the_conservative_rules_are_all_still_there():
+    """The rules that keep a diagram DRAWABLE, and only those.
+
+    THE TWO CAPS ARE GONE, 2026-09-28, and this test is why they were still
+    here. "at most ONE diagram per answer" and "under ~20 nodes" were asserted
+    as conservative rules, so a release that reported removing them removed
+    them from nothing: the string still carried both, verbatim, read out of the
+    RUNNING container on 2026-09-28. A cap that has been withdrawn in a release
+    note and held in place by a test is the worst of both — nobody can see it,
+    and nobody can remove it without this file going red.
+
+    They were withdrawn because they make the product refuse work it can do. An
+    architecture answer that needs a context diagram AND a sequence diagram got
+    one; a 40-node deploy pipeline got a summary of itself. Neither cap was ever
+    a renderer limit: the browser's mermaid has none, and the limit that is real
+    — 24 nodes and 40 edges inside a GENERATED FILE — lives in
+    `render/diagrams.py` where it is enforced rather than requested.
+
+    What stays are the rules whose absence makes a diagram FAIL TO DRAW, plus
+    the one that keeps it off ordinary turns.
+    """
     for rule in (
-        "at most ONE diagram per answer",
         "must NOT contain a diagram",
-        "under ~20 nodes",
         "Never draw ASCII-art boxes",
         "one statement per line",
         "every label in double quotes",
     ):
         assert rule in DIAGRAM_INSTRUCTION, rule
     assert "sentences saying what it shows" in DIAGRAM_INSTRUCTION
+    for withdrawn in ("at most ONE diagram", "~20 nodes", "keep it SMALL"):
+        assert withdrawn not in DIAGRAM_INSTRUCTION, (
+            f"{withdrawn!r} is back: it was withdrawn on 2026-09-28 because the browser "
+            "has no such limit and the real one is enforced in render/diagrams.py"
+        )
+
+
+def test_it_names_every_diagram_head_the_browser_draws():
+    """The prompt and `frontend/lib/mermaid.ts` must not drift apart.
+
+    Measured on ae25da28: the instruction named NINE of the twenty-three heads
+    in DIAGRAM_HEADS and the browser drew all twenty-three, so fourteen kinds
+    existed in the renderer and nowhere in the model's instructions. Live that
+    day, "timeline of the project milestones" came back as prose and "kanban
+    board of my open tasks" came back offering an Excel file.
+
+    `architecture` is the one deliberate omission — see CHARS_CEILING's note.
+    """
+    heads = re.search(r"const DIAGRAM_HEADS = \[(.*?)\];",
+                      (Path(__file__).resolve().parents[2] / "frontend/lib/mermaid.ts").read_text(encoding="utf-8"),
+                      re.S)
+    assert heads, "DIAGRAM_HEADS moved; this gate cannot read it"
+    names = [h.strip().strip("'\"") for h in heads.group(1).replace("\n", " ").split(",") if h.strip()]
+    assert len(names) == 23, f"DIAGRAM_HEADS now has {len(names)} entries; re-read the prompt against it"
+    low = DIAGRAM_INSTRUCTION.lower()
+    missing = [n for n in names if n not in low]
+    assert missing == ["architecture"], (
+        f"the prompt does not name {missing}; the browser draws them, so the model should "
+        "know they exist (`architecture` is the documented omission)"
+    )
 
 
 def test_the_three_restored_fragments_are_pinned_so_they_cannot_vanish_again():
