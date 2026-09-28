@@ -67,6 +67,10 @@ _BUCKETS_BY_METRIC = {
     # the same edges as the TTFT it is being subtracted from.
     "knowledge_prepare_seconds": _TTFT_BUCKETS,
     "knowledge_fast_lookup_seconds": _TTFT_BUCKETS,
+    # The part of the pre-pass the answer actually waited for, and the first
+    # answer token per class of turn (2026-09-29): read on the same edges.
+    "knowledge_blocked_seconds": _TTFT_BUCKETS,
+    "chat_first_answer_seconds": _TTFT_BUCKETS,
     # Event-loop lag (server performance track, 2026-09-15): 1 ms to 2.5 s.
     "orchestrator_event_loop_lag_seconds": (
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
@@ -265,6 +269,16 @@ KNOWLEDGE_DECISIONS = frozenset({
     "none",
 })
 
+#: The shape of a chat turn's prompt, for chat_first_answer_seconds
+#: (2026-09-29). It is what the engine's prefill depends on, which is most of
+#: the first-answer time once the pre-pass is done:
+#:   lane      the Fast small-talk lane (a ~630-character prompt);
+#:   paste     the message is pasted material (core/pasted.is_paste): a
+#:             5,000-word paste measured 1.2-1.7 s of prefill on its own;
+#:   followup  the conversation has earlier turns, which ride in the prompt;
+#:   plain     a first message: the system prompt and nothing else.
+CHAT_ANSWER_SHAPES = frozenset({"lane", "paste", "followup", "plain"})
+
 #: app/fast_lane.py's vocabulary, for fast_lane_total. Literal here so this
 #: module imports nothing; tests/test_fast_lane_classifier.py pins the two
 #: lists together.
@@ -342,6 +356,15 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     "knowledge_fast_lookup_seconds": {
         "stage": {"fetch", "readback"},
         "outcome": set(STEP_OUTCOMES),
+    },
+    "knowledge_blocked_seconds": {
+        "effort": set(CHAT_EFFORTS),
+        "decision": set(KNOWLEDGE_DECISIONS),
+    },
+    "chat_first_answer_seconds": {
+        "effort": set(CHAT_EFFORTS),
+        "decision": set(KNOWLEDGE_DECISIONS),
+        "shape": set(CHAT_ANSWER_SHAPES),
     },
     # The route is not known yet while the context is assembled; `mode` is
     # ChatRequest.mode's Literal.
@@ -569,6 +592,40 @@ def knowledge_prepare(seconds: float, *, effort: str, decision: str, outcome: st
         effort=effort,
         decision=decision,
         outcome=outcome,
+    )
+
+
+def knowledge_blocked(seconds: float, *, effort: str, decision: str) -> None:
+    """How long the answer path was BLOCKED on the knowledge pre-pass: from
+    the moment /chat starts awaiting it to the moment the await returns.
+
+    knowledge_prepare_seconds is timed from the task's dispatch, and the task
+    overlaps memory recall, the context reads and compaction, so on a turn
+    whose pre-pass finished before the await it records work nobody waited
+    for. This one is near zero on such a turn: it is the pre-pass's share of
+    the time to the first token.
+    """
+    observe(
+        "knowledge_blocked_seconds",
+        seconds,
+        "Time the answer path waited on the knowledge pre-pass (await start to return).",
+        effort=effort,
+        decision=decision,
+    )
+
+
+def chat_first_answer(seconds: float, *, effort: str, decision: str, shape: str) -> None:
+    """Request start to the first ANSWER token, by what the knowledge pre-pass
+    decided and by the shape of the prompt (CHAT_ANSWER_SHAPES). Observed once
+    per turn. A status line or a reasoning token is not an answer token, so
+    unlike chat_first_visible_seconds a 3 ms status line cannot count here."""
+    observe(
+        "chat_first_answer_seconds",
+        seconds,
+        "Request start to the first answer token, by knowledge decision and prompt shape.",
+        effort=effort,
+        decision=decision,
+        shape=shape,
     )
 
 

@@ -460,7 +460,8 @@ def test_the_main_wrapper_forwards_the_turns_it_was_given():
 
 
 def test_every_main_call_site_hands_the_knowledge_layer_the_turns():
-    """Both of them: the early pre-pass task and the late in-line fallback.
+    """All three: the Think/Max pre-pass started beside decide() (2026-09-29),
+    the early pre-pass task after decide(), and the late in-line fallback.
 
     An omission at ONE call site is the shape of this bug — the answer is
     still produced, still cited, and silently ungrounded on exactly the turns
@@ -475,7 +476,7 @@ def test_every_main_call_site_hands_the_knowledge_layer_the_turns():
         if isinstance(node, ast.Call)
         and getattr(node.func, "id", getattr(node.func, "attr", "")) == "_prepare_knowledge"
     ]
-    assert len(calls) == 2, f"expected both known call sites, found {len(calls)}"
+    assert len(calls) == 3, f"expected the three known call sites, found {len(calls)}"
     for node in calls:
         keywords = {k.arg for k in node.keywords}
         assert "history" in keywords or None in keywords, (

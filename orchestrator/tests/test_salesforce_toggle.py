@@ -371,7 +371,10 @@ def test_salesforce_mode_meta_auto_reports_the_gated_decision(spy):
 def test_assistant_mode_status_still_announces_web_search(spy, monkeypatch):
     """The reorder must not silence the honest case: assistant mode with an
     eager plan still tells the user the web is being searched."""
-    monkeypatch.setattr("app.engines.search.rate_ok", lambda key: True)
+    # An empty per-user search window: since 2026-09-29 /chat peeks it and
+    # spends a slot only when a search runs, so the old `rate_ok` stub no
+    # longer reaches the gate. A fresh window holds for either shape.
+    monkeypatch.setattr("app.engines.search._rate", {})
     resp = ask("assistant", web_search="auto")
     statuses = [d for e, d in _parse_sse(resp.text) if e == "status"]
     assert any("web" in s.lower() for s in statuses), statuses

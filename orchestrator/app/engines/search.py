@@ -678,6 +678,26 @@ def rate_ok(user_key: str) -> bool:
     return True
 
 
+def rate_peek(user_key: str) -> bool:
+    """Would a search be allowed now? Reads the window, records nothing.
+
+    For a caller that decides whether a turn MAY search before it knows
+    whether it WILL (main.py's Fast plan): `rate_ok` spent a slot on every
+    assistant turn, so from the 11th Fast turn in a minute the live lookup was
+    switched off although none of those turns had searched."""
+    now = time.monotonic()
+    window = [t for t in _rate.get(user_key, []) if now - t < 60.0]
+    return len(window) < settings.search_rate_per_min
+
+
+def rate_take(user_key: str) -> None:
+    """Record one search that is actually running against the window."""
+    now = time.monotonic()
+    window = [t for t in _rate.get(user_key, []) if now - t < 60.0]
+    window.append(now)
+    _rate[user_key] = window
+
+
 # --------------------------------------------------------------------------
 # steps
 # --------------------------------------------------------------------------

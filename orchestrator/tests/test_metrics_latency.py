@@ -18,6 +18,9 @@ LATENCY_HISTOGRAMS = (
     "context_assembly_seconds",
     "orchestrate_decide_seconds",
     "relay_overhead_seconds",
+    # 2026-09-29: the pre-pass's blocking share and the per-class first answer.
+    "knowledge_blocked_seconds",
+    "chat_first_answer_seconds",
 )
 
 
@@ -62,6 +65,8 @@ def test_the_new_buckets_are_per_metric_and_leave_the_default_set_alone():
 def test_first_visible_and_knowledge_prepare_are_read_on_the_ttft_edges():
     assert metrics._buckets_for("chat_first_visible_seconds") == metrics._buckets_for("chat_ttft_seconds")
     assert metrics._buckets_for("knowledge_prepare_seconds") == metrics._buckets_for("chat_ttft_seconds")
+    assert metrics._buckets_for("knowledge_blocked_seconds") == metrics._buckets_for("chat_ttft_seconds")
+    assert metrics._buckets_for("chat_first_answer_seconds") == metrics._buckets_for("chat_ttft_seconds")
 
 
 @pytest.mark.parametrize("stage", ["lexical", "dense_scan", "embed", "meta", "rerank", "servable"])
@@ -102,6 +107,8 @@ def test_the_helpers_emit_each_new_histogram_under_its_exact_name():
     metrics.context_assembly(0.2, effort="fast", mode="assistant")
     metrics.orchestrate_decide(0.25, effort="max", plan=metrics.plan_label(True, False))
     metrics.relay_overhead(0.01, route="chat", effort="fast")
+    metrics.knowledge_blocked(0.05, effort="think", decision="local")
+    metrics.chat_first_answer(0.7, effort="fast", decision="small_talk_lane", shape="lane")
     text = metrics.render()
     for name in LATENCY_HISTOGRAMS:
         assert f"# TYPE {name} histogram" in text, name
@@ -110,6 +117,23 @@ def test_the_helpers_emit_each_new_histogram_under_its_exact_name():
     assert 'context_assembly_seconds_count{effort="fast",mode="assistant"} 1' in text
     assert 'orchestrate_decide_seconds_count{effort="max",outcome="ok",plan="agent"} 1' in text
     assert 'relay_overhead_seconds_count{effort="fast",route="chat"} 1' in text
+    assert 'knowledge_blocked_seconds_count{decision="local",effort="think"} 1' in text
+    assert (
+        'chat_first_answer_seconds_count{decision="small_talk_lane",effort="fast",shape="lane"} 1'
+        in text
+    )
+
+
+def test_the_answer_shape_vocabulary_is_what_main_can_say():
+    from app import main as app_main
+
+    said = {
+        app_main._answer_shape(True, "hi", []),
+        app_main._answer_shape(False, "x" * 1200, []),
+        app_main._answer_shape(False, "and on a Mac?", [{"role": "user", "content": "q"}]),
+        app_main._answer_shape(False, "what is a CRM?", []),
+    }
+    assert said == metrics.CHAT_ANSWER_SHAPES
 
 
 @pytest.mark.parametrize("name", LATENCY_HISTOGRAMS)
