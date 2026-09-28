@@ -122,7 +122,26 @@ from . import theme
 #: exactly four slots wide and has no fifth that passes.
 DIAGRAM_ROLES: Tuple[str, ...] = ("service", "store", "model", "external")
 
-#: chart_spec.DEFAULT_PALETTE slots 1-4, in that fixed order. Validated above.
+#: chart_spec.DEFAULT_PALETTE slots 1-4, in that fixed order. Validated above,
+#: and RE-VALIDATED 2026-09-28 because feat/understand-every-picture-ask routes
+#: many more requests down this path — every flow chart, org chart, dependency
+#: graph, state diagram and mind map that used to be answered "attach a CSV"
+#: now arrives here. `scripts/validate_palette.js "#2F6FB2,#E07B00,#0E9D9A,#C0566B"
+#: --mode light`, surface #fcfcfb: ALL CHECKS PASS, with the same two warnings
+#: the design already answers —
+#:
+#:   CVD separation  #C0566B <-> #0E9D9A  ΔE 7.1 deutan (tritan 28.4), inside
+#:                   the 6-8 floor band, legal only with secondary encoding;
+#:   contrast        #E07B00 at 2.92:1, under 3:1, relief required.
+#:
+#: Both obligations are met by construction and not by luck: `spec.DiagramNode
+#: .label` is min_length=1 so every box carries its own text, `_legend_for`
+#: names each role a diagram declares, and the fills are blended 0.78 toward
+#: white so the label's contrast does not move with the role.
+#:
+#: `--mode dark` FAILS the lightness band on #E07B00 and is NOT APPLICABLE: this
+#: module is paper-only (see the module docstring) and never draws on a dark
+#: surface. The browser's mermaid is a separate renderer with its own classDefs.
 ROLE_COLOURS: Dict[str, str] = {
     "service": "#2F6FB2",
     "store": "#E07B00",
@@ -634,11 +653,29 @@ _STATE_DECL_RE = re.compile(
 )
 #: A mindmap node: the indentation is the tree, and the label may wear any of
 #: mermaid's shape brackets.
+#:
+#: TWO ALTERNATIVES, NOT ONE OPTIONAL ID, and the reason is a bug the rendered
+#: PNG showed that no assertion in this file would have. Written as one branch
+#: with an OPTIONAL id in front of an OPTIONAL bracket, the id group happily
+#: matched the first WORD of a bracket-less label and the rest became the label:
+#:
+#:     "Upload reliability"  -> id="Upload"    label="reliability"
+#:     "Fast lane"           -> id="Fast"      label="lane"
+#:     "Diagrams in files"   -> id="Diagrams"  label="in files"
+#:
+#: Every multi-word branch of the mind map was drawn under its LAST word, and
+#: the picture was wrong in a way only looking at it could show. An id exists in
+#: mermaid only when a bracket follows it (`root((Roadmap))`, `a[Feature A]`),
+#: so that is its own branch now and a line without brackets is a plain label,
+#: whole.
 _MIND_RE = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<id>[A-Za-z_][\w-]{0,39})?"
-    r"(?:\(\(|\[\[|\[|\(|\{\{|\{|\)\)?)?\s*"
-    r"(?P<label>[^\n]*?)\s*"
-    r"(?:\)\)|\]\]|\]|\)|\}\}|\})?$"
+    # `root((Roadmap))`, `a[Feature A]`, `x{Decision}` — an id THEN a bracket.
+    r"^(?P<indent>[ \t]*)(?:"
+    r"(?P<id>[A-Za-z_][\w-]{0,39})\s*(?:\(\(|\[\[|\[|\(|\{\{|\{)\s*"
+    r"(?P<label>[^\n]*?)\s*(?:\)\)|\]\]|\]|\)|\}\}|\})\s*"
+    # …or the whole line, brackets and all absent.
+    r"|(?P<plain>[^\n]+?)\s*"
+    r")$"
 )
 
 
@@ -693,7 +730,13 @@ def rewrite_note(source: str) -> str:
 
 
 def _er_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
-    out: List[str] = ["flowchart LR"]
+    # TD, NOT LR, and the rendered PNG is why. Four entities in a chain laid out
+    # left to right filled the 6.3-inch box edge to edge: the boxes butted
+    # together, two arrowheads disappeared between them, and the "contains" and
+    # "produces" edge labels were painted over the box borders. The same graph
+    # downward has room for every label — compare `_state_as_flowchart`, which
+    # was TD from the start and reads cleanly at six nodes.
+    out: List[str] = ["flowchart TD"]
     dropped = 0
     depth = 0
     for raw in body:
@@ -784,7 +827,7 @@ def _mindmap_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
         m = _MIND_RE.match(raw)
         if not m:
             return None
-        label = _q(m.group("label") or m.group("id") or "")
+        label = _q(m.group("label") or m.group("plain") or m.group("id") or "")
         if not label:
             # A bracket on a line of its own is not a node and not something
             # this reader understands.

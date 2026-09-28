@@ -456,3 +456,96 @@ def test_a_flow_that_is_a_QUANTITY_stays_in_the_data_lane():
     for row in ("Waterfall chart of the cash flow items.", "नकदी प्रवाह का वॉटरफॉल चार्ट बनाइए"):
         i = I.decide(row, has_dataset=True, upload_formats=("xlsx",))
         assert i.action == "create" and i.chart_request, f"{row!r} -> {i.action}/{i.rule}"
+
+
+# ---------------------------------- the picture INSIDE a generated file --
+
+def test_the_three_kinds_that_are_node_and_edge_graphs_are_drawn():
+    """A generated file could hold only a `flowchart`: `_DIR_RE` accepted
+    `flowchart`/`graph`, so a source opening `erDiagram`, `stateDiagram-v2` or
+    `mindmap` refused at its first line and md_import substituted a callout.
+    "a docx of the schema with an ER diagram" routed perfectly and then shipped
+    an apology where the picture goes."""
+    from app.artifacts import spec as S
+    from app.artifacts.render import diagrams as D
+
+    cases = {
+        "erDiagram\n    USERS ||--o{ SESSIONS : has\n    SESSIONS ||--o{ MESSAGES : contains": (3, 2),
+        "stateDiagram-v2\n    [*] --> Queued\n    Queued --> Running: picked up\n    Running --> [*]": (4, 3),
+        "mindmap\n  root((Roadmap))\n    Q1\n      Upload reliability\n    Q2": (4, 3),
+    }
+    for src, (nodes, edges) in cases.items():
+        fields = D.parse_mermaid(src)
+        assert fields, src.splitlines()[0]
+        S.Diagram(**fields)                       # the strict model must accept it
+        assert (len(fields["nodes"]), len(fields["edges"])) == (nodes, edges), src.splitlines()[0]
+
+
+def test_a_mindmap_label_is_not_truncated_to_its_last_word():
+    """A bug the rendered PNG showed and no assertion in the parser would have.
+
+    `_MIND_RE` had an OPTIONAL id in front of an OPTIONAL bracket, so the id
+    group matched the first WORD of a bracket-less label: "Upload reliability"
+    became a node called "reliability". Every multi-word branch of every mind
+    map was drawn under its last word.
+    """
+    from app.artifacts.render import diagrams as D
+
+    fields = D.parse_mermaid(
+        "mindmap\n  root((Roadmap))\n    Q1\n      Upload reliability\n      Fast lane\n"
+        "    Q2\n      Diagrams in files\n    Q3\n      Public API"
+    )
+    assert fields
+    labels = [n["label"] for n in fields["nodes"]]
+    assert labels == ["Roadmap", "Q1", "Upload reliability", "Fast lane", "Q2",
+                      "Diagrams in files", "Q3", "Public API"], labels
+    # …and the bracketed `id[Label]` form still works.
+    f2 = D.parse_mermaid("mindmap\n  root((Product))\n    a[Chat]\n    b[Upload reliability]")
+    assert [n["label"] for n in f2["nodes"]] == ["Product", "Chat", "Upload reliability"]
+
+
+def test_the_kinds_a_file_cannot_hold_say_which_one_and_why():
+    """"Diagram omitted / A diagram in the answer was not reproduced in this
+    document" was true and useless: a reader could not tell whether the model
+    had failed, the document had, or the platform simply cannot put that kind of
+    picture in a file. It is the third."""
+    from app.artifacts import md_import as M
+    from app.artifacts.render import diagrams as D
+
+    for src, kind in (("sequenceDiagram\n    A->>B: x", "Sequence diagram"),
+                      ("gantt\n  title P\n  section A\n  T :a1, 2026-01-01, 30d", "Gantt chart"),
+                      ("kanban\n  Todo\n    A", "Kanban board")):
+        doc, notes = M.markdown_to_document("# T\n\n```mermaid\n" + src + "\n```\n")
+        callouts = [b for b in doc.blocks if type(b).__name__ == "Callout"]
+        assert len(callouts) == 1, src.splitlines()[0]
+        assert callouts[0].title == f"{kind} not included", callouts[0].title
+        assert "drawn in the answer above" in callouts[0].text
+        assert notes and kind.lower() in notes[0].lower()
+    # every head the browser draws has a reason written for it
+    import re as _re
+    from pathlib import Path as _P
+    heads = _re.search(r"const DIAGRAM_HEADS = \[(.*?)\];",
+                       (_P(__file__).resolve().parents[2] / "frontend/lib/mermaid.ts").read_text(encoding="utf-8"),
+                       _re.S).group(1)
+    for name in [h.strip().strip("'\"") for h in heads.replace("\n", " ").split(",") if h.strip()]:
+        if name in ("flowchart", "graph") or name in D.TRANSLATABLE:
+            continue
+        assert name in D.UNTRANSLATABLE_REASON, f"{name} would get the anonymous callout"
+
+
+def test_the_role_palette_still_passes_the_validator_on_paper():
+    """This branch routes far more requests into the role-coloured diagram, so
+    the palette is re-checked rather than assumed. Re-run 2026-09-28 with the
+    dataviz validator, light, surface #fcfcfb: ALL CHECKS PASS. The two warnings
+    (CVD ΔE 7.1 deutan on external<->model; #E07B00 contrast 2.92:1) are legal
+    only WITH secondary encoding, and this asserts the encoding is there."""
+    from app.artifacts import spec as S
+    from app.artifacts.render import diagrams as D
+
+    assert list(D.ROLE_COLOURS) == list(D.DIAGRAM_ROLES) == ["service", "store", "model", "external"]
+    assert S.DiagramNode.model_fields["label"].metadata, "a label must be required, or colour stands alone"
+    # a node's label is never empty, so identity is never colour-alone
+    fields = D.parse_mermaid('flowchart TD\n  A["Client"]:::external --> B["Gateway"]:::service')
+    assert fields and all(n["label"] for n in fields["nodes"])
+    # and the key names only the roles the diagram actually declares
+    assert D._legend_for(S.Diagram(**fields)) == ("service", "external")
