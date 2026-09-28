@@ -4,8 +4,13 @@ WHY THIS FILE EXISTS. `DIAGRAM_INSTRUCTION` is concatenated onto the system
 prompt at ELEVEN call sites — engines/chat.py x2, rag.py, repo.py x2,
 agent.py, url.py x2, dataset.py, document.py and search.py — on the chat
 path, at EVERY effort, with no effort gate. A byte added here is a byte of
-prefill on every Fast turn in nine engines, and the only prompt-size budget
-the suite otherwise has (`test_fast_lane_classifier.py`) covers the
+prefill on every Fast turn in all EIGHT of those modules (eleven sites in
+eight files: counted 2026-09-28 by the same regex the last test in this file
+uses, on this tree and on origin/dev ff1a5d7c, where it is also eleven, so
+the Max-gate split did not move it. A count of NINE engines, which this
+docstring and the comment beside the string both used to give, was inherited
+from an older header and was never either number), and the only prompt-size
+budget the suite otherwise has (`test_fast_lane_classifier.py`) covers the
 small-talk lane, which skips this string entirely.
 
 THE NUMBER, CORRECTED 2026-09-27. It is 1,082 CHARACTERS, not bytes — this
@@ -29,8 +34,8 @@ now pinned, each against its own re-measured number.
 WHAT THE EDIT ITSELF WAS: the ban on `style`, `classDef`, `linkStyle`,
 `click` and `%%{init}%%` became a ban on those PLUS colours and hex values,
 and gained the four role names, paid for by shortening prose elsewhere.
-Raising either ceiling is a decision about Fast latency in nine engines and
-needs the measurement that justifies it, not a bump.
+Raising either ceiling is a decision about Fast latency in eight engine
+modules and needs the measurement that justifies it, not a bump.
 
 THE CEILING WAS RAISED ONCE, 2026-09-27, AND THIS IS THE MEASUREMENT. Two
 branches shipped the same `:::role` fix: this one, which held 1,082
@@ -48,31 +53,71 @@ integration keeps that ban and re-compresses everything around it:
     THIS TREE, measured today              1,602 characters, 1,606 bytes
 
 So the raise is +520 characters and +520 UTF-8 bytes over origin/dev (both
-deltas are the same number because the string gained two em dashes and lost
-one, so its non-ASCII count did not move), and −246 characters against the
-naive merge. What could NOT be removed, counted: 71 characters are the seven
-diagram-type names the ban has to name to be concrete (sequenceDiagram,
-erDiagram, pie, journey, timeline, mindmap, gitGraph), and the remainder is
-the role list with its glosses, the "do not invent a name" rule and the two
-accessibility rules. The ceilings below are the measured numbers, and a `<=`
-plus an exact pin, so the next character still has to be argued for.
+deltas are the same number because the string gained ONE em dash and lost
+one, so its non-ASCII count did not move), and −220 characters against the
+naive merge.
+
+    CORRECTED 2026-09-28, both numbers re-measured, because the two the
+    previous revision stated were wrong in a file whose subject is measuring
+    rather than asserting. (a) the clause here used to say the string had
+    gained TWO em dashes against one lost. That moves the non-ASCII count by
+    one and makes the byte delta 522, not the 520 the same sentence states, so
+    it contradicted the number it was offered to explain — and the revision
+    that wrote it had changed "by coincidence" to "because", so it asserted a
+    mechanism as well. Counted with str.count("\u2014"): origin/dev 2,
+    fix/document-vocabulary-r2 3, fix/diagram-roles 5, integ/diagram-group 2,
+    THIS TREE 2. Against origin/dev the string gained the dash in
+    `outside system) — A["Payments API"]:::service` and lost the one in
+    `directives — the app applies its own theme`: one for one, which is
+    exactly why the two deltas match. (b) −246 was the delta against
+    fix/diagram-roles (1,848 − 1,602), not against the naive merge: the row
+    two lines up gives that as 1,822, and 1,822 − 1,602 = 220. It was right
+    for the previous size (7f16f4b7 said −273, and 1,822 − 1,549 = 273) and
+    was updated to the wrong referent when the size moved.
+
+What could NOT be removed, counted: 71 characters are the seven diagram-type
+names the ban has to name to be concrete (sequenceDiagram, erDiagram, pie,
+journey, timeline, mindmap, gitGraph), and the remainder is the role list with
+its glosses, the "do not invent a name" rule and the two accessibility rules.
+The ceilings below are the measured numbers, and a `<=` plus an exact pin, so
+the next character still has to be argued for.
 
 THE LAST 53 CHARACTERS ARE THREE PIECES OF origin/dev's OWN PROSE, PUT BACK.
 The reconciliation at 1,549 dropped them silently, and no test held any of
 them, so they are pinned below — with the reason each one is load-bearing:
 
-  * "inside labels" (+13). The ban reads "no parentheses, brackets, pipes or
+  * "inside labels" (+14). The ban reads "no parentheses, brackets, pipes or
     markdown INSIDE LABELS". Without the last two words it is a ban on
     brackets anywhere, which forbids `A["Payments API"]` — the form the very
     next sentence of this same string requires.
-  * "custom colours break dark mode" (+32). The REASON the directive ban
+  * "custom colours break dark mode" (+36). The REASON the directive ban
     exists. The compression replaced it with "the app paints a ROLE
     instead", which says what happens next and not why the model must not.
-  * "prefer" over "use" for `flowchart TD`/`LR` (+4, in the file's own
+  * "prefer" over "use" for `flowchart TD`/`LR` (+3, in the file's own
     spelling). "use" states the flowchart as mandatory, and four sentences
     later the same string tells the model what to do in a sequenceDiagram,
     erDiagram, pie, journey, timeline, mindmap or gitGraph. "prefer" is
     origin/dev's word and is the one that does not contradict itself.
+
+    CORRECTED 2026-09-28: these three were stated as +13, +32 and +4, which
+    sum to 49 — neither the 53 the paragraph above headlines nor the 53 the
+    string really moved, in the three places this branch wrote them (here,
+    the comment beside the string, and its own commit message). Re-measured
+    with difflib.SequenceMatcher over the two compiled strings, 7f16f4b7 →
+    this tree, 1,549 → 1,602, every opcode that is not "equal":
+
+        replace  -"us"  +"pr"                                    net  +0
+        insert          +"fer"                                   net  +3
+        insert          +" inside labels"                        net +14
+        insert          +" custom colours break dark mode, and"  net +36
+                                                                 net +53
+
+    Each delta is the text actually inserted, joining space and rejoining
+    ", and" included, which is what the +53 is made of; the bare phrases are
+    13 and 30 characters and neither 32 nor 4 is a reading of anything. The
+    assertions below pin the phrases, and `test_the_three_fragment_costs_are
+    _the_arithmetic_of_their_own_total` now pins the arithmetic, so a wrong
+    sum cannot sit in the record again.
 
 Two further origin/dev fragments are gone and are NOT coming back, so that
 the list above is the whole account: the worked example `(e.g. A["Login
@@ -82,11 +127,15 @@ teach nothing new (a test below keeps ONE such example in the string); and
 the adjective in "plain, SIMPLE sentences", because the clause it sits in
 already ends "so a non-technical reader can follow it".
 
-THE TOKEN COST, MEASURED 2026-09-27 (this is the unit prefill is charged in,
-so it is the one that decides). Pinned engine tokenizer, on CPU, no GPU
-touched: tokenizers 0.23.2 over
-Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json,
-load average 2.76.
+THE TOKEN COST, MEASURED 2026-09-27 AND RE-MEASURED 2026-09-28 (this is the
+unit prefill is charged in, so it is the one that decides). Pinned engine
+tokenizer, on CPU, no GPU touched: tokenizers 0.23.2 over
+Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json, load
+average 2.76 the first time and 4.18 the second. Every row below came back
+the same on both days, and the 2026-09-28 run also measured origin/dev at
+ff1a5d7c — after fix/deploy-honesty-r2 and integ/max-gates landed on it —
+which touches neither this string nor the golden fixtures: still 232 tokens
+and still 41,496 over the twelve.
 
     origin/dev                                232 tokens
     fix/document-vocabulary-r2                240 tokens   (+8)
@@ -94,17 +143,23 @@ load average 2.76.
     integ/diagram-group (7f16f4b7)            356 tokens   (+124)
     THIS TREE                                 365 tokens   (+133)
 
-+133 tokens per prompt, at every effort, in nine engines. Against the twelve
-golden fixtures in tests/fixtures/context_assembly_golden, whose mean prompt
-on origin/dev is 3,458 tokens (41,496 over twelve), that is 3.85%; the same
-fixtures on this tree total 43,092, and the delta is exactly +133 on each of
-the twelve, which is how we know the string is the only thing that moved.
++133 tokens per prompt, at every effort, in eight engine modules. Against
+the twelve golden fixtures in tests/fixtures/context_assembly_golden, whose
+mean prompt on origin/dev is 3,458 tokens (41,496 over twelve), that is
+3.846%; the same fixtures on this tree total 43,092, and the delta is exactly
++133 on each of the twelve, which is how we know the string is the only thing
+that moved.
 
-The +183 / 5.3% figure that was carried into this release is `fix/diagram-
-roles`' 1,848-character wording, NOT this one; it was the cost the
-integration accepted, and this tree comes in under it at +133. An earlier
-version of this docstring said the token cost was unmeasured — it is
-measured now, and no GPU was involved in measuring it.
+THE BUDGET THIS RELEASE ACCEPTED, and the row it belongs to. The integration
+accepted +183 tokens per prompt — 5.29% of that same 3,458-token mean — and
+that figure is `fix/diagram-roles`' 1,848-character wording (415 tokens),
+NOT this tree's. This tree is 365 tokens, +133, 3.846%, so it comes in 50
+tokens UNDER the accepted budget. Both numbers are in the table above and
+both were re-measured on 2026-09-28; the cost is settled and this is the
+whole of it, so a re-opening needs a new measurement rather than a re-reading
+of these two rows. (The mean is 3,458, not 3,453: 41,496 / 12 exactly.) An
+earlier version of this docstring said the token cost was unmeasured — it is
+measured, and no GPU was involved in measuring it.
 
 WHAT MUST NOT CHANGE, and why each one is here rather than in a comment:
 the one-diagram cap and the "ordinary questions get none" rule are what stop
@@ -120,6 +175,17 @@ from pathlib import Path
 
 from app.engines import DIAGRAM_INSTRUCTION
 
+
+def _flat(path: Path) -> str:
+    """A file's text with every run of whitespace collapsed to one space.
+
+    Prose wraps, and a gate that matches across a line break is a gate that a
+    re-wrap silently disarms — measured 2026-09-28, when the first version of
+    the em-dash check below stayed green against the very wording it forbids
+    because the mutation landed a newline inside the phrase.
+    """
+    return " ".join(path.read_text(encoding="utf-8").split())
+
 #: `len()` of a `str` is CHARACTERS. Measured on origin/dev at 593af55,
 #: before feat/document-vocabulary: 1,082. Kept as the HISTORICAL floor, so
 #: the raise below is always read against the string this branch started from.
@@ -131,16 +197,40 @@ PRE_EDIT_CHARS = 1082
 #: so anything larger is a rule nobody has argued for.
 CHARS_CEILING = 1602
 
-#: The same string in UTF-8, measured on the same commit: 1,086. This edit
-#: takes it to 1,088 — two bytes, one extra em dash — so the ceiling is the
-#: RE-MEASURED number and not the old one. It is stated rather than hidden
-#: because the earlier claim was "1,082 bytes before and after", which was
-#: the character count wearing a byte's name.
+#: The same string in UTF-8, measured on the same commit: 1,086. The
+#: document-vocabulary edit took it to 1,088 — two bytes, one extra em dash —
+#: and this tree takes it to the 1,606 pinned below. This floor is stated
+#: rather than hidden because the earlier claim was "1,082 bytes before and
+#: after", which was the character count wearing a byte's name.
 PRE_EDIT_UTF8_BYTES = 1086
 
 #: The same string in UTF-8 on this tree: 1,606. Two em dashes (U+2014, three
 #: UTF-8 bytes each) account for the four bytes over the character count.
 UTF8_BYTES_CEILING = 1606
+
+#: The reconciliation this tree restored three fragments ON TOP OF, measured
+#: on integ/diagram-group at 7f16f4b7. The three deltas below have to add up
+#: to the distance from here to CHARS_CEILING; nothing else may.
+RECONCILED_CHARS = 1549
+
+#: The naive conflict resolution toward fix/diagram-roles' wording, and
+#: fix/diagram-roles itself. Both are rows of the table in this file's
+#: docstring, and both are here so the deltas quoted in prose are arithmetic
+#: this file performs rather than numbers a reader has to trust.
+NAIVE_MERGE_CHARS = 1822
+DIAGRAM_ROLES_CHARS = 1848
+
+#: The three restored fragments and the characters each one costs, measured
+#: 2026-09-28 with difflib.SequenceMatcher over the compiled string on
+#: 7f16f4b7 and on this tree. Each value is the text actually inserted —
+#: joining space and rejoining ", and" included — which is what makes the
+#: total the +53 the docstring names. The bare phrases are 13 and 30
+#: characters; the +13/+32/+4 this branch first published were neither.
+RESTORED_FRAGMENT_CHARS = {
+    "inside labels": 14,
+    "custom colours break dark mode": 36,
+    "prefer over use": 3,
+}
 
 
 def test_the_instruction_did_not_grow_in_characters():
@@ -154,9 +244,15 @@ def test_the_instruction_did_not_grow_in_characters():
 
 def test_the_instruction_is_measured_in_the_unit_it_names():
     """The two units, each against what it really is, so neither can be
-    quoted as the other again. The byte ceiling is the re-measured 1,088, not
-    the 1,086 of origin/dev: the +2 is real and is recorded here rather than
-    asserted away."""
+    quoted as the other again.
+
+    RE-TARGETED 2026-09-28: this docstring still described the 1,088-byte
+    ceiling of fix/document-vocabulary-r2, two sizes ago. On this tree the
+    ceiling is 1,606 bytes against 1,602 characters, and the +520 the raise
+    cost is the same number in both units because the string gained one em
+    dash and lost one. The 1,086 and 1,088 of origin/dev and
+    document-vocabulary-r2 are still named, in the constants below, because
+    the withdrawn "1,082 bytes" claim is read against them."""
     chars = len(DIAGRAM_INSTRUCTION)
     encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
     assert chars == CHARS_CEILING, (
@@ -178,6 +274,103 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     )
 
 
+def test_the_three_fragment_costs_are_the_arithmetic_of_their_own_total():
+    """A number stated as measured is checked here, not believed.
+
+    This branch published the three restored fragments as +13, +32 and +4 —
+    in this file, in the comment beside the string, and in its commit message
+    — and 13 + 32 + 4 is 49, while the same paragraph headlines 53 and the
+    string really moved 53. The sum is now arithmetic that runs, and the
+    prose that quotes it is read back out of both files, because a docstring
+    has no other gate. Re-measured 2026-09-28 with difflib over the compiled
+    strings: +3 ("fer"), +14 (" inside labels"), +36 (" custom colours break
+    dark mode, and").
+    """
+    assert sum(RESTORED_FRAGMENT_CHARS.values()) == CHARS_CEILING - RECONCILED_CHARS == 53
+    root = Path(__file__).resolve().parents[1]
+    prose = _flat(root / "app" / "engines" / "__init__.py")
+    mine = _flat(Path(__file__))
+    for text, where in ((prose, "app/engines/__init__.py"), (mine, "this file")):
+        for phrase, cost in RESTORED_FRAGMENT_CHARS.items():
+            if phrase == "prefer over use":
+                assert "/`LR` (+3" in text, where
+                continue
+            assert f'"{phrase}" (+{cost})' in text, where
+        # ...and the numbers that were published instead, built rather than
+        # quoted so this gate does not carry the wording it forbids.
+        for phrase, withdrawn in (("inside labels", 13), ("custom colours break dark mode", 32)):
+            wrong = '"%s" (+%d)' % (phrase, withdrawn)
+            assert wrong not in text, f"{where} still states {wrong}"
+        assert "/`LR` (+%d" % 4 not in text, where
+
+
+def test_the_delta_against_the_naive_merge_is_arithmetic_and_not_a_referent_error():
+    """The delta the previous revision gave against the naive merge was the
+    delta against fix/diagram-roles, and it reached both this file's docstring
+    and the golden MANIFEST's `size` note when the size moved from 1,549 to
+    1,602. The two deltas are computed here so neither can be quoted for the
+    other again, and the prose is read back out of the two files that carry
+    it.
+
+    (MANIFEST.json is not itself hashed — tests/test_context_assembly_golden.py
+    reads it, and its sha256 map covers the 24 fixture files only — so
+    correcting that note costs no recapture.)
+    """
+    assert NAIVE_MERGE_CHARS - CHARS_CEILING == 220
+    assert DIAGRAM_ROLES_CHARS - CHARS_CEILING == 246
+    root = Path(__file__).resolve().parents[1]
+    naive, roles = NAIVE_MERGE_CHARS - CHARS_CEILING, DIAGRAM_ROLES_CHARS - CHARS_CEILING
+    manifest = _flat(root / "tests/fixtures/context_assembly_golden/MANIFEST.json")
+    assert f"-{naive} against the naive merge" in manifest
+    assert f"-{roles} against the naive merge" not in manifest, "the wrong referent is back"
+    mine = _flat(Path(__file__))
+    assert f"\u2212{naive} characters against the naive merge" in mine
+    assert f"\u2212{roles} characters against the naive merge" not in mine
+
+
+def test_the_em_dash_count_is_the_one_the_byte_delta_implies():
+    """The mechanism, not just the number. The character and byte deltas over
+    origin/dev are both +520, which can only hold if the non-ASCII count did
+    not move; the previous revision explained that as a gain of TWO em dashes
+    against a loss of one, which would move the count by one and make the byte
+    delta 522 — it contradicted the number it was offered to explain. Counted
+    2026-09-28: origin/dev 2, fix/document-vocabulary-r2 3, fix/diagram-roles
+    5, integ/diagram-group 2, this tree 2 — gained one, lost one."""
+    assert DIAGRAM_INSTRUCTION.count("\u2014") == 2
+    assert len(DIAGRAM_INSTRUCTION.encode("utf-8")) - len(DIAGRAM_INSTRUCTION) == 2 * 2
+    mine = _flat(Path(__file__))
+    assert "gained ONE em dash and lost one, so its non-ASCII count did not move" in mine
+    wrong = "gained %s em dashes and lost one, so its non-ASCII" % "two"
+    assert wrong not in mine, "the withdrawn mechanism is back in the docstring"
+
+
+def test_the_count_of_engine_modules_is_the_one_on_disk():
+    """A count of NINE engines appeared five times across this file and the
+    comment beside the string, and it is neither of the two real numbers:
+    measured 2026-09-28, ELEVEN concatenation sites in EIGHT modules (agent 1,
+    chat 2, dataset 1, document 1, rag 1, repo 2, search 1, url 2), and the
+    same eleven on origin/dev ff1a5d7c, so the Max-gate split did not move it.
+    The phrase was inherited from an older header, so it was never measured;
+    it is counted here and the prose is held to the count."""
+    engines = Path(__file__).resolve().parents[1] / "app" / "engines"
+    per_module = {}
+    for path in sorted(engines.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        n = len(re.findall(r"\+\s*DIAGRAM_INSTRUCTION|DIAGRAM_INSTRUCTION\s*\+",
+                           path.read_text(encoding="utf-8")))
+        if n:
+            per_module[path.name] = n
+    assert sum(per_module.values()) == 11, per_module
+    assert len(per_module) == 8, per_module
+    for text, where in (
+        (_flat(Path(__file__)), "this file"),
+        (_flat(engines / "__init__.py"), "app/engines/__init__.py"),
+    ):
+        wrong = "%s engines" % "nine"
+        assert wrong not in text, f"{where} still says {wrong!r}"
+
+
 def test_the_withdrawn_byte_claim_is_not_restated_anywhere():
     """The unit correction above was made in this file first and left standing
     in the two places a reader actually meets it, so the branch still carried
@@ -191,8 +384,8 @@ def test_the_withdrawn_byte_claim_is_not_restated_anywhere():
     for rel in ("app/engines/__init__.py", "tests/fixtures/context_assembly_golden/MANIFEST.json"):
         text = (root / rel).read_text(encoding="utf-8")
         for wrong in ("1,082 bytes", "1082 bytes"):
-            offenders = [line.strip() for line in text.splitlines() if wrong in line]
-            assert not offenders, f"{rel} still states the withdrawn claim {wrong!r}: {offenders}"
+            # collapsed as well, for the same reason `_flat` exists
+            assert wrong not in " ".join(text.split()), f"{rel} still states the withdrawn claim {wrong!r}"
         assert "1,082 CHARACTERS" in text, f"{rel} should name the unit that is actually 1,082"
         assert "1,086" in text and "1,088" in text, f"{rel} should carry both re-measured byte counts"
 

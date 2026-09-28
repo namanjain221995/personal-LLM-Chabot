@@ -51,7 +51,14 @@ floor (worst pair ΔE 3.0). The border and the label are what identify a node;
 the tint is a wash that makes the role visible at a glance.
 
 PAPER ONLY. There is no dark palette here. A DOCX and a PDF are printed on
-white, and no dark set has been validated for this use.
+white, and no dark set has been validated for this use. What that would cost
+is now measured rather than left open (2026-09-28, the same validator,
+`--mode dark --surface "#1a1a19" --pairs all`): the four hold their CVD and
+normal-vision separation unchanged on a dark surface (7.1 deutan, 15.1 normal)
+and all four clear 3:1 against it, but `#E07B00` sits at OKLCH L 0.682 and
+falls outside the dark mode's lightness band, so a dark set is a RE-STEP of at
+least the orange and not a reuse of these four. Nothing here reads `theme` for
+a dark surface, so that is a future decision, not a gap in this one.
 
 PAGE FIT IS PART OF THE DRAWING. `docx.py` pins a picture to the content
 width, so a figure wider than the page is scaled DOWN and its labels shrink
@@ -425,7 +432,14 @@ _EDGE_MID_RE = re.compile(rf"^{_node_part('a')}\s*{_MID_ARROW}\s*{_node_part('b'
 #: it was wrong, and the table above is what replaced it.
 _MID_LABEL_SWALLOWED_AN_ARROW_RE = re.compile(r"--|-\.|\.-|==|[<>;]")
 
-#: AN ID IS A NAME, NOT AN ARROW THAT LOST ITS SPACES.
+#: A DASH RUN IS AN ARROW, NOT THE INSIDE OF A NAME.
+#:
+#: (Narrowed 2026-09-28. This block used to be headed "AN ID IS A NAME, NOT AN
+#: ARROW THAT LOST ITS SPACES" and to say the hole was closed "at every site an
+#: id comes from". Both were wider than this regex: it closes DASH RUNS only,
+#: and an arrowhead that lost its space — `A---oB` — walked straight through
+#: it. That family is closed below, by `_arrowhead_became_the_target`, and the
+#: two guards together are what the old heading claimed.)
 #:
 #: `_node_part` admits `-` inside an id, because mermaid does: `api-gateway`
 #: is a legal node id and is written in real sources. The cost of that, found
@@ -440,8 +454,9 @@ _MID_LABEL_SWALLOWED_AN_ARROW_RE = re.compile(r"--|-\.|\.-|==|[<>;]")
 #: box nobody wrote — the same class of defect as the bare `flowchart` line
 #: above, and the same broken promise. It is NOT reached through
 #: `_MID_LABEL_SWALLOWED_AN_ARROW_RE`: that guard sees only lines that matched
-#: `_EDGE_MID_RE`, and none of these three does. So it is closed here, at
-#: every site an id comes from, rather than beside that guard.
+#: `_EDGE_MID_RE`, and none of these three does. So it is closed at all three
+#: sites a `-` can reach an id — `_EDGE_RE`, `_EDGE_MID_RE` and `_DECL_RE` —
+#: rather than beside that guard.
 #:
 #: A single inner hyphen stays legal, which is the whole point: `api-gateway`
 #: and `my-node` pass, `A--B`, `-A` and `A-` do not. `A---B` keeps working as
@@ -453,6 +468,78 @@ _ID_IS_AN_ARROW_RE = re.compile(r"^-|--|-$")
 def _ids_are_names(*ids: Optional[str]) -> bool:
     """True when every id a matched line produced is a name, not a dash run."""
     return not any(_ID_IS_AN_ARROW_RE.search(i) for i in ids if i)
+
+
+#: AN ARROWHEAD IS NOT THE FIRST LETTER OF THE TARGET'S NAME.
+#:
+#: mermaid's links may END in `o` or `x` as well as `>` — a circle or a cross
+#: drawn at the target end — and the head belongs to the LINK whether or not a
+#: space follows it: its own lexer rules are
+#: /^(?:\s*[xo<]?--+[-xo>]\s*)/ and /^(?:\s*[xo<]?-?\.+-[xo>]?\s*)/
+#: (frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-RHFEMEQ7.mjs,
+#: 11.17.0). `_ARROW` and `_MID_ARROW` stop at the last dash, so the `o`/`x`
+#: fell through to `_node_part('b')` and became the first letter of a name.
+#: `_ID_IS_AN_ARROW_RE` cannot see it: `oB` holds no dash.
+#:
+#: MEASURED 2026-09-28 on d9edd8a7, beside what mermaid 11.17.0 itself does —
+#: not read off its regexes but RUN: `diagram.parser.parse()` out of the
+#: chunk above, under node with `frontend/node_modules/jsdom` supplying the
+#: DOM its label sanitiser needs, reading back `db.getVertices()` and
+#: `db.getEdges()`. The wrong picture was also read in the pixels first —
+#: `A["Ingest"]:::service---oB["Index"]` with `B --> C["Answer"]` drew FOUR
+#: boxes, one of them labelled literally "B", where mermaid draws three:
+#:
+#:     source              mermaid 11.17.0        this grammar, before
+#:     A---oB              A -> B, circle head    A -> a node called "oB"
+#:     A---xB              A -> B, cross head     A -> a node called "xB"
+#:     A-.-oB              A -> B, dotted         A -> "oB", dashed
+#:     A-..-oB             A -> B, dotted         A -> "oB", dashed
+#:     A-- yes ---oB       A -> B "yes"           A -> "oB" "yes"
+#:     A-.yes.-oB          A -> B "yes" dotted    A -> "oB" "yes"
+#:     A---o               PARSE ERROR            A -> a node called "o"
+#:     A---oscar           A -> a node "scar"     A -> a node "oscar"
+#:     A---xylophone       A -> a node "ylophone" A -> "xylophone"
+#:
+#: WHY THIS REFUSES RATHER THAN DRAWING mermaid'S PICTURE. Mirroring the two
+#: lexer rules was tried first and rejected on the last two rows: mermaid
+#: reads `A---oscar` as an edge to a node called "scar", so copying it trades
+#: one box nobody wrote for another. The source does not say which the author
+#: meant, and a grammar that has to guess is exactly the case this module
+#: answers with the callout (`style`, `subgraph`, an HTML label and a chain
+#: all refuse here while the browser draws them happily). Refusing also costs
+#: no correct capability, because the unspaced form is the ONLY one in doubt:
+#: `A --- oB`, `A --> oscar` and `A---|"n"|oB` keep their o-initial targets,
+#: and mermaid agrees with us on all three. The price is recorded rather than
+#: hidden: `api---orders` now loses its whole diagram to the callout where it
+#: used to draw api -> orders, and a source written with the spaces mermaid's
+#: own examples use never reaches this guard.
+#:
+#: WHAT IS LEFT, stated narrowly this time. After this, the id class
+#: `[A-Za-z_][\w-]` admits exactly two characters mermaid can also read as
+#: part of a link — `-` (above) and the arrowheads `o`/`x` (here). Every other
+#: link character (`.`, `=`, `<`, `>`, `|`, `&`) is outside the class, so such
+#: a line matches nothing and the source refuses: `A----B`, `A==B`, `A==oB`,
+#: `A<--B`, `Ao--oB` and `A o--o B` are all callouts today, and a
+#: LEFT-hand head that abuts its source (`Ao---B`, `Ax--xB`) is read as the id
+#: `Ao`/`Ax` by mermaid too, so it is not this defect.
+def _arrowhead_became_the_target(m: "re.Match[str]", *arrow_groups: str) -> bool:
+    """True when the target id begins with the `o` or `x` of an arrowhead.
+
+    The head is only in doubt when it ABUTS the target: `m.start("bid")` has
+    to be exactly where the arrow ended, so `A --- oB` (spaced) and
+    `A---|"n"|oB` (an explicit label between them) are names and stay legal.
+    """
+    bid = m.group("bid")
+    if not bid or bid[0] not in ("o", "x"):
+        return False
+    for name in arrow_groups:
+        tail = m.group(name)
+        if tail is None:
+            continue
+        # Only a link whose body ENDS in a dash can take an `o`/`x` head:
+        # `-->`, `-.->` and `==>` are already complete at the `>`.
+        return tail.endswith("-") and m.end(name) == m.start("bid")
+    return False
 
 
 _DECL_RE = re.compile(rf"^{_node_part('a')}$")
@@ -513,6 +600,8 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             g = m.groupdict()
             if not _ids_are_names(g["aid"], g["bid"]):
                 return None
+            if _arrowhead_became_the_target(m, "arrow"):
+                return None
             touch(g["aid"], g["alabel"], g["arole"])
             touch(g["bid"], g["blabel"], g["brole"])
             edges.append({
@@ -539,6 +628,8 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
                 # note; refusing here says so at the point it is decided.)
                 return None
             if not _ids_are_names(g["aid"], g["bid"]):
+                return None
+            if _arrowhead_became_the_target(m, "mtail_s", "mtail_d", "mtail_t"):
                 return None
             touch(g["aid"], g["alabel"], g["arole"])
             touch(g["bid"], g["blabel"], g["brole"])
@@ -1098,12 +1189,21 @@ def _tint(hex_colour: str, amount: float) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
-def role_colour(role: str) -> str:
-    """The saturated slot for a role; neutral grey for anything else."""
+def role_colour(role: Optional[str]) -> str:
+    """The saturated slot for a role; neutral grey for anything else.
+
+    `Optional`, and measured rather than assumed: since `DiagramNode.kind`
+    became nullable on 2026-09-27 an untagged node's role is None, and None
+    is what a test now passes here. The `.get` already answered it with the
+    neutral; the annotation said `str` and was the only thing that was wrong.
+    The render path still never sends None — `_build` folds a missing role to
+    `""` — so this is the annotation catching up with the caller, not a
+    behaviour change.
+    """
     return ROLE_COLOURS.get(role, NEUTRAL)
 
 
-def role_fill(role: str) -> str:
+def role_fill(role: Optional[str]) -> str:
     """The node fill: the role's colour blended towards paper."""
     return _tint(role_colour(role), FILL_TINT)
 

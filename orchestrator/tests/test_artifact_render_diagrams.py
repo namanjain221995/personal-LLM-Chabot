@@ -678,10 +678,10 @@ def test_the_swallow_class_is_strictly_wider_than_the_proposed_prototype(monkeyp
         return D.parse_mermaid(f'flowchart TD\n  X["x"] --> Y["y"]\n  {line}\n') is not None
 
     # Shipped: every one of the seven falls back to the callout.
-    assert [l for l in shapes if drew(l)] == []
+    assert [line for line in shapes if drew(line)] == []
 
     monkeypatch.setattr(D, "_MID_LABEL_SWALLOWED_AN_ARROW_RE", _PROPOSED_PROTOTYPE_CLASS)
-    assert [l for l in shapes if drew(l)] == [
+    assert [line for line in shapes if drew(line)] == [
         'A --> B; C --> D',
         'A -- <b>html</b> --> B',
         'A-->B-->C',
@@ -1205,8 +1205,9 @@ def test_the_module_imports_no_layout_library():
         assert f"import {banned}" not in source
 
 
-# ------------------------------------------------- an id is a name, not an --
-# ------------------------------------------------- arrow that lost its space --
+# --------------------------------------------- an arrow that lost its space --
+# --------------------------------------------- is not part of an id, and the --
+# --------------------------------------------- guards are one per character --
 
 
 @pytest.mark.parametrize("line,why", [
@@ -1232,8 +1233,15 @@ def test_a_dash_run_is_never_read_as_a_node_id(line, why):
     Every one of those is a box the author never wrote, which is the exact
     promise this module makes and the same defect the bare `flowchart` line
     had. The hole is NOT reachable through the mid-label swallow guard —
-    none of these lines matches `_EDGE_MID_RE` — so it is closed at every
-    site an id comes from instead of beside that guard.
+    none of these lines matches `_EDGE_MID_RE` — so it is closed at all three
+    sites a dash can reach an id (`_EDGE_RE`, `_EDGE_MID_RE`, `_DECL_RE`)
+    instead of beside that guard.
+
+    NARROWED 2026-09-28: this guard closes DASH RUNS, and that is all it
+    closes. An ARROWHEAD that lost its space (`A---oB`) holds no dash and
+    walked through it until the test below was written; the old wording here
+    and in diagrams.py said "every site an id comes from", which read as the
+    whole class.
     """
     source = f'flowchart TD\n  {line}\n  Z["end"] --> Y["also"]\n'
     assert D.parse_mermaid(source) is None, (line, why)
@@ -1253,6 +1261,118 @@ def test_a_hyphenated_id_is_still_an_ordinary_id(source, ids):
     fields = D.parse_mermaid(source)
     assert fields is not None, source
     assert [n["id"] for n in fields["nodes"]] == ids
+
+
+#: WHAT MERMAID 11.17.0 ITSELF DOES with an arrowhead that abuts its target,
+#: measured 2026-09-28 by RUNNING its parser — `diagram.parser.parse()` from
+#: frontend/node_modules/mermaid/dist/chunks/mermaid.core/chunk-RHFEMEQ7.mjs
+#: under node, with frontend/node_modules/jsdom supplying the DOM its label
+#: sanitiser needs — and reading back `db.getVertices()` / `db.getEdges()`.
+#: The value is what mermaid calls the TARGET of the single edge it read.
+_MERMAID_11_17_READS = {
+    "A---oB": "B",
+    "A---xB": "B",
+    "A-.-oB": "B",
+    "A-.-xB": "B",
+    "A-..-oB": "B",
+    "A-- yes ---oB": "B",
+    "A-.yes.-oB": "B",
+    "A -- n ---xB": "B",
+    # The two rows that decided this guard refuses instead of mirroring
+    # mermaid: mermaid's own reading here is ALSO a box nobody wrote.
+    "A---oscar": "scar",
+    "A---xylophone": "ylophone",
+    # And one mermaid refuses outright, where we used to draw a node "o".
+    "A---o": None,
+}
+
+
+@pytest.mark.parametrize("line", sorted(_MERMAID_11_17_READS))
+def test_an_arrowhead_is_never_read_as_the_first_letter_of_a_target(line):
+    r"""mermaid links may end in `o` or `x` — a circle or a cross at the
+    target end — and the head belongs to the LINK whether or not a space
+    follows: its own lexer rules are /^(?:\s*[xo<]?--+[-xo>]\s*)/ and
+    /^(?:\s*[xo<]?-?\.+-[xo>]?\s*)/. `_ARROW` and `_MID_ARROW` stop at the
+    last dash, so before 2026-09-28 the `o`/`x` fell through to the target's
+    id class, which holds no dash for `_ID_IS_AN_ARROW_RE` to catch.
+
+    Measured on d9edd8a7: `A---oB` came back as an edge from `A` to a node
+    called `oB`, and the fence
+    `A["Ingest"]:::service---oB["Index"]` + `B --> C["Answer"]` drew FOUR
+    boxes — one of them labelled literally "B" — where mermaid draws three
+    connected ones. That is a box the author never wrote, in a person's PDF,
+    which is the one thing this module promises not to do.
+
+    It REFUSES rather than adopting mermaid's reading, and the last two rows
+    of `_MERMAID_11_17_READS` are the reason: mermaid reads `A---oscar` as an
+    edge to a node called `scar`, so mirroring it would trade one invented
+    box for another. Nothing in the source says which the author meant, and
+    an unreadable source is what the callout is for.
+    """
+    source = f'flowchart TD\n  {line}\n  Z["end"] --> Y["also"]\n'
+    assert D.parse_mermaid(source) is None, (line, _MERMAID_11_17_READS[line])
+
+
+def test_the_arrowhead_guard_costs_nothing_that_is_written_with_its_space():
+    """The other half of the measurement: every o/x-initial target that is NOT
+    in doubt still parses, and mermaid 11.17.0 agrees with each of these
+    readings (same probe, same day). The unspaced form is the only ambiguous
+    one, so the guard is exactly as wide as the doubt."""
+    for line, ids in (
+        # a space, so the `o` cannot be a head
+        ('A --- oB', ["A", "oB"]),
+        ('A --- oscar', ["A", "oscar"]),
+        ('A -.- xB', ["A", "xB"]),
+        # the link is already complete at the `>`
+        ('A-->oB', ["A", "oB"]),
+        ('A-.->oB', ["A", "oB"]),
+        ('A==>xB', ["A", "xB"]),
+        # an explicit `|label|` stands between the arrow and the id
+        ('A---|"n"|oB', ["A", "oB"]),
+        # a target that merely contains o/x elsewhere
+        ('A---B', ["A", "B"]),
+        ('repo---db', ["repo", "db"]),
+        ('api-gateway --> my-store', ["api-gateway", "my-store"]),
+        ('A -- yes --> oscar', ["A", "oscar"]),
+    ):
+        fields = D.parse_mermaid(f'flowchart TD\n  {line}\n')
+        assert fields is not None, line
+        assert [n["id"] for n in fields["nodes"]] == ids, line
+
+
+def test_the_price_of_the_arrowhead_guard_is_on_the_record():
+    """What this costs, so nobody rediscovers it as a surprise: an unspaced
+    link into a target whose name STARTS with o or x now loses the whole
+    diagram to the callout, where it used to draw the edge the author probably
+    meant. mermaid does not draw that edge either — it reads `api---orders` as
+    an edge to a node called `rders` — but the loss is real and belongs in a
+    test rather than in a note."""
+    assert D.parse_mermaid('flowchart TD\n  api---orders\n  orders --> db\n') is None
+    # With the space mermaid's own examples use, the same graph is fine.
+    fields = D.parse_mermaid('flowchart TD\n  api --- orders\n  orders --> db\n')
+    assert fields is not None
+    assert [n["id"] for n in fields["nodes"]] == ["api", "orders", "db"]
+
+
+def test_the_id_class_admits_exactly_two_characters_a_link_can_also_use():
+    r"""The narrow version of the claim this branch first made too widely.
+
+    An arrow character can only be misread as part of an id if the id class
+    admits it. `_node_part`'s class is `[A-Za-z_][\w-]{0,39}`, and the
+    characters mermaid's link rules use are `-`, `.`, `=`, `<`, `>`, `o`, `x`,
+    `|` and `&`. Exactly two of those are inside the class — `-` and the
+    arrowheads `o`/`x` — and each has its own guard above. Every other one is
+    outside it, so the line matches no rule at all and the source refuses,
+    which this test also checks rather than asserting.
+    """
+    id_class = re.compile(r"[\w-]")
+    inside = {c for c in "-.=<>ox|&" if id_class.fullmatch(c)}
+    assert inside == {"-", "o", "x"}, inside
+    # ...and every shape built from the characters OUTSIDE the class refuses,
+    # so none of them can reach an id in the first place.
+    for line in ("A==B", "A==oB", "A===B", "A<--B", "A<-->B", "Ao--oB",
+                 "A o--o B", "A & B --> C", "A --> B & C"):
+        assert D.parse_mermaid(f'flowchart TD\n  {line}\n  Z["e"] --> Y["a"]\n') is None, line
 
 
 def test_the_neutral_fill_of_an_untagged_node_is_in_the_rendered_pixels(tmp_path):

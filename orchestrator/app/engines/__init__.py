@@ -134,13 +134,17 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 # chat diagram painted on one default node fill, which is the owner's report.
 #
 # THE SIZE IS A TEST, AND IT WAS RAISED ONCE, DELIBERATELY. This string is
-# concatenated at ELEVEN call sites (chat.py x2, rag.py, repo.py x2, agent.py,
-# url.py x2, dataset.py, document.py, search.py), on the chat path, at EVERY
-# effort, with no gate — so a character added here is prefill on every Fast
-# turn in nine engines. The one-diagram cap, the "ordinary questions get none"
-# rule and the ~20-node legibility cap are therefore all kept; the
-# three-diagram allowance for a DOCUMENT lives on the artifact path, which
-# never imports this string.
+# concatenated at ELEVEN call sites in EIGHT modules (chat.py x2, rag.py,
+# repo.py x2, agent.py, url.py x2, dataset.py, document.py, search.py), on the
+# chat path, at EVERY effort, with no gate — so a character added here is
+# prefill on every Fast turn in all eight of them. (A count of NINE engines,
+# which this comment and the budget test both used to give, was inherited from
+# an older header and is neither of the two real numbers; counted 2026-09-28,
+# on this tree and on origin/dev ff1a5d7c, by the last test in
+# tests/test_diagram_instruction_budget.py.) The
+# one-diagram cap, the "ordinary questions get none" rule and the ~20-node
+# legibility cap are therefore all kept; the three-diagram allowance for a
+# DOCUMENT lives on the artifact path, which never imports this string.
 #
 # Measured 2026-09-27 by importing the string on each tree:
 #
@@ -167,11 +171,11 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 # THE LAST 53 CHARACTERS ARE origin/dev's OWN PROSE, PUT BACK. The 1,549
 # reconciliation dropped three fragments that no test held, which is why the
 # loss was silent. Each changes what the model is told, so each is back and
-# pinned: "inside labels" (+13), without which the ban on brackets and pipes
+# pinned: "inside labels" (+14), without which the ban on brackets and pipes
 # reads globally and forbids the `A["Payments API"]` this very string then
-# requires; "custom colours break dark mode" (+32), the REASON the directive
+# requires; "custom colours break dark mode" (+36), the REASON the directive
 # ban exists, which the compression had replaced with what happens next;
-# and "prefer" over "use" for `flowchart TD`/`LR` (+4), because "use" makes
+# and "prefer" over "use" for `flowchart TD`/`LR` (+3), because "use" makes
 # the flowchart mandatory four sentences before this string explains what to
 # do inside seven other diagram types. Two further fragments stay dropped and
 # are listed in the budget test so the account is complete: the second worked
@@ -184,12 +188,16 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 #   origin/dev 232 tokens; document-vocabulary-r2 240; diagram-roles 415;
 #   integ/diagram-group 356; THIS FILE 365.
 #
-# So +133 tokens per prompt over origin/dev, at every effort, in nine engines.
-# Against the twelve context_assembly_golden fixtures — 41,496 tokens on
-# origin/dev, mean 3,458 per prompt, 43,092 here, exactly +133 on each of the
-# twelve — that is 3.85% of the mean prompt. The +183 / 5.3% figure carried
-# through the release is fix/diagram-roles' 1,848-character wording, NOT this
-# one. The old note here claimed "+8 tokens per prompt / 30,832 -> 30,928
+# So +133 tokens per prompt over origin/dev, at every effort, in all eight
+# modules. Against the twelve context_assembly_golden fixtures — 41,496 tokens
+# on origin/dev, mean 3,458 per prompt, 43,092 here, exactly +133 on each of
+# the twelve — that is 3.846% of the mean prompt. The +183 / 5.29% figure the
+# integration accepted as the budget is fix/diagram-roles' 1,848-character
+# wording (415 tokens), NOT this one, which is 365 and lands 50 tokens under
+# it. Re-measured 2026-09-28 at load average 4.18, including origin/dev at
+# ff1a5d7c (still 232 tokens, still 41,496 over the twelve: neither
+# fix/deploy-honesty-r2 nor integ/max-gates touches this string or those
+# fixtures). The old note here claimed "+8 tokens per prompt / 30,832 -> 30,928
 # across the twelve golden fixtures"; that claim stays withdrawn, and the
 # numbers above replace it with first-hand ones.
 #
