@@ -114,16 +114,29 @@ describe('opening a recording', () => {
       false,
     ],
     [429, { detail: 'slow down', reason: 'rate_limited' }, 'Too many recordings were started just now. Wait a moment and try again.', true],
-    [
-      503,
-      { detail: 'full', reason: 'capacity_full' },
-      "Too many people are recording right now, so this one didn't start. Try again in a minute.",
-      true,
-    ],
     [507, { detail: 'disk', reason: 'storage_full' }, "The server has no space left for recordings, so this one didn't start.", false],
+    [
+      507,
+      { detail: 'quota', reason: 'quota_exceeded' },
+      "Your recordings have used all the space your account has, so this one didn't start. Delete some on the Recordings page (/recordings) to record again.",
+      false,
+    ],
   ])('%i %j reads as its own sentence', async (status, body, message, retryable) => {
     const result = await open(status, body);
     expect(result).toEqual({ kind: 'error', error: { message, retryable } });
+  });
+
+  // 2026-09-29 (fix/voice-server-hardening decision): a full server no longer
+  // refuses a dictation. The legacy road has its own pool, so a short one
+  // still works; the recorder says it is not stored and stops at 10 minutes.
+  it('takes the ten-minute road, and says it is not stored, when the server is full', async () => {
+    expect(await open(503, { detail: 'full', reason: 'capacity_full' })).toEqual({
+      kind: 'legacy',
+      reason: 'capacity_full',
+    });
+    expect(VOICE_MESSAGES.capacityLegacyHint).toBe(
+      "Too many people are recording right now, so this recording isn't saved to your account and stops at 10 minutes.",
+    );
   });
 
   it('takes the ten-minute road, with a line saying so, when the server has no sessions', async () => {
@@ -190,10 +203,16 @@ async function interruptedAt(
   injection: Injection,
   store: OutboxStore = createMemoryOutbox(),
   extraSlicesAfter = 0,
+  createRefusal?: Injection,
 ): Promise<{ result: SessionResult; server: FakeSessionServer }> {
   // Four parts (0:20) go up; the fifth is refused.
   const server = new FakeSessionServer({
-    inject: ({ method, seq }) => (method === 'PUT' && seq === 4 ? injection : undefined),
+    inject: ({ method, seq, path }) =>
+      method === 'PUT' && seq === 4
+        ? injection
+        : method === 'POST' && path === '/api/audio/sessions'
+          ? createRefusal
+          : undefined,
   });
   server.status = 'recording';
   const session = new VoiceSession(
@@ -218,8 +237,10 @@ describe('the server stops taking parts mid-recording', () => {
   it('a sign-out keeps the unsent seconds on a device that can keep them, and says which', async () => {
     const persistent = { ...createMemoryOutbox(), persistent: true } as OutboxStore;
     const kept = await interruptedAt({ status: 401, body: { detail: 'Not authenticated' } }, persistent);
+    // "…unless someone else signs in…" since 2026-09-29: the outbox of an
+    // account is deleted when another account signs in on the same browser.
     expect(messageOf(kept.result)).toBe(
-      'You were signed out. Everything up to 0:20 is saved on the server; the last few seconds are kept on this device and will upload when you sign in again.',
+      'You were signed out. Everything up to 0:20 is saved on the server; the last few seconds are kept on this device and will upload when you sign in again, unless someone else signs in on this browser first.',
     );
     const lost = await interruptedAt({ status: 401, body: { detail: 'Not authenticated' } });
     expect(messageOf(lost.result)).toBe(
@@ -228,10 +249,6 @@ describe('the server stops taking parts mid-recording', () => {
   });
 
   it.each([
-    [
-      { status: 403, body: { detail: 'Voice input is turned off for your account. Ask an administrator.', reason: 'voice_off' } },
-      'Voice input is turned off for your account. Ask an administrator.',
-    ],
     [
       { status: 404, body: { detail: 'gone', reason: 'not_found' } },
       'This recording is no longer on the server. It was discarded or has expired.',
@@ -250,31 +267,62 @@ describe('the server stops taking parts mid-recording', () => {
     expect(messageOf(result)).toBe(message);
   });
 
-  it('a session the server closed for silence says so, and still delivers what was said', async () => {
+  // 2026-09-29: in each case below the fifth part (0:20-0:25) was refused
+  // and is still on this device. It used to be deleted with the outbox and the
+  // sentence said nothing of it; it is now KEPT, the sentence says so, and
+  // "Upload the rest" is offered. (These slices are not WebM, so no new
+  // session can continue them: tests/voice-session-edges covers that road.)
+  const uploadRest = (result: SessionResult) =>
+    result.kind === 'withdrawn' ? null : result.offer?.kind === 'upload_rest' ? result.offer.label : null;
+
+  it('voice turned off mid-recording keeps what the server did not take', async () => {
     const { result } = await interruptedAt({
-      status: 409,
-      body: { detail: 'closed', reason: 'session_closed', status: 'finishing', ended_by: 'idle' },
+      status: 403,
+      body: { detail: 'Voice input is turned off for your account. Ask an administrator.', reason: 'voice_off' },
     });
-    expect(result.kind).toBe('text');
+    expect(result.kind).toBe('error');
     expect(messageOf(result)).toBe(
-      "This recording was closed after 10 minutes with no audio arriving, and everything before that is saved. You're not being recorded now. Press the microphone to start a new recording.",
+      'Voice input is turned off for your account. Ask an administrator. The last 0:05 of this recording is kept on this device.',
     );
   });
 
-  it('a session ended from another tab says so', async () => {
+  it('a session the server closed for silence says so, still delivers what was said, and keeps the rest', async () => {
+    // An idle-closed session is continued in a new one at once
+    // (voice-session-edges.test.ts); this is the sentence when that is refused.
+    const { result } = await interruptedAt(
+      {
+        status: 409,
+        body: { detail: 'closed', reason: 'session_closed', status: 'finishing', ended_by: 'idle' },
+      },
+      undefined,
+      0,
+      { status: 409, body: { detail: 'no', reason: 'not_continuable' } },
+    );
+    expect(result.kind).toBe('text');
+    expect(messageOf(result)).toBe(
+      "This recording was closed after 10 minutes with no audio arriving. Everything up to 0:20 is saved on the server. The last 0:05 is kept on this device, because the server would not take it after that. You're not being recorded now.",
+    );
+    expect(uploadRest(result)).toBe('Upload the rest');
+  });
+
+  it('a session ended from another tab says so, and keeps the rest', async () => {
     const { result } = await interruptedAt({
       status: 409,
       body: { detail: 'closed', reason: 'session_closed', status: 'finishing', ended_by: 'person' },
     });
-    expect(messageOf(result)).toBe('This recording was ended from another tab. What was recorded is saved.');
+    expect(messageOf(result)).toBe(
+      'This recording was ended from another tab. What reached the server is saved; the last 0:05 is kept on this device, because the server would not take it after that.',
+    );
+    expect(uploadRest(result)).toBe('Upload the rest');
   });
 
-  it('a full disk stops the recording where it is, and transcribes everything before it', async () => {
+  it('a full disk stops the recording where it is, transcribes everything before it, and keeps the rest', async () => {
     const { result } = await interruptedAt({ status: 507, body: { detail: 'full', reason: 'storage_full' } });
     expect(result.kind).toBe('text');
     expect(messageOf(result)).toBe(
-      'The server ran out of space, so recording stopped at 0:20. Everything up to then is saved and is being transcribed.',
+      'The server ran out of space, so recording stopped at 0:20. Everything up to then is saved and is being transcribed; the last 0:05 is kept on this device.',
     );
+    expect(uploadRest(result)).toBe('Upload the rest');
   });
 
   it('retries corrupt, cut-short, rate-limited and unsaveable parts silently', async () => {

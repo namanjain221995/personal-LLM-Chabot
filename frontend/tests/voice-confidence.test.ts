@@ -96,16 +96,26 @@ describe('an empty draft is never called silence unless silence was measured', (
   // 'unclear' — the second opinion was declined, or the words were dropped
   // as invented. 'low' — a caution that still came back empty. null — a
   // server that said nothing about it. None of them measured silence.
-  it.each([['unclear'], ['low']])(
-    'confidence %s does not claim the room was quiet',
-    async (confidence: string | null) => {
-      const result = await send(reply({ confidence }));
-      expect('error' in result).toBe(true);
-      const message = (result as { error: { message: string } }).error.message;
-      expect(message).toBe(CLEAR);
-      expect(message).not.toContain('Nothing was said');
-    },
-  );
+  it('confidence unclear does not claim the room was quiet', async () => {
+    const result = await send(reply({ confidence: 'unclear' }));
+    expect('error' in result).toBe(true);
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(CLEAR);
+    expect(message).not.toContain('Nothing was said');
+  });
+
+  // 2026-09-29: 'low' is the server's word for "there IS a draft and it may be
+  // invented" (orchestrator/app/asr.py CONFIDENCE_LOW). An empty draft marked
+  // 'low' is not a judgement that the audio was unclear, so it is not blamed
+  // on the microphone; it was, until then.
+  it('confidence low on an empty draft does not claim the room was quiet, nor blame the microphone', async () => {
+    const result = await send(reply({ confidence: 'low' }));
+    expect('error' in result).toBe(true);
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(UNSAID);
+    expect(message).not.toContain('microphone');
+    expect(message).not.toContain('Nothing was said');
+  });
 
   // 2026-09-29: "closer to the microphone" is kept ONLY where the server
   // judged the audio unclear. A server that said nothing about it used to get

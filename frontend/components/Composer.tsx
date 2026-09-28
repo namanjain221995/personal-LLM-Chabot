@@ -18,6 +18,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
@@ -46,7 +47,12 @@ import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
 import { VoiceBar, VoiceFollowUpLine } from './VoiceBar';
 import { useVoiceRecorder } from './useVoiceRecorder';
-import { mergeTranscript, replaceTranscript } from '@/lib/voice';
+import {
+  mergeTranscriptAt,
+  placeRetranscript,
+  shiftSpan,
+  type DraftSpan,
+} from '@/lib/voice';
 import { ModelPicker } from './ModelPicker';
 import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
@@ -482,18 +488,45 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     // in, so this is false both when an admin turned it off for this person
     // and when the deployment has no video pipeline at all.
     const videoAllowed = features?.video_analysis !== false;
+    // WHERE THE LAST TRANSCRIPT WENT (2026-09-29). Retry on a transcript with
+    // gaps returns the whole recording's text again; it has to replace the
+    // first one, not follow it. Looking for the first text verbatim failed as
+    // soon as the person changed one character, and the fallback appended a
+    // second copy: a 9,000-word draft went from 79,889 to 159,786 characters.
+    // The span is carried through every edit of the draft (shiftSpan), so the
+    // new text lands exactly where the old one is, with the person's own edits
+    // merged in, or the recorder asks.
+    const voiceSpan = useRef<DraftSpan | null>(null);
+    const committedText = useRef(text);
+    useLayoutEffect(() => {
+      if (committedText.current === text) return;
+      voiceSpan.current = shiftSpan(voiceSpan.current, committedText.current, text);
+      committedText.current = text;
+    }, [text]);
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
       onTranscript: (transcript, notice, replaces) => {
-        setText((prev) => {
-          // `replaces` is set when a saved recording was transcribed again
-          // (Retry): its first transcript is already in the draft.
-          const next = replaces
-            ? replaceTranscript(prev, replaces, transcript)
-            : mergeTranscript(prev, transcript);
-          onDraftChange?.(next);
-          return next;
-        });
+        // Read from the last committed draft, not a state updater: whether
+        // the text could be placed has to be known now, to ask if it cannot.
+        const prev = committedText.current;
+        let next: string;
+        let span: DraftSpan | null;
+        if (replaces) {
+          // A saved recording transcribed again (Retry, Upload the rest): its
+          // first transcript is already in the draft.
+          const placed = placeRetranscript(prev, voiceSpan.current, replaces, transcript);
+          if (!placed) return false;
+          next = placed.text;
+          span = placed.span;
+        } else {
+          const merged = mergeTranscriptAt(prev, transcript);
+          next = merged.text;
+          span = merged.span;
+        }
+        committedText.current = next;
+        voiceSpan.current = span;
+        setText(next);
+        onDraftChange?.(next);
         // Same handoff `prefill` uses: the textarea is controlled, so the
         // caret has to move after the new text has actually landed.
         caretToEnd.current = true;
@@ -503,6 +536,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         // every other composer message uses, so it is never a dialog and
         // never blocks the send.
         if (notice) toast(notice, 'info');
+        return true;
       },
     });
     const voiceActive =

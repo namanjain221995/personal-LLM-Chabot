@@ -164,6 +164,19 @@ export async function performLogout(
   fetchFn: FetchLike = fetch,
   navigate: (url: string) => void = (url) => window.location.assign(url),
 ): Promise<void> {
+  // Voice dictation (2026-09-29, security review item 10): the logout below
+  // deletes this browser's voice outbox, including audio it never managed to
+  // upload, so that the next person on a shared computer cannot read it. The
+  // person is asked first when there is any, and owed discards are sent while
+  // the cookie is still valid. Declining keeps them signed in.
+  try {
+    const { voiceLogoutCheck } = await import('@/lib/voice');
+    const account = cachedAccount;
+    const owner = account ? (account.user ? `u${account.user.id}` : account.username) : null;
+    if (!(await voiceLogoutCheck(owner, { fetchImpl: fetchFn as typeof fetch }))) return;
+  } catch {
+    // The check is a courtesy; it never keeps anyone signed in by failing.
+  }
   try {
     await fetchFn('/api/auth/logout', { method: 'POST' });
   } catch {
